@@ -7,6 +7,8 @@ import { MessageRouter } from "./slack/message-router.js";
 import { MemoryManager } from "./memory/memory-manager.js";
 import { Scheduler } from "./scheduler/scheduler.js";
 import { HealthReporter } from "./health/health-reporter.js";
+import { isStatusQuery, handleStatusQuery } from "./health/health-query.js";
+import { LinearClient } from "./linear/linear-client.js";
 
 const log = createLogger("index");
 
@@ -22,13 +24,28 @@ async function main(): Promise<void> {
   const memoryManager = new MemoryManager(config.memory.localPath);
   await memoryManager.init();
 
+  const linearClient = new LinearClient();
+  linearClient.init();
+
   const agentManager = new AgentManager(registry);
   const healthReporter = new HealthReporter(agentManager, memoryManager);
   const messageRouter = new MessageRouter(registry, agentManager, config.agents.defaultAgent);
 
   // Start Slack gateway
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
-  slack.onMessage((msg) => messageRouter.route(msg, slack));
+
+  slack.onMessage(async (msg) => {
+    // Intercept status queries before routing to agents
+    if (isStatusQuery(msg)) {
+      const statusText = handleStatusQuery(healthReporter);
+      const threadTs = msg.threadTs ?? msg.ts;
+      await slack.postMessage(msg.channel, statusText, threadTs);
+      return;
+    }
+
+    messageRouter.route(msg, slack);
+  });
+
   await slack.start();
   log.info("Slack gateway connected");
 

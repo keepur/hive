@@ -1,0 +1,80 @@
+import { readdir, readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
+import { createLogger } from "../logging/logger.js";
+import type { AgentConfig, AgentSchedule } from "../types/agent-config.js";
+
+const log = createLogger("agent-registry");
+
+export class AgentRegistry {
+  private agents = new Map<string, AgentConfig>();
+  private basePath: string;
+
+  constructor(basePath: string) {
+    this.basePath = resolve(basePath);
+  }
+
+  async load(): Promise<void> {
+    const entries = await readdir(this.basePath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+
+      const agentDir = join(this.basePath, entry.name);
+      try {
+        const config = await this.loadAgent(agentDir, entry.name);
+        this.agents.set(config.id, config);
+        log.info("Loaded agent", { id: config.id, name: config.name });
+      } catch (err) {
+        log.error("Failed to load agent", { dir: entry.name, error: String(err) });
+      }
+    }
+  }
+
+  private async loadAgent(dir: string, dirName: string): Promise<AgentConfig> {
+    const yamlPath = join(dir, "agent.yaml");
+    const promptPath = join(dir, "system-prompt.md");
+
+    const yamlContent = await readFile(yamlPath, "utf-8");
+    const raw = parseYaml(yamlContent) as Record<string, unknown>;
+
+    const systemPrompt = await readFile(promptPath, "utf-8");
+
+    return {
+      id: (raw.id as string) || dirName,
+      name: (raw.name as string) || dirName,
+      model: (raw.model as string) || "claude-sonnet-4-6",
+      channels: (raw.channels as string[]) || [],
+      keywords: (raw.keywords as string[]) || [],
+      isDefault: (raw.isDefault as boolean) || false,
+      schedule: (raw.schedule as AgentSchedule[]) || [],
+      budgetUsd: (raw.budgetUsd as number) || 10,
+      systemPrompt,
+    };
+  }
+
+  get(id: string): AgentConfig | undefined {
+    return this.agents.get(id);
+  }
+
+  getAll(): AgentConfig[] {
+    return Array.from(this.agents.values());
+  }
+
+  listIds(): string[] {
+    return Array.from(this.agents.keys());
+  }
+
+  findByChannel(channel: string): AgentConfig | undefined {
+    return this.getAll().find((a) => a.channels.includes(channel));
+  }
+
+  findByKeyword(text: string): AgentConfig | undefined {
+    const lower = text.toLowerCase();
+    return this.getAll().find((a) => a.keywords.some((kw) => lower.includes(kw.toLowerCase())));
+  }
+
+  getDefault(): AgentConfig | undefined {
+    return this.getAll().find((a) => a.isDefault);
+  }
+}
