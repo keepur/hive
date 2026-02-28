@@ -27,12 +27,16 @@ async function main(): Promise<void> {
   const linearClient = new LinearClient();
   linearClient.init();
 
-  const agentManager = new AgentManager(registry);
+  const agentManager = new AgentManager(registry, memoryManager);
   const healthReporter = new HealthReporter(agentManager, memoryManager);
   const messageRouter = new MessageRouter(registry, agentManager, config.agents.defaultAgent);
 
   // Start Slack gateway
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
+
+  // Assistant thread events (AI Apps split view)
+  slack.onThreadStarted((event) => messageRouter.handleThreadStarted(event, slack));
+  slack.onThreadContextChanged((event) => messageRouter.handleContextChanged(event, slack));
 
   slack.onMessage(async (msg) => {
     // Intercept status queries before routing to agents

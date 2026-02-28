@@ -34,11 +34,13 @@ export class AgentRegistry {
   private async loadAgent(dir: string, dirName: string): Promise<AgentConfig> {
     const yamlPath = join(dir, "agent.yaml");
     const promptPath = join(dir, "system-prompt.md");
+    const soulPath = join(dir, "soul.md");
 
     const yamlContent = await readFile(yamlPath, "utf-8");
     const raw = parseYaml(yamlContent) as Record<string, unknown>;
 
     const systemPrompt = await readFile(promptPath, "utf-8");
+    const soul = await readFile(soulPath, "utf-8").catch(() => "");
 
     return {
       id: (raw.id as string) || dirName,
@@ -49,6 +51,7 @@ export class AgentRegistry {
       isDefault: (raw.isDefault as boolean) || false,
       schedule: (raw.schedule as AgentSchedule[]) || [],
       budgetUsd: (raw.budgetUsd as number) || 10,
+      soul,
       systemPrompt,
     };
   }

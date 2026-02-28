@@ -15,9 +15,10 @@ export const config = {
   slack: {
     appToken: required("SLACK_APP_TOKEN"),
     botToken: required("SLACK_BOT_TOKEN"),
+    mcpToken: optional("SLACK_MCP_TOKEN", ""),
   },
   anthropic: {
-    apiKey: required("ANTHROPIC_API_KEY"),
+    apiKey: optional("ANTHROPIC_API_KEY", ""),
   },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),

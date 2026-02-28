@@ -1,12 +1,14 @@
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig, AgentState, AgentStatus, IncomingMessage } from "../types/agent-config.js";
-import { AgentRunner, type RunResult } from "./agent-runner.js";
+import { AgentRunner, type RunResult, type StreamCallback } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
+import type { MemoryManager } from "../memory/memory-manager.js";
 
 const log = createLogger("agent-manager");
 
 interface QueuedMessage {
   message: IncomingMessage;
+  onStream?: StreamCallback;
   resolve: (result: RunResult) => void;
   reject: (error: Error) => void;
 }
@@ -17,9 +19,11 @@ export class AgentManager {
   private queues = new Map<string, QueuedMessage[]>();
   private processing = new Set<string>();
   private registry: AgentRegistry;
+  private memoryManager: MemoryManager;
 
-  constructor(registry: AgentRegistry) {
+  constructor(registry: AgentRegistry, memoryManager: MemoryManager) {
     this.registry = registry;
+    this.memoryManager = memoryManager;
   }
 
   private getOrCreateRunner(agentId: string): AgentRunner {
@@ -27,7 +31,7 @@ export class AgentManager {
     if (!runner) {
       const config = this.registry.get(agentId);
       if (!config) throw new Error(`Unknown agent: ${agentId}`);
-      runner = new AgentRunner(config);
+      runner = new AgentRunner(config, this.memoryManager);
       this.runners.set(agentId, runner);
       this.states.set(agentId, {
         id: agentId,
@@ -40,12 +44,12 @@ export class AgentManager {
     return runner;
   }
 
-  async sendMessage(agentId: string, message: IncomingMessage): Promise<RunResult> {
+  async sendMessage(agentId: string, message: IncomingMessage, onStream?: StreamCallback): Promise<RunResult> {
     this.getOrCreateRunner(agentId);
 
     return new Promise<RunResult>((resolve, reject) => {
       const queue = this.queues.get(agentId) ?? [];
-      queue.push({ message, resolve, reject });
+      queue.push({ message, onStream, resolve, reject });
       this.queues.set(agentId, queue);
       this.processQueue(agentId);
     });
@@ -64,7 +68,7 @@ export class AgentManager {
       const item = queue.shift()!;
       try {
         const runner = this.getOrCreateRunner(agentId);
-        const result = await runner.send(item.message.text);
+        const result = await runner.send(item.message.text, item.onStream);
 
         const state = this.states.get(agentId)!;
         state.messagesProcessed++;

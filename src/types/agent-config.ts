@@ -12,6 +12,7 @@ export interface AgentConfig {
   isDefault: boolean;
   schedule: AgentSchedule[];
   budgetUsd: number;
+  soul: string;
   systemPrompt: string;
 }
 
