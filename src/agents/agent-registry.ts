@@ -14,7 +14,12 @@ export class AgentRegistry {
     this.basePath = resolve(basePath);
   }
 
-  async load(): Promise<void> {
+  async load(): Promise<{ added: string[]; updated: string[]; removed: string[] }> {
+    const previousIds = new Set(this.agents.keys());
+    const currentIds = new Set<string>();
+    const added: string[] = [];
+    const updated: string[] = [];
+
     const entries = await readdir(this.basePath, { withFileTypes: true });
 
     for (const entry of entries) {
@@ -23,12 +28,32 @@ export class AgentRegistry {
       const agentDir = join(this.basePath, entry.name);
       try {
         const config = await this.loadAgent(agentDir, entry.name);
+        currentIds.add(config.id);
+
+        if (previousIds.has(config.id)) {
+          updated.push(config.id);
+        } else {
+          added.push(config.id);
+        }
+
         this.agents.set(config.id, config);
         log.info("Loaded agent", { id: config.id, name: config.name });
       } catch (err) {
         log.error("Failed to load agent", { dir: entry.name, error: String(err) });
       }
     }
+
+    // Remove agents whose directories were deleted
+    const removed: string[] = [];
+    for (const id of previousIds) {
+      if (!currentIds.has(id)) {
+        this.agents.delete(id);
+        removed.push(id);
+        log.info("Removed agent", { id });
+      }
+    }
+
+    return { added, updated, removed };
   }
 
   private async loadAgent(dir: string, dirName: string): Promise<AgentConfig> {

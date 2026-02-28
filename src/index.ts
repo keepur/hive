@@ -1,3 +1,5 @@
+import { watch } from "node:fs";
+import { resolve } from "node:path";
 import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
@@ -30,6 +32,34 @@ async function main(): Promise<void> {
   const agentManager = new AgentManager(registry, memoryManager);
   const healthReporter = new HealthReporter(agentManager, memoryManager);
   const messageRouter = new MessageRouter(registry, agentManager, config.agents.defaultAgent);
+
+  // --- Hot reload ---
+  let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const reload = async () => {
+    log.info("Hot-reloading agent registry...");
+    const result = await registry.load();
+
+    if (result.added.length) log.info("New agents online", { agents: result.added });
+    if (result.updated.length) log.info("Agents updated", { agents: result.updated });
+    if (result.removed.length) {
+      log.info("Agents removed", { agents: result.removed });
+      for (const id of result.removed) {
+        agentManager.stopAgent(id);
+      }
+    }
+  };
+
+  // Watch agents/ directory for changes — debounced to 500ms
+  const agentsDir = resolve(config.agents.definitionsPath);
+  watch(agentsDir, { recursive: true }, () => {
+    if (reloadTimer) clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => reload(), 500);
+  });
+
+  // SIGUSR1: manual hot-reload trigger
+  process.on("SIGUSR1", () => reload());
+  log.info("Hot-reload enabled", { watched: agentsDir, signal: "SIGUSR1" });
 
   // Start Slack gateway
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
