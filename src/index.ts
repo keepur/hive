@@ -13,6 +13,7 @@ import { SessionStore } from "./agents/session-store.js";
 import { Dispatcher } from "./channels/dispatcher.js";
 import { SlackAdapter } from "./channels/slack-adapter.js";
 import { SmsAdapter } from "./channels/sms-adapter.js";
+import { DodiTaskClient } from "./dodi/task-client.js";
 
 const log = createLogger("index");
 
@@ -33,6 +34,12 @@ async function main(): Promise<void> {
 
   const linearClient = new LinearClient();
   linearClient.init();
+
+  const taskClient = new DodiTaskClient(config.dodi.apiUrl, config.dodi.apiKey);
+  if (taskClient.isConfigured) {
+    log.info("DodiHome task client configured", { apiUrl: config.dodi.apiUrl });
+  }
+
 
   const agentManager = new AgentManager(registry, memoryManager, sessionStore);
   const healthReporter = new HealthReporter(agentManager, memoryManager);

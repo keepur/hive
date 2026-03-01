@@ -56,6 +56,10 @@ export const config = {
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),
   },
+  dodi: {
+    apiUrl: optional("DODI_API_URL", "http://localhost:3002"),
+    apiKey: optional("DODI_API_KEY", ""),
+  },
   mongo: {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
     dbName: optional("MONGODB_DB", "hive"),
