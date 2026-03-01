@@ -110,6 +110,20 @@ export class AgentRunner {
       },
     };
 
+    // DodiHome task ledger
+    if (config.dodi.apiKey) {
+      servers["tasks"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/dodi/task-mcp-server.js")],
+        env: {
+          DODI_API_URL: config.dodi.apiUrl,
+          DODI_API_KEY: config.dodi.apiKey,
+        },
+      };
+    }
+
+
     return servers;
   }
 
