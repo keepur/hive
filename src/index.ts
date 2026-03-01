@@ -32,8 +32,13 @@ async function main(): Promise<void> {
   const sessionStore = new SessionStore(config.mongo.uri);
   await sessionStore.connect(config.mongo.dbName);
 
-  const linearClient = new LinearClient();
-  linearClient.init();
+  if (config.linear.apiKey) {
+    const linearClient = new LinearClient(
+      config.linear.apiKey,
+      config.linear.teamId || undefined,
+    );
+    log.info("Linear client configured");
+  }
 
   const taskClient = new DodiTaskClient(config.dodi.apiUrl, config.dodi.apiKey);
   if (taskClient.isConfigured) {

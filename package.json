@@ -19,6 +19,7 @@
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@slack/socket-mode": "^2.0.5",
     "@slack/web-api": "^7.14.1",
+    "brave-search-mcp": "^2.0.1",
     "csv-parse": "^6.1.0",
     "dotenv": "^17.3.1",
     "mongodb": "^7.1.0",

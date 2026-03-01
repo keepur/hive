@@ -55,6 +55,10 @@ export const config = {
   },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),
+    teamId: optional("LINEAR_TEAM_ID", ""),
+  },
+  brave: {
+    apiKey: optional("BRAVE_API_KEY", ""),
   },
   dodi: {
     apiUrl: optional("DODI_API_URL", "http://localhost:3002"),
