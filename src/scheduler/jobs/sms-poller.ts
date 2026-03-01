@@ -32,6 +32,8 @@ export class SmsPoller {
   private router: MessageRouter;
   private gateway: SlackGateway;
   private slackChannelIds = new Map<string, string>(); // name → id
+  /** Slack timestamps of messages we posted — gateway should ignore these */
+  private postedTs = new Set<string>();
 
   constructor(apiKey: string, router: MessageRouter, gateway: SlackGateway) {
     this.apiKey = apiKey;
@@ -67,6 +69,11 @@ export class SmsPoller {
 
     this.interval = setInterval(() => this.poll(), intervalMs);
     log.info("SMS poller started", { intervalMs, lines: this.lines.map((l) => l.label) });
+  }
+
+  /** Check if a Slack message timestamp was posted by this poller */
+  isPollerMessage(ts: string): boolean {
+    return this.postedTs.has(ts);
   }
 
   stop(): void {
@@ -143,6 +150,13 @@ export class SmsPoller {
               undefined,
               { name: "Quo", icon: ":phone:" },
             );
+
+            // Track this ts so the gateway doesn't re-route it.
+            // Slack echoes the event within seconds, so expire after 60s.
+            if (slackTs) {
+              this.postedTs.add(slackTs);
+              setTimeout(() => this.postedTs.delete(slackTs), 60_000);
+            }
 
             // Route to the agent watching this channel
             const incomingMsg: IncomingMessage = {
