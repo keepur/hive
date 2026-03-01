@@ -7,10 +7,11 @@ const log = createLogger("sms-adapter");
 const QUO_BASE = "https://api.openphone.com/v1";
 
 interface SmsLine {
-  id: string;        // phoneNumberId
-  label: string;     // e.g. "May (CEO)"
-  number: string;    // E.164 phone number
-  lastSeen: string;  // ISO 8601 timestamp of last polled message
+  id: string;         // phoneNumberId
+  label: string;      // e.g. "May (CEO)"
+  number: string;     // E.164 phone number
+  routeLabel: string; // channel name for agent routing (e.g. "quo-may")
+  lastSeen: string;   // ISO 8601 timestamp of last polled message
 }
 
 interface QuoMessage {
@@ -31,10 +32,13 @@ export class SmsAdapter implements ChannelAdapter {
   private lines: SmsLine[];
   private interval: ReturnType<typeof setInterval> | null = null;
 
-  constructor(apiKey: string, lines: Array<{ id: string; label: string; number: string }>) {
+  constructor(apiKey: string, lines: Array<{ id: string; label: string; number: string; slackChannel?: string }>) {
     this.apiKey = apiKey;
     this.lines = lines.map((l) => ({
-      ...l,
+      id: l.id,
+      label: l.label,
+      number: l.number,
+      routeLabel: l.slackChannel ?? l.label,
       lastSeen: new Date().toISOString(),
     }));
   }
@@ -148,7 +152,7 @@ export class SmsAdapter implements ChannelAdapter {
               source: {
                 kind: "sms",
                 id: line.id,
-                label: line.label,
+                label: line.routeLabel,
               },
               sender: msg.from,
               threadId: `sms:${line.id}:${msg.from}`,
