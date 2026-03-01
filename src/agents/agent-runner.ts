@@ -123,6 +123,33 @@ export class AgentRunner {
       };
     }
 
+    // Brave Search — web search and research
+    if (config.brave.apiKey) {
+      servers["brave-search"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("node_modules/brave-search-mcp/dist/index.js")],
+        env: {
+          BRAVE_API_KEY: config.brave.apiKey,
+        },
+      };
+    }
+
+    // Linear — issue tracking (per-agent team via memory, LINEAR_TEAM_ID is optional default)
+    if (config.linear.apiKey) {
+      const env: Record<string, string> = {
+        LINEAR_API_KEY: config.linear.apiKey,
+      };
+      if (config.linear.teamId) {
+        env.LINEAR_TEAM_ID = config.linear.teamId;
+      }
+      servers["linear"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/linear/linear-mcp-server.js")],
+        env,
+      };
+    }
 
     return servers;
   }
