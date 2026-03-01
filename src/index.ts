@@ -67,8 +67,10 @@ async function main(): Promise<void> {
   log.info("Hot-reload enabled", { watched: agentsDir, signal: "SIGUSR1" });
 
   // Start Slack adapter (wraps SlackGateway)
+  // Exclude SMS channels — those are handled directly by the SmsAdapter
+  const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
-  const slackAdapter = new SlackAdapter(slack, registry);
+  const slackAdapter = new SlackAdapter(slack, registry, smsChannels);
   dispatcher.registerAdapter(slackAdapter);
   await slackAdapter.start((item) => dispatcher.dispatch(item));
   log.info("Slack adapter connected");

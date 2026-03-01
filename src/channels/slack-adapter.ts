@@ -23,19 +23,29 @@ export class SlackAdapter implements ChannelAdapter {
 
   private gateway: SlackGateway;
   private registry: AgentRegistry;
+  private excludeChannels: Set<string>;
 
-  constructor(gateway: SlackGateway, registry: AgentRegistry) {
+  constructor(gateway: SlackGateway, registry: AgentRegistry, excludeChannels: string[] = []) {
     this.gateway = gateway;
     this.registry = registry;
+    this.excludeChannels = new Set(excludeChannels);
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
-    // Register integration channels from registry
-    const allAgentChannels = this.registry.getAll().flatMap((a) => a.channels);
+    // Register integration channels from registry, excluding channels handled by other adapters
+    const allAgentChannels = this.registry.getAll()
+      .flatMap((a) => a.channels)
+      .filter((ch) => !this.excludeChannels.has(ch));
     this.gateway.addIntegrationChannels(allAgentChannels);
 
     // Convert incoming Slack messages to WorkItems
     this.gateway.onMessage((msg) => {
+      // Skip channels handled by other adapters (e.g. SMS channels)
+      if (this.excludeChannels.has(msg.channelName)) {
+        log.debug("Ignoring message from excluded channel", { channel: msg.channelName });
+        return;
+      }
+
       const workItem: WorkItem = {
         id: msg.ts,
         text: msg.text,
