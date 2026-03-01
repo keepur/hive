@@ -16,11 +16,14 @@ const API_KEY = process.env.QUO_API_KEY ?? "";
 const DEFAULT_PHONE_ID = process.env.QUO_PHONE_NUMBER_ID ?? "";
 const BASE = "https://api.openphone.com/v1";
 
-// Named lines for easy switching
-const LINES: Record<string, { id: string; number: string; label: string }> = {
-  main: { id: "PNPrFfnQHH", number: "(408) 668-3634", label: "DodiHome Main" },
-  personal: { id: "PND0avmbpw", number: "(650) 649-3009", label: "May (CEO)" },
-};
+// Named lines loaded from config (passed via QUO_LINES_JSON env var)
+const LINES: Record<string, { id: string; number: string; label: string }> = (() => {
+  try {
+    return JSON.parse(process.env.QUO_LINES_JSON ?? "{}");
+  } catch {
+    return {};
+  }
+})();
 
 function resolveLine(from?: string): string {
   if (!from) return DEFAULT_PHONE_ID;
@@ -77,7 +80,10 @@ server.registerTool("quo_phone_numbers", {
 
 server.registerTool("quo_send_sms", {
   title: "Send SMS",
-  description: `Send a text message via Quo. Use "main" for the DodiHome business line (408) 668-3634, or "personal" for the CEO's line (650) 649-3009. Defaults to the CEO's personal line.`,
+  description: (() => {
+    const lineDescs = Object.entries(LINES).map(([k, v]) => `"${k}" for ${v.label} ${v.number}`).join(", ");
+    return `Send a text message via Quo.${lineDescs ? ` Available lines: ${lineDescs}.` : ""} Pass a line name or PNxxx ID.`;
+  })(),
   inputSchema: {
     to: z.string().describe("Recipient phone number in E.164 format (e.g. +14085551234)"),
     content: z.string().max(1600).describe("Message text (max 1600 chars)"),

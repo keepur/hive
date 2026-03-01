@@ -94,6 +94,7 @@ export class AgentRunner {
         env: {
           QUO_API_KEY: config.quo.apiKey,
           ...(config.quo.phoneNumberId ? { QUO_PHONE_NUMBER_ID: config.quo.phoneNumberId } : {}),
+          QUO_LINES_JSON: JSON.stringify(config.quo.lines),
         },
       };
     }

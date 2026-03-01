@@ -6,7 +6,12 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "npx tsx src/index.ts"
+    "dev": "npx tsx src/index.ts",
+    "setup": "npx tsx setup/setup-wizard.ts",
+    "setup:prereqs": "bash setup/install-prereqs.sh",
+    "setup:agents": "npx tsx setup/generate-agents.ts",
+    "setup:plist": "npx tsx setup/generate-plist.ts",
+    "update": "git pull && npm install && npm run build"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.63",

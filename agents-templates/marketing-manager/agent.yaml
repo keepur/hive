@@ -1,0 +1,20 @@
+id: marketing-manager
+name: River
+icon: ":art:"
+model: claude-sonnet-4-6
+channels:
+  - marketing
+keywords:
+  - marketing
+  - content
+  - campaign
+  - social
+  - brand
+  - leads
+  - seo
+  - collateral
+isDefault: false
+schedule:
+  - cron: "0 9 * * 1-5"
+    task: marketing-pulse
+budgetUsd: 50

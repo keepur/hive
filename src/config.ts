@@ -1,4 +1,8 @@
 import dotenv from "dotenv";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
+
 dotenv.config();
 
 function required(key: string): string {
@@ -11,7 +15,36 @@ function optional(key: string, fallback: string): string {
   return process.env[key] || fallback;
 }
 
+// Load hive.yaml instance config
+const hiveConfigPath = resolve(process.env.HIVE_CONFIG ?? "./hive.yaml");
+let hive: Record<string, any> = {};
+if (existsSync(hiveConfigPath)) {
+  hive = parseYaml(readFileSync(hiveConfigPath, "utf-8")) ?? {};
+}
+
+const home = process.env.HOME ?? "/tmp";
+
+export interface SmsLine {
+  id: string;
+  label: string;
+  number: string;
+  slackChannel: string;
+}
+
+export interface QuoLine {
+  id: string;
+  number: string;
+  label: string;
+}
+
 export const config = {
+  business: {
+    name: hive.business?.name ?? optional("BUSINESS_NAME", ""),
+    description: hive.business?.description ?? "",
+    location: hive.business?.location ?? "",
+    ownerName: hive.business?.owner?.name ?? "",
+    ownerRole: hive.business?.owner?.role ?? "",
+  },
   slack: {
     appToken: required("SLACK_APP_TOKEN"),
     botToken: required("SLACK_BOT_TOKEN"),
@@ -28,8 +61,11 @@ export const config = {
     dbName: optional("MONGODB_DB", "hive"),
   },
   memory: {
-    repo: optional("HIVE_MEMORY_REPO", "bot-dodi/hive-memory"),
-    localPath: optional("HIVE_MEMORY_LOCAL_PATH", "/Users/mokie/github/hive-memory"),
+    repo: optional("HIVE_MEMORY_REPO", hive.memory?.repo ?? ""),
+    localPath: optional(
+      "HIVE_MEMORY_LOCAL_PATH",
+      (hive.memory?.localPath ?? `${home}/hive-memory`).replace("~", home),
+    ),
   },
   agents: {
     defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
@@ -42,6 +78,10 @@ export const config = {
   quo: {
     apiKey: optional("QUO_API_KEY", ""),
     phoneNumberId: optional("QUO_PHONE_NUMBER_ID", ""),
+    lines: (hive.quo?.lines ?? {}) as Record<string, QuoLine>,
+  },
+  sms: {
+    lines: (hive.sms?.lines ?? []) as SmsLine[],
   },
   scheduler: {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),

@@ -1,0 +1,60 @@
+display_information:
+  name: Hive
+  description: Multi-agent AI assistant for your Slack workspace
+  background_color: "#1a1a2e"
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  assistant:
+    assistant_description: Your AI assistant team — ask anything
+  bot_user:
+    display_name: Hive
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - assistant:write
+      - channels:history
+      - channels:join
+      - channels:read
+      - chat:write
+      - chat:write.customize
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - reactions:read
+      - reactions:write
+      - users:read
+    user:
+      - channels:history
+      - channels:read
+      - chat:write
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - mpim:history
+      - mpim:read
+      - reactions:read
+      - search:read
+      - users:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - assistant_thread_context_changed
+      - assistant_thread_started
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

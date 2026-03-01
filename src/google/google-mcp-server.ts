@@ -5,10 +5,10 @@
  * Agents can search/read email, send email, and manage calendar events.
  *
  * Requires `gog` CLI to be installed and authenticated.
- * See: /opt/homebrew/bin/gog
  *
  * Env vars:
  *   GOG_ACCOUNT — Google account email (optional, uses gog default if unset)
+ *   GOG_PATH    — path to gog binary (optional, auto-detected if unset)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -17,7 +17,10 @@ import { z } from "zod";
 import { execSync } from "node:child_process";
 
 const ACCOUNT = process.env.GOG_ACCOUNT ?? "";
-const GOG = "/opt/homebrew/bin/gog";
+const GOG = process.env.GOG_PATH ?? (() => {
+  try { return execSync("which gog", { encoding: "utf-8" }).trim(); }
+  catch { return "gog"; }
+})();
 
 function gog(args: string): string {
   const accountFlag = ACCOUNT ? `-a "${ACCOUNT}"` : "";

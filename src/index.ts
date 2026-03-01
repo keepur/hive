@@ -94,8 +94,10 @@ async function main(): Promise<void> {
 
   // Start SMS poller — polls Quo API directly for incoming messages
   const smsPoller = new SmsPoller(config.quo.apiKey, messageRouter, slack);
-  if (config.quo.apiKey && config.quo.phoneNumberId) {
-    smsPoller.addLine(config.quo.phoneNumberId, "May (CEO)", "quo-may");
+  if (config.quo.apiKey && config.sms.lines.length > 0) {
+    for (const line of config.sms.lines) {
+      smsPoller.addLine(line.id, line.label, line.slackChannel);
+    }
     await smsPoller.start(30_000);
   }
 
