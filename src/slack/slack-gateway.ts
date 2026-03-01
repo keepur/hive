@@ -32,7 +32,6 @@ export class SlackGateway {
   private botId: string | null = null; // bot_id (Bxxx) — different from user_id (Uxxx)
   private channelNameCache = new Map<string, string>(); // id → name
   private integrationChannels = new Set<string>(); // channel names that accept bot messages
-  private ignoreTs: ((ts: string) => boolean) | null = null; // skip messages posted by e.g. SMS poller
 
   constructor(appToken: string, botToken: string) {
     this.socket = new SocketModeClient({ appToken });
@@ -41,11 +40,6 @@ export class SlackGateway {
 
   addIntegrationChannels(channels: string[]): void {
     for (const ch of channels) this.integrationChannels.add(ch);
-  }
-
-  /** Register a filter — if it returns true for a message ts, skip that message */
-  setIgnoreFilter(fn: (ts: string) => boolean): void {
-    this.ignoreTs = fn;
   }
 
   onMessage(handler: MessageHandler): void {
@@ -87,9 +81,6 @@ export class SlackGateway {
       // Skip our own bot's messages (by user ID or bot ID)
       if (event.user === this.botUserId) return;
       if (event.bot_id && event.bot_id === this.botId) return;
-
-      // Skip messages posted by internal systems (e.g. SMS poller) that route directly
-      if (event.ts && this.ignoreTs?.(event.ts)) return;
 
       // For bot messages or messages with subtypes, only allow in integration channels
       if (event.bot_id || event.subtype) {

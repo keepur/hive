@@ -5,14 +5,14 @@ import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
 import { SlackGateway } from "./slack/slack-gateway.js";
-import { MessageRouter } from "./slack/message-router.js";
 import { MemoryManager } from "./memory/memory-manager.js";
 import { Scheduler } from "./scheduler/scheduler.js";
 import { HealthReporter } from "./health/health-reporter.js";
-import { isStatusQuery, handleStatusQuery } from "./health/health-query.js";
 import { LinearClient } from "./linear/linear-client.js";
 import { SessionStore } from "./agents/session-store.js";
-import { SmsPoller } from "./scheduler/jobs/sms-poller.js";
+import { Dispatcher } from "./channels/dispatcher.js";
+import { SlackAdapter } from "./channels/slack-adapter.js";
+import { SmsAdapter } from "./channels/sms-adapter.js";
 
 const log = createLogger("index");
 
@@ -36,7 +36,7 @@ async function main(): Promise<void> {
 
   const agentManager = new AgentManager(registry, memoryManager, sessionStore);
   const healthReporter = new HealthReporter(agentManager, memoryManager);
-  const messageRouter = new MessageRouter(registry, agentManager, config.agents.defaultAgent);
+  const dispatcher = new Dispatcher(registry, agentManager, healthReporter, config.agents.defaultAgent);
 
   // --- Hot reload ---
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
@@ -66,40 +66,28 @@ async function main(): Promise<void> {
   process.on("SIGUSR1", () => reload());
   log.info("Hot-reload enabled", { watched: agentsDir, signal: "SIGUSR1" });
 
-  // Start Slack gateway
+  // Start Slack adapter (wraps SlackGateway)
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
+  const slackAdapter = new SlackAdapter(slack, registry);
+  dispatcher.registerAdapter(slackAdapter);
+  await slackAdapter.start((item) => dispatcher.dispatch(item));
+  log.info("Slack adapter connected");
 
-  // Allow bot messages (from integrations like Quo) in all agent-watched channels
-  const allAgentChannels = registry.getAll().flatMap((a) => a.channels);
-  slack.addIntegrationChannels(allAgentChannels);
-
-  // Assistant thread events (AI Apps split view)
-  slack.onThreadStarted((event) => messageRouter.handleThreadStarted(event, slack));
-  slack.onThreadContextChanged((event) => messageRouter.handleContextChanged(event, slack));
-
-  slack.onMessage(async (msg) => {
-    // Intercept status queries before routing to agents
-    if (isStatusQuery(msg)) {
-      const statusText = handleStatusQuery(healthReporter);
-      const threadTs = msg.threadTs ?? msg.ts;
-      await slack.postMessage(msg.channel, statusText, threadTs);
-      return;
+  // Set Slack as audit channel for cross-channel visibility
+  try {
+    const channels = await slack.client.conversations.list({ types: "public_channel", limit: 200 });
+    const generalCh = (channels.channels ?? []).find((c: any) => c.name === "general");
+    if (generalCh?.id) {
+      dispatcher.setAuditChannel(slackAdapter, generalCh.id);
     }
+  } catch {}
 
-    messageRouter.route(msg, slack);
-  });
-
-  await slack.start();
-  log.info("Slack gateway connected");
-
-  // Start SMS poller — polls Quo API directly for incoming messages
-  const smsPoller = new SmsPoller(config.quo.apiKey, messageRouter, slack);
-  slack.setIgnoreFilter((ts) => smsPoller.isPollerMessage(ts));
+  // SMS adapter — direct path, bypasses Slack
+  const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines);
+  dispatcher.registerAdapter(smsAdapter);
   if (config.quo.apiKey && config.sms.lines.length > 0) {
-    for (const line of config.sms.lines) {
-      smsPoller.addLine(line.id, line.label, line.slackChannel);
-    }
-    await smsPoller.start(30_000);
+    await smsAdapter.start((item) => dispatcher.dispatch(item));
+    log.info("SMS adapter started", { lines: config.sms.lines.length });
   }
 
   // Start scheduler
@@ -110,11 +98,11 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
-    smsPoller.stop();
+    await smsAdapter.stop();
     scheduler.stop();
     agentManager.stopAll();
     await sessionStore.close();
-    await slack.stop();
+    await slackAdapter.stop();
     log.info("Hive shut down cleanly");
     process.exit(0);
   };
