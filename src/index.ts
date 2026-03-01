@@ -11,6 +11,8 @@ import { Scheduler } from "./scheduler/scheduler.js";
 import { HealthReporter } from "./health/health-reporter.js";
 import { isStatusQuery, handleStatusQuery } from "./health/health-query.js";
 import { LinearClient } from "./linear/linear-client.js";
+import { SessionStore } from "./agents/session-store.js";
+import { SmsPoller } from "./scheduler/jobs/sms-poller.js";
 
 const log = createLogger("index");
 
@@ -26,10 +28,13 @@ async function main(): Promise<void> {
   const memoryManager = new MemoryManager(config.memory.localPath);
   await memoryManager.init();
 
+  const sessionStore = new SessionStore(config.mongo.uri);
+  await sessionStore.connect(config.mongo.dbName);
+
   const linearClient = new LinearClient();
   linearClient.init();
 
-  const agentManager = new AgentManager(registry, memoryManager);
+  const agentManager = new AgentManager(registry, memoryManager, sessionStore);
   const healthReporter = new HealthReporter(agentManager, memoryManager);
   const messageRouter = new MessageRouter(registry, agentManager, config.agents.defaultAgent);
 
@@ -64,6 +69,10 @@ async function main(): Promise<void> {
   // Start Slack gateway
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
 
+  // Allow bot messages (from integrations like Quo) in all agent-watched channels
+  const allAgentChannels = registry.getAll().flatMap((a) => a.channels);
+  slack.addIntegrationChannels(allAgentChannels);
+
   // Assistant thread events (AI Apps split view)
   slack.onThreadStarted((event) => messageRouter.handleThreadStarted(event, slack));
   slack.onThreadContextChanged((event) => messageRouter.handleContextChanged(event, slack));
@@ -83,6 +92,13 @@ async function main(): Promise<void> {
   await slack.start();
   log.info("Slack gateway connected");
 
+  // Start SMS poller — polls Quo API directly for incoming messages
+  const smsPoller = new SmsPoller(config.quo.apiKey, messageRouter, slack);
+  if (config.quo.apiKey && config.quo.phoneNumberId) {
+    smsPoller.addLine(config.quo.phoneNumberId, "May (CEO)", "quo-may");
+    await smsPoller.start(30_000);
+  }
+
   // Start scheduler
   const scheduler = new Scheduler(agentManager, memoryManager, healthReporter, registry);
   scheduler.start();
@@ -91,8 +107,10 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
+    smsPoller.stop();
     scheduler.stop();
     agentManager.stopAll();
+    await sessionStore.close();
     await slack.stop();
     log.info("Hive shut down cleanly");
     process.exit(0);

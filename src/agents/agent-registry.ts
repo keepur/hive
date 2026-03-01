@@ -76,6 +76,8 @@ export class AgentRegistry {
       isDefault: (raw.isDefault as boolean) || false,
       schedule: (raw.schedule as AgentSchedule[]) || [],
       budgetUsd: (raw.budgetUsd as number) || 10,
+      maxTurns: (raw.maxTurns as number) || 25,
+      icon: (raw.icon as string) || "",
       soul,
       systemPrompt,
     };
@@ -93,13 +95,23 @@ export class AgentRegistry {
     return Array.from(this.agents.keys());
   }
 
-  findByChannel(channel: string): AgentConfig | undefined {
-    return this.getAll().find((a) => a.channels.includes(channel));
+  findByChannel(channelName: string): AgentConfig | undefined {
+    return this.getAll().find((a) => a.channels.includes(channelName));
   }
 
   findByKeyword(text: string): AgentConfig | undefined {
     const lower = text.toLowerCase();
     return this.getAll().find((a) => a.keywords.some((kw) => lower.includes(kw.toLowerCase())));
+  }
+
+  findByName(text: string): AgentConfig | undefined {
+    const lower = text.toLowerCase();
+    return this.getAll().find((a) => {
+      const name = a.name.toLowerCase();
+      // Match "hey River", "River,", "@River", or just "River" at word boundaries
+      const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
+      return pattern.test(text);
+    });
   }
 
   getDefault(): AgentConfig | undefined {

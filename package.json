@@ -11,14 +11,17 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.63",
     "@linear/sdk": "^76.0.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@slack/socket-mode": "^2.0.5",
     "@slack/web-api": "^7.14.1",
+    "csv-parse": "^6.1.0",
     "dotenv": "^17.3.1",
+    "mongodb": "^7.1.0",
     "yaml": "^2.8.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "typescript": "^5.7.0",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
   }
 }

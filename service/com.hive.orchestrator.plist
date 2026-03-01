@@ -8,11 +8,11 @@
     <key>ProgramArguments</key>
     <array>
         <string>/Users/mokie/.nvm/versions/node/v24.13.1/bin/node</string>
-        <string>/Users/mokie/hive/dist/index.js</string>
+        <string>/Users/mokie/github/hive/dist/index.js</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/mokie/hive</string>
+    <string>/Users/mokie/github/hive</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -35,9 +35,9 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/mokie/hive/logs/stdout.log</string>
+    <string>/Users/mokie/github/hive/logs/stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/mokie/hive/logs/stderr.log</string>
+    <string>/Users/mokie/github/hive/logs/stderr.log</string>
 </dict>
 </plist>

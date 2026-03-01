@@ -12,6 +12,8 @@ export interface AgentConfig {
   isDefault: boolean;
   schedule: AgentSchedule[];
   budgetUsd: number;
+  maxTurns: number;
+  icon: string; // emoji like ":briefcase:" or URL
   soul: string;
   systemPrompt: string;
 }
@@ -30,6 +32,7 @@ export interface AgentState {
 export interface IncomingMessage {
   text: string;
   channel: string;
+  channelName: string;
   user: string;
   ts: string;
   threadTs?: string;

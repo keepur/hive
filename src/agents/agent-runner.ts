@@ -1,4 +1,5 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import { resolve } from "node:path";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
@@ -20,16 +21,11 @@ export interface RunResult {
 export class AgentRunner {
   private agentConfig: AgentConfig;
   private memoryManager: MemoryManager;
-  private sessionId: string | undefined;
   private activeQuery: Query | null = null;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
-  }
-
-  get currentSessionId(): string | undefined {
-    return this.sessionId;
   }
 
   private async buildSystemPrompt(): Promise<string> {
@@ -49,8 +45,8 @@ export class AgentRunner {
     return parts.join("\n\n---\n\n");
   }
 
-  private buildMcpServers(): Record<string, { type: "http"; url: string; headers?: Record<string, string> }> {
-    const servers: Record<string, { type: "http"; url: string; headers?: Record<string, string> }> = {};
+  private buildMcpServers(): Record<string, McpServerConfig> {
+    const servers: Record<string, McpServerConfig> = {};
 
     if (config.slack.mcpToken) {
       servers["slack"] = {
@@ -60,13 +56,66 @@ export class AgentRunner {
       };
     }
 
+    // Memory MCP server — gives the agent read/write access to its own memory
+    servers["memory"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/memory/memory-mcp-server.js")],
+      env: {
+        AGENT_ID: this.agentConfig.id,
+        MEMORY_REPO_PATH: config.memory.localPath,
+      },
+    };
+
+    // Keychain MCP server — read-only access to macOS Keychain secrets
+    servers["keychain"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/keychain/keychain-mcp-server.js")],
+    };
+
+    // Google MCP server — Gmail + Calendar via gog CLI
+    servers["google"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/google/google-mcp-server.js")],
+      env: {
+        ...(config.google?.account ? { GOG_ACCOUNT: config.google.account } : {}),
+        PATH: process.env.PATH ?? "",
+      },
+    };
+
+    // Quo MCP server — SMS, calls, contacts via Quo (OpenPhone) API
+    if (config.quo.apiKey) {
+      servers["quo"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/quo/quo-mcp-server.js")],
+        env: {
+          QUO_API_KEY: config.quo.apiKey,
+          ...(config.quo.phoneNumberId ? { QUO_PHONE_NUMBER_ID: config.quo.phoneNumberId } : {}),
+        },
+      };
+    }
+
+    // Contacts MCP server — centralized contact lookup (MongoDB)
+    servers["contacts"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/contacts/contacts-mcp-server.js")],
+      env: {
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+      },
+    };
+
     return servers;
   }
 
-  async send(prompt: string, onStream?: StreamCallback): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback): Promise<RunResult> {
     log.info("Sending prompt to agent", {
       agent: this.agentConfig.id,
-      resumeSession: this.sessionId ?? "new",
+      resumeSession: sessionId ?? "new",
       promptLength: prompt.length,
       streaming: !!onStream,
     });
@@ -81,10 +130,10 @@ export class AgentRunner {
         systemPrompt,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
-        maxTurns: 10,
+        maxTurns: this.agentConfig.maxTurns,
         maxBudgetUsd: this.agentConfig.budgetUsd,
         includePartialMessages: !!onStream,
-        ...(this.sessionId ? { resume: this.sessionId } : {}),
+        ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
         env: {
           ...process.env,
@@ -98,7 +147,7 @@ export class AgentRunner {
     this.activeQuery = q;
 
     let resultText = "";
-    let resultSessionId = this.sessionId ?? "";
+    let resultSessionId = sessionId ?? "";
     let costUsd = 0;
     let durationMs = 0;
     let streamed = false;
@@ -110,8 +159,7 @@ export class AgentRunner {
 
         if (msg.type === "system" && msg.subtype === "init") {
           resultSessionId = msg.session_id;
-          this.sessionId = msg.session_id;
-          log.debug("Session initialized", { sessionId: this.sessionId });
+          log.debug("Session initialized", { sessionId: resultSessionId });
         }
 
         // Stream text chunks in real-time
@@ -134,7 +182,6 @@ export class AgentRunner {
           }
           if (msg.session_id) {
             resultSessionId = msg.session_id;
-            this.sessionId = msg.session_id;
           }
         }
 
@@ -143,7 +190,6 @@ export class AgentRunner {
           costUsd = result.total_cost_usd;
           durationMs = result.duration_ms;
           resultSessionId = result.session_id;
-          this.sessionId = result.session_id;
 
           if (result.subtype === "success") {
             resultText = result.result || resultText;
@@ -180,9 +226,5 @@ export class AgentRunner {
       this.activeQuery.close();
       this.activeQuery = null;
     }
-  }
-
-  resetSession(): void {
-    this.sessionId = undefined;
   }
 }

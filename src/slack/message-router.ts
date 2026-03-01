@@ -65,52 +65,42 @@ export class MessageRouter {
       return;
     }
 
+    const agentConfig = this.registry.get(agentId);
+    const identity = agentConfig ? { name: agentConfig.name, icon: agentConfig.icon || undefined } : undefined;
+
     log.info("Routing message", { agentId, channel: msg.channel, user: msg.user });
 
     const threadKey = msg.threadTs ?? msg.ts;
     threadAgentMap.set(threadKey, agentId);
 
-    // Show loading status in assistant thread
-    await slack.setThreadStatus(msg.channel, threadKey, "Thinking...");
+    // For integration messages (from bots), don't thread — post as new message
+    // Slack won't let us reply to another bot's messages
+    const isIntegrationMsg = msg.user?.startsWith("B") || msg.user === "integration";
+    const replyThread = isIntegrationMsg ? undefined : threadKey;
 
-    // Try streaming first, fall back to standard postMessage
-    const stream = await slack.startStream(msg.channel, threadKey);
+    // Show thinking indicator (only for user threads)
+    if (replyThread) {
+      await slack.setThreadStatus(msg.channel, replyThread, "Thinking...");
+    }
 
     try {
-      const result = await this.agentManager.sendMessage(agentId, msg, (chunk: string) => {
-        if (stream) {
-          slack.appendStream(stream.channel, stream.ts, chunk);
-        }
-      });
-
-      if (stream) {
-        if (result.text && !result.streamed) {
-          await slack.appendStream(stream.channel, stream.ts, result.text);
-        }
-        await slack.stopStream(stream.channel, stream.ts);
-      } else {
-        // Fallback: non-streaming post
-        if (result.error) {
-          await slack.postMessage(msg.channel, formatError(result.error), threadKey);
-        } else {
-          await slack.postMessage(msg.channel, result.text || "_No response._", threadKey);
-        }
-      }
-
-      // Clear status
-      await slack.setThreadStatus(msg.channel, threadKey, "");
+      const result = await this.agentManager.sendMessage(agentId, msg);
 
       if (result.error) {
+        await slack.postMessage(msg.channel, formatError(result.error), replyThread, identity);
         log.error("Agent returned error", { agentId, error: result.error });
+      } else {
+        await slack.postMessage(msg.channel, result.text || "_No response._", replyThread, identity);
+      }
+
+      if (replyThread) {
+        await slack.setThreadStatus(msg.channel, replyThread, "");
       }
     } catch (err) {
-      if (stream) {
-        await slack.appendStream(stream.channel, stream.ts, formatError(String(err)));
-        await slack.stopStream(stream.channel, stream.ts);
-      } else {
-        await slack.postMessage(msg.channel, formatError(String(err)), threadKey);
+      await slack.postMessage(msg.channel, formatError(String(err)), replyThread, identity);
+      if (replyThread) {
+        await slack.setThreadStatus(msg.channel, replyThread, "");
       }
-      await slack.setThreadStatus(msg.channel, threadKey, "");
       log.error("Failed to process message", { agentId, error: String(err) });
     }
   }
@@ -122,15 +112,19 @@ export class MessageRouter {
       if (threadAgent) return threadAgent;
     }
 
-    // 2. Channel mapping
-    const channelAgent = this.registry.findByChannel(msg.channel);
+    // 2. Name addressing ("hey River", "@River", "River, ...")
+    const namedAgent = this.registry.findByName(msg.text);
+    if (namedAgent) return namedAgent.id;
+
+    // 3. Channel mapping (by name, not ID)
+    const channelAgent = this.registry.findByChannel(msg.channelName);
     if (channelAgent) return channelAgent.id;
 
-    // 3. Keyword match
+    // 4. Keyword match
     const keywordAgent = this.registry.findByKeyword(msg.text);
     if (keywordAgent) return keywordAgent.id;
 
-    // 4. Default agent
+    // 5. Default agent
     return this.defaultAgentId;
   }
 }

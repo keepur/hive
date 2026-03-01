@@ -3,6 +3,7 @@ import type { AgentConfig, AgentState, AgentStatus, IncomingMessage } from "../t
 import { AgentRunner, type RunResult, type StreamCallback } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
+import type { SessionStore } from "./session-store.js";
 
 const log = createLogger("agent-manager");
 
@@ -20,10 +21,12 @@ export class AgentManager {
   private processing = new Set<string>();
   private registry: AgentRegistry;
   private memoryManager: MemoryManager;
+  private sessionStore: SessionStore;
 
-  constructor(registry: AgentRegistry, memoryManager: MemoryManager) {
+  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore) {
     this.registry = registry;
     this.memoryManager = memoryManager;
+    this.sessionStore = sessionStore;
   }
 
   private getOrCreateRunner(agentId: string): AgentRunner {
@@ -68,7 +71,17 @@ export class AgentManager {
       const item = queue.shift()!;
       try {
         const runner = this.getOrCreateRunner(agentId);
-        const result = await runner.send(item.message.text, item.onStream);
+
+        // Look up session for this thread
+        const threadKey = item.message.threadTs ?? item.message.ts;
+        const existingSession = await this.sessionStore.get(agentId, threadKey);
+
+        const result = await runner.send(item.message.text, existingSession, item.onStream);
+
+        // Persist session ID for this thread
+        if (result.sessionId) {
+          this.sessionStore.set(agentId, threadKey, result.sessionId);
+        }
 
         const state = this.states.get(agentId)!;
         state.messagesProcessed++;
@@ -116,6 +129,7 @@ export class AgentManager {
     const runner = this.runners.get(agentId);
     if (runner) {
       runner.abort();
+      this.runners.delete(agentId);
       this.updateStatus(agentId, "stopped");
     }
   }
@@ -129,11 +143,14 @@ export class AgentManager {
 
   restartAgent(agentId: string): void {
     this.stopAgent(agentId);
-    const runner = this.runners.get(agentId);
-    if (runner) {
-      runner.resetSession();
-      this.updateStatus(agentId, "idle");
-      log.info("Agent restarted", { agentId });
-    }
+    this.sessionStore.clearAgent(agentId);
+    this.states.set(agentId, {
+      id: agentId,
+      status: "idle",
+      lastActivity: new Date(),
+      messagesProcessed: 0,
+      errorCount: 0,
+    });
+    log.info("Agent restarted", { agentId });
   }
 }

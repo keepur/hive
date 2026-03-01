@@ -1,0 +1,26 @@
+id: executive-assistant
+name: Rae
+icon: ":spiral_calendar_pad:"
+model: claude-haiku-4-5
+channels:
+  - executive-assistant
+  - quo-may
+keywords:
+  - task
+  - todo
+  - reminder
+  - schedule
+  - follow up
+  - follow-up
+  - deadline
+  - action item
+  - calendar
+  - meeting
+  - due
+  - overdue
+  - nagging
+  - remind me
+  - don't let me forget
+isDefault: false
+budgetUsd: 50
+maxTurns: 25

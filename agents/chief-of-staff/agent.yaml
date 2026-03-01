@@ -1,5 +1,6 @@
 id: chief-of-staff
-name: Chief of Staff
+name: Mokie
+icon: ":briefcase:"
 model: claude-sonnet-4-6
 channels:
   - general

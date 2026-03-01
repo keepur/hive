@@ -96,6 +96,7 @@ export class Scheduler {
           .sendMessage(job.agentId, {
             text: `[Scheduled task: ${job.task}] Execute your scheduled "${job.task}" task now.`,
             channel: "scheduler",
+            channelName: "scheduler",
             user: "system",
             ts: Date.now().toString(),
           })

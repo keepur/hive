@@ -29,10 +29,17 @@ export class SlackGateway {
   private threadStartedHandler: ThreadStartedHandler | null = null;
   private threadContextHandler: ThreadContextHandler | null = null;
   private botUserId: string | null = null;
+  private botId: string | null = null; // bot_id (Bxxx) — different from user_id (Uxxx)
+  private channelNameCache = new Map<string, string>(); // id → name
+  private integrationChannels = new Set<string>(); // channel names that accept bot messages
 
   constructor(appToken: string, botToken: string) {
     this.socket = new SocketModeClient({ appToken });
     this.web = new WebClient(botToken);
+  }
+
+  addIntegrationChannels(channels: string[]): void {
+    for (const ch of channels) this.integrationChannels.add(ch);
   }
 
   onMessage(handler: MessageHandler): void {
@@ -50,22 +57,82 @@ export class SlackGateway {
   async start(): Promise<void> {
     const auth = await this.web.auth.test();
     this.botUserId = auth.user_id as string;
-    log.info("Bot identity resolved", { botUserId: this.botUserId });
+    this.botId = auth.bot_id as string ?? null;
+    log.info("Bot identity resolved", { botUserId: this.botUserId, botId: this.botId });
 
     // Standard message events
     this.socket.on("message", async ({ event, ack }) => {
       await ack();
-      if (!event || event.bot_id || event.subtype || event.user === this.botUserId) return;
+      if (!event) return;
+
+      // Log raw events for debugging
+      log.debug("Raw message event", {
+        subtype: event.subtype,
+        bot_id: event.bot_id,
+        user: event.user,
+        channel: event.channel,
+        hasText: !!event.text,
+        text: event.text?.slice(0, 100),
+        hasAttachments: !!event.attachments?.length,
+        hasBlocks: !!event.blocks?.length,
+        attachmentFallback: event.attachments?.[0]?.fallback?.slice(0, 100),
+      });
+
+      // Skip our own bot's messages (by user ID or bot ID)
+      if (event.user === this.botUserId) return;
+      if (event.bot_id && event.bot_id === this.botId) return;
+
+      // For bot messages or messages with subtypes, only allow in integration channels
+      if (event.bot_id || event.subtype) {
+        const channelName = await this.resolveChannelName(event.channel);
+        if (!this.integrationChannels.has(channelName)) return;
+        log.info("Integration message accepted", { channelName, subtype: event.subtype, bot_id: event.bot_id });
+      }
+
+      const channelName = await this.resolveChannelName(event.channel);
+
+      // Extract text — bot_message subtypes may carry text in attachments or blocks
+      let text = event.text ?? "";
+      if (!text) {
+        // Collect all blocks — both top-level and inside attachments
+        const allBlocks: any[] = [...(event.blocks ?? [])];
+        for (const att of event.attachments ?? []) {
+          if (att.blocks) allBlocks.push(...att.blocks);
+          if (att.text) text += att.text + "\n";
+        }
+
+        if (!text) {
+          text = allBlocks
+            .filter((b: any) => b.type === "section" || b.type === "rich_text")
+            .map((b: any) => {
+              if (b.text?.text) return b.text.text;
+              if (b.elements) return b.elements.map((e: any) =>
+                e.elements?.map((el: any) => el.text || "").join("") ?? ""
+              ).join("\n");
+              return "";
+            })
+            .filter(Boolean)
+            .join("\n");
+        }
+
+        text = text.trim();
+      }
+
+      if (!text) {
+        log.debug("Skipping message with no extractable text", { channel: event.channel, channelName });
+        return;
+      }
 
       const msg: IncomingMessage = {
-        text: event.text ?? "",
+        text,
         channel: event.channel,
-        user: event.user,
+        channelName,
+        user: event.user ?? event.bot_id ?? "unknown",
         ts: event.ts,
         threadTs: event.thread_ts,
       };
 
-      log.info("Message received", { channel: msg.channel, user: msg.user, textLength: msg.text.length });
+      log.info("Message received", { channel: msg.channel, channelName, user: msg.user, textLength: msg.text.length });
       this.messageHandler?.(msg);
     });
 
@@ -97,6 +164,15 @@ export class SlackGateway {
         threadTs: thread.thread_ts,
         context: thread.context ?? {},
       });
+    });
+
+    // Catch-all: log every event type for debugging
+    this.socket.on("slack_event", async ({ ack, body }) => {
+      await ack();
+      const event = body?.event;
+      if (event) {
+        log.debug("slack_event", { type: event.type, subtype: event.subtype, channel: event.channel });
+      }
     });
 
     await this.socket.start();
@@ -179,7 +255,38 @@ export class SlackGateway {
 
   // --- Standard messaging ---
 
-  async postMessage(channel: string, text: string, threadTs?: string): Promise<string | undefined> {
+  async postMessage(
+    channel: string,
+    text: string,
+    threadTs?: string,
+    identity?: { name: string; icon?: string },
+  ): Promise<string | undefined> {
+    // Try with agent identity first, fall back to plain bot post
+    if (identity) {
+      try {
+        const iconOpts: Record<string, string> = {};
+        if (identity.icon) {
+          if (identity.icon.startsWith(":") && identity.icon.endsWith(":")) {
+            iconOpts.icon_emoji = identity.icon;
+          } else {
+            iconOpts.icon_url = identity.icon;
+          }
+        }
+
+        const result = await this.web.chat.postMessage({
+          channel,
+          text,
+          thread_ts: threadTs,
+          unfurl_links: false,
+          username: identity.name,
+          ...iconOpts,
+        });
+        return result.ts;
+      } catch (err) {
+        log.warn("Failed to post with identity, falling back to plain post", { error: String(err) });
+      }
+    }
+
     const result = await this.web.chat.postMessage({
       channel,
       text,
@@ -205,6 +312,22 @@ export class SlackGateway {
       await this.web.reactions.remove({ channel, name: emoji, timestamp: ts });
     } catch {
       // Ignore errors on removal
+    }
+  }
+
+  private async resolveChannelName(channelId: string): Promise<string> {
+    const cached = this.channelNameCache.get(channelId);
+    if (cached) return cached;
+
+    try {
+      const result = await this.web.conversations.info({ channel: channelId });
+      const name = (result.channel as any)?.name ?? channelId;
+      this.channelNameCache.set(channelId, name);
+      return name;
+    } catch {
+      // DMs and some channels don't have names — use the ID
+      this.channelNameCache.set(channelId, channelId);
+      return channelId;
     }
   }
 

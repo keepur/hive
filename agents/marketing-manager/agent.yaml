@@ -1,5 +1,6 @@
 id: marketing-manager
 name: River
+icon: ":art:"
 model: claude-sonnet-4-6
 channels:
   - marketing
