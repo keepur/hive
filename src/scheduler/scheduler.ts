@@ -4,6 +4,7 @@ import type { AgentManager } from "../agents/agent-manager.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
+import type { WorkItem } from "../types/work-item.js";
 
 const log = createLogger("scheduler");
 
@@ -92,17 +93,17 @@ export class Scheduler {
         job.lastRun = now;
         log.info("Triggering scheduled task", { agentId: job.agentId, task: job.task });
 
-        this.agentManager
-          .sendMessage(job.agentId, {
-            text: `[Scheduled task: ${job.task}] Execute your scheduled "${job.task}" task now.`,
-            channel: "scheduler",
-            channelName: "scheduler",
-            user: "system",
-            ts: Date.now().toString(),
-          })
-          .catch((err) => {
-            log.error("Scheduled task failed", { agentId: job.agentId, task: job.task, error: String(err) });
-          });
+        const workItem: WorkItem = {
+          id: `sched:${job.agentId}:${job.task}:${Date.now()}`,
+          text: `[Scheduled task: ${job.task}] Execute your scheduled "${job.task}" task now.`,
+          source: { kind: "scheduler", id: job.agentId, label: "scheduler" },
+          sender: "system",
+          threadId: `scheduler:${job.agentId}:${job.task}:${now.toISOString().split("T")[0]}`,
+          timestamp: now,
+        };
+        this.agentManager.sendMessage(job.agentId, workItem).catch((err) => {
+          log.error("Scheduled task failed", { agentId: job.agentId, task: job.task, error: String(err) });
+        });
       }
     }
   }

@@ -4,9 +4,9 @@ import { createLogger } from "../logging/logger.js";
 const log = createLogger("session-store");
 
 interface SessionDoc {
-  _id: string; // "{agentId}:{threadTs}"
+  _id: string; // "{agentId}:{threadId}"
   agentId: string;
-  threadTs: string;
+  threadId: string;
   sessionId: string;
   createdAt: Date;
   updatedAt: Date;
@@ -35,25 +35,34 @@ export class SessionStore {
     log.info("Session store connected", { count });
   }
 
-  async get(agentId: string, threadTs: string): Promise<string | undefined> {
-    const doc = await this.collection.findOne({ _id: `${agentId}:${threadTs}` });
-    return doc?.sessionId;
+  async get(agentId: string, threadId: string): Promise<string | undefined> {
+    const doc = await this.collection.findOne({ _id: `${agentId}:${threadId}` });
+    if (doc) return doc.sessionId;
+
+    // Fallback: try legacy key format for old "slack:{channel}:{ts}" threadIds
+    if (threadId.startsWith("slack:")) {
+      const legacyTs = threadId.split(":").pop()!;
+      const legacy = await this.collection.findOne({ _id: `${agentId}:${legacyTs}` });
+      return legacy?.sessionId;
+    }
+
+    return undefined;
   }
 
-  async set(agentId: string, threadTs: string, sessionId: string): Promise<void> {
+  async set(agentId: string, threadId: string, sessionId: string): Promise<void> {
     const now = new Date();
     await this.collection.updateOne(
-      { _id: `${agentId}:${threadTs}` },
+      { _id: `${agentId}:${threadId}` },
       {
-        $set: { agentId, threadTs, sessionId, updatedAt: now },
+        $set: { agentId, threadId, sessionId, updatedAt: now },
         $setOnInsert: { createdAt: now },
       },
       { upsert: true },
     );
   }
 
-  async delete(agentId: string, threadTs: string): Promise<void> {
-    await this.collection.deleteOne({ _id: `${agentId}:${threadTs}` });
+  async delete(agentId: string, threadId: string): Promise<void> {
+    await this.collection.deleteOne({ _id: `${agentId}:${threadId}` });
   }
 
   async clearAgent(agentId: string): Promise<void> {

@@ -37,3 +37,6 @@ export interface IncomingMessage {
   ts: string;
   threadTs?: string;
 }
+
+// Channel-agnostic types (new architecture)
+export type { WorkItem, WorkResult, ChannelRef, ChannelKind } from "./work-item.js";

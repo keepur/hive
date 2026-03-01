@@ -1,5 +1,6 @@
 import { createLogger } from "../logging/logger.js";
-import type { AgentConfig, AgentState, AgentStatus, IncomingMessage } from "../types/agent-config.js";
+import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
+import type { WorkItem } from "../types/work-item.js";
 import { AgentRunner, type RunResult, type StreamCallback } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
@@ -8,7 +9,7 @@ import type { SessionStore } from "./session-store.js";
 const log = createLogger("agent-manager");
 
 interface QueuedMessage {
-  message: IncomingMessage;
+  message: WorkItem;
   onStream?: StreamCallback;
   resolve: (result: RunResult) => void;
   reject: (error: Error) => void;
@@ -47,7 +48,7 @@ export class AgentManager {
     return runner;
   }
 
-  async sendMessage(agentId: string, message: IncomingMessage, onStream?: StreamCallback): Promise<RunResult> {
+  async sendMessage(agentId: string, message: WorkItem, onStream?: StreamCallback): Promise<RunResult> {
     this.getOrCreateRunner(agentId);
 
     return new Promise<RunResult>((resolve, reject) => {
@@ -73,7 +74,7 @@ export class AgentManager {
         const runner = this.getOrCreateRunner(agentId);
 
         // Look up session for this thread
-        const threadKey = item.message.threadTs ?? item.message.ts;
+        const threadKey = item.message.threadId ?? item.message.id;
         const existingSession = await this.sessionStore.get(agentId, threadKey);
 
         const result = await runner.send(item.message.text, existingSession, item.onStream);
