@@ -12,6 +12,7 @@ export interface HealthReport {
     messagesProcessed: number;
     errorCount: number;
     sessionId?: string;
+    activeThreads: number;
   }>;
 }
 
@@ -34,6 +35,7 @@ export class HealthReporter {
         messagesProcessed: state.messagesProcessed,
         errorCount: state.errorCount,
         sessionId: state.currentSessionId,
+        activeThreads: state.activeThreadCount ?? 0,
       };
     }
 
@@ -60,7 +62,8 @@ export class HealthReporter {
         info.status === "error" ? ":red_circle:" :
         ":black_circle:";
 
-      lines.push(`${statusEmoji} *${id}*`);
+      const threadInfo = info.activeThreads > 0 ? ` (${info.activeThreads} threads)` : "";
+      lines.push(`${statusEmoji} *${id}*${threadInfo}`);
       lines.push(`  Messages: ${info.messagesProcessed} | Errors: ${info.errorCount}`);
       lines.push(`  Last active: ${new Date(info.lastActivity).toLocaleString()}`);
     }

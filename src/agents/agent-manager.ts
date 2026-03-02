@@ -16,10 +16,11 @@ interface QueuedMessage {
 }
 
 export class AgentManager {
-  private runners = new Map<string, AgentRunner>();
   private states = new Map<string, AgentState>();
   private queues = new Map<string, QueuedMessage[]>();
   private processing = new Set<string>();
+  private activeRunners = new Map<string, Set<AgentRunner>>();
+  private activeThreads = new Map<string, Set<string>>();
   private registry: AgentRegistry;
   private memoryManager: MemoryManager;
   private sessionStore: SessionStore;
@@ -30,58 +31,75 @@ export class AgentManager {
     this.sessionStore = sessionStore;
   }
 
-  private getOrCreateRunner(agentId: string): AgentRunner {
-    let runner = this.runners.get(agentId);
-    if (!runner) {
-      const config = this.registry.get(agentId);
-      if (!config) throw new Error(`Unknown agent: ${agentId}`);
-      runner = new AgentRunner(config, this.memoryManager);
-      this.runners.set(agentId, runner);
+  private createRunner(agentId: string): AgentRunner {
+    const config = this.registry.get(agentId);
+    if (!config) throw new Error(`Unknown agent: ${agentId}`);
+    return new AgentRunner(config, this.memoryManager);
+  }
+
+  private ensureState(agentId: string): void {
+    if (!this.states.has(agentId)) {
       this.states.set(agentId, {
         id: agentId,
         status: "idle",
         lastActivity: new Date(),
         messagesProcessed: 0,
         errorCount: 0,
+        activeThreadCount: 0,
       });
     }
-    return runner;
   }
 
   async sendMessage(agentId: string, message: WorkItem, onStream?: StreamCallback): Promise<RunResult> {
-    this.getOrCreateRunner(agentId);
+    this.ensureState(agentId);
+    const threadId = message.threadId ?? message.id;
+    const threadKey = `${agentId}:${threadId}`;
 
     return new Promise<RunResult>((resolve, reject) => {
-      const queue = this.queues.get(agentId) ?? [];
+      const queue = this.queues.get(threadKey) ?? [];
       queue.push({ message, onStream, resolve, reject });
-      this.queues.set(agentId, queue);
-      this.processQueue(agentId);
+      this.queues.set(threadKey, queue);
+      this.processThreadQueue(agentId, threadKey);
     });
   }
 
-  private async processQueue(agentId: string): Promise<void> {
-    if (this.processing.has(agentId)) return;
+  private async processThreadQueue(agentId: string, threadKey: string): Promise<void> {
+    // Serialize within same thread
+    if (this.processing.has(threadKey)) return;
 
-    const queue = this.queues.get(agentId);
+    const queue = this.queues.get(threadKey);
     if (!queue || queue.length === 0) return;
 
-    this.processing.add(agentId);
+    // Check concurrency limit
+    const config = this.registry.get(agentId);
+    const limit = config?.maxConcurrent ?? 3;
+    const activeSet = this.activeThreads.get(agentId) ?? new Set();
+    if (activeSet.size >= limit) {
+      log.debug("Agent at concurrency limit, deferring", { agentId, threadKey, active: activeSet.size, limit });
+      return;
+    }
+
+    this.processing.add(threadKey);
+    activeSet.add(threadKey);
+    this.activeThreads.set(agentId, activeSet);
     this.updateStatus(agentId, "processing");
+    this.updateThreadCount(agentId);
+
+    const runner = this.createRunner(agentId);
+    const runners = this.activeRunners.get(agentId) ?? new Set();
+    runners.add(runner);
+    this.activeRunners.set(agentId, runners);
 
     while (queue.length > 0) {
       const item = queue.shift()!;
       try {
-        const runner = this.getOrCreateRunner(agentId);
-
-        // Look up session for this thread
-        const threadKey = item.message.threadId ?? item.message.id;
-        const existingSession = await this.sessionStore.get(agentId, threadKey);
+        const threadId = item.message.threadId ?? item.message.id;
+        const existingSession = await this.sessionStore.get(agentId, threadId);
 
         const result = await runner.send(item.message.text, existingSession, item.onStream);
 
-        // Persist session ID for this thread
         if (result.sessionId) {
-          this.sessionStore.set(agentId, threadKey, result.sessionId);
+          this.sessionStore.set(agentId, threadId, result.sessionId);
         }
 
         const state = this.states.get(agentId)!;
@@ -91,7 +109,7 @@ export class AgentManager {
 
         if (result.error) {
           state.errorCount++;
-          this.updateStatus(agentId, "error");
+          // Don't set agent to error — other threads may be fine
         }
 
         item.resolve(result);
@@ -101,13 +119,40 @@ export class AgentManager {
           state.errorCount++;
           state.lastActivity = new Date();
         }
-        this.updateStatus(agentId, "error");
         item.reject(err instanceof Error ? err : new Error(String(err)));
       }
     }
 
-    this.processing.delete(agentId);
-    this.updateStatus(agentId, "idle");
+    // Cleanup
+    runners.delete(runner);
+    this.processing.delete(threadKey);
+    activeSet.delete(threadKey);
+    this.queues.delete(threadKey);
+    this.updateThreadCount(agentId);
+
+    if (activeSet.size === 0) {
+      this.updateStatus(agentId, "idle");
+    }
+
+    // Pick up deferred threads that were waiting for a slot
+    this.retryDeferredThreads(agentId);
+  }
+
+  private updateThreadCount(agentId: string): void {
+    const state = this.states.get(agentId);
+    if (state) {
+      state.activeThreadCount = this.activeThreads.get(agentId)?.size ?? 0;
+    }
+  }
+
+  private retryDeferredThreads(agentId: string): void {
+    const prefix = `${agentId}:`;
+    for (const [threadKey, queue] of this.queues) {
+      if (threadKey.startsWith(prefix) && queue.length > 0 && !this.processing.has(threadKey)) {
+        this.processThreadQueue(agentId, threadKey);
+        break; // One at a time to respect limit
+      }
+    }
   }
 
   private updateStatus(agentId: string, status: AgentStatus): void {
@@ -127,17 +172,21 @@ export class AgentManager {
   }
 
   stopAgent(agentId: string): void {
-    const runner = this.runners.get(agentId);
-    if (runner) {
-      runner.abort();
-      this.runners.delete(agentId);
-      this.updateStatus(agentId, "stopped");
+    const runners = this.activeRunners.get(agentId);
+    if (runners) {
+      for (const runner of runners) {
+        runner.abort();
+      }
+      runners.clear();
     }
+    this.activeRunners.delete(agentId);
+    this.activeThreads.delete(agentId);
+    this.updateStatus(agentId, "stopped");
   }
 
   stopAll(): void {
-    for (const [id] of this.runners) {
-      this.stopAgent(id);
+    for (const agentId of this.states.keys()) {
+      this.stopAgent(agentId);
     }
     log.info("All agents stopped");
   }
@@ -151,6 +200,7 @@ export class AgentManager {
       lastActivity: new Date(),
       messagesProcessed: 0,
       errorCount: 0,
+      activeThreadCount: 0,
     });
     log.info("Agent restarted", { agentId });
   }
