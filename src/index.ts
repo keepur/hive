@@ -95,6 +95,11 @@ async function main(): Promise<void> {
     dispatcher.registerAdapter(slackJasperAdapter);
     await slackJasperAdapter.start((item) => dispatcher.dispatch(item));
     log.info("Slack adapter connected (jasper)");
+
+    // Cross-register bot IDs so each gateway filters the other's messages
+    slack.addPeerBotIds(slackJasper.resolvedBotUserId, slackJasper.resolvedBotId);
+    slackJasper.addPeerBotIds(slack.resolvedBotUserId, slack.resolvedBotId);
+    log.info("Cross-gateway bot ID filtering enabled");
   }
 
   // Set Slack as audit channel for cross-channel visibility

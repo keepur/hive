@@ -21,8 +21,11 @@ export class Dispatcher {
   private healthReporter: HealthReporter;
   private defaultAgentId: string;
   private threadAgentMap = new Map<string, string>(); // threadId -> agentId
+  private recentMessageIds = new Map<string, number>(); // messageTs -> timestamp (dedup)
   private auditAdapter?: ChannelAdapter;
   private auditChannelId?: string;
+
+  private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
 
   constructor(
     registry: AgentRegistry,
@@ -46,6 +49,14 @@ export class Dispatcher {
   }
 
   async dispatch(item: WorkItem): Promise<void> {
+    // 0. Deduplicate — if two adapters see the same Slack message, only process it once
+    if (this.recentMessageIds.has(item.id)) {
+      log.debug("Duplicate message skipped", { id: item.id, source: item.source.adapterId });
+      return;
+    }
+    this.recentMessageIds.set(item.id, Date.now());
+    this.pruneDedup();
+
     // 1. Intercept status queries
     if (STATUS_PATTERNS.some((p) => p.test(item.text.trim()))) {
       const statusText = this.healthReporter.formatForSlack();
@@ -122,6 +133,14 @@ export class Dispatcher {
       log.error("Dispatch failed", { agentId, error: String(err) });
     } finally {
       await adapter?.onProcessingEnd?.(item);
+    }
+  }
+
+  /** Evict stale dedup entries to prevent memory growth */
+  private pruneDedup(): void {
+    const cutoff = Date.now() - Dispatcher.DEDUP_TTL_MS;
+    for (const [id, ts] of this.recentMessageIds) {
+      if (ts < cutoff) this.recentMessageIds.delete(id);
     }
   }
 
