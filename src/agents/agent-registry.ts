@@ -80,6 +80,8 @@ export class AgentRegistry {
       icon: (raw.icon as string) || "",
       slackBot: (raw.slackBot as string) || undefined,
       servers: (raw.servers as string[]) || undefined,
+      maxConcurrent: (raw.maxConcurrent as number) || undefined,
+      timeoutMs: (raw.timeoutMs as number) || undefined,
       soul,
       systemPrompt,
     };

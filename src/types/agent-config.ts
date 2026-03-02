@@ -16,6 +16,8 @@ export interface AgentConfig {
   icon: string; // emoji like ":briefcase:" or URL
   slackBot?: string; // which Slack bot this agent uses (e.g. "jasper") — omit for primary bot
   servers?: string[];  // MCP server allowlist. Omit = all servers (backward compat)
+  maxConcurrent?: number;  // Max concurrent threads. Default 3
+  timeoutMs?: number;      // Response timeout in ms. Default 300000 (5 min)
   soul: string;
   systemPrompt: string;
 }
@@ -29,6 +31,7 @@ export interface AgentState {
   messagesProcessed: number;
   errorCount: number;
   currentSessionId?: string;
+  activeThreadCount: number;
 }
 
 export interface IncomingMessage {

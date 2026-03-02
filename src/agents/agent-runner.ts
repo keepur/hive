@@ -231,6 +231,15 @@ export class AgentRunner {
     let streamed = false;
     let error: string | undefined;
 
+    const timeoutMs = this.agentConfig.timeoutMs ?? 300_000; // 5 min default
+    const deadline = setTimeout(() => {
+      log.warn("Agent query timed out, aborting", {
+        agent: this.agentConfig.id,
+        timeoutMs,
+      });
+      this.abort();
+    }, timeoutMs);
+
     try {
       for await (const message of q) {
         const msg = message as SDKMessage;
@@ -283,6 +292,7 @@ export class AgentRunner {
       error = String(err);
       log.error("Agent query failed", { agent: this.agentConfig.id, error });
     } finally {
+      clearTimeout(deadline);
       this.activeQuery = null;
     }
 
