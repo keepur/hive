@@ -1,0 +1,34 @@
+id: product-manager
+name: Chloe
+icon: ":bulb:"
+model: claude-sonnet-4-6
+channels:
+  - product
+  - bugs
+keywords:
+  - feature
+  - user story
+  - prd
+  - spec
+  - backlog
+  - ticket
+  - linear
+  - epic
+  - acceptance criteria
+  - scope
+  - story
+  - requirements
+  - bug
+  - broken
+  - issue
+  - error
+  - not working
+  - regression
+isDefault: false
+budgetUsd: 50
+servers:
+  - memory
+  - linear
+  - slack
+  - contacts
+  - brave-search
