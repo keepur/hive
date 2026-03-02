@@ -3,21 +3,17 @@ name: River
 icon: ":art:"
 model: claude-sonnet-4-6
 channels:
-  - marketing
-keywords:
-  - marketing
-  - content
-  - campaign
-  - social
-  - brand
-  - scraping
-  - leads
-  - seo
-  - collateral
-  - permit
-  - reddit
+  - agent-river
+keywords: []
 isDefault: false
 schedule:
   - cron: "0 9 * * 1-5"
     task: marketing-pulse
 budgetUsd: 50
+servers:
+  - memory
+  - contacts
+  - linear
+  - brave-search
+  - slack
+  - tasks

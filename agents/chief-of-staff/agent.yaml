@@ -4,7 +4,6 @@ icon: ":briefcase:"
 model: claude-sonnet-4-6
 channels:
   - general
-  - operations
 keywords:
   - status
   - update
@@ -18,3 +17,9 @@ schedule:
   - cron: "0 17 * * 1-5"
     task: end-of-day-summary
 budgetUsd: 50
+servers:
+  - memory
+  - contacts
+  - slack
+  - brave-search
+  - tasks
