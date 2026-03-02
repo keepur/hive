@@ -18,3 +18,10 @@ schedule:
   - cron: "0 9 * * 1-5"
     task: marketing-pulse
 budgetUsd: 50
+servers:
+  - memory
+  - contacts
+  - linear
+  - brave-search
+  - slack
+  - tasks

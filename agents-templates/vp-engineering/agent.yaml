@@ -8,7 +8,6 @@ channels:
   - bugs
 keywords:
   - engineering
-  - dev
   - code
   - bug
   - feature
@@ -26,3 +25,11 @@ keywords:
 slackBot: jasper
 isDefault: false
 budgetUsd: 50
+servers:
+  - memory
+  - linear
+  - brave-search
+  - slack
+  - tasks
+  - contacts
+  - keychain

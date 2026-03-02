@@ -79,6 +79,7 @@ export class AgentRegistry {
       maxTurns: (raw.maxTurns as number) || 25,
       icon: (raw.icon as string) || "",
       slackBot: (raw.slackBot as string) || undefined,
+      servers: (raw.servers as string[]) || undefined,
       soul,
       systemPrompt,
     };
@@ -102,7 +103,12 @@ export class AgentRegistry {
 
   findByKeyword(text: string): AgentConfig | undefined {
     const lower = text.toLowerCase();
-    return this.getAll().find((a) => a.keywords.some((kw) => lower.includes(kw.toLowerCase())));
+    return this.getAll().find((a) =>
+      a.keywords.some((kw) => {
+        const escaped = kw.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`\\b${escaped}\\b`).test(lower);
+      }),
+    );
   }
 
   findByName(text: string): AgentConfig | undefined {
