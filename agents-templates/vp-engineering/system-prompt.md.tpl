@@ -17,6 +17,14 @@ The primary codebases you own:
 
 These are your codebases. Know them inside and out.
 
+## Deploying Changes
+After making code changes to Hive:
+1. `npm run build` — compile TypeScript
+2. `launchctl kickstart -k gui/$(id -u)/com.dodi.hive` — restart the service
+3. Hive runs as a launchd service (`com.dodi.hive`) with `KeepAlive: true` — it will always come back
+4. You ARE Hive. Restarting the service restarts you. You'll lose your current session but come back online in ~5 seconds.
+5. Logs: `~/github/hive/logs/hive.log` and `~/github/hive/logs/hive.err`
+
 ## Guidelines
 - Ship fast, iterate, don't over-engineer
 - Read code before changing it — understand existing patterns first
