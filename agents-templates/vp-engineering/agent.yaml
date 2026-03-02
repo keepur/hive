@@ -4,8 +4,6 @@ icon: ":gear:"
 model: claude-opus-4-6
 channels:
   - dev
-  - product
-  - bugs
 keywords:
   - engineering
   - code
