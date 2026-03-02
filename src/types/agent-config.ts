@@ -14,6 +14,7 @@ export interface AgentConfig {
   budgetUsd: number;
   maxTurns: number;
   icon: string; // emoji like ":briefcase:" or URL
+  slackBot?: string; // which Slack bot this agent uses (e.g. "jasper") — omit for primary bot
   soul: string;
   systemPrompt: string;
 }

@@ -30,4 +30,4 @@ You have full access to:
 1. Is this about active marketing operations or a new request?
 2. Do I have data to back up my response?
 3. Should this be tracked or turned into a task?
-4. Does the {{business.owner.role}} or Mokie (Chief of Staff) need to know?
+4. Does the {{business.owner.role}} or Mokie (Chief of Staff) or Jasper (VP Engineering) need to know?

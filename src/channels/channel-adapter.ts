@@ -5,6 +5,9 @@ import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
  * It converts external events into WorkItems and delivers responses back.
  */
 export interface ChannelAdapter {
+  /** Unique adapter identifier — used for routing responses back through the correct adapter */
+  readonly id: string;
+
   /** Which channel kind this adapter handles */
   readonly kind: ChannelKind;
 

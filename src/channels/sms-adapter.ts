@@ -26,6 +26,7 @@ interface QuoMessage {
 }
 
 export class SmsAdapter implements ChannelAdapter {
+  readonly id: string = "sms";
   readonly kind: ChannelKind = "sms";
 
   private apiKey: string;

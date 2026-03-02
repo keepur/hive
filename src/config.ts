@@ -50,6 +50,11 @@ export const config = {
     botToken: required("SLACK_BOT_TOKEN"),
     mcpToken: optional("SLACK_MCP_TOKEN", ""),
   },
+  slackJasper: {
+    appToken: optional("SLACK_JASPER_APP_TOKEN", ""),
+    botToken: optional("SLACK_JASPER_BOT_TOKEN", ""),
+    mcpToken: optional("SLACK_JASPER_MCP_TOKEN", ""),
+  },
   anthropic: {
     apiKey: optional("ANTHROPIC_API_KEY", ""),
   },

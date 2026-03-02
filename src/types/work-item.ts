@@ -4,6 +4,7 @@ export interface ChannelRef {
   kind: ChannelKind;
   id: string;
   label: string;
+  adapterId?: string;
 }
 
 export interface WorkItem {
