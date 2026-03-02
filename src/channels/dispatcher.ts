@@ -159,13 +159,13 @@ export class Dispatcher {
     const channelAgent = this.registry.findByChannel(item.source.label);
     if (channelAgent) return channelAgent.id;
 
-    // 4. Keyword match
-    const keyword = this.registry.findByKeyword(item.text);
-    if (keyword) return keyword.id;
-
-    // 5. Adapter-specific default (e.g. DMs to Jasper's bot → vp-engineering)
+    // 4. Adapter-specific default (e.g. DMs to Jasper's bot → vp-engineering)
     const adapterDefault = item.meta?.defaultAgentId as string | undefined;
     if (adapterDefault && this.registry.get(adapterDefault)) return adapterDefault;
+
+    // 5. Keyword match
+    const keyword = this.registry.findByKeyword(item.text);
+    if (keyword) return keyword.id;
 
     // 6. Global default
     return this.defaultAgentId;
