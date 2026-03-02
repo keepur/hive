@@ -145,6 +145,21 @@ export class AgentRunner {
       };
     }
 
+    // Resend — email sending with HubSpot BCC logging
+    if (config.resend.apiKey) {
+      servers["resend"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/resend/resend-mcp-server.js")],
+        env: {
+          RESEND_API_KEY: config.resend.apiKey,
+          RESEND_FROM_ADDRESS: config.resend.fromAddress,
+          RESEND_DEFAULT_CC: config.resend.defaultCc,
+          HUBSPOT_BCC: config.resend.hubspotBcc,
+        },
+      };
+    }
+
     // Linear — issue tracking (per-agent team via memory, LINEAR_TEAM_ID is optional default)
     if (config.linear.apiKey) {
       const env: Record<string, string> = {

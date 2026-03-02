@@ -96,6 +96,12 @@ export const config = {
   sms: {
     lines: (hive.sms?.lines ?? []) as SmsLine[],
   },
+  resend: {
+    apiKey: optional("RESEND_API_KEY", ""),
+    fromAddress: optional("RESEND_FROM_ADDRESS", "Dodi <bot@dodihome.com>"),
+    defaultCc: optional("RESEND_DEFAULT_CC", "sales@dodihome.com"),
+    hubspotBcc: optional("HUBSPOT_BCC_OUTGOING", ""),
+  },
   scheduler: {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
   },
