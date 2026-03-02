@@ -15,6 +15,7 @@ export interface AgentConfig {
   maxTurns: number;
   icon: string; // emoji like ":briefcase:" or URL
   slackBot?: string; // which Slack bot this agent uses (e.g. "jasper") — omit for primary bot
+  servers?: string[];  // MCP server allowlist. Omit = all servers (backward compat)
   soul: string;
   systemPrompt: string;
 }

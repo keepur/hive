@@ -23,3 +23,12 @@ keywords:
 isDefault: false
 budgetUsd: 50
 maxTurns: 25
+servers:
+  - memory
+  - google
+  - contacts
+  - slack
+  - keychain
+  - quo
+  - brave-search
+  - tasks

@@ -161,6 +161,16 @@ export class AgentRunner {
       };
     }
 
+    // Guardrail: filter to agent's allowed MCP servers
+    if (this.agentConfig.servers?.length) {
+      const allowed = new Set(this.agentConfig.servers);
+      for (const key of Object.keys(servers)) {
+        if (!allowed.has(key)) {
+          delete servers[key];
+        }
+      }
+    }
+
     return servers;
   }
 
