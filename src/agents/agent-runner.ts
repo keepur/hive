@@ -37,6 +37,12 @@ export class AgentRunner {
 
     parts.push(this.agentConfig.systemPrompt);
 
+    // Constitution is always loaded — non-negotiable team rules
+    const constitution = await this.memoryManager.read("shared/constitution.md");
+    if (constitution) {
+      parts.push(constitution);
+    }
+
     const memory = await this.memoryManager.read(`agents/${this.agentConfig.id}/memory.md`);
     if (memory) {
       parts.push(`## Your Memory\n${memory}`);
