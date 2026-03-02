@@ -30,6 +30,8 @@ export class SlackGateway {
   private threadContextHandler: ThreadContextHandler | null = null;
   private botUserId: string | null = null;
   private botId: string | null = null; // bot_id (Bxxx) — different from user_id (Uxxx)
+  private peerBotUserIds = new Set<string>(); // bot user IDs from other gateways
+  private peerBotIds = new Set<string>(); // bot IDs (Bxxx) from other gateways
   private channelNameCache = new Map<string, string>(); // id → name
   private integrationChannels = new Set<string>(); // channel names that accept bot messages
 
@@ -41,6 +43,20 @@ export class SlackGateway {
   addIntegrationChannels(channels: string[]): void {
     for (const ch of channels) this.integrationChannels.add(ch);
   }
+
+  /** Register bot identities from peer gateways so we can filter their messages too */
+  addPeerBotIds(botUserId: string | null, botId: string | null): void {
+    if (botUserId) this.peerBotUserIds.add(botUserId);
+    if (botId) this.peerBotIds.add(botId);
+    log.info("Peer bot IDs registered", {
+      peerBotUserIds: [...this.peerBotUserIds],
+      peerBotIds: [...this.peerBotIds],
+    });
+  }
+
+  /** Expose resolved bot identity for cross-gateway registration */
+  get resolvedBotUserId(): string | null { return this.botUserId; }
+  get resolvedBotId(): string | null { return this.botId; }
 
   onMessage(handler: MessageHandler): void {
     this.messageHandler = handler;
@@ -78,9 +94,11 @@ export class SlackGateway {
         attachmentFallback: event.attachments?.[0]?.fallback?.slice(0, 100),
       });
 
-      // Skip our own bot's messages (by user ID or bot ID)
+      // Skip messages from any Hive bot (own + peer gateways)
       if (event.user === this.botUserId) return;
+      if (this.peerBotUserIds.has(event.user)) return;
       if (event.bot_id && event.bot_id === this.botId) return;
+      if (event.bot_id && this.peerBotIds.has(event.bot_id)) return;
 
       // For bot messages or messages with subtypes, only allow in integration channels
       if (event.bot_id || event.subtype) {
