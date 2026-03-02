@@ -78,14 +78,24 @@ async function main(): Promise<void> {
   process.on("SIGUSR1", () => reload());
   log.info("Hot-reload enabled", { watched: agentsDir, signal: "SIGUSR1" });
 
-  // Start Slack adapter (wraps SlackGateway)
+  // Start primary Slack adapter (Mokie, River, Rae, etc.)
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
-  const slackAdapter = new SlackAdapter(slack, registry, smsChannels);
+  const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack");
   dispatcher.registerAdapter(slackAdapter);
   await slackAdapter.start((item) => dispatcher.dispatch(item));
-  log.info("Slack adapter connected");
+  log.info("Slack adapter connected (primary)");
+
+  // Start Jasper's Slack adapter (separate bot identity)
+  let slackJasperAdapter: SlackAdapter | undefined;
+  if (config.slackJasper.appToken && config.slackJasper.botToken) {
+    const slackJasper = new SlackGateway(config.slackJasper.appToken, config.slackJasper.botToken);
+    slackJasperAdapter = new SlackAdapter(slackJasper, registry, smsChannels, "slack:jasper", "vp-engineering");
+    dispatcher.registerAdapter(slackJasperAdapter);
+    await slackJasperAdapter.start((item) => dispatcher.dispatch(item));
+    log.info("Slack adapter connected (jasper)");
+  }
 
   // Set Slack as audit channel for cross-channel visibility
   try {
@@ -117,6 +127,7 @@ async function main(): Promise<void> {
     agentManager.stopAll();
     await sessionStore.close();
     await slackAdapter.stop();
+    if (slackJasperAdapter) await slackJasperAdapter.stop();
     log.info("Hive shut down cleanly");
     process.exit(0);
   };

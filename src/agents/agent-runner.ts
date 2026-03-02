@@ -48,11 +48,15 @@ export class AgentRunner {
   private buildMcpServers(): Record<string, McpServerConfig> {
     const servers: Record<string, McpServerConfig> = {};
 
-    if (config.slack.mcpToken) {
+    // Slack MCP — use agent-specific bot token if configured, otherwise primary
+    const slackMcpToken = this.agentConfig.slackBot === "jasper"
+      ? config.slackJasper.mcpToken
+      : config.slack.mcpToken;
+    if (slackMcpToken) {
       servers["slack"] = {
         type: "http",
         url: "https://mcp.slack.com/mcp",
-        headers: { Authorization: `Bearer ${config.slack.mcpToken}` },
+        headers: { Authorization: `Bearer ${slackMcpToken}` },
       };
     }
 
@@ -159,6 +163,7 @@ export class AgentRunner {
       agent: this.agentConfig.id,
       resumeSession: sessionId ?? "new",
       promptLength: prompt.length,
+      promptPreview: prompt.slice(0, 200),
       streaming: !!onStream,
     });
 

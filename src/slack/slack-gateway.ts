@@ -287,13 +287,18 @@ export class SlackGateway {
       }
     }
 
-    const result = await this.web.chat.postMessage({
-      channel,
-      text,
-      thread_ts: threadTs,
-      unfurl_links: false,
-    });
-    return result.ts;
+    try {
+      const result = await this.web.chat.postMessage({
+        channel,
+        text,
+        thread_ts: threadTs,
+        unfurl_links: false,
+      });
+      return result.ts;
+    } catch (err) {
+      log.error("Failed to post message", { channel, error: String(err) });
+      return undefined;
+    }
   }
 
   async addReaction(channel: string, ts: string, emoji: string): Promise<void> {

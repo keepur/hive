@@ -78,6 +78,7 @@ export class AgentRegistry {
       budgetUsd: (raw.budgetUsd as number) || 10,
       maxTurns: (raw.maxTurns as number) || 25,
       icon: (raw.icon as string) || "",
+      slackBot: (raw.slackBot as string) || undefined,
       soul,
       systemPrompt,
     };

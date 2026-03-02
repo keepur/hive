@@ -1,0 +1,28 @@
+id: vp-engineering
+name: Jasper
+icon: ":gear:"
+model: claude-opus-4-6
+channels:
+  - dev
+  - product
+  - bugs
+keywords:
+  - engineering
+  - dev
+  - code
+  - bug
+  - feature
+  - deploy
+  - release
+  - sprint
+  - pull request
+  - build
+  - test
+  - architecture
+  - refactor
+  - api
+  - database
+  - migration
+slackBot: jasper
+isDefault: false
+budgetUsd: 50

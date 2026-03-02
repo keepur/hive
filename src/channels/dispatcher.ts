@@ -37,7 +37,7 @@ export class Dispatcher {
   }
 
   registerAdapter(adapter: ChannelAdapter): void {
-    this.adapters.set(adapter.kind, adapter);
+    this.adapters.set(adapter.id, adapter);
   }
 
   setAuditChannel(adapter: ChannelAdapter, channelId: string): void {
@@ -49,7 +49,7 @@ export class Dispatcher {
     // 1. Intercept status queries
     if (STATUS_PATTERNS.some((p) => p.test(item.text.trim()))) {
       const statusText = this.healthReporter.formatForSlack();
-      const adapter = this.adapters.get(item.source.kind);
+      const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
       if (adapter) {
         await adapter.deliver({
           text: statusText,
@@ -77,7 +77,7 @@ export class Dispatcher {
     this.threadAgentMap.set(threadId, agentId);
 
     // 3. Notify adapter processing started
-    const adapter = this.adapters.get(item.source.kind);
+    const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
     await adapter?.onProcessingStart?.(item);
 
     try {
@@ -144,7 +144,11 @@ export class Dispatcher {
     const keyword = this.registry.findByKeyword(item.text);
     if (keyword) return keyword.id;
 
-    // 5. Default
+    // 5. Adapter-specific default (e.g. DMs to Jasper's bot → vp-engineering)
+    const adapterDefault = item.meta?.defaultAgentId as string | undefined;
+    if (adapterDefault && this.registry.get(adapterDefault)) return adapterDefault;
+
+    // 6. Global default
     return this.defaultAgentId;
   }
 

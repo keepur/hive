@@ -19,16 +19,20 @@ const DEFAULT_PROMPTS = [
 ];
 
 export class SlackAdapter implements ChannelAdapter {
+  readonly id: string;
   readonly kind: ChannelKind = "slack";
 
   private gateway: SlackGateway;
   private registry: AgentRegistry;
   private excludeChannels: Set<string>;
+  private defaultAgentId?: string;
 
-  constructor(gateway: SlackGateway, registry: AgentRegistry, excludeChannels: string[] = []) {
+  constructor(gateway: SlackGateway, registry: AgentRegistry, excludeChannels: string[] = [], id: string = "slack", defaultAgentId?: string) {
+    this.id = id;
     this.gateway = gateway;
     this.registry = registry;
     this.excludeChannels = new Set(excludeChannels);
+    this.defaultAgentId = defaultAgentId;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
@@ -49,11 +53,11 @@ export class SlackAdapter implements ChannelAdapter {
       const workItem: WorkItem = {
         id: msg.ts,
         text: msg.text,
-        source: { kind: "slack", id: msg.channel, label: msg.channelName },
+        source: { kind: "slack", id: msg.channel, label: msg.channelName, adapterId: this.id },
         sender: msg.user,
         threadId: msg.threadTs ? `slack:${msg.channel}:${msg.threadTs}` : undefined,
         timestamp: new Date(),
-        meta: { slackTs: msg.ts, slackThreadTs: msg.threadTs },
+        meta: { slackTs: msg.ts, slackThreadTs: msg.threadTs, defaultAgentId: this.defaultAgentId },
       };
 
       onWorkItem(workItem);
