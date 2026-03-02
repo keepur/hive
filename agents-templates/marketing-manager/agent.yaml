@@ -4,15 +4,7 @@ icon: ":art:"
 model: claude-sonnet-4-6
 channels:
   - agent-river
-keywords:
-  - marketing
-  - content
-  - campaign
-  - social
-  - brand
-  - leads
-  - seo
-  - collateral
+keywords: []
 isDefault: false
 schedule:
   - cron: "0 9 * * 1-5"

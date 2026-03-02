@@ -4,18 +4,7 @@ icon: ":shield:"
 model: claude-sonnet-4-6
 channels:
   - devops
-keywords:
-  - ci
-  - pipeline
-  - monitoring
-  - logs
-  - uptime
-  - server status
-  - health check
-  - infrastructure
-  - hive status
-  - ci status
-  - deployment status
+keywords: []
 isDefault: false
 budgetUsd: 25
 maxTurns: 15
