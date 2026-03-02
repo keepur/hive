@@ -16,14 +16,27 @@ export class SessionStore {
   private client: MongoClient;
   private db!: Db;
   private collection!: Collection<SessionDoc>;
+  private uri: string;
+  private dbName: string;
 
   constructor(uri: string, dbName = "hive") {
-    this.client = new MongoClient(uri);
+    this.uri = uri;
+    this.dbName = dbName;
+    this.client = new MongoClient(uri, {
+      // Keep the connection alive overnight
+      heartbeatFrequencyMS: 30_000,        // Ping server every 30s (default 10s is fine too)
+      serverSelectionTimeoutMS: 10_000,     // Wait up to 10s to find a server
+      socketTimeoutMS: 30_000,             // Kill stale sockets after 30s
+      maxIdleTimeMS: 300_000,              // Close idle connections after 5 min (driver recreates on demand)
+      retryWrites: true,                   // Auto-retry failed writes (transient errors)
+      retryReads: true,                    // Auto-retry failed reads
+    });
   }
 
-  async connect(dbName = "hive"): Promise<void> {
+  async connect(dbName?: string): Promise<void> {
+    this.dbName = dbName ?? this.dbName;
     await this.client.connect();
-    this.db = this.client.db(dbName);
+    this.db = this.client.db(this.dbName);
     this.collection = this.db.collection<SessionDoc>("sessions");
 
     // TTL index: expire sessions after 7 days of inactivity
@@ -35,41 +48,94 @@ export class SessionStore {
     log.info("Session store connected", { count });
   }
 
-  async get(agentId: string, threadId: string): Promise<string | undefined> {
-    const doc = await this.collection.findOne({ _id: `${agentId}:${threadId}` });
-    if (doc) return doc.sessionId;
+  /**
+   * Reconnect after a connection failure. Creates a fresh client.
+   */
+  private async reconnect(): Promise<void> {
+    log.warn("Reconnecting to MongoDB...");
+    try {
+      await this.client.close().catch(() => {}); // best-effort close old client
+    } catch {}
+    this.client = new MongoClient(this.uri, {
+      heartbeatFrequencyMS: 30_000,
+      serverSelectionTimeoutMS: 10_000,
+      socketTimeoutMS: 30_000,
+      maxIdleTimeMS: 300_000,
+      retryWrites: true,
+      retryReads: true,
+    });
+    await this.client.connect();
+    this.db = this.client.db(this.dbName);
+    this.collection = this.db.collection<SessionDoc>("sessions");
+    log.info("MongoDB reconnected");
+  }
 
-    // Fallback: try legacy key format for old "slack:{channel}:{ts}" threadIds
-    if (threadId.startsWith("slack:")) {
-      const legacyTs = threadId.split(":").pop()!;
-      const legacy = await this.collection.findOne({ _id: `${agentId}:${legacyTs}` });
-      return legacy?.sessionId;
+  /**
+   * Run a MongoDB operation with one retry on connection failure.
+   * If both attempts fail, returns the fallback value instead of throwing.
+   */
+  private async withRetry<T>(op: () => Promise<T>, fallback: T, label: string): Promise<T> {
+    try {
+      return await op();
+    } catch (err: any) {
+      const msg = String(err?.message ?? err);
+      log.warn("MongoDB operation failed, retrying after reconnect", { label, error: msg });
+      try {
+        await this.reconnect();
+        return await op();
+      } catch (retryErr: any) {
+        log.error("MongoDB operation failed after retry, using fallback", {
+          label,
+          error: String(retryErr?.message ?? retryErr),
+        });
+        return fallback;
+      }
     }
+  }
 
-    return undefined;
+  async get(agentId: string, threadId: string): Promise<string | undefined> {
+    return this.withRetry(async () => {
+      const doc = await this.collection.findOne({ _id: `${agentId}:${threadId}` });
+      if (doc) return doc.sessionId;
+
+      // Fallback: try legacy key format for old "slack:{channel}:{ts}" threadIds
+      if (threadId.startsWith("slack:")) {
+        const legacyTs = threadId.split(":").pop()!;
+        const legacy = await this.collection.findOne({ _id: `${agentId}:${legacyTs}` });
+        return legacy?.sessionId;
+      }
+
+      return undefined;
+    }, undefined, `get(${agentId}:${threadId})`);
   }
 
   async set(agentId: string, threadId: string, sessionId: string): Promise<void> {
-    const now = new Date();
-    await this.collection.updateOne(
-      { _id: `${agentId}:${threadId}` },
-      {
-        $set: { agentId, threadId, sessionId, updatedAt: now },
-        $setOnInsert: { createdAt: now },
-      },
-      { upsert: true },
-    );
+    await this.withRetry(async () => {
+      const now = new Date();
+      await this.collection.updateOne(
+        { _id: `${agentId}:${threadId}` },
+        {
+          $set: { agentId, threadId, sessionId, updatedAt: now },
+          $setOnInsert: { createdAt: now },
+        },
+        { upsert: true },
+      );
+    }, undefined, `set(${agentId}:${threadId})`);
   }
 
   async delete(agentId: string, threadId: string): Promise<void> {
-    await this.collection.deleteOne({ _id: `${agentId}:${threadId}` });
+    await this.withRetry(async () => {
+      await this.collection.deleteOne({ _id: `${agentId}:${threadId}` });
+    }, undefined, `delete(${agentId}:${threadId})`);
   }
 
   async clearAgent(agentId: string): Promise<void> {
-    const result = await this.collection.deleteMany({ agentId });
-    if (result.deletedCount > 0) {
-      log.info("Cleared agent sessions", { agentId, deleted: result.deletedCount });
-    }
+    await this.withRetry(async () => {
+      const result = await this.collection.deleteMany({ agentId });
+      if (result.deletedCount > 0) {
+        log.info("Cleared agent sessions", { agentId, deleted: result.deletedCount });
+      }
+    }, undefined, `clearAgent(${agentId})`);
   }
 
   async close(): Promise<void> {
