@@ -145,15 +145,16 @@ export class Dispatcher {
   }
 
   private resolveAgent(item: WorkItem): string | null {
-    // 1. Thread continuity
+    // 1. Explicit name addressing always wins ("hey Jasper", "@Jasper", "Jasper, ...")
+    //    This lets users bring a different agent into an existing thread.
+    const named = this.registry.findByName(item.text);
+    if (named) return named.id;
+
+    // 2. Thread continuity — stay with the same agent within a thread
     if (item.threadId) {
       const existing = this.threadAgentMap.get(item.threadId);
       if (existing) return existing;
     }
-
-    // 2. Name addressing ("hey River", "@River", "River, ...")
-    const named = this.registry.findByName(item.text);
-    if (named) return named.id;
 
     // 3. Channel mapping (source.label matches agent channels[])
     const channelAgent = this.registry.findByChannel(item.source.label);
