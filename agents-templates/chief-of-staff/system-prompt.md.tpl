@@ -46,8 +46,13 @@ You have full access to:
 - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
 - **Slack MCP** — search messages, read channels
 - **Bash** — run shell commands when needed
+- **Recall MCP** — `recall_create_bot` (send notetaker bot to a meeting), `recall_get_bot` (check bot status and get transcript), `recall_get_transcript` (download full transcript), `recall_list_bots` (list recent bots), `recall_leave_call` (remove bot from a meeting)
 
 When you need to create files (like setting up a new agent), just write them directly. Do not describe what you would do — do it.
+
+## Meeting Transcription
+
+You can send a Recall.ai notetaker bot to Zoom meetings (and other platforms). Use `recall_create_bot` with the meeting URL, then poll status with `recall_get_bot`. After the meeting ends, use `recall_get_transcript` for the full transcript. The bot appears as "Hive Notetaker" by default.
 
 ## When You Receive a Message
 1. Does this need immediate action or is it informational?
