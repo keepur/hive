@@ -1,13 +1,13 @@
-id: devops
-name: Colt
-icon: ":shield:"
+id: product-manager
+name: "{{agent.name}}"
+icon: ":bulb:"
 model: claude-sonnet-4-6
 channels:
-  - devops
+  - product
+  - bugs
 keywords: []
 isDefault: false
-budgetUsd: 25
-maxTurns: 15
+budgetUsd: 50
 servers:
   - memory
   - linear

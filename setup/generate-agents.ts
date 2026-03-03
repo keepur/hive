@@ -8,9 +8,9 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
-import { resolve, join, extname } from "node:path";
-import { createHash } from "node:crypto";
+import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { render, fileHash } from "./template-renderer.ts";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const TEMPLATES_DIR = join(ROOT, "agents-templates");
@@ -34,9 +34,9 @@ function loadConfig(): Record<string, any> {
   return parseYaml(readFileSync(HIVE_CONFIG, "utf-8")) ?? {};
 }
 
-// Simple template engine: replaces {{key.subkey}} with values from context
-function render(template: string, ctx: Record<string, any>): string {
-  // Handle {{#sms_section}}...{{/sms_section}} blocks
+// Pre-process SMS-specific template directives, then delegate to shared render()
+function renderAgent(template: string, ctx: Record<string, any>): string {
+  // Handle {{#sms_section}}...{{/sms_section}} blocks (special: checks lines.length)
   template = template.replace(
     /\{\{#sms_section\}\}([\s\S]*?)\{\{\/sms_section\}\}/g,
     (_, block) => {
@@ -60,22 +60,8 @@ function render(template: string, ctx: Record<string, any>): string {
       .join("\n");
   });
 
-  // Replace {{key.subkey}} with values from context
-  template = template.replace(/\{\{(\w+(?:\.\w+)*)\}\}/g, (match, path) => {
-    const parts = path.split(".");
-    let val: any = ctx;
-    for (const p of parts) {
-      val = val?.[p];
-      if (val === undefined) return match; // leave unreplaced if not found
-    }
-    return String(val);
-  });
-
-  return template;
-}
-
-function fileHash(content: string): string {
-  return createHash("sha256").update(content).digest("hex").slice(0, 16);
+  // Delegate remaining variable + conditional substitution to shared renderer
+  return render(template, ctx);
 }
 
 function main() {
@@ -88,6 +74,13 @@ function main() {
     sms: config.sms ?? { lines: [] },
     quo: config.quo ?? {},
   };
+
+  // Build team map: agentId → display name
+  const agentConfigs: Record<string, any> = config.agents ?? {};
+  const team: Record<string, string> = {};
+  for (const [id, def] of Object.entries(agentConfigs)) {
+    team[id] = (def as any).name ?? id;
+  }
 
   // Load existing generation metadata
   let meta: Record<string, string> = {};
@@ -112,6 +105,16 @@ function main() {
       mkdirSync(agentDir, { recursive: true });
     }
 
+    // Build per-agent context with agent identity and team roster
+    const agentCtx = {
+      ...ctx,
+      agent: {
+        name: team[agentId] ?? agentId,
+        id: agentId,
+      },
+      team,
+    };
+
     const files = readdirSync(templateDir);
     for (const file of files) {
       const srcPath = join(templateDir, file);
@@ -121,7 +124,7 @@ function main() {
       const metaKey = `${agentId}/${outName}`;
 
       const raw = readFileSync(srcPath, "utf-8");
-      const content = isTemplate ? render(raw, ctx) : raw;
+      const content = isTemplate ? renderAgent(raw, agentCtx) : raw;
       const hash = fileHash(content);
       newMeta[metaKey] = hash;
 
@@ -156,6 +159,40 @@ function main() {
       }
     }
     writeFileSync(eaYamlPath, yaml);
+  }
+
+  // Generate constitution if template exists and memory path is configured
+  const constitutionTplPath = join(ROOT, "setup", "templates", "constitution.md.tpl");
+  if (existsSync(constitutionTplPath)) {
+    const memoryPath = (config.memory?.localPath ?? `${process.env.HOME}/hive-memory`).replace("~", process.env.HOME ?? "/tmp");
+    const sharedDir = join(memoryPath, "shared");
+    const constitutionOutPath = join(sharedDir, "constitution.md");
+
+    if (existsSync(sharedDir)) {
+      const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
+      const constitutionCtx = { business: ctx.business, team };
+      const content = render(constitutionTpl, constitutionCtx);
+
+      // Check if user modified the constitution (respect their changes)
+      const constitutionMetaKey = "shared/constitution.md";
+      if (existsSync(constitutionOutPath) && !force) {
+        const existing = readFileSync(constitutionOutPath, "utf-8");
+        const existingHash = fileHash(existing);
+        const originalHash = meta[constitutionMetaKey];
+        if (originalHash && existingHash !== originalHash) {
+          console.log(`  SKIP ${constitutionMetaKey} (modified by user — use --force to overwrite)`);
+          newMeta[constitutionMetaKey] = existingHash;
+        } else {
+          writeFileSync(constitutionOutPath, content);
+          newMeta[constitutionMetaKey] = fileHash(content);
+          console.log(`  WRITE ${constitutionMetaKey}`);
+        }
+      } else {
+        writeFileSync(constitutionOutPath, content);
+        newMeta[constitutionMetaKey] = fileHash(content);
+        console.log(`  WRITE ${constitutionMetaKey}`);
+      }
+    }
   }
 
   // Save metadata

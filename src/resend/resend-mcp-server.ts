@@ -4,12 +4,12 @@
  * Resend MCP Server — Email sending via Resend API.
  *
  * Sends from a fixed bot address with configurable reply-to per rep.
- * Auto-CCs sales@dodihome.com and BCCs HubSpot for CRM logging.
+ * Auto-CCs configured sales address and BCCs HubSpot for CRM logging.
  *
  * Env vars:
  *   RESEND_API_KEY      — required, from Resend dashboard
- *   RESEND_FROM_ADDRESS — from address (default: "Dodi <bot@dodihome.com>")
- *   RESEND_DEFAULT_CC   — default CC address (default: "sales@dodihome.com")
+ *   RESEND_FROM_ADDRESS — from address (configured in .env)
+ *   RESEND_DEFAULT_CC   — default CC address (configured in .env)
  *   HUBSPOT_BCC         — HubSpot BCC address for outgoing email logging
  */
 
@@ -18,8 +18,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const API_KEY = process.env.RESEND_API_KEY ?? "";
-const FROM_ADDRESS = process.env.RESEND_FROM_ADDRESS ?? "Dodi <bot@dodihome.com>";
-const DEFAULT_CC = process.env.RESEND_DEFAULT_CC ?? "sales@dodihome.com";
+const FROM_ADDRESS = process.env.RESEND_FROM_ADDRESS ?? "";
+const DEFAULT_CC = process.env.RESEND_DEFAULT_CC ?? "";
 const HUBSPOT_BCC = process.env.HUBSPOT_BCC ?? "";
 
 const server = new McpServer({

@@ -181,8 +181,38 @@ async function main() {
   console.log("Hive comes with starter agents you can customize later.");
   console.log("Chief of Staff (default triage agent) is always included.\n");
 
-  const wantRae = await confirm("Include Executive Assistant (task tracking, email, calendar)?", true);
-  const wantRiver = await confirm("Include Marketing Manager (lead gen, content)?", false);
+  const wantVpEng = await confirm("Include VP of Engineering (code, architecture, deploys)?", true);
+  const wantEa = await confirm("Include Executive Assistant (task tracking, email, calendar)?", true);
+  const wantPm = await confirm("Include Product Manager (specs, Linear issues, backlog)?", false);
+  const wantMarketing = await confirm("Include Marketing Manager (lead gen, content)?", false);
+  const wantDevops = await confirm("Include DevOps Engineer (monitoring, CI, system health)?", false);
+
+  // ── Agent Names ──────────────────────────────────────────────
+  section("Agent Names");
+
+  console.log("Give your agents names. These appear in Slack and in their personality.");
+  console.log("Press Enter to accept the defaults.\n");
+
+  const agentNames: Record<string, string> = {};
+
+  // Chief of Staff is always included
+  agentNames["chief-of-staff"] = await ask("Name your Chief of Staff", "Mokie");
+
+  if (wantVpEng) {
+    agentNames["vp-engineering"] = await ask("Name your VP of Engineering", "Jasper");
+  }
+  if (wantEa) {
+    agentNames["executive-assistant"] = await ask("Name your Executive Assistant", "Rae");
+  }
+  if (wantPm) {
+    agentNames["product-manager"] = await ask("Name your Product Manager", "Chloe");
+  }
+  if (wantMarketing) {
+    agentNames["marketing-manager"] = await ask("Name your Marketing Manager", "River");
+  }
+  if (wantDevops) {
+    agentNames["devops"] = await ask("Name your DevOps Engineer", "Colt");
+  }
 
   // ── Memory Setup ───────────────────────────────────────────────
   section("Memory");
@@ -201,7 +231,8 @@ async function main() {
   console.log(`  SMS (Quo):    ${wantQuo ? `✓ ${smsLines.length} line(s)` : "disabled"}`);
   console.log(`  Google:       ${wantGoogle ? "✓ " + googleAccount : "disabled"}`);
   console.log(`  Linear:       ${wantLinear ? "✓ configured" : "disabled"}`);
-  console.log(`  Agents:       Chief of Staff${wantRae ? ", Executive Assistant" : ""}${wantRiver ? ", Marketing Manager" : ""}`);
+  const agentList = Object.entries(agentNames).map(([id, name]) => `${name} (${id.replace(/-/g, ' ')})`).join(", ");
+  console.log(`  Agents:       ${agentList}`);
   console.log(`  Memory:       ${memoryPath}`);
   console.log("");
 
@@ -228,6 +259,11 @@ async function main() {
       ...(memoryRepo ? { repo: memoryRepo } : {}),
     },
   };
+
+  hiveConfig.agents = {};
+  for (const [id, name] of Object.entries(agentNames)) {
+    hiveConfig.agents[id] = { name };
+  }
 
   if (smsLines.length > 0) {
     hiveConfig.sms = { lines: smsLines };
@@ -260,13 +296,17 @@ async function main() {
   // For now, generate all, then remove unwanted
   execSync("npx tsx setup/generate-agents.ts", { cwd: ROOT, stdio: "inherit" });
 
-  if (!wantRae) {
-    execSync(`rm -rf ${join(ROOT, "agents", "executive-assistant")}`);
-    console.log("  (removed executive-assistant — not selected)");
-  }
-  if (!wantRiver) {
-    execSync(`rm -rf ${join(ROOT, "agents", "marketing-manager")}`);
-    console.log("  (removed marketing-manager — not selected)");
+  // Remove unselected agents
+  const allAgents = ["vp-engineering", "executive-assistant", "product-manager", "marketing-manager", "devops"];
+  const selectedAgents = new Set(Object.keys(agentNames));
+  for (const agentId of allAgents) {
+    if (!selectedAgents.has(agentId)) {
+      const agentDir = join(ROOT, "agents", agentId);
+      if (existsSync(agentDir)) {
+        execSync(`rm -rf "${agentDir}"`);
+        console.log(`  (removed ${agentId} — not selected)`);
+      }
+    }
   }
 
   // Generate launchd plist
@@ -279,7 +319,11 @@ async function main() {
     execSync("git init", { cwd: resolvedMemPath, stdio: "pipe" });
 
     // Create initial structure
-    for (const dir of ["agents/chief-of-staff", "shared", "status"]) {
+    const memoryDirs = ["shared", "status"];
+    for (const agentId of Object.keys(agentNames)) {
+      memoryDirs.push(`agents/${agentId}`);
+    }
+    for (const dir of memoryDirs) {
       mkdirSync(join(resolvedMemPath, dir), { recursive: true });
     }
 
@@ -298,6 +342,24 @@ async function main() {
       .join("\n");
 
     writeFileSync(join(resolvedMemPath, "shared", "business-context.md"), contextMd);
+
+    // Generate constitution from template
+    const constitutionTplPath = join(ROOT, "setup", "templates", "constitution.md.tpl");
+    if (existsSync(constitutionTplPath)) {
+      const { render: renderTemplate } = await import("./template-renderer.ts");
+      const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
+      const team: Record<string, string> = {};
+      for (const [id, name] of Object.entries(agentNames)) {
+        team[id] = name;
+      }
+      const constitutionCtx = {
+        business: { name: businessName, description: businessDesc, location: businessLocation, owner: { name: ownerName, role: ownerRole } },
+        team,
+      };
+      const constitutionContent = renderTemplate(constitutionTpl, constitutionCtx);
+      writeFileSync(join(resolvedMemPath, "shared", "constitution.md"), constitutionContent);
+      console.log("  ✓ shared/constitution.md (team constitution)");
+    }
 
     execSync("git add -A && git commit -m 'Initial Hive memory setup'", {
       cwd: resolvedMemPath,
