@@ -31,8 +31,10 @@ async function api(method: string, path: string, body?: object): Promise<any> {
       ...(body ? { "Content-Type": "application/json" } : {}),
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(`Recall API ${res.status}: ${await res.text()}`);
+  if (res.status === 204) return {};
   return res.json();
 }
 
@@ -132,7 +134,7 @@ server.registerTool("recall_get_transcript", {
 }, async ({ bot_id }) => {
   try {
     const result = await api("GET", `/bot/${bot_id}/transcript/`);
-    const entries = Array.isArray(result) ? result : [];
+    const entries = Array.isArray(result) ? result : (Array.isArray(result.results) ? result.results : []);
     if (entries.length === 0) {
       return { content: [{ type: "text", text: "Transcript is not yet available or the meeting has no recorded speech." }] };
     }
