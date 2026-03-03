@@ -65,9 +65,9 @@ export const config = {
   brave: {
     apiKey: optional("BRAVE_API_KEY", ""),
   },
-  dodi: {
-    apiUrl: optional("DODI_API_URL", "http://localhost:3002"),
-    apiKey: optional("DODI_API_KEY", ""),
+  taskLedger: {
+    apiUrl: optional("TASK_LEDGER_API_URL", "http://localhost:3002"),
+    apiKey: optional("TASK_LEDGER_API_KEY", ""),
   },
   mongo: {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
