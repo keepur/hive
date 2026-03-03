@@ -31,3 +31,4 @@ servers:
   - tasks
   - contacts
   - keychain
+  - background

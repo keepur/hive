@@ -77,6 +77,6 @@ export class MemoryManager {
   }
 
   private async git(command: string): Promise<{ stdout: string; stderr: string }> {
-    return execAsync(`git -C "${this.repoPath}" ${command}`);
+    return execAsync(`git -C "${this.repoPath}" ${command}`, { timeout: 30_000 });
   }
 }

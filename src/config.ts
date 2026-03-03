@@ -105,4 +105,7 @@ export const config = {
   scheduler: {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
   },
+  background: {
+    port: parseInt(optional("BG_TASK_PORT", "3100"), 10),
+  },
 } as const;
