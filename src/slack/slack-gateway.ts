@@ -33,6 +33,7 @@ export class SlackGateway {
   private peerBotUserIds = new Set<string>(); // bot user IDs from other gateways
   private peerBotIds = new Set<string>(); // bot IDs (Bxxx) from other gateways
   private channelNameCache = new Map<string, string>(); // id → name
+  private userNameCache = new Map<string, string>(); // userId → display name
   private integrationChannels = new Set<string>(); // channel names that accept bot messages
 
   constructor(appToken: string, botToken: string) {
@@ -140,6 +141,9 @@ export class SlackGateway {
         log.debug("Skipping message with no extractable text", { channel: event.channel, channelName });
         return;
       }
+
+      // Resolve <@USERID> mentions to @displayname for readable text and name-based routing
+      text = await this.resolveUserMentions(text);
 
       const msg: IncomingMessage = {
         text,
@@ -336,6 +340,31 @@ export class SlackGateway {
     } catch {
       // Ignore errors on removal
     }
+  }
+
+  /** Replace <@USERID> mentions with @displayname so downstream consumers see readable names */
+  async resolveUserMentions(text: string): Promise<string> {
+    const mentionPattern = /<@(U[A-Z0-9]+)>/g;
+    const mentions = [...text.matchAll(mentionPattern)];
+    if (mentions.length === 0) return text;
+
+    let resolved = text;
+    for (const match of mentions) {
+      const userId = match[1];
+      let name = this.userNameCache.get(userId);
+      if (!name) {
+        try {
+          const result = await this.web.users.info({ user: userId });
+          name = result.user?.profile?.display_name || result.user?.real_name || result.user?.name || userId;
+          this.userNameCache.set(userId, name);
+        } catch {
+          this.userNameCache.set(userId, userId);
+          continue;
+        }
+      }
+      resolved = resolved.replace(match[0], `@${name}`);
+    }
+    return resolved;
   }
 
   private async resolveChannelName(channelId: string): Promise<string> {
