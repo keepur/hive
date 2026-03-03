@@ -1,8 +1,8 @@
 import { createLogger } from "../logging/logger.js";
 
-const log = createLogger("dodi-task-client");
+const log = createLogger("task-client");
 
-export class DodiTaskClient {
+export class TaskClient {
   private apiUrl: string;
   private apiKey: string;
 
@@ -24,7 +24,7 @@ export class DodiTaskClient {
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
-    if (!res.ok) throw new Error(`DodiHome API ${res.status}: ${await res.text()}`);
+    if (!res.ok) throw new Error(`Task API ${res.status}: ${await res.text()}`);
     return res.json();
   }
 

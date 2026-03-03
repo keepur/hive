@@ -120,15 +120,15 @@ export class AgentRunner {
       },
     };
 
-    // DodiHome task ledger
-    if (config.dodi.apiKey) {
+    // External task ledger
+    if (config.taskLedger.apiKey) {
       servers["tasks"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/dodi/task-mcp-server.js")],
+        args: [resolve("dist/tasks/task-mcp-server.js")],
         env: {
-          DODI_API_URL: config.dodi.apiUrl,
-          DODI_API_KEY: config.dodi.apiKey,
+          TASK_LEDGER_API_URL: config.taskLedger.apiUrl,
+          TASK_LEDGER_API_KEY: config.taskLedger.apiKey,
         },
       };
     }

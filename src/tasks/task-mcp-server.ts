@@ -1,23 +1,24 @@
 #!/usr/bin/env node
 
 /**
- * DodiHome Task MCP Server — runs as a stdio subprocess inside each agent's Claude Code session.
- * Gives agents the ability to create, read, update, query, and comment on tasks in dodi_v2.
+ * Task Ledger MCP Server — runs as a stdio subprocess inside each agent's Claude Code session.
+ * Gives agents the ability to create, read, update, query, and comment on tasks
+ * in an external task management system.
  *
  * Env vars:
- *   DODI_API_URL — base URL for dodi_v2 API (e.g. https://app.dodihome.com)
- *   DODI_API_KEY — API key for X-API-Key header
+ *   TASK_LEDGER_API_URL — base URL for the task API
+ *   TASK_LEDGER_API_KEY — API key for X-API-Key header
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const API_URL = process.env.DODI_API_URL ?? "http://localhost:3002";
-const API_KEY = process.env.DODI_API_KEY ?? "";
+const API_URL = process.env.TASK_LEDGER_API_URL ?? "http://localhost:3002";
+const API_KEY = process.env.TASK_LEDGER_API_KEY ?? "";
 
 if (!API_KEY) {
-  process.stderr.write("task-mcp-server: DODI_API_KEY is required\n");
+  process.stderr.write("task-mcp-server: TASK_LEDGER_API_KEY is required\n");
   process.exit(1);
 }
 
@@ -30,19 +31,19 @@ async function api(method: string, path: string, body?: object): Promise<any> {
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
-  if (!res.ok) throw new Error(`DodiHome API ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Task API ${res.status}: ${await res.text()}`);
   return res.json();
 }
 
 const server = new McpServer({
-  name: "dodi-tasks",
+  name: "task-ledger",
   version: "0.1.0",
 });
 
 // --- Tool: task_create ---
 server.registerTool("task_create", {
   title: "Create Task",
-  description: "Create a new task in DodiHome.",
+  description: "Create a new task in the task ledger.",
   inputSchema: {
     name: z.string().describe("Task title"),
     description: z.string().optional().describe("Task description (markdown)"),
