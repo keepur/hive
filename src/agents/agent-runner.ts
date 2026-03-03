@@ -9,6 +9,16 @@ const log = createLogger("agent-runner");
 
 export type StreamCallback = (chunk: string) => void;
 
+export interface WorkItemContext {
+  adapterId: string;
+  channelId: string;
+  channelKind: string;
+  channelLabel: string;
+  threadId: string;
+  slackTs: string;
+  slackThreadTs: string;
+}
+
 export interface RunResult {
   text: string;
   sessionId: string;
@@ -63,7 +73,7 @@ export class AgentRunner {
     return parts.join("\n\n---\n\n");
   }
 
-  private buildMcpServers(): Record<string, McpServerConfig> {
+  private buildMcpServers(context?: WorkItemContext): Record<string, McpServerConfig> {
     const servers: Record<string, McpServerConfig> = {};
 
     // Slack MCP — use agent-specific bot token if configured, otherwise primary
@@ -188,6 +198,24 @@ export class AgentRunner {
       };
     }
 
+    // Background task server — agents can spawn detached background processes
+    servers["background"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/background/background-task-mcp-server.js")],
+      env: {
+        BG_TASK_API: `http://127.0.0.1:${config.background.port}`,
+        BG_AGENT_ID: this.agentConfig.id,
+        BG_ADAPTER_ID: context?.adapterId ?? "",
+        BG_CHANNEL_ID: context?.channelId ?? "",
+        BG_CHANNEL_KIND: context?.channelKind ?? "internal",
+        BG_CHANNEL_LABEL: context?.channelLabel ?? "",
+        BG_THREAD_ID: context?.threadId ?? "",
+        BG_SLACK_TS: context?.slackTs ?? "",
+        BG_SLACK_THREAD_TS: context?.slackThreadTs ?? "",
+      },
+    };
+
     // Guardrail: filter to agent's allowed MCP servers
     if (this.agentConfig.servers?.length) {
       const allowed = new Set(this.agentConfig.servers);
@@ -201,7 +229,7 @@ export class AgentRunner {
     return servers;
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext): Promise<RunResult> {
     log.info("Sending prompt to agent", {
       agent: this.agentConfig.id,
       resumeSession: sessionId ?? "new",
@@ -211,7 +239,7 @@ export class AgentRunner {
     });
 
     const systemPrompt = await this.buildSystemPrompt();
-    const mcpServers = this.buildMcpServers();
+    const mcpServers = this.buildMcpServers(context);
 
     const q = query({
       prompt,

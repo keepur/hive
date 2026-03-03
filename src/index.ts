@@ -14,6 +14,7 @@ import { Dispatcher } from "./channels/dispatcher.js";
 import { SlackAdapter } from "./channels/slack-adapter.js";
 import { SmsAdapter } from "./channels/sms-adapter.js";
 import { TaskClient } from "./tasks/task-client.js";
+import { BackgroundTaskManager } from "./background/background-task-manager.js";
 
 const log = createLogger("index");
 
@@ -49,6 +50,17 @@ async function main(): Promise<void> {
   const agentManager = new AgentManager(registry, memoryManager, sessionStore);
   const healthReporter = new HealthReporter(agentManager, memoryManager);
   const dispatcher = new Dispatcher(registry, agentManager, healthReporter, config.agents.defaultAgent);
+
+  // Background task manager — agents can spawn detached background processes
+  const bgTaskManager = new BackgroundTaskManager(
+    config.background.port,
+    (item) => dispatcher.dispatch(item).catch((err) => {
+      log.error("Background task completion dispatch failed", { error: String(err) });
+    }),
+  );
+  await bgTaskManager.start();
+  await bgTaskManager.scanOrphans();
+  log.info("Background task manager started", { port: config.background.port });
 
   // --- Hot reload ---
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
@@ -129,6 +141,7 @@ async function main(): Promise<void> {
     log.info("Shutdown signal received", { signal });
     await smsAdapter.stop();
     scheduler.stop();
+    bgTaskManager.stop();
     agentManager.stopAll();
     await sessionStore.close();
     await slackAdapter.stop();
@@ -142,6 +155,13 @@ async function main(): Promise<void> {
 
   log.info("Hive is running");
 }
+
+process.on("unhandledRejection", (reason) => {
+  log.error("Unhandled promise rejection", {
+    error: String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
+});
 
 main().catch((err) => {
   log.error("Fatal startup error", { error: String(err) });

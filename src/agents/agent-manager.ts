@@ -1,7 +1,7 @@
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem } from "../types/work-item.js";
-import { AgentRunner, type RunResult, type StreamCallback } from "./agent-runner.js";
+import { AgentRunner, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
@@ -59,7 +59,24 @@ export class AgentManager {
       const queue = this.queues.get(threadKey) ?? [];
       queue.push({ message, onStream, resolve, reject });
       this.queues.set(threadKey, queue);
-      this.processThreadQueue(agentId, threadKey);
+      this.processThreadQueue(agentId, threadKey).catch((err) => {
+        log.error("processThreadQueue failed unexpectedly", { agentId, threadKey, error: String(err) });
+        this.processing.delete(threadKey);
+        const activeSet = this.activeThreads.get(agentId);
+        if (activeSet) {
+          activeSet.delete(threadKey);
+          this.updateThreadCount(agentId);
+          if (activeSet.size === 0) this.updateStatus(agentId, "idle");
+        }
+        const queue = this.queues.get(threadKey);
+        if (queue) {
+          for (const pending of queue) {
+            pending.reject(err instanceof Error ? err : new Error(String(err)));
+          }
+          this.queues.delete(threadKey);
+        }
+        this.retryDeferredThreads(agentId);
+      });
     });
   }
 
@@ -96,7 +113,17 @@ export class AgentManager {
         const threadId = item.message.threadId ?? item.message.id;
         const existingSession = await this.sessionStore.get(agentId, threadId);
 
-        const result = await runner.send(item.message.text, existingSession, item.onStream);
+        const bgContext: WorkItemContext = {
+          adapterId: item.message.source.adapterId ?? item.message.source.kind,
+          channelId: item.message.source.id,
+          channelKind: item.message.source.kind,
+          channelLabel: item.message.source.label,
+          threadId: item.message.threadId ?? item.message.id,
+          slackTs: (item.message.meta?.slackTs as string) ?? "",
+          slackThreadTs: (item.message.meta?.slackThreadTs as string) ?? "",
+        };
+
+        const result = await runner.send(item.message.text, existingSession, item.onStream, bgContext);
 
         if (result.sessionId) {
           this.sessionStore.set(agentId, threadId, result.sessionId);
