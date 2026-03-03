@@ -104,7 +104,17 @@ export class SlackGateway {
       // For bot messages or messages with subtypes, only allow in integration channels
       if (event.bot_id || event.subtype) {
         const channelName = await this.resolveChannelName(event.channel);
-        if (!this.integrationChannels.has(channelName)) return;
+        if (!this.integrationChannels.has(channelName)) {
+          log.info("Message filtered (subtype/bot in non-integration channel)", {
+            channel: event.channel,
+            channelName,
+            user: event.user,
+            subtype: event.subtype,
+            bot_id: event.bot_id,
+            hasText: !!event.text,
+          });
+          return;
+        }
         log.info("Integration message accepted", { channelName, subtype: event.subtype, bot_id: event.bot_id });
       }
 
@@ -138,7 +148,15 @@ export class SlackGateway {
       }
 
       if (!text) {
-        log.debug("Skipping message with no extractable text", { channel: event.channel, channelName });
+        log.info("Skipping message with no extractable text", {
+          channel: event.channel,
+          channelName,
+          user: event.user,
+          subtype: event.subtype,
+          hasBlocks: !!event.blocks?.length,
+          hasAttachments: !!event.attachments?.length,
+          blockTypes: event.blocks?.map((b: any) => b.type),
+        });
         return;
       }
 
