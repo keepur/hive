@@ -1,5 +1,5 @@
 id: executive-assistant
-name: Rae
+name: "{{agent.name}}"
 icon: ":spiral_calendar_pad:"
 model: claude-haiku-4-5
 channels:

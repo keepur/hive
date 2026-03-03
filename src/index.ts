@@ -42,7 +42,7 @@ async function main(): Promise<void> {
 
   const taskClient = new DodiTaskClient(config.dodi.apiUrl, config.dodi.apiKey);
   if (taskClient.isConfigured) {
-    log.info("DodiHome task client configured", { apiUrl: config.dodi.apiUrl });
+    log.info("External app task client configured", { apiUrl: config.dodi.apiUrl });
   }
 
 
@@ -78,7 +78,7 @@ async function main(): Promise<void> {
   process.on("SIGUSR1", () => reload());
   log.info("Hot-reload enabled", { watched: agentsDir, signal: "SIGUSR1" });
 
-  // Start primary Slack adapter (Mokie, River, Rae, etc.)
+  // Start primary Slack adapter (default agents)
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
@@ -87,14 +87,14 @@ async function main(): Promise<void> {
   await slackAdapter.start((item) => dispatcher.dispatch(item));
   log.info("Slack adapter connected (primary)");
 
-  // Start Jasper's Slack adapter (separate bot identity)
+  // Start secondary Slack adapter (separate bot identity)
   let slackJasperAdapter: SlackAdapter | undefined;
   if (config.slackJasper.appToken && config.slackJasper.botToken) {
     const slackJasper = new SlackGateway(config.slackJasper.appToken, config.slackJasper.botToken);
     slackJasperAdapter = new SlackAdapter(slackJasper, registry, smsChannels, "slack:jasper", "vp-engineering");
     dispatcher.registerAdapter(slackJasperAdapter);
     await slackJasperAdapter.start((item) => dispatcher.dispatch(item));
-    log.info("Slack adapter connected (jasper)");
+    log.info("Slack adapter connected (secondary)");
 
     // Cross-register bot IDs so each gateway filters the other's messages
     slack.addPeerBotIds(slackJasper.resolvedBotUserId, slackJasper.resolvedBotId);

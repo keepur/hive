@@ -98,8 +98,8 @@ export const config = {
   },
   resend: {
     apiKey: optional("RESEND_API_KEY", ""),
-    fromAddress: optional("RESEND_FROM_ADDRESS", "Dodi <bot@dodihome.com>"),
-    defaultCc: optional("RESEND_DEFAULT_CC", "sales@dodihome.com"),
+    fromAddress: optional("RESEND_FROM_ADDRESS", ""),
+    defaultCc: optional("RESEND_DEFAULT_CC", ""),
     hubspotBcc: optional("HUBSPOT_BCC_OUTGOING", ""),
   },
   scheduler: {

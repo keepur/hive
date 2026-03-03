@@ -1,5 +1,5 @@
 id: chief-of-staff
-name: Mokie
+name: "{{agent.name}}"
 icon: ":briefcase:"
 model: claude-sonnet-4-6
 channels:

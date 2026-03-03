@@ -1,13 +1,13 @@
-id: product-manager
-name: Chloe
-icon: ":bulb:"
+id: devops
+name: "{{agent.name}}"
+icon: ":shield:"
 model: claude-sonnet-4-6
 channels:
-  - product
-  - bugs
+  - devops
 keywords: []
 isDefault: false
-budgetUsd: 50
+budgetUsd: 25
+maxTurns: 15
 servers:
   - memory
   - linear

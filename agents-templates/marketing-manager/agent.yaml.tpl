@@ -1,5 +1,5 @@
 id: marketing-manager
-name: River
+name: "{{agent.name}}"
 icon: ":art:"
 model: claude-sonnet-4-6
 channels:

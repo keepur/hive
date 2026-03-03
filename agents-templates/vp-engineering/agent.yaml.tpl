@@ -1,5 +1,5 @@
 id: vp-engineering
-name: Jasper
+name: "{{agent.name}}"
 icon: ":gear:"
 model: claude-opus-4-6
 channels:
