@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { promisify } from "node:util";
 import { createLogger } from "../logging/logger.js";
@@ -30,6 +30,16 @@ export class MemoryManager {
       return await readFile(fullPath, "utf-8");
     } catch {
       return null;
+    }
+  }
+
+  async list(relativePath: string): Promise<string[]> {
+    try {
+      const fullPath = join(this.repoPath, relativePath);
+      const entries = await readdir(fullPath);
+      return entries.filter((e) => !e.startsWith("."));
+    } catch {
+      return [];
     }
   }
 

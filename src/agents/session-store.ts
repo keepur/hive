@@ -43,6 +43,8 @@ export class SessionStore {
     await this.collection.createIndex({ updatedAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 });
     // Fast lookups by agent
     await this.collection.createIndex({ agentId: 1 });
+    // Fast lookups by threadId (for thread→agent resolution after restart)
+    await this.collection.createIndex({ threadId: 1 });
 
     const count = await this.collection.countDocuments();
     log.info("Session store connected", { count });
@@ -136,6 +138,20 @@ export class SessionStore {
         log.info("Cleared agent sessions", { agentId, deleted: result.deletedCount });
       }
     }, undefined, `clearAgent(${agentId})`);
+  }
+
+  /**
+   * Find which agent was handling a given thread.
+   * Used by Dispatcher for thread-continuity after restart.
+   */
+  async findAgentByThread(threadId: string): Promise<string | undefined> {
+    return this.withRetry(async () => {
+      const doc = await this.collection.findOne(
+        { threadId },
+        { sort: { updatedAt: -1 }, projection: { agentId: 1 } },
+      );
+      return doc?.agentId;
+    }, undefined, `findAgentByThread(${threadId})`);
   }
 
   async close(): Promise<void> {

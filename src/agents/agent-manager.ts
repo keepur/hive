@@ -191,6 +191,14 @@ export class AgentManager {
     log.info("All agents stopped");
   }
 
+  /**
+   * Find which agent was handling a given thread (delegates to SessionStore).
+   * Used by Dispatcher for thread-continuity after restart.
+   */
+  async findAgentForThread(threadId: string): Promise<string | undefined> {
+    return this.sessionStore.findAgentByThread(threadId);
+  }
+
   restartAgent(agentId: string): void {
     this.stopAgent(agentId);
     this.sessionStore.clearAgent(agentId);

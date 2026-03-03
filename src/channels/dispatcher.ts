@@ -14,6 +14,13 @@ const STATUS_PATTERNS = [
   /system status/i,
 ];
 
+/** Patterns that indicate the agent chose not to respond — suppress delivery */
+const NON_RESPONSE_PATTERNS = [
+  /^no response (requested|needed|required|necessary)\.?$/i,
+  /^\(no response\)$/i,
+  /^n\/a\.?$/i,
+];
+
 export class Dispatcher {
   private adapters = new Map<string, ChannelAdapter>();
   private registry: AgentRegistry;
@@ -74,7 +81,7 @@ export class Dispatcher {
     }
 
     // 2. Resolve agent
-    const agentId = this.resolveAgent(item);
+    const agentId = await this.resolveAgent(item);
     if (!agentId) {
       log.warn("No agent found for work item", {
         source: item.source.kind,
@@ -95,31 +102,45 @@ export class Dispatcher {
       // 4. Send to agent
       const runResult = await this.agentManager.sendMessage(agentId, item);
 
-      const workResult: WorkResult = {
-        text: runResult.text || "_No response._",
-        agentId,
-        workItem: item,
-        costUsd: runResult.costUsd,
-        durationMs: runResult.durationMs,
-        error: runResult.error,
-      };
+      // 4b. Check if agent indicated no response
+      const trimmedText = runResult.text.trim();
+      const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
-      // 5. Deliver response
-      if (adapter) {
-        await adapter.deliver(workResult);
+      if (isNonResponse) {
+        log.info("Non-response suppressed", {
+          agentId,
+          source: item.source.kind,
+          text: trimmedText,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+        });
+      } else {
+        const workResult: WorkResult = {
+          text: runResult.text || "_No response._",
+          agentId,
+          workItem: item,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+          error: runResult.error,
+        };
+
+        // 5. Deliver response
+        if (adapter) {
+          await adapter.deliver(workResult);
+        }
+
+        // 6. Audit log for cross-channel activity
+        if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
+          await this.postAuditLog(workResult);
+        }
+
+        log.info("Work item dispatched", {
+          agentId,
+          source: item.source.kind,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+        });
       }
-
-      // 6. Audit log for cross-channel activity
-      if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
-        await this.postAuditLog(workResult);
-      }
-
-      log.info("Work item dispatched", {
-        agentId,
-        source: item.source.kind,
-        costUsd: runResult.costUsd,
-        durationMs: runResult.durationMs,
-      });
     } catch (err) {
       const errorResult: WorkResult = {
         text: `Something went wrong: ${String(err)}`,
@@ -144,7 +165,7 @@ export class Dispatcher {
     }
   }
 
-  private resolveAgent(item: WorkItem): string | null {
+  private async resolveAgent(item: WorkItem): Promise<string | null> {
     // 1. Explicit name addressing always wins ("hey Jasper", "@Jasper", "Jasper, ...")
     //    This lets users bring a different agent into an existing thread.
     const named = this.registry.findByName(item.text);
@@ -154,6 +175,13 @@ export class Dispatcher {
     if (item.threadId) {
       const existing = this.threadAgentMap.get(item.threadId);
       if (existing) return existing;
+
+      // Fallback: check persisted sessions (survives restart)
+      const persisted = await this.agentManager.findAgentForThread(item.threadId);
+      if (persisted && this.registry.get(persisted)) {
+        this.threadAgentMap.set(item.threadId, persisted);
+        return persisted;
+      }
     }
 
     // 3. Channel mapping (source.label matches agent channels[])

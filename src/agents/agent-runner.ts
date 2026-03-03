@@ -43,9 +43,21 @@ export class AgentRunner {
       parts.push(constitution);
     }
 
-    const memory = await this.memoryManager.read(`agents/${this.agentConfig.id}/memory.md`);
+    const memoryDir = `agents/${this.agentConfig.id}`;
+    const memory = await this.memoryManager.read(`${memoryDir}/memory.md`);
     if (memory) {
       parts.push(`## Your Memory\n${memory}`);
+    }
+
+    // List available memory files so the agent knows what references it has
+    const memoryFiles = await this.memoryManager.list(memoryDir);
+    const mdFiles = memoryFiles.filter((f) => f.endsWith(".md") && f !== "memory.md");
+    if (mdFiles.length > 0) {
+      parts.push(
+        `## Available Memory Files\nYou have ${mdFiles.length} reference file(s) in your memory directory:\n` +
+        mdFiles.map((f) => `- ${memoryDir}/${f}`).join("\n") +
+        `\n\nRead relevant files via the memory MCP server (\`memory_read\`) before starting tasks that may relate to them.`,
+      );
     }
 
     return parts.join("\n\n---\n\n");
