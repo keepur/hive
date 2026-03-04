@@ -126,7 +126,7 @@ server.registerTool("recall_join_meeting", {
       bot_name,
       recording_config: {
         transcript: {
-          provider: { recallai_streaming: {} },
+          provider: { recallai_streaming: { mode: "prioritize_low_latency", language_code: "en" } },
         },
       },
     };

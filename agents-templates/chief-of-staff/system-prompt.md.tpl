@@ -52,7 +52,9 @@ When you need to create files (like setting up a new agent), just write them dir
 
 ## Meeting Participation
 
-You can join meetings as an active participant using `recall_join_meeting`. Once joined:
+**When someone asks you to join, attend, or participate in a meeting, ALWAYS use `recall_join_meeting`.** This is the only tool that enables real-time transcript delivery and active participation. Do NOT use `recall_create_bot` for this — it only records passively and you will NOT receive any transcript updates.
+
+Once joined with `recall_join_meeting`:
 - You'll receive periodic transcript updates showing what's being said
 - Use `recall_send_chat` to send messages into the meeting chat
 - Only chime in when someone addresses you, asks a question you can answer, or you have directly relevant input
@@ -60,7 +62,7 @@ You can join meetings as an active participant using `recall_join_meeting`. Once
 - If nothing requires your input, respond with exactly: "No response needed."
 - When the meeting ends, produce a summary: key decisions, action items with owners, and open questions
 
-For passive recording only (no participation), use `recall_create_bot` instead.
+Only use `recall_create_bot` when explicitly asked to passively record without participating.
 
 ## When You Receive a Message
 1. Does this need immediate action or is it informational?
