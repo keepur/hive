@@ -7,6 +7,8 @@ import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
 import { triage } from "../agents/triage.js";
 import { config } from "../config.js";
+import type { SweepResult } from "../sweeper/sweeper.js";
+import type { RetryQueue } from "../sweeper/retry-queue.js";
 
 const log = createLogger("dispatcher");
 
@@ -34,10 +36,12 @@ export class Dispatcher {
   private healthReporter: HealthReporter;
   private defaultAgentId: string;
   private threadAgentMap = new Map<string, string>(); // threadId -> agentId
+  private threadAgentLastSeen = new Map<string, number>();
   private recentMessageIds = new Map<string, number>(); // messageTs -> timestamp (dedup)
   private auditAdapter?: ChannelAdapter;
   private auditChannelId?: string;
   private taskLedger?: TaskLedger;
+  private retryQueue?: RetryQueue;
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
 
@@ -57,6 +61,10 @@ export class Dispatcher {
 
   registerAdapter(adapter: ChannelAdapter): void {
     this.adapters.set(adapter.id, adapter);
+  }
+
+  setRetryQueue(queue: RetryQueue): void {
+    this.retryQueue = queue;
   }
 
   setAuditChannel(adapter: ChannelAdapter, channelId: string): void {
@@ -80,13 +88,18 @@ export class Dispatcher {
       const statusText = this.healthReporter.formatForSlack();
       const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
       if (adapter) {
-        await adapter.deliver({
-          text: statusText,
-          agentId: "system",
-          workItem: item,
-          costUsd: 0,
-          durationMs: 0,
-        });
+        try {
+          await adapter.deliver({
+            text: statusText,
+            agentId: "system",
+            workItem: item,
+            costUsd: 0,
+            durationMs: 0,
+          });
+        } catch (err) {
+          log.warn("Status delivery failed, queuing for retry", { error: String(err) });
+          this.retryQueue?.enqueue({ text: statusText, agentId: "system", workItem: item, costUsd: 0, durationMs: 0 }, adapter);
+        }
       }
       return;
     }
@@ -104,6 +117,7 @@ export class Dispatcher {
 
     const threadId = item.threadId ?? item.id;
     this.threadAgentMap.set(threadId, agentId);
+    this.threadAgentLastSeen.set(threadId, Date.now());
 
     // 3. Track in task ledger (fire-and-forget — never blocks pipeline)
     const tracked = this.taskLedger?.shouldTrack(item) ?? false;
@@ -135,7 +149,14 @@ export class Dispatcher {
             costUsd: triageResult.costUsd,
             durationMs: triageResult.durationMs,
           };
-          if (adapter) await adapter.deliver(workResult);
+          if (adapter) {
+            try {
+              await adapter.deliver(workResult);
+            } catch (err) {
+              log.warn("Triage delivery failed, queuing for retry", { error: String(err) });
+              this.retryQueue?.enqueue(workResult, adapter);
+            }
+          }
           if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
             await this.postAuditLog(workResult);
           }
@@ -152,13 +173,19 @@ export class Dispatcher {
         // action === "continue" — post ack immediately, then proceed to full agent
         // Keep "Thinking..." active — don't clear between triage and full agent
         if (adapter) {
-          await adapter.deliver({
+          const ackResult: WorkResult = {
             text: triageResult.response,
             agentId,
             workItem: item,
             costUsd: triageResult.costUsd,
             durationMs: triageResult.durationMs,
-          });
+          };
+          try {
+            await adapter.deliver(ackResult);
+          } catch (err) {
+            log.warn("Triage ack delivery failed, queuing for retry", { error: String(err) });
+            this.retryQueue?.enqueue(ackResult, adapter);
+          }
         }
         log.info("Triage ack posted, continuing to full agent", {
           agentId,
@@ -197,7 +224,12 @@ export class Dispatcher {
         };
 
         if (adapter) {
-          await adapter.deliver(workResult);
+          try {
+            await adapter.deliver(workResult);
+          } catch (err) {
+            log.warn("Agent response delivery failed, queuing for retry", { error: String(err) });
+            this.retryQueue?.enqueue(workResult, adapter);
+          }
         }
 
         if (tracked) {
@@ -226,7 +258,14 @@ export class Dispatcher {
         durationMs: 0,
         error: String(err),
       };
-      if (adapter) await adapter.deliver(errorResult);
+      if (adapter) {
+        try {
+          await adapter.deliver(errorResult);
+        } catch (deliverErr) {
+          log.warn("Error delivery failed, queuing for retry", { error: String(deliverErr) });
+          this.retryQueue?.enqueue(errorResult, adapter);
+        }
+      }
       log.error("Dispatch failed", { agentId, error: String(err) });
     } finally {
       await adapter?.onProcessingEnd?.(item);
@@ -250,12 +289,16 @@ export class Dispatcher {
     // 2. Thread continuity — stay with the same agent within a thread
     if (item.threadId) {
       const existing = this.threadAgentMap.get(item.threadId);
-      if (existing) return existing;
+      if (existing) {
+        this.threadAgentLastSeen.set(item.threadId, Date.now());
+        return existing;
+      }
 
       // Fallback: check persisted sessions (survives restart)
       const persisted = await this.agentManager.findAgentForThread(item.threadId);
       if (persisted && this.registry.get(persisted)) {
         this.threadAgentMap.set(item.threadId, persisted);
+        this.threadAgentLastSeen.set(item.threadId, Date.now());
         return persisted;
       }
     }
@@ -274,6 +317,19 @@ export class Dispatcher {
 
     // 6. Global default
     return this.defaultAgentId;
+  }
+
+  sweep(threadTtlMs: number): SweepResult {
+    const cutoff = Date.now() - threadTtlMs;
+    let pruned = 0;
+    for (const [id, ts] of this.threadAgentLastSeen) {
+      if (ts < cutoff) {
+        this.threadAgentMap.delete(id);
+        this.threadAgentLastSeen.delete(id);
+        pruned++;
+      }
+    }
+    return { component: "dispatcher", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 
   private async postAuditLog(result: WorkResult): Promise<void> {

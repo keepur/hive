@@ -17,6 +17,8 @@ import { TaskClient } from "./tasks/task-client.js";
 import { TaskLedger } from "./tasks/task-ledger.js";
 import { BackgroundTaskManager } from "./background/background-task-manager.js";
 import { MeetingMonitor } from "./recall/meeting-monitor.js";
+import { RetryQueue } from "./sweeper/retry-queue.js";
+import { Sweeper } from "./sweeper/sweeper.js";
 
 const log = createLogger("index");
 
@@ -134,8 +136,9 @@ async function main(): Promise<void> {
 
   // Start secondary Slack adapter (separate bot identity)
   let slackJasperAdapter: SlackAdapter | undefined;
+  let slackJasper: SlackGateway | undefined;
   if (config.slackJasper.appToken && config.slackJasper.botToken) {
-    const slackJasper = new SlackGateway(config.slackJasper.appToken, config.slackJasper.botToken);
+    slackJasper = new SlackGateway(config.slackJasper.appToken, config.slackJasper.botToken);
     slackJasperAdapter = new SlackAdapter(slackJasper, registry, smsChannels, "slack:jasper", "vp-engineering");
     dispatcher.registerAdapter(slackJasperAdapter);
     await slackJasperAdapter.start((item) => {
@@ -177,9 +180,43 @@ async function main(): Promise<void> {
   scheduler.start();
   log.info("Scheduler started");
 
+  // Periodic sweeper — state cleanup, message recovery, health metrics
+  const retryQueue = new RetryQueue({
+    maxAttempts: config.sweeper.retryMaxAttempts,
+    baseDelayMs: config.sweeper.retryBaseDelayMs,
+  });
+  dispatcher.setRetryQueue(retryQueue);
+
+  const slackAdapters = [slackAdapter, ...(slackJasperAdapter ? [slackJasperAdapter] : [])];
+  const slackGateways = [slack, ...(slackJasper ? [slackJasper] : [])];
+
+  const sweeper = new Sweeper(
+    {
+      intervalMs: config.sweeper.intervalMs,
+      threadTtlMs: config.sweeper.threadTtlMs,
+      taskFileTtlMs: config.sweeper.taskFileTtlMs,
+      meetingSessionTtlMs: config.sweeper.meetingSessionTtlMs,
+      cacheTtlMs: config.sweeper.cacheTtlMs,
+    },
+    {
+      dispatcher,
+      slackAdapters,
+      bgTaskManager,
+      meetingMonitor,
+      taskLedger: taskLedger.isConfigured ? taskLedger : undefined,
+      slackGateways,
+      agentManager,
+      retryQueue,
+    },
+    taskClient.isConfigured ? taskClient : undefined,
+  );
+  sweeper.start();
+  log.info("Sweeper started", { intervalMs: config.sweeper.intervalMs });
+
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
+    sweeper.stop();
     await smsAdapter.stop();
     scheduler.stop();
     bgTaskManager.stop();

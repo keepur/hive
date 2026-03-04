@@ -1,10 +1,11 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, stat, unlink } from "node:fs/promises";
 import { openSync, closeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../logging/logger.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
+import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("bg-task-manager");
 const TASKS_DIR = "/tmp/hive-bg-tasks";
@@ -366,6 +367,39 @@ export class BackgroundTaskManager {
     }, 5_000);
 
     this.orphanPollers.set(taskId, timer);
+  }
+
+  async sweep(taskFileTtlMs: number): Promise<SweepResult> {
+    const cutoff = Date.now() - taskFileTtlMs;
+    let pruned = 0;
+    let bytesFreed = 0;
+    const errors: string[] = [];
+
+    for (const [id, task] of this.tasks) {
+      if (task.status === "running") continue;
+      if (!task.completedAt) continue;
+
+      const completedTime = new Date(task.completedAt).getTime();
+      if (completedTime > cutoff) continue;
+
+      // Delete files
+      for (const filePath of [task.metaPath, task.logPath]) {
+        try {
+          const st = await stat(filePath);
+          bytesFreed += st.size;
+          await unlink(filePath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            errors.push(`Failed to delete ${filePath}: ${String(err)}`);
+          }
+        }
+      }
+
+      this.tasks.delete(id);
+      pruned++;
+    }
+
+    return { component: "bg-task-manager", pruned, retried: 0, bytesFreed, errors };
   }
 
   private readBody(req: IncomingMessage): Promise<string> {

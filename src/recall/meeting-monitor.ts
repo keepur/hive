@@ -2,6 +2,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../logging/logger.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
+import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("meeting-monitor");
 
@@ -37,6 +38,7 @@ interface MeetingSession {
   pollTimer: ReturnType<typeof setInterval> | null;
   pollCount: number;
   status: "monitoring" | "ended" | "error";
+  endedAt: number | null;
 }
 
 export class MeetingMonitor {
@@ -115,6 +117,7 @@ export class MeetingMonitor {
         session.pollTimer = null;
       }
       session.status = "ended";
+      session.endedAt = Date.now();
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "stopped" }));
@@ -238,6 +241,7 @@ export class MeetingMonitor {
       pollTimer: null,
       pollCount: 0,
       status: "monitoring",
+      endedAt: null,
     };
 
     this.sessions.set(id, session);
@@ -453,6 +457,30 @@ export class MeetingMonitor {
       session.pollTimer = null;
     }
     session.status = "ended";
+    session.endedAt = Date.now();
+  }
+
+  sweep(sessionTtlMs: number): SweepResult {
+    const cutoff = Date.now() - sessionTtlMs;
+    let pruned = 0;
+
+    for (const [id, session] of this.sessions) {
+      if (session.endedAt === null) continue;
+      if (session.endedAt > cutoff) continue;
+
+      // Clear any lingering timers
+      if (session.pollTimer) {
+        clearInterval(session.pollTimer);
+        session.pollTimer = null;
+      }
+
+      // Remove from both maps
+      this.sessionsByBotId.delete(session.botId);
+      this.sessions.delete(id);
+      pruned++;
+    }
+
+    return { component: "meeting-monitor", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 
   private readBody(req: IncomingMessage): Promise<string> {

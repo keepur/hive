@@ -125,4 +125,13 @@ export const config = {
     timeoutMs: parseInt(optional("TRIAGE_TIMEOUT_MS", "10000"), 10),
     enabled: optional("TRIAGE_ENABLED", "true") === "true",
   },
+  sweeper: {
+    intervalMs: parseInt(optional("SWEEPER_INTERVAL_MS", "300000"), 10),
+    threadTtlMs: parseInt(optional("SWEEPER_THREAD_TTL_MS", "86400000"), 10),
+    taskFileTtlMs: parseInt(optional("SWEEPER_TASK_FILE_TTL_MS", "604800000"), 10),
+    meetingSessionTtlMs: parseInt(optional("SWEEPER_MEETING_TTL_MS", "3600000"), 10),
+    cacheTtlMs: parseInt(optional("SWEEPER_CACHE_TTL_MS", "3600000"), 10),
+    retryMaxAttempts: parseInt(optional("SWEEPER_RETRY_MAX_ATTEMPTS", "3"), 10),
+    retryBaseDelayMs: parseInt(optional("SWEEPER_RETRY_BASE_DELAY_MS", "30000"), 10),
+  },
 } as const;
