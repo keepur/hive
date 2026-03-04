@@ -207,6 +207,16 @@ export class AgentRunner {
         env: {
           RECALL_API_KEY: config.recall.apiKey,
           RECALL_API_REGION: config.recall.region,
+          MEETING_MONITOR_API: `http://127.0.0.1:${config.recall.monitorPort}`,
+          MEETING_MONITOR_PUBLIC_URL: config.recall.monitorPublicUrl,
+          RECALL_AGENT_ID: this.agentConfig.id,
+          RECALL_ADAPTER_ID: context?.adapterId ?? "",
+          RECALL_CHANNEL_ID: context?.channelId ?? "",
+          RECALL_CHANNEL_KIND: context?.channelKind ?? "internal",
+          RECALL_CHANNEL_LABEL: context?.channelLabel ?? "",
+          RECALL_THREAD_ID: context?.threadId ?? "",
+          RECALL_SLACK_TS: context?.slackTs ?? "",
+          RECALL_SLACK_THREAD_TS: context?.slackThreadTs ?? "",
         },
       };
     }

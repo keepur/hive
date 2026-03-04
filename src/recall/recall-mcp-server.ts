@@ -17,6 +17,9 @@ import { z } from "zod";
 const API_KEY = process.env.RECALL_API_KEY ?? "";
 const REGION = process.env.RECALL_API_REGION ?? "us-west-2";
 const BASE_URL = `https://${REGION}.recall.ai/api/v1`;
+const MEETING_MONITOR_API = process.env.MEETING_MONITOR_API ?? "";
+const MEETING_MONITOR_PUBLIC_URL = process.env.MEETING_MONITOR_PUBLIC_URL ?? "";
+const AGENT_ID = process.env.RECALL_AGENT_ID ?? "";
 
 if (!API_KEY) {
   process.stderr.write("recall-mcp-server: RECALL_API_KEY is required\n");
@@ -36,6 +39,32 @@ async function api(method: string, path: string, body?: object): Promise<any> {
   if (!res.ok) throw new Error(`Recall API ${res.status}: ${await res.text()}`);
   if (res.status === 204) return {};
   return res.json();
+}
+
+async function monitorApi(method: string, path: string, body?: object): Promise<any> {
+  if (!MEETING_MONITOR_API) throw new Error("Meeting monitor not configured");
+  const res = await fetch(`${MEETING_MONITOR_API}${path}`, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    ...(body ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`Monitor API ${res.status}: ${await res.text()}`);
+  if (res.status === 204) return {};
+  return res.json();
+}
+
+function buildContext() {
+  return {
+    agentId: AGENT_ID,
+    adapterId: process.env.RECALL_ADAPTER_ID ?? "",
+    channelId: process.env.RECALL_CHANNEL_ID ?? "",
+    channelKind: process.env.RECALL_CHANNEL_KIND ?? "internal",
+    channelLabel: process.env.RECALL_CHANNEL_LABEL ?? "",
+    threadId: process.env.RECALL_THREAD_ID ?? "",
+    slackTs: process.env.RECALL_SLACK_TS ?? "",
+    slackThreadTs: process.env.RECALL_SLACK_THREAD_TS ?? "",
+  };
 }
 
 const server = new McpServer({
@@ -80,6 +109,93 @@ server.registerTool("recall_create_bot", {
   }
 });
 
+// --- Tool: recall_join_meeting ---
+server.registerTool("recall_join_meeting", {
+  title: "Join Meeting (Active Participation)",
+  description:
+    "Join a meeting as an active participant. Creates a bot AND starts real-time transcript monitoring. " +
+    "You will receive transcript updates in this thread. Use recall_send_chat to respond.",
+  inputSchema: {
+    meeting_url: z.string().describe("The meeting URL to join (Zoom, Google Meet, etc.)"),
+    bot_name: z.string().optional().default("Hive Assistant").describe("Display name for the bot"),
+  },
+}, async ({ meeting_url, bot_name }) => {
+  try {
+    const botBody: Record<string, any> = {
+      meeting_url,
+      bot_name,
+      recording_config: {
+        transcript: {
+          provider: { recallai_streaming: {} },
+        },
+      },
+    };
+
+    // Enable real-time transcript webhooks if public URL is configured
+    if (MEETING_MONITOR_PUBLIC_URL) {
+      botBody.recording_config.realtime_endpoints = [{
+        type: "webhook",
+        url: `${MEETING_MONITOR_PUBLIC_URL}/webhook/transcript`,
+        events: ["transcript.data", "transcript.partial_data"],
+      }];
+    }
+
+    const bot = await api("POST", "/bot/", botBody);
+
+    let monitorSessionId = "not started";
+    if (MEETING_MONITOR_API) {
+      try {
+        const monitorResult = await monitorApi("POST", "/meetings/start", {
+          botId: bot.id,
+          botName: bot_name,
+          meetingUrl: meeting_url,
+          apiKey: API_KEY,
+          region: REGION,
+          context: buildContext(),
+        });
+        monitorSessionId = monitorResult.sessionId ?? "started";
+      } catch (err) {
+        monitorSessionId = `failed: ${String(err)}`;
+      }
+    }
+
+    const summary = [
+      `Joined meeting as active participant.`,
+      `- **Bot ID**: ${bot.id}`,
+      `- **Bot Name**: ${bot_name}`,
+      `- **Meeting URL**: ${bot.meeting_url?.meeting_id ? meeting_url : "N/A"}`,
+      `- **Monitor**: ${monitorSessionId}`,
+      ``,
+      `You will receive periodic transcript updates in this thread.`,
+      `Use \`recall_send_chat\` with bot_id "${bot.id}" to send chat messages into the meeting.`,
+    ].join("\n");
+    return { content: [{ type: "text", text: summary }] };
+  } catch (err) {
+    return { content: [{ type: "text", text: `Failed to join meeting: ${String(err)}` }], isError: true };
+  }
+});
+
+// --- Tool: recall_send_chat ---
+server.registerTool("recall_send_chat", {
+  title: "Send Meeting Chat",
+  description:
+    "Send a chat message into an active meeting. The message appears in the meeting chat for all participants to see.",
+  inputSchema: {
+    bot_id: z.string().describe("The bot ID in the meeting"),
+    message: z.string().describe("The chat message to send"),
+  },
+}, async ({ bot_id, message }) => {
+  try {
+    await api("POST", `/bot/${bot_id}/send_chat_message/`, {
+      to: "everyone",
+      message,
+    });
+    return { content: [{ type: "text", text: `Chat sent to meeting: "${message}"` }] };
+  } catch (err) {
+    return { content: [{ type: "text", text: `Failed to send chat: ${String(err)}` }], isError: true };
+  }
+});
+
 // --- Tool: recall_get_bot ---
 server.registerTool("recall_get_bot", {
   title: "Get Bot Details",
@@ -101,21 +217,15 @@ server.registerTool("recall_get_bot", {
       `**Bot Name**: ${result.bot_name ?? "N/A"}`,
     ];
 
-    // Inline transcript if available
-    if (Array.isArray(result.transcript) && result.transcript.length > 0) {
-      lines.push("", "**Transcript:**");
-      for (const entry of result.transcript) {
-        const words = Array.isArray(entry.words)
-          ? entry.words.map((w: any) => w.text).join(" ")
-          : "";
-        lines.push(`[${entry.speaker}]: ${words}`);
+    // Transcript info from recordings
+    const recordings = Array.isArray(result.recordings) ? result.recordings : [];
+    const recording = recordings[0];
+    const transcript = recording?.media_shortcuts?.transcript;
+    if (transcript) {
+      lines.push(`**Transcript Status**: ${transcript.status?.code ?? "unknown"}`);
+      if (transcript.data?.download_url) {
+        lines.push(`**Transcript Download URL**: ${transcript.data.download_url}`);
       }
-    }
-
-    // Download URL if available
-    const downloadUrl = result.media_shortcuts?.transcript?.data?.download_url;
-    if (downloadUrl) {
-      lines.push("", `**Transcript download URL**: ${downloadUrl}`);
     }
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -133,17 +243,37 @@ server.registerTool("recall_get_transcript", {
   },
 }, async ({ bot_id }) => {
   try {
-    const result = await api("GET", `/bot/${bot_id}/transcript/`);
-    const entries = Array.isArray(result) ? result : (Array.isArray(result.results) ? result.results : []);
-    if (entries.length === 0) {
-      return { content: [{ type: "text", text: "Transcript is not yet available or the meeting has no recorded speech." }] };
+    // Get bot to find transcript download URL from recordings
+    const bot = await api("GET", `/bot/${bot_id}/`);
+    const recordings = Array.isArray(bot.recordings) ? bot.recordings : [];
+    const recording = recordings[0];
+    const downloadUrl = recording?.media_shortcuts?.transcript?.data?.download_url;
+
+    if (!downloadUrl) {
+      const transcriptStatus = recording?.media_shortcuts?.transcript?.status?.code;
+      if (transcriptStatus === "processing") {
+        return { content: [{ type: "text", text: "Transcript is still processing. Try again after the meeting ends." }] };
+      }
+      return { content: [{ type: "text", text: "Transcript is not available for this bot." }] };
     }
+
+    // Fetch the transcript from the download URL
+    const res = await fetch(downloadUrl, { signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`Transcript download failed: ${res.status}`);
+
+    const data = await res.json();
+    const entries = Array.isArray(data) ? data : (Array.isArray(data.results) ? data.results : []);
+    if (entries.length === 0) {
+      return { content: [{ type: "text", text: "Transcript is empty — no recorded speech." }] };
+    }
+
     const lines: string[] = [];
     for (const entry of entries) {
+      const speaker = entry.speaker ?? entry.participant?.name ?? "Unknown";
       const words = Array.isArray(entry.words)
         ? entry.words.map((w: any) => w.text).join(" ")
-        : "";
-      lines.push(`[${entry.speaker}]: ${words}`);
+        : (typeof entry.text === "string" ? entry.text : "");
+      lines.push(`[${speaker}]: ${words}`);
     }
     return { content: [{ type: "text", text: lines.join("\n") }] };
   } catch (err) {
