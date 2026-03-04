@@ -58,7 +58,7 @@ server.registerTool("recall_create_bot", {
       bot_name,
       recording_config: {
         transcript: {
-          provider: { recall_ai: { language: "en" } },
+          provider: { recallai_streaming: {} },
         },
       },
     });
