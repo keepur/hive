@@ -5,6 +5,7 @@ import { AgentRunner, type RunResult, type StreamCallback, type WorkItemContext 
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
+import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("agent-manager");
 
@@ -238,5 +239,58 @@ export class AgentManager {
       activeThreadCount: 0,
     });
     log.info("Agent restarted", { agentId });
+  }
+
+  sweep(): SweepResult {
+    let pruned = 0;
+    const errors: string[] = [];
+
+    // 1. Remove zombie states — agents removed from registry
+    for (const [agentId, state] of this.states) {
+      if (!this.registry.get(agentId) && (state.status === "stopped" || state.status === "idle")) {
+        this.states.delete(agentId);
+        this.activeRunners.delete(agentId);
+        this.activeThreads.delete(agentId);
+        pruned++;
+        log.info("Zombie agent state removed", { agentId });
+      }
+    }
+
+    // 2. Detect stuck processing flags
+    for (const threadKey of this.processing) {
+      const agentId = threadKey.split(":")[0];
+      const runners = this.activeRunners.get(agentId);
+      if (!runners || runners.size === 0) {
+        // No active runners but processing flag is set — stuck
+        this.processing.delete(threadKey);
+        const activeSet = this.activeThreads.get(agentId);
+        if (activeSet) {
+          activeSet.delete(threadKey);
+          this.updateThreadCount(agentId);
+          if (activeSet.size === 0) this.updateStatus(agentId, "idle");
+        }
+        pruned++;
+        log.warn("Stuck processing flag cleared", { threadKey, agentId });
+
+        // Try to restart the queue for this thread
+        const queue = this.queues.get(threadKey);
+        if (queue && queue.length > 0) {
+          this.processThreadQueue(agentId, threadKey).catch((err) => {
+            log.error("Failed to restart stuck queue", { threadKey, error: String(err) });
+          });
+        }
+      }
+    }
+
+    // 3. Retry deferred threads for ALL agents with pending queues
+    const agentIds = new Set<string>();
+    for (const threadKey of this.queues.keys()) {
+      agentIds.add(threadKey.split(":")[0]);
+    }
+    for (const agentId of agentIds) {
+      this.retryDeferredThreads(agentId);
+    }
+
+    return { component: "agent-manager", pruned, retried: 0, bytesFreed: 0, errors };
   }
 }

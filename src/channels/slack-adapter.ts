@@ -5,11 +5,9 @@ import type { SlackGateway } from "../slack/slack-gateway.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import { formatError } from "../slack/response-formatter.js";
 import type { WebClient } from "@slack/web-api";
+import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("slack-adapter");
-
-// Track channel context per thread (from assistant_thread_context_changed)
-const threadContextMap = new Map<string, string>();
 
 const DEFAULT_PROMPTS = [
   { title: "Daily briefing", message: "What's on my plate today?" },
@@ -26,6 +24,8 @@ export class SlackAdapter implements ChannelAdapter {
   private registry: AgentRegistry;
   private excludeChannels: Set<string>;
   private defaultAgentId?: string;
+  private threadContextMap = new Map<string, string>();
+  private threadContextLastSeen = new Map<string, number>();
 
   constructor(gateway: SlackGateway, registry: AgentRegistry, excludeChannels: string[] = [], id: string = "slack", defaultAgentId?: string) {
     this.id = id;
@@ -74,14 +74,16 @@ export class SlackAdapter implements ChannelAdapter {
       await this.gateway.setThreadStatus(event.channel, event.threadTs, "");
 
       if (event.context.channelId) {
-        threadContextMap.set(event.threadTs, event.context.channelId);
+        this.threadContextMap.set(event.threadTs, event.context.channelId);
+        this.threadContextLastSeen.set(event.threadTs, Date.now());
       }
     });
 
     // Handle assistant thread context changed
     this.gateway.onThreadContextChanged(async (event) => {
       if (event.context.channelId) {
-        threadContextMap.set(event.threadTs, event.context.channelId);
+        this.threadContextMap.set(event.threadTs, event.context.channelId);
+        this.threadContextLastSeen.set(event.threadTs, Date.now());
         log.info("Thread context updated", { threadTs: event.threadTs, channelId: event.context.channelId });
       }
     });
@@ -131,6 +133,19 @@ export class SlackAdapter implements ChannelAdapter {
     if (!isIntegrationMsg && threadTs) {
       await this.gateway.setThreadStatus(item.source.id, threadTs, "");
     }
+  }
+
+  sweep(threadTtlMs: number): SweepResult {
+    const cutoff = Date.now() - threadTtlMs;
+    let pruned = 0;
+    for (const [id, ts] of this.threadContextLastSeen) {
+      if (ts < cutoff) {
+        this.threadContextMap.delete(id);
+        this.threadContextLastSeen.delete(id);
+        pruned++;
+      }
+    }
+    return { component: `slack-adapter:${this.id}`, pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 
   async stop(): Promise<void> {

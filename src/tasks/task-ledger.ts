@@ -1,5 +1,6 @@
 import { createLogger } from "../logging/logger.js";
 import type { WorkItem, WorkResult } from "../types/work-item.js";
+import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("task-ledger");
 
@@ -9,6 +10,7 @@ const log = createLogger("task-ledger");
  */
 export class TaskLedger {
   private threadTaskMap = new Map<string, string>(); // threadId → taskId
+  private threadTaskLastSeen = new Map<string, number>();
   private apiUrl: string;
   private agentKeys: Record<string, string>;
   private fallbackKey: string;
@@ -38,6 +40,7 @@ export class TaskLedger {
     // Thread continuation → add comment to existing task
     const existingTaskId = this.threadTaskMap.get(threadId);
     if (existingTaskId) {
+      this.threadTaskLastSeen.set(threadId, Date.now());
       await this.addComment(existingTaskId, apiKey, this.formatIncomingComment(item));
       return;
     }
@@ -46,6 +49,7 @@ export class TaskLedger {
     const taskId = await this.createTask(apiKey, item);
     if (taskId) {
       this.threadTaskMap.set(threadId, taskId);
+      this.threadTaskLastSeen.set(threadId, Date.now());
     }
   }
 
@@ -56,6 +60,7 @@ export class TaskLedger {
 
     const threadId = result.workItem.threadId ?? result.workItem.id;
     const taskId = this.threadTaskMap.get(threadId);
+    if (taskId) this.threadTaskLastSeen.set(threadId, Date.now());
     if (!taskId) return;
 
     // Add agent response as comment
@@ -66,6 +71,19 @@ export class TaskLedger {
     if (!result.error) {
       await this.updateTask(taskId, apiKey, { state: "DONE" });
     }
+  }
+
+  sweep(threadTtlMs: number): SweepResult {
+    const cutoff = Date.now() - threadTtlMs;
+    let pruned = 0;
+    for (const [id, ts] of this.threadTaskLastSeen) {
+      if (ts < cutoff) {
+        this.threadTaskMap.delete(id);
+        this.threadTaskLastSeen.delete(id);
+        pruned++;
+      }
+    }
+    return { component: "task-ledger", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 
   private getApiKey(agentId: string): string | null {

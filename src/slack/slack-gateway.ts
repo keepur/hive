@@ -2,6 +2,7 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { createLogger } from "../logging/logger.js";
 import type { IncomingMessage } from "../types/agent-config.js";
+import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("slack-gateway");
 
@@ -399,6 +400,13 @@ export class SlackGateway {
       this.channelNameCache.set(channelId, channelId);
       return channelId;
     }
+  }
+
+  sweep(): SweepResult {
+    const pruned = this.channelNameCache.size + this.userNameCache.size;
+    this.channelNameCache.clear();
+    this.userNameCache.clear();
+    return { component: "slack-gateway", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 
   get client(): WebClient {
