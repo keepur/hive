@@ -22,7 +22,10 @@ function buildTriagePrompt(agentConfig: AgentConfig, isThread: boolean): string 
     ? "\nThis message is in an existing conversation thread. Default to \"continue\" unless it's clearly standalone (like \"thanks\", \"ok\", \"got it\")."
     : "";
 
-  return `You are triaging messages for ${agentConfig.name}.
+  const now = new Date();
+  const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+
+  return `You are triaging messages for ${agentConfig.name}. Current date/time: ${pacific} (Pacific Time).
 
 ${agentConfig.soul}
 

@@ -42,6 +42,11 @@ export class AgentRunner {
   private async buildSystemPrompt(): Promise<string> {
     const parts: string[] = [];
 
+    // Inject current date/time context so agents don't have to guess
+    const now = new Date();
+    const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+    parts.push(`**Current date/time**: ${pacific} (Pacific Time)`);
+
     if (this.agentConfig.soul) {
       parts.push(this.agentConfig.soul);
     }
