@@ -102,6 +102,10 @@ export const config = {
     defaultCc: optional("RESEND_DEFAULT_CC", ""),
     hubspotBcc: optional("HUBSPOT_BCC_OUTGOING", ""),
   },
+  recall: {
+    apiKey: optional("RECALL_API_KEY", ""),
+    region: optional("RECALL_API_REGION", "us-west-2"),
+  },
   scheduler: {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
   },
