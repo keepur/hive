@@ -5,6 +5,8 @@ import type { AgentManager } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
+import { triage } from "../agents/triage.js";
+import { config } from "../config.js";
 
 const log = createLogger("dispatcher");
 
@@ -106,15 +108,66 @@ export class Dispatcher {
       );
     }
 
-    // 4. Notify adapter processing started
     const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
-    await adapter?.onProcessingStart?.(item);
+    const agentConfig = this.registry.get(agentId);
 
+    // 4. Triage gate — fast Haiku response for interactive channels
+    const isInteractive = item.source.kind === "slack" || item.source.kind === "sms";
+    if (isInteractive && config.triage.enabled && agentConfig) {
+      await adapter?.onProcessingStart?.(item);
+      try {
+        const triageResult = await triage(item.text, agentConfig, {
+          isThread: !!item.threadId,
+        });
+
+        if (triageResult.action === "done") {
+          const workResult: WorkResult = {
+            text: triageResult.response,
+            agentId,
+            workItem: item,
+            costUsd: triageResult.costUsd,
+            durationMs: triageResult.durationMs,
+          };
+          if (adapter) await adapter.deliver(workResult);
+          if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
+            await this.postAuditLog(workResult);
+          }
+          log.info("Triage handled message", {
+            agentId,
+            source: item.source.kind,
+            costUsd: triageResult.costUsd,
+            durationMs: triageResult.durationMs,
+          });
+          await adapter?.onProcessingEnd?.(item);
+          return;
+        }
+
+        // action === "continue" — post ack immediately, then proceed to full agent
+        if (adapter) {
+          await adapter.deliver({
+            text: triageResult.response,
+            agentId,
+            workItem: item,
+            costUsd: triageResult.costUsd,
+            durationMs: triageResult.durationMs,
+          });
+        }
+        log.info("Triage ack posted, continuing to full agent", {
+          agentId,
+          source: item.source.kind,
+          ack: triageResult.response.slice(0, 80),
+        });
+      } catch (err) {
+        log.warn("Triage failed, falling through to full agent", { error: String(err) });
+      }
+      await adapter?.onProcessingEnd?.(item);
+    }
+
+    // 5. Full agent processing
+    await adapter?.onProcessingStart?.(item);
     try {
-      // 5. Send to agent
       const runResult = await this.agentManager.sendMessage(agentId, item);
 
-      // 4b. Check if agent indicated no response
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
@@ -136,19 +189,16 @@ export class Dispatcher {
           error: runResult.error,
         };
 
-        // 5. Deliver response
         if (adapter) {
           await adapter.deliver(workResult);
         }
 
-        // 6. Update task ledger with result (fire-and-forget)
         if (tracked) {
           this.taskLedger!.onComplete(workResult).catch((err) =>
             log.warn("Task ledger complete failed", { error: String(err) }),
           );
         }
 
-        // 7. Audit log for cross-channel activity
         if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
           await this.postAuditLog(workResult);
         }
