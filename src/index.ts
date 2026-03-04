@@ -15,6 +15,7 @@ import { SlackAdapter } from "./channels/slack-adapter.js";
 import { SmsAdapter } from "./channels/sms-adapter.js";
 import { TaskClient } from "./tasks/task-client.js";
 import { BackgroundTaskManager } from "./background/background-task-manager.js";
+import { MeetingMonitor } from "./recall/meeting-monitor.js";
 
 const log = createLogger("index");
 
@@ -61,6 +62,19 @@ async function main(): Promise<void> {
   await bgTaskManager.start();
   await bgTaskManager.scanOrphans();
   log.info("Background task manager started", { port: config.background.port });
+
+  // Meeting monitor — real-time meeting participation via Recall.ai
+  let meetingMonitor: MeetingMonitor | undefined;
+  if (config.recall.apiKey) {
+    meetingMonitor = new MeetingMonitor(
+      config.recall.monitorPort,
+      (item) => dispatcher.dispatch(item).catch((err) => {
+        log.error("Meeting monitor dispatch failed", { error: String(err) });
+      }),
+    );
+    await meetingMonitor.start();
+    log.info("Meeting monitor started", { port: config.recall.monitorPort });
+  }
 
   // --- Hot reload ---
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
@@ -142,6 +156,7 @@ async function main(): Promise<void> {
     await smsAdapter.stop();
     scheduler.stop();
     bgTaskManager.stop();
+    meetingMonitor?.stop();
     agentManager.stopAll();
     await sessionStore.close();
     await slackAdapter.stop();

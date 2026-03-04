@@ -105,6 +105,8 @@ export const config = {
   recall: {
     apiKey: optional("RECALL_API_KEY", ""),
     region: optional("RECALL_API_REGION", "us-west-2"),
+    monitorPort: parseInt(optional("MEETING_MONITOR_PORT", "3101"), 10),
+    monitorPublicUrl: optional("MEETING_MONITOR_PUBLIC_URL", ""),
   },
   scheduler: {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
