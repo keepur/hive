@@ -11,10 +11,7 @@
     "setup:prereqs": "bash setup/install-prereqs.sh",
     "setup:agents": "npx tsx setup/generate-agents.ts",
     "setup:plist": "npx tsx setup/generate-plist.ts",
-    "update": "git pull && npm install && npm run build",
-    "hubspot:extract": "npx tsx src/hubspot/hubspot-extract.ts",
-    "hubspot:embed": "npx tsx src/hubspot/hubspot-embed.ts",
-    "hubspot:sync": "npx tsx src/hubspot/hubspot-sync.ts"
+    "update": "git pull && npm install && npm run build"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.63",
