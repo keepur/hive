@@ -10,11 +10,14 @@ import { config } from "../config.js";
 
 const log = createLogger("dispatcher");
 
+/** Max length for status queries — anything longer is real content, not a status check */
+const STATUS_MAX_LENGTH = 80;
+
 const STATUS_PATTERNS = [
   /^status\??$/i,
-  /how.*(everyone|agents?|doing|running)/i,
+  /^how.{0,20}(everyone|agents?|doing|running)/i,
   /^health\??$/i,
-  /system status/i,
+  /^system status/i,
 ];
 
 /** Patterns that indicate the agent chose not to respond — suppress delivery */
@@ -70,8 +73,10 @@ export class Dispatcher {
     this.recentMessageIds.set(item.id, Date.now());
     this.pruneDedup();
 
-    // 1. Intercept status queries
-    if (STATUS_PATTERNS.some((p) => p.test(item.text.trim()))) {
+    // 1. Intercept status queries (short messages only — long messages are real content)
+    const trimmed = item.text.trim();
+    if (trimmed.length <= STATUS_MAX_LENGTH && STATUS_PATTERNS.some((p) => p.test(trimmed))) {
+      log.info("Status query intercepted", { source: item.source.kind, text: trimmed });
       const statusText = this.healthReporter.formatForSlack();
       const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
       if (adapter) {
@@ -113,11 +118,13 @@ export class Dispatcher {
 
     // 4. Triage gate — fast Haiku response for interactive channels
     const isInteractive = item.source.kind === "slack" || item.source.kind === "sms";
+    let processingStarted = false;
     if (isInteractive && config.triage.enabled && agentConfig) {
       await adapter?.onProcessingStart?.(item);
+      processingStarted = true;
       try {
         const triageResult = await triage(item.text, agentConfig, {
-          isThread: !!item.threadId,
+          isThread: !!item.meta?.slackThreadTs,
         });
 
         if (triageResult.action === "done") {
@@ -143,6 +150,7 @@ export class Dispatcher {
         }
 
         // action === "continue" — post ack immediately, then proceed to full agent
+        // Keep "Thinking..." active — don't clear between triage and full agent
         if (adapter) {
           await adapter.deliver({
             text: triageResult.response,
@@ -160,11 +168,10 @@ export class Dispatcher {
       } catch (err) {
         log.warn("Triage failed, falling through to full agent", { error: String(err) });
       }
-      await adapter?.onProcessingEnd?.(item);
     }
 
     // 5. Full agent processing
-    await adapter?.onProcessingStart?.(item);
+    if (!processingStarted) await adapter?.onProcessingStart?.(item);
     try {
       const runResult = await this.agentManager.sendMessage(agentId, item);
 

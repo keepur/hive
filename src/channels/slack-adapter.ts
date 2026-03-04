@@ -55,7 +55,9 @@ export class SlackAdapter implements ChannelAdapter {
         text: msg.text,
         source: { kind: "slack", id: msg.channel, label: msg.channelName, adapterId: this.id },
         sender: msg.user,
-        threadId: msg.threadTs ? `slack:${msg.channel}:${msg.threadTs}` : undefined,
+        // Always use consistent threadId: slack:channelId:threadTs|ts
+        // For parent messages, ts becomes the thread_ts for future replies
+        threadId: `slack:${msg.channel}:${msg.threadTs ?? msg.ts}`,
         timestamp: new Date(),
         meta: { slackTs: msg.ts, slackThreadTs: msg.threadTs, defaultAgentId: this.defaultAgentId },
       };
