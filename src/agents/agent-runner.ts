@@ -142,15 +142,16 @@ export class AgentRunner {
       },
     };
 
-    // External task ledger
-    if (config.taskLedger.apiKey) {
+    // External task ledger — per-agent API key for attribution
+    const taskKey = config.taskLedger.agentKeys[this.agentConfig.id] ?? config.taskLedger.apiKey;
+    if (taskKey) {
       servers["tasks"] = {
         type: "stdio",
         command: "node",
         args: [resolve("dist/tasks/task-mcp-server.js")],
         env: {
           TASK_LEDGER_API_URL: config.taskLedger.apiUrl,
-          TASK_LEDGER_API_KEY: config.taskLedger.apiKey,
+          TASK_LEDGER_API_KEY: taskKey,
         },
       };
     }

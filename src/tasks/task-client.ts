@@ -16,10 +16,10 @@ export class TaskClient {
   }
 
   private async api(method: string, path: string, body?: object): Promise<any> {
-    const res = await fetch(`${this.apiUrl}/api${path}`, {
+    const res = await fetch(`${this.apiUrl}/api/v1${path}`, {
       method,
       headers: {
-        "X-API-Key": this.apiKey,
+        "x-api-key": this.apiKey,
         ...(body ? { "Content-Type": "application/json" } : {}),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
@@ -60,9 +60,9 @@ export class TaskClient {
     }
   }
 
-  async addComment(taskId: string, body: string): Promise<boolean> {
+  async addComment(taskId: string, content: string): Promise<boolean> {
     try {
-      await this.api("POST", `/tasks/${taskId}/comments`, { body });
+      await this.api("POST", `/tasks/${taskId}/comments`, { content });
       log.info("Comment added", { taskId });
       return true;
     } catch (err) {

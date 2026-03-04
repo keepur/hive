@@ -14,6 +14,7 @@ import { Dispatcher } from "./channels/dispatcher.js";
 import { SlackAdapter } from "./channels/slack-adapter.js";
 import { SmsAdapter } from "./channels/sms-adapter.js";
 import { TaskClient } from "./tasks/task-client.js";
+import { TaskLedger } from "./tasks/task-ledger.js";
 import { BackgroundTaskManager } from "./background/background-task-manager.js";
 import { MeetingMonitor } from "./recall/meeting-monitor.js";
 
@@ -47,10 +48,24 @@ async function main(): Promise<void> {
     log.info("Task ledger client configured", { apiUrl: config.taskLedger.apiUrl });
   }
 
+  const taskLedger = new TaskLedger(
+    config.taskLedger.apiUrl,
+    config.taskLedger.agentKeys,
+    config.taskLedger.apiKey,
+  );
+  if (taskLedger.isConfigured) {
+    log.info("Task ledger auto-tracking enabled", {
+      apiUrl: config.taskLedger.apiUrl,
+      agents: Object.keys(config.taskLedger.agentKeys),
+    });
+  }
 
   const agentManager = new AgentManager(registry, memoryManager, sessionStore);
   const healthReporter = new HealthReporter(agentManager, memoryManager);
-  const dispatcher = new Dispatcher(registry, agentManager, healthReporter, config.agents.defaultAgent);
+  const dispatcher = new Dispatcher(
+    registry, agentManager, healthReporter, config.agents.defaultAgent,
+    taskLedger.isConfigured ? taskLedger : undefined,
+  );
 
   // Background task manager — agents can spawn detached background processes
   const bgTaskManager = new BackgroundTaskManager(

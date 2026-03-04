@@ -4,6 +4,7 @@ import type { ChannelAdapter } from "./channel-adapter.js";
 import type { AgentManager } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
+import type { TaskLedger } from "../tasks/task-ledger.js";
 
 const log = createLogger("dispatcher");
 
@@ -31,6 +32,7 @@ export class Dispatcher {
   private recentMessageIds = new Map<string, number>(); // messageTs -> timestamp (dedup)
   private auditAdapter?: ChannelAdapter;
   private auditChannelId?: string;
+  private taskLedger?: TaskLedger;
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
 
@@ -39,11 +41,13 @@ export class Dispatcher {
     agentManager: AgentManager,
     healthReporter: HealthReporter,
     defaultAgentId: string,
+    taskLedger?: TaskLedger,
   ) {
     this.registry = registry;
     this.agentManager = agentManager;
     this.healthReporter = healthReporter;
     this.defaultAgentId = defaultAgentId;
+    this.taskLedger = taskLedger;
   }
 
   registerAdapter(adapter: ChannelAdapter): void {
@@ -94,12 +98,20 @@ export class Dispatcher {
     const threadId = item.threadId ?? item.id;
     this.threadAgentMap.set(threadId, agentId);
 
-    // 3. Notify adapter processing started
+    // 3. Track in task ledger (fire-and-forget — never blocks pipeline)
+    const tracked = this.taskLedger?.shouldTrack(item) ?? false;
+    if (tracked) {
+      this.taskLedger!.onDispatch(item, agentId).catch((err) =>
+        log.warn("Task ledger dispatch failed", { error: String(err) }),
+      );
+    }
+
+    // 4. Notify adapter processing started
     const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
     await adapter?.onProcessingStart?.(item);
 
     try {
-      // 4. Send to agent
+      // 5. Send to agent
       const runResult = await this.agentManager.sendMessage(agentId, item);
 
       // 4b. Check if agent indicated no response
@@ -129,7 +141,14 @@ export class Dispatcher {
           await adapter.deliver(workResult);
         }
 
-        // 6. Audit log for cross-channel activity
+        // 6. Update task ledger with result (fire-and-forget)
+        if (tracked) {
+          this.taskLedger!.onComplete(workResult).catch((err) =>
+            log.warn("Task ledger complete failed", { error: String(err) }),
+          );
+        }
+
+        // 7. Audit log for cross-channel activity
         if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
           await this.postAuditLog(workResult);
         }

@@ -3,11 +3,11 @@
 /**
  * Task Ledger MCP Server — runs as a stdio subprocess inside each agent's Claude Code session.
  * Gives agents the ability to create, read, update, query, and comment on tasks
- * in an external task management system.
+ * in dodi_v2's task system.
  *
  * Env vars:
- *   TASK_LEDGER_API_URL — base URL for the task API
- *   TASK_LEDGER_API_KEY — API key for X-API-Key header
+ *   TASK_LEDGER_API_URL — base URL for the task API (default: http://localhost:3002)
+ *   TASK_LEDGER_API_KEY — per-agent API key for X-API-Key header
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -23,10 +23,10 @@ if (!API_KEY) {
 }
 
 async function api(method: string, path: string, body?: object): Promise<any> {
-  const res = await fetch(`${API_URL}/api${path}`, {
+  const res = await fetch(`${API_URL}/api/v1${path}`, {
     method,
     headers: {
-      "X-API-Key": API_KEY,
+      "x-api-key": API_KEY,
       ...(body ? { "Content-Type": "application/json" } : {}),
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -37,7 +37,7 @@ async function api(method: string, path: string, body?: object): Promise<any> {
 
 const server = new McpServer({
   name: "task-ledger",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // --- Tool: task_create ---
@@ -46,82 +46,103 @@ server.registerTool("task_create", {
   description: "Create a new task in the task ledger.",
   inputSchema: {
     name: z.string().describe("Task title"),
-    description: z.string().optional().describe("Task description (markdown)"),
-    type: z.enum(["FOLLOW_UP", "ACTION_ITEM", "QA", "FABRICATION", "ASSEMBLY", "PURCHASING", "LOGISTICS"])
-      .optional().default("ACTION_ITEM").describe("Task type"),
-    priority: z.number().optional().describe("Priority: 1=Back Burner, 2=Low, 3=Normal, 4=High, 5=Urgent"),
-    jobIds: z.array(z.string()).optional().describe("Related job IDs"),
-    assignedTo: z.string().optional().describe("User ID to assign to"),
+    description: z.string().optional().describe("Task description"),
+    type: z.enum([
+      "FOLLOW_UP", "ACTION_ITEM", "AGENT", "OPS", "MILESTONE",
+      "QA", "FABRICATION", "ASSEMBLY", "PURCHASING", "LOGISTICS",
+      "FINISHING", "CUSTOM_BUILD", "PLANNING", "RECEIVING", "PURCHASE_ORDER",
+    ]).optional().default("ACTION_ITEM").describe("Task type"),
+    assignedTo: z.object({
+      personId: z.string(),
+      name: z.string(),
+    }).optional().describe("Person to assign to ({ personId, name })"),
     dueDate: z.string().optional().describe("Due date (ISO 8601)"),
+    caseId: z.string().optional().describe("Link to a case"),
+    issueId: z.string().optional().describe("Link to a Linear issue"),
+    jobId: z.string().optional().describe("Link to a production job"),
+    data: z.record(z.string(), z.unknown()).optional().describe("Custom type-specific data"),
   },
 }, async (input) => {
   try {
     const result = await api("POST", "/tasks", input);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    return { content: [{ type: "text", text: `Failed to create task: ${String(err)}` }], isError: true };
+    return { content: [{ type: "text" as const, text: `Failed to create task: ${String(err)}` }], isError: true };
   }
 });
 
 // --- Tool: task_get ---
 server.registerTool("task_get", {
   title: "Get Task",
-  description: "Get full details of a task by ID.",
+  description: "Get full details of a task by ID, including dependencies.",
   inputSchema: {
     taskId: z.string().describe("Task ID"),
   },
 }, async ({ taskId }) => {
   try {
     const result = await api("GET", `/tasks/${taskId}`);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    return { content: [{ type: "text", text: `Failed to get task: ${String(err)}` }], isError: true };
+    return { content: [{ type: "text" as const, text: `Failed to get task: ${String(err)}` }], isError: true };
   }
 });
 
 // --- Tool: task_update ---
 server.registerTool("task_update", {
   title: "Update Task",
-  description: "Update a task's state, priority, assignee, description, or due date.",
+  description: "Update a task's state, priority, assignee, description, name, or due date.",
   inputSchema: {
     taskId: z.string().describe("Task ID"),
-    state: z.enum(["TODO", "IN_PROGRESS", "BLOCKED", "PAUSED", "DONE"]).optional().describe("Task state"),
-    priority: z.number().optional().describe("Priority: 1=Back Burner, 2=Low, 3=Normal, 4=High, 5=Urgent"),
-    assignedTo: z.string().optional().describe("User ID to assign to"),
-    description: z.string().optional().describe("Updated description (markdown)"),
-    dueDate: z.string().optional().describe("Due date (ISO 8601)"),
+    name: z.string().optional().describe("Updated task title"),
+    state: z.enum(["TODO", "IN_PROGRESS", "BLOCKED", "DONE", "CANCELLED", "ARCHIVED"])
+      .optional().describe("Task state transition"),
+    description: z.string().optional().describe("Updated description"),
+    priority: z.number().min(0).max(10).optional()
+      .describe("Priority (0-10)"),
+    assignedTo: z.object({
+      personId: z.string(),
+      name: z.string(),
+    }).nullable().optional().describe("Person to assign to, or null to unassign"),
+    dueDate: z.string().nullable().optional().describe("Due date (ISO 8601), or null to clear"),
+    data: z.record(z.string(), z.unknown()).optional().describe("Custom type-specific data (merged with existing)"),
   },
 }, async ({ taskId, ...updates }) => {
   try {
     const result = await api("PUT", `/tasks/${taskId}`, updates);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    return { content: [{ type: "text", text: `Failed to update task: ${String(err)}` }], isError: true };
+    return { content: [{ type: "text" as const, text: `Failed to update task: ${String(err)}` }], isError: true };
   }
 });
 
 // --- Tool: task_list ---
 server.registerTool("task_list", {
   title: "List Tasks",
-  description: "List tasks with optional filters.",
+  description: "List tasks with optional filters. Returns paginated results sorted by last modified.",
   inputSchema: {
-    state: z.string().optional().describe("Filter by state: TODO, IN_PROGRESS, BLOCKED, PAUSED, DONE"),
-    type: z.string().optional().describe("Filter by type: FOLLOW_UP, ACTION_ITEM, QA, FABRICATION, ASSEMBLY, PURCHASING, LOGISTICS"),
-    assignedTo: z.string().optional().describe("Filter by assignee user ID"),
-    limit: z.number().optional().default(20).describe("Max results to return"),
+    state: z.string().optional().describe("Filter by state: TODO, IN_PROGRESS, BLOCKED, DONE, CANCELLED, ARCHIVED"),
+    type: z.string().optional().describe("Filter by type: FOLLOW_UP, ACTION_ITEM, AGENT, OPS, etc."),
+    assignee: z.string().optional().describe("Filter by assignee userId"),
+    jobId: z.string().optional().describe("Filter by job ID"),
+    caseId: z.string().optional().describe("Filter by case ID"),
+    limit: z.number().min(1).max(250).optional().default(50).describe("Max results (1-250, default 50)"),
+    offset: z.number().optional().default(0).describe("Pagination offset"),
   },
 }, async (input) => {
   try {
     const params = new URLSearchParams();
     if (input.state) params.set("state", input.state);
     if (input.type) params.set("type", input.type);
-    if (input.assignedTo) params.set("assignedTo", input.assignedTo);
+    if (input.assignee) params.set("assignee", input.assignee);
+    if (input.jobId) params.set("jobId", input.jobId);
+    if (input.caseId) params.set("caseId", input.caseId);
     if (input.limit) params.set("limit", String(input.limit));
+    if (input.offset) params.set("offset", String(input.offset));
     const qs = params.toString();
     const result = await api("GET", `/tasks${qs ? `?${qs}` : ""}`);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    return { content: [{ type: "text", text: `Failed to list tasks: ${String(err)}` }], isError: true };
+    return { content: [{ type: "text" as const, text: `Failed to list tasks: ${String(err)}` }], isError: true };
   }
 });
 
@@ -131,33 +152,15 @@ server.registerTool("task_add_comment", {
   description: "Add a comment to an existing task.",
   inputSchema: {
     taskId: z.string().describe("Task ID"),
-    body: z.string().describe("Comment text (markdown)"),
+    content: z.string().describe("Comment text"),
+    contentFormat: z.enum(["text", "html"]).optional().default("text").describe("Comment format"),
   },
-}, async ({ taskId, body }) => {
+}, async ({ taskId, content, contentFormat }) => {
   try {
-    const result = await api("POST", `/tasks/${taskId}/comments`, { body });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    const result = await api("POST", `/tasks/${taskId}/comments`, { content, contentFormat });
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    return { content: [{ type: "text", text: `Failed to add comment: ${String(err)}` }], isError: true };
-  }
-});
-
-// --- Tool: task_search ---
-server.registerTool("task_search", {
-  title: "Search Tasks",
-  description: "Search tasks by text query.",
-  inputSchema: {
-    query: z.string().describe("Search query"),
-    limit: z.number().optional().default(20).describe("Max results to return"),
-  },
-}, async (input) => {
-  try {
-    const params = new URLSearchParams({ q: input.query });
-    if (input.limit) params.set("limit", String(input.limit));
-    const result = await api("GET", `/tasks?${params.toString()}`);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to search tasks: ${String(err)}` }], isError: true };
+    return { content: [{ type: "text" as const, text: `Failed to add comment: ${String(err)}` }], isError: true };
   }
 });
 

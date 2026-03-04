@@ -67,6 +67,12 @@ export const config = {
   },
   taskLedger: {
     apiUrl: optional("TASK_LEDGER_API_URL", "http://localhost:3002"),
+    /** Per-agent API keys for task attribution. Falls back to shared TASK_LEDGER_API_KEY. */
+    agentKeys: Object.fromEntries(
+      Object.entries(process.env)
+        .filter(([k]) => k.startsWith("TASK_LEDGER_KEY_"))
+        .map(([k, v]) => [k.replace("TASK_LEDGER_KEY_", "").toLowerCase().replace(/_/g, "-"), v!]),
+    ) as Record<string, string>,
     apiKey: optional("TASK_LEDGER_API_KEY", ""),
   },
   mongo: {
