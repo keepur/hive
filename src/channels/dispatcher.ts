@@ -281,12 +281,7 @@ export class Dispatcher {
   }
 
   private async resolveAgent(item: WorkItem): Promise<string | null> {
-    // 1. Explicit name addressing always wins ("hey Jasper", "@Jasper", "Jasper, ...")
-    //    This lets users bring a different agent into an existing thread.
-    const named = this.registry.findByName(item.text);
-    if (named) return named.id;
-
-    // 2. Thread continuity — stay with the same agent within a thread
+    // 1. Thread continuity — stay with the same agent within a thread
     if (item.threadId) {
       const existing = this.threadAgentMap.get(item.threadId);
       if (existing) {
@@ -303,9 +298,14 @@ export class Dispatcher {
       }
     }
 
-    // 3. Channel mapping (source.label matches agent channels[])
+    // 2. Channel mapping — dedicated channels always route to their owning agent
+    //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
     const channelAgent = this.registry.findByChannel(item.source.label);
     if (channelAgent) return channelAgent.id;
+
+    // 3. Name addressing — works in shared channels ("hey Jasper", "@Jasper", "Jasper, ...")
+    const named = this.registry.findByName(item.text);
+    if (named) return named.id;
 
     // 4. Adapter-specific default (e.g. DMs to Jasper's bot → vp-engineering)
     const adapterDefault = item.meta?.defaultAgentId as string | undefined;

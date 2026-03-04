@@ -139,7 +139,7 @@ async function main(): Promise<void> {
   let slackJasper: SlackGateway | undefined;
   if (config.slackJasper.appToken && config.slackJasper.botToken) {
     slackJasper = new SlackGateway(config.slackJasper.appToken, config.slackJasper.botToken);
-    slackJasperAdapter = new SlackAdapter(slackJasper, registry, smsChannels, "slack:jasper", "vp-engineering");
+    slackJasperAdapter = new SlackAdapter(slackJasper, registry, smsChannels, "slack:jasper", "vp-engineering", "jasper");
     dispatcher.registerAdapter(slackJasperAdapter);
     await slackJasperAdapter.start((item) => {
       dispatcher.dispatch(item).catch((err) => {
