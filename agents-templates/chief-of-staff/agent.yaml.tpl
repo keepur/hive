@@ -23,3 +23,4 @@ servers:
   - slack
   - brave-search
   - tasks
+  - recall

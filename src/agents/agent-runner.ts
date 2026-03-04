@@ -198,6 +198,19 @@ export class AgentRunner {
       };
     }
 
+    // Recall.ai — meeting bots and transcription
+    if (config.recall.apiKey) {
+      servers["recall"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/recall/recall-mcp-server.js")],
+        env: {
+          RECALL_API_KEY: config.recall.apiKey,
+          RECALL_API_REGION: config.recall.region,
+        },
+      };
+    }
+
     // Background task server — agents can spawn detached background processes
     servers["background"] = {
       type: "stdio",
