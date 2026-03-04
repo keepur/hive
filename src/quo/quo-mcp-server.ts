@@ -186,6 +186,38 @@ server.registerTool("quo_list_calls", {
   }
 });
 
+// ── Call Transcripts & Recordings ────────────────────────────────────────
+
+server.registerTool("quo_get_transcript", {
+  title: "Get Call Transcript",
+  description: "Get the full transcript of a specific call. Use quo_list_calls first to find the call ID.",
+  inputSchema: {
+    callId: z.string().describe("The call ID (from quo_list_calls results)"),
+  },
+}, async ({ callId }) => {
+  try {
+    const result = await api("GET", `/call-transcripts/${callId}`);
+    return { content: [{ type: "text", text: result }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: e.message }], isError: true };
+  }
+});
+
+server.registerTool("quo_get_recording", {
+  title: "Get Call Recording",
+  description: "Get recording URLs for a specific call. Use quo_list_calls first to find the call ID.",
+  inputSchema: {
+    callId: z.string().describe("The call ID (from quo_list_calls results)"),
+  },
+}, async ({ callId }) => {
+  try {
+    const result = await api("GET", `/call-recordings/${callId}`);
+    return { content: [{ type: "text", text: result }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: e.message }], isError: true };
+  }
+});
+
 // ── Contacts ────────────────────────────────────────────────────────────
 
 server.registerTool("quo_list_contacts", {

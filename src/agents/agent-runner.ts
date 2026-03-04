@@ -241,6 +241,21 @@ export class AgentRunner {
       },
     };
 
+    // CRM Search — semantic search over HubSpot data in Atlas
+    const atlasUri = process.env.MONGODB_ATLAS_URI ?? "";
+    const voyageKey = process.env.VOYAGEAI_API_KEY ?? "";
+    if (atlasUri && voyageKey) {
+      servers["crm-search"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/hubspot/crm-search-mcp-server.js")],
+        env: {
+          MONGODB_ATLAS_URI: atlasUri,
+          VOYAGEAI_API_KEY: voyageKey,
+        },
+      };
+    }
+
     // Guardrail: filter to agent's allowed MCP servers
     if (this.agentConfig.servers?.length) {
       const allowed = new Set(this.agentConfig.servers);

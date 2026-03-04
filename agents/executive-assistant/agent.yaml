@@ -18,3 +18,4 @@ servers:
   - quo
   - brave-search
   - tasks
+  - crm-search

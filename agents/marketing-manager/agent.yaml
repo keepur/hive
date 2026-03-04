@@ -18,3 +18,4 @@ servers:
   - brave-search
   - slack
   - tasks
+  - crm-search

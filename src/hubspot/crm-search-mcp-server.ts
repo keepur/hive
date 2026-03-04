@@ -38,6 +38,7 @@ async function connect(): Promise<void> {
 async function ensureConnected(): Promise<void> {
   if (!connected) {
     await connect();
+    await loadStageMappings();
     connected = true;
   }
 }
@@ -93,10 +94,49 @@ function collectionForObjectType(objectType: string): string {
   }
 }
 
+// ── Pipeline Stage Lookup ────────────────────────────────────────────────────
+
+let stageMap: Map<string, string> | null = null;
+let pipelineMap: Map<string, string> | null = null;
+
+async function loadStageMappings(): Promise<void> {
+  if (stageMap) return;
+  stageMap = new Map();
+  pipelineMap = new Map();
+  try {
+    const pipelines = await db.collection("staging_pipelines").find({}).toArray();
+    for (const p of pipelines) {
+      pipelineMap.set(p.id, p.label);
+      for (const s of p.stages ?? []) {
+        stageMap.set(s.id, s.label);
+      }
+    }
+  } catch {
+    // Non-fatal — fall through to raw IDs
+  }
+}
+
+function resolveStage(stageId: string): string {
+  return stageMap?.get(stageId) ?? stageId;
+}
+
+function resolvePipeline(pipelineId: string): string {
+  return pipelineMap?.get(pipelineId) ?? pipelineId;
+}
+
 // ── Result Formatting ───────────────────────────────────────────────────────
 
+function enrichEmbeddingText(text: string): string {
+  if (!stageMap) return text;
+  // Replace raw stage IDs in embedding text (e.g. "Stage: 33086345" → "Stage: Closed won early adopter program")
+  return text.replace(/Stage: (\w+)/g, (match, id) => {
+    const resolved = resolveStage(id);
+    return resolved !== id ? `Stage: ${resolved}` : match;
+  });
+}
+
 function formatResult(r: any, index: number): string {
-  const lines = [`${index}. [${r.objectType}] ${r.embeddingText}`];
+  const lines = [`${index}. [${r.objectType}] ${enrichEmbeddingText(r.embeddingText)}`];
   lines.push(`   Score: ${r.score.toFixed(3)} | HubSpot ID: ${r.hubspotId} | dodi ID: ${r.dodiId ?? "N/A"}`);
 
   if (r.properties) {
@@ -104,7 +144,7 @@ function formatResult(r: any, index: number): string {
     if (props.email) lines.push(`   Email: ${props.email}`);
     if (props.phone) lines.push(`   Phone: ${props.phone}`);
     if (props.amount) lines.push(`   Amount: $${props.amount}`);
-    if (props.dealstage) lines.push(`   Stage: ${props.dealstage}`);
+    if (props.dealstage) lines.push(`   Stage: ${resolveStage(props.dealstage)}`);
     if (props.dealname) lines.push(`   Deal: ${props.dealname}`);
     if (props.lifecyclestage) lines.push(`   Lifecycle: ${props.lifecyclestage}`);
     if (props.hs_engagement_type) lines.push(`   Type: ${props.hs_engagement_type}`);
@@ -423,7 +463,7 @@ server.registerTool("crm_stats", {
 
       const lines = ["Deal Pipeline", "============="];
       for (const stage of pipeline) {
-        const stageName = stage._id || "Unknown";
+        const stageName = stage._id ? resolveStage(stage._id) : "Unknown";
         const amount = stage.totalAmount
           ? ` | Total: $${stage.totalAmount.toLocaleString()}`
           : "";
