@@ -3,6 +3,7 @@ name: "Mokie"
 icon: ":briefcase:"
 model: claude-sonnet-4-6
 channels:
+  - agent-mokie
   - general
 keywords:
   - status
@@ -23,3 +24,4 @@ servers:
   - slack
   - brave-search
   - tasks
+  - recall
