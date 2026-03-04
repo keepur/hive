@@ -82,6 +82,7 @@ export class AgentRegistry {
       servers: (raw.servers as string[]) || undefined,
       maxConcurrent: (raw.maxConcurrent as number) || undefined,
       timeoutMs: (raw.timeoutMs as number) || undefined,
+      triageModel: (raw.triageModel as string) || undefined,
       soul,
       systemPrompt,
     };

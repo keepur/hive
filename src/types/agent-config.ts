@@ -18,6 +18,7 @@ export interface AgentConfig {
   servers?: string[];  // MCP server allowlist. Omit = all servers (backward compat)
   maxConcurrent?: number;  // Max concurrent threads. Default 3
   timeoutMs?: number;      // Response timeout in ms. Default 300000 (5 min)
+  triageModel?: string;    // Override triage model. Default: config.triage.model
   soul: string;
   systemPrompt: string;
 }
