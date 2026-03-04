@@ -78,6 +78,7 @@ export const config = {
   mongo: {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
     dbName: optional("MONGODB_DB", "hive"),
+    atlasUri: optional("MONGODB_ATLAS_URI", ""),
   },
   memory: {
     repo: optional("HIVE_MEMORY_REPO", hive.memory?.repo ?? ""),
@@ -113,6 +114,15 @@ export const config = {
     region: optional("RECALL_API_REGION", "us-west-2"),
     monitorPort: parseInt(optional("MEETING_MONITOR_PORT", "3101"), 10),
     monitorPublicUrl: optional("MEETING_MONITOR_PUBLIC_URL", ""),
+  },
+  hubspot: {
+    apiKey: optional("HUBSPOT_API_KEY", ""),
+  },
+  dodi: {
+    mongoUri: optional("DODI_MONGODB_URI", ""),
+  },
+  voyageai: {
+    apiKey: optional("VOYAGEAI_API_KEY", ""),
   },
   scheduler: {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
