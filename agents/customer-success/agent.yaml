@@ -1,0 +1,23 @@
+id: customer-success
+name: "Jessica"
+icon: ":handshake:"
+model: claude-sonnet-4-6
+channels:
+  - agent-jessica
+keywords:
+  - customer
+  - client
+  - deal
+  - order
+  - account
+isDefault: false
+budgetUsd: 50
+maxTurns: 30
+servers:
+  - memory
+  - crm-search
+  - contacts
+  - slack
+  - brave-search
+  - tasks
+  - quo

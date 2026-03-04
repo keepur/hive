@@ -25,3 +25,4 @@ servers:
   - brave-search
   - tasks
   - recall
+  - crm-search
