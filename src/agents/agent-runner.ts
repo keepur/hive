@@ -26,6 +26,7 @@ export interface RunResult {
   durationMs: number;
   streamed: boolean;
   error?: string;
+  aborted?: boolean;
 }
 
 export class AgentRunner {
@@ -294,6 +295,7 @@ export class AgentRunner {
     let durationMs = 0;
     let streamed = false;
     let error: string | undefined;
+    this._aborted = false;
 
     const timeoutMs = this.agentConfig.timeoutMs ?? 300_000; // 5 min default
     const deadline = setTimeout(() => {
@@ -369,12 +371,19 @@ export class AgentRunner {
       hasError: !!error,
     });
 
-    return { text: resultText, sessionId: resultSessionId, costUsd, durationMs, streamed, error };
+    return { text: resultText, sessionId: resultSessionId, costUsd, durationMs, streamed, error, aborted: this._aborted };
+  }
+
+  private _aborted = false;
+
+  get wasAborted(): boolean {
+    return this._aborted;
   }
 
   abort(): void {
     if (this.activeQuery) {
       log.info("Aborting active query", { agent: this.agentConfig.id });
+      this._aborted = true;
       this.activeQuery.close();
       this.activeQuery = null;
     }

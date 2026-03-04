@@ -125,7 +125,7 @@ export class AgentManager {
 
         const result = await runner.send(item.message.text, existingSession, item.onStream, bgContext);
 
-        if (result.sessionId) {
+        if (result.sessionId && !result.aborted) {
           this.sessionStore.set(agentId, threadId, result.sessionId);
         }
 

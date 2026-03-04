@@ -102,13 +102,13 @@ export async function triage(
       options: {
         model,
         systemPrompt,
-        tools: [],
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         maxTurns: 1,
         maxBudgetUsd: 0.01,
         persistSession: false,
         thinking: { type: "disabled" },
+        disallowedTools: ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "WebFetch", "WebSearch", "NotebookEdit"],
         env: {
           ...process.env,
           ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),

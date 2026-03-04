@@ -125,7 +125,11 @@ async function main(): Promise<void> {
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
   const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack");
   dispatcher.registerAdapter(slackAdapter);
-  await slackAdapter.start((item) => dispatcher.dispatch(item));
+  await slackAdapter.start((item) => {
+    dispatcher.dispatch(item).catch((err) => {
+      log.error("Slack dispatch failed", { error: String(err), source: item.source.label });
+    });
+  });
   log.info("Slack adapter connected (primary)");
 
   // Start secondary Slack adapter (separate bot identity)
@@ -134,7 +138,11 @@ async function main(): Promise<void> {
     const slackJasper = new SlackGateway(config.slackJasper.appToken, config.slackJasper.botToken);
     slackJasperAdapter = new SlackAdapter(slackJasper, registry, smsChannels, "slack:jasper", "vp-engineering");
     dispatcher.registerAdapter(slackJasperAdapter);
-    await slackJasperAdapter.start((item) => dispatcher.dispatch(item));
+    await slackJasperAdapter.start((item) => {
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("Slack (jasper) dispatch failed", { error: String(err), source: item.source.label });
+      });
+    });
     log.info("Slack adapter connected (secondary)");
 
     // Cross-register bot IDs so each gateway filters the other's messages
@@ -156,7 +164,11 @@ async function main(): Promise<void> {
   const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines);
   dispatcher.registerAdapter(smsAdapter);
   if (config.quo.apiKey && config.sms.lines.length > 0) {
-    await smsAdapter.start((item) => dispatcher.dispatch(item));
+    await smsAdapter.start((item) => {
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("SMS dispatch failed", { error: String(err), source: item.source.label });
+      });
+    });
     log.info("SMS adapter started", { lines: config.sms.lines.length });
   }
 
