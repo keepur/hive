@@ -24,20 +24,23 @@ export class SlackAdapter implements ChannelAdapter {
   private registry: AgentRegistry;
   private excludeChannels: Set<string>;
   private defaultAgentId?: string;
+  private botLabel?: string;
   private threadContextMap = new Map<string, string>();
   private threadContextLastSeen = new Map<string, number>();
 
-  constructor(gateway: SlackGateway, registry: AgentRegistry, excludeChannels: string[] = [], id: string = "slack", defaultAgentId?: string) {
+  constructor(gateway: SlackGateway, registry: AgentRegistry, excludeChannels: string[] = [], id: string = "slack", defaultAgentId?: string, botLabel?: string) {
     this.id = id;
     this.gateway = gateway;
     this.registry = registry;
     this.excludeChannels = new Set(excludeChannels);
     this.defaultAgentId = defaultAgentId;
+    this.botLabel = botLabel;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
-    // Register integration channels from registry, excluding channels handled by other adapters
+    // Register integration channels — only for agents assigned to this bot
     const allAgentChannels = this.registry.getAll()
+      .filter((a) => (a.slackBot ?? undefined) === this.botLabel)
       .flatMap((a) => a.channels)
       .filter((ch) => !this.excludeChannels.has(ch));
     this.gateway.addIntegrationChannels(allAgentChannels);
@@ -47,6 +50,13 @@ export class SlackAdapter implements ChannelAdapter {
       // Skip channels handled by other adapters (e.g. SMS channels)
       if (this.excludeChannels.has(msg.channelName)) {
         log.debug("Ignoring message from excluded channel", { channel: msg.channelName });
+        return;
+      }
+
+      // Skip channels owned by another bot's agent
+      const owningAgent = this.registry.findByChannel(msg.channelName);
+      if (owningAgent && (owningAgent.slackBot ?? undefined) !== this.botLabel) {
+        log.debug("Ignoring message from other bot's channel", { channel: msg.channelName, owner: owningAgent.id, botLabel: this.botLabel });
         return;
       }
 
