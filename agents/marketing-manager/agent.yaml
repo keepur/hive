@@ -4,7 +4,6 @@ icon: ":art:"
 model: claude-sonnet-4-6
 channels:
   - agent-river
-  - marketing
 keywords: []
 isDefault: false
 schedule:
@@ -14,8 +13,11 @@ budgetUsd: 50
 servers:
   - memory
   - contacts
+  - crm-search
+  - hubspot-crm
   - linear
   - brave-search
   - slack
+  - permits
   - tasks
-  - crm-search
+  - google-workspace
