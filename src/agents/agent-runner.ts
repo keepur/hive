@@ -178,7 +178,7 @@ export class AgentRunner {
     // Each agent sends from their own address: Name <name@dodihome.com>
     if (config.resend.apiKey) {
       const agentName = this.agentConfig.name.toLowerCase();
-      const agentFromAddress = `${this.agentConfig.name} <${agentName}@dodihome.com>`;
+      const agentFromAddress = `${this.agentConfig.name} (DodiHome) <${agentName}@dodihome.com>`;
       servers["resend"] = {
         type: "stdio",
         command: "node",

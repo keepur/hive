@@ -21,4 +21,5 @@ servers:
   - slack
   - brave-search
   - tasks
+  - resend
   - quo
