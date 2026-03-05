@@ -3,7 +3,7 @@ name: "{{agent.name}}"
 icon: ":spiral_calendar_pad:"
 model: claude-haiku-4-5
 channels:
-  - executive-assistant
+  - agent-rae
 keywords: []
 isDefault: false
 budgetUsd: 50
