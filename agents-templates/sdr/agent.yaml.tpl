@@ -10,8 +10,6 @@ keywords:
   - prospect
   - outreach
   - follow up
-  - pipeline
-  - deal
   - qualify
 isDefault: false
 schedule:
