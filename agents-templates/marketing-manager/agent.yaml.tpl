@@ -17,4 +17,5 @@ servers:
   - linear
   - brave-search
   - slack
+  - permits
   - tasks

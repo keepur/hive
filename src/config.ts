@@ -111,6 +111,9 @@ export const config = {
   hubspot: {
     apiKey: optional("HUBSPOT_API_KEY", ""),
   },
+  permits: {
+    mongoUri: optional("PERMITS_MONGO_URI", "mongodb://localhost:27017/permits"),
+  },
   recall: {
     apiKey: optional("RECALL_API_KEY", ""),
     region: optional("RECALL_API_REGION", "us-west-2"),

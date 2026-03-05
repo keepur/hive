@@ -275,6 +275,16 @@ export class AgentRunner {
       };
     }
 
+    // Permits — read-only access to permit pipeline data
+    servers["permits"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/permits/permit-mcp-server.js")],
+      env: {
+        PERMITS_MONGO_URI: config.permits.mongoUri,
+      },
+    };
+
     // Guardrail: filter to agent's allowed MCP servers
     if (this.agentConfig.servers?.length) {
       const allowed = new Set(this.agentConfig.servers);
