@@ -243,6 +243,119 @@ export class HubSpotApiClient {
     await this.api<HubSpotObject>("PATCH", `/crm/v3/objects/tasks/${id}`, { properties });
   }
 
+  // ── Activity History ────────────────────────────────────────────────────
+
+  /**
+   * Get all activities (emails, notes, tasks, calls, meetings) associated with
+   * a contact or deal, sorted by timestamp descending.
+   */
+  async getActivities(
+    objectType: "contact" | "deal",
+    objectId: string,
+    options?: { limit?: number },
+  ): Promise<{ type: string; timestamp: string; summary: string }[]> {
+    const limit = options?.limit ?? 50;
+    const engagementTypes = ["emails", "notes", "tasks", "calls", "meetings"] as const;
+
+    // Step 1: get associated IDs for each engagement type
+    const associationResults = await Promise.all(
+      engagementTypes.map(async (engType) => {
+        try {
+          const res = await this.api<{ results: { id: string }[] }>(
+            "GET",
+            `/crm/v3/objects/${objectType}s/${objectId}/associations/${engType}`,
+          );
+          return { type: engType, ids: res.results.map(r => r.id) };
+        } catch {
+          return { type: engType, ids: [] };
+        }
+      }),
+    );
+
+    // Step 2: fetch actual objects (batch per type)
+    const propertyMap: Record<string, string[]> = {
+      emails: ["hs_email_subject", "hs_email_text", "hs_email_direction", "hs_timestamp", "hs_email_from_email", "hs_email_to_email"],
+      notes: ["hs_note_body", "hs_timestamp"],
+      tasks: ["hs_task_subject", "hs_task_body", "hs_task_status", "hs_timestamp"],
+      calls: ["hs_call_title", "hs_call_body", "hs_call_direction", "hs_call_duration", "hs_timestamp"],
+      meetings: ["hs_meeting_title", "hs_meeting_body", "hs_meeting_start_time", "hs_meeting_end_time", "hs_timestamp"],
+    };
+
+    const activities: { type: string; timestamp: string; summary: string }[] = [];
+
+    for (const { type: engType, ids } of associationResults) {
+      if (ids.length === 0) continue;
+
+      const props = propertyMap[engType] ?? [];
+      const propsQuery = props.length > 0 ? `?properties=${props.join(",")}` : "";
+
+      // Fetch individually (batch read endpoint has quirks with engagement types)
+      const fetches = ids.slice(0, limit).map(async (id) => {
+        try {
+          const obj = await this.api<HubSpotObject>(
+            "GET",
+            `/crm/v3/objects/${engType}/${id}${propsQuery}`,
+          );
+          return obj;
+        } catch {
+          return null;
+        }
+      });
+
+      const results = (await Promise.all(fetches)).filter(Boolean) as HubSpotObject[];
+
+      for (const obj of results) {
+        const p = obj.properties;
+        const ts = p.hs_timestamp || obj.createdAt || "";
+        let summary = "";
+
+        switch (engType) {
+          case "emails": {
+            const dir = p.hs_email_direction === "INCOMING_EMAIL" ? "Received" : "Sent";
+            const from = p.hs_email_from_email || "unknown";
+            const to = p.hs_email_to_email || "unknown";
+            const subj = p.hs_email_subject || "(no subject)";
+            const body = (p.hs_email_text || "").slice(0, 300);
+            summary = `${dir} email — From: ${from} → To: ${to}\n  Subject: ${subj}\n  ${body}`;
+            break;
+          }
+          case "notes": {
+            const body = (p.hs_note_body || "").replace(/<[^>]*>/g, "").slice(0, 300);
+            summary = `Note: ${body}`;
+            break;
+          }
+          case "tasks": {
+            const subj = p.hs_task_subject || "(no subject)";
+            const status = p.hs_task_status || "unknown";
+            const body = p.hs_task_body ? `\n  ${(p.hs_task_body).replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
+            summary = `Task [${status}]: ${subj}${body}`;
+            break;
+          }
+          case "calls": {
+            const dir = p.hs_call_direction === "INBOUND" ? "Inbound" : "Outbound";
+            const dur = p.hs_call_duration ? `${Math.round(Number(p.hs_call_duration) / 1000)}s` : "unknown duration";
+            const body = p.hs_call_body ? `\n  ${(p.hs_call_body).replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
+            summary = `${dir} call (${dur})${body}`;
+            break;
+          }
+          case "meetings": {
+            const title = p.hs_meeting_title || "(no title)";
+            const start = p.hs_meeting_start_time || "";
+            const body = p.hs_meeting_body ? `\n  ${(p.hs_meeting_body).replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
+            summary = `Meeting: ${title}${start ? ` (${start})` : ""}${body}`;
+            break;
+          }
+        }
+
+        activities.push({ type: engType.replace(/s$/, ""), timestamp: ts, summary });
+      }
+    }
+
+    // Sort by timestamp descending
+    activities.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+    return activities.slice(0, limit);
+  }
+
   // ── Associations ────────────────────────────────────────────────────────
 
   async associate(
