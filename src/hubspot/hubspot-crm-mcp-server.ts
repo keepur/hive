@@ -128,19 +128,18 @@ server.registerTool("hubspot_update_contact", {
 
 server.registerTool("hubspot_create_deal", {
   title: "Create HubSpot Deal",
-  description: "Create a new deal in HubSpot CRM. Optionally associate with an existing contact.",
+  description: "Create a new deal in the Sales Pipeline. Optionally associate with an existing contact. Valid stages: S0 - Prospect (appointmentscheduled), S1 - Meeting (qualifiedtobuy), S2 - Discovery (15520138), S3 - Evaluation (15520119), S4 - Proposal (decisionmakerboughtin), S5 - Invoice (63682726), Sales Nurture (149783667), Closed won (closedwon), Closed lost (closedlost).",
   inputSchema: {
     dealname: z.string().describe("Deal name (required)"),
-    pipeline: z.string().optional().default("default").describe("Pipeline ID (default: \"default\")"),
-    dealstage: z.string().describe("Deal stage ID (required)"),
+    dealstage: z.string().describe("Deal stage ID — use the ID in parentheses from the tool description"),
     amount: z.string().optional().describe("Deal amount"),
     closedate: z.string().optional().describe("Expected close date (ISO format)"),
     hubspot_owner_id: z.string().optional().describe("HubSpot owner ID"),
     associateContactId: z.string().optional().describe("Contact ID to associate this deal with"),
   },
-}, async ({ dealname, pipeline, dealstage, amount, closedate, hubspot_owner_id, associateContactId }) => {
+}, async ({ dealname, dealstage, amount, closedate, hubspot_owner_id, associateContactId }) => {
   try {
-    const properties: Record<string, string> = { dealname, pipeline, dealstage };
+    const properties: Record<string, string> = { dealname, pipeline: "default", dealstage };
     if (amount) properties.amount = amount;
     if (closedate) properties.closedate = closedate;
     if (hubspot_owner_id) properties.hubspot_owner_id = hubspot_owner_id;
@@ -154,7 +153,7 @@ server.registerTool("hubspot_create_deal", {
     const lines: string[] = [`Created deal ${result.id}`];
     lines.push(`- Name: ${dealname}`);
     lines.push(`- Stage: ${dealstage}`);
-    lines.push(`- Pipeline: ${pipeline}`);
+    lines.push(`- Pipeline: Sales Pipeline`);
     if (amount) lines.push(`- Amount: $${amount}`);
     if (closedate) lines.push(`- Close Date: ${closedate}`);
     if (hubspot_owner_id) lines.push(`- Owner: ${hubspot_owner_id}`);

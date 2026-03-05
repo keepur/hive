@@ -189,6 +189,8 @@ server.registerTool("crm_search", {
     // Run $vectorSearch on each collection
     const allResults: any[] = [];
     for (const col of collections) {
+      // Fetch extra candidates for deals — post-filter removes non-Sales Pipeline junk
+      const fetchLimit = col.name === "rag_deals" ? limit * 3 : limit;
       const results = await db
         .collection(col.name)
         .aggregate([
@@ -197,10 +199,12 @@ server.registerTool("crm_search", {
               index: "vector_index",
               path: "embedding",
               queryVector: queryEmbedding,
-              numCandidates: limit * 10,
-              limit: limit,
+              numCandidates: fetchLimit * 10,
+              limit: fetchLimit,
             },
           },
+          // Only show Sales Pipeline deals (pipeline "default"), skip junk pipelines
+          ...(col.name === "rag_deals" ? [{ $match: { "properties.pipeline": "default" } }] : []),
           {
             $project: {
               _id: 1,
@@ -267,6 +271,7 @@ server.registerTool("crm_find_similar", {
     }
 
     // Search for similar records using the source embedding, fetch one extra to exclude source
+    const similarFetchLimit = colName === "rag_deals" ? (limit + 1) * 3 : limit + 1;
     const results = await col
       .aggregate([
         {
@@ -274,10 +279,11 @@ server.registerTool("crm_find_similar", {
             index: "vector_index",
             path: "embedding",
             queryVector: source.embedding,
-            numCandidates: (limit + 1) * 10,
-            limit: limit + 1,
+            numCandidates: similarFetchLimit * 10,
+            limit: similarFetchLimit,
           },
         },
+        ...(colName === "rag_deals" ? [{ $match: { "properties.pipeline": "default" } }] : []),
         {
           $project: {
             _id: 1,
@@ -416,7 +422,7 @@ server.registerTool("crm_stats", {
     if (metric === "overview") {
       const [contactCount, dealCount, activityCount] = await Promise.all([
         db.collection("rag_contacts").countDocuments(),
-        db.collection("rag_deals").countDocuments(),
+        db.collection("rag_deals").countDocuments({ "properties.pipeline": "default" }),
         db.collection("rag_activities").countDocuments(),
       ]);
 
@@ -444,6 +450,7 @@ server.registerTool("crm_stats", {
       const pipeline = await db
         .collection("rag_deals")
         .aggregate([
+          { $match: { "properties.pipeline": "default" } },
           {
             $group: {
               _id: "$properties.dealstage",
