@@ -38,9 +38,9 @@ export class SlackAdapter implements ChannelAdapter {
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
-    // Register integration channels — only for agents assigned to this bot
+    // Register integration channels — agents assigned to this bot, or any bot (no slackBot set)
     const allAgentChannels = this.registry.getAll()
-      .filter((a) => (a.slackBot ?? undefined) === this.botLabel)
+      .filter((a) => !a.slackBot || a.slackBot === this.botLabel)
       .flatMap((a) => a.channels)
       .filter((ch) => !this.excludeChannels.has(ch));
     this.gateway.addIntegrationChannels(allAgentChannels);
@@ -53,9 +53,10 @@ export class SlackAdapter implements ChannelAdapter {
         return;
       }
 
-      // Skip channels owned by another bot's agent
+      // Skip channels owned by an agent explicitly bound to a different bot
+      // Agents with no slackBot are accessible from any adapter
       const owningAgent = this.registry.findByChannel(msg.channelName);
-      if (owningAgent && (owningAgent.slackBot ?? undefined) !== this.botLabel) {
+      if (owningAgent && owningAgent.slackBot && owningAgent.slackBot !== this.botLabel) {
         log.debug("Ignoring message from other bot's channel", { channel: msg.channelName, owner: owningAgent.id, botLabel: this.botLabel });
         return;
       }
