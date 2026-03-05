@@ -16,6 +16,7 @@ maxTurns: 30
 servers:
   - memory
   - crm-search
+  - hubspot-crm
   - contacts
   - slack
   - brave-search

@@ -108,6 +108,9 @@ export const config = {
     defaultCc: optional("RESEND_DEFAULT_CC", ""),
     hubspotBcc: optional("HUBSPOT_BCC_OUTGOING", ""),
   },
+  hubspot: {
+    apiKey: optional("HUBSPOT_API_KEY", ""),
+  },
   recall: {
     apiKey: optional("RECALL_API_KEY", ""),
     region: optional("RECALL_API_REGION", "us-west-2"),

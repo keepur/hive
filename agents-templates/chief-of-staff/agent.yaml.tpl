@@ -21,6 +21,8 @@ budgetUsd: 50
 servers:
   - memory
   - contacts
+  - crm-search
+  - hubspot-crm
   - slack
   - brave-search
   - tasks

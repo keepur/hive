@@ -261,6 +261,17 @@ export class AgentRunner {
       };
     }
 
+    // HubSpot CRM — read/write CRM operations
+    const hubspotApiKey = process.env.HUBSPOT_API_KEY ?? "";
+    if (hubspotApiKey) {
+      servers["hubspot-crm"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/hubspot/hubspot-crm-mcp-server.js")],
+        env: { HUBSPOT_API_KEY: hubspotApiKey },
+      };
+    }
+
     // Guardrail: filter to agent's allowed MCP servers
     if (this.agentConfig.servers?.length) {
       const allowed = new Set(this.agentConfig.servers);
