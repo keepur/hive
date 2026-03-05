@@ -361,6 +361,21 @@ export class SlackGateway {
     }
   }
 
+  /** Resolve a Slack user ID to display name */
+  async resolveUserName(userId: string): Promise<string> {
+    let name = this.userNameCache.get(userId);
+    if (name) return name;
+    try {
+      const result = await this.web.users.info({ user: userId });
+      name = result.user?.profile?.display_name || result.user?.real_name || result.user?.name || userId;
+      this.userNameCache.set(userId, name);
+      return name;
+    } catch {
+      this.userNameCache.set(userId, userId);
+      return userId;
+    }
+  }
+
   /** Replace <@USERID> mentions with @displayname so downstream consumers see readable names */
   async resolveUserMentions(text: string): Promise<string> {
     const mentionPattern = /<@(U[A-Z0-9]+)>/g;

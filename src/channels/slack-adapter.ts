@@ -46,7 +46,7 @@ export class SlackAdapter implements ChannelAdapter {
     this.gateway.addIntegrationChannels(allAgentChannels);
 
     // Convert incoming Slack messages to WorkItems
-    this.gateway.onMessage((msg) => {
+    this.gateway.onMessage(async (msg) => {
       // Skip channels handled by other adapters (e.g. SMS channels)
       if (this.excludeChannels.has(msg.channelName)) {
         log.debug("Ignoring message from excluded channel", { channel: msg.channelName });
@@ -61,11 +61,17 @@ export class SlackAdapter implements ChannelAdapter {
         return;
       }
 
+      // Resolve sender display name for human users
+      const senderName = msg.user.startsWith("U")
+        ? await this.gateway.resolveUserName(msg.user)
+        : undefined;
+
       const workItem: WorkItem = {
         id: msg.ts,
         text: msg.text,
         source: { kind: "slack", id: msg.channel, label: msg.channelName, adapterId: this.id },
         sender: msg.user,
+        senderName,
         // Always use consistent threadId: slack:channelId:threadTs|ts
         // For parent messages, ts becomes the thread_ts for future replies
         threadId: `slack:${msg.channel}:${msg.threadTs ?? msg.ts}`,
