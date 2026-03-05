@@ -4,7 +4,7 @@ icon: ":spiral_calendar_pad:"
 model: claude-haiku-4-5
 channels:
   - quo-may
-  - executive-assistant
+  - agent-rae
 keywords: []
 isDefault: false
 budgetUsd: 50
@@ -16,6 +16,8 @@ servers:
   - slack
   - keychain
   - quo
+  - crm-search
+  - hubspot-crm
   - brave-search
   - tasks
-  - crm-search
+  - google-workspace
