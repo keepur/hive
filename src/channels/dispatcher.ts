@@ -171,8 +171,10 @@ export class Dispatcher {
         }
 
         // action === "continue" — post ack immediately, then proceed to full agent
-        // Keep "Thinking..." active — don't clear between triage and full agent
-        if (adapter) {
+        // Skip ack in threads — "Thinking..." indicator is already visible and the ack
+        // creates a redundant 2-turn feel (ack + real response)
+        const isThread = !!item.meta?.slackThreadTs;
+        if (adapter && !isThread) {
           const ackResult: WorkResult = {
             text: triageResult.response,
             agentId,

@@ -58,7 +58,7 @@ Respond with ONLY a JSON object, no markdown fences, no explanation.
 - If unsure, default to "continue"
 
 Keep "continue" ack responses under 15 words, natural, in character.
-Keep "done" responses brief and natural.`;
+Keep "done" responses brief and natural. Do NOT ask follow-up questions in "done" responses — the conversation ends there.`;
 }
 
 function parseTriageOutput(text: string): TriageOutput | null {
