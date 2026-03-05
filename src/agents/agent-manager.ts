@@ -124,7 +124,13 @@ export class AgentManager {
           slackThreadTs: (item.message.meta?.slackThreadTs as string) ?? "",
         };
 
-        const result = await runner.send(item.message.text, existingSession, item.onStream, bgContext);
+        // Prepend sender identity so the agent knows who they're talking to
+        const senderLabel = item.message.senderName ?? item.message.sender;
+        const prompt = item.message.senderName
+          ? `[${senderLabel} in #${item.message.source.label}]: ${item.message.text}`
+          : item.message.text;
+
+        const result = await runner.send(prompt, existingSession, item.onStream, bgContext);
 
         if (result.sessionId && !result.aborted) {
           this.sessionStore.set(agentId, threadId, result.sessionId);
