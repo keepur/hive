@@ -77,6 +77,7 @@ export class SlackAdapter implements ChannelAdapter {
         threadId: `slack:${msg.channel}:${msg.threadTs ?? msg.ts}`,
         timestamp: new Date(),
         meta: { slackTs: msg.ts, slackThreadTs: msg.threadTs, defaultAgentId: this.defaultAgentId },
+        files: msg.files,
       };
 
       onWorkItem(workItem);

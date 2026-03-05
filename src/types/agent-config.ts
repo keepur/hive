@@ -42,6 +42,8 @@ export interface IncomingMessage {
   user: string;
   ts: string;
   threadTs?: string;
+  /** Processed file attachments from the message */
+  files?: import("../files/file-processor.js").ProcessedFile[];
 }
 
 // Channel-agnostic types (new architecture)

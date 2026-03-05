@@ -16,6 +16,8 @@ export interface WorkItem {
   threadId?: string;
   timestamp: Date;
   meta?: Record<string, unknown>;
+  /** Processed file attachments from the message */
+  files?: import("../files/file-processor.js").ProcessedFile[];
 }
 
 export interface WorkResult {
