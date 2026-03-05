@@ -48,8 +48,9 @@ server.registerTool("send_email", {
   }
 
   try {
-    // Build CC list — always include default CC
-    const ccList = new Set<string>([DEFAULT_CC]);
+    // Build CC list — include default CC if configured
+    const ccList = new Set<string>();
+    if (DEFAULT_CC) ccList.add(DEFAULT_CC);
     if (cc) {
       const extras = Array.isArray(cc) ? cc : [cc];
       for (const addr of extras) ccList.add(addr);
@@ -63,7 +64,7 @@ server.registerTool("send_email", {
       from: FROM_ADDRESS,
       to: Array.isArray(to) ? to : [to],
       subject,
-      cc: [...ccList],
+      ...(ccList.size > 0 ? { cc: [...ccList] } : {}),
       ...(bccList.length > 0 ? { bcc: bccList } : {}),
       ...(reply_to ? { reply_to } : {}),
       ...(html ? { html } : { text: body }),
