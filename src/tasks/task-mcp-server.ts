@@ -51,7 +51,7 @@ server.registerTool("task_create", {
       "FOLLOW_UP", "ACTION_ITEM", "AGENT", "OPS", "MILESTONE",
       "QA", "FABRICATION", "ASSEMBLY", "PURCHASING", "LOGISTICS",
       "FINISHING", "CUSTOM_BUILD", "PLANNING", "RECEIVING", "PURCHASE_ORDER",
-    ]).optional().default("ACTION_ITEM").describe("Task type"),
+    ]).optional().default("AGENT").describe("Task type (defaults to AGENT)"),
     assignedTo: z.object({
       personId: z.string(),
       name: z.string(),
