@@ -138,6 +138,10 @@ export class AgentManager {
         if (result.error) {
           state.errorCount++;
           // Don't set agent to error — other threads may be fine
+          // Clear stale session so next message starts fresh
+          if (existingSession) {
+            this.sessionStore.delete(agentId, threadId);
+          }
         }
 
         item.resolve(result);
