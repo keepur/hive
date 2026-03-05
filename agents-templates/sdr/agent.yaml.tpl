@@ -4,8 +4,6 @@ icon: ":rocket:"
 model: claude-sonnet-4-6
 channels:
   - agent-milo
-  - sales
-  - leads
   - biz-dev
 keywords:
   - lead
