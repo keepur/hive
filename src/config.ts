@@ -94,6 +94,11 @@ export const config = {
   google: {
     account: optional("GOOGLE_ACCOUNT", ""),
   },
+  googleWorkspace: {
+    account: optional("GWS_ACCOUNT", "bot@dodihome.com"),
+    gwsPath: optional("GWS_PATH", ""),
+    sharedFolder: optional("GWS_SHARED_FOLDER", "149-loWJnUWfJP6rEAsuFoYsI2pS1JjRM"),
+  },
   quo: {
     apiKey: optional("QUO_API_KEY", ""),
     phoneNumberId: optional("QUO_PHONE_NUMBER_ID", ""),

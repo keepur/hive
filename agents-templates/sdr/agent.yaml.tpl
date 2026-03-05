@@ -31,3 +31,4 @@ servers:
   - google
   - permits
   - tasks
+  - google-workspace

@@ -28,3 +28,4 @@ servers:
   - permits
   - tasks
   - recall
+  - google-workspace

@@ -123,6 +123,19 @@ export class AgentRunner {
       },
     };
 
+    // Google Workspace — Drive upload/download/list via gws CLI (bot@dodihome.com)
+    servers["google-workspace"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/drive/drive-mcp-server.js")],
+      env: {
+        GWS_PATH: config.googleWorkspace.gwsPath || "gws",
+        DRIVE_SHARED_FOLDER: config.googleWorkspace.sharedFolder,
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+      },
+    };
+
     // Quo MCP server — SMS, calls, contacts via Quo (OpenPhone) API
     if (config.quo.apiKey) {
       servers["quo"] = {
