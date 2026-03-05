@@ -19,7 +19,6 @@ import { BackgroundTaskManager } from "./background/background-task-manager.js";
 import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
-
 const log = createLogger("index");
 
 async function main(): Promise<void> {

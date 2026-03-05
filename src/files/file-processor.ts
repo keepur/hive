@@ -41,60 +41,6 @@ export interface ProcessedFile {
 }
 
 const IMAGE_TYPES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
-const VISION_MODEL = process.env.VISION_MODEL || "claude-sonnet-4-6";
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-
-async function describeImage(buffer: Buffer, mimetype: string): Promise<string> {
-  if (!ANTHROPIC_API_KEY) {
-    return "[Image — no API key configured for vision processing]";
-  }
-
-  try {
-    const base64 = buffer.toString("base64");
-    const mediaType = mimetype.replace("image/jpeg", "image/jpeg")
-      .replace("image/jpg", "image/jpeg") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: VISION_MODEL,
-        max_tokens: 2000,
-        messages: [{
-          role: "user",
-          content: [
-            {
-              type: "image",
-              source: { type: "base64", media_type: mediaType, data: base64 },
-            },
-            {
-              type: "text",
-              text: "Describe this image in detail. If it's a diagram, architecture drawing, screenshot, or technical image, extract all text, labels, relationships, and structure. If it's a photo, describe what you see. Be thorough but concise.",
-            },
-          ],
-        }],
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      log.warn("Vision API error", { status: res.status, error: err.slice(0, 200) });
-      return "[Image — vision processing failed]";
-    }
-
-    const data = await res.json() as any;
-    const text = data.content?.[0]?.text ?? "[No description generated]";
-    log.info("Image described", { model: VISION_MODEL, tokens: data.usage?.output_tokens });
-    return text;
-  } catch (e: any) {
-    log.warn("Vision processing failed", { error: e.message });
-    return "[Image — vision processing failed]";
-  }
-}
 const TEXT_TYPES = new Set(["csv", "tsv", "txt", "text", "md", "markdown", "json", "xml", "html", "yaml", "yml", "log"]);
 
 export async function downloadAndProcess(
@@ -126,10 +72,9 @@ export async function downloadAndProcess(
     const ext = extname(file.name).slice(1).toLowerCase();
     const isImage = IMAGE_TYPES.has(ext) || file.mimetype.startsWith("image/");
 
-    // Images — describe via Claude Vision
+    // Images — saved locally, agent views via Read tool
     if (isImage) {
-      const description = await describeImage(buffer, file.mimetype);
-      return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: description, isImage: true };
+      return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: null, isImage: true };
     }
 
     // Text-based files
@@ -195,9 +140,12 @@ export function formatFilesForPrompt(files: ProcessedFile[]): string {
   const parts = files.map((f) => {
     const header = `📎 File: ${f.name} (${formatSize(f.size)}, ${f.mimetype})`;
 
+    if (f.isImage) {
+      return `${header}\n  Image saved at: ${f.localPath}\n  Use the Read tool to view this image.`;
+    }
+
     if (f.textContent) {
-      const label = f.isImage ? "image description" : "file content";
-      return `${header}\n--- ${label} ---\n${f.textContent}\n--- end ${label} ---`;
+      return `${header}\n--- file content ---\n${f.textContent}\n--- end file content ---`;
     }
 
     return `${header}\n  Saved at: ${f.localPath}\n  (Content could not be extracted — file available for download)`;
