@@ -25,5 +25,6 @@ servers:
   - hubspot-crm
   - slack
   - brave-search
+  - permits
   - tasks
   - recall

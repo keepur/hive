@@ -29,4 +29,5 @@ servers:
   - brave-search
   - slack
   - google
+  - permits
   - tasks
