@@ -30,5 +30,6 @@ servers:
   - slack
   - tasks
   - contacts
+  - crm-search
   - keychain
   - background

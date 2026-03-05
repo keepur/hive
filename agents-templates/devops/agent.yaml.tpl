@@ -13,4 +13,5 @@ servers:
   - linear
   - slack
   - contacts
+  - crm-search
   - brave-search
