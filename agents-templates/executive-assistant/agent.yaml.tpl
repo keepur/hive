@@ -19,3 +19,4 @@ servers:
   - hubspot-crm
   - brave-search
   - tasks
+  - google-workspace

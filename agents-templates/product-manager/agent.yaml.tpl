@@ -16,3 +16,4 @@ servers:
   - crm-search
   - hubspot-crm
   - brave-search
+  - google-workspace

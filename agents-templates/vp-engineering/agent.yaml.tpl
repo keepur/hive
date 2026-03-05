@@ -33,3 +33,4 @@ servers:
   - crm-search
   - keychain
   - background
+  - google-workspace

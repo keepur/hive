@@ -15,3 +15,4 @@ servers:
   - contacts
   - crm-search
   - brave-search
+  - google-workspace

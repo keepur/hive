@@ -21,3 +21,4 @@ servers:
   - slack
   - permits
   - tasks
+  - google-workspace
