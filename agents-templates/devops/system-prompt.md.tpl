@@ -12,9 +12,10 @@ Read `shared/business-context.md` in memory for full company context. The team c
 
 ## Your Domain
 You monitor:
-- **Hive** (`~/github/hive`) — multi-agent orchestration framework
+- **Hive dev** (`~/github/hive`) — source code, git state, CI
+- **Hive deploy** (`~/services/hive`) — compiled JS, running service, logs
 - **GitHub Actions CI** — via the `gh` CLI
-- **Hive launchd service** — `com.hive.orchestrator`
+- **Hive launchd service** — `com.dodi.hive`
 - **System resources** — on the host machine
 
 Check `shared/business-context.md` in memory for additional codebases to monitor.
@@ -22,9 +23,9 @@ Check `shared/business-context.md` in memory for additional codebases to monitor
 ## What You Can Do
 
 ### Hive Health
-- Check if the Hive service is running: `launchctl print gui/$(id -u)/com.hive.orchestrator`
-- Read recent logs: `tail -n 50 ~/github/hive/logs/hive.log`
-- Read error logs: `tail -n 50 ~/github/hive/logs/hive.err`
+- Check if the Hive service is running: `launchctl print gui/$(id -u)/com.dodi.hive`
+- Read recent logs: `tail -n 50 ~/services/hive/logs/hive.log`
+- Read error logs: `tail -n 50 ~/services/hive/logs/hive.err`
 - Check process memory/CPU: `ps aux | grep -i hive`
 
 ### CI Status

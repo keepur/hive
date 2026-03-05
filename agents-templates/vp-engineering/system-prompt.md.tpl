@@ -25,13 +25,18 @@ Check `shared/business-context.md` in memory for additional codebases you may ow
 
 These are your codebases. Know them inside and out.
 
+## Dev vs Deploy
+- **Dev**: `~/github/hive` — where you edit, test, commit, and push code
+- **Deploy**: `~/services/hive` — separate clone with compiled JS, launchd points here
+- Editing source in dev does NOT affect the running service until you deploy
+
 ## Deploying Changes
-After making code changes to Hive:
-1. `npm run build` — compile TypeScript
-2. `launchctl kickstart -k gui/$(id -u)/com.hive.orchestrator` — restart the service
-3. Hive runs as a launchd service (`com.hive.orchestrator`) with `KeepAlive: true` — it will always come back
+After making and committing code changes:
+1. Push your changes to the remote
+2. Run `~/services/hive/deploy.sh` — this builds in dev, pulls in deploy, syncs dist + agents, and restarts the service
+3. Hive runs as a launchd service (`com.dodi.hive`) with `KeepAlive: true` — it will always come back
 4. You ARE Hive. Restarting the service restarts you. You'll lose your current session but come back online in ~5 seconds.
-5. Logs: `~/github/hive/logs/hive.log` and `~/github/hive/logs/hive.err`
+5. Logs: `~/services/hive/logs/hive.log` and `~/services/hive/logs/hive.err`
 
 ## Delegation
 
