@@ -3,6 +3,7 @@ import { WebClient } from "@slack/web-api";
 import { createLogger } from "../logging/logger.js";
 import type { IncomingMessage } from "../types/agent-config.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
+import { downloadAndProcess, type SlackFile, type ProcessedFile } from "../files/file-processor.js";
 
 const log = createLogger("slack-gateway");
 
@@ -36,10 +37,12 @@ export class SlackGateway {
   private channelNameCache = new Map<string, string>(); // id → name
   private userNameCache = new Map<string, string>(); // userId → display name
   private integrationChannels = new Set<string>(); // channel names that accept bot messages
+  private botToken: string;
 
   constructor(appToken: string, botToken: string) {
     this.socket = new SocketModeClient({ appToken });
     this.web = new WebClient(botToken);
+    this.botToken = botToken;
   }
 
   addIntegrationChannels(channels: string[]): void {
@@ -148,8 +151,18 @@ export class SlackGateway {
         text = text.trim();
       }
 
-      if (!text) {
-        log.info("Skipping message with no extractable text", {
+      // Process file attachments
+      let processedFiles: ProcessedFile[] = [];
+      if (event.files?.length) {
+        log.info("Processing file attachments", { count: event.files.length, names: event.files.map((f: any) => f.name) });
+        const results = await Promise.all(
+          event.files.map((f: any) => downloadAndProcess(f as SlackFile, this.botToken)),
+        );
+        processedFiles = results.filter(Boolean) as ProcessedFile[];
+      }
+
+      if (!text && processedFiles.length === 0) {
+        log.info("Skipping message with no extractable text or files", {
           channel: event.channel,
           channelName,
           user: event.user,
@@ -159,6 +172,11 @@ export class SlackGateway {
           blockTypes: event.blocks?.map((b: any) => b.type),
         });
         return;
+      }
+
+      // Default text for file-only messages
+      if (!text && processedFiles.length > 0) {
+        text = `[shared ${processedFiles.length} file${processedFiles.length > 1 ? "s" : ""}]`;
       }
 
       // Resolve <@USERID> mentions to @displayname for readable text and name-based routing
@@ -171,9 +189,10 @@ export class SlackGateway {
         user: event.user ?? event.bot_id ?? "unknown",
         ts: event.ts,
         threadTs: event.thread_ts,
+        files: processedFiles.length > 0 ? processedFiles : undefined,
       };
 
-      log.info("Message received", { channel: msg.channel, channelName, user: msg.user, textLength: msg.text.length });
+      log.info("Message received", { channel: msg.channel, channelName, user: msg.user, textLength: msg.text.length, fileCount: processedFiles.length });
       this.messageHandler?.(msg);
     });
 

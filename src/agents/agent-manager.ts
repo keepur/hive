@@ -6,6 +6,7 @@ import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
+import { formatFilesForPrompt } from "../files/file-processor.js";
 
 const log = createLogger("agent-manager");
 
@@ -126,9 +127,14 @@ export class AgentManager {
 
         // Prepend sender identity so the agent knows who they're talking to
         const senderLabel = item.message.senderName ?? item.message.sender;
-        const prompt = item.message.senderName
+        let prompt = item.message.senderName
           ? `[${senderLabel} in #${item.message.source.label}]: ${item.message.text}`
           : item.message.text;
+
+        // Append file attachments to prompt
+        if (item.message.files?.length) {
+          prompt += formatFilesForPrompt(item.message.files);
+        }
 
         const result = await runner.send(prompt, existingSession, item.onStream, bgContext);
 

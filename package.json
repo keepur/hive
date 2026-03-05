@@ -22,7 +22,10 @@
     "brave-search-mcp": "^2.0.1",
     "csv-parse": "^6.1.0",
     "dotenv": "^17.3.1",
+    "mammoth": "^1.11.0",
     "mongodb": "^7.1.0",
+    "pdf-parse": "^2.4.5",
+    "xlsx": "^0.18.5",
     "yaml": "^2.8.2"
   },
   "devDependencies": {
