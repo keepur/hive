@@ -6,6 +6,7 @@ channels:
   - agent-milo
   - sales
   - leads
+  - biz-dev
 keywords:
   - lead
   - prospect
