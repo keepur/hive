@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dodi.hive</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mokie/services/hive</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mokie/.nvm/versions/node/v24.13.1/bin/node</string>
+    <string>dist/index.js</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/mokie/.nvm/versions/node/v24.13.1/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/mokie</string>
+  </dict>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mokie/services/hive/logs/hive.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/mokie/services/hive/logs/hive.err</string>
+
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+</dict>
+</plist>
