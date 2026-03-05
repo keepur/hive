@@ -18,12 +18,30 @@ interface TriageOutput {
 }
 
 function buildTriagePrompt(agentConfig: AgentConfig, isThread: boolean): string {
-  const threadNote = isThread
-    ? "\nThis message is in an existing conversation thread. Default to \"continue\" unless it's clearly standalone (like \"thanks\", \"ok\", \"got it\")."
-    : "";
-
   const now = new Date();
   const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+
+  if (isThread) {
+    // In-thread: almost always continue — triage has NO thread history,
+    // so it can't answer contextual questions. Only handle trivial acks.
+    return `You are triaging messages for ${agentConfig.name}. Current date/time: ${pacific} (Pacific Time).
+
+${agentConfig.soul}
+
+This message is part of an ongoing conversation thread. You do NOT have access to previous messages in this thread, so you CANNOT answer questions that depend on context.
+
+Respond with ONLY a JSON object, no markdown fences, no explanation.
+
+{ "response": "<brief ack>", "action": "done" } ONLY when the message is:
+- A standalone thank you, acknowledgment, or farewell ("thanks", "ok", "got it", "bye")
+
+{ "response": "<brief ack>", "action": "continue" } for EVERYTHING else, including:
+- Any question (even if it seems simple — you lack thread context to answer it)
+- Any request, instruction, or follow-up
+- Anything you're not 100% sure is a trivial ack
+
+Keep ack responses under 15 words, natural, in character.`;
+  }
 
   return `You are triaging messages for ${agentConfig.name}. Current date/time: ${pacific} (Pacific Time).
 
@@ -40,7 +58,7 @@ Respond with ONLY a JSON object, no markdown fences, no explanation.
 - If unsure, default to "continue"
 
 Keep "continue" ack responses under 15 words, natural, in character.
-Keep "done" responses brief and natural.${threadNote}`;
+Keep "done" responses brief and natural.`;
 }
 
 function parseTriageOutput(text: string): TriageOutput | null {
