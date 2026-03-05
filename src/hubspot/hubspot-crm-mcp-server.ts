@@ -286,6 +286,38 @@ server.registerTool("hubspot_update_task", {
   }
 });
 
+// ── Tool: hubspot_get_activities ─────────────────────────────────────────
+
+server.registerTool("hubspot_get_activities", {
+  title: "Get HubSpot Activities",
+  description:
+    "Get all activities (emails, notes, tasks, calls, meetings) associated with a specific contact or deal by ID. " +
+    "Returns a chronological timeline of all engagement history. " +
+    "Use this instead of semantic search when you have a specific record ID and need its full activity history.",
+  inputSchema: {
+    object_type: z.enum(["contact", "deal"]).describe("Record type — 'contact' or 'deal'"),
+    object_id: z.string().describe("HubSpot record ID"),
+    limit: z.number().optional().default(50).describe("Max activities to return (default 50)"),
+  },
+}, async ({ object_type, object_id, limit }) => {
+  try {
+    const activities = await client.getActivities(object_type, object_id, { limit });
+
+    if (activities.length === 0) {
+      return { content: [{ type: "text", text: `No activities found for ${object_type} ${object_id}` }] };
+    }
+
+    const lines = activities.map((a) => {
+      const date = a.timestamp ? new Date(a.timestamp).toLocaleString("en-US", { timeZone: "America/Los_Angeles" }) : "unknown date";
+      return `[${date}] ${a.summary}`;
+    });
+
+    return { content: [{ type: "text", text: `${activities.length} activities for ${object_type} ${object_id}:\n\n${lines.join("\n\n")}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: e.message }], isError: true };
+  }
+});
+
 // ── Tool: hubspot_associate ─────────────────────────────────────────────────
 
 server.registerTool("hubspot_associate", {
