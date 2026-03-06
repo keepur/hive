@@ -15,6 +15,8 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { readFileSync, existsSync } from "node:fs";
+import { basename } from "node:path";
 import { z } from "zod";
 
 const API_KEY = process.env.RESEND_API_KEY ?? "";
@@ -41,8 +43,12 @@ server.registerTool("send_email", {
     html: z.string().optional().describe("Email body (HTML) — if provided, used instead of plain text for rich formatting"),
     reply_to: z.string().optional().describe("Reply-To address (e.g. the assigned rep's email). Customer replies go here."),
     cc: z.union([z.string(), z.array(z.string())]).optional().describe(`Additional CC addresses. ${DEFAULT_CC} is always included automatically.`),
+    attachments: z.array(z.object({
+      path: z.string().describe("Absolute path to the file on disk (e.g. /tmp/slack-files/F123-photo.png)"),
+      filename: z.string().optional().describe("Override the filename in the email (defaults to the file's basename)"),
+    })).optional().describe("Files to attach to the email. Use the local file path from Slack file downloads."),
   },
-}, async ({ to, subject, body, html, reply_to, cc }) => {
+}, async ({ to, subject, body, html, reply_to, cc, attachments }) => {
   if (!API_KEY) {
     return { content: [{ type: "text", text: "Resend API key not configured." }], isError: true };
   }
@@ -60,6 +66,21 @@ server.registerTool("send_email", {
     const bccList: string[] = [];
     if (HUBSPOT_BCC) bccList.push(HUBSPOT_BCC);
 
+    // Build attachments — read files from disk and base64 encode
+    const emailAttachments: { filename: string; content: string }[] = [];
+    if (attachments) {
+      for (const att of attachments) {
+        if (!existsSync(att.path)) {
+          return { content: [{ type: "text", text: `Attachment not found: ${att.path}` }], isError: true };
+        }
+        const fileBuffer = readFileSync(att.path);
+        emailAttachments.push({
+          filename: att.filename || basename(att.path),
+          content: fileBuffer.toString("base64"),
+        });
+      }
+    }
+
     const payload: Record<string, unknown> = {
       from: FROM_ADDRESS,
       to: Array.isArray(to) ? to : [to],
@@ -68,6 +89,7 @@ server.registerTool("send_email", {
       ...(bccList.length > 0 ? { bcc: bccList } : {}),
       ...(reply_to ? { reply_to } : {}),
       ...(html ? { html } : { text: body }),
+      ...(emailAttachments.length > 0 ? { attachments: emailAttachments } : {}),
     };
 
     // Also include plain text as fallback when HTML is provided
@@ -99,6 +121,7 @@ server.registerTool("send_email", {
       `  From: ${FROM_ADDRESS}${replyDisplay}`,
       `  Subject: ${subject}`,
       `  CC: ${[...ccList].join(", ")}`,
+      ...(emailAttachments.length > 0 ? [`  Attachments: ${emailAttachments.map(a => a.filename).join(", ")}`] : []),
       ...(HUBSPOT_BCC ? [`  HubSpot: logged via BCC`] : []),
       `  Resend ID: ${data.id}`,
     ].join("\n");
