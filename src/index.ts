@@ -19,10 +19,17 @@ import { BackgroundTaskManager } from "./background/background-task-manager.js";
 import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
+import { setGeminiApiKey } from "./files/file-processor.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
   log.info("Hive starting up");
+
+  // Initialize Gemini vision for image processing
+  if (config.gemini.apiKey) {
+    setGeminiApiKey(config.gemini.apiKey);
+    log.info("Gemini vision enabled", { model: config.gemini.visionModel });
+  }
 
   // Load agent definitions
   const registry = new AgentRegistry(config.agents.definitionsPath);
