@@ -20,7 +20,6 @@ keywords:
   - api
   - database
   - migration
-slackBot: jasper
 isDefault: false
 budgetUsd: 50
 servers:
