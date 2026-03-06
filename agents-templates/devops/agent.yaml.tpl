@@ -1,7 +1,7 @@
 id: devops
 name: "{{agent.name}}"
 icon: ":shield:"
-model: claude-sonnet-4-6
+model: claude-haiku-4-5
 channels:
   - devops
 keywords: []

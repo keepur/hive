@@ -1,7 +1,7 @@
 id: vp-engineering
 name: "{{agent.name}}"
 icon: ":gear:"
-model: claude-opus-4-6
+model: claude-sonnet-4-6
 channels:
   - dev
 keywords:
