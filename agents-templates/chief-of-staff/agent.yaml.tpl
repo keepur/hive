@@ -29,3 +29,4 @@ servers:
   - tasks
   - recall
   - google-workspace
+  - admin

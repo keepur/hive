@@ -101,7 +101,8 @@ export class AgentRunner {
       args: [resolve("dist/memory/memory-mcp-server.js")],
       env: {
         AGENT_ID: this.agentConfig.id,
-        MEMORY_REPO_PATH: config.memory.localPath,
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
       },
     };
 
@@ -298,6 +299,17 @@ export class AgentRunner {
       },
     };
 
+    // Admin MCP server — model management, system controls
+    servers["admin"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/admin/admin-mcp-server.js")],
+      env: {
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+      },
+    };
+
     // Guardrail: filter to agent's allowed MCP servers
     if (this.agentConfig.servers?.length) {
       const allowed = new Set(this.agentConfig.servers);
@@ -412,8 +424,26 @@ export class AgentRunner {
         }
       }
     } catch (err) {
-      error = String(err);
-      log.error("Agent query failed", { agent: this.agentConfig.id, error });
+      const errStr = String(err);
+      // If the agent produced a valid response but crashed during cleanup (e.g. MCP server exit),
+      // treat it as a warning — don't discard the response
+      if (resultText && costUsd > 0) {
+        log.warn("Agent process crashed after producing response — using response anyway", {
+          agent: this.agentConfig.id,
+          error: errStr,
+          resultPreview: resultText.slice(0, 200),
+          costUsd,
+          durationMs,
+        });
+      } else {
+        error = errStr;
+        log.error("Agent query failed", {
+          agent: this.agentConfig.id,
+          error: errStr,
+          costUsd,
+          durationMs,
+        });
+      }
     } finally {
       clearTimeout(deadline);
       this.activeQuery = null;
