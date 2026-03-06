@@ -3,18 +3,56 @@ import { join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig, AgentSchedule } from "../types/agent-config.js";
+import { MongoClient, type Collection, type Db } from "mongodb";
 
 const log = createLogger("agent-registry");
+
+interface ModelOverride {
+  agentId: string;
+  model: string;
+  updatedAt: Date;
+  updatedBy?: string;
+}
 
 export class AgentRegistry {
   private agents = new Map<string, AgentConfig>();
   private basePath: string;
+  private modelOverrides = new Map<string, string>();
+  private db?: Db;
+  private overridesCollection?: Collection<ModelOverride>;
 
   constructor(basePath: string) {
     this.basePath = resolve(basePath);
   }
 
+  /** Connect to MongoDB for dynamic model overrides */
+  async connectDb(mongoUri: string, dbName: string): Promise<void> {
+    const client = new MongoClient(mongoUri);
+    await client.connect();
+    this.db = client.db(dbName);
+    this.overridesCollection = this.db.collection<ModelOverride>("model_overrides");
+    await this.overridesCollection.createIndex({ agentId: 1 }, { unique: true });
+    await this.loadModelOverrides();
+    log.info("Model overrides loaded from MongoDB");
+  }
+
+  private async loadModelOverrides(): Promise<void> {
+    if (!this.overridesCollection) return;
+    const docs = await this.overridesCollection.find().toArray();
+    this.modelOverrides.clear();
+    for (const doc of docs) {
+      this.modelOverrides.set(doc.agentId, doc.model);
+    }
+    if (docs.length > 0) {
+      log.info("Active model overrides", {
+        overrides: Object.fromEntries(this.modelOverrides),
+      });
+    }
+  }
+
   async load(): Promise<{ added: string[]; updated: string[]; removed: string[] }> {
+    // Refresh model overrides on every reload
+    await this.loadModelOverrides();
     const previousIds = new Set(this.agents.keys());
     const currentIds = new Set<string>();
     const added: string[] = [];
@@ -67,10 +105,18 @@ export class AgentRegistry {
     const systemPrompt = await readFile(promptPath, "utf-8");
     const soul = await readFile(soulPath, "utf-8").catch(() => "");
 
+    const agentId = (raw.id as string) || dirName;
+    const yamlModel = (raw.model as string) || "claude-sonnet-4-6";
+    const model = this.modelOverrides.get(agentId) ?? yamlModel;
+
+    if (this.modelOverrides.has(agentId)) {
+      log.info("Model override active", { agent: agentId, yaml: yamlModel, override: model });
+    }
+
     return {
-      id: (raw.id as string) || dirName,
+      id: agentId,
       name: (raw.name as string) || dirName,
-      model: (raw.model as string) || "claude-sonnet-4-6",
+      model,
       channels: (raw.channels as string[]) || [],
       keywords: (raw.keywords as string[]) || [],
       isDefault: (raw.isDefault as boolean) || false,
