@@ -44,20 +44,20 @@ export class Scheduler {
   private cronJobs: CronJob[] = [];
   private mongoClient: MongoClient | null = null;
   private callbackCollection: Collection<CallbackDoc> | null = null;
-  private onCallbackDispatch?: (item: WorkItem) => void;
+  private onDispatch?: (item: WorkItem) => void;
 
   constructor(
     agentManager: AgentManager,
     memoryManager: MemoryManager,
     healthReporter: HealthReporter,
     registry: AgentRegistry,
-    onCallbackDispatch?: (item: WorkItem) => void,
+    onDispatch?: (item: WorkItem) => void,
   ) {
     this.agentManager = agentManager;
     this.memoryManager = memoryManager;
     this.healthReporter = healthReporter;
     this.registry = registry;
-    this.onCallbackDispatch = onCallbackDispatch;
+    this.onDispatch = onDispatch;
 
     // Build cron job list from agent configs
     for (const agent of registry.getAll()) {
@@ -142,17 +142,27 @@ export class Scheduler {
         job.lastRun = now;
         log.info("Triggering scheduled task", { agentId: job.agentId, task: job.task });
 
+        // Route through dispatcher so responses are delivered to the agent's home channel
+        const agent = this.registry.get(job.agentId);
+        const homeChannel = agent?.channels[0] ?? job.agentId;
+
         const workItem: WorkItem = {
           id: `sched:${job.agentId}:${job.task}:${Date.now()}`,
           text: `[Scheduled task: ${job.task}] Execute your scheduled "${job.task}" task now.`,
-          source: { kind: "scheduler", id: job.agentId, label: "scheduler" },
+          source: { kind: "slack", id: homeChannel, label: homeChannel },
           sender: "system",
           threadId: `scheduler:${job.agentId}:${job.task}:${now.toISOString().split("T")[0]}`,
           timestamp: now,
+          meta: { targetAgentId: job.agentId },
         };
-        this.agentManager.sendMessage(job.agentId, workItem).catch((err) => {
-          log.error("Scheduled task failed", { agentId: job.agentId, task: job.task, error: String(err) });
-        });
+
+        if (this.onDispatch) {
+          this.onDispatch(workItem);
+        } else {
+          this.agentManager.sendMessage(job.agentId, workItem).catch((err) => {
+            log.error("Scheduled task failed", { agentId: job.agentId, task: job.task, error: String(err) });
+          });
+        }
       }
     }
   }
@@ -207,9 +217,9 @@ export class Scheduler {
         },
       };
 
-      if (this.onCallbackDispatch) {
+      if (this.onDispatch) {
         // Route through dispatcher for full pipeline (triage, agent, delivery)
-        this.onCallbackDispatch(workItem);
+        this.onDispatch(workItem);
       } else {
         // Fallback: direct to agent manager (no response routing)
         this.agentManager.sendMessage(cb.agentId, workItem).catch((err) => {
