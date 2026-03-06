@@ -11,6 +11,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSy
 import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { render, fileHash } from "./template-renderer.ts";
+import { MongoClient } from "mongodb";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const TEMPLATES_DIR = join(ROOT, "agents-templates");
@@ -64,7 +65,7 @@ function renderAgent(template: string, ctx: Record<string, any>): string {
   return render(template, ctx);
 }
 
-function main() {
+async function main() {
   const force = process.argv.includes("--force");
   const config = loadConfig();
 
@@ -192,6 +193,51 @@ function main() {
         newMeta[constitutionMetaKey] = fileHash(content);
         console.log(`  WRITE ${constitutionMetaKey}`);
       }
+    }
+  }
+
+  // Sync constitution to MongoDB (agents read from Mongo, not filesystem)
+  const constitutionPath = join(
+    (config.memory?.localPath ?? `${process.env.HOME}/hive-memory`).replace("~", process.env.HOME ?? "/tmp"),
+    "shared",
+    "constitution.md",
+  );
+  if (existsSync(constitutionPath)) {
+    const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
+    const mongoDb = process.env.MONGODB_DB || "hive";
+    try {
+      const client = new MongoClient(mongoUri);
+      await client.connect();
+      const db = client.db(mongoDb);
+      const content = readFileSync(constitutionPath, "utf-8");
+
+      // Save current version to history
+      const existing = await db.collection("memory").findOne({ path: "shared/constitution.md" });
+      if (existing && existing.content !== content) {
+        await db.collection("memory_versions").insertOne({
+          path: "shared/constitution.md",
+          content: existing.content,
+          savedAt: existing.updatedAt,
+          savedBy: existing.updatedBy || "system",
+        });
+        await db.collection("memory").updateOne(
+          { path: "shared/constitution.md" },
+          { $set: { content, updatedAt: new Date(), updatedBy: "setup:agents" } },
+        );
+        console.log("  SYNC shared/constitution.md → MongoDB");
+      } else if (!existing) {
+        await db.collection("memory").insertOne({
+          path: "shared/constitution.md",
+          content,
+          updatedAt: new Date(),
+          updatedBy: "setup:agents",
+        });
+        console.log("  SYNC shared/constitution.md → MongoDB (new)");
+      }
+
+      await client.close();
+    } catch (err) {
+      console.warn(`  WARN: Failed to sync constitution to MongoDB: ${err}`);
     }
   }
 
