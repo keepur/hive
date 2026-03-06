@@ -4,7 +4,8 @@ import type { AgentManager } from "../agents/agent-manager.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
-import type { WorkItem } from "../types/work-item.js";
+import type { WorkItem, ChannelKind } from "../types/work-item.js";
+import { MongoClient, type Collection, type Db } from "mongodb";
 
 const log = createLogger("scheduler");
 
@@ -15,25 +16,48 @@ interface CronJob {
   lastRun: Date | null;
 }
 
+interface CallbackDoc {
+  agentId: string;
+  dueAt: Date;
+  context: string;
+  createdAt: Date;
+  status: "pending" | "fired" | "cancelled";
+  source: {
+    adapterId: string;
+    channelId: string;
+    channelKind: string;
+    channelLabel: string;
+    threadId: string;
+    slackTs: string;
+    slackThreadTs: string;
+  };
+}
+
 export class Scheduler {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private cronTimer: ReturnType<typeof setInterval> | null = null;
+  private callbackTimer: ReturnType<typeof setInterval> | null = null;
   private agentManager: AgentManager;
   private memoryManager: MemoryManager;
   private healthReporter: HealthReporter;
   private registry: AgentRegistry;
   private cronJobs: CronJob[] = [];
+  private mongoClient: MongoClient | null = null;
+  private callbackCollection: Collection<CallbackDoc> | null = null;
+  private onCallbackDispatch?: (item: WorkItem) => void;
 
   constructor(
     agentManager: AgentManager,
     memoryManager: MemoryManager,
     healthReporter: HealthReporter,
     registry: AgentRegistry,
+    onCallbackDispatch?: (item: WorkItem) => void,
   ) {
     this.agentManager = agentManager;
     this.memoryManager = memoryManager;
     this.healthReporter = healthReporter;
     this.registry = registry;
+    this.onCallbackDispatch = onCallbackDispatch;
 
     // Build cron job list from agent configs
     for (const agent of registry.getAll()) {
@@ -46,6 +70,16 @@ export class Scheduler {
         });
       }
     }
+  }
+
+  async connectDb(uri: string, dbName: string): Promise<void> {
+    this.mongoClient = new MongoClient(uri);
+    await this.mongoClient.connect();
+    const db = this.mongoClient.db(dbName);
+    this.callbackCollection = db.collection<CallbackDoc>("agent_callbacks");
+    // Index for efficient polling
+    await this.callbackCollection.createIndex({ status: 1, dueAt: 1 });
+    log.info("Callback store connected", { db: dbName });
   }
 
   start(): void {
@@ -64,9 +98,19 @@ export class Scheduler {
       this.checkCronJobs();
     }, 60_000);
 
+    // Callbacks: check every 30 seconds for due agent callbacks
+    if (this.callbackCollection) {
+      this.callbackTimer = setInterval(() => {
+        this.checkCallbacks().catch((err) => {
+          log.error("Callback check failed", { error: String(err) });
+        });
+      }, 30_000);
+    }
+
     log.info("Scheduler started", {
       heartbeatMs: config.scheduler.heartbeatIntervalMs,
       cronJobs: this.cronJobs.length,
+      callbacksEnabled: !!this.callbackCollection,
     });
   }
 
@@ -79,6 +123,11 @@ export class Scheduler {
       clearInterval(this.cronTimer);
       this.cronTimer = null;
     }
+    if (this.callbackTimer) {
+      clearInterval(this.callbackTimer);
+      this.callbackTimer = null;
+    }
+    this.mongoClient?.close().catch(() => {});
     log.info("Scheduler stopped");
   }
 
@@ -103,6 +152,72 @@ export class Scheduler {
         };
         this.agentManager.sendMessage(job.agentId, workItem).catch((err) => {
           log.error("Scheduled task failed", { agentId: job.agentId, task: job.task, error: String(err) });
+        });
+      }
+    }
+  }
+
+  private async checkCallbacks(): Promise<void> {
+    if (!this.callbackCollection) return;
+
+    const now = new Date();
+
+    // Find all due callbacks and mark them fired atomically
+    const cursor = this.callbackCollection.find({
+      status: "pending",
+      dueAt: { $lte: now },
+    });
+
+    for await (const cb of cursor) {
+      // Mark as fired first to prevent double-dispatch
+      const updateResult = await this.callbackCollection.updateOne(
+        { _id: cb._id, status: "pending" },
+        { $set: { status: "fired", firedAt: now } },
+      );
+      if (updateResult.modifiedCount === 0) continue; // already picked up
+
+      log.info("Firing callback", {
+        agentId: cb.agentId,
+        callbackId: cb._id.toString(),
+        contextPreview: cb.context.slice(0, 80),
+      });
+
+      // Verify the agent still exists
+      if (!this.registry.get(cb.agentId)) {
+        log.warn("Callback agent not found, skipping", { agentId: cb.agentId });
+        continue;
+      }
+
+      const workItem: WorkItem = {
+        id: `callback:${cb._id.toString()}`,
+        text: `[Scheduled callback] ${cb.context}`,
+        source: {
+          kind: (cb.source.channelKind || "slack") as ChannelKind,
+          id: cb.source.channelId,
+          label: cb.source.channelLabel,
+          adapterId: cb.source.adapterId,
+        },
+        sender: "system",
+        threadId: cb.source.threadId || undefined,
+        timestamp: now,
+        meta: {
+          slackTs: cb.source.slackTs,
+          slackThreadTs: cb.source.slackThreadTs,
+          targetAgentId: cb.agentId,
+        },
+      };
+
+      if (this.onCallbackDispatch) {
+        // Route through dispatcher for full pipeline (triage, agent, delivery)
+        this.onCallbackDispatch(workItem);
+      } else {
+        // Fallback: direct to agent manager (no response routing)
+        this.agentManager.sendMessage(cb.agentId, workItem).catch((err) => {
+          log.error("Callback dispatch failed", {
+            agentId: cb.agentId,
+            callbackId: cb._id.toString(),
+            error: String(err),
+          });
         });
       }
     }

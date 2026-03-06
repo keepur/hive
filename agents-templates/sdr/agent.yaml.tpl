@@ -32,3 +32,4 @@ servers:
   - permits
   - tasks
   - google-workspace
+  - callback

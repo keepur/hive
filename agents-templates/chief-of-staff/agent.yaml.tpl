@@ -30,3 +30,4 @@ servers:
   - recall
   - google-workspace
   - admin
+  - callback

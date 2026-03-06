@@ -18,3 +18,4 @@ servers:
   - slack
   - keychain
   - background
+  - callback
