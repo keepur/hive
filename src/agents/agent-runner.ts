@@ -82,10 +82,8 @@ export class AgentRunner {
   private buildMcpServers(context?: WorkItemContext): Record<string, McpServerConfig> {
     const servers: Record<string, McpServerConfig> = {};
 
-    // Slack MCP — use agent-specific bot token if configured, otherwise primary
-    const slackMcpToken = this.agentConfig.slackBot === "jasper"
-      ? config.slackJasper.mcpToken
-      : config.slack.mcpToken;
+    // Slack MCP
+    const slackMcpToken = config.slack.mcpToken;
     if (slackMcpToken) {
       servers["slack"] = {
         type: "http",

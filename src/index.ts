@@ -128,7 +128,7 @@ async function main(): Promise<void> {
   process.on("SIGUSR1", () => reload());
   log.info("Hot-reload enabled", { watched: agentsDir, signal: "SIGUSR1" });
 
-  // Start primary Slack adapter (default agents)
+  // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
@@ -139,27 +139,7 @@ async function main(): Promise<void> {
       log.error("Slack dispatch failed", { error: String(err), source: item.source.label });
     });
   });
-  log.info("Slack adapter connected (primary)");
-
-  // Start secondary Slack adapter (separate bot identity)
-  let slackJasperAdapter: SlackAdapter | undefined;
-  let slackJasper: SlackGateway | undefined;
-  if (config.slackJasper.appToken && config.slackJasper.botToken) {
-    slackJasper = new SlackGateway(config.slackJasper.appToken, config.slackJasper.botToken);
-    slackJasperAdapter = new SlackAdapter(slackJasper, registry, smsChannels, "slack:jasper", "vp-engineering", "jasper");
-    dispatcher.registerAdapter(slackJasperAdapter);
-    await slackJasperAdapter.start((item) => {
-      dispatcher.dispatch(item).catch((err) => {
-        log.error("Slack (jasper) dispatch failed", { error: String(err), source: item.source.label });
-      });
-    });
-    log.info("Slack adapter connected (secondary)");
-
-    // Cross-register bot IDs so each gateway filters the other's messages
-    slack.addPeerBotIds(slackJasper.resolvedBotUserId, slackJasper.resolvedBotId);
-    slackJasper.addPeerBotIds(slack.resolvedBotUserId, slack.resolvedBotId);
-    log.info("Cross-gateway bot ID filtering enabled");
-  }
+  log.info("Slack adapter connected");
 
   // Set Slack as audit channel for cross-channel visibility
   try {
@@ -194,8 +174,8 @@ async function main(): Promise<void> {
   });
   dispatcher.setRetryQueue(retryQueue);
 
-  const slackAdapters = [slackAdapter, ...(slackJasperAdapter ? [slackJasperAdapter] : [])];
-  const slackGateways = [slack, ...(slackJasper ? [slackJasper] : [])];
+  const slackAdapters = [slackAdapter];
+  const slackGateways = [slack];
 
   const sweeper = new Sweeper(
     {
@@ -231,7 +211,6 @@ async function main(): Promise<void> {
     agentManager.stopAll();
     await sessionStore.close();
     await slackAdapter.stop();
-    if (slackJasperAdapter) await slackJasperAdapter.stop();
     log.info("Hive shut down cleanly");
     process.exit(0);
   };
