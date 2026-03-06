@@ -41,6 +41,53 @@ export interface ProcessedFile {
 }
 
 const IMAGE_TYPES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+
+let geminiApiKey = "";
+const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL || "gemini-2.0-flash";
+
+/** Set the Gemini API key for image processing */
+export function setGeminiApiKey(key: string): void {
+  geminiApiKey = key;
+}
+
+async function describeImageWithGemini(buffer: Buffer, mimetype: string): Promise<string | null> {
+  if (!geminiApiKey) return null;
+
+  try {
+    const base64 = buffer.toString("base64");
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { inline_data: { mime_type: mimetype, data: base64 } },
+              { text: "Describe this image in detail. If it contains text, extract all of it. If it's a diagram, architecture drawing, or technical image, describe all labels, relationships, and structure. If it's a screenshot of messages or a conversation, transcribe everything. Be thorough." },
+            ],
+          }],
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      const err = await res.text();
+      log.warn("Gemini vision error", { status: res.status, error: err.slice(0, 200) });
+      return null;
+    }
+
+    const data = await res.json() as any;
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (text) {
+      log.info("Image described via Gemini", { model: GEMINI_MODEL, chars: text.length });
+    }
+    return text || null;
+  } catch (e: any) {
+    log.warn("Gemini vision failed", { error: e.message });
+    return null;
+  }
+}
 const TEXT_TYPES = new Set(["csv", "tsv", "txt", "text", "md", "markdown", "json", "xml", "html", "yaml", "yml", "log"]);
 
 export async function downloadAndProcess(
@@ -72,9 +119,10 @@ export async function downloadAndProcess(
     const ext = extname(file.name).slice(1).toLowerCase();
     const isImage = IMAGE_TYPES.has(ext) || file.mimetype.startsWith("image/");
 
-    // Images — saved locally, agent views via Read tool
+    // Images — describe via Gemini vision, fall back to metadata only
     if (isImage) {
-      return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: null, isImage: true };
+      const description = await describeImageWithGemini(buffer, file.mimetype);
+      return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: description, isImage: true };
     }
 
     // Text-based files
