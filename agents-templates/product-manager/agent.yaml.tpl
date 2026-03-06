@@ -1,7 +1,7 @@
 id: product-manager
 name: "{{agent.name}}"
 icon: ":bulb:"
-model: claude-sonnet-4-6
+model: claude-haiku-4-5
 channels:
   - product
   - bugs
