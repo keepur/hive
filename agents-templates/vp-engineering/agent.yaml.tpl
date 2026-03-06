@@ -5,10 +5,10 @@ model: claude-haiku-4-5
 channels:
   - dev
 keywords:
-  - deploy
   - build
   - bug
   - fix
+  - code
 isDefault: false
 budgetUsd: 10
 servers:
