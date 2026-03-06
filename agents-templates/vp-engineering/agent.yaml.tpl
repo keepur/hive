@@ -1,35 +1,20 @@
 id: vp-engineering
 name: "{{agent.name}}"
-icon: ":gear:"
-model: claude-sonnet-4-6
+icon: ":wrench:"
+model: claude-haiku-4-5
 channels:
   - dev
 keywords:
-  - engineering
-  - code
-  - bug
-  - feature
   - deploy
-  - release
-  - sprint
-  - pull request
   - build
-  - test
-  - architecture
-  - refactor
-  - api
-  - database
-  - migration
+  - bug
+  - fix
 isDefault: false
-budgetUsd: 50
+budgetUsd: 10
 servers:
   - memory
   - linear
   - brave-search
   - slack
-  - tasks
-  - contacts
-  - crm-search
   - keychain
   - background
-  - google-workspace
