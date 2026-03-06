@@ -33,11 +33,12 @@ async function main(): Promise<void> {
 
   // Load agent definitions
   const registry = new AgentRegistry(config.agents.definitionsPath);
+  await registry.connectDb(config.mongo.uri, config.mongo.dbName);
   await registry.load();
   log.info("Agent registry loaded", { agents: registry.listIds() });
 
   // Initialize core systems
-  const memoryManager = new MemoryManager(config.memory.localPath);
+  const memoryManager = new MemoryManager(config.mongo.uri, config.mongo.dbName);
   await memoryManager.init();
 
   const sessionStore = new SessionStore(config.mongo.uri);

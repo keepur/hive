@@ -1,82 +1,93 @@
-import { exec } from "node:child_process";
-import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
-import { join, dirname } from "node:path";
-import { promisify } from "node:util";
+import { MongoClient, type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 
-const execAsync = promisify(exec);
 const log = createLogger("memory-manager");
 
-export class MemoryManager {
-  private repoPath: string;
+interface MemoryDoc {
+  path: string;
+  content: string;
+  updatedAt: Date;
+  updatedBy?: string;
+}
 
-  constructor(repoPath: string) {
-    this.repoPath = repoPath;
+interface MemoryVersionDoc {
+  path: string;
+  content: string;
+  savedAt: Date;
+  savedBy?: string;
+}
+
+export class MemoryManager {
+  private mongoUri: string;
+  private dbName: string;
+  private client!: MongoClient;
+  private db!: Db;
+  private collection!: Collection<MemoryDoc>;
+  private versions!: Collection<MemoryVersionDoc>;
+
+  constructor(mongoUri: string, dbName: string = "hive") {
+    this.mongoUri = mongoUri;
+    this.dbName = dbName;
   }
 
   async init(): Promise<void> {
-    try {
-      await this.git("status --short");
-      log.info("Memory repo ready", { path: this.repoPath });
-    } catch {
-      log.error("Memory repo not found or not a git repo", { path: this.repoPath });
-      throw new Error(`Memory repo not available at ${this.repoPath}`);
-    }
+    this.client = new MongoClient(this.mongoUri);
+    await this.client.connect();
+    this.db = this.client.db(this.dbName);
+    this.collection = this.db.collection<MemoryDoc>("memory");
+    this.versions = this.db.collection<MemoryVersionDoc>("memory_versions");
+    await this.collection.createIndex({ path: 1 }, { unique: true });
+    await this.versions.createIndex({ path: 1, savedAt: -1 });
+    log.info("Memory manager connected to MongoDB", { db: this.dbName });
   }
 
   async read(relativePath: string): Promise<string | null> {
-    try {
-      const fullPath = join(this.repoPath, relativePath);
-      return await readFile(fullPath, "utf-8");
-    } catch {
-      return null;
-    }
+    const doc = await this.collection.findOne({ path: relativePath });
+    return doc?.content ?? null;
   }
 
   async list(relativePath: string): Promise<string[]> {
-    try {
-      const fullPath = join(this.repoPath, relativePath);
-      const entries = await readdir(fullPath);
-      return entries.filter((e) => !e.startsWith("."));
-    } catch {
-      return [];
-    }
+    // List files under a directory prefix (e.g. "agents/chief-of-staff/")
+    const prefix = relativePath.endsWith("/") ? relativePath : relativePath + "/";
+    const docs = await this.collection
+      .find({ path: { $regex: `^${escapeRegex(prefix)}[^/]+$` } })
+      .project<{ path: string }>({ path: 1 })
+      .toArray();
+    return docs.map((d) => d.path.slice(prefix.length));
   }
 
-  async write(relativePath: string, content: string): Promise<void> {
-    const fullPath = join(this.repoPath, relativePath);
-    await mkdir(dirname(fullPath), { recursive: true });
-    await writeFile(fullPath, content, "utf-8");
+  async write(relativePath: string, content: string, updatedBy?: string): Promise<void> {
+    // Save previous version before overwriting
+    const existing = await this.collection.findOne({ path: relativePath });
+    if (existing) {
+      await this.versions.insertOne({
+        path: relativePath,
+        content: existing.content,
+        savedAt: existing.updatedAt,
+        savedBy: existing.updatedBy,
+      });
+    }
+
+    await this.collection.updateOne(
+      { path: relativePath },
+      { $set: { content, updatedAt: new Date(), ...(updatedBy ? { updatedBy } : {}) } },
+      { upsert: true },
+    );
   }
 
-  async commitAndPush(message: string): Promise<void> {
-    try {
-      await this.git("add -A");
-
-      // Check if there are changes to commit
-      const { stdout } = await this.git("status --porcelain");
-      if (!stdout.trim()) {
-        log.debug("No changes to commit");
-        return;
-      }
-
-      await this.git(`commit -m "${message.replace(/"/g, '\\"')}"`);
-      await this.git("push");
-      log.info("Memory committed and pushed", { message });
-    } catch (err) {
-      log.error("Failed to commit/push memory", { error: String(err) });
-    }
+  async commitAndPush(_message: string): Promise<void> {
+    // No-op — Mongo writes are immediate, no git needed
   }
 
   async pull(): Promise<void> {
-    try {
-      await this.git("pull --rebase");
-    } catch (err) {
-      log.warn("Failed to pull memory repo", { error: String(err) });
-    }
+    // No-op — Mongo reads are always fresh
   }
 
-  private async git(command: string): Promise<{ stdout: string; stderr: string }> {
-    return execAsync(`git -C "${this.repoPath}" ${command}`, { timeout: 30_000 });
+  async close(): Promise<void> {
+    await this.client?.close();
   }
+}
+
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
