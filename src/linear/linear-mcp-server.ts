@@ -245,6 +245,30 @@ server.registerTool("linear_search", {
   }
 });
 
+// ── Tool: linear_search_users ──────────────────────────────────────────────
+
+server.registerTool("linear_search_users", {
+  title: "Search Users",
+  description: "Search for Linear workspace members by name, display name, or email address.",
+  inputSchema: {
+    query: z.string().describe("Name, display name, or email to search for"),
+    limit: z.number().optional().default(10).describe("Max results to return"),
+  },
+}, async ({ query, limit }) => {
+  try {
+    const users = await linearClient.searchUsers(query, limit);
+    if (users.length === 0) {
+      return { content: [{ type: "text", text: "No users found." }] };
+    }
+    const lines = users.map(u =>
+      `${u.name} (${u.displayName}) — ${u.email} [id: ${u.id}]${u.active ? "" : " [inactive]"}`
+    );
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  } catch (err) {
+    return { content: [{ type: "text", text: `Failed to search users: ${String(err)}` }], isError: true };
+  }
+});
+
 // ── Tool: linear_list_states ───────────────────────────────────────────────
 
 server.registerTool("linear_list_states", {

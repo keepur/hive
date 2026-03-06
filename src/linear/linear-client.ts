@@ -57,6 +57,14 @@ export interface TeamInfo {
   key: string;
 }
 
+export interface UserInfo {
+  id: string;
+  name: string;
+  displayName: string;
+  email: string;
+  active: boolean;
+}
+
 // ── Client ──────────────────────────────────────────────────────────────────
 
 export class LinearClient {
@@ -227,6 +235,31 @@ export class LinearClient {
       }));
     } catch (err) {
       log.error("Failed to get workflow states", { error: String(err) });
+      return [];
+    }
+  }
+
+  async searchUsers(query: string, limit?: number): Promise<UserInfo[]> {
+    try {
+      const result = await this.client.users({
+        filter: {
+          or: [
+            { name: { containsIgnoreCase: query } } as any,
+            { displayName: { containsIgnoreCase: query } } as any,
+            { email: { containsIgnoreCase: query } } as any,
+          ],
+        },
+        first: limit ?? 10,
+      });
+      return result.nodes.map((u) => ({
+        id: u.id,
+        name: u.name,
+        displayName: u.displayName,
+        email: u.email,
+        active: u.active,
+      }));
+    } catch (err) {
+      log.error("Failed to search users", { error: String(err), query });
       return [];
     }
   }
