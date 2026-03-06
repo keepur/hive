@@ -43,7 +43,7 @@ export interface ProcessedFile {
 const IMAGE_TYPES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
 
 let geminiApiKey = "";
-const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL || "gemini-2.0-flash";
+const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
 
 /** Set the Gemini API key for image processing */
 export function setGeminiApiKey(key: string): void {
@@ -101,10 +101,22 @@ export async function downloadAndProcess(
   }
 
   try {
-    // Download from Slack (requires auth)
-    const res = await fetch(url, {
+    // Download from Slack — don't auto-follow redirects (auth header gets stripped)
+    // Instead, follow manually without the auth header on the redirect target
+    log.info("Downloading file", { id: file.id, url: url.slice(0, 80), mimetype: file.mimetype });
+    let res = await fetch(url, {
       headers: { Authorization: `Bearer ${botToken}` },
+      redirect: "manual",
     });
+
+    // Follow redirect to CDN (no auth needed on the redirect URL)
+    if (res.status === 302 || res.status === 301) {
+      const redirectUrl = res.headers.get("location");
+      if (redirectUrl) {
+        log.info("Following redirect", { id: file.id });
+        res = await fetch(redirectUrl);
+      }
+    }
 
     if (!res.ok) {
       log.error("Failed to download file", { id: file.id, status: res.status });
@@ -122,7 +134,11 @@ export async function downloadAndProcess(
     // Images — describe via Gemini vision, fall back to metadata only
     if (isImage) {
       const description = await describeImageWithGemini(buffer, file.mimetype);
-      return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: description, isImage: true };
+      return {
+        name: file.name, mimetype: file.mimetype, size: file.size, localPath,
+        textContent: description ?? "[Image — could not extract description]",
+        isImage: true,
+      };
     }
 
     // Text-based files
@@ -189,7 +205,10 @@ export function formatFilesForPrompt(files: ProcessedFile[]): string {
     const header = `📎 File: ${f.name} (${formatSize(f.size)}, ${f.mimetype})`;
 
     if (f.isImage) {
-      return `${header}\n  Image saved at: ${f.localPath}\n  Use the Read tool to view this image.`;
+      if (f.textContent) {
+        return `${header}\n--- image description ---\n${f.textContent}\n--- end image description ---`;
+      }
+      return `${header}\n  [Image received but could not be processed]`;
     }
 
     if (f.textContent) {
