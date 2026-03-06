@@ -261,6 +261,25 @@ export class AgentRunner {
       },
     };
 
+    // Callback server — agents can schedule future self-invocations
+    servers["callback"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/callback/callback-mcp-server.js")],
+      env: {
+        CB_AGENT_ID: this.agentConfig.id,
+        CB_ADAPTER_ID: context?.adapterId ?? "",
+        CB_CHANNEL_ID: context?.channelId ?? "",
+        CB_CHANNEL_KIND: context?.channelKind ?? "internal",
+        CB_CHANNEL_LABEL: context?.channelLabel ?? "",
+        CB_THREAD_ID: context?.threadId ?? "",
+        CB_SLACK_TS: context?.slackTs ?? "",
+        CB_SLACK_THREAD_TS: context?.slackThreadTs ?? "",
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+      },
+    };
+
     // CRM Search — semantic search over HubSpot data in Atlas
     const atlasUri = process.env.MONGODB_ATLAS_URI ?? "";
     const voyageKey = process.env.VOYAGEAI_API_KEY ?? "";

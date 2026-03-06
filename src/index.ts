@@ -162,8 +162,13 @@ async function main(): Promise<void> {
     log.info("SMS adapter started", { lines: config.sms.lines.length });
   }
 
-  // Start scheduler
-  const scheduler = new Scheduler(agentManager, memoryManager, healthReporter, registry);
+  // Start scheduler (with callback support via MongoDB)
+  const scheduler = new Scheduler(agentManager, memoryManager, healthReporter, registry, (item) => {
+    dispatcher.dispatch(item).catch((err) => {
+      log.error("Callback dispatch failed", { error: String(err) });
+    });
+  });
+  await scheduler.connectDb(config.mongo.uri, config.mongo.dbName);
   scheduler.start();
   log.info("Scheduler started");
 

@@ -283,6 +283,12 @@ export class Dispatcher {
   }
 
   private async resolveAgent(item: WorkItem): Promise<string | null> {
+    // 0. Explicit target — callbacks and internal routing specify exact agent
+    const targetAgentId = item.meta?.targetAgentId as string | undefined;
+    if (targetAgentId && this.registry.get(targetAgentId)) {
+      return targetAgentId;
+    }
+
     // 1. Thread continuity — stay with the same agent within a thread
     if (item.threadId) {
       const existing = this.threadAgentMap.get(item.threadId);

@@ -17,3 +17,4 @@ servers:
   - hubspot-crm
   - brave-search
   - google-workspace
+  - callback

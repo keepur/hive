@@ -22,3 +22,4 @@ servers:
   - google-workspace
   - keychain
   - background
+  - callback
