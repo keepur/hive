@@ -135,6 +135,11 @@ export const config = {
   background: {
     port: parseInt(optional("BG_TASK_PORT", "3100"), 10),
   },
+  ws: {
+    enabled: optional("WS_ENABLED", "false") === "true",
+    port: parseInt(optional("WS_PORT", "3200"), 10),
+    jwtSecret: optional("WS_JWT_SECRET", ""),
+  },
   triage: {
     model: optional("TRIAGE_MODEL", "claude-haiku-4-5-20251001"),
     timeoutMs: parseInt(optional("TRIAGE_TIMEOUT_MS", "10000"), 10),
