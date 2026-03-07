@@ -375,15 +375,42 @@ async function main() {
     await doBuild();
   }
 
-  // ── 8. Service ────────────────────────────────────────────────────
+  // ── 8. Deploy Clone ──────────────────────────────────────────────
+  section("Deploy");
+
+  const deployDir = join(process.env.HOME ?? "/tmp", "services", "hive");
+  const deployExists = existsSync(join(deployDir, "package.json"));
+
+  if (deployExists) {
+    console.log(`Deploy directory exists: ${deployDir}`);
+    const redeploy = await confirm("Sync latest build and config?", true);
+    if (redeploy) {
+      await doDeploy(deployDir);
+    } else {
+      console.log("  ✓ Skipped");
+    }
+  } else {
+    console.log("Hive runs from a separate deploy directory (not this dev repo).");
+    console.log(`  Dev:    ${ROOT}`);
+    console.log(`  Deploy: ${deployDir}`);
+    console.log("");
+    const setupDeploy = await confirm("Set up the deploy directory now?", true);
+    if (setupDeploy) {
+      await doDeploy(deployDir);
+    }
+  }
+
+  // ── 9. Service ────────────────────────────────────────────────────
   section("Service");
 
   const installService = await confirm("Install Hive as a LaunchAgent (starts on login)?");
   if (installService) {
     try {
-      execSync("bash service/install.sh", { cwd: ROOT, stdio: "inherit" });
+      // Generate plists pointing to the deploy directory
+      execSync(`HIVE_DEPLOY_DIR="${deployDir}" bash service/install.sh`, { cwd: ROOT, stdio: "inherit" });
     } catch {
-      console.log("  ⚠ Service installation failed — you can run manually with 'npm start'");
+      console.log("  ⚠ Service installation failed — you can start manually:");
+      console.log(`     cd ${deployDir} && npm start`);
     }
   }
 
@@ -394,10 +421,11 @@ async function main() {
   console.log("╚══════════════════════════════════════════════╝");
   console.log("");
   console.log("Quick reference:");
-  console.log("  Start:    npm start");
-  console.log("  Dev mode: npm run dev");
-  console.log("  Logs:     tail -f logs/hive.log");
-  console.log("  Update:   npm run update");
+  console.log(`  Deploy dir: ${deployDir}`);
+  console.log(`  Start:      cd ${deployDir} && npm start`);
+  console.log(`  Logs:       tail -f ${deployDir}/logs/hive.log`);
+  console.log(`  Dev mode:   npm run dev  (from ${ROOT})`);
+  console.log(`  Redeploy:   bash ${ROOT}/service/deploy.sh`);
   console.log("");
   console.log("Your chief-of-staff agent is in agents/chief-of-staff/.");
   console.log("Additional agents can be created through the chief of staff.");
@@ -604,6 +632,72 @@ async function doBuild() {
     console.log("  ⚠ Build failed:");
     console.log(String(err));
   }
+}
+
+async function doDeploy(deployDir: string) {
+  const { mkdirSync: mkdir } = await import("node:fs");
+
+  if (!existsSync(join(deployDir, "package.json"))) {
+    // Fresh clone
+    console.log("  Cloning repository...");
+    const parentDir = resolve(deployDir, "..");
+    mkdir(parentDir, { recursive: true });
+
+    const remoteUrl = execSync("git remote get-url origin", { cwd: ROOT, encoding: "utf-8" }).trim();
+    execSync(`git clone "${remoteUrl}" "${deployDir}"`, { stdio: "inherit" });
+    console.log("  ✓ Repository cloned");
+  } else {
+    // Pull latest
+    console.log("  Pulling latest...");
+    try {
+      execSync("git pull --ff-only", { cwd: deployDir, stdio: "inherit" });
+    } catch {
+      console.log("  ⚠ git pull failed — continuing with existing code");
+    }
+  }
+
+  // Install production dependencies
+  console.log("  Installing production dependencies...");
+  execSync("npm install --omit=dev", { cwd: deployDir, stdio: "pipe" });
+  console.log("  ✓ Dependencies installed");
+
+  // Copy instance-specific files (not in git)
+  console.log("  Syncing config and build output...");
+
+  // .env
+  const envSrc = join(ROOT, ".env");
+  if (existsSync(envSrc)) {
+    const { copyFileSync } = await import("node:fs");
+    copyFileSync(envSrc, join(deployDir, ".env"));
+    console.log("  ✓ .env");
+  }
+
+  // hive.yaml
+  const hiveSrc = join(ROOT, "hive.yaml");
+  if (existsSync(hiveSrc)) {
+    const { copyFileSync } = await import("node:fs");
+    copyFileSync(hiveSrc, join(deployDir, "hive.yaml"));
+    console.log("  ✓ hive.yaml");
+  }
+
+  // agents/
+  const agentsSrc = join(ROOT, "agents");
+  if (existsSync(agentsSrc)) {
+    execSync(`rsync -a --delete "${agentsSrc}/" "${join(deployDir, "agents")}/"`, { stdio: "pipe" });
+    console.log("  ✓ agents/");
+  }
+
+  // dist/ (build output)
+  const distSrc = join(ROOT, "dist");
+  if (existsSync(distSrc)) {
+    execSync(`rsync -a --delete "${distSrc}/" "${join(deployDir, "dist")}/"`, { stdio: "pipe" });
+    console.log("  ✓ dist/");
+  }
+
+  // Ensure logs directory
+  mkdir(join(deployDir, "logs"), { recursive: true });
+
+  console.log(`\n  ✓ Deploy directory ready: ${deployDir}`);
 }
 
 main().catch((err) => {

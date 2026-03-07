@@ -15,8 +15,9 @@ import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 
 const ROOT = resolve(import.meta.dirname, "..");
+const DEPLOY_DIR = process.env.HIVE_DEPLOY_DIR ?? ROOT;
 const SERVICE_DIR = join(ROOT, "service");
-const LOGS_DIR = join(ROOT, "logs");
+const LOGS_DIR = join(DEPLOY_DIR, "logs");
 
 const LABEL = "com.hive.agent";
 const LABEL_LOGS = "com.hive.rotate-logs";
@@ -46,7 +47,7 @@ const hivePlist = `<?xml version="1.0" encoding="UTF-8"?>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>${ROOT}</string>
+  <string>${DEPLOY_DIR}</string>
 
   <key>EnvironmentVariables</key>
   <dict>
@@ -81,7 +82,7 @@ writeFileSync(hivePlistPath, hivePlist);
 console.log(`Generated: ${hivePlistPath}`);
 console.log(`  Label: ${LABEL}`);
 console.log(`  Node: ${nodePath}`);
-console.log(`  Working dir: ${ROOT}`);
+console.log(`  Working dir: ${DEPLOY_DIR}`);
 console.log(`  Logs: ${LOGS_DIR}/`);
 
 // ── Log rotation plist ─────────────────────────────────────────────
@@ -95,7 +96,7 @@ const rotatePlist = `<?xml version="1.0" encoding="UTF-8"?>
 
   <key>ProgramArguments</key>
   <array>
-    <string>${ROOT}/service/rotate-logs.sh</string>
+    <string>${DEPLOY_DIR}/service/rotate-logs.sh</string>
   </array>
 
   <key>EnvironmentVariables</key>

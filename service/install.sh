@@ -3,19 +3,23 @@ set -euo pipefail
 
 # Install Hive as a LaunchAgent (user scope).
 # Generates plists, symlinks them into ~/Library/LaunchAgents, and bootstraps.
+#
+# Set HIVE_DEPLOY_DIR to override the working directory (default: ~/services/hive)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HIVE_ROOT="$(dirname "$SCRIPT_DIR")"
+DEPLOY_DIR="${HIVE_DEPLOY_DIR:-$HOME/services/hive}"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 
 LABEL="com.hive.agent"
 LABEL_LOGS="com.hive.rotate-logs"
 
 echo "Installing Hive LaunchAgents..."
+echo "  Deploy dir: $DEPLOY_DIR"
 
-# Generate plists with correct paths for this machine
+# Generate plists pointing to the deploy directory
 cd "$HIVE_ROOT"
-npx tsx setup/generate-plist.ts
+HIVE_DEPLOY_DIR="$DEPLOY_DIR" npx tsx setup/generate-plist.ts
 
 # Ensure LaunchAgents directory exists
 mkdir -p "$LAUNCH_AGENTS_DIR"
@@ -26,14 +30,14 @@ for lbl in "$LABEL" "$LABEL_LOGS"; do
 done
 
 # Symlink plists into LaunchAgents
-ln -sf "$SCRIPT_DIR/$LABEL.plist" "$LAUNCH_AGENTS_DIR/$LABEL.plist"
-ln -sf "$SCRIPT_DIR/$LABEL_LOGS.plist" "$LAUNCH_AGENTS_DIR/$LABEL_LOGS.plist"
+ln -sf "$HIVE_ROOT/service/$LABEL.plist" "$LAUNCH_AGENTS_DIR/$LABEL.plist"
+ln -sf "$HIVE_ROOT/service/$LABEL_LOGS.plist" "$LAUNCH_AGENTS_DIR/$LABEL_LOGS.plist"
 
 # Ensure logs directory exists
-mkdir -p "$HIVE_ROOT/logs"
+mkdir -p "$DEPLOY_DIR/logs"
 
 # Make rotate script executable
-chmod +x "$SCRIPT_DIR/rotate-logs.sh"
+chmod +x "$HIVE_ROOT/service/rotate-logs.sh"
 
 # Bootstrap (load and start)
 launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENTS_DIR/$LABEL.plist"
@@ -41,8 +45,9 @@ launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENTS_DIR/$LABEL_LOGS.plist"
 
 echo ""
 echo "✓ Hive service installed (LaunchAgent, user scope)"
-echo "  Label:   $LABEL"
-echo "  Logs:    $HIVE_ROOT/logs/"
+echo "  Label:      $LABEL"
+echo "  Working dir: $DEPLOY_DIR"
+echo "  Logs:        $DEPLOY_DIR/logs/"
 echo ""
 echo "Manage with:"
 echo "  launchctl kickstart -k gui/$(id -u)/$LABEL    # restart"
