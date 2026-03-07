@@ -2,8 +2,9 @@
  * Shared template renderer for Hive agent generation and setup wizard.
  *
  * Supports:
- *   {{key.sub-key}}                  – dot-path variable substitution (hyphens OK)
+ *   {{key.sub-key}}                    – dot-path variable substitution (hyphens OK)
  *   {{#path.to.key}}...{{/path.to.key}} – conditional blocks (truthy = render, falsy = remove)
+ *   {{^path.to.key}}...{{/path.to.key}} – inverted blocks (falsy = render, truthy = remove)
  *   {{#sms_section}}...{{/sms_section}} – special SMS block (kept in generate-agents)
  */
 
@@ -23,40 +24,52 @@ function resolvePath(ctx: Record<string, any>, path: string): any {
   return val;
 }
 
+function isTruthy(val: any): boolean {
+  return val !== null && val !== undefined && val !== "" && val !== false;
+}
+
 /**
  * Render a template string by replacing variables and evaluating conditional blocks.
  *
  * Processing order:
  *   1. {{#sms_section}}...{{/sms_section}}  – handled by caller (SMS-specific logic)
- *   2. {{#path.to.key}}...{{/path.to.key}}  – generic conditional blocks
+ *   2. {{#path}}...{{/path}} and {{^path}}...{{/path}} – conditional/inverted blocks
+ *      (multiple passes to handle nesting)
  *   3. {{path.to.key}}                      – variable substitution
  */
 export function render(template: string, ctx: Record<string, any>): string {
-  // ---- 1. Generic conditional blocks ----------------------------------------
-  // Match {{#some.path-key}}...{{/some.path-key}} but NOT {{#sms_section}}
-  // which is handled separately by generate-agents before calling render.
-  template = template.replace(
-    /\{\{#([\w][\w-]*(?:\.[\w][\w-]*)*)\}\}([\s\S]*?)\{\{\/\1\}\}/g,
-    (full, path, block) => {
-      // Skip sms_section — it's handled by the caller with special logic
-      if (path === "sms_section") return full;
+  // ---- 1. Conditional blocks (multiple passes for nesting) --------------------
+  // Process innermost blocks first, repeat until no more matches.
+  let changed = true;
+  while (changed) {
+    changed = false;
 
-      const val = resolvePath(ctx, path);
-      // Truthy: non-null, non-undefined, non-empty-string
-      if (val !== null && val !== undefined && val !== "") {
-        return block;
-      }
-      return "";
-    },
-  );
+    // Truthy blocks: {{#key}}...{{/key}}
+    template = template.replace(
+      /\{\{#([\w][\w-]*(?:\.[\w][\w-]*)*)\}\}([\s\S]*?)\{\{\/\1\}\}/g,
+      (full, path, block) => {
+        if (path === "sms_section") return full;
+        changed = true;
+        return isTruthy(resolvePath(ctx, path)) ? block : "";
+      },
+    );
+
+    // Inverted blocks: {{^key}}...{{/key}}
+    template = template.replace(
+      /\{\{\^([\w][\w-]*(?:\.[\w][\w-]*)*)\}\}([\s\S]*?)\{\{\/\1\}\}/g,
+      (_full, path, block) => {
+        changed = true;
+        return !isTruthy(resolvePath(ctx, path)) ? block : "";
+      },
+    );
+  }
 
   // ---- 2. Variable substitution ---------------------------------------------
-  // Matches {{key}}, {{key.sub}}, {{key.sub-key}}, {{a.b-c.d}} etc.
   template = template.replace(
     /\{\{([\w][\w-]*(?:\.[\w][\w-]*)*)\}\}/g,
     (match, path) => {
       const val = resolvePath(ctx, path);
-      if (val === undefined) return match; // leave unreplaced if not found
+      if (val === undefined) return match;
       return String(val);
     },
   );
