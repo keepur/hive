@@ -80,7 +80,7 @@ export class DeviceRegistry {
       { $unset: { pairingCode: "", pairingCodeExpiresAt: "" } },
     );
 
-    const token = jwt.sign({ deviceId: device._id }, this.jwtSecret);
+    const token = jwt.sign({ deviceId: device._id }, this.jwtSecret, { expiresIn: "90d" });
     log.info("Device paired", { id: device._id, name: device.name });
 
     // Return the device without the pairing fields
