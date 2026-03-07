@@ -22,7 +22,7 @@ echo "Syncing agents from dev..."
 rsync -a --delete "$DEV_DIR/agents/" "$DEPLOY_DIR/agents/"
 
 echo "Restarting service..."
-launchctl kickstart -k "gui/$(id -u)/com.dodi.hive"
+launchctl kickstart -k "gui/$(id -u)/com.hive.agent"
 
 sleep 3
 if tail -1 "$DEPLOY_DIR/logs/hive.log" | grep -q '"Hive is running"'; then

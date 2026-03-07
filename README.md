@@ -160,12 +160,12 @@ npm start
 npm run dev
 
 # View logs
-tail -f logs/stdout.log
+tail -f logs/hive.log
 ```
 
-### Run as a system service (starts on boot)
+### Run as a LaunchAgent (starts on login)
 
-The setup wizard offers to install Hive as a launchd service. You can also do it manually:
+The setup wizard offers to install Hive as a LaunchAgent (user scope). You can also do it manually:
 
 ```bash
 bash service/install.sh
@@ -174,14 +174,17 @@ bash service/install.sh
 To manage the service:
 
 ```bash
+# Restart
+launchctl kickstart -k gui/$(id -u)/com.hive.agent
+
 # Stop
-launchctl bootout gui/$(id -u)/com.dodi.hive
+launchctl bootout gui/$(id -u)/com.hive.agent
 
 # Start
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dodi.hive.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hive.agent.plist
 
 # Status
-launchctl print gui/$(id -u)/com.dodi.hive
+launchctl print gui/$(id -u)/com.hive.agent
 ```
 
 ## Configuration
