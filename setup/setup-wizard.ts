@@ -260,8 +260,67 @@ async function main() {
   // Google
   const wantGoogle = await confirm("Enable Google Gmail/Calendar integration?", false);
   if (wantGoogle) {
-    env.GOOGLE_ACCOUNT = await ask("Google account email", env.GOOGLE_ACCOUNT || "");
-    console.log("  Note: You'll need the 'gog' CLI installed and authenticated.");
+    // Check if gog is installed
+    let gogInstalled = false;
+    try {
+      execSync("which gog", { stdio: "pipe" });
+      gogInstalled = true;
+      console.log("  ✓ gog CLI found");
+    } catch {
+      console.log("  gog CLI not found. Installing via Homebrew...");
+      try {
+        execSync("brew install gog", { stdio: "inherit" });
+        gogInstalled = true;
+        console.log("  ✓ gog CLI installed");
+      } catch {
+        console.log("  ⚠ Failed to install gog. Install manually: brew install gog");
+      }
+    }
+
+    if (gogInstalled) {
+      // Check existing accounts
+      try {
+        const authList = execSync("gog auth list 2>&1", { encoding: "utf-8" }).trim();
+        if (authList && !authList.includes("no accounts")) {
+          console.log("\n  Authenticated accounts:");
+          console.log(`  ${authList.replace(/\n/g, "\n  ")}`);
+        }
+      } catch {}
+
+      console.log("");
+      const addAccount = await confirm("Authenticate a Google account now?", true);
+      if (addAccount) {
+        let addMore = true;
+        while (addMore) {
+          const email = await ask("Google account email");
+          console.log(`\n  Opening browser for ${email}...`);
+          console.log("  Complete the OAuth flow in your browser, then come back here.\n");
+          try {
+            execSync(`gog auth add "${email}"`, { stdio: "inherit" });
+            console.log(`  ✓ ${email} authenticated`);
+          } catch {
+            console.log(`  ⚠ Authentication failed for ${email}. You can retry later: gog auth add ${email}`);
+          }
+          addMore = await confirm("Authenticate another Google account?", false);
+        }
+      }
+
+      // Set primary account
+      env.GOOGLE_ACCOUNT = await ask("Primary Google account for Hive", env.GOOGLE_ACCOUNT || "");
+
+      // Verify it works
+      if (env.GOOGLE_ACCOUNT) {
+        try {
+          execSync(`gog gmail search "is:unread" -a "${env.GOOGLE_ACCOUNT}" --json --results-only --no-input 2>&1`, {
+            encoding: "utf-8",
+            timeout: 15_000,
+          });
+          console.log(`  ✓ Gmail access verified for ${env.GOOGLE_ACCOUNT}`);
+        } catch {
+          console.log(`  ⚠ Could not verify Gmail access — check authentication later`);
+        }
+      }
+    }
   }
 
   // Project Management
