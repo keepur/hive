@@ -82,7 +82,7 @@ function saveEnv(env: Record<string, string>) {
     { header: "# Anthropic", keys: ["ANTHROPIC_API_KEY"] },
     { header: "# SMS (Quo/OpenPhone)", keys: ["QUO_API_KEY", "QUO_PHONE_NUMBER_ID"] },
     { header: "# Google", keys: ["GOOGLE_ACCOUNT"] },
-    { header: "# Linear", keys: ["LINEAR_API_KEY"] },
+    { header: "# Project Management", keys: ["LINEAR_API_KEY", "CLICKUP_API_TOKEN"] },
   ];
 
   const written = new Set<string>();
@@ -264,10 +264,19 @@ async function main() {
     console.log("  Note: You'll need the 'gog' CLI installed and authenticated.");
   }
 
-  // Linear
-  const wantLinear = await confirm("Enable Linear (project management)?", false);
-  if (wantLinear) {
-    env.LINEAR_API_KEY = await ask("Linear API Key", env.LINEAR_API_KEY || "");
+  // Project Management
+  const wantPm = await confirm("Enable project management integration?", false);
+  if (wantPm) {
+    const pmChoice = await ask("Which system? (linear / clickup)", "");
+    if (pmChoice.toLowerCase().startsWith("l")) {
+      env.LINEAR_API_KEY = await ask("Linear API Key", env.LINEAR_API_KEY || "");
+      console.log("  Get it from: Linear → Settings → API → Personal API Keys");
+    } else if (pmChoice.toLowerCase().startsWith("c")) {
+      env.CLICKUP_API_TOKEN = await ask("ClickUp API Token", env.CLICKUP_API_TOKEN || "");
+      console.log("  Get it from: ClickUp → Settings → Apps → API Token");
+    } else {
+      console.log("  Skipped — you can configure this in .env later.");
+    }
   }
 
   // Save after integrations
