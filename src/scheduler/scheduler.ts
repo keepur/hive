@@ -142,16 +142,18 @@ export class Scheduler {
         job.lastRun = now;
         log.info("Triggering scheduled task", { agentId: job.agentId, task: job.task });
 
-        // Route through dispatcher so responses are delivered to the agent's home channel
+        // Route through dispatcher so responses are delivered to the agent's dedicated channel
         const agent = this.registry.get(job.agentId);
-        const homeChannel = agent?.channels[0] ?? job.agentId;
+        // Use agent-{id} channel (dedicated), not channels[0] which may be SMS/shared
+        const homeChannel = agent?.channels.find((ch) => ch.startsWith("agent-")) ?? `agent-${job.agentId}`;
 
         const workItem: WorkItem = {
           id: `sched:${job.agentId}:${job.task}:${Date.now()}`,
           text: `[Scheduled task: ${job.task}] Execute your scheduled "${job.task}" task now.`,
           source: { kind: "slack", id: homeChannel, label: homeChannel },
           sender: "system",
-          threadId: `scheduler:${job.agentId}:${job.task}:${now.toISOString().split("T")[0]}`,
+          // Unique threadId per run — don't pollute thread continuity routing
+          threadId: `scheduler:${job.agentId}:${job.task}:${Date.now()}`,
           timestamp: now,
           meta: { targetAgentId: job.agentId },
         };
