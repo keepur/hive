@@ -209,15 +209,14 @@ async function main() {
       console.log("  ✓ Skipped");
     }
   } else {
-    console.log("If you have a Claude Max subscription, you can skip this —");
-    console.log("the Agent SDK will authenticate via your Claude CLI session.");
+    console.log("Your Claude CLI session is already authenticated — Hive's Agent SDK");
+    console.log("will use that automatically. No API key needed.");
     console.log("");
-    const wantKey = await confirm("Enter an Anthropic API key?", false);
+    const wantKey = await confirm("Use a separate API key instead?", false);
     if (wantKey) {
       await doAnthropic(env);
     } else {
-      console.log("  ✓ Using Claude Max (OAuth)");
-      env.ANTHROPIC_API_KEY = "";
+      console.log("  ✓ Using existing Claude authentication");
       saveEnv(env);
     }
   }
