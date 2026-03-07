@@ -30,7 +30,3 @@ business:
 #       id: "PNyyyyy"
 #       number: "(555) 987-6543"
 #       label: "Personal"
-
-memory:
-  localPath: ~/hive-memory
-  # repo: "your-org/hive-memory"  # Optional: GitHub repo for backup

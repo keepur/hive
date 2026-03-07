@@ -7,8 +7,9 @@ features:
     home_tab_enabled: false
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
-  assistant:
+  assistant_view:
     assistant_description: Your AI assistant team — ask anything
+    suggested_prompts: []
   bot_user:
     display_name: Hive
     always_online: true
