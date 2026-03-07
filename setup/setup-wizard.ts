@@ -83,6 +83,7 @@ function saveEnv(env: Record<string, string>) {
     { header: "# SMS (Quo/OpenPhone)", keys: ["QUO_API_KEY", "QUO_PHONE_NUMBER_ID"] },
     { header: "# Google", keys: ["GOOGLE_ACCOUNT"] },
     { header: "# Project Management", keys: ["LINEAR_API_KEY", "CLICKUP_API_TOKEN"] },
+    { header: "# External Communications", keys: ["EXTERNAL_COMMS_ENABLED"] },
   ];
 
   const written = new Set<string>();
@@ -596,19 +597,29 @@ async function doConstitution(hive: Record<string, any>) {
     console.log(`  ✗ Only ${ownerName} can build and deploy — ${cosName} will ask you`);
   }
 
-  // 3. External communications
+  // 3. External communications (hard gate)
   console.log(`\n── External communications (email, SMS)`);
-  console.log(`By default, all customer-facing messages require your approval.\n`);
+  console.log(`This is a hard gate — when off, email and SMS tools are completely`);
+  console.log(`removed from all agents. Not just a policy, they literally can't send.\n`);
+  console.log(`Default: OFF. You can enable later by setting EXTERNAL_COMMS_ENABLED=true`);
+  console.log(`in .env and restarting Hive.\n`);
   hive.constitution.cosCanContactExternal = await confirm(
-    `Allow ${cosName} to send emails/SMS without per-message approval?`,
+    `Enable external communications now?`,
     false,
   );
+
+  // Load env to set the hard gate flag
+  const extEnv = loadEnv();
   if (hive.constitution.cosCanContactExternal) {
-    console.log(`  ✓ ${cosName} can send external messages autonomously`);
-    console.log(`    (sensitive topics still escalate to ${ownerName})`);
+    extEnv.EXTERNAL_COMMS_ENABLED = "true";
+    console.log(`  ✓ External comms enabled — email/SMS tools available`);
+    console.log(`    (sensitive topics still escalate to ${ownerName} per constitution)`);
   } else {
-    console.log(`  ✗ ${cosName} will draft messages and ask ${ownerName} to approve`);
+    extEnv.EXTERNAL_COMMS_ENABLED = "";
+    console.log(`  ✗ External comms disabled — no agent can send email or SMS`);
+    console.log(`    To enable later: set EXTERNAL_COMMS_ENABLED=true in .env`);
   }
+  saveEnv(extEnv);
 
   // 4. Source code
   console.log(`\n── Source code (Hive repository)`);

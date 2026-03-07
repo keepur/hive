@@ -337,6 +337,17 @@ export class AgentRunner {
       }
     }
 
+    // Hard gate: strip external communication servers unless explicitly enabled
+    if (!config.externalComms.enabled) {
+      const externalServers = ["resend", "quo"];
+      for (const key of externalServers) {
+        if (servers[key]) {
+          log.debug("External comms disabled — removing server", { server: key, agent: this.agentConfig.id });
+          delete servers[key];
+        }
+      }
+    }
+
     return servers;
   }
 
