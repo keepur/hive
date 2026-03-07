@@ -9,3 +9,6 @@ hive.yaml
 /agents/
 logs/
 .hive-generated.json
+
+# Generated plists (machine-specific paths)
+service/com.hive.*.plist
