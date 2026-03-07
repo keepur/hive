@@ -140,6 +140,9 @@ export const config = {
     port: parseInt(optional("WS_PORT", "3200"), 10),
     jwtSecret: optional("WS_JWT_SECRET", ""),
   },
+  externalComms: {
+    enabled: optional("EXTERNAL_COMMS_ENABLED", "false") === "true",
+  },
   triage: {
     model: optional("TRIAGE_MODEL", "claude-haiku-4-5-20251001"),
     timeoutMs: parseInt(optional("TRIAGE_TIMEOUT_MS", "10000"), 10),
