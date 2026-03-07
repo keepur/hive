@@ -50,7 +50,7 @@ export function setGeminiApiKey(key: string): void {
   geminiApiKey = key;
 }
 
-async function describeImageWithGemini(buffer: Buffer, mimetype: string): Promise<string | null> {
+export async function describeImageWithGemini(buffer: Buffer, mimetype: string): Promise<string | null> {
   if (!geminiApiKey) return null;
 
   try {
@@ -195,6 +195,27 @@ export async function downloadAndProcess(
     log.error("File processing failed", { id: file.id, name: file.name, error: e.message });
     return null;
   }
+}
+
+/** Process a raw image buffer (e.g. from WebSocket) into a ProcessedFile */
+export async function processImageBuffer(
+  buffer: Buffer,
+  filename: string,
+  mimetype: string,
+): Promise<ProcessedFile> {
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const localPath = join(DOWNLOAD_DIR, `ws-${Date.now()}-${safeName}`);
+  writeFileSync(localPath, buffer);
+
+  const description = await describeImageWithGemini(buffer, mimetype);
+  return {
+    name: filename,
+    mimetype,
+    size: buffer.length,
+    localPath,
+    textContent: description ?? "[Image — could not extract description]",
+    isImage: true,
+  };
 }
 
 /** Format processed files as text to append to the agent prompt */

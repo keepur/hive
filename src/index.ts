@@ -162,6 +162,25 @@ async function main(): Promise<void> {
     log.info("SMS adapter started", { lines: config.sms.lines.length });
   }
 
+  // WebSocket adapter — mobile app channel
+  let wsAdapter: import("./channels/ws/ws-adapter.js").WsAdapter | undefined;
+  if (config.ws.enabled && config.ws.jwtSecret) {
+    const { DeviceRegistry } = await import("./channels/ws/device-registry.js");
+    const { WsAdapter } = await import("./channels/ws/ws-adapter.js");
+
+    const deviceRegistry = new DeviceRegistry(config.mongo.uri, config.mongo.dbName, config.ws.jwtSecret);
+    await deviceRegistry.connect();
+
+    wsAdapter = new WsAdapter(config.ws.port, deviceRegistry);
+    dispatcher.registerAdapter(wsAdapter);
+    await wsAdapter.start((item) => {
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("WS dispatch failed", { error: String(err), source: item.source.label });
+      });
+    });
+    log.info("WebSocket adapter started", { port: config.ws.port });
+  }
+
   // Start scheduler (with callback support via MongoDB)
   const scheduler = new Scheduler(agentManager, memoryManager, healthReporter, registry, (item) => {
     dispatcher.dispatch(item).catch((err) => {
@@ -210,6 +229,7 @@ async function main(): Promise<void> {
     log.info("Shutdown signal received", { signal });
     sweeper.stop();
     await smsAdapter.stop();
+    if (wsAdapter) await wsAdapter.stop();
     scheduler.stop();
     bgTaskManager.stop();
     meetingMonitor?.stop();
