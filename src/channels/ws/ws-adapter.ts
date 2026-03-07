@@ -13,7 +13,7 @@ const log = createLogger("ws-adapter");
 
 export class WsAdapter implements ChannelAdapter {
   readonly id = "ws";
-  readonly kind: ChannelKind = "app" as ChannelKind; // Cast needed until ChannelKind is updated
+  readonly kind: ChannelKind = "app";
 
   private port: number;
   private deviceRegistry: DeviceRegistry;
@@ -95,7 +95,7 @@ export class WsAdapter implements ChannelAdapter {
     });
 
     // WebSocket server — handle upgrade manually for auth
-    this.wss = new WebSocketServer({ noServer: true });
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: 10 * 1024 * 1024 }); // 10 MB max message size
 
     this.server.on("upgrade", async (req, socket, head) => {
       // Extract token from query string ?token=... or Authorization header
@@ -154,7 +154,7 @@ export class WsAdapter implements ChannelAdapter {
               id: msg.id || randomUUID(),
               text: msg.text,
               source: {
-                kind: "app" as ChannelKind,
+                kind: "app",
                 id: deviceId,
                 label: `app:${device.name}`,
                 adapterId: "ws",
@@ -185,7 +185,7 @@ export class WsAdapter implements ChannelAdapter {
                 id: msg.id || randomUUID(),
                 text: `[Photo: ${msg.filename}]`,
                 source: {
-                  kind: "app" as ChannelKind,
+                  kind: "app",
                   id: deviceId,
                   label: `app:${device.name}`,
                   adapterId: "ws",
