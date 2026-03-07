@@ -356,11 +356,14 @@ async function main() {
     await doAgent(hive);
   }
 
-  // ── 6. Seed Memory to MongoDB ─────────────────────────────────────
+  // ── 6. Constitution ──────────────────────────────────────────────
+  await doConstitution(hive);
+
+  // ── 7. Seed Memory to MongoDB ─────────────────────────────────────
   section("Memory (MongoDB)");
   await doMemory(hive);
 
-  // ── 7. Build ──────────────────────────────────────────────────────
+  // ── 8. Build ──────────────────────────────────────────────────────
   section("Build");
 
   if (isBuildDone()) {
@@ -375,7 +378,7 @@ async function main() {
     await doBuild();
   }
 
-  // ── 8. Deploy Clone ──────────────────────────────────────────────
+  // ── 9. Deploy Clone ──────────────────────────────────────────────
   section("Deploy");
 
   const deployDir = join(process.env.HOME ?? "/tmp", "services", "hive");
@@ -400,7 +403,7 @@ async function main() {
     }
   }
 
-  // ── 9. Service ────────────────────────────────────────────────────
+  // ── 10. Service ───────────────────────────────────────────────────
   section("Service");
 
   const installService = await confirm("Install Hive as a LaunchAgent (starts on login)?");
@@ -554,6 +557,96 @@ async function doAgent(hive: Record<string, any>) {
   }
 
   console.log(`  ✓ ${agentName} (Chief of Staff) is ready`);
+}
+
+async function doConstitution(hive: Record<string, any>) {
+  section("Constitution — Chief of Staff Permissions");
+
+  const cosName = hive.agents?.["chief-of-staff"]?.name ?? "Chief of Staff";
+  const ownerName = hive.business?.owner?.name ?? "you";
+  const hasOtherAgents = Object.keys(hive.agents ?? {}).length > 1;
+
+  console.log("The constitution defines what your agents can and can't do.");
+  console.log(`Since ${cosName} is your only agent right now, we need to decide`);
+  console.log("what permissions to grant.\n");
+
+  // Initialize constitution config
+  if (!hive.constitution) hive.constitution = {};
+
+  // 1. Agent management
+  console.log(`── Agent files (agents/ directory)`);
+  console.log(`${cosName} can create new agents, edit their personality and config,`);
+  console.log(`and manage the team roster.\n`);
+  hive.constitution.cosCanManageAgents = true;
+  console.log(`  ✓ ${cosName} can manage agent definitions\n`);
+
+  // 2. Build & deploy
+  console.log(`── Build & deploy`);
+  if (!hasOtherAgents) {
+    console.log(`Without a DevOps agent, someone needs to rebuild and restart Hive`);
+    console.log(`after agent changes (e.g., adding a new agent).\n`);
+  }
+  hive.constitution.cosCanBuildDeploy = await confirm(
+    `Allow ${cosName} to build and redeploy Hive?`,
+    true,
+  );
+  if (hive.constitution.cosCanBuildDeploy) {
+    console.log(`  ✓ ${cosName} can run deploy.sh, npm run build, and restart the service`);
+  } else {
+    console.log(`  ✗ Only ${ownerName} can build and deploy — ${cosName} will ask you`);
+  }
+
+  // 3. External communications
+  console.log(`\n── External communications (email, SMS)`);
+  console.log(`By default, all customer-facing messages require your approval.\n`);
+  hive.constitution.cosCanContactExternal = await confirm(
+    `Allow ${cosName} to send emails/SMS without per-message approval?`,
+    false,
+  );
+  if (hive.constitution.cosCanContactExternal) {
+    console.log(`  ✓ ${cosName} can send external messages autonomously`);
+    console.log(`    (sensitive topics still escalate to ${ownerName})`);
+  } else {
+    console.log(`  ✗ ${cosName} will draft messages and ask ${ownerName} to approve`);
+  }
+
+  // 4. Source code
+  console.log(`\n── Source code (Hive repository)`);
+  console.log(`This is about modifying Hive's actual code — not agent configs.\n`);
+  hive.constitution.cosCanEditSourceCode = await confirm(
+    `Allow ${cosName} to modify Hive source code?`,
+    false,
+  );
+  if (hive.constitution.cosCanEditSourceCode) {
+    console.log(`  ✓ ${cosName} can edit source code (use with caution)`);
+  } else {
+    console.log(`  ✗ Source code changes require ${ownerName} (or a future dev agent)`);
+  }
+
+  // 5. Break glass
+  console.log(`\n── Emergency access`);
+  console.log(`If Hive goes down and you're unreachable, should ${cosName} be able`);
+  console.log(`to take minimum action to restore service?\n`);
+  hive.constitution.cosBreakGlass = await confirm(
+    `Grant ${cosName} emergency break-glass access?`,
+    true,
+  );
+  if (hive.constitution.cosBreakGlass) {
+    console.log(`  ✓ ${cosName} can restart services in emergencies (logged, ${ownerName} notified)`);
+  } else {
+    console.log(`  ✗ ${cosName} must wait for ${ownerName} even in emergencies`);
+  }
+
+  // Summary
+  console.log("\n── Summary ─────────────────────────────────────");
+  console.log(`  Agent management:       ✓ yes`);
+  console.log(`  Build & deploy:         ${hive.constitution.cosCanBuildDeploy ? "✓ yes" : "✗ no"}`);
+  console.log(`  External communications: ${hive.constitution.cosCanContactExternal ? "✓ yes" : "✗ no"}`);
+  console.log(`  Source code:            ${hive.constitution.cosCanEditSourceCode ? "✓ yes" : "✗ no"}`);
+  console.log(`  Break glass:            ${hive.constitution.cosBreakGlass ? "✓ yes" : "✗ no"}`);
+
+  saveHiveYaml(hive);
+  console.log("\n  ✓ Constitution preferences saved (hive.yaml)");
 }
 
 async function doMemory(hive: Record<string, any>) {
