@@ -319,12 +319,10 @@ async function main() {
   // ── 8. Service ────────────────────────────────────────────────────
   section("Service");
 
-  const installService = await confirm("Install Hive as a system service (starts on boot)?");
+  const installService = await confirm("Install Hive as a LaunchAgent (starts on login)?");
   if (installService) {
     try {
-      execSync("npx tsx setup/generate-plist.ts", { cwd: ROOT, stdio: "inherit" });
       execSync("bash service/install.sh", { cwd: ROOT, stdio: "inherit" });
-      console.log("  ✓ Service installed");
     } catch {
       console.log("  ⚠ Service installation failed — you can run manually with 'npm start'");
     }
@@ -339,7 +337,7 @@ async function main() {
   console.log("Quick reference:");
   console.log("  Start:    npm start");
   console.log("  Dev mode: npm run dev");
-  console.log("  Logs:     tail -f logs/stdout.log");
+  console.log("  Logs:     tail -f logs/hive.log");
   console.log("  Update:   npm run update");
   console.log("");
   console.log("Your chief-of-staff agent is in agents/chief-of-staff/.");
