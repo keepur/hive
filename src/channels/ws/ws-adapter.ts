@@ -97,6 +97,54 @@ export class WsAdapter implements ChannelAdapter {
         return;
       }
 
+      // --- Device self-service (requires device JWT) ---
+
+      // PUT /me — update own name (authenticated device)
+      if (req.method === "PUT" && url.pathname === "/me") {
+        try {
+          const device = await this.verifyDeviceToken(req);
+          if (!device) { res.writeHead(401); res.end("Unauthorized"); return; }
+
+          const body = await readBody(req);
+          const parsed = JSON.parse(body) as { name?: string };
+          const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
+          if (!name) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Missing required field: name" }));
+            return;
+          }
+
+          const updated = await this.deviceRegistry.updateDevice(device._id, { name });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ deviceId: device._id, name: updated?.name ?? name }));
+        } catch (err) {
+          log.error("PUT /me error", { error: String(err) });
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+        return;
+      }
+
+      // GET /me — get own device info (authenticated device)
+      if (req.method === "GET" && url.pathname === "/me") {
+        try {
+          const device = await this.verifyDeviceToken(req);
+          if (!device) { res.writeHead(401); res.end("Unauthorized"); return; }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            deviceId: device._id,
+            name: device.name,
+            defaultAgentId: device.defaultAgentId,
+          }));
+        } catch (err) {
+          log.error("GET /me error", { error: String(err) });
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+        return;
+      }
+
       // --- Admin API (requires Bearer <adminSecret>) ---
       const isAdmin = this.verifyAdmin(req);
 
@@ -447,6 +495,13 @@ export class WsAdapter implements ChannelAdapter {
   /** Number of currently connected devices */
   get connectionCount(): number {
     return this.connections.size;
+  }
+
+  private async verifyDeviceToken(req: IncomingMessage): Promise<Device | null> {
+    const auth = req.headers.authorization;
+    const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) return null;
+    return this.deviceRegistry.verifyToken(token);
   }
 
   private verifyAdmin(req: IncomingMessage): boolean {
