@@ -306,6 +306,23 @@ export class AgentRunner {
       };
     }
 
+    // Dodi Ops — dodi_v2 REST API (jobs, comments, attachments, cutlists)
+    // Reuses same API URL and per-agent keys as task ledger (same dodi_v2 backend)
+    if (config.taskLedger.apiUrl && taskKey) {
+      const dodiOpsMode = this.agentConfig.dodiOpsMode ?? "full";
+      servers["dodi-ops"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/dodi-ops/dodi-ops-mcp-server.js")],
+        env: {
+          DODI_OPS_API_URL: config.taskLedger.apiUrl,
+          DODI_OPS_API_KEY: taskKey,
+          DODI_OPS_MODE: dodiOpsMode,
+          DODI_OPS_AGENT_ID: this.agentConfig.id,
+        },
+      };
+    }
+
     // Permits — read-only access to permit pipeline data
     servers["permits"] = {
       type: "stdio",
