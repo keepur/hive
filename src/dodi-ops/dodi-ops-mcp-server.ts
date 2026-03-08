@@ -3,9 +3,12 @@
  * Dodi Ops MCP Server
  *
  * Provides Hive agents with access to the dodi_v2 REST API:
+ * - Persons: search, detail, CRUD
+ * - Projects: list, detail, CRUD, person management
+ * - Designs: list, detail, BOM, create
  * - Jobs: CRUD + lifecycle (state transitions, link design/order, refresh)
  * - Comments: CRUD on any entity
- * - Attachments: list, detail, download URL (upload TBD)
+ * - Attachments: list, detail, download URL
  * - Cutlists: list, detail, parts
  *
  * Env vars:
@@ -70,6 +73,271 @@ function ok(data: unknown): { content: { type: "text"; text: string }[] } {
 
 function err(e: unknown): { content: { type: "text"; text: string }[]; isError: true } {
   return { content: [{ type: "text", text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+}
+
+// ---------------------------------------------------------------------------
+// Persons — Read
+// ---------------------------------------------------------------------------
+
+server.registerTool("dodi_persons_search", {
+  title: "Search Persons",
+  description: "Search for persons (customers, contacts) by email, phone, or name.",
+  inputSchema: {
+    email: z.string().optional().describe("Search by email address"),
+    phone: z.string().optional().describe("Search by phone number"),
+    name: z.string().optional().describe("Search by name (partial match)"),
+    limit: z.number().optional().default(20).describe("Max results"),
+    skip: z.number().optional().default(0).describe("Offset for pagination"),
+  },
+}, async (input) => {
+  try {
+    const params = new URLSearchParams();
+    if (input.email) params.set("email", input.email);
+    if (input.phone) params.set("phone", input.phone);
+    if (input.name) params.set("name", input.name);
+    if (input.limit) params.set("limit", String(input.limit));
+    if (input.skip) params.set("skip", String(input.skip));
+    return ok(await api("GET", `/persons?${params.toString()}`));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("dodi_persons_get", {
+  title: "Get Person Detail",
+  description: "Get full details for a person by ID.",
+  inputSchema: {
+    personId: z.string().describe("Person ID"),
+  },
+}, async ({ personId }) => {
+  try { return ok(await api("GET", `/persons/${personId}`)); }
+  catch (e) { return err(e); }
+});
+
+server.registerTool("dodi_persons_projects", {
+  title: "List Person's Projects",
+  description: "Get all projects associated with a person.",
+  inputSchema: {
+    personId: z.string().describe("Person ID"),
+  },
+}, async ({ personId }) => {
+  try { return ok(await api("GET", `/persons/${personId}/projects`)); }
+  catch (e) { return err(e); }
+});
+
+// ---------------------------------------------------------------------------
+// Persons — Write (full mode only)
+// ---------------------------------------------------------------------------
+
+if (MODE === "full") {
+  server.registerTool("dodi_persons_create", {
+    title: "Find or Create Person",
+    description: "Find an existing person by email/phone or create a new one. Returns the person record either way.",
+    inputSchema: {
+      firstName: z.string().describe("First name"),
+      lastName: z.string().optional().describe("Last name"),
+      email: z.string().optional().describe("Email address"),
+      phone: z.object({
+        number: z.string().describe("Phone number"),
+      }).optional().describe("Phone number"),
+      company: z.string().optional().describe("Company name"),
+    },
+  }, async (input) => {
+    try { return ok(await api("POST", "/persons", input)); }
+    catch (e) { return err(e); }
+  });
+
+  server.registerTool("dodi_persons_update", {
+    title: "Update Person",
+    description: "Update a person's details (name, email, phone).",
+    inputSchema: {
+      personId: z.string().describe("Person ID to update"),
+      firstName: z.string().optional().describe("First name"),
+      lastName: z.string().optional().describe("Last name"),
+      email: z.string().optional().describe("Email address"),
+      phone: z.object({
+        number: z.string().describe("Phone number"),
+      }).optional().describe("Phone number"),
+    },
+  }, async ({ personId, ...body }) => {
+    try { return ok(await api("PUT", `/persons/${personId}`, body)); }
+    catch (e) { return err(e); }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Projects — Read
+// ---------------------------------------------------------------------------
+
+server.registerTool("dodi_projects_list", {
+  title: "List Projects",
+  description: "List projects with optional filters by state, search, or customer.",
+  inputSchema: {
+    state: z.string().optional().describe("Filter by project state"),
+    search: z.string().optional().describe("Search by name"),
+    limit: z.number().optional().default(20).describe("Max results"),
+    skip: z.number().optional().default(0).describe("Offset for pagination"),
+  },
+}, async (input) => {
+  try {
+    const params = new URLSearchParams();
+    if (input.state) params.set("state", input.state);
+    if (input.search) params.set("search", input.search);
+    if (input.limit) params.set("limit", String(input.limit));
+    if (input.skip) params.set("skip", String(input.skip));
+    const qs = params.toString();
+    return ok(await api("GET", `/projects${qs ? `?${qs}` : ""}`));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("dodi_projects_get", {
+  title: "Get Project Detail",
+  description: "Get full project details including related data (designs, quotes, orders, jobs, cases).",
+  inputSchema: {
+    projectId: z.string().describe("Project ID"),
+  },
+}, async ({ projectId }) => {
+  try { return ok(await api("GET", `/projects/${projectId}`)); }
+  catch (e) { return err(e); }
+});
+
+// ---------------------------------------------------------------------------
+// Projects — Write (full mode only)
+// ---------------------------------------------------------------------------
+
+if (MODE === "full") {
+  server.registerTool("dodi_projects_create", {
+    title: "Create Project",
+    description: "Create a new project.",
+    inputSchema: {
+      name: z.string().describe("Project name"),
+      description: z.string().optional().describe("Project description"),
+      address: z.object({
+        street: z.string().optional(),
+        city: z.string().optional(),
+        state: z.string().optional(),
+        zip: z.string().optional(),
+        country: z.string().optional(),
+      }).optional().describe("Project address"),
+      projectType: z.enum(["Remodel", "New Construction"]).optional().describe("Project type"),
+    },
+  }, async (input) => {
+    try { return ok(await api("POST", "/projects", input)); }
+    catch (e) { return err(e); }
+  });
+
+  server.registerTool("dodi_projects_update", {
+    title: "Update Project",
+    description: "Update project fields (name, description, address, state).",
+    inputSchema: {
+      projectId: z.string().describe("Project ID to update"),
+      name: z.string().optional().describe("New name"),
+      description: z.string().optional().describe("New description"),
+      state: z.string().optional().describe("New state"),
+      address: z.object({
+        street: z.string().optional(),
+        city: z.string().optional(),
+        state: z.string().optional(),
+        zip: z.string().optional(),
+        country: z.string().optional(),
+      }).optional().describe("Updated address"),
+    },
+  }, async ({ projectId, ...body }) => {
+    try { return ok(await api("PUT", `/projects/${projectId}`, body)); }
+    catch (e) { return err(e); }
+  });
+
+  server.registerTool("dodi_projects_add_person", {
+    title: "Add Person to Project",
+    description: "Add a person to a project. Either provide an existing personId or a person object to find/create.",
+    inputSchema: {
+      projectId: z.string().describe("Project ID"),
+      personId: z.string().optional().describe("Existing person ID to add"),
+      person: z.object({
+        firstName: z.string().describe("First name"),
+        lastName: z.string().optional().describe("Last name"),
+        email: z.string().optional().describe("Email"),
+        phone: z.object({ number: z.string() }).optional().describe("Phone"),
+      }).optional().describe("Person details (will find-or-create)"),
+      role: z.string().optional().describe("Person's role on the project"),
+    },
+  }, async ({ projectId, ...body }) => {
+    try { return ok(await api("POST", `/projects/${projectId}/persons`, body)); }
+    catch (e) { return err(e); }
+  });
+
+  server.registerTool("dodi_projects_remove_person", {
+    title: "Remove Person from Project",
+    description: "Remove a person from a project.",
+    inputSchema: {
+      projectId: z.string().describe("Project ID"),
+      personId: z.string().describe("Person ID to remove"),
+    },
+  }, async ({ projectId, personId }) => {
+    try { return ok(await api("DELETE", `/projects/${projectId}/persons/${personId}`)); }
+    catch (e) { return err(e); }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Designs — Read
+// ---------------------------------------------------------------------------
+
+server.registerTool("dodi_designs_list", {
+  title: "List Designs",
+  description: "List designs for a project.",
+  inputSchema: {
+    projectId: z.string().describe("Project ID to list designs for"),
+  },
+}, async ({ projectId }) => {
+  try { return ok(await api("GET", `/designs?projectId=${projectId}`)); }
+  catch (e) { return err(e); }
+});
+
+server.registerTool("dodi_designs_get", {
+  title: "Get Design Detail",
+  description: "Get full details for a design.",
+  inputSchema: {
+    designId: z.string().describe("Design ID"),
+  },
+}, async ({ designId }) => {
+  try { return ok(await api("GET", `/designs/${designId}`)); }
+  catch (e) { return err(e); }
+});
+
+server.registerTool("dodi_designs_bom", {
+  title: "Get Design BOM",
+  description: "Get the Bill of Materials summary for a design.",
+  inputSchema: {
+    designId: z.string().describe("Design ID"),
+  },
+}, async ({ designId }) => {
+  try { return ok(await api("GET", `/designs/${designId}/bom`)); }
+  catch (e) { return err(e); }
+});
+
+// ---------------------------------------------------------------------------
+// Designs — Write (full mode only)
+// ---------------------------------------------------------------------------
+
+if (MODE === "full") {
+  server.registerTool("dodi_designs_create", {
+    title: "Create Design",
+    description: "Create a new design for a project.",
+    inputSchema: {
+      projectId: z.string().describe("Project ID"),
+      spec: z.object({
+        roomShape: z.string().optional().describe("Room shape"),
+        dimension: z.object({
+          x: z.number(), y: z.number(), z: z.number(),
+        }).optional().describe("Room dimensions"),
+        spaceType: z.enum(["kitchen", "bath", "laundry", "mud_room", "closet", "other"]).optional().describe("Space type"),
+        style: z.string().optional().describe("Design style"),
+      }).optional().describe("Design specification"),
+      generateLayout: z.boolean().optional().describe("Auto-generate layout from spec"),
+    },
+  }, async (input) => {
+    try { return ok(await api("POST", "/designs", input)); }
+    catch (e) { return err(e); }
+  });
 }
 
 // ---------------------------------------------------------------------------
