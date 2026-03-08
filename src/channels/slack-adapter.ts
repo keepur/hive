@@ -128,7 +128,7 @@ export class SlackAdapter implements ChannelAdapter {
     let text = result.error ? formatError(result.error) : formatResponse(result.text);
     if (agentConfig) {
       const avatar = agentConfig.icon ? `${agentConfig.icon} ` : "";
-      text = `${avatar}**${agentConfig.name}**: ${text}`;
+      text = `${avatar}*${agentConfig.name}*: ${text}`;
     }
 
     await this.gateway.postMessage(channel, text, replyThread);
