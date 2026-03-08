@@ -31,3 +31,4 @@ servers:
   - google-workspace
   - admin
   - callback
+  - dodi-ops

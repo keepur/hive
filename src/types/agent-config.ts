@@ -19,6 +19,7 @@ export interface AgentConfig {
   maxConcurrent?: number;  // Max concurrent threads. Default 3
   timeoutMs?: number;      // Response timeout in ms. Default 300000 (5 min)
   triageModel?: string;    // Override triage model. Default: config.triage.model
+  dodiOpsMode?: "full" | "readonly";  // Dodi Ops access level. Default: "full"
   soul: string;
   systemPrompt: string;
 }

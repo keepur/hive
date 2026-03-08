@@ -24,3 +24,4 @@ servers:
   - resend
   - quo
   - google-workspace
+  - dodi-ops
