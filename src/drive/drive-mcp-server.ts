@@ -113,25 +113,55 @@ server.registerTool("drive_download", {
     return { content: [{ type: "text", text: "Provide either file_id or a Google Drive URL." }], isError: true };
   }
 
+  // Google-native MIME types that need export instead of direct download
+  const EXPORT_MIME: Record<string, { ext: string; mime: string }> = {
+    "application/vnd.google-apps.document": { ext: ".txt", mime: "text/plain" },
+    "application/vnd.google-apps.spreadsheet": { ext: ".csv", mime: "text/csv" },
+    "application/vnd.google-apps.presentation": { ext: ".txt", mime: "text/plain" },
+  };
+
   try {
     // Get file metadata first
     const fields = JSON.stringify({ fileId: id, fields: "id,name,mimeType,size", supportsAllDrives: true });
     const info = gws(`drive files get --params '${fields}'`);
     const meta = JSON.parse(info);
-    const fileName = meta.name || `drive-${id}`;
+    const isGoogleNative = meta.mimeType in EXPORT_MIME;
+    const exportInfo = isGoogleNative ? EXPORT_MIME[meta.mimeType] : null;
+    const fileName = (meta.name || `drive-${id}`) + (exportInfo?.ext ?? "");
     const localPath = join(DOWNLOAD_DIR, fileName);
 
-    // Download the file content
-    const dlParams = JSON.stringify({ fileId: id, alt: "media", supportsAllDrives: true });
-    gws(`drive files get --params '${dlParams}' --output "${localPath}"`);
+    if (isGoogleNative) {
+      // Google Docs/Sheets/Slides must be exported, not downloaded with alt:media
+      const exportParams = JSON.stringify({ fileId: id, mimeType: exportInfo!.mime });
+      gws(`drive files export --params '${exportParams}' --output "${localPath}"`);
+    } else {
+      // Regular files: download with alt:media
+      const dlParams = JSON.stringify({ fileId: id, alt: "media", supportsAllDrives: true });
+      gws(`drive files get --params '${dlParams}' --output "${localPath}"`);
+    }
 
     if (!existsSync(localPath)) {
       return { content: [{ type: "text", text: `Download failed — file not saved.` }], isError: true };
     }
 
+    // For text-based exports, return the content directly so the agent can read it
+    if (isGoogleNative) {
+      const { readFileSync } = await import("node:fs");
+      const content = readFileSync(localPath, "utf-8");
+      const summary = [
+        `Google ${meta.mimeType.split(".").pop()} exported as ${exportInfo!.ext.slice(1)}`,
+        `  Name: ${meta.name}`,
+        `  Local path: ${localPath}`,
+        ``,
+        `--- Content ---`,
+        content,
+      ].join("\n");
+      return { content: [{ type: "text", text: summary }] };
+    }
+
     const summary = [
       `Downloaded from Google Drive`,
-      `  Name: ${fileName}`,
+      `  Name: ${meta.name || fileName}`,
       `  Type: ${meta.mimeType || "unknown"}`,
       `  Local path: ${localPath}`,
     ].join("\n");

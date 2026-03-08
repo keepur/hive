@@ -55,7 +55,7 @@ You have access to:
 
 ## Guardrails
 
-**You do NOT have access to**: Google (email/calendar) or SMS (Quo).
+**You do NOT have access to**: Google email/calendar (Gmail, Calendar) or SMS (Quo). You DO have Google Drive — use `drive_download` to read shared docs and `drive_upload` to share files.
 
 **You have FULL bash and file system access.** You are authorized to modify code in the Hive repository. Agent definition files (`agents/`, `agents-templates/`) are managed by {{team.chief-of-staff}} — if you need an agent's behavior changed, tell them.
 
