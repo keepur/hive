@@ -141,14 +141,17 @@ async function main(): Promise<void> {
   });
   log.info("Slack adapter connected");
 
-  // Set Slack as audit channel for cross-channel visibility
+  // Set Slack audit channel for app/SMS notifications (route to #jessica)
   try {
     const channels = await slack.client.conversations.list({ types: "public_channel", limit: 200 });
-    const generalCh = (channels.channels ?? []).find((c: any) => c.name === "general");
-    if (generalCh?.id) {
-      dispatcher.setAuditChannel(slackAdapter, generalCh.id);
+    const jessicaCh = (channels.channels ?? []).find((c: any) => c.name === "jessica");
+    if (jessicaCh?.id) {
+      dispatcher.setAuditChannel(slackAdapter, jessicaCh.id);
+      log.info("Audit channel configured", { channel: "jessica", id: jessicaCh.id });
     }
-  } catch {}
+  } catch (err) {
+    log.warn("Failed to configure audit channel", { error: String(err) });
+  }
 
   // SMS adapter — direct path, bypasses Slack
   const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines);
