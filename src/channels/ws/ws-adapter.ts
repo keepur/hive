@@ -20,6 +20,7 @@ export class WsAdapter implements ChannelAdapter {
   private server!: Server;
   private wss!: WebSocketServer;
   private connections = new Map<string, WebSocket>(); // deviceId -> ws
+  private pendingMessages = new Map<string, ServerMessage[]>(); // deviceId -> queued messages
   private onWorkItem!: (item: WorkItem) => void;
 
   constructor(port: number, deviceRegistry: DeviceRegistry) {
@@ -125,6 +126,16 @@ export class WsAdapter implements ChannelAdapter {
     this.wss.on("connection", (ws: WebSocket, _req: IncomingMessage, device: Device) => {
       const deviceId = device._id;
       log.info("Device connected", { deviceId, name: device.name });
+
+      // Drain any pending messages from before reconnect
+      const pending = this.pendingMessages.get(deviceId);
+      if (pending?.length) {
+        log.info("Draining pending messages", { deviceId, count: pending.length });
+        for (const msg of pending) {
+          this.send(ws, msg);
+        }
+        this.pendingMessages.delete(deviceId);
+      }
 
       // Close existing connection for this device (reconnect scenario)
       const existing = this.connections.get(deviceId);
@@ -238,23 +249,28 @@ export class WsAdapter implements ChannelAdapter {
       return;
     }
 
-    const ws = this.connections.get(deviceId);
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      log.warn("Device not connected, dropping message", { deviceId });
-      return;
-    }
-
     const text = result.error
       ? `Error: ${result.error}`
       : result.text;
 
-    this.send(ws, {
+    const msg: ServerMessage = {
       type: "message",
       text,
       agentId: result.agentId,
-      agentName: result.agentId, // TODO: resolve display name from agent registry
+      agentName: result.agentId,
       replyTo: result.workItem.id,
-    });
+    };
+
+    const ws = this.connections.get(deviceId);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      this.send(ws, msg);
+    } else {
+      // Buffer for delivery when device reconnects
+      log.info("Device not connected, buffering message", { deviceId });
+      const queue = this.pendingMessages.get(deviceId) ?? [];
+      queue.push(msg);
+      this.pendingMessages.set(deviceId, queue);
+    }
   }
 
   async onProcessingStart(item: WorkItem): Promise<void> {
