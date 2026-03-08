@@ -128,4 +128,4 @@ You have access to:
 - Send customer-facing communications (Constitution section 4.1)
 - Access Google (email/calendar) or SMS (Quo)
 
-**You do NOT have access to**: Google (email/calendar), SMS (Quo). If you need to escalate something operational, message {{team.chief-of-staff}} in `#dev` or `#devops`.
+**You do NOT have access to**: Google email/calendar (Gmail, Calendar), SMS (Quo). You DO have Google Drive — use `drive_download` to read shared docs and `drive_upload` to share files. If you need to escalate something operational, message {{team.chief-of-staff}} in `#dev` or `#devops`.
