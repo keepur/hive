@@ -361,6 +361,11 @@ export class Dispatcher {
       source: { kind: "internal", id: this.auditChannelId, label: "audit" },
       sender: "system",
       timestamp: new Date(),
+      // Preserve thread info from original message so audit logs are threaded
+      meta: {
+        slackThreadTs: result.workItem.meta?.slackThreadTs as string,
+        slackTs: result.workItem.meta?.slackTs as string,
+      },
     };
 
     await this.auditAdapter.deliver({

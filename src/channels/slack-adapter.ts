@@ -115,11 +115,8 @@ export class SlackAdapter implements ChannelAdapter {
     const threadTs = (result.workItem.meta?.slackThreadTs as string) ??
       (result.workItem.meta?.slackTs as string);
 
-    // Look up agent config for bot identity
+    // Look up agent config for signature
     const agentConfig = this.registry.get(result.agentId);
-    const identity = agentConfig
-      ? { name: agentConfig.name, icon: agentConfig.icon || undefined }
-      : undefined;
 
     // For integration/bot messages, don't thread the reply
     const isIntegrationMsg =
@@ -127,10 +124,14 @@ export class SlackAdapter implements ChannelAdapter {
       result.workItem.sender === "integration";
     const replyThread = isIntegrationMsg ? undefined : threadTs;
 
-    // Format text
-    const text = result.error ? formatError(result.error) : result.text;
+    // Format text with agent signature
+    let text = result.error ? formatError(result.error) : result.text;
+    if (agentConfig) {
+      const avatar = agentConfig.icon ? `${agentConfig.icon} ` : "";
+      text = `${avatar}**${agentConfig.name}**: ${text}`;
+    }
 
-    await this.gateway.postMessage(channel, text, replyThread, identity);
+    await this.gateway.postMessage(channel, text, replyThread);
   }
 
   async onProcessingStart(item: WorkItem): Promise<void> {
