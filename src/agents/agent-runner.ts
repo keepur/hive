@@ -368,9 +368,13 @@ export class AgentRunner {
     return servers;
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string): Promise<RunResult> {
+    const effectiveModel = modelOverride ?? this.agentConfig.model;
+
     log.info("Sending prompt to agent", {
       agent: this.agentConfig.id,
+      model: effectiveModel,
+      modelOverride: modelOverride ? true : false,
       resumeSession: sessionId ?? "new",
       promptLength: prompt.length,
       promptPreview: prompt.slice(0, 200),
@@ -383,7 +387,7 @@ export class AgentRunner {
     const q = query({
       prompt,
       options: {
-        model: this.agentConfig.model,
+        model: effectiveModel,
         systemPrompt,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
