@@ -3,7 +3,7 @@ import type { ChannelAdapter } from "./channel-adapter.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
 import type { SlackGateway } from "../slack/slack-gateway.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
-import { formatError } from "../slack/response-formatter.js";
+import { formatError, formatResponse } from "../slack/response-formatter.js";
 import type { WebClient } from "@slack/web-api";
 import type { SweepResult } from "../sweeper/sweeper.js";
 
@@ -125,7 +125,7 @@ export class SlackAdapter implements ChannelAdapter {
     const replyThread = isIntegrationMsg ? undefined : threadTs;
 
     // Format text with agent signature
-    let text = result.error ? formatError(result.error) : result.text;
+    let text = result.error ? formatError(result.error) : formatResponse(result.text);
     if (agentConfig) {
       const avatar = agentConfig.icon ? `${agentConfig.icon} ` : "";
       text = `${avatar}**${agentConfig.name}**: ${text}`;
