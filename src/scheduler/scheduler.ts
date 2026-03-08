@@ -16,6 +16,14 @@ interface CronJob {
   lastRun: Date | null;
 }
 
+interface ScheduleOverride {
+  agentId: string;
+  /** null = disabled, array = replacement schedule */
+  schedule: { cron: string; task: string }[] | null;
+  updatedAt: Date;
+  updatedBy: string;
+}
+
 interface CallbackDoc {
   agentId: string;
   dueAt: Date;
@@ -43,7 +51,9 @@ export class Scheduler {
   private registry: AgentRegistry;
   private cronJobs: CronJob[] = [];
   private mongoClient: MongoClient | null = null;
+  private db: Db | null = null;
   private callbackCollection: Collection<CallbackDoc> | null = null;
+  private scheduleOverrides: Collection<ScheduleOverride> | null = null;
   private onDispatch?: (item: WorkItem) => void;
 
   constructor(
@@ -75,11 +85,60 @@ export class Scheduler {
   async connectDb(uri: string, dbName: string): Promise<void> {
     this.mongoClient = new MongoClient(uri);
     await this.mongoClient.connect();
-    const db = this.mongoClient.db(dbName);
-    this.callbackCollection = db.collection<CallbackDoc>("agent_callbacks");
-    // Index for efficient polling
+    this.db = this.mongoClient.db(dbName);
+    this.callbackCollection = this.db.collection<CallbackDoc>("agent_callbacks");
+    this.scheduleOverrides = this.db.collection<ScheduleOverride>("schedule_overrides");
+    // Indexes
     await this.callbackCollection.createIndex({ status: 1, dueAt: 1 });
+    await this.scheduleOverrides.createIndex({ agentId: 1 }, { unique: true });
+    // Apply overrides to cron jobs
+    await this.loadScheduleOverrides();
     log.info("Callback store connected", { db: dbName });
+  }
+
+  /** Reload cron jobs from agent configs + MongoDB overrides. Called on hot-reload. */
+  async reloadSchedules(): Promise<void> {
+    // Rebuild from YAML defaults
+    this.cronJobs = [];
+    for (const agent of this.registry.getAll()) {
+      for (const schedule of agent.schedule) {
+        this.cronJobs.push({
+          agentId: agent.id,
+          cron: schedule.cron,
+          task: schedule.task,
+          lastRun: null,
+        });
+      }
+    }
+    // Apply overrides
+    await this.loadScheduleOverrides();
+  }
+
+  private async loadScheduleOverrides(): Promise<void> {
+    if (!this.scheduleOverrides) return;
+    const docs = await this.scheduleOverrides.find().toArray();
+    if (docs.length === 0) return;
+
+    for (const doc of docs) {
+      // Remove all YAML-based jobs for this agent
+      this.cronJobs = this.cronJobs.filter((j) => j.agentId !== doc.agentId);
+
+      if (doc.schedule === null) {
+        // Disabled — no jobs for this agent
+        log.info("Schedule override: disabled", { agentId: doc.agentId });
+      } else {
+        // Replacement schedule
+        for (const s of doc.schedule) {
+          this.cronJobs.push({
+            agentId: doc.agentId,
+            cron: s.cron,
+            task: s.task,
+            lastRun: null,
+          });
+        }
+        log.info("Schedule override: replaced", { agentId: doc.agentId, jobs: doc.schedule.length });
+      }
+    }
   }
 
   start(): void {

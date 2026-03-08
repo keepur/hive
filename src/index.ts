@@ -115,6 +115,9 @@ async function main(): Promise<void> {
         agentManager.stopAgent(id);
       }
     }
+
+    // Reload schedule overrides
+    await scheduler.reloadSchedules();
   };
 
   // Watch agents/ directory for changes — debounced to 500ms
