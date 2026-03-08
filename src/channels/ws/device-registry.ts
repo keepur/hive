@@ -20,6 +20,7 @@ export interface Device {
   defaultAgentId: string;
   createdAt: Date;
   lastSeenAt: Date;
+  pairedAt?: Date;
   active: boolean;
 }
 
@@ -63,7 +64,7 @@ export class DeviceRegistry {
     return device;
   }
 
-  async verifyPairingCode(code: string): Promise<{ device: Device; token: string } | null> {
+  async verifyPairingCode(code: string, name?: string): Promise<{ device: Device; token: string } | null> {
     const device = await this.collection.findOne({
       pairingCode: code,
       pairingCodeExpiresAt: { $gt: new Date() },
@@ -74,17 +75,27 @@ export class DeviceRegistry {
       return null;
     }
 
-    // Clear the pairing code so it cannot be reused
+    const now = new Date();
+    const updates: Record<string, unknown> = { pairedAt: now };
+    if (name) updates.name = name;
+
+    // Clear the pairing code and set paired timestamp (+ optional name override)
     await this.collection.updateOne(
       { _id: device._id },
-      { $unset: { pairingCode: "", pairingCodeExpiresAt: "" } },
+      { $set: updates, $unset: { pairingCode: "", pairingCodeExpiresAt: "" } },
     );
 
+    const finalName = name ?? device.name;
     const token = jwt.sign({ deviceId: device._id }, this.jwtSecret, { expiresIn: "90d" });
-    log.info("Device paired", { id: device._id, name: device.name });
+    log.info("Device paired", { id: device._id, name: finalName });
 
-    // Return the device without the pairing fields
-    const paired: Device = { ...device, pairingCode: undefined, pairingCodeExpiresAt: undefined };
+    const paired: Device = {
+      ...device,
+      name: finalName,
+      pairedAt: now,
+      pairingCode: undefined,
+      pairingCodeExpiresAt: undefined,
+    };
     return { device: paired, token };
   }
 
@@ -119,6 +130,32 @@ export class DeviceRegistry {
       { _id: deviceId },
       { $set: { lastSeenAt: new Date() } },
     );
+  }
+
+  async getDevice(deviceId: string): Promise<Device | null> {
+    return this.collection.findOne({ _id: deviceId });
+  }
+
+  async updateDevice(deviceId: string, fields: { name?: string; defaultAgentId?: string }): Promise<Device | null> {
+    const result = await this.collection.findOneAndUpdate(
+      { _id: deviceId },
+      { $set: fields },
+      { returnDocument: "after" },
+    );
+    if (result) log.info("Device updated", { deviceId, ...fields });
+    return result;
+  }
+
+  async deactivateDevice(deviceId: string): Promise<boolean> {
+    const result = await this.collection.updateOne(
+      { _id: deviceId },
+      { $set: { active: false } },
+    );
+    if (result.modifiedCount > 0) {
+      log.info("Device deactivated", { deviceId });
+      return true;
+    }
+    return false;
   }
 
   async listDevices(): Promise<Device[]> {

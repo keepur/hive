@@ -177,7 +177,7 @@ async function main(): Promise<void> {
     const deviceRegistry = new DeviceRegistry(config.mongo.uri, config.mongo.dbName, config.ws.jwtSecret);
     await deviceRegistry.connect();
 
-    wsAdapter = new WsAdapter(config.ws.port, deviceRegistry);
+    wsAdapter = new WsAdapter(config.ws.port, deviceRegistry, config.ws.jwtSecret);
     dispatcher.registerAdapter(wsAdapter);
     await wsAdapter.start((item) => {
       dispatcher.dispatch(item).catch((err) => {
