@@ -148,6 +148,11 @@ export const config = {
     timeoutMs: parseInt(optional("TRIAGE_TIMEOUT_MS", "10000"), 10),
     enabled: optional("TRIAGE_ENABLED", "true") === "true",
   },
+  modelRouter: {
+    enabled: optional("MODEL_ROUTER_ENABLED", "true") === "true",
+    model: optional("MODEL_ROUTER_MODEL", "claude-haiku-4-5-20251001"),
+    timeoutMs: parseInt(optional("MODEL_ROUTER_TIMEOUT_MS", "8000"), 10),
+  },
   sweeper: {
     intervalMs: parseInt(optional("SWEEPER_INTERVAL_MS", "300000"), 10),
     threadTtlMs: parseInt(optional("SWEEPER_THREAD_TTL_MS", "86400000"), 10),

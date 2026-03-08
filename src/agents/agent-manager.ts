@@ -7,6 +7,8 @@ import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import { formatFilesForPrompt } from "../files/file-processor.js";
+import { routeModel } from "./model-router.js";
+import { config as appConfig } from "../config.js";
 
 const log = createLogger("agent-manager");
 
@@ -136,7 +138,24 @@ export class AgentManager {
           prompt += formatFilesForPrompt(item.message.files);
         }
 
-        const result = await runner.send(prompt, existingSession, item.onStream, bgContext);
+        // Model routing — classify complexity and pick the right model tier
+        let modelOverride: string | undefined;
+        let routerCostUsd = 0;
+        if (appConfig.modelRouter.enabled && item.message.sender !== "system") {
+          try {
+            const agentConfig = this.registry.get(agentId);
+            if (agentConfig) {
+              const route = await routeModel(item.message.text, agentConfig.model);
+              modelOverride = route.model !== agentConfig.model ? route.model : undefined;
+              routerCostUsd = route.costUsd;
+            }
+          } catch (err) {
+            log.warn("Model router failed, using default", { agentId, error: String(err) });
+          }
+        }
+
+        const result = await runner.send(prompt, existingSession, item.onStream, bgContext, modelOverride);
+        result.costUsd += routerCostUsd;
 
         if (result.sessionId && !result.aborted) {
           this.sessionStore.set(agentId, threadId, result.sessionId);
