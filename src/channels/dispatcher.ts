@@ -131,7 +131,7 @@ export class Dispatcher {
     const agentConfig = this.registry.get(agentId);
 
     // 4. Triage gate — fast Haiku response for interactive channels (skip for system/scheduled)
-    const isInteractive = (item.source.kind === "slack" || item.source.kind === "sms" || item.source.kind === "app") && item.sender !== "system";
+    const isInteractive = (item.source.kind === "slack" || item.source.kind === "sms") && item.sender !== "system";
     let processingStarted = false;
     if (isInteractive && config.triage.enabled && agentConfig) {
       await adapter?.onProcessingStart?.(item);
