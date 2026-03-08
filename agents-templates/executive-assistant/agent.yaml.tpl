@@ -8,11 +8,7 @@ keywords: []
 isDefault: false
 budgetUsd: 50
 maxTurns: 25
-schedule:
-  - cron: "*/30 * * * *"
-    task: check-slack-dms
-  - cron: "0 * * * *"
-    task: check-gmail-inbox
+schedule: []
 servers:
   - memory
   - google
