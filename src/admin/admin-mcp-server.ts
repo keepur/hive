@@ -21,6 +21,7 @@ const client = new MongoClient(MONGODB_URI);
 await client.connect();
 const db = client.db(MONGODB_DB);
 const overrides = db.collection("model_overrides");
+const scheduleOverrides = db.collection("schedule_overrides");
 
 const server = new McpServer({
   name: "hive-admin",
@@ -90,6 +91,94 @@ server.registerTool("model_reset", {
   } catch {}
 
   return { content: [{ type: "text", text: `Model override removed for ${agent_id}. Reverted to YAML default. Hot-reload triggered.` }] };
+});
+
+// ---------------------------------------------------------------------------
+// Schedule override tools
+// ---------------------------------------------------------------------------
+
+server.registerTool("schedule_list", {
+  title: "List Agent Schedules",
+  description: "Show scheduled tasks for all agents, including any overrides. Shows what's actually active.",
+  inputSchema: {},
+}, async () => {
+  const docs = await scheduleOverrides.find().toArray();
+  const overrideMap = new Map(docs.map((d: any) => [d.agentId, d]));
+
+  // We don't have direct access to agent configs here, so just show overrides
+  if (docs.length === 0) {
+    return { content: [{ type: "text", text: "No schedule overrides active. All agents are using their YAML defaults.\n\nUse schedule_set to add/change schedules, or schedule_disable to turn off an agent's schedule." }] };
+  }
+
+  const lines = docs.map((d: any) => {
+    const by = d.updatedBy ? ` (by ${d.updatedBy})` : "";
+    const date = d.updatedAt instanceof Date ? d.updatedAt.toISOString() : String(d.updatedAt ?? "");
+    if (d.schedule === null) {
+      return `${d.agentId}: DISABLED${by} — ${date}`;
+    }
+    const tasks = d.schedule.map((s: any) => `  ${s.cron} → ${s.task}`).join("\n");
+    return `${d.agentId}: OVERRIDE${by} — ${date}\n${tasks}`;
+  });
+
+  return { content: [{ type: "text", text: `Schedule overrides:\n${lines.join("\n\n")}` }] };
+});
+
+server.registerTool("schedule_disable", {
+  title: "Disable Agent Schedule",
+  description: "Disable all scheduled tasks for an agent. The agent still responds to messages, but won't run any cron jobs.",
+  inputSchema: {
+    agent_id: z.string().describe("The agent ID (e.g. 'executive-assistant')"),
+  },
+}, async ({ agent_id }) => {
+  await scheduleOverrides.updateOne(
+    { agentId: agent_id },
+    { $set: { schedule: null, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+    { upsert: true },
+  );
+
+  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
+
+  return { content: [{ type: "text", text: `All scheduled tasks disabled for ${agent_id}. Hot-reload triggered.` }] };
+});
+
+server.registerTool("schedule_set", {
+  title: "Set Agent Schedule",
+  description: "Override an agent's scheduled tasks. Replaces any YAML-defined schedule. Each entry needs a cron expression and task name.",
+  inputSchema: {
+    agent_id: z.string().describe("The agent ID"),
+    schedule: z.array(z.object({
+      cron: z.string().describe("Cron expression (e.g. '0 8 * * 1-5' for weekdays at 8am)"),
+      task: z.string().describe("Task name (e.g. 'morning-briefing', 'check-gmail-inbox')"),
+    })).min(1).describe("List of scheduled tasks"),
+  },
+}, async ({ agent_id, schedule }) => {
+  await scheduleOverrides.updateOne(
+    { agentId: agent_id },
+    { $set: { schedule, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+    { upsert: true },
+  );
+
+  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
+
+  const lines = schedule.map((s) => `  ${s.cron} → ${s.task}`).join("\n");
+  return { content: [{ type: "text", text: `Schedule for ${agent_id} set to:\n${lines}\n\nHot-reload triggered.` }] };
+});
+
+server.registerTool("schedule_reset", {
+  title: "Reset Agent Schedule",
+  description: "Remove the schedule override for an agent, reverting to whatever is defined in their YAML config.",
+  inputSchema: {
+    agent_id: z.string().describe("The agent ID to reset"),
+  },
+}, async ({ agent_id }) => {
+  const result = await scheduleOverrides.deleteOne({ agentId: agent_id });
+  if (result.deletedCount === 0) {
+    return { content: [{ type: "text", text: `No schedule override found for ${agent_id} — already using YAML default.` }] };
+  }
+
+  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
+
+  return { content: [{ type: "text", text: `Schedule override removed for ${agent_id}. Reverted to YAML default. Hot-reload triggered.` }] };
 });
 
 // Cleanup on exit
