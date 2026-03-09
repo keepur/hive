@@ -234,8 +234,12 @@ export class AgentRegistry {
   }
 
   findByName(text: string): AgentConfig | undefined {
-    const lower = text.toLowerCase();
-    return this.getAll().find((a) => {
+    return this.findAllByName(text)[0];
+  }
+
+  /** Return ALL agents whose names are mentioned in the text */
+  findAllByName(text: string): AgentConfig[] {
+    return this.getAll().filter((a) => {
       const name = a.name.toLowerCase();
       // Match "hey River", "River,", "@River", or just "River" at word boundaries
       const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
