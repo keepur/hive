@@ -105,8 +105,8 @@ export class Dispatcher {
     }
 
     // 2. Resolve agent
-    const agentId = await this.resolveAgent(item);
-    if (!agentId) {
+    const resolved = await this.resolveAgent(item);
+    if (!resolved) {
       log.warn("No agent found for work item", {
         source: item.source.kind,
         label: item.source.label,
@@ -114,6 +114,7 @@ export class Dispatcher {
       });
       return;
     }
+    const { agentId, skipTriage } = resolved;
 
     const threadId = item.threadId ?? item.id;
     this.threadAgentMap.set(threadId, agentId);
@@ -133,7 +134,7 @@ export class Dispatcher {
     // 4. Triage gate — fast Haiku response for interactive channels (skip for system/scheduled)
     const isInteractive = (item.source.kind === "slack" || item.source.kind === "sms") && item.sender !== "system";
     let processingStarted = false;
-    if (isInteractive && config.triage.enabled && agentConfig) {
+    if (isInteractive && config.triage.enabled && agentConfig && !skipTriage) {
       await adapter?.onProcessingStart?.(item);
       processingStarted = true;
       try {
@@ -282,11 +283,11 @@ export class Dispatcher {
     }
   }
 
-  private async resolveAgent(item: WorkItem): Promise<string | null> {
+  private async resolveAgent(item: WorkItem): Promise<{ agentId: string; skipTriage: boolean } | null> {
     // 0. Explicit target — callbacks and internal routing specify exact agent
     const targetAgentId = item.meta?.targetAgentId as string | undefined;
     if (targetAgentId && this.registry.get(targetAgentId)) {
-      return targetAgentId;
+      return { agentId: targetAgentId, skipTriage: false };
     }
 
     // 1. Thread continuity — stay with the same agent within a thread
@@ -294,7 +295,7 @@ export class Dispatcher {
       const existing = this.threadAgentMap.get(item.threadId);
       if (existing) {
         this.threadAgentLastSeen.set(item.threadId, Date.now());
-        return existing;
+        return { agentId: existing, skipTriage: false };
       }
 
       // Fallback: check persisted sessions (survives restart)
@@ -302,29 +303,37 @@ export class Dispatcher {
       if (persisted && this.registry.get(persisted)) {
         this.threadAgentMap.set(item.threadId, persisted);
         this.threadAgentLastSeen.set(item.threadId, Date.now());
-        return persisted;
+        return { agentId: persisted, skipTriage: false };
       }
     }
 
     // 2. Channel mapping — dedicated channels always route to their owning agent
     //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
     const channelAgent = this.registry.findByChannel(item.source.label);
-    if (channelAgent) return channelAgent.id;
+    if (channelAgent) return { agentId: channelAgent.id, skipTriage: false };
 
     // 3. Name addressing — works in shared channels ("hey Jasper", "@Jasper", "Jasper, ...")
     const named = this.registry.findByName(item.text);
-    if (named) return named.id;
+    if (named) {
+      // In passive channels, skip triage — agent was explicitly summoned
+      const isPassive = named.passiveChannels.includes(item.source.label);
+      return { agentId: named.id, skipTriage: isPassive };
+    }
 
     // 4. Adapter-specific default (e.g. DMs to Jasper's bot → vp-engineering)
     const adapterDefault = item.meta?.defaultAgentId as string | undefined;
-    if (adapterDefault && this.registry.get(adapterDefault)) return adapterDefault;
+    if (adapterDefault && this.registry.get(adapterDefault)) return { agentId: adapterDefault, skipTriage: false };
 
     // 5. Keyword match
     const keyword = this.registry.findByKeyword(item.text);
-    if (keyword) return keyword.id;
+    if (keyword) return { agentId: keyword.id, skipTriage: false };
 
-    // 6. Global default
-    return this.defaultAgentId;
+    // 6. Global default — but not in passive channels (require explicit mention)
+    if (this.registry.isPassiveChannel(item.source.label)) {
+      log.debug("Passive channel, no agent mentioned — dropping", { channel: item.source.label });
+      return null;
+    }
+    return { agentId: this.defaultAgentId, skipTriage: false };
   }
 
   sweep(threadTtlMs: number): SweepResult {
