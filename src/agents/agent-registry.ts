@@ -118,6 +118,7 @@ export class AgentRegistry {
       name: (raw.name as string) || dirName,
       model,
       channels: (raw.channels as string[]) || [],
+      passiveChannels: (raw.passiveChannels as string[]) || [],
       keywords: (raw.keywords as string[]) || [],
       isDefault: (raw.isDefault as boolean) || false,
       schedule: (raw.schedule as AgentSchedule[]) || [],
@@ -149,6 +150,11 @@ export class AgentRegistry {
 
   findByChannel(channelName: string): AgentConfig | undefined {
     return this.getAll().find((a) => a.channels.includes(channelName));
+  }
+
+  /** Check if any agent has this channel as passive (listen but don't auto-route) */
+  isPassiveChannel(channelName: string): boolean {
+    return this.getAll().some((a) => a.passiveChannels.includes(channelName));
   }
 
   findByKeyword(text: string): AgentConfig | undefined {

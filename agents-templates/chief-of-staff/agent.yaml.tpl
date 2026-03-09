@@ -5,6 +5,8 @@ model: claude-sonnet-4-6
 channels:
   - agent-mokie
   - general
+passiveChannels:
+  - marketing
 keywords:
   - status
   - update
