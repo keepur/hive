@@ -7,6 +7,7 @@ channels:
   - general
 passiveChannels:
   - marketing
+  - biz
 keywords:
   - status
   - update

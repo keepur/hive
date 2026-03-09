@@ -4,6 +4,8 @@ icon: ":handshake:"
 model: claude-sonnet-4-6
 channels:
   - agent-jessica
+passiveChannels:
+  - biz
 keywords:
   - customer
   - client
