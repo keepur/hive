@@ -323,6 +323,19 @@ export class AgentRunner {
       };
     }
 
+    // Catalog — read-only access to dodi_v2 product catalog (parts, families, types)
+    if (config.taskLedger.apiUrl && taskKey) {
+      servers["catalog"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/catalog/catalog-mcp-server.js")],
+        env: {
+          CATALOG_API_URL: config.taskLedger.apiUrl,
+          CATALOG_API_KEY: taskKey,
+        },
+      };
+    }
+
     // Permits — read-only access to permit pipeline data
     servers["permits"] = {
       type: "stdio",
