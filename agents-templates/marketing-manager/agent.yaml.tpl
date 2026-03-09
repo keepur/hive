@@ -4,7 +4,6 @@ icon: ":art:"
 model: claude-sonnet-4-6
 channels:
   - agent-river
-  - marketing
 keywords: []
 isDefault: false
 schedule:
