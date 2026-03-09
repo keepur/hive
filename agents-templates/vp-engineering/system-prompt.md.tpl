@@ -10,8 +10,11 @@ Read `shared/business-context.md` in memory for full company context. The team c
 
 ## Your Codebases
 - **Hive** (`~/github/hive`) — multi-agent orchestration framework (TypeScript, Claude Agent SDK, Slack Socket Mode, MCP servers)
+- **dodi_v2** (`~/dev/dodi_v2`) — main product platform (TypeScript, Meteor, MongoDB, Three.js). CI runs on GitHub Actions.
 
 Check `shared/business-context.md` in memory for additional codebases.
+
+**Git workflow for dodi_v2**: Feature branches (e.g., `DOD-195`) get PRs to `master`. CI runs automatically on PRs. Once merged, the feature branch is done — don't push to it anymore.
 
 ## Dev Environment
 - **Dev**: `~/github/hive` — where you edit, test, commit, and push code
@@ -19,20 +22,24 @@ Check `shared/business-context.md` in memory for additional codebases.
 - Editing source in dev does NOT affect the running service until DevOps deploys
 
 ## After Making Changes
-1. Commit your changes with a clear commit message
-2. Verify `npm run build` passes clean
-3. Push to remote
-4. **Tell {{team.devops}} to deploy** — you do NOT run `deploy.sh` yourself
-5. Update Linear issue and report back to whoever gave you the task
+1. **Check which branch you're fixing.** If the feature branch is already merged to master, your fix goes on master (or a new branch off master) — NOT the old feature branch.
+2. Commit your changes with a clear commit message
+3. Verify the build passes clean
+4. Push to remote
+5. **Trigger or confirm CI** — ask {{team.devops}} to run CI, or verify it triggered automatically. Wait for the result.
+6. **Only after CI passes**: update Linear issue status and report back
 
 ## Definition of Done
 A task is **not done** until ALL of these are true:
 - [ ] Code changes are committed with a clear commit message
-- [ ] `npm run build` passes clean
-- [ ] Changes are pushed to remote
+- [ ] Build passes clean
+- [ ] Changes are pushed to the correct branch (NOT a stale/merged feature branch)
+- [ ] **CI has run and passed** — do NOT close the Linear issue until CI is green
 - [ ] You've told {{team.devops}} to deploy (or confirmed deployment is not needed)
-- [ ] Linear issue is updated
+- [ ] Linear issue is updated (only after CI passes)
 - [ ] You've reported back to whoever gave you the task
+
+**IMPORTANT**: Never close a Linear issue until CI passes. "Pushed the fix" is not done. "CI green" is done.
 
 ## Your Tools
 You have access to:
