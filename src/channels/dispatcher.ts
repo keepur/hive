@@ -104,9 +104,9 @@ export class Dispatcher {
       return;
     }
 
-    // 2. Resolve agent
-    const resolved = await this.resolveAgent(item);
-    if (!resolved) {
+    // 2. Resolve agent(s) — may fan out to multiple when several agents are named
+    const resolvedList = await this.resolveAgents(item);
+    if (resolvedList.length === 0) {
       log.warn("No agent found for work item", {
         source: item.source.kind,
         label: item.source.label,
@@ -114,7 +114,15 @@ export class Dispatcher {
       });
       return;
     }
-    const { agentId, skipTriage } = resolved;
+
+    // Fan-out: if multiple agents resolved, dispatch to each concurrently
+    if (resolvedList.length > 1) {
+      log.info("Multi-agent fan-out", { agents: resolvedList.map((r) => r.agentId) });
+      await Promise.all(resolvedList.map((r) => this.dispatchToAgent(item, r)));
+      return;
+    }
+
+    const { agentId, skipTriage } = resolvedList[0];
 
     const threadId = item.threadId ?? item.id;
     this.threadAgentMap.set(threadId, agentId);
@@ -283,11 +291,11 @@ export class Dispatcher {
     }
   }
 
-  private async resolveAgent(item: WorkItem): Promise<{ agentId: string; skipTriage: boolean } | null> {
+  private async resolveAgents(item: WorkItem): Promise<{ agentId: string; skipTriage: boolean }[]> {
     // 0. Explicit target — callbacks and internal routing specify exact agent
     const targetAgentId = item.meta?.targetAgentId as string | undefined;
     if (targetAgentId && this.registry.get(targetAgentId)) {
-      return { agentId: targetAgentId, skipTriage: false };
+      return [{ agentId: targetAgentId, skipTriage: false }];
     }
 
     // 1. Thread continuity — stay with the same agent within a thread
@@ -295,7 +303,7 @@ export class Dispatcher {
       const existing = this.threadAgentMap.get(item.threadId);
       if (existing) {
         this.threadAgentLastSeen.set(item.threadId, Date.now());
-        return { agentId: existing, skipTriage: false };
+        return [{ agentId: existing, skipTriage: false }];
       }
 
       // Fallback: check persisted sessions (survives restart)
@@ -303,37 +311,137 @@ export class Dispatcher {
       if (persisted && this.registry.get(persisted)) {
         this.threadAgentMap.set(item.threadId, persisted);
         this.threadAgentLastSeen.set(item.threadId, Date.now());
-        return { agentId: persisted, skipTriage: false };
+        return [{ agentId: persisted, skipTriage: false }];
       }
     }
 
     // 2. Channel mapping — dedicated channels always route to their owning agent
     //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
     const channelAgent = this.registry.findByChannel(item.source.label);
-    if (channelAgent) return { agentId: channelAgent.id, skipTriage: false };
+    if (channelAgent) return [{ agentId: channelAgent.id, skipTriage: false }];
 
     // 3. Name addressing — works in shared channels ("hey Jasper", "@Jasper", "Jasper, ...")
-    const named = this.registry.findByName(item.text);
-    if (named) {
-      // In passive channels, skip triage — agent was explicitly summoned
-      const isPassive = named.passiveChannels.includes(item.source.label);
-      return { agentId: named.id, skipTriage: isPassive };
+    //    May return multiple agents if several are mentioned in the same message
+    const allNamed = this.registry.findAllByName(item.text);
+    if (allNamed.length > 0) {
+      return allNamed.map((a) => ({
+        agentId: a.id,
+        skipTriage: a.passiveChannels.includes(item.source.label),
+      }));
     }
 
     // 4. Adapter-specific default (e.g. DMs to Jasper's bot → vp-engineering)
     const adapterDefault = item.meta?.defaultAgentId as string | undefined;
-    if (adapterDefault && this.registry.get(adapterDefault)) return { agentId: adapterDefault, skipTriage: false };
+    if (adapterDefault && this.registry.get(adapterDefault)) return [{ agentId: adapterDefault, skipTriage: false }];
 
     // 5. Keyword match
     const keyword = this.registry.findByKeyword(item.text);
-    if (keyword) return { agentId: keyword.id, skipTriage: false };
+    if (keyword) return [{ agentId: keyword.id, skipTriage: false }];
 
     // 6. Global default — but not in passive channels (require explicit mention)
     if (this.registry.isPassiveChannel(item.source.label)) {
       log.debug("Passive channel, no agent mentioned — dropping", { channel: item.source.label });
-      return null;
+      return [];
     }
-    return { agentId: this.defaultAgentId, skipTriage: false };
+    return [{ agentId: this.defaultAgentId, skipTriage: false }];
+  }
+
+  /** Dispatch a single work item to a single agent (used for fan-out) */
+  private async dispatchToAgent(item: WorkItem, resolved: { agentId: string; skipTriage: boolean }): Promise<void> {
+    const { agentId, skipTriage } = resolved;
+
+    const threadId = item.threadId ?? item.id;
+    // For fan-out, don't set thread affinity (would overwrite with last agent)
+
+    const tracked = this.taskLedger?.shouldTrack(item) ?? false;
+    if (tracked) {
+      this.taskLedger!.onDispatch(item, agentId).catch((err) =>
+        log.warn("Task ledger dispatch failed", { error: String(err) }),
+      );
+    }
+
+    const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
+    const agentConfig = this.registry.get(agentId);
+
+    const isInteractive = (item.source.kind === "slack" || item.source.kind === "sms") && item.sender !== "system";
+
+    // Skip triage for fan-out — go straight to full agent
+    if (isInteractive && config.triage.enabled && agentConfig && !skipTriage) {
+      try {
+        const triageResult = await triage(item.text, agentConfig, {
+          isThread: !!item.meta?.slackThreadTs,
+        });
+        if (triageResult.action === "done") {
+          const workResult: WorkResult = {
+            text: triageResult.response,
+            agentId,
+            workItem: item,
+            costUsd: triageResult.costUsd,
+            durationMs: triageResult.durationMs,
+          };
+          if (adapter) {
+            try { await adapter.deliver(workResult); } catch (err) {
+              this.retryQueue?.enqueue(workResult, adapter);
+            }
+          }
+          if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
+            await this.postAuditLog(workResult);
+          }
+          return;
+        }
+        // "continue" — no ack for fan-out, proceed to full agent
+      } catch (err) {
+        log.warn("Triage failed in fan-out, falling through to full agent", { agentId, error: String(err) });
+      }
+    }
+
+    try {
+      const runResult = await this.agentManager.sendMessage(agentId, item);
+      const trimmedText = runResult.text.trim();
+      const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
+
+      if (isNonResponse) {
+        log.info("Non-response suppressed (fan-out)", { agentId });
+      } else {
+        const workResult: WorkResult = {
+          text: runResult.text || "_No response._",
+          agentId,
+          workItem: item,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+          error: runResult.error,
+        };
+        if (adapter) {
+          try { await adapter.deliver(workResult); } catch (err) {
+            this.retryQueue?.enqueue(workResult, adapter);
+          }
+        }
+        if (tracked) {
+          this.taskLedger!.onComplete(workResult).catch((err) =>
+            log.warn("Task ledger complete failed", { error: String(err) }),
+          );
+        }
+        if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
+          await this.postAuditLog(workResult);
+        }
+        log.info("Fan-out dispatch complete", { agentId, costUsd: runResult.costUsd, durationMs: runResult.durationMs });
+      }
+    } catch (err) {
+      const errorResult: WorkResult = {
+        text: `Something went wrong: ${String(err)}`,
+        agentId,
+        workItem: item,
+        costUsd: 0,
+        durationMs: 0,
+        error: String(err),
+      };
+      if (adapter) {
+        try { await adapter.deliver(errorResult); } catch (deliverErr) {
+          this.retryQueue?.enqueue(errorResult, adapter);
+        }
+      }
+      log.error("Fan-out dispatch failed", { agentId, error: String(err) });
+    }
   }
 
   sweep(threadTtlMs: number): SweepResult {
