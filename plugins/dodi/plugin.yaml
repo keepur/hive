@@ -1,0 +1,34 @@
+name: dodi
+description: DodiHome cabinet manufacturing integrations
+mcp-servers:
+  hubspot-crm:
+    entry: mcp-servers/hubspot-crm/hubspot-crm-mcp-server.ts
+    env: [HUBSPOT_API_KEY]
+  dodi-ops:
+    entry: mcp-servers/dodi-ops/dodi-ops-mcp-server.ts
+    env: [TASK_LEDGER_API_URL, TASK_LEDGER_API_KEY]
+    env-map:
+      DODI_OPS_API_URL: TASK_LEDGER_API_URL
+      DODI_OPS_API_KEY: TASK_LEDGER_API_KEY
+    agent-env:
+      DODI_OPS_MODE: dodiOpsMode
+      DODI_OPS_AGENT_ID: id
+  catalog:
+    entry: mcp-servers/catalog/catalog-mcp-server.ts
+    env: [TASK_LEDGER_API_URL, TASK_LEDGER_API_KEY]
+    env-map:
+      CATALOG_API_URL: TASK_LEDGER_API_URL
+      CATALOG_API_KEY: TASK_LEDGER_API_KEY
+  permits:
+    entry: mcp-servers/permits/permit-mcp-server.ts
+    env: [PERMITS_MONGO_URI]
+agents-templates:
+  - sdr
+  - customer-success
+  - marketing-manager
+  - executive-assistant
+  - product-manager
+  - product-specialist
+  - vp-engineering
+  - devops
+  - production-support

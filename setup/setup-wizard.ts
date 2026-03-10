@@ -11,7 +11,7 @@
  */
 
 import { createInterface } from "node:readline";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
@@ -343,6 +343,44 @@ async function main() {
   saveEnv(env);
   saveHiveYaml(hive);
   console.log("\n  ✓ Configuration saved (.env + hive.yaml)");
+
+  // ── 4.5 Plugins ─────────────────────────────────────────────────
+  section("Plugins");
+
+  const pluginsDir = join(ROOT, "plugins");
+  if (existsSync(pluginsDir)) {
+    const available = readdirSync(pluginsDir).filter((d) => {
+      return existsSync(join(pluginsDir, d, "plugin.yaml"));
+    });
+
+    if (available.length > 0) {
+      console.log("Available plugins:\n");
+      for (const p of available) {
+        const manifest = parseYaml(readFileSync(join(pluginsDir, p, "plugin.yaml"), "utf-8"));
+        console.log(`  ${p} — ${manifest.description ?? "(no description)"}`);
+      }
+      console.log("");
+
+      const current = (hive.plugins ?? []).join(", ") || "none";
+      const selected = await ask(
+        "Which plugins to enable? (comma-separated, or 'none')",
+        current,
+      );
+      if (selected.toLowerCase() !== "none") {
+        hive.plugins = selected.split(",").map((s: string) => s.trim()).filter(Boolean);
+      } else {
+        hive.plugins = [];
+      }
+    } else {
+      console.log("No plugins found in plugins/ directory.");
+      hive.plugins = [];
+    }
+  } else {
+    console.log("No plugins/ directory found.");
+    hive.plugins = [];
+  }
+
+  saveHiveYaml(hive);
 
   // ── 5. Agent Setup ────────────────────────────────────────────────
   if (isAgentDone()) {

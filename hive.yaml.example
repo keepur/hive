@@ -30,3 +30,21 @@ business:
 #       id: "PNyyyyy"
 #       number: "(555) 987-6543"
 #       label: "Personal"
+
+# Plugins — enable business-specific integrations
+# plugins:
+#   - dodi  # DodiHome manufacturing integrations
+
+# Slack audit channel — receives app/SMS notifications
+# slack:
+#   auditChannel: jessica
+
+# Google Workspace
+# googleWorkspace:
+#   account: bot@yourdomain.com
+#   sharedFolder: your-shared-folder-id
+
+# Email (Resend)
+# resend:
+#   emailDomain: yourdomain.com
+#   businessName: Your Business

@@ -9,6 +9,8 @@ import type { SweepResult } from "../sweeper/sweeper.js";
 import { formatFilesForPrompt } from "../files/file-processor.js";
 import { routeModel } from "./model-router.js";
 import { config as appConfig } from "../config.js";
+import { loadPlugins } from "../plugins/plugin-loader.js";
+import type { LoadedPlugin } from "../plugins/types.js";
 
 const log = createLogger("agent-manager");
 
@@ -28,17 +30,19 @@ export class AgentManager {
   private registry: AgentRegistry;
   private memoryManager: MemoryManager;
   private sessionStore: SessionStore;
+  private plugins: LoadedPlugin[];
 
   constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
+    this.plugins = loadPlugins(appConfig.plugins, process.cwd());
   }
 
   private createRunner(agentId: string): AgentRunner {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
-    return new AgentRunner(config, this.memoryManager);
+    return new AgentRunner(config, this.memoryManager, this.plugins);
   }
 
   private ensureState(agentId: string): void {

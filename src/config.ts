@@ -49,6 +49,7 @@ export const config = {
     appToken: required("SLACK_APP_TOKEN"),
     botToken: required("SLACK_BOT_TOKEN"),
     mcpToken: optional("SLACK_MCP_TOKEN", ""),
+    auditChannel: optional("SLACK_AUDIT_CHANNEL", hive.slack?.auditChannel ?? ""),
   },
   slackJasper: {
     appToken: optional("SLACK_JASPER_APP_TOKEN", ""),
@@ -95,9 +96,9 @@ export const config = {
     account: optional("GOOGLE_ACCOUNT", ""),
   },
   googleWorkspace: {
-    account: optional("GWS_ACCOUNT", "bot@dodihome.com"),
+    account: optional("GWS_ACCOUNT", hive.googleWorkspace?.account ?? ""),
     gwsPath: optional("GWS_PATH", ""),
-    sharedFolder: optional("GWS_SHARED_FOLDER", "149-loWJnUWfJP6rEAsuFoYsI2pS1JjRM"),
+    sharedFolder: optional("GWS_SHARED_FOLDER", hive.googleWorkspace?.sharedFolder ?? ""),
   },
   quo: {
     apiKey: optional("QUO_API_KEY", ""),
@@ -112,7 +113,10 @@ export const config = {
     fromAddress: optional("RESEND_FROM_ADDRESS", ""),
     defaultCc: optional("RESEND_DEFAULT_CC", ""),
     hubspotBcc: optional("HUBSPOT_BCC_OUTGOING", ""),
+    emailDomain: optional("RESEND_EMAIL_DOMAIN", hive.resend?.emailDomain ?? ""),
+    businessName: optional("RESEND_BUSINESS_NAME", hive.resend?.businessName ?? ""),
   },
+  plugins: (hive.plugins ?? []) as string[],
   hubspot: {
     apiKey: optional("HUBSPOT_API_KEY", ""),
   },

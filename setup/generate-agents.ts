@@ -93,13 +93,37 @@ async function main() {
   let generated = 0;
   let skipped = 0;
 
-  // Get list of template agents
-  const agents = readdirSync(TEMPLATES_DIR).filter((d) =>
+  // Core templates
+  const coreAgents = readdirSync(TEMPLATES_DIR).filter((d) =>
     statSync(join(TEMPLATES_DIR, d)).isDirectory(),
   );
 
-  for (const agentId of agents) {
-    const templateDir = join(TEMPLATES_DIR, agentId);
+  // Plugin templates (from enabled plugins in hive.yaml)
+  const enabledPlugins: string[] = config.plugins ?? [];
+  const pluginAgents: Array<{ id: string; templateDir: string }> = [];
+
+  for (const pluginName of enabledPlugins) {
+    const pluginTemplatesDir = join(ROOT, "plugins", pluginName, "agents-templates");
+    if (!existsSync(pluginTemplatesDir)) continue;
+    const templates = readdirSync(pluginTemplatesDir).filter((d) =>
+      statSync(join(pluginTemplatesDir, d)).isDirectory(),
+    );
+    for (const t of templates) {
+      if (coreAgents.includes(t)) {
+        console.log(`  SKIP plugin/${pluginName}/${t} (conflicts with core template)`);
+        continue;
+      }
+      pluginAgents.push({ id: t, templateDir: join(pluginTemplatesDir, t) });
+    }
+  }
+
+  // Merge: core uses TEMPLATES_DIR, plugin uses own dir
+  const allAgents = [
+    ...coreAgents.map(id => ({ id, templateDir: join(TEMPLATES_DIR, id) })),
+    ...pluginAgents,
+  ];
+
+  for (const { id: agentId, templateDir } of allAgents) {
     const agentDir = join(AGENTS_DIR, agentId);
 
     if (!existsSync(agentDir)) {
