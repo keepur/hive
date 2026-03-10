@@ -4,6 +4,7 @@ import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import { config } from "../config.js";
+import type { LoadedPlugin } from "../plugins/types.js";
 
 const log = createLogger("agent-runner");
 
@@ -36,11 +37,13 @@ export interface RunResult {
 export class AgentRunner {
   private agentConfig: AgentConfig;
   private memoryManager: MemoryManager;
+  private plugins: LoadedPlugin[];
   private activeQuery: Query | null = null;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = []) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
+    this.plugins = plugins;
   }
 
   private async buildSystemPrompt(): Promise<string> {
@@ -126,7 +129,7 @@ export class AgentRunner {
       },
     };
 
-    // Google Workspace — Drive upload/download/list via gws CLI (bot@dodihome.com)
+    // Google Workspace — Drive upload/download/list via gws CLI
     servers["google-workspace"] = {
       type: "stdio",
       command: "node",
@@ -191,10 +194,14 @@ export class AgentRunner {
     }
 
     // Resend — email sending with HubSpot BCC logging
-    // Each agent sends from their own address: Name <name@dodihome.com>
+    // Each agent sends from their own address: Name <name@domain.com>
     if (config.resend.apiKey) {
       const agentName = this.agentConfig.name.toLowerCase();
-      const agentFromAddress = `${this.agentConfig.name} (DodiHome) <${agentName}@dodihome.com>`;
+      const emailDomain = config.resend.emailDomain;
+      const businessLabel = config.resend.businessName ? ` (${config.resend.businessName})` : "";
+      const agentFromAddress = emailDomain
+        ? `${this.agentConfig.name}${businessLabel} <${agentName}@${emailDomain}>`
+        : config.resend.fromAddress;
       servers["resend"] = {
         type: "stdio",
         command: "node",
@@ -319,56 +326,44 @@ export class AgentRunner {
       env: { ...searchEnv },
     };
 
-    // HubSpot CRM — read/write CRM operations
-    const hubspotApiKey = process.env.HUBSPOT_API_KEY ?? "";
-    if (hubspotApiKey) {
-      servers["hubspot-crm"] = {
-        type: "stdio",
-        command: "node",
-        args: [resolve("dist/hubspot/hubspot-crm-mcp-server.js")],
-        env: { HUBSPOT_API_KEY: hubspotApiKey },
-      };
-    }
+    // ── Plugin MCP Servers ──────────────────────────────────────────
+    for (const plugin of this.plugins) {
+      for (const [name, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
+        if (servers[name]) {
+          log.warn("Plugin server name conflicts with core server, skipping", {
+            plugin: plugin.name, server: name,
+          });
+          continue;
+        }
+        const compiledPath = resolve(
+          `dist/plugins/${plugin.name}/${serverDef.entry.replace(/\.ts$/, ".js")}`,
+        );
 
-    // Dodi Ops — dodi_v2 REST API (jobs, comments, attachments, cutlists)
-    // Reuses same API URL and per-agent keys as task ledger (same dodi_v2 backend)
-    if (config.taskLedger.apiUrl && taskKey) {
-      const dodiOpsMode = this.agentConfig.dodiOpsMode ?? "full";
-      servers["dodi-ops"] = {
-        type: "stdio",
-        command: "node",
-        args: [resolve("dist/dodi-ops/dodi-ops-mcp-server.js")],
-        env: {
-          DODI_OPS_API_URL: config.taskLedger.apiUrl,
-          DODI_OPS_API_KEY: taskKey,
-          DODI_OPS_MODE: dodiOpsMode,
-          DODI_OPS_AGENT_ID: this.agentConfig.id,
-        },
-      };
-    }
+        const env: Record<string, string> = {
+          AGENT_ID: this.agentConfig.id,
+          AGENT_NAME: this.agentConfig.name,
+          MONGODB_URI: config.mongo.uri,
+          MONGODB_DB: config.mongo.dbName,
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+        };
 
-    // Catalog — read-only access to dodi_v2 product catalog (parts, families, types)
-    if (config.taskLedger.apiUrl && taskKey) {
-      servers["catalog"] = {
-        type: "stdio",
-        command: "node",
-        args: [resolve("dist/catalog/catalog-mcp-server.js")],
-        env: {
-          CATALOG_API_URL: config.taskLedger.apiUrl,
-          CATALOG_API_KEY: taskKey,
-        },
-      };
-    }
+        for (const envVar of serverDef.env ?? []) {
+          if (process.env[envVar]) env[envVar] = process.env[envVar]!;
+        }
 
-    // Permits — read-only access to permit pipeline data
-    servers["permits"] = {
-      type: "stdio",
-      command: "node",
-      args: [resolve("dist/permits/permit-mcp-server.js")],
-      env: {
-        PERMITS_MONGO_URI: config.permits.mongoUri,
-      },
-    };
+        for (const [envVar, fieldName] of Object.entries(serverDef.agentEnv ?? {})) {
+          env[envVar] = String((this.agentConfig as any)[fieldName] ?? "");
+        }
+
+        servers[name] = {
+          type: "stdio",
+          command: "node",
+          args: [compiledPath],
+          env,
+        };
+      }
+    }
 
     // Admin MCP server — model management, system controls
     servers["admin"] = {

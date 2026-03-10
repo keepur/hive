@@ -144,16 +144,19 @@ async function main(): Promise<void> {
   });
   log.info("Slack adapter connected");
 
-  // Set Slack audit channel for app/SMS notifications (route to #jessica)
-  try {
-    const channels = await slack.client.conversations.list({ types: "public_channel", limit: 200 });
-    const jessicaCh = (channels.channels ?? []).find((c: any) => c.name === "jessica");
-    if (jessicaCh?.id) {
-      dispatcher.setAuditChannel(slackAdapter, jessicaCh.id);
-      log.info("Audit channel configured", { channel: "jessica", id: jessicaCh.id });
+  // Set Slack audit channel for app/SMS notifications
+  const auditChannelName = config.slack.auditChannel;
+  if (auditChannelName) {
+    try {
+      const channels = await slack.client.conversations.list({ types: "public_channel", limit: 200 });
+      const auditCh = (channels.channels ?? []).find((c: any) => c.name === auditChannelName);
+      if (auditCh?.id) {
+        dispatcher.setAuditChannel(slackAdapter, auditCh.id);
+        log.info("Audit channel configured", { channel: auditChannelName, id: auditCh.id });
+      }
+    } catch (err) {
+      log.warn("Failed to configure audit channel", { error: String(err) });
     }
-  } catch (err) {
-    log.warn("Failed to configure audit channel", { error: String(err) });
   }
 
   // SMS adapter — direct path, bypasses Slack
