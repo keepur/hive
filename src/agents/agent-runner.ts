@@ -339,17 +339,26 @@ export class AgentRunner {
           `dist/plugins/${plugin.name}/${serverDef.entry.replace(/\.ts$/, ".js")}`,
         );
 
+        // Base env available to all plugin servers
+        const pluginTaskKey = config.taskLedger.agentKeys[this.agentConfig.id] ?? config.taskLedger.apiKey;
         const env: Record<string, string> = {
           AGENT_ID: this.agentConfig.id,
           AGENT_NAME: this.agentConfig.name,
           MONGODB_URI: config.mongo.uri,
           MONGODB_DB: config.mongo.dbName,
+          TASK_LEDGER_API_URL: config.taskLedger.apiUrl,
+          ...(pluginTaskKey ? { TASK_LEDGER_API_KEY: pluginTaskKey } : {}),
           PATH: process.env.PATH ?? "",
           HOME: process.env.HOME ?? "",
         };
 
         for (const envVar of serverDef.env ?? []) {
           if (process.env[envVar]) env[envVar] = process.env[envVar]!;
+        }
+
+        // env-map: rename base env vars (e.g. DODI_OPS_API_URL -> TASK_LEDGER_API_URL)
+        for (const [targetVar, sourceVar] of Object.entries(serverDef.envMap ?? {})) {
+          if (env[sourceVar]) env[targetVar] = env[sourceVar];
         }
 
         for (const [envVar, fieldName] of Object.entries(serverDef.agentEnv ?? {})) {

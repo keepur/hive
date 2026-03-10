@@ -9,11 +9,11 @@
  */
 
 // Minimal logger (self-contained — no dependency on core src/)
+// All levels write to stderr since stdout is the MCP JSON-RPC transport
 function createLogger(component: string) {
   const emit = (level: string, msg: string, data?: Record<string, unknown>) => {
     const entry = { ts: new Date().toISOString(), level, component, msg, ...data };
-    const out = level === "error" ? process.stderr : process.stdout;
-    out.write(JSON.stringify(entry) + "\n");
+    process.stderr.write(JSON.stringify(entry) + "\n");
   };
   return {
     debug: (msg: string, data?: Record<string, unknown>) => emit("debug", msg, data),

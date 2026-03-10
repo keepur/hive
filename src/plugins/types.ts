@@ -1,6 +1,7 @@
 export interface PluginMcpServer {
   entry: string;
-  env?: string[];
+  env?: string[];              // pass-through from base env (same name)
+  envMap?: Record<string, string>;  // rename: SERVER_VAR -> BASE_VAR
   agentEnv?: Record<string, string>;
 }
 
