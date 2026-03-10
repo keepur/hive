@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsc -p tsconfig.plugins.json",
+    "build:plugins": "tsc -p tsconfig.plugins.json",
     "start": "node dist/index.js",
     "dev": "npx tsx src/index.ts",
     "setup": "npx tsx setup/setup-wizard.ts",
