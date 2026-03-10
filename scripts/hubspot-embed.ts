@@ -39,8 +39,8 @@ const QDRANT_URL = process.env.QDRANT_URL ?? "http://localhost:6333";
 const MONGODB_STAGING_URI = process.env.MONGODB_STAGING_URI ?? "mongodb://localhost:27017/hubspot";
 
 const QDRANT_UPSERT_BATCH = 100;
-const OLLAMA_MAX_RETRIES = 3;
-const OLLAMA_RETRY_DELAY_MS = 2000;
+const OLLAMA_MAX_RETRIES = 5;
+const OLLAMA_RETRY_DELAY_MS = 5000;
 const EMBED_TEXT_MAX = 1000;
 
 // UUID v5 namespace (DNS namespace UUID)
@@ -102,8 +102,9 @@ async function embedBatch(texts: string[]): Promise<number[][]> {
       return data.embeddings;
     } catch (err: any) {
       if (attempt < OLLAMA_MAX_RETRIES) {
-        console.warn(`  Ollama attempt ${attempt} failed: ${err.message} — retrying in ${OLLAMA_RETRY_DELAY_MS}ms`);
-        await sleep(OLLAMA_RETRY_DELAY_MS);
+        const delay = OLLAMA_RETRY_DELAY_MS * attempt; // exponential-ish backoff
+        console.warn(`  Ollama attempt ${attempt} failed: ${err.message} — retrying in ${delay}ms`);
+        await sleep(delay);
       } else {
         throw err;
       }
