@@ -132,6 +132,7 @@ const CRM_COLLECTIONS = ["contacts", "deals", "activities"];
 const OPS_COLLECTIONS = [
   "persons", "projects", "designs", "quotes",
   "orders", "jobs", "operational_tasks", "parts", "cases",
+  "comments", "product_families",
 ];
 
 interface CollectionInfo {
@@ -175,6 +176,10 @@ function collectionsForTypeQdrant(objectType: string): CollectionInfo[] {
       return [{ name: "parts", type: "part" }];
     case "case":
       return [{ name: "cases", type: "case" }];
+    case "comment":
+      return [{ name: "comments", type: "comment" }];
+    case "product_family":
+      return [{ name: "product_families", type: "product_family" }];
     default:
       return CRM_COLLECTIONS.map((c) => ({ name: c, type: c }));
   }
@@ -222,6 +227,10 @@ function collectionForObjectType(objectType: string): string {
         return "parts";
       case "case":
         return "cases";
+      case "comment":
+        return "comments";
+      case "product_family":
+        return "product_families";
       default:
         return "contacts";
     }
@@ -339,6 +348,12 @@ function formatResult(r: any, index: number): string {
     if (r.total) lines.push(`   Total: $${r.total}`);
     if (r.family) lines.push(`   Family: ${r.family}`);
     if (r.price) lines.push(`   Price: $${r.price}`);
+    if (r.author) lines.push(`   Author: ${r.author}`);
+    if (r.targetId) lines.push(`   Target: ${r.targetId}`);
+    if (r.vendor) lines.push(`   Vendor: ${r.vendor}`);
+    if (r.familyType) lines.push(`   Type: ${r.familyType}`);
+    if (r.customerName) lines.push(`   Customer: ${r.customerName}`);
+    if (r.projectName) lines.push(`   Project: ${r.projectName}`);
   }
 
   return lines.join("\n");
@@ -357,6 +372,7 @@ const objectTypeEnum = z.enum([
   "contact", "company", "deal", "activity",
   "person", "project", "design", "quote",
   "order", "job", "task", "part", "case",
+  "comment", "product_family",
   "all",
 ]);
 
