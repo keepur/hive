@@ -13,7 +13,8 @@ servers:
   - linear
   - slack
   - contacts
-  - knowledge-base
+  - crm-search
+  - product-search
   - hubspot-crm
   - brave-search
   - google-workspace

@@ -17,7 +17,7 @@ servers:
   - linear
   - slack
   - contacts
-  - knowledge-base
+  - crm-search
   - brave-search
   - google-workspace
   - keychain
