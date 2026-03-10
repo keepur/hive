@@ -6,7 +6,7 @@
 
 ### Tasks
 
-1. Install Ollama via Homebrew, pull `nomic-embed-text` model
+1. Install Ollama via Homebrew, pull `bge-large` model
 2. Install Qdrant via Homebrew or Docker, configure storage directory
 3. Create launchd plists for both services (`com.dodi.ollama.plist`, `com.dodi.qdrant.plist`)
 4. Verify Ollama embedding endpoint responds at `http://localhost:11434/api/embed`
@@ -41,7 +41,7 @@
 
 ### Deliverables
 
-- All 70K records loaded into Qdrant with nomic-embed-text embeddings (768 dims)
+- All 70K records loaded into Qdrant with bge-large embeddings (1024 dims)
 - Search quality report comparing Atlas/Voyage vs Qdrant/Ollama results
 - Migration script retained for re-runs if needed
 
@@ -95,7 +95,7 @@
    - Replace `embedBatch()` Voyage AI call → Ollama local batch embed
    - Replace MongoDB `rag_*` collection writes → Qdrant upserts
    - Keep the same `OBJECT_CONFIGS` structure, same embedding text builders
-   - Update `EMBED_DIMENSIONS` from 1024 to 768
+   - Keep `EMBED_DIMENSIONS` at 1024 (bge-large matches Voyage-4-lite)
    - Remove `ensureVectorIndex()` (no longer needed)
 2. Update env var requirements: remove `VOYAGE_API_KEY`, add `OLLAMA_URL` and `QDRANT_URL`
 3. Test incremental embedding: run with a few new/changed records, verify upsert behavior
@@ -192,11 +192,11 @@
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| nomic-embed-text quality lower than Voyage-4-lite | Search relevance degrades | Phase 2 quality comparison before cutting over; can try alternative local models (e5-large, bge-large) |
+| bge-large quality lower than Voyage-4-lite | Search relevance degrades | Phase 2 quality comparison before cutting over; can try alternative local models (e5-large, nomic-embed-text) |
 | Qdrant service crashes or corrupts data | KB unavailable | Atlas fallback via `KB_BACKEND` env var; Qdrant snapshot backups |
-| Ollama OOM on Mac Mini under load | Embedding fails | nomic-embed-text is small (~274MB); monitor memory; set Ollama memory limits |
+| Ollama OOM on Mac Mini under load | Embedding fails | bge-large is ~1.2GB; monitor memory; set Ollama memory limits |
 | Sanitization Haiku pass misses sensitive data | Customer sees internal pricing | Test suite with known sensitive data; log sanitized results for audit; start with internal-only rollout |
-| Mac Mini disk space for local vector DB | Qdrant storage fills up | 70K records + 768-dim vectors ≈ 200MB; 90K total with ops data well under 1GB |
+| Mac Mini disk space for local vector DB | Qdrant storage fills up | 70K records + 1024-dim vectors ≈ 280MB; 90K total with ops data well under 1GB |
 | Nightly pipeline timing conflict | Stale data | Sequence pipelines: HubSpot at 3am, operational at 4am; add health checks |
 
 ## Rollback Plan

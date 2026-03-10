@@ -15,7 +15,7 @@ The replacement path is: Ollama local inference (embed query) → Qdrant local v
 ### Acceptance Criteria
 
 - [ ] A single `kb_search` call completes in under 1 second (p95), measured end-to-end from tool invocation to result return
-- [ ] Query embedding via Ollama `nomic-embed-text` completes in under 200ms
+- [ ] Query embedding via Ollama `bge-large` completes in under 200ms
 - [ ] Qdrant search across all collections completes in under 100ms
 - [ ] All existing KB tools (`kb_search`, `kb_find_similar`, `kb_timeline`, `kb_stats`) work with the new backend
 - [ ] Search quality is validated against a set of 20+ known queries with expected top-3 results

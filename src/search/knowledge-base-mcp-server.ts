@@ -10,8 +10,9 @@
  *   KB_BACKEND        — "qdrant" (default) or "atlas"
  *   OLLAMA_URL        — Ollama server URL (default: http://localhost:11434)
  *   QDRANT_URL        — Qdrant server URL (default: http://localhost:6333)
- *   MONGODB_ATLAS_URI — Atlas cluster connection string (required for atlas backend)
- *   VOYAGEAI_API_KEY  — Voyage AI API key (required for atlas backend)
+ *   MONGODB_STAGING_URI — Local MongoDB connection string (preferred)
+ *   MONGODB_ATLAS_URI   — Atlas cluster connection string (fallback; required for atlas backend)
+ *   VOYAGEAI_API_KEY    — Voyage AI API key (required for atlas backend)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -23,11 +24,11 @@ import { z } from "zod";
 const KB_BACKEND = (process.env.KB_BACKEND ?? "qdrant") as "qdrant" | "atlas";
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 const QDRANT_URL = process.env.QDRANT_URL ?? "http://localhost:6333";
-const ATLAS_URI = process.env.MONGODB_ATLAS_URI ?? "";
+const MONGO_URI = process.env.MONGODB_STAGING_URI ?? process.env.MONGODB_ATLAS_URI ?? "";
 const VOYAGE_KEY = process.env.VOYAGEAI_API_KEY ?? "";
 const EMBED_MODEL = process.env.KB_EMBED_MODEL ?? "bge-large";
 
-if (KB_BACKEND === "atlas" && (!ATLAS_URI || !VOYAGE_KEY)) {
+if (KB_BACKEND === "atlas" && (!MONGO_URI || !VOYAGE_KEY)) {
   process.stderr.write("knowledge-base: KB_BACKEND=atlas requires MONGODB_ATLAS_URI and VOYAGEAI_API_KEY\n");
   process.exit(1);
 }
@@ -39,7 +40,7 @@ let mongoConnected = false;
 
 async function connectMongo(): Promise<void> {
   if (db) return;
-  const client = new MongoClient(ATLAS_URI);
+  const client = new MongoClient(MONGO_URI);
   await client.connect();
   db = client.db(); // Atlas URI includes the DB name
 }
@@ -78,7 +79,7 @@ async function ensureReady(): Promise<void> {
   if (KB_BACKEND === "qdrant") {
     await ensureQdrantReady();
     // Also connect to MongoDB for stage mappings if available
-    if (ATLAS_URI) {
+    if (MONGO_URI) {
       try {
         await connectMongo();
         await loadStageMappings();
@@ -831,7 +832,7 @@ async function kbStatsQdrant(metric: string): Promise<ToolResult> {
 
   if (metric === "pipeline" || metric === "lifecycle" || metric === "activity_types") {
     // For aggregation metrics, fall back to MongoDB if available
-    if (ATLAS_URI && mongoConnected) {
+    if (MONGO_URI && mongoConnected) {
       return await kbStatsAtlas(metric);
     }
     return {

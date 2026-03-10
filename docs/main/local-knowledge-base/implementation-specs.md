@@ -2,13 +2,13 @@
 
 ## 1. Qdrant Collection Schema
 
-All collections use 768-dimension vectors (nomic-embed-text output) with cosine distance.
+All collections use 1024-dimension vectors (bge-large output) with cosine distance.
 
 ### CRM Collections (migrated from Atlas)
 
 #### `contacts`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   hubspotId: keyword (indexed)
   dodiId: keyword (indexed)
@@ -26,7 +26,7 @@ payload fields:
 
 #### `deals`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   hubspotId: keyword (indexed)
   dodiId: keyword (indexed)
@@ -43,7 +43,7 @@ payload fields:
 
 #### `activities`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   hubspotId: keyword (indexed)
   objectType: keyword (indexed)  // "task" | "note" | "call" | "email" | "meeting" | "communication" | "form_submission"
@@ -58,7 +58,7 @@ payload fields:
 
 #### `persons`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "person"
@@ -72,7 +72,7 @@ payload fields:
 
 #### `projects`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "project"
@@ -87,7 +87,7 @@ payload fields:
 
 #### `designs`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "design"
@@ -101,7 +101,7 @@ payload fields:
 
 #### `quotes`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "quote"
@@ -115,7 +115,7 @@ payload fields:
 
 #### `orders`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "order"
@@ -128,7 +128,7 @@ payload fields:
 
 #### `jobs`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "job"
@@ -143,7 +143,7 @@ payload fields:
 
 #### `operational_tasks`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "operational_task"
@@ -158,7 +158,7 @@ Note: Named `operational_tasks` to avoid collision with CRM "task" activities in
 
 #### `parts`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "part"
@@ -174,7 +174,7 @@ payload fields:
 
 #### `cases`
 ```
-vectors: { size: 768, distance: "Cosine" }
+vectors: { size: 1024, distance: "Cosine" }
 payload fields:
   dodiId: keyword (indexed)
   objectType: keyword  // "case"
@@ -194,15 +194,15 @@ payload fields:
 
 ```
 URL: http://localhost:11434/api/embed
-Model: nomic-embed-text
-Dimensions: 768
+Model: bge-large
+Dimensions: 1024
 ```
 
 ### Embedding Function (replaces Voyage AI)
 
 ```typescript
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
-const EMBED_MODEL = "nomic-embed-text";
+const EMBED_MODEL = "bge-large";
 
 async function embed(text: string): Promise<number[]> {
   const res = await fetch(`${OLLAMA_URL}/api/embed`, {
@@ -236,9 +236,9 @@ async function embedBatch(texts: string[]): Promise<number[][]> {
 
 - No API key required
 - No rate limiting (local inference)
-- No `input_type` parameter (nomic-embed-text handles query/document uniformly)
-- Output is 768 dimensions instead of 1024
-- Batch size can be larger since there are no API limits (but memory-bound; use batches of 256)
+- No `input_type` parameter (bge-large handles query/document uniformly)
+- Output is 1024 dimensions (same as Voyage-4-lite)
+- Batch size can be larger since there are no API limits (but memory-bound; use batches of 100)
 
 ---
 
@@ -258,6 +258,7 @@ async function embedBatch(texts: string[]): Promise<number[][]> {
 Remove: VOYAGEAI_API_KEY
 Add:    OLLAMA_URL (default: http://localhost:11434)
         QDRANT_URL (default: http://localhost:6333)
+        KB_EMBED_MODEL (default: bge-large)
 Keep:   MONGODB_ATLAS_URI (for fallback and kb_stats aggregations)
 Add:    KB_BACKEND (qdrant | atlas, default: qdrant)
 ```
@@ -386,8 +387,8 @@ async function upsertToQdrant(
 ```
 
 3. **Update constants**:
-   - `EMBED_DIMENSIONS`: 1024 → 768
-   - `EMBED_BATCH_SIZE`: 128 → 256 (no API rate limits)
+   - `EMBED_DIMENSIONS`: 1024 (unchanged — bge-large matches Voyage-4-lite)
+   - `EMBED_BATCH_SIZE`: 128 → 100 (no API rate limits, memory-bound)
    - Remove `VOYAGE_MODEL`
    - Remove `MAX_RETRIES` for Voyage (Ollama is local, retries are simpler)
 
