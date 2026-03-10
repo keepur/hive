@@ -22,5 +22,6 @@ budgetUsd: 20
 servers:
   - memory
   - catalog
+  - product-search
   - slack
   - callback

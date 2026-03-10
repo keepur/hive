@@ -16,7 +16,7 @@ servers:
   - slack
   - keychain
   - quo
-  - knowledge-base
+  - crm-search
   - hubspot-crm
   - brave-search
   - tasks

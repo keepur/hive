@@ -20,7 +20,7 @@ servers:
   - dodi-ops
   - slack
   - contacts
-  - knowledge-base
+  - ops-search
   - hubspot-crm
   - tasks
   - callback

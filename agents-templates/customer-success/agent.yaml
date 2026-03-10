@@ -17,7 +17,8 @@ budgetUsd: 50
 maxTurns: 30
 servers:
   - memory
-  - knowledge-base
+  - crm-search
+  - product-search
   - hubspot-crm
   - contacts
   - slack
