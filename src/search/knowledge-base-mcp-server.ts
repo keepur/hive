@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * CRM Search MCP Server — semantic search over synced HubSpot data in MongoDB Atlas.
+ * Knowledge Base MCP Server — semantic search over synced HubSpot data in MongoDB Atlas.
  *
  * Queries Atlas vector indexes for contacts, companies, deals, and activities
  * that were extracted and embedded by hubspot-sync.ts. No HubSpot API calls at runtime.
@@ -19,7 +19,7 @@ const ATLAS_URI = process.env.MONGODB_ATLAS_URI ?? "";
 const VOYAGE_KEY = process.env.VOYAGEAI_API_KEY ?? "";
 
 if (!ATLAS_URI || !VOYAGE_KEY) {
-  process.stderr.write("crm-search: MONGODB_ATLAS_URI and VOYAGEAI_API_KEY required\n");
+  process.stderr.write("knowledge-base: MONGODB_ATLAS_URI and VOYAGEAI_API_KEY required\n");
   process.exit(1);
 }
 
@@ -156,16 +156,16 @@ function formatResult(r: any, index: number): string {
 // ── Server ──────────────────────────────────────────────────────────────────
 
 const server = new McpServer({
-  name: "crm-search",
+  name: "knowledge-base",
   version: "1.0.0",
 });
 
-// ── Tool: crm_search ────────────────────────────────────────────────────────
+// ── Tool: kb_search ─────────────────────────────────────────────────────────
 
-server.registerTool("crm_search", {
-  title: "CRM Search",
+server.registerTool("kb_search", {
+  title: "Knowledge Base Search",
   description:
-    "Search CRM data (contacts, companies, deals, activities) using natural language. Returns the most relevant records with full context from 5 years of customer history.",
+    "Semantic search across all CRM, design, and production data — contacts, companies, deals, activities. Returns the most relevant records for a natural language query.",
   inputSchema: {
     query: z
       .string()
@@ -236,12 +236,12 @@ server.registerTool("crm_search", {
   }
 });
 
-// ── Tool: crm_find_similar ──────────────────────────────────────────────────
+// ── Tool: kb_find_similar ───────────────────────────────────────────────────
 
-server.registerTool("crm_find_similar", {
+server.registerTool("kb_find_similar", {
   title: "Find Similar Records",
   description:
-    "Find CRM records similar to a given record. Uses the source record's embedding to find semantically similar contacts, deals, or activities.",
+    "Find records similar to a given record. Uses the source record's embedding to find semantically similar contacts, deals, or activities.",
   inputSchema: {
     hubspotId: z.string().describe("HubSpot ID of the source record"),
     objectType: z
@@ -322,10 +322,10 @@ server.registerTool("crm_find_similar", {
   }
 });
 
-// ── Tool: crm_timeline ──────────────────────────────────────────────────────
+// ── Tool: kb_timeline ───────────────────────────────────────────────────────
 
-server.registerTool("crm_timeline", {
-  title: "CRM Timeline",
+server.registerTool("kb_timeline", {
+  title: "Activity Timeline",
   description:
     "Get a chronological activity history for a person or company. Searches activities by name using semantic search and returns them sorted by date.",
   inputSchema: {
@@ -402,12 +402,12 @@ server.registerTool("crm_timeline", {
   }
 });
 
-// ── Tool: crm_stats ─────────────────────────────────────────────────────────
+// ── Tool: kb_stats ──────────────────────────────────────────────────────────
 
-server.registerTool("crm_stats", {
-  title: "CRM Statistics",
+server.registerTool("kb_stats", {
+  title: "Data Statistics",
   description:
-    "Get pipeline, lifecycle, and record statistics from the CRM data. Useful for understanding deal pipeline health, contact lifecycle distribution, and activity volume.",
+    "Get pipeline, lifecycle, and record statistics from the knowledge base. Useful for understanding deal pipeline health, contact lifecycle distribution, and activity volume.",
   inputSchema: {
     metric: z
       .enum(["pipeline", "lifecycle", "activity_types", "overview"])
@@ -433,8 +433,8 @@ server.registerTool("crm_stats", {
       ]);
 
       const lines = [
-        "CRM Overview",
-        "============",
+        "Knowledge Base Overview",
+        "=======================",
         `Contacts:   ${contactOnly.toLocaleString()}`,
         `Companies:  ${companyOnly.toLocaleString()}`,
         `Deals:      ${dealCount.toLocaleString()}`,
