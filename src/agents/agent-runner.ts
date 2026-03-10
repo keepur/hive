@@ -24,6 +24,10 @@ export interface RunResult {
   sessionId: string;
   costUsd: number;
   durationMs: number;
+  llmMs: number;
+  toolMs: number;
+  toolCalls: number;
+  toolSummary: string;
   streamed: boolean;
   error?: string;
   aborted?: boolean;
@@ -281,19 +285,22 @@ export class AgentRunner {
     };
 
     // Knowledge Base — semantic search over CRM, design, and production data
-    const atlasUri = process.env.MONGODB_ATLAS_URI ?? "";
-    const voyageKey = process.env.VOYAGEAI_API_KEY ?? "";
-    if (atlasUri && voyageKey) {
-      servers["knowledge-base"] = {
-        type: "stdio",
-        command: "node",
-        args: [resolve("dist/search/knowledge-base-mcp-server.js")],
-        env: {
-          MONGODB_ATLAS_URI: atlasUri,
-          VOYAGEAI_API_KEY: voyageKey,
-        },
-      };
+    const kbBackend = process.env.KB_BACKEND ?? "qdrant";
+    const kbEnv: Record<string, string> = { KB_BACKEND: kbBackend };
+    if (kbBackend === "qdrant") {
+      kbEnv.OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
+      kbEnv.QDRANT_URL = process.env.QDRANT_URL ?? "http://localhost:6333";
+      if (process.env.KB_EMBED_MODEL) kbEnv.KB_EMBED_MODEL = process.env.KB_EMBED_MODEL;
     }
+    // Atlas fallback still needs these
+    if (process.env.MONGODB_ATLAS_URI) kbEnv.MONGODB_ATLAS_URI = process.env.MONGODB_ATLAS_URI;
+    if (process.env.VOYAGEAI_API_KEY) kbEnv.VOYAGEAI_API_KEY = process.env.VOYAGEAI_API_KEY;
+    servers["knowledge-base"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/search/knowledge-base-mcp-server.js")],
+      env: kbEnv,
+    };
 
     // HubSpot CRM — read/write CRM operations
     const hubspotApiKey = process.env.HUBSPOT_API_KEY ?? "";
@@ -406,6 +413,7 @@ export class AgentRunner {
         allowDangerouslySkipPermissions: true,
         maxTurns: this.agentConfig.maxTurns,
         maxBudgetUsd: this.agentConfig.budgetUsd,
+        thinking: { type: "disabled" },
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
@@ -427,6 +435,11 @@ export class AgentRunner {
     let streamed = false;
     let error: string | undefined;
     this._aborted = false;
+
+    // Instrumentation
+    const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
+    let activeToolStart: number | null = null;
+    let activeToolName: string | null = null;
 
     const timeoutMs = this.agentConfig.timeoutMs ?? 300_000; // 5 min default
     const deadline = setTimeout(() => {
@@ -455,12 +468,35 @@ export class AgentRunner {
           }
         }
 
+        // Log tool call timing
+        if (msg.type === "tool_progress") {
+          const tp = msg as any;
+          log.info("Tool in progress", {
+            agent: this.agentConfig.id,
+            tool: tp.tool_name,
+            elapsed: tp.elapsed_time_seconds,
+          });
+        }
+
         if (msg.type === "assistant") {
           const content = (msg as any).message?.content;
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === "text") {
                 resultText = block.text;
+              } else if (block.type === "tool_use") {
+                // Close previous tool timing if any
+                if (activeToolName && toolCalls.length > 0) {
+                  toolCalls[toolCalls.length - 1]!.endMs = Date.now();
+                }
+                activeToolName = block.name;
+                activeToolStart = Date.now();
+                toolCalls.push({ tool: block.name, startMs: activeToolStart });
+                log.info("Tool call started", {
+                  agent: this.agentConfig.id,
+                  tool: block.name,
+                  inputPreview: JSON.stringify(block.input).slice(0, 120),
+                });
               }
             }
           }
@@ -511,16 +547,43 @@ export class AgentRunner {
       this.activeQuery = null;
     }
 
+    // Close last tool timing
+    if (activeToolName && toolCalls.length > 0) {
+      toolCalls[toolCalls.length - 1]!.endMs = Date.now();
+    }
+
+    // Build tool stats
+    const toolStats: Record<string, { count: number; totalMs: number }> = {};
+    for (const tc of toolCalls) {
+      const dur = (tc.endMs ?? Date.now()) - tc.startMs;
+      const serverName = tc.tool.includes("__") ? tc.tool.split("__")[1]! : tc.tool;
+      if (!toolStats[serverName]) toolStats[serverName] = { count: 0, totalMs: 0 };
+      toolStats[serverName]!.count++;
+      toolStats[serverName]!.totalMs += dur;
+    }
+
+    const toolSummary = Object.entries(toolStats)
+      .sort((a, b) => b[1].totalMs - a[1].totalMs)
+      .map(([name, s]) => `${name}:${s.count}x/${(s.totalMs / 1000).toFixed(1)}s`)
+      .join(", ");
+
+    const totalToolMs = toolCalls.reduce((sum, tc) => sum + ((tc.endMs ?? Date.now()) - tc.startMs), 0);
+    const llmMs = durationMs - totalToolMs;
+
     log.info("Agent response complete", {
       agent: this.agentConfig.id,
       sessionId: resultSessionId,
       costUsd,
       durationMs,
+      llmMs,
+      toolMs: totalToolMs,
+      toolCalls: toolCalls.length,
+      toolSummary: toolSummary || "none",
       streamed,
       hasError: !!error,
     });
 
-    return { text: resultText, sessionId: resultSessionId, costUsd, durationMs, streamed, error, aborted: this._aborted };
+    return { text: resultText, sessionId: resultSessionId, costUsd, durationMs, llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length, toolSummary: toolSummary || "none", streamed, error, aborted: this._aborted };
   }
 
   private _aborted = false;

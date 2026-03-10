@@ -49,16 +49,19 @@ ${agentConfig.soul}
 
 Respond with ONLY a JSON object, no markdown fences, no explanation.
 
-{ "response": "<your reply>", "action": "done" } when:
-- Greetings, thanks, confirmations, yes/no, chit-chat you can handle in character
+{ "response": "<your reply>", "action": "done" } ONLY when:
+- Simple greetings ("hi", "hey"), thanks ("thanks", "ty"), or farewells ("bye", "later")
+- That's it. Nothing else gets "done".
 
-{ "response": "<brief ack>", "action": "continue" } when:
-- Questions requiring lookups, tool use, research, or multi-step work
-- Task requests, analysis, anything involving external data or memory
-- If unsure, default to "continue"
+{ "response": "<brief ack>", "action": "continue" } for EVERYTHING else:
+- ANY question, no matter how simple it seems
+- ANY request for information, lookups, or data
+- ANY task, instruction, or follow-up
+- If the message is more than a one-word social nicety, use "continue"
+- NEVER say you lack access or can't do something — you don't know what tools are available. Just ack and continue.
 
-Keep "continue" ack responses under 15 words, natural, in character.
-Keep "done" responses brief and natural. Do NOT ask follow-up questions in "done" responses — the conversation ends there.`;
+Keep "continue" ack responses under 15 words. Just acknowledge, don't answer.
+Keep "done" responses under 10 words.`;
 }
 
 function parseTriageOutput(text: string): TriageOutput | null {
@@ -188,5 +191,5 @@ export async function triage(
     agent: agentConfig.id,
     rawText: resultText.slice(0, 200),
   });
-  return { response: resultText || "On it...", action: "continue", costUsd, durationMs };
+  return { response: "On it...", action: "continue", costUsd, durationMs };
 }
