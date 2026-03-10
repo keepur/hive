@@ -168,8 +168,8 @@ export function enrichEmbeddingText(stageMap: Map<string, string>, text: string)
 export interface FieldDef {
   key: string;
   label: string;
-  prefix?: string;       // e.g. "$"
-  resolve?: "stage";     // apply resolveStage
+  prefix?: string; // e.g. "$"
+  resolve?: "stage"; // apply resolveStage
 }
 
 export interface FieldConfig {
@@ -198,9 +198,7 @@ export function formatResult(r: any, index: number, config: FieldConfig): string
     const value = r.properties?.[field.key] ?? r[field.key];
     if (value != null && value !== "") {
       const prefix = field.prefix ?? "";
-      const displayValue = field.resolve === "stage"
-        ? resolveStage(stageMap, String(value))
-        : `${prefix}${value}`;
+      const displayValue = field.resolve === "stage" ? resolveStage(stageMap, String(value)) : `${prefix}${value}`;
       lines.push(`   ${field.label}: ${field.resolve === "stage" ? displayValue : displayValue}`);
     }
   }

@@ -73,122 +73,133 @@ function parseDelay(delay: string): number | null {
 
 // ── Tool: schedule_callback ─────────────────────────────────────────────
 
-server.registerTool("schedule_callback", {
-  title: "Schedule Callback",
-  description:
-    "Schedule a future self-invocation. You'll be re-invoked with the context you provide after the specified delay. " +
-    "Use this for async follow-ups: checking CI status, waiting for a deploy, polling for a response, etc. " +
-    "The callback will arrive as a message in the same channel where you're currently working.",
-  inputSchema: {
-    delay: z
-      .string()
-      .describe('How long to wait before the callback. Examples: "5m", "30s", "1h", "10m", "2h30m"'),
-    context: z
-      .string()
-      .describe(
-        "The prompt/context you'll receive when the callback fires. Be specific — include what to check and what to do with the result.",
-      ),
-  },
-}, async ({ delay, context }) => {
-  const delayMs = parseDelay(delay);
-  if (!delayMs) {
-    return {
-      content: [{ type: "text", text: `Invalid delay format: "${delay}". Use formats like "5m", "30s", "1h", "2h30m".` }],
-      isError: true,
-    };
-  }
-
-  const dueAt = new Date(Date.now() + delayMs);
-
-  const doc = {
-    agentId: AGENT_ID,
-    dueAt,
-    context,
-    createdAt: new Date(),
-    status: "pending" as const,
-    source: {
-      adapterId: ADAPTER_ID,
-      channelId: CHANNEL_ID,
-      channelKind: CHANNEL_KIND,
-      channelLabel: CHANNEL_LABEL,
-      threadId: THREAD_ID,
-      slackTs: SLACK_TS,
-      slackThreadTs: SLACK_THREAD_TS,
+server.registerTool(
+  "schedule_callback",
+  {
+    title: "Schedule Callback",
+    description:
+      "Schedule a future self-invocation. You'll be re-invoked with the context you provide after the specified delay. " +
+      "Use this for async follow-ups: checking CI status, waiting for a deploy, polling for a response, etc. " +
+      "The callback will arrive as a message in the same channel where you're currently working.",
+    inputSchema: {
+      delay: z.string().describe('How long to wait before the callback. Examples: "5m", "30s", "1h", "10m", "2h30m"'),
+      context: z
+        .string()
+        .describe(
+          "The prompt/context you'll receive when the callback fires. Be specific — include what to check and what to do with the result.",
+        ),
     },
-  };
+  },
+  async ({ delay, context }) => {
+    const delayMs = parseDelay(delay);
+    if (!delayMs) {
+      return {
+        content: [
+          { type: "text", text: `Invalid delay format: "${delay}". Use formats like "5m", "30s", "1h", "2h30m".` },
+        ],
+        isError: true,
+      };
+    }
 
-  const result = await callbacks.insertOne(doc);
+    const dueAt = new Date(Date.now() + delayMs);
 
-  const friendlyTime = dueAt.toLocaleTimeString("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-    timeZone: "America/Los_Angeles",
-  });
+    const doc = {
+      agentId: AGENT_ID,
+      dueAt,
+      context,
+      createdAt: new Date(),
+      status: "pending" as const,
+      source: {
+        adapterId: ADAPTER_ID,
+        channelId: CHANNEL_ID,
+        channelKind: CHANNEL_KIND,
+        channelLabel: CHANNEL_LABEL,
+        threadId: THREAD_ID,
+        slackTs: SLACK_TS,
+        slackThreadTs: SLACK_THREAD_TS,
+      },
+    };
 
-  return {
-    content: [{
-      type: "text",
-      text: `Callback scheduled for ${friendlyTime} (in ${delay}). ID: ${result.insertedId.toString()}`,
-    }],
-  };
-});
+    const result = await callbacks.insertOne(doc);
 
-// ── Tool: list_callbacks ────────────────────────────────────────────────
-
-server.registerTool("list_callbacks", {
-  title: "List Callbacks",
-  description: "List your pending scheduled callbacks.",
-  inputSchema: {},
-}, async () => {
-  const pending = await callbacks
-    .find({ agentId: AGENT_ID, status: "pending" })
-    .sort({ dueAt: 1 })
-    .toArray();
-
-  if (pending.length === 0) {
-    return { content: [{ type: "text", text: "No pending callbacks." }] };
-  }
-
-  const lines = pending.map((cb) => {
-    const due = new Date(cb.dueAt).toLocaleTimeString("en-US", {
+    const friendlyTime = dueAt.toLocaleTimeString("en-US", {
       hour: "numeric",
       minute: "2-digit",
       timeZone: "America/Los_Angeles",
     });
-    const preview = cb.context.length > 80 ? cb.context.slice(0, 80) + "..." : cb.context;
-    return `${cb._id.toString()} — due ${due} — ${preview}`;
-  });
 
-  return { content: [{ type: "text", text: lines.join("\n") }] };
-});
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Callback scheduled for ${friendlyTime} (in ${delay}). ID: ${result.insertedId.toString()}`,
+        },
+      ],
+    };
+  },
+);
+
+// ── Tool: list_callbacks ────────────────────────────────────────────────
+
+server.registerTool(
+  "list_callbacks",
+  {
+    title: "List Callbacks",
+    description: "List your pending scheduled callbacks.",
+    inputSchema: {},
+  },
+  async () => {
+    const pending = await callbacks.find({ agentId: AGENT_ID, status: "pending" }).sort({ dueAt: 1 }).toArray();
+
+    if (pending.length === 0) {
+      return { content: [{ type: "text", text: "No pending callbacks." }] };
+    }
+
+    const lines = pending.map((cb) => {
+      const due = new Date(cb.dueAt).toLocaleTimeString("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+        timeZone: "America/Los_Angeles",
+      });
+      const preview = cb.context.length > 80 ? cb.context.slice(0, 80) + "..." : cb.context;
+      return `${cb._id.toString()} — due ${due} — ${preview}`;
+    });
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  },
+);
 
 // ── Tool: cancel_callback ───────────────────────────────────────────────
 
-server.registerTool("cancel_callback", {
-  title: "Cancel Callback",
-  description: "Cancel a pending callback by its ID.",
-  inputSchema: {
-    callbackId: z.string().describe("The callback ID to cancel"),
+server.registerTool(
+  "cancel_callback",
+  {
+    title: "Cancel Callback",
+    description: "Cancel a pending callback by its ID.",
+    inputSchema: {
+      callbackId: z.string().describe("The callback ID to cancel"),
+    },
   },
-}, async ({ callbackId }) => {
-  let oid: ObjectId;
-  try {
-    oid = new ObjectId(callbackId);
-  } catch {
-    return { content: [{ type: "text", text: "Invalid callback ID." }], isError: true };
-  }
+  async ({ callbackId }) => {
+    let oid: ObjectId;
+    try {
+      oid = new ObjectId(callbackId);
+    } catch {
+      return { content: [{ type: "text", text: "Invalid callback ID." }], isError: true };
+    }
 
-  const result = await callbacks.updateOne(
-    { _id: oid, agentId: AGENT_ID, status: "pending" },
-    { $set: { status: "cancelled", cancelledAt: new Date() } },
-  );
+    const result = await callbacks.updateOne(
+      { _id: oid, agentId: AGENT_ID, status: "pending" },
+      { $set: { status: "cancelled", cancelledAt: new Date() } },
+    );
 
-  if (result.modifiedCount === 0) {
-    return { content: [{ type: "text", text: "Callback not found or already fired/cancelled." }] };
-  }
+    if (result.modifiedCount === 0) {
+      return { content: [{ type: "text", text: "Callback not found or already fired/cancelled." }] };
+    }
 
-  return { content: [{ type: "text", text: "Callback cancelled." }] };
-});
+    return { content: [{ type: "text", text: "Callback cancelled." }] };
+  },
+);
 
 // ── Connect ─────────────────────────────────────────────────────────────
 

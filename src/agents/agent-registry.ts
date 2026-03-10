@@ -14,6 +14,43 @@ interface ModelOverride {
   updatedBy?: string;
 }
 
+/**
+ * Apply config overrides to an agent config.
+ * Pure transformation — takes config, override, and template snapshot; returns modified config.
+ */
+export function applyConfigOverrides(
+  config: AgentConfig,
+  override: ConfigOverride | undefined,
+  template: AgentConfig | undefined,
+): AgentConfig {
+  if (!override) return config;
+
+  // Apply array field overrides
+  const arrayFields = ["channels", "passiveChannels", "keywords", "servers"] as const;
+  for (const field of arrayFields) {
+    const arrOverride = override[field] as ArrayOverride | undefined;
+    if (!arrOverride) continue;
+
+    if (arrOverride.replace) {
+      (config as unknown as Record<string, unknown>)[field] = [...arrOverride.replace];
+    } else {
+      const base = [...((template?.[field] as string[]) || [])];
+      const added = arrOverride.add ? [...base, ...arrOverride.add.filter((v) => !base.includes(v))] : base;
+      const result = arrOverride.remove ? added.filter((v) => !arrOverride.remove!.includes(v)) : added;
+      (config as unknown as Record<string, unknown>)[field] = result;
+    }
+  }
+
+  // Apply scalar field overrides
+  if (override.isDefault !== undefined) config.isDefault = override.isDefault;
+  if (override.budgetUsd !== undefined) config.budgetUsd = override.budgetUsd;
+  if (override.maxTurns !== undefined) config.maxTurns = override.maxTurns;
+  if (override.maxConcurrent !== undefined) config.maxConcurrent = override.maxConcurrent;
+  if (override.timeoutMs !== undefined) config.timeoutMs = override.timeoutMs;
+
+  return config;
+}
+
 export class AgentRegistry {
   private agents = new Map<string, AgentConfig>();
   private basePath: string;
@@ -161,40 +198,17 @@ export class AgentRegistry {
     // Save pre-override snapshot for comparison
     this.templateConfigs.set(config.id, { ...config });
 
-    return this.applyConfigOverrides(config);
+    return this.applyOverrides(config);
   }
 
-  private applyConfigOverrides(config: AgentConfig): AgentConfig {
+  private applyOverrides(config: AgentConfig): AgentConfig {
     const override = this.configOverrides.get(config.id);
-    if (!override) return config;
-
     const template = this.templateConfigs.get(config.id);
-
-    // Apply array field overrides
-    const arrayFields = ["channels", "passiveChannels", "keywords", "servers"] as const;
-    for (const field of arrayFields) {
-      const arrOverride = override[field] as ArrayOverride | undefined;
-      if (!arrOverride) continue;
-
-      if (arrOverride.replace) {
-        (config as unknown as Record<string, unknown>)[field] = [...arrOverride.replace];
-      } else {
-        const base = [...((template?.[field] as string[]) || [])];
-        const added = arrOverride.add ? [...base, ...arrOverride.add.filter((v) => !base.includes(v))] : base;
-        const result = arrOverride.remove ? added.filter((v) => !arrOverride.remove!.includes(v)) : added;
-        (config as unknown as Record<string, unknown>)[field] = result;
-      }
+    const result = applyConfigOverrides(config, override, template);
+    if (override) {
+      log.info("Config override applied", { agent: config.id });
     }
-
-    // Apply scalar field overrides
-    if (override.isDefault !== undefined) config.isDefault = override.isDefault;
-    if (override.budgetUsd !== undefined) config.budgetUsd = override.budgetUsd;
-    if (override.maxTurns !== undefined) config.maxTurns = override.maxTurns;
-    if (override.maxConcurrent !== undefined) config.maxConcurrent = override.maxConcurrent;
-    if (override.timeoutMs !== undefined) config.timeoutMs = override.timeoutMs;
-
-    log.info("Config override applied", { agent: config.id });
-    return config;
+    return result;
   }
 
   /** Get the pre-override template config for an agent */

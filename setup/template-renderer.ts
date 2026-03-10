@@ -65,14 +65,11 @@ export function render(template: string, ctx: Record<string, any>): string {
   }
 
   // ---- 2. Variable substitution ---------------------------------------------
-  template = template.replace(
-    /\{\{([\w][\w-]*(?:\.[\w][\w-]*)*)\}\}/g,
-    (match, path) => {
-      const val = resolvePath(ctx, path);
-      if (val === undefined) return match;
-      return String(val);
-    },
-  );
+  template = template.replace(/\{\{([\w][\w-]*(?:\.[\w][\w-]*)*)\}\}/g, (match, path) => {
+    const val = resolvePath(ctx, path);
+    if (val === undefined) return match;
+    return String(val);
+  });
 
   return template;
 }

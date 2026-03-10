@@ -90,10 +90,7 @@ export class LinearClient {
     }
   }
 
-  async createIssue(
-    title: string,
-    opts?: CreateIssueOpts,
-  ): Promise<IssueResult | null> {
+  async createIssue(title: string, opts?: CreateIssueOpts): Promise<IssueResult | null> {
     try {
       const teamId = opts?.teamId ?? this.defaultTeamId;
       if (!teamId) {
@@ -125,10 +122,7 @@ export class LinearClient {
     }
   }
 
-  async updateIssue(
-    issueId: string,
-    fields: UpdateIssueFields,
-  ): Promise<boolean> {
+  async updateIssue(issueId: string, fields: UpdateIssueFields): Promise<boolean> {
     try {
       await this.client.updateIssue(issueId, fields);
       log.info("Issue updated", { issueId, ...fields });
@@ -185,11 +179,7 @@ export class LinearClient {
     }
   }
 
-  async searchIssues(
-    term: string,
-    limit?: number,
-    teamId?: string,
-  ): Promise<IssueSummary[]> {
+  async searchIssues(term: string, limit?: number, teamId?: string): Promise<IssueSummary[]> {
     try {
       const resolvedTeamId = teamId ?? this.defaultTeamId;
       const result = await this.client.searchIssues(term, {
@@ -264,9 +254,7 @@ export class LinearClient {
     }
   }
 
-  async findIssueByIdentifier(
-    identifier: string,
-  ): Promise<IssueDetail | null> {
+  async findIssueByIdentifier(identifier: string): Promise<IssueDetail | null> {
     try {
       const issue = await this.client.issue(identifier);
       const state = await issue.state;

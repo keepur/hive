@@ -98,7 +98,10 @@ export class Dispatcher {
           });
         } catch (err) {
           log.warn("Status delivery failed, queuing for retry", { error: String(err) });
-          this.retryQueue?.enqueue({ text: statusText, agentId: "system", workItem: item, costUsd: 0, durationMs: 0 }, adapter);
+          this.retryQueue?.enqueue(
+            { text: statusText, agentId: "system", workItem: item, costUsd: 0, durationMs: 0 },
+            adapter,
+          );
         }
       }
       return;
@@ -384,7 +387,9 @@ export class Dispatcher {
             durationMs: triageResult.durationMs,
           };
           if (adapter) {
-            try { await adapter.deliver(workResult); } catch (err) {
+            try {
+              await adapter.deliver(workResult);
+            } catch (err) {
               this.retryQueue?.enqueue(workResult, adapter);
             }
           }
@@ -416,7 +421,9 @@ export class Dispatcher {
           error: runResult.error,
         };
         if (adapter) {
-          try { await adapter.deliver(workResult); } catch (err) {
+          try {
+            await adapter.deliver(workResult);
+          } catch (err) {
             this.retryQueue?.enqueue(workResult, adapter);
           }
         }
@@ -428,7 +435,11 @@ export class Dispatcher {
         if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
           await this.postAuditLog(workResult);
         }
-        log.info("Fan-out dispatch complete", { agentId, costUsd: runResult.costUsd, durationMs: runResult.durationMs });
+        log.info("Fan-out dispatch complete", {
+          agentId,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+        });
       }
     } catch (err) {
       const errorResult: WorkResult = {
@@ -440,7 +451,9 @@ export class Dispatcher {
         error: String(err),
       };
       if (adapter) {
-        try { await adapter.deliver(errorResult); } catch (deliverErr) {
+        try {
+          await adapter.deliver(errorResult);
+        } catch (deliverErr) {
           this.retryQueue?.enqueue(errorResult, adapter);
         }
       }
@@ -467,14 +480,13 @@ export class Dispatcher {
     const agentConfig = this.registry.get(result.agentId);
     const agentName = agentConfig?.name ?? result.agentId;
     const icon =
-      result.workItem.source.kind === "sms" ? ":phone:" :
-      result.workItem.source.kind === "app" ? ":iphone:" :
-      ":incoming_envelope:";
+      result.workItem.source.kind === "sms"
+        ? ":phone:"
+        : result.workItem.source.kind === "app"
+          ? ":iphone:"
+          : ":incoming_envelope:";
     const senderDisplay = result.workItem.senderName ?? result.workItem.sender;
-    const summary =
-      result.text.length > 300
-        ? result.text.slice(0, 300) + "..."
-        : result.text;
+    const summary = result.text.length > 300 ? result.text.slice(0, 300) + "..." : result.text;
 
     const auditItem: WorkItem = {
       id: `audit:${result.workItem.id}`,

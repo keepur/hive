@@ -13,11 +13,11 @@ import { parse } from "csv-parse/sync";
 import { readFileSync } from "node:fs";
 
 const CONTACT_TYPE_MAP: Record<string, string> = {
-  "Homeowner": "homeowner",
+  Homeowner: "homeowner",
   "Professional Designer": "designer",
   "Contractor / Builder": "contractor",
-  "Realtor": "realtor",
-  "Other": "other",
+  Realtor: "realtor",
+  Other: "other",
   "Investor - Tier 1": "investor",
   "Project Manager": "project_manager",
   "Design and Build": "design_build",
@@ -99,7 +99,10 @@ async function main() {
     // Build phone entries — deduplicate
     const phones: { number: string; formatted: string; label: string }[] = [];
     const seenPhones = new Set<string>();
-    for (const [raw, label] of [[rawPhone, "Primary"], [rawMobile, "Mobile"]] as const) {
+    for (const [raw, label] of [
+      [rawPhone, "Primary"],
+      [rawMobile, "Mobile"],
+    ] as const) {
       const entry = makePhoneEntry(raw, label);
       if (entry && !seenPhones.has(entry.number)) {
         phones.push(entry);

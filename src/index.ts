@@ -45,10 +45,7 @@ async function main(): Promise<void> {
   await sessionStore.connect(config.mongo.dbName);
 
   if (config.linear.apiKey) {
-    const linearClient = new LinearClient(
-      config.linear.apiKey,
-      config.linear.teamId || undefined,
-    );
+    const linearClient = new LinearClient(config.linear.apiKey, config.linear.teamId || undefined);
     log.info("Linear client configured");
   }
 
@@ -57,11 +54,7 @@ async function main(): Promise<void> {
     log.info("Task ledger client configured", { apiUrl: config.taskLedger.apiUrl });
   }
 
-  const taskLedger = new TaskLedger(
-    config.taskLedger.apiUrl,
-    config.taskLedger.agentKeys,
-    config.taskLedger.apiKey,
-  );
+  const taskLedger = new TaskLedger(config.taskLedger.apiUrl, config.taskLedger.agentKeys, config.taskLedger.apiKey);
   if (taskLedger.isConfigured) {
     log.info("Task ledger auto-tracking enabled", {
       apiUrl: config.taskLedger.apiUrl,
@@ -72,14 +65,16 @@ async function main(): Promise<void> {
   const agentManager = new AgentManager(registry, memoryManager, sessionStore);
   const healthReporter = new HealthReporter(agentManager, memoryManager);
   const dispatcher = new Dispatcher(
-    registry, agentManager, healthReporter, config.agents.defaultAgent,
+    registry,
+    agentManager,
+    healthReporter,
+    config.agents.defaultAgent,
     taskLedger.isConfigured ? taskLedger : undefined,
   );
 
   // Background task manager — agents can spawn detached background processes
-  const bgTaskManager = new BackgroundTaskManager(
-    config.background.port,
-    (item) => dispatcher.dispatch(item).catch((err) => {
+  const bgTaskManager = new BackgroundTaskManager(config.background.port, (item) =>
+    dispatcher.dispatch(item).catch((err) => {
       log.error("Background task completion dispatch failed", { error: String(err) });
     }),
   );
@@ -90,9 +85,8 @@ async function main(): Promise<void> {
   // Meeting monitor — real-time meeting participation via Recall.ai
   let meetingMonitor: MeetingMonitor | undefined;
   if (config.recall.apiKey) {
-    meetingMonitor = new MeetingMonitor(
-      config.recall.monitorPort,
-      (item) => dispatcher.dispatch(item).catch((err) => {
+    meetingMonitor = new MeetingMonitor(config.recall.monitorPort, (item) =>
+      dispatcher.dispatch(item).catch((err) => {
         log.error("Meeting monitor dispatch failed", { error: String(err) });
       }),
     );

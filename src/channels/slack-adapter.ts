@@ -28,7 +28,14 @@ export class SlackAdapter implements ChannelAdapter {
   private threadContextMap = new Map<string, string>();
   private threadContextLastSeen = new Map<string, number>();
 
-  constructor(gateway: SlackGateway, registry: AgentRegistry, excludeChannels: string[] = [], id: string = "slack", defaultAgentId?: string, botLabel?: string) {
+  constructor(
+    gateway: SlackGateway,
+    registry: AgentRegistry,
+    excludeChannels: string[] = [],
+    id: string = "slack",
+    defaultAgentId?: string,
+    botLabel?: string,
+  ) {
     this.id = id;
     this.gateway = gateway;
     this.registry = registry;
@@ -39,7 +46,8 @@ export class SlackAdapter implements ChannelAdapter {
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
     // Register integration channels — agents assigned to this bot, or any bot (no slackBot set)
-    const allAgentChannels = this.registry.getAll()
+    const allAgentChannels = this.registry
+      .getAll()
       .filter((a) => !a.slackBot || a.slackBot === this.botLabel)
       .flatMap((a) => a.channels)
       .filter((ch) => !this.excludeChannels.has(ch));
@@ -57,14 +65,16 @@ export class SlackAdapter implements ChannelAdapter {
       // Agents with no slackBot are accessible from any adapter
       const owningAgent = this.registry.findByChannel(msg.channelName);
       if (owningAgent && owningAgent.slackBot && owningAgent.slackBot !== this.botLabel) {
-        log.debug("Ignoring message from other bot's channel", { channel: msg.channelName, owner: owningAgent.id, botLabel: this.botLabel });
+        log.debug("Ignoring message from other bot's channel", {
+          channel: msg.channelName,
+          owner: owningAgent.id,
+          botLabel: this.botLabel,
+        });
         return;
       }
 
       // Resolve sender display name for human users
-      const senderName = msg.user.startsWith("U")
-        ? await this.gateway.resolveUserName(msg.user)
-        : undefined;
+      const senderName = msg.user.startsWith("U") ? await this.gateway.resolveUserName(msg.user) : undefined;
 
       const workItem: WorkItem = {
         id: msg.ts,
@@ -112,16 +122,13 @@ export class SlackAdapter implements ChannelAdapter {
 
   async deliver(result: WorkResult): Promise<void> {
     const channel = result.workItem.source.id;
-    const threadTs = (result.workItem.meta?.slackThreadTs as string) ??
-      (result.workItem.meta?.slackTs as string);
+    const threadTs = (result.workItem.meta?.slackThreadTs as string) ?? (result.workItem.meta?.slackTs as string);
 
     // Look up agent config for signature
     const agentConfig = this.registry.get(result.agentId);
 
     // For integration/bot messages, don't thread the reply
-    const isIntegrationMsg =
-      result.workItem.sender?.startsWith("B") ||
-      result.workItem.sender === "integration";
+    const isIntegrationMsg = result.workItem.sender?.startsWith("B") || result.workItem.sender === "integration";
     const replyThread = isIntegrationMsg ? undefined : threadTs;
 
     // Format text with agent signature
@@ -135,8 +142,7 @@ export class SlackAdapter implements ChannelAdapter {
   }
 
   async onProcessingStart(item: WorkItem): Promise<void> {
-    const isIntegrationMsg =
-      item.sender?.startsWith("B") || item.sender === "integration";
+    const isIntegrationMsg = item.sender?.startsWith("B") || item.sender === "integration";
     const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string);
 
     if (!isIntegrationMsg && threadTs) {
@@ -145,8 +151,7 @@ export class SlackAdapter implements ChannelAdapter {
   }
 
   async onProcessingEnd(item: WorkItem): Promise<void> {
-    const isIntegrationMsg =
-      item.sender?.startsWith("B") || item.sender === "integration";
+    const isIntegrationMsg = item.sender?.startsWith("B") || item.sender === "integration";
     const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string);
 
     if (!isIntegrationMsg && threadTs) {

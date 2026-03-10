@@ -74,11 +74,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
       return null;
 
     case "image":
-      if (
-        typeof msg.data === "string" &&
-        typeof msg.filename === "string" &&
-        typeof msg.id === "string"
-      ) {
+      if (typeof msg.data === "string" && typeof msg.filename === "string" && typeof msg.id === "string") {
         return { type: "image", data: msg.data, filename: msg.filename, id: msg.id };
       }
       return null;

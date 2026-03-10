@@ -187,9 +187,7 @@ export class TaskLedger {
 
     // Include the full message text (truncated for very long messages like transcripts)
     const maxLen = 5000;
-    const body = item.text.length > maxLen
-      ? item.text.slice(0, maxLen) + "\n\n... (truncated)"
-      : item.text;
+    const body = item.text.length > maxLen ? item.text.slice(0, maxLen) + "\n\n... (truncated)" : item.text;
     parts.push("", "---", "", body);
 
     return parts.join("\n");
@@ -200,18 +198,14 @@ export class TaskLedger {
   }
 
   private formatCompletionComment(result: WorkResult): string {
-    const parts = [
-      `**Agent response** ($${result.costUsd.toFixed(3)} · ${(result.durationMs / 1000).toFixed(1)}s)`,
-    ];
+    const parts = [`**Agent response** ($${result.costUsd.toFixed(3)} · ${(result.durationMs / 1000).toFixed(1)}s)`];
 
     if (result.error) {
       parts.push(`\n**Error:** ${result.error}`);
     }
 
     const maxLen = 5000;
-    const text = result.text.length > maxLen
-      ? result.text.slice(0, maxLen) + "\n\n... (truncated)"
-      : result.text;
+    const text = result.text.length > maxLen ? result.text.slice(0, maxLen) + "\n\n... (truncated)" : result.text;
     parts.push("", text);
 
     return parts.join("\n");

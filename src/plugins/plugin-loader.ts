@@ -25,7 +25,9 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
       const entryPath = join(pluginDir, serverDef.entry);
       if (!existsSync(entryPath)) {
         log.warn("Plugin MCP server entry not found", {
-          plugin: name, server: serverName, entry: entryPath,
+          plugin: name,
+          server: serverName,
+          entry: entryPath,
         });
       }
     }
@@ -48,7 +50,7 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
   return plugins;
 }
 
-function normalizeManifest(raw: any): PluginManifest {
+export function normalizeManifest(raw: any): PluginManifest {
   return {
     name: raw.name ?? "",
     description: raw.description ?? "",

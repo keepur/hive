@@ -185,9 +185,7 @@ export class MeetingMonitor {
 
       const participantId = data.participant?.id ?? 0;
       const speaker = data.participant?.name ?? "Unknown";
-      const words = Array.isArray(data.words)
-        ? data.words.map((w: any) => w.text).join(" ")
-        : "";
+      const words = Array.isArray(data.words) ? data.words.map((w: any) => w.text).join(" ") : "";
 
       if (!words) return;
 
@@ -274,8 +272,7 @@ export class MeetingMonitor {
     const hasContent = session.pendingSegments.length > 0 || session.activePartials.size > 0;
     const timeSinceDispatch = Date.now() - session.lastDispatchTime;
     const shouldDispatch =
-      (timeSinceDispatch >= BATCH_WINDOW_MS && hasContent) ||
-      (session.idlePollCount >= IDLE_FLUSH_POLLS && hasContent);
+      (timeSinceDispatch >= BATCH_WINDOW_MS && hasContent) || (session.idlePollCount >= IDLE_FLUSH_POLLS && hasContent);
 
     if (shouldDispatch) {
       this.dispatchBatch(session);
@@ -352,13 +349,15 @@ export class MeetingMonitor {
 
       const data = await res.json();
       // Transcript format: array of segments with speaker + words
-      const entries = Array.isArray(data) ? data : (Array.isArray(data.results) ? data.results : []);
+      const entries = Array.isArray(data) ? data : Array.isArray(data.results) ? data.results : [];
 
       return entries.map((entry: any) => ({
         speaker: entry.speaker ?? entry.participant?.name ?? "Unknown",
         text: Array.isArray(entry.words)
           ? entry.words.map((w: any) => w.text).join(" ")
-          : (typeof entry.text === "string" ? entry.text : ""),
+          : typeof entry.text === "string"
+            ? entry.text
+            : "",
       }));
     } catch (err) {
       log.error("Transcript download error", { sessionId: session.id, error: String(err) });
@@ -384,7 +383,7 @@ export class MeetingMonitor {
         `Bot ID: ${session.botId}`,
         ``,
         `New transcript:`,
-        ...segments.map(s => `[${s.speaker}]: ${s.text}`),
+        ...segments.map((s) => `[${s.speaker}]: ${s.text}`),
         ``,
         `---`,
         `You are participating in this meeting. Use recall_send_chat with bot_id "${session.botId}" if you have relevant input. Otherwise respond "No response needed."`,
@@ -422,7 +421,7 @@ export class MeetingMonitor {
         `Bot ID: ${session.botId}`,
         ``,
         `Full transcript:`,
-        ...allSegments.map(s => `[${s.speaker}]: ${s.text}`),
+        ...allSegments.map((s) => `[${s.speaker}]: ${s.text}`),
         ``,
         `---`,
         `Meeting has ended. Produce a summary: key decisions made, action items with owners, and open questions.`,
@@ -486,7 +485,9 @@ export class MeetingMonitor {
   private readBody(req: IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
       let body = "";
-      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+      });
       req.on("end", () => resolve(body));
       req.on("error", reject);
     });

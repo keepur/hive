@@ -60,8 +60,12 @@ export class SlackGateway {
   }
 
   /** Expose resolved bot identity for cross-gateway registration */
-  get resolvedBotUserId(): string | null { return this.botUserId; }
-  get resolvedBotId(): string | null { return this.botId; }
+  get resolvedBotUserId(): string | null {
+    return this.botUserId;
+  }
+  get resolvedBotId(): string | null {
+    return this.botId;
+  }
 
   onMessage(handler: MessageHandler): void {
     this.messageHandler = handler;
@@ -78,7 +82,7 @@ export class SlackGateway {
   async start(): Promise<void> {
     const auth = await this.web.auth.test();
     this.botUserId = auth.user_id as string;
-    this.botId = auth.bot_id as string ?? null;
+    this.botId = (auth.bot_id as string) ?? null;
     log.info("Bot identity resolved", { botUserId: this.botUserId, botId: this.botId });
 
     // Standard message events
@@ -139,9 +143,10 @@ export class SlackGateway {
             .filter((b: any) => b.type === "section" || b.type === "rich_text")
             .map((b: any) => {
               if (b.text?.text) return b.text.text;
-              if (b.elements) return b.elements.map((e: any) =>
-                e.elements?.map((el: any) => el.text || "").join("") ?? ""
-              ).join("\n");
+              if (b.elements)
+                return b.elements
+                  .map((e: any) => e.elements?.map((el: any) => el.text || "").join("") ?? "")
+                  .join("\n");
               return "";
             })
             .filter(Boolean)
@@ -154,7 +159,10 @@ export class SlackGateway {
       // Process file attachments
       let processedFiles: ProcessedFile[] = [];
       if (event.files?.length) {
-        log.info("Processing file attachments", { count: event.files.length, names: event.files.map((f: any) => f.name) });
+        log.info("Processing file attachments", {
+          count: event.files.length,
+          names: event.files.map((f: any) => f.name),
+        });
         const results = await Promise.all(
           event.files.map((f: any) => downloadAndProcess(f as SlackFile, this.botToken)),
         );
@@ -192,7 +200,13 @@ export class SlackGateway {
         files: processedFiles.length > 0 ? processedFiles : undefined,
       };
 
-      log.info("Message received", { channel: msg.channel, channelName, user: msg.user, textLength: msg.text.length, fileCount: processedFiles.length });
+      log.info("Message received", {
+        channel: msg.channel,
+        channelName,
+        user: msg.user,
+        textLength: msg.text.length,
+        fileCount: processedFiles.length,
+      });
       this.messageHandler?.(msg);
     });
 

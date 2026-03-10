@@ -362,12 +362,12 @@ async function main() {
       console.log("");
 
       const current = (hive.plugins ?? []).join(", ") || "none";
-      const selected = await ask(
-        "Which plugins to enable? (comma-separated, or 'none')",
-        current,
-      );
+      const selected = await ask("Which plugins to enable? (comma-separated, or 'none')", current);
       if (selected.toLowerCase() !== "none") {
-        hive.plugins = selected.split(",").map((s: string) => s.trim()).filter(Boolean);
+        hive.plugins = selected
+          .split(",")
+          .map((s: string) => s.trim())
+          .filter(Boolean);
       } else {
         hive.plugins = [];
       }
@@ -625,10 +625,7 @@ async function doConstitution(hive: Record<string, any>) {
     console.log(`Without a DevOps agent, someone needs to rebuild and restart Hive`);
     console.log(`after agent changes (e.g., adding a new agent).\n`);
   }
-  hive.constitution.cosCanBuildDeploy = await confirm(
-    `Allow ${cosName} to build and redeploy Hive?`,
-    true,
-  );
+  hive.constitution.cosCanBuildDeploy = await confirm(`Allow ${cosName} to build and redeploy Hive?`, true);
   if (hive.constitution.cosCanBuildDeploy) {
     console.log(`  ✓ ${cosName} can run deploy.sh, npm run build, and restart the service`);
   } else {
@@ -641,10 +638,7 @@ async function doConstitution(hive: Record<string, any>) {
   console.log(`removed from all agents. Not just a policy, they literally can't send.\n`);
   console.log(`Default: OFF. You can enable later by setting EXTERNAL_COMMS_ENABLED=true`);
   console.log(`in .env and restarting Hive.\n`);
-  hive.constitution.cosCanContactExternal = await confirm(
-    `Enable external communications now?`,
-    false,
-  );
+  hive.constitution.cosCanContactExternal = await confirm(`Enable external communications now?`, false);
 
   // Load env to set the hard gate flag
   const extEnv = loadEnv();
@@ -662,10 +656,7 @@ async function doConstitution(hive: Record<string, any>) {
   // 4. Source code
   console.log(`\n── Source code (Hive repository)`);
   console.log(`This is about modifying Hive's actual code — not agent configs.\n`);
-  hive.constitution.cosCanEditSourceCode = await confirm(
-    `Allow ${cosName} to modify Hive source code?`,
-    false,
-  );
+  hive.constitution.cosCanEditSourceCode = await confirm(`Allow ${cosName} to modify Hive source code?`, false);
   if (hive.constitution.cosCanEditSourceCode) {
     console.log(`  ✓ ${cosName} can edit source code (use with caution)`);
   } else {
@@ -676,10 +667,7 @@ async function doConstitution(hive: Record<string, any>) {
   console.log(`\n── Emergency access`);
   console.log(`If Hive goes down and you're unreachable, should ${cosName} be able`);
   console.log(`to take minimum action to restore service?\n`);
-  hive.constitution.cosBreakGlass = await confirm(
-    `Grant ${cosName} emergency break-glass access?`,
-    true,
-  );
+  hive.constitution.cosBreakGlass = await confirm(`Grant ${cosName} emergency break-glass access?`, true);
   if (hive.constitution.cosBreakGlass) {
     console.log(`  ✓ ${cosName} can restart services in emergencies (logged, ${ownerName} notified)`);
   } else {

@@ -13,8 +13,8 @@ interface RetryEntry {
 }
 
 export interface RetryQueueConfig {
-  maxAttempts: number;     // default 3
-  baseDelayMs: number;     // default 30000
+  maxAttempts: number; // default 3
+  baseDelayMs: number; // default 30000
 }
 
 export interface RetryQueueStats {
