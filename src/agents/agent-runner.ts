@@ -294,6 +294,7 @@ export class AgentRunner {
     }
     // Atlas fallback still needs these
     if (process.env.MONGODB_ATLAS_URI) kbEnv.MONGODB_ATLAS_URI = process.env.MONGODB_ATLAS_URI;
+    if (process.env.MONGODB_STAGING_URI) kbEnv.MONGODB_STAGING_URI = process.env.MONGODB_STAGING_URI;
     if (process.env.VOYAGEAI_API_KEY) kbEnv.VOYAGEAI_API_KEY = process.env.VOYAGEAI_API_KEY;
     servers["knowledge-base"] = {
       type: "stdio",

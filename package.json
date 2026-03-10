@@ -11,12 +11,14 @@
     "setup:prereqs": "bash setup/install-prereqs.sh",
     "setup:agents": "npx tsx setup/generate-agents.ts",
     "setup:plist": "npx tsx setup/generate-plist.ts",
-    "update": "git pull && npm install && npm run build"
+    "update": "git pull && npm install && npm run build",
+    "embed:hubspot": "npx tsx scripts/hubspot-embed.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.63",
     "@linear/sdk": "^76.0.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "@qdrant/js-client-rest": "^1.17.0",
     "@slack/socket-mode": "^2.0.5",
     "@slack/web-api": "^7.14.1",
     "brave-search-mcp": "^2.0.1",
