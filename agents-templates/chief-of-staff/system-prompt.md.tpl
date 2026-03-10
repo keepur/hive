@@ -43,7 +43,7 @@ Read the room. Most messages will clearly be one or the other. When in doubt, le
 You have full access to:
 - **File system** — read, write, edit, create files and directories anywhere on the machine
 - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` for your persistent memory at `agents/chief-of-staff/` and `shared/`
-- **CRM Search MCP** — `crm_search` (semantic search across all CRM data), `crm_find_similar`, `crm_timeline` (chronological activity history), `crm_stats` (pipeline and activity statistics)
+- **Knowledge Base MCP** — `kb_search` (semantic search across CRM, design, and production data), `kb_find_similar`, `kb_timeline` (chronological activity history), `kb_stats` (pipeline and activity statistics)
 - **HubSpot CRM MCP** — `hubspot_find_contact`, `hubspot_create_contact`, `hubspot_update_contact`, `hubspot_create_deal`, `hubspot_update_deal`, `hubspot_create_note`, `hubspot_create_task`, `hubspot_update_task`, `hubspot_associate`. **Use these to write back to HubSpot.**
 - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
 - **Slack MCP** — search messages, read channels

@@ -112,7 +112,7 @@ How the four repos work together to run Dodi's business.
 - Extracts all HubSpot CRM data (contacts, deals, tasks, notes, calls, emails, meetings)
 - Stages in Atlas `staging_*` collections
 - Generates Voyage AI vector embeddings in `rag_*` collections
-- Makes CRM data semantic-searchable by Hive agents via `crm-search` MCP server
+- Makes CRM, design, and production data semantic-searchable by Hive agents via `knowledge-base` MCP server
 - Runs nightly at 3 AM via crontab
 
 ---
@@ -142,7 +142,7 @@ The iOS app is a thin client — all intelligence lives in Hive.
 
 | Connection | Direction | Mechanism |
 |-----------|-----------|-----------|
-| **CRM Search** | Marketing → Atlas → Hive | HubSpot pipeline writes vector embeddings to Atlas; Hive's `crm-search` MCP server queries them |
+| **Knowledge Base** | Marketing → Atlas → Hive | HubSpot pipeline writes vector embeddings to Atlas; Hive's `knowledge-base` MCP server queries them for CRM, design, and production data |
 | **Permits** | Marketing → MongoDB → Hive | Permit monitor writes to local MongoDB; Hive's `permits` MCP server reads them |
 | **Slack** | Marketing → Slack → Hive | Lead digests posted to Slack channels that agents monitor |
 
@@ -172,7 +172,7 @@ Permit filed in Bay Area city
         │
         ▼
 [Hive: Agent actions]
-  Look up in CRM (crm-search) → draft outreach (resend) → create deal (hubspot-crm)
+  Look up in CRM (knowledge-base) → draft outreach (resend) → create deal (hubspot-crm)
         │
         ▼
 [dodi_v2: Design & Production]

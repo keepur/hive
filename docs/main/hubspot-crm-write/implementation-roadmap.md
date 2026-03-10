@@ -2,7 +2,7 @@
 
 ## Design Summary
 
-New `hubspot-crm` MCP server alongside the existing read-only `crm-search` server. Two new files (API client + MCP server), plus wiring changes in agent-runner, config, and agent templates.
+New `hubspot-crm` MCP server alongside the existing read-only `knowledge-base` server. Two new files (API client + MCP server), plus wiring changes in agent-runner, config, and agent templates.
 
 The API client reuses proven patterns from the marketing extraction client (rate limiting, retry, auth) but is focused on single-object CRUD rather than bulk extraction.
 
@@ -20,7 +20,7 @@ The API client reuses proven patterns from the marketing extraction client (rate
 
 ### Phase 3: Agent Templates
 - Add `hubspot-crm` to server lists for Jessica, SDR, Rae
-- Add `crm-search` to Rae (missing today)
+- Add `knowledge-base` to Rae (missing today)
 - Independent of Phase 2
 
 ## Dependencies

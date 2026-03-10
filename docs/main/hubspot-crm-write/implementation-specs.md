@@ -6,11 +6,11 @@
 |------|--------|-------------|
 | `src/hubspot/hubspot-api-client.ts` | Create | HubSpot v3 API client with rate limiting, retry, CRUD |
 | `src/hubspot/hubspot-crm-mcp-server.ts` | Create | MCP server with 9 CRM tools |
-| `src/agents/agent-runner.ts` | Modify | Register `hubspot-crm` server (after crm-search block, ~line 262) |
+| `src/agents/agent-runner.ts` | Modify | Register `hubspot-crm` server (after knowledge-base block, ~line 262) |
 | `src/config.ts` | Modify | Add `hubspot.apiKey` config entry |
 | `agents-templates/customer-success/agent.yaml` | Modify | Add `hubspot-crm` to servers |
 | `agents-templates/sdr/agent.yaml.tpl` | Modify | Add `hubspot-crm` to servers |
-| `agents-templates/chief-of-staff/agent.yaml.tpl` | Modify | Add `crm-search` + `hubspot-crm` to servers |
+| `agents-templates/chief-of-staff/agent.yaml.tpl` | Modify | Add `knowledge-base` + `hubspot-crm` to servers |
 
 ## API Client Interface
 
@@ -124,7 +124,7 @@ const ASSOCIATION_TYPES: Record<string, Record<string, number>> = {
 
 ## Agent Runner Wiring
 
-Insert after the `crm-search` block (~line 262 in agent-runner.ts):
+Insert after the `knowledge-base` block (~line 262 in agent-runner.ts):
 
 ```typescript
 const hubspotApiKey = process.env.HUBSPOT_API_KEY ?? "";

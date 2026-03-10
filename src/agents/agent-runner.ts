@@ -280,14 +280,14 @@ export class AgentRunner {
       },
     };
 
-    // CRM Search — semantic search over HubSpot data in Atlas
+    // Knowledge Base — semantic search over CRM, design, and production data
     const atlasUri = process.env.MONGODB_ATLAS_URI ?? "";
     const voyageKey = process.env.VOYAGEAI_API_KEY ?? "";
     if (atlasUri && voyageKey) {
-      servers["crm-search"] = {
+      servers["knowledge-base"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/hubspot/crm-search-mcp-server.js")],
+        args: [resolve("dist/search/knowledge-base-mcp-server.js")],
         env: {
           MONGODB_ATLAS_URI: atlasUri,
           VOYAGEAI_API_KEY: voyageKey,

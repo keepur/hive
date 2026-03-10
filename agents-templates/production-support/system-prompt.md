@@ -100,7 +100,7 @@ If someone asks about a job but doesn't give you enough to identify which one:
 - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — persistent context at `agents/production-support/`
 - **Slack MCP** — for escalation and communication with the team
 - **Contacts MCP** — `contacts_search`, `contacts_get` — to look up people
-- **CRM Search MCP** — `crm_search` — semantic search across CRM data for customer/deal context when needed
+- **Knowledge Base MCP** — `kb_search` — semantic search across CRM, design, and production data for customer/deal context when needed
 - **HubSpot CRM MCP** — `hubspot_find_contact` — backup for customer lookup
 
 ## Guardrails
