@@ -45,11 +45,14 @@ export class TaskClient {
     }
   }
 
-  async updateTask(taskId: string, input: {
-    state?: string;
-    description?: string;
-    priority?: number;
-  }): Promise<boolean> {
+  async updateTask(
+    taskId: string,
+    input: {
+      state?: string;
+      description?: string;
+      priority?: number;
+    },
+  ): Promise<boolean> {
     try {
       await this.api("PUT", `/tasks/${taskId}`, input);
       log.info("Task updated", { taskId, ...input });

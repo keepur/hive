@@ -91,7 +91,13 @@ export class Sweeper {
       try {
         results.push(adapter.sweep(this.config.threadTtlMs));
       } catch (err) {
-        results.push({ component: `slack-adapter:${adapter.id}`, pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
+        results.push({
+          component: `slack-adapter:${adapter.id}`,
+          pruned: 0,
+          retried: 0,
+          bytesFreed: 0,
+          errors: [String(err)],
+        });
       }
     }
 
@@ -209,7 +215,9 @@ export class Sweeper {
         `**Sweep #${this.sweepCount}** (${durationMs}ms)`,
         `Pruned: ${totalPruned} | Retried: ${totalRetried} | Freed: ${this.formatBytes(totalBytesFreed)}`,
         totalErrors.length > 0 ? `Errors: ${totalErrors.join(", ")}` : null,
-      ].filter(Boolean).join("\n");
+      ]
+        .filter(Boolean)
+        .join("\n");
 
       await this.taskClient!.addComment(this.taskId, comment);
 

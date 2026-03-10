@@ -38,14 +38,11 @@ function loadConfig(): Record<string, any> {
 // Pre-process SMS-specific template directives, then delegate to shared render()
 function renderAgent(template: string, ctx: Record<string, any>): string {
   // Handle {{#sms_section}}...{{/sms_section}} blocks (special: checks lines.length)
-  template = template.replace(
-    /\{\{#sms_section\}\}([\s\S]*?)\{\{\/sms_section\}\}/g,
-    (_, block) => {
-      const lines: SmsLine[] = ctx.sms?.lines ?? [];
-      if (lines.length === 0) return "";
-      return block;
-    },
-  );
+  template = template.replace(/\{\{#sms_section\}\}([\s\S]*?)\{\{\/sms_section\}\}/g, (_, block) => {
+    const lines: SmsLine[] = ctx.sms?.lines ?? [];
+    if (lines.length === 0) return "";
+    return block;
+  });
 
   // Replace {{sms_channels}} with list of channel names
   template = template.replace(/\{\{sms_channels\}\}/g, () => {
@@ -94,9 +91,7 @@ async function main() {
   let skipped = 0;
 
   // Core templates
-  const coreAgents = readdirSync(TEMPLATES_DIR).filter((d) =>
-    statSync(join(TEMPLATES_DIR, d)).isDirectory(),
-  );
+  const coreAgents = readdirSync(TEMPLATES_DIR).filter((d) => statSync(join(TEMPLATES_DIR, d)).isDirectory());
 
   // Plugin templates (from enabled plugins in hive.yaml)
   const enabledPlugins: string[] = config.plugins ?? [];
@@ -118,10 +113,7 @@ async function main() {
   }
 
   // Merge: core uses TEMPLATES_DIR, plugin uses own dir
-  const allAgents = [
-    ...coreAgents.map(id => ({ id, templateDir: join(TEMPLATES_DIR, id) })),
-    ...pluginAgents,
-  ];
+  const allAgents = [...coreAgents.map((id) => ({ id, templateDir: join(TEMPLATES_DIR, id) })), ...pluginAgents];
 
   for (const { id: agentId, templateDir } of allAgents) {
     const agentDir = join(AGENTS_DIR, agentId);
@@ -189,7 +181,10 @@ async function main() {
   // Generate constitution if template exists and memory path is configured
   const constitutionTplPath = join(ROOT, "setup", "templates", "constitution.md.tpl");
   if (existsSync(constitutionTplPath)) {
-    const memoryPath = (config.memory?.localPath ?? `${process.env.HOME}/hive-memory`).replace("~", process.env.HOME ?? "/tmp");
+    const memoryPath = (config.memory?.localPath ?? `${process.env.HOME}/hive-memory`).replace(
+      "~",
+      process.env.HOME ?? "/tmp",
+    );
     const sharedDir = join(memoryPath, "shared");
     const constitutionOutPath = join(sharedDir, "constitution.md");
 
@@ -244,10 +239,12 @@ async function main() {
           savedAt: existing.updatedAt,
           savedBy: existing.updatedBy || "system",
         });
-        await db.collection("memory").updateOne(
-          { path: "shared/constitution.md" },
-          { $set: { content, updatedAt: new Date(), updatedBy: "setup:agents" } },
-        );
+        await db
+          .collection("memory")
+          .updateOne(
+            { path: "shared/constitution.md" },
+            { $set: { content, updatedAt: new Date(), updatedBy: "setup:agents" } },
+          );
         console.log("  SYNC shared/constitution.md → MongoDB");
       } else if (!existing) {
         await db.collection("memory").insertOne({

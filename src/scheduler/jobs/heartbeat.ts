@@ -4,10 +4,7 @@ import { createLogger } from "../../logging/logger.js";
 
 const log = createLogger("heartbeat");
 
-export async function runHeartbeat(
-  healthReporter: HealthReporter,
-  memoryManager: MemoryManager,
-): Promise<void> {
+export async function runHeartbeat(healthReporter: HealthReporter, memoryManager: MemoryManager): Promise<void> {
   try {
     await memoryManager.pull();
     await healthReporter.writeToMemory();

@@ -126,10 +126,7 @@ export class DeviceRegistry {
   }
 
   async updateLastSeen(deviceId: string): Promise<void> {
-    await this.collection.updateOne(
-      { _id: deviceId },
-      { $set: { lastSeenAt: new Date() } },
-    );
+    await this.collection.updateOne({ _id: deviceId }, { $set: { lastSeenAt: new Date() } });
   }
 
   async getDevice(deviceId: string): Promise<Device | null> {
@@ -147,10 +144,7 @@ export class DeviceRegistry {
   }
 
   async deactivateDevice(deviceId: string): Promise<boolean> {
-    const result = await this.collection.updateOne(
-      { _id: deviceId },
-      { $set: { active: false } },
-    );
+    const result = await this.collection.updateOne({ _id: deviceId }, { $set: { active: false } });
     if (result.modifiedCount > 0) {
       log.info("Device deactivated", { deviceId });
       return true;

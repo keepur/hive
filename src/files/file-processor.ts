@@ -61,12 +61,16 @@ export async function describeImageWithGemini(buffer: Buffer, mimetype: string):
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [{
-            parts: [
-              { inline_data: { mime_type: mimetype, data: base64 } },
-              { text: "Describe this image in detail. If it contains text, extract all of it. If it's a diagram, architecture drawing, or technical image, describe all labels, relationships, and structure. If it's a screenshot of messages or a conversation, transcribe everything. Be thorough." },
-            ],
-          }],
+          contents: [
+            {
+              parts: [
+                { inline_data: { mime_type: mimetype, data: base64 } },
+                {
+                  text: "Describe this image in detail. If it contains text, extract all of it. If it's a diagram, architecture drawing, or technical image, describe all labels, relationships, and structure. If it's a screenshot of messages or a conversation, transcribe everything. Be thorough.",
+                },
+              ],
+            },
+          ],
         }),
       },
     );
@@ -77,7 +81,7 @@ export async function describeImageWithGemini(buffer: Buffer, mimetype: string):
       return null;
     }
 
-    const data = await res.json() as any;
+    const data = (await res.json()) as any;
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (text) {
       log.info("Image described via Gemini", { model: GEMINI_MODEL, chars: text.length });
@@ -88,12 +92,22 @@ export async function describeImageWithGemini(buffer: Buffer, mimetype: string):
     return null;
   }
 }
-const TEXT_TYPES = new Set(["csv", "tsv", "txt", "text", "md", "markdown", "json", "xml", "html", "yaml", "yml", "log"]);
+const TEXT_TYPES = new Set([
+  "csv",
+  "tsv",
+  "txt",
+  "text",
+  "md",
+  "markdown",
+  "json",
+  "xml",
+  "html",
+  "yaml",
+  "yml",
+  "log",
+]);
 
-export async function downloadAndProcess(
-  file: SlackFile,
-  botToken: string,
-): Promise<ProcessedFile | null> {
+export async function downloadAndProcess(file: SlackFile, botToken: string): Promise<ProcessedFile | null> {
   const url = file.url_private_download || file.url_private;
   if (!url) {
     log.warn("No download URL for file", { id: file.id, name: file.name });
@@ -135,7 +149,10 @@ export async function downloadAndProcess(
     if (isImage) {
       const description = await describeImageWithGemini(buffer, file.mimetype);
       return {
-        name: file.name, mimetype: file.mimetype, size: file.size, localPath,
+        name: file.name,
+        mimetype: file.mimetype,
+        size: file.size,
+        localPath,
         textContent: description ?? "[Image — could not extract description]",
         isImage: true,
       };
@@ -144,7 +161,14 @@ export async function downloadAndProcess(
     // Text-based files
     if (TEXT_TYPES.has(ext) || file.mimetype.startsWith("text/")) {
       const text = buffer.toString("utf-8");
-      return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: truncate(text), isImage: false };
+      return {
+        name: file.name,
+        mimetype: file.mimetype,
+        size: file.size,
+        localPath,
+        textContent: truncate(text),
+        isImage: false,
+      };
     }
 
     // PDF
@@ -153,10 +177,24 @@ export async function downloadAndProcess(
         const pdfModule = await import("pdf-parse");
         const pdfParse = (pdfModule as any).default ?? pdfModule;
         const result = await pdfParse(buffer);
-        return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: truncate(result.text), isImage: false };
+        return {
+          name: file.name,
+          mimetype: file.mimetype,
+          size: file.size,
+          localPath,
+          textContent: truncate(result.text),
+          isImage: false,
+        };
       } catch (e: any) {
         log.warn("PDF parse failed", { name: file.name, error: e.message });
-        return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: "[PDF — could not extract text]", isImage: false };
+        return {
+          name: file.name,
+          mimetype: file.mimetype,
+          size: file.size,
+          localPath,
+          textContent: "[PDF — could not extract text]",
+          isImage: false,
+        };
       }
     }
 
@@ -165,10 +203,24 @@ export async function downloadAndProcess(
       try {
         const mammoth = await import("mammoth");
         const result = await mammoth.extractRawText({ buffer });
-        return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: truncate(result.value), isImage: false };
+        return {
+          name: file.name,
+          mimetype: file.mimetype,
+          size: file.size,
+          localPath,
+          textContent: truncate(result.value),
+          isImage: false,
+        };
       } catch (e: any) {
         log.warn("DOCX parse failed", { name: file.name, error: e.message });
-        return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: "[DOCX — could not extract text]", isImage: false };
+        return {
+          name: file.name,
+          mimetype: file.mimetype,
+          size: file.size,
+          localPath,
+          textContent: "[DOCX — could not extract text]",
+          isImage: false,
+        };
       }
     }
 
@@ -181,10 +233,24 @@ export async function downloadAndProcess(
           const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[name]);
           return `--- Sheet: ${name} ---\n${csv}`;
         });
-        return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: truncate(sheets.join("\n\n")), isImage: false };
+        return {
+          name: file.name,
+          mimetype: file.mimetype,
+          size: file.size,
+          localPath,
+          textContent: truncate(sheets.join("\n\n")),
+          isImage: false,
+        };
       } catch (e: any) {
         log.warn("XLSX parse failed", { name: file.name, error: e.message });
-        return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, textContent: "[Spreadsheet — could not extract content]", isImage: false };
+        return {
+          name: file.name,
+          mimetype: file.mimetype,
+          size: file.size,
+          localPath,
+          textContent: "[Spreadsheet — could not extract content]",
+          isImage: false,
+        };
       }
     }
 
@@ -198,11 +264,7 @@ export async function downloadAndProcess(
 }
 
 /** Process a raw image buffer (e.g. from WebSocket) into a ProcessedFile */
-export async function processImageBuffer(
-  buffer: Buffer,
-  filename: string,
-  mimetype: string,
-): Promise<ProcessedFile> {
+export async function processImageBuffer(buffer: Buffer, filename: string, mimetype: string): Promise<ProcessedFile> {
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
   const localPath = join(DOWNLOAD_DIR, `ws-${Date.now()}-${safeName}`);
   writeFileSync(localPath, buffer);

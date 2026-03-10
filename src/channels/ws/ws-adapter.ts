@@ -76,12 +76,14 @@ export class WsAdapter implements ChannelAdapter {
 
           log.info("Device paired", { deviceId: result.device._id, name: result.device.name });
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            token: result.token,
-            deviceId: result.device._id,
-            deviceName: result.device.name,
-            defaultAgentId: result.device.defaultAgentId,
-          }));
+          res.end(
+            JSON.stringify({
+              token: result.token,
+              deviceId: result.device._id,
+              deviceName: result.device.name,
+              defaultAgentId: result.device.defaultAgentId,
+            }),
+          );
         } catch (err) {
           log.error("Pair endpoint error", { error: String(err) });
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -103,7 +105,11 @@ export class WsAdapter implements ChannelAdapter {
       if (req.method === "PUT" && url.pathname === "/me") {
         try {
           const device = await this.verifyDeviceToken(req);
-          if (!device) { res.writeHead(401); res.end("Unauthorized"); return; }
+          if (!device) {
+            res.writeHead(401);
+            res.end("Unauthorized");
+            return;
+          }
 
           const body = await readBody(req);
           const parsed = JSON.parse(body) as { name?: string };
@@ -129,14 +135,20 @@ export class WsAdapter implements ChannelAdapter {
       if (req.method === "GET" && url.pathname === "/me") {
         try {
           const device = await this.verifyDeviceToken(req);
-          if (!device) { res.writeHead(401); res.end("Unauthorized"); return; }
+          if (!device) {
+            res.writeHead(401);
+            res.end("Unauthorized");
+            return;
+          }
 
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            deviceId: device._id,
-            name: device.name,
-            defaultAgentId: device.defaultAgentId,
-          }));
+          res.end(
+            JSON.stringify({
+              deviceId: device._id,
+              name: device.name,
+              defaultAgentId: device.defaultAgentId,
+            }),
+          );
         } catch (err) {
           log.error("GET /me error", { error: String(err) });
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -150,7 +162,11 @@ export class WsAdapter implements ChannelAdapter {
 
       // POST /devices — create a new device, returns pairing code
       if (req.method === "POST" && url.pathname === "/devices") {
-        if (!isAdmin) { res.writeHead(401); res.end("Unauthorized"); return; }
+        if (!isAdmin) {
+          res.writeHead(401);
+          res.end("Unauthorized");
+          return;
+        }
         try {
           const body = await readBody(req);
           const parsed = JSON.parse(body) as { name?: string; defaultAgentId?: string };
@@ -158,13 +174,15 @@ export class WsAdapter implements ChannelAdapter {
           const agentId = parsed.defaultAgentId || "production-support";
           const device = await this.deviceRegistry.createDevice(name, agentId);
           res.writeHead(201, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            deviceId: device._id,
-            name: device.name,
-            pairingCode: device.pairingCode,
-            expiresAt: device.pairingCodeExpiresAt,
-            defaultAgentId: device.defaultAgentId,
-          }));
+          res.end(
+            JSON.stringify({
+              deviceId: device._id,
+              name: device.name,
+              pairingCode: device.pairingCode,
+              expiresAt: device.pairingCodeExpiresAt,
+              defaultAgentId: device.defaultAgentId,
+            }),
+          );
         } catch (err) {
           log.error("Create device error", { error: String(err) });
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -175,7 +193,11 @@ export class WsAdapter implements ChannelAdapter {
 
       // GET /devices — list all devices
       if (req.method === "GET" && url.pathname === "/devices") {
-        if (!isAdmin) { res.writeHead(401); res.end("Unauthorized"); return; }
+        if (!isAdmin) {
+          res.writeHead(401);
+          res.end("Unauthorized");
+          return;
+        }
         try {
           const devices = await this.deviceRegistry.listDevices();
           const list = devices.map((d) => ({
@@ -288,9 +310,7 @@ export class WsAdapter implements ChannelAdapter {
     this.server.on("upgrade", async (req, socket, head) => {
       // Extract token from query string ?token=... or Authorization header
       const url = new URL(req.url ?? "/", `http://localhost:${this.port}`);
-      const token =
-        url.searchParams.get("token") ??
-        req.headers.authorization?.replace("Bearer ", "");
+      const token = url.searchParams.get("token") ?? req.headers.authorization?.replace("Bearer ", "");
 
       if (!token) {
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
@@ -436,9 +456,7 @@ export class WsAdapter implements ChannelAdapter {
       return;
     }
 
-    const text = result.error
-      ? `Error: ${result.error}`
-      : result.text;
+    const text = result.error ? `Error: ${result.error}` : result.text;
 
     const msg: ServerMessage = {
       type: "message",

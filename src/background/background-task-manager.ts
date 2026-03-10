@@ -244,48 +244,51 @@ export class BackgroundTaskManager {
 
     // Read output synchronously-ish via a promise we don't await
     // (fireCompletion is called from event handlers, keep it non-blocking)
-    this.tailLog(task.logPath, LOG_TAIL_LINES).then((output) => {
-      const statusEmoji = task.status === "completed" ? "completed" : task.status === "failed" ? "failed" : "orphaned";
+    this.tailLog(task.logPath, LOG_TAIL_LINES)
+      .then((output) => {
+        const statusEmoji =
+          task.status === "completed" ? "completed" : task.status === "failed" ? "failed" : "orphaned";
 
-      const completionItem: WorkItem = {
-        id: `bg:${task.id}:done:${Date.now()}`,
-        text: [
-          `[Background task ${statusEmoji}] Task \`${task.id}\` finished with exit code ${task.exitCode ?? "unknown"}.`,
-          `Command: \`${task.command}\``,
-          `Duration: ${durationSec}s`,
-          `Output (last ${LOG_TAIL_LINES} lines):`,
-          "```",
-          output || "(no output)",
-          "```",
-        ].join("\n"),
-        source: {
-          kind: (task.context.channelKind || "internal") as ChannelKind,
-          id: task.context.channelId,
-          label: task.context.channelLabel,
-          adapterId: task.context.adapterId,
-        },
-        sender: "system",
-        threadId: task.context.threadId,
-        timestamp: new Date(),
-        meta: {
-          slackTs: task.context.slackTs,
-          slackThreadTs: task.context.slackThreadTs,
-          bgTaskId: task.id,
-        },
-      };
+        const completionItem: WorkItem = {
+          id: `bg:${task.id}:done:${Date.now()}`,
+          text: [
+            `[Background task ${statusEmoji}] Task \`${task.id}\` finished with exit code ${task.exitCode ?? "unknown"}.`,
+            `Command: \`${task.command}\``,
+            `Duration: ${durationSec}s`,
+            `Output (last ${LOG_TAIL_LINES} lines):`,
+            "```",
+            output || "(no output)",
+            "```",
+          ].join("\n"),
+          source: {
+            kind: (task.context.channelKind || "internal") as ChannelKind,
+            id: task.context.channelId,
+            label: task.context.channelLabel,
+            adapterId: task.context.adapterId,
+          },
+          sender: "system",
+          threadId: task.context.threadId,
+          timestamp: new Date(),
+          meta: {
+            slackTs: task.context.slackTs,
+            slackThreadTs: task.context.slackThreadTs,
+            bgTaskId: task.id,
+          },
+        };
 
-      log.info("Background task completed, dispatching notification", {
-        id: task.id,
-        status: task.status,
-        exitCode: task.exitCode,
-        durationSec,
-        agentId: task.context.agentId,
+        log.info("Background task completed, dispatching notification", {
+          id: task.id,
+          status: task.status,
+          exitCode: task.exitCode,
+          durationSec,
+          agentId: task.context.agentId,
+        });
+
+        this.onComplete(completionItem);
+      })
+      .catch((err) => {
+        log.error("Failed to fire completion notification", { id: task.id, error: String(err) });
       });
-
-      this.onComplete(completionItem);
-    }).catch((err) => {
-      log.error("Failed to fire completion notification", { id: task.id, error: String(err) });
-    });
   }
 
   private async taskStatus(id: string): Promise<Record<string, unknown> | null> {
@@ -405,7 +408,9 @@ export class BackgroundTaskManager {
   private readBody(req: IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
       let body = "";
-      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+      });
       req.on("end", () => resolve(body));
       req.on("error", reject);
     });

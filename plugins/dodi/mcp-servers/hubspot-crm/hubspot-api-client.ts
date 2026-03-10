@@ -34,10 +34,10 @@ class RateLimiter {
 
   async acquire(): Promise<void> {
     const now = Date.now();
-    this.timestamps = this.timestamps.filter(t => t > now - this.windowMs);
+    this.timestamps = this.timestamps.filter((t) => t > now - this.windowMs);
     if (this.timestamps.length >= this.maxRequests) {
       const waitMs = this.timestamps[0] + this.windowMs - now + 50;
-      await new Promise(r => setTimeout(r, waitMs));
+      await new Promise((r) => setTimeout(r, waitMs));
     }
     this.timestamps.push(Date.now());
   }
@@ -63,24 +63,9 @@ const ASSOCIATION_TYPES: Record<string, Record<string, number>> = {
 
 // ── Default Property Lists ──────────────────────────────────────────────────
 
-const CONTACT_PROPERTIES = [
-  "firstname",
-  "lastname",
-  "email",
-  "phone",
-  "company",
-  "jobtitle",
-  "lifecyclestage",
-];
+const CONTACT_PROPERTIES = ["firstname", "lastname", "email", "phone", "company", "jobtitle", "lifecyclestage"];
 
-const DEAL_PROPERTIES = [
-  "dealname",
-  "dealstage",
-  "pipeline",
-  "amount",
-  "closedate",
-  "hubspot_owner_id",
-];
+const DEAL_PROPERTIES = ["dealname", "dealstage", "pipeline", "amount", "closedate", "hubspot_owner_id"];
 
 // ── Client ──────────────────────────────────────────────────────────────────
 
@@ -123,7 +108,7 @@ export class HubSpotApiClient {
               backoffMs,
               path,
             });
-            await new Promise(r => setTimeout(r, backoffMs));
+            await new Promise((r) => setTimeout(r, backoffMs));
             continue;
           }
         }
@@ -146,7 +131,7 @@ export class HubSpotApiClient {
             backoffMs,
             path,
           });
-          await new Promise(r => setTimeout(r, backoffMs));
+          await new Promise((r) => setTimeout(r, backoffMs));
           continue;
         }
         throw err;
@@ -165,29 +150,19 @@ export class HubSpotApiClient {
     const body = {
       filterGroups: [
         {
-          filters: [
-            { propertyName: "email", operator: "EQ", value: query },
-          ],
+          filters: [{ propertyName: "email", operator: "EQ", value: query }],
         },
         {
-          filters: [
-            { propertyName: "firstname", operator: "CONTAINS_TOKEN", value: query },
-          ],
+          filters: [{ propertyName: "firstname", operator: "CONTAINS_TOKEN", value: query }],
         },
         {
-          filters: [
-            { propertyName: "lastname", operator: "CONTAINS_TOKEN", value: query },
-          ],
+          filters: [{ propertyName: "lastname", operator: "CONTAINS_TOKEN", value: query }],
         },
       ],
       properties: CONTACT_PROPERTIES,
     };
 
-    const result = await this.api<{ results: HubSpotObject[] }>(
-      "POST",
-      "/crm/v3/objects/contacts/search",
-      body,
-    );
+    const result = await this.api<{ results: HubSpotObject[] }>("POST", "/crm/v3/objects/contacts/search", body);
 
     return result.results[0] ?? null;
   }
@@ -278,7 +253,7 @@ export class HubSpotApiClient {
             "GET",
             `/crm/v3/objects/${objectType}s/${objectId}/associations/${engType}`,
           );
-          return { type: engType, ids: res.results.map(r => r.id) };
+          return { type: engType, ids: res.results.map((r) => r.id) };
         } catch {
           return { type: engType, ids: [] };
         }
@@ -287,7 +262,14 @@ export class HubSpotApiClient {
 
     // Step 2: fetch actual objects (batch per type)
     const propertyMap: Record<string, string[]> = {
-      emails: ["hs_email_subject", "hs_email_text", "hs_email_direction", "hs_timestamp", "hs_email_from_email", "hs_email_to_email"],
+      emails: [
+        "hs_email_subject",
+        "hs_email_text",
+        "hs_email_direction",
+        "hs_timestamp",
+        "hs_email_from_email",
+        "hs_email_to_email",
+      ],
       notes: ["hs_note_body", "hs_timestamp"],
       tasks: ["hs_task_subject", "hs_task_body", "hs_task_status", "hs_timestamp"],
       calls: ["hs_call_title", "hs_call_body", "hs_call_direction", "hs_call_duration", "hs_timestamp"],
@@ -305,10 +287,7 @@ export class HubSpotApiClient {
       // Fetch individually (batch read endpoint has quirks with engagement types)
       const fetches = ids.slice(0, limit).map(async (id) => {
         try {
-          const obj = await this.api<HubSpotObject>(
-            "GET",
-            `/crm/v3/objects/${engType}/${id}${propsQuery}`,
-          );
+          const obj = await this.api<HubSpotObject>("GET", `/crm/v3/objects/${engType}/${id}${propsQuery}`);
           return obj;
         } catch {
           return null;
@@ -340,21 +319,21 @@ export class HubSpotApiClient {
           case "tasks": {
             const subj = p.hs_task_subject || "(no subject)";
             const status = p.hs_task_status || "unknown";
-            const body = p.hs_task_body ? `\n  ${(p.hs_task_body).replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
+            const body = p.hs_task_body ? `\n  ${p.hs_task_body.replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
             summary = `Task [${status}]: ${subj}${body}`;
             break;
           }
           case "calls": {
             const dir = p.hs_call_direction === "INBOUND" ? "Inbound" : "Outbound";
             const dur = p.hs_call_duration ? `${Math.round(Number(p.hs_call_duration) / 1000)}s` : "unknown duration";
-            const body = p.hs_call_body ? `\n  ${(p.hs_call_body).replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
+            const body = p.hs_call_body ? `\n  ${p.hs_call_body.replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
             summary = `${dir} call (${dur})${body}`;
             break;
           }
           case "meetings": {
             const title = p.hs_meeting_title || "(no title)";
             const start = p.hs_meeting_start_time || "";
-            const body = p.hs_meeting_body ? `\n  ${(p.hs_meeting_body).replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
+            const body = p.hs_meeting_body ? `\n  ${p.hs_meeting_body.replace(/<[^>]*>/g, "").slice(0, 200)}` : "";
             summary = `Meeting: ${title}${start ? ` (${start})` : ""}${body}`;
             break;
           }
@@ -371,12 +350,7 @@ export class HubSpotApiClient {
 
   // ── Associations ────────────────────────────────────────────────────────
 
-  async associate(
-    fromType: string,
-    fromId: string,
-    toType: string,
-    toId: string,
-  ): Promise<void> {
+  async associate(fromType: string, fromId: string, toType: string, toId: string): Promise<void> {
     const typeId = ASSOCIATION_TYPES[fromType]?.[toType];
     if (typeId === undefined) {
       throw new Error(`Unknown association: ${fromType} -> ${toType}`);
@@ -384,10 +358,8 @@ export class HubSpotApiClient {
 
     log.info("Creating association", { fromType, fromId, toType, toId, typeId });
 
-    await this.api<unknown>(
-      "PUT",
-      `/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}`,
-      [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: typeId }],
-    );
+    await this.api<unknown>("PUT", `/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}`, [
+      { associationCategory: "HUBSPOT_DEFINED", associationTypeId: typeId },
+    ]);
   }
 }

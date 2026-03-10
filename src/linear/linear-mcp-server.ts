@@ -34,7 +34,7 @@ async function resolveStateName(name: string, teamId?: string): Promise<string |
   if (!tid) return undefined;
   if (!stateCaches.has(tid)) {
     const states = await linearClient.getWorkflowStates(tid);
-    stateCaches.set(tid, new Map(states.map(s => [s.name.toLowerCase(), s.id])));
+    stateCaches.set(tid, new Map(states.map((s) => [s.name.toLowerCase(), s.id])));
   }
   return stateCaches.get(tid)!.get(name.toLowerCase());
 }
@@ -51,244 +51,284 @@ async function resolveIssueId(issueId: string): Promise<string | null> {
 
 // ── Tool: linear_list_teams ────────────────────────────────────────────────
 
-server.registerTool("linear_list_teams", {
-  title: "List Teams",
-  description:
-    "List all Linear teams accessible to Hive. Use this to find your team ID when first setting up Linear access.",
-  inputSchema: {},
-}, async () => {
-  try {
-    const teams = await linearClient.listTeams();
-    if (teams.length === 0) {
-      return { content: [{ type: "text", text: "No teams found." }] };
+server.registerTool(
+  "linear_list_teams",
+  {
+    title: "List Teams",
+    description:
+      "List all Linear teams accessible to Hive. Use this to find your team ID when first setting up Linear access.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const teams = await linearClient.listTeams();
+      if (teams.length === 0) {
+        return { content: [{ type: "text", text: "No teams found." }] };
+      }
+      const lines = teams.map((t) => `${t.key}: ${t.name} (${t.id})`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to list teams: ${String(err)}` }], isError: true };
     }
-    const lines = teams.map(t => `${t.key}: ${t.name} (${t.id})`);
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to list teams: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Tool: linear_list_issues ───────────────────────────────────────────────
 
-server.registerTool("linear_list_issues", {
-  title: "List Issues",
-  description: "List issues filtered by team and workflow state type.",
-  inputSchema: {
-    teamId: z.string().optional().describe("Team ID (defaults to LINEAR_TEAM_ID env var)"),
-    statusType: z
-      .enum(["backlog", "unstarted", "started", "completed", "canceled"])
-      .optional()
-      .describe("Filter by workflow state type"),
-    limit: z.number().optional().default(25).describe("Max results to return"),
+server.registerTool(
+  "linear_list_issues",
+  {
+    title: "List Issues",
+    description: "List issues filtered by team and workflow state type.",
+    inputSchema: {
+      teamId: z.string().optional().describe("Team ID (defaults to LINEAR_TEAM_ID env var)"),
+      statusType: z
+        .enum(["backlog", "unstarted", "started", "completed", "canceled"])
+        .optional()
+        .describe("Filter by workflow state type"),
+      limit: z.number().optional().default(25).describe("Max results to return"),
+    },
   },
-}, async ({ teamId, statusType, limit }) => {
-  try {
-    const issues = await linearClient.listIssues({
-      teamId,
-      stateType: statusType,
-      limit,
-    });
-    if (issues.length === 0) {
-      return { content: [{ type: "text", text: "No issues found." }] };
+  async ({ teamId, statusType, limit }) => {
+    try {
+      const issues = await linearClient.listIssues({
+        teamId,
+        stateType: statusType,
+        limit,
+      });
+      if (issues.length === 0) {
+        return { content: [{ type: "text", text: "No issues found." }] };
+      }
+      const lines = issues.map((i) => `${i.identifier}: ${i.title} [${i.state}]`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to list issues: ${String(err)}` }], isError: true };
     }
-    const lines = issues.map(i => `${i.identifier}: ${i.title} [${i.state}]`);
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to list issues: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Tool: linear_get_issue ─────────────────────────────────────────────────
 
-server.registerTool("linear_get_issue", {
-  title: "Get Issue",
-  description: "Get full details of a Linear issue by identifier or UUID.",
-  inputSchema: {
-    issueId: z.string().describe("Issue identifier (e.g. HIVE-123) or UUID"),
+server.registerTool(
+  "linear_get_issue",
+  {
+    title: "Get Issue",
+    description: "Get full details of a Linear issue by identifier or UUID.",
+    inputSchema: {
+      issueId: z.string().describe("Issue identifier (e.g. HIVE-123) or UUID"),
+    },
   },
-}, async ({ issueId }) => {
-  try {
-    const issue = await linearClient.findIssueByIdentifier(issueId);
-    if (!issue) {
-      return { content: [{ type: "text", text: "Issue not found." }] };
+  async ({ issueId }) => {
+    try {
+      const issue = await linearClient.findIssueByIdentifier(issueId);
+      if (!issue) {
+        return { content: [{ type: "text", text: "Issue not found." }] };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(issue, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to get issue: ${String(err)}` }], isError: true };
     }
-    return { content: [{ type: "text", text: JSON.stringify(issue, null, 2) }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to get issue: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Tool: linear_create_issue ──────────────────────────────────────────────
 
-server.registerTool("linear_create_issue", {
-  title: "Create Issue",
-  description: "Create a new issue in the specified or default Linear team.",
-  inputSchema: {
-    title: z.string().describe("Issue title"),
-    teamId: z.string().optional().describe("Team ID (defaults to LINEAR_TEAM_ID env var)"),
-    description: z.string().optional().describe("Issue description (markdown)"),
-    priority: z.number().optional().describe("Priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low"),
-    stateName: z.string().optional().describe("Workflow state name (e.g. 'In Progress', 'Todo')"),
+server.registerTool(
+  "linear_create_issue",
+  {
+    title: "Create Issue",
+    description: "Create a new issue in the specified or default Linear team.",
+    inputSchema: {
+      title: z.string().describe("Issue title"),
+      teamId: z.string().optional().describe("Team ID (defaults to LINEAR_TEAM_ID env var)"),
+      description: z.string().optional().describe("Issue description (markdown)"),
+      priority: z.number().optional().describe("Priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low"),
+      stateName: z.string().optional().describe("Workflow state name (e.g. 'In Progress', 'Todo')"),
+    },
   },
-}, async ({ title, teamId, description, priority, stateName }) => {
-  try {
-    let stateId: string | undefined;
-    if (stateName) {
-      stateId = await resolveStateName(stateName, teamId);
+  async ({ title, teamId, description, priority, stateName }) => {
+    try {
+      let stateId: string | undefined;
+      if (stateName) {
+        stateId = await resolveStateName(stateName, teamId);
+      }
+      const result = await linearClient.createIssue(title, {
+        teamId,
+        description,
+        priority,
+        stateId,
+      });
+      if (!result) {
+        return { content: [{ type: "text", text: "Failed to create issue." }] };
+      }
+      return { content: [{ type: "text", text: `Created ${result.identifier}: ${result.url}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to create issue: ${String(err)}` }], isError: true };
     }
-    const result = await linearClient.createIssue(title, {
-      teamId,
-      description,
-      priority,
-      stateId,
-    });
-    if (!result) {
-      return { content: [{ type: "text", text: "Failed to create issue." }] };
-    }
-    return { content: [{ type: "text", text: `Created ${result.identifier}: ${result.url}` }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to create issue: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Tool: linear_update_issue ──────────────────────────────────────────────
 
-server.registerTool("linear_update_issue", {
-  title: "Update Issue",
-  description: "Update fields on an existing Linear issue.",
-  inputSchema: {
-    issueId: z.string().describe("Issue identifier (e.g. HIVE-123) or UUID"),
-    title: z.string().optional().describe("New issue title"),
-    description: z.string().optional().describe("New description (markdown)"),
-    priority: z.number().optional().describe("Priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low"),
-    stateName: z.string().optional().describe("Workflow state name (e.g. 'In Progress', 'Done')"),
+server.registerTool(
+  "linear_update_issue",
+  {
+    title: "Update Issue",
+    description: "Update fields on an existing Linear issue.",
+    inputSchema: {
+      issueId: z.string().describe("Issue identifier (e.g. HIVE-123) or UUID"),
+      title: z.string().optional().describe("New issue title"),
+      description: z.string().optional().describe("New description (markdown)"),
+      priority: z.number().optional().describe("Priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low"),
+      stateName: z.string().optional().describe("Workflow state name (e.g. 'In Progress', 'Done')"),
+    },
   },
-}, async ({ issueId, title, description, priority, stateName }) => {
-  try {
-    const resolvedId = await resolveIssueId(issueId);
-    if (!resolvedId) {
-      return { content: [{ type: "text", text: "Issue not found." }] };
-    }
+  async ({ issueId, title, description, priority, stateName }) => {
+    try {
+      const resolvedId = await resolveIssueId(issueId);
+      if (!resolvedId) {
+        return { content: [{ type: "text", text: "Issue not found." }] };
+      }
 
-    let stateId: string | undefined;
-    if (stateName) {
-      stateId = await resolveStateName(stateName);
-    }
+      let stateId: string | undefined;
+      if (stateName) {
+        stateId = await resolveStateName(stateName);
+      }
 
-    const fields: Record<string, unknown> = {};
-    if (title !== undefined) fields.title = title;
-    if (description !== undefined) fields.description = description;
-    if (priority !== undefined) fields.priority = priority;
-    if (stateId !== undefined) fields.stateId = stateId;
+      const fields: Record<string, unknown> = {};
+      if (title !== undefined) fields.title = title;
+      if (description !== undefined) fields.description = description;
+      if (priority !== undefined) fields.priority = priority;
+      if (stateId !== undefined) fields.stateId = stateId;
 
-    const ok = await linearClient.updateIssue(resolvedId, fields as {
-      title?: string;
-      description?: string;
-      priority?: number;
-      stateId?: string;
-    });
-    if (!ok) {
-      return { content: [{ type: "text", text: "Failed to update issue." }] };
+      const ok = await linearClient.updateIssue(
+        resolvedId,
+        fields as {
+          title?: string;
+          description?: string;
+          priority?: number;
+          stateId?: string;
+        },
+      );
+      if (!ok) {
+        return { content: [{ type: "text", text: "Failed to update issue." }] };
+      }
+      return { content: [{ type: "text", text: "Issue updated." }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to update issue: ${String(err)}` }], isError: true };
     }
-    return { content: [{ type: "text", text: "Issue updated." }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to update issue: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Tool: linear_add_comment ───────────────────────────────────────────────
 
-server.registerTool("linear_add_comment", {
-  title: "Add Comment",
-  description: "Add a comment to an existing Linear issue.",
-  inputSchema: {
-    issueId: z.string().describe("Issue identifier (e.g. HIVE-123) or UUID"),
-    body: z.string().describe("Comment text (markdown)"),
+server.registerTool(
+  "linear_add_comment",
+  {
+    title: "Add Comment",
+    description: "Add a comment to an existing Linear issue.",
+    inputSchema: {
+      issueId: z.string().describe("Issue identifier (e.g. HIVE-123) or UUID"),
+      body: z.string().describe("Comment text (markdown)"),
+    },
   },
-}, async ({ issueId, body }) => {
-  try {
-    const resolvedId = await resolveIssueId(issueId);
-    if (!resolvedId) {
-      return { content: [{ type: "text", text: "Issue not found." }] };
+  async ({ issueId, body }) => {
+    try {
+      const resolvedId = await resolveIssueId(issueId);
+      if (!resolvedId) {
+        return { content: [{ type: "text", text: "Issue not found." }] };
+      }
+      const commentId = await linearClient.addComment(resolvedId, body);
+      if (!commentId) {
+        return { content: [{ type: "text", text: "Failed to add comment." }] };
+      }
+      return { content: [{ type: "text", text: "Comment added." }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to add comment: ${String(err)}` }], isError: true };
     }
-    const commentId = await linearClient.addComment(resolvedId, body);
-    if (!commentId) {
-      return { content: [{ type: "text", text: "Failed to add comment." }] };
-    }
-    return { content: [{ type: "text", text: "Comment added." }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to add comment: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Tool: linear_search ────────────────────────────────────────────────────
 
-server.registerTool("linear_search", {
-  title: "Search Issues",
-  description: "Full-text search for Linear issues, optionally scoped to a team.",
-  inputSchema: {
-    query: z.string().describe("Search query"),
-    teamId: z.string().optional().describe("Team ID to scope search to"),
-    limit: z.number().optional().default(10).describe("Max results to return"),
+server.registerTool(
+  "linear_search",
+  {
+    title: "Search Issues",
+    description: "Full-text search for Linear issues, optionally scoped to a team.",
+    inputSchema: {
+      query: z.string().describe("Search query"),
+      teamId: z.string().optional().describe("Team ID to scope search to"),
+      limit: z.number().optional().default(10).describe("Max results to return"),
+    },
   },
-}, async ({ query, teamId, limit }) => {
-  try {
-    const issues = await linearClient.searchIssues(query, limit, teamId);
-    if (issues.length === 0) {
-      return { content: [{ type: "text", text: "No results." }] };
+  async ({ query, teamId, limit }) => {
+    try {
+      const issues = await linearClient.searchIssues(query, limit, teamId);
+      if (issues.length === 0) {
+        return { content: [{ type: "text", text: "No results." }] };
+      }
+      const lines = issues.map((i) => `${i.identifier}: ${i.title} [${i.state}]`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to search issues: ${String(err)}` }], isError: true };
     }
-    const lines = issues.map(i => `${i.identifier}: ${i.title} [${i.state}]`);
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to search issues: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Tool: linear_search_users ──────────────────────────────────────────────
 
-server.registerTool("linear_search_users", {
-  title: "Search Users",
-  description: "Search for Linear workspace members by name, display name, or email address.",
-  inputSchema: {
-    query: z.string().describe("Name, display name, or email to search for"),
-    limit: z.number().optional().default(10).describe("Max results to return"),
+server.registerTool(
+  "linear_search_users",
+  {
+    title: "Search Users",
+    description: "Search for Linear workspace members by name, display name, or email address.",
+    inputSchema: {
+      query: z.string().describe("Name, display name, or email to search for"),
+      limit: z.number().optional().default(10).describe("Max results to return"),
+    },
   },
-}, async ({ query, limit }) => {
-  try {
-    const users = await linearClient.searchUsers(query, limit);
-    if (users.length === 0) {
-      return { content: [{ type: "text", text: "No users found." }] };
+  async ({ query, limit }) => {
+    try {
+      const users = await linearClient.searchUsers(query, limit);
+      if (users.length === 0) {
+        return { content: [{ type: "text", text: "No users found." }] };
+      }
+      const lines = users.map(
+        (u) => `${u.name} (${u.displayName}) — ${u.email} [id: ${u.id}]${u.active ? "" : " [inactive]"}`,
+      );
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to search users: ${String(err)}` }], isError: true };
     }
-    const lines = users.map(u =>
-      `${u.name} (${u.displayName}) — ${u.email} [id: ${u.id}]${u.active ? "" : " [inactive]"}`
-    );
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to search users: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Tool: linear_list_states ───────────────────────────────────────────────
 
-server.registerTool("linear_list_states", {
-  title: "List Workflow States",
-  description: "List workflow states for a team. Use this to see available states before creating or updating issues.",
-  inputSchema: {
-    teamId: z.string().optional().describe("Team ID (defaults to LINEAR_TEAM_ID env var)"),
+server.registerTool(
+  "linear_list_states",
+  {
+    title: "List Workflow States",
+    description:
+      "List workflow states for a team. Use this to see available states before creating or updating issues.",
+    inputSchema: {
+      teamId: z.string().optional().describe("Team ID (defaults to LINEAR_TEAM_ID env var)"),
+    },
   },
-}, async ({ teamId }) => {
-  try {
-    const states = await linearClient.getWorkflowStates(teamId);
-    if (states.length === 0) {
-      return { content: [{ type: "text", text: "No workflow states found." }] };
+  async ({ teamId }) => {
+    try {
+      const states = await linearClient.getWorkflowStates(teamId);
+      if (states.length === 0) {
+        return { content: [{ type: "text", text: "No workflow states found." }] };
+      }
+      const lines = states.map((s) => `${s.name} (${s.type})`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to list workflow states: ${String(err)}` }], isError: true };
     }
-    const lines = states.map(s => `${s.name} (${s.type})`);
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  } catch (err) {
-    return { content: [{ type: "text", text: `Failed to list workflow states: ${String(err)}` }], isError: true };
-  }
-});
+  },
+);
 
 // ── Connect and run ────────────────────────────────────────────────────────
 

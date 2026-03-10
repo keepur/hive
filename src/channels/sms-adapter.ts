@@ -7,11 +7,11 @@ const log = createLogger("sms-adapter");
 const QUO_BASE = "https://api.openphone.com/v1";
 
 interface SmsLine {
-  id: string;         // phoneNumberId
-  label: string;      // e.g. "May (CEO)"
-  number: string;     // E.164 phone number
+  id: string; // phoneNumberId
+  label: string; // e.g. "May (CEO)"
+  number: string; // E.164 phone number
   routeLabel: string; // channel name for agent routing (e.g. "quo-may")
-  lastSeen: string;   // ISO 8601 timestamp of last polled message
+  lastSeen: string; // ISO 8601 timestamp of last polled message
 }
 
 interface QuoMessage {

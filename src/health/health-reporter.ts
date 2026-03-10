@@ -6,14 +6,17 @@ const log = createLogger("health-reporter");
 
 export interface HealthReport {
   lastUpdated: string;
-  agents: Record<string, {
-    status: string;
-    lastActivity: string;
-    messagesProcessed: number;
-    errorCount: number;
-    sessionId?: string;
-    activeThreads: number;
-  }>;
+  agents: Record<
+    string,
+    {
+      status: string;
+      lastActivity: string;
+      messagesProcessed: number;
+      errorCount: number;
+      sessionId?: string;
+      activeThreads: number;
+    }
+  >;
 }
 
 export class HealthReporter {
@@ -57,10 +60,13 @@ export class HealthReporter {
 
     for (const [id, info] of Object.entries(report.agents)) {
       const statusEmoji =
-        info.status === "idle" ? ":white_circle:" :
-        info.status === "processing" ? ":large_blue_circle:" :
-        info.status === "error" ? ":red_circle:" :
-        ":black_circle:";
+        info.status === "idle"
+          ? ":white_circle:"
+          : info.status === "processing"
+            ? ":large_blue_circle:"
+            : info.status === "error"
+              ? ":red_circle:"
+              : ":black_circle:";
 
       const threadInfo = info.activeThreads > 0 ? ` (${info.activeThreads} threads)` : "";
       lines.push(`${statusEmoji} *${id}*${threadInfo}`);

@@ -29,158 +29,228 @@ const server = new McpServer({
   version: "0.1.0",
 });
 
-server.registerTool("model_list", {
-  title: "List Agent Models",
-  description: "Show the current model assignment for all agents, including any overrides.",
-  inputSchema: {},
-}, async () => {
-  const docs = await overrides.find().toArray();
-  if (docs.length === 0) {
-    return { content: [{ type: "text", text: "No model overrides active. All agents are using their YAML defaults." }] };
-  }
-
-  const lines = docs.map((d: any) => {
-    const date = d.updatedAt instanceof Date ? d.updatedAt.toISOString() : String(d.updatedAt ?? "");
-    const by = d.updatedBy ? ` (set by ${d.updatedBy})` : "";
-    return `${d.agentId}: ${d.model}${by} — ${date}`;
-  });
-
-  return { content: [{ type: "text", text: `Active model overrides:\n${lines.join("\n")}` }] };
-});
-
-server.registerTool("model_set", {
-  title: "Set Agent Model",
-  description: "Override the model for an agent. Takes effect on next hot-reload (SIGUSR1) or restart. Valid models: claude-sonnet-4-6, claude-haiku-4-5, claude-opus-4-6.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID (e.g. 'executive-assistant', 'customer-success')"),
-    model: z.string().describe("The model to use (e.g. 'claude-sonnet-4-6', 'claude-haiku-4-5')"),
+server.registerTool(
+  "model_list",
+  {
+    title: "List Agent Models",
+    description: "Show the current model assignment for all agents, including any overrides.",
+    inputSchema: {},
   },
-}, async ({ agent_id, model }) => {
-  const VALID_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-6"];
-  if (!VALID_MODELS.includes(model)) {
-    return { content: [{ type: "text", text: `Invalid model: ${model}. Valid options: ${VALID_MODELS.join(", ")}` }], isError: true };
-  }
+  async () => {
+    const docs = await overrides.find().toArray();
+    if (docs.length === 0) {
+      return {
+        content: [{ type: "text", text: "No model overrides active. All agents are using their YAML defaults." }],
+      };
+    }
 
-  await overrides.updateOne(
-    { agentId: agent_id },
-    { $set: { model, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
-    { upsert: true },
-  );
+    const lines = docs.map((d: any) => {
+      const date = d.updatedAt instanceof Date ? d.updatedAt.toISOString() : String(d.updatedAt ?? "");
+      const by = d.updatedBy ? ` (set by ${d.updatedBy})` : "";
+      return `${d.agentId}: ${d.model}${by} — ${date}`;
+    });
 
-  // Send SIGUSR1 to trigger hot-reload
-  try {
-    process.kill(process.ppid, "SIGUSR1");
-  } catch {}
-
-  return { content: [{ type: "text", text: `Model for ${agent_id} set to ${model}. Hot-reload triggered.` }] };
-});
-
-server.registerTool("model_reset", {
-  title: "Reset Agent Model",
-  description: "Remove the model override for an agent, reverting to the YAML default.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID to reset"),
+    return { content: [{ type: "text", text: `Active model overrides:\n${lines.join("\n")}` }] };
   },
-}, async ({ agent_id }) => {
-  const result = await overrides.deleteOne({ agentId: agent_id });
-  if (result.deletedCount === 0) {
-    return { content: [{ type: "text", text: `No override found for ${agent_id} — already using YAML default.` }] };
-  }
+);
 
-  try {
-    process.kill(process.ppid, "SIGUSR1");
-  } catch {}
+server.registerTool(
+  "model_set",
+  {
+    title: "Set Agent Model",
+    description:
+      "Override the model for an agent. Takes effect on next hot-reload (SIGUSR1) or restart. Valid models: claude-sonnet-4-6, claude-haiku-4-5, claude-opus-4-6.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID (e.g. 'executive-assistant', 'customer-success')"),
+      model: z.string().describe("The model to use (e.g. 'claude-sonnet-4-6', 'claude-haiku-4-5')"),
+    },
+  },
+  async ({ agent_id, model }) => {
+    const VALID_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-6"];
+    if (!VALID_MODELS.includes(model)) {
+      return {
+        content: [{ type: "text", text: `Invalid model: ${model}. Valid options: ${VALID_MODELS.join(", ")}` }],
+        isError: true,
+      };
+    }
 
-  return { content: [{ type: "text", text: `Model override removed for ${agent_id}. Reverted to YAML default. Hot-reload triggered.` }] };
-});
+    await overrides.updateOne(
+      { agentId: agent_id },
+      { $set: { model, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { upsert: true },
+    );
+
+    // Send SIGUSR1 to trigger hot-reload
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    return { content: [{ type: "text", text: `Model for ${agent_id} set to ${model}. Hot-reload triggered.` }] };
+  },
+);
+
+server.registerTool(
+  "model_reset",
+  {
+    title: "Reset Agent Model",
+    description: "Remove the model override for an agent, reverting to the YAML default.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID to reset"),
+    },
+  },
+  async ({ agent_id }) => {
+    const result = await overrides.deleteOne({ agentId: agent_id });
+    if (result.deletedCount === 0) {
+      return { content: [{ type: "text", text: `No override found for ${agent_id} — already using YAML default.` }] };
+    }
+
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Model override removed for ${agent_id}. Reverted to YAML default. Hot-reload triggered.`,
+        },
+      ],
+    };
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Schedule override tools
 // ---------------------------------------------------------------------------
 
-server.registerTool("schedule_list", {
-  title: "List Agent Schedules",
-  description: "Show scheduled tasks for all agents, including any overrides. Shows what's actually active.",
-  inputSchema: {},
-}, async () => {
-  const docs = await scheduleOverrides.find().toArray();
-  const overrideMap = new Map(docs.map((d: any) => [d.agentId, d]));
+server.registerTool(
+  "schedule_list",
+  {
+    title: "List Agent Schedules",
+    description: "Show scheduled tasks for all agents, including any overrides. Shows what's actually active.",
+    inputSchema: {},
+  },
+  async () => {
+    const docs = await scheduleOverrides.find().toArray();
+    const overrideMap = new Map(docs.map((d: any) => [d.agentId, d]));
 
-  // We don't have direct access to agent configs here, so just show overrides
-  if (docs.length === 0) {
-    return { content: [{ type: "text", text: "No schedule overrides active. All agents are using their YAML defaults.\n\nUse schedule_set to add/change schedules, or schedule_disable to turn off an agent's schedule." }] };
-  }
-
-  const lines = docs.map((d: any) => {
-    const by = d.updatedBy ? ` (by ${d.updatedBy})` : "";
-    const date = d.updatedAt instanceof Date ? d.updatedAt.toISOString() : String(d.updatedAt ?? "");
-    if (d.schedule === null) {
-      return `${d.agentId}: DISABLED${by} — ${date}`;
+    // We don't have direct access to agent configs here, so just show overrides
+    if (docs.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No schedule overrides active. All agents are using their YAML defaults.\n\nUse schedule_set to add/change schedules, or schedule_disable to turn off an agent's schedule.",
+          },
+        ],
+      };
     }
-    const tasks = d.schedule.map((s: any) => `  ${s.cron} → ${s.task}`).join("\n");
-    return `${d.agentId}: OVERRIDE${by} — ${date}\n${tasks}`;
-  });
 
-  return { content: [{ type: "text", text: `Schedule overrides:\n${lines.join("\n\n")}` }] };
-});
+    const lines = docs.map((d: any) => {
+      const by = d.updatedBy ? ` (by ${d.updatedBy})` : "";
+      const date = d.updatedAt instanceof Date ? d.updatedAt.toISOString() : String(d.updatedAt ?? "");
+      if (d.schedule === null) {
+        return `${d.agentId}: DISABLED${by} — ${date}`;
+      }
+      const tasks = d.schedule.map((s: any) => `  ${s.cron} → ${s.task}`).join("\n");
+      return `${d.agentId}: OVERRIDE${by} — ${date}\n${tasks}`;
+    });
 
-server.registerTool("schedule_disable", {
-  title: "Disable Agent Schedule",
-  description: "Disable all scheduled tasks for an agent. The agent still responds to messages, but won't run any cron jobs.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID (e.g. 'executive-assistant')"),
+    return { content: [{ type: "text", text: `Schedule overrides:\n${lines.join("\n\n")}` }] };
   },
-}, async ({ agent_id }) => {
-  await scheduleOverrides.updateOne(
-    { agentId: agent_id },
-    { $set: { schedule: null, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
-    { upsert: true },
-  );
+);
 
-  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
-
-  return { content: [{ type: "text", text: `All scheduled tasks disabled for ${agent_id}. Hot-reload triggered.` }] };
-});
-
-server.registerTool("schedule_set", {
-  title: "Set Agent Schedule",
-  description: "Override an agent's scheduled tasks. Replaces any YAML-defined schedule. Each entry needs a cron expression and task name.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID"),
-    schedule: z.array(z.object({
-      cron: z.string().describe("Cron expression (e.g. '0 8 * * 1-5' for weekdays at 8am)"),
-      task: z.string().describe("Task name (e.g. 'morning-briefing', 'check-gmail-inbox')"),
-    })).min(1).describe("List of scheduled tasks"),
+server.registerTool(
+  "schedule_disable",
+  {
+    title: "Disable Agent Schedule",
+    description:
+      "Disable all scheduled tasks for an agent. The agent still responds to messages, but won't run any cron jobs.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID (e.g. 'executive-assistant')"),
+    },
   },
-}, async ({ agent_id, schedule }) => {
-  await scheduleOverrides.updateOne(
-    { agentId: agent_id },
-    { $set: { schedule, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
-    { upsert: true },
-  );
+  async ({ agent_id }) => {
+    await scheduleOverrides.updateOne(
+      { agentId: agent_id },
+      { $set: { schedule: null, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { upsert: true },
+    );
 
-  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
 
-  const lines = schedule.map((s) => `  ${s.cron} → ${s.task}`).join("\n");
-  return { content: [{ type: "text", text: `Schedule for ${agent_id} set to:\n${lines}\n\nHot-reload triggered.` }] };
-});
-
-server.registerTool("schedule_reset", {
-  title: "Reset Agent Schedule",
-  description: "Remove the schedule override for an agent, reverting to whatever is defined in their YAML config.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID to reset"),
+    return { content: [{ type: "text", text: `All scheduled tasks disabled for ${agent_id}. Hot-reload triggered.` }] };
   },
-}, async ({ agent_id }) => {
-  const result = await scheduleOverrides.deleteOne({ agentId: agent_id });
-  if (result.deletedCount === 0) {
-    return { content: [{ type: "text", text: `No schedule override found for ${agent_id} — already using YAML default.` }] };
-  }
+);
 
-  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
+server.registerTool(
+  "schedule_set",
+  {
+    title: "Set Agent Schedule",
+    description:
+      "Override an agent's scheduled tasks. Replaces any YAML-defined schedule. Each entry needs a cron expression and task name.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID"),
+      schedule: z
+        .array(
+          z.object({
+            cron: z.string().describe("Cron expression (e.g. '0 8 * * 1-5' for weekdays at 8am)"),
+            task: z.string().describe("Task name (e.g. 'morning-briefing', 'check-gmail-inbox')"),
+          }),
+        )
+        .min(1)
+        .describe("List of scheduled tasks"),
+    },
+  },
+  async ({ agent_id, schedule }) => {
+    await scheduleOverrides.updateOne(
+      { agentId: agent_id },
+      { $set: { schedule, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { upsert: true },
+    );
 
-  return { content: [{ type: "text", text: `Schedule override removed for ${agent_id}. Reverted to YAML default. Hot-reload triggered.` }] };
-});
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    const lines = schedule.map((s) => `  ${s.cron} → ${s.task}`).join("\n");
+    return { content: [{ type: "text", text: `Schedule for ${agent_id} set to:\n${lines}\n\nHot-reload triggered.` }] };
+  },
+);
+
+server.registerTool(
+  "schedule_reset",
+  {
+    title: "Reset Agent Schedule",
+    description: "Remove the schedule override for an agent, reverting to whatever is defined in their YAML config.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID to reset"),
+    },
+  },
+  async ({ agent_id }) => {
+    const result = await scheduleOverrides.deleteOne({ agentId: agent_id });
+    if (result.deletedCount === 0) {
+      return {
+        content: [{ type: "text", text: `No schedule override found for ${agent_id} — already using YAML default.` }],
+      };
+    }
+
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Schedule override removed for ${agent_id}. Reverted to YAML default. Hot-reload triggered.`,
+        },
+      ],
+    };
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Config override tools
@@ -190,194 +260,293 @@ const ARRAY_FIELDS = ["channels", "passiveChannels", "keywords", "servers"];
 const SCALAR_FIELDS = ["isDefault", "budgetUsd", "maxTurns", "maxConcurrent", "timeoutMs"];
 const ALL_CONFIG_FIELDS = [...ARRAY_FIELDS, ...SCALAR_FIELDS];
 
-server.registerTool("config_list", {
-  title: "List Config Overrides",
-  description: "Show all active runtime config overrides for agents (channels, keywords, budgets, etc.).",
-  inputSchema: {},
-}, async () => {
-  const docs = await configOverrides.find().toArray();
-  if (docs.length === 0) {
-    return { content: [{ type: "text", text: "No config overrides active. All agents are using their template defaults." }] };
-  }
-
-  const lines = docs.map((d: any) => {
-    const fields = ALL_CONFIG_FIELDS.filter((f) => d[f] !== undefined);
-    const date = d.updatedAt instanceof Date ? d.updatedAt.toISOString() : String(d.updatedAt ?? "");
-    const by = d.updatedBy ? ` (by ${d.updatedBy})` : "";
-    return `${d.agentId}: ${fields.join(", ")}${by} — ${date}`;
-  });
-
-  return { content: [{ type: "text", text: `Active config overrides:\n${lines.join("\n")}` }] };
-});
-
-server.registerTool("config_get", {
-  title: "Get Config Override",
-  description: "Show the config override details for a specific agent.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID (e.g. 'executive-assistant')"),
+server.registerTool(
+  "config_list",
+  {
+    title: "List Config Overrides",
+    description: "Show all active runtime config overrides for agents (channels, keywords, budgets, etc.).",
+    inputSchema: {},
   },
-}, async ({ agent_id }) => {
-  const doc = await configOverrides.findOne({ agentId: agent_id }) as any;
-  if (!doc) {
-    return { content: [{ type: "text", text: `No config override found for ${agent_id} — using template defaults.` }] };
-  }
-
-  const lines: string[] = [];
-  for (const field of ALL_CONFIG_FIELDS) {
-    if (doc[field] === undefined) continue;
-    const val = doc[field];
-    if (ARRAY_FIELDS.includes(field)) {
-      const parts: string[] = [];
-      if (val.replace) parts.push(`replace: [${val.replace.join(", ")}]`);
-      if (val.add?.length) parts.push(`add: [${val.add.join(", ")}]`);
-      if (val.remove?.length) parts.push(`remove: [${val.remove.join(", ")}]`);
-      lines.push(`${field}: ${parts.join(", ") || "(empty override)"}`);
-    } else {
-      lines.push(`${field}: ${val}`);
+  async () => {
+    const docs = await configOverrides.find().toArray();
+    if (docs.length === 0) {
+      return {
+        content: [{ type: "text", text: "No config overrides active. All agents are using their template defaults." }],
+      };
     }
-  }
 
-  const date = doc.updatedAt instanceof Date ? doc.updatedAt.toISOString() : String(doc.updatedAt ?? "");
-  const by = doc.updatedBy ? ` (by ${doc.updatedBy})` : "";
-  return { content: [{ type: "text", text: `Config override for ${agent_id}${by} — ${date}:\n${lines.join("\n")}` }] };
-});
+    const lines = docs.map((d: any) => {
+      const fields = ALL_CONFIG_FIELDS.filter((f) => d[f] !== undefined);
+      const date = d.updatedAt instanceof Date ? d.updatedAt.toISOString() : String(d.updatedAt ?? "");
+      const by = d.updatedBy ? ` (by ${d.updatedBy})` : "";
+      return `${d.agentId}: ${fields.join(", ")}${by} — ${date}`;
+    });
 
-server.registerTool("config_set", {
-  title: "Set Config Override",
-  description: "Override a config field for an agent. For array fields (channels, passiveChannels, keywords, servers), value should be { replace?: string[], add?: string[], remove?: string[] }. For scalar fields (isDefault, budgetUsd, maxTurns, maxConcurrent, timeoutMs), value is the scalar.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID"),
-    field: z.string().describe("The config field to override"),
-    value: z.any().describe("The override value"),
+    return { content: [{ type: "text", text: `Active config overrides:\n${lines.join("\n")}` }] };
   },
-}, async ({ agent_id, field, value }) => {
-  if (!ALL_CONFIG_FIELDS.includes(field)) {
-    return { content: [{ type: "text", text: `Invalid field: ${field}. Valid fields: ${ALL_CONFIG_FIELDS.join(", ")}` }], isError: true };
-  }
+);
 
-  await configOverrides.updateOne(
-    { agentId: agent_id },
-    { $set: { [field]: value, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
-    { upsert: true },
-  );
-
-  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
-
-  return { content: [{ type: "text", text: `Config override for ${agent_id}.${field} set to ${JSON.stringify(value)}. Hot-reload triggered.` }] };
-});
-
-server.registerTool("config_reset", {
-  title: "Reset Config Override",
-  description: "Remove a config override for an agent. If field is provided, only that field is removed. If no field, the entire override is deleted.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID to reset"),
-    field: z.string().optional().describe("Specific field to reset (omit to reset all)"),
+server.registerTool(
+  "config_get",
+  {
+    title: "Get Config Override",
+    description: "Show the config override details for a specific agent.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID (e.g. 'executive-assistant')"),
+    },
   },
-}, async ({ agent_id, field }) => {
-  if (field) {
+  async ({ agent_id }) => {
+    const doc = (await configOverrides.findOne({ agentId: agent_id })) as any;
+    if (!doc) {
+      return {
+        content: [{ type: "text", text: `No config override found for ${agent_id} — using template defaults.` }],
+      };
+    }
+
+    const lines: string[] = [];
+    for (const field of ALL_CONFIG_FIELDS) {
+      if (doc[field] === undefined) continue;
+      const val = doc[field];
+      if (ARRAY_FIELDS.includes(field)) {
+        const parts: string[] = [];
+        if (val.replace) parts.push(`replace: [${val.replace.join(", ")}]`);
+        if (val.add?.length) parts.push(`add: [${val.add.join(", ")}]`);
+        if (val.remove?.length) parts.push(`remove: [${val.remove.join(", ")}]`);
+        lines.push(`${field}: ${parts.join(", ") || "(empty override)"}`);
+      } else {
+        lines.push(`${field}: ${val}`);
+      }
+    }
+
+    const date = doc.updatedAt instanceof Date ? doc.updatedAt.toISOString() : String(doc.updatedAt ?? "");
+    const by = doc.updatedBy ? ` (by ${doc.updatedBy})` : "";
+    return {
+      content: [{ type: "text", text: `Config override for ${agent_id}${by} — ${date}:\n${lines.join("\n")}` }],
+    };
+  },
+);
+
+server.registerTool(
+  "config_set",
+  {
+    title: "Set Config Override",
+    description:
+      "Override a config field for an agent. For array fields (channels, passiveChannels, keywords, servers), value should be { replace?: string[], add?: string[], remove?: string[] }. For scalar fields (isDefault, budgetUsd, maxTurns, maxConcurrent, timeoutMs), value is the scalar.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID"),
+      field: z.string().describe("The config field to override"),
+      value: z.any().describe("The override value"),
+    },
+  },
+  async ({ agent_id, field, value }) => {
     if (!ALL_CONFIG_FIELDS.includes(field)) {
-      return { content: [{ type: "text", text: `Invalid field: ${field}. Valid fields: ${ALL_CONFIG_FIELDS.join(", ")}` }], isError: true };
+      return {
+        content: [{ type: "text", text: `Invalid field: ${field}. Valid fields: ${ALL_CONFIG_FIELDS.join(", ")}` }],
+        isError: true,
+      };
     }
+
     await configOverrides.updateOne(
       { agentId: agent_id },
-      { $unset: { [field]: "" }, $set: { updatedAt: new Date() } },
+      { $set: { [field]: value, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { upsert: true },
     );
 
-    try { process.kill(process.ppid, "SIGUSR1"); } catch {}
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
 
-    return { content: [{ type: "text", text: `Config override for ${agent_id}.${field} removed. Reverted to template default. Hot-reload triggered.` }] };
-  }
-
-  const result = await configOverrides.deleteOne({ agentId: agent_id });
-  if (result.deletedCount === 0) {
-    return { content: [{ type: "text", text: `No config override found for ${agent_id} — already using template defaults.` }] };
-  }
-
-  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
-
-  return { content: [{ type: "text", text: `All config overrides removed for ${agent_id}. Reverted to template defaults. Hot-reload triggered.` }] };
-});
-
-server.registerTool("config_add", {
-  title: "Add to Array Config",
-  description: "Add values to an array config field (channels, passiveChannels, keywords, servers). Convenience tool that handles merge logic automatically.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID"),
-    field: z.string().describe("The array field (channels, passiveChannels, keywords, servers)"),
-    values: z.array(z.string()).describe("Values to add"),
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Config override for ${agent_id}.${field} set to ${JSON.stringify(value)}. Hot-reload triggered.`,
+        },
+      ],
+    };
   },
-}, async ({ agent_id, field, values }) => {
-  if (!ARRAY_FIELDS.includes(field)) {
-    return { content: [{ type: "text", text: `Invalid array field: ${field}. Valid array fields: ${ARRAY_FIELDS.join(", ")}` }], isError: true };
-  }
+);
 
-  const doc = await configOverrides.findOne({ agentId: agent_id }) as any;
-  const existing = doc?.[field] ?? {};
-
-  if (existing.replace) {
-    // Replace mode: add values to the replace array (deduped)
-    const merged = [...new Set([...(existing.replace as string[]), ...values])];
-    existing.replace = merged;
-  } else {
-    // Add/remove mode: merge into add, remove from remove
-    const addSet = new Set([...(existing.add ?? []), ...values]);
-    existing.add = [...addSet];
-    if (existing.remove?.length) {
-      existing.remove = existing.remove.filter((v: string) => !values.includes(v));
-      if (existing.remove.length === 0) delete existing.remove;
-    }
-  }
-
-  await configOverrides.updateOne(
-    { agentId: agent_id },
-    { $set: { [field]: existing, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
-    { upsert: true },
-  );
-
-  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
-
-  return { content: [{ type: "text", text: `Added [${values.join(", ")}] to ${agent_id}.${field}. Override is now: ${JSON.stringify(existing)}. Hot-reload triggered.` }] };
-});
-
-server.registerTool("config_remove", {
-  title: "Remove from Array Config",
-  description: "Remove values from an array config field (channels, passiveChannels, keywords, servers). Convenience tool that handles merge logic automatically.",
-  inputSchema: {
-    agent_id: z.string().describe("The agent ID"),
-    field: z.string().describe("The array field (channels, passiveChannels, keywords, servers)"),
-    values: z.array(z.string()).describe("Values to remove"),
+server.registerTool(
+  "config_reset",
+  {
+    title: "Reset Config Override",
+    description:
+      "Remove a config override for an agent. If field is provided, only that field is removed. If no field, the entire override is deleted.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID to reset"),
+      field: z.string().optional().describe("Specific field to reset (omit to reset all)"),
+    },
   },
-}, async ({ agent_id, field, values }) => {
-  if (!ARRAY_FIELDS.includes(field)) {
-    return { content: [{ type: "text", text: `Invalid array field: ${field}. Valid array fields: ${ARRAY_FIELDS.join(", ")}` }], isError: true };
-  }
+  async ({ agent_id, field }) => {
+    if (field) {
+      if (!ALL_CONFIG_FIELDS.includes(field)) {
+        return {
+          content: [{ type: "text", text: `Invalid field: ${field}. Valid fields: ${ALL_CONFIG_FIELDS.join(", ")}` }],
+          isError: true,
+        };
+      }
+      await configOverrides.updateOne(
+        { agentId: agent_id },
+        { $unset: { [field]: "" }, $set: { updatedAt: new Date() } },
+      );
 
-  const doc = await configOverrides.findOne({ agentId: agent_id }) as any;
-  const existing = doc?.[field] ?? {};
+      try {
+        process.kill(process.ppid, "SIGUSR1");
+      } catch {}
 
-  if (existing.replace) {
-    // Replace mode: filter values out of the replace array
-    existing.replace = (existing.replace as string[]).filter((v: string) => !values.includes(v));
-  } else {
-    // Add/remove mode: merge into remove, remove from add
-    const removeSet = new Set([...(existing.remove ?? []), ...values]);
-    existing.remove = [...removeSet];
-    if (existing.add?.length) {
-      existing.add = existing.add.filter((v: string) => !values.includes(v));
-      if (existing.add.length === 0) delete existing.add;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Config override for ${agent_id}.${field} removed. Reverted to template default. Hot-reload triggered.`,
+          },
+        ],
+      };
     }
-  }
 
-  await configOverrides.updateOne(
-    { agentId: agent_id },
-    { $set: { [field]: existing, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
-    { upsert: true },
-  );
+    const result = await configOverrides.deleteOne({ agentId: agent_id });
+    if (result.deletedCount === 0) {
+      return {
+        content: [
+          { type: "text", text: `No config override found for ${agent_id} — already using template defaults.` },
+        ],
+      };
+    }
 
-  try { process.kill(process.ppid, "SIGUSR1"); } catch {}
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
 
-  return { content: [{ type: "text", text: `Removed [${values.join(", ")}] from ${agent_id}.${field}. Override is now: ${JSON.stringify(existing)}. Hot-reload triggered.` }] };
-});
+    return {
+      content: [
+        {
+          type: "text",
+          text: `All config overrides removed for ${agent_id}. Reverted to template defaults. Hot-reload triggered.`,
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
+  "config_add",
+  {
+    title: "Add to Array Config",
+    description:
+      "Add values to an array config field (channels, passiveChannels, keywords, servers). Convenience tool that handles merge logic automatically.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID"),
+      field: z.string().describe("The array field (channels, passiveChannels, keywords, servers)"),
+      values: z.array(z.string()).describe("Values to add"),
+    },
+  },
+  async ({ agent_id, field, values }) => {
+    if (!ARRAY_FIELDS.includes(field)) {
+      return {
+        content: [
+          { type: "text", text: `Invalid array field: ${field}. Valid array fields: ${ARRAY_FIELDS.join(", ")}` },
+        ],
+        isError: true,
+      };
+    }
+
+    const doc = (await configOverrides.findOne({ agentId: agent_id })) as any;
+    const existing = doc?.[field] ?? {};
+
+    if (existing.replace) {
+      // Replace mode: add values to the replace array (deduped)
+      const merged = [...new Set([...(existing.replace as string[]), ...values])];
+      existing.replace = merged;
+    } else {
+      // Add/remove mode: merge into add, remove from remove
+      const addSet = new Set([...(existing.add ?? []), ...values]);
+      existing.add = [...addSet];
+      if (existing.remove?.length) {
+        existing.remove = existing.remove.filter((v: string) => !values.includes(v));
+        if (existing.remove.length === 0) delete existing.remove;
+      }
+    }
+
+    await configOverrides.updateOne(
+      { agentId: agent_id },
+      { $set: { [field]: existing, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { upsert: true },
+    );
+
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Added [${values.join(", ")}] to ${agent_id}.${field}. Override is now: ${JSON.stringify(existing)}. Hot-reload triggered.`,
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
+  "config_remove",
+  {
+    title: "Remove from Array Config",
+    description:
+      "Remove values from an array config field (channels, passiveChannels, keywords, servers). Convenience tool that handles merge logic automatically.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID"),
+      field: z.string().describe("The array field (channels, passiveChannels, keywords, servers)"),
+      values: z.array(z.string()).describe("Values to remove"),
+    },
+  },
+  async ({ agent_id, field, values }) => {
+    if (!ARRAY_FIELDS.includes(field)) {
+      return {
+        content: [
+          { type: "text", text: `Invalid array field: ${field}. Valid array fields: ${ARRAY_FIELDS.join(", ")}` },
+        ],
+        isError: true,
+      };
+    }
+
+    const doc = (await configOverrides.findOne({ agentId: agent_id })) as any;
+    const existing = doc?.[field] ?? {};
+
+    if (existing.replace) {
+      // Replace mode: filter values out of the replace array
+      existing.replace = (existing.replace as string[]).filter((v: string) => !values.includes(v));
+    } else {
+      // Add/remove mode: merge into remove, remove from add
+      const removeSet = new Set([...(existing.remove ?? []), ...values]);
+      existing.remove = [...removeSet];
+      if (existing.add?.length) {
+        existing.add = existing.add.filter((v: string) => !values.includes(v));
+        if (existing.add.length === 0) delete existing.add;
+      }
+    }
+
+    await configOverrides.updateOne(
+      { agentId: agent_id },
+      { $set: { [field]: existing, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { upsert: true },
+    );
+
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Removed [${values.join(", ")}] from ${agent_id}.${field}. Override is now: ${JSON.stringify(existing)}. Hot-reload triggered.`,
+        },
+      ],
+    };
+  },
+);
 
 // Cleanup on exit
 process.on("SIGTERM", () => client.close());
