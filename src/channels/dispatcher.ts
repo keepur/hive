@@ -258,6 +258,10 @@ export class Dispatcher {
           source: item.source.kind,
           costUsd: runResult.costUsd,
           durationMs: runResult.durationMs,
+          llmMs: runResult.llmMs,
+          toolMs: runResult.toolMs,
+          toolCalls: runResult.toolCalls,
+          toolSummary: runResult.toolSummary,
         });
       }
     } catch (err) {
