@@ -46,6 +46,14 @@ export interface ConfigOverride {
   updatedBy: string;
 }
 
+export interface PromptOverride {
+  agentId: string;
+  soul?: string;
+  systemPrompt?: string;
+  updatedAt: Date;
+  updatedBy: string;
+}
+
 export type AgentStatus = "idle" | "processing" | "error" | "stopped";
 
 export interface AgentState {

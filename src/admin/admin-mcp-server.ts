@@ -24,6 +24,8 @@ const overrides = db.collection("model_overrides");
 const scheduleOverrides = db.collection("schedule_overrides");
 const configOverrides = db.collection("agent_config_overrides");
 
+const promptOverrides = db.collection("prompt_overrides");
+
 const server = new McpServer({
   name: "hive-admin",
   version: "0.1.0",
@@ -542,6 +544,154 @@ server.registerTool(
         {
           type: "text",
           text: `Removed [${values.join(", ")}] from ${agent_id}.${field}. Override is now: ${JSON.stringify(existing)}. Hot-reload triggered.`,
+        },
+      ],
+    };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Prompt override tools (soul + system prompt)
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "prompt_get",
+  {
+    title: "Get Agent Prompt",
+    description:
+      "Show the current soul and/or system prompt override for an agent. If no override exists, the agent is using the file-based default.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID (e.g. 'vp-engineering')"),
+    },
+  },
+  async ({ agent_id }) => {
+    const doc = (await promptOverrides.findOne({ agentId: agent_id })) as any;
+    if (!doc) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No prompt override for ${agent_id} — using file defaults from agents/${agent_id}/soul.md and system-prompt.md.`,
+          },
+        ],
+      };
+    }
+
+    const date = doc.updatedAt instanceof Date ? doc.updatedAt.toISOString() : String(doc.updatedAt ?? "");
+    const by = doc.updatedBy ? ` (by ${doc.updatedBy})` : "";
+    const parts: string[] = [`Prompt override for ${agent_id}${by} — ${date}:\n`];
+
+    if (doc.soul !== undefined) {
+      parts.push(`=== SOUL ===\n${doc.soul}\n`);
+    }
+    if (doc.systemPrompt !== undefined) {
+      parts.push(`=== SYSTEM PROMPT ===\n${doc.systemPrompt}\n`);
+    }
+
+    return { content: [{ type: "text", text: parts.join("\n") }] };
+  },
+);
+
+server.registerTool(
+  "prompt_set",
+  {
+    title: "Set Agent Prompt",
+    description:
+      "Override an agent's soul and/or system prompt. These take effect on next hot-reload (immediate — no rebuild/redeploy needed). Pass only the fields you want to override; omitted fields keep using the file default.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID (e.g. 'vp-engineering')"),
+      soul: z
+        .string()
+        .optional()
+        .describe("New soul.md content (personality, voice, values). Omit to leave unchanged."),
+      system_prompt: z
+        .string()
+        .optional()
+        .describe("New system-prompt.md content (role, tools, guardrails). Omit to leave unchanged."),
+    },
+  },
+  async ({ agent_id, soul, system_prompt }) => {
+    if (soul === undefined && system_prompt === undefined) {
+      return {
+        content: [{ type: "text", text: "Nothing to set — provide at least one of soul or system_prompt." }],
+        isError: true,
+      };
+    }
+
+    const update: Record<string, unknown> = {
+      updatedAt: new Date(),
+      updatedBy: "chief-of-staff",
+    };
+    if (soul !== undefined) update.soul = soul;
+    if (system_prompt !== undefined) update.systemPrompt = system_prompt;
+
+    await promptOverrides.updateOne({ agentId: agent_id }, { $set: update }, { upsert: true });
+
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    const fields = [...(soul !== undefined ? ["soul"] : []), ...(system_prompt !== undefined ? ["systemPrompt"] : [])];
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Prompt override for ${agent_id} set: ${fields.join(", ")}. Hot-reload triggered — takes effect on next message.`,
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
+  "prompt_reset",
+  {
+    title: "Reset Agent Prompt",
+    description:
+      "Remove prompt overrides for an agent, reverting to the file-based defaults. If field is provided ('soul' or 'systemPrompt'), only that field is reset. If no field, both are reset.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID to reset"),
+      field: z.enum(["soul", "systemPrompt"]).optional().describe("Specific field to reset (omit to reset both)"),
+    },
+  },
+  async ({ agent_id, field }) => {
+    if (field) {
+      await promptOverrides.updateOne(
+        { agentId: agent_id },
+        { $unset: { [field]: "" }, $set: { updatedAt: new Date() } },
+      );
+
+      try {
+        process.kill(process.ppid, "SIGUSR1");
+      } catch {}
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Prompt override for ${agent_id}.${field} removed. Reverted to file default. Hot-reload triggered.`,
+          },
+        ],
+      };
+    }
+
+    const result = await promptOverrides.deleteOne({ agentId: agent_id });
+    if (result.deletedCount === 0) {
+      return {
+        content: [{ type: "text", text: `No prompt override found for ${agent_id} — already using file defaults.` }],
+      };
+    }
+
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `All prompt overrides removed for ${agent_id}. Reverted to file defaults. Hot-reload triggered.`,
         },
       ],
     };
