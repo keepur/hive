@@ -103,7 +103,8 @@ export async function routeModel(
       options: {
         model: routerModel,
         systemPrompt: ROUTER_PROMPT,
-        permissionMode: "dontAsk",
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
         maxTurns: 1,
         maxBudgetUsd: 0.01,
         persistSession: false,

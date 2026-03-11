@@ -126,7 +126,8 @@ export async function triage(
       options: {
         model,
         systemPrompt,
-        permissionMode: "dontAsk",
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
         maxTurns: 1,
         maxBudgetUsd: 0.01,
         persistSession: false,
