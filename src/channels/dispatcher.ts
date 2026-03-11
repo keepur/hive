@@ -118,14 +118,25 @@ export class Dispatcher {
       return;
     }
 
+    // 2b. Filter out disabled agents
+    const activeList = resolvedList.filter(({ agentId }) => {
+      const agentConfig = this.registry.get(agentId);
+      if (agentConfig?.disabled) {
+        log.info("Message dropped — agent is disabled", { agentId, source: item.source.kind });
+        return false;
+      }
+      return true;
+    });
+    if (activeList.length === 0) return;
+
     // Fan-out: if multiple agents resolved, dispatch to each concurrently
-    if (resolvedList.length > 1) {
-      log.info("Multi-agent fan-out", { agents: resolvedList.map((r) => r.agentId) });
-      await Promise.all(resolvedList.map((r) => this.dispatchToAgent(item, r)));
+    if (activeList.length > 1) {
+      log.info("Multi-agent fan-out", { agents: activeList.map((r) => r.agentId) });
+      await Promise.all(activeList.map((r) => this.dispatchToAgent(item, r)));
       return;
     }
 
-    const { agentId, skipTriage } = resolvedList[0];
+    const { agentId, skipTriage } = activeList[0];
 
     const threadId = item.threadId ?? item.id;
     this.threadAgentMap.set(threadId, agentId);

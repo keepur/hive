@@ -1,5 +1,6 @@
 import { createLogger } from "../logging/logger.js";
 import type { AgentManager } from "../agents/agent-manager.js";
+import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 
 const log = createLogger("health-reporter");
@@ -22,10 +23,12 @@ export interface HealthReport {
 export class HealthReporter {
   private agentManager: AgentManager;
   private memoryManager: MemoryManager;
+  private registry?: AgentRegistry;
 
-  constructor(agentManager: AgentManager, memoryManager: MemoryManager) {
+  constructor(agentManager: AgentManager, memoryManager: MemoryManager, registry?: AgentRegistry) {
     this.agentManager = agentManager;
     this.memoryManager = memoryManager;
+    this.registry = registry;
   }
 
   generateReport(): HealthReport {
@@ -59,8 +62,11 @@ export class HealthReporter {
     const lines = [`*Hive Status* — ${new Date().toLocaleString()}\n`];
 
     for (const [id, info] of Object.entries(report.agents)) {
-      const statusEmoji =
-        info.status === "idle"
+      const agentConfig = this.registry?.get(id);
+      const isDisabled = agentConfig?.disabled;
+      const statusEmoji = isDisabled
+        ? ":no_entry_sign:"
+        : info.status === "idle"
           ? ":white_circle:"
           : info.status === "processing"
             ? ":large_blue_circle:"
