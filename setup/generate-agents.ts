@@ -178,59 +178,20 @@ async function main() {
     writeFileSync(eaYamlPath, yaml);
   }
 
-  // Generate constitution if template exists and memory path is configured
+  // Render constitution and sync directly to MongoDB
   const constitutionTplPath = join(ROOT, "setup", "templates", "constitution.md.tpl");
   if (existsSync(constitutionTplPath)) {
-    const memoryPath = (config.memory?.localPath ?? `${process.env.HOME}/hive-memory`).replace(
-      "~",
-      process.env.HOME ?? "/tmp",
-    );
-    const sharedDir = join(memoryPath, "shared");
-    const constitutionOutPath = join(sharedDir, "constitution.md");
+    const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
+    const constitutionCtx = { business: ctx.business, team };
+    const content = render(constitutionTpl, constitutionCtx);
 
-    if (existsSync(sharedDir)) {
-      const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
-      const constitutionCtx = { business: ctx.business, team };
-      const content = render(constitutionTpl, constitutionCtx);
-
-      // Check if user modified the constitution (respect their changes)
-      const constitutionMetaKey = "shared/constitution.md";
-      if (existsSync(constitutionOutPath) && !force) {
-        const existing = readFileSync(constitutionOutPath, "utf-8");
-        const existingHash = fileHash(existing);
-        const originalHash = meta[constitutionMetaKey];
-        if (originalHash && existingHash !== originalHash) {
-          console.log(`  SKIP ${constitutionMetaKey} (modified by user — use --force to overwrite)`);
-          newMeta[constitutionMetaKey] = existingHash;
-        } else {
-          writeFileSync(constitutionOutPath, content);
-          newMeta[constitutionMetaKey] = fileHash(content);
-          console.log(`  WRITE ${constitutionMetaKey}`);
-        }
-      } else {
-        writeFileSync(constitutionOutPath, content);
-        newMeta[constitutionMetaKey] = fileHash(content);
-        console.log(`  WRITE ${constitutionMetaKey}`);
-      }
-    }
-  }
-
-  // Sync constitution to MongoDB (agents read from Mongo, not filesystem)
-  const constitutionPath = join(
-    (config.memory?.localPath ?? `${process.env.HOME}/hive-memory`).replace("~", process.env.HOME ?? "/tmp"),
-    "shared",
-    "constitution.md",
-  );
-  if (existsSync(constitutionPath)) {
     const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
     const mongoDb = process.env.MONGODB_DB || "hive";
     try {
       const client = new MongoClient(mongoUri);
       await client.connect();
       const db = client.db(mongoDb);
-      const content = readFileSync(constitutionPath, "utf-8");
 
-      // Save current version to history
       const existing = await db.collection("memory").findOne({ path: "shared/constitution.md" });
       if (existing && existing.content !== content) {
         await db.collection("memory_versions").insertOne({

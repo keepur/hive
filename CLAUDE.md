@@ -17,7 +17,6 @@
 - **Deploy**: `~/services/hive` — separate clone, compiled JS, launchd points here
 - **Deploy script**: `~/services/hive/deploy.sh` — pulls, installs, builds, syncs agents, restarts
 - Editing source in dev does NOT affect the running service
-- `~/github/hive-memory` is shared by both (separate repo, agents' persistent memory)
 
 ## Conventions
 
