@@ -1,0 +1,472 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// Mock logger
+vi.mock("../logging/logger.js", () => ({
+  createLogger: () => ({
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  }),
+}));
+
+// Mock config
+vi.mock("../config.js", () => ({
+  config: {
+    plugins: [],
+    modelRouter: { enabled: false },
+  },
+}));
+
+// Mock plugin loader
+vi.mock("../plugins/plugin-loader.js", () => ({
+  loadPlugins: vi.fn().mockReturnValue([]),
+}));
+
+// Mock model router
+vi.mock("./model-router.js", () => ({
+  routeModel: vi.fn(),
+}));
+
+// Mock file processor
+vi.mock("../files/file-processor.js", () => ({
+  formatFilesForPrompt: vi.fn().mockReturnValue(""),
+}));
+
+// Mock AgentRunner - need to capture instances
+const mockRunnerSend = vi.fn();
+const mockRunnerAbort = vi.fn();
+vi.mock("./agent-runner.js", () => ({
+  AgentRunner: vi.fn().mockImplementation(() => ({
+    send: mockRunnerSend,
+    abort: mockRunnerAbort,
+    wasAborted: false,
+  })),
+}));
+
+import { AgentManager } from "./agent-manager.js";
+import type { AgentConfig } from "../types/agent-config.js";
+import type { WorkItem } from "../types/work-item.js";
+
+function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+  return {
+    id: "test-agent",
+    name: "TestAgent",
+    model: "claude-haiku-4-5",
+    channels: [],
+    passiveChannels: [],
+    keywords: [],
+    isDefault: false,
+    schedule: [],
+    budgetUsd: 10,
+    maxTurns: 25,
+    icon: "",
+    soul: "",
+    systemPrompt: "",
+    ...overrides,
+  };
+}
+
+let workItemCounter = 0;
+
+function makeWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
+  workItemCounter++;
+  return {
+    id: `msg-${workItemCounter}-${Date.now()}-${Math.random()}`,
+    text: "test message",
+    source: { kind: "slack", id: "C123", label: "general" },
+    sender: "user1",
+    timestamp: new Date(),
+    ...overrides,
+  };
+}
+
+function makeRunResult(overrides: Partial<any> = {}) {
+  return {
+    text: "response",
+    sessionId: "session-1",
+    costUsd: 0.01,
+    durationMs: 1000,
+    llmMs: 800,
+    toolMs: 200,
+    toolCalls: 1,
+    toolSummary: "memory:1x/0.2s",
+    streamed: false,
+    aborted: false,
+    ...overrides,
+  };
+}
+
+function makeMockRegistry() {
+  const agents = new Map<string, AgentConfig>();
+  agents.set("agent-a", makeAgentConfig({ id: "agent-a", name: "AgentA", maxConcurrent: 2 }));
+  agents.set("agent-b", makeAgentConfig({ id: "agent-b", name: "AgentB" }));
+
+  return {
+    get: vi.fn().mockImplementation((id: string) => agents.get(id)),
+    getAll: () => Array.from(agents.values()),
+    listIds: () => Array.from(agents.keys()),
+    _agents: agents,
+  };
+}
+
+function makeMockSessionStore() {
+  const sessions = new Map<string, string>();
+  return {
+    get: vi.fn().mockImplementation(async (agentId: string, threadId: string) => {
+      return sessions.get(`${agentId}:${threadId}`);
+    }),
+    set: vi.fn().mockImplementation(async (agentId: string, threadId: string, sessionId: string) => {
+      sessions.set(`${agentId}:${threadId}`, sessionId);
+    }),
+    delete: vi.fn(),
+    clearAgent: vi.fn(),
+    findAgentByThread: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+function makeMockMemoryManager() {
+  return {
+    read: vi.fn().mockResolvedValue(null),
+    write: vi.fn().mockResolvedValue(undefined),
+    list: vi.fn().mockResolvedValue([]),
+  };
+}
+
+describe("AgentManager", () => {
+  let manager: AgentManager;
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let sessionStore: ReturnType<typeof makeMockSessionStore>;
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workItemCounter = 0;
+    registry = makeMockRegistry();
+    sessionStore = makeMockSessionStore();
+    memoryManager = makeMockMemoryManager();
+
+    // Default mock: runner.send resolves with a result
+    mockRunnerSend.mockResolvedValue(makeRunResult());
+
+    manager = new AgentManager(registry as any, memoryManager as any, sessionStore as any);
+  });
+
+  describe("sendMessage", () => {
+    it("sends message to agent and returns result", async () => {
+      const item = makeWorkItem();
+      const result = await manager.sendMessage("agent-a", item);
+
+      expect(result.text).toBe("response");
+      expect(result.sessionId).toBe("session-1");
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+    });
+
+    it("saves session after successful response", async () => {
+      const threadId = `thread-${Date.now()}`;
+      const item = makeWorkItem({ threadId });
+      await manager.sendMessage("agent-a", item);
+
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", threadId, "session-1");
+    });
+
+    it("does not save session when aborted", async () => {
+      mockRunnerSend.mockResolvedValue(makeRunResult({ aborted: true }));
+
+      const threadId = `thread-aborted-${Date.now()}`;
+      const item = makeWorkItem({ threadId });
+      await manager.sendMessage("agent-a", item);
+
+      expect(sessionStore.set).not.toHaveBeenCalled();
+    });
+
+    it("updates agent state after processing", async () => {
+      const item = makeWorkItem();
+      await manager.sendMessage("agent-a", item);
+
+      const state = manager.getState("agent-a");
+      expect(state).toBeDefined();
+      expect(state!.messagesProcessed).toBe(1);
+      expect(state!.status).toBe("idle");
+    });
+
+    it("increments error count on runner error", async () => {
+      mockRunnerSend.mockResolvedValue(makeRunResult({
+        text: "",
+        error: "something broke",
+        costUsd: 0,
+        durationMs: 100,
+        llmMs: 100,
+        toolMs: 0,
+        toolCalls: 0,
+        toolSummary: "none",
+      }));
+
+      const item = makeWorkItem();
+      await manager.sendMessage("agent-a", item);
+
+      const state = manager.getState("agent-a");
+      expect(state!.errorCount).toBe(1);
+    });
+
+    it("uses message id as threadId when threadId is absent", async () => {
+      const item = makeWorkItem({ threadId: undefined });
+      await manager.sendMessage("agent-a", item);
+
+      // Session should be saved with message id as thread key
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", item.id, "session-1");
+    });
+
+    it("increments error count on runner throw", async () => {
+      mockRunnerSend.mockRejectedValue(new Error("runner crash"));
+
+      const item = makeWorkItem();
+      await expect(manager.sendMessage("agent-a", item)).rejects.toThrow("runner crash");
+
+      const state = manager.getState("agent-a");
+      expect(state!.errorCount).toBe(1);
+    });
+  });
+
+  describe("concurrency limiting", () => {
+    it("respects maxConcurrent limit", async () => {
+      // agent-a has maxConcurrent: 2
+      const resolvers: (() => void)[] = [];
+      mockRunnerSend.mockImplementation(() => {
+        return new Promise<any>((resolve) => {
+          resolvers.push(() => resolve(makeRunResult()));
+        });
+      });
+
+      // Send 3 messages on different threads
+      const p1 = manager.sendMessage("agent-a", makeWorkItem({ threadId: "t1" }));
+      const p2 = manager.sendMessage("agent-a", makeWorkItem({ threadId: "t2" }));
+      const p3 = manager.sendMessage("agent-a", makeWorkItem({ threadId: "t3" }));
+
+      // Wait a tick for queues to process
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Only 2 should be processing (maxConcurrent: 2)
+      expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+
+      // Resolve one
+      resolvers[0]!();
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Now the third should start
+      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
+
+      // Resolve remaining
+      resolvers[1]!();
+      resolvers[2]!();
+
+      await Promise.all([p1, p2, p3]);
+    });
+
+    it("processes messages on same thread serially", async () => {
+      const resolvers: (() => void)[] = [];
+      mockRunnerSend.mockImplementation(() => {
+        return new Promise<any>((resolve) => {
+          resolvers.push(() => resolve(makeRunResult()));
+        });
+      });
+
+      const sharedThread = `serial-thread-${Date.now()}`;
+      const p1 = manager.sendMessage("agent-a", makeWorkItem({ threadId: sharedThread }));
+      const p2 = manager.sendMessage("agent-a", makeWorkItem({ threadId: sharedThread }));
+
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Only one runner call — second message queued behind first on same thread
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+
+      // Resolve first — second should process within the same while loop
+      resolvers[0]!();
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+
+      resolvers[1]!();
+      await Promise.all([p1, p2]);
+    });
+  });
+
+  describe("stopAgent", () => {
+    it("aborts active runners and sets status to stopped", async () => {
+      let resolver: () => void;
+      mockRunnerSend.mockImplementation(() => new Promise<any>((r) => {
+        resolver = () => r(makeRunResult({ text: "", aborted: true }));
+      }));
+
+      const p = manager.sendMessage("agent-a", makeWorkItem());
+      await new Promise((r) => setTimeout(r, 10));
+
+      manager.stopAgent("agent-a");
+      expect(mockRunnerAbort).toHaveBeenCalled();
+
+      const state = manager.getState("agent-a");
+      expect(state!.status).toBe("stopped");
+
+      // Resolve to clean up
+      resolver!();
+      await p.catch(() => {});
+    });
+
+    it("is safe to call on an agent with no active runners", () => {
+      // Create state by sending a completed message first
+      expect(() => manager.stopAgent("agent-a")).not.toThrow();
+    });
+  });
+
+  describe("stopAll", () => {
+    it("stops all agents that have state", async () => {
+      await manager.sendMessage("agent-a", makeWorkItem());
+      await manager.sendMessage("agent-b", makeWorkItem());
+
+      manager.stopAll();
+
+      const stateA = manager.getState("agent-a");
+      const stateB = manager.getState("agent-b");
+      expect(stateA!.status).toBe("stopped");
+      expect(stateB!.status).toBe("stopped");
+    });
+  });
+
+  describe("sweep", () => {
+    it("removes zombie states for agents no longer in registry", async () => {
+      // Process a message to create state, then let it go idle
+      await manager.sendMessage("agent-a", makeWorkItem());
+      expect(manager.getState("agent-a")).toBeDefined();
+
+      // Remove agent-a from registry
+      registry.get.mockImplementation((id: string) =>
+        id === "agent-b" ? makeAgentConfig({ id: "agent-b" }) : undefined
+      );
+
+      const result = manager.sweep();
+      expect(result.pruned).toBeGreaterThanOrEqual(1);
+      expect(manager.getState("agent-a")).toBeUndefined();
+    });
+
+    it("does not remove zombie states for processing agents", async () => {
+      let resolver: () => void;
+      mockRunnerSend.mockImplementation(() => new Promise<any>((r) => {
+        resolver = () => r(makeRunResult());
+      }));
+
+      const p = manager.sendMessage("agent-a", makeWorkItem());
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Remove agent-a from registry while it's processing
+      registry.get.mockImplementation((id: string) =>
+        id === "agent-b" ? makeAgentConfig({ id: "agent-b" }) : undefined
+      );
+
+      const result = manager.sweep();
+      // Should NOT prune processing agents
+      expect(manager.getState("agent-a")).toBeDefined();
+      expect(manager.getState("agent-a")!.status).toBe("processing");
+
+      // Cleanup
+      resolver!();
+      await p;
+    });
+
+    it("returns zero pruned when no zombies", async () => {
+      await manager.sendMessage("agent-a", makeWorkItem());
+      const result = manager.sweep();
+      expect(result.component).toBe("agent-manager");
+      expect(result.pruned).toBe(0);
+    });
+
+    it("clears stuck processing flags with no active runners", async () => {
+      // Send a message so state exists
+      await manager.sendMessage("agent-a", makeWorkItem());
+
+      // Manually inject a stuck processing flag
+      const processing = (manager as any).processing as Set<string>;
+      const stuckKey = "agent-a:stuck-thread";
+      processing.add(stuckKey);
+
+      // Add to activeThreads to simulate the stuck condition
+      const activeThreads = (manager as any).activeThreads as Map<string, Set<string>>;
+      const threadSet = activeThreads.get("agent-a") ?? new Set();
+      threadSet.add(stuckKey);
+      activeThreads.set("agent-a", threadSet);
+
+      // No runners for agent-a (already cleaned up from the completed message)
+      const result = manager.sweep();
+
+      expect(result.pruned).toBeGreaterThanOrEqual(1);
+      expect(processing.has(stuckKey)).toBe(false);
+    });
+  });
+
+  describe("findAgentForThread", () => {
+    it("delegates to session store", async () => {
+      sessionStore.findAgentByThread.mockResolvedValue("agent-a");
+      const result = await manager.findAgentForThread("thread-123");
+      expect(result).toBe("agent-a");
+      expect(sessionStore.findAgentByThread).toHaveBeenCalledWith("thread-123");
+    });
+
+    it("returns undefined when no agent found", async () => {
+      const result = await manager.findAgentForThread("unknown-thread");
+      expect(result).toBeUndefined();
+    });
+  });
+
+  describe("restartAgent", () => {
+    it("resets agent state and clears sessions", async () => {
+      await manager.sendMessage("agent-a", makeWorkItem());
+      const stateBefore = manager.getState("agent-a");
+      expect(stateBefore!.messagesProcessed).toBe(1);
+
+      manager.restartAgent("agent-a");
+
+      const stateAfter = manager.getState("agent-a");
+      expect(stateAfter!.status).toBe("idle");
+      expect(stateAfter!.messagesProcessed).toBe(0);
+      expect(stateAfter!.errorCount).toBe(0);
+      expect(stateAfter!.activeThreadCount).toBe(0);
+      expect(sessionStore.clearAgent).toHaveBeenCalledWith("agent-a");
+    });
+
+    it("aborts active runners before resetting", async () => {
+      let resolver: () => void;
+      mockRunnerSend.mockImplementation(() => new Promise<any>((r) => {
+        resolver = () => r(makeRunResult({ aborted: true }));
+      }));
+
+      const p = manager.sendMessage("agent-a", makeWorkItem());
+      await new Promise((r) => setTimeout(r, 10));
+
+      manager.restartAgent("agent-a");
+      expect(mockRunnerAbort).toHaveBeenCalled();
+
+      const state = manager.getState("agent-a");
+      expect(state!.status).toBe("idle");
+      expect(state!.messagesProcessed).toBe(0);
+
+      // Cleanup
+      resolver!();
+      await p.catch(() => {});
+    });
+  });
+
+  describe("getAllStates", () => {
+    it("returns all agent states", async () => {
+      await manager.sendMessage("agent-a", makeWorkItem());
+      await manager.sendMessage("agent-b", makeWorkItem());
+
+      const states = manager.getAllStates();
+      expect(states).toHaveLength(2);
+      expect(states.map((s) => s.id).sort()).toEqual(["agent-a", "agent-b"]);
+    });
+
+    it("returns empty array when no agents have state", () => {
+      const states = manager.getAllStates();
+      expect(states).toEqual([]);
+    });
+  });
+});
