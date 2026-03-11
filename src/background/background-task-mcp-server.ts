@@ -23,6 +23,7 @@ import { z } from "zod";
 
 const API = process.env.BG_TASK_API ?? "http://127.0.0.1:3100";
 const AGENT_ID = process.env.BG_AGENT_ID ?? "";
+const AUTH_TOKEN = process.env.BG_AUTH_TOKEN ?? "";
 
 interface BackgroundTaskContext {
   agentId: string;
@@ -51,7 +52,10 @@ function buildContext(): BackgroundTaskContext {
 async function bgApi(method: string, path: string, body?: object): Promise<any> {
   const res = await fetch(`${API}${path}`, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {}),
+    },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
   if (!res.ok) {
@@ -68,26 +72,30 @@ server.registerTool(
   {
     title: "Execute in Background",
     description:
-      "Spawn a shell command as a detached background process. Returns immediately with a task ID. " +
+      "Spawn a background process that runs detached. Returns immediately with a task ID. " +
       "You will be notified in this thread when the command completes. " +
-      "Use for any operation that might take more than 30 seconds: npm test, npm run build, git push, deploy scripts, etc.",
+      "Use for any operation that might take more than 30 seconds: npm test, npm run build, git push, deploy scripts, etc. " +
+      "Provide the executable name as 'command' and arguments as an array in 'args'.",
     inputSchema: {
-      command: z.string().describe("The shell command to run (e.g. 'npm test', 'npm run build')"),
+      command: z.string().describe("Executable name or path (e.g. 'npm', 'git', '/path/to/deploy.sh')"),
+      args: z.array(z.string()).optional().describe("Arguments array (e.g. ['test', '--coverage']). Each argument is a separate element — no shell quoting needed."),
       cwd: z.string().optional().describe("Working directory (absolute path). Defaults to $HOME."),
     },
   },
-  async ({ command, cwd }) => {
+  async ({ command, args, cwd }) => {
     try {
       const result = await bgApi("POST", "/tasks", {
         command,
+        args,
         cwd,
         context: buildContext(),
       });
+      const displayCmd = command + (args?.length ? " " + args.join(" ") : "");
       return {
         content: [
           {
             type: "text" as const,
-            text: `Background task started.\nID: ${result.id}\nCommand: ${command}\nYou will be notified in this thread when it completes.`,
+            text: `Background task started.\nID: ${result.id}\nCommand: ${displayCmd}\nYou will be notified in this thread when it completes.`,
           },
         ],
       };

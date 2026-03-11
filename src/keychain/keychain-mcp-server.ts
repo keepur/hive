@@ -15,13 +15,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 const SERVICE = process.env.KEYCHAIN_SERVICE ?? "hive";
-
-function run(command: string): string {
-  return execSync(command, { encoding: "utf-8", timeout: 5000 }).trim();
-}
 
 const server = new McpServer({
   name: "hive-keychain",
@@ -39,7 +35,8 @@ server.registerTool(
   },
   async ({ account }) => {
     try {
-      const password = run(`security find-generic-password -s "${SERVICE}" -a "${account}" -w`);
+      const password = execFileSync("security", ["find-generic-password", "-s", SERVICE, "-a", account, "-w"],
+        { encoding: "utf-8", timeout: 5000 }).trim();
       return { content: [{ type: "text", text: password }] };
     } catch {
       return { content: [{ type: "text", text: `Secret not found: ${account}` }], isError: true };
@@ -56,9 +53,16 @@ server.registerTool(
   },
   async () => {
     try {
-      // Dump all generic passwords, grep for our service, extract account names
-      const raw = run(`security dump-keychain | grep -A4 'svce.*"${SERVICE}"' | grep '"acct"' | sed 's/.*="//;s/"$//'`);
-      const accounts = raw.split("\n").filter(Boolean);
+      // Dump all generic passwords, filter for our service, extract account names
+      const raw = execFileSync("security", ["dump-keychain"], { encoding: "utf-8", timeout: 5000 });
+      const accounts: string[] = [];
+      const blocks = raw.split("keychain:");
+      for (const block of blocks) {
+        if (block.includes(`"svce"<blob>="${SERVICE}"`)) {
+          const acctMatch = block.match(/"acct"<blob>="([^"]+)"/);
+          if (acctMatch) accounts.push(acctMatch[1]);
+        }
+      }
       if (accounts.length === 0) {
         return {
           content: [

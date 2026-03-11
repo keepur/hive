@@ -62,8 +62,9 @@ vi.mock("../config.js", () => ({
       region: "",
       monitorPort: 3100,
       monitorPublicUrl: "",
+      webhookSecret: "test-webhook-secret",
     },
-    background: { port: 3200 },
+    background: { port: 3200, authToken: "test-bg-token" },
     anthropic: { apiKey: "test-key" },
     externalComms: { enabled: true },
     triage: { enabled: false },
@@ -104,6 +105,11 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 function getCapturedServers(): Record<string, any> {
   const call = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
   return call[0].options.mcpServers ?? {};
+}
+
+function getCapturedOptions(): Record<string, any> {
+  const call = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
+  return call[0].options ?? {};
 }
 
 // ── Import after mocks ──────────────────────────────────────────────
@@ -359,5 +365,63 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     await runner.send("hello");
     const servers = getCapturedServers();
     expect(servers).not.toHaveProperty("quo");
+  });
+});
+
+// ── Security hardening tests ─────────────────────────────────────
+describe("AgentRunner security hardening", () => {
+  let runner: AgentRunner;
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("passes disallowedTools to block SDK built-in tools", async () => {
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.disallowedTools).toEqual([
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Agent",
+      "WebFetch",
+      "WebSearch",
+      "NotebookEdit",
+    ]);
+  });
+
+  it("passes BG_AUTH_TOKEN to background MCP server env", async () => {
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers["background"].env.BG_AUTH_TOKEN).toBe("test-bg-token");
+  });
+
+  it("passes RECALL_WEBHOOK_SECRET to recall MCP server env", async () => {
+    const { config } = await import("../config.js");
+    const origApiKey = config.recall.apiKey;
+    const origMonitorPublicUrl = config.recall.monitorPublicUrl;
+    (config.recall as any).apiKey = "test-recall-key";
+    (config.recall as any).monitorPublicUrl = "http://test";
+
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers["recall"].env.RECALL_WEBHOOK_SECRET).toBe(
+      "test-webhook-secret",
+    );
+
+    // Restore
+    (config.recall as any).apiKey = origApiKey;
+    (config.recall as any).monitorPublicUrl = origMonitorPublicUrl;
   });
 });
