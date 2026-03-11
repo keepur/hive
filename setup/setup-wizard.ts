@@ -484,6 +484,8 @@ async function doBusiness(hive: Record<string, any>) {
   const businessName = await ask("Business name", hive.business?.name || "");
   const businessDesc = await ask("What does your business do? (one sentence)", hive.business?.description || "");
   const businessLocation = await ask("Location (city, state)", hive.business?.location || "");
+  const businessTimezone = await ask("Timezone (e.g. America/New_York)", hive.business?.timezone || "");
+  const businessHours = await ask("Business hours (e.g. 9 AM - 5 PM)", hive.business?.businessHours || "9 AM - 5 PM");
   const ownerName = await ask("Your name", hive.business?.owner?.name || "");
   const ownerRole = await ask("Your role", hive.business?.owner?.role || "CEO");
 
@@ -491,6 +493,8 @@ async function doBusiness(hive: Record<string, any>) {
     name: businessName,
     description: businessDesc,
     ...(businessLocation ? { location: businessLocation } : {}),
+    ...(businessTimezone ? { timezone: businessTimezone } : {}),
+    businessHours,
     owner: { name: ownerName, role: ownerRole },
   };
 
@@ -619,20 +623,7 @@ async function doConstitution(hive: Record<string, any>) {
   hive.constitution.cosCanManageAgents = true;
   console.log(`  ✓ ${cosName} can manage agent definitions\n`);
 
-  // 2. Build & deploy
-  console.log(`── Build & deploy`);
-  if (!hasOtherAgents) {
-    console.log(`Without a DevOps agent, someone needs to rebuild and restart Hive`);
-    console.log(`after agent changes (e.g., adding a new agent).\n`);
-  }
-  hive.constitution.cosCanBuildDeploy = await confirm(`Allow ${cosName} to build and redeploy Hive?`, true);
-  if (hive.constitution.cosCanBuildDeploy) {
-    console.log(`  ✓ ${cosName} can run deploy.sh, npm run build, and restart the service`);
-  } else {
-    console.log(`  ✗ Only ${ownerName} can build and deploy — ${cosName} will ask you`);
-  }
-
-  // 3. External communications (hard gate)
+  // 2. External communications (hard gate)
   console.log(`\n── External communications (email, SMS)`);
   console.log(`This is a hard gate — when off, email and SMS tools are completely`);
   console.log(`removed from all agents. Not just a policy, they literally can't send.\n`);
@@ -653,34 +644,12 @@ async function doConstitution(hive: Record<string, any>) {
   }
   saveEnv(extEnv);
 
-  // 4. Source code
-  console.log(`\n── Source code (Hive repository)`);
-  console.log(`This is about modifying Hive's actual code — not agent configs.\n`);
-  hive.constitution.cosCanEditSourceCode = await confirm(`Allow ${cosName} to modify Hive source code?`, false);
-  if (hive.constitution.cosCanEditSourceCode) {
-    console.log(`  ✓ ${cosName} can edit source code (use with caution)`);
-  } else {
-    console.log(`  ✗ Source code changes require ${ownerName} (or a future dev agent)`);
-  }
-
-  // 5. Break glass
-  console.log(`\n── Emergency access`);
-  console.log(`If Hive goes down and you're unreachable, should ${cosName} be able`);
-  console.log(`to take minimum action to restore service?\n`);
-  hive.constitution.cosBreakGlass = await confirm(`Grant ${cosName} emergency break-glass access?`, true);
-  if (hive.constitution.cosBreakGlass) {
-    console.log(`  ✓ ${cosName} can restart services in emergencies (logged, ${ownerName} notified)`);
-  } else {
-    console.log(`  ✗ ${cosName} must wait for ${ownerName} even in emergencies`);
-  }
-
-  // Summary
+  // 3. Summary
   console.log("\n── Summary ─────────────────────────────────────");
   console.log(`  Agent management:       ✓ yes`);
-  console.log(`  Build & deploy:         ${hive.constitution.cosCanBuildDeploy ? "✓ yes" : "✗ no"}`);
   console.log(`  External communications: ${hive.constitution.cosCanContactExternal ? "✓ yes" : "✗ no"}`);
-  console.log(`  Source code:            ${hive.constitution.cosCanEditSourceCode ? "✓ yes" : "✗ no"}`);
-  console.log(`  Break glass:            ${hive.constitution.cosBreakGlass ? "✓ yes" : "✗ no"}`);
+  console.log(`  Hive build & deploy:    ✗ no (external provisioning only)`);
+  console.log(`  Hive source code:       ✗ no (external provisioning only)`);
 
   saveHiveYaml(hive);
   console.log("\n  ✓ Constitution preferences saved (hive.yaml)");
@@ -708,6 +677,8 @@ async function doMemory(hive: Record<string, any>) {
       `**Company:** ${biz.name ?? ""}`,
       `**About:** ${biz.description ?? ""}`,
       biz.location ? `**Location:** ${biz.location}` : "",
+      biz.timezone ? `**Timezone:** ${biz.timezone}` : "",
+      biz.businessHours ? `**Business Hours:** ${biz.businessHours}${biz.timezone ? ` (${biz.timezone})` : ""}` : "",
       `**Owner:** ${biz.owner?.name ?? ""} (${biz.owner?.role ?? ""})`,
       "",
       "## Additional Context",
