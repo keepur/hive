@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { createLogger } from "../logging/logger.js";
-import type { AgentConfig, AgentSchedule, ConfigOverride, ArrayOverride } from "../types/agent-config.js";
+import type { AgentConfig, AgentSchedule, ConfigOverride, ArrayOverride, PromptOverride } from "../types/agent-config.js";
 import { MongoClient, type Collection, type Db } from "mongodb";
 
 const log = createLogger("agent-registry");
@@ -56,9 +56,11 @@ export class AgentRegistry {
   private basePath: string;
   private modelOverrides = new Map<string, string>();
   private configOverrides = new Map<string, ConfigOverride>();
+  private promptOverrides = new Map<string, PromptOverride>();
   private db?: Db;
   private overridesCollection?: Collection<ModelOverride>;
   private configOverridesCollection?: Collection<ConfigOverride>;
+  private promptOverridesCollection?: Collection<PromptOverride>;
   private templateConfigs = new Map<string, AgentConfig>(); // pre-override snapshots
 
   constructor(basePath: string) {
@@ -79,6 +81,11 @@ export class AgentRegistry {
     await this.configOverridesCollection.createIndex({ agentId: 1 }, { unique: true });
     await this.loadConfigOverrides();
     log.info("Config overrides loaded from MongoDB");
+
+    this.promptOverridesCollection = this.db.collection<PromptOverride>("prompt_overrides");
+    await this.promptOverridesCollection.createIndex({ agentId: 1 }, { unique: true });
+    await this.loadPromptOverrides();
+    log.info("Prompt overrides loaded from MongoDB");
   }
 
   private async loadModelOverrides(): Promise<void> {
@@ -109,10 +116,25 @@ export class AgentRegistry {
     }
   }
 
+  private async loadPromptOverrides(): Promise<void> {
+    if (!this.promptOverridesCollection) return;
+    const docs = await this.promptOverridesCollection.find().toArray();
+    this.promptOverrides.clear();
+    for (const doc of docs) {
+      this.promptOverrides.set(doc.agentId, doc);
+    }
+    if (docs.length > 0) {
+      log.info("Active prompt overrides", {
+        agents: docs.map((d) => d.agentId),
+      });
+    }
+  }
+
   async load(): Promise<{ added: string[]; updated: string[]; removed: string[] }> {
     // Refresh overrides on every reload
     await this.loadModelOverrides();
     await this.loadConfigOverrides();
+    await this.loadPromptOverrides();
     const previousIds = new Set(this.agents.keys());
     const currentIds = new Set<string>();
     const added: string[] = [];
@@ -197,6 +219,20 @@ export class AgentRegistry {
 
     // Save pre-override snapshot for comparison
     this.templateConfigs.set(config.id, { ...config });
+
+    // Apply prompt overrides (soul and/or systemPrompt from MongoDB)
+    const promptOverride = this.promptOverrides.get(agentId);
+    if (promptOverride) {
+      if (promptOverride.soul !== undefined) config.soul = promptOverride.soul;
+      if (promptOverride.systemPrompt !== undefined) config.systemPrompt = promptOverride.systemPrompt;
+      log.info("Prompt override applied", {
+        agent: agentId,
+        fields: [
+          ...(promptOverride.soul !== undefined ? ["soul"] : []),
+          ...(promptOverride.systemPrompt !== undefined ? ["systemPrompt"] : []),
+        ],
+      });
+    }
 
     return this.applyOverrides(config);
   }
