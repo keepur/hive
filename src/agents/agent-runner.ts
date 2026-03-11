@@ -431,7 +431,8 @@ export class AgentRunner {
       options: {
         model: effectiveModel,
         systemPrompt,
-        permissionMode: "dontAsk",
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
         disallowedTools: ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "WebFetch", "WebSearch", "NotebookEdit"],
         maxTurns: this.agentConfig.maxTurns,
         maxBudgetUsd: this.agentConfig.budgetUsd,
