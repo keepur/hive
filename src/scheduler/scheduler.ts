@@ -199,10 +199,15 @@ export class Scheduler {
         if (job.lastRun && isSameMinute(job.lastRun, now)) continue;
 
         job.lastRun = now;
-        log.info("Triggering scheduled task", { agentId: job.agentId, task: job.task });
 
-        // Route through dispatcher so responses are delivered to the agent's dedicated channel
+        // Skip disabled agents
         const agent = this.registry.get(job.agentId);
+        if (agent?.disabled) {
+          log.debug("Skipping scheduled task — agent disabled", { agentId: job.agentId, task: job.task });
+          continue;
+        }
+
+        log.info("Triggering scheduled task", { agentId: job.agentId, task: job.task });
         // Use agent-{id} channel (dedicated), not channels[0] which may be SMS/shared
         const homeChannel = agent?.channels.find((ch) => ch.startsWith("agent-")) ?? `agent-${job.agentId}`;
 
@@ -253,9 +258,14 @@ export class Scheduler {
         contextPreview: cb.context.slice(0, 80),
       });
 
-      // Verify the agent still exists
-      if (!this.registry.get(cb.agentId)) {
+      // Verify the agent still exists and is not disabled
+      const cbAgent = this.registry.get(cb.agentId);
+      if (!cbAgent) {
         log.warn("Callback agent not found, skipping", { agentId: cb.agentId });
+        continue;
+      }
+      if (cbAgent.disabled) {
+        log.info("Callback agent disabled, skipping", { agentId: cb.agentId });
         continue;
       }
 

@@ -63,7 +63,7 @@ async function main(): Promise<void> {
   }
 
   const agentManager = new AgentManager(registry, memoryManager, sessionStore);
-  const healthReporter = new HealthReporter(agentManager, memoryManager);
+  const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
     registry,
     agentManager,
@@ -111,6 +111,15 @@ async function main(): Promise<void> {
       for (const id of result.removed) {
         agentManager.stopAgent(id);
       }
+    }
+
+    // Stop disabled agents (abort active runners)
+    const disabled = registry.getDisabled();
+    for (const agent of disabled) {
+      agentManager.stopAgent(agent.id);
+    }
+    if (disabled.length) {
+      log.info("Disabled agents stopped", { agents: disabled.map((a) => a.id) });
     }
 
     // Reload schedule overrides

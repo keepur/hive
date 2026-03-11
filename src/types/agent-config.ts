@@ -21,6 +21,7 @@ export interface AgentConfig {
   timeoutMs?: number; // Response timeout in ms. Default 300000 (5 min)
   triageModel?: string; // Override triage model. Default: config.triage.model
   dodiOpsMode?: "full" | "readonly"; // Dodi Ops access level. Default: "full"
+  disabled?: boolean; // Agent is offline — won't receive messages or run schedules
   soul: string;
   systemPrompt: string;
 }
@@ -42,6 +43,7 @@ export interface ConfigOverride {
   maxTurns?: number;
   maxConcurrent?: number;
   timeoutMs?: number;
+  disabled?: boolean;
   updatedAt: Date;
   updatedBy: string;
 }

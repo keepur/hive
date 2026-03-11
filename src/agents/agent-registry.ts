@@ -47,6 +47,7 @@ export function applyConfigOverrides(
   if (override.maxTurns !== undefined) config.maxTurns = override.maxTurns;
   if (override.maxConcurrent !== undefined) config.maxConcurrent = override.maxConcurrent;
   if (override.timeoutMs !== undefined) config.timeoutMs = override.timeoutMs;
+  if (override.disabled !== undefined) config.disabled = override.disabled;
 
   return config;
 }
@@ -265,17 +266,18 @@ export class AgentRegistry {
   }
 
   findByChannel(channelName: string): AgentConfig | undefined {
-    return this.getAll().find((a) => a.channels.includes(channelName));
+    return this.getAll().find((a) => !a.disabled && a.channels.includes(channelName));
   }
 
   /** Check if any agent has this channel as passive (listen but don't auto-route) */
   isPassiveChannel(channelName: string): boolean {
-    return this.getAll().some((a) => a.passiveChannels.includes(channelName));
+    return this.getAll().some((a) => !a.disabled && a.passiveChannels.includes(channelName));
   }
 
   findByKeyword(text: string): AgentConfig | undefined {
     const lower = text.toLowerCase();
     return this.getAll().find((a) =>
+      !a.disabled &&
       a.keywords.some((kw) => {
         const escaped = kw.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         return new RegExp(`\\b${escaped}\\b`).test(lower);
@@ -290,6 +292,7 @@ export class AgentRegistry {
   /** Return ALL agents whose names are mentioned in the text */
   findAllByName(text: string): AgentConfig[] {
     return this.getAll().filter((a) => {
+      if (a.disabled) return false;
       const name = a.name.toLowerCase();
       // Match "hey River", "River,", "@River", or just "River" at word boundaries
       const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
@@ -298,6 +301,11 @@ export class AgentRegistry {
   }
 
   getDefault(): AgentConfig | undefined {
-    return this.getAll().find((a) => a.isDefault);
+    return this.getAll().find((a) => !a.disabled && a.isDefault);
+  }
+
+  /** Get all disabled agents (for admin reporting) */
+  getDisabled(): AgentConfig[] {
+    return this.getAll().filter((a) => a.disabled);
   }
 }

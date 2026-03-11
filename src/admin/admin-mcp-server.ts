@@ -255,6 +255,72 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
+// Agent enable/disable tools
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "agent_disable",
+  {
+    title: "Disable Agent",
+    description:
+      "Take an agent offline. The agent stops receiving messages, won't match by name/channel/keyword, and active sessions are aborted. Survives restarts. Use agent_enable to bring them back.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID to disable (e.g. 'sdr', 'marketing-manager')"),
+    },
+  },
+  async ({ agent_id }) => {
+    await configOverrides.updateOne(
+      { agentId: agent_id },
+      { $set: { disabled: true, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { upsert: true },
+    );
+
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${agent_id} is now offline. Active sessions aborted, no new messages will be routed. Use agent_enable to bring them back.`,
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
+  "agent_enable",
+  {
+    title: "Enable Agent",
+    description: "Bring a disabled agent back online. They'll start receiving messages again on the next message.",
+    inputSchema: {
+      agent_id: z.string().describe("The agent ID to enable"),
+    },
+  },
+  async ({ agent_id }) => {
+    await configOverrides.updateOne(
+      { agentId: agent_id },
+      { $unset: { disabled: "" }, $set: { updatedAt: new Date() } },
+    );
+
+    try {
+      process.kill(process.ppid, "SIGUSR1");
+    } catch {}
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${agent_id} is back online. Will receive messages on next routing.`,
+        },
+      ],
+    };
+  },
+);
+
+// ---------------------------------------------------------------------------
 // Config override tools
 // ---------------------------------------------------------------------------
 
