@@ -13,7 +13,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { tmpdir } from "node:os";
@@ -23,7 +23,7 @@ const GWS =
   process.env.GWS_PATH ||
   (() => {
     try {
-      return execSync("which gws", { encoding: "utf-8" }).trim();
+      return execFileSync("which", ["gws"], { encoding: "utf-8" }).trim();
     } catch {
       return "gws";
     }
@@ -31,9 +31,8 @@ const GWS =
 const DOWNLOAD_DIR = join(tmpdir(), "hive-drive-downloads");
 mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
-function gws(args: string): string {
-  const cmd = `${GWS} ${args} 2>&1`;
-  return execSync(cmd, { encoding: "utf-8", timeout: 60_000 }).trim();
+function gws(args: string[]): string {
+  return execFileSync(GWS, args, { encoding: "utf-8", timeout: 60_000 }).trim();
 }
 
 const server = new McpServer({
@@ -74,7 +73,7 @@ server.registerTool(
       // Upload with metadata
       const params = JSON.stringify({ uploadType: "multipart", supportsAllDrives: true });
       const meta = JSON.stringify({ name: fileName, parents: [SHARED_FOLDER] });
-      const result = gws(`drive files create --params '${params}' --json '${meta}' --upload "${file_path}"`);
+      const result = gws(["drive", "files", "create", "--params", params, "--json", meta, "--upload", file_path]);
       const data = JSON.parse(result);
 
       if (!data.id) {
@@ -87,7 +86,7 @@ server.registerTool(
         fields: "id,name,webViewLink,webContentLink",
         supportsAllDrives: true,
       });
-      const info = gws(`drive files get --params '${fields}'`);
+      const info = gws(["drive", "files", "get", "--params", fields]);
       const fileInfo = JSON.parse(info);
 
       const summary = [
@@ -142,7 +141,7 @@ server.registerTool(
     try {
       // Get file metadata first
       const fields = JSON.stringify({ fileId: id, fields: "id,name,mimeType,size", supportsAllDrives: true });
-      const info = gws(`drive files get --params '${fields}'`);
+      const info = gws(["drive", "files", "get", "--params", fields]);
       const meta = JSON.parse(info);
       const isGoogleNative = meta.mimeType in EXPORT_MIME;
       const exportInfo = isGoogleNative ? EXPORT_MIME[meta.mimeType] : null;
@@ -152,11 +151,11 @@ server.registerTool(
       if (isGoogleNative) {
         // Google Docs/Sheets/Slides must be exported, not downloaded with alt:media
         const exportParams = JSON.stringify({ fileId: id, mimeType: exportInfo!.mime });
-        gws(`drive files export --params '${exportParams}' --output "${localPath}"`);
+        gws(["drive", "files", "export", "--params", exportParams, "--output", localPath]);
       } else {
         // Regular files: download with alt:media
         const dlParams = JSON.stringify({ fileId: id, alt: "media", supportsAllDrives: true });
-        gws(`drive files get --params '${dlParams}' --output "${localPath}"`);
+        gws(["drive", "files", "get", "--params", dlParams, "--output", localPath]);
       }
 
       if (!existsSync(localPath)) {
@@ -222,7 +221,7 @@ server.registerTool(
         includeItemsFromAllDrives: true,
         corpora: "allDrives",
       });
-      const result = gws(`drive files list --params '${params}'`);
+      const result = gws(["drive", "files", "list", "--params", params]);
       const data = JSON.parse(result);
 
       if (!data.files?.length) {

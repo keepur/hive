@@ -38,13 +38,15 @@ interface BackgroundTask {
 
 export class BackgroundTaskManager {
   private port: number;
+  private authToken: string;
   private tasks = new Map<string, BackgroundTask>();
   private onComplete: (item: WorkItem) => void;
   private server: Server | null = null;
   private orphanPollers = new Map<string, ReturnType<typeof setInterval>>();
 
-  constructor(port: number, onComplete: (item: WorkItem) => void) {
+  constructor(port: number, authToken: string, onComplete: (item: WorkItem) => void) {
     this.port = port;
+    this.authToken = authToken;
     this.onComplete = onComplete;
   }
 
@@ -126,6 +128,13 @@ export class BackgroundTaskManager {
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${this.port}`);
 
+    const authHeader = req.headers.authorization;
+    if (authHeader !== `Bearer ${this.authToken}`) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+
     // POST /tasks — spawn a new background task
     if (req.method === "POST" && url.pathname === "/tasks") {
       const body = await this.readBody(req);
@@ -171,6 +180,7 @@ export class BackgroundTaskManager {
 
   private async spawnTask(body: {
     command: string;
+    args?: string[];
     cwd?: string;
     context: BackgroundTaskContext;
   }): Promise<BackgroundTask> {
@@ -181,9 +191,8 @@ export class BackgroundTaskManager {
 
     const logFd = openSync(logPath, "a");
 
-    const child = spawn(body.command, {
+    const child = spawn(body.command, body.args ?? [], {
       cwd,
-      shell: true,
       detached: true,
       stdio: ["ignore", logFd, logFd],
     });
@@ -193,7 +202,7 @@ export class BackgroundTaskManager {
 
     const task: BackgroundTask = {
       id,
-      command: body.command,
+      command: body.command + (body.args?.length ? " " + body.args.join(" ") : ""),
       cwd,
       status: "running",
       exitCode: null,

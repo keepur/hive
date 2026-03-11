@@ -97,10 +97,8 @@ export class SlackGateway {
         user: event.user,
         channel: event.channel,
         hasText: !!event.text,
-        text: event.text?.slice(0, 100),
         hasAttachments: !!event.attachments?.length,
         hasBlocks: !!event.blocks?.length,
-        attachmentFallback: event.attachments?.[0]?.fallback?.slice(0, 100),
       });
 
       // Skip messages from any Hive bot (own + peer gateways)
