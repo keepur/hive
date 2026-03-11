@@ -60,7 +60,7 @@ export class DeviceRegistry {
       active: true,
     };
     await this.collection.insertOne(device);
-    log.info("Device created", { id: device._id, name, pairingCode: device.pairingCode });
+    log.info("Device created", { id: device._id, name });
     return device;
   }
 
@@ -71,7 +71,7 @@ export class DeviceRegistry {
     });
 
     if (!device) {
-      log.warn("Pairing code invalid or expired", { code });
+      log.warn("Pairing code invalid or expired");
       return null;
     }
 
@@ -121,7 +121,7 @@ export class DeviceRegistry {
       { _id: deviceId },
       { $set: { pairingCode: code, pairingCodeExpiresAt: expiresAt } },
     );
-    log.info("Pairing code refreshed", { deviceId, code });
+    log.info("Pairing code refreshed", { deviceId });
     return code;
   }
 

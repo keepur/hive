@@ -14,29 +14,27 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 const ACCOUNT = process.env.GOG_ACCOUNT ?? "";
 const GOG =
   process.env.GOG_PATH ??
   (() => {
     try {
-      return execSync("which gog", { encoding: "utf-8" }).trim();
+      return execFileSync("which", ["gog"], { encoding: "utf-8" }).trim();
     } catch {
       return "gog";
     }
   })();
 
-function gog(args: string): string {
-  const accountFlag = ACCOUNT ? `-a "${ACCOUNT}"` : "";
-  const cmd = `${GOG} ${args} ${accountFlag} --json --results-only --no-input 2>&1`;
-  return execSync(cmd, { encoding: "utf-8", timeout: 30_000 }).trim();
+function gog(args: string[]): string {
+  const fullArgs = [...args, ...(ACCOUNT ? ["-a", ACCOUNT] : []), "--json", "--results-only", "--no-input"];
+  return execFileSync(GOG, fullArgs, { encoding: "utf-8", timeout: 30_000 }).trim();
 }
 
-function gogPlain(args: string): string {
-  const accountFlag = ACCOUNT ? `-a "${ACCOUNT}"` : "";
-  const cmd = `${GOG} ${args} ${accountFlag} --plain --no-input 2>&1`;
-  return execSync(cmd, { encoding: "utf-8", timeout: 30_000 }).trim();
+function gogPlain(args: string[]): string {
+  const fullArgs = [...args, ...(ACCOUNT ? ["-a", ACCOUNT] : []), "--plain", "--no-input"];
+  return execFileSync(GOG, fullArgs, { encoding: "utf-8", timeout: 30_000 }).trim();
 }
 
 const server = new McpServer({
@@ -59,7 +57,7 @@ server.registerTool(
   },
   async ({ query, max }) => {
     try {
-      const result = gog(`gmail search "${query.replace(/"/g, '\\"')}" --max=${max}`);
+      const result = gog(["gmail", "search", query, `--max=${max}`]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Search failed: ${e.message}` }], isError: true };
@@ -78,7 +76,7 @@ server.registerTool(
   },
   async ({ messageId }) => {
     try {
-      const result = gog(`gmail get "${messageId}"`);
+      const result = gog(["gmail", "get", messageId]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to read message: ${e.message}` }], isError: true };
@@ -97,7 +95,7 @@ server.registerTool(
   },
   async ({ threadId }) => {
     try {
-      const result = gog(`gmail thread get "${threadId}"`);
+      const result = gog(["gmail", "thread", "get", threadId]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to read thread: ${e.message}` }], isError: true };
@@ -120,10 +118,18 @@ server.registerTool(
   },
   async ({ to, subject, body, cc, threadId }) => {
     try {
-      let cmd = `send --to="${to}" --subject="${subject.replace(/"/g, '\\"')}" --body="${body.replace(/"/g, '\\"')}" --force`;
-      if (cc) cmd += ` --cc="${cc}"`;
-      if (threadId) cmd += ` --thread-id="${threadId}"`;
-      const result = gogPlain(cmd);
+      const result = gogPlain([
+        "send",
+        "--to",
+        to,
+        "--subject",
+        subject,
+        "--body",
+        body,
+        "--force",
+        ...(cc ? ["--cc", cc] : []),
+        ...(threadId ? ["--thread-id", threadId] : []),
+      ]);
       return { content: [{ type: "text", text: result || "Email sent." }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to send: ${e.message}` }], isError: true };
@@ -142,7 +148,7 @@ server.registerTool(
   },
   async () => {
     try {
-      const result = gog("cal calendars");
+      const result = gog(["cal", "calendars"]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to list calendars: ${e.message}` }], isError: true };
@@ -167,16 +173,17 @@ server.registerTool(
   },
   async ({ from, to, today, days, max, calendarId }) => {
     try {
-      let cmd = `cal events`;
-      if (calendarId) cmd += ` "${calendarId}"`;
-      if (today) cmd += " --today";
-      else if (days) cmd += ` --days=${days}`;
-      else {
-        if (from) cmd += ` --from="${from}"`;
-        if (to) cmd += ` --to="${to}"`;
-      }
-      cmd += ` --max=${max}`;
-      const result = gog(cmd);
+      const args: string[] = ["cal", "events"];
+      if (calendarId) args.push(calendarId);
+      args.push(
+        ...(today
+          ? ["--today"]
+          : days
+            ? [`--days=${days}`]
+            : [...(from ? ["--from", from] : []), ...(to ? ["--to", to] : [])]),
+      );
+      args.push(`--max=${max}`);
+      const result = gog(args);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to list events: ${e.message}` }], isError: true };
@@ -197,10 +204,7 @@ server.registerTool(
   },
   async ({ query, from, to }) => {
     try {
-      let cmd = `cal search "${query.replace(/"/g, '\\"')}"`;
-      if (from) cmd += ` --from="${from}"`;
-      if (to) cmd += ` --to="${to}"`;
-      const result = gog(cmd);
+      const result = gog(["cal", "search", query, ...(from ? ["--from", from] : []), ...(to ? ["--to", to] : [])]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `No events found or search failed: ${e.message}` }], isError: true };
@@ -225,11 +229,21 @@ server.registerTool(
   },
   async ({ summary, from, to, description, location, attendees, calendarId }) => {
     try {
-      let cmd = `cal create "${calendarId}" --summary="${summary.replace(/"/g, '\\"')}" --from="${from}" --to="${to}" --force`;
-      if (description) cmd += ` --description="${description.replace(/"/g, '\\"')}"`;
-      if (location) cmd += ` --location="${location.replace(/"/g, '\\"')}"`;
-      if (attendees) cmd += ` --attendees="${attendees}"`;
-      const result = gogPlain(cmd);
+      const result = gogPlain([
+        "cal",
+        "create",
+        calendarId,
+        "--summary",
+        summary,
+        "--from",
+        from,
+        "--to",
+        to,
+        "--force",
+        ...(description ? ["--description", description] : []),
+        ...(location ? ["--location", location] : []),
+        ...(attendees ? ["--attendees", attendees] : []),
+      ]);
       return { content: [{ type: "text", text: result || "Event created." }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to create event: ${e.message}` }], isError: true };
@@ -250,7 +264,7 @@ server.registerTool(
   },
   async ({ from, to, calendarIds }) => {
     try {
-      const result = gog(`cal freebusy "${calendarIds}" --from="${from}" --to="${to}"`);
+      const result = gog(["cal", "freebusy", calendarIds, "--from", from, "--to", to]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to check free/busy: ${e.message}` }], isError: true };

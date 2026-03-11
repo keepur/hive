@@ -51,6 +51,7 @@ export class SmsAdapter implements ChannelAdapter {
     }
 
     // Poll immediately, then every 30 seconds
+    this.poll(onWorkItem);
     this.interval = setInterval(() => this.poll(onWorkItem), 30_000);
     log.info("SMS adapter started", { lines: this.lines.map((l) => l.label) });
   }

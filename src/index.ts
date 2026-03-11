@@ -73,7 +73,7 @@ async function main(): Promise<void> {
   );
 
   // Background task manager — agents can spawn detached background processes
-  const bgTaskManager = new BackgroundTaskManager(config.background.port, (item) =>
+  const bgTaskManager = new BackgroundTaskManager(config.background.port, config.background.authToken, (item) =>
     dispatcher.dispatch(item).catch((err) => {
       log.error("Background task completion dispatch failed", { error: String(err) });
     }),
@@ -85,13 +85,16 @@ async function main(): Promise<void> {
   // Meeting monitor — real-time meeting participation via Recall.ai
   let meetingMonitor: MeetingMonitor | undefined;
   if (config.recall.apiKey) {
-    meetingMonitor = new MeetingMonitor(config.recall.monitorPort, (item) =>
+    meetingMonitor = new MeetingMonitor(config.recall.monitorPort, config.recall.webhookSecret, (item) =>
       dispatcher.dispatch(item).catch((err) => {
         log.error("Meeting monitor dispatch failed", { error: String(err) });
       }),
     );
     await meetingMonitor.start();
     log.info("Meeting monitor started", { port: config.recall.monitorPort });
+    if (config.recall.apiKey && !config.recall.webhookSecret) {
+      log.error("Real-time transcript delivery disabled — RECALL_WEBHOOK_SECRET not set");
+    }
   }
 
   // --- Hot reload ---

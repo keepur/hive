@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 
 dotenv.config();
@@ -125,12 +126,14 @@ export const config = {
     region: optional("RECALL_API_REGION", "us-west-2"),
     monitorPort: parseInt(optional("MEETING_MONITOR_PORT", "3101"), 10),
     monitorPublicUrl: optional("MEETING_MONITOR_PUBLIC_URL", ""),
+    webhookSecret: optional("RECALL_WEBHOOK_SECRET", ""),
   },
   scheduler: {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
   },
   background: {
     port: parseInt(optional("BG_TASK_PORT", "3100"), 10),
+    authToken: optional("BG_TASK_AUTH_TOKEN", "") || randomUUID(),
   },
   ws: {
     enabled: optional("WS_ENABLED", "false") === "true",

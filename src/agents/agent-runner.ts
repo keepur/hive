@@ -240,6 +240,7 @@ export class AgentRunner {
         env: {
           RECALL_API_KEY: config.recall.apiKey,
           RECALL_API_REGION: config.recall.region,
+          RECALL_WEBHOOK_SECRET: config.recall.webhookSecret,
           MEETING_MONITOR_API: `http://127.0.0.1:${config.recall.monitorPort}`,
           MEETING_MONITOR_PUBLIC_URL: config.recall.monitorPublicUrl,
           RECALL_AGENT_ID: this.agentConfig.id,
@@ -261,6 +262,7 @@ export class AgentRunner {
       args: [resolve("dist/background/background-task-mcp-server.js")],
       env: {
         BG_TASK_API: `http://127.0.0.1:${config.background.port}`,
+        BG_AUTH_TOKEN: config.background.authToken,
         BG_AGENT_ID: this.agentConfig.id,
         BG_ADAPTER_ID: context?.adapterId ?? "",
         BG_CHANNEL_ID: context?.channelId ?? "",
@@ -418,7 +420,6 @@ export class AgentRunner {
       modelOverride: modelOverride ? true : false,
       resumeSession: sessionId ?? "new",
       promptLength: prompt.length,
-      promptPreview: prompt.slice(0, 200),
       streaming: !!onStream,
     });
 
@@ -432,6 +433,7 @@ export class AgentRunner {
         systemPrompt,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
+        disallowedTools: ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "WebFetch", "WebSearch", "NotebookEdit"],
         maxTurns: this.agentConfig.maxTurns,
         maxBudgetUsd: this.agentConfig.budgetUsd,
         thinking: { type: "disabled" },
@@ -516,7 +518,6 @@ export class AgentRunner {
                 log.info("Tool call started", {
                   agent: this.agentConfig.id,
                   tool: block.name,
-                  inputPreview: JSON.stringify(block.input).slice(0, 120),
                 });
               }
             }

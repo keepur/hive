@@ -43,13 +43,15 @@ interface MeetingSession {
 
 export class MeetingMonitor {
   private port: number;
+  private webhookSecret: string;
   private onUpdate: (item: WorkItem) => void;
   private server: Server | null = null;
   private sessions = new Map<string, MeetingSession>();
   private sessionsByBotId = new Map<string, string>();
 
-  constructor(port: number, onUpdate: (item: WorkItem) => void) {
+  constructor(port: number, webhookSecret: string, onUpdate: (item: WorkItem) => void) {
     this.port = port;
+    this.webhookSecret = webhookSecret;
     this.onUpdate = onUpdate;
   }
 
@@ -67,6 +69,11 @@ export class MeetingMonitor {
     });
 
     log.info("Meeting monitor started", { port: this.port });
+    if (!this.webhookSecret) {
+      log.error(
+        "Webhook verification disabled — RECALL_WEBHOOK_SECRET not set. All webhook requests will be rejected.",
+      );
+    }
   }
 
   stop(): void {
@@ -124,11 +131,20 @@ export class MeetingMonitor {
       return;
     }
 
-    // POST /webhook/transcript — receive real-time transcript from Recall
-    if (req.method === "POST" && url.pathname === "/webhook/transcript") {
+    // POST /webhook/transcript/<secret> — receive real-time transcript from Recall
+    if (req.method === "POST" && url.pathname.startsWith("/webhook/transcript")) {
+      if (!this.webhookSecret) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Webhook verification not configured" }));
+        return;
+      }
+      if (url.pathname !== `/webhook/transcript/${this.webhookSecret}`) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Not found" }));
+        return;
+      }
       const body = await this.readBody(req);
       this.handleTranscriptWebhook(body);
-
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
       return;

@@ -19,6 +19,7 @@ const REGION = process.env.RECALL_API_REGION ?? "us-west-2";
 const BASE_URL = `https://${REGION}.recall.ai/api/v1`;
 const MEETING_MONITOR_API = process.env.MEETING_MONITOR_API ?? "";
 const MEETING_MONITOR_PUBLIC_URL = process.env.MEETING_MONITOR_PUBLIC_URL ?? "";
+const WEBHOOK_SECRET = process.env.RECALL_WEBHOOK_SECRET ?? "";
 const AGENT_ID = process.env.RECALL_AGENT_ID ?? "";
 
 if (!API_KEY) {
@@ -139,12 +140,12 @@ server.registerTool(
         },
       };
 
-      // Enable real-time transcript webhooks if public URL is configured
-      if (MEETING_MONITOR_PUBLIC_URL) {
+      // Enable real-time transcript webhooks if public URL and webhook secret are configured
+      if (MEETING_MONITOR_PUBLIC_URL && WEBHOOK_SECRET) {
         botBody.recording_config.realtime_endpoints = [
           {
             type: "webhook",
-            url: `${MEETING_MONITOR_PUBLIC_URL}/webhook/transcript`,
+            url: `${MEETING_MONITOR_PUBLIC_URL}/webhook/transcript/${WEBHOOK_SECRET}`,
             events: ["transcript.data", "transcript.partial_data"],
           },
         ];
@@ -169,12 +170,17 @@ server.registerTool(
         }
       }
 
+      const realtimeNote =
+        MEETING_MONITOR_PUBLIC_URL && !WEBHOOK_SECRET
+          ? `\n- **Note**: Real-time transcript delivery is disabled — RECALL_WEBHOOK_SECRET not configured. Transcript will be available after the meeting ends.`
+          : "";
+
       const summary = [
         `Joined meeting as active participant.`,
         `- **Bot ID**: ${bot.id}`,
         `- **Bot Name**: ${bot_name}`,
         `- **Meeting URL**: ${bot.meeting_url?.meeting_id ? meeting_url : "N/A"}`,
-        `- **Monitor**: ${monitorSessionId}`,
+        `- **Monitor**: ${monitorSessionId}${realtimeNote}`,
         ``,
         `You will receive periodic transcript updates in this thread.`,
         `Use \`recall_send_chat\` with bot_id "${bot.id}" to send chat messages into the meeting.`,
