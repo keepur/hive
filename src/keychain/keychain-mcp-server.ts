@@ -35,8 +35,10 @@ server.registerTool(
   },
   async ({ account }) => {
     try {
-      const password = execFileSync("security", ["find-generic-password", "-s", SERVICE, "-a", account, "-w"],
-        { encoding: "utf-8", timeout: 5000 }).trim();
+      const password = execFileSync("security", ["find-generic-password", "-s", SERVICE, "-a", account, "-w"], {
+        encoding: "utf-8",
+        timeout: 5000,
+      }).trim();
       return { content: [{ type: "text", text: password }] };
     } catch {
       return { content: [{ type: "text", text: `Secret not found: ${account}` }], isError: true };

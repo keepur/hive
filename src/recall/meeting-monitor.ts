@@ -70,7 +70,9 @@ export class MeetingMonitor {
 
     log.info("Meeting monitor started", { port: this.port });
     if (!this.webhookSecret) {
-      log.error("Webhook verification disabled — RECALL_WEBHOOK_SECRET not set. All webhook requests will be rejected.");
+      log.error(
+        "Webhook verification disabled — RECALL_WEBHOOK_SECRET not set. All webhook requests will be rejected.",
+      );
     }
   }
 

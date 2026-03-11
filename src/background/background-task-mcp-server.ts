@@ -78,7 +78,12 @@ server.registerTool(
       "Provide the executable name as 'command' and arguments as an array in 'args'.",
     inputSchema: {
       command: z.string().describe("Executable name or path (e.g. 'npm', 'git', '/path/to/deploy.sh')"),
-      args: z.array(z.string()).optional().describe("Arguments array (e.g. ['test', '--coverage']). Each argument is a separate element — no shell quoting needed."),
+      args: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Arguments array (e.g. ['test', '--coverage']). Each argument is a separate element — no shell quoting needed.",
+        ),
       cwd: z.string().optional().describe("Working directory (absolute path). Defaults to $HOME."),
     },
   },

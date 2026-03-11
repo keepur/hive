@@ -170,9 +170,10 @@ server.registerTool(
         }
       }
 
-      const realtimeNote = (MEETING_MONITOR_PUBLIC_URL && !WEBHOOK_SECRET)
-        ? `\n- **Note**: Real-time transcript delivery is disabled — RECALL_WEBHOOK_SECRET not configured. Transcript will be available after the meeting ends.`
-        : "";
+      const realtimeNote =
+        MEETING_MONITOR_PUBLIC_URL && !WEBHOOK_SECRET
+          ? `\n- **Note**: Real-time transcript delivery is disabled — RECALL_WEBHOOK_SECRET not configured. Transcript will be available after the meeting ends.`
+          : "";
 
       const summary = [
         `Joined meeting as active participant.`,

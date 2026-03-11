@@ -118,7 +118,18 @@ server.registerTool(
   },
   async ({ to, subject, body, cc, threadId }) => {
     try {
-      const result = gogPlain(["send", "--to", to, "--subject", subject, "--body", body, "--force", ...(cc ? ["--cc", cc] : []), ...(threadId ? ["--thread-id", threadId] : [])]);
+      const result = gogPlain([
+        "send",
+        "--to",
+        to,
+        "--subject",
+        subject,
+        "--body",
+        body,
+        "--force",
+        ...(cc ? ["--cc", cc] : []),
+        ...(threadId ? ["--thread-id", threadId] : []),
+      ]);
       return { content: [{ type: "text", text: result || "Email sent." }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to send: ${e.message}` }], isError: true };
@@ -164,7 +175,13 @@ server.registerTool(
     try {
       const args: string[] = ["cal", "events"];
       if (calendarId) args.push(calendarId);
-      args.push(...(today ? ["--today"] : days ? [`--days=${days}`] : [...(from ? ["--from", from] : []), ...(to ? ["--to", to] : [])]));
+      args.push(
+        ...(today
+          ? ["--today"]
+          : days
+            ? [`--days=${days}`]
+            : [...(from ? ["--from", from] : []), ...(to ? ["--to", to] : [])]),
+      );
       args.push(`--max=${max}`);
       const result = gog(args);
       return { content: [{ type: "text", text: result }] };
@@ -212,7 +229,21 @@ server.registerTool(
   },
   async ({ summary, from, to, description, location, attendees, calendarId }) => {
     try {
-      const result = gogPlain(["cal", "create", calendarId, "--summary", summary, "--from", from, "--to", to, "--force", ...(description ? ["--description", description] : []), ...(location ? ["--location", location] : []), ...(attendees ? ["--attendees", attendees] : [])]);
+      const result = gogPlain([
+        "cal",
+        "create",
+        calendarId,
+        "--summary",
+        summary,
+        "--from",
+        from,
+        "--to",
+        to,
+        "--force",
+        ...(description ? ["--description", description] : []),
+        ...(location ? ["--location", location] : []),
+        ...(attendees ? ["--attendees", attendees] : []),
+      ]);
       return { content: [{ type: "text", text: result || "Event created." }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to create event: ${e.message}` }], isError: true };
