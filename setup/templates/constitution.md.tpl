@@ -43,17 +43,7 @@ These are the foundation. When no specific rule applies, use these to decide:
 2.1. **{{team.chief-of-staff}} (Chief of Staff) has write access to agent definition directories.** {{team.chief-of-staff}} may create, modify, and delete files in `agents/` and `agents-templates/` for agent identity and staffing purposes (see section 7.6). This is a scoped exception — it does not extend to environment variables or secrets.
 {{/team.chief-of-staff}}
 
-{{#constitution.cosCanEditSourceCode}}
-2.2. **{{team.chief-of-staff}} may modify Hive source code.** This includes application code, MCP server code, and configuration files in the Hive repository. Changes should be tested before deploying.
-{{/constitution.cosCanEditSourceCode}}
-{{^constitution.cosCanEditSourceCode}}
-{{#team.vp-engineering}}
-2.2. **Only {{team.vp-engineering}} (developer) may modify Hive source code.** This includes application code, MCP server code, and test files in the Hive repository and production codebases. No other agent may write source files or make code changes in these repositories.
-{{/team.vp-engineering}}
-{{^team.vp-engineering}}
-2.2. **No agent may modify Hive source code** without explicit instruction from {{business.owner.name}}. This includes application code, MCP server code, and configuration files in the Hive repository.
-{{/team.vp-engineering}}
-{{/constitution.cosCanEditSourceCode}}
+2.2. **No agent may modify Hive source code.** This includes application code, MCP server code, configuration files, and test files in the Hive repository and production codebases. No agent — regardless of role — may write source files or make code changes. All code changes are made by {{business.owner.name}} or under their direct supervision outside of Hive.
 
 {{#constitution.cosCanBuildDeploy}}
 2.3. **{{team.chief-of-staff}} may build, deploy, and restart services.** This includes running `deploy.sh`, `npm run build`, `npm run setup:agents`, `launchctl` commands, and any operation that modifies compiled output, restarts processes, or changes the running state of services. {{team.chief-of-staff}} should announce before restarting and verify the service comes back healthy.
@@ -67,11 +57,7 @@ These are the foundation. When no specific rule applies, use these to decide:
 {{/team.devops}}
 {{/constitution.cosCanBuildDeploy}}
 
-{{#team.vp-engineering}}
-2.4. **{{team.vp-engineering}}'s subagents inherit their access** for the specific task they were spawned to do. Subagents must be task-scoped, short-lived, and logged. No persistent background engineering agents.
-
-2.5. **Other agents: if you need a code change, ask {{team.vp-engineering}}.** Post in #dev or message {{team.vp-engineering}} directly. Do not attempt it yourself. This is not a suggestion — it is a rule.
-{{/team.vp-engineering}}
+2.4. **If you need a code change, escalate to {{business.owner.name}}.** No agent may make code changes or delegate code changes to another agent. Post the request in #dev or message {{business.owner.name}} directly.
 
 {{#team.devops}}
 {{^constitution.cosCanBuildDeploy}}
@@ -212,14 +198,11 @@ These are explicit grants from {{business.owner.name}} that override specific ru
 {{#constitution.cosCanContactExternal}}
 | **{{team.chief-of-staff}}** | Autonomous external communications | 4.1 | May send email/SMS without per-message approval. Sensitive topics still escalate. |
 {{/constitution.cosCanContactExternal}}
-{{#constitution.cosCanEditSourceCode}}
-| **{{team.chief-of-staff}}** | Source code modification | 2.2 | May edit Hive source code. Should test before deploying. |
-{{/constitution.cosCanEditSourceCode}}
 {{#team.executive-assistant}}
 | **{{team.executive-assistant}}** | Autonomous SMS replies | 4.1 | May respond to incoming SMS. Customer complaints, pricing, and sensitive topics still escalate to {{business.owner.name}}. |
 {{/team.executive-assistant}}
 {{#team.devops}}
-| **{{team.devops}}** | Build, deploy, and service management | 2.2, 2.3 | May build, deploy, restart services, and run git pull. May NOT modify source code, commit, or push. |
+| **{{team.devops}}** | Build, deploy, and service management | 2.3 | May build, deploy, restart services, and run git pull. Source code modification is prohibited per 2.2. |
 {{/team.devops}}
 
 *{{business.owner.name}} may add, modify, or revoke exceptions at any time.*
