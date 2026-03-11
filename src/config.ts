@@ -80,10 +80,6 @@ export const config = {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
     dbName: optional("MONGODB_DB", "hive"),
   },
-  memory: {
-    repo: optional("HIVE_MEMORY_REPO", hive.memory?.repo ?? ""),
-    localPath: optional("HIVE_MEMORY_LOCAL_PATH", (hive.memory?.localPath ?? `${home}/hive-memory`).replace("~", home)),
-  },
   agents: {
     defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
     defaultModel: optional("DEFAULT_MODEL", "claude-sonnet-4-6"),
