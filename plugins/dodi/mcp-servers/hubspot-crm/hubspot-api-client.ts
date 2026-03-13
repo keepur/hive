@@ -144,6 +144,14 @@ export class HubSpotApiClient {
 
   // ── Contacts ────────────────────────────────────────────────────────────
 
+  async getContact(id: string, properties?: string[]): Promise<HubSpotObject> {
+    const props = properties ?? CONTACT_PROPERTIES;
+    const queryString = props.length > 0 ? `?properties=${props.join(",")}` : "";
+    log.info("Getting contact", { id, properties: props });
+
+    return this.api<HubSpotObject>("GET", `/crm/v3/objects/contacts/${id}${queryString}`);
+  }
+
   async findContact(query: string): Promise<HubSpotObject | null> {
     log.info("Searching for contact", { query });
 
@@ -180,6 +188,24 @@ export class HubSpotApiClient {
   }
 
   // ── Deals ───────────────────────────────────────────────────────────────
+
+  async findDeal(query: string): Promise<HubSpotObject[]> {
+    log.info("Searching for deal", { query });
+
+    const body = {
+      filterGroups: [
+        {
+          filters: [{ propertyName: "dealname", operator: "CONTAINS_TOKEN", value: query }],
+        },
+      ],
+      properties: DEAL_PROPERTIES,
+      sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+      limit: 10,
+    };
+
+    const result = await this.api<{ results: HubSpotObject[] }>("POST", "/crm/v3/objects/deals/search", body);
+    return result.results;
+  }
 
   async getDeal(id: string, properties?: string[]): Promise<HubSpotObject> {
     const props = properties ?? DEAL_PROPERTIES;
@@ -346,6 +372,18 @@ export class HubSpotApiClient {
     // Sort by timestamp descending
     activities.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
     return activities.slice(0, limit);
+  }
+
+  // ── Owners ──────────────────────────────────────────────────────────────
+
+  async listOwners(): Promise<{ id: string; email: string; firstName: string; lastName: string }[]> {
+    log.info("Listing owners");
+
+    const result = await this.api<{
+      results: { id: string; email: string; firstName: string; lastName: string }[];
+    }>("GET", "/crm/v3/owners");
+
+    return result.results;
   }
 
   // ── Associations ────────────────────────────────────────────────────────

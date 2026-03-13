@@ -62,6 +62,105 @@ server.registerTool(
   },
 );
 
+// ── Tool: hubspot_get_contact ────────────────────────────────────────────────
+
+server.registerTool(
+  "hubspot_get_contact",
+  {
+    title: "Get HubSpot Contact by ID",
+    description:
+      "Fetch a contact's current details from HubSpot by their record ID. Use this when you already have a contact ID and need fresh data.",
+    inputSchema: {
+      id: z.string().describe("HubSpot contact ID"),
+    },
+  },
+  async ({ id }) => {
+    try {
+      const contact = await client.getContact(id);
+      const p = contact.properties;
+      const lines: string[] = [`Contact ${contact.id}`];
+      const name = [p.firstname, p.lastname].filter(Boolean).join(" ");
+      if (name) lines.push(`- Name: ${name}`);
+      if (p.email) lines.push(`- Email: ${p.email}`);
+      if (p.phone) lines.push(`- Phone: ${p.phone}`);
+      if (p.company) lines.push(`- Company: ${p.company}`);
+      if (p.jobtitle) lines.push(`- Job Title: ${p.jobtitle}`);
+      if (p.lifecyclestage) lines.push(`- Lifecycle: ${p.lifecyclestage}`);
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: e.message }], isError: true };
+    }
+  },
+);
+
+// ── Tool: hubspot_get_deal ──────────────────────────────────────────────────
+
+server.registerTool(
+  "hubspot_get_deal",
+  {
+    title: "Get HubSpot Deal by ID",
+    description:
+      "Fetch a deal's current details from HubSpot by its record ID. Use this when you already have a deal ID and need fresh data.",
+    inputSchema: {
+      id: z.string().describe("HubSpot deal ID"),
+    },
+  },
+  async ({ id }) => {
+    try {
+      const deal = await client.getDeal(id);
+      const p = deal.properties;
+      const lines: string[] = [`Deal ${deal.id}`];
+      if (p.dealname) lines.push(`- Name: ${p.dealname}`);
+      if (p.dealstage) lines.push(`- Stage: ${p.dealstage}`);
+      if (p.pipeline) lines.push(`- Pipeline: ${p.pipeline}`);
+      if (p.amount) lines.push(`- Amount: $${p.amount}`);
+      if (p.closedate) lines.push(`- Close Date: ${p.closedate}`);
+      if (p.hubspot_owner_id) lines.push(`- Owner: ${p.hubspot_owner_id}`);
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: e.message }], isError: true };
+    }
+  },
+);
+
+// ── Tool: hubspot_find_deal ─────────────────────────────────────────────────
+
+server.registerTool(
+  "hubspot_find_deal",
+  {
+    title: "Find HubSpot Deal",
+    description:
+      "Search for deals in HubSpot by name. Returns up to 10 matching deals sorted by creation date (newest first).",
+    inputSchema: {
+      query: z.string().describe("Deal name to search for"),
+    },
+  },
+  async ({ query }) => {
+    try {
+      const deals = await client.findDeal(query);
+
+      if (deals.length === 0) {
+        return { content: [{ type: "text", text: `No deals found for "${query}"` }] };
+      }
+
+      const lines = deals.map((deal) => {
+        const p = deal.properties;
+        const parts: string[] = [`Deal ${deal.id}: ${p.dealname ?? "(unnamed)"}`];
+        if (p.dealstage) parts.push(`  Stage: ${p.dealstage}`);
+        if (p.amount) parts.push(`  Amount: $${p.amount}`);
+        if (p.closedate) parts.push(`  Close: ${p.closedate}`);
+        return parts.join("\n");
+      });
+
+      return { content: [{ type: "text", text: `Found ${deals.length} deals:\n\n${lines.join("\n\n")}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: e.message }], isError: true };
+    }
+  },
+);
+
 // ── Tool: hubspot_create_contact ────────────────────────────────────────────
 
 server.registerTool(
@@ -367,6 +466,41 @@ server.registerTool(
           },
         ],
       };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: e.message }], isError: true };
+    }
+  },
+);
+
+// ── Tool: hubspot_find_owner ─────────────────────────────────────────────────
+
+server.registerTool(
+  "hubspot_find_owner",
+  {
+    title: "Find HubSpot Owner",
+    description:
+      "Look up a HubSpot owner (team member) by name or email. Returns matching owners with their IDs, which you can use in hubspot_owner_id fields when creating deals or tasks. Searches all owners and filters by your query.",
+    inputSchema: {
+      query: z.string().describe("Name or email to search for (e.g. 'Corey', 'corey@dodihome.com')"),
+    },
+  },
+  async ({ query }) => {
+    try {
+      const owners = await client.listOwners();
+      const q = query.toLowerCase();
+
+      const matches = owners.filter((o) => {
+        const full = `${o.firstName} ${o.lastName}`.toLowerCase();
+        return full.includes(q) || o.email.toLowerCase().includes(q);
+      });
+
+      if (matches.length === 0) {
+        return { content: [{ type: "text", text: `No owner found matching "${query}"` }] };
+      }
+
+      const lines = matches.map((o) => `Owner ${o.id}: ${o.firstName} ${o.lastName} (${o.email})`);
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: e.message }], isError: true };
     }
