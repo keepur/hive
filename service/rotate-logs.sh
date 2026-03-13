@@ -25,3 +25,13 @@ for logfile in hive.log hive.err; do
   fi
 done
 find "$HIVE_LOG_DIR" -name "hive.*.2*" -mtime +${KEEP_DAYS} -delete 2>/dev/null || true
+
+# --- Deploy checker ---
+for logfile in deploy-check.log; do
+  src="$HIVE_LOG_DIR/$logfile"
+  if [ -s "$src" ]; then
+    cp "$src" "$HIVE_LOG_DIR/${logfile}.${TIMESTAMP}"
+    : > "$src"
+  fi
+done
+find "$HIVE_LOG_DIR" -name "deploy-check.*.2*" -mtime +${KEEP_DAYS} -delete 2>/dev/null || true
