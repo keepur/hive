@@ -2,6 +2,8 @@
 
 ## Overview
 
+> **Superseded:** The push-based GitHub Actions approach was replaced by a pull-based deploy checker. See `docs/superpowers/specs/2026-03-13-deploy-checker-design.md`.
+
 Automated deployment pipeline for Hive using GitHub Actions and SSH. Merging a PR from `main` into a `deploy` branch triggers a remote deploy to the Mac Mini, with pre-deploy checks, automatic rollback on failure, and notifications via Mokie.
 
 ## Branch Strategy
