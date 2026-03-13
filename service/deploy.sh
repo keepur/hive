@@ -83,7 +83,11 @@ DEPLOY_MSG=$(git log -1 --pretty=%s)
 
 # 3. Install full deps (for checks + build)
 echo "Installing dependencies..."
-npm install
+if ! npm install; then
+  notify "Deploy aborted. \`npm install\` failed. No changes applied. Commit: \`$DEPLOY_SHA\`."
+  echo "Dependency install failed. Deploy aborted."
+  exit 1
+fi
 
 # 4. Run checks
 echo "Running checks..."
@@ -103,7 +107,11 @@ fi
 
 # 6. Generate agents
 echo "Generating agents..."
-npm run setup:agents
+if ! npm run setup:agents; then
+  notify "Deploy aborted. Agent generation failed. No changes applied. Commit: \`$DEPLOY_SHA\`."
+  echo "Agent generation failed. Deploy aborted."
+  exit 1
+fi
 
 # 7. Prepare deploy dir
 echo "Preparing deploy dir..."
