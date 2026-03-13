@@ -8,6 +8,7 @@ channels:
 passiveChannels:
   - marketing
   - biz
+  - devops
 keywords:
   - status
   - update
