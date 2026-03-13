@@ -161,6 +161,61 @@ server.registerTool(
   },
 );
 
+// ── Tool: hubspot_list_deals ─────────────────────────────────────────────────
+
+server.registerTool(
+  "hubspot_list_deals",
+  {
+    title: "List HubSpot Deals",
+    description:
+      "List deals from the Sales Pipeline with optional filters. " +
+      "Filter by stage(s) and/or close date range to get a complete list of matching deals. " +
+      "Stage IDs: S0 Prospect (appointmentscheduled), S1 Meeting (qualifiedtobuy), " +
+      "S2 Discovery (15520138), S3 Evaluation (15520119), S4 Proposal (decisionmakerboughtin), " +
+      "S5 Invoice (63682726), Sales Nurture (149783667), Closed won (closedwon), Closed lost (closedlost).",
+    inputSchema: {
+      stages: z
+        .array(z.string())
+        .optional()
+        .describe('Deal stage IDs to filter by (e.g. ["15520138", "15520119", "decisionmakerboughtin", "149783667"])'),
+      closeDateAfter: z
+        .string()
+        .optional()
+        .describe("Only deals with close date on or after this date (ISO format, e.g. 2026-03-01)"),
+      closeDateBefore: z
+        .string()
+        .optional()
+        .describe("Only deals with close date on or before this date (ISO format, e.g. 2026-05-31)"),
+      limit: z.number().optional().default(100).describe("Max deals to return (default 100)"),
+    },
+  },
+  async ({ stages, closeDateAfter, closeDateBefore, limit }) => {
+    try {
+      const deals = await client.listDeals({ stages, closeDateAfter, closeDateBefore, limit });
+
+      if (deals.length === 0) {
+        return { content: [{ type: "text", text: "No deals found matching those filters." }] };
+      }
+
+      const lines = deals.map((deal) => {
+        const p = deal.properties;
+        const parts: string[] = [`Deal ${deal.id}: ${p.dealname ?? "(unnamed)"}`];
+        if (p.dealstage) parts.push(`  Stage: ${p.dealstage}`);
+        if (p.amount) parts.push(`  Amount: $${p.amount}`);
+        if (p.closedate) parts.push(`  Close: ${p.closedate}`);
+        if (p.hubspot_owner_id) parts.push(`  Owner: ${p.hubspot_owner_id}`);
+        return parts.join("\n");
+      });
+
+      return {
+        content: [{ type: "text", text: `${deals.length} deals:\n\n${lines.join("\n\n")}` }],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: e.message }], isError: true };
+    }
+  },
+);
+
 // ── Tool: hubspot_create_contact ────────────────────────────────────────────
 
 server.registerTool(

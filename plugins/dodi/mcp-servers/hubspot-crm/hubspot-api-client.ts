@@ -207,6 +207,39 @@ export class HubSpotApiClient {
     return result.results;
   }
 
+  async listDeals(options: {
+    stages?: string[];
+    closeDateAfter?: string;
+    closeDateBefore?: string;
+    limit?: number;
+  }): Promise<HubSpotObject[]> {
+    log.info("Listing deals", { options });
+
+    const filters: { propertyName: string; operator: string; value?: string; values?: string[] }[] = [
+      { propertyName: "pipeline", operator: "EQ", value: "default" },
+    ];
+
+    if (options.stages && options.stages.length > 0) {
+      filters.push({ propertyName: "dealstage", operator: "IN", values: options.stages });
+    }
+    if (options.closeDateAfter) {
+      filters.push({ propertyName: "closedate", operator: "GTE", value: options.closeDateAfter });
+    }
+    if (options.closeDateBefore) {
+      filters.push({ propertyName: "closedate", operator: "LTE", value: options.closeDateBefore });
+    }
+
+    const body = {
+      filterGroups: [{ filters }],
+      properties: DEAL_PROPERTIES,
+      sorts: [{ propertyName: "dealname", direction: "ASCENDING" }],
+      limit: options.limit ?? 100,
+    };
+
+    const result = await this.api<{ results: HubSpotObject[] }>("POST", "/crm/v3/objects/deals/search", body);
+    return result.results;
+  }
+
   async getDeal(id: string, properties?: string[]): Promise<HubSpotObject> {
     const props = properties ?? DEAL_PROPERTIES;
     const queryString = props.length > 0 ? `?properties=${props.join(",")}` : "";
