@@ -21,6 +21,7 @@ const LOGS_DIR = join(DEPLOY_DIR, "logs");
 
 const LABEL = "com.hive.agent";
 const LABEL_LOGS = "com.hive.rotate-logs";
+const LABEL_DEPLOY = "com.hive.deploy-check";
 
 // Detect paths
 const nodePath = execSync("which node", { encoding: "utf-8" }).trim();
@@ -127,3 +128,41 @@ const rotatePlistPath = join(SERVICE_DIR, `${LABEL_LOGS}.plist`);
 writeFileSync(rotatePlistPath, rotatePlist);
 console.log(`Generated: ${rotatePlistPath}`);
 console.log(`  Label: ${LABEL_LOGS}`);
+
+// ── Deploy checker plist ──────────────────────────────────────────
+
+const deployCheckPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL_DEPLOY}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>${DEPLOY_DIR}/service/deploy-check.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${pathEnv}</string>
+    <key>HOME</key>
+    <string>${home}</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>StandardOutPath</key>
+  <string>${LOGS_DIR}/deploy-check.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOGS_DIR}/deploy-check.log</string>
+</dict>
+</plist>
+`;
+
+const deployCheckPlistPath = join(SERVICE_DIR, `${LABEL_DEPLOY}.plist`);
+writeFileSync(deployCheckPlistPath, deployCheckPlist);
+console.log(`Generated: ${deployCheckPlistPath}`);
+console.log(`  Label: ${LABEL_DEPLOY}`);
