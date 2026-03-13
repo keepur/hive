@@ -7,6 +7,7 @@
  * - Projects: list, detail, CRUD, person management
  * - Designs: list, detail, BOM, create
  * - Jobs: CRUD + lifecycle (state transitions, link design/order, refresh)
+ * - Cases: CRUD + lifecycle (state transitions, assign, resolve) + issues sub-resource
  * - Comments: CRUD on any entity
  * - Attachments: list, detail, download URL
  * - Cutlists: list, detail, parts
@@ -950,6 +951,361 @@ if (MODE === "full") {
     async ({ cutlistId }) => {
       try {
         return ok(await api("DELETE", `/cutlists/${cutlistId}`));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Cases — Read
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "dodi_cases_list",
+  {
+    title: "List Cases",
+    description:
+      "List cases with optional filters. Cases track customer service issues, warranty claims, complaints, and sales support requests.",
+    inputSchema: {
+      state: z.string().optional().describe("Filter by state (comma-separated, e.g. 'OPEN,IN_PROGRESS')"),
+      type: z
+        .enum(["customer_service", "sales_support", "warranty", "complaint"])
+        .optional()
+        .describe("Filter by case type"),
+      priority: z.number().optional().describe("Filter by priority (1=low, 2=normal, 3=high, 4=urgent)"),
+      assignedTo: z.string().optional().describe("Filter by assignee user ID"),
+      projectId: z.string().optional().describe("Filter by referenced project ID"),
+      search: z.string().optional().describe("Search by name, number, or customer"),
+      limit: z.number().optional().default(20).describe("Max results (default 20, max 250)"),
+      offset: z.number().optional().default(0).describe("Offset for pagination"), // cases API uses 'offset', not 'skip'
+    },
+  },
+  async (input) => {
+    try {
+      const params = new URLSearchParams();
+      if (input.state) params.set("state", input.state);
+      if (input.type) params.set("type", input.type);
+      if (input.priority) params.set("priority", String(input.priority));
+      if (input.assignedTo) params.set("assignedTo", input.assignedTo);
+      if (input.projectId) params.set("projectId", input.projectId);
+      if (input.search) params.set("search", input.search);
+      if (input.limit) params.set("limit", String(input.limit));
+      if (input.offset) params.set("offset", String(input.offset));
+      const qs = params.toString();
+      return ok(await api("GET", `/cases${qs ? `?${qs}` : ""}`));
+    } catch (e) {
+      return err(e);
+    }
+  },
+);
+
+server.registerTool(
+  "dodi_cases_get",
+  {
+    title: "Get Case Detail",
+    description: "Get full details for a case by ID, including issues, references, and resolution info.",
+    inputSchema: {
+      caseId: z.string().describe("Case ID"),
+    },
+  },
+  async ({ caseId }) => {
+    try {
+      return ok(await api("GET", `/cases/${caseId}`));
+    } catch (e) {
+      return err(e);
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Cases — Write (full mode only)
+// ---------------------------------------------------------------------------
+
+if (MODE === "full") {
+  server.registerTool(
+    "dodi_cases_create",
+    {
+      title: "Create Case",
+      description:
+        "Create a new case. Cases track customer issues, warranty claims, complaints, and sales support requests.",
+      inputSchema: {
+        name: z.string().describe("Case name/title"),
+        type: z.enum(["customer_service", "sales_support", "warranty", "complaint"]).optional().describe("Case type"),
+        priority: z.number().optional().describe("Priority (1=low, 2=normal, 3=high, 4=urgent)"),
+        source: z
+          .enum(["phone", "email", "in_person", "website", "other"])
+          .optional()
+          .describe("How the case originated"),
+        description: z.string().optional().describe("Detailed description (supports HTML)"),
+        customer: z.string().optional().describe("Customer name (free-form, when no Person record)"),
+        projectId: z.string().optional().describe("Link to a project"),
+        dealId: z.string().optional().describe("Link to a deal"),
+        jobId: z.string().optional().describe("Link to a job"),
+        contactId: z.string().optional().describe("Link to a contact person"),
+        dueDate: z.string().optional().describe("ISO-8601 due date"),
+        assignedTo: z
+          .object({
+            personId: z.string().describe("Assignee person ID"),
+            name: z.string().describe("Assignee display name"),
+          })
+          .optional()
+          .describe("Assign to a person"),
+      },
+    },
+    async (input) => {
+      try {
+        return ok(await api("POST", "/cases", input));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "dodi_cases_update",
+    {
+      title: "Update Case",
+      description: "Update case fields (name, type, priority, source, description, customer, dueDate).",
+      inputSchema: {
+        caseId: z.string().describe("Case ID to update"),
+        name: z.string().optional().describe("New name"),
+        type: z.enum(["customer_service", "sales_support", "warranty", "complaint"]).optional().describe("New type"),
+        priority: z.number().optional().describe("New priority (1=low, 2=normal, 3=high, 4=urgent)"),
+        source: z.enum(["phone", "email", "in_person", "website", "other"]).optional().describe("New source"),
+        description: z.string().optional().describe("New description"),
+        customer: z.string().nullable().optional().describe("New customer name (null to clear)"),
+        dueDate: z.string().nullable().optional().describe("New ISO-8601 due date (null to clear)"),
+      },
+    },
+    async ({ caseId, ...body }) => {
+      try {
+        return ok(await api("PUT", `/cases/${caseId}`, body));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "dodi_cases_delete",
+    {
+      title: "Delete Case",
+      description: "Delete a case.",
+      inputSchema: {
+        caseId: z.string().describe("Case ID to delete"),
+      },
+    },
+    async ({ caseId }) => {
+      try {
+        return ok(await api("DELETE", `/cases/${caseId}`));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "dodi_cases_transition",
+    {
+      title: "Transition Case State",
+      description: "Advance a case to a new state (OPEN → IN_PROGRESS → RESOLVED).",
+      inputSchema: {
+        caseId: z.string().describe("Case ID"),
+        toState: z.string().describe("Target state (OPEN, IN_PROGRESS, RESOLVED)"),
+      },
+    },
+    async ({ caseId, toState }) => {
+      try {
+        return ok(await api("POST", `/cases/${caseId}/transition`, { toState }));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "dodi_cases_assign",
+    {
+      title: "Assign Case",
+      description: "Assign a case to a person, or pass null to unassign.",
+      inputSchema: {
+        caseId: z.string().describe("Case ID"),
+        assignee: z
+          .object({
+            personId: z.string().describe("Person ID"),
+            name: z.string().describe("Display name"),
+          })
+          .nullable()
+          .describe("Assignee (null to unassign)"),
+      },
+    },
+    async ({ caseId, assignee }) => {
+      try {
+        return ok(await api("POST", `/cases/${caseId}/assign`, { assignee }));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "dodi_cases_resolve",
+    {
+      title: "Resolve Case",
+      description:
+        "Resolve a case with a resolution summary. Transitions to RESOLVED and records who resolved it and when.",
+      inputSchema: {
+        caseId: z.string().describe("Case ID"),
+        resolution: z.string().describe("Resolution summary explaining how the case was resolved"),
+      },
+    },
+    async ({ caseId, resolution }) => {
+      try {
+        return ok(await api("POST", `/cases/${caseId}/resolve`, { resolution }));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Case Issues — Read
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "dodi_case_issues_list",
+  {
+    title: "List Case Issues",
+    description: "List issues for a specific case. Issues are individual problems or action items within a case.",
+    inputSchema: {
+      caseId: z.string().describe("Case ID"),
+    },
+  },
+  async ({ caseId }) => {
+    try {
+      return ok(await api("GET", `/cases/${caseId}/issues`));
+    } catch (e) {
+      return err(e);
+    }
+  },
+);
+
+server.registerTool(
+  "dodi_case_issues_get",
+  {
+    title: "Get Case Issue Detail",
+    description: "Get full details for a specific issue within a case.",
+    inputSchema: {
+      caseId: z.string().describe("Case ID"),
+      issueId: z.string().describe("Issue ID"),
+    },
+  },
+  async ({ caseId, issueId }) => {
+    try {
+      return ok(await api("GET", `/cases/${caseId}/issues/${issueId}`));
+    } catch (e) {
+      return err(e);
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Case Issues — Write (full mode only)
+// ---------------------------------------------------------------------------
+
+if (MODE === "full") {
+  server.registerTool(
+    "dodi_case_issues_create",
+    {
+      title: "Create Case Issue",
+      description: "Create a new issue within a case. Issues represent individual problems or action items.",
+      inputSchema: {
+        caseId: z.string().describe("Case ID"),
+        name: z.string().describe("Issue name/title"),
+        description: z.string().optional().describe("Issue details"),
+        priority: z.number().optional().describe("Priority (1=low, 2=normal, 3=high, 4=urgent)"),
+        dueDate: z.string().optional().describe("ISO-8601 due date"),
+        eta: z.string().optional().describe("ISO-8601 customer-facing ETA"),
+      },
+    },
+    async ({ caseId, ...body }) => {
+      try {
+        return ok(await api("POST", `/cases/${caseId}/issues`, body));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "dodi_case_issues_update",
+    {
+      title: "Update Case Issue",
+      description: "Update a case issue's fields.",
+      inputSchema: {
+        caseId: z.string().describe("Case ID"),
+        issueId: z.string().describe("Issue ID to update"),
+        name: z.string().optional().describe("New name"),
+        description: z.string().optional().describe("New description"),
+        priority: z.number().optional().describe("New priority (1-4)"),
+        dueDate: z.string().nullable().optional().describe("New due date (null to clear)"),
+        eta: z.string().nullable().optional().describe("New ETA (null to clear)"),
+        assignedTo: z
+          .object({
+            userId: z.string().describe("User ID"),
+            displayName: z.string().describe("Display name"),
+          })
+          .nullable()
+          .optional()
+          .describe("Assignee (null to unassign)"),
+        resolution: z.string().optional().describe("Resolution summary"),
+      },
+    },
+    async ({ caseId, issueId, ...body }) => {
+      try {
+        return ok(await api("PUT", `/cases/${caseId}/issues/${issueId}`, body));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "dodi_case_issues_delete",
+    {
+      title: "Delete Case Issue",
+      description: "Delete an issue from a case.",
+      inputSchema: {
+        caseId: z.string().describe("Case ID"),
+        issueId: z.string().describe("Issue ID to delete"),
+      },
+    },
+    async ({ caseId, issueId }) => {
+      try {
+        return ok(await api("DELETE", `/cases/${caseId}/issues/${issueId}`));
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "dodi_case_issues_transition",
+    {
+      title: "Transition Case Issue State",
+      description: "Transition an issue to a new state (OPEN → RESOLVED).",
+      inputSchema: {
+        caseId: z.string().describe("Case ID"),
+        issueId: z.string().describe("Issue ID"),
+        toState: z.string().describe("Target state (OPEN, RESOLVED)"),
+      },
+    },
+    async ({ caseId, issueId, toState }) => {
+      try {
+        return ok(await api("POST", `/cases/${caseId}/issues/${issueId}/transition`, { toState }));
       } catch (e) {
         return err(e);
       }
