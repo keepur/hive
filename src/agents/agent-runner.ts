@@ -1,5 +1,6 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
+import { existsSync } from "node:fs";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
@@ -446,6 +447,32 @@ export class AgentRunner {
     return servers;
   }
 
+  private buildSdkPlugins(): SdkPluginConfig[] {
+    const pluginNames = this.agentConfig.plugins;
+    if (!pluginNames?.length) return [];
+
+    const sdkPlugins: SdkPluginConfig[] = [];
+    const pluginsDir = resolve("plugins/claude-code");
+
+    for (const name of pluginNames) {
+      const pluginPath = resolve(pluginsDir, name);
+      if (!existsSync(pluginPath)) {
+        log.warn("Plugin not found, skipping", { plugin: name, expected: pluginPath, agent: this.agentConfig.id });
+        continue;
+      }
+      sdkPlugins.push({ type: "local", path: pluginPath });
+    }
+
+    if (sdkPlugins.length > 0) {
+      log.debug("Loaded plugins for agent", {
+        agent: this.agentConfig.id,
+        plugins: sdkPlugins.map((p) => p.path),
+      });
+    }
+
+    return sdkPlugins;
+  }
+
   async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string): Promise<RunResult> {
     const effectiveModel = modelOverride ?? this.agentConfig.model;
 
@@ -460,6 +487,7 @@ export class AgentRunner {
 
     const systemPrompt = await this.buildSystemPrompt();
     const mcpServers = this.buildMcpServers(context);
+    const sdkPlugins = this.buildSdkPlugins();
 
     const q = query({
       prompt,
@@ -475,6 +503,7 @@ export class AgentRunner {
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
+        ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
         env: {
           ...process.env,
           ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
