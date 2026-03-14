@@ -19,3 +19,5 @@ servers:
   - brave-search
   - google-workspace
   - callback
+plugins:
+  - dodi-dev

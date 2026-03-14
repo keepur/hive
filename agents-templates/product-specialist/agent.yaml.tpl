@@ -25,3 +25,5 @@ servers:
   - product-search
   - slack
   - callback
+plugins:
+  - dodi-dev

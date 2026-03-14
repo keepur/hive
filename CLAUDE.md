@@ -1,9 +1,37 @@
 # Hive — Claude Code Instructions
 
-## Workflow
+## Development Process
 
-- **Before submitting a branch**: Run `npm run check` (typecheck + lint + format + test) to validate changes, then create a PR to merge.
-- **Feature docs**: Specs live in `docs/specs/` and `docs/plans/`. Read them before modifying related code.
+All repos under **[dodi-hq](https://github.com/dodi-hq)** use the same plugin-driven workflow via the `dodi-dev` plugin (`dodi-hq/dodi-skills`).
+
+### Workflow
+
+| Step | Skill | What Happens |
+|------|-------|-------------|
+| 1 | `dodi-dev:brainstorm` | Explore intent, constraints, approaches → write design spec |
+| 2 | `dodi-dev:file-ticket` | Create tracker ticket with context from design session |
+| 3 | `dodi-dev:pickup` | Take a ticket, create isolated worktree |
+| 4 | `dodi-dev:write-plan` | Step-by-step implementation plan |
+| 5 | `dodi-dev:implement` | Execute plan — subagent per task, tests along the way, commits as you go |
+| 6 | `/quality-gate` | Repo-specific: typecheck + lint + format + test (stops on failure) |
+| 7 | `dodi-dev:review` | Agent code review: spec compliance, quality, security, regression risk |
+| 8 | `dodi-dev:submit` | Create PR → wait for CI → merge when green → cleanup |
+
+`dodi-dev:verify` is active throughout — enforces "evidence before claims" at every step.
+
+**Skip steps 1-2** for trivial fixes (typos, one-liners, obvious config changes). **Skip step 4** if the change is small enough to implement directly.
+
+### Specs and Plans
+
+- Design specs: `docs/specs/YYYY-MM-DD-<topic>-design.md`
+- Implementation plans: `docs/plans/YYYY-MM-DD-<feature-name>.md`
+- Read relevant specs before modifying related code
+
+### PR & Merge
+
+- All changes go through PRs into `main`
+- `npm run check` must pass before submitting
+- Deploy: `/deploy` pushes `main` → `deploy` with pre-flight checks
 
 ## Project Overview
 

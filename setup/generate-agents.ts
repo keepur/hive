@@ -7,8 +7,9 @@
  *   npx tsx setup/generate-agents.ts [--force]
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, cpSync, rmSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { homedir } from "node:os";
 import { parse as parseYaml } from "yaml";
 import { render, fileHash } from "./template-renderer.ts";
 import { MongoClient } from "mongodb";
@@ -18,6 +19,9 @@ const TEMPLATES_DIR = join(ROOT, "agents-templates");
 const AGENTS_DIR = join(ROOT, "agents");
 const HIVE_CONFIG = join(ROOT, "hive.yaml");
 const META_FILE = join(ROOT, ".hive-generated.json");
+
+const PLUGINS_DIR = join(ROOT, "plugins", "claude-code");
+const PLUGIN_CACHE = join(homedir(), ".claude", "plugins", "cache");
 
 interface SmsLine {
   id: string;
@@ -60,6 +64,66 @@ function renderAgent(template: string, ctx: Record<string, any>): string {
 
   // Delegate remaining variable + conditional substitution to shared renderer
   return render(template, ctx);
+}
+
+function syncPlugins(): void {
+  if (!existsSync(PLUGIN_CACHE)) {
+    console.log("\n  No plugin cache found — skipping plugin sync");
+    return;
+  }
+
+  // Build index: plugin-name → latest cache path
+  const pluginIndex = new Map<string, string>();
+  const sourceRepos = readdirSync(PLUGIN_CACHE).filter((d) => statSync(join(PLUGIN_CACHE, d)).isDirectory());
+
+  for (const repo of sourceRepos) {
+    const repoDir = join(PLUGIN_CACHE, repo);
+    const plugins = readdirSync(repoDir).filter((d) => statSync(join(repoDir, d)).isDirectory());
+
+    for (const pluginName of plugins) {
+      const pluginDir = join(repoDir, pluginName);
+      const versions = readdirSync(pluginDir).filter((d) => statSync(join(pluginDir, d)).isDirectory());
+
+      if (versions.length === 0) continue;
+
+      // Pick latest by mtime
+      const latest = versions
+        .map((v) => ({ v, mtime: statSync(join(pluginDir, v)).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime)[0]!;
+
+      pluginIndex.set(pluginName, join(pluginDir, latest.v));
+    }
+  }
+
+  // Ensure output dir exists
+  if (!existsSync(PLUGINS_DIR)) {
+    mkdirSync(PLUGINS_DIR, { recursive: true });
+  }
+
+  // Copy each indexed plugin into plugins/claude-code/<name>/
+  let synced = 0;
+  for (const [name, sourcePath] of pluginIndex) {
+    // Validate: must contain skills/ dir or a manifest to be a real plugin
+    const hasSkills = existsSync(join(sourcePath, "skills"));
+    const hasManifest = existsSync(join(sourcePath, "plugin.json"));
+    if (!hasSkills && !hasManifest) {
+      console.log(`  SKIP plugin ${name} — no skills/ dir or plugin.json`);
+      continue;
+    }
+
+    const destPath = join(PLUGINS_DIR, name);
+
+    // Remove existing copy and replace
+    if (existsSync(destPath)) {
+      rmSync(destPath, { recursive: true, force: true });
+    }
+
+    cpSync(sourcePath, destPath, { recursive: true });
+    console.log(`  SYNC plugin ${name} ← ${sourcePath}`);
+    synced++;
+  }
+
+  console.log(`\n  ${synced} plugin(s) synced to plugins/claude-code/`);
 }
 
 async function main() {
@@ -222,6 +286,9 @@ async function main() {
       console.warn(`  WARN: Failed to sync constitution to MongoDB: ${err}`);
     }
   }
+
+  // Sync Claude Code plugins from cache
+  syncPlugins();
 
   // Save metadata
   writeFileSync(META_FILE, JSON.stringify(newMeta, null, 2) + "\n");

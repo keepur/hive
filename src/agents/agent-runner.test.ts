@@ -2,6 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 
+// ── node:fs mock ─────────────────────────────────────────────────────
+const mockExistsSync = vi.fn().mockReturnValue(true);
+vi.mock("node:fs", () => ({
+  existsSync: (...args: any[]) => mockExistsSync(...args),
+}));
+
 // ── SDK mock ────────────────────────────────────────────────────────
 const mockQuery = vi.fn();
 
@@ -424,5 +430,155 @@ describe("AgentRunner security hardening", () => {
     // Restore
     (config.recall as any).apiKey = origApiKey;
     (config.recall as any).monitorPublicUrl = origMonitorPublicUrl;
+  });
+});
+
+// ── buildSdkPlugins tests ────────────────────────────────────────
+describe("AgentRunner.buildSdkPlugins (via send)", () => {
+  let runner: AgentRunner;
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Default: any path checked with existsSync returns true (plugin dir exists)
+    mockExistsSync.mockReturnValue(true);
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("does not include plugins in query options when no plugins configured", async () => {
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).not.toHaveProperty("plugins");
+  });
+
+  it("does not include plugins when plugins array is empty", async () => {
+    runner = new AgentRunner(makeAgentConfig({ plugins: [] }), memoryManager as any);
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).not.toHaveProperty("plugins");
+  });
+
+  it("passes plugins array with correct type and path when plugins are configured and dirs exist", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: ["quality-gate", "deploy"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("plugins");
+    expect(options.plugins).toHaveLength(2);
+    expect(options.plugins[0].type).toBe("local");
+    expect(options.plugins[0].path).toContain("quality-gate");
+    expect(options.plugins[1].type).toBe("local");
+    expect(options.plugins[1].path).toContain("deploy");
+  });
+
+  it("resolves plugin paths relative to plugins/claude-code directory", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: ["my-plugin"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.plugins[0].path).toMatch(/plugins[/\\]claude-code[/\\]my-plugin/);
+  });
+
+  it("skips missing plugin dir and warns, still includes remaining plugins", async () => {
+    // Only the second plugin path exists
+    mockExistsSync.mockImplementation((p: string) => {
+      return String(p).includes("present-plugin");
+    });
+
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: ["missing-plugin", "present-plugin"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("plugins");
+    expect(options.plugins).toHaveLength(1);
+    expect(options.plugins[0].path).toContain("present-plugin");
+  });
+
+  it("does not include plugins in options when all plugins are missing", async () => {
+    mockExistsSync.mockReturnValue(false);
+
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: ["gone"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).not.toHaveProperty("plugins");
+  });
+
+  it("skips plugin name containing forward slash", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: ["bad/name", "good-plugin"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("plugins");
+    expect(options.plugins).toHaveLength(1);
+    expect(options.plugins[0].path).toContain("good-plugin");
+  });
+
+  it("skips plugin name containing backslash", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: ["bad\\name", "good-plugin"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("plugins");
+    expect(options.plugins).toHaveLength(1);
+    expect(options.plugins[0].path).toContain("good-plugin");
+  });
+
+  it("skips plugin name equal to '..'", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: ["..", "good-plugin"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("plugins");
+    expect(options.plugins).toHaveLength(1);
+    expect(options.plugins[0].path).toContain("good-plugin");
+  });
+
+  it("skips plugin name starting with a dot", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: [".hidden", "good-plugin"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("plugins");
+    expect(options.plugins).toHaveLength(1);
+    expect(options.plugins[0].path).toContain("good-plugin");
+  });
+
+  it("skips all invalid names and does not include plugins key when no valid ones remain", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ plugins: ["../escape", ".hidden", "bad/slash"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).not.toHaveProperty("plugins");
   });
 });

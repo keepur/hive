@@ -72,6 +72,11 @@ rollback() {
     run_cmd mv "$DEPLOY_DIR/agents.bak" "$DEPLOY_DIR/agents"
   fi
 
+  if [[ -d "$DEPLOY_DIR/plugins/claude-code.bak" ]]; then
+    run_cmd rm -rf "$DEPLOY_DIR/plugins/claude-code"
+    run_cmd mv "$DEPLOY_DIR/plugins/claude-code.bak" "$DEPLOY_DIR/plugins/claude-code"
+  fi
+
   echo "Restarting service with previous version..."
   run_cmd launchctl kickstart -k "gui/$(id -u)/com.hive.agent"
 
@@ -142,14 +147,16 @@ run_cmd git pull --ff-only
 run_cmd npm install --omit=dev
 
 # 8. Backup current dist and agents
-run_cmd rm -rf "$DEPLOY_DIR/dist.bak" "$DEPLOY_DIR/agents.bak"
+run_cmd rm -rf "$DEPLOY_DIR/dist.bak" "$DEPLOY_DIR/agents.bak" "$DEPLOY_DIR/plugins/claude-code.bak"
 run_cmd cp -a "$DEPLOY_DIR/dist" "$DEPLOY_DIR/dist.bak" 2>/dev/null || true
 run_cmd cp -a "$DEPLOY_DIR/agents" "$DEPLOY_DIR/agents.bak" 2>/dev/null || true
+run_cmd cp -a "$DEPLOY_DIR/plugins/claude-code" "$DEPLOY_DIR/plugins/claude-code.bak" 2>/dev/null || true
 
 # 9. Rsync built artifacts
 echo "Syncing build output..."
 run_cmd rsync -a --delete "$BUILD_DIR/dist/" "$DEPLOY_DIR/dist/"
 run_cmd rsync -a --delete "$BUILD_DIR/agents/" "$DEPLOY_DIR/agents/"
+[[ -d "$BUILD_DIR/plugins/claude-code" ]] && run_cmd rsync -a --delete "$BUILD_DIR/plugins/claude-code/" "$DEPLOY_DIR/plugins/claude-code/"
 
 # 10. Restart service
 echo "Restarting service..."
@@ -167,4 +174,4 @@ notify "Deploy succeeded. Commit \`$DEPLOY_SHA\`: $DEPLOY_MSG. Hive is running."
 echo "Deploy complete. Hive is running."
 
 # 13. Cleanup backups
-run_cmd rm -rf "$DEPLOY_DIR/dist.bak" "$DEPLOY_DIR/agents.bak"
+run_cmd rm -rf "$DEPLOY_DIR/dist.bak" "$DEPLOY_DIR/agents.bak" "$DEPLOY_DIR/plugins/claude-code.bak"

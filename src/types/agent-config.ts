@@ -17,6 +17,7 @@ export interface AgentConfig {
   icon: string; // emoji like ":briefcase:" or URL
   slackBot?: string; // which Slack bot this agent uses (e.g. "jasper") — omit for primary bot
   servers?: string[]; // MCP server allowlist. Omit = all servers (backward compat)
+  plugins?: string[]; // Claude Code plugin allowlist. Omit = no plugins
   maxConcurrent?: number; // Max concurrent threads. Default 3
   timeoutMs?: number; // Response timeout in ms. Default 300000 (5 min)
   triageModel?: string; // Override triage model. Default: config.triage.model
@@ -38,6 +39,7 @@ export interface ConfigOverride {
   passiveChannels?: ArrayOverride;
   keywords?: ArrayOverride;
   servers?: ArrayOverride;
+  plugins?: ArrayOverride;
   isDefault?: boolean;
   budgetUsd?: number;
   maxTurns?: number;
