@@ -6,6 +6,7 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import { config } from "../config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
+import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 
 const log = createLogger("agent-runner");
 
@@ -39,12 +40,14 @@ export class AgentRunner {
   private agentConfig: AgentConfig;
   private memoryManager: MemoryManager;
   private plugins: LoadedPlugin[];
+  private skillIndex: SkillIndex;
   private activeQuery: Query | null = null;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = []) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map()) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
+    this.skillIndex = skillIndex;
   }
 
   private async buildSystemPrompt(): Promise<string> {
@@ -477,6 +480,10 @@ export class AgentRunner {
     return sdkPlugins;
   }
 
+  private buildNativeSkills(): SdkPluginConfig[] {
+    return getSkillsForAgent(this.skillIndex, this.agentConfig.id);
+  }
+
   async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string): Promise<RunResult> {
     const effectiveModel = modelOverride ?? this.agentConfig.model;
 
@@ -491,7 +498,7 @@ export class AgentRunner {
 
     const systemPrompt = await this.buildSystemPrompt();
     const mcpServers = this.buildMcpServers(context);
-    const sdkPlugins = this.buildSdkPlugins();
+    const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
 
     const q = query({
       prompt,
