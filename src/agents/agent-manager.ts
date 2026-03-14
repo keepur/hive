@@ -11,6 +11,7 @@ import { routeModel } from "./model-router.js";
 import { config as appConfig } from "../config.js";
 import { loadPlugins } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
+import { loadSkillIndex, type SkillIndex } from "./skill-loader.js";
 
 const log = createLogger("agent-manager");
 
@@ -31,18 +32,24 @@ export class AgentManager {
   private memoryManager: MemoryManager;
   private sessionStore: SessionStore;
   private plugins: LoadedPlugin[];
+  private skillIndex: SkillIndex;
 
   constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
     this.plugins = loadPlugins(appConfig.plugins, process.cwd());
+    this.skillIndex = loadSkillIndex();
   }
 
   private createRunner(agentId: string): AgentRunner {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
-    return new AgentRunner(config, this.memoryManager, this.plugins);
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex);
+  }
+
+  reloadSkills(): void {
+    this.skillIndex = loadSkillIndex();
   }
 
   private ensureState(agentId: string): void {
