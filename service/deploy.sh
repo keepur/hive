@@ -156,7 +156,7 @@ run_cmd cp -a "$DEPLOY_DIR/plugins/claude-code" "$DEPLOY_DIR/plugins/claude-code
 echo "Syncing build output..."
 run_cmd rsync -a --delete "$BUILD_DIR/dist/" "$DEPLOY_DIR/dist/"
 run_cmd rsync -a --delete "$BUILD_DIR/agents/" "$DEPLOY_DIR/agents/"
-run_cmd rsync -a --delete "$BUILD_DIR/plugins/claude-code/" "$DEPLOY_DIR/plugins/claude-code/"
+[[ -d "$BUILD_DIR/plugins/claude-code" ]] && run_cmd rsync -a --delete "$BUILD_DIR/plugins/claude-code/" "$DEPLOY_DIR/plugins/claude-code/"
 
 # 10. Restart service
 echo "Restarting service..."

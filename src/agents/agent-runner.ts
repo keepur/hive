@@ -455,6 +455,10 @@ export class AgentRunner {
     const pluginsDir = resolve("plugins/claude-code");
 
     for (const name of pluginNames) {
+      if (name.includes("/") || name.includes("\\") || name === ".." || name.startsWith(".")) {
+        log.warn("Invalid plugin name, skipping", { plugin: name, agent: this.agentConfig.id });
+        continue;
+      }
       const pluginPath = resolve(pluginsDir, name);
       if (!existsSync(pluginPath)) {
         log.warn("Plugin not found, skipping", { plugin: name, expected: pluginPath, agent: this.agentConfig.id });

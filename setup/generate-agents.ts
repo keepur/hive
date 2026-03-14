@@ -109,6 +109,14 @@ function syncPlugins(): void {
   // Copy each indexed plugin into plugins/claude-code/<name>/
   let synced = 0;
   for (const [name, sourcePath] of pluginIndex) {
+    // Validate: must contain skills/ dir or a manifest to be a real plugin
+    const hasSkills = existsSync(join(sourcePath, "skills"));
+    const hasManifest = existsSync(join(sourcePath, "plugin.json"));
+    if (!hasSkills && !hasManifest) {
+      console.log(`  SKIP plugin ${name} — no skills/ dir or plugin.json`);
+      continue;
+    }
+
     const destPath = join(PLUGINS_DIR, name);
 
     // Remove existing copy and replace
