@@ -139,6 +139,44 @@ describe("applyConfigOverrides", () => {
     expect(result.passiveChannels).toEqual(["biz", "general"]);
     expect(result.keywords).toEqual(["ship", "release"]);
   });
+
+  it("replaces plugins array entirely", () => {
+    const config = makeConfig({ plugins: ["old-plugin"] });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      plugins: { replace: ["new-plugin-a", "new-plugin-b"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, makeConfig());
+    expect(result.plugins).toEqual(["new-plugin-a", "new-plugin-b"]);
+  });
+
+  it("adds plugins without duplicates", () => {
+    const template = makeConfig({ plugins: ["existing-plugin"] });
+    const config = makeConfig({ plugins: ["existing-plugin"] });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      plugins: { add: ["existing-plugin", "new-plugin"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, template);
+    expect(result.plugins).toEqual(["existing-plugin", "new-plugin"]);
+  });
+
+  it("removes plugins", () => {
+    const template = makeConfig({ plugins: ["keep-plugin", "remove-plugin"] });
+    const config = makeConfig({ plugins: ["keep-plugin", "remove-plugin"] });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      plugins: { remove: ["remove-plugin"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, template);
+    expect(result.plugins).toEqual(["keep-plugin"]);
+  });
 });
 
 describe("name matching patterns", () => {
