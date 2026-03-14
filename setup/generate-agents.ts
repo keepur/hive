@@ -74,21 +74,15 @@ function syncPlugins(): void {
 
   // Build index: plugin-name → latest cache path
   const pluginIndex = new Map<string, string>();
-  const sourceRepos = readdirSync(PLUGIN_CACHE).filter((d) =>
-    statSync(join(PLUGIN_CACHE, d)).isDirectory(),
-  );
+  const sourceRepos = readdirSync(PLUGIN_CACHE).filter((d) => statSync(join(PLUGIN_CACHE, d)).isDirectory());
 
   for (const repo of sourceRepos) {
     const repoDir = join(PLUGIN_CACHE, repo);
-    const plugins = readdirSync(repoDir).filter((d) =>
-      statSync(join(repoDir, d)).isDirectory(),
-    );
+    const plugins = readdirSync(repoDir).filter((d) => statSync(join(repoDir, d)).isDirectory());
 
     for (const pluginName of plugins) {
       const pluginDir = join(repoDir, pluginName);
-      const versions = readdirSync(pluginDir).filter((d) =>
-        statSync(join(pluginDir, d)).isDirectory(),
-      );
+      const versions = readdirSync(pluginDir).filter((d) => statSync(join(pluginDir, d)).isDirectory());
 
       if (versions.length === 0) continue;
 
