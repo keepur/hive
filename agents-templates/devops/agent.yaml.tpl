@@ -23,3 +23,5 @@ servers:
   - keychain
   - background
   - callback
+plugins:
+  - dodi-dev

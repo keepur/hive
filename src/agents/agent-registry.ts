@@ -26,7 +26,7 @@ export function applyConfigOverrides(
   if (!override) return config;
 
   // Apply array field overrides
-  const arrayFields = ["channels", "passiveChannels", "keywords", "servers"] as const;
+  const arrayFields = ["channels", "passiveChannels", "keywords", "servers", "plugins"] as const;
   for (const field of arrayFields) {
     const arrOverride = override[field] as ArrayOverride | undefined;
     if (!arrOverride) continue;
@@ -210,6 +210,7 @@ export class AgentRegistry {
       icon: (raw.icon as string) || "",
       slackBot: (raw.slackBot as string) || undefined,
       servers: (raw.servers as string[]) || undefined,
+      plugins: (raw.plugins as string[]) || undefined,
       maxConcurrent: (raw.maxConcurrent as number) || undefined,
       timeoutMs: (raw.timeoutMs as number) || undefined,
       triageModel: (raw.triageModel as string) || undefined,

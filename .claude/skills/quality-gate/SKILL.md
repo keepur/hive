@@ -9,7 +9,8 @@ Run before submitting a branch. Fails fast on first error.
 
 ## Steps
 
-1. Run `npm run check` (typecheck + lint + format + test)
-2. Run `npm run build` (compile core + plugins)
+1. Run `npm run test` — tests must pass before anything else
+2. Run `npm run check` (typecheck + lint + format + test)
+3. Run `npm run build` (compile core + plugins)
 
-Both must pass. If either fails, report the error and stop.
+All steps must pass. Fail fast on first error — report and stop.
