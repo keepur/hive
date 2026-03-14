@@ -23,7 +23,7 @@ if (!REPO) {
 }
 
 function gh(args: string[]): string {
-  const env: Record<string, string> = { ...process.env as Record<string, string> };
+  const env: Record<string, string> = { ...(process.env as Record<string, string>) };
   if (TOKEN) env.GH_TOKEN = TOKEN;
   return execFileSync("gh", args, { encoding: "utf-8", env, maxBuffer: 10 * 1024 * 1024 });
 }
@@ -216,7 +216,8 @@ server.registerTool(
   "github_search_issues",
   {
     title: "Search Issues",
-    description: "Search GitHub issues by text query. Uses the repo-scoped REST Issues API for real-time, consistent results.",
+    description:
+      "Search GitHub issues by text query. Uses the repo-scoped REST Issues API for real-time, consistent results.",
     inputSchema: {
       query: z.string().describe("Search query"),
       state: z.enum(["open", "closed", "all"]).optional().default("open").describe("Issue state filter"),
