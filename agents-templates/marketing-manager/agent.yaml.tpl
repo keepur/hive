@@ -17,7 +17,7 @@ servers:
   - contacts
   - crm-search
   - hubspot-crm
-  - github-issues
+  - linear
   - brave-search
   - slack
   - permits

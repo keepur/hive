@@ -48,7 +48,7 @@ health_check() {
     return 0
   fi
   local log_file="$DEPLOY_DIR/logs/hive.log"
-  for _ in $(seq 1 10); do
+  for _ in $(seq 1 30); do
     sleep 1
     if tail -5 "$log_file" | grep -q '"Hive is running"'; then
       return 0
