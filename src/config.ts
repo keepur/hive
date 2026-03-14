@@ -64,6 +64,10 @@ export const config = {
     apiKey: optional("LINEAR_API_KEY", ""),
     teamId: optional("LINEAR_TEAM_ID", ""),
   },
+  github: {
+    repo: optional("GITHUB_REPO", ""),
+    token: optional("GH_TOKEN", ""),
+  },
   brave: {
     apiKey: optional("BRAVE_API_KEY", ""),
   },

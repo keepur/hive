@@ -249,6 +249,23 @@ export class AgentRunner {
       };
     }
 
+    // GitHub Issues — issue tracking via gh CLI
+    if (config.github.repo) {
+      const ghEnv: Record<string, string> = {
+        GITHUB_REPO: config.github.repo,
+        PATH: process.env.PATH ?? "",
+      };
+      if (config.github.token) {
+        ghEnv.GH_TOKEN = config.github.token;
+      }
+      servers["github-issues"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/github/github-issues-mcp-server.js")],
+        env: ghEnv,
+      };
+    }
+
     // Recall.ai — meeting bots and transcription
     if (config.recall.apiKey) {
       servers["recall"] = {
