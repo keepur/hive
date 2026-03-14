@@ -38,3 +38,5 @@ servers:
   - admin
   - callback
   - dodi-ops
+plugins:
+  - dodi-dev

@@ -23,3 +23,5 @@ servers:
   - tasks
   - google-workspace
   - callback
+plugins:
+  - dodi-dev

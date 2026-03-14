@@ -24,3 +24,5 @@ servers:
   - hubspot-crm
   - tasks
   - callback
+plugins:
+  - dodi-dev
