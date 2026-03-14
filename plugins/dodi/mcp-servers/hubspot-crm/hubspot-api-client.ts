@@ -377,19 +377,14 @@ export class HubSpotApiClient {
             // Fetch task statuses
             const taskFetches = taskIds.slice(0, 20).map(async (id) => {
               try {
-                return await this.api<HubSpotObject>(
-                  "GET",
-                  `/crm/v3/objects/tasks/${id}?properties=hs_task_status`,
-                );
+                return await this.api<HubSpotObject>("GET", `/crm/v3/objects/tasks/${id}?properties=hs_task_status`);
               } catch {
                 return null;
               }
             });
 
             const tasks = (await Promise.all(taskFetches)).filter(Boolean) as HubSpotObject[];
-            const hasOpen = tasks.some(
-              (t) => t.properties.hs_task_status !== "COMPLETED",
-            );
+            const hasOpen = tasks.some((t) => t.properties.hs_task_status !== "COMPLETED");
 
             return { deal, taskCount: tasks.length, allCompleted: !hasOpen };
           } catch {

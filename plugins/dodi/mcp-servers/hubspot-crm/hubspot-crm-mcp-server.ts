@@ -493,19 +493,10 @@ server.registerTool(
       "Filter by status, owner, and/or due date range. " +
       "Use this to find overdue tasks, tasks due today/tomorrow, or all open tasks across the pipeline.",
     inputSchema: {
-      status: z
-        .enum(["NOT_STARTED", "IN_PROGRESS", "COMPLETED"])
-        .optional()
-        .describe("Filter by task status"),
+      status: z.enum(["NOT_STARTED", "IN_PROGRESS", "COMPLETED"]).optional().describe("Filter by task status"),
       ownerId: z.string().optional().describe("Filter by HubSpot owner ID"),
-      dueAfter: z
-        .string()
-        .optional()
-        .describe("Only tasks due on or after this date (ISO format, e.g. 2026-03-14)"),
-      dueBefore: z
-        .string()
-        .optional()
-        .describe("Only tasks due on or before this date (ISO format, e.g. 2026-03-15)"),
+      dueAfter: z.string().optional().describe("Only tasks due on or after this date (ISO format, e.g. 2026-03-14)"),
+      dueBefore: z.string().optional().describe("Only tasks due on or before this date (ISO format, e.g. 2026-03-15)"),
       limit: z.number().optional().default(100).describe("Max tasks to return (default 100)"),
     },
   },
@@ -557,10 +548,7 @@ server.registerTool(
       "S2 Discovery (15520138), S3 Evaluation (15520119), S4 Proposal (decisionmakerboughtin), " +
       "S5 Invoice (63682726), Sales Nurture (149783667).",
     inputSchema: {
-      stages: z
-        .array(z.string())
-        .optional()
-        .describe("Deal stage IDs to check (defaults to all active stages)"),
+      stages: z.array(z.string()).optional().describe("Deal stage IDs to check (defaults to all active stages)"),
     },
   },
   async ({ stages }) => {
