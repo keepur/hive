@@ -2,9 +2,8 @@
 
 ## Workflow
 
-- **Major planning work**: After a plan is approved, always run `/spec-and-implement` to generate specification documents and delegate parallel implementation. Never skip this step for non-trivial architectural changes.
-- **Before submitting a branch**: Run `/pre-submit-testing` to validate changes, then `/submit-branch` to merge.
-- **Feature docs**: Specs live in `docs/<ticket-id>/` (user-story, implementation-specs, implementation-roadmap). Read them before modifying related code.
+- **Before submitting a branch**: Run `npm run check` (typecheck + lint + format + test) to validate changes, then create a PR to merge.
+- **Feature docs**: Specs live in `docs/specs/` and `docs/plans/`. Read them before modifying related code.
 
 ## Project Overview
 
@@ -21,7 +20,7 @@ Message (Slack/SMS/WebSocket/Scheduler)
   → Channel Adapter (slack, sms, ws)
   → Dispatcher (routing, dedup, status interception)
   → Triage (fast Haiku for simple queries, interactive channels only)
-  → Model Router (Haiku/Sonnet/Opus classification, respects agent ceiling)
+  → Model Router (Haiku/Sonnet classification, respects agent ceiling)
   → Agent Manager (concurrency limits, per-thread serialization)
   → Agent Runner (spawns Claude session + MCP servers)
   → Response → Channel Adapter → delivery
@@ -33,29 +32,42 @@ Message (Slack/SMS/WebSocket/Scheduler)
 - `src/agents/agent-runner.ts` — spawns Claude sessions, assembles system prompts, configures MCP servers
 - `src/agents/agent-manager.ts` — concurrency, thread queues, agent state
 - `src/agents/agent-registry.ts` — loads agent definitions from `agents/`, applies MongoDB overrides
+- `src/agents/session-store.ts` — manages agent session state in MongoDB
 - `src/agents/triage.ts` — fast Haiku classifier (done/continue)
 - `src/agents/model-router.ts` — complexity classifier for model selection
 - `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue
 - `src/channels/slack-adapter.ts` — Slack events → WorkItems → delivery
+- `src/channels/sms-adapter.ts` — SMS message adapter via Quo/OpenPhone
 - `src/slack/slack-gateway.ts` — Socket Mode listener, message filtering
 
 ### MCP Servers (stdio subprocesses per agent session)
 All in `src/` — each agent only gets servers listed in its `agent.yaml` `servers` field:
 - `memory-mcp-server.ts` — read/write/list/history/rollback agent memory (MongoDB)
-- `slack-mcp-server.ts` — Slack operations via official MCP
 - `google-mcp-server.ts` — Gmail + Calendar via `gog` CLI
 - `drive/drive-mcp-server.ts` — Google Drive via `gws` CLI
 - `keychain-mcp-server.ts` — macOS Keychain read-only
-- `contacts-mcp-server.ts` — contact lookups
-- `linear-mcp-server.ts` — Linear issue tracking
-- `search/crm-search-mcp-server.ts` — Atlas vector search over CRM
+- `contacts-mcp-server.ts` — contact lookups (MongoDB)
+- `github/github-issues-mcp-server.ts` — GitHub Issues tracking via `gh` CLI
+- `linear-mcp-server.ts` — Linear issue tracking (being removed)
+- `search/crm-search-mcp-server.ts` — vector search over CRM data
+- `search/product-search-mcp-server.ts` — vector search over product catalog
+- `search/ops-search-mcp-server.ts` — vector search over ops data
 - `tasks/task-mcp-server.ts` — dodi_v2 task CRUD
 - `background/background-task-mcp-server.ts` — spawn detached long-running commands
 - `recall/recall-mcp-server.ts` — meeting participation via Recall.ai
 - `quo-mcp-server.ts` — SMS via Quo/OpenPhone
-- `resend/resend-mcp-server.ts` — outbound email
+- `resend/resend-mcp-server.ts` — outbound email via Resend
 - `callback-mcp-server.ts` — timer callbacks for delayed responses
-- `admin-mcp-server.ts` — model/config overrides (Mokie only)
+- `admin-mcp-server.ts` — model/config overrides (authorized agents only)
+- `clickup/clickup-mcp-server.ts` — ClickUp task management
+
+Slack MCP uses the official Slack HTTP MCP server (`https://mcp.slack.com/mcp`), not a local stdio server.
+
+### Plugin MCP Servers (`plugins/dodi/`)
+- `dodi-ops-mcp-server.ts` — dodi_v2 REST API (persons, projects, designs, jobs, cases, comments, attachments, cutlists)
+- `hubspot-crm-mcp-server.ts` — HubSpot CRM read/write
+- `catalog-mcp-server.ts` — read-only product catalog access
+- `permit-mcp-server.ts` — permit management
 
 ## Dev vs Deploy
 
@@ -76,6 +88,8 @@ npm run lint           # ESLint
 npm run format         # Prettier
 npm run test           # Vitest
 npm run check          # All checks (typecheck + lint + format + test)
+npm run embed:hubspot  # Run HubSpot → Qdrant embed pipeline
+npm run embed:dodi     # Run dodi_v2 → Qdrant embed pipeline
 ```
 
 ## Agent Anatomy
@@ -91,7 +105,20 @@ agents-templates/<agent-id>/
 
 **Template variables**: `{{agent.name}}`, `{{business.name}}`, `{{#if condition}}`, `{{sms_channels}}`, etc. Rendered by `setup/generate-agents.ts`.
 
-**Model ceilings**: Opus (Mokie), Sonnet (Jasper, River, Jessica, Colt, Wyatt, Sige), Haiku (Chloe, Milo, Rae)
+**Agent templates** (10 total):
+
+| Template | Model | Role |
+|----------|-------|------|
+| chief-of-staff | Sonnet | Default agent, delegation, coordination |
+| vp-engineering | Haiku | Code, builds, engineering backlog |
+| devops | Sonnet | Deploy, CI, monitoring |
+| product-manager | Haiku | Specs, user stories, backlog |
+| marketing-manager | Sonnet | Lead gen, content, market research |
+| customer-success | Sonnet | CRM, customer emails, follow-ups |
+| executive-assistant | Haiku | Email, calendar, scheduling |
+| product-specialist | Sonnet | Catalog, pricing, product knowledge |
+| production-support | Sonnet | Jobs, orders, manufacturing ops |
+| sdr | Haiku | Outbound outreach, lead qualification |
 
 ## Conventions
 
@@ -122,4 +149,4 @@ agents-templates/<agent-id>/
 - Thread deduplication: 60s window prevents double-processing
 - Triage is disabled in threads (no context available for classification)
 - Agent concurrency default: 3 threads. Excess messages deferred and retried on sweep.
-- MongoDB collections: `memory`, `memory_versions`, `agent_sessions`, `model_overrides`, `agent_config_overrides`, `devices`
+- MongoDB collections: `memory`, `memory_versions`, `agent_sessions`, `model_overrides`, `agent_config_overrides`, `devices`, `agent_callbacks`, `contacts`, `prompt_overrides`, `schedule_overrides`
