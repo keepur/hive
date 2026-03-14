@@ -290,6 +290,121 @@ export class HubSpotApiClient {
     await this.api<HubSpotObject>("PATCH", `/crm/v3/objects/tasks/${id}`, { properties });
   }
 
+  async listTasks(options: {
+    status?: string;
+    ownerId?: string;
+    dueBefore?: string;
+    dueAfter?: string;
+    limit?: number;
+  }): Promise<HubSpotObject[]> {
+    log.info("Listing tasks", { options });
+
+    const filters: { propertyName: string; operator: string; value?: string; values?: string[] }[] = [];
+
+    if (options.status) {
+      filters.push({ propertyName: "hs_task_status", operator: "EQ", value: options.status });
+    }
+    if (options.ownerId) {
+      filters.push({ propertyName: "hubspot_owner_id", operator: "EQ", value: options.ownerId });
+    }
+    if (options.dueAfter) {
+      filters.push({ propertyName: "hs_timestamp", operator: "GTE", value: options.dueAfter });
+    }
+    if (options.dueBefore) {
+      filters.push({ propertyName: "hs_timestamp", operator: "LTE", value: options.dueBefore });
+    }
+
+    const body = {
+      filterGroups: filters.length > 0 ? [{ filters }] : [],
+      properties: [
+        "hs_task_subject",
+        "hs_task_body",
+        "hs_task_status",
+        "hs_task_priority",
+        "hs_timestamp",
+        "hubspot_owner_id",
+      ],
+      sorts: [{ propertyName: "hs_timestamp", direction: "ASCENDING" }],
+      limit: options.limit ?? 100,
+    };
+
+    const result = await this.api<{ results: HubSpotObject[] }>("POST", "/crm/v3/objects/tasks/search", body);
+    return result.results;
+  }
+
+  /**
+   * Find active deals (non-closed stages) that have no open tasks associated.
+   * Returns deals along with a flag indicating whether any tasks exist at all.
+   */
+  async getDealsWithoutOpenTasks(options?: {
+    stages?: string[];
+    limit?: number;
+  }): Promise<{ deal: HubSpotObject; taskCount: number; allCompleted: boolean }[]> {
+    // Step 1: get active deals
+    const activeStages = options?.stages ?? [
+      "appointmentscheduled", // S0 Prospect
+      "qualifiedtobuy", // S1 Meeting
+      "15520138", // S2 Discovery
+      "15520119", // S3 Evaluation
+      "decisionmakerboughtin", // S4 Proposal
+      "63682726", // S5 Invoice
+      "149783667", // Sales Nurture
+    ];
+
+    const deals = await this.listDeals({ stages: activeStages, limit: options?.limit ?? 200 });
+    log.info("Checking tasks for active deals", { dealCount: deals.length });
+
+    // Step 2: for each deal, check associated tasks
+    const results: { deal: HubSpotObject; taskCount: number; allCompleted: boolean }[] = [];
+
+    // Process in batches of 10 to respect rate limits
+    for (let i = 0; i < deals.length; i += 10) {
+      const batch = deals.slice(i, i + 10);
+      const batchResults = await Promise.all(
+        batch.map(async (deal) => {
+          try {
+            // Get task associations for this deal
+            const assocRes = await this.api<{ results: { id: string }[] }>(
+              "GET",
+              `/crm/v3/objects/deals/${deal.id}/associations/tasks`,
+            );
+            const taskIds = assocRes.results.map((r) => r.id);
+
+            if (taskIds.length === 0) {
+              return { deal, taskCount: 0, allCompleted: true };
+            }
+
+            // Fetch task statuses
+            const taskFetches = taskIds.slice(0, 20).map(async (id) => {
+              try {
+                return await this.api<HubSpotObject>(
+                  "GET",
+                  `/crm/v3/objects/tasks/${id}?properties=hs_task_status`,
+                );
+              } catch {
+                return null;
+              }
+            });
+
+            const tasks = (await Promise.all(taskFetches)).filter(Boolean) as HubSpotObject[];
+            const hasOpen = tasks.some(
+              (t) => t.properties.hs_task_status !== "COMPLETED",
+            );
+
+            return { deal, taskCount: tasks.length, allCompleted: !hasOpen };
+          } catch {
+            // If associations endpoint fails, treat as no tasks
+            return { deal, taskCount: 0, allCompleted: true };
+          }
+        }),
+      );
+      results.push(...batchResults);
+    }
+
+    // Return only deals without open tasks
+    return results.filter((r) => r.taskCount === 0 || r.allCompleted);
+  }
+
   // ── Activity History ────────────────────────────────────────────────────
 
   /**

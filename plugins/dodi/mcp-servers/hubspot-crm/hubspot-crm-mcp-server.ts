@@ -482,6 +482,124 @@ server.registerTool(
   },
 );
 
+// ── Tool: hubspot_list_tasks ─────────────────────────────────────────────
+
+server.registerTool(
+  "hubspot_list_tasks",
+  {
+    title: "List HubSpot Tasks",
+    description:
+      "List tasks from HubSpot CRM with optional filters. " +
+      "Filter by status, owner, and/or due date range. " +
+      "Use this to find overdue tasks, tasks due today/tomorrow, or all open tasks across the pipeline.",
+    inputSchema: {
+      status: z
+        .enum(["NOT_STARTED", "IN_PROGRESS", "COMPLETED"])
+        .optional()
+        .describe("Filter by task status"),
+      ownerId: z.string().optional().describe("Filter by HubSpot owner ID"),
+      dueAfter: z
+        .string()
+        .optional()
+        .describe("Only tasks due on or after this date (ISO format, e.g. 2026-03-14)"),
+      dueBefore: z
+        .string()
+        .optional()
+        .describe("Only tasks due on or before this date (ISO format, e.g. 2026-03-15)"),
+      limit: z.number().optional().default(100).describe("Max tasks to return (default 100)"),
+    },
+  },
+  async ({ status, ownerId, dueAfter, dueBefore, limit }) => {
+    try {
+      const tasks = await client.listTasks({ status, ownerId, dueAfter, dueBefore, limit });
+
+      if (tasks.length === 0) {
+        return { content: [{ type: "text", text: "No tasks found matching those filters." }] };
+      }
+
+      const lines = tasks.map((task) => {
+        const p = task.properties;
+        const parts: string[] = [`Task ${task.id}: ${p.hs_task_subject ?? "(no subject)"}`];
+        if (p.hs_task_status) parts.push(`  Status: ${p.hs_task_status}`);
+        if (p.hs_task_priority) parts.push(`  Priority: ${p.hs_task_priority}`);
+        if (p.hs_timestamp) {
+          const due = new Date(p.hs_timestamp);
+          parts.push(`  Due: ${due.toISOString().split("T")[0]}`);
+        }
+        if (p.hubspot_owner_id) parts.push(`  Owner: ${p.hubspot_owner_id}`);
+        if (p.hs_task_body) {
+          const body = p.hs_task_body.replace(/<[^>]*>/g, "").slice(0, 150);
+          parts.push(`  ${body}`);
+        }
+        return parts.join("\n");
+      });
+
+      return {
+        content: [{ type: "text", text: `${tasks.length} tasks:\n\n${lines.join("\n\n")}` }],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: e.message }], isError: true };
+    }
+  },
+);
+
+// ── Tool: hubspot_deals_without_tasks ────────────────────────────────────
+
+server.registerTool(
+  "hubspot_deals_without_tasks",
+  {
+    title: "Deals Without Open Tasks",
+    description:
+      "Find active deals in the Sales Pipeline that have NO open tasks associated. " +
+      "This surfaces deals where follow-up may be dropping — either no tasks exist at all, " +
+      "or all tasks are already completed. " +
+      "Stage IDs: S0 Prospect (appointmentscheduled), S1 Meeting (qualifiedtobuy), " +
+      "S2 Discovery (15520138), S3 Evaluation (15520119), S4 Proposal (decisionmakerboughtin), " +
+      "S5 Invoice (63682726), Sales Nurture (149783667).",
+    inputSchema: {
+      stages: z
+        .array(z.string())
+        .optional()
+        .describe("Deal stage IDs to check (defaults to all active stages)"),
+    },
+  },
+  async ({ stages }) => {
+    try {
+      const results = await client.getDealsWithoutOpenTasks({ stages });
+
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: "All active deals have open tasks. No gaps found." }] };
+      }
+
+      const lines = results.map((r) => {
+        const p = r.deal.properties;
+        const parts: string[] = [`Deal ${r.deal.id}: ${p.dealname ?? "(unnamed)"}`];
+        if (p.dealstage) parts.push(`  Stage: ${p.dealstage}`);
+        if (p.amount) parts.push(`  Amount: $${p.amount}`);
+        if (p.closedate) parts.push(`  Close: ${p.closedate}`);
+        if (p.hubspot_owner_id) parts.push(`  Owner: ${p.hubspot_owner_id}`);
+        if (r.taskCount === 0) {
+          parts.push(`  ⚠ No tasks at all`);
+        } else {
+          parts.push(`  ⚠ ${r.taskCount} task(s), all completed — needs new follow-up`);
+        }
+        return parts.join("\n");
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${results.length} active deal(s) without open tasks:\n\n${lines.join("\n\n")}`,
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: e.message }], isError: true };
+    }
+  },
+);
+
 // ── Tool: hubspot_get_activities ─────────────────────────────────────────
 
 server.registerTool(
