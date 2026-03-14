@@ -1,4 +1,4 @@
-import { watch } from "node:fs";
+import { existsSync, watch } from "node:fs";
 import { resolve } from "node:path";
 import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
@@ -124,6 +124,7 @@ async function main(): Promise<void> {
 
     // Reload schedule overrides
     await scheduler.reloadSchedules();
+    agentManager.reloadSkills();
   };
 
   // Watch agents/ directory for changes — debounced to 500ms
@@ -132,6 +133,16 @@ async function main(): Promise<void> {
     if (reloadTimer) clearTimeout(reloadTimer);
     reloadTimer = setTimeout(() => reload(), 500);
   });
+
+  // Watch skills/ directory for changes — debounced to 500ms
+  const skillsDir = resolve("skills");
+  if (existsSync(skillsDir)) {
+    watch(skillsDir, { recursive: true }, () => {
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => reload(), 500);
+    });
+    log.info("Skills hot-reload enabled", { watched: skillsDir });
+  }
 
   // SIGUSR1: manual hot-reload trigger
   process.on("SIGUSR1", () => reload());
