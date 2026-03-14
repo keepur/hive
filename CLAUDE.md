@@ -36,7 +36,7 @@ All repos under **[dodi-hq](https://github.com/dodi-hq)** use the same plugin-dr
 ## Project Overview
 
 - TypeScript, Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`), Slack Socket Mode + Web API
-- Runtime: Node 24 on Mac Mini, runs as launchd service (`com.dodi.hive`)
+- Runtime: Node 24 on Mac Mini, runs as launchd service (`com.hive.agent`)
 - Config: `hive.yaml` (instance config, gitignored) + `.env` (secrets, gitignored)
 - Agents: `agents/` (gitignored, per-instance) generated from `agents-templates/` via `npm run setup:agents`
 - Plugins: `plugins/<name>/` — business-specific MCP servers + agent templates (e.g., `plugins/dodi/`)
@@ -103,7 +103,7 @@ Slack MCP uses the official Slack HTTP MCP server (`https://mcp.slack.com/mcp`),
 - **Deploy**: `~/services/hive` — separate clone, compiled JS, launchd points here
 - **Deploy script**: `~/services/hive/deploy.sh` — pulls, builds, syncs agents, restarts. Supports `--rollback`.
 - Editing source in dev does NOT affect the running service
-- Service restart: `launchctl kickstart -k "gui/$(id -u)/com.dodi.hive"`
+- Service restart: `launchctl kickstart -k "gui/$(id -u)/com.hive.agent"`
 
 ## Commands
 

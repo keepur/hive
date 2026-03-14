@@ -44,7 +44,7 @@ How the four repos work together to run Dodi's business.
 - **WebSocket Channel** (`src/channels/ws/`) — Backend for iOS shop app connections
 - **Model Router** — Per-turn Haiku classifier for dynamic model selection (Haiku vs Sonnet)
 
-**Runtime**: Node 24 on Mac Mini, `launchd` service (`com.dodi.hive`), two clones:
+**Runtime**: Node 24 on Mac Mini, `launchd` service (`com.hive.agent`), two clones:
 - Dev: `~/github/hive` (edit/commit/push)
 - Deploy: `~/services/hive` (compiled JS, `deploy.sh` pulls/builds/restarts)
 

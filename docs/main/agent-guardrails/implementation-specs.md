@@ -206,7 +206,7 @@ Also update `## Your Tools` to add Keychain:
 
 1. `npm run build` — compiles cleanly
 2. `npx tsx setup/generate-agents.ts` — regenerates `agents/` from templates
-3. `launchctl kickstart -k gui/$(id -u)/com.dodi.hive` — Hive restarts
+3. `launchctl kickstart -k gui/$(id -u)/com.hive.agent` — Hive restarts
 4. Check logs for "Loaded agent" lines with correct server counts
 5. Message Mokie → ask to "send an email" → should say it can't and delegate to Rae
 6. Message River → ask to "check email" → should say it can't

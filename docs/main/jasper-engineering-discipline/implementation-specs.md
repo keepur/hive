@@ -25,7 +25,7 @@ Uses template variables: `{{team.devops}}` for the devops agent reference.
 
 1. `npm run setup:agents` — regenerate `agents/vp-engineering/system-prompt.md`
 2. `npm run build` — recompile
-3. `launchctl kickstart -k gui/$(id -u)/com.dodi.hive` — restart Hive
+3. `launchctl kickstart -k gui/$(id -u)/com.hive.agent` — restart Hive
 4. Commit template file and push
 
 ## Testing
