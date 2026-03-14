@@ -30,7 +30,7 @@ export function loadSkillIndex(skillsDir: string = resolve("skills")): SkillInde
 
     for (const workflow of workflows) {
       const workflowPath = join(skillsDir, workflow);
-      const skillsSubdir = join(workflowPath, ".claude", "skills");
+      const skillsSubdir = join(workflowPath, "skills");
 
       if (!existsSync(skillsSubdir)) {
         log.debug("Workflow missing .claude/skills/, skipping", { workflow });
