@@ -49,7 +49,11 @@ export class AgentManager {
   }
 
   reloadSkills(): void {
-    this.skillIndex = loadSkillIndex();
+    try {
+      this.skillIndex = loadSkillIndex();
+    } catch (err) {
+      log.warn("Skill reload failed, retaining previous index", { error: String(err) });
+    }
   }
 
   private ensureState(agentId: string): void {

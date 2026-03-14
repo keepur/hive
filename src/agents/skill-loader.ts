@@ -19,76 +19,80 @@ export function loadSkillIndex(skillsDir: string = resolve("skills")): SkillInde
     return index;
   }
 
-  // Collect workflows that apply to "all" agents
-  const universalPlugins: SdkPluginConfig[] = [];
+  try {
+    // Collect workflows that apply to "all" agents
+    const universalPlugins: SdkPluginConfig[] = [];
 
-  // Each top-level dir in skills/ is a workflow
-  const workflows = readdirSync(skillsDir).filter((d) =>
-    statSync(join(skillsDir, d)).isDirectory(),
-  );
-
-  for (const workflow of workflows) {
-    const workflowPath = join(skillsDir, workflow);
-    const skillsSubdir = join(workflowPath, ".claude", "skills");
-
-    if (!existsSync(skillsSubdir)) {
-      log.debug("Workflow missing .claude/skills/, skipping", { workflow });
-      continue;
-    }
-
-    const pluginConfig: SdkPluginConfig = { type: "local", path: workflowPath };
-
-    // Scan each skill inside the workflow for agents frontmatter
-    const agentIds = new Set<string>();
-    let hasAll = false;
-
-    const skillDirs = readdirSync(skillsSubdir).filter((d) =>
-      statSync(join(skillsSubdir, d)).isDirectory(),
+    // Each top-level dir in skills/ is a workflow
+    const workflows = readdirSync(skillsDir).filter((d) =>
+      statSync(join(skillsDir, d)).isDirectory(),
     );
 
-    for (const skillDir of skillDirs) {
-      const skillMd = join(skillsSubdir, skillDir, "SKILL.md");
-      if (!existsSync(skillMd)) continue;
+    for (const workflow of workflows) {
+      const workflowPath = join(skillsDir, workflow);
+      const skillsSubdir = join(workflowPath, ".claude", "skills");
 
-      const agents = parseAgentsFromFrontmatter(readFileSync(skillMd, "utf-8"));
-      for (const agent of agents) {
-        if (agent === "all") {
-          hasAll = true;
-        } else {
-          agentIds.add(agent);
+      if (!existsSync(skillsSubdir)) {
+        log.debug("Workflow missing .claude/skills/, skipping", { workflow });
+        continue;
+      }
+
+      const pluginConfig: SdkPluginConfig = { type: "local", path: workflowPath };
+
+      // Scan each skill inside the workflow for agents frontmatter
+      const agentIds = new Set<string>();
+      let hasAll = false;
+
+      const skillDirs = readdirSync(skillsSubdir).filter((d) =>
+        statSync(join(skillsSubdir, d)).isDirectory(),
+      );
+
+      for (const skillDir of skillDirs) {
+        const skillMd = join(skillsSubdir, skillDir, "SKILL.md");
+        if (!existsSync(skillMd)) continue;
+
+        const agents = parseAgentsFromFrontmatter(readFileSync(skillMd, "utf-8"));
+        for (const agent of agents) {
+          if (agent === "all") {
+            hasAll = true;
+          } else {
+            agentIds.add(agent);
+          }
         }
       }
-    }
 
-    if (hasAll) {
-      universalPlugins.push(pluginConfig);
-      log.debug("Workflow registered as universal", { workflow, skills: skillDirs.length });
-    } else if (agentIds.size > 0) {
-      for (const agentId of agentIds) {
-        const existing = index.get(agentId) ?? [];
-        existing.push(pluginConfig);
-        index.set(agentId, existing);
+      if (hasAll) {
+        universalPlugins.push(pluginConfig);
+        log.debug("Workflow registered as universal", { workflow, skills: skillDirs.length });
+      } else if (agentIds.size > 0) {
+        for (const agentId of agentIds) {
+          const existing = index.get(agentId) ?? [];
+          existing.push(pluginConfig);
+          index.set(agentId, existing);
+        }
+        log.debug("Workflow registered", { workflow, agents: [...agentIds], skills: skillDirs.length });
       }
-      log.debug("Workflow registered", { workflow, agents: [...agentIds], skills: skillDirs.length });
     }
-  }
 
-  // Merge universal plugins into every agent's list
-  if (universalPlugins.length > 0) {
-    // Get all agent IDs currently in the index
-    const allAgentIds = new Set(index.keys());
-    // Also need to handle agents with no workflow-specific skills —
-    // they'll get universal plugins when looked up via getSkillsForAgent()
-    for (const agentId of allAgentIds) {
-      const existing = index.get(agentId)!;
-      existing.push(...universalPlugins);
+    // Merge universal plugins into every agent's list
+    if (universalPlugins.length > 0) {
+      // Get all agent IDs currently in the index
+      const allAgentIds = new Set(index.keys());
+      // Also need to handle agents with no workflow-specific skills —
+      // they'll get universal plugins when looked up via getSkillsForAgent()
+      for (const agentId of allAgentIds) {
+        const existing = index.get(agentId)!;
+        existing.push(...universalPlugins);
+      }
+      // Store universal plugins under a sentinel key for agents not yet in the index
+      index.set("__universal__", universalPlugins);
     }
-    // Store universal plugins under a sentinel key for agents not yet in the index
-    index.set("__universal__", universalPlugins);
-  }
 
-  const totalWorkflows = workflows.filter((w) => existsSync(join(skillsDir, w, ".claude", "skills"))).length;
-  log.info("Skill index loaded", { workflows: totalWorkflows, agents: index.size - (index.has("__universal__") ? 1 : 0) });
+    const totalWorkflows = workflows.filter((w) => existsSync(join(skillsDir, w, ".claude", "skills"))).length;
+    log.info("Skill index loaded", { workflows: totalWorkflows, agents: index.size - (index.has("__universal__") ? 1 : 0) });
+  } catch (err) {
+    log.warn("Failed to load skill index, returning empty index", { error: String(err) });
+  }
 
   return index;
 }
