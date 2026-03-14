@@ -57,6 +57,19 @@ health_check() {
   return 1
 }
 
+# --- Helper: Kill stale processes on Hive ports ---
+kill_stale_ports() {
+  for port in 3100 3200; do
+    local pids
+    pids=$(lsof -i :"$port" -t 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+      echo "Killing stale process(es) on port $port: $pids"
+      echo "$pids" | xargs kill -9 2>/dev/null || true
+    fi
+  done
+  sleep 1
+}
+
 # --- Helper: Rollback ---
 rollback() {
   local prev_sha="$1"
@@ -78,6 +91,7 @@ rollback() {
   fi
 
   echo "Restarting service with previous version..."
+  kill_stale_ports
   run_cmd launchctl kickstart -k "gui/$(id -u)/com.hive.agent"
 
   if health_check; then
@@ -160,6 +174,7 @@ run_cmd rsync -a --delete "$BUILD_DIR/agents/" "$DEPLOY_DIR/agents/"
 
 # 10. Restart service
 echo "Restarting service..."
+kill_stale_ports
 run_cmd launchctl kickstart -k "gui/$(id -u)/com.hive.agent"
 
 # 11. Health check
