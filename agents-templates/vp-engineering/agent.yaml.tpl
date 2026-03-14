@@ -13,7 +13,7 @@ isDefault: false
 budgetUsd: 10
 servers:
   - memory
-  - github-issues
+  - linear
   - brave-search
   - slack
   - keychain

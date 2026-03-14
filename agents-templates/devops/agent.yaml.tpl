@@ -14,7 +14,7 @@ budgetUsd: 25
 maxTurns: 15
 servers:
   - memory
-  - github-issues
+  - linear
   - slack
   - contacts
   - crm-search

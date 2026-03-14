@@ -10,7 +10,7 @@ isDefault: false
 budgetUsd: 50
 servers:
   - memory
-  - github-issues
+  - linear
   - slack
   - contacts
   - crm-search
