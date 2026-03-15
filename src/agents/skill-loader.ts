@@ -88,7 +88,7 @@ export function loadSkillIndex(skillsDir: string = resolve("skills")): SkillInde
       index.set("__universal__", universalPlugins);
     }
 
-    const totalWorkflows = workflows.filter((w) => existsSync(join(skillsDir, w, ".claude", "skills"))).length;
+    const totalWorkflows = workflows.filter((w) => existsSync(join(skillsDir, w, "skills"))).length;
     log.info("Skill index loaded", { workflows: totalWorkflows, agents: index.size - (index.has("__universal__") ? 1 : 0) });
   } catch (err) {
     log.warn("Failed to load skill index, returning empty index", { error: String(err) });
