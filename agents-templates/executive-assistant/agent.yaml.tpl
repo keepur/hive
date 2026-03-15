@@ -12,7 +12,6 @@ maxTurns: 25
 schedule: []
 servers:
   - memory
-  - google
   - contacts
   - slack
   - keychain

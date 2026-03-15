@@ -28,7 +28,6 @@ servers:
   - resend
   - brave-search
   - slack
-  - google
   - permits
   - tasks
   - google-workspace
