@@ -27,5 +27,6 @@ servers:
   - resend
   - quo
   - google-workspace
+  - dodi-ops
 plugins:
   - dodi-dev
