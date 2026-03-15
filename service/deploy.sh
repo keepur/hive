@@ -153,40 +153,53 @@ if ! run_cmd npm run setup:agents; then
   exit 1
 fi
 
-# 7. Prepare deploy dir
-echo "Preparing deploy dir..."
+# 7. Preserve agent-made changes in deploy dir
+echo "Checking for agent-made changes..."
 cd "$DEPLOY_DIR"
 [[ "$(git branch --show-current)" == "deploy" ]] || { echo "ERROR: Deploy dir not on deploy branch"; exit 1; }
+if [[ -n "$(git status --porcelain skills/ 2>/dev/null)" ]]; then
+  echo "Agent-made skill changes detected — committing and pushing..."
+  run_cmd git add skills/
+  run_cmd git commit -m "chore: preserve agent-made skill changes (auto-commit by deploy)"
+  run_cmd git push
+  # Re-pull in build dir so it has the agent changes before checks
+  cd "$BUILD_DIR"
+  run_cmd git pull --ff-only
+  cd "$DEPLOY_DIR"
+fi
+
+# 8. Pull latest into deploy dir
+echo "Preparing deploy dir..."
 run_cmd git pull --ff-only
 run_cmd npm install --omit=dev
 
-# 8. Backup current dist and agents
+# 9. Backup current dist and agents
 run_cmd rm -rf "$DEPLOY_DIR/dist.bak" "$DEPLOY_DIR/agents.bak" "$DEPLOY_DIR/plugins/claude-code.bak"
 run_cmd cp -a "$DEPLOY_DIR/dist" "$DEPLOY_DIR/dist.bak" 2>/dev/null || true
 run_cmd cp -a "$DEPLOY_DIR/agents" "$DEPLOY_DIR/agents.bak" 2>/dev/null || true
 run_cmd cp -a "$DEPLOY_DIR/plugins/claude-code" "$DEPLOY_DIR/plugins/claude-code.bak" 2>/dev/null || true
 
-# 9. Rsync built artifacts
+# 10. Rsync built artifacts
 echo "Syncing build output..."
 run_cmd rsync -a --delete "$BUILD_DIR/dist/" "$DEPLOY_DIR/dist/"
 run_cmd rsync -a --delete "$BUILD_DIR/agents/" "$DEPLOY_DIR/agents/"
 [[ -d "$BUILD_DIR/plugins/claude-code" ]] && run_cmd rsync -a --delete "$BUILD_DIR/plugins/claude-code/" "$DEPLOY_DIR/plugins/claude-code/"
 
-# 10. Restart service
+# 11. Restart service
 echo "Restarting service..."
 kill_stale_ports
 run_cmd launchctl kickstart -k "gui/$(id -u)/com.hive.agent"
 
-# 11. Health check
+# 12. Health check
 echo "Checking health..."
 if ! health_check; then
   echo "Health check failed. Triggering rollback..."
   rollback "$PREV_SHA"
 fi
 
-# 12. Success
+# 13. Success
 notify "Deploy succeeded. Commit \`$DEPLOY_SHA\`: $DEPLOY_MSG. Hive is running."
 echo "Deploy complete. Hive is running."
 
-# 13. Cleanup backups
+# 14. Cleanup backups
 run_cmd rm -rf "$DEPLOY_DIR/dist.bak" "$DEPLOY_DIR/agents.bak" "$DEPLOY_DIR/plugins/claude-code.bak"
