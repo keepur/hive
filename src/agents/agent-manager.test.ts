@@ -44,6 +44,16 @@ vi.mock("./agent-runner.js", () => ({
   })),
 }));
 
+// Mock conversation index (hoisted because ConversationIndex is instantiated at module level)
+const { mockConversationIndex } = vi.hoisted(() => ({
+  mockConversationIndex: vi.fn(),
+}));
+vi.mock("../search/conversation-index.js", () => ({
+  ConversationIndex: vi.fn().mockImplementation(() => ({
+    index: mockConversationIndex,
+  })),
+}));
+
 import { AgentManager } from "./agent-manager.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { WorkItem } from "../types/work-item.js";
@@ -467,6 +477,71 @@ describe("AgentManager", () => {
     it("returns empty array when no agents have state", () => {
       const states = manager.getAllStates();
       expect(states).toEqual([]);
+    });
+  });
+
+  describe("conversation indexing", () => {
+    it("indexes conversation after successful response", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const item = makeWorkItem({
+        threadId: "idx-thread",
+        senderName: "Alice",
+        source: { kind: "slack", id: "C999", label: "general" },
+      });
+
+      await manager.sendMessage("agent-a", item);
+
+      // Fire-and-forget — flush microtasks
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockConversationIndex).toHaveBeenCalledTimes(1);
+      const call = mockConversationIndex.mock.calls[0]![0];
+      expect(call.agentId).toBe("agent-a");
+      expect(call.threadId).toBe("idx-thread");
+      expect(call.channelId).toBe("C999");
+      expect(call.source).toBe("slack");
+      expect(call.senderName).toBe("Alice");
+      expect(call.response).toBe("response");
+      expect(call.inbound).toContain("test message");
+      expect(call.timestampUnix).toBeTypeOf("number");
+      expect(call.timestamp).toBeTypeOf("string");
+    });
+
+    it("does NOT index when result has error", async () => {
+      mockRunnerSend.mockResolvedValue(makeRunResult({
+        text: "partial",
+        error: "something broke",
+      }));
+
+      const item = makeWorkItem();
+      await manager.sendMessage("agent-a", item);
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockConversationIndex).not.toHaveBeenCalled();
+    });
+
+    it("does NOT index when result.text is empty", async () => {
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "" }));
+
+      const item = makeWorkItem();
+      await manager.sendMessage("agent-a", item);
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockConversationIndex).not.toHaveBeenCalled();
+    });
+
+    it("indexing failure does not reject the work item", async () => {
+      mockConversationIndex.mockRejectedValue(new Error("Qdrant down"));
+
+      const item = makeWorkItem();
+      const result = await manager.sendMessage("agent-a", item);
+
+      // Wait for fire-and-forget to settle
+      await new Promise((r) => setTimeout(r, 10));
+
+      // The work item resolved successfully despite indexing failure
+      expect(result.text).toBe("response");
+      expect(mockConversationIndex).toHaveBeenCalledTimes(1);
     });
   });
 });
