@@ -30,6 +30,13 @@ export interface ListIssuesOpts {
   stateType?: string;
   limit?: number;
   teamId?: string;
+  assigneeEmail?: string;
+}
+
+export interface AssigneeInfo {
+  id: string;
+  name: string;
+  email: string;
 }
 
 export interface IssueSummary {
@@ -39,6 +46,7 @@ export interface IssueSummary {
   state: string;
   priority: number;
   url: string;
+  assignee?: AssigneeInfo;
 }
 
 export interface IssueDetail extends IssueSummary {
@@ -155,6 +163,9 @@ export class LinearClient {
       if (opts?.stateType) {
         filter.state = { type: { eq: opts.stateType } };
       }
+      if (opts?.assigneeEmail) {
+        filter.assignee = { email: { eq: opts.assigneeEmail } };
+      }
       const result = await this.client.issues({
         filter,
         first: opts?.limit ?? 50,
@@ -163,6 +174,7 @@ export class LinearClient {
       const summaries: IssueSummary[] = [];
       for (const issue of result.nodes) {
         const state = await issue.state;
+        const assignee = await issue.assignee;
         summaries.push({
           identifier: issue.identifier,
           id: issue.id,
@@ -170,6 +182,7 @@ export class LinearClient {
           state: state?.name ?? "Unknown",
           priority: issue.priority,
           url: issue.url,
+          assignee: assignee ? { id: assignee.id, name: assignee.name, email: assignee.email } : undefined,
         });
       }
       return summaries;
@@ -194,6 +207,7 @@ export class LinearClient {
           if (issueTeam?.id !== resolvedTeamId) continue;
         }
         const state = await issue.state;
+        const assignee = await issue.assignee;
         summaries.push({
           identifier: issue.identifier,
           id: issue.id,
@@ -201,6 +215,7 @@ export class LinearClient {
           state: state?.name ?? "Unknown",
           priority: issue.priority,
           url: issue.url,
+          assignee: assignee ? { id: assignee.id, name: assignee.name, email: assignee.email } : undefined,
         });
       }
       return summaries;
@@ -258,6 +273,7 @@ export class LinearClient {
     try {
       const issue = await this.client.issue(identifier);
       const state = await issue.state;
+      const assignee = await issue.assignee;
       return {
         identifier: issue.identifier,
         id: issue.id,
@@ -266,6 +282,7 @@ export class LinearClient {
         priority: issue.priority,
         url: issue.url,
         description: issue.description ?? undefined,
+        assignee: assignee ? { id: assignee.id, name: assignee.name, email: assignee.email } : undefined,
       };
     } catch (err) {
       log.error("Failed to find issue", { error: String(err), identifier });
