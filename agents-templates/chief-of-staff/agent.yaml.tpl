@@ -26,19 +26,14 @@ servers:
   - memory
   - contacts
   - crm-search
-  - product-search
-  - ops-search
   - conversation-search
-  - hubspot-crm
   - slack
   - brave-search
-  - linear
-  - permits
   - tasks
   - recall
   - google-workspace
   - admin
   - callback
-  - dodi-ops
+  - permits
 plugins:
   - dodi-dev
