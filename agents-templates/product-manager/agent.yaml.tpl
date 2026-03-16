@@ -15,6 +15,7 @@ servers:
   - contacts
   - crm-search
   - product-search
+  - conversation-search
   - hubspot-crm
   - brave-search
   - google-workspace

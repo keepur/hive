@@ -12,8 +12,10 @@ import { config as appConfig } from "../config.js";
 import { loadPlugins } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { loadSkillIndex, type SkillIndex } from "./skill-loader.js";
+import { ConversationIndex } from "../search/conversation-index.js";
 
 const log = createLogger("agent-manager");
+const conversationIndex = new ConversationIndex();
 
 interface QueuedMessage {
   message: WorkItem;
@@ -191,6 +193,21 @@ export class AgentManager {
         }
 
         item.resolve(result);
+
+        // Fire-and-forget: index conversation turn for semantic recall
+        if (result.text && !result.error) {
+          conversationIndex.index({
+            agentId,
+            threadId,
+            channelId: item.message.source.id,
+            source: item.message.source.kind,
+            senderName: item.message.senderName ?? "unknown",
+            timestampUnix: Math.floor(Date.now() / 1000),
+            timestamp: new Date().toISOString(),
+            inbound: prompt,
+            response: result.text,
+          }).catch(err => log.warn("Conversation indexing failed", { agentId, error: String(err) }));
+        }
       } catch (err) {
         const state = this.states.get(agentId);
         if (state) {

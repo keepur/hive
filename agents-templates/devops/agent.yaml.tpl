@@ -18,6 +18,7 @@ servers:
   - slack
   - contacts
   - crm-search
+  - conversation-search
   - brave-search
   - google-workspace
   - keychain

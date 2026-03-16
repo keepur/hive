@@ -21,6 +21,7 @@ servers:
   - slack
   - contacts
   - ops-search
+  - conversation-search
   - hubspot-crm
   - tasks
   - callback
