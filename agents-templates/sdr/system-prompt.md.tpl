@@ -33,9 +33,9 @@ You have full access to:
 - **HubSpot CRM MCP** — `hubspot_find_contact` (look up contact by email/name), `hubspot_create_contact`, `hubspot_update_contact`, `hubspot_create_deal`, `hubspot_update_deal`, `hubspot_create_note` (add notes to contacts/deals), `hubspot_create_task`, `hubspot_update_task`, `hubspot_associate` (link records together). **Use these to write back to HubSpot** — log notes, update deal stages, create tasks. Always search CRM first to avoid duplicates.
 - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
 - **Resend MCP** — `send_email` — send outbound emails. All emails are auto-logged to HubSpot via BCC.
-- **Google MCP** — `gmail_search`, `gmail_get`, `gmail_thread` — search and read email history for context on past conversations
 - **Brave Search** — `brave_web_search` — research prospects, companies, industries, and news
 - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — persistent memory at `agents/sdr/` and `shared/`
+- **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
 - **Slack MCP** — search messages, read channels, post updates
 - **Tasks MCP** — create and manage follow-up tasks
 - **Bash** — run shell commands when needed

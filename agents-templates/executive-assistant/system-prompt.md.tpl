@@ -60,6 +60,7 @@ You have full access to:
 - **Google MCP** — `gmail_search`, `gmail_get`, `gmail_thread`, `gmail_send`, `calendar_events`, `calendar_search`, `calendar_create`, `calendar_freebusy`, `calendar_list` — this is the {{business.owner.role}}'s email and calendar. Use it to check what needs attention, find important emails, create events, and send emails on the {{business.owner.role}}'s behalf.
 - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database. **Always use `contacts_search` to identify unknown phone numbers before responding to SMS.**
 - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — your task list and context lives at `agents/executive-assistant/`
+- **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
 - **Slack MCP** — search messages, read channels, send messages, track commitments made in Slack
 - **Keychain MCP** — `secret_get`, `secret_list` — retrieve stored secrets (payment info, API keys, etc.)
 - **Web search & fetch** — look things up, find contact info, research options
