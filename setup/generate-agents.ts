@@ -22,6 +22,7 @@ const META_FILE = join(ROOT, ".hive-generated.json");
 
 const PLUGINS_DIR = join(ROOT, "plugins", "claude-code");
 const PLUGIN_CACHE = join(homedir(), ".claude", "plugins", "cache");
+const PLUGIN_MARKETPLACES = join(homedir(), ".claude", "plugins", "marketplaces");
 
 interface SmsLine {
   id: string;
@@ -67,31 +68,55 @@ function renderAgent(template: string, ctx: Record<string, any>): string {
 }
 
 function syncPlugins(): void {
-  if (!existsSync(PLUGIN_CACHE)) {
-    console.log("\n  No plugin cache found — skipping plugin sync");
+  if (!existsSync(PLUGIN_CACHE) && !existsSync(PLUGIN_MARKETPLACES)) {
+    console.log("\n  No plugin cache or marketplaces found — skipping plugin sync");
     return;
   }
 
-  // Build index: plugin-name → latest cache path
+  // Build index: plugin-name → source path (marketplaces take priority over cache)
   const pluginIndex = new Map<string, string>();
-  const sourceRepos = readdirSync(PLUGIN_CACHE).filter((d) => statSync(join(PLUGIN_CACHE, d)).isDirectory());
 
-  for (const repo of sourceRepos) {
-    const repoDir = join(PLUGIN_CACHE, repo);
-    const plugins = readdirSync(repoDir).filter((d) => statSync(join(repoDir, d)).isDirectory());
+  // 1. Scan cache (versioned directories, pick latest by mtime)
+  if (existsSync(PLUGIN_CACHE)) {
+    const sourceRepos = readdirSync(PLUGIN_CACHE).filter((d) => statSync(join(PLUGIN_CACHE, d)).isDirectory());
 
-    for (const pluginName of plugins) {
-      const pluginDir = join(repoDir, pluginName);
-      const versions = readdirSync(pluginDir).filter((d) => statSync(join(pluginDir, d)).isDirectory());
+    for (const repo of sourceRepos) {
+      const repoDir = join(PLUGIN_CACHE, repo);
+      const plugins = readdirSync(repoDir).filter((d) => statSync(join(repoDir, d)).isDirectory());
 
-      if (versions.length === 0) continue;
+      for (const pluginName of plugins) {
+        const pluginDir = join(repoDir, pluginName);
+        const versions = readdirSync(pluginDir).filter((d) => statSync(join(pluginDir, d)).isDirectory());
 
-      // Pick latest by mtime
-      const latest = versions
-        .map((v) => ({ v, mtime: statSync(join(pluginDir, v)).mtimeMs }))
-        .sort((a, b) => b.mtime - a.mtime)[0]!;
+        if (versions.length === 0) continue;
 
-      pluginIndex.set(pluginName, join(pluginDir, latest.v));
+        // Pick latest by mtime
+        const latest = versions
+          .map((v) => ({ v, mtime: statSync(join(pluginDir, v)).mtimeMs }))
+          .sort((a, b) => b.mtime - a.mtime)[0]!;
+
+        pluginIndex.set(pluginName, join(pluginDir, latest.v));
+      }
+    }
+  }
+
+  // 2. Scan marketplaces (flat directories, override cache — always latest)
+  if (existsSync(PLUGIN_MARKETPLACES)) {
+    const marketplaces = readdirSync(PLUGIN_MARKETPLACES).filter((d) =>
+      statSync(join(PLUGIN_MARKETPLACES, d)).isDirectory(),
+    );
+
+    for (const marketplace of marketplaces) {
+      const marketplaceDir = join(PLUGIN_MARKETPLACES, marketplace);
+      const plugins = readdirSync(marketplaceDir).filter((d) => statSync(join(marketplaceDir, d)).isDirectory());
+
+      for (const pluginName of plugins) {
+        if (pluginName.startsWith(".")) continue;
+        const pluginPath = join(marketplaceDir, pluginName);
+        // Only index if it looks like a plugin (has skills/ or .claude-plugin/)
+        if (!existsSync(join(pluginPath, "skills")) && !existsSync(join(pluginPath, ".claude-plugin"))) continue;
+        pluginIndex.set(pluginName, pluginPath);
+      }
     }
   }
 
