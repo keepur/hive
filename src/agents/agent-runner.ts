@@ -367,6 +367,14 @@ export class AgentRunner {
       env: { ...searchEnv },
     };
 
+    // Conversation Search — semantic search over past agent conversations (Qdrant only)
+    servers["conversation-search"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/search/conversation-search-mcp-server.js")],
+      env: { ...searchEnv, AGENT_ID: this.agentConfig.id },
+    };
+
     // ── Plugin MCP Servers ──────────────────────────────────────────
     for (const plugin of this.plugins) {
       for (const [name, serverDef] of Object.entries(plugin.manifest.mcpServers)) {

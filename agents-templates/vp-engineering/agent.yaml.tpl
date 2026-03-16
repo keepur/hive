@@ -15,6 +15,7 @@ servers:
   - memory
   - linear
   - brave-search
+  - conversation-search
   - slack
   - keychain
   - background

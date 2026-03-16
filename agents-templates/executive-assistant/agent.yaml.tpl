@@ -17,6 +17,7 @@ servers:
   - keychain
   - quo
   - crm-search
+  - conversation-search
   - hubspot-crm
   - brave-search
   - tasks

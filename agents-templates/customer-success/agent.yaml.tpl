@@ -19,6 +19,7 @@ servers:
   - memory
   - crm-search
   - product-search
+  - conversation-search
   - hubspot-crm
   - contacts
   - slack

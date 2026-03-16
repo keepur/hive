@@ -23,6 +23,7 @@ servers:
   - memory
   - catalog
   - product-search
+  - conversation-search
   - slack
   - callback
 plugins:

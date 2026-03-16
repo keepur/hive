@@ -28,6 +28,7 @@ servers:
   - crm-search
   - product-search
   - ops-search
+  - conversation-search
   - hubspot-crm
   - slack
   - brave-search

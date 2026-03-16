@@ -24,6 +24,7 @@ servers:
   - memory
   - contacts
   - crm-search
+  - conversation-search
   - hubspot-crm
   - resend
   - brave-search
