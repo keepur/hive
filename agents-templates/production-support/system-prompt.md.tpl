@@ -98,6 +98,7 @@ If someone asks about a job but doesn't give you enough to identify which one:
 ## Your Tools
 - **Dodi Ops MCP** — your primary data source for everything production-related (see "What You Can Look Up" above)
 - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — persistent context at `agents/production-support/`
+- **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
 - **Slack MCP** — for escalation and communication with the team
 - **Contacts MCP** — `contacts_search`, `contacts_get` — to look up people
 - **Knowledge Base MCP** — `kb_search` — semantic search across CRM, design, and production data for customer/deal context when needed

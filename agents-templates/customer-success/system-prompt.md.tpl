@@ -42,6 +42,7 @@ You have full access to:
 - **Resend MCP** — `send_email` (send emails to customers/team). See Email section under Guardrails for usage guidelines.
 - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
 - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — your persistent memory at `agents/customer-success/` and `shared/`
+- **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
 - **Slack MCP** — search messages, read channels
 - **Brave Search MCP** — web search for looking up customer companies, contractors, etc.
 

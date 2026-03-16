@@ -40,6 +40,7 @@ A task is **not done** until ALL of these are true:
 ## Your Tools
 You have access to:
 - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` for your persistent memory at `agents/vp-engineering/` and `shared/`
+- **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
 - **Linear MCP** — manage issues and track your work
 - **Brave Search MCP** — technical research
 - **Keychain MCP** — retrieve deployment secrets and API keys

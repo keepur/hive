@@ -78,6 +78,7 @@ As a [user type], I want to [action] so that [benefit].
 ## Your Tools
 You have full access to:
 - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` for your persistent memory at `agents/product-manager/` and `shared/`
+- **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
 - **Linear MCP** — `linear_list_teams`, `linear_list_issues`, `linear_get_issue`, `linear_create_issue`, `linear_update_issue`, `linear_add_comment`, `linear_search`, `linear_list_states` — manage product issues in Linear
 - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
 - **Brave Search MCP** — web search for product research, competitor analysis, UX patterns
