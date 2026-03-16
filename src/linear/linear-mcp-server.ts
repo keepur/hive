@@ -86,20 +86,24 @@ server.registerTool(
         .enum(["backlog", "unstarted", "started", "completed", "canceled"])
         .optional()
         .describe("Filter by workflow state type"),
+      assigneeEmail: z.string().optional().describe("Filter by assignee email address (e.g. bot@dodihome.com)"),
       limit: z.number().optional().default(25).describe("Max results to return"),
     },
   },
-  async ({ teamId, statusType, limit }) => {
+  async ({ teamId, statusType, assigneeEmail, limit }) => {
     try {
       const issues = await linearClient.listIssues({
         teamId,
         stateType: statusType,
+        assigneeEmail,
         limit,
       });
       if (issues.length === 0) {
         return { content: [{ type: "text", text: "No issues found." }] };
       }
-      const lines = issues.map((i) => `${i.identifier}: ${i.title} [${i.state}]`);
+      const lines = issues.map(
+        (i) => `${i.identifier}: ${i.title} [${i.state}]${i.assignee ? ` (${i.assignee.name})` : ""}`,
+      );
       return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Failed to list issues: ${String(err)}` }], isError: true };
@@ -268,7 +272,9 @@ server.registerTool(
       if (issues.length === 0) {
         return { content: [{ type: "text", text: "No results." }] };
       }
-      const lines = issues.map((i) => `${i.identifier}: ${i.title} [${i.state}]`);
+      const lines = issues.map(
+        (i) => `${i.identifier}: ${i.title} [${i.state}]${i.assignee ? ` (${i.assignee.name})` : ""}`,
+      );
       return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Failed to search issues: ${String(err)}` }], isError: true };
