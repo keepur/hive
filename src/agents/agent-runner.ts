@@ -332,6 +332,25 @@ export class AgentRunner {
       },
     };
 
+    // Code task server — agents can spawn Claude Code CLI sessions
+    servers["code-task"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/code-task/code-task-mcp-server.js")],
+      env: {
+        CT_TASK_API: `http://127.0.0.1:${config.codeTask.port}`,
+        CT_AUTH_TOKEN: config.codeTask.authToken,
+        CT_AGENT_ID: this.agentConfig.id,
+        CT_ADAPTER_ID: context?.adapterId ?? "",
+        CT_CHANNEL_ID: context?.channelId ?? "",
+        CT_CHANNEL_KIND: context?.channelKind ?? "internal",
+        CT_CHANNEL_LABEL: context?.channelLabel ?? "",
+        CT_THREAD_ID: context?.threadId ?? "",
+        CT_SLACK_TS: context?.slackTs ?? "",
+        CT_SLACK_THREAD_TS: context?.slackThreadTs ?? "",
+      },
+    };
+
     // ── Domain Search Servers ──────────────────────────────────────
     // Shared env for all search servers (Qdrant + Ollama + MongoDB for stage mappings)
     const searchEnv: Record<string, string> = {
