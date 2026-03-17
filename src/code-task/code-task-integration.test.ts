@@ -21,7 +21,7 @@ import type { WorkItem } from "../types/work-item.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = resolve(__dirname, "test-fixtures");
 
-const PORT = 39200;
+const PORT = 39300;
 const AUTH_TOKEN = "test-integration";
 const PLUGIN_DIR = "/tmp/fake-plugin-dir";
 
