@@ -20,5 +20,6 @@ servers:
   - keychain
   - background
   - callback
+  - code-task
 plugins:
   - dodi-dev
