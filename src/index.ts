@@ -16,6 +16,7 @@ import { SmsAdapter } from "./channels/sms-adapter.js";
 import { TaskClient } from "./tasks/task-client.js";
 import { TaskLedger } from "./tasks/task-ledger.js";
 import { BackgroundTaskManager } from "./background/background-task-manager.js";
+import { CodeTaskManager } from "./code-task/code-task-manager.js";
 import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
@@ -81,6 +82,21 @@ async function main(): Promise<void> {
   await bgTaskManager.start();
   await bgTaskManager.scanOrphans();
   log.info("Background task manager started", { port: config.background.port });
+
+  // Code task manager — agents can spawn Claude Code CLI sessions
+  const codeTaskManager = new CodeTaskManager(
+    config.codeTask.port,
+    config.codeTask.authToken,
+    config.codeTask.pluginDir,
+    config.codeTask.maxConcurrent,
+    (item) =>
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("Code task completion dispatch failed", { error: String(err) });
+      }),
+  );
+  await codeTaskManager.start();
+  await codeTaskManager.scanOrphans();
+  log.info("Code task manager started", { port: config.codeTask.port });
 
   // Meeting monitor — real-time meeting participation via Recall.ai
   let meetingMonitor: MeetingMonitor | undefined;
@@ -239,6 +255,7 @@ async function main(): Promise<void> {
       dispatcher,
       slackAdapters,
       bgTaskManager,
+      codeTaskManager,
       meetingMonitor,
       taskLedger: taskLedger.isConfigured ? taskLedger : undefined,
       slackGateways,
@@ -258,6 +275,7 @@ async function main(): Promise<void> {
     if (wsAdapter) await wsAdapter.stop();
     scheduler.stop();
     bgTaskManager.stop();
+    codeTaskManager.stop();
     meetingMonitor?.stop();
     agentManager.stopAll();
     await sessionStore.close();

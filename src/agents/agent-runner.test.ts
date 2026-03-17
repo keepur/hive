@@ -72,6 +72,7 @@ vi.mock("../config.js", () => ({
       webhookSecret: "test-webhook-secret",
     },
     background: { port: 3200, authToken: "test-bg-token" },
+    codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
     anthropic: { apiKey: "test-key" },
     externalComms: { enabled: true },
     triage: { enabled: false },
