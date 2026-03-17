@@ -161,11 +161,17 @@ export class CodeTaskManager {
 
     // POST /tasks — spawn a new code task
     if (req.method === "POST" && url.pathname === "/tasks") {
-      const body = await this.readBody(req);
-      const parsed = JSON.parse(body);
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(await this.readBody(req));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
 
       try {
-        const task = await this.spawnTask(parsed);
+        const task = await this.spawnTask(parsed as Parameters<typeof this.spawnTask>[0]);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ id: task.id, status: "running" }));
       } catch (err) {
@@ -181,11 +187,18 @@ export class CodeTaskManager {
     const respondMatch = url.pathname.match(/^\/tasks\/([a-f0-9-]+)\/respond$/);
     if (req.method === "POST" && respondMatch) {
       const id = respondMatch[1];
-      const body = await this.readBody(req);
-      const parsed = JSON.parse(body);
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(await this.readBody(req));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
 
       try {
-        const task = await this.resumeTask(id, parsed.response, parsed.context);
+        const task = await this.resumeTask(id, parsed.response as string, parsed.context as CodeTaskContext);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ id: task.id, status: "running", resumedFrom: id }));
       } catch (err) {
@@ -272,6 +285,13 @@ export class CodeTaskManager {
       stdio: ["ignore", stdoutFd, stderrFd],
     });
 
+    // Attach listeners before closing fds to avoid missing immediate exits (ENOENT, etc.)
+    child.on("exit", (code) => this.handleExit(id, code));
+    child.on("error", (err) => {
+      log.error("Code task process error", { id, error: String(err) });
+      this.handleExit(id, 1);
+    });
+
     closeSync(stdoutFd);
     closeSync(stderrFd);
 
@@ -300,12 +320,6 @@ export class CodeTaskManager {
 
     this.tasks.set(id, task);
     await this.writeMeta(task);
-
-    child.on("exit", (code) => this.handleExit(id, code));
-    child.on("error", (err) => {
-      log.error("Code task process error", { id, error: String(err) });
-      this.handleExit(id, 1);
-    });
 
     log.info("Code task spawned", {
       id,

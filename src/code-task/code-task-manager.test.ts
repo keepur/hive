@@ -318,35 +318,38 @@ describe("concurrency limit", () => {
     await mgr.start();
 
     try {
-      // Spawn a long-running task (sleep 10)
-      const res1 = await fetch(`http://127.0.0.1:${PORT + 1}/tasks`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${AUTH_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          prompt: "long task",
-          cwd: "/tmp",
-          context: makeContext(),
+      // Send both requests concurrently — the first grabs the slot, the second should be rejected.
+      // Using Promise.all ensures both hit the server before the event loop processes exit events.
+      const [res1, res2] = await Promise.all([
+        fetch(`http://127.0.0.1:${PORT + 1}/tasks`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${AUTH_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            prompt: "task 1",
+            cwd: "/tmp",
+            context: makeContext(),
+          }),
         }),
-      });
-      expect(res1.status).toBe(200);
+        fetch(`http://127.0.0.1:${PORT + 1}/tasks`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${AUTH_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            prompt: "task 2",
+            cwd: "/tmp",
+            context: makeContext(),
+          }),
+        }),
+      ]);
 
-      // Try to spawn another — should fail with 429
-      const res2 = await fetch(`http://127.0.0.1:${PORT + 1}/tasks`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${AUTH_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          prompt: "another task",
-          cwd: "/tmp",
-          context: makeContext(),
-        }),
-      });
-      expect(res2.status).toBe(429);
+      const statuses = [res1.status, res2.status].sort();
+      // One should succeed (200), one should be rejected (429)
+      expect(statuses).toEqual([200, 429]);
     } finally {
       mgr.stop();
     }
