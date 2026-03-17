@@ -139,6 +139,15 @@ export const config = {
     port: parseInt(optional("BG_TASK_PORT", "3100"), 10),
     authToken: optional("BG_TASK_AUTH_TOKEN", "") || randomUUID(),
   },
+  codeTask: {
+    port: parseInt(optional("CODE_TASK_PORT", "3102"), 10),
+    authToken: optional("CODE_TASK_AUTH_TOKEN", "") || randomUUID(),
+    pluginDir: optional("CODE_TASK_PLUGIN_DIR", resolve("plugins/claude-code/dodi-dev")),
+    defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-4-6"),
+    defaultMaxTurns: parseInt(optional("CODE_TASK_MAX_TURNS", "100"), 10),
+    defaultMaxBudget: parseFloat(optional("CODE_TASK_MAX_BUDGET", "5.00")),
+    maxConcurrent: parseInt(optional("CODE_TASK_MAX_CONCURRENT", "2"), 10),
+  },
   ws: {
     enabled: optional("WS_ENABLED", "false") === "true",
     port: parseInt(optional("WS_PORT", "3200"), 10),

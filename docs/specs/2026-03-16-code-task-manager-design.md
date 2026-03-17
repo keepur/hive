@@ -1,7 +1,8 @@
 # Code Task Manager — Design Spec
 
 **Date**: 2026-03-16
-**Status**: Draft
+**Updated**: 2026-03-17 — resolved open questions, validated assumptions
+**Status**: Approved
 
 ## Problem
 
@@ -34,8 +35,9 @@ When Claude Code spawns with `cwd` set to a dodi_v2 worktree:
 - **Project skills** (`.claude/skills/`) — `/quality-gate`, `/create-tests`, `/meteor-compliance`, `/dev-servers`, etc.
 - **dodi-dev plugin skills** — `dodi-dev:implement`, `dodi-dev:review`, `dodi-dev:submit`, etc. (loaded via `--plugin-dir`)
 - **MCP servers** — Linear, etc. (loaded via `--mcp-config` if needed)
+- **`.claude/settings.local.json`** — pre-approved tool permissions for dodi_v2
 
-No special wiring needed for any of this — it's how Claude Code works.
+No special wiring needed for any of this — it's how Claude Code works. **Verified**: all of the above confirmed working via manual CLI tests on 2026-03-17.
 
 ## Architecture
 
@@ -82,7 +84,6 @@ Spawns a Claude Code CLI session as a detached background process.
     properties: {
       prompt:       { type: "string", description: "What to do (task description, plan reference, etc.)" },
       cwd:          { type: "string", description: "Working directory (worktree path)" },
-      allowedTools: { type: "array", items: { type: "string" }, description: "Tools to pre-approve (default: Read,Write,Edit,Bash,Glob,Grep,Agent)" },
       maxTurns:     { type: "number", description: "Max agentic turns (default: 100)" },
       maxBudget:    { type: "number", description: "Max spend in USD (default: 5.00)" },
       model:        { type: "string", description: "Model override (default: from config)" },
@@ -232,12 +233,8 @@ private buildArgs(params: CodeTaskParams): string[] {
     "--output-format", "json",
     "--max-turns", String(params.maxTurns ?? 100),
     "--max-budget-usd", String(params.maxBudget ?? 5.0),
-    "--permission-mode", "auto",
+    "--dangerously-skip-permissions",
   ];
-
-  if (params.allowedTools?.length) {
-    args.push("--allowedTools", params.allowedTools.join(","));
-  }
 
   if (params.model) {
     args.push("--model", params.model);
@@ -252,6 +249,8 @@ private buildArgs(params: CodeTaskParams): string[] {
 ```
 
 Spawned via `spawn("claude", args, { cwd: worktreePath, detached: true, stdio: [...] })` — same `detached: true` pattern as BackgroundTaskManager for process isolation.
+
+**Decision (2026-03-17):** Use `--dangerously-skip-permissions` instead of `--permission-mode auto` + `--allowedTools`. The inner session runs trusted code on a trusted machine — no user-facing interaction. This avoids maintaining an allowlist and prevents the session from hanging on permission prompts in `-p` mode. The dodi_v2 project's `.claude/settings.local.json` already has granular tool approvals as a secondary safety net.
 
 ### Output Handling
 
@@ -296,15 +295,7 @@ codeTask:
   defaultModel: claude-sonnet-4-6
   defaultMaxTurns: 100
   defaultMaxBudget: 5.00
-  defaultAllowedTools:
-    - Read
-    - Write
-    - Edit
-    - Bash
-    - Glob
-    - Grep
-    - Agent
-    - Skill
+  maxConcurrent: 2
 ```
 
 In `config.ts`:
@@ -317,6 +308,7 @@ codeTask: {
   defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-4-6"),
   defaultMaxTurns: parseInt(optional("CODE_TASK_MAX_TURNS", "100"), 10),
   defaultMaxBudget: parseFloat(optional("CODE_TASK_MAX_BUDGET", "5.00")),
+  maxConcurrent: parseInt(optional("CODE_TASK_MAX_CONCURRENT", "2"), 10),
 },
 ```
 
@@ -333,9 +325,9 @@ const codeTaskManager = new CodeTaskManager(
 );
 await codeTaskManager.start();
 await codeTaskManager.scanOrphans();
-
-sweeper.register("code-task-manager", (ttl) => codeTaskManager.sweep(ttl));
 ```
+
+Add `codeTaskManager` to `SweeperTargets` interface and the `Sweeper` constructor call. Add a sweep step in `Sweeper.sweep()` (same pattern as bgTaskManager).
 
 ### agent-runner.ts — buildMcpServers()
 
@@ -415,12 +407,13 @@ src/code-task/
 
 ## Security
 
-- **No `--dangerously-skip-permissions`** — use `--permission-mode auto` with `--allowedTools` whitelist instead
+- **`--dangerously-skip-permissions`** — inner sessions are trusted, non-interactive code on a trusted machine. The dodi_v2 `.claude/settings.local.json` provides a secondary layer of tool approvals.
 - **Bearer token auth** on all HTTP endpoints (same pattern as BackgroundTaskManager)
 - **Loopback only** — HTTP server on 127.0.0.1
 - **Per-agent isolation** — tasks tagged with agent ID
 - **Budget cap** — `--max-budget-usd` prevents runaway spend
 - **Turn cap** — `--max-turns` prevents infinite loops
+- **Concurrency cap** — max 2 concurrent sessions (configurable)
 - **No shell injection** — `spawn("claude", argsArray)`, never shell strings
 
 ## Risks and Mitigations
@@ -433,7 +426,7 @@ src/code-task/
 | Cost overrun | Per-task budget cap + aggregate tracking per ticket |
 | Orphaned sessions (Hive restarts) | Same orphan recovery pattern as BackgroundTaskManager |
 | Plugin dir path differs dev vs deploy | Configured in hive.yaml, not hardcoded |
-| ANTHROPIC_API_KEY needed for CLI | Must be set in deploy env — separate from Hive's subscription auth |
+| Auth fails if Hive moves to LaunchDaemon | Will need `ANTHROPIC_API_KEY` — currently inherits subscription auth from GUI session |
 
 ## Prior Art
 
@@ -442,17 +435,21 @@ src/code-task/
 - **jefest-mcp** — 3-tier contract-based model (Opus plans → orchestrator → Sonnet executes in worktrees). Similar philosophy but uses structured documents, not exit-and-resume.
 - **Hive's BackgroundTaskManager** — direct architectural ancestor. We reuse spawn, lifecycle, orphan recovery, and completion-via-dispatcher patterns.
 
-## Open Questions
+## Resolved Questions (2026-03-17)
 
-1. **Should the inner session get a Linear MCP?** Pro: can read tickets directly. Con: more tools = more context. Leaning: yes, pass `--mcp-config` with Linear only.
+1. **Linear MCP for inner session?** Deferred to v2. Inner session gets ticket context via Jasper's prompt. If sessions need to read tickets directly, add `--mcp-config` later.
 
-2. **Streaming progress to Slack?** CLI supports `--output-format stream-json`. We could pipe and post periodic updates. Leaning: not in v1, add if sessions feel "silent."
+2. **Streaming progress to Slack?** Not in v1. Add if sessions feel "silent."
 
-3. **Per-ticket cost aggregation** — track cumulative cost across resume cycles for budget alerting?
+3. **Per-ticket cost aggregation?** Yes — CodeTaskManager tracks `total_cost_usd` per task and across resume cycles. Deferred: aggregate alerting.
 
-4. **Concurrent sessions** — Jasper might run sessions on multiple tickets. Should we cap concurrency? Leaning: allow 2-3 concurrent, configurable.
+4. **Concurrent sessions?** Cap at 2 (configurable via `maxConcurrent`).
 
-5. **Auth model for CLI** — deploy machine currently uses subscription auth (LaunchAgent/GUI session). Claude Code CLI may need `ANTHROPIC_API_KEY` instead. Need to verify.
+5. **Auth model for CLI?** **Resolved**: CLI inherits subscription auth from the GUI session (LaunchAgent). Tested and confirmed — no `ANTHROPIC_API_KEY` needed. If Hive moves to LaunchDaemon in the future, will need API key.
+
+6. **Permission model?** **Resolved**: Use `--dangerously-skip-permissions`. Inner sessions are trusted code on a trusted machine. dodi_v2's `.claude/settings.local.json` provides secondary safety.
+
+7. **Worktree creation?** **Resolved**: Jasper creates the worktree and passes `cwd` to `code_task`. He owns the workflow; the inner session owns the coding.
 
 ## Out of Scope (v1)
 
