@@ -50,11 +50,17 @@ interface CodeTask {
   parentTaskId: string | null;
 }
 
+export interface CodeTaskManagerOptions {
+  /** Path to the claude CLI binary (default: "claude") */
+  cliBin?: string;
+}
+
 export class CodeTaskManager {
   private port: number;
   private authToken: string;
   private pluginDir: string;
   private maxConcurrent: number;
+  private cliBin: string;
   private tasks = new Map<string, CodeTask>();
   private onComplete: (item: WorkItem) => void;
   private server: Server | null = null;
@@ -66,12 +72,14 @@ export class CodeTaskManager {
     pluginDir: string,
     maxConcurrent: number,
     onComplete: (item: WorkItem) => void,
+    options?: CodeTaskManagerOptions,
   ) {
     this.port = port;
     this.authToken = authToken;
     this.pluginDir = pluginDir;
     this.maxConcurrent = maxConcurrent;
     this.onComplete = onComplete;
+    this.cliBin = options?.cliBin ?? "claude";
   }
 
   async start(): Promise<void> {
@@ -279,7 +287,7 @@ export class CodeTaskManager {
     const stdoutFd = openSync(stdoutPath, "w");
     const stderrFd = openSync(stderrPath, "w");
 
-    const child = spawn("claude", args, {
+    const child = spawn(this.cliBin, args, {
       cwd,
       detached: true,
       stdio: ["ignore", stdoutFd, stderrFd],
