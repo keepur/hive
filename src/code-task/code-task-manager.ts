@@ -351,11 +351,7 @@ export class CodeTaskManager {
 
   // ── Resume ──────────────────────────────────────────────────────────
 
-  private async resumeTask(
-    taskId: string,
-    response: string,
-    context?: CodeTaskContext,
-  ): Promise<CodeTask> {
+  private async resumeTask(taskId: string, response: string, context?: CodeTaskContext): Promise<CodeTask> {
     const original = this.tasks.get(taskId);
     if (!original) throw new Error(`Task ${taskId} not found`);
     if (original.status !== "needs_input") {
@@ -421,10 +417,7 @@ export class CodeTaskManager {
     const buildText = async (): Promise<string> => {
       if (task.status === "needs_input" && task.escalation) {
         // Escalation — needs Jasper's input
-        const lines = [
-          `[Code task needs input] Task \`${task.id}\` is waiting for a decision.`,
-          "",
-        ];
+        const lines = [`[Code task needs input] Task \`${task.id}\` is waiting for a decision.`, ""];
         if (task.escalation.status === "BLOCKED") {
           lines.push(`**BLOCKED**: ${task.escalation.question || "No details provided."}`);
         } else {

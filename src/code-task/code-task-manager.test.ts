@@ -146,28 +146,68 @@ Files changed: 3
 
 describe("resolveTaskStatus", () => {
   it("returns completed for exit 0 + success", () => {
-    const output = { sessionId: null, result: "", subtype: "success", costUsd: 0, durationMs: 0, numTurns: 0, isError: false };
+    const output = {
+      sessionId: null,
+      result: "",
+      subtype: "success",
+      costUsd: 0,
+      durationMs: 0,
+      numTurns: 0,
+      isError: false,
+    };
     expect(resolveTaskStatus(0, output, null)).toBe("completed");
   });
 
   it("returns needs_input for escalation", () => {
-    const output = { sessionId: null, result: "", subtype: "success", costUsd: 0, durationMs: 0, numTurns: 0, isError: false };
+    const output = {
+      sessionId: null,
+      result: "",
+      subtype: "success",
+      costUsd: 0,
+      durationMs: 0,
+      numTurns: 0,
+      isError: false,
+    };
     const escalation = { status: "BLOCKED" as const, question: "help", context: "" };
     expect(resolveTaskStatus(0, output, escalation)).toBe("needs_input");
   });
 
   it("returns needs_input for max_turns", () => {
-    const output = { sessionId: null, result: "", subtype: "error_max_turns", costUsd: 0, durationMs: 0, numTurns: 100, isError: true };
+    const output = {
+      sessionId: null,
+      result: "",
+      subtype: "error_max_turns",
+      costUsd: 0,
+      durationMs: 0,
+      numTurns: 100,
+      isError: true,
+    };
     expect(resolveTaskStatus(1, output, null)).toBe("needs_input");
   });
 
   it("returns needs_input for max_budget", () => {
-    const output = { sessionId: null, result: "", subtype: "error_max_budget_usd", costUsd: 5, durationMs: 0, numTurns: 50, isError: true };
+    const output = {
+      sessionId: null,
+      result: "",
+      subtype: "error_max_budget_usd",
+      costUsd: 5,
+      durationMs: 0,
+      numTurns: 50,
+      isError: true,
+    };
     expect(resolveTaskStatus(1, output, null)).toBe("needs_input");
   });
 
   it("returns failed for non-zero exit without escalation", () => {
-    const output = { sessionId: null, result: "Error occurred", subtype: "error", costUsd: 0, durationMs: 0, numTurns: 0, isError: true };
+    const output = {
+      sessionId: null,
+      result: "Error occurred",
+      subtype: "error",
+      costUsd: 0,
+      durationMs: 0,
+      numTurns: 0,
+      isError: true,
+    };
     expect(resolveTaskStatus(1, output, null)).toBe("failed");
   });
 
