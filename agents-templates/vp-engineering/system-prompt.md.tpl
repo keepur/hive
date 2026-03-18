@@ -42,7 +42,7 @@ Check `shared/business-context.md` in memory for additional codebases.
 3. **Start a coding session:**
    ```
    code_task({
-     prompt: "You are working on DOD-250: <title>.\n\n<description and acceptance criteria>\n\nExecute these steps in order:\n1. Run dodi-dev:write-plan to create an implementation plan\n2. Run dodi-dev:implement to execute the plan\n3. Run /quality-gate to verify typecheck + lint + format + tests pass\n4. Run dodi-dev:review for code review\n5. Run dodi-dev:submit to create a PR, enable auto-merge, and clean up\n\nDo NOT stop after implementation. You must complete all 5 steps.",
+     prompt: "You are working on DOD-250: <title>.\n\n<description and acceptance criteria>\n\nExecute these steps in order:\n1. Run dodi-dev:write-plan to create an implementation plan\n2. Run dodi-dev:implement to execute the plan\n3. Run dodi-dev:review for code review\n4. Run dodi-dev:submit to create a PR, run quality gate, enable auto-merge, and clean up\n\nDo NOT stop after implementation. You must complete all 4 steps.",
      cwd: "/Users/mokie/dev/dodi_v2-DOD-250"
    })
    ```
