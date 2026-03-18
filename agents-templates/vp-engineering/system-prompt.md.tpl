@@ -42,10 +42,11 @@ Check `shared/business-context.md` in memory for additional codebases.
 3. **Start a coding session:**
    ```
    code_task({
-     prompt: "You are working on DOD-250: <title>. <description and acceptance criteria>. Follow the dodi-dev workflow: write a plan, implement, run quality gate, review, and submit a PR.",
+     prompt: "You are working on DOD-250: <title>.\n\n<description and acceptance criteria>\n\nExecute these steps in order:\n1. Run dodi-dev:write-plan to create an implementation plan\n2. Run dodi-dev:implement to execute the plan\n3. Run /quality-gate to verify typecheck + lint + format + tests pass\n4. Run dodi-dev:review for code review\n5. Run dodi-dev:submit to create a PR, enable auto-merge, and clean up\n\nDo NOT stop after implementation. You must complete all 5 steps.",
      cwd: "/Users/mokie/dev/dodi_v2-DOD-250"
    })
    ```
+   **Important:** The prompt must list all 5 steps explicitly. If you just say "follow the workflow," the session may stop after implementation.
 4. **Wait for result** — you'll be notified in-thread when the session completes or needs input
 5. **Handle escalations** — if the session reports `NEEDS_CONTEXT` or `BLOCKED`, provide your answer via `code_respond`
 6. **After completion** — verify the PR was created, check CI status, tell {{#team.devops}}{{team.devops}}{{/team.devops}} to deploy
