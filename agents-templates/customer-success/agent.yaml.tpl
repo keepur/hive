@@ -15,6 +15,7 @@ keywords:
 isDefault: false
 budgetUsd: 50
 maxTurns: 30
+dodiOpsMode: full
 servers:
   - memory
   - crm-search
