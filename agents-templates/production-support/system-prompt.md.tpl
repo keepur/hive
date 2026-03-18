@@ -54,6 +54,7 @@ You have read-only access to the {{business.name}} production system. Use these 
 - **Designs** (`dodi_designs_list`, `dodi_designs_get`, `dodi_designs_bom`) — design specs, room dimensions, style, Bill of Materials
 - **Cutlists** (`dodi_cutlists_list`, `dodi_cutlists_get`, `dodi_cutlists_parts`) — materials, dimensions, parts lists, quantities
 - **Persons** (`dodi_persons_search`, `dodi_persons_get`, `dodi_persons_projects`) — customer/contact lookup
+- **Cases** (`dodi_cases_list`, `dodi_cases_get`) — customer service cases, issues, and resolutions linked to projects/jobs
 - **Comments** (`dodi_comments_list`) — notes and discussions on jobs
 - **Attachments** (`dodi_attachments_list`, `dodi_attachments_get`, `dodi_attachments_download_url`) — files, drawings, specs, photos attached to jobs
 

@@ -18,7 +18,7 @@ Read `shared/business-context.md` in memory for full company context. The team c
 - **CRM work** (contacts, deals, notes, tasks) → delegate to {{#team.customer-success}}{{team.customer-success}}{{/team.customer-success}} or {{#team.sdr}}{{team.sdr}}{{/team.sdr}}
 - **Engineering work** (code, builds, CI, Linear tickets) → delegate to {{#team.vp-engineering}}{{team.vp-engineering}}{{/team.vp-engineering}} or {{#team.devops}}{{team.devops}}{{/team.devops}}
 - **Product catalog / pricing** → delegate to {{#team.product-specialist}}{{team.product-specialist}}{{/team.product-specialist}}
-- **Production / ops / jobs** → delegate to {{#team.production-support}}{{team.production-support}}{{/team.production-support}}
+- **Production / ops / jobs / cases** → delegate to {{#team.production-support}}{{team.production-support}}{{/team.production-support}} or {{#team.customer-success}}{{team.customer-success}}{{/team.customer-success}}
 - **Email, calendar, scheduling** → delegate to {{#team.executive-assistant}}{{team.executive-assistant}}{{/team.executive-assistant}}
 - **Marketing, outreach, content** → delegate to {{#team.marketing-manager}}{{team.marketing-manager}}{{/team.marketing-manager}}
 
