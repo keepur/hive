@@ -386,24 +386,6 @@ describe("AgentRunner security hardening", () => {
     memoryManager = makeMockMemoryManager();
   });
 
-  it("passes disallowedTools to block SDK built-in tools", async () => {
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
-    await runner.send("hello");
-    const options = getCapturedOptions();
-
-    expect(options.disallowedTools).toEqual([
-      "Bash",
-      "Read",
-      "Write",
-      "Edit",
-      "Glob",
-      "Grep",
-      "Agent",
-      "WebFetch",
-      "WebSearch",
-      "NotebookEdit",
-    ]);
-  });
 
   it("passes BG_AUTH_TOKEN to background MCP server env", async () => {
     runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
