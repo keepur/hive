@@ -90,23 +90,7 @@ export class AgentRunner {
     return parts.join("\n\n---\n\n");
   }
 
-  /** Agents that need SDK file system + bash tools for their role */
-  private static readonly TOOL_EXCEPTIONS: Record<string, string[]> = {
-    // CoS: file system access for agent identity management (Constitution 2.3, 7.6)
-    "chief-of-staff": ["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-    // Engineering: full tool access for dodi_v2 development (Constitution 2.5)
-    "vp-engineering": ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent", "WebFetch", "WebSearch"],
-    "devops": ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent", "WebFetch", "WebSearch"],
-  };
 
-  private static readonly ALL_DISALLOWED = [
-    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "WebFetch", "WebSearch", "NotebookEdit",
-  ];
-
-  private getDisallowedTools(): string[] {
-    const allowed = AgentRunner.TOOL_EXCEPTIONS[this.agentConfig.id] ?? [];
-    return AgentRunner.ALL_DISALLOWED.filter((t) => !allowed.includes(t));
-  }
 
   private buildMcpServers(context?: WorkItemContext): Record<string, McpServerConfig> {
     const servers: Record<string, McpServerConfig> = {};
@@ -534,7 +518,7 @@ export class AgentRunner {
         systemPrompt,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
-        disallowedTools: this.getDisallowedTools(),
+
         maxTurns: this.agentConfig.maxTurns,
         maxBudgetUsd: this.agentConfig.budgetUsd,
         thinking: { type: "disabled" },

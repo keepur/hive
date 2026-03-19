@@ -162,7 +162,7 @@ agents-templates/<agent-id>/
 ## Security (DOD-212)
 
 - **No shell execution**: Use `execFileSync(binary, argsArray)`, never `execSync(shellString)`
-- **Agent permissions**: `bypassPermissions` + `disallowedTools` — MCP tools work, SDK built-ins (Bash, Read, Write, Edit, etc.) blocked. Do NOT use `dontAsk` mode — it blocks MCP tools too.
+- **Agent permissions**: `bypassPermissions` mode — all SDK tools (Bash, Read, Write, Edit, etc.) and MCP tools available to all agents. Per-agent guardrails are enforced via system prompts, not tool blocking.
 - **Background task API**: Bearer token auth on all endpoints (`BG_TASK_AUTH_TOKEN`)
 - **Webhook secrets**: Recall webhooks use secret path token (`RECALL_WEBHOOK_SECRET`). Fail-closed if missing.
 - **Per-agent MCP whitelist**: `servers` array in agent.yaml — agents only get servers they need
