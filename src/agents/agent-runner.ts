@@ -335,47 +335,23 @@ export class AgentRunner {
       },
     };
 
-    // ── Domain Search Servers ──────────────────────────────────────
-    // Shared env for all search servers (Qdrant + Ollama + MongoDB for stage mappings)
+    // ── Conversation Search ──────────────────────────────────────
+    // Core search server — semantic search over past agent conversations (Qdrant only)
     const searchEnv: Record<string, string> = {
       OLLAMA_URL: process.env.OLLAMA_URL ?? "http://localhost:11434",
       QDRANT_URL: process.env.QDRANT_URL ?? "http://localhost:6333",
     };
     if (process.env.KB_EMBED_MODEL) searchEnv.KB_EMBED_MODEL = process.env.KB_EMBED_MODEL;
-    if (process.env.MONGODB_ATLAS_URI) searchEnv.MONGODB_ATLAS_URI = process.env.MONGODB_ATLAS_URI;
-    if (process.env.MONGODB_STAGING_URI) searchEnv.MONGODB_STAGING_URI = process.env.MONGODB_STAGING_URI;
-    if (process.env.VOYAGEAI_API_KEY) searchEnv.VOYAGEAI_API_KEY = process.env.VOYAGEAI_API_KEY;
 
-    // CRM Search — contacts, deals, activities (supports atlas legacy backend)
-    servers["crm-search"] = {
-      type: "stdio",
-      command: "node",
-      args: [resolve("dist/search/crm-search-mcp-server.js")],
-      env: { ...searchEnv, KB_BACKEND: process.env.KB_BACKEND ?? "qdrant" },
-    };
-
-    // Product Search — parts, product families, designs (Qdrant only)
-    servers["product-search"] = {
-      type: "stdio",
-      command: "node",
-      args: [resolve("dist/search/product-search-mcp-server.js")],
-      env: { ...searchEnv },
-    };
-
-    // Ops Search — projects, quotes, orders, jobs, tasks, cases (Qdrant only)
-    servers["ops-search"] = {
-      type: "stdio",
-      command: "node",
-      args: [resolve("dist/search/ops-search-mcp-server.js")],
-      env: { ...searchEnv },
-    };
-
-    // Conversation Search — semantic search over past agent conversations (Qdrant only)
     servers["conversation-search"] = {
       type: "stdio",
       command: "node",
       args: [resolve("dist/search/conversation-search-mcp-server.js")],
-      env: { ...searchEnv, AGENT_ID: this.agentConfig.id },
+      env: {
+        ...searchEnv,
+        AGENT_ID: this.agentConfig.id,
+        DEFAULT_AGENT: config.agents.defaultAgent,
+      },
     };
 
     // ── Plugin MCP Servers ──────────────────────────────────────────
@@ -434,6 +410,7 @@ export class AgentRunner {
       env: {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
+        AGENT_ID: this.agentConfig.id,
       },
     };
 

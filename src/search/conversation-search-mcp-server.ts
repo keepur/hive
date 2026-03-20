@@ -2,8 +2,8 @@
 /**
  * Conversation Search MCP Server — semantic search over agent conversation history.
  *
- * Agents search their own conversations by default. Chief-of-staff can search
- * any agent's conversations by passing a different agentId.
+ * Agents search their own conversations by default. The default agent (DEFAULT_AGENT)
+ * can search any agent's conversations by passing a different agentId.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -16,6 +16,7 @@ if (!AGENT_ID) {
   process.stderr.write("conversation-search: AGENT_ID env var is required\n");
   process.exit(1);
 }
+const DEFAULT_AGENT = process.env.DEFAULT_AGENT ?? "chief-of-staff";
 
 const server = new McpServer({ name: "conversation-search", version: "1.0.0" });
 
@@ -33,7 +34,7 @@ server.registerTool(
   {
     title: "Conversation Search",
     description:
-      "Semantic search over past conversations. Returns the most relevant exchanges for a natural language query. By default searches your own conversations; chief-of-staff can search other agents.",
+      "Semantic search over past conversations. Returns the most relevant exchanges for a natural language query. By default searches your own conversations; the default agent can search other agents.",
     inputSchema: {
       query: z
         .string()
@@ -41,7 +42,7 @@ server.registerTool(
       agentId: z
         .string()
         .optional()
-        .describe("Agent ID to search. Defaults to your own. Only chief-of-staff can search other agents."),
+        .describe("Agent ID to search. Defaults to your own. Only the default agent can search other agents."),
       limit: z.number().optional().default(10).describe("Maximum results to return"),
       since: z.string().optional().describe("Only return conversations after this ISO date, e.g. '2026-01-01'"),
     },
@@ -52,13 +53,13 @@ server.registerTool(
 
       const effectiveAgentId = agentId ?? AGENT_ID;
 
-      // Access control: only chief-of-staff can search other agents
-      if (effectiveAgentId !== AGENT_ID && AGENT_ID !== "chief-of-staff") {
+      // Access control: only the default agent can search other agents
+      if (effectiveAgentId !== AGENT_ID && AGENT_ID !== DEFAULT_AGENT) {
         return {
           content: [
             {
               type: "text",
-              text: `Access denied: only chief-of-staff can search other agents' conversations.`,
+              text: `Access denied: only ${DEFAULT_AGENT} can search other agents' conversations.`,
             },
           ],
           isError: true,
