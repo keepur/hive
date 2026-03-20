@@ -74,6 +74,7 @@ vi.mock("../config.js", () => ({
     background: { port: 3200, authToken: "test-bg-token" },
     codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
     anthropic: { apiKey: "test-key" },
+    agents: { defaultAgent: "chief-of-staff" },
     externalComms: { enabled: true },
     triage: { enabled: false },
   },
@@ -373,6 +374,35 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     await runner.send("hello");
     const servers = getCapturedServers();
     expect(servers).not.toHaveProperty("quo");
+  });
+
+  it("conversation-search server env includes DEFAULT_AGENT and AGENT_ID", async () => {
+    runner = new AgentRunner(makeAgentConfig({ id: "my-agent" }), memoryManager as any);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers).toHaveProperty("conversation-search");
+    expect(servers["conversation-search"].env.AGENT_ID).toBe("my-agent");
+    expect(servers["conversation-search"].env.DEFAULT_AGENT).toBe("chief-of-staff");
+  });
+
+  it("admin server env includes AGENT_ID", async () => {
+    runner = new AgentRunner(makeAgentConfig({ id: "some-agent" }), memoryManager as any);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers).toHaveProperty("admin");
+    expect(servers["admin"].env.AGENT_ID).toBe("some-agent");
+  });
+
+  it("does not include crm-search, product-search, or ops-search in core servers", async () => {
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers).not.toHaveProperty("crm-search");
+    expect(servers).not.toHaveProperty("product-search");
+    expect(servers).not.toHaveProperty("ops-search");
   });
 });
 
