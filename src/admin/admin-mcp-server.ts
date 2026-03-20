@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
 /**
- * Admin MCP Server — management tools for authorized agents (e.g. chief-of-staff).
+ * Admin MCP Server — management tools for authorized agents.
  * Provides model override management and other admin capabilities.
  *
  * Env vars:
  *   MONGODB_URI  — MongoDB connection string
  *   MONGODB_DB   — database name (default: "hive")
+ *   AGENT_ID     — the calling agent's ID (used for audit trails)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -16,6 +17,7 @@ import { MongoClient } from "mongodb";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
 const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
+const AGENT_ID = process.env.AGENT_ID ?? "admin";
 
 const client = new MongoClient(MONGODB_URI);
 await client.connect();
@@ -78,7 +80,7 @@ server.registerTool(
 
     await overrides.updateOne(
       { agentId: agent_id },
-      { $set: { model, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { $set: { model, updatedAt: new Date(), updatedBy: AGENT_ID } },
       { upsert: true },
     );
 
@@ -175,7 +177,7 @@ server.registerTool(
   async ({ agent_id }) => {
     await scheduleOverrides.updateOne(
       { agentId: agent_id },
-      { $set: { schedule: null, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { $set: { schedule: null, updatedAt: new Date(), updatedBy: AGENT_ID } },
       { upsert: true },
     );
 
@@ -209,7 +211,7 @@ server.registerTool(
   async ({ agent_id, schedule }) => {
     await scheduleOverrides.updateOne(
       { agentId: agent_id },
-      { $set: { schedule, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { $set: { schedule, updatedAt: new Date(), updatedBy: AGENT_ID } },
       { upsert: true },
     );
 
@@ -271,7 +273,7 @@ server.registerTool(
   async ({ agent_id }) => {
     await configOverrides.updateOne(
       { agentId: agent_id },
-      { $set: { disabled: true, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { $set: { disabled: true, updatedAt: new Date(), updatedBy: AGENT_ID } },
       { upsert: true },
     );
 
@@ -416,7 +418,7 @@ server.registerTool(
 
     await configOverrides.updateOne(
       { agentId: agent_id },
-      { $set: { [field]: value, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { $set: { [field]: value, updatedAt: new Date(), updatedBy: AGENT_ID } },
       { upsert: true },
     );
 
@@ -538,7 +540,7 @@ server.registerTool(
 
     await configOverrides.updateOne(
       { agentId: agent_id },
-      { $set: { [field]: existing, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { $set: { [field]: existing, updatedAt: new Date(), updatedBy: AGENT_ID } },
       { upsert: true },
     );
 
@@ -597,7 +599,7 @@ server.registerTool(
 
     await configOverrides.updateOne(
       { agentId: agent_id },
-      { $set: { [field]: existing, updatedAt: new Date(), updatedBy: "chief-of-staff" } },
+      { $set: { [field]: existing, updatedAt: new Date(), updatedBy: AGENT_ID } },
       { upsert: true },
     );
 
@@ -686,7 +688,7 @@ server.registerTool(
 
     const update: Record<string, unknown> = {
       updatedAt: new Date(),
-      updatedBy: "chief-of-staff",
+      updatedBy: AGENT_ID,
     };
     if (soul !== undefined) update.soul = soul;
     if (system_prompt !== undefined) update.systemPrompt = system_prompt;
