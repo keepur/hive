@@ -22,6 +22,15 @@ mcp-servers:
   permits:
     entry: mcp-servers/permits/permit-mcp-server.ts
     env: [PERMITS_MONGO_URI]
+  crm-search:
+    entry: mcp-servers/crm-search/crm-search-mcp-server.ts
+    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY, KB_BACKEND]
+  product-search:
+    entry: mcp-servers/product-search/product-search-mcp-server.ts
+    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
+  ops-search:
+    entry: mcp-servers/ops-search/ops-search-mcp-server.ts
+    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
 agents-templates:
   - sdr
   - customer-success

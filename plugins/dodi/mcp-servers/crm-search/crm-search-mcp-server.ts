@@ -24,7 +24,7 @@ import {
   type SearchBackend,
   type FieldConfig,
   type ToolResult,
-} from "./search-shared.js";
+} from "../search-shared.js";
 
 const server = new McpServer({ name: "crm-search", version: "1.0.0" });
 
