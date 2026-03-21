@@ -156,10 +156,17 @@ async function main() {
   const config = loadConfig();
 
   // Build template context
+  const instanceType = (config.instance?.type as string) ?? "business";
   const ctx = {
     business: config.business ?? {},
     sms: config.sms ?? { lines: [] },
     quo: config.quo ?? {},
+    instance: {
+      id: (config.instance?.id as string) ?? "hive",
+      type: instanceType,
+      personal: instanceType === "personal",
+      business: instanceType === "business",
+    },
   };
 
   // Build team map: agentId → display name
@@ -268,7 +275,6 @@ async function main() {
   }
 
   // Render constitution and sync directly to MongoDB
-  const instanceType = (config.instance?.type as string) ?? "business";
   const constitutionFile =
     instanceType === "personal" ? "constitution-personal.md.tpl" : "constitution-business.md.tpl";
   // Fall back to legacy constitution.md.tpl if the typed file doesn't exist
