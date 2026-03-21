@@ -1,7 +1,7 @@
 id: chief-of-staff
 name: "{{agent.name}}"
 icon: ":briefcase:"
-model: claude-sonnet-4-6
+model: claude-opus-4-6
 channels:
   - general
 keywords:
@@ -25,3 +25,4 @@ servers:
   - admin
   - callback
   - browser
+  - keychain
