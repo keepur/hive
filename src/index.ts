@@ -13,6 +13,7 @@ import { SessionStore } from "./agents/session-store.js";
 import { Dispatcher } from "./channels/dispatcher.js";
 import { SlackAdapter } from "./channels/slack-adapter.js";
 import { SmsAdapter } from "./channels/sms-adapter.js";
+import { IMessageAdapter } from "./channels/imessage-adapter.js";
 import { TaskClient } from "./tasks/task-client.js";
 import { TaskLedger } from "./tasks/task-ledger.js";
 import { BackgroundTaskManager } from "./background/background-task-manager.js";
@@ -209,6 +210,25 @@ async function main(): Promise<void> {
     log.info("SMS adapter started", { lines: config.sms.lines.length });
   }
 
+  // iMessage adapter — poll chat.db for inbound, AppleScript for outbound
+  let iMessageAdapter: IMessageAdapter | undefined;
+  if (config.imessage.enabled) {
+    iMessageAdapter = new IMessageAdapter(
+      config.imessage,
+      config.mongo.uri,
+      config.mongo.dbName,
+      slack,
+      config.instance.id,
+    );
+    dispatcher.registerAdapter(iMessageAdapter);
+    await iMessageAdapter.start((item) => {
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("iMessage dispatch failed", { error: String(err) });
+      });
+    });
+    log.info("iMessage adapter started");
+  }
+
   // WebSocket adapter — mobile app channel
   let wsAdapter: import("./channels/ws/ws-adapter.js").WsAdapter | undefined;
   if (config.ws.enabled && config.ws.jwtSecret) {
@@ -277,6 +297,7 @@ async function main(): Promise<void> {
     log.info("Shutdown signal received", { signal });
     sweeper.stop();
     await smsAdapter.stop();
+    if (iMessageAdapter) await iMessageAdapter.stop();
     if (wsAdapter) await wsAdapter.stop();
     scheduler.stop();
     bgTaskManager.stop();
