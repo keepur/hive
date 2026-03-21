@@ -27,6 +27,20 @@ function makeContext(): BackgroundTaskContext {
   };
 }
 
+/** Poll task status until it leaves "running", with timeout. */
+async function waitForCompletion(taskId: string, timeoutMs = 5000): Promise<any> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const res = await fetch(`${BASE}/tasks/${taskId}`, {
+      headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+    });
+    const body = await res.json();
+    if (body.status !== "running") return body;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(`Task ${taskId} did not complete within ${timeoutMs}ms`);
+}
+
 // ── Setup ───────────────────────────────────────────────────────────
 const PORT = 39100;
 const AUTH_TOKEN = "test-token-123";
@@ -116,15 +130,7 @@ describe("structured spawn (no shell)", () => {
     const body = await res.json();
     expect(body).toHaveProperty("id");
 
-    // Wait for the process to complete
-    await new Promise((r) => setTimeout(r, 500));
-
-    const statusRes = await fetch(`${BASE}/tasks/${body.id}`, {
-      headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
-    });
-    expect(statusRes.status).toBe(200);
-
-    const status = await statusRes.json();
+    const status = await waitForCompletion(body.id);
     expect(status.status).toBe("completed");
   });
 
