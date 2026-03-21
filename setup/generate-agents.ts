@@ -209,7 +209,14 @@ async function main() {
   }
 
   // Merge: core uses TEMPLATES_DIR, plugin uses own dir
-  const allAgents = [...coreAgents.map((id) => ({ id, templateDir: join(TEMPLATES_DIR, id) })), ...pluginAgents];
+  const configuredAgentIds = Object.keys(agentConfigs);
+  const allCandidates = [...coreAgents.map((id) => ({ id, templateDir: join(TEMPLATES_DIR, id) })), ...pluginAgents];
+
+  // If agents are explicitly listed in config, only generate those (+ plugin agents which are always included)
+  const allAgents =
+    configuredAgentIds.length > 0
+      ? allCandidates.filter((a) => configuredAgentIds.includes(a.id) || pluginAgents.some((p) => p.id === a.id))
+      : allCandidates;
 
   for (const { id: agentId, templateDir } of allAgents) {
     const agentDir = join(AGENTS_DIR, agentId);
