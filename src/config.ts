@@ -4,7 +4,13 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 
-dotenv.config();
+// Load .env file — if HIVE_CONFIG is set (e.g., hive-personal.yaml), load matching .env
+// hive-personal.yaml → .env-personal, hive.yaml → .env
+const hiveConfigFile = process.env.HIVE_CONFIG ?? "";
+const dotenvPath = hiveConfigFile.match(/^hive-(.+)\.yaml$/)
+  ? `.env-${hiveConfigFile.match(/^hive-(.+)\.yaml$/)![1]}`
+  : ".env";
+dotenv.config({ path: dotenvPath });
 
 function required(key: string): string {
   const val = process.env[key];

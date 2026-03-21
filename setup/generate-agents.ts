@@ -16,8 +16,8 @@ import { MongoClient } from "mongodb";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const TEMPLATES_DIR = join(ROOT, "agents-templates");
-const AGENTS_DIR = join(ROOT, "agents");
-const HIVE_CONFIG = join(ROOT, "hive.yaml");
+const AGENTS_DIR = resolve(process.env.AGENTS_PATH ?? join(ROOT, "agents"));
+const HIVE_CONFIG = resolve(process.env.HIVE_CONFIG ?? join(ROOT, "hive.yaml"));
 const META_FILE = join(ROOT, ".hive-generated.json");
 
 const PLUGINS_DIR = join(ROOT, "plugins", "claude-code");
