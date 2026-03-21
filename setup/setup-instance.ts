@@ -21,7 +21,7 @@ import { resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 const ROOT = resolve(import.meta.dirname, "..");
-const HIVE_YAML = resolve(ROOT, "hive.yaml");
+const HIVE_YAML = resolve(process.env.HIVE_CONFIG ?? "hive.yaml");
 
 /** Check if a port is in use (returns true if occupied). */
 function isPortInUse(port: number): boolean {
