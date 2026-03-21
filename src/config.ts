@@ -112,6 +112,13 @@ export const config = {
   sms: {
     lines: (hive.sms?.lines ?? []) as SmsLine[],
   },
+  imessage: {
+    enabled: (hive.imessage?.enabled ?? false) as boolean,
+    slackChannel: (hive.imessage?.slackChannel ?? "imessage") as string,
+    hotWindowMs: (hive.imessage?.hotWindowMs ?? 300_000) as number,
+    coldIntervalMs: (hive.imessage?.coldIntervalMs ?? 300_000) as number,
+    hotIntervalMs: (hive.imessage?.hotIntervalMs ?? 10_000) as number,
+  },
   resend: {
     apiKey: optional("RESEND_API_KEY", ""),
     fromAddress: optional("RESEND_FROM_ADDRESS", ""),

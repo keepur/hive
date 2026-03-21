@@ -154,7 +154,9 @@ export class Dispatcher {
     const agentConfig = this.registry.get(agentId);
 
     // 4. Triage gate — fast Haiku response for interactive channels (skip for system/scheduled)
-    const isInteractive = (item.source.kind === "slack" || item.source.kind === "sms") && item.sender !== "system";
+    const isInteractive =
+      (item.source.kind === "slack" || item.source.kind === "sms" || item.source.kind === "imessage") &&
+      item.sender !== "system";
     let processingStarted = false;
     if (isInteractive && config.triage.enabled && agentConfig && !skipTriage) {
       await adapter?.onProcessingStart?.(item);
@@ -381,7 +383,9 @@ export class Dispatcher {
     const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
     const agentConfig = this.registry.get(agentId);
 
-    const isInteractive = (item.source.kind === "slack" || item.source.kind === "sms") && item.sender !== "system";
+    const isInteractive =
+      (item.source.kind === "slack" || item.source.kind === "sms" || item.source.kind === "imessage") &&
+      item.sender !== "system";
 
     // Skip triage for fan-out — go straight to full agent
     if (isInteractive && config.triage.enabled && agentConfig && !skipTriage) {
@@ -493,9 +497,11 @@ export class Dispatcher {
     const icon =
       result.workItem.source.kind === "sms"
         ? ":phone:"
-        : result.workItem.source.kind === "app"
-          ? ":iphone:"
-          : ":incoming_envelope:";
+        : result.workItem.source.kind === "imessage"
+          ? ":speech_balloon:"
+          : result.workItem.source.kind === "app"
+            ? ":iphone:"
+            : ":incoming_envelope:";
     const senderDisplay = result.workItem.senderName ?? result.workItem.sender;
     const summary = result.text.length > 300 ? result.text.slice(0, 300) + "..." : result.text;
 
