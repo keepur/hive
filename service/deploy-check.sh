@@ -3,6 +3,12 @@ set -euo pipefail
 
 BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 
+# Read instance ID for deploy dir default
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTANCE_ID=$(grep '^\s*id:' "$SCRIPT_DIR/../hive.yaml" 2>/dev/null | head -1 | awk '{print $2}')
+[[ -z "$INSTANCE_ID" ]] && INSTANCE_ID="hive"
+DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/$INSTANCE_ID}"
+
 cd "$BUILD_DIR"
 [[ "$(git branch --show-current)" == "deploy" ]] || { echo "ERROR: Build dir not on deploy branch"; exit 1; }
 
@@ -20,5 +26,4 @@ fi
 echo "New commits detected: $LOCAL_SHA -> $REMOTE_SHA"
 echo "Starting deploy..."
 
-DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/hive}"
 exec "$DEPLOY_DIR/service/deploy.sh"
