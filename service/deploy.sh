@@ -1,9 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Instance helpers ---
+read_instance_id() {
+  local yaml_file="$1/hive.yaml"
+  local id
+  id=$(grep '^\s*id:' "$yaml_file" 2>/dev/null | head -1 | awk '{print $2}')
+  [[ -z "$id" ]] && id="hive"
+  echo "$id"
+}
+
+read_port_base() {
+  local yaml_file="$1/hive.yaml"
+  local port
+  port=$(grep '^\s*portBase:' "$yaml_file" 2>/dev/null | head -1 | awk '{print $2}')
+  [[ -z "$port" ]] && port="3100"
+  echo "$port"
+}
+
 # --- Configuration ---
 BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
-DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/hive}"
+# Derive deploy dir from instance ID if not explicitly set
+if [[ -z "${DEPLOY_DIR:-}" ]]; then
+  INSTANCE_ID=$(read_instance_id "$BUILD_DIR")
+  DEPLOY_DIR="$HOME/services/$INSTANCE_ID"
+fi
+INSTANCE_ID=$(read_instance_id "$DEPLOY_DIR")
+PORT_BASE=$(read_port_base "$DEPLOY_DIR")
+LABEL="com.hive.${INSTANCE_ID}.agent"
 
 # --- Dry-run flag (must be before .env sourcing) ---
 DRY_RUN=false
@@ -57,9 +81,10 @@ health_check() {
   return 1
 }
 
-# --- Helper: Kill stale processes on Hive ports ---
+# --- Helper: Kill stale processes on instance ports ---
 kill_stale_ports() {
-  for port in 3100 3200; do
+  for offset in 0 1 2 3; do
+    local port=$((PORT_BASE + offset))
     local pids
     pids=$(lsof -i :"$port" -t 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
@@ -92,7 +117,7 @@ rollback() {
 
   echo "Restarting service with previous version..."
   kill_stale_ports
-  run_cmd launchctl kickstart -k "gui/$(id -u)/com.hive.agent"
+  run_cmd launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
   if health_check; then
     notify "Deploy failed (health check). Rolled back to \`$prev_sha\`. Hive is running on previous version."
@@ -105,7 +130,7 @@ rollback() {
 }
 
 # --- Main ---
-echo "=== Hive Deploy ==="
+echo "=== Hive Deploy ($INSTANCE_ID, ports $PORT_BASE-$((PORT_BASE + 3))) ==="
 
 # 1. Record current deployed SHA
 cd "$DEPLOY_DIR"
@@ -188,7 +213,7 @@ run_cmd rsync -a --delete "$BUILD_DIR/agents/" "$DEPLOY_DIR/agents/"
 # 11. Restart service
 echo "Restarting service..."
 kill_stale_ports
-run_cmd launchctl kickstart -k "gui/$(id -u)/com.hive.agent"
+run_cmd launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
 # 12. Health check
 echo "Checking health..."

@@ -10,7 +10,6 @@ import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("code-task-manager");
-const TASKS_DIR = "/tmp/hive-code-tasks";
 const RESULT_TAIL_CHARS = 2000;
 const LOG_TAIL_LINES = 100;
 
@@ -60,6 +59,7 @@ export class CodeTaskManager {
   private authToken: string;
   private pluginDir: string;
   private maxConcurrent: number;
+  private tasksDir: string;
   private cliBin: string;
   private tasks = new Map<string, CodeTask>();
   private onComplete: (item: WorkItem) => void;
@@ -71,6 +71,7 @@ export class CodeTaskManager {
     authToken: string,
     pluginDir: string,
     maxConcurrent: number,
+    tasksDir: string,
     onComplete: (item: WorkItem) => void,
     options?: CodeTaskManagerOptions,
   ) {
@@ -78,12 +79,13 @@ export class CodeTaskManager {
     this.authToken = authToken;
     this.pluginDir = pluginDir;
     this.maxConcurrent = maxConcurrent;
+    this.tasksDir = tasksDir;
     this.onComplete = onComplete;
     this.cliBin = options?.cliBin ?? "claude";
   }
 
   async start(): Promise<void> {
-    await mkdir(TASKS_DIR, { recursive: true });
+    await mkdir(this.tasksDir, { recursive: true });
 
     this.server = createServer((req, res) => {
       this.handleRequest(req, res).catch((err) => {
@@ -103,7 +105,7 @@ export class CodeTaskManager {
   async scanOrphans(): Promise<void> {
     let files: string[];
     try {
-      files = await readdir(TASKS_DIR);
+      files = await readdir(this.tasksDir);
     } catch {
       return;
     }
@@ -114,7 +116,7 @@ export class CodeTaskManager {
 
     for (const file of jsonFiles) {
       try {
-        const content = await readFile(`${TASKS_DIR}/${file}`, "utf-8");
+        const content = await readFile(`${this.tasksDir}/${file}`, "utf-8");
         const task: CodeTask = JSON.parse(content);
 
         this.tasks.set(task.id, task);
@@ -268,9 +270,9 @@ export class CodeTaskManager {
     }
 
     const id = randomUUID();
-    const stdoutPath = `${TASKS_DIR}/${id}.stdout.json`;
-    const stderrPath = `${TASKS_DIR}/${id}.stderr.log`;
-    const metaPath = `${TASKS_DIR}/${id}.meta.json`;
+    const stdoutPath = `${this.tasksDir}/${id}.stdout.json`;
+    const stderrPath = `${this.tasksDir}/${id}.stderr.log`;
+    const metaPath = `${this.tasksDir}/${id}.meta.json`;
     const cwd = body.cwd;
     const model = body.model ?? "";
     const maxTurns = body.maxTurns ?? 100;

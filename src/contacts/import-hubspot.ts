@@ -10,7 +10,9 @@
 
 import { MongoClient } from "mongodb";
 import { parse } from "csv-parse/sync";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 const CONTACT_TYPE_MAP: Record<string, string> = {
   Homeowner: "homeowner",
@@ -52,8 +54,16 @@ async function main() {
     process.exit(1);
   }
 
+  // Load hive.yaml for instance-aware db name
+  const hiveConfigPath = resolve(process.cwd(), process.env.HIVE_CONFIG ?? "hive.yaml");
+  let hiveConfig: Record<string, any> = {};
+  if (existsSync(hiveConfigPath)) {
+    hiveConfig = parseYaml(readFileSync(hiveConfigPath, "utf-8")) ?? {};
+  }
+  const instanceId = (hiveConfig.instance?.id as string) ?? "hive";
+
   const uri = process.env.MONGODB_URI || "mongodb://localhost:27017";
-  const dbName = process.env.MONGODB_DB || "hive";
+  const dbName = process.env.MONGODB_DB || `hive_${instanceId}`;
 
   console.log(`Reading ${csvPath}...`);
   const csv = readFileSync(csvPath, "utf-8");
