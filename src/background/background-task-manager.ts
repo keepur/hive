@@ -215,14 +215,19 @@ export class BackgroundTaskManager {
       pid: child.pid ?? null,
     };
 
+    // Must be in the map before exit handler fires
     this.tasks.set(id, task);
-    await this.writeMeta(task);
 
+    // Register exit handler BEFORE any async work — if echo finishes instantly,
+    // the exit event fires synchronously and would be missed after an await.
     child.on("exit", (code) => this.handleExit(id, code));
     child.on("error", (err) => {
       log.error("Background task process error", { id, error: String(err) });
       this.handleExit(id, 1);
     });
+
+    // Write metadata to disk (non-blocking — ok if exit fires first)
+    this.writeMeta(task).catch(() => {});
 
     log.info("Background task spawned", {
       id,
