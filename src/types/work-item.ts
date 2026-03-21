@@ -1,4 +1,4 @@
-export type ChannelKind = "slack" | "sms" | "email" | "scheduler" | "callback" | "internal" | "app";
+export type ChannelKind = "slack" | "sms" | "imessage" | "email" | "scheduler" | "callback" | "internal" | "app";
 
 export interface ChannelRef {
   kind: ChannelKind;
