@@ -14,3 +14,4 @@ logs/
 # Generated plists (machine-specific paths)
 service/com.hive.*.plist
 coverage/
+.qdrant-initialized
