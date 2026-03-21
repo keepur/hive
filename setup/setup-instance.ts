@@ -110,6 +110,17 @@ async function main() {
     process.exit(1);
   }
 
+  // Prompt for instance type
+  const currentType = config.instance?.type;
+  const defaultType = currentType ?? "personal";
+  const typeInput = await rl.question(`Instance type — "personal" or "business" [${defaultType}]: `);
+  const instanceType = typeInput.trim() || defaultType;
+
+  if (instanceType !== "personal" && instanceType !== "business") {
+    console.error('Error: Instance type must be "personal" or "business".');
+    process.exit(1);
+  }
+
   // Port assignment
   let ports: Record<string, number>;
 
@@ -166,6 +177,10 @@ async function main() {
   // Show summary
   console.log("\nInstance configuration:");
   console.log(`  ID:          ${instanceId}`);
+  console.log(`  Type:        ${instanceType}`);
+  console.log(
+    `  Constitution: ${instanceType === "personal" ? "lightweight (trust-based)" : "full (team governance)"}`,
+  );
   console.log(`  Database:    hive_${instanceId}`);
   console.log(
     `  Ports:       bg=${ports.background}, recall=${ports.recall}, code-task=${ports.codeTask}, ws=${ports.ws}`,
@@ -182,7 +197,7 @@ async function main() {
   }
 
   // Write to hive.yaml — use explicit ports, drop portBase
-  config.instance = { id: instanceId, ports };
+  config.instance = { id: instanceId, type: instanceType, ports };
   delete config.instance.portBase;
   writeFileSync(HIVE_YAML, stringifyYaml(config, { lineWidth: 120 }));
 

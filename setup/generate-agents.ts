@@ -268,7 +268,13 @@ async function main() {
   }
 
   // Render constitution and sync directly to MongoDB
-  const constitutionTplPath = join(ROOT, "setup", "templates", "constitution.md.tpl");
+  const instanceType = (config.instance?.type as string) ?? "business";
+  const constitutionFile =
+    instanceType === "personal" ? "constitution-personal.md.tpl" : "constitution-business.md.tpl";
+  // Fall back to legacy constitution.md.tpl if the typed file doesn't exist
+  const typedPath = join(ROOT, "setup", "templates", constitutionFile);
+  const legacyPath = join(ROOT, "setup", "templates", "constitution.md.tpl");
+  const constitutionTplPath = existsSync(typedPath) ? typedPath : legacyPath;
   if (existsSync(constitutionTplPath)) {
     const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
     const constitutionCtx = { business: ctx.business, team };
