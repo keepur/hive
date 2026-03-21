@@ -24,7 +24,7 @@ import { setGeminiApiKey } from "./files/file-processor.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
-  log.info("Hive starting up");
+  log.info("Hive starting up", { instance: config.instance.id, portBase: config.instance.portBase });
 
   // Initialize Gemini vision for image processing
   if (config.gemini.apiKey) {
