@@ -77,6 +77,7 @@ vi.mock("../config.js", () => ({
     agents: { defaultAgent: "chief-of-staff" },
     externalComms: { enabled: true },
     triage: { enabled: false },
+    browser: { cdpEndpoint: "" },
   },
 }));
 
