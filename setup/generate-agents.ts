@@ -226,10 +226,12 @@ async function main() {
     }
 
     // Build per-agent context with agent identity and team roster
+    const agentName = team[agentId] ?? agentId;
     const agentCtx = {
       ...ctx,
       agent: {
-        name: team[agentId] ?? agentId,
+        name: agentName,
+        name_lower: agentName.toLowerCase(),
         id: agentId,
       },
       team,
