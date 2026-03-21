@@ -141,7 +141,7 @@ export const config = {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
   },
   background: {
-    port: parseInt(optional("BG_TASK_PORT", String(portBase + 0)), 10),
+    port: parseInt(optional("BG_TASK_PORT", String(portBase)), 10),
     authToken: optional("BG_TASK_AUTH_TOKEN", "") || randomUUID(),
   },
   codeTask: {

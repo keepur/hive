@@ -4,13 +4,13 @@ set -euo pipefail
 # Install Hive as a LaunchAgent (user scope).
 # Generates plists, symlinks them into ~/Library/LaunchAgents, and bootstraps.
 #
-# Set HIVE_DEPLOY_DIR to override the working directory (default: ~/services/hive)
+# Set HIVE_DEPLOY_DIR to override the working directory (default: ~/services/<instance-id>)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HIVE_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Read instance ID from hive.yaml (falls back to "hive")
-INSTANCE_ID=$(grep -A1 '^instance:' "$HIVE_ROOT/hive.yaml" 2>/dev/null | grep 'id:' | awk '{print $2}' || echo "hive")
+INSTANCE_ID=$(grep '^\s*id:' "$HIVE_ROOT/hive.yaml" 2>/dev/null | head -1 | awk '{print $2}')
 [[ -z "$INSTANCE_ID" ]] && INSTANCE_ID="hive"
 
 DEPLOY_DIR="${HIVE_DEPLOY_DIR:-$HOME/services/$INSTANCE_ID}"

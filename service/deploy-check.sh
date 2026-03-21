@@ -5,7 +5,7 @@ BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 
 # Read instance ID for deploy dir default
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTANCE_ID=$(grep -A1 '^instance:' "$SCRIPT_DIR/../hive.yaml" 2>/dev/null | grep 'id:' | awk '{print $2}' || echo "hive")
+INSTANCE_ID=$(grep '^\s*id:' "$SCRIPT_DIR/../hive.yaml" 2>/dev/null | head -1 | awk '{print $2}')
 [[ -z "$INSTANCE_ID" ]] && INSTANCE_ID="hive"
 DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/$INSTANCE_ID}"
 

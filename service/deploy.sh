@@ -5,7 +5,7 @@ set -euo pipefail
 read_instance_id() {
   local yaml_file="$1/hive.yaml"
   local id
-  id=$(grep -A1 '^instance:' "$yaml_file" 2>/dev/null | grep 'id:' | awk '{print $2}' || echo "hive")
+  id=$(grep '^\s*id:' "$yaml_file" 2>/dev/null | head -1 | awk '{print $2}')
   [[ -z "$id" ]] && id="hive"
   echo "$id"
 }
@@ -13,7 +13,7 @@ read_instance_id() {
 read_port_base() {
   local yaml_file="$1/hive.yaml"
   local port
-  port=$(grep -A2 '^instance:' "$yaml_file" 2>/dev/null | grep 'portBase:' | awk '{print $2}' || echo "3100")
+  port=$(grep '^\s*portBase:' "$yaml_file" 2>/dev/null | head -1 | awk '{print $2}')
   [[ -z "$port" ]] && port="3100"
   echo "$port"
 }
@@ -22,7 +22,7 @@ read_port_base() {
 BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 # Derive deploy dir from instance ID if not explicitly set
 if [[ -z "${DEPLOY_DIR:-}" ]]; then
-  INSTANCE_ID=$(read_instance_id "$HOME/services/$(read_instance_id "$BUILD_DIR")")
+  INSTANCE_ID=$(read_instance_id "$BUILD_DIR")
   DEPLOY_DIR="$HOME/services/$INSTANCE_ID"
 fi
 INSTANCE_ID=$(read_instance_id "$DEPLOY_DIR")

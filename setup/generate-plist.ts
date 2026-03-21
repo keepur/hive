@@ -2,9 +2,10 @@
 /**
  * Generate launchd plists for Hive with correct paths for this machine.
  *
- * Generates:
- *   service/com.hive.agent.plist      — main Hive service
- *   service/com.hive.rotate-logs.plist — daily log rotation
+ * Generates (filenames include instance ID from hive.yaml):
+ *   service/com.hive.<id>.agent.plist        — main Hive service
+ *   service/com.hive.<id>.rotate-logs.plist  — daily log rotation
+ *   service/com.hive.<id>.deploy-check.plist — periodic deploy checker
  *
  * Usage:
  *   npx tsx setup/generate-plist.ts
