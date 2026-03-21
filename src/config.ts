@@ -25,6 +25,10 @@ if (existsSync(hiveConfigPath)) {
 
 const home = process.env.HOME ?? "/tmp";
 
+// Instance identity — single source of truth for multi-instance derivation
+const instanceId = (hive.instance?.id as string) ?? "hive";
+const portBase = (hive.instance?.portBase as number) ?? 3100;
+
 export interface SmsLine {
   id: string;
   label: string;
@@ -39,6 +43,7 @@ export interface QuoLine {
 }
 
 export const config = {
+  instance: { id: instanceId, portBase },
   business: {
     name: hive.business?.name ?? optional("BUSINESS_NAME", ""),
     description: hive.business?.description ?? "",
@@ -83,7 +88,7 @@ export const config = {
   },
   mongo: {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
-    dbName: optional("MONGODB_DB", "hive"),
+    dbName: optional("MONGODB_DB", `hive_${instanceId}`),
   },
   agents: {
     defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
@@ -128,7 +133,7 @@ export const config = {
   recall: {
     apiKey: optional("RECALL_API_KEY", ""),
     region: optional("RECALL_API_REGION", "us-west-2"),
-    monitorPort: parseInt(optional("MEETING_MONITOR_PORT", "3101"), 10),
+    monitorPort: parseInt(optional("MEETING_MONITOR_PORT", String(portBase + 1)), 10),
     monitorPublicUrl: optional("MEETING_MONITOR_PUBLIC_URL", ""),
     webhookSecret: optional("RECALL_WEBHOOK_SECRET", ""),
   },
@@ -136,11 +141,11 @@ export const config = {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
   },
   background: {
-    port: parseInt(optional("BG_TASK_PORT", "3100"), 10),
+    port: parseInt(optional("BG_TASK_PORT", String(portBase + 0)), 10),
     authToken: optional("BG_TASK_AUTH_TOKEN", "") || randomUUID(),
   },
   codeTask: {
-    port: parseInt(optional("CODE_TASK_PORT", "3102"), 10),
+    port: parseInt(optional("CODE_TASK_PORT", String(portBase + 2)), 10),
     authToken: optional("CODE_TASK_AUTH_TOKEN", "") || randomUUID(),
     pluginDir: optional("CODE_TASK_PLUGIN_DIR", resolve("plugins/claude-code/dodi-dev")),
     defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-4-6"),
@@ -150,7 +155,7 @@ export const config = {
   },
   ws: {
     enabled: optional("WS_ENABLED", "false") === "true",
-    port: parseInt(optional("WS_PORT", "3200"), 10),
+    port: parseInt(optional("WS_PORT", String(portBase + 3)), 10),
     jwtSecret: optional("WS_JWT_SECRET", ""),
   },
   externalComms: {
@@ -174,5 +179,9 @@ export const config = {
     cacheTtlMs: parseInt(optional("SWEEPER_CACHE_TTL_MS", "3600000"), 10),
     retryMaxAttempts: parseInt(optional("SWEEPER_RETRY_MAX_ATTEMPTS", "3"), 10),
     retryBaseDelayMs: parseInt(optional("SWEEPER_RETRY_BASE_DELAY_MS", "30000"), 10),
+  },
+  tasksDir: {
+    code: optional("CODE_TASKS_DIR", `/tmp/${instanceId}-code-tasks`),
+    background: optional("BG_TASKS_DIR", `/tmp/${instanceId}-bg-tasks`),
   },
 } as const;
