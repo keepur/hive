@@ -11,21 +11,31 @@
  */
 
 import { execSync } from "node:child_process";
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 const ROOT = resolve(import.meta.dirname, "..");
-const DEPLOY_DIR = process.env.HIVE_DEPLOY_DIR ?? ROOT;
+
+// Load instance ID from hive.yaml
+const hiveConfigPath = resolve(ROOT, process.env.HIVE_CONFIG ?? "hive.yaml");
+let hiveConfig: Record<string, any> = {};
+if (existsSync(hiveConfigPath)) {
+  hiveConfig = parseYaml(readFileSync(hiveConfigPath, "utf-8")) ?? {};
+}
+const instanceId = (hiveConfig.instance?.id as string) ?? "hive";
+
+const home = process.env.HOME ?? "/tmp";
+const DEPLOY_DIR = process.env.HIVE_DEPLOY_DIR ?? resolve(home, "services", instanceId);
 const SERVICE_DIR = join(ROOT, "service");
 const LOGS_DIR = join(DEPLOY_DIR, "logs");
 
-const LABEL = "com.hive.agent";
-const LABEL_LOGS = "com.hive.rotate-logs";
-const LABEL_DEPLOY = "com.hive.deploy-check";
+const LABEL = `com.hive.${instanceId}.agent`;
+const LABEL_LOGS = `com.hive.${instanceId}.rotate-logs`;
+const LABEL_DEPLOY = `com.hive.${instanceId}.deploy-check`;
 
 // Detect paths
 const nodePath = execSync("which node", { encoding: "utf-8" }).trim();
-const home = process.env.HOME ?? "/tmp";
 const pathEnv = process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 
 // Ensure directories exist
@@ -56,6 +66,8 @@ const hivePlist = `<?xml version="1.0" encoding="UTF-8"?>
     <string>${pathEnv}</string>
     <key>HOME</key>
     <string>${home}</string>
+    <key>DEPLOY_DIR</key>
+    <string>${DEPLOY_DIR}</string>
   </dict>
 
   <key>RunAtLoad</key>

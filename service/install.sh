@@ -8,12 +8,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HIVE_ROOT="$(dirname "$SCRIPT_DIR")"
-DEPLOY_DIR="${HIVE_DEPLOY_DIR:-$HOME/services/hive}"
+
+# Read instance ID from hive.yaml (falls back to "hive")
+INSTANCE_ID=$(grep -A1 '^instance:' "$HIVE_ROOT/hive.yaml" 2>/dev/null | grep 'id:' | awk '{print $2}' || echo "hive")
+[[ -z "$INSTANCE_ID" ]] && INSTANCE_ID="hive"
+
+DEPLOY_DIR="${HIVE_DEPLOY_DIR:-$HOME/services/$INSTANCE_ID}"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 
-LABEL="com.hive.agent"
-LABEL_LOGS="com.hive.rotate-logs"
-LABEL_DEPLOY="com.hive.deploy-check"
+LABEL="com.hive.${INSTANCE_ID}.agent"
+LABEL_LOGS="com.hive.${INSTANCE_ID}.rotate-logs"
+LABEL_DEPLOY="com.hive.${INSTANCE_ID}.deploy-check"
 
 echo "Installing Hive LaunchAgents..."
 echo "  Deploy dir: $DEPLOY_DIR"
