@@ -16,6 +16,6 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ["dist/", "node_modules/", "agents/", "logs/", "*.js", "coverage/", "plugins/claude-code/"],
+    ignores: ["dist/", "node_modules/", "agents/", "logs/", "**/*.js", "coverage/", "plugins/claude-code/"],
   },
 );
