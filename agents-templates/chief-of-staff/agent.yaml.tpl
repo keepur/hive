@@ -3,12 +3,7 @@ name: "{{agent.name}}"
 icon: ":briefcase:"
 model: claude-sonnet-4-6
 channels:
-  - agent-mokie
   - general
-passiveChannels:
-  - marketing
-  - biz
-  - devops
 keywords:
   - status
   - update
@@ -24,16 +19,9 @@ schedule:
 budgetUsd: 50
 servers:
   - memory
-  - contacts
-  - crm-search
   - conversation-search
   - slack
   - brave-search
-  - tasks
-  - recall
-  - google-workspace
   - admin
   - callback
-  - permits
-plugins:
-  - dodi-dev
+  - browser
