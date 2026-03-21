@@ -30,12 +30,13 @@ function makeContext(): BackgroundTaskContext {
 // ── Setup ───────────────────────────────────────────────────────────
 const PORT = 39100;
 const AUTH_TOKEN = "test-token-123";
+const TASKS_DIR = `/tmp/hive-bg-tasks-test-${process.pid}`;
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let manager: BackgroundTaskManager;
 
 beforeAll(async () => {
-  manager = new BackgroundTaskManager(PORT, AUTH_TOKEN, () => {});
+  manager = new BackgroundTaskManager(PORT, AUTH_TOKEN, TASKS_DIR, () => {});
   await manager.start();
 });
 

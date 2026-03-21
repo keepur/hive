@@ -226,11 +226,12 @@ const PORT = 39102;
 const AUTH_TOKEN = "test-token-ct";
 const BASE = `http://127.0.0.1:${PORT}`;
 const PLUGIN_DIR = "/tmp/fake-plugin-dir";
+const TASKS_DIR = `/tmp/hive-code-tasks-test-${process.pid}`;
 
 let manager: CodeTaskManager;
 
 beforeAll(async () => {
-  manager = new CodeTaskManager(PORT, AUTH_TOKEN, PLUGIN_DIR, 2, () => {});
+  manager = new CodeTaskManager(PORT, AUTH_TOKEN, PLUGIN_DIR, 2, TASKS_DIR, () => {});
   await manager.start();
 });
 
@@ -314,7 +315,7 @@ describe("spawn and status", () => {
 describe("concurrency limit", () => {
   it("rejects tasks when concurrency limit reached", async () => {
     // Create a manager with concurrency 1
-    const mgr = new CodeTaskManager(PORT + 1, AUTH_TOKEN, PLUGIN_DIR, 1, () => {});
+    const mgr = new CodeTaskManager(PORT + 1, AUTH_TOKEN, PLUGIN_DIR, 1, TASKS_DIR, () => {});
     await mgr.start();
 
     try {
