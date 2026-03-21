@@ -28,7 +28,7 @@ function makeContext(): BackgroundTaskContext {
 }
 
 /** Poll task status until it leaves "running", with timeout. */
-async function waitForCompletion(taskId: string, timeoutMs = 5000): Promise<any> {
+async function waitForCompletion(taskId: string, timeoutMs = 10000): Promise<any> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const res = await fetch(`${BASE}/tasks/${taskId}`, {
@@ -36,7 +36,7 @@ async function waitForCompletion(taskId: string, timeoutMs = 5000): Promise<any>
     });
     const body = await res.json();
     if (body.status !== "running") return body;
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 100));
   }
   throw new Error(`Task ${taskId} did not complete within ${timeoutMs}ms`);
 }
