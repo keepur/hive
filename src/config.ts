@@ -28,6 +28,7 @@ const home = process.env.HOME ?? "/tmp";
 // Instance identity — single source of truth for multi-instance derivation
 const instanceId = (hive.instance?.id as string) ?? "hive";
 const portBase = (hive.instance?.portBase as number) ?? 3100;
+const ports = (hive.instance?.ports as Record<string, number>) ?? {};
 
 export interface SmsLine {
   id: string;
@@ -133,7 +134,7 @@ export const config = {
   recall: {
     apiKey: optional("RECALL_API_KEY", ""),
     region: optional("RECALL_API_REGION", "us-west-2"),
-    monitorPort: parseInt(optional("MEETING_MONITOR_PORT", String(portBase + 1)), 10),
+    monitorPort: parseInt(optional("MEETING_MONITOR_PORT", String(ports.recall ?? portBase + 1)), 10),
     monitorPublicUrl: optional("MEETING_MONITOR_PUBLIC_URL", ""),
     webhookSecret: optional("RECALL_WEBHOOK_SECRET", ""),
   },
@@ -141,11 +142,11 @@ export const config = {
     heartbeatIntervalMs: parseInt(optional("HEARTBEAT_INTERVAL_MS", "120000"), 10),
   },
   background: {
-    port: parseInt(optional("BG_TASK_PORT", String(portBase)), 10),
+    port: parseInt(optional("BG_TASK_PORT", String(ports.background ?? portBase)), 10),
     authToken: optional("BG_TASK_AUTH_TOKEN", "") || randomUUID(),
   },
   codeTask: {
-    port: parseInt(optional("CODE_TASK_PORT", String(portBase + 2)), 10),
+    port: parseInt(optional("CODE_TASK_PORT", String(ports.codeTask ?? portBase + 2)), 10),
     authToken: optional("CODE_TASK_AUTH_TOKEN", "") || randomUUID(),
     pluginDir: optional("CODE_TASK_PLUGIN_DIR", resolve("plugins/claude-code/dodi-dev")),
     defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-4-6"),
@@ -155,7 +156,7 @@ export const config = {
   },
   ws: {
     enabled: optional("WS_ENABLED", "false") === "true",
-    port: parseInt(optional("WS_PORT", String(portBase + 3)), 10),
+    port: parseInt(optional("WS_PORT", String(ports.ws ?? portBase + 3)), 10),
     jwtSecret: optional("WS_JWT_SECRET", ""),
   },
   externalComms: {
