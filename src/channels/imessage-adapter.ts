@@ -53,13 +53,7 @@ export class IMessageAdapter implements ChannelAdapter {
   private lastColdPoll = 0;
   private stateFilePath: string;
 
-  constructor(
-    config: IMessageConfig,
-    mongoUri: string,
-    dbName: string,
-    gateway: SlackGateway,
-    instanceId: string,
-  ) {
+  constructor(config: IMessageConfig, mongoUri: string, dbName: string, gateway: SlackGateway, instanceId: string) {
     this.config = config;
     this.mongoUri = mongoUri;
     this.dbName = dbName;

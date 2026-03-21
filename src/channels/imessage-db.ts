@@ -145,7 +145,10 @@ function extractTextAfterHeader(blob: Buffer, offset: number): string | null {
 
   if (bestStart === -1) return null;
 
-  const text = blob.subarray(bestStart, bestStart + bestLen).toString("utf-8").trim();
+  const text = blob
+    .subarray(bestStart, bestStart + bestLen)
+    .toString("utf-8")
+    .trim();
   return text.length > 0 ? text : null;
 }
 
