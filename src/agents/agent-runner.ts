@@ -278,6 +278,19 @@ export class AgentRunner {
       };
     }
 
+    // Browser — Playwright MCP connected to user's Chrome via CDP
+    if (config.browser.cdpEndpoint) {
+      servers["browser"] = {
+        type: "stdio",
+        command: "npx",
+        args: ["@playwright/mcp@latest", "--cdp-endpoint", config.browser.cdpEndpoint],
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+        },
+      };
+    }
+
     // Background task server — agents can spawn detached background processes
     servers["background"] = {
       type: "stdio",

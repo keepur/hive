@@ -188,6 +188,9 @@ export const config = {
     retryMaxAttempts: parseInt(optional("SWEEPER_RETRY_MAX_ATTEMPTS", "3"), 10),
     retryBaseDelayMs: parseInt(optional("SWEEPER_RETRY_BASE_DELAY_MS", "30000"), 10),
   },
+  browser: {
+    cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),
+  },
   tasksDir: {
     code: optional("CODE_TASKS_DIR", `/tmp/${instanceId}-code-tasks`),
     background: optional("BG_TASKS_DIR", `/tmp/${instanceId}-bg-tasks`),
