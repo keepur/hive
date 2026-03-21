@@ -8,7 +8,6 @@ import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("bg-task-manager");
-const TASKS_DIR = "/tmp/hive-bg-tasks";
 const LOG_TAIL_LINES = 100;
 
 export interface BackgroundTaskContext {
@@ -39,19 +38,21 @@ interface BackgroundTask {
 export class BackgroundTaskManager {
   private port: number;
   private authToken: string;
+  private tasksDir: string;
   private tasks = new Map<string, BackgroundTask>();
   private onComplete: (item: WorkItem) => void;
   private server: Server | null = null;
   private orphanPollers = new Map<string, ReturnType<typeof setInterval>>();
 
-  constructor(port: number, authToken: string, onComplete: (item: WorkItem) => void) {
+  constructor(port: number, authToken: string, tasksDir: string, onComplete: (item: WorkItem) => void) {
     this.port = port;
     this.authToken = authToken;
+    this.tasksDir = tasksDir;
     this.onComplete = onComplete;
   }
 
   async start(): Promise<void> {
-    await mkdir(TASKS_DIR, { recursive: true });
+    await mkdir(this.tasksDir, { recursive: true });
 
     this.server = createServer((req, res) => {
       this.handleRequest(req, res).catch((err) => {
@@ -71,7 +72,7 @@ export class BackgroundTaskManager {
   async scanOrphans(): Promise<void> {
     let files: string[];
     try {
-      files = await readdir(TASKS_DIR);
+      files = await readdir(this.tasksDir);
     } catch {
       return;
     }
@@ -82,7 +83,7 @@ export class BackgroundTaskManager {
 
     for (const file of jsonFiles) {
       try {
-        const content = await readFile(`${TASKS_DIR}/${file}`, "utf-8");
+        const content = await readFile(`${this.tasksDir}/${file}`, "utf-8");
         const task: BackgroundTask = JSON.parse(content);
 
         this.tasks.set(task.id, task);
@@ -185,8 +186,8 @@ export class BackgroundTaskManager {
     context: BackgroundTaskContext;
   }): Promise<BackgroundTask> {
     const id = randomUUID();
-    const logPath = `${TASKS_DIR}/${id}.log`;
-    const metaPath = `${TASKS_DIR}/${id}.json`;
+    const logPath = `${this.tasksDir}/${id}.log`;
+    const metaPath = `${this.tasksDir}/${id}.json`;
     const cwd = body.cwd ?? process.env.HOME ?? "/tmp";
 
     const logFd = openSync(logPath, "a");

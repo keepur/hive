@@ -74,10 +74,14 @@ async function main(): Promise<void> {
   );
 
   // Background task manager — agents can spawn detached background processes
-  const bgTaskManager = new BackgroundTaskManager(config.background.port, config.background.authToken, (item) =>
-    dispatcher.dispatch(item).catch((err) => {
-      log.error("Background task completion dispatch failed", { error: String(err) });
-    }),
+  const bgTaskManager = new BackgroundTaskManager(
+    config.background.port,
+    config.background.authToken,
+    config.tasksDir.background,
+    (item) =>
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("Background task completion dispatch failed", { error: String(err) });
+      }),
   );
   await bgTaskManager.start();
   await bgTaskManager.scanOrphans();
@@ -89,6 +93,7 @@ async function main(): Promise<void> {
     config.codeTask.authToken,
     config.codeTask.pluginDir,
     config.codeTask.maxConcurrent,
+    config.tasksDir.code,
     (item) =>
       dispatcher.dispatch(item).catch((err) => {
         log.error("Code task completion dispatch failed", { error: String(err) });
