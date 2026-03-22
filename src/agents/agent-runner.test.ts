@@ -78,6 +78,7 @@ vi.mock("../config.js", () => ({
     externalComms: { enabled: true },
     triage: { enabled: false },
     browser: { cdpEndpoint: "" },
+    memory: { hotBudgetTokens: 3000 },
   },
 }));
 
@@ -90,6 +91,7 @@ function makeMockMemoryManager() {
     delete: vi.fn().mockResolvedValue(undefined),
     history: vi.fn().mockResolvedValue([]),
     rollback: vi.fn().mockResolvedValue(undefined),
+    getHotTierPrompt: vi.fn().mockResolvedValue(null),
   };
 }
 
