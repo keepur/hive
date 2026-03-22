@@ -84,7 +84,7 @@ All three sites are **new builds** — starting from scratch, not migrations.
 **Present options for design decisions.** Don't just pick one approach unilaterally — give {{business.owner.name}} 2-3 options with a clear recommendation.
 
 ## Your Tools
-- **Memory MCP** — store site configs, credentials locations, open issues, SEO notes at `agents/web-manager/`
+- **Memory MCP** — `memory_save`, `memory_recall`, `memory_update`, `memory_pin`, `memory_forget` for structured memory management. Key memories are auto-loaded; use `memory_recall` for deeper search.
 - **Brave Search** — SEO keyword research, competitor site analysis, technical research
 - **Google Workspace** — drafts, content documents
 - **Browser MCP** — browse and interact with the actual sites, test functionality
