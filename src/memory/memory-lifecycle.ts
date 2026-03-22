@@ -1,5 +1,5 @@
 import { ObjectId } from "mongodb";
-import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../logging/logger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { MemoryStore } from "./memory-store.js";
@@ -139,14 +139,11 @@ export class MemoryLifecycle {
 
     // 3. Enforce hot budget — pinned records don't count against the budget
     const hotRecords = await this.store.getHotTier(agentId);
-    let pinnedTokens = 0;
     let nonPinnedTokens = 0;
     const toOverflow: ObjectId[] = [];
     for (const r of hotRecords) {
       const tokens = this.estimateTokens(r.content);
-      if (r.pinned) {
-        pinnedTokens += tokens;
-      } else {
+      if (!r.pinned) {
         nonPinnedTokens += tokens;
         if (nonPinnedTokens > this.config.hotBudgetTokens) {
           toOverflow.push(r._id!);

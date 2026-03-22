@@ -294,14 +294,12 @@ describe("MemoryLifecycle budget enforcement", () => {
     store.getColdTopics.mockResolvedValueOnce([]);
     store.deleteSummarizedOlderThan.mockResolvedValueOnce(0);
 
-    const result = await lifecycle.sweep();
+    await lifecycle.sweep();
 
     // nonPinned1 = 50 tokens (within budget), nonPinned2 = 100 cumulative (over 60)
     // So nonPinned2 should overflow to warm
     // setTierBulk is called for tier scoring AND for overflow — find the overflow call
-    const warmCalls = store.setTierBulk.mock.calls.filter(
-      ([_ids, tier]: [ObjectId[], string]) => tier === "warm",
-    );
+    const warmCalls = store.setTierBulk.mock.calls.filter(([_ids, tier]: [ObjectId[], string]) => tier === "warm");
     const overflowedIds = warmCalls.flatMap(([ids]: [ObjectId[]]) => ids);
     expect(overflowedIds).toContain(nonPinned2._id);
     // The pinned record should NOT have been overflowed
