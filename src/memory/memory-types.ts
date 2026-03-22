@@ -22,6 +22,7 @@ export interface MemoryRecord {
   supersededBy?: ObjectId;
   summaryGroup?: ObjectId;
   summarized: boolean;
+  summarizedAt?: Date;
   qdrantPointId: string;
 }
 

@@ -65,10 +65,15 @@ export class MemoryManager {
     const db = this.client.db(this.dbName);
     const agentMemory = db.collection<MemoryRecord>("agent_memory");
 
-    const hotRecords = await agentMemory
-      .find({ agentId, tier: "hot" })
-      .sort({ pinned: -1, updatedAt: -1 })
-      .toArray();
+    // Sort in application code — importance enum can't be sorted correctly as a string
+    const WEIGHT: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+    const hotRecords = await agentMemory.find({ agentId, tier: "hot" }).toArray();
+    hotRecords.sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      const wDiff = (WEIGHT[b.importance] ?? 0) - (WEIGHT[a.importance] ?? 0);
+      if (wDiff !== 0) return wDiff;
+      return b.updatedAt.getTime() - a.updatedAt.getTime();
+    });
 
     if (hotRecords.length === 0) return null;
 

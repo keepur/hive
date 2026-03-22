@@ -148,7 +148,7 @@ export class MemoryStore {
     if (ids.length === 0) return;
     await this.collection.updateMany(
       { _id: { $in: ids } },
-      { $set: { summarized: true, summaryGroup: summaryGroupId } },
+      { $set: { summarized: true, summaryGroup: summaryGroupId, summarizedAt: new Date() } },
     );
   }
 
@@ -156,7 +156,7 @@ export class MemoryStore {
     const result = await this.collection.deleteMany({
       agentId,
       summarized: true,
-      updatedAt: { $lt: before },
+      summarizedAt: { $lt: before },
     });
     return result.deletedCount;
   }

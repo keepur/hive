@@ -160,7 +160,8 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    expect(Object.keys(servers)).toEqual(["memory", "keychain"]);
+    // structured-memory is auto-paired with memory in the allowlist
+    expect(Object.keys(servers)).toEqual(["memory", "structured-memory", "keychain"]);
   });
 
   it("removes resend and quo when external comms disabled", async () => {

@@ -136,14 +136,20 @@ export class MemoryLifecycle {
       await this.store.setTierBulk(ids, tier);
     }
 
-    // 3. Enforce hot budget
+    // 3. Enforce hot budget — pinned records don't count against the budget
     const hotRecords = await this.store.getHotTier(agentId);
-    let totalTokens = 0;
+    let pinnedTokens = 0;
+    let nonPinnedTokens = 0;
     const toOverflow: ObjectId[] = [];
     for (const r of hotRecords) {
-      totalTokens += this.estimateTokens(r.content);
-      if (totalTokens > this.config.hotBudgetTokens && !r.pinned) {
-        toOverflow.push(r._id!);
+      const tokens = this.estimateTokens(r.content);
+      if (r.pinned) {
+        pinnedTokens += tokens;
+      } else {
+        nonPinnedTokens += tokens;
+        if (nonPinnedTokens > this.config.hotBudgetTokens) {
+          toOverflow.push(r._id!);
+        }
       }
     }
     if (toOverflow.length > 0) {
