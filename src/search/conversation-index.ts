@@ -6,11 +6,11 @@
  */
 
 import { QdrantClient } from "@qdrant/js-client-rest";
+import { embedOllama } from "./embed-utils.js";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const COLLECTION = "conversations";
-const EMBED_MODEL = process.env.KB_EMBED_MODEL ?? "bge-large";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -37,19 +37,6 @@ export interface ConversationResult {
   inbound: string;
   response: string;
   score: number;
-}
-
-// ── Embedding helper ─────────────────────────────────────────────────────────
-
-async function embedOllama(ollamaUrl: string, text: string): Promise<number[]> {
-  const res = await fetch(`${ollamaUrl}/api/embed`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: EMBED_MODEL, input: text }),
-  });
-  if (!res.ok) throw new Error(`Ollama embed ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.embeddings[0];
 }
 
 // ── ConversationIndex class ──────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 import { MongoClient, type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
+import type { MemoryStore } from "./memory-store.js";
 
 const log = createLogger("memory-manager");
 
@@ -24,6 +25,12 @@ export class MemoryManager {
   private db!: Db;
   private collection!: Collection<MemoryDoc>;
   private versions!: Collection<MemoryVersionDoc>;
+  private _memoryStore?: MemoryStore;
+
+  /** Set the MemoryStore for structured memory operations (hot-tier injection). */
+  set memoryStore(store: MemoryStore) {
+    this._memoryStore = store;
+  }
 
   constructor(mongoUri: string, dbName: string = "hive") {
     this.mongoUri = mongoUri;
@@ -54,6 +61,66 @@ export class MemoryManager {
       .project<{ path: string }>({ path: 1 })
       .toArray();
     return docs.map((d) => d.path.slice(prefix.length));
+  }
+
+  /**
+   * Build the hot-tier memory section for system prompt injection.
+   * Delegates to MemoryStore for the correctly-sorted hot-tier query.
+   * Returns null if no structured memories exist for this agent.
+   */
+  async getHotTierPrompt(agentId: string, budgetTokens: number): Promise<string | null> {
+    if (!this._memoryStore) return null;
+    const hotRecords = await this._memoryStore.getHotTier(agentId);
+    if (hotRecords.length === 0) return null;
+
+    const sectionLabels: Record<string, string> = {
+      task: "Active Tasks",
+      fact: "Key Facts",
+      decision: "Recent Decisions",
+      preference: "Preferences",
+      interaction: "Recent Interactions",
+      summary: "Summaries",
+    };
+
+    const sections: Record<string, string[]> = {};
+    const pinnedEntries: string[] = [];
+    let tokenCount = 0;
+
+    for (const r of hotRecords) {
+      const date = r.updatedAt.toISOString().split("T")[0];
+      const line = `- [${date}] ${r.content} (${r.importance})`;
+      const lineTokens = Math.ceil(line.length / 4);
+
+      if (tokenCount + lineTokens > budgetTokens && !r.pinned) break;
+      tokenCount += lineTokens;
+
+      if (r.pinned) {
+        pinnedEntries.push(`- ${r.content} (${r.importance}, pinned)`);
+      } else {
+        const type = r.type as string;
+        if (!sections[type]) sections[type] = [];
+        sections[type].push(line);
+      }
+    }
+
+    const parts: string[] = ["## Your Memory"];
+    for (const [type, label] of Object.entries(sectionLabels)) {
+      if (sections[type]?.length) {
+        parts.push(`### ${label}\n${sections[type].join("\n")}`);
+      }
+    }
+    if (pinnedEntries.length > 0) {
+      parts.push(`### Pinned\n${pinnedEntries.join("\n")}`);
+    }
+
+    const warmColdCount = await this._memoryStore.countNonHot(agentId);
+    if (warmColdCount > 0) {
+      parts.push(
+        `---\nYou have ${warmColdCount} additional memories available via \`memory_recall\`. Use it to search for context before starting tasks.`,
+      );
+    }
+
+    return parts.join("\n\n");
   }
 
   async write(relativePath: string, content: string, updatedBy?: string): Promise<void> {

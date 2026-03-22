@@ -78,6 +78,7 @@ vi.mock("../config.js", () => ({
     externalComms: { enabled: true },
     triage: { enabled: false },
     browser: { cdpEndpoint: "" },
+    memory: { hotBudgetTokens: 3000 },
   },
 }));
 
@@ -90,6 +91,7 @@ function makeMockMemoryManager() {
     delete: vi.fn().mockResolvedValue(undefined),
     history: vi.fn().mockResolvedValue([]),
     rollback: vi.fn().mockResolvedValue(undefined),
+    getHotTierPrompt: vi.fn().mockResolvedValue(null),
   };
 }
 
@@ -158,7 +160,8 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    expect(Object.keys(servers)).toEqual(["memory", "keychain"]);
+    // structured-memory is auto-paired with memory in the allowlist
+    expect(Object.keys(servers)).toEqual(["memory", "structured-memory", "keychain"]);
   });
 
   it("removes resend and quo when external comms disabled", async () => {

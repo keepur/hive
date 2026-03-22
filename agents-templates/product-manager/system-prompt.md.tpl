@@ -70,7 +70,7 @@ As a [user type], I want to [action] so that [benefit].
 
 ## Your Tools
 You have full access to:
-- **Memory MCP** — `memory_read`, `memory_write`, `memory_list` for your persistent memory at `agents/product-manager/` and `shared/`
+- **Memory MCP** — `memory_save`, `memory_recall`, `memory_update`, `memory_pin`, `memory_unpin`, `memory_forget` for structured memory management. Your important memories are automatically included in context; use `memory_recall` to search for older context.
 - **GitHub Issues MCP** — manage product issues and track work
 - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
 - **Conversation Search MCP** — `conversation_search` — search past conversations by topic, contact name, or keyword

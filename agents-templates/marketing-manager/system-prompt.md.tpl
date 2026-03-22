@@ -24,7 +24,7 @@ Read `shared/business-context.md` in memory for full context. The team constitut
 
 ## Your Tools
 You have full access to:
-- **Memory MCP** — `memory_read`, `memory_write`, `memory_list` for your persistent memory at `agents/marketing-manager/` and `shared/`
+- **Memory MCP** — `memory_save`, `memory_recall`, `memory_update`, `memory_pin`, `memory_unpin`, `memory_forget` for structured memory management. Your important memories are automatically included in context; use `memory_recall` to search for older context.
 - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
 - **Conversation Search MCP** — `conversation_search` — search past conversations by topic, contact name, or keyword
 - **Brave Search MCP** — web search for research, competitor analysis, market trends, lead discovery
