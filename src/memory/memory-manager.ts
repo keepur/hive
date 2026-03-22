@@ -1,6 +1,6 @@
 import { MongoClient, type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import type { MemoryRecord, MemoryType } from "./memory-types.js";
+import type { MemoryStore } from "./memory-store.js";
 
 const log = createLogger("memory-manager");
 
@@ -25,6 +25,12 @@ export class MemoryManager {
   private db!: Db;
   private collection!: Collection<MemoryDoc>;
   private versions!: Collection<MemoryVersionDoc>;
+  private _memoryStore?: MemoryStore;
+
+  /** Set the MemoryStore for structured memory operations (hot-tier injection). */
+  set memoryStore(store: MemoryStore) {
+    this._memoryStore = store;
+  }
 
   constructor(mongoUri: string, dbName: string = "hive") {
     this.mongoUri = mongoUri;
@@ -59,26 +65,14 @@ export class MemoryManager {
 
   /**
    * Build the hot-tier memory section for system prompt injection.
+   * Delegates to MemoryStore for the correctly-sorted hot-tier query.
    * Returns null if no structured memories exist for this agent.
    */
   async getHotTierPrompt(agentId: string, budgetTokens: number): Promise<string | null> {
-    const db = this.client.db(this.dbName);
-    const agentMemory = db.collection<MemoryRecord>("agent_memory");
-
-    // Sort in application code — importance enum can't be sorted correctly as a string
-    const WEIGHT: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
-    const hotRecords = await agentMemory.find({ agentId, tier: "hot" }).toArray();
-    hotRecords.sort((a, b) => {
-      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-      const wDiff = (WEIGHT[b.importance] ?? 0) - (WEIGHT[a.importance] ?? 0);
-      if (wDiff !== 0) return wDiff;
-      return b.updatedAt.getTime() - a.updatedAt.getTime();
-    });
-
+    if (!this._memoryStore) return null;
+    const hotRecords = await this._memoryStore.getHotTier(agentId);
     if (hotRecords.length === 0) return null;
 
-    // Group by type, enforce token budget
-    const sections: Record<string, string[]> = {};
     const sectionLabels: Record<string, string> = {
       task: "Active Tasks",
       fact: "Key Facts",
@@ -88,8 +82,9 @@ export class MemoryManager {
       summary: "Summaries",
     };
 
-    let tokenCount = 0;
+    const sections: Record<string, string[]> = {};
     const pinnedEntries: string[] = [];
+    let tokenCount = 0;
 
     for (const r of hotRecords) {
       const date = r.updatedAt.toISOString().split("T")[0];
@@ -108,9 +103,7 @@ export class MemoryManager {
       }
     }
 
-    // Render
     const parts: string[] = ["## Your Memory"];
-
     for (const [type, label] of Object.entries(sectionLabels)) {
       if (sections[type]?.length) {
         parts.push(`### ${label}\n${sections[type].join("\n")}`);
@@ -120,8 +113,7 @@ export class MemoryManager {
       parts.push(`### Pinned\n${pinnedEntries.join("\n")}`);
     }
 
-    // Count warm+cold for the hint
-    const warmColdCount = await agentMemory.countDocuments({ agentId, tier: { $ne: "hot" } });
+    const warmColdCount = await this._memoryStore.countNonHot(agentId);
     if (warmColdCount > 0) {
       parts.push(
         `---\nYou have ${warmColdCount} additional memories available via \`memory_recall\`. Use it to search for context before starting tasks.`,

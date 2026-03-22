@@ -1,11 +1,11 @@
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { createLogger } from "../logging/logger.js";
+import { embedOllama } from "../search/embed-utils.js";
 import type { MemoryRecallFilters } from "./memory-types.js";
 
 const log = createLogger("memory-embedder");
 
 const COLLECTION = "agent_memory";
-const EMBED_MODEL = process.env.KB_EMBED_MODEL ?? "bge-large";
 
 interface QdrantPayload {
   [key: string]: unknown;
@@ -40,14 +40,7 @@ export class MemoryEmbedder {
   }
 
   private async embed(text: string): Promise<number[]> {
-    const res = await fetch(`${this.ollamaUrl}/api/embed`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: EMBED_MODEL, input: text }),
-    });
-    if (!res.ok) throw new Error(`Ollama embed ${res.status}: ${await res.text()}`);
-    const data = await res.json();
-    return data.embeddings[0];
+    return embedOllama(this.ollamaUrl, text);
   }
 
   async ensureCollection(): Promise<void> {

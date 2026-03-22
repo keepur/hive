@@ -20,7 +20,7 @@ import { z } from "zod";
 import { ObjectId } from "mongodb";
 import { MemoryStore } from "./memory-store.js";
 import { MemoryEmbedder } from "./memory-embedder.js";
-import type { MemoryType, MemoryImportance } from "./memory-types.js";
+import type { MemoryType, MemoryImportance, MemoryTier } from "./memory-types.js";
 
 const AGENT_ID = process.env.AGENT_ID ?? "";
 const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
@@ -112,10 +112,10 @@ server.registerTool(
   },
   async ({ query, type, topic, tier, importance, limit }) => {
     const searchResults = await embedder.search(query, AGENT_ID, {
-      type: type as any,
+      type: type as MemoryType,
       topic,
-      tier: tier as any,
-      importance: importance as any,
+      tier: tier as MemoryTier,
+      importance: importance as MemoryImportance,
       limit,
     });
 
@@ -123,12 +123,14 @@ server.registerTool(
       return { content: [{ type: "text", text: "No matching memories found." }] };
     }
 
-    // Fetch full records from MongoDB
+    // Bulk fetch records from MongoDB (avoids N+1)
     const ids = searchResults.map((r) => new ObjectId(r.mongoId));
-    const records: string[] = [];
+    const allRecords = await store.getByIds(ids);
+    const recordMap = new Map(allRecords.map((r) => [r._id!.toString(), r]));
 
+    const records: string[] = [];
     for (const sr of searchResults) {
-      const record = await store.getById(new ObjectId(sr.mongoId));
+      const record = recordMap.get(sr.mongoId);
       if (!record) continue;
       const pinLabel = record.pinned ? " [pinned]" : "";
       const date = record.updatedAt.toISOString().split("T")[0];

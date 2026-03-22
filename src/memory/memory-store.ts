@@ -1,6 +1,6 @@
-import { MongoClient, ObjectId, type Collection, type Db } from "mongodb";
+import { MongoClient, ObjectId, type Collection, type Db, type WithoutId } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import type { MemoryRecord, MemoryRecordInput, MemoryTier } from "./memory-types.js";
+import type { MemoryRecord, MemoryRecordInput, MemoryImportance, MemoryTier } from "./memory-types.js";
 
 const log = createLogger("memory-store");
 
@@ -53,7 +53,7 @@ export class MemoryStore {
       summarized: false,
       qdrantPointId,
     };
-    const result = await this.collection.insertOne(record as any);
+    const result = await this.collection.insertOne(record as WithoutId<MemoryRecord>);
     record._id = result.insertedId;
     return record;
   }
@@ -65,10 +65,10 @@ export class MemoryStore {
   async update(
     id: ObjectId,
     content: string,
-    importance?: string,
+    importance?: MemoryImportance,
     qdrantPointId?: string,
   ): Promise<MemoryRecord | null> {
-    const updates: Record<string, any> = {
+    const updates: Partial<MemoryRecord> & { updatedAt: Date } = {
       content,
       updatedAt: new Date(),
     };
@@ -113,6 +113,15 @@ export class MemoryStore {
       if (wDiff !== 0) return wDiff;
       return b.updatedAt.getTime() - a.updatedAt.getTime();
     });
+  }
+
+  async getByIds(ids: ObjectId[]): Promise<MemoryRecord[]> {
+    if (ids.length === 0) return [];
+    return this.collection.find({ _id: { $in: ids } }).toArray();
+  }
+
+  async countNonHot(agentId: string): Promise<number> {
+    return this.collection.countDocuments({ agentId, tier: { $ne: "hot" } });
   }
 
   async getAllNonPinned(agentId: string): Promise<MemoryRecord[]> {

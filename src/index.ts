@@ -49,6 +49,7 @@ async function main(): Promise<void> {
   // Structured memory lifecycle
   const memoryStore = new MemoryStore(config.mongo.uri, config.mongo.dbName);
   await memoryStore.init();
+  memoryManager.memoryStore = memoryStore;
   const memoryEmbedder = new MemoryEmbedder();
   const memoryLifecycle = new MemoryLifecycle(memoryStore, memoryEmbedder, {
     hotBudgetTokens: config.memory.hotBudgetTokens,
