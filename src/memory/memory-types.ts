@@ -1,0 +1,71 @@
+import type { ObjectId } from "mongodb";
+
+export type MemoryType = "fact" | "task" | "interaction" | "preference" | "decision" | "summary";
+export type MemoryImportance = "critical" | "high" | "medium" | "low";
+export type MemoryTier = "hot" | "warm" | "cold";
+
+export interface MemoryRecord {
+  _id?: ObjectId;
+  agentId: string;
+  content: string;
+  type: MemoryType;
+  topic: string;
+  importance: MemoryImportance;
+  tier: MemoryTier;
+  createdAt: Date;
+  updatedAt: Date;
+  lastAccessedAt: Date;
+  accessCount: number;
+  sourceChannel?: string;
+  sourceThread?: string;
+  pinned: boolean;
+  supersededBy?: ObjectId;
+  summaryGroup?: ObjectId;
+  summarized: boolean;
+  qdrantPointId: string;
+}
+
+export interface MemoryRecordInput {
+  content: string;
+  type: MemoryType;
+  topic: string;
+  importance: MemoryImportance;
+}
+
+export interface MemoryRecallFilters {
+  type?: MemoryType;
+  topic?: string;
+  tier?: MemoryTier;
+  importance?: MemoryImportance;
+  limit?: number;
+}
+
+export interface MemoryRecallResult extends MemoryRecord {
+  score: number;
+}
+
+export interface MemoryLifecycleConfig {
+  hotBudgetTokens: number;
+  sweepIntervalHours: number;
+  hotThreshold: number;
+  warmThreshold: number;
+  recencyHalfLifeDays: number;
+  coldSummaryMinRecords: number;
+  coldRetentionDays: number;
+}
+
+export const IMPORTANCE_WEIGHTS: Record<MemoryImportance, number> = {
+  critical: 1.0,
+  high: 0.75,
+  medium: 0.5,
+  low: 0.25,
+};
+
+export const TYPE_WEIGHTS: Record<MemoryType, number> = {
+  decision: 1.0,
+  fact: 0.8,
+  preference: 0.8,
+  summary: 0.6,
+  task: 0.5,
+  interaction: 0.3,
+};
