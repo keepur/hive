@@ -127,6 +127,22 @@ export class AgentRunner {
       },
     };
 
+    // Structured Memory MCP server — semantic + temporal memory with vector search
+    servers["structured-memory"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/memory/structured-memory-mcp-server.js")],
+      env: {
+        AGENT_ID: this.agentConfig.id,
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+        CHANNEL_ID: context?.channelId ?? "",
+        THREAD_ID: context?.threadId ?? "",
+        QDRANT_URL: process.env.QDRANT_URL ?? "http://localhost:6333",
+        OLLAMA_URL: process.env.OLLAMA_URL ?? "http://localhost:11434",
+      },
+    };
+
     // Keychain MCP server — read-only access to macOS Keychain secrets
     servers["keychain"] = {
       type: "stdio",
