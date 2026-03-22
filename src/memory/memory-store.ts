@@ -9,7 +9,10 @@ export class MemoryStore {
   private db!: Db;
   private collection!: Collection<MemoryRecord>;
 
-  constructor(private mongoUri: string, private dbName: string) {
+  constructor(
+    private mongoUri: string,
+    private dbName: string,
+  ) {
     this.client = new MongoClient(mongoUri);
   }
 
@@ -25,7 +28,13 @@ export class MemoryStore {
     log.info("Memory store initialized", { db: this.dbName });
   }
 
-  async save(agentId: string, input: MemoryRecordInput, qdrantPointId: string, sourceChannel?: string, sourceThread?: string): Promise<MemoryRecord> {
+  async save(
+    agentId: string,
+    input: MemoryRecordInput,
+    qdrantPointId: string,
+    sourceChannel?: string,
+    sourceThread?: string,
+  ): Promise<MemoryRecord> {
     const now = new Date();
     const record: MemoryRecord = {
       agentId,
@@ -53,7 +62,12 @@ export class MemoryStore {
     return this.collection.findOne({ _id: id });
   }
 
-  async update(id: ObjectId, content: string, importance?: string, qdrantPointId?: string): Promise<MemoryRecord | null> {
+  async update(
+    id: ObjectId,
+    content: string,
+    importance?: string,
+    qdrantPointId?: string,
+  ): Promise<MemoryRecord | null> {
     const updates: Record<string, any> = {
       content,
       updatedAt: new Date(),
@@ -61,27 +75,17 @@ export class MemoryStore {
     if (importance) updates.importance = importance;
     if (qdrantPointId) updates.qdrantPointId = qdrantPointId;
 
-    const result = await this.collection.findOneAndUpdate(
-      { _id: id },
-      { $set: updates },
-      { returnDocument: "after" },
-    );
+    const result = await this.collection.findOneAndUpdate({ _id: id }, { $set: updates }, { returnDocument: "after" });
     return result;
   }
 
   async pin(id: ObjectId): Promise<boolean> {
-    const result = await this.collection.updateOne(
-      { _id: id },
-      { $set: { pinned: true, tier: "hot" as MemoryTier } },
-    );
+    const result = await this.collection.updateOne({ _id: id }, { $set: { pinned: true, tier: "hot" as MemoryTier } });
     return result.modifiedCount > 0;
   }
 
   async unpin(id: ObjectId): Promise<boolean> {
-    const result = await this.collection.updateOne(
-      { _id: id },
-      { $set: { pinned: false } },
-    );
+    const result = await this.collection.updateOne({ _id: id }, { $set: { pinned: false } });
     return result.modifiedCount > 0;
   }
 
@@ -129,10 +133,7 @@ export class MemoryStore {
   }
 
   async getColdByTopic(agentId: string, topic: string): Promise<MemoryRecord[]> {
-    return this.collection
-      .find({ agentId, tier: "cold", topic, summarized: false })
-      .sort({ createdAt: 1 })
-      .toArray();
+    return this.collection.find({ agentId, tier: "cold", topic, summarized: false }).sort({ createdAt: 1 }).toArray();
   }
 
   async getColdTopics(agentId: string): Promise<string[]> {

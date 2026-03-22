@@ -36,10 +36,7 @@ if (!AGENT_ID) {
 const store = new MemoryStore(MONGODB_URI, MONGODB_DB);
 await store.init();
 
-const embedder = new MemoryEmbedder(
-  process.env.QDRANT_URL,
-  process.env.OLLAMA_URL,
-);
+const embedder = new MemoryEmbedder(process.env.QDRANT_URL, process.env.OLLAMA_URL);
 
 const server = new McpServer({
   name: "hive-structured-memory",
@@ -53,7 +50,8 @@ server.registerTool(
   "memory_save",
   {
     title: "Save Memory",
-    description: "Save a new structured memory record. Use this to remember facts, tasks, interactions, preferences, or decisions.",
+    description:
+      "Save a new structured memory record. Use this to remember facts, tasks, interactions, preferences, or decisions.",
     inputSchema: {
       content: z.string().describe("The memory content — a fact, note, task, preference, or decision"),
       type: z.enum(VALID_TYPES).describe("Memory type: fact, task, interaction, preference, or decision"),
@@ -72,20 +70,24 @@ server.registerTool(
     );
 
     // Embed async — don't block the response on Qdrant
-    embedder.upsert(pointId, content, {
-      agentId: AGENT_ID,
-      mongoId: record._id!.toString(),
-      type,
-      topic,
-      tier: "hot",
-      importance,
-      createdAt: Math.floor(record.createdAt.getTime() / 1000),
-    }).catch((err) => {
-      process.stderr.write(`memory_save embed error: ${err}\n`);
-    });
+    embedder
+      .upsert(pointId, content, {
+        agentId: AGENT_ID,
+        mongoId: record._id!.toString(),
+        type,
+        topic,
+        tier: "hot",
+        importance,
+        createdAt: Math.floor(record.createdAt.getTime() / 1000),
+      })
+      .catch((err) => {
+        process.stderr.write(`memory_save embed error: ${err}\n`);
+      });
 
     return {
-      content: [{ type: "text", text: `Saved memory [${record._id}] — type:${type} topic:"${topic}" importance:${importance}` }],
+      content: [
+        { type: "text", text: `Saved memory [${record._id}] — type:${type} topic:"${topic}" importance:${importance}` },
+      ],
     };
   },
 );
@@ -94,10 +96,14 @@ server.registerTool(
   "memory_recall",
   {
     title: "Recall Memory",
-    description: "Search your memories semantically. Returns the most relevant memories across all tiers (hot, warm, cold). Use this before starting tasks to find relevant context.",
+    description:
+      "Search your memories semantically. Returns the most relevant memories across all tiers (hot, warm, cold). Use this before starting tasks to find relevant context.",
     inputSchema: {
       query: z.string().describe("What to search for — natural language query"),
-      type: z.enum([...VALID_TYPES, "summary"]).optional().describe("Filter by memory type"),
+      type: z
+        .enum([...VALID_TYPES, "summary"])
+        .optional()
+        .describe("Filter by memory type"),
       topic: z.string().optional().describe("Filter by topic tag"),
       tier: z.enum(["hot", "warm", "cold"]).optional().describe("Filter by tier"),
       importance: z.enum(VALID_IMPORTANCE).optional().describe("Filter by importance"),
@@ -128,7 +134,7 @@ server.registerTool(
       const date = record.updatedAt.toISOString().split("T")[0];
       records.push(
         `**[${record._id}]** (${record.type}/${record.importance}, ${record.tier}${pinLabel}, ${date}, relevance: ${sr.score.toFixed(2)})\n` +
-        `Topic: ${record.topic}\n${record.content}`
+          `Topic: ${record.topic}\n${record.content}`,
       );
     }
 
@@ -169,17 +175,19 @@ server.registerTool(
     }
 
     // Re-embed
-    embedder.upsert(updated.qdrantPointId, content, {
-      agentId: AGENT_ID,
-      mongoId: id,
-      type: updated.type,
-      topic: updated.topic,
-      tier: updated.tier,
-      importance: updated.importance,
-      createdAt: Math.floor(updated.createdAt.getTime() / 1000),
-    }).catch((err) => {
-      process.stderr.write(`memory_update embed error: ${err}\n`);
-    });
+    embedder
+      .upsert(updated.qdrantPointId, content, {
+        agentId: AGENT_ID,
+        mongoId: id,
+        type: updated.type,
+        topic: updated.topic,
+        tier: updated.tier,
+        importance: updated.importance,
+        createdAt: Math.floor(updated.createdAt.getTime() / 1000),
+      })
+      .catch((err) => {
+        process.stderr.write(`memory_update embed error: ${err}\n`);
+      });
 
     return { content: [{ type: "text", text: `Updated memory [${id}]` }] };
   },
@@ -189,7 +197,8 @@ server.registerTool(
   "memory_pin",
   {
     title: "Pin Memory",
-    description: "Pin a memory to the hot tier. Pinned memories are always included in your context. Use for critical facts that must never be forgotten.",
+    description:
+      "Pin a memory to the hot tier. Pinned memories are always included in your context. Use for critical facts that must never be forgotten.",
     inputSchema: {
       id: z.string().describe("Memory record ID to pin"),
     },
@@ -216,7 +225,8 @@ server.registerTool(
   "memory_unpin",
   {
     title: "Unpin Memory",
-    description: "Remove pin from a memory, returning it to normal lifecycle scoring. It may be demoted to warm/cold on the next sweep.",
+    description:
+      "Remove pin from a memory, returning it to normal lifecycle scoring. It may be demoted to warm/cold on the next sweep.",
     inputSchema: {
       id: z.string().describe("Memory record ID to unpin"),
     },

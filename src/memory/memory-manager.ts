@@ -90,8 +90,6 @@ export class MemoryManager {
 
     let tokenCount = 0;
     const pinnedEntries: string[] = [];
-    let includedCount = 0;
-    const totalCount = hotRecords.length;
 
     for (const r of hotRecords) {
       const date = r.updatedAt.toISOString().split("T")[0];
@@ -100,7 +98,6 @@ export class MemoryManager {
 
       if (tokenCount + lineTokens > budgetTokens && !r.pinned) break;
       tokenCount += lineTokens;
-      includedCount++;
 
       if (r.pinned) {
         pinnedEntries.push(`- ${r.content} (${r.importance}, pinned)`);
@@ -126,11 +123,10 @@ export class MemoryManager {
     // Count warm+cold for the hint
     const warmColdCount = await agentMemory.countDocuments({ agentId, tier: { $ne: "hot" } });
     if (warmColdCount > 0) {
-      parts.push(`---\nYou have ${warmColdCount} additional memories available via \`memory_recall\`. Use it to search for context before starting tasks.`);
+      parts.push(
+        `---\nYou have ${warmColdCount} additional memories available via \`memory_recall\`. Use it to search for context before starting tasks.`,
+      );
     }
-
-    void includedCount;
-    void totalCount;
 
     return parts.join("\n\n");
   }

@@ -27,14 +27,13 @@ export class MemoryLifecycle {
     // Recency: exponential decay from updatedAt
     const ageMs = Date.now() - record.updatedAt.getTime();
     const halfLifeMs = this.config.recencyHalfLifeDays * 24 * 60 * 60 * 1000;
-    const recencyWeight = Math.exp(-0.693 * ageMs / halfLifeMs); // ln(2) ≈ 0.693
+    const recencyWeight = Math.exp((-0.693 * ageMs) / halfLifeMs); // ln(2) ≈ 0.693
 
     // Access frequency: normalized against agent median
-    const accessWeight = medianAccess > 0
-      ? Math.min(record.accessCount / medianAccess, 1.0)
-      : (record.accessCount > 0 ? 1.0 : 0.0);
+    const accessWeight =
+      medianAccess > 0 ? Math.min(record.accessCount / medianAccess, 1.0) : record.accessCount > 0 ? 1.0 : 0.0;
 
-    return (importanceWeight * 0.4) + (recencyWeight * 0.3) + (accessWeight * 0.2) + (typeWeight * 0.1);
+    return importanceWeight * 0.4 + recencyWeight * 0.3 + accessWeight * 0.2 + typeWeight * 0.1;
   }
 
   /**
@@ -95,7 +94,9 @@ export class MemoryLifecycle {
     };
   }
 
-  private async sweepAgent(agentId: string): Promise<{ promoted: number; demoted: number; summarized: number; cleaned: number }> {
+  private async sweepAgent(
+    agentId: string,
+  ): Promise<{ promoted: number; demoted: number; summarized: number; cleaned: number }> {
     let promoted = 0;
     let demoted = 0;
 
@@ -180,9 +181,7 @@ export class MemoryLifecycle {
       const coldRecords = await this.store.getColdByTopic(agentId, topic);
       if (coldRecords.length < this.config.coldSummaryMinRecords) continue;
 
-      const entries = coldRecords
-        .map((r) => `- [${r.type}/${r.importance}] ${r.content}`)
-        .join("\n");
+      const entries = coldRecords.map((r) => `- [${r.type}/${r.importance}] ${r.content}`).join("\n");
 
       const prompt = [
         `Summarize the following memory entries for agent ${agentId} about topic "${topic}".`,

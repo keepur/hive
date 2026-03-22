@@ -115,7 +115,10 @@ for (const doc of legacyDocs) {
 
     let entries: MemoryRecordInput[];
     try {
-      const text = resultText.trim().replace(/^```json?\n?/, "").replace(/\n?```$/, "");
+      const text = resultText
+        .trim()
+        .replace(/^```json?\n?/, "")
+        .replace(/\n?```$/, "");
       entries = JSON.parse(text);
     } catch (err) {
       console.log(`  Failed to parse Haiku response for chunk — skipping`);
@@ -134,12 +137,16 @@ for (const doc of legacyDocs) {
 
     for (const entry of entries) {
       const pointId = crypto.randomUUID();
-      const record = await store.save(agentId, {
-        content: entry.content,
-        type: entry.type as MemoryType,
-        topic: entry.topic,
-        importance: entry.importance as MemoryImportance,
-      }, pointId);
+      const record = await store.save(
+        agentId,
+        {
+          content: entry.content,
+          type: entry.type as MemoryType,
+          topic: entry.topic,
+          importance: entry.importance as MemoryImportance,
+        },
+        pointId,
+      );
 
       await embedder.upsert(pointId, entry.content, {
         agentId,
