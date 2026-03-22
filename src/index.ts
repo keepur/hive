@@ -22,6 +22,9 @@ import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
 import { setGeminiApiKey } from "./files/file-processor.js";
+import { MemoryStore } from "./memory/memory-store.js";
+import { MemoryEmbedder } from "./memory/memory-embedder.js";
+import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
@@ -42,6 +45,20 @@ async function main(): Promise<void> {
   // Initialize core systems
   const memoryManager = new MemoryManager(config.mongo.uri, config.mongo.dbName);
   await memoryManager.init();
+
+  // Structured memory lifecycle
+  const memoryStore = new MemoryStore(config.mongo.uri, config.mongo.dbName);
+  await memoryStore.init();
+  const memoryEmbedder = new MemoryEmbedder();
+  const memoryLifecycle = new MemoryLifecycle(memoryStore, memoryEmbedder, {
+    hotBudgetTokens: config.memory.hotBudgetTokens,
+    sweepIntervalHours: config.memory.sweepIntervalHours,
+    hotThreshold: config.memory.hotThreshold,
+    warmThreshold: config.memory.warmThreshold,
+    recencyHalfLifeDays: config.memory.recencyHalfLifeDays,
+    coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
+    coldRetentionDays: config.memory.coldRetentionDays,
+  });
 
   const sessionStore = new SessionStore(config.mongo.uri);
   await sessionStore.connect(config.mongo.dbName);
@@ -275,6 +292,7 @@ async function main(): Promise<void> {
       taskFileTtlMs: config.sweeper.taskFileTtlMs,
       meetingSessionTtlMs: config.sweeper.meetingSessionTtlMs,
       cacheTtlMs: config.sweeper.cacheTtlMs,
+      memorySweepIntervalHours: config.memory.sweepIntervalHours,
     },
     {
       dispatcher,
@@ -286,6 +304,7 @@ async function main(): Promise<void> {
       slackGateways,
       agentManager,
       retryQueue,
+      memoryLifecycle,
     },
     taskClient.isConfigured ? taskClient : undefined,
   );
@@ -305,6 +324,7 @@ async function main(): Promise<void> {
     meetingMonitor?.stop();
     agentManager.stopAll();
     await sessionStore.close();
+    await memoryStore.close();
     await slackAdapter.stop();
     log.info("Hive shut down cleanly");
     process.exit(0);

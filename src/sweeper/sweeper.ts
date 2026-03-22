@@ -9,6 +9,7 @@ import type { SlackGateway } from "../slack/slack-gateway.js";
 import type { AgentManager } from "../agents/agent-manager.js";
 import type { RetryQueue } from "./retry-queue.js";
 import type { TaskClient } from "../tasks/task-client.js";
+import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 
 const log = createLogger("sweeper");
 
@@ -26,6 +27,7 @@ export interface SweeperConfig {
   taskFileTtlMs: number;
   meetingSessionTtlMs: number;
   cacheTtlMs: number;
+  memorySweepIntervalHours?: number;
 }
 
 export interface SweeperTargets {
@@ -38,6 +40,7 @@ export interface SweeperTargets {
   slackGateways: SlackGateway[];
   agentManager: AgentManager;
   retryQueue?: RetryQueue;
+  memoryLifecycle?: MemoryLifecycle;
 }
 
 export class Sweeper {
@@ -48,6 +51,8 @@ export class Sweeper {
   private timer: ReturnType<typeof setInterval> | null = null;
   private sweepCount = 0;
   private gatewayCycleCounter = 0;
+  private memoryCycleCounter = 0;
+  private memorySweepEvery: number;
 
   private static readonly GATEWAY_SWEEP_EVERY = 12; // every 12th cycle (~1h at 5min interval)
 
@@ -55,6 +60,9 @@ export class Sweeper {
     this.config = config;
     this.targets = targets;
     this.taskClient = taskClient;
+    // Derive memory sweep cycle count: e.g., 6 hours / (300000ms → 0.0833h) = 72 cycles
+    const sweepIntervalH = config.memorySweepIntervalHours ?? 6;
+    this.memorySweepEvery = Math.round((sweepIntervalH * 3600000) / config.intervalMs);
   }
 
   start(): void {
@@ -169,6 +177,19 @@ export class Sweeper {
         });
       } catch (err) {
         results.push({ component: "retry-queue", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
+      }
+    }
+
+    // 9. Memory lifecycle — tier scoring, budget enforcement, summarization
+    if (this.targets.memoryLifecycle) {
+      this.memoryCycleCounter++;
+      if (this.memoryCycleCounter >= this.memorySweepEvery) {
+        this.memoryCycleCounter = 0;
+        try {
+          results.push(await this.targets.memoryLifecycle.sweep());
+        } catch (err) {
+          results.push({ component: "memory-lifecycle", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
+        }
       }
     }
 
