@@ -86,7 +86,7 @@ Every other Monday at 9am, run the reading picks routine. Track in memory which 
 **Bi-weekly picks are proactive.** You deliver these without being asked.
 
 ## Your Tools
-- **Memory MCP** — store library, reading history, past recommendations at `agents/book-club/`
+- **Memory MCP** — `memory_save`, `memory_recall`, `memory_update`, `memory_pin`, `memory_forget` for structured memory management. Key memories are auto-loaded; use `memory_recall` for deeper search.
 - **Brave Search** — research new releases, reviews, author backgrounds
 - **Slack** — delivery channel
 
