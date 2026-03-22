@@ -46,20 +46,27 @@ async function main(): Promise<void> {
   const memoryManager = new MemoryManager(config.mongo.uri, config.mongo.dbName);
   await memoryManager.init();
 
-  // Structured memory lifecycle
-  const memoryStore = new MemoryStore(config.mongo.uri, config.mongo.dbName);
-  await memoryStore.init();
-  memoryManager.memoryStore = memoryStore;
-  const memoryEmbedder = new MemoryEmbedder();
-  const memoryLifecycle = new MemoryLifecycle(memoryStore, memoryEmbedder, {
-    hotBudgetTokens: config.memory.hotBudgetTokens,
-    sweepIntervalHours: config.memory.sweepIntervalHours,
-    hotThreshold: config.memory.hotThreshold,
-    warmThreshold: config.memory.warmThreshold,
-    recencyHalfLifeDays: config.memory.recencyHalfLifeDays,
-    coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
-    coldRetentionDays: config.memory.coldRetentionDays,
-  });
+  // Structured memory lifecycle — opt-in via memory.structured in hive.yaml
+  let memoryLifecycle: MemoryLifecycle | undefined;
+  let memoryStore: MemoryStore | undefined;
+  if (config.memory.structured) {
+    memoryStore = new MemoryStore(config.mongo.uri, config.mongo.dbName);
+    await memoryStore.init();
+    memoryManager.memoryStore = memoryStore;
+    const memoryEmbedder = new MemoryEmbedder();
+    memoryLifecycle = new MemoryLifecycle(memoryStore, memoryEmbedder, {
+      hotBudgetTokens: config.memory.hotBudgetTokens,
+      sweepIntervalHours: config.memory.sweepIntervalHours,
+      hotThreshold: config.memory.hotThreshold,
+      warmThreshold: config.memory.warmThreshold,
+      recencyHalfLifeDays: config.memory.recencyHalfLifeDays,
+      coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
+      coldRetentionDays: config.memory.coldRetentionDays,
+    });
+    log.info("Structured memory lifecycle enabled");
+  } else {
+    log.info("Structured memory lifecycle disabled (legacy mode)");
+  }
 
   const sessionStore = new SessionStore(config.mongo.uri);
   await sessionStore.connect(config.mongo.dbName);
@@ -325,7 +332,7 @@ async function main(): Promise<void> {
     meetingMonitor?.stop();
     agentManager.stopAll();
     await sessionStore.close();
-    await memoryStore.close();
+    await memoryStore?.close();
     await slackAdapter.stop();
     log.info("Hive shut down cleanly");
     process.exit(0);

@@ -195,6 +195,7 @@ export const config = {
     retryBaseDelayMs: parseInt(optional("SWEEPER_RETRY_BASE_DELAY_MS", "30000"), 10),
   },
   memory: {
+    structured: hive.memory?.structured === true || process.env.MEMORY_STRUCTURED === "true",
     hotBudgetTokens: parseInt(optional("MEMORY_HOT_BUDGET_TOKENS", String(hive.memory?.hotBudgetTokens ?? 3000)), 10),
     sweepIntervalHours: parseFloat(
       optional("MEMORY_SWEEP_INTERVAL_HOURS", String(hive.memory?.sweepIntervalHours ?? 6)),
