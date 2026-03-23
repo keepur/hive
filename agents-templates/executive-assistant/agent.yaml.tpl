@@ -11,11 +11,8 @@ maxTurns: 25
 schedule:
   - cron: "*/30 * * * *"
     task: check-slack-dms
-  - cron: "0 * * * *"
-    task: check-gmail-inbox
 servers:
   - memory
-  - google
   - contacts
   - slack
   - keychain

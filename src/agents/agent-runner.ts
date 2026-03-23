@@ -154,12 +154,14 @@ export class AgentRunner {
     };
 
     // Google MCP server — Gmail + Calendar via gog CLI
+    // Per-agent account from google.accounts map, falls back to global google.account
+    const gogAccount = config.google.accounts[this.agentConfig.id] || config.google.account;
     servers["google"] = {
       type: "stdio",
       command: "node",
       args: [resolve("dist/google/google-mcp-server.js")],
       env: {
-        ...(config.google?.account ? { GOG_ACCOUNT: config.google.account } : {}),
+        ...(gogAccount ? { GOG_ACCOUNT: gogAccount } : {}),
         PATH: process.env.PATH ?? "",
       },
     };
