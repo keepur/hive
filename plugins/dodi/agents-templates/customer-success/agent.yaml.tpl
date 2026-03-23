@@ -31,5 +31,6 @@ servers:
   - quo
   - google-workspace
   - dodi-ops
+  - callback
 plugins:
   - dodi-dev
