@@ -13,6 +13,7 @@ schedule:
 budgetUsd: 50
 servers:
   - memory
+  - google
   - contacts
   - conversation-search
   - brave-search
