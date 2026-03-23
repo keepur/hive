@@ -14,6 +14,7 @@ schedule:
 budgetUsd: 50
 servers:
   - memory
+  - google
   - contacts
   - crm-search
   - conversation-search

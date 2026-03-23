@@ -45,7 +45,7 @@ vi.mock("../config.js", () => ({
   config: {
     slack: { mcpToken: "" },
     mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
-    google: { account: "" },
+    google: { account: "", accounts: {} },
     googleWorkspace: { gwsPath: "gws", sharedFolder: "test-folder" },
     quo: { apiKey: "", phoneNumberId: "", lines: [] },
     taskLedger: {

@@ -18,6 +18,7 @@ maxTurns: 30
 dodiOpsMode: full
 servers:
   - memory
+  - google
   - crm-search
   - product-search
   - conversation-search

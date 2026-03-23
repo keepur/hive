@@ -22,6 +22,7 @@ budgetUsd: 50
 maxTurns: 30
 servers:
   - memory
+  - google
   - contacts
   - crm-search
   - conversation-search

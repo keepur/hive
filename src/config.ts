@@ -104,6 +104,7 @@ export const config = {
   },
   google: {
     account: optional("GOOGLE_ACCOUNT", ""),
+    accounts: (hive.google?.accounts ?? {}) as Record<string, string>,
   },
   googleWorkspace: {
     account: optional("GWS_ACCOUNT", hive.googleWorkspace?.account ?? ""),
