@@ -299,10 +299,7 @@ server.registerTool(
         .describe("Filter by memory type: fact, task, interaction, preference, or decision"),
       importance: z.enum(VALID_IMPORTANCE).optional().describe("Filter by importance level"),
       tier: z.enum(["hot", "warm", "cold"]).optional().describe("Filter by current tier"),
-      olderThan: z
-        .string()
-        .optional()
-        .describe("ISO 8601 date string — purge records with updatedAt before this date"),
+      olderThan: z.string().optional().describe("ISO 8601 date string — purge records with updatedAt before this date"),
     },
   },
   async ({ topic, type, importance, tier, olderThan }) => {

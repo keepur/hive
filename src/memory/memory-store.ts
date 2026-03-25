@@ -143,7 +143,10 @@ export class MemoryStore {
   }
 
   async getColdByTopic(agentId: string, topic: string): Promise<MemoryRecord[]> {
-    return this.collection.find({ agentId, tier: "cold", topic, summarized: false, purged: { $ne: true } }).sort({ createdAt: 1 }).toArray();
+    return this.collection
+      .find({ agentId, tier: "cold", topic, summarized: false, purged: { $ne: true } })
+      .sort({ createdAt: 1 })
+      .toArray();
   }
 
   async getColdTopics(agentId: string): Promise<string[]> {
@@ -204,9 +207,7 @@ export class MemoryStore {
   }
 
   async deletePurgedOlderThan(agentId: string, before: Date): Promise<MemoryRecord[]> {
-    const records = await this.collection
-      .find({ agentId, purged: true, purgedAt: { $lt: before } })
-      .toArray();
+    const records = await this.collection.find({ agentId, purged: true, purgedAt: { $lt: before } }).toArray();
 
     if (records.length === 0) return [];
 
