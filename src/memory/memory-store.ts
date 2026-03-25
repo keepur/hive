@@ -1,6 +1,6 @@
 import { MongoClient, ObjectId, type Collection, type Db, type WithoutId } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import type { MemoryRecord, MemoryRecordInput, MemoryImportance, MemoryTier } from "./memory-types.js";
+import type { MemoryRecord, MemoryRecordInput, MemoryImportance, MemoryTier, PurgeFilters } from "./memory-types.js";
 
 const log = createLogger("memory-store");
 
@@ -25,6 +25,7 @@ export class MemoryStore {
     await this.collection.createIndex({ agentId: 1, topic: 1 });
     await this.collection.createIndex({ agentId: 1, updatedAt: 1 });
     await this.collection.createIndex({ agentId: 1, type: 1 });
+    await this.collection.createIndex({ agentId: 1, purged: 1, purgedAt: 1 });
     log.info("Memory store initialized", { db: this.dbName });
   }
 
@@ -106,7 +107,7 @@ export class MemoryStore {
     // correctly as a string (alphabetical: critical < high < low < medium).
     // We need weighted sort: pinned first, then by importance weight desc, then recency.
     const WEIGHT: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
-    const records = await this.collection.find({ agentId, tier: "hot" }).toArray();
+    const records = await this.collection.find({ agentId, tier: "hot", purged: { $ne: true } }).toArray();
     return records.sort((a, b) => {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       const wDiff = (WEIGHT[b.importance] ?? 0) - (WEIGHT[a.importance] ?? 0);
@@ -117,7 +118,7 @@ export class MemoryStore {
 
   async getByIds(ids: ObjectId[]): Promise<MemoryRecord[]> {
     if (ids.length === 0) return [];
-    return this.collection.find({ _id: { $in: ids } }).toArray();
+    return this.collection.find({ _id: { $in: ids }, purged: { $ne: true } }).toArray();
   }
 
   async countNonHot(agentId: string): Promise<number> {
@@ -125,7 +126,7 @@ export class MemoryStore {
   }
 
   async getAllNonPinned(agentId: string): Promise<MemoryRecord[]> {
-    return this.collection.find({ agentId, pinned: false }).toArray();
+    return this.collection.find({ agentId, pinned: false, purged: { $ne: true } }).toArray();
   }
 
   async getAllForAgent(agentId: string): Promise<MemoryRecord[]> {
@@ -142,7 +143,7 @@ export class MemoryStore {
   }
 
   async getColdByTopic(agentId: string, topic: string): Promise<MemoryRecord[]> {
-    return this.collection.find({ agentId, tier: "cold", topic, summarized: false }).sort({ createdAt: 1 }).toArray();
+    return this.collection.find({ agentId, tier: "cold", topic, summarized: false, purged: { $ne: true } }).sort({ createdAt: 1 }).toArray();
   }
 
   async getColdTopics(agentId: string): Promise<string[]> {
@@ -150,6 +151,7 @@ export class MemoryStore {
       agentId,
       tier: "cold",
       summarized: false,
+      purged: { $ne: true },
     });
     return result;
   }
@@ -169,6 +171,48 @@ export class MemoryStore {
       summarizedAt: { $lt: before },
     });
     return result.deletedCount;
+  }
+
+  async purge(agentId: string, filters: PurgeFilters): Promise<number> {
+    const hasFilter =
+      filters.topic !== undefined ||
+      filters.type !== undefined ||
+      filters.importance !== undefined ||
+      filters.tier !== undefined ||
+      filters.olderThan !== undefined;
+
+    if (!hasFilter) {
+      throw new Error("purge() requires at least one filter");
+    }
+
+    const query: Record<string, unknown> = {
+      agentId,
+      pinned: false,
+      purged: { $ne: true },
+    };
+
+    if (filters.topic !== undefined) query.topic = filters.topic;
+    if (filters.type !== undefined) query.type = filters.type;
+    if (filters.importance !== undefined) query.importance = filters.importance;
+    if (filters.tier !== undefined) query.tier = filters.tier;
+    if (filters.olderThan !== undefined) query.updatedAt = { $lt: filters.olderThan };
+
+    const result = await this.collection.updateMany(query, {
+      $set: { purged: true, purgedAt: new Date() },
+    });
+    return result.modifiedCount;
+  }
+
+  async deletePurgedOlderThan(agentId: string, before: Date): Promise<MemoryRecord[]> {
+    const records = await this.collection
+      .find({ agentId, purged: true, purgedAt: { $lt: before } })
+      .toArray();
+
+    if (records.length === 0) return [];
+
+    const ids = records.map((r) => r._id!);
+    await this.collection.deleteMany({ _id: { $in: ids } });
+    return records;
   }
 
   async getAgentIds(): Promise<string[]> {
