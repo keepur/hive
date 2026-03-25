@@ -20,7 +20,7 @@ import { z } from "zod";
 import { ObjectId } from "mongodb";
 import { MemoryStore } from "./memory-store.js";
 import { MemoryEmbedder } from "./memory-embedder.js";
-import type { MemoryType, MemoryImportance, MemoryTier } from "./memory-types.js";
+import type { MemoryType, MemoryImportance, MemoryTier, PurgeFilters } from "./memory-types.js";
 
 const AGENT_ID = process.env.AGENT_ID ?? "";
 const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
@@ -282,6 +282,84 @@ server.registerTool(
     });
 
     return { content: [{ type: "text", text: `Forgotten memory [${id}]` }] };
+  },
+);
+
+server.registerTool(
+  "memory_purge",
+  {
+    title: "Purge Memories",
+    description:
+      "Bulk soft-delete memories by filter. Purged records become invisible immediately and are permanently deleted after the retention period (default 7 days). At least one filter is required. Pinned records are never purged — unpin them first.",
+    inputSchema: {
+      topic: z.string().optional().describe('Exact match on topic tag, e.g. "pipeline-review"'),
+      type: z
+        .enum(VALID_TYPES)
+        .optional()
+        .describe("Filter by memory type: fact, task, interaction, preference, or decision"),
+      importance: z.enum(VALID_IMPORTANCE).optional().describe("Filter by importance level"),
+      tier: z.enum(["hot", "warm", "cold"]).optional().describe("Filter by current tier"),
+      olderThan: z
+        .string()
+        .optional()
+        .describe("ISO 8601 date string — purge records with updatedAt before this date"),
+    },
+  },
+  async ({ topic, type, importance, tier, olderThan }) => {
+    const hasFilter =
+      topic !== undefined ||
+      type !== undefined ||
+      importance !== undefined ||
+      tier !== undefined ||
+      olderThan !== undefined;
+
+    if (!hasFilter) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "At least one filter is required (topic, type, importance, tier, or olderThan). Provide a filter to avoid an accidental full purge.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const filters: PurgeFilters = {};
+    if (topic !== undefined) filters.topic = topic;
+    if (type !== undefined) filters.type = type as MemoryType;
+    if (importance !== undefined) filters.importance = importance as MemoryImportance;
+    if (tier !== undefined) filters.tier = tier as MemoryTier;
+    if (olderThan !== undefined) {
+      const parsed = new Date(olderThan);
+      if (isNaN(parsed.getTime())) {
+        return {
+          content: [{ type: "text", text: `Invalid date for olderThan: "${olderThan}"` }],
+          isError: true,
+        };
+      }
+      filters.olderThan = parsed;
+    }
+
+    const count = await store.purge(AGENT_ID, filters);
+
+    const parts: string[] = [];
+    if (filters.topic !== undefined) parts.push(`topic:"${filters.topic}"`);
+    if (filters.type !== undefined) parts.push(`type:${filters.type}`);
+    if (filters.importance !== undefined) parts.push(`importance:${filters.importance}`);
+    if (filters.tier !== undefined) parts.push(`tier:${filters.tier}`);
+    if (filters.olderThan !== undefined) parts.push(`olderThan:${filters.olderThan.toISOString()}`);
+
+    const summary = parts.join(" ");
+    const noun = count === 1 ? "memory" : "memories";
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Purged ${count} ${noun} matching ${summary}`,
+        },
+      ],
+    };
   },
 );
 
