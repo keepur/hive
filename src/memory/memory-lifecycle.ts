@@ -52,6 +52,7 @@ export class MemoryLifecycle {
     let demoted = 0;
     let summarized = 0;
     let cleaned = 0;
+    let purged = 0;
     const errors: string[] = [];
 
     try {
@@ -64,6 +65,7 @@ export class MemoryLifecycle {
           demoted += result.demoted;
           summarized += result.summarized;
           cleaned += result.cleaned;
+          purged += result.purged;
         } catch (err) {
           errors.push(`${agentId}: ${err}`);
           log.error("Memory lifecycle sweep failed for agent", { agentId, error: String(err) });
@@ -73,7 +75,7 @@ export class MemoryLifecycle {
       errors.push(`global: ${err}`);
     }
 
-    const totalActions = promoted + demoted + summarized + cleaned;
+    const totalActions = promoted + demoted + summarized + cleaned + purged;
     if (totalActions > 0) {
       log.info("Memory lifecycle sweep complete", {
         durationMs: Date.now() - start,
@@ -81,13 +83,14 @@ export class MemoryLifecycle {
         demoted,
         summarized,
         cleaned,
+        purged,
         errors: errors.length,
       });
     }
 
     return {
       component: "memory-lifecycle",
-      pruned: demoted + cleaned,
+      pruned: demoted + cleaned + purged,
       retried: promoted,
       bytesFreed: 0,
       errors,
@@ -96,13 +99,13 @@ export class MemoryLifecycle {
 
   private async sweepAgent(
     agentId: string,
-  ): Promise<{ promoted: number; demoted: number; summarized: number; cleaned: number }> {
+  ): Promise<{ promoted: number; demoted: number; summarized: number; cleaned: number; purged: number }> {
     let promoted = 0;
     let demoted = 0;
 
     // 1. Score all non-pinned records
     const records = await this.store.getAllNonPinned(agentId);
-    if (records.length === 0) return { promoted: 0, demoted: 0, summarized: 0, cleaned: 0 };
+    if (records.length === 0) return { promoted: 0, demoted: 0, summarized: 0, cleaned: 0, purged: 0 };
 
     const accessCounts = records.map((r) => r.accessCount).sort((a, b) => a - b);
     const medianAccess = accessCounts[Math.floor(accessCounts.length / 2)] ?? 0;
@@ -167,7 +170,24 @@ export class MemoryLifecycle {
     const retentionDate = new Date(Date.now() - this.config.coldRetentionDays * 24 * 60 * 60 * 1000);
     const cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
 
-    return { promoted, demoted, summarized: summarizedCount, cleaned: cleanedCount };
+    // 6. Hard-delete purged records older than retention period
+    const purgeCutoff = new Date(Date.now() - this.config.purgeRetentionDays * 24 * 60 * 60 * 1000);
+    let purgedCount = 0;
+    try {
+      const purgedRecords = await this.store.deletePurgedOlderThan(agentId, purgeCutoff);
+      purgedCount = purgedRecords.length;
+      if (purgedRecords.length > 0) {
+        const pointIds = purgedRecords.map((r) => r.qdrantPointId).filter(Boolean);
+        for (const pointId of pointIds) {
+          await this.embedder.remove(pointId);
+        }
+        log.info("Hard-deleted purged records", { agentId, count: purgedRecords.length });
+      }
+    } catch (err) {
+      log.warn("Purge hard-delete phase failed", { agentId, error: String(err) });
+    }
+
+    return { promoted, demoted, summarized: summarizedCount, cleaned: cleanedCount, purged: purgedCount };
   }
 
   private async summarizeCold(agentId: string): Promise<number> {
