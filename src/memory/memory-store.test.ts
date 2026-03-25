@@ -99,7 +99,7 @@ describe("MemoryStore", () => {
   describe("init", () => {
     it("connects and creates indexes", async () => {
       expect(mockClient.connect).toHaveBeenCalled();
-      expect(mockCreateIndex).toHaveBeenCalledTimes(4);
+      expect(mockCreateIndex).toHaveBeenCalledTimes(5);
     });
   });
 
@@ -167,11 +167,11 @@ describe("MemoryStore", () => {
       expect(result[1]).toBe(older);
     });
 
-    it("queries for correct agentId and tier", async () => {
+    it("queries for correct agentId and tier, excluding purged", async () => {
       mockToArray.mockResolvedValueOnce([]);
       await store.getHotTier("my-agent");
 
-      expect(mockFind).toHaveBeenCalledWith({ agentId: "my-agent", tier: "hot" });
+      expect(mockFind).toHaveBeenCalledWith({ agentId: "my-agent", tier: "hot", purged: { $ne: true } });
     });
   });
 
@@ -211,20 +211,91 @@ describe("MemoryStore", () => {
   });
 
   describe("getByIds", () => {
-    it("returns records matching the given IDs", async () => {
+    it("returns records matching the given IDs, excluding purged", async () => {
       const records = [makeRecord(), makeRecord()];
       mockToArray.mockResolvedValueOnce(records);
       const ids = [records[0]._id!, records[1]._id!];
 
       const result = await store.getByIds(ids);
 
-      expect(mockFind).toHaveBeenCalledWith({ _id: { $in: ids } });
+      expect(mockFind).toHaveBeenCalledWith({ _id: { $in: ids }, purged: { $ne: true } });
       expect(result).toEqual(records);
     });
 
     it("returns empty array for empty input", async () => {
       const result = await store.getByIds([]);
       expect(result).toEqual([]);
+    });
+  });
+
+  describe("getAllNonPinned", () => {
+    it("queries with purged: { $ne: true }", async () => {
+      mockToArray.mockResolvedValueOnce([]);
+      await store.getAllNonPinned("agent-1");
+      expect(mockFind).toHaveBeenCalledWith({ agentId: "agent-1", pinned: false, purged: { $ne: true } });
+    });
+  });
+
+  describe("purge", () => {
+    it("throws when no filters are provided", async () => {
+      await expect(store.purge("agent-1", {})).rejects.toThrow("at least one filter");
+    });
+
+    it("sets purged:true and purgedAt on matching unpinned records", async () => {
+      mockUpdateMany.mockResolvedValueOnce({ modifiedCount: 3 });
+      const count = await store.purge("agent-1", { topic: "pipeline-review" });
+      expect(mockUpdateMany).toHaveBeenCalledWith(
+        { agentId: "agent-1", pinned: false, purged: { $ne: true }, topic: "pipeline-review" },
+        { $set: { purged: true, purgedAt: expect.any(Date) } },
+      );
+      expect(count).toBe(3);
+    });
+
+    it("ANDs all provided filters together", async () => {
+      mockUpdateMany.mockResolvedValueOnce({ modifiedCount: 1 });
+      const olderThan = new Date("2026-01-01");
+      await store.purge("agent-1", { type: "task", tier: "cold", olderThan });
+      expect(mockUpdateMany).toHaveBeenCalledWith(
+        {
+          agentId: "agent-1",
+          pinned: false,
+          purged: { $ne: true },
+          type: "task",
+          tier: "cold",
+          updatedAt: { $lt: olderThan },
+        },
+        { $set: { purged: true, purgedAt: expect.any(Date) } },
+      );
+    });
+
+    it("returns 0 when no records match", async () => {
+      mockUpdateMany.mockResolvedValueOnce({ modifiedCount: 0 });
+      const count = await store.purge("agent-1", { topic: "nonexistent" });
+      expect(count).toBe(0);
+    });
+  });
+
+  describe("deletePurgedOlderThan", () => {
+    it("returns empty array and skips deleteMany when no records match", async () => {
+      mockToArray.mockResolvedValueOnce([]);
+      const result = await store.deletePurgedOlderThan("agent-1", new Date());
+      expect(result).toEqual([]);
+      expect(mockDeleteMany).not.toHaveBeenCalled();
+    });
+
+    it("fetches then deletes matching records by _id", async () => {
+      const record = makeRecord({ purged: true, purgedAt: new Date("2026-01-01") });
+      mockToArray.mockResolvedValueOnce([record]);
+      mockDeleteMany.mockResolvedValueOnce({ deletedCount: 1 });
+      const before = new Date("2026-03-01");
+      const result = await store.deletePurgedOlderThan("agent-1", before);
+      expect(mockFind).toHaveBeenCalledWith({
+        agentId: "agent-1",
+        purged: true,
+        purgedAt: { $lt: before },
+      });
+      expect(mockDeleteMany).toHaveBeenCalledWith({ _id: { $in: [record._id] } });
+      expect(result).toEqual([record]);
     });
   });
 

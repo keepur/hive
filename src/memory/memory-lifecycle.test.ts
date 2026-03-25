@@ -41,6 +41,7 @@ function makeMockStore() {
     getColdByTopic: vi.fn().mockResolvedValue([]),
     markSummarized: vi.fn().mockResolvedValue(undefined),
     deleteSummarizedOlderThan: vi.fn().mockResolvedValue(0),
+    deletePurgedOlderThan: vi.fn().mockResolvedValue([]),
     save: vi.fn().mockResolvedValue({ _id: new ObjectId() }),
     countNonHot: vi.fn().mockResolvedValue(0),
     getById: vi.fn(),
@@ -76,6 +77,7 @@ const defaultConfig: MemoryLifecycleConfig = {
   recencyHalfLifeDays: 7,
   coldSummaryMinRecords: 5,
   coldRetentionDays: 90,
+  purgeRetentionDays: 7,
 };
 
 function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
@@ -239,6 +241,81 @@ describe("MemoryLifecycle.sweep", () => {
     // setTierBulk should have been called for demotion
     expect(store.setTierBulk).toHaveBeenCalled();
     expect(result.pruned).toBeGreaterThan(0);
+  });
+});
+
+// ── Phase 6: hard-delete purged records ─────────────────────────────
+describe("MemoryLifecycle Phase 6: hard-delete purged records", () => {
+  let store: ReturnType<typeof makeMockStore>;
+  let embedder: ReturnType<typeof makeMockEmbedder>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store = makeMockStore();
+    embedder = makeMockEmbedder();
+  });
+
+  it("calls deletePurgedOlderThan with the correct 7-day cutoff", async () => {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
+    // Must return at least one record so sweepAgent doesn't bail early
+    store.getAllNonPinned.mockResolvedValueOnce([makeRecord({ agentId: "agent-1" })]);
+    store.getHotTier.mockResolvedValueOnce([]);
+    store.getColdTopics.mockResolvedValueOnce([]);
+    store.deleteSummarizedOlderThan.mockResolvedValueOnce(0);
+    store.deletePurgedOlderThan.mockResolvedValueOnce([]);
+
+    const before = Date.now();
+    await lifecycle.sweep();
+    const after = Date.now();
+
+    const [calledAgentId, calledBefore] = store.deletePurgedOlderThan.mock.calls[0];
+    expect(calledAgentId).toBe("agent-1");
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    expect(calledBefore.getTime()).toBeGreaterThanOrEqual(before - sevenDaysMs - 1000);
+    expect(calledBefore.getTime()).toBeLessThanOrEqual(after - sevenDaysMs + 1000);
+  });
+
+  it("calls embedder.remove for each hard-deleted record's qdrantPointId", async () => {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    const deletedRecord = makeRecord({ purged: true, purgedAt: new Date("2026-01-01"), qdrantPointId: "pt-purged-1" });
+
+    store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
+    // Must return at least one record so sweepAgent doesn't bail early
+    store.getAllNonPinned.mockResolvedValueOnce([makeRecord({ agentId: "agent-1" })]);
+    store.getHotTier.mockResolvedValueOnce([]);
+    store.getColdTopics.mockResolvedValueOnce([]);
+    store.deleteSummarizedOlderThan.mockResolvedValueOnce(0);
+    store.deletePurgedOlderThan.mockResolvedValueOnce([deletedRecord]);
+
+    await lifecycle.sweep();
+
+    expect(embedder.remove).toHaveBeenCalledOnce();
+    expect(embedder.remove).toHaveBeenCalledWith("pt-purged-1");
+  });
+
+  it("does not call embedder.remove when no records are hard-deleted", async () => {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
+    store.getAllNonPinned.mockResolvedValueOnce([]);
+    store.getColdTopics.mockResolvedValueOnce([]);
+    store.deleteSummarizedOlderThan.mockResolvedValueOnce(0);
+    store.deletePurgedOlderThan.mockResolvedValueOnce([]);
+
+    await lifecycle.sweep();
+
+    expect(embedder.remove).not.toHaveBeenCalled();
+  });
+
+  it("continues sweep without throwing when phase 6 throws", async () => {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
+    store.getAllNonPinned.mockResolvedValueOnce([]);
+    store.getColdTopics.mockResolvedValueOnce([]);
+    store.deleteSummarizedOlderThan.mockResolvedValueOnce(0);
+    store.deletePurgedOlderThan.mockRejectedValueOnce(new Error("mongo timeout"));
+
+    await expect(lifecycle.sweep()).resolves.not.toThrow();
   });
 });
 
