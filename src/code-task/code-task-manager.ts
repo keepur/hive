@@ -278,8 +278,17 @@ export class CodeTaskManager {
     const maxTurns = body.maxTurns ?? 100;
     const maxBudget = body.maxBudget ?? 5.0;
 
+    // Append quality-gate requirement to new tasks (not resumes)
+    const prompt = body.sessionId
+      ? body.prompt
+      : body.prompt +
+        "\n\n---\n" +
+        "IMPORTANT: After completing implementation, you MUST run /quality-gate before reporting done. " +
+        "This includes test creation, lint, typecheck, and build verification. " +
+        "Do not claim completion without quality-gate passing.";
+
     const args = this.buildArgs({
-      prompt: body.prompt,
+      prompt,
       maxTurns,
       maxBudget,
       model,

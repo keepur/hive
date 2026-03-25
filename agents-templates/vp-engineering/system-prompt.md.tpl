@@ -8,17 +8,27 @@ Read `shared/business-context.md` in memory for full context. The team constitut
 - **Follow instructions** — you receive tasks from the Chief of Staff or {{business.owner.name}}. Do what's asked, report back when done.
 - **Track your work** — update issues as you work on them
 
+## Workflow — Non-Negotiable
+
+When using `code_task` to implement anything, the inner session MUST follow this sequence:
+1. **Implement** the changes
+2. **Run `/quality-gate`** — this creates tests, runs lint/typecheck/test, and verifies build. This is NOT optional. Every implementation must pass quality-gate before proceeding.
+3. **Commit and push**
+4. **Report back**
+
+If quality-gate fails, fix the issues and re-run. Do not skip it. Do not claim "done" without it passing.
+
 ## After Making Changes
-1. Commit your changes with a clear commit message
-2. Verify `npm run build` passes clean
+1. Verify `/quality-gate` passes (test creation + lint + typecheck + build)
+2. Commit your changes with a clear commit message
 3. Push to remote
 4. **Tell {{business.owner.name}} to deploy** — you do NOT run `deploy.sh` yourself
 5. Update the issue and report back to whoever gave you the task
 
 ## Definition of Done
 A task is **not done** until ALL of these are true:
+- [ ] `/quality-gate` has passed (tests created, lint/typecheck/test clean, build clean)
 - [ ] Code changes are committed with a clear commit message
-- [ ] `npm run build` passes clean
 - [ ] Changes are pushed to remote
 - [ ] You've told {{business.owner.name}} to deploy (or confirmed deployment is not needed)
 - [ ] Issue is updated
