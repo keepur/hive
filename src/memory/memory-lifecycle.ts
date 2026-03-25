@@ -105,72 +105,75 @@ export class MemoryLifecycle {
 
     // 1. Score all non-pinned records
     const records = await this.store.getAllNonPinned(agentId);
-    if (records.length === 0) return { promoted: 0, demoted: 0, summarized: 0, cleaned: 0, purged: 0 };
+    let summarizedCount = 0;
+    let cleanedCount = 0;
 
-    const accessCounts = records.map((r) => r.accessCount).sort((a, b) => a - b);
-    const medianAccess = accessCounts[Math.floor(accessCounts.length / 2)] ?? 0;
+    if (records.length > 0) {
+      const accessCounts = records.map((r) => r.accessCount).sort((a, b) => a - b);
+      const medianAccess = accessCounts[Math.floor(accessCounts.length / 2)] ?? 0;
 
-    const scored = records.map((r) => ({
-      record: r,
-      score: this.computeScore(r, medianAccess),
-    }));
+      const scored = records.map((r) => ({
+        record: r,
+        score: this.computeScore(r, medianAccess),
+      }));
 
-    // 2. Enforce tier placement based on score
-    const tierUpdates: { id: ObjectId; newTier: MemoryTier }[] = [];
-    for (const { record, score } of scored) {
-      let targetTier: MemoryTier;
-      if (score >= this.config.hotThreshold) {
-        targetTier = "hot";
-      } else if (score >= this.config.warmThreshold) {
-        targetTier = "warm";
-      } else {
-        targetTier = "cold";
-      }
+      // 2. Enforce tier placement based on score
+      const tierUpdates: { id: ObjectId; newTier: MemoryTier }[] = [];
+      for (const { record, score } of scored) {
+        let targetTier: MemoryTier;
+        if (score >= this.config.hotThreshold) {
+          targetTier = "hot";
+        } else if (score >= this.config.warmThreshold) {
+          targetTier = "warm";
+        } else {
+          targetTier = "cold";
+        }
 
-      if (targetTier !== record.tier) {
-        tierUpdates.push({ id: record._id!, newTier: targetTier });
-        if (targetTier === "hot" && record.tier !== "hot") promoted++;
-        if (targetTier !== "hot" && record.tier === "hot") demoted++;
-      }
-    }
-
-    // Apply tier changes
-    for (const tier of ["hot", "warm", "cold"] as MemoryTier[]) {
-      const ids = tierUpdates.filter((u) => u.newTier === tier).map((u) => u.id);
-      await this.store.setTierBulk(ids, tier);
-    }
-
-    // 3. Enforce hot budget — pinned records don't count against the budget
-    const hotRecords = await this.store.getHotTier(agentId);
-    let nonPinnedTokens = 0;
-    const toOverflow: ObjectId[] = [];
-    for (const r of hotRecords) {
-      const tokens = this.estimateTokens(r.content);
-      if (!r.pinned) {
-        nonPinnedTokens += tokens;
-        if (nonPinnedTokens > this.config.hotBudgetTokens) {
-          toOverflow.push(r._id!);
+        if (targetTier !== record.tier) {
+          tierUpdates.push({ id: record._id!, newTier: targetTier });
+          if (targetTier === "hot" && record.tier !== "hot") promoted++;
+          if (targetTier !== "hot" && record.tier === "hot") demoted++;
         }
       }
-    }
-    if (toOverflow.length > 0) {
-      await this.store.setTierBulk(toOverflow, "warm");
-      demoted += toOverflow.length;
-    }
 
-    // 4. Summarize cold batches
-    let summarizedCount = 0;
-    try {
-      summarizedCount = await this.summarizeCold(agentId);
-    } catch (err) {
-      log.warn("Cold summarization failed", { agentId, error: String(err) });
-    }
+      // Apply tier changes
+      for (const tier of ["hot", "warm", "cold"] as MemoryTier[]) {
+        const ids = tierUpdates.filter((u) => u.newTier === tier).map((u) => u.id);
+        await this.store.setTierBulk(ids, tier);
+      }
 
-    // 5. Clean up old summarized records
-    const retentionDate = new Date(Date.now() - this.config.coldRetentionDays * 24 * 60 * 60 * 1000);
-    const cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
+      // 3. Enforce hot budget — pinned records don't count against the budget
+      const hotRecords = await this.store.getHotTier(agentId);
+      let nonPinnedTokens = 0;
+      const toOverflow: ObjectId[] = [];
+      for (const r of hotRecords) {
+        const tokens = this.estimateTokens(r.content);
+        if (!r.pinned) {
+          nonPinnedTokens += tokens;
+          if (nonPinnedTokens > this.config.hotBudgetTokens) {
+            toOverflow.push(r._id!);
+          }
+        }
+      }
+      if (toOverflow.length > 0) {
+        await this.store.setTierBulk(toOverflow, "warm");
+        demoted += toOverflow.length;
+      }
+
+      // 4. Summarize cold batches
+      try {
+        summarizedCount = await this.summarizeCold(agentId);
+      } catch (err) {
+        log.warn("Cold summarization failed", { agentId, error: String(err) });
+      }
+
+      // 5. Clean up old summarized records
+      const retentionDate = new Date(Date.now() - this.config.coldRetentionDays * 24 * 60 * 60 * 1000);
+      cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
+    }
 
     // 6. Hard-delete purged records older than retention period
+    // Runs unconditionally — agents that purged all memories still need cleanup.
     const purgeCutoff = new Date(Date.now() - this.config.purgeRetentionDays * 24 * 60 * 60 * 1000);
     let purgedCount = 0;
     try {

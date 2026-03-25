@@ -343,11 +343,15 @@ describe("MemoryStore", () => {
   });
 
   describe("countNonHot", () => {
-    it("counts documents not in hot tier", async () => {
+    it("counts documents not in hot tier, excluding purged", async () => {
       mockCountDocuments.mockResolvedValueOnce(42);
       const result = await store.countNonHot("agent-1");
 
-      expect(mockCountDocuments).toHaveBeenCalledWith({ agentId: "agent-1", tier: { $ne: "hot" } });
+      expect(mockCountDocuments).toHaveBeenCalledWith({
+        agentId: "agent-1",
+        purged: { $ne: true },
+        tier: { $ne: "hot" },
+      });
       expect(result).toBe(42);
     });
   });

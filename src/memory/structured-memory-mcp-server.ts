@@ -43,7 +43,7 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-const VALID_TYPES = ["fact", "task", "interaction", "preference", "decision"] as const;
+const VALID_TYPES = ["fact", "task", "interaction", "preference", "decision", "summary"] as const;
 const VALID_IMPORTANCE = ["critical", "high", "medium", "low"] as const;
 
 server.registerTool(

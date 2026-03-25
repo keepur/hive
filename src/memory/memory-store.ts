@@ -122,7 +122,7 @@ export class MemoryStore {
   }
 
   async countNonHot(agentId: string): Promise<number> {
-    return this.collection.countDocuments({ agentId, tier: { $ne: "hot" } });
+    return this.collection.countDocuments({ agentId, tier: { $ne: "hot" }, purged: { $ne: true } });
   }
 
   async getAllNonPinned(agentId: string): Promise<MemoryRecord[]> {

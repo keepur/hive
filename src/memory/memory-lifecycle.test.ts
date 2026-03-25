@@ -258,11 +258,8 @@ describe("MemoryLifecycle Phase 6: hard-delete purged records", () => {
   it("calls deletePurgedOlderThan with the correct 7-day cutoff", async () => {
     const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
     store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
-    // Must return at least one record so sweepAgent doesn't bail early
-    store.getAllNonPinned.mockResolvedValueOnce([makeRecord({ agentId: "agent-1" })]);
-    store.getHotTier.mockResolvedValueOnce([]);
-    store.getColdTopics.mockResolvedValueOnce([]);
-    store.deleteSummarizedOlderThan.mockResolvedValueOnce(0);
+    // Empty records — Phase 6 must still run even when agent has no active memories
+    store.getAllNonPinned.mockResolvedValueOnce([]);
     store.deletePurgedOlderThan.mockResolvedValueOnce([]);
 
     const before = Date.now();
@@ -281,11 +278,8 @@ describe("MemoryLifecycle Phase 6: hard-delete purged records", () => {
     const deletedRecord = makeRecord({ purged: true, purgedAt: new Date("2026-01-01"), qdrantPointId: "pt-purged-1" });
 
     store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
-    // Must return at least one record so sweepAgent doesn't bail early
-    store.getAllNonPinned.mockResolvedValueOnce([makeRecord({ agentId: "agent-1" })]);
-    store.getHotTier.mockResolvedValueOnce([]);
-    store.getColdTopics.mockResolvedValueOnce([]);
-    store.deleteSummarizedOlderThan.mockResolvedValueOnce(0);
+    // Empty records — Phase 6 must still run even when agent has no active memories
+    store.getAllNonPinned.mockResolvedValueOnce([]);
     store.deletePurgedOlderThan.mockResolvedValueOnce([deletedRecord]);
 
     await lifecycle.sweep();
