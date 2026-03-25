@@ -214,6 +214,10 @@ export const config = {
       optional("MEMORY_COLD_RETENTION_DAYS", String(hive.memory?.coldRetentionDays ?? 90)),
       10,
     ),
+    purgeRetentionDays: parseInt(
+      optional("MEMORY_PURGE_RETENTION_DAYS", String(hive.memory?.purgeRetentionDays ?? 7)),
+      10,
+    ),
   },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),
