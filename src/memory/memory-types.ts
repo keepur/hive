@@ -24,6 +24,8 @@ export interface MemoryRecord {
   summarized: boolean;
   summarizedAt?: Date;
   qdrantPointId: string;
+  purged?: boolean;
+  purgedAt?: Date;
 }
 
 export interface MemoryRecordInput {
@@ -41,6 +43,14 @@ export interface MemoryRecallFilters {
   limit?: number;
 }
 
+export interface PurgeFilters {
+  topic?: string;
+  type?: MemoryType;
+  importance?: MemoryImportance;
+  tier?: MemoryTier;
+  olderThan?: Date;
+}
+
 export interface MemoryRecallResult extends MemoryRecord {
   score: number;
 }
@@ -53,6 +63,7 @@ export interface MemoryLifecycleConfig {
   recencyHalfLifeDays: number;
   coldSummaryMinRecords: number;
   coldRetentionDays: number;
+  purgeRetentionDays: number;
 }
 
 export const IMPORTANCE_WEIGHTS: Record<MemoryImportance, number> = {
