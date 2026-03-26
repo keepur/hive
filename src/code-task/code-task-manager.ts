@@ -302,6 +302,7 @@ export class CodeTaskManager {
       cwd,
       detached: true,
       stdio: ["ignore", stdoutFd, stderrFd],
+      env: process.env,
     });
 
     // Attach listeners before closing fds to avoid missing immediate exits (ENOENT, etc.)
