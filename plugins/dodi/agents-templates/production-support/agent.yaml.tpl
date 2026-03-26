@@ -15,6 +15,9 @@ isDefault: false
 budgetUsd: 50
 maxTurns: 25
 dodiOpsMode: readonly
+schedule:
+  - cron: "0 6 * * 0"
+    task: memory-review
 servers:
   - memory
   - dodi-ops

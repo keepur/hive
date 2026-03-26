@@ -19,6 +19,9 @@ keywords:
   - lead time
 isDefault: false
 budgetUsd: 20
+schedule:
+  - cron: "0 6 * * 0"
+    task: memory-review
 servers:
   - memory
   - catalog

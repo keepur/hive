@@ -18,6 +18,8 @@ schedule:
     task: afternoon-follow-ups
   - cron: "0 17 * * 5"
     task: weekly-pipeline-summary
+  - cron: "0 6 * * 0"
+    task: memory-review
 budgetUsd: 50
 maxTurns: 30
 servers:

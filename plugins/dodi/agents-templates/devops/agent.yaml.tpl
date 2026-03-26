@@ -12,6 +12,9 @@ keywords:
 isDefault: false
 budgetUsd: 25
 maxTurns: 15
+schedule:
+  - cron: "0 6 * * 0"
+    task: memory-review
 servers:
   - memory
   - linear

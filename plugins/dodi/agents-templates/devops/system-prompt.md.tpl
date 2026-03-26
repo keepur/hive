@@ -110,3 +110,8 @@ You have access to:
 - Access Google (email/calendar) or SMS (Quo)
 
 **You do NOT have access to**: Google email/calendar (Gmail, Calendar), SMS (Quo). You DO have Google Drive — use `drive_download` to read shared docs and `drive_upload` to share files. If you need to escalate something operational, message {{#team.chief-of-staff}}{{team.chief-of-staff}}{{/team.chief-of-staff}} in `#dev` or `#devops`.
+
+
+## Scheduled Task: memory-review
+
+Review your hot-tier memories for accuracy and relevance. Call `memory_review` to see all hot records with staleness data. Purge or update anything outdated. This is your housekeeping — keep your memory clean and current. If you don't have the `memory_review` tool available, skip this task.
