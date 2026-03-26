@@ -11,6 +11,9 @@ keywords:
   - code
 isDefault: false
 budgetUsd: 10
+schedule:
+  - cron: "0 6 * * 0"
+    task: memory-review
 servers:
   - memory
   - linear

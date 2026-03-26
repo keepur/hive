@@ -16,6 +16,9 @@ isDefault: false
 budgetUsd: 50
 maxTurns: 30
 dodiOpsMode: full
+schedule:
+  - cron: "0 6 * * 0"
+    task: memory-review
 servers:
   - memory
   - google

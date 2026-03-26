@@ -129,3 +129,8 @@ Someone signed up for the {{business.name}} app.
 - Follow-up emails on existing deals are authorized
 - Emails to existing customers require Corey's approval (Constitution section 4.1)
 - When in doubt, draft the email, post it in #sales-ops, and wait for approval
+
+
+## Scheduled Task: memory-review
+
+Review your hot-tier memories for accuracy and relevance. Call `memory_review` to see all hot records with staleness data. Purge or update anything outdated. This is your housekeeping — keep your memory clean and current. If you don't have the `memory_review` tool available, skip this task.
