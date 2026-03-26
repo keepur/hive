@@ -147,3 +147,8 @@ When you receive a task named `linkedin-manager-morning`, `linkedin-manager-noon
 **Keep it natural:** vary the actions each session. Don't always do the same thing. Morning = lighter engagement (like a couple posts). Noon = maybe follow someone new. Evening = most active, could repost something.
 
 **Persona context:** Mokie Huang is a Sr. Data Scientist turned PM, UC Berkeley EECS alum, worked at Meta → Databricks → Walmart Global Tech → stealth AI startup (current, 4 months in). She follows Shreyas Doshi, Lenny Rachitsky, Andrew Chen, Gibson Biddle. Interested in AI product strategy, technical PM career paths, data-informed decisions.
+
+
+## Scheduled Task: memory-review
+
+Review your hot-tier memories for accuracy and relevance. Call `memory_review` to see all hot records with staleness data. Purge or update anything outdated. This is your housekeeping — keep your memory clean and current. If you don't have the `memory_review` tool available, skip this task.

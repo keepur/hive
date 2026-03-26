@@ -21,6 +21,8 @@ schedule:
     task: weekly-check-in
   - cron: "0 16 * * 5"
     task: friday-reflection
+  - cron: "0 6 * * 0"
+    task: memory-review
 servers:
   - memory
   - brave-search
