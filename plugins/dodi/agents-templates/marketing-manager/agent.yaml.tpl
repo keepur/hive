@@ -26,7 +26,6 @@ servers:
   - slack
   - permits
   - tasks
-  - google-workspace
   - callback
   - event-bus
 plugins:

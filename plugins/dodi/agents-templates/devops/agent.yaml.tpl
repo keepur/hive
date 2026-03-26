@@ -23,7 +23,7 @@ servers:
   - crm-search
   - conversation-search
   - brave-search
-  - google-workspace
+  - google
   - keychain
   - background
   - callback

@@ -43,10 +43,10 @@ vi.mock("../logging/logger.js", () => ({
 // ── Config mock ─────────────────────────────────────────────────────
 vi.mock("../config.js", () => ({
   config: {
+    instance: { id: "hive", portBase: 3100 },
     slack: { mcpToken: "" },
     mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
-    google: { account: "", accounts: {} },
-    googleWorkspace: { gwsPath: "gws", sharedFolder: "test-folder" },
+    google: { account: "", accounts: {}, sharedFolder: "test-folder" },
     quo: { apiKey: "", phoneNumberId: "", lines: [] },
     taskLedger: {
       apiUrl: "http://localhost:3000",
@@ -145,7 +145,6 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers).toHaveProperty("memory");
     expect(servers).toHaveProperty("keychain");
     expect(servers).toHaveProperty("google");
-    expect(servers).toHaveProperty("google-workspace");
     expect(servers).toHaveProperty("contacts");
     expect(servers).toHaveProperty("background");
     expect(servers).toHaveProperty("callback");

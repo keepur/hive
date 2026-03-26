@@ -32,7 +32,6 @@ servers:
   - tasks
   - resend
   - quo
-  - google-workspace
   - dodi-ops
   - callback
   - event-bus

@@ -23,5 +23,5 @@ servers:
   - conversation-search
   - brave-search
   - slack
-  - google-workspace
+  - google
   - callback
