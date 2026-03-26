@@ -16,6 +16,8 @@ schedule:
     task: morning-briefing
   - cron: "0 17 * * 1-5"
     task: end-of-day-summary
+  - cron: "0 6 * * 0"
+    task: memory-review
 budgetUsd: 50
 servers:
   - memory

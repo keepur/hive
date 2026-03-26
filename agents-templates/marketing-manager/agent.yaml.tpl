@@ -10,6 +10,8 @@ isDefault: false
 schedule:
   - cron: "0 9 * * 1-5"
     task: marketing-pulse
+  - cron: "0 6 * * 0"
+    task: memory-review
 budgetUsd: 50
 servers:
   - memory

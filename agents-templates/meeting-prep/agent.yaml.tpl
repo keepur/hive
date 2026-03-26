@@ -15,6 +15,8 @@ isDefault: false
 schedule:
   - cron: "0 6 * * 1-5"
     task: daily-meeting-prep
+  - cron: "0 6 * * 0"
+    task: memory-review
 budgetUsd: 50
 servers:
   - memory
