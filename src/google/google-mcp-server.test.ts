@@ -208,7 +208,12 @@ describe("google-mcp-server", () => {
         if (args?.includes("ls")) {
           capturedArgs = args;
           return JSON.stringify([
-            { name: "permits.csv", size: "1024", modifiedTime: "2026-03-20T10:00:00Z", webViewLink: "https://drive.google.com/file/abc" },
+            {
+              name: "permits.csv",
+              size: "1024",
+              modifiedTime: "2026-03-20T10:00:00Z",
+              webViewLink: "https://drive.google.com/file/abc",
+            },
           ]);
         }
         return "";

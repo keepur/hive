@@ -327,7 +327,29 @@ export class SlackGateway {
 
   // --- Standard messaging ---
 
+  // Length thresholds for message handling
+  private static readonly SLACK_MAX_CHARS = 3900; // below Slack's ~4K collapse threshold
+  private static readonly SPLIT_MAX_CHARS = 8000; // above this, use file upload instead of splitting
+  private static readonly SUMMARY_LENGTH = 200; // chars of original text to include in file upload summary
+
   async postMessage(
+    channel: string,
+    text: string,
+    threadTs?: string,
+    identity?: { name: string; icon?: string },
+  ): Promise<string | undefined> {
+    if (text.length <= SlackGateway.SLACK_MAX_CHARS) {
+      return this.postSingle(channel, text, threadTs, identity);
+    }
+
+    if (text.length <= SlackGateway.SPLIT_MAX_CHARS) {
+      return this.postSplit(channel, text, threadTs, identity);
+    }
+
+    return this.postAsFile(channel, text, threadTs, identity);
+  }
+
+  private async postSingle(
     channel: string,
     text: string,
     threadTs?: string,
@@ -370,6 +392,120 @@ export class SlackGateway {
     } catch (err) {
       log.error("Failed to post message", { channel, error: String(err) });
       return undefined;
+    }
+  }
+
+  private splitText(text: string): string[] {
+    const maxLen = SlackGateway.SLACK_MAX_CHARS;
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > maxLen) {
+      let splitAt = -1;
+
+      // Priority 1: double newline (paragraph break)
+      const doubleNl = remaining.lastIndexOf("\n\n", maxLen);
+      if (doubleNl > 0) {
+        splitAt = doubleNl + 2; // include the double newline in current chunk boundary
+      }
+
+      // Priority 2: single newline
+      if (splitAt === -1) {
+        const singleNl = remaining.lastIndexOf("\n", maxLen);
+        if (singleNl > 0) {
+          splitAt = singleNl + 1;
+        }
+      }
+
+      // Priority 3: space (word boundary)
+      if (splitAt === -1) {
+        const space = remaining.lastIndexOf(" ", maxLen);
+        if (space > 0) {
+          splitAt = space + 1;
+        }
+      }
+
+      // Priority 4: hard cut
+      if (splitAt === -1) {
+        splitAt = maxLen;
+      }
+
+      chunks.push(remaining.slice(0, splitAt).trimEnd());
+      remaining = remaining.slice(splitAt).trimStart();
+    }
+
+    if (remaining.length > 0) {
+      chunks.push(remaining);
+    }
+
+    return chunks;
+  }
+
+  private async postSplit(
+    channel: string,
+    text: string,
+    threadTs?: string,
+    identity?: { name: string; icon?: string },
+  ): Promise<string | undefined> {
+    const chunks = this.splitText(text);
+    log.info("Splitting oversized message", { channel, totalLength: text.length, chunks: chunks.length });
+
+    let firstTs: string | undefined;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = i === 0 ? chunks[i] : `_(cont.)_ ${chunks[i]}`;
+      const ts = await this.postSingle(channel, chunk, threadTs, identity);
+      if (i === 0) firstTs = ts;
+    }
+    return firstTs;
+  }
+
+  private async postAsFile(
+    channel: string,
+    text: string,
+    threadTs?: string,
+    identity?: { name: string; icon?: string },
+  ): Promise<string | undefined> {
+    // Build summary: first SUMMARY_LENGTH chars, trimmed to last complete sentence or line break
+    const summaryRaw = text.slice(0, SlackGateway.SUMMARY_LENGTH);
+    let summary = summaryRaw;
+    // Try to trim to last sentence boundary
+    const sentenceEnd = Math.max(
+      summaryRaw.lastIndexOf(". "),
+      summaryRaw.lastIndexOf(".\n"),
+      summaryRaw.lastIndexOf("?\n"),
+      summaryRaw.lastIndexOf("? "),
+      summaryRaw.lastIndexOf("!\n"),
+      summaryRaw.lastIndexOf("! "),
+    );
+    if (sentenceEnd > 0) {
+      summary = summaryRaw.slice(0, sentenceEnd + 1);
+    } else {
+      // Fall back to last line break
+      const lineEnd = summaryRaw.lastIndexOf("\n");
+      if (lineEnd > 0) {
+        summary = summaryRaw.slice(0, lineEnd);
+      }
+    }
+    summary = `${summary.trimEnd()}\n\n_(full response attached)_`;
+
+    const agentName = identity?.name ?? "hive";
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const filename = `${agentName.toLowerCase()}-${timestamp}.md`;
+
+    // Post summary message first for context
+    const summaryTs = await this.postSingle(channel, summary, threadTs, identity);
+
+    // Upload full text as .md file
+    try {
+      const baseArgs = { content: text, filename, title: `${agentName} response` };
+      const destination = threadTs ? { channel_id: channel, thread_ts: threadTs } : { channel_id: channel };
+      await this.web.files.uploadV2({ ...baseArgs, ...destination });
+      log.info("Uploaded oversized message as file", { channel, filename, length: text.length });
+      return summaryTs;
+    } catch (err) {
+      log.warn("File upload failed, falling back to split", { channel, error: String(err) });
+      // Fallback: split the remaining text (summary already posted)
+      return this.postSplit(channel, text, threadTs, identity);
     }
   }
 

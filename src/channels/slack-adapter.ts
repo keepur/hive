@@ -138,7 +138,8 @@ export class SlackAdapter implements ChannelAdapter {
       text = `${avatar}*${agentConfig.name}*: ${text}`;
     }
 
-    await this.gateway.postMessage(channel, text, replyThread);
+    const identity = agentConfig ? { name: agentConfig.name, icon: agentConfig.icon } : undefined;
+    await this.gateway.postMessage(channel, text, replyThread, identity);
   }
 
   async onProcessingStart(item: WorkItem): Promise<void> {
