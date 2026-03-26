@@ -126,20 +126,24 @@ describe("google-mcp-server", () => {
       expect(result.content[0].text).toContain("Provide either file_id or a Google Drive URL");
     });
 
-    it("extracts file ID from Drive URL", async () => {
+    it("extracts file ID from Drive URL and uses deterministic --out path", async () => {
       await loadServer({ GOG_PATH: "/usr/local/bin/gog", DRIVE_SHARED_FOLDER: "folder-123" });
       let capturedArgs: string[] = [];
       mockExecFileSync.mockImplementation((cmd: any, args: any) => {
         if (cmd === "which") return "/usr/local/bin/gog\n";
         if (args?.includes("download")) {
           capturedArgs = args;
-          return "saved to /tmp/hive-drive-downloads/abc123";
+          return "";
         }
         return "";
       });
 
       await callTool("drive_download", { url: "https://drive.google.com/file/d/abc123/view" });
       expect(capturedArgs).toContain("abc123");
+      // Should use --out with a deterministic file path (not a directory)
+      const outIdx = capturedArgs.indexOf("--out");
+      expect(outIdx).toBeGreaterThan(-1);
+      expect(capturedArgs[outIdx + 1]).toMatch(/abc123$/);
     });
 
     it("extracts file ID from id= URL format", async () => {
@@ -149,7 +153,7 @@ describe("google-mcp-server", () => {
         if (cmd === "which") return "/usr/local/bin/gog\n";
         if (args?.includes("download")) {
           capturedArgs = args;
-          return "downloaded to /tmp/file";
+          return "";
         }
         return "";
       });
@@ -162,9 +166,7 @@ describe("google-mcp-server", () => {
       await loadServer({ GOG_PATH: "/usr/local/bin/gog", DRIVE_SHARED_FOLDER: "folder-123", INSTANCE_ID: "hive" });
       mockExecFileSync.mockImplementation((cmd: any, args: any) => {
         if (cmd === "which") return "/usr/local/bin/gog\n";
-        if (args?.includes("download")) {
-          return "saved to /tmp/hive-drive-downloads/doc.csv";
-        }
+        if (args?.includes("download")) return "";
         return "";
       });
       mockExistsSync.mockReturnValue(true);
@@ -173,6 +175,20 @@ describe("google-mcp-server", () => {
       const result = await callTool("drive_download", { file_id: "abc123", format: "csv" });
       expect(result.content[0].text).toContain("--- Content ---");
       expect(result.content[0].text).toContain("col1,col2");
+      expect(result.content[0].text).toContain("exported as csv");
+    });
+
+    it("returns deterministic path for non-text downloads", async () => {
+      await loadServer({ GOG_PATH: "/usr/local/bin/gog", DRIVE_SHARED_FOLDER: "folder-123", INSTANCE_ID: "hive" });
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("download")) return "";
+        return "";
+      });
+      mockExistsSync.mockReturnValue(false);
+
+      const result = await callTool("drive_download", { file_id: "doc456", format: "pdf" });
+      expect(result.content[0].text).toContain("doc456.pdf");
     });
   });
 
@@ -184,14 +200,16 @@ describe("google-mcp-server", () => {
       expect(result.content[0].text).toContain("not configured");
     });
 
-    it("lists files with query filter", async () => {
+    it("lists files with formatted output", async () => {
       await loadServer({ GOG_PATH: "/usr/local/bin/gog", DRIVE_SHARED_FOLDER: "folder-123" });
       let capturedArgs: string[] = [];
       mockExecFileSync.mockImplementation((cmd: any, args: any) => {
         if (cmd === "which") return "/usr/local/bin/gog\n";
         if (args?.includes("ls")) {
           capturedArgs = args;
-          return JSON.stringify([{ name: "permits.csv", size: 1024 }]);
+          return JSON.stringify([
+            { name: "permits.csv", size: "1024", modifiedTime: "2026-03-20T10:00:00Z", webViewLink: "https://drive.google.com/file/abc" },
+          ]);
         }
         return "";
       });
@@ -201,6 +219,32 @@ describe("google-mcp-server", () => {
       expect(capturedArgs).toContain("permits");
       expect(capturedArgs).toContain("--max=10");
       expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain("📄 permits.csv");
+      expect(result.content[0].text).toContain("https://drive.google.com/file/abc");
+    });
+
+    it("returns 'No files found' for empty array", async () => {
+      await loadServer({ GOG_PATH: "/usr/local/bin/gog", DRIVE_SHARED_FOLDER: "folder-123" });
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("ls")) return "[]";
+        return "";
+      });
+
+      const result = await callTool("drive_list", {});
+      expect(result.content[0].text).toBe("No files found.");
+    });
+
+    it("falls back to raw output on parse error", async () => {
+      await loadServer({ GOG_PATH: "/usr/local/bin/gog", DRIVE_SHARED_FOLDER: "folder-123" });
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("ls")) return "not valid json";
+        return "";
+      });
+
+      const result = await callTool("drive_list", {});
+      expect(result.content[0].text).toBe("not valid json");
     });
 
     it("uses default limit of 20", async () => {

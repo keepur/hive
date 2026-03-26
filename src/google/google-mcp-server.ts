@@ -352,21 +352,19 @@ server.registerTool(
     }
 
     try {
-      const args = ["drive", "download", id, "--out", DOWNLOAD_DIR];
+      const outPath = join(DOWNLOAD_DIR, id + (format ? `.${format}` : ""));
+      const args = ["drive", "download", id, "--out", outPath];
       if (format) args.push("--format", format);
-      const result = gogPlain(args);
+      gogPlain(args);
 
-      // Try to find the downloaded file path from output
-      const pathMatch = result.match(/(?:saved to|downloaded to|→)\s*(.+)/i);
-      const localPath = pathMatch ? pathMatch[1].trim() : join(DOWNLOAD_DIR, id);
-
-      // For text exports, return content inline
-      const textExtensions = [".txt", ".csv"];
-      if (format && textExtensions.includes(`.${format}`) && existsSync(localPath)) {
-        const content = readFileSync(localPath, "utf-8");
+      // Return inline content for text-readable files
+      const textExtensions = new Set([".txt", ".csv", ".md", ".json", ".xml", ".html", ".tsv"]);
+      const ext = outPath.includes(".") ? outPath.slice(outPath.lastIndexOf(".")) : "";
+      if (existsSync(outPath) && textExtensions.has(ext)) {
+        const content = readFileSync(outPath, "utf-8");
         const summary = [
-          `Downloaded and exported as ${format}`,
-          `  Local path: ${localPath}`,
+          `Downloaded${format ? ` and exported as ${format}` : ""}`,
+          `  Local path: ${outPath}`,
           ``,
           `--- Content ---`,
           content,
@@ -374,7 +372,7 @@ server.registerTool(
         return { content: [{ type: "text", text: summary }] };
       }
 
-      return { content: [{ type: "text", text: result || `Downloaded to ${DOWNLOAD_DIR}` }] };
+      return { content: [{ type: "text", text: `Downloaded to ${outPath}` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Download failed: ${e.message}` }], isError: true };
     }
@@ -402,7 +400,25 @@ server.registerTool(
       if (query) args.push("--query", query);
       args.push(`--max=${limit ?? 20}`);
       const result = gog(args);
-      return { content: [{ type: "text", text: result || "No files found." }] };
+
+      // Format as human-readable text
+      try {
+        const files = JSON.parse(result);
+        if (!Array.isArray(files) || files.length === 0) {
+          return { content: [{ type: "text", text: "No files found." }] };
+        }
+        const lines = files.map((f: Record<string, unknown>) => {
+          const name = (f.name as string) || "Untitled";
+          const size = (f.size as string) || "—";
+          const modified = (f.modifiedTime as string) ? new Date(f.modifiedTime as string).toLocaleDateString() : "—";
+          const link = (f.webViewLink as string) || "";
+          return `📄 ${name} — ${size} — ${modified}${link ? ` — ${link}` : ""}`;
+        });
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch {
+        // Parse failed — return raw output
+        return { content: [{ type: "text", text: result || "No files found." }] };
+      }
     } catch (e: any) {
       return { content: [{ type: "text", text: `List failed: ${e.message}` }], isError: true };
     }
