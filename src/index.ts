@@ -62,6 +62,7 @@ async function main(): Promise<void> {
       recencyHalfLifeDays: config.memory.recencyHalfLifeDays,
       coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
       coldRetentionDays: config.memory.coldRetentionDays,
+      purgeRetentionDays: config.memory.purgeRetentionDays,
     });
     log.info("Structured memory lifecycle enabled");
   } else {

@@ -52,6 +52,7 @@ export class MemoryLifecycle {
     let demoted = 0;
     let summarized = 0;
     let cleaned = 0;
+    let purged = 0;
     const errors: string[] = [];
 
     try {
@@ -64,6 +65,7 @@ export class MemoryLifecycle {
           demoted += result.demoted;
           summarized += result.summarized;
           cleaned += result.cleaned;
+          purged += result.purged;
         } catch (err) {
           errors.push(`${agentId}: ${err}`);
           log.error("Memory lifecycle sweep failed for agent", { agentId, error: String(err) });
@@ -73,7 +75,7 @@ export class MemoryLifecycle {
       errors.push(`global: ${err}`);
     }
 
-    const totalActions = promoted + demoted + summarized + cleaned;
+    const totalActions = promoted + demoted + summarized + cleaned + purged;
     if (totalActions > 0) {
       log.info("Memory lifecycle sweep complete", {
         durationMs: Date.now() - start,
@@ -81,13 +83,14 @@ export class MemoryLifecycle {
         demoted,
         summarized,
         cleaned,
+        purged,
         errors: errors.length,
       });
     }
 
     return {
       component: "memory-lifecycle",
-      pruned: demoted + cleaned,
+      pruned: demoted + cleaned + purged,
       retried: promoted,
       bytesFreed: 0,
       errors,
@@ -96,78 +99,99 @@ export class MemoryLifecycle {
 
   private async sweepAgent(
     agentId: string,
-  ): Promise<{ promoted: number; demoted: number; summarized: number; cleaned: number }> {
+  ): Promise<{ promoted: number; demoted: number; summarized: number; cleaned: number; purged: number }> {
     let promoted = 0;
     let demoted = 0;
 
     // 1. Score all non-pinned records
     const records = await this.store.getAllNonPinned(agentId);
-    if (records.length === 0) return { promoted: 0, demoted: 0, summarized: 0, cleaned: 0 };
+    let summarizedCount = 0;
+    let cleanedCount = 0;
 
-    const accessCounts = records.map((r) => r.accessCount).sort((a, b) => a - b);
-    const medianAccess = accessCounts[Math.floor(accessCounts.length / 2)] ?? 0;
+    if (records.length > 0) {
+      const accessCounts = records.map((r) => r.accessCount).sort((a, b) => a - b);
+      const medianAccess = accessCounts[Math.floor(accessCounts.length / 2)] ?? 0;
 
-    const scored = records.map((r) => ({
-      record: r,
-      score: this.computeScore(r, medianAccess),
-    }));
+      const scored = records.map((r) => ({
+        record: r,
+        score: this.computeScore(r, medianAccess),
+      }));
 
-    // 2. Enforce tier placement based on score
-    const tierUpdates: { id: ObjectId; newTier: MemoryTier }[] = [];
-    for (const { record, score } of scored) {
-      let targetTier: MemoryTier;
-      if (score >= this.config.hotThreshold) {
-        targetTier = "hot";
-      } else if (score >= this.config.warmThreshold) {
-        targetTier = "warm";
-      } else {
-        targetTier = "cold";
-      }
+      // 2. Enforce tier placement based on score
+      const tierUpdates: { id: ObjectId; newTier: MemoryTier }[] = [];
+      for (const { record, score } of scored) {
+        let targetTier: MemoryTier;
+        if (score >= this.config.hotThreshold) {
+          targetTier = "hot";
+        } else if (score >= this.config.warmThreshold) {
+          targetTier = "warm";
+        } else {
+          targetTier = "cold";
+        }
 
-      if (targetTier !== record.tier) {
-        tierUpdates.push({ id: record._id!, newTier: targetTier });
-        if (targetTier === "hot" && record.tier !== "hot") promoted++;
-        if (targetTier !== "hot" && record.tier === "hot") demoted++;
-      }
-    }
-
-    // Apply tier changes
-    for (const tier of ["hot", "warm", "cold"] as MemoryTier[]) {
-      const ids = tierUpdates.filter((u) => u.newTier === tier).map((u) => u.id);
-      await this.store.setTierBulk(ids, tier);
-    }
-
-    // 3. Enforce hot budget — pinned records don't count against the budget
-    const hotRecords = await this.store.getHotTier(agentId);
-    let nonPinnedTokens = 0;
-    const toOverflow: ObjectId[] = [];
-    for (const r of hotRecords) {
-      const tokens = this.estimateTokens(r.content);
-      if (!r.pinned) {
-        nonPinnedTokens += tokens;
-        if (nonPinnedTokens > this.config.hotBudgetTokens) {
-          toOverflow.push(r._id!);
+        if (targetTier !== record.tier) {
+          tierUpdates.push({ id: record._id!, newTier: targetTier });
+          if (targetTier === "hot" && record.tier !== "hot") promoted++;
+          if (targetTier !== "hot" && record.tier === "hot") demoted++;
         }
       }
-    }
-    if (toOverflow.length > 0) {
-      await this.store.setTierBulk(toOverflow, "warm");
-      demoted += toOverflow.length;
-    }
 
-    // 4. Summarize cold batches
-    let summarizedCount = 0;
-    try {
-      summarizedCount = await this.summarizeCold(agentId);
-    } catch (err) {
-      log.warn("Cold summarization failed", { agentId, error: String(err) });
+      // Apply tier changes
+      for (const tier of ["hot", "warm", "cold"] as MemoryTier[]) {
+        const ids = tierUpdates.filter((u) => u.newTier === tier).map((u) => u.id);
+        await this.store.setTierBulk(ids, tier);
+      }
+
+      // 3. Enforce hot budget — pinned records don't count against the budget
+      const hotRecords = await this.store.getHotTier(agentId);
+      let nonPinnedTokens = 0;
+      const toOverflow: ObjectId[] = [];
+      for (const r of hotRecords) {
+        const tokens = this.estimateTokens(r.content);
+        if (!r.pinned) {
+          nonPinnedTokens += tokens;
+          if (nonPinnedTokens > this.config.hotBudgetTokens) {
+            toOverflow.push(r._id!);
+          }
+        }
+      }
+      if (toOverflow.length > 0) {
+        await this.store.setTierBulk(toOverflow, "warm");
+        demoted += toOverflow.length;
+      }
+
+      // 4. Summarize cold batches
+      try {
+        summarizedCount = await this.summarizeCold(agentId);
+      } catch (err) {
+        log.warn("Cold summarization failed", { agentId, error: String(err) });
+      }
     }
 
     // 5. Clean up old summarized records
+    // Runs unconditionally — agents with no active memories still have old summaries to clean.
     const retentionDate = new Date(Date.now() - this.config.coldRetentionDays * 24 * 60 * 60 * 1000);
-    const cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
+    cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
 
-    return { promoted, demoted, summarized: summarizedCount, cleaned: cleanedCount };
+    // 6. Hard-delete purged records older than retention period
+    // Runs unconditionally — agents that purged all memories still need cleanup.
+    const purgeCutoff = new Date(Date.now() - this.config.purgeRetentionDays * 24 * 60 * 60 * 1000);
+    let purgedCount = 0;
+    try {
+      const purgedRecords = await this.store.deletePurgedOlderThan(agentId, purgeCutoff);
+      purgedCount = purgedRecords.length;
+      if (purgedRecords.length > 0) {
+        const pointIds = purgedRecords.map((r) => r.qdrantPointId).filter(Boolean);
+        for (const pointId of pointIds) {
+          await this.embedder.remove(pointId);
+        }
+        log.info("Hard-deleted purged records", { agentId, count: purgedRecords.length });
+      }
+    } catch (err) {
+      log.warn("Purge hard-delete phase failed", { agentId, error: String(err) });
+    }
+
+    return { promoted, demoted, summarized: summarizedCount, cleaned: cleanedCount, purged: purgedCount };
   }
 
   private async summarizeCold(agentId: string): Promise<number> {
