@@ -8,6 +8,7 @@
  *
  * Env vars:
  *   GOG_ACCOUNT — Google account email (optional, uses gog default if unset)
+ *   GOG_CLIENT  — OAuth client name (optional, uses gog default if unset)
  *   GOG_PATH    — path to gog binary (optional, auto-detected if unset)
  */
 
@@ -19,6 +20,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 
 const ACCOUNT = process.env.GOG_ACCOUNT ?? "";
+const CLIENT = process.env.GOG_CLIENT ?? "";
 const GOG =
   process.env.GOG_PATH ??
   (() => {
@@ -30,12 +32,25 @@ const GOG =
   })();
 
 function gog(args: string[]): string {
-  const fullArgs = [...args, ...(ACCOUNT ? ["-a", ACCOUNT] : []), "--json", "--results-only", "--no-input"];
+  const fullArgs = [
+    ...args,
+    ...(ACCOUNT ? ["-a", ACCOUNT] : []),
+    ...(CLIENT ? ["--client", CLIENT] : []),
+    "--json",
+    "--results-only",
+    "--no-input",
+  ];
   return execFileSync(GOG, fullArgs, { encoding: "utf-8", timeout: 30_000 }).trim();
 }
 
 function gogPlain(args: string[]): string {
-  const fullArgs = [...args, ...(ACCOUNT ? ["-a", ACCOUNT] : []), "--plain", "--no-input"];
+  const fullArgs = [
+    ...args,
+    ...(ACCOUNT ? ["-a", ACCOUNT] : []),
+    ...(CLIENT ? ["--client", CLIENT] : []),
+    "--plain",
+    "--no-input",
+  ];
   return execFileSync(GOG, fullArgs, { encoding: "utf-8", timeout: 30_000 }).trim();
 }
 
