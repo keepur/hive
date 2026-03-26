@@ -218,9 +218,7 @@ export const config = {
       optional("MEMORY_PURGE_RETENTION_DAYS", String(hive.memory?.purgeRetentionDays ?? 7)),
       10,
     ),
-    reflectionEnabled:
-      (hive.memory?.reflectionEnabled ?? true) &&
-      process.env.MEMORY_REFLECTION_ENABLED !== "false",
+    reflectionEnabled: (hive.memory?.reflectionEnabled ?? true) && process.env.MEMORY_REFLECTION_ENABLED !== "false",
     reflectionMinTurns: parseInt(
       optional("MEMORY_REFLECTION_MIN_TURNS", String(hive.memory?.reflectionMinTurns ?? 3)),
       10,
