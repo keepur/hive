@@ -42,12 +42,14 @@ export class AgentRunner {
   private plugins: LoadedPlugin[];
   private skillIndex: SkillIndex;
   private activeQuery: Query | null = null;
+  private eventSubscribersJson: string;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map()) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}") {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
     this.skillIndex = skillIndex;
+    this.eventSubscribersJson = eventSubscribersJson;
   }
 
   private async buildSystemPrompt(): Promise<string> {
@@ -445,6 +447,19 @@ export class AgentRunner {
         };
       }
     }
+
+    // Event Bus MCP server — emit structured events for cross-agent coordination
+    servers["event-bus"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/events/event-bus-mcp-server.js")],
+      env: {
+        AGENT_ID: this.agentConfig.id,
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+        EVENT_SUBSCRIBERS: this.eventSubscribersJson,
+      },
+    };
 
     // Admin MCP server — model management, system controls
     servers["admin"] = {

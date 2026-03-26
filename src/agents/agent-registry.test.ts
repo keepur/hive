@@ -179,6 +179,46 @@ describe("applyConfigOverrides", () => {
   });
 });
 
+describe("subscribe overrides", () => {
+  it("replaces subscribe array entirely", () => {
+    const config = makeConfig({ subscribe: ["deals"] });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      subscribe: { replace: ["cases", "jobs"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, makeConfig());
+    expect(result.subscribe).toEqual(["cases", "jobs"]);
+  });
+
+  it("adds to subscribe array without duplicates", () => {
+    const template = makeConfig({ subscribe: ["deals"] });
+    const config = makeConfig({ subscribe: ["deals"] });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      subscribe: { add: ["deals", "jobs"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, template);
+    expect(result.subscribe).toEqual(["deals", "jobs"]);
+  });
+
+  it("removes from subscribe array", () => {
+    const template = makeConfig({ subscribe: ["deals", "jobs", "cases"] });
+    const config = makeConfig({ subscribe: ["deals", "jobs", "cases"] });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      subscribe: { remove: ["jobs"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, template);
+    expect(result.subscribe).toEqual(["deals", "cases"]);
+  });
+});
+
 describe("name matching patterns", () => {
   // These test the same regex logic used in findAllByName
   function matchesName(text: string, agentName: string): boolean {

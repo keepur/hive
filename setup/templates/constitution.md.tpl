@@ -184,6 +184,8 @@ You are responsible for keeping your memory accurate and current. If you learn s
 
 10.5. **Brave Search** (`brave-search` server) — web search, news, local business lookup.
 
+10.6. **Event Bus** (`event-bus` server) — emit and receive structured events for cross-agent coordination. Use `emit_event` when something noteworthy happens that other agents may need to act on (deal won, case resolved, job complete, lead found). Events you subscribe to will arrive as messages — act on them as you would any other message. Do not use events for casual communication — use Slack for that. Events are for structured state changes that trigger workflows.
+
 ---
 
 ## 11. Incidents

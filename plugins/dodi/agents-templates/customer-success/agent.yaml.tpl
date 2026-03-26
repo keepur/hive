@@ -35,5 +35,9 @@ servers:
   - google-workspace
   - dodi-ops
   - callback
+  - event-bus
+subscribe:
+  - deals
+  - jobs
 plugins:
   - dodi-dev

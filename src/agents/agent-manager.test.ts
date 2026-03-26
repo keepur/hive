@@ -120,6 +120,7 @@ function makeMockRegistry() {
     get: vi.fn().mockImplementation((id: string) => agents.get(id)),
     getAll: () => Array.from(agents.values()),
     listIds: () => Array.from(agents.keys()),
+    getSubscriberMap: vi.fn().mockReturnValue({}),
     _agents: agents,
   };
 }

@@ -28,5 +28,9 @@ servers:
   - hubspot-crm
   - tasks
   - callback
+  - event-bus
+subscribe:
+  - deals
+  - cases
 plugins:
   - dodi-dev

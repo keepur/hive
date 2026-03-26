@@ -23,6 +23,7 @@ export interface AgentConfig {
   triageModel?: string; // Override triage model. Default: config.triage.model
   dodiOpsMode?: "full" | "readonly"; // Dodi Ops access level. Default: "full"
   disabled?: boolean; // Agent is offline — won't receive messages or run schedules
+  subscribe?: string[]; // Event bus domain subscriptions (e.g., ["deals", "jobs"])
   soul: string;
   systemPrompt: string;
 }
@@ -40,6 +41,7 @@ export interface ConfigOverride {
   keywords?: ArrayOverride;
   servers?: ArrayOverride;
   plugins?: ArrayOverride;
+  subscribe?: ArrayOverride;
   isDefault?: boolean;
   budgetUsd?: number;
   maxTurns?: number;
