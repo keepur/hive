@@ -21,7 +21,7 @@ servers:
   - conversation-search
   - hubspot-crm
   - brave-search
-  - google-workspace
+  - google
   - callback
 plugins:
   - dodi-dev

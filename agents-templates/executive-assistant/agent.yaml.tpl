@@ -21,5 +21,5 @@ servers:
   - quo
   - conversation-search
   - brave-search
-  - google-workspace
+  - google
   - callback

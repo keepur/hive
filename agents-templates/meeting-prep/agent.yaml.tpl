@@ -25,5 +25,4 @@ servers:
   - brave-search
   - slack
   - google
-  - google-workspace
   - callback

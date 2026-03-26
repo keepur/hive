@@ -23,7 +23,7 @@ servers:
   - hubspot-crm
   - brave-search
   - tasks
-  - google-workspace
+  - google
   - callback
 plugins:
   - dodi-dev

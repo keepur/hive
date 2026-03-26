@@ -18,6 +18,6 @@ servers:
   - contacts
   - conversation-search
   - brave-search
-  - google-workspace
+  - google
   - github-issues
   - callback

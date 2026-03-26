@@ -164,20 +164,9 @@ export class AgentRunner {
       args: [resolve("dist/google/google-mcp-server.js")],
       env: {
         ...(gogAccount ? { GOG_ACCOUNT: gogAccount } : {}),
+        DRIVE_SHARED_FOLDER: config.google.sharedFolder,
+        INSTANCE_ID: config.instance.id,
         PATH: process.env.PATH ?? "",
-      },
-    };
-
-    // Google Workspace — Drive upload/download/list via gws CLI
-    servers["google-workspace"] = {
-      type: "stdio",
-      command: "node",
-      args: [resolve("dist/drive/drive-mcp-server.js")],
-      env: {
-        GWS_PATH: config.googleWorkspace.gwsPath || "gws",
-        DRIVE_SHARED_FOLDER: config.googleWorkspace.sharedFolder,
-        PATH: process.env.PATH ?? "",
-        HOME: process.env.HOME ?? "",
       },
     };
 

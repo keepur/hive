@@ -71,8 +71,7 @@ Message (Slack/SMS/WebSocket/Scheduler)
 ### MCP Servers (stdio subprocesses per agent session)
 All in `src/` — each agent only gets servers listed in its `agent.yaml` `servers` field:
 - `memory-mcp-server.ts` — read/write/list/history/rollback agent memory (MongoDB)
-- `google-mcp-server.ts` — Gmail + Calendar via `gog` CLI
-- `drive/drive-mcp-server.ts` — Google Drive via `gws` CLI
+- `google/google-mcp-server.ts` — Gmail + Calendar + Drive via `gog` CLI
 - `keychain-mcp-server.ts` — macOS Keychain read-only
 - `contacts-mcp-server.ts` — contact lookups (MongoDB)
 - `github/github-issues-mcp-server.ts` — GitHub Issues tracking via `gh` CLI

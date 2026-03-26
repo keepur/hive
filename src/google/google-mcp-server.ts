@@ -15,6 +15,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join, basename } from "node:path";
 
 const ACCOUNT = process.env.GOG_ACCOUNT ?? "";
 const GOG =
@@ -268,6 +270,157 @@ server.registerTool(
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to check free/busy: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+// ── Drive ─────────────────────────────────────────────────────────────
+
+const SHARED_FOLDER = process.env.DRIVE_SHARED_FOLDER ?? "";
+const INSTANCE_ID = process.env.INSTANCE_ID ?? "hive";
+const DOWNLOAD_DIR = join("/tmp", `${INSTANCE_ID}-drive-downloads`);
+mkdirSync(DOWNLOAD_DIR, { recursive: true });
+
+server.registerTool(
+  "drive_upload",
+  {
+    title: "Upload File to Google Drive",
+    description:
+      "Upload a local file to the company shared Google Drive folder. " +
+      "Returns a shareable link. Use this to share CSVs, reports, documents with the team. " +
+      "The file must exist on the local filesystem (e.g. from permit_export_csv or other export tools).",
+    inputSchema: {
+      file_path: z.string().describe("Absolute path to the local file to upload"),
+      name: z.string().optional().describe("Override the filename in Drive (defaults to local filename)"),
+    },
+  },
+  async ({ file_path, name }) => {
+    if (!SHARED_FOLDER) {
+      return {
+        content: [{ type: "text", text: "Drive shared folder not configured (DRIVE_SHARED_FOLDER)." }],
+        isError: true,
+      };
+    }
+
+    if (!existsSync(file_path)) {
+      return { content: [{ type: "text", text: `File not found: ${file_path}` }], isError: true };
+    }
+
+    const fileName = name || basename(file_path);
+
+    try {
+      const result = gog(["drive", "upload", file_path, "--parent", SHARED_FOLDER, "--name", fileName]);
+      const data = JSON.parse(result);
+
+      const summary = [
+        `Uploaded to Google Drive`,
+        `  Name: ${data.name || fileName}`,
+        ...(data.webViewLink ? [`  View: ${data.webViewLink}`] : []),
+        ...(data.id ? [`  File ID: ${data.id}`] : []),
+      ].join("\n");
+
+      return { content: [{ type: "text", text: summary }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Upload failed: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.registerTool(
+  "drive_download",
+  {
+    title: "Download File from Google Drive",
+    description:
+      "Download a file from Google Drive to the local filesystem for processing. " +
+      "Provide either a file ID or a Drive URL. For Google Docs/Sheets/Slides, exports as text/CSV.",
+    inputSchema: {
+      file_id: z.string().optional().describe("Google Drive file ID"),
+      url: z.string().optional().describe("Google Drive URL (file ID will be extracted)"),
+      format: z.string().optional().describe("Export format (e.g. txt, csv, pdf). Only for Google-native files."),
+    },
+  },
+  async ({ file_id, url, format }) => {
+    let id = file_id;
+
+    if (!id && url) {
+      const match = url.match(/\/d\/([a-zA-Z0-9_-]+)/) ?? url.match(/id=([a-zA-Z0-9_-]+)/);
+      if (match) id = match[1];
+    }
+
+    if (!id) {
+      return { content: [{ type: "text", text: "Provide either file_id or a Google Drive URL." }], isError: true };
+    }
+
+    try {
+      const outPath = join(DOWNLOAD_DIR, id + (format ? `.${format}` : ""));
+      const args = ["drive", "download", id, "--out", outPath];
+      if (format) args.push("--format", format);
+      gogPlain(args);
+
+      // Return inline content for text-readable files
+      const textExtensions = new Set([".txt", ".csv", ".md", ".json", ".xml", ".html", ".tsv"]);
+      const ext = outPath.includes(".") ? outPath.slice(outPath.lastIndexOf(".")) : "";
+      if (existsSync(outPath) && textExtensions.has(ext)) {
+        const content = readFileSync(outPath, "utf-8");
+        const summary = [
+          `Downloaded${format ? ` and exported as ${format}` : ""}`,
+          `  Local path: ${outPath}`,
+          ``,
+          `--- Content ---`,
+          content,
+        ].join("\n");
+        return { content: [{ type: "text", text: summary }] };
+      }
+
+      return { content: [{ type: "text", text: `Downloaded to ${outPath}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Download failed: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.registerTool(
+  "drive_list",
+  {
+    title: "List Files in Shared Drive Folder",
+    description:
+      "List files in the company shared Drive folder. Useful to see what reports and documents have been shared.",
+    inputSchema: {
+      query: z.string().optional().describe("Search query to filter files (e.g. 'permits' or 'name contains report')"),
+      limit: z.number().optional().default(20).describe("Max results (default 20)"),
+    },
+  },
+  async ({ query, limit }) => {
+    if (!SHARED_FOLDER) {
+      return { content: [{ type: "text", text: "Drive shared folder not configured." }], isError: true };
+    }
+
+    try {
+      const args = ["drive", "ls", "--parent", SHARED_FOLDER];
+      if (query) args.push("--query", query);
+      args.push(`--max=${limit ?? 20}`);
+      const result = gog(args);
+
+      // Format as human-readable text
+      try {
+        const files = JSON.parse(result);
+        if (!Array.isArray(files) || files.length === 0) {
+          return { content: [{ type: "text", text: "No files found." }] };
+        }
+        const lines = files.map((f: Record<string, unknown>) => {
+          const name = (f.name as string) || "Untitled";
+          const size = (f.size as string) || "—";
+          const modified = (f.modifiedTime as string) ? new Date(f.modifiedTime as string).toLocaleDateString() : "—";
+          const link = (f.webViewLink as string) || "";
+          return `📄 ${name} — ${size} — ${modified}${link ? ` — ${link}` : ""}`;
+        });
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch {
+        // Parse failed — return raw output
+        return { content: [{ type: "text", text: result || "No files found." }] };
+      }
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `List failed: ${e.message}` }], isError: true };
     }
   },
 );
