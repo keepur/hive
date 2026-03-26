@@ -9,6 +9,9 @@ channels:
 keywords: []
 isDefault: false
 budgetUsd: 50
+schedule:
+  - cron: "0 6 * * 0"
+    task: memory-review
 servers:
   - memory
   - slack

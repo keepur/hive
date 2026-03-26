@@ -128,6 +128,10 @@ export class AgentManager {
     runners.add(runner);
     this.activeRunners.set(agentId, runners);
 
+    let turnCount = 0;
+    let lastItem: QueuedMessage | undefined;
+    let lastResult: RunResult | undefined;
+
     while (queue.length > 0) {
       const item = queue.shift()!;
       try {
@@ -194,6 +198,10 @@ export class AgentManager {
 
         item.resolve(result);
 
+        turnCount++;
+        lastItem = item;
+        lastResult = result;
+
         // Fire-and-forget: index conversation turn for semantic recall
         if (result.text && !result.error) {
           conversationIndex.index({
@@ -215,6 +223,48 @@ export class AgentManager {
           state.lastActivity = new Date();
         }
         item.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // End-of-conversation reflection — prompt agent to save memories
+    if (
+      appConfig.memory.reflectionEnabled &&
+      lastResult &&
+      lastItem &&
+      !lastResult.error &&
+      !lastResult.aborted &&
+      turnCount >= appConfig.memory.reflectionMinTurns &&
+      lastItem.message.sender !== "system"
+    ) {
+      try {
+        const reflectionPrompt = [
+          "[System — end of conversation reflection]",
+          "This conversation is wrapping up. Review what was discussed:",
+          "- Were any new facts, decisions, or commitments made?",
+          "- Did anything contradict or update what you previously knew?",
+          "- Should any existing memories be updated or forgotten?",
+          "",
+          "If yes, use memory_save, memory_update, or memory_forget now.",
+          "If nothing worth saving, do nothing.",
+        ].join("\n");
+
+        const reflectionResult = await runner.send(reflectionPrompt, lastResult.sessionId);
+        log.info("Reflection completed", {
+          agentId,
+          threadKey,
+          turnCount,
+          costUsd: reflectionResult.costUsd,
+          toolCalls: reflectionResult.toolCalls,
+          toolSummary: reflectionResult.toolSummary || undefined,
+        });
+
+        // Persist session so next message picks up post-reflection state
+        if (reflectionResult.sessionId && !reflectionResult.aborted) {
+          const threadId = lastItem.message.threadId ?? lastItem.message.id;
+          this.sessionStore.set(agentId, threadId, reflectionResult.sessionId);
+        }
+      } catch (err) {
+        log.warn("Reflection failed, non-critical", { agentId, threadKey, error: String(err) });
       }
     }
 

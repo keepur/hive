@@ -16,6 +16,8 @@ isDefault: false
 schedule:
   - cron: "0 7 * * 1-5"
     task: daily-intel-brief
+  - cron: "0 6 * * 0"
+    task: memory-review
 budgetUsd: 50
 servers:
   - memory

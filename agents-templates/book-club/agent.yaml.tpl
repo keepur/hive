@@ -15,6 +15,8 @@ isDefault: false
 schedule:
   - cron: "0 9 * * 1"
     task: biweekly-reading-picks
+  - cron: "0 6 * * 0"
+    task: memory-review
 budgetUsd: 25
 servers:
   - memory

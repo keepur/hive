@@ -11,6 +11,8 @@ maxTurns: 25
 schedule:
   - cron: "*/30 * * * *"
     task: check-slack-dms
+  - cron: "0 6 * * 0"
+    task: memory-review
 servers:
   - memory
   - contacts
