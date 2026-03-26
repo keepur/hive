@@ -28,5 +28,6 @@ servers:
   - tasks
   - google-workspace
   - callback
+  - event-bus
 plugins:
   - dodi-dev

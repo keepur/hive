@@ -365,11 +365,13 @@ export class Scheduler {
         );
         if (updateResult.modifiedCount === 0) continue; // already picked up
 
-        // Check if this was the last pending delivery — clear hasPending flag
-        const remainingPending = pendingDeliveries.filter((d) => d.agentId !== delivery.agentId);
-        if (remainingPending.length === 0) {
-          await this.eventsCollection.updateOne({ _id: event._id }, { $set: { hasPending: false } });
-        }
+        // Clear hasPending if no more pending deliveries remain in the DB.
+        // Use a DB-side condition rather than the in-memory snapshot to avoid
+        // the multi-subscriber bug where remainingPending always has length > 0.
+        await this.eventsCollection.updateOne(
+          { _id: event._id, "deliveries.status": { $ne: "pending" } },
+          { $set: { hasPending: false } },
+        );
 
         // Verify the agent still exists and is not disabled
         const agent = this.registry.get(delivery.agentId);
