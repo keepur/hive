@@ -22,6 +22,6 @@ servers:
   - memory
   - brave-search
   - slack
-  - google-workspace
+  - google
   - browser
   - callback

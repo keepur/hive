@@ -105,6 +105,10 @@ export const config = {
   google: {
     account: optional("GOOGLE_ACCOUNT", ""),
     accounts: (hive.google?.accounts ?? {}) as Record<string, string>,
+    sharedFolder: optional(
+      "DRIVE_SHARED_FOLDER",
+      hive.google?.sharedFolder ?? hive.googleWorkspace?.sharedFolder ?? "",
+    ),
   },
   googleWorkspace: {
     account: optional("GWS_ACCOUNT", hive.googleWorkspace?.account ?? ""),
