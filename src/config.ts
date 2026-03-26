@@ -103,7 +103,8 @@ export const config = {
     definitionsPath: optional("AGENTS_PATH", "./agents"),
   },
   google: {
-    account: optional("GOOGLE_ACCOUNT", ""),
+    account: optional("GOOGLE_ACCOUNT", hive.google?.account ?? ""),
+    client: optional("GOG_CLIENT", hive.google?.client ?? ""),
     accounts: (hive.google?.accounts ?? {}) as Record<string, string>,
     sharedFolder: optional(
       "DRIVE_SHARED_FOLDER",
