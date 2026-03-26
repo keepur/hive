@@ -224,6 +224,9 @@ export const config = {
       10,
     ),
   },
+  events: {
+    retentionDays: parseInt(optional("EVENT_RETENTION_DAYS", String(hive.events?.retentionDays ?? 30)), 10),
+  },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),
   },

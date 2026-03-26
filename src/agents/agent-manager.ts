@@ -47,7 +47,8 @@ export class AgentManager {
   private createRunner(agentId: string): AgentRunner {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
-    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex);
+    const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson);
   }
 
   reloadSkills(): void {

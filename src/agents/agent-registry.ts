@@ -26,7 +26,7 @@ export function applyConfigOverrides(
   if (!override) return config;
 
   // Apply array field overrides
-  const arrayFields = ["channels", "passiveChannels", "keywords", "servers", "plugins"] as const;
+  const arrayFields = ["channels", "passiveChannels", "keywords", "servers", "plugins", "subscribe"] as const;
   for (const field of arrayFields) {
     const arrOverride = override[field] as ArrayOverride | undefined;
     if (!arrOverride) continue;
@@ -215,6 +215,7 @@ export class AgentRegistry {
       timeoutMs: (raw.timeoutMs as number) || undefined,
       triageModel: (raw.triageModel as string) || undefined,
       dodiOpsMode: (raw.dodiOpsMode as "full" | "readonly") || undefined,
+      subscribe: (raw.subscribe as string[]) || [],
       soul,
       systemPrompt,
     };
@@ -308,5 +309,22 @@ export class AgentRegistry {
   /** Get all disabled agents (for admin reporting) */
   getDisabled(): AgentConfig[] {
     return this.getAll().filter((a) => a.disabled);
+  }
+
+  /** Build domain → subscriber agent IDs map from all agents' subscribe arrays */
+  getSubscriberMap(): Record<string, string[]> {
+    const map: Record<string, string[]> = {};
+    for (const agent of this.getAll()) {
+      if (agent.disabled) continue;
+      for (const sub of agent.subscribe ?? []) {
+        // Support both domain-level ("deals") and action-level ("deals:won") subscriptions
+        const domain = sub.includes(":") ? sub.split(":")[0] : sub;
+        if (!map[domain]) map[domain] = [];
+        if (!map[domain].includes(agent.id)) {
+          map[domain].push(agent.id);
+        }
+      }
+    }
+    return map;
   }
 }
