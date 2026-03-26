@@ -464,15 +464,21 @@ export class AgentRunner {
       },
     };
 
-    // Guardrail: filter to agent's allowed MCP servers
-    if (this.agentConfig.servers?.length) {
-      const allowed = new Set(this.agentConfig.servers);
+    // Guardrail: filter to agent's allowed MCP servers (core + delegate for the full allowlist)
+    const allAllowed = [...this.agentConfig.coreServers, ...this.agentConfig.delegateServers];
+    if (allAllowed.length > 0) {
+      const allowed = new Set(allAllowed);
       // structured-memory is always paired with memory — if agent has memory, it gets both
       if (allowed.has("memory")) {
         allowed.add("structured-memory");
       }
+      // For the parent session, only connect core servers
+      const coreSet = new Set(this.agentConfig.coreServers);
+      if (coreSet.has("memory")) {
+        coreSet.add("structured-memory");
+      }
       for (const key of Object.keys(servers)) {
-        if (!allowed.has(key)) {
+        if (!coreSet.has(key)) {
           delete servers[key];
         }
       }

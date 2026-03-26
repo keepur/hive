@@ -228,9 +228,9 @@ export class AgentManager {
     }
 
     // End-of-conversation reflection — prompt agent to save memories
-    const hasMemoryServer = config?.servers?.some(
-      (s) => s === "memory" || s === "structured-memory"
-    ) ?? false;
+    const hasMemoryServer = config?.coreServers.includes("memory")
+      || config?.coreServers.includes("structured-memory")
+      || false;
     if (
       appConfig.memory.reflectionEnabled &&
       hasMemoryServer &&

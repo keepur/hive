@@ -16,7 +16,8 @@ export interface AgentConfig {
   maxTurns: number;
   icon: string; // emoji like ":briefcase:" or URL
   slackBot?: string; // which Slack bot this agent uses (e.g. "jasper") — omit for primary bot
-  servers?: string[]; // MCP server allowlist. Omit = all servers (backward compat)
+  coreServers: string[];
+  delegateServers: string[];
   plugins?: string[]; // Claude Code plugin allowlist. Omit = no plugins
   maxConcurrent?: number; // Max concurrent threads. Default 3
   timeoutMs?: number; // Response timeout in ms. Default 300000 (5 min)
@@ -39,7 +40,8 @@ export interface ConfigOverride {
   channels?: ArrayOverride;
   passiveChannels?: ArrayOverride;
   keywords?: ArrayOverride;
-  servers?: ArrayOverride;
+  coreServers?: ArrayOverride;
+  delegateServers?: ArrayOverride;
   plugins?: ArrayOverride;
   subscribe?: ArrayOverride;
   isDefault?: boolean;

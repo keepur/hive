@@ -26,7 +26,12 @@ export function applyConfigOverrides(
   if (!override) return config;
 
   // Apply array field overrides
-  const arrayFields = ["channels", "passiveChannels", "keywords", "servers", "plugins", "subscribe"] as const;
+  const arrayFields = ["channels", "passiveChannels", "keywords", "coreServers", "delegateServers", "plugins", "subscribe"] as const;
+
+  // Backward compat: old MongoDB override documents may have `servers` instead of `coreServers`
+  if ((override as any).servers && !override.coreServers) {
+    override.coreServers = (override as any).servers;
+  }
   for (const field of arrayFields) {
     const arrOverride = override[field] as ArrayOverride | undefined;
     if (!arrOverride) continue;
@@ -196,6 +201,24 @@ export class AgentRegistry {
       log.info("Model override active", { agent: agentId, yaml: yamlModel, override: model });
     }
 
+    // Parse tiered servers: flat array (backward compat) or { core, delegate } object
+    const rawServers = raw.servers;
+    let coreServers: string[];
+    let delegateServers: string[];
+
+    if (Array.isArray(rawServers)) {
+      // Backward compat: flat array = all core
+      coreServers = rawServers;
+      delegateServers = [];
+    } else if (rawServers && typeof rawServers === "object") {
+      const tiered = rawServers as { core?: string[]; delegate?: string[] };
+      coreServers = tiered.core ?? [];
+      delegateServers = tiered.delegate ?? [];
+    } else {
+      coreServers = [];
+      delegateServers = [];
+    }
+
     const config: AgentConfig = {
       id: agentId,
       name: (raw.name as string) || dirName,
@@ -209,7 +232,8 @@ export class AgentRegistry {
       maxTurns: (raw.maxTurns as number) || 25,
       icon: (raw.icon as string) || "",
       slackBot: (raw.slackBot as string) || undefined,
-      servers: (raw.servers as string[]) || undefined,
+      coreServers,
+      delegateServers,
       plugins: (raw.plugins as string[]) || undefined,
       maxConcurrent: (raw.maxConcurrent as number) || undefined,
       timeoutMs: (raw.timeoutMs as number) || undefined,

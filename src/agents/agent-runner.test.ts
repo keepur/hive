@@ -108,6 +108,8 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     budgetUsd: 10,
     maxTurns: 25,
     icon: "",
+    coreServers: [],
+    delegateServers: [],
     soul: "",
     systemPrompt: "You are a test agent.",
     ...overrides,
@@ -151,9 +153,9 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers).toHaveProperty("admin");
   });
 
-  it("filters servers by agent allowlist", async () => {
+  it("filters servers by agent coreServers allowlist", async () => {
     runner = new AgentRunner(
-      makeAgentConfig({ servers: ["memory", "keychain"] }),
+      makeAgentConfig({ coreServers: ["memory", "keychain"] }),
       memoryManager as any,
     );
     await runner.send("hello");
