@@ -15,6 +15,7 @@ vi.mock("../config.js", () => ({
   config: {
     plugins: [],
     modelRouter: { enabled: false },
+    memory: { reflectionEnabled: true, reflectionMinTurns: 3 },
   },
 }));
 
@@ -542,6 +543,111 @@ describe("AgentManager", () => {
       // The work item resolved successfully despite indexing failure
       expect(result.text).toBe("response");
       expect(mockConversationIndex).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("end-of-conversation reflection", () => {
+    it("sends reflection prompt after qualifying conversation (3+ turns)", async () => {
+      const threadId = `thread-reflect-${Date.now()}`;
+
+      // Send 3 messages in the same thread to meet the threshold
+      const item1 = makeWorkItem({ threadId });
+      const item2 = makeWorkItem({ threadId });
+      const item3 = makeWorkItem({ threadId });
+
+      // Queue all three before processing starts
+      const p1 = manager.sendMessage("agent-a", item1);
+      const p2 = manager.sendMessage("agent-a", item2);
+      const p3 = manager.sendMessage("agent-a", item3);
+
+      await Promise.all([p1, p2, p3]);
+
+      // runner.send called 3 times for messages + 1 for reflection = 4
+      expect(mockRunnerSend).toHaveBeenCalledTimes(4);
+
+      // The 4th call should be the reflection prompt
+      const reflectionCall = mockRunnerSend.mock.calls[3];
+      expect(reflectionCall[0]).toContain("end of conversation reflection");
+    });
+
+    it("skips reflection for fewer than 3 turns", async () => {
+      const threadId = `thread-short-${Date.now()}`;
+      const item1 = makeWorkItem({ threadId });
+      const item2 = makeWorkItem({ threadId });
+
+      const p1 = manager.sendMessage("agent-a", item1);
+      const p2 = manager.sendMessage("agent-a", item2);
+
+      await Promise.all([p1, p2]);
+
+      // Only 2 calls — no reflection
+      expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+    });
+
+    it("skips reflection for system sender", async () => {
+      const threadId = `thread-system-${Date.now()}`;
+      const item1 = makeWorkItem({ threadId, sender: "system" });
+      const item2 = makeWorkItem({ threadId, sender: "system" });
+      const item3 = makeWorkItem({ threadId, sender: "system" });
+
+      const p1 = manager.sendMessage("agent-a", item1);
+      const p2 = manager.sendMessage("agent-a", item2);
+      const p3 = manager.sendMessage("agent-a", item3);
+
+      await Promise.all([p1, p2, p3]);
+
+      // Only 3 calls — no reflection for system messages
+      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
+    });
+
+    it("skips reflection when last result has error", async () => {
+      const threadId = `thread-error-${Date.now()}`;
+
+      // First two succeed, third errors
+      mockRunnerSend
+        .mockResolvedValueOnce(makeRunResult())
+        .mockResolvedValueOnce(makeRunResult())
+        .mockResolvedValueOnce(makeRunResult({ error: "something failed" }));
+
+      const item1 = makeWorkItem({ threadId });
+      const item2 = makeWorkItem({ threadId });
+      const item3 = makeWorkItem({ threadId });
+
+      const p1 = manager.sendMessage("agent-a", item1);
+      const p2 = manager.sendMessage("agent-a", item2);
+      const p3 = manager.sendMessage("agent-a", item3);
+
+      await Promise.all([p1, p2, p3]);
+
+      // Only 3 calls — no reflection after error
+      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
+    });
+
+    it("persists session after reflection", async () => {
+      const threadId = `thread-persist-${Date.now()}`;
+      const reflectionSessionId = "reflection-session-123";
+
+      // 3 normal results + 1 reflection result with new session
+      mockRunnerSend
+        .mockResolvedValueOnce(makeRunResult())
+        .mockResolvedValueOnce(makeRunResult())
+        .mockResolvedValueOnce(makeRunResult({ sessionId: "pre-reflection" }))
+        .mockResolvedValueOnce(makeRunResult({ sessionId: reflectionSessionId }));
+
+      const item1 = makeWorkItem({ threadId });
+      const item2 = makeWorkItem({ threadId });
+      const item3 = makeWorkItem({ threadId });
+
+      const p1 = manager.sendMessage("agent-a", item1);
+      const p2 = manager.sendMessage("agent-a", item2);
+      const p3 = manager.sendMessage("agent-a", item3);
+
+      await Promise.all([p1, p2, p3]);
+
+      // Session store should have been called with the reflection session ID last
+      const setCalls = sessionStore.set.mock.calls;
+      const lastSetCall = setCalls[setCalls.length - 1];
+      expect(lastSetCall[2]).toBe(reflectionSessionId);
     });
   });
 });

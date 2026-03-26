@@ -375,4 +375,37 @@ describe("MemoryStore", () => {
       expect(result).toEqual(["agent-a", "agent-b"]);
     });
   });
+
+  describe("getHotTierWithStats", () => {
+    it("computes ageDays and daysSinceAccess correctly", async () => {
+      const now = Date.now();
+      const tenDaysAgo = new Date(now - 10 * 24 * 60 * 60 * 1000);
+      const threeDaysAgo = new Date(now - 3 * 24 * 60 * 60 * 1000);
+
+      mockFind.mockReturnValueOnce({
+        toArray: vi.fn().mockResolvedValueOnce([
+          makeRecord({
+            createdAt: tenDaysAgo,
+            updatedAt: tenDaysAgo,
+            lastAccessedAt: threeDaysAgo,
+            accessCount: 5,
+          }),
+        ]),
+      });
+
+      const results = await store.getHotTierWithStats("test-agent");
+      expect(results).toHaveLength(1);
+      expect(results[0].ageDays).toBe(10);
+      expect(results[0].daysSinceAccess).toBe(3);
+    });
+
+    it("returns empty array when no hot records", async () => {
+      mockFind.mockReturnValueOnce({
+        toArray: vi.fn().mockResolvedValueOnce([]),
+      });
+
+      const results = await store.getHotTierWithStats("test-agent");
+      expect(results).toHaveLength(0);
+    });
+  });
 });
