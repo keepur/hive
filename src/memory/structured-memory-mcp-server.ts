@@ -360,6 +360,52 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "memory_review",
+  {
+    title: "Review Hot-Tier Memories",
+    description:
+      "Returns all your hot-tier memories with staleness signals for review. Use this during scheduled memory-review tasks to audit your knowledge. For stale or outdated records, use memory_purge (bulk) or memory_forget (single). For records that need correction, use memory_update.",
+    inputSchema: {},
+  },
+  async () => {
+    const records = await store.getHotTierWithStats(AGENT_ID);
+
+    if (records.length === 0) {
+      return {
+        content: [{ type: "text", text: "No hot-tier memories to review." }],
+      };
+    }
+
+    const STALE_THRESHOLD_DAYS = 14;
+    const lines: string[] = [`Your hot-tier memories (${records.length} records):`, ""];
+
+    for (const r of records) {
+      const id = String(r._id);
+      const flags: string[] = [];
+      if (r.pinned) flags.push("📌 pinned");
+      if (r.daysSinceAccess >= STALE_THRESHOLD_DAYS) flags.push(`⚠ Not accessed in ${r.daysSinceAccess} days`);
+
+      lines.push(
+        `[ID: ${id}] topic:"${r.topic}" type:${r.type} importance:${r.importance}`,
+        `  Created: ${r.createdAt.toISOString().slice(0, 10)} | Last accessed: ${r.lastAccessedAt.toISOString().slice(0, 10)} | Access count: ${r.accessCount}`,
+        `  Content: "${r.content.length > 120 ? r.content.slice(0, 120) + "..." : r.content}"`,
+      );
+      if (flags.length > 0) lines.push(`  ${flags.join(" | ")}`);
+      lines.push("");
+    }
+
+    lines.push(
+      "Review each memory. For stale or outdated records, use memory_purge (bulk by filter) or memory_forget (single by ID).",
+    );
+    lines.push("For records that need correction, use memory_update.");
+
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+    };
+  },
+);
+
 // Cleanup on exit
 process.on("SIGTERM", () => store.close());
 process.on("SIGINT", () => store.close());

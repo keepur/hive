@@ -116,6 +116,16 @@ export class MemoryStore {
     });
   }
 
+  async getHotTierWithStats(agentId: string): Promise<(MemoryRecord & { ageDays: number; daysSinceAccess: number })[]> {
+    const records = await this.getHotTier(agentId);
+    const now = Date.now();
+    return records.map((r) => ({
+      ...r,
+      ageDays: Math.floor((now - r.createdAt.getTime()) / (1000 * 60 * 60 * 24)),
+      daysSinceAccess: Math.floor((now - r.lastAccessedAt.getTime()) / (1000 * 60 * 60 * 24)),
+    }));
+  }
+
   async getByIds(ids: ObjectId[]): Promise<MemoryRecord[]> {
     if (ids.length === 0) return [];
     return this.collection.find({ _id: { $in: ids }, purged: { $ne: true } }).toArray();
