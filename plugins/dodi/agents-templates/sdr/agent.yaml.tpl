@@ -36,5 +36,9 @@ servers:
   - tasks
   - google-workspace
   - callback
+  - event-bus
+subscribe:
+  - cases
+  - leads
 plugins:
   - dodi-dev

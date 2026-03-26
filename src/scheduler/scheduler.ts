@@ -5,7 +5,7 @@ import type { MemoryManager } from "../memory/memory-manager.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
-import { MongoClient, type Collection, type Db } from "mongodb";
+import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
 
 const log = createLogger("scheduler");
 
@@ -22,6 +22,23 @@ interface ScheduleOverride {
   schedule: { cron: string; task: string }[] | null;
   updatedAt: Date;
   updatedBy: string;
+}
+
+interface EventDelivery {
+  agentId: string;
+  status: "pending" | "fired";
+  firedAt?: Date;
+}
+
+interface AgentEventDoc {
+  _id: ObjectId;
+  type: string;
+  domain: string;
+  payload: Record<string, unknown>;
+  sourceAgentId: string;
+  createdAt: Date;
+  hasPending: boolean;
+  deliveries: EventDelivery[];
 }
 
 interface CallbackDoc {
@@ -45,6 +62,7 @@ export class Scheduler {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private cronTimer: ReturnType<typeof setInterval> | null = null;
   private callbackTimer: ReturnType<typeof setInterval> | null = null;
+  private eventTimer: ReturnType<typeof setInterval> | null = null;
   private agentManager: AgentManager;
   private memoryManager: MemoryManager;
   private healthReporter: HealthReporter;
@@ -53,6 +71,7 @@ export class Scheduler {
   private mongoClient: MongoClient | null = null;
   private db: Db | null = null;
   private callbackCollection: Collection<CallbackDoc> | null = null;
+  private eventsCollection: Collection<AgentEventDoc> | null = null;
   private scheduleOverrides: Collection<ScheduleOverride> | null = null;
   private onDispatch?: (item: WorkItem) => void;
 
@@ -87,9 +106,17 @@ export class Scheduler {
     await this.mongoClient.connect();
     this.db = this.mongoClient.db(dbName);
     this.callbackCollection = this.db.collection<CallbackDoc>("agent_callbacks");
+    this.eventsCollection = this.db.collection<AgentEventDoc>("agent_events");
     this.scheduleOverrides = this.db.collection<ScheduleOverride>("schedule_overrides");
     // Indexes
     await this.callbackCollection.createIndex({ status: 1, dueAt: 1 });
+    await this.eventsCollection.createIndex({ hasPending: 1, createdAt: 1 });
+    await this.eventsCollection.createIndex({ sourceAgentId: 1, createdAt: -1 });
+    await this.eventsCollection.createIndex({ domain: 1, createdAt: -1 });
+    await this.eventsCollection.createIndex(
+      { createdAt: 1 },
+      { expireAfterSeconds: config.events.retentionDays * 86400 },
+    );
     await this.scheduleOverrides.createIndex({ agentId: 1 }, { unique: true });
     // Apply overrides to cron jobs
     await this.loadScheduleOverrides();
@@ -166,10 +193,20 @@ export class Scheduler {
       }, 30_000);
     }
 
+    // Events: check every 30 seconds for pending event deliveries
+    if (this.eventsCollection) {
+      this.eventTimer = setInterval(() => {
+        this.checkEvents().catch((err) => {
+          log.error("Event check failed", { error: String(err) });
+        });
+      }, 30_000);
+    }
+
     log.info("Scheduler started", {
       heartbeatMs: config.scheduler.heartbeatIntervalMs,
       cronJobs: this.cronJobs.length,
       callbacksEnabled: !!this.callbackCollection,
+      eventsEnabled: !!this.eventsCollection,
     });
   }
 
@@ -185,6 +222,10 @@ export class Scheduler {
     if (this.callbackTimer) {
       clearInterval(this.callbackTimer);
       this.callbackTimer = null;
+    }
+    if (this.eventTimer) {
+      clearInterval(this.eventTimer);
+      this.eventTimer = null;
     }
     this.mongoClient?.close().catch(() => {});
     log.info("Scheduler stopped");
@@ -300,6 +341,97 @@ export class Scheduler {
             error: String(err),
           });
         });
+      }
+    }
+  }
+  private async checkEvents(): Promise<void> {
+    if (!this.eventsCollection) return;
+
+    const cursor = this.eventsCollection.find({ hasPending: true });
+
+    for await (const event of cursor) {
+      const pendingDeliveries = event.deliveries.filter((d) => d.status === "pending");
+
+      for (const delivery of pendingDeliveries) {
+        const now = new Date();
+
+        // Atomically mark this delivery as fired
+        const updateResult = await this.eventsCollection.updateOne(
+          {
+            _id: event._id,
+            deliveries: { $elemMatch: { agentId: delivery.agentId, status: "pending" } },
+          },
+          { $set: { "deliveries.$.status": "fired", "deliveries.$.firedAt": now } },
+        );
+        if (updateResult.modifiedCount === 0) continue; // already picked up
+
+        // Clear hasPending if no more pending deliveries remain in the DB.
+        // Use a DB-side condition rather than the in-memory snapshot to avoid
+        // the multi-subscriber bug where remainingPending always has length > 0.
+        await this.eventsCollection.updateOne(
+          { _id: event._id, "deliveries.status": { $ne: "pending" } },
+          { $set: { hasPending: false } },
+        );
+
+        // Verify the agent still exists and is not disabled
+        const agent = this.registry.get(delivery.agentId);
+        if (!agent) {
+          log.warn("Event target agent not found, skipping", {
+            agentId: delivery.agentId,
+            eventType: event.type,
+          });
+          continue;
+        }
+        if (agent.disabled) {
+          log.info("Event target agent disabled, skipping", {
+            agentId: delivery.agentId,
+            eventType: event.type,
+          });
+          continue;
+        }
+
+        const eventId = event._id.toHexString();
+        const sourceAgent = this.registry.get(event.sourceAgentId);
+        const sourceName = sourceAgent?.name ?? event.sourceAgentId;
+
+        log.info("Dispatching event", {
+          eventType: event.type,
+          eventId,
+          targetAgent: delivery.agentId,
+          sourceAgent: event.sourceAgentId,
+        });
+
+        const workItem: WorkItem = {
+          id: `event:${eventId}:${delivery.agentId}`,
+          text: `[Event: ${event.type} from ${sourceName}]\n\n${JSON.stringify(event.payload)}`,
+          source: {
+            kind: "internal" as ChannelKind,
+            id: `agent-${delivery.agentId}`,
+            label: `agent-${delivery.agentId}`,
+          },
+          sender: "system",
+          threadId: `event:${eventId}:${delivery.agentId}:${now.getTime()}`,
+          timestamp: now,
+          meta: {
+            targetAgentId: delivery.agentId,
+            eventType: event.type,
+            eventDomain: event.domain,
+            eventId,
+          },
+        };
+
+        if (this.onDispatch) {
+          this.onDispatch(workItem);
+        } else {
+          this.agentManager.sendMessage(delivery.agentId, workItem).catch((err) => {
+            log.error("Event dispatch failed", {
+              agentId: delivery.agentId,
+              eventType: event.type,
+              eventId,
+              error: String(err),
+            });
+          });
+        }
       }
     }
   }

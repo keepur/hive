@@ -28,3 +28,6 @@ servers:
   - callback
   - browser
   - keychain
+  - event-bus
+subscribe:
+  - system

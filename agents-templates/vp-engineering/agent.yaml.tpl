@@ -23,3 +23,6 @@ servers:
   - keychain
   - background
   - callback
+  - event-bus
+subscribe:
+  - system
