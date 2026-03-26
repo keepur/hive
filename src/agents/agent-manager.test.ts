@@ -56,6 +56,8 @@ vi.mock("../search/conversation-index.js", () => ({
 }));
 
 import { AgentManager } from "./agent-manager.js";
+import { config as appConfig } from "../config.js";
+import type { RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { WorkItem } from "../types/work-item.js";
 
@@ -71,6 +73,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     schedule: [],
     budgetUsd: 10,
     maxTurns: 25,
+    servers: ["memory"],
     icon: "",
     soul: "",
     systemPrompt: "",
@@ -92,7 +95,7 @@ function makeWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
   };
 }
 
-function makeRunResult(overrides: Partial<any> = {}) {
+function makeRunResult(overrides: Partial<RunResult> = {}) {
   return {
     text: "response",
     sessionId: "session-1",
@@ -620,6 +623,51 @@ describe("AgentManager", () => {
       await Promise.all([p1, p2, p3]);
 
       // Only 3 calls — no reflection after error
+      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
+    });
+
+    it("skips reflection when reflectionEnabled is false", async () => {
+      const original = appConfig.memory.reflectionEnabled;
+      appConfig.memory.reflectionEnabled = false;
+      try {
+        const threadId = `thread-disabled-${Date.now()}`;
+        const item1 = makeWorkItem({ threadId });
+        const item2 = makeWorkItem({ threadId });
+        const item3 = makeWorkItem({ threadId });
+
+        const p1 = manager.sendMessage("agent-a", item1);
+        const p2 = manager.sendMessage("agent-a", item2);
+        const p3 = manager.sendMessage("agent-a", item3);
+
+        await Promise.all([p1, p2, p3]);
+
+        // Only 3 calls — no reflection when disabled
+        expect(mockRunnerSend).toHaveBeenCalledTimes(3);
+      } finally {
+        appConfig.memory.reflectionEnabled = original;
+      }
+    });
+
+    it("skips reflection when agent has no memory server", async () => {
+      // Register an agent without memory in its servers list
+      registry._agents.set(
+        "agent-nomem",
+        makeAgentConfig({ id: "agent-nomem", name: "NoMem", servers: ["slack", "brave-search"] }),
+      );
+      registry.get.mockImplementation((id: string) => registry._agents.get(id));
+
+      const threadId = `thread-nomem-${Date.now()}`;
+      const item1 = makeWorkItem({ threadId });
+      const item2 = makeWorkItem({ threadId });
+      const item3 = makeWorkItem({ threadId });
+
+      const p1 = manager.sendMessage("agent-nomem", item1);
+      const p2 = manager.sendMessage("agent-nomem", item2);
+      const p3 = manager.sendMessage("agent-nomem", item3);
+
+      await Promise.all([p1, p2, p3]);
+
+      // Only 3 calls — no reflection for agents without memory server
       expect(mockRunnerSend).toHaveBeenCalledTimes(3);
     });
 
