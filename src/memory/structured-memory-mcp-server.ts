@@ -51,7 +51,7 @@ server.registerTool(
   {
     title: "Save Memory",
     description:
-      "Save a new structured memory record. Use this to remember facts, tasks, interactions, preferences, or decisions.",
+      "Save a new structured memory record. Use this to remember facts, tasks, interactions, preferences, decisions, or summaries.",
     inputSchema: {
       content: z.string().describe("The memory content — a fact, note, task, preference, or decision"),
       type: z.enum(VALID_TYPES).describe("Memory type: fact, task, interaction, preference, or decision"),
@@ -296,7 +296,7 @@ server.registerTool(
       type: z
         .enum(VALID_TYPES)
         .optional()
-        .describe("Filter by memory type: fact, task, interaction, preference, or decision"),
+        .describe("Filter by memory type: fact, task, interaction, preference, decision, or summary"),
       importance: z.enum(VALID_IMPORTANCE).optional().describe("Filter by importance level"),
       tier: z.enum(["hot", "warm", "cold"]).optional().describe("Filter by current tier"),
       olderThan: z.string().optional().describe("ISO 8601 date string — purge records with updatedAt before this date"),

@@ -132,6 +132,16 @@ describe("MemoryStore", () => {
     });
   });
 
+  describe("getById", () => {
+    it("excludes purged records", async () => {
+      mockFindOne.mockResolvedValueOnce(null);
+      const id = new ObjectId();
+      await store.getById(id);
+
+      expect(mockFindOne).toHaveBeenCalledWith({ _id: id, purged: { $ne: true } });
+    });
+  });
+
   describe("getHotTier", () => {
     it("sorts pinned records first", async () => {
       const pinned = makeRecord({ pinned: true, importance: "low" });

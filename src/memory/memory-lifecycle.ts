@@ -166,11 +166,12 @@ export class MemoryLifecycle {
       } catch (err) {
         log.warn("Cold summarization failed", { agentId, error: String(err) });
       }
-
-      // 5. Clean up old summarized records
-      const retentionDate = new Date(Date.now() - this.config.coldRetentionDays * 24 * 60 * 60 * 1000);
-      cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
     }
+
+    // 5. Clean up old summarized records
+    // Runs unconditionally — agents with no active memories still have old summaries to clean.
+    const retentionDate = new Date(Date.now() - this.config.coldRetentionDays * 24 * 60 * 60 * 1000);
+    cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
 
     // 6. Hard-delete purged records older than retention period
     // Runs unconditionally — agents that purged all memories still need cleanup.

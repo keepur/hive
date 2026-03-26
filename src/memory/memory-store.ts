@@ -60,7 +60,7 @@ export class MemoryStore {
   }
 
   async getById(id: ObjectId): Promise<MemoryRecord | null> {
-    return this.collection.findOne({ _id: id });
+    return this.collection.findOne({ _id: id, purged: { $ne: true } });
   }
 
   async update(
