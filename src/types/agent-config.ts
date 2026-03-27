@@ -25,6 +25,7 @@ export interface AgentConfig {
   dodiOpsMode?: "full" | "readonly"; // Dodi Ops access level. Default: "full"
   disabled?: boolean; // Agent is offline — won't receive messages or run schedules
   subscribe?: string[]; // Event bus domain subscriptions (e.g., ["deals", "jobs"])
+  delegatePrompts?: Record<string, string>;
   soul: string;
   systemPrompt: string;
 }
