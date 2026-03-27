@@ -20,21 +20,23 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - google
-  - crm-search
-  - product-search
-  - conversation-search
-  - hubspot-crm
-  - contacts
-  - slack
-  - brave-search
-  - tasks
-  - resend
-  - quo
-  - dodi-ops
-  - callback
-  - event-bus
+  core:
+    - memory
+    - slack
+    - callback
+    - event-bus
+    - conversation-search
+    - crm-search
+    - product-search
+    - contacts
+  delegate:
+    - hubspot-crm
+    - dodi-ops
+    - google
+    - resend
+    - quo
+    - brave-search
+    - tasks
 subscribe:
   - deals
   - jobs
