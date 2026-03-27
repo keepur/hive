@@ -249,6 +249,10 @@ async function main() {
         if (entry === "delegate-prompts") {
           const promptFiles = readdirSync(srcPath);
           for (const pf of promptFiles) {
+            if (!pf.endsWith(".md") && !pf.endsWith(".md.tpl")) {
+              console.log(`  SKIP delegate-prompts/${pf} (not .md or .md.tpl)`);
+              continue;
+            }
             const pfPath = join(srcPath, pf);
             const pfRaw = readFileSync(pfPath, "utf-8");
             const pfContent = pf.endsWith(".tpl") ? renderAgent(pfRaw, agentCtx) : pfRaw;
@@ -294,11 +298,15 @@ async function main() {
       const yamlPath = join(agentDir, "agent.yaml");
       if (existsSync(yamlPath)) {
         let yaml = readFileSync(yamlPath, "utf-8");
+        // Strip existing delegatePrompts block for idempotent re-runs
+        yaml = yaml.replace(/\ndelegatePrompts:[\s\S]*$/, "");
         // Build YAML block scalar entries
         const lines: string[] = ["delegatePrompts:"];
         for (const [server, prompt] of Object.entries(delegatePrompts)) {
           lines.push(`  ${server}: |`);
-          for (const line of prompt.split("\n")) {
+          // Strip trailing newline to avoid extra blank line in block scalar
+          const promptLines = prompt.replace(/\n$/, "").split("\n");
+          for (const line of promptLines) {
             lines.push(`    ${line}`);
           }
         }

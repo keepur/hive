@@ -611,6 +611,37 @@ describe("AgentRunner delegate subagents (via send)", () => {
 
     expect(options.agents["google"].description).toContain("Gmail");
   });
+
+  it("uses custom delegatePrompt when available", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+        delegatePrompts: { google: "Custom Google prompt." },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents["google"].prompt).toBe("Custom Google prompt.");
+    expect(options.agents["google"].maxTurns).toBe(7);
+  });
+
+  it("uses generic prompt and maxTurns 10 when no custom delegatePrompt", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents["google"].prompt).toContain("tool specialist");
+    expect(options.agents["google"].maxTurns).toBe(10);
+  });
 });
 
 // ── Security hardening tests ─────────────────────────────────────
