@@ -411,6 +411,30 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
   });
 });
 
+// ── buildServerConfig tests ──────────────────────────────────────
+describe("AgentRunner.buildServerConfig", () => {
+  let runner: AgentRunner;
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("returns config for a known server", () => {
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const serverConfig = runner.buildServerConfig("google");
+    expect(serverConfig).toBeDefined();
+    expect(serverConfig!.type).toBe("stdio");
+  });
+
+  it("returns undefined for an unknown server", () => {
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const serverConfig = runner.buildServerConfig("nonexistent");
+    expect(serverConfig).toBeUndefined();
+  });
+});
+
 // ── Security hardening tests ─────────────────────────────────────
 describe("AgentRunner security hardening", () => {
   let runner: AgentRunner;

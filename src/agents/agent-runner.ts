@@ -104,7 +104,20 @@ export class AgentRunner {
 
 
 
-  private buildMcpServers(context?: WorkItemContext): Record<string, McpServerConfig> {
+  /**
+   * Build config for a single named MCP server.
+   * Used by AgentDefinition construction for delegate subagents.
+   */
+  buildServerConfig(name: string, context?: WorkItemContext): McpServerConfig | undefined {
+    const all = this.buildAllServerConfigs(context);
+    return all[name];
+  }
+
+  /**
+   * Build ALL server configs (core + plugin), no filtering.
+   * This is the source of truth for server configs — buildMcpServers and buildServerConfig call this.
+   */
+  private buildAllServerConfigs(context?: WorkItemContext): Record<string, McpServerConfig> {
     const servers: Record<string, McpServerConfig> = {};
 
     // Slack MCP
@@ -464,16 +477,21 @@ export class AgentRunner {
       },
     };
 
-    // Guardrail: filter to agent's allowed MCP servers (core + delegate for the full allowlist)
+    return servers;
+  }
+
+  /**
+   * Build MCP servers for the parent agent session — core servers only, with filtering.
+   */
+  private buildMcpServers(context?: WorkItemContext): Record<string, McpServerConfig> {
+    const servers = this.buildAllServerConfigs(context);
+
+    // Guardrail: filter to agent's allowed core servers for the parent session
     const allAllowed = [...this.agentConfig.coreServers, ...this.agentConfig.delegateServers];
     if (allAllowed.length > 0) {
-      const allowed = new Set(allAllowed);
-      // structured-memory is always paired with memory — if agent has memory, it gets both
-      if (allowed.has("memory")) {
-        allowed.add("structured-memory");
-      }
       // For the parent session, only connect core servers
       const coreSet = new Set(this.agentConfig.coreServers);
+      // structured-memory is always paired with memory — if agent has memory, it gets both
       if (coreSet.has("memory")) {
         coreSet.add("structured-memory");
       }
