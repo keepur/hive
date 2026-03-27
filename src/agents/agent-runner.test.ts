@@ -517,6 +517,31 @@ describe("AgentRunner delegate subagents (via send)", () => {
     expect(options.agents["google"].model).toBe("inherit");
   });
 
+  it("excludes resend and quo from delegates when external comms disabled", async () => {
+    const { config } = await import("../config.js");
+    const orig = config.externalComms.enabled;
+    const origResendKey = config.resend.apiKey;
+    (config.externalComms as any).enabled = false;
+    (config.resend as any).apiKey = "test-key";
+
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "resend"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents).toHaveProperty("google");
+    expect(options.agents).not.toHaveProperty("resend");
+
+    // Restore
+    (config.externalComms as any).enabled = orig;
+    (config.resend as any).apiKey = origResendKey;
+  });
+
   it("delegate servers are NOT in parent mcpServers", async () => {
     const runner = new AgentRunner(
       makeAgentConfig({

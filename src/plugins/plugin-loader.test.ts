@@ -39,10 +39,25 @@ describe("normalizeManifest", () => {
     expect(result.agentsTemplates).toEqual(["agent-a", "agent-b"]);
     expect(result.mcpServers["my-server"]).toEqual({
       entry: "mcp-servers/my-server/index.ts",
+      description: undefined,
       env: ["API_KEY"],
       envMap: { SERVER_URL: "BASE_URL" },
       agentEnv: { MODE: "agentMode" },
     });
+  });
+
+  it("passes through server description when present", () => {
+    const raw = {
+      name: "desc-plugin",
+      "mcp-servers": {
+        "crm-server": {
+          entry: "mcp-servers/crm/index.ts",
+          description: "CRM operations — contacts, deals, notes",
+        },
+      },
+    };
+    const result = normalizeManifest(raw);
+    expect(result.mcpServers["crm-server"].description).toBe("CRM operations — contacts, deals, notes");
   });
 
   it("defaults missing fields", () => {
@@ -62,6 +77,7 @@ describe("normalizeManifest", () => {
     const result = normalizeManifest(raw);
     expect(result.mcpServers.simple).toEqual({
       entry: "index.ts",
+      description: undefined,
       env: [],
       envMap: {},
       agentEnv: {},

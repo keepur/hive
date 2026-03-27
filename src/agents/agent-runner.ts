@@ -495,8 +495,8 @@ export class AgentRunner {
   /**
    * Build MCP servers for the parent agent session — core servers only, with filtering.
    */
-  private buildMcpServers(context?: WorkItemContext): Record<string, McpServerConfig> {
-    const servers = this.buildAllServerConfigs(context);
+  private filterCoreServers(allConfigs: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
+    const servers = { ...allConfigs };
 
     // Guardrail: filter to agent's allowed core servers for the parent session
     const allAllowed = [...this.agentConfig.coreServers, ...this.agentConfig.delegateServers];
@@ -537,14 +537,24 @@ export class AgentRunner {
    * Build AgentDefinition objects for delegate servers.
    * Each delegate server becomes a named subagent with its own MCP connection.
    */
-  private buildDelegateAgents(context?: WorkItemContext): Record<string, AgentDefinition> {
+  private buildDelegateAgents(allConfigs: Record<string, McpServerConfig>): Record<string, AgentDefinition> {
     const delegates = this.agentConfig.delegateServers;
     if (delegates.length === 0) return {};
 
-    const allConfigs = this.buildAllServerConfigs(context);
     const agents: Record<string, AgentDefinition> = {};
 
+    // Same externalComms gate as buildMcpServers — block resend/quo in delegates too
+    const externalBlocked = !config.externalComms.enabled
+      ? new Set(["resend", "quo"])
+      : new Set<string>();
+
     for (const serverName of delegates) {
+      // Hard gate: strip external communication servers unless explicitly enabled
+      if (externalBlocked.has(serverName)) {
+        log.debug("External comms disabled — skipping delegate server", { server: serverName, agent: this.agentConfig.id });
+        continue;
+      }
+
       // Warn if a context-dependent server is being delegated
       if (AgentRunner.CONTEXT_DEPENDENT_SERVERS.has(serverName)) {
         log.warn("Context-dependent server in delegateServers — subagent won't have channel context", {
@@ -644,8 +654,9 @@ export class AgentRunner {
     });
 
     const systemPrompt = await this.buildSystemPrompt();
-    const mcpServers = this.buildMcpServers(context);
-    const delegateAgents = this.buildDelegateAgents(context);
+    const allServerConfigs = this.buildAllServerConfigs(context);
+    const mcpServers = this.filterCoreServers(allServerConfigs);
+    const delegateAgents = this.buildDelegateAgents(allServerConfigs);
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
 
     if (Object.keys(delegateAgents).length > 0) {
