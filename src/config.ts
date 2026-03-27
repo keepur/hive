@@ -76,6 +76,9 @@ export const config = {
     apiKey: optional("LINEAR_API_KEY", ""),
     teamId: optional("LINEAR_TEAM_ID", ""),
   },
+  clickup: {
+    apiToken: optional("CLICKUP_API_TOKEN", ""),
+  },
   github: {
     repo: optional("GITHUB_REPO", ""),
     token: optional("GH_TOKEN", ""),
