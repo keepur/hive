@@ -20,14 +20,16 @@ schedule:
     task: memory-review
 budgetUsd: 50
 servers:
-  - memory
-  - conversation-search
-  - slack
-  - brave-search
-  - admin
-  - callback
-  - browser
-  - keychain
-  - event-bus
+  core:
+    - memory
+    - conversation-search
+    - slack
+    - admin
+    - callback
+    - browser
+    - keychain
+    - event-bus
+  delegate:
+    - brave-search
 subscribe:
   - system

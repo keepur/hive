@@ -15,14 +15,16 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - linear
-  - brave-search
-  - conversation-search
-  - slack
-  - keychain
-  - background
-  - callback
-  - code-task
+  core:
+    - memory
+    - conversation-search
+    - slack
+    - keychain
+    - background
+    - callback
+    - code-task
+  delegate:
+    - linear
+    - brave-search
 plugins:
   - dodi-dev

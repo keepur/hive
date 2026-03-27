@@ -16,13 +16,15 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - github-issues
-  - brave-search
-  - slack
-  - keychain
-  - background
-  - callback
-  - event-bus
+  core:
+    - memory
+    - slack
+    - keychain
+    - background
+    - callback
+    - event-bus
+  delegate:
+    - github-issues
+    - brave-search
 subscribe:
   - system

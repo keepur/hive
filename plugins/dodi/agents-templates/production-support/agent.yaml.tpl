@@ -19,16 +19,18 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - dodi-ops
-  - slack
-  - contacts
-  - ops-search
-  - conversation-search
-  - hubspot-crm
-  - tasks
-  - callback
-  - event-bus
+  core:
+    - memory
+    - slack
+    - contacts
+    - ops-search
+    - conversation-search
+    - callback
+    - event-bus
+  delegate:
+    - dodi-ops
+    - hubspot-crm
+    - tasks
 subscribe:
   - deals
   - cases

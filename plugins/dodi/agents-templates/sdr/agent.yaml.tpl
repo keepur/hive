@@ -23,19 +23,21 @@ schedule:
 budgetUsd: 50
 maxTurns: 30
 servers:
-  - memory
-  - google
-  - contacts
-  - crm-search
-  - conversation-search
-  - hubspot-crm
-  - resend
-  - brave-search
-  - slack
-  - permits
-  - tasks
-  - callback
-  - event-bus
+  core:
+    - memory
+    - contacts
+    - crm-search
+    - conversation-search
+    - slack
+    - callback
+    - event-bus
+  delegate:
+    - google
+    - hubspot-crm
+    - resend
+    - brave-search
+    - permits
+    - tasks
 subscribe:
   - cases
   - leads

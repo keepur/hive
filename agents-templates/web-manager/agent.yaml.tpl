@@ -19,9 +19,11 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - brave-search
-  - slack
-  - google
-  - browser
-  - callback
+  core:
+    - memory
+    - slack
+    - browser
+    - callback
+  delegate:
+    - brave-search
+    - google

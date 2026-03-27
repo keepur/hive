@@ -23,11 +23,13 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - catalog
-  - product-search
-  - conversation-search
-  - slack
-  - callback
+  core:
+    - memory
+    - catalog
+    - product-search
+    - conversation-search
+    - slack
+    - callback
+  delegate: []
 plugins:
   - dodi-dev
