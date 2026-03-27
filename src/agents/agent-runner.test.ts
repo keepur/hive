@@ -435,6 +435,146 @@ describe("AgentRunner.buildServerConfig", () => {
   });
 });
 
+// ── Delegate subagents tests ─────────────────────────────────────
+describe("AgentRunner delegate subagents (via send)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("passes delegate agents in query options when delegateServers configured", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "slack"],
+        delegateServers: ["google", "contacts"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("agents");
+    expect(Object.keys(options.agents)).toEqual(["google", "contacts"]);
+  });
+
+  it("does not pass agents when no delegateServers", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"], delegateServers: [] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).not.toHaveProperty("agents");
+  });
+
+  it("delegate AgentDefinition uses Record-form mcpServers", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+    const googleAgent = options.agents["google"];
+
+    expect(googleAgent.mcpServers).toHaveLength(1);
+    expect(googleAgent.mcpServers[0]).toHaveProperty("google");
+    expect(typeof googleAgent.mcpServers[0]).toBe("object");
+    // Must NOT be a string reference
+    expect(typeof googleAgent.mcpServers[0]).not.toBe("string");
+  });
+
+  it("delegate AgentDefinition has disallowedTools: ['Agent']", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents["google"].disallowedTools).toEqual(["Agent"]);
+  });
+
+  it("delegate AgentDefinition has model: 'inherit'", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents["google"].model).toBe("inherit");
+  });
+
+  it("delegate servers are NOT in parent mcpServers", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "contacts"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers).toHaveProperty("memory");
+    expect(servers).not.toHaveProperty("google");
+    expect(servers).not.toHaveProperty("contacts");
+  });
+
+  it("system prompt includes delegate summaries when delegateServers present", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "contacts"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).toContain("Available via subagents");
+    expect(options.systemPrompt).toContain("google:");
+    expect(options.systemPrompt).toContain("contacts:");
+  });
+
+  it("system prompt does NOT include delegate section when no delegateServers", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"], delegateServers: [] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).not.toContain("Available via subagents");
+  });
+
+  it("includes namespace description in delegate AgentDefinition", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents["google"].description).toContain("Gmail");
+  });
+});
+
 // ── Security hardening tests ─────────────────────────────────────
 describe("AgentRunner security hardening", () => {
   let runner: AgentRunner;
