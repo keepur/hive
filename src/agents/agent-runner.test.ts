@@ -108,6 +108,8 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     budgetUsd: 10,
     maxTurns: 25,
     icon: "",
+    coreServers: [],
+    delegateServers: [],
     soul: "",
     systemPrompt: "You are a test agent.",
     ...overrides,
@@ -138,7 +140,8 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
   });
 
   it("includes core servers (memory, keychain, google, etc.)", async () => {
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const coreServers = ["memory", "keychain", "google", "contacts", "background", "callback", "admin"];
+    runner = new AgentRunner(makeAgentConfig({ coreServers }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -151,9 +154,9 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers).toHaveProperty("admin");
   });
 
-  it("filters servers by agent allowlist", async () => {
+  it("filters servers by agent coreServers allowlist", async () => {
     runner = new AgentRunner(
-      makeAgentConfig({ servers: ["memory", "keychain"] }),
+      makeAgentConfig({ coreServers: ["memory", "keychain"] }),
       memoryManager as any,
     );
     await runner.send("hello");
@@ -161,6 +164,17 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     // structured-memory only included when memory.structured is enabled
     expect(Object.keys(servers)).toEqual(["memory", "keychain"]);
+  });
+
+  it("empty coreServers means zero servers, not all servers", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(Object.keys(servers)).toEqual([]);
   });
 
   it("removes resend and quo when external comms disabled", async () => {
@@ -202,7 +216,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
       },
     };
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any, [plugin]);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -234,7 +248,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
       },
     };
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any, [plugin]);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["mapped-server"] }), memoryManager as any, [plugin]);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -264,7 +278,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     };
 
     runner = new AgentRunner(
-      makeAgentConfig({ dodiOpsMode: "readonly" }),
+      makeAgentConfig({ dodiOpsMode: "readonly", coreServers: ["agent-env-server"] }),
       memoryManager as any,
       [plugin],
     );
@@ -295,7 +309,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
       },
     };
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any, [plugin]);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin]);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -324,7 +338,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     // agent-a has a per-agent key "key-a" in the mock config
     runner = new AgentRunner(
-      makeAgentConfig({ id: "agent-a" }),
+      makeAgentConfig({ id: "agent-a", coreServers: ["keyed-server"] }),
       memoryManager as any,
       [plugin],
     );
@@ -355,7 +369,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     // "unknown-agent" doesn't have a per-agent key
     runner = new AgentRunner(
-      makeAgentConfig({ id: "unknown-agent" }),
+      makeAgentConfig({ id: "unknown-agent", coreServers: ["keyed-server"] }),
       memoryManager as any,
       [plugin],
     );
@@ -380,7 +394,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
   });
 
   it("conversation-search server env includes DEFAULT_AGENT and AGENT_ID", async () => {
-    runner = new AgentRunner(makeAgentConfig({ id: "my-agent" }), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ id: "my-agent", coreServers: ["conversation-search"] }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -390,7 +404,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
   });
 
   it("admin server env includes AGENT_ID", async () => {
-    runner = new AgentRunner(makeAgentConfig({ id: "some-agent" }), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ id: "some-agent", coreServers: ["admin"] }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -409,6 +423,195 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
   });
 });
 
+// ── buildServerConfig tests ──────────────────────────────────────
+describe("AgentRunner.buildServerConfig", () => {
+  let runner: AgentRunner;
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("returns config for a known server", () => {
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const serverConfig = runner.buildServerConfig("google");
+    expect(serverConfig).toBeDefined();
+    expect(serverConfig!.type).toBe("stdio");
+  });
+
+  it("returns undefined for an unknown server", () => {
+    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const serverConfig = runner.buildServerConfig("nonexistent");
+    expect(serverConfig).toBeUndefined();
+  });
+});
+
+// ── Delegate subagents tests ─────────────────────────────────────
+describe("AgentRunner delegate subagents (via send)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("passes delegate agents in query options when delegateServers configured", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "slack"],
+        delegateServers: ["google", "contacts"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("agents");
+    expect(Object.keys(options.agents)).toEqual(["google", "contacts"]);
+  });
+
+  it("does not pass agents when no delegateServers", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"], delegateServers: [] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).not.toHaveProperty("agents");
+  });
+
+  it("delegate AgentDefinition uses Record-form mcpServers", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+    const googleAgent = options.agents["google"];
+
+    expect(googleAgent.mcpServers).toHaveLength(1);
+    expect(googleAgent.mcpServers[0]).toHaveProperty("google");
+    expect(typeof googleAgent.mcpServers[0]).toBe("object");
+    // Must NOT be a string reference
+    expect(typeof googleAgent.mcpServers[0]).not.toBe("string");
+  });
+
+  it("delegate AgentDefinition has disallowedTools: ['Agent']", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents["google"].disallowedTools).toEqual(["Agent"]);
+  });
+
+  it("delegate AgentDefinition has model: 'inherit'", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents["google"].model).toBe("inherit");
+  });
+
+  it("excludes resend and quo from delegates when external comms disabled", async () => {
+    const { config } = await import("../config.js");
+    const orig = config.externalComms.enabled;
+    const origResendKey = config.resend.apiKey;
+    (config.externalComms as any).enabled = false;
+    (config.resend as any).apiKey = "test-key";
+
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "resend"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents).toHaveProperty("google");
+    expect(options.agents).not.toHaveProperty("resend");
+
+    // Restore
+    (config.externalComms as any).enabled = orig;
+    (config.resend as any).apiKey = origResendKey;
+  });
+
+  it("delegate servers are NOT in parent mcpServers", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "contacts"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers).toHaveProperty("memory");
+    expect(servers).not.toHaveProperty("google");
+    expect(servers).not.toHaveProperty("contacts");
+  });
+
+  it("system prompt includes delegate summaries when delegateServers present", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "contacts"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).toContain("Available via subagents");
+    expect(options.systemPrompt).toContain("google:");
+    expect(options.systemPrompt).toContain("contacts:");
+  });
+
+  it("system prompt does NOT include delegate section when no delegateServers", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"], delegateServers: [] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).not.toContain("Available via subagents");
+  });
+
+  it("includes namespace description in delegate AgentDefinition", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents["google"].description).toContain("Gmail");
+  });
+});
+
 // ── Security hardening tests ─────────────────────────────────────
 describe("AgentRunner security hardening", () => {
   let runner: AgentRunner;
@@ -421,7 +624,7 @@ describe("AgentRunner security hardening", () => {
 
 
   it("passes BG_AUTH_TOKEN to background MCP server env", async () => {
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["background"] }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -435,7 +638,7 @@ describe("AgentRunner security hardening", () => {
     (config.recall as any).apiKey = "test-recall-key";
     (config.recall as any).monitorPublicUrl = "http://test";
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["recall"] }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 

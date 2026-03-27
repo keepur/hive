@@ -15,6 +15,8 @@ function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     budgetUsd: 10,
     maxTurns: 25,
     icon: "",
+    coreServers: [],
+    delegateServers: [],
     soul: "",
     systemPrompt: "",
     ...overrides,
@@ -138,6 +140,43 @@ describe("applyConfigOverrides", () => {
     const result = applyConfigOverrides(config, override, template);
     expect(result.passiveChannels).toEqual(["biz", "general"]);
     expect(result.keywords).toEqual(["ship", "release"]);
+  });
+
+  it("overrides coreServers via replace", () => {
+    const config = makeConfig({ coreServers: ["memory", "slack"] });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      coreServers: { replace: ["memory", "callback"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, makeConfig());
+    expect(result.coreServers).toEqual(["memory", "callback"]);
+  });
+
+  it("adds to delegateServers without duplicates", () => {
+    const template = makeConfig({ delegateServers: ["hubspot-crm"] });
+    const config = makeConfig({ delegateServers: ["hubspot-crm"] });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      delegateServers: { add: ["hubspot-crm", "dodi-ops"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, template);
+    expect(result.delegateServers).toEqual(["hubspot-crm", "dodi-ops"]);
+  });
+
+  it("backward compat: treats old 'servers' override as coreServers", () => {
+    const config = makeConfig({ coreServers: ["memory"] });
+    const override = {
+      agentId: "test-agent",
+      servers: { replace: ["memory", "slack", "callback"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    } as any as ConfigOverride;
+    const result = applyConfigOverrides(config, override, makeConfig());
+    expect(result.coreServers).toEqual(["memory", "slack", "callback"]);
   });
 
   it("replaces plugins array entirely", () => {

@@ -20,8 +20,10 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - brave-search
-  - slack
-  - google
-  - callback
+  core:
+    - memory
+    - slack
+    - callback
+  delegate:
+    - brave-search
+    - google

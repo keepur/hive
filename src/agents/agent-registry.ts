@@ -25,10 +25,18 @@ export function applyConfigOverrides(
 ): AgentConfig {
   if (!override) return config;
 
+  // Shallow copy to avoid mutating the cached MongoDB document
+  const ov = { ...override };
+
   // Apply array field overrides
-  const arrayFields = ["channels", "passiveChannels", "keywords", "servers", "plugins", "subscribe"] as const;
+  const arrayFields = ["channels", "passiveChannels", "keywords", "coreServers", "delegateServers", "plugins", "subscribe"] as const;
+
+  // Backward compat: old MongoDB override documents may have `servers` instead of `coreServers`
+  if ((ov as any).servers && !ov.coreServers) {
+    ov.coreServers = (ov as any).servers;
+  }
   for (const field of arrayFields) {
-    const arrOverride = override[field] as ArrayOverride | undefined;
+    const arrOverride = ov[field] as ArrayOverride | undefined;
     if (!arrOverride) continue;
 
     if (arrOverride.replace) {
@@ -42,12 +50,12 @@ export function applyConfigOverrides(
   }
 
   // Apply scalar field overrides
-  if (override.isDefault !== undefined) config.isDefault = override.isDefault;
-  if (override.budgetUsd !== undefined) config.budgetUsd = override.budgetUsd;
-  if (override.maxTurns !== undefined) config.maxTurns = override.maxTurns;
-  if (override.maxConcurrent !== undefined) config.maxConcurrent = override.maxConcurrent;
-  if (override.timeoutMs !== undefined) config.timeoutMs = override.timeoutMs;
-  if (override.disabled !== undefined) config.disabled = override.disabled;
+  if (ov.isDefault !== undefined) config.isDefault = ov.isDefault;
+  if (ov.budgetUsd !== undefined) config.budgetUsd = ov.budgetUsd;
+  if (ov.maxTurns !== undefined) config.maxTurns = ov.maxTurns;
+  if (ov.maxConcurrent !== undefined) config.maxConcurrent = ov.maxConcurrent;
+  if (ov.timeoutMs !== undefined) config.timeoutMs = ov.timeoutMs;
+  if (ov.disabled !== undefined) config.disabled = ov.disabled;
 
   return config;
 }
@@ -196,6 +204,24 @@ export class AgentRegistry {
       log.info("Model override active", { agent: agentId, yaml: yamlModel, override: model });
     }
 
+    // Parse tiered servers: flat array (backward compat) or { core, delegate } object
+    const rawServers = raw.servers;
+    let coreServers: string[];
+    let delegateServers: string[];
+
+    if (Array.isArray(rawServers)) {
+      // Backward compat: flat array = all core
+      coreServers = rawServers;
+      delegateServers = [];
+    } else if (rawServers && typeof rawServers === "object") {
+      const tiered = rawServers as { core?: string[]; delegate?: string[] };
+      coreServers = tiered.core ?? [];
+      delegateServers = tiered.delegate ?? [];
+    } else {
+      coreServers = [];
+      delegateServers = [];
+    }
+
     const config: AgentConfig = {
       id: agentId,
       name: (raw.name as string) || dirName,
@@ -209,7 +235,8 @@ export class AgentRegistry {
       maxTurns: (raw.maxTurns as number) || 25,
       icon: (raw.icon as string) || "",
       slackBot: (raw.slackBot as string) || undefined,
-      servers: (raw.servers as string[]) || undefined,
+      coreServers,
+      delegateServers,
       plugins: (raw.plugins as string[]) || undefined,
       maxConcurrent: (raw.maxConcurrent as number) || undefined,
       timeoutMs: (raw.timeoutMs as number) || undefined,

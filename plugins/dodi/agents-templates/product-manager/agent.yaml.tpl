@@ -12,16 +12,18 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - linear
-  - slack
-  - contacts
-  - crm-search
-  - product-search
-  - conversation-search
-  - hubspot-crm
-  - brave-search
-  - google
-  - callback
+  core:
+    - memory
+    - slack
+    - contacts
+    - crm-search
+    - product-search
+    - conversation-search
+    - callback
+  delegate:
+    - linear
+    - hubspot-crm
+    - brave-search
+    - google
 plugins:
   - dodi-dev

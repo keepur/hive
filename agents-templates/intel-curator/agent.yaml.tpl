@@ -20,7 +20,9 @@ schedule:
     task: memory-review
 budgetUsd: 50
 servers:
-  - memory
-  - brave-search
-  - slack
-  - callback
+  core:
+    - memory
+    - slack
+    - callback
+  delegate:
+    - brave-search

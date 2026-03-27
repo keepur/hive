@@ -59,6 +59,7 @@ export function normalizeManifest(raw: any): PluginManifest {
         k,
         {
           entry: v.entry,
+          description: v.description,
           env: v.env ?? [],
           envMap: v["env-map"] ?? {},
           agentEnv: v["agent-env"] ?? {},

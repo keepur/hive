@@ -15,18 +15,20 @@ schedule:
     task: memory-review
 budgetUsd: 50
 servers:
-  - memory
-  - google
-  - contacts
-  - crm-search
-  - conversation-search
-  - hubspot-crm
-  - linear
-  - brave-search
-  - slack
-  - permits
-  - tasks
-  - callback
-  - event-bus
+  core:
+    - memory
+    - contacts
+    - crm-search
+    - conversation-search
+    - slack
+    - callback
+    - event-bus
+  delegate:
+    - google
+    - hubspot-crm
+    - linear
+    - brave-search
+    - permits
+    - tasks
 plugins:
   - dodi-dev
