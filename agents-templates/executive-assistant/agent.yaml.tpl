@@ -22,6 +22,7 @@ servers:
     - conversation-search
     - callback
   delegate:
+    - clickup
     - quo
     - brave-search
     - google

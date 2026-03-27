@@ -22,7 +22,9 @@ budgetUsd: 50
 servers:
   core:
     - memory
+    - conversation-search
     - slack
     - callback
   delegate:
+    - clickup
     - brave-search
