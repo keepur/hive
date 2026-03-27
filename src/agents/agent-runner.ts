@@ -587,14 +587,27 @@ export class AgentRunner {
       // Get description from namespace registry or plugin manifest
       const description = this.getServerDescription(serverName);
 
+      // Use custom delegate prompt if available, otherwise generic
+      const customPrompt = this.agentConfig.delegatePrompts?.[serverName];
+      const prompt = customPrompt
+        ?? `You are a tool specialist for ${serverName}. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.`;
+
       agents[serverName] = {
         description,
-        prompt: `You are a tool specialist for ${serverName}. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.`,
+        prompt,
         mcpServers: [{ [serverName]: serverConfig }], // Record form — NOT string reference
         model: "inherit",
-        maxTurns: 10,
+        maxTurns: customPrompt ? 7 : 10, // Intent-aware delegates need fewer turns
         disallowedTools: ["Agent"], // subagents cannot spawn sub-subagents
       };
+
+      if (customPrompt) {
+        log.info("Intent-aware delegate prompt loaded", {
+          agent: this.agentConfig.id,
+          server: serverName,
+          promptLength: customPrompt.length,
+        });
+      }
     }
 
     return agents;
