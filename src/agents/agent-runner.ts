@@ -120,7 +120,8 @@ export class AgentRunner {
 
   /**
    * Build config for a single named MCP server.
-   * Used by AgentDefinition construction for delegate subagents.
+   * Without a WorkItemContext, context-dependent servers (callback, background, recall, etc.)
+   * will have empty channel/thread env vars — only use without context for non-context servers.
    */
   buildServerConfig(name: string, context?: WorkItemContext): McpServerConfig | undefined {
     const all = this.buildAllServerConfigs(context);
