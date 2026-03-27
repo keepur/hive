@@ -243,6 +243,7 @@ export class AgentRegistry {
       triageModel: (raw.triageModel as string) || undefined,
       dodiOpsMode: (raw.dodiOpsMode as "full" | "readonly") || undefined,
       subscribe: (raw.subscribe as string[]) || [],
+      delegatePrompts: (raw.delegatePrompts as Record<string, string>) || undefined,
       soul,
       systemPrompt,
     };

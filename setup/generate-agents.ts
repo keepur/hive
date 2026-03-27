@@ -237,11 +237,35 @@ async function main() {
       team,
     };
 
-    const files = readdirSync(templateDir);
-    for (const file of files) {
-      const srcPath = join(templateDir, file);
-      const isTemplate = file.endsWith(".tpl");
-      const outName = isTemplate ? file.slice(0, -4) : file; // strip .tpl
+    const entries = readdirSync(templateDir);
+    const delegatePrompts: Record<string, string> = {};
+
+    for (const entry of entries) {
+      const srcPath = join(templateDir, entry);
+      const stat = statSync(srcPath);
+
+      // Handle delegate-prompts/ subdirectory
+      if (stat.isDirectory()) {
+        if (entry === "delegate-prompts") {
+          const promptFiles = readdirSync(srcPath);
+          for (const pf of promptFiles) {
+            if (!pf.endsWith(".md") && !pf.endsWith(".md.tpl")) {
+              console.log(`  SKIP delegate-prompts/${pf} (not .md or .md.tpl)`);
+              continue;
+            }
+            const pfPath = join(srcPath, pf);
+            const pfRaw = readFileSync(pfPath, "utf-8");
+            const pfContent = pf.endsWith(".tpl") ? renderAgent(pfRaw, agentCtx) : pfRaw;
+            // server name = filename without .md.tpl or .md
+            const serverName = pf.replace(/\.md(\.tpl)?$/, "");
+            delegatePrompts[serverName] = pfContent;
+          }
+        }
+        continue;
+      }
+
+      const isTemplate = entry.endsWith(".tpl");
+      const outName = isTemplate ? entry.slice(0, -4) : entry; // strip .tpl
       const outPath = join(agentDir, outName);
       const metaKey = `${agentId}/${outName}`;
 
@@ -267,6 +291,31 @@ async function main() {
       writeFileSync(outPath, content);
       console.log(`  WRITE ${metaKey}`);
       generated++;
+    }
+
+    // Inject delegatePrompts into agent.yaml if any were found
+    if (Object.keys(delegatePrompts).length > 0) {
+      const yamlPath = join(agentDir, "agent.yaml");
+      if (existsSync(yamlPath)) {
+        let yaml = readFileSync(yamlPath, "utf-8");
+        // Strip existing delegatePrompts block for idempotent re-runs
+        yaml = yaml.replace(/\ndelegatePrompts:[\s\S]*$/, "");
+        // Build YAML block scalar entries
+        const lines: string[] = ["delegatePrompts:"];
+        for (const [server, prompt] of Object.entries(delegatePrompts)) {
+          lines.push(`  ${server}: |`);
+          // Strip trailing newline to avoid extra blank line in block scalar
+          const promptLines = prompt.replace(/\n$/, "").split("\n");
+          for (const line of promptLines) {
+            lines.push(`    ${line}`);
+          }
+        }
+        yaml += "\n" + lines.join("\n") + "\n";
+        writeFileSync(yamlPath, yaml);
+        // Update meta hash to include injected content — prevents false "modified by user" skips
+        newMeta[`${agentId}/agent.yaml`] = fileHash(yaml);
+        console.log(`  INJECT ${agentId}/agent.yaml delegatePrompts: [${Object.keys(delegatePrompts).join(", ")}]`);
+      }
     }
   }
 
