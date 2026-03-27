@@ -26,5 +26,6 @@ servers:
     - slack
     - callback
   delegate:
+    - clickup
     - brave-search
     - google

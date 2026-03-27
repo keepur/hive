@@ -21,9 +21,11 @@ schedule:
 servers:
   core:
     - memory
+    - conversation-search
     - slack
     - browser
     - callback
   delegate:
+    - clickup
     - brave-search
     - google

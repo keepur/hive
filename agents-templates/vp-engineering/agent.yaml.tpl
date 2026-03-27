@@ -18,12 +18,14 @@ schedule:
 servers:
   core:
     - memory
+    - conversation-search
     - slack
     - keychain
     - background
     - callback
     - event-bus
   delegate:
+    - clickup
     - github-issues
     - brave-search
 subscribe:

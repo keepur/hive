@@ -30,6 +30,7 @@ servers:
     - keychain
     - event-bus
   delegate:
+    - clickup
     - brave-search
 subscribe:
   - system

@@ -20,6 +20,7 @@ servers:
     - conversation-search
     - callback
   delegate:
+    - clickup
     - brave-search
     - google
     - github-issues
