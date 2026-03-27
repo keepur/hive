@@ -312,6 +312,8 @@ async function main() {
         }
         yaml += "\n" + lines.join("\n") + "\n";
         writeFileSync(yamlPath, yaml);
+        // Update meta hash to include injected content — prevents false "modified by user" skips
+        newMeta[`${agentId}/agent.yaml`] = fileHash(yaml);
         console.log(`  INJECT ${agentId}/agent.yaml delegatePrompts: [${Object.keys(delegatePrompts).join(", ")}]`);
       }
     }
