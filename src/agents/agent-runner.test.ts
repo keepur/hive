@@ -63,6 +63,7 @@ vi.mock("../config.js", () => ({
       hubspotBcc: "",
     },
     linear: { apiKey: "", teamId: "" },
+    clickup: { apiToken: "" },
     github: { repo: "", token: "" },
     recall: {
       apiKey: "",
