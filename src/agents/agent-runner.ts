@@ -306,6 +306,18 @@ export class AgentRunner {
       };
     }
 
+    // ClickUp — task management across workspaces
+    if (config.clickup.apiToken) {
+      servers["clickup"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/clickup/clickup-mcp-server.js")],
+        env: {
+          CLICKUP_API_TOKEN: config.clickup.apiToken,
+        },
+      };
+    }
+
     // Recall.ai — meeting bots and transcription
     if (config.recall.apiKey) {
       servers["recall"] = {
