@@ -590,7 +590,7 @@ export class AgentRunner {
       // Use custom delegate prompt if available, otherwise generic
       const customPrompt = this.agentConfig.delegatePrompts?.[serverName];
       const prompt = customPrompt
-        ?? `You are a tool specialist for ${serverName}. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.`;
+        || `You are a tool specialist for ${serverName}. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.`;
 
       agents[serverName] = {
         description,

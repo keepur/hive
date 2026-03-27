@@ -642,6 +642,44 @@ describe("AgentRunner delegate subagents (via send)", () => {
     expect(options.agents["google"].prompt).toContain("tool specialist");
     expect(options.agents["google"].maxTurns).toBe(10);
   });
+
+  it("delegatePrompts only applies to the matching server, not other delegates", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "contacts"],
+        delegatePrompts: { contacts: "Custom Contacts prompt." },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    // contacts gets the custom prompt and maxTurns 7
+    expect(options.agents["contacts"].prompt).toBe("Custom Contacts prompt.");
+    expect(options.agents["contacts"].maxTurns).toBe(7);
+
+    // google (no matching delegatePrompt) gets the generic prompt and maxTurns 10
+    expect(options.agents["google"].prompt).toContain("tool specialist");
+    expect(options.agents["google"].maxTurns).toBe(10);
+  });
+
+  it("delegatePrompts with empty string falls back to generic prompt and maxTurns 10", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+        delegatePrompts: { google: "" },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    // empty string is falsy — should fall back to generic prompt
+    expect(options.agents["google"].prompt).toContain("tool specialist");
+    expect(options.agents["google"].maxTurns).toBe(10);
+  });
 });
 
 // ── Security hardening tests ─────────────────────────────────────

@@ -258,6 +258,60 @@ describe("subscribe overrides", () => {
   });
 });
 
+describe("delegatePrompts in applyConfigOverrides", () => {
+  it("preserves delegatePrompts when no override is applied", () => {
+    const config = makeConfig({ delegatePrompts: { google: "My Google prompt." } });
+    const result = applyConfigOverrides(config, undefined, undefined);
+    expect(result.delegatePrompts).toEqual({ google: "My Google prompt." });
+  });
+
+  it("preserves delegatePrompts when scalar overrides are applied", () => {
+    const config = makeConfig({
+      budgetUsd: 10,
+      delegatePrompts: { google: "My Google prompt.", clickup: "My ClickUp prompt." },
+    });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      budgetUsd: 50,
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, makeConfig());
+    // scalar override is applied
+    expect(result.budgetUsd).toBe(50);
+    // delegatePrompts is untouched
+    expect(result.delegatePrompts).toEqual({ google: "My Google prompt.", clickup: "My ClickUp prompt." });
+  });
+
+  it("preserves delegatePrompts when array overrides are applied", () => {
+    const template = makeConfig({ channels: ["agent-test"], delegatePrompts: { google: "Prompt A." } });
+    const config = makeConfig({ channels: ["agent-test"], delegatePrompts: { google: "Prompt A." } });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      channels: { add: ["new-channel"] },
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, template);
+    // array override is applied
+    expect(result.channels).toContain("new-channel");
+    // delegatePrompts is untouched
+    expect(result.delegatePrompts).toEqual({ google: "Prompt A." });
+  });
+
+  it("preserves undefined delegatePrompts unchanged", () => {
+    const config = makeConfig(); // no delegatePrompts
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      budgetUsd: 20,
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, makeConfig());
+    expect(result.delegatePrompts).toBeUndefined();
+  });
+});
+
 describe("name matching patterns", () => {
   // These test the same regex logic used in findAllByName
   function matchesName(text: string, agentName: string): boolean {
