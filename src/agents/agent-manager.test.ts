@@ -73,7 +73,8 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     schedule: [],
     budgetUsd: 10,
     maxTurns: 25,
-    servers: ["memory"],
+    coreServers: ["memory"],
+    delegateServers: [],
     icon: "",
     soul: "",
     systemPrompt: "",
@@ -653,7 +654,7 @@ describe("AgentManager", () => {
       // Register an agent without memory in its servers list
       registry._agents.set(
         "agent-nomem",
-        makeAgentConfig({ id: "agent-nomem", name: "NoMem", servers: ["slack", "brave-search"] }),
+        makeAgentConfig({ id: "agent-nomem", name: "NoMem", coreServers: ["slack", "brave-search"] }),
       );
       registry.get.mockImplementation((id: string) => registry._agents.get(id));
 

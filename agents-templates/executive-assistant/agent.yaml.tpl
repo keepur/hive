@@ -14,12 +14,14 @@ schedule:
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
-  - memory
-  - contacts
-  - slack
-  - keychain
-  - quo
-  - conversation-search
-  - brave-search
-  - google
-  - callback
+  core:
+    - memory
+    - contacts
+    - slack
+    - keychain
+    - conversation-search
+    - callback
+  delegate:
+    - quo
+    - brave-search
+    - google

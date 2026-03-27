@@ -1,4 +1,4 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { createLogger } from "../logging/logger.js";
@@ -7,6 +7,7 @@ import type { MemoryManager } from "../memory/memory-manager.js";
 import { config } from "../config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
+import { NAMESPACE_DESCRIPTIONS } from "../delegate/namespace-descriptions.js";
 
 const log = createLogger("agent-runner");
 
@@ -52,7 +53,7 @@ export class AgentRunner {
     this.eventSubscribersJson = eventSubscribersJson;
   }
 
-  private async buildSystemPrompt(): Promise<string> {
+  private async buildSystemPrompt(activeDelegates?: string[]): Promise<string> {
     const parts: string[] = [];
 
     // Inject current date/time context so agents don't have to guess
@@ -65,6 +66,19 @@ export class AgentRunner {
     }
 
     parts.push(this.agentConfig.systemPrompt);
+
+    // Inject delegate namespace summaries so the agent knows what subagents are available
+    // Uses activeDelegates (actually constructed) rather than config (may include credential-gated servers)
+    const delegates = activeDelegates ?? [];
+    if (delegates.length > 0) {
+      const lines = delegates.map((s) => {
+        const desc = this.getServerDescription(s);
+        return `- ${s}: ${desc}`;
+      });
+      parts.push(
+        `## Available via subagents\n\nUse the Agent tool to delegate tasks to these specialists:\n${lines.join("\n")}`,
+      );
+    }
 
     // Constitution is always loaded — non-negotiable team rules
     const constitution = await this.memoryManager.read("shared/constitution.md");
@@ -104,7 +118,21 @@ export class AgentRunner {
 
 
 
-  private buildMcpServers(context?: WorkItemContext): Record<string, McpServerConfig> {
+  /**
+   * Build config for a single named MCP server.
+   * Without a WorkItemContext, context-dependent servers (callback, background, recall, etc.)
+   * will have empty channel/thread env vars — only use without context for non-context servers.
+   */
+  buildServerConfig(name: string, context?: WorkItemContext): McpServerConfig | undefined {
+    const all = this.buildAllServerConfigs(context);
+    return all[name];
+  }
+
+  /**
+   * Build ALL server configs (core + plugin), no filtering.
+   * This is the source of truth for server configs — buildMcpServers and buildServerConfig call this.
+   */
+  private buildAllServerConfigs(context?: WorkItemContext): Record<string, McpServerConfig> {
     const servers: Record<string, McpServerConfig> = {};
 
     // Slack MCP
@@ -464,17 +492,25 @@ export class AgentRunner {
       },
     };
 
-    // Guardrail: filter to agent's allowed MCP servers
-    if (this.agentConfig.servers?.length) {
-      const allowed = new Set(this.agentConfig.servers);
-      // structured-memory is always paired with memory — if agent has memory, it gets both
-      if (allowed.has("memory")) {
-        allowed.add("structured-memory");
-      }
-      for (const key of Object.keys(servers)) {
-        if (!allowed.has(key)) {
-          delete servers[key];
-        }
+    return servers;
+  }
+
+  /**
+   * Build MCP servers for the parent agent session — core servers only, with filtering.
+   */
+  private filterCoreServers(allConfigs: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
+    const servers = { ...allConfigs };
+
+    // Guardrail: filter to agent's allowed core servers for the parent session
+    // Always filter — empty coreServers means zero servers, not all servers
+    const coreSet = new Set(this.agentConfig.coreServers);
+    // structured-memory is always paired with memory — if agent has memory, it gets both
+    if (coreSet.has("memory")) {
+      coreSet.add("structured-memory");
+    }
+    for (const key of Object.keys(servers)) {
+      if (!coreSet.has(key)) {
+        delete servers[key];
       }
     }
 
@@ -490,6 +526,85 @@ export class AgentRunner {
     }
 
     return servers;
+  }
+
+  // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)
+  private static CONTEXT_DEPENDENT_SERVERS = new Set([
+    "callback", "background", "code-task", "recall", "structured-memory", "memory",
+  ]);
+
+  /**
+   * Build AgentDefinition objects for delegate servers.
+   * Each delegate server becomes a named subagent with its own MCP connection.
+   */
+  private buildDelegateAgents(allConfigs: Record<string, McpServerConfig>): Record<string, AgentDefinition> {
+    const delegates = this.agentConfig.delegateServers;
+    if (delegates.length === 0) return {};
+
+    const agents: Record<string, AgentDefinition> = {};
+
+    // Same externalComms gate as buildMcpServers — block resend/quo in delegates too
+    const externalBlocked = !config.externalComms.enabled
+      ? new Set(["resend", "quo"])
+      : new Set<string>();
+
+    for (const serverName of delegates) {
+      // Hard gate: strip external communication servers unless explicitly enabled
+      if (externalBlocked.has(serverName)) {
+        log.debug("External comms disabled — skipping delegate server", { server: serverName, agent: this.agentConfig.id });
+        continue;
+      }
+
+      // Warn if a context-dependent server is being delegated
+      if (AgentRunner.CONTEXT_DEPENDENT_SERVERS.has(serverName)) {
+        log.warn("Context-dependent server in delegateServers — subagent won't have channel context", {
+          agent: this.agentConfig.id,
+          server: serverName,
+        });
+      }
+
+      const serverConfig = allConfigs[serverName];
+      if (!serverConfig) {
+        log.warn("Delegate server not found in configs, skipping", {
+          agent: this.agentConfig.id,
+          server: serverName,
+        });
+        continue;
+      }
+
+      // Get description from namespace registry or plugin manifest
+      const description = this.getServerDescription(serverName);
+
+      agents[serverName] = {
+        description,
+        prompt: `You are a tool specialist for ${serverName}. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.`,
+        mcpServers: [{ [serverName]: serverConfig }], // Record form — NOT string reference
+        model: "inherit",
+        maxTurns: 10,
+        disallowedTools: ["Agent"], // subagents cannot spawn sub-subagents
+      };
+    }
+
+    return agents;
+  }
+
+  /**
+   * Get a human-readable description for a server name.
+   * Checks namespace descriptions registry first, then plugin manifests.
+   */
+  private getServerDescription(serverName: string): string {
+    // Check core namespace descriptions
+    if (NAMESPACE_DESCRIPTIONS[serverName]) {
+      return NAMESPACE_DESCRIPTIONS[serverName];
+    }
+    // Check plugin manifests for description
+    for (const plugin of this.plugins) {
+      const serverDef = plugin.manifest.mcpServers[serverName];
+      if (serverDef?.description) {
+        return serverDef.description;
+      }
+    }
+    return serverName;
   }
 
   private buildSdkPlugins(): SdkPluginConfig[] {
@@ -538,9 +653,18 @@ export class AgentRunner {
       streaming: !!onStream,
     });
 
-    const systemPrompt = await this.buildSystemPrompt();
-    const mcpServers = this.buildMcpServers(context);
+    const allServerConfigs = this.buildAllServerConfigs(context);
+    const mcpServers = this.filterCoreServers(allServerConfigs);
+    const delegateAgents = this.buildDelegateAgents(allServerConfigs);
+    const systemPrompt = await this.buildSystemPrompt(Object.keys(delegateAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
+
+    if (Object.keys(delegateAgents).length > 0) {
+      log.info("Delegate subagents configured", {
+        agent: this.agentConfig.id,
+        delegates: Object.keys(delegateAgents),
+      });
+    }
 
     const q = query({
       prompt,
@@ -556,6 +680,7 @@ export class AgentRunner {
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
+        ...(Object.keys(delegateAgents).length > 0 ? { agents: delegateAgents } : {}),
         ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
         env: {
           ...process.env,
