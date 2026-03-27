@@ -9,4 +9,5 @@ export const NAMESPACE_DESCRIPTIONS: Record<string, string> = {
   permits: "Permit pipeline data",
   linear: "Issue tracking and project management",
   catalog: "Product catalog — parts, families, pricing",
+  "github-issues": "GitHub issue tracking — create, search, update, comment on issues",
 };

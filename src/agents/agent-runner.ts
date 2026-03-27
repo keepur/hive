@@ -53,7 +53,7 @@ export class AgentRunner {
     this.eventSubscribersJson = eventSubscribersJson;
   }
 
-  private async buildSystemPrompt(): Promise<string> {
+  private async buildSystemPrompt(activeDelegates?: string[]): Promise<string> {
     const parts: string[] = [];
 
     // Inject current date/time context so agents don't have to guess
@@ -68,8 +68,10 @@ export class AgentRunner {
     parts.push(this.agentConfig.systemPrompt);
 
     // Inject delegate namespace summaries so the agent knows what subagents are available
-    if (this.agentConfig.delegateServers.length > 0) {
-      const lines = this.agentConfig.delegateServers.map((s) => {
+    // Uses activeDelegates (actually constructed) rather than config (may include credential-gated servers)
+    const delegates = activeDelegates ?? [];
+    if (delegates.length > 0) {
+      const lines = delegates.map((s) => {
         const desc = this.getServerDescription(s);
         return `- ${s}: ${desc}`;
       });
@@ -499,18 +501,15 @@ export class AgentRunner {
     const servers = { ...allConfigs };
 
     // Guardrail: filter to agent's allowed core servers for the parent session
-    const allAllowed = [...this.agentConfig.coreServers, ...this.agentConfig.delegateServers];
-    if (allAllowed.length > 0) {
-      // For the parent session, only connect core servers
-      const coreSet = new Set(this.agentConfig.coreServers);
-      // structured-memory is always paired with memory — if agent has memory, it gets both
-      if (coreSet.has("memory")) {
-        coreSet.add("structured-memory");
-      }
-      for (const key of Object.keys(servers)) {
-        if (!coreSet.has(key)) {
-          delete servers[key];
-        }
+    // Always filter — empty coreServers means zero servers, not all servers
+    const coreSet = new Set(this.agentConfig.coreServers);
+    // structured-memory is always paired with memory — if agent has memory, it gets both
+    if (coreSet.has("memory")) {
+      coreSet.add("structured-memory");
+    }
+    for (const key of Object.keys(servers)) {
+      if (!coreSet.has(key)) {
+        delete servers[key];
       }
     }
 
@@ -530,7 +529,7 @@ export class AgentRunner {
 
   // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)
   private static CONTEXT_DEPENDENT_SERVERS = new Set([
-    "callback", "background", "code-task", "recall", "structured-memory",
+    "callback", "background", "code-task", "recall", "structured-memory", "memory",
   ]);
 
   /**
@@ -653,10 +652,10 @@ export class AgentRunner {
       streaming: !!onStream,
     });
 
-    const systemPrompt = await this.buildSystemPrompt();
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
     const delegateAgents = this.buildDelegateAgents(allServerConfigs);
+    const systemPrompt = await this.buildSystemPrompt(Object.keys(delegateAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
 
     if (Object.keys(delegateAgents).length > 0) {

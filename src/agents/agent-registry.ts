@@ -25,15 +25,18 @@ export function applyConfigOverrides(
 ): AgentConfig {
   if (!override) return config;
 
+  // Shallow copy to avoid mutating the cached MongoDB document
+  const ov = { ...override };
+
   // Apply array field overrides
   const arrayFields = ["channels", "passiveChannels", "keywords", "coreServers", "delegateServers", "plugins", "subscribe"] as const;
 
   // Backward compat: old MongoDB override documents may have `servers` instead of `coreServers`
-  if ((override as any).servers && !override.coreServers) {
-    override.coreServers = (override as any).servers;
+  if ((ov as any).servers && !ov.coreServers) {
+    ov.coreServers = (ov as any).servers;
   }
   for (const field of arrayFields) {
-    const arrOverride = override[field] as ArrayOverride | undefined;
+    const arrOverride = ov[field] as ArrayOverride | undefined;
     if (!arrOverride) continue;
 
     if (arrOverride.replace) {
@@ -47,12 +50,12 @@ export function applyConfigOverrides(
   }
 
   // Apply scalar field overrides
-  if (override.isDefault !== undefined) config.isDefault = override.isDefault;
-  if (override.budgetUsd !== undefined) config.budgetUsd = override.budgetUsd;
-  if (override.maxTurns !== undefined) config.maxTurns = override.maxTurns;
-  if (override.maxConcurrent !== undefined) config.maxConcurrent = override.maxConcurrent;
-  if (override.timeoutMs !== undefined) config.timeoutMs = override.timeoutMs;
-  if (override.disabled !== undefined) config.disabled = override.disabled;
+  if (ov.isDefault !== undefined) config.isDefault = ov.isDefault;
+  if (ov.budgetUsd !== undefined) config.budgetUsd = ov.budgetUsd;
+  if (ov.maxTurns !== undefined) config.maxTurns = ov.maxTurns;
+  if (ov.maxConcurrent !== undefined) config.maxConcurrent = ov.maxConcurrent;
+  if (ov.timeoutMs !== undefined) config.timeoutMs = ov.timeoutMs;
+  if (ov.disabled !== undefined) config.disabled = ov.disabled;
 
   return config;
 }

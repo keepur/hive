@@ -140,7 +140,8 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
   });
 
   it("includes core servers (memory, keychain, google, etc.)", async () => {
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const coreServers = ["memory", "keychain", "google", "contacts", "background", "callback", "admin"];
+    runner = new AgentRunner(makeAgentConfig({ coreServers }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -163,6 +164,17 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     // structured-memory only included when memory.structured is enabled
     expect(Object.keys(servers)).toEqual(["memory", "keychain"]);
+  });
+
+  it("empty coreServers means zero servers, not all servers", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(Object.keys(servers)).toEqual([]);
   });
 
   it("removes resend and quo when external comms disabled", async () => {
@@ -204,7 +216,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
       },
     };
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any, [plugin]);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -236,7 +248,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
       },
     };
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any, [plugin]);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["mapped-server"] }), memoryManager as any, [plugin]);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -266,7 +278,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     };
 
     runner = new AgentRunner(
-      makeAgentConfig({ dodiOpsMode: "readonly" }),
+      makeAgentConfig({ dodiOpsMode: "readonly", coreServers: ["agent-env-server"] }),
       memoryManager as any,
       [plugin],
     );
@@ -297,7 +309,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
       },
     };
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any, [plugin]);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin]);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -326,7 +338,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     // agent-a has a per-agent key "key-a" in the mock config
     runner = new AgentRunner(
-      makeAgentConfig({ id: "agent-a" }),
+      makeAgentConfig({ id: "agent-a", coreServers: ["keyed-server"] }),
       memoryManager as any,
       [plugin],
     );
@@ -357,7 +369,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     // "unknown-agent" doesn't have a per-agent key
     runner = new AgentRunner(
-      makeAgentConfig({ id: "unknown-agent" }),
+      makeAgentConfig({ id: "unknown-agent", coreServers: ["keyed-server"] }),
       memoryManager as any,
       [plugin],
     );
@@ -382,7 +394,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
   });
 
   it("conversation-search server env includes DEFAULT_AGENT and AGENT_ID", async () => {
-    runner = new AgentRunner(makeAgentConfig({ id: "my-agent" }), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ id: "my-agent", coreServers: ["conversation-search"] }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -392,7 +404,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
   });
 
   it("admin server env includes AGENT_ID", async () => {
-    runner = new AgentRunner(makeAgentConfig({ id: "some-agent" }), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ id: "some-agent", coreServers: ["admin"] }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -612,7 +624,7 @@ describe("AgentRunner security hardening", () => {
 
 
   it("passes BG_AUTH_TOKEN to background MCP server env", async () => {
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["background"] }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -626,7 +638,7 @@ describe("AgentRunner security hardening", () => {
     (config.recall as any).apiKey = "test-recall-key";
     (config.recall as any).monitorPublicUrl = "http://test";
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["recall"] }), memoryManager as any);
     await runner.send("hello");
     const servers = getCapturedServers();
 
