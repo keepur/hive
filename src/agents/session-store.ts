@@ -154,6 +154,19 @@ export class SessionStore {
     }, undefined, `findAgentByThread(${threadId})`);
   }
 
+  /**
+   * Find ALL agents that have sessions for a given thread.
+   * Used by Dispatcher to recover multi-agent participant sets after restart.
+   */
+  async findAgentsByThread(threadId: string): Promise<string[]> {
+    return this.withRetry(async () => {
+      const docs = await this.collection
+        .find({ threadId }, { projection: { agentId: 1 } })
+        .toArray();
+      return [...new Set(docs.map((d) => d.agentId))];
+    }, [], `findAgentsByThread(${threadId})`);
+  }
+
   async close(): Promise<void> {
     await this.client.close();
   }
