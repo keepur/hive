@@ -35,7 +35,8 @@ export class Dispatcher {
   private agentManager: AgentManager;
   private healthReporter: HealthReporter;
   private defaultAgentId: string;
-  private threadAgentMap = new Map<string, string>(); // threadId -> agentId
+  private threadAgentMap = new Map<string, string>(); // threadId -> agentId (single-agent threads)
+  private threadParticipants = new Map<string, Set<string>>(); // threadId -> agentIds (multi-agent threads)
   private threadAgentLastSeen = new Map<string, number>();
   private recentMessageIds = new Map<string, number>(); // messageTs -> timestamp (dedup)
   private auditAdapter?: ChannelAdapter;
@@ -131,6 +132,12 @@ export class Dispatcher {
 
     // Fan-out: if multiple agents resolved, dispatch to each concurrently
     if (activeList.length > 1) {
+      const threadId = item.threadId ?? item.id;
+      // Persist participant set so follow-up messages fan out to all participants
+      if (!this.threadParticipants.has(threadId)) {
+        this.threadParticipants.set(threadId, new Set(activeList.map((r) => r.agentId)));
+      }
+      this.threadAgentLastSeen.set(threadId, Date.now());
       log.info("Multi-agent fan-out", { agents: activeList.map((r) => r.agentId) });
       await Promise.all(activeList.map((r) => this.dispatchToAgent(item, r)));
       return;
@@ -313,32 +320,69 @@ export class Dispatcher {
 
   private async resolveAgents(item: WorkItem): Promise<{ agentId: string; skipTriage: boolean }[]> {
     // 0. Explicit target — callbacks and internal routing specify exact agent
+    //    Always returns single agent, even in multi-agent threads
     const targetAgentId = item.meta?.targetAgentId as string | undefined;
     if (targetAgentId && this.registry.get(targetAgentId)) {
       return [{ agentId: targetAgentId, skipTriage: false }];
     }
 
-    // 1. Thread continuity — stay with the same agent within a thread
+    // 1. Dedicated channel mapping — always route to channel owner
+    //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
+    //    Checked before thread logic so dedicated channels never become multi-agent
+    const channelAgent = this.registry.findByChannel(item.source.label);
+    if (channelAgent) return [{ agentId: channelAgent.id, skipTriage: false }];
+
+    // 2. Thread participant resolution — scan for new mentions in existing threads
     if (item.threadId) {
+      const newMentions = this.registry.findAllByName(item.text);
+      const newMentionIds = new Set(newMentions.map((a) => a.id));
+
+      // 2a. Existing multi-agent thread — add any new mentions
+      const existingParticipants = this.threadParticipants.get(item.threadId);
+      if (existingParticipants) {
+        for (const id of newMentionIds) existingParticipants.add(id);
+        this.threadAgentLastSeen.set(item.threadId, Date.now());
+        return [...existingParticipants].map((agentId) => ({ agentId, skipTriage: false }));
+      }
+
+      // 2b. Existing single-agent thread — check for single→multi transition
       const existing = this.threadAgentMap.get(item.threadId);
       if (existing) {
+        // If new mentions include agents beyond the current one, transition to multi-agent
+        const hasNewAgents = newMentions.some((a) => a.id !== existing);
+        if (newMentionIds.size > 0 && hasNewAgents) {
+          const participants = new Set([existing, ...newMentionIds]);
+          this.threadParticipants.set(item.threadId, participants);
+          this.threadAgentMap.delete(item.threadId);
+          this.threadAgentLastSeen.set(item.threadId, Date.now());
+          log.info("Thread transitioned to multi-agent", {
+            threadId: item.threadId,
+            participants: [...participants],
+          });
+          return [...participants].map((agentId) => ({ agentId, skipTriage: false }));
+        }
+        // Single-agent continuity (unchanged behavior)
         this.threadAgentLastSeen.set(item.threadId, Date.now());
         return [{ agentId: existing, skipTriage: false }];
       }
 
-      // Fallback: check persisted sessions (survives restart)
-      const persisted = await this.agentManager.findAgentForThread(item.threadId);
-      if (persisted && this.registry.get(persisted)) {
-        this.threadAgentMap.set(item.threadId, persisted);
-        this.threadAgentLastSeen.set(item.threadId, Date.now());
-        return [{ agentId: persisted, skipTriage: false }];
+      // 2c. No in-memory affinity — check persisted sessions (survives restart)
+      const persisted = await this.agentManager.findAgentsForThread(item.threadId);
+      if (persisted.length > 0) {
+        const validAgents = persisted.filter((id) => this.registry.get(id));
+        if (validAgents.length > 1) {
+          const participants = new Set(validAgents);
+          this.threadParticipants.set(item.threadId, participants);
+          this.threadAgentLastSeen.set(item.threadId, Date.now());
+          return [...participants].map((agentId) => ({ agentId, skipTriage: false }));
+        }
+        if (validAgents.length === 1) {
+          this.threadAgentMap.set(item.threadId, validAgents[0]);
+          this.threadAgentLastSeen.set(item.threadId, Date.now());
+          return [{ agentId: validAgents[0], skipTriage: false }];
+        }
       }
     }
-
-    // 2. Channel mapping — dedicated channels always route to their owning agent
-    //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
-    const channelAgent = this.registry.findByChannel(item.source.label);
-    if (channelAgent) return [{ agentId: channelAgent.id, skipTriage: false }];
 
     // 3. Name addressing — works in shared channels ("hey Jasper", "@Jasper", "Jasper, ...")
     //    May return multiple agents if several are mentioned in the same message
@@ -371,7 +415,8 @@ export class Dispatcher {
     const { agentId, skipTriage } = resolved;
 
     const threadId = item.threadId ?? item.id;
-    // For fan-out, don't set thread affinity (would overwrite with last agent)
+    // Refresh TTL for multi-agent threads (affinity already set by resolveAgents)
+    this.threadAgentLastSeen.set(threadId, Date.now());
 
     const tracked = this.taskLedger?.shouldTrack(item) ?? false;
     if (tracked) {
@@ -482,6 +527,7 @@ export class Dispatcher {
     for (const [id, ts] of this.threadAgentLastSeen) {
       if (ts < cutoff) {
         this.threadAgentMap.delete(id);
+        this.threadParticipants.delete(id);
         this.threadAgentLastSeen.delete(id);
         pruned++;
       }
