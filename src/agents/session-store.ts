@@ -161,7 +161,7 @@ export class SessionStore {
   async findAgentsByThread(threadId: string): Promise<string[]> {
     return this.withRetry(async () => {
       const docs = await this.collection
-        .find({ threadId }, { projection: { agentId: 1 } })
+        .find({ threadId }, { projection: { agentId: 1 }, sort: { updatedAt: -1 } })
         .toArray();
       return [...new Set(docs.map((d) => d.agentId))];
     }, [], `findAgentsByThread(${threadId})`);

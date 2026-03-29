@@ -368,7 +368,7 @@ export class Dispatcher {
 
       // 2c. No in-memory affinity — check persisted sessions (survives restart)
       const persisted = await this.agentManager.findAgentsForThread(item.threadId);
-      if (persisted.length > 1) {
+      if (persisted.length > 0) {
         const validAgents = persisted.filter((id) => this.registry.get(id));
         if (validAgents.length > 1) {
           const participants = new Set(validAgents);
@@ -376,13 +376,10 @@ export class Dispatcher {
           this.threadAgentLastSeen.set(item.threadId, Date.now());
           return [...participants].map((agentId) => ({ agentId, skipTriage: false }));
         }
-      }
-      if (persisted.length >= 1) {
-        const agentId = persisted[0];
-        if (this.registry.get(agentId)) {
-          this.threadAgentMap.set(item.threadId, agentId);
+        if (validAgents.length === 1) {
+          this.threadAgentMap.set(item.threadId, validAgents[0]);
           this.threadAgentLastSeen.set(item.threadId, Date.now());
-          return [{ agentId, skipTriage: false }];
+          return [{ agentId: validAgents[0], skipTriage: false }];
         }
       }
     }
