@@ -235,6 +235,41 @@ for inst in "${INSTANCES[@]}"; do
 done
 
 # =============================================================================
+# Phase 2b: Beekeeper
+# =============================================================================
+
+echo ""
+echo "--- Phase 2b: Beekeeper ---"
+mkdir -p "$DEPLOY_DIR/logs-beekeeper"
+
+# Install plist if not present
+BEEKEEPER_PLIST="$HOME/Library/LaunchAgents/com.hive.beekeeper.plist"
+if [ ! -f "$BEEKEEPER_PLIST" ]; then
+  echo "  Installing Beekeeper LaunchAgent..."
+  run_cmd cp "$DEPLOY_DIR/service/com.hive.beekeeper.plist" "$BEEKEEPER_PLIST"
+  run_cmd launchctl bootstrap "gui/$(id -u)" "$BEEKEEPER_PLIST"
+else
+  echo "  Restarting Beekeeper..."
+  run_cmd launchctl kickstart -k "gui/$(id -u)/com.hive.beekeeper"
+fi
+
+# Health check
+BEEKEEPER_OK=false
+for _ in $(seq 1 15); do
+  sleep 1
+  if curl -sf http://localhost:3099/health >/dev/null 2>&1; then
+    BEEKEEPER_OK=true
+    break
+  fi
+done
+
+if [ "$BEEKEEPER_OK" = true ]; then
+  echo "  ✓ Beekeeper healthy"
+else
+  echo "  ✗ Beekeeper health check failed"
+fi
+
+# =============================================================================
 # Phase 3: Report
 # =============================================================================
 
