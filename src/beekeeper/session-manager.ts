@@ -112,6 +112,7 @@ export class SessionManager {
           allowDangerouslySkipPermissions: true,
           includePartialMessages: true,
           cwd: workspacePath,
+          plugins: this.config.plugins?.map((p) => ({ type: "local" as const, path: p })),
           ...(this.sessionId ? { resume: this.sessionId } : {}),
           hooks: {
             PreToolUse: [
@@ -120,10 +121,7 @@ export class SessionManager {
               },
             ],
           },
-          env: {
-            ...process.env,
-            CLAUDECODE: undefined,
-          },
+          env: this.cleanEnv(),
         },
       });
 
@@ -139,6 +137,7 @@ export class SessionManager {
             type: "session_info",
             sessionId: this.sessionId!,
             workspace: this.workspace,
+            workspaces: Object.keys(this.config.workspaces),
           });
         }
 
@@ -204,6 +203,20 @@ export class SessionManager {
       this.activeQuery = null;
       this.send({ type: "status", state: "idle" });
     }
+  }
+
+  /**
+   * Build a clean env for the SDK subprocess.
+   * Remove CLAUDECODE (prevents nested-session detection) and empty ANTHROPIC_API_KEY (lets subscription auth work).
+   */
+  private cleanEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (key === "CLAUDECODE") continue;
+      if (key === "ANTHROPIC_API_KEY" && !value) continue;
+      if (value !== undefined) env[key] = value;
+    }
+    return env;
   }
 
   /**
