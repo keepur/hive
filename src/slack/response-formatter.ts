@@ -1,5 +1,3 @@
-const MAX_SLACK_MESSAGE_LENGTH = 3000;
-
 /**
  * Convert standard Markdown to Slack mrkdwn format.
  * Slack uses *bold* not **bold**, no # headers, <url|text> not [text](url), etc.
@@ -26,15 +24,9 @@ export function markdownToMrkdwn(text: string): string {
 export function formatResponse(text: string): string {
   if (!text) return "_No response._";
 
-  // Convert markdown to Slack mrkdwn
-  let formatted = markdownToMrkdwn(text.trim());
-
-  // Truncate if too long for a single Slack message
-  if (formatted.length > MAX_SLACK_MESSAGE_LENGTH) {
-    formatted = formatted.slice(0, MAX_SLACK_MESSAGE_LENGTH - 20) + "\n\n_...truncated_";
-  }
-
-  return formatted;
+  // Convert markdown to Slack mrkdwn — no truncation here,
+  // SlackGateway.postMessage handles splitting/file-upload for long messages
+  return markdownToMrkdwn(text.trim());
 }
 
 export function formatError(error: string): string {
