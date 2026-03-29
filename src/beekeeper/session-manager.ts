@@ -66,6 +66,7 @@ export class SessionManager {
 
   /**
    * Start a new session in the given workspace.
+   * Eagerly spawns the SDK session so session_info is sent immediately.
    */
   async newSession(workspaceName?: string): Promise<void> {
     // Stop existing session
@@ -80,13 +81,22 @@ export class SessionManager {
 
     this.sessionId = null;
     this.send({ type: "status", state: "session_ended" });
-    // session_info is sent when the first sendMessage() processes the SDK init event
+
+    // Eagerly spawn the session so the client gets session_info right away
+    await this.runQuery("You are now connected. Briefly acknowledge readiness.");
   }
 
   /**
    * Send a message to the Claude Code session and stream the response.
    */
   async sendMessage(text: string): Promise<void> {
+    await this.runQuery(text);
+  }
+
+  /**
+   * Run a query against the SDK session and stream events to the client.
+   */
+  private async runQuery(text: string): Promise<void> {
     const workspacePath = this.resolveWorkspace(this.workspace);
 
     this.send({ type: "status", state: "thinking" });
@@ -118,8 +128,6 @@ export class SessionManager {
       });
 
       this.activeQuery = q;
-
-      let resultText = "";
 
       for await (const message of q) {
         const msg = message as SDKMessage;
@@ -164,9 +172,7 @@ export class SessionManager {
           const result = msg as SDKResultMessage;
           this.sessionId = result.session_id;
 
-          if (result.subtype === "success") {
-            resultText = result.result;
-          } else {
+          if (result.subtype !== "success") {
             this.send({
               type: "error",
               message: `Session ended: ${result.subtype}`,
