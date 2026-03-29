@@ -181,10 +181,10 @@ export class SessionManager {
         }
       }
 
-      // Send final message
+      // Send final sentinel (streamed chunks already delivered)
       this.send({
         type: "message",
-        text: resultText,
+        text: "",
         sessionId: this.sessionId ?? "unknown",
         final: true,
       });

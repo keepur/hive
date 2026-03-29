@@ -267,6 +267,8 @@ if [ "$BEEKEEPER_OK" = true ]; then
   echo "  ✓ Beekeeper healthy"
 else
   echo "  ✗ Beekeeper health check failed"
+  FAILED_INSTANCES+=("beekeeper")
+  notify "Beekeeper health check failed after deploy (commit \`$DEPLOY_SHA\`)."
 fi
 
 # =============================================================================

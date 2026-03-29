@@ -59,6 +59,7 @@ wss.on("connection", (ws: WebSocket) => {
   // Replace previous client if any
   if (activeClient && activeClient.readyState === WebSocket.OPEN) {
     log.info("Replacing existing client connection");
+    guardian.denyAll("Replaced by new connection");
     activeClient.close(1000, "Replaced by new connection");
   }
 
