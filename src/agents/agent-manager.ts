@@ -349,6 +349,14 @@ export class AgentManager {
     return this.sessionStore.findAgentByThread(threadId);
   }
 
+  /**
+   * Find ALL agents that have sessions for a given thread (delegates to SessionStore).
+   * Used by Dispatcher to recover multi-agent participant sets after restart.
+   */
+  async findAgentsForThread(threadId: string): Promise<string[]> {
+    return this.sessionStore.findAgentsByThread(threadId);
+  }
+
   restartAgent(agentId: string): void {
     this.stopAgent(agentId);
     this.sessionStore.clearAgent(agentId);

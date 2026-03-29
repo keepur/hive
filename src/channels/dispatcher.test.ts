@@ -103,6 +103,7 @@ function makeMockAgentManager() {
       durationMs: 1000,
     }),
     findAgentForThread: vi.fn().mockResolvedValue(null),
+    findAgentsForThread: vi.fn().mockResolvedValue([]),
   };
 }
 
@@ -314,5 +315,244 @@ describe("Dispatcher routing", () => {
     const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-agent thread tests
+// ---------------------------------------------------------------------------
+
+describe("Multi-agent threads", () => {
+  let dispatcher: Dispatcher;
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let agentManager: ReturnType<typeof makeMockAgentManager>;
+  let adapter: ReturnType<typeof makeMockAdapter>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workItemCounter = 0;
+    registry = makeMockRegistry();
+    agentManager = makeMockAgentManager();
+    const healthReporter = makeMockHealthReporter();
+    adapter = makeMockAdapter();
+
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "mokie");
+    dispatcher.registerAdapter(adapter as any);
+  });
+
+  it("creates participant set when multiple agents are mentioned in a thread", async () => {
+    const item = makeWorkItem({
+      id: "multi-1",
+      threadId: "thread-multi",
+      text: "Jasper, and River, let's discuss",
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(calledAgents).toContain("jasper");
+    expect(calledAgents).toContain("river");
+
+    // Follow-up in same thread (no mentions) should still fan out to both
+    agentManager.sendMessage.mockClear();
+    const item2 = makeWorkItem({
+      id: "multi-2",
+      threadId: "thread-multi",
+      text: "any updates?",
+    });
+    await dispatcher.dispatch(item2);
+
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+    const followUpAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(followUpAgents).toContain("jasper");
+    expect(followUpAgents).toContain("river");
+  });
+
+  it("transitions single-agent thread to multi-agent when new agent mentioned", async () => {
+    // Start with single-agent thread
+    const item1 = makeWorkItem({
+      id: "trans-1",
+      threadId: "thread-transition",
+      text: "hey River, help me",
+    });
+    await dispatcher.dispatch(item1);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item1);
+
+    // Mention a second agent in the same thread
+    agentManager.sendMessage.mockClear();
+    const item2 = makeWorkItem({
+      id: "trans-2",
+      threadId: "thread-transition",
+      text: "Jasper, can you weigh in?",
+    });
+    await dispatcher.dispatch(item2);
+
+    // Both River (original) and Jasper (new) should be called
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(calledAgents).toContain("river");
+    expect(calledAgents).toContain("jasper");
+
+    // Follow-up should continue to fan out
+    agentManager.sendMessage.mockClear();
+    const item3 = makeWorkItem({
+      id: "trans-3",
+      threadId: "thread-transition",
+      text: "thoughts?",
+    });
+    await dispatcher.dispatch(item3);
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not transition when re-mentioning the same agent", async () => {
+    const item1 = makeWorkItem({
+      id: "same-1",
+      threadId: "thread-same",
+      text: "hey River, help me",
+    });
+    await dispatcher.dispatch(item1);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item1);
+
+    // Re-mention River — should stay single-agent
+    agentManager.sendMessage.mockClear();
+    const item2 = makeWorkItem({
+      id: "same-2",
+      threadId: "thread-same",
+      text: "River, one more thing",
+    });
+    await dispatcher.dispatch(item2);
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item2);
+  });
+
+  it("adds new participants to existing multi-agent thread", async () => {
+    // Start multi-agent with Jasper + River
+    const item1 = makeWorkItem({
+      id: "add-1",
+      threadId: "thread-add",
+      text: "Jasper, and River, discuss this",
+    });
+    await dispatcher.dispatch(item1);
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+
+    // Now mention Mokie — should add to participant set
+    agentManager.sendMessage.mockClear();
+    const item2 = makeWorkItem({
+      id: "add-2",
+      threadId: "thread-add",
+      text: "Mokie, join us",
+    });
+    await dispatcher.dispatch(item2);
+
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(3);
+    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(calledAgents).toContain("jasper");
+    expect(calledAgents).toContain("river");
+    expect(calledAgents).toContain("mokie");
+  });
+
+  it("recovers multi-agent thread from persisted sessions after restart", async () => {
+    // Simulate restart: no in-memory state, but session store has multiple agents
+    agentManager.findAgentsForThread.mockResolvedValue(["jasper", "river"]);
+
+    const item = makeWorkItem({
+      id: "recover-1",
+      threadId: "thread-recover",
+      text: "any update?",
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(calledAgents).toContain("jasper");
+    expect(calledAgents).toContain("river");
+  });
+
+  it("recovers single-agent thread from persisted sessions after restart", async () => {
+    agentManager.findAgentsForThread.mockResolvedValue(["river"]);
+
+    const item = makeWorkItem({
+      id: "recover-single-1",
+      threadId: "thread-recover-single",
+      text: "follow up",
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item);
+  });
+
+  it("sweep cleans up expired multi-agent threads", async () => {
+    vi.useFakeTimers();
+    try {
+      // Create a multi-agent thread
+      const item = makeWorkItem({
+        id: "sweep-1",
+        threadId: "thread-sweep",
+        text: "Jasper, and River, discuss",
+      });
+      await dispatcher.dispatch(item);
+      expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+
+      // Advance time past the TTL, then sweep
+      vi.advanceTimersByTime(1000);
+      const result = dispatcher.sweep(500);
+      expect(result.pruned).toBeGreaterThanOrEqual(1);
+
+      // Next message in that thread should not fan out (affinity lost)
+      agentManager.sendMessage.mockClear();
+      agentManager.findAgentsForThread.mockResolvedValue([]);
+      const item2 = makeWorkItem({
+        id: "sweep-2",
+        threadId: "thread-sweep",
+        text: "hello?",
+      });
+      await dispatcher.dispatch(item2);
+      // Falls through to default routing (mokie), not multi-agent
+      expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
+      expect(agentManager.sendMessage).toHaveBeenCalledWith("mokie", item2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dedicated channel routing takes precedence over thread participants", async () => {
+    // Even if threadId has multi-agent participants, dedicated channel routes to channel owner
+    agentManager.findAgentsForThread.mockResolvedValue(["jasper", "river"]);
+
+    const item = makeWorkItem({
+      id: "channel-1",
+      threadId: "thread-channel",
+      text: "hey Jasper, help",
+      source: { kind: "slack", id: "C456", label: "agent-jasper" },
+    });
+    await dispatcher.dispatch(item);
+
+    // Should route to jasper only (channel owner), not fan out
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+  });
+
+  it("explicit targetAgentId overrides multi-agent thread", async () => {
+    // Set up multi-agent thread first
+    const item1 = makeWorkItem({
+      id: "target-1",
+      threadId: "thread-target",
+      text: "Jasper, and River, discuss",
+    });
+    await dispatcher.dispatch(item1);
+
+    // Callback with targetAgentId should only go to that agent
+    agentManager.sendMessage.mockClear();
+    const item2 = makeWorkItem({
+      id: "target-2",
+      threadId: "thread-target",
+      text: "callback response",
+      meta: { targetAgentId: "jasper" },
+    });
+    await dispatcher.dispatch(item2);
+
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item2);
   });
 });
