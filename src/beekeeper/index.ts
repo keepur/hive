@@ -74,6 +74,7 @@ wss.on("connection", (ws: WebSocket) => {
       type: "session_info",
       sessionId,
       workspace: sessionManager.getWorkspace(),
+      workspaces: Object.keys(config.workspaces),
     };
     ws.send(JSON.stringify(msg));
   }

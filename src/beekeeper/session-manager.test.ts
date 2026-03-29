@@ -100,6 +100,7 @@ describe("SessionManager", () => {
         type: "session_info",
         sessionId: "sess-abc",
         workspace: "hive",
+        workspaces: ["hive", "other"],
       });
     });
 

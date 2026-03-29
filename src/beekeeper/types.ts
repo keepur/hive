@@ -12,7 +12,7 @@ export type ServerMessage =
   | { type: "message"; text: string; sessionId: string; final: boolean }
   | { type: "tool_approval"; toolUseId: string; tool: string; input: string }
   | { type: "status"; state: "thinking" | "idle" | "tool_running" | "session_ended" }
-  | { type: "session_info"; sessionId: string; workspace: string }
+  | { type: "session_info"; sessionId: string; workspace: string; workspaces: string[] }
   | { type: "error"; message: string }
   | { type: "pong" };
 
@@ -23,4 +23,5 @@ export interface BeekeeperConfig {
   workspaces: Record<string, string>;
   confirmOperations: string[];
   authToken: string;
+  plugins?: string[];
 }
