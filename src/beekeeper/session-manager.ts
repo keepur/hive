@@ -1,15 +1,20 @@
 import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { WebSocket } from "ws";
 import { createLogger } from "../logging/logger.js";
-import { ToolGuardian } from "./tool-guardian.js";
+import type { ToolGuardian } from "./tool-guardian.js";
 import type { ServerMessage, BeekeeperConfig } from "./types.js";
 
 const log = createLogger("beekeeper-session");
 
+export interface SessionSlot {
+  sessionId: string;
+  cwd: string;
+  activeQuery: Query | null;
+  state: "idle" | "busy";
+}
+
 export class SessionManager {
-  private sessionId: string | null = null;
-  private workspace: string;
-  private activeQuery: Query | null = null;
+  private sessions = new Map<string, SessionSlot>();
   private client: WebSocket | null = null;
   private guardian: ToolGuardian;
   private config: BeekeeperConfig;
@@ -18,20 +23,10 @@ export class SessionManager {
   constructor(config: BeekeeperConfig, guardian: ToolGuardian) {
     this.config = config;
     this.guardian = guardian;
-    this.workspace = config.defaultWorkspace;
-  }
-
-  getSessionId(): string | null {
-    return this.sessionId;
-  }
-
-  getWorkspace(): string {
-    return this.workspace;
   }
 
   setClient(ws: WebSocket | null): void {
     this.client = ws;
-    // Drain buffered output to new client
     if (ws && this.outputBuffer.length > 0) {
       log.info("Draining buffered output", { count: this.outputBuffer.length });
       for (const msg of this.outputBuffer) {
@@ -41,11 +36,8 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Send a message to the client, or buffer if disconnected.
-   */
   private send(msg: ServerMessage): void {
-    if (this.client && this.client.readyState === 1 /* OPEN */) {
+    if (this.client && this.client.readyState === 1) {
       this.client.send(JSON.stringify(msg));
     } else {
       this.outputBuffer.push(msg);
@@ -53,55 +45,101 @@ export class SessionManager {
   }
 
   /**
-   * Resolve workspace name to absolute path.
+   * Create a new session in the given cwd. Spawns SDK eagerly.
    */
-  private resolveWorkspace(name?: string): string {
-    const wsName = name ?? this.config.defaultWorkspace;
-    const path = this.config.workspaces[wsName];
-    if (!path) {
-      throw new Error(`Unknown workspace: ${wsName}. Available: ${Object.keys(this.config.workspaces).join(", ")}`);
+  async newSession(cwd: string): Promise<string> {
+    log.info("Creating new session", { cwd });
+    const slot: SessionSlot = {
+      sessionId: `pending-${Date.now()}`,
+      cwd,
+      activeQuery: null,
+      state: "idle",
+    };
+
+    const realId = await this.runQuery(slot, "You are now connected. Briefly acknowledge readiness.");
+
+    slot.sessionId = realId;
+    this.sessions.set(realId, slot);
+    log.info("Session created", { sessionId: realId, cwd });
+    return realId;
+  }
+
+  /**
+   * Send a message to a specific session.
+   */
+  async sendMessage(sessionId: string, text: string): Promise<void> {
+    const slot = this.sessions.get(sessionId);
+    if (!slot) {
+      this.send({ type: "error", message: `Unknown session: ${sessionId}`, sessionId });
+      return;
     }
-    return path;
+    if (slot.state === "busy") {
+      this.send({ type: "error", message: "Session is busy", sessionId });
+      return;
+    }
+    await this.runQuery(slot, text);
   }
 
   /**
-   * Start a new session in the given workspace.
-   * Eagerly spawns the SDK session so session_info is sent immediately.
+   * Clear (stop and remove) a specific session.
    */
-  async newSession(workspaceName?: string): Promise<void> {
-    // Stop existing session
-    await this.stopSession();
+  async clearSession(sessionId: string): Promise<boolean> {
+    const slot = this.sessions.get(sessionId);
+    if (!slot) return false;
 
-    const wsName = workspaceName ?? this.config.defaultWorkspace;
-    this.workspace = wsName;
-    // Validate workspace exists
-    this.resolveWorkspace(wsName);
-
-    log.info("Starting new session", { workspace: wsName, path: this.resolveWorkspace(wsName) });
-
-    this.sessionId = null;
-    this.send({ type: "status", state: "session_ended" });
-
-    // Eagerly spawn the session so the client gets session_info right away
-    await this.runQuery("You are now connected. Briefly acknowledge readiness.");
+    if (slot.activeQuery) {
+      await slot.activeQuery.interrupt();
+    }
+    this.sessions.delete(sessionId);
+    this.send({ type: "session_cleared", sessionId });
+    log.info("Session cleared", { sessionId });
+    return true;
   }
 
   /**
-   * Send a message to the Claude Code session and stream the response.
+   * List all active sessions.
    */
-  async sendMessage(text: string): Promise<void> {
-    await this.runQuery(text);
+  listSessions(): void {
+    const sessions = Array.from(this.sessions.values()).map((s) => ({
+      sessionId: s.sessionId,
+      cwd: s.cwd,
+      state: s.state,
+    }));
+    this.send({ type: "session_list", sessions });
   }
 
   /**
-   * Run a query against the SDK session and stream events to the client.
+   * Get session info for reconnection.
    */
-  private async runQuery(text: string): Promise<void> {
-    const workspacePath = this.resolveWorkspace(this.workspace);
+  getActiveSessions(): Array<{ sessionId: string; cwd: string; state: "idle" | "busy" }> {
+    return Array.from(this.sessions.values()).map((s) => ({
+      sessionId: s.sessionId,
+      cwd: s.cwd,
+      state: s.state,
+    }));
+  }
 
-    this.send({ type: "status", state: "thinking" });
+  /**
+   * Stop all sessions (used on shutdown).
+   */
+  async stopAll(): Promise<void> {
+    for (const [sessionId, slot] of this.sessions) {
+      if (slot.activeQuery) {
+        log.info("Stopping session", { sessionId });
+        await slot.activeQuery.interrupt();
+      }
+    }
+    this.sessions.clear();
+  }
 
-    const guardianCallback = this.guardian.createHookCallback();
+  /**
+   * Run a query in a session slot.
+   */
+  private async runQuery(slot: SessionSlot, text: string): Promise<string> {
+    slot.state = "busy";
+    this.send({ type: "status", state: "thinking", sessionId: slot.sessionId });
+
+    const guardianCallback = this.guardian.createHookCallback(slot.sessionId);
 
     try {
       const q = query({
@@ -111,9 +149,9 @@ export class SessionManager {
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           includePartialMessages: true,
-          cwd: workspacePath,
+          cwd: slot.cwd,
           plugins: this.config.plugins?.map((p) => ({ type: "local" as const, path: p })),
-          ...(this.sessionId ? { resume: this.sessionId } : {}),
+          ...(slot.sessionId.startsWith("pending-") ? {} : { resume: slot.sessionId }),
           hooks: {
             PreToolUse: [
               {
@@ -125,90 +163,89 @@ export class SessionManager {
         },
       });
 
-      this.activeQuery = q;
+      slot.activeQuery = q;
+      let resolvedSessionId = slot.sessionId;
 
       for await (const message of q) {
         const msg = message as SDKMessage;
 
-        // Capture session ID from init
         if (msg.type === "system" && (msg as any).subtype === "init") {
-          this.sessionId = (msg as any).session_id;
+          resolvedSessionId = (msg as any).session_id;
+          slot.sessionId = resolvedSessionId;
           this.send({
             type: "session_info",
-            sessionId: this.sessionId!,
-            workspace: this.workspace,
-            workspaces: Object.keys(this.config.workspaces),
+            sessionId: resolvedSessionId,
+            cwd: slot.cwd,
           });
         }
 
-        // Stream text chunks
         if (msg.type === "stream_event") {
           const event = (msg as any).event;
           if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
             this.send({
               type: "message",
               text: event.delta.text,
-              sessionId: this.sessionId ?? "unknown",
+              sessionId: resolvedSessionId,
               final: false,
             });
           }
         }
 
-        // Tool progress
         if (msg.type === "tool_progress") {
-          this.send({ type: "status", state: "tool_running" });
+          this.send({ type: "status", state: "tool_running", sessionId: resolvedSessionId });
         }
 
-        // Assistant message — capture session ID
         if (msg.type === "assistant") {
           if ((msg as any).session_id) {
-            this.sessionId = (msg as any).session_id;
+            resolvedSessionId = (msg as any).session_id;
+            slot.sessionId = resolvedSessionId;
           }
         }
 
-        // Result message
         if (msg.type === "result") {
           const result = msg as SDKResultMessage;
-          this.sessionId = result.session_id;
+          resolvedSessionId = result.session_id;
+          slot.sessionId = resolvedSessionId;
 
           if (result.subtype !== "success") {
             this.send({
               type: "error",
               message: `Session ended: ${result.subtype}`,
+              sessionId: resolvedSessionId,
             });
           }
 
           log.info("Query complete", {
-            sessionId: this.sessionId,
+            sessionId: resolvedSessionId,
             cost: result.total_cost_usd,
             durationMs: result.duration_ms,
           });
         }
       }
 
-      // Send final sentinel (streamed chunks already delivered)
       this.send({
         type: "message",
         text: "",
-        sessionId: this.sessionId ?? "unknown",
+        sessionId: resolvedSessionId,
         final: true,
       });
+
+      return resolvedSessionId;
     } catch (err) {
-      log.error("Query failed", { error: String(err) });
+      log.error("Query failed", { sessionId: slot.sessionId, error: String(err) });
       this.send({
         type: "error",
         message: `Query failed: ${err instanceof Error ? err.message : String(err)}`,
+        sessionId: slot.sessionId,
       });
+      return slot.sessionId;
     } finally {
-      this.activeQuery = null;
-      this.send({ type: "status", state: "idle" });
+      slot.activeQuery = null;
+      slot.state = "idle";
+      this.send({ type: "status", state: "idle", sessionId: slot.sessionId });
     }
   }
 
-  /**
-   * Build a clean env for the SDK subprocess.
-   * Remove CLAUDECODE (prevents nested-session detection) and empty ANTHROPIC_API_KEY (lets subscription auth work).
-   */
   private cleanEnv(): Record<string, string> {
     const env: Record<string, string> = {};
     for (const [key, value] of Object.entries(process.env)) {
@@ -217,16 +254,5 @@ export class SessionManager {
       if (value !== undefined) env[key] = value;
     }
     return env;
-  }
-
-  /**
-   * Stop the current session.
-   */
-  async stopSession(): Promise<void> {
-    if (this.activeQuery) {
-      log.info("Stopping active query", { sessionId: this.sessionId });
-      await this.activeQuery.interrupt();
-      this.activeQuery = null;
-    }
   }
 }
