@@ -205,6 +205,8 @@ kill -SIGUSR1 $(pgrep -f "node.*dist/index.js")
 
 ### Temporary Server Override (MongoDB)
 
+Array override syntax: `{ replace: [...] }` for full replacement, `{ add: [...] }` to append, `{ remove: [...] }` to drop. These are processed by `applyConfigOverrides()` in agent-registry.
+
 ```bash
 # Add a server to an agent's core servers
 mongosh hive --eval 'db.agent_config_overrides.updateOne(
@@ -218,6 +220,8 @@ mongosh hive --eval 'db.agent_config_overrides.updateOne(
 )'
 kill -SIGUSR1 $(pgrep -f "node.*dist/index.js")
 ```
+
+Valid array fields: `channels`, `passiveChannels`, `keywords`, `coreServers`, `delegateServers`, `plugins`, `subscribe`.
 
 ---
 
