@@ -3,18 +3,20 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 vi.mock("node:fs", () => ({
   existsSync: vi.fn(),
   readFileSync: vi.fn(),
+  readdirSync: vi.fn().mockReturnValue([]),
 }));
 
 vi.mock("yaml", () => ({
   parse: vi.fn(),
 }));
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import { loadConfig } from "./config.js";
 
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
+const mockReaddirSync = vi.mocked(readdirSync);
 const mockParseYaml = vi.mocked(parseYaml);
 
 describe("loadConfig", () => {
@@ -26,6 +28,7 @@ describe("loadConfig", () => {
     process.env.BEEKEEPER_AUTH_TOKEN = "test-token-abc";
     process.env.BEEKEEPER_CONFIG = "/tmp/beekeeper.yaml";
     process.env.HOME = "/Users/testuser";
+    mockReaddirSync.mockReturnValue([] as any);
   });
 
   afterEach(() => {
@@ -45,7 +48,7 @@ describe("loadConfig", () => {
 
     const config = loadConfig();
 
-    expect(config).toEqual({
+    expect(config).toMatchObject({
       port: 4000,
       defaultWorkspace: "my-workspace",
       model: "claude-sonnet-4-5",
@@ -53,6 +56,7 @@ describe("loadConfig", () => {
       confirmOperations: ["rm -rf", "git push --force"],
       authToken: "test-token-abc",
     });
+    expect(config).toHaveProperty("plugins");
   });
 
   it("throws if config file not found", () => {
@@ -103,7 +107,7 @@ describe("loadConfig", () => {
 
     const config = loadConfig();
 
-    expect(config.model).toBe("claude-opus-4-5-20250514");
+    expect(config.model).toBe("claude-opus-4-6");
   });
 
   it("falls back to default confirm_operations when field is missing", () => {
