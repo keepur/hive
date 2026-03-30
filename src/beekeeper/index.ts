@@ -147,7 +147,14 @@ async function main(): Promise<void> {
           return;
         }
         const body = await readBody(req);
-        const parsed = JSON.parse(body) as { name?: string };
+        let parsed: { name?: string };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
         const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
         if (!name) {
           res.writeHead(400, { "Content-Type": "application/json" });
@@ -177,7 +184,14 @@ async function main(): Promise<void> {
       }
       try {
         const body = await readBody(req);
-        const parsed = JSON.parse(body) as { name?: string };
+        let parsed: { name?: string };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
         const name = parsed.name || "Unnamed Device";
         const device = await deviceRegistry.createDevice(name);
         res.writeHead(201, { "Content-Type": "application/json" });
@@ -236,7 +250,14 @@ async function main(): Promise<void> {
       if (req.method === "PUT" && !action) {
         try {
           const body = await readBody(req);
-          const parsed = JSON.parse(body) as { name?: string };
+          let parsed: { name?: string };
+          try {
+            parsed = JSON.parse(body);
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON" }));
+            return;
+          }
           if (!parsed.name) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "No fields to update" }));
@@ -285,6 +306,11 @@ async function main(): Promise<void> {
       if (req.method === "POST" && action === "refresh-code") {
         try {
           const code = await deviceRegistry.refreshPairingCode(deviceId);
+          if (!code) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Device not found" }));
+            return;
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ pairingCode: code }));
         } catch (err) {

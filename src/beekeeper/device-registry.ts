@@ -44,7 +44,7 @@ export class BeekeeperDeviceRegistry {
     const device: BeekeeperDevice = {
       _id: randomUUID(),
       name,
-      pairingCode: randomInt(100000, 999999).toString(),
+      pairingCode: randomInt(100000, 1000000).toString(),
       pairingCodeExpiresAt: new Date(now.getTime() + PAIRING_CODE_TTL_MS),
       createdAt: now,
       lastSeenAt: now,
@@ -104,13 +104,17 @@ export class BeekeeperDeviceRegistry {
     }
   }
 
-  async refreshPairingCode(deviceId: string): Promise<string> {
-    const code = randomInt(100000, 999999).toString();
+  async refreshPairingCode(deviceId: string): Promise<string | null> {
+    const code = randomInt(100000, 1000000).toString();
     const expiresAt = new Date(Date.now() + PAIRING_CODE_TTL_MS);
-    await this.collection.updateOne(
+    const result = await this.collection.updateOne(
       { _id: deviceId },
       { $set: { pairingCode: code, pairingCodeExpiresAt: expiresAt } },
     );
+    if (result.matchedCount === 0) {
+      log.warn("Refresh pairing code failed — device not found", { deviceId });
+      return null;
+    }
     log.info("Pairing code refreshed", { deviceId });
     return code;
   }
