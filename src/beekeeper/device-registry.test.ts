@@ -211,4 +211,111 @@ describe("BeekeeperDeviceRegistry", () => {
       expect(result).toBe(false);
     });
   });
+
+  describe("refreshPairingCode", () => {
+    it("returns new code when device exists", async () => {
+      await registry.connect();
+      mockCollection.updateOne.mockResolvedValueOnce({ matchedCount: 1 });
+
+      const code = await registry.refreshPairingCode("device-123");
+
+      expect(code).toBe("123456");
+      expect(mockCollection.updateOne).toHaveBeenCalledWith(
+        { _id: "device-123" },
+        { $set: { pairingCode: "123456", pairingCodeExpiresAt: expect.any(Date) } },
+      );
+    });
+
+    it("returns null when device not found", async () => {
+      await registry.connect();
+      mockCollection.updateOne.mockResolvedValueOnce({ matchedCount: 0 });
+
+      const code = await registry.refreshPairingCode("nonexistent");
+
+      expect(code).toBeNull();
+    });
+  });
+
+  describe("listDevices", () => {
+    it("returns all devices", async () => {
+      await registry.connect();
+      const devices = [makeDevice(), makeDevice({ _id: "device-2", name: "Second" })];
+      mockCollection.find.mockReturnValueOnce({ toArray: vi.fn().mockResolvedValueOnce(devices) });
+
+      const result = await registry.listDevices();
+
+      expect(result).toEqual(devices);
+    });
+  });
+
+  describe("getDevice", () => {
+    it("returns device by ID", async () => {
+      await registry.connect();
+      const device = makeDevice();
+      mockCollection.findOne.mockResolvedValueOnce(device);
+
+      const result = await registry.getDevice("test-uuid-1234");
+
+      expect(result).toEqual(device);
+      expect(mockCollection.findOne).toHaveBeenCalledWith({ _id: "test-uuid-1234" });
+    });
+
+    it("returns null when not found", async () => {
+      await registry.connect();
+      mockCollection.findOne.mockResolvedValueOnce(null);
+
+      const result = await registry.getDevice("nonexistent");
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("updateDevice", () => {
+    it("updates and returns device", async () => {
+      await registry.connect();
+      const updated = makeDevice({ name: "New Name" });
+      mockCollection.findOneAndUpdate.mockResolvedValueOnce(updated);
+
+      const result = await registry.updateDevice("test-uuid-1234", { name: "New Name" });
+
+      expect(result).toEqual(updated);
+      expect(mockCollection.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: "test-uuid-1234" },
+        { $set: { name: "New Name" } },
+        { returnDocument: "after" },
+      );
+    });
+
+    it("returns null when device not found", async () => {
+      await registry.connect();
+      mockCollection.findOneAndUpdate.mockResolvedValueOnce(null);
+
+      const result = await registry.updateDevice("nonexistent", { name: "X" });
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("updateLastSeen", () => {
+    it("updates lastSeenAt timestamp", async () => {
+      await registry.connect();
+
+      await registry.updateLastSeen("device-123");
+
+      expect(mockCollection.updateOne).toHaveBeenCalledWith(
+        { _id: "device-123" },
+        { $set: { lastSeenAt: expect.any(Date) } },
+      );
+    });
+  });
+
+  describe("close", () => {
+    it("closes MongoDB client", async () => {
+      await registry.connect();
+
+      await registry.close();
+
+      expect(mockClient.close).toHaveBeenCalledOnce();
+    });
+  });
 });
