@@ -1,4 +1,30 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+// Mock MongoDB to prevent top-level await client.connect() from failing
+vi.mock("mongodb", () => ({
+  MongoClient: vi.fn().mockImplementation(() => ({
+    connect: vi.fn().mockResolvedValue(undefined),
+    db: vi.fn().mockReturnValue({
+      collection: vi.fn().mockReturnValue({
+        findOne: vi.fn().mockResolvedValue(null),
+        updateOne: vi.fn().mockResolvedValue({}),
+      }),
+    }),
+    close: vi.fn(),
+  })),
+}));
+
+// Mock MCP SDK to prevent stdio transport from starting
+vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
+  McpServer: vi.fn().mockImplementation(() => ({
+    registerTool: vi.fn(),
+    connect: vi.fn().mockResolvedValue(undefined),
+  })),
+}));
+vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
+  StdioServerTransport: vi.fn(),
+}));
+
 import { validateMinInterval } from "./schedule-mcp-server.js";
 
 describe("validateMinInterval", () => {
@@ -19,7 +45,7 @@ describe("validateMinInterval", () => {
     expect(validateMinInterval("* * * * *")).toContain("every minute");
   });
 
-  it("allows wildcard minutes with restricted other fields", () => {
+  it("allows wildcard minutes with restricted hour (known gap — runs every minute of that hour)", () => {
     expect(validateMinInterval("* 8 * * *")).toBeNull();
   });
 

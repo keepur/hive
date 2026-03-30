@@ -151,8 +151,21 @@ server.registerTool(
     }
 
     const override = (await scheduleOverrides.findOne({ agentId: AGENT_ID })) as any;
-    const current: Array<{ cron: string; task: string }> =
-      override?.schedule ?? (override?.schedule === null ? [] : [...defaults]);
+
+    // Block if schedule is explicitly disabled (null means admin/agent disabled all schedules)
+    if (override?.schedule === null) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Your schedule is currently disabled. Use my_schedule_remove to clear the disable, or ask the platform admin to re-enable it first.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const current: Array<{ cron: string; task: string }> = override?.schedule ?? [...defaults];
 
     if (current.length >= MAX_SCHEDULES) {
       return {
@@ -209,8 +222,15 @@ server.registerTool(
   },
   async ({ task, reason }) => {
     const override = (await scheduleOverrides.findOne({ agentId: AGENT_ID })) as any;
-    const current: Array<{ cron: string; task: string }> =
-      override?.schedule ?? (override?.schedule === null ? [] : [...defaults]);
+
+    if (override?.schedule === null) {
+      return {
+        content: [{ type: "text", text: "Your schedule is currently disabled. Nothing to remove." }],
+        isError: true,
+      };
+    }
+
+    const current: Array<{ cron: string; task: string }> = override?.schedule ?? [...defaults];
 
     const idx = current.findIndex((s) => s.task === task);
     if (idx === -1) {
@@ -268,8 +288,15 @@ server.registerTool(
     }
 
     const override = (await scheduleOverrides.findOne({ agentId: AGENT_ID })) as any;
-    const current: Array<{ cron: string; task: string }> =
-      override?.schedule ?? (override?.schedule === null ? [] : [...defaults]);
+
+    if (override?.schedule === null) {
+      return {
+        content: [{ type: "text", text: "Your schedule is currently disabled. Nothing to update." }],
+        isError: true,
+      };
+    }
+
+    const current: Array<{ cron: string; task: string }> = override?.schedule ?? [...defaults];
 
     const idx = current.findIndex((s) => s.task === task);
     if (idx === -1) {
