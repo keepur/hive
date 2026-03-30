@@ -30,7 +30,10 @@ function makeConfig(overrides: Partial<BeekeeperConfig> = {}): BeekeeperConfig {
     model: "claude-sonnet-4-5",
     workspaces: { hive: "/home/user/hive", other: "/home/user/other" },
     confirmOperations: [],
-    authToken: "test-token",
+    jwtSecret: "test-jwt-secret",
+    adminSecret: "test-admin-secret",
+    mongoUri: "mongodb://localhost:27017",
+    mongoDbName: "test-db",
     ...overrides,
   };
 }
