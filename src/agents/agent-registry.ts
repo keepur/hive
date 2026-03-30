@@ -242,6 +242,7 @@ export class AgentRegistry {
       timeoutMs: (raw.timeoutMs as number) || undefined,
       triageModel: (raw.triageModel as string) || undefined,
       dodiOpsMode: (raw.dodiOpsMode as "full" | "readonly") || undefined,
+      disabled: (raw.disabled as boolean) || false,
       subscribe: (raw.subscribe as string[]) || [],
       delegatePrompts: (raw.delegatePrompts as Record<string, string>) || undefined,
       soul,
