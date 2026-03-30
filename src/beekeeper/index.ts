@@ -1,163 +1,456 @@
 import "dotenv/config";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { URL } from "node:url";
+import { timingSafeEqual } from "node:crypto";
 import { createLogger } from "../logging/logger.js";
 import { loadConfig } from "./config.js";
 import { ToolGuardian } from "./tool-guardian.js";
 import { SessionManager } from "./session-manager.js";
+import { BeekeeperDeviceRegistry, type BeekeeperDevice } from "./device-registry.js";
 import type { ClientMessage, ServerMessage } from "./types.js";
 
 const log = createLogger("beekeeper");
 
-const config = loadConfig();
-const guardian = new ToolGuardian(config.confirmOperations);
-const sessionManager = new SessionManager(config, guardian);
+async function main(): Promise<void> {
+  const config = loadConfig();
+  const guardian = new ToolGuardian(config.confirmOperations);
+  const sessionManager = new SessionManager(config, guardian);
 
-// HTTP server for health check
-const server = createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        sessionId: sessionManager.getSessionId(),
-        workspace: sessionManager.getWorkspace(),
-      }),
-    );
-    return;
-  }
-  res.writeHead(404);
-  res.end();
-});
+  // Connect device registry (fail to start if MongoDB unreachable)
+  const deviceRegistry = new BeekeeperDeviceRegistry(config.mongoUri, config.mongoDbName, config.jwtSecret);
+  await deviceRegistry.connect();
 
-// WebSocket server with auth on upgrade
-const wss = new WebSocketServer({ noServer: true });
+  // Track active device for force-disconnect on deactivation
+  let activeClient: WebSocket | null = null;
+  let activeDeviceId: string | null = null;
 
-server.on("upgrade", (req, socket, head) => {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-  const token = url.searchParams.get("token") ?? req.headers.authorization?.replace("Bearer ", "");
+  // --- Helper functions ---
 
-  if (token !== config.authToken) {
-    log.warn("WebSocket auth failed");
-    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    socket.destroy();
-    return;
+  function verifyAdmin(req: IncomingMessage): boolean {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith("Bearer ")) return false;
+    const provided = Buffer.from(auth.slice(7));
+    const expected = Buffer.from(config.adminSecret);
+    if (provided.length !== expected.length) return false;
+    return timingSafeEqual(provided, expected);
   }
 
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws);
-  });
-});
-
-// Single client connection management
-let activeClient: WebSocket | null = null;
-
-wss.on("connection", (ws: WebSocket) => {
-  log.info("Client connected");
-
-  // Replace previous client if any
-  if (activeClient && activeClient.readyState === WebSocket.OPEN) {
-    log.info("Replacing existing client connection");
-    guardian.denyAll("Replaced by new connection");
-    activeClient.close(1000, "Replaced by new connection");
+  async function verifyDeviceToken(req: IncomingMessage): Promise<BeekeeperDevice | null> {
+    const auth = req.headers.authorization;
+    const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) return null;
+    return deviceRegistry.verifyToken(token);
   }
 
-  activeClient = ws;
-  guardian.setClient(ws);
-  sessionManager.setClient(ws);
+  // --- HTTP server ---
 
-  // Send current session info or start new session
-  const sessionId = sessionManager.getSessionId();
-  if (sessionId) {
-    const msg: ServerMessage = {
-      type: "session_info",
-      sessionId,
-      workspace: sessionManager.getWorkspace(),
-      workspaces: Object.keys(config.workspaces),
-    };
-    ws.send(JSON.stringify(msg));
-  }
+  const server = createServer(async (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, GET, PUT, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-  ws.on("message", async (raw: Buffer | ArrayBuffer | Buffer[]) => {
-    let msg: ClientMessage;
-    try {
-      msg = JSON.parse(raw.toString()) as ClientMessage;
-    } catch {
-      ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
       return;
     }
 
-    try {
-      switch (msg.type) {
-        case "ping":
-          ws.send(JSON.stringify({ type: "pong" }));
-          break;
+    const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
 
-        case "message":
-          await sessionManager.sendMessage(msg.text);
-          break;
-
-        case "new_session":
-          await sessionManager.newSession(msg.workspace);
-          break;
-
-        case "switch_workspace":
-          await sessionManager.newSession(msg.workspace);
-          break;
-
-        case "approve":
-          guardian.handleApproval(msg.toolUseId, true);
-          break;
-
-        case "deny":
-          guardian.handleApproval(msg.toolUseId, false);
-          break;
-
-        default:
-          ws.send(JSON.stringify({ type: "error", message: `Unknown message type` }));
-      }
-    } catch (err) {
-      log.error("Error handling message", { type: msg.type, error: String(err) });
-      ws.send(
+    // GET /health (public)
+    if (req.method === "GET" && url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
         JSON.stringify({
-          type: "error",
-          message: err instanceof Error ? err.message : String(err),
+          status: "ok",
+          sessionId: sessionManager.getSessionId(),
+          workspace: sessionManager.getWorkspace(),
+          connected: activeClient !== null,
         }),
       );
+      return;
     }
-  });
 
-  ws.on("close", () => {
-    log.info("Client disconnected");
-    if (activeClient === ws) {
-      activeClient = null;
-      guardian.setClient(null);
-      sessionManager.setClient(null);
+    // POST /pair (public) — exchange pairing code for JWT
+    if (req.method === "POST" && url.pathname === "/pair") {
+      try {
+        const body = await readBody(req);
+        let parsed: { code?: string; name?: string };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+
+        if (!parsed.code || typeof parsed.code !== "string") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing required field: code" }));
+          return;
+        }
+
+        const name = typeof parsed.name === "string" ? parsed.name.trim() : undefined;
+        const result = await deviceRegistry.verifyPairingCode(parsed.code, name || undefined);
+        if (!result) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid or expired pairing code" }));
+          return;
+        }
+
+        log.info("Device paired via HTTP", { deviceId: result.device._id });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            token: result.token,
+            deviceId: result.device._id,
+            deviceName: result.device.name,
+          }),
+        );
+      } catch (err) {
+        log.error("Pair endpoint error", { error: String(err) });
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+      return;
     }
+
+    // --- Device self-service (Bearer JWT) ---
+
+    // GET /me
+    if (req.method === "GET" && url.pathname === "/me") {
+      try {
+        const device = await verifyDeviceToken(req);
+        if (!device) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ deviceId: device._id, name: device.name }));
+      } catch (err) {
+        log.error("GET /me error", { error: String(err) });
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+      return;
+    }
+
+    // PUT /me
+    if (req.method === "PUT" && url.pathname === "/me") {
+      try {
+        const device = await verifyDeviceToken(req);
+        if (!device) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as { name?: string };
+        const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
+        if (!name) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing required field: name" }));
+          return;
+        }
+        const updated = await deviceRegistry.updateDevice(device._id, { name });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ deviceId: device._id, name: updated?.name ?? name }));
+      } catch (err) {
+        log.error("PUT /me error", { error: String(err) });
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+      return;
+    }
+
+    // --- Admin API (Bearer BEEKEEPER_ADMIN_SECRET) ---
+    const isAdmin = verifyAdmin(req);
+
+    // POST /devices
+    if (req.method === "POST" && url.pathname === "/devices") {
+      if (!isAdmin) {
+        res.writeHead(401);
+        res.end("Unauthorized");
+        return;
+      }
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as { name?: string };
+        const name = parsed.name || "Unnamed Device";
+        const device = await deviceRegistry.createDevice(name);
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            deviceId: device._id,
+            name: device.name,
+            pairingCode: device.pairingCode,
+            expiresAt: device.pairingCodeExpiresAt,
+          }),
+        );
+      } catch (err) {
+        log.error("Create device error", { error: String(err) });
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+      return;
+    }
+
+    // GET /devices
+    if (req.method === "GET" && url.pathname === "/devices") {
+      if (!isAdmin) {
+        res.writeHead(401);
+        res.end("Unauthorized");
+        return;
+      }
+      try {
+        const devices = await deviceRegistry.listDevices();
+        const list = devices.map((d) => ({
+          deviceId: d._id,
+          name: d.name,
+          active: d.active,
+          paired: !!d.pairedAt,
+          pairedAt: d.pairedAt,
+          lastSeenAt: d.lastSeenAt,
+          connected: d._id === activeDeviceId && activeClient !== null,
+          hasPendingCode: !!d.pairingCode,
+        }));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(list));
+      } catch (err) {
+        log.error("List devices error", { error: String(err) });
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+      return;
+    }
+
+    // Routes with device ID: /devices/:id/...
+    const deviceMatch = url.pathname.match(/^\/devices\/([^/]+)(\/(.+))?$/);
+    if (deviceMatch && isAdmin) {
+      const deviceId = deviceMatch[1];
+      const action = deviceMatch[3];
+
+      // PUT /devices/:id
+      if (req.method === "PUT" && !action) {
+        try {
+          const body = await readBody(req);
+          const parsed = JSON.parse(body) as { name?: string };
+          if (!parsed.name) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "No fields to update" }));
+            return;
+          }
+          const device = await deviceRegistry.updateDevice(deviceId, { name: parsed.name });
+          if (!device) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Device not found" }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ deviceId: device._id, name: device.name }));
+        } catch (err) {
+          log.error("Update device error", { error: String(err) });
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+        return;
+      }
+
+      // DELETE /devices/:id
+      if (req.method === "DELETE" && !action) {
+        try {
+          const ok = await deviceRegistry.deactivateDevice(deviceId);
+          if (!ok) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Device not found or already inactive" }));
+            return;
+          }
+          // Force-disconnect if this is the active device
+          if (activeDeviceId === deviceId && activeClient) {
+            activeClient.close(1000, "Device deactivated");
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+          log.error("Deactivate device error", { error: String(err) });
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+        return;
+      }
+
+      // POST /devices/:id/refresh-code
+      if (req.method === "POST" && action === "refresh-code") {
+        try {
+          const code = await deviceRegistry.refreshPairingCode(deviceId);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ pairingCode: code }));
+        } catch (err) {
+          log.error("Refresh code error", { error: String(err) });
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+        return;
+      }
+    } else if (deviceMatch && !isAdmin) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
   });
 
-  ws.on("error", (err) => {
-    log.error("WebSocket error", { error: String(err) });
+  // --- WebSocket server with JWT auth on upgrade ---
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on("upgrade", async (req, socket, head) => {
+    const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+    const token = url.searchParams.get("token") ?? req.headers.authorization?.replace("Bearer ", "");
+
+    if (!token) {
+      log.warn("WebSocket auth failed — no token");
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const device = await deviceRegistry.verifyToken(token);
+    if (!device) {
+      log.warn("WebSocket auth failed — invalid token");
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, device);
+    });
   });
-});
 
-// Start server
-server.listen(config.port, () => {
-  log.info("Beekeeper is running", { port: config.port });
-});
+  // --- Single client connection management ---
 
-// Graceful shutdown
-process.on("SIGTERM", () => {
-  log.info("Shutting down");
-  wss.close();
-  server.close();
-  process.exit(0);
-});
+  wss.on("connection", (ws: WebSocket, device: BeekeeperDevice) => {
+    log.info("Client connected", { deviceId: device._id, name: device.name });
 
-process.on("SIGINT", () => {
-  log.info("Shutting down");
-  wss.close();
-  server.close();
-  process.exit(0);
+    // Replace previous client if any
+    if (activeClient && activeClient.readyState === WebSocket.OPEN) {
+      log.info("Replacing existing client connection");
+      guardian.denyAll("Replaced by new connection");
+      activeClient.close(1000, "Replaced by new connection");
+    }
+
+    activeClient = ws;
+    activeDeviceId = device._id;
+    guardian.setClient(ws);
+    sessionManager.setClient(ws);
+
+    // Update lastSeenAt
+    deviceRegistry.updateLastSeen(device._id).catch(() => {});
+
+    // Send current session info or start new session
+    const sessionId = sessionManager.getSessionId();
+    if (sessionId) {
+      const msg: ServerMessage = {
+        type: "session_info",
+        sessionId,
+        workspace: sessionManager.getWorkspace(),
+        workspaces: Object.keys(config.workspaces),
+      };
+      ws.send(JSON.stringify(msg));
+    }
+
+    ws.on("message", async (raw: Buffer | ArrayBuffer | Buffer[]) => {
+      let msg: ClientMessage;
+      try {
+        msg = JSON.parse(raw.toString()) as ClientMessage;
+      } catch {
+        ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
+        return;
+      }
+
+      try {
+        switch (msg.type) {
+          case "ping":
+            deviceRegistry.updateLastSeen(device._id).catch(() => {});
+            ws.send(JSON.stringify({ type: "pong" }));
+            break;
+          case "message":
+            await sessionManager.sendMessage(msg.text);
+            break;
+          case "new_session":
+            await sessionManager.newSession(msg.workspace);
+            break;
+          case "switch_workspace":
+            await sessionManager.newSession(msg.workspace);
+            break;
+          case "approve":
+            guardian.handleApproval(msg.toolUseId, true);
+            break;
+          case "deny":
+            guardian.handleApproval(msg.toolUseId, false);
+            break;
+          default:
+            ws.send(JSON.stringify({ type: "error", message: "Unknown message type" }));
+        }
+      } catch (err) {
+        log.error("Error handling message", { type: msg.type, error: String(err) });
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: err instanceof Error ? err.message : String(err),
+          }),
+        );
+      }
+    });
+
+    ws.on("close", () => {
+      log.info("Client disconnected", { deviceId: device._id });
+      if (activeClient === ws) {
+        activeClient = null;
+        activeDeviceId = null;
+        guardian.setClient(null);
+        sessionManager.setClient(null);
+      }
+    });
+
+    ws.on("error", (err) => {
+      log.error("WebSocket error", { error: String(err) });
+    });
+  });
+
+  // --- Start ---
+  server.listen(config.port, () => {
+    log.info("Beekeeper is running", { port: config.port });
+  });
+
+  // --- Graceful shutdown ---
+  const shutdown = async () => {
+    log.info("Shutting down");
+    wss.close();
+    server.close();
+    await deviceRegistry.close();
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}
+
+/** Read the full request body as a string. */
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
+main().catch((err) => {
+  log.error("Failed to start beekeeper", { error: String(err) });
+  process.exit(1);
 });
