@@ -26,9 +26,7 @@ import type { BeekeeperConfig } from "./types.js";
 function makeConfig(overrides: Partial<BeekeeperConfig> = {}): BeekeeperConfig {
   return {
     port: 3099,
-    defaultWorkspace: "hive",
     model: "claude-sonnet-4-5",
-    workspaces: { hive: "/home/user/hive", other: "/home/user/other" },
     confirmOperations: [],
     jwtSecret: "test-jwt-secret",
     adminSecret: "test-admin-secret",
@@ -72,8 +70,8 @@ describe("SessionManager", () => {
     guardian = new ToolGuardian([]);
   });
 
-  describe("newSession()", () => {
-    it("eagerly spawns a session and sends session_info", async () => {
+  describe("newSession(cwd)", () => {
+    it("eagerly spawns a session and sends session_info with cwd, returns sessionId", async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian);
       manager.setClient(ws as never);
@@ -92,48 +90,22 @@ describe("SessionManager", () => {
         ]),
       );
 
-      await manager.newSession("hive");
+      const sessionId = await manager.newSession("/home/user/hive");
 
-      expect(manager.getSessionId()).toBe("sess-abc");
+      expect(sessionId).toBe("sess-abc");
 
-      // Verify session_info was sent
+      // Verify session_info was sent with cwd (not workspace/workspaces)
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const sessionInfo = sent.find((m: Record<string, unknown>) => m.type === "session_info");
       expect(sessionInfo).toEqual({
         type: "session_info",
         sessionId: "sess-abc",
-        workspace: "hive",
-        workspaces: ["hive", "other"],
+        cwd: "/home/user/hive",
       });
-    });
-
-    it("sends session_ended status before spawning", async () => {
-      const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
-      manager.setClient(ws as never);
-
-      mockQueryIterator.mockReturnValue(
-        makeAsyncIterable([
-          { type: "system", subtype: "init", session_id: "sess-1" },
-          { type: "result", subtype: "success", result: "", session_id: "sess-1", total_cost_usd: 0, duration_ms: 50 },
-        ]),
-      );
-
-      await manager.newSession();
-
-      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
-      const types = sent.map((m: Record<string, unknown>) => (m.type === "status" ? m.state : m.type));
-      expect(types[0]).toBe("session_ended");
-    });
-
-    it("throws for unknown workspace", async () => {
-      const manager = new SessionManager(config, guardian);
-
-      await expect(manager.newSession("nonexistent")).rejects.toThrow("Unknown workspace: nonexistent");
     });
   });
 
-  describe("sendMessage()", () => {
+  describe("sendMessage(sessionId, text)", () => {
     it("streams text chunks to client", async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian);
@@ -146,10 +118,10 @@ describe("SessionManager", () => {
           { type: "result", subtype: "success", result: "", session_id: "sess-1", total_cost_usd: 0, duration_ms: 50 },
         ]),
       );
-      await manager.newSession();
+      const sessionId = await manager.newSession("/tmp/test");
       ws.send.mockClear();
 
-      // Now send a message
+      // Now send a message using sessionId
       mockQueryIterator.mockReturnValueOnce(
         makeAsyncIterable([
           {
@@ -167,7 +139,7 @@ describe("SessionManager", () => {
         ]),
       );
 
-      await manager.sendMessage("Hi");
+      await manager.sendMessage(sessionId, "Hi");
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const textChunk = sent.find((m: Record<string, unknown>) => m.type === "message" && m.text === "Hello");
@@ -183,33 +155,206 @@ describe("SessionManager", () => {
       expect(final).toBeDefined();
     });
 
-    it("sends error for non-success results", async () => {
+    it("sends error for unknown sessionId", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian);
+      manager.setClient(ws as never);
+
+      await manager.sendMessage("nonexistent-session", "Hi");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      const errorMsg = sent.find((m: Record<string, unknown>) => m.type === "error");
+      expect(errorMsg).toEqual({
+        type: "error",
+        message: "Unknown session: nonexistent-session",
+        sessionId: "nonexistent-session",
+      });
+    });
+
+    it("sends error when session is busy", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian);
+      manager.setClient(ws as never);
+
+      // Create a session that will stay busy (never resolves)
+      let resolveQuery: (() => void) | undefined;
+      const hangingIterable = {
+        async *[Symbol.asyncIterator]() {
+          yield { type: "system", subtype: "init", session_id: "sess-busy" };
+          // Hang until resolved
+          await new Promise<void>((resolve) => {
+            resolveQuery = resolve;
+          });
+          yield {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-busy",
+            total_cost_usd: 0,
+            duration_ms: 50,
+          };
+        },
+        interrupt: vi.fn(),
+      };
+      mockQueryIterator.mockReturnValueOnce(hangingIterable);
+
+      // Start newSession but don't await — it will be "busy" since the query hangs
+      const newSessionPromise = manager.newSession("/tmp/test");
+
+      // Wait a tick for the session to register as busy
+      await new Promise((r) => setTimeout(r, 10));
+
+      // The session is still in progress (busy), but it hasn't gotten its real ID yet.
+      // We need to test sendMessage on a session that's already created but busy.
+      // Let's use a different approach: create a session, then send two messages rapidly.
+
+      // Resolve the first query to complete session creation
+      resolveQuery?.();
+      await newSessionPromise;
+
+      // Now make the next query hang
+      let resolveSecond: (() => void) | undefined;
+      const hangingIterable2 = {
+        async *[Symbol.asyncIterator]() {
+          await new Promise<void>((resolve) => {
+            resolveSecond = resolve;
+          });
+          yield {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-busy",
+            total_cost_usd: 0,
+            duration_ms: 50,
+          };
+        },
+        interrupt: vi.fn(),
+      };
+      mockQueryIterator.mockReturnValueOnce(hangingIterable2);
+
+      ws.send.mockClear();
+
+      // Send first message (will hang)
+      const firstMsgPromise = manager.sendMessage("sess-busy", "First");
+
+      // Wait a tick for state to be set to busy
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Try to send second message while first is busy
+      await manager.sendMessage("sess-busy", "Second");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      const errorMsg = sent.find((m: Record<string, unknown>) => m.type === "error");
+      expect(errorMsg).toEqual({
+        type: "error",
+        message: "Session is busy",
+        sessionId: "sess-busy",
+      });
+
+      // Clean up: resolve the hanging query
+      resolveSecond?.();
+      await firstMsgPromise;
+    });
+  });
+
+  describe("clearSession(sessionId)", () => {
+    it("removes session and sends session_cleared", async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian);
       manager.setClient(ws as never);
 
       mockQueryIterator.mockReturnValue(
         makeAsyncIterable([
-          { type: "system", subtype: "init", session_id: "sess-err" },
-          { type: "result", subtype: "error", result: "", session_id: "sess-err", total_cost_usd: 0, duration_ms: 10 },
+          { type: "system", subtype: "init", session_id: "sess-clear" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-clear",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
         ]),
       );
 
-      await manager.sendMessage("fail");
+      const sessionId = await manager.newSession("/tmp/test");
+      ws.send.mockClear();
+
+      const result = await manager.clearSession(sessionId);
+
+      expect(result).toBe(true);
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
-      const errorMsg = sent.find((m: Record<string, unknown>) => m.type === "error");
-      expect(errorMsg).toEqual({
-        type: "error",
-        message: "Session ended: error",
+      const clearedMsg = sent.find((m: Record<string, unknown>) => m.type === "session_cleared");
+      expect(clearedMsg).toEqual({
+        type: "session_cleared",
+        sessionId: "sess-clear",
       });
-    });
 
-    it("sends error and idle status on query failure", async () => {
+      // Session should no longer exist — sending a message should error
+      ws.send.mockClear();
+      await manager.sendMessage(sessionId, "after clear");
+      const errorSent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      const errorMsg = errorSent.find((m: Record<string, unknown>) => m.type === "error");
+      expect(errorMsg?.message).toContain("Unknown session");
+    });
+  });
+
+  describe("listSessions()", () => {
+    it("sends session_list message with active sessions", async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian);
       manager.setClient(ws as never);
 
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-a" },
+          { type: "result", subtype: "success", result: "", session_id: "sess-a", total_cost_usd: 0, duration_ms: 10 },
+        ]),
+      );
+      await manager.newSession("/home/user/hive");
+
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-b" },
+          { type: "result", subtype: "success", result: "", session_id: "sess-b", total_cost_usd: 0, duration_ms: 10 },
+        ]),
+      );
+      await manager.newSession("/home/user/other");
+
+      ws.send.mockClear();
+      manager.listSessions();
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      const listMsg = sent.find((m: Record<string, unknown>) => m.type === "session_list");
+      expect(listMsg).toBeDefined();
+      expect((listMsg as any).sessions).toHaveLength(2);
+      expect((listMsg as any).sessions).toEqual(
+        expect.arrayContaining([
+          { sessionId: "sess-a", cwd: "/home/user/hive", state: "idle" },
+          { sessionId: "sess-b", cwd: "/home/user/other", state: "idle" },
+        ]),
+      );
+    });
+  });
+
+  describe("error handling", () => {
+    it("SDK failure sends error with sessionId", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian);
+      manager.setClient(ws as never);
+
+      // Create a session first
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-err" },
+          { type: "result", subtype: "success", result: "", session_id: "sess-err", total_cost_usd: 0, duration_ms: 10 },
+        ]),
+      );
+      const sessionId = await manager.newSession("/tmp/test");
+      ws.send.mockClear();
+
+      // Make next query throw
       mockQueryIterator.mockReturnValue({
         // eslint-disable-next-line require-yield
         async *[Symbol.asyncIterator]() {
@@ -218,14 +363,16 @@ describe("SessionManager", () => {
         interrupt: vi.fn(),
       });
 
-      await manager.sendMessage("boom");
+      await manager.sendMessage(sessionId, "boom");
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const errorMsg = sent.find((m: Record<string, unknown>) => m.type === "error");
       expect(errorMsg?.message).toContain("SDK connection failed");
+      expect(errorMsg?.sessionId).toBe("sess-err");
 
       const lastStatus = sent.filter((m: Record<string, unknown>) => m.type === "status").pop();
       expect(lastStatus?.state).toBe("idle");
+      expect(lastStatus?.sessionId).toBe("sess-err");
     });
   });
 
@@ -247,8 +394,8 @@ describe("SessionManager", () => {
         ]),
       );
 
-      // Send with no client — messages buffer
-      await manager.sendMessage("hello");
+      // Spawn session with no client — messages buffer
+      await manager.newSession("/tmp/test");
 
       // Now connect a client — buffer drains
       const ws = makeMockWs();
@@ -258,27 +405,7 @@ describe("SessionManager", () => {
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const sessionInfo = sent.find((m: Record<string, unknown>) => m.type === "session_info");
       expect(sessionInfo?.sessionId).toBe("sess-buf");
-    });
-  });
-
-  describe("stopSession()", () => {
-    it("calls interrupt on the active query", async () => {
-      const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
-      manager.setClient(ws as never);
-
-      // Run a normal query to set up an active session
-      const iterable = makeAsyncIterable([
-        { type: "system", subtype: "init", session_id: "sess-stop" },
-        { type: "result", subtype: "success", result: "", session_id: "sess-stop", total_cost_usd: 0, duration_ms: 10 },
-      ]);
-      mockQueryIterator.mockReturnValue(iterable);
-
-      await manager.newSession();
-
-      // After newSession completes, activeQuery is cleared. Verify stopSession
-      // works without error when no active query exists (no-op path).
-      await expect(manager.stopSession()).resolves.toBeUndefined();
+      expect(sessionInfo?.cwd).toBe("/tmp/test");
     });
   });
 });

@@ -64,7 +64,7 @@ describe("ToolGuardian", () => {
 
   describe("createHookCallback()", () => {
     it("approves non-PreToolUse events", async () => {
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = {
         hook_event_name: "PostToolUse" as const,
         tool_name: "Bash",
@@ -81,7 +81,7 @@ describe("ToolGuardian", () => {
     });
 
     it("approves non-Bash tools", async () => {
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeNonBashInput("Read");
 
       const result = await callback(input, undefined, { signal: DUMMY_ABORT_SIGNAL });
@@ -90,7 +90,7 @@ describe("ToolGuardian", () => {
     });
 
     it("approves Bash commands that do not match any confirm pattern", async () => {
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git status");
 
       const result = await callback(input, undefined, { signal: DUMMY_ABORT_SIGNAL });
@@ -99,7 +99,7 @@ describe("ToolGuardian", () => {
     });
 
     it("approves safe git commands that partially look like patterns", async () => {
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git push origin main");
 
       const result = await callback(input, undefined, { signal: DUMMY_ABORT_SIGNAL });
@@ -108,7 +108,7 @@ describe("ToolGuardian", () => {
     });
 
     it("blocks matching commands when no client is connected", async () => {
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git push --force origin main");
 
       const result = await callback(input, undefined, { signal: DUMMY_ABORT_SIGNAL });
@@ -120,7 +120,7 @@ describe("ToolGuardian", () => {
       const closedWs = makeMockWs(3); // CLOSED state
       guardian.setClient(closedWs as never);
 
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("rm -rf /tmp/old");
 
       const result = await callback(input, undefined, { signal: DUMMY_ABORT_SIGNAL });
@@ -132,7 +132,7 @@ describe("ToolGuardian", () => {
       const mockWs = makeMockWs(1);
       guardian.setClient(mockWs as never);
 
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git push --force origin main", "tool-use-xyz");
 
       // Don't await — let it pend
@@ -145,6 +145,7 @@ describe("ToolGuardian", () => {
         toolUseId: "tool-use-xyz",
         tool: "Bash",
         input: "git push --force origin main",
+        sessionId: "test-session",
       });
 
       // Resolve the pending approval to avoid timer leaks
@@ -156,7 +157,7 @@ describe("ToolGuardian", () => {
       const mockWs = makeMockWs(1);
       guardian.setClient(mockWs as never);
 
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git reset --hard HEAD~1", "timeout-id");
 
       const resultPromise = callback(input, undefined, { signal: DUMMY_ABORT_SIGNAL });
@@ -175,7 +176,7 @@ describe("ToolGuardian", () => {
       const mockWs = makeMockWs(1);
       guardian.setClient(mockWs as never);
 
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git push --force origin main", "approve-id");
 
       const resultPromise = callback(input, undefined, { signal: DUMMY_ABORT_SIGNAL });
@@ -190,7 +191,7 @@ describe("ToolGuardian", () => {
       const mockWs = makeMockWs(1);
       guardian.setClient(mockWs as never);
 
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("rm -rf /important", "deny-id");
 
       const resultPromise = callback(input, undefined, { signal: DUMMY_ABORT_SIGNAL });
@@ -212,7 +213,7 @@ describe("ToolGuardian", () => {
       const mockWs = makeMockWs(1);
       guardian.setClient(mockWs as never);
 
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
 
       const input1 = makeBashInput("git push --force", "id-1");
       const input2 = makeBashInput("rm -rf /tmp", "id-2");
@@ -235,7 +236,7 @@ describe("ToolGuardian", () => {
       const mockWs = makeMockWs(1);
       guardian.setClient(mockWs as never);
 
-      const callback = guardian.createHookCallback();
+      const callback = guardian.createHookCallback("test-session");
 
       const input1 = makeBashInput("git push --force", "bulk-id-1");
       const input2 = makeBashInput("git branch -D old-branch", "bulk-id-2");
