@@ -228,16 +228,16 @@ describe("Dispatcher routing", () => {
     expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item);
   });
 
-  it("routes by keyword", async () => {
+  it("drops messages with no explicit routing match", async () => {
     const item = makeWorkItem({ text: "need help with marketing" });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item);
+    expect(agentManager.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("falls back to default agent", async () => {
+  it("drops unaddressed messages instead of falling back to default", async () => {
     const item = makeWorkItem({ text: "random question" });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("mokie", item);
+    expect(agentManager.sendMessage).not.toHaveBeenCalled();
   });
 
   it("drops messages in passive channels without mention", async () => {
@@ -250,7 +250,10 @@ describe("Dispatcher routing", () => {
   });
 
   it("deduplicates messages with same ID", async () => {
-    const item = makeWorkItem({ id: "dedup-same-id" });
+    const item = makeWorkItem({
+      id: "dedup-same-id",
+      text: "hey Jasper, help",
+    });
     await dispatcher.dispatch(item);
     await dispatcher.dispatch(item); // duplicate
     expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
@@ -289,7 +292,7 @@ describe("Dispatcher routing", () => {
       costUsd: 0.01,
       durationMs: 500,
     });
-    const item = makeWorkItem({ text: "random question" });
+    const item = makeWorkItem({ text: "hey Jasper, check this" });
     await dispatcher.dispatch(item);
     // sendMessage is called, but deliver should NOT be called (non-response suppressed)
     expect(agentManager.sendMessage).toHaveBeenCalled();
@@ -508,9 +511,8 @@ describe("Multi-agent threads", () => {
         text: "hello?",
       });
       await dispatcher.dispatch(item2);
-      // Falls through to default routing (mokie), not multi-agent
-      expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-      expect(agentManager.sendMessage).toHaveBeenCalledWith("mokie", item2);
+      // Falls through — no match, message dropped (no default fallback)
+      expect(agentManager.sendMessage).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
