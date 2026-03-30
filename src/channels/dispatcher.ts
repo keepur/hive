@@ -398,16 +398,14 @@ export class Dispatcher {
     const adapterDefault = item.meta?.defaultAgentId as string | undefined;
     if (adapterDefault && this.registry.get(adapterDefault)) return [{ agentId: adapterDefault, skipTriage: false }];
 
-    // 5. Keyword match
-    const keyword = this.registry.findByKeyword(item.text);
-    if (keyword) return [{ agentId: keyword.id, skipTriage: false }];
+    // 5. Keyword match — disabled (too many false positives in shared channels)
+    // const keyword = this.registry.findByKeyword(item.text);
+    // if (keyword) return [{ agentId: keyword.id, skipTriage: false }];
 
-    // 6. Global default — but not in passive channels (require explicit mention)
-    if (this.registry.isPassiveChannel(item.source.label)) {
-      log.debug("Passive channel, no agent mentioned — dropping", { channel: item.source.label });
-      return [];
-    }
-    return [{ agentId: this.defaultAgentId, skipTriage: false }];
+    // 6. No match — drop unless it's a dedicated channel or DM
+    //    Agents must be explicitly addressed (name mention, dedicated channel, thread continuity, or DM)
+    log.debug("No agent matched — dropping", { channel: item.source.label });
+    return [];
   }
 
   /** Dispatch a single work item to a single agent (used for fan-out) */
