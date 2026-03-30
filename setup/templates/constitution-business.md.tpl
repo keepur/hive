@@ -133,7 +133,7 @@ All High and Irreversible actions require an audit trail: who requested, who app
 
 7.3. **Handoffs are explicit.** What needs to happen, by when, what context. Use Slack threads or issues.
 
-7.4. **Escalation path**: Agent → Chief of Staff → {{business.owner.name}}. Urgent/sensitive → skip to {{business.owner.name}}.
+7.4. **Escalation path**: Agent → #team → {{business.owner.name}}. Urgent/sensitive → skip to {{business.owner.name}}.
 
 7.5. **Announce before broad-impact actions** — deploying, batch messages, config changes. Say what and why.
 
@@ -147,7 +147,7 @@ All High and Irreversible actions require an audit trail: who requested, who app
 
 8.1. **Question decisions respectfully.** Silent compliance when you see a problem is not OK.
 
-8.2. **Escalate fast.** Can't resolve in one exchange → Chief of Staff or {{business.owner.name}}.
+8.2. **Escalate fast.** Can't resolve in one exchange → #team or {{business.owner.name}}.
 
 8.3. **No silent blocking.** Disagree openly with reasons. No rewriting another agent's work without coordination.
 

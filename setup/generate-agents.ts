@@ -319,6 +319,23 @@ async function main() {
     }
   }
 
+  // Prune stale agent directories (agents/ dirs with no matching template)
+  const generatedIds = new Set(allAgents.map((a) => a.id));
+  const existingAgentDirs = readdirSync(AGENTS_DIR).filter((d) =>
+    statSync(join(AGENTS_DIR, d)).isDirectory(),
+  );
+  let pruned = 0;
+  for (const dir of existingAgentDirs) {
+    if (!generatedIds.has(dir)) {
+      rmSync(join(AGENTS_DIR, dir), { recursive: true, force: true });
+      console.log(`  PRUNE ${dir} (no matching template)`);
+      pruned++;
+    }
+  }
+  if (pruned > 0) {
+    console.log(`\n  ${pruned} stale agent dir(s) pruned`);
+  }
+
   // Also add SMS channels to executive-assistant agent.yaml if SMS is configured
   const eaYamlPath = join(AGENTS_DIR, "executive-assistant", "agent.yaml");
   if (existsSync(eaYamlPath) && ctx.sms.lines.length > 0) {
