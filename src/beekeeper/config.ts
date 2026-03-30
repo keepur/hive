@@ -52,7 +52,6 @@ function discoverUserSkills(): string[] {
   return paths;
 }
 
-
 export function loadConfig(): BeekeeperConfig {
   const configPath = resolve(process.env.BEEKEEPER_CONFIG ?? "./beekeeper.yaml");
   if (!existsSync(configPath)) {

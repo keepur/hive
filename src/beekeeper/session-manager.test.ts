@@ -348,7 +348,14 @@ describe("SessionManager", () => {
       mockQueryIterator.mockReturnValueOnce(
         makeAsyncIterable([
           { type: "system", subtype: "init", session_id: "sess-err" },
-          { type: "result", subtype: "success", result: "", session_id: "sess-err", total_cost_usd: 0, duration_ms: 10 },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-err",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
         ]),
       );
       const sessionId = await manager.newSession("/tmp/test");
