@@ -492,6 +492,19 @@ export class AgentRunner {
       },
     };
 
+    // Schedule MCP server — self-service schedule management for each agent
+    servers["schedule"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/schedule/schedule-mcp-server.js")],
+      env: {
+        AGENT_ID: this.agentConfig.id,
+        AGENT_SCHEDULE_DEFAULTS: JSON.stringify(this.agentConfig.schedule ?? []),
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+      },
+    };
+
     // Admin MCP server — model management, system controls
     servers["admin"] = {
       type: "stdio",
