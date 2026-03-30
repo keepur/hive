@@ -164,10 +164,11 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     const servers = getCapturedServers();
 
     // structured-memory only included when memory.structured is enabled
-    expect(Object.keys(servers)).toEqual(["memory", "keychain"]);
+    // schedule is always included as implicit core server
+    expect(Object.keys(servers)).toEqual(["memory", "keychain", "schedule"]);
   });
 
-  it("empty coreServers means zero servers, not all servers", async () => {
+  it("empty coreServers means only implicit servers", async () => {
     runner = new AgentRunner(
       makeAgentConfig({ coreServers: [] }),
       memoryManager as any,
@@ -175,7 +176,8 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    expect(Object.keys(servers)).toEqual([]);
+    // schedule is always included as implicit core server
+    expect(Object.keys(servers)).toEqual(["schedule"]);
   });
 
   it("removes resend and quo when external comms disabled", async () => {

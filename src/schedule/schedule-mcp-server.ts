@@ -137,7 +137,7 @@ server.registerTool(
   {
     title: "Add Schedule",
     description:
-      "Add a new scheduled task. Must provide a cron expression and task name. Minimum interval: 15 minutes. Maximum: 10 schedules.",
+      "Add a new scheduled task. Must provide a cron expression and task name. Minimum interval: 15 minutes. Maximum: 10 schedules. Note: range patterns like 0-14 bypass the interval guard — use step syntax (*/15) for intervals.",
     inputSchema: {
       cron: z.string().describe("Cron expression (e.g. '0 9 * * 1-5' for weekdays at 9am)"),
       task: z.string().describe("Task name (e.g. 'check-inbox', 'weekly-report')"),
@@ -253,7 +253,8 @@ server.registerTool(
   "my_schedule_update",
   {
     title: "Update Schedule",
-    description: "Update the cron expression for an existing scheduled task.",
+    description:
+      "Update the cron expression for an existing scheduled task. Minimum interval: 15 minutes. Note: range patterns like 0-14 bypass the interval guard — use step syntax (*/15) for intervals.",
     inputSchema: {
       task: z.string().describe("The task name to update"),
       cron: z.string().describe("New cron expression"),

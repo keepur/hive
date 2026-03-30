@@ -533,6 +533,8 @@ export class AgentRunner {
     if (coreSet.has("memory")) {
       coreSet.add("structured-memory");
     }
+    // schedule is an implicit core server — available to all agents unconditionally
+    coreSet.add("schedule");
     for (const key of Object.keys(servers)) {
       if (!coreSet.has(key)) {
         delete servers[key];
