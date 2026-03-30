@@ -78,10 +78,7 @@ describe("BeekeeperDeviceRegistry", () => {
       expect(mockClient.connect).toHaveBeenCalledOnce();
       expect(mockClient.db).toHaveBeenCalledWith("test_db");
       expect(mockDb.collection).toHaveBeenCalledWith("beekeeper_devices");
-      expect(mockCollection.createIndex).toHaveBeenCalledWith(
-        { pairingCode: 1 },
-        { sparse: true },
-      );
+      expect(mockCollection.createIndex).toHaveBeenCalledWith({ pairingCode: 1 }, { sparse: true });
     });
   });
 
@@ -117,11 +114,7 @@ describe("BeekeeperDeviceRegistry", () => {
       expect(result!.device.pairedAt).toBeInstanceOf(Date);
       expect(result!.device.pairingCode).toBeUndefined();
       expect(result!.device.pairingCodeExpiresAt).toBeUndefined();
-      expect(jwt.sign).toHaveBeenCalledWith(
-        { deviceId: existing._id },
-        "secret",
-        { expiresIn: "90d" },
-      );
+      expect(jwt.sign).toHaveBeenCalledWith({ deviceId: existing._id }, "secret", { expiresIn: "90d" });
     });
 
     it("applies optional name override", async () => {
@@ -206,10 +199,7 @@ describe("BeekeeperDeviceRegistry", () => {
       const result = await registry.deactivateDevice("device-123");
 
       expect(result).toBe(true);
-      expect(mockCollection.updateOne).toHaveBeenCalledWith(
-        { _id: "device-123" },
-        { $set: { active: false } },
-      );
+      expect(mockCollection.updateOne).toHaveBeenCalledWith({ _id: "device-123" }, { $set: { active: false } });
     });
 
     it("returns false when device not found", async () => {
