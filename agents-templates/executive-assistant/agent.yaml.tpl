@@ -1,28 +1,19 @@
 id: executive-assistant
 name: "{{agent.name}}"
-icon: ":spiral_calendar_pad:"
+icon: ":incoming_envelope:"
 model: claude-haiku-4-5
 channels:
+  - general
   - agent-{{agent.name_lower}}
 keywords: []
-isDefault: false
-budgetUsd: 50
-maxTurns: 25
+isDefault: true
+budgetUsd: 10
+maxTurns: 10
 schedule:
-  - cron: "*/30 * * * *"
-    task: check-slack-dms
   - cron: "0 6 * * 0"
     task: memory-review
 servers:
   core:
     - memory
-    - contacts
     - slack
-    - keychain
     - conversation-search
-    - callback
-  delegate:
-    - clickup
-    - quo
-    - brave-search
-    - google

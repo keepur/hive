@@ -2,15 +2,16 @@ id: chief-of-staff
 name: "{{agent.name}}"
 icon: ":briefcase:"
 model: claude-opus-4-6
+disabled: true
 channels:
-  - general
+  - agent-{{agent.name_lower}}
 keywords:
   - status
   - update
   - task
   - schedule
   - follow up
-isDefault: true
+isDefault: false
 schedule:
   - cron: "0 8 * * 1-5"
     task: morning-briefing
@@ -24,7 +25,6 @@ servers:
     - memory
     - conversation-search
     - slack
-    - admin
     - callback
     - browser
     - keychain

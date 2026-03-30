@@ -97,6 +97,18 @@ describe("applyConfigOverrides", () => {
     expect(result.isDefault).toBe(true);
   });
 
+  it("overrides disabled flag", () => {
+    const config = makeConfig({ disabled: false });
+    const override: ConfigOverride = {
+      agentId: "test-agent",
+      disabled: true,
+      updatedAt: new Date(),
+      updatedBy: "test",
+    };
+    const result = applyConfigOverrides(config, override, makeConfig());
+    expect(result.disabled).toBe(true);
+  });
+
   it("uses template as base for add/remove (not current config)", () => {
     // Template has ["a", "b"], current config was already modified to ["a", "b", "extra"]
     // Override should use template as base, not current
