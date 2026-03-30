@@ -8,6 +8,9 @@ import { loadConfig } from "./config.js";
 import { ToolGuardian } from "./tool-guardian.js";
 import { SessionManager } from "./session-manager.js";
 import { BeekeeperDeviceRegistry, type BeekeeperDevice } from "./device-registry.js";
+import { validatePath } from "./path-utils.js";
+import { readdirSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import type { ClientMessage, ServerMessage } from "./types.js";
 
 const log = createLogger("beekeeper");
@@ -441,15 +444,31 @@ async function main(): Promise<void> {
           case "message":
             await sessionManager.sendMessage(msg.sessionId, msg.text);
             break;
-          case "new_session":
-            await sessionManager.newSession(msg.path);
+          case "new_session": {
+            const validatedPath = validatePath(msg.path);
+            await sessionManager.newSession(validatedPath);
             break;
+          }
           case "clear_session":
             await sessionManager.clearSession(msg.sessionId);
             break;
           case "list_sessions":
             sessionManager.listSessions();
             break;
+          case "browse": {
+            const home = realpathSync(homedir());
+            const browseTarget = msg.path ? validatePath(msg.path) : home;
+            const raw = readdirSync(browseTarget, { withFileTypes: true });
+            const entries = raw
+              .filter((e) => !e.name.startsWith("."))
+              .map((e) => ({ name: e.name, isDirectory: e.isDirectory() }))
+              .sort((a, b) => {
+                if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+                return a.name.localeCompare(b.name);
+              });
+            ws.send(JSON.stringify({ type: "browse_result", path: browseTarget, entries }));
+            break;
+          }
           case "approve":
             guardian.handleApproval(msg.toolUseId, true);
             break;
