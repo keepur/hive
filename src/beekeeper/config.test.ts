@@ -25,7 +25,9 @@ describe("loadConfig", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     process.env = { ...originalEnv };
-    process.env.BEEKEEPER_AUTH_TOKEN = "test-token-abc";
+    process.env.BEEKEEPER_JWT_SECRET = "test-jwt-secret";
+    process.env.BEEKEEPER_ADMIN_SECRET = "test-admin-secret";
+    process.env.MONGO_URI = "mongodb://localhost:27017";
     process.env.BEEKEEPER_CONFIG = "/tmp/beekeeper.yaml";
     process.env.HOME = "/Users/testuser";
     mockReaddirSync.mockReturnValue([] as any);
@@ -54,7 +56,10 @@ describe("loadConfig", () => {
       model: "claude-sonnet-4-5",
       workspaces: { home: "/home/user/projects" },
       confirmOperations: ["rm -rf", "git push --force"],
-      authToken: "test-token-abc",
+      jwtSecret: "test-jwt-secret",
+      adminSecret: "test-admin-secret",
+      mongoUri: "mongodb://localhost:27017",
+      mongoDbName: "hive",
     });
     expect(config).toHaveProperty("plugins");
   });
@@ -65,13 +70,31 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow("Beekeeper config not found");
   });
 
-  it("throws if BEEKEEPER_AUTH_TOKEN env var is missing", () => {
-    delete process.env.BEEKEEPER_AUTH_TOKEN;
+  it("throws if BEEKEEPER_JWT_SECRET env var is missing", () => {
+    delete process.env.BEEKEEPER_JWT_SECRET;
     mockExistsSync.mockReturnValue(true);
     mockReadFileSync.mockReturnValue("yaml content");
     mockParseYaml.mockReturnValue({ port: 3099 });
 
-    expect(() => loadConfig()).toThrow("Missing required env var: BEEKEEPER_AUTH_TOKEN");
+    expect(() => loadConfig()).toThrow("Missing required env var: BEEKEEPER_JWT_SECRET");
+  });
+
+  it("throws if BEEKEEPER_ADMIN_SECRET env var is missing", () => {
+    delete process.env.BEEKEEPER_ADMIN_SECRET;
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue("yaml content");
+    mockParseYaml.mockReturnValue({ port: 3099 });
+
+    expect(() => loadConfig()).toThrow("Missing required env var: BEEKEEPER_ADMIN_SECRET");
+  });
+
+  it("throws if MONGO_URI env var is missing", () => {
+    delete process.env.MONGO_URI;
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue("yaml content");
+    mockParseYaml.mockReturnValue({ port: 3099 });
+
+    expect(() => loadConfig()).toThrow("Missing required env var: MONGO_URI");
   });
 
   it("expands ~ in workspace paths", () => {
