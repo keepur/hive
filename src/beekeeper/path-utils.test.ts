@@ -26,9 +26,7 @@ describe("validatePath", () => {
     const resolvedPath = "/Users/testuser/projects/myapp";
     // First call: realpathSync(homedir()) → home
     // Second call: realpathSync(absolute) → resolved path
-    mockRealpathSync
-      .mockReturnValueOnce("/Users/testuser")
-      .mockReturnValueOnce(resolvedPath);
+    mockRealpathSync.mockReturnValueOnce("/Users/testuser").mockReturnValueOnce(resolvedPath);
 
     const result = validatePath("/Users/testuser/projects/myapp");
 
@@ -37,9 +35,7 @@ describe("validatePath", () => {
 
   it("expands ~ to home directory and resolves correctly", () => {
     const resolvedPath = "/Users/testuser/documents/notes";
-    mockRealpathSync
-      .mockReturnValueOnce("/Users/testuser")
-      .mockReturnValueOnce(resolvedPath);
+    mockRealpathSync.mockReturnValueOnce("/Users/testuser").mockReturnValueOnce(resolvedPath);
 
     const result = validatePath("~/documents/notes");
 
@@ -47,35 +43,27 @@ describe("validatePath", () => {
   });
 
   it("throws 'outside home directory' for path outside home", () => {
-    mockRealpathSync
-      .mockReturnValueOnce("/Users/testuser")
-      .mockReturnValueOnce("/tmp/some-other-dir");
+    mockRealpathSync.mockReturnValueOnce("/Users/testuser").mockReturnValueOnce("/tmp/some-other-dir");
 
-    expect(() => validatePath("/tmp/some-other-dir")).toThrow(
-      "Path is outside home directory: /tmp/some-other-dir"
-    );
+    expect(() => validatePath("/tmp/some-other-dir")).toThrow("Path is outside home directory: /tmp/some-other-dir");
   });
 
   it("throws 'does not exist' when realpathSync throws for the input path", () => {
-    mockRealpathSync
-      .mockReturnValueOnce("/Users/testuser")
-      .mockImplementationOnce(() => {
-        throw new Error("ENOENT: no such file or directory");
-      });
+    mockRealpathSync.mockReturnValueOnce("/Users/testuser").mockImplementationOnce(() => {
+      throw new Error("ENOENT: no such file or directory");
+    });
 
     expect(() => validatePath("/Users/testuser/nonexistent")).toThrow(
-      "Path does not exist: /Users/testuser/nonexistent"
+      "Path does not exist: /Users/testuser/nonexistent",
     );
   });
 
   it("throws 'not a directory' when path points to a file", () => {
-    mockRealpathSync
-      .mockReturnValueOnce("/Users/testuser")
-      .mockReturnValueOnce("/Users/testuser/somefile.txt");
+    mockRealpathSync.mockReturnValueOnce("/Users/testuser").mockReturnValueOnce("/Users/testuser/somefile.txt");
     mockStatSync.mockReturnValue({ isDirectory: () => false } as ReturnType<typeof statSync>);
 
     expect(() => validatePath("/Users/testuser/somefile.txt")).toThrow(
-      "Path is not a directory: /Users/testuser/somefile.txt"
+      "Path is not a directory: /Users/testuser/somefile.txt",
     );
   });
 });
