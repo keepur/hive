@@ -64,8 +64,7 @@ async function main(): Promise<void> {
       res.end(
         JSON.stringify({
           status: "ok",
-          sessionId: sessionManager.getSessionId(),
-          workspace: sessionManager.getWorkspace(),
+          sessions: sessionManager.getActiveSessions().length,
           connected: activeClient !== null,
         }),
       );
@@ -415,15 +414,10 @@ async function main(): Promise<void> {
       .updateLastSeen(device._id)
       .catch((err) => log.warn("Failed to update lastSeenAt", { error: String(err) }));
 
-    // Send current session info or start new session
-    const sessionId = sessionManager.getSessionId();
-    if (sessionId) {
-      const msg: ServerMessage = {
-        type: "session_info",
-        sessionId,
-        workspace: sessionManager.getWorkspace(),
-        workspaces: Object.keys(config.workspaces),
-      };
+    // Send session list on reconnect
+    const activeSessions = sessionManager.getActiveSessions();
+    if (activeSessions.length > 0) {
+      const msg: ServerMessage = { type: "session_list", sessions: activeSessions };
       ws.send(JSON.stringify(msg));
     }
 
@@ -445,13 +439,16 @@ async function main(): Promise<void> {
             ws.send(JSON.stringify({ type: "pong" }));
             break;
           case "message":
-            await sessionManager.sendMessage(msg.text);
+            await sessionManager.sendMessage(msg.sessionId, msg.text);
             break;
           case "new_session":
-            await sessionManager.newSession(msg.workspace);
+            await sessionManager.newSession(msg.cwd);
             break;
-          case "switch_workspace":
-            await sessionManager.newSession(msg.workspace);
+          case "clear_session":
+            await sessionManager.clearSession(msg.sessionId);
+            break;
+          case "list_sessions":
+            sessionManager.listSessions();
             break;
           case "approve":
             guardian.handleApproval(msg.toolUseId, true);
@@ -480,6 +477,7 @@ async function main(): Promise<void> {
         activeDeviceId = null;
         guardian.setClient(null);
         sessionManager.setClient(null);
+        // Sessions stay in memory — client can reconnect and resume
       }
     });
 
@@ -496,6 +494,7 @@ async function main(): Promise<void> {
   // --- Graceful shutdown ---
   const shutdown = async () => {
     log.info("Shutting down");
+    await sessionManager.stopAll();
     wss.close();
     server.close();
     await deviceRegistry.close();
