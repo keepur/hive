@@ -81,8 +81,8 @@ function makeMockRegistry() {
     findByChannel: (ch: string) => Array.from(agents.values()).find((a) => !a.disabled && a.channels.includes(ch)),
     findByKeyword: (text: string) => {
       const lower = text.toLowerCase();
-      return Array.from(agents.values()).find((a) =>
-        !a.disabled && a.keywords.some((kw: string) => new RegExp(`\\b${kw}\\b`).test(lower)),
+      return Array.from(agents.values()).find(
+        (a) => !a.disabled && a.keywords.some((kw: string) => new RegExp(`\\b${kw}\\b`).test(lower)),
       );
     },
     findByName: (text: string) => {
@@ -101,7 +101,8 @@ function makeMockRegistry() {
         return pattern.test(text);
       });
     },
-    isPassiveChannel: (ch: string) => Array.from(agents.values()).some((a) => !a.disabled && a.passiveChannels.includes(ch)),
+    isPassiveChannel: (ch: string) =>
+      Array.from(agents.values()).some((a) => !a.disabled && a.passiveChannels.includes(ch)),
     getDefault: () => agents.get("executive-assistant"),
   };
 }
