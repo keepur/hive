@@ -32,7 +32,7 @@ function makeWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
   return {
     id: `msg-${workItemCounter}-${Date.now()}`,
     text: "hello",
-    source: { kind: "slack", id: "C123", label: "general" },
+    source: { kind: "slack", id: "C999", label: "random" },
     sender: "user1",
     timestamp: new Date(),
     ...overrides,
@@ -41,13 +41,22 @@ function makeWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
 
 function makeMockRegistry() {
   const agents = new Map<string, any>();
-  agents.set("mokie", {
-    id: "mokie",
-    name: "Mokie",
-    channels: ["agent-mokie"],
+  agents.set("executive-assistant", {
+    id: "executive-assistant",
+    name: "Rae",
+    channels: ["general", "agent-rae"],
     passiveChannels: ["biz"],
     keywords: [],
     isDefault: true,
+  });
+  agents.set("chief-of-staff", {
+    id: "chief-of-staff",
+    name: "Mokie",
+    channels: ["agent-mokie"],
+    passiveChannels: [],
+    keywords: [],
+    isDefault: false,
+    disabled: true,
   });
   agents.set("jasper", {
     id: "jasper",
@@ -69,15 +78,16 @@ function makeMockRegistry() {
   return {
     get: (id: string) => agents.get(id),
     getAll: () => Array.from(agents.values()),
-    findByChannel: (ch: string) => Array.from(agents.values()).find((a) => a.channels.includes(ch)),
+    findByChannel: (ch: string) => Array.from(agents.values()).find((a) => !a.disabled && a.channels.includes(ch)),
     findByKeyword: (text: string) => {
       const lower = text.toLowerCase();
-      return Array.from(agents.values()).find((a) =>
-        a.keywords.some((kw: string) => new RegExp(`\\b${kw}\\b`).test(lower)),
+      return Array.from(agents.values()).find(
+        (a) => !a.disabled && a.keywords.some((kw: string) => new RegExp(`\\b${kw}\\b`).test(lower)),
       );
     },
     findByName: (text: string) => {
       return Array.from(agents.values()).find((a) => {
+        if (a.disabled) return false;
         const name = a.name.toLowerCase();
         const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
         return pattern.test(text);
@@ -85,13 +95,15 @@ function makeMockRegistry() {
     },
     findAllByName: (text: string) => {
       return Array.from(agents.values()).filter((a) => {
+        if (a.disabled) return false;
         const name = a.name.toLowerCase();
         const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
         return pattern.test(text);
       });
     },
-    isPassiveChannel: (ch: string) => Array.from(agents.values()).some((a) => a.passiveChannels.includes(ch)),
-    getDefault: () => agents.get("mokie"),
+    isPassiveChannel: (ch: string) =>
+      Array.from(agents.values()).some((a) => !a.disabled && a.passiveChannels.includes(ch)),
+    getDefault: () => agents.get("executive-assistant"),
   };
 }
 
@@ -202,8 +214,17 @@ describe("Dispatcher routing", () => {
     const healthReporter = makeMockHealthReporter();
     adapter = makeMockAdapter();
 
-    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "mokie");
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
     dispatcher.registerAdapter(adapter as any);
+  });
+
+  it("routes to Rae via general channel", async () => {
+    const item = makeWorkItem({
+      source: { kind: "slack", id: "C123", label: "general" },
+      text: "need help with something",
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
   });
 
   it("routes to explicit targetAgentId", async () => {
@@ -339,7 +360,7 @@ describe("Multi-agent threads", () => {
     const healthReporter = makeMockHealthReporter();
     adapter = makeMockAdapter();
 
-    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "mokie");
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
     dispatcher.registerAdapter(adapter as any);
   });
 
@@ -438,12 +459,12 @@ describe("Multi-agent threads", () => {
     await dispatcher.dispatch(item1);
     expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
 
-    // Now mention Mokie — should add to participant set
+    // Now mention Rae — should add to participant set
     agentManager.sendMessage.mockClear();
     const item2 = makeWorkItem({
       id: "add-2",
       threadId: "thread-add",
-      text: "Mokie, join us",
+      text: "Rae, join us",
     });
     await dispatcher.dispatch(item2);
 
@@ -451,7 +472,7 @@ describe("Multi-agent threads", () => {
     const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
-    expect(calledAgents).toContain("mokie");
+    expect(calledAgents).toContain("executive-assistant");
   });
 
   it("recovers multi-agent thread from persisted sessions after restart", async () => {
