@@ -321,9 +321,7 @@ async function main() {
 
   // Prune stale agent directories (agents/ dirs with no matching template)
   const generatedIds = new Set(allAgents.map((a) => a.id));
-  const existingAgentDirs = readdirSync(AGENTS_DIR).filter((d) =>
-    statSync(join(AGENTS_DIR, d)).isDirectory(),
-  );
+  const existingAgentDirs = readdirSync(AGENTS_DIR).filter((d) => statSync(join(AGENTS_DIR, d)).isDirectory());
   let pruned = 0;
   for (const dir of existingAgentDirs) {
     if (!generatedIds.has(dir)) {
