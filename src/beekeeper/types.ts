@@ -4,8 +4,8 @@ export type ClientMessage =
   | { type: "new_session"; cwd: string }
   | { type: "clear_session"; sessionId: string }
   | { type: "list_sessions" }
-  | { type: "approve"; toolUseId: string; sessionId: string }
-  | { type: "deny"; toolUseId: string; sessionId: string }
+  | { type: "approve"; toolUseId: string }
+  | { type: "deny"; toolUseId: string }
   | { type: "ping" };
 
 // Server → Client messages

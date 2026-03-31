@@ -11,6 +11,7 @@ export interface SessionSlot {
   cwd: string;
   activeQuery: Query | null;
   state: "idle" | "busy";
+  cleared?: boolean;
 }
 
 export class SessionManager {
@@ -49,15 +50,21 @@ export class SessionManager {
    */
   async newSession(cwd: string): Promise<string> {
     log.info("Creating new session", { cwd });
+    const pendingId = `pending-${Date.now()}`;
     const slot: SessionSlot = {
-      sessionId: `pending-${Date.now()}`,
+      sessionId: pendingId,
       cwd,
       activeQuery: null,
       state: "idle",
     };
 
+    // Register immediately so the session is visible during the inaugural query
+    this.sessions.set(pendingId, slot);
+
     const realId = await this.runQuery(slot, "You are now connected. Briefly acknowledge readiness.");
 
+    // Replace pending key with real session ID
+    this.sessions.delete(pendingId);
     slot.sessionId = realId;
     this.sessions.set(realId, slot);
     log.info("Session created", { sessionId: realId, cwd });
@@ -87,6 +94,7 @@ export class SessionManager {
     const slot = this.sessions.get(sessionId);
     if (!slot) return false;
 
+    slot.cleared = true;
     if (slot.activeQuery) {
       await slot.activeQuery.interrupt();
     }
@@ -242,7 +250,10 @@ export class SessionManager {
     } finally {
       slot.activeQuery = null;
       slot.state = "idle";
-      this.send({ type: "status", state: "idle", sessionId: slot.sessionId });
+      // Suppress status messages for cleared sessions — session_cleared is the terminal event
+      if (!slot.cleared) {
+        this.send({ type: "status", state: "idle", sessionId: slot.sessionId });
+      }
     }
   }
 
