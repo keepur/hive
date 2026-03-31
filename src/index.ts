@@ -1,5 +1,6 @@
 import { existsSync, watch } from "node:fs";
 import { resolve } from "node:path";
+import { MongoClient } from "mongodb";
 import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
@@ -25,6 +26,7 @@ import { setGeminiApiKey } from "./files/file-processor.js";
 import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
+import { AdminApi } from "./admin/admin-api.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
@@ -36,9 +38,59 @@ async function main(): Promise<void> {
     log.info("Gemini vision enabled", { model: config.gemini.visionModel });
   }
 
-  // Load agent definitions
-  const registry = new AgentRegistry(config.agents.definitionsPath);
-  await registry.connectDb(config.mongo.uri, config.mongo.dbName);
+  // Shared MongoDB client
+  const mongoClient = new MongoClient(config.mongo.uri);
+  await mongoClient.connect();
+  const db = mongoClient.db(config.mongo.dbName);
+
+  // Agent definitions collection
+  const agentDefsCollection = db.collection("agent_definitions");
+  await agentDefsCollection.createIndex({ channels: 1 });
+  await agentDefsCollection.createIndex({ disabled: 1 });
+
+  // Forward-declare variables used in reload closure (assigned after reload() definition)
+  // eslint-disable-next-line prefer-const
+  let registry: AgentRegistry;
+  // eslint-disable-next-line prefer-const
+  let agentManager: AgentManager;
+  // eslint-disable-next-line prefer-const
+  let scheduler: Scheduler;
+  let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const reload = async () => {
+    // Guard: reload may fire via change stream before agentManager/scheduler are assigned
+    if (!agentManager || !scheduler) return;
+
+    log.info("Hot-reloading agent registry...");
+    const result = await registry.load();
+
+    if (result.added.length) log.info("New agents online", { agents: result.added });
+    if (result.updated.length) log.info("Agents updated", { agents: result.updated });
+    if (result.removed.length) {
+      log.info("Agents removed", { agents: result.removed });
+      for (const id of result.removed) {
+        agentManager.stopAgent(id);
+      }
+    }
+
+    // Stop disabled agents (abort active runners)
+    const disabled = registry.getDisabled();
+    for (const agent of disabled) {
+      agentManager.stopAgent(agent.id);
+    }
+    if (disabled.length) {
+      log.info("Disabled agents stopped", { agents: disabled.map((a) => a.id) });
+    }
+
+    // Reload schedule overrides
+    await scheduler.reloadSchedules();
+    agentManager.reloadSkills();
+  };
+
+  registry = new AgentRegistry(agentDefsCollection as any, () => {
+    if (reloadTimer) clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => reload(), 500);
+  });
   await registry.load();
   log.info("Agent registry loaded", { agents: registry.listIds() });
 
@@ -90,13 +142,13 @@ async function main(): Promise<void> {
     });
   }
 
-  const agentManager = new AgentManager(registry, memoryManager, sessionStore);
+  agentManager = new AgentManager(registry, memoryManager, sessionStore);
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
     registry,
     agentManager,
     healthReporter,
-    config.agents.defaultAgent,
+    config.defaultAgent,
     taskLedger.isConfigured ? taskLedger : undefined,
   );
 
@@ -145,43 +197,6 @@ async function main(): Promise<void> {
     }
   }
 
-  // --- Hot reload ---
-  let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const reload = async () => {
-    log.info("Hot-reloading agent registry...");
-    const result = await registry.load();
-
-    if (result.added.length) log.info("New agents online", { agents: result.added });
-    if (result.updated.length) log.info("Agents updated", { agents: result.updated });
-    if (result.removed.length) {
-      log.info("Agents removed", { agents: result.removed });
-      for (const id of result.removed) {
-        agentManager.stopAgent(id);
-      }
-    }
-
-    // Stop disabled agents (abort active runners)
-    const disabled = registry.getDisabled();
-    for (const agent of disabled) {
-      agentManager.stopAgent(agent.id);
-    }
-    if (disabled.length) {
-      log.info("Disabled agents stopped", { agents: disabled.map((a) => a.id) });
-    }
-
-    // Reload schedule overrides
-    await scheduler.reloadSchedules();
-    agentManager.reloadSkills();
-  };
-
-  // Watch agents/ directory for changes — debounced to 500ms
-  const agentsDir = resolve(config.agents.definitionsPath);
-  watch(agentsDir, { recursive: true }, () => {
-    if (reloadTimer) clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(() => reload(), 500);
-  });
-
   // Watch skills/ directory for changes — debounced to 500ms
   const skillsDir = resolve("skills");
   if (existsSync(skillsDir)) {
@@ -194,7 +209,7 @@ async function main(): Promise<void> {
 
   // SIGUSR1: manual hot-reload trigger
   process.on("SIGUSR1", () => reload());
-  log.info("Hot-reload enabled", { watched: agentsDir, signal: "SIGUSR1" });
+  log.info("Hot-reload enabled", { signal: "SIGUSR1" });
 
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
@@ -275,7 +290,7 @@ async function main(): Promise<void> {
   }
 
   // Start scheduler (with callback support via MongoDB)
-  const scheduler = new Scheduler(agentManager, memoryManager, healthReporter, registry, (item) => {
+  scheduler = new Scheduler(agentManager, memoryManager, healthReporter, registry, (item) => {
     dispatcher.dispatch(item).catch((err) => {
       log.error("Callback dispatch failed", { error: String(err) });
     });
@@ -283,6 +298,23 @@ async function main(): Promise<void> {
   await scheduler.connectDb(config.mongo.uri, config.mongo.dbName);
   scheduler.start();
   log.info("Scheduler started");
+
+  // Start watching for agent definition changes
+  await registry.startWatching();
+
+  // Admin REST API
+  let adminApi: AdminApi | undefined;
+  if (config.adminApi.token) {
+    adminApi = new AdminApi(
+      config.adminApi.port,
+      config.adminApi.token,
+      agentDefsCollection as any,
+      db.collection("agent_definition_versions") as any,
+      () => reload(),
+    );
+    await adminApi.start();
+    log.info("Admin API started", { port: config.adminApi.port });
+  }
 
   // Periodic sweeper — state cleanup, message recovery, health metrics
   const retryQueue = new RetryQueue({
@@ -324,6 +356,8 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
     sweeper.stop();
+    adminApi?.stop();
+    registry.stopWatching();
     await smsAdapter.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
     if (wsAdapter) await wsAdapter.stop();
@@ -335,6 +369,7 @@ async function main(): Promise<void> {
     await sessionStore.close();
     await memoryStore?.close();
     await slackAdapter.stop();
+    await mongoClient.close();
     log.info("Hive shut down cleanly");
     process.exit(0);
   };

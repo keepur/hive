@@ -75,7 +75,7 @@ vi.mock("../config.js", () => ({
     background: { port: 3200, authToken: "test-bg-token" },
     codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
     anthropic: { apiKey: "test-key" },
-    agents: { defaultAgent: "chief-of-staff" },
+    defaultAgent: "chief-of-staff",
     externalComms: { enabled: true },
     triage: { enabled: false },
     browser: { cdpEndpoint: "" },
@@ -215,7 +215,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
             agentEnv: {},
           },
         },
-        agentsTemplates: [],
+        agentSeeds: [],
       },
     };
 
@@ -247,7 +247,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
             agentEnv: {},
           },
         },
-        agentsTemplates: [],
+        agentSeeds: [],
       },
     };
 
@@ -276,7 +276,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
             agentEnv: { CUSTOM_MODE: "dodiOpsMode", CUSTOM_ID: "id" },
           },
         },
-        agentsTemplates: [],
+        agentSeeds: [],
       },
     };
 
@@ -308,7 +308,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
             agentEnv: {},
           },
         },
-        agentsTemplates: [],
+        agentSeeds: [],
       },
     };
 
@@ -335,7 +335,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
             agentEnv: {},
           },
         },
-        agentsTemplates: [],
+        agentSeeds: [],
       },
     };
 
@@ -366,7 +366,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
             agentEnv: {},
           },
         },
-        agentsTemplates: [],
+        agentSeeds: [],
       },
     };
 
