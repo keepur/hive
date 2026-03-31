@@ -42,9 +42,7 @@ describe("loadConfig", () => {
     mockReadFileSync.mockReturnValue("yaml content");
     mockParseYaml.mockReturnValue({
       port: 4000,
-      default_workspace: "my-workspace",
       model: "claude-sonnet-4-5",
-      workspaces: { home: "/home/user/projects" },
       confirm_operations: ["rm -rf", "git push --force"],
     });
 
@@ -52,9 +50,7 @@ describe("loadConfig", () => {
 
     expect(config).toMatchObject({
       port: 4000,
-      defaultWorkspace: "my-workspace",
       model: "claude-sonnet-4-5",
-      workspaces: { home: "/home/user/projects" },
       confirmOperations: ["rm -rf", "git push --force"],
       jwtSecret: "test-jwt-secret",
       adminSecret: "test-admin-secret",
@@ -97,22 +93,6 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow("Missing required env var: MONGO_URI");
   });
 
-  it("expands ~ in workspace paths", () => {
-    mockExistsSync.mockReturnValue(true);
-    mockReadFileSync.mockReturnValue("yaml content");
-    mockParseYaml.mockReturnValue({
-      workspaces: {
-        hive: "~/github/hive",
-        work: "~/work/projects",
-      },
-    });
-
-    const config = loadConfig();
-
-    expect(config.workspaces.hive).toBe("/Users/testuser/github/hive");
-    expect(config.workspaces.work).toBe("/Users/testuser/work/projects");
-  });
-
   it("falls back to default port (3099) when port is missing", () => {
     mockExistsSync.mockReturnValue(true);
     mockReadFileSync.mockReturnValue("yaml content");
@@ -143,26 +123,6 @@ describe("loadConfig", () => {
     expect(config.confirmOperations).toContain("git push --force");
     expect(config.confirmOperations).toContain("rm -rf");
     expect(config.confirmOperations.length).toBeGreaterThan(0);
-  });
-
-  it("falls back to empty workspaces when workspaces field is missing", () => {
-    mockExistsSync.mockReturnValue(true);
-    mockReadFileSync.mockReturnValue("yaml content");
-    mockParseYaml.mockReturnValue({});
-
-    const config = loadConfig();
-
-    expect(config.workspaces).toEqual({});
-  });
-
-  it("falls back to default_workspace 'hive' when field is missing", () => {
-    mockExistsSync.mockReturnValue(true);
-    mockReadFileSync.mockReturnValue("yaml content");
-    mockParseYaml.mockReturnValue({});
-
-    const config = loadConfig();
-
-    expect(config.defaultWorkspace).toBe("hive");
   });
 
   it("uses BEEKEEPER_CONFIG env var to locate config file", () => {

@@ -8,6 +8,10 @@ import { loadConfig } from "./config.js";
 import { ToolGuardian } from "./tool-guardian.js";
 import { SessionManager } from "./session-manager.js";
 import { BeekeeperDeviceRegistry, type BeekeeperDevice } from "./device-registry.js";
+import { validatePath } from "./path-utils.js";
+import { readdirSync, realpathSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import type { ClientMessage, ServerMessage } from "./types.js";
 
 const log = createLogger("beekeeper");
@@ -64,8 +68,7 @@ async function main(): Promise<void> {
       res.end(
         JSON.stringify({
           status: "ok",
-          sessionId: sessionManager.getSessionId(),
-          workspace: sessionManager.getWorkspace(),
+          sessions: sessionManager.getActiveSessions().length,
           connected: activeClient !== null,
         }),
       );
@@ -407,7 +410,7 @@ async function main(): Promise<void> {
 
     activeClient = ws;
     activeDeviceId = device._id;
-    guardian.setClient(ws);
+    guardian.setSendDelegate((msg) => sessionManager.send(msg));
     sessionManager.setClient(ws);
 
     // Update lastSeenAt
@@ -415,15 +418,10 @@ async function main(): Promise<void> {
       .updateLastSeen(device._id)
       .catch((err) => log.warn("Failed to update lastSeenAt", { error: String(err) }));
 
-    // Send current session info or start new session
-    const sessionId = sessionManager.getSessionId();
-    if (sessionId) {
-      const msg: ServerMessage = {
-        type: "session_info",
-        sessionId,
-        workspace: sessionManager.getWorkspace(),
-        workspaces: Object.keys(config.workspaces),
-      };
+    // Send session list on reconnect
+    const activeSessions = sessionManager.getActiveSessions();
+    if (activeSessions.length > 0) {
+      const msg: ServerMessage = { type: "session_list", sessions: activeSessions };
       ws.send(JSON.stringify(msg));
     }
 
@@ -447,14 +445,66 @@ async function main(): Promise<void> {
             ws.send(JSON.stringify({ type: "pong" }));
             break;
           case "message":
-            await sessionManager.sendMessage(msg.text);
+            await sessionManager.sendMessage(msg.sessionId, msg.text);
             break;
-          case "new_session":
-            await sessionManager.newSession(msg.workspace);
+          case "new_session": {
+            if (!msg.path || typeof msg.path !== "string") {
+              ws.send(JSON.stringify({ type: "error", message: "Missing required field: path" }));
+              break;
+            }
+            try {
+              const validatedPath = validatePath(msg.path);
+              await sessionManager.newSession(validatedPath);
+            } catch (err) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                }),
+              );
+            }
             break;
-          case "switch_workspace":
-            await sessionManager.newSession(msg.workspace);
+          }
+          case "clear_session":
+            await sessionManager.clearSession(msg.sessionId);
             break;
+          case "list_sessions":
+            sessionManager.listSessions();
+            break;
+          case "browse": {
+            try {
+              const home = realpathSync(homedir());
+              const browseTarget = msg.path ? validatePath(msg.path) : home;
+              const dirEntries = readdirSync(browseTarget, { withFileTypes: true });
+              const entries = dirEntries
+                .filter((e) => !e.name.startsWith("."))
+                .map((e) => {
+                  let isDirectory = e.isDirectory();
+                  if (e.isSymbolicLink()) {
+                    try {
+                      isDirectory = statSync(join(browseTarget, e.name)).isDirectory();
+                    } catch {
+                      /* broken symlink — treat as file */
+                    }
+                  }
+                  return { name: e.name, isDirectory };
+                })
+                .sort((a, b) => {
+                  if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+                  return a.name.localeCompare(b.name);
+                })
+                .slice(0, 200);
+              ws.send(JSON.stringify({ type: "browse_result", path: browseTarget, entries }));
+            } catch (err) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                }),
+              );
+            }
+            break;
+          }
           case "approve":
             guardian.handleApproval(msg.toolUseId, true);
             break;
@@ -480,8 +530,9 @@ async function main(): Promise<void> {
       if (activeClient === ws) {
         activeClient = null;
         activeDeviceId = null;
-        guardian.setClient(null);
+        guardian.setSendDelegate(null);
         sessionManager.setClient(null);
+        // Sessions stay in memory — client can reconnect and resume
       }
     });
 
@@ -498,6 +549,7 @@ async function main(): Promise<void> {
   // --- Graceful shutdown ---
   const shutdown = async () => {
     log.info("Shutting down");
+    await sessionManager.stopAll();
     wss.close();
     server.close();
     await deviceRegistry.close();

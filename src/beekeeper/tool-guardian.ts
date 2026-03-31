@@ -1,5 +1,4 @@
 import type { HookInput, HookJSONOutput, HookCallback } from "@anthropic-ai/claude-agent-sdk";
-import type { WebSocket } from "ws";
 import { createLogger } from "../logging/logger.js";
 import type { ServerMessage } from "./types.js";
 
@@ -8,69 +7,70 @@ const log = createLogger("beekeeper-guardian");
 interface PendingApproval {
   resolve: (decision: HookJSONOutput) => void;
   timer: ReturnType<typeof setTimeout>;
+  sessionId: string;
 }
 
 export class ToolGuardian {
   private pendingApprovals = new Map<string, PendingApproval>();
   private confirmPatterns: string[];
-  private client: WebSocket | null = null;
+  private sendDelegate: ((msg: ServerMessage) => void) | null = null;
 
   constructor(confirmPatterns: string[]) {
     this.confirmPatterns = confirmPatterns;
   }
 
-  setClient(ws: WebSocket | null): void {
-    this.client = ws;
-    // Auto-deny all pending approvals if client disconnects
-    if (!ws) {
+  /**
+   * Set the send delegate. Pass null on client disconnect.
+   * The delegate should route through SessionManager.send() so messages
+   * land in per-session output buffers when the client is disconnected.
+   */
+  setSendDelegate(send: ((msg: ServerMessage) => void) | null): void {
+    if (!send) {
       this.denyAll("Client disconnected");
     }
+    this.sendDelegate = send;
   }
 
   /**
    * Returns the hook callback for SDK PreToolUse registration.
+   * Each callback is scoped to a specific session.
    */
-  createHookCallback(): HookCallback {
+  createHookCallback(sessionId: string): HookCallback {
     return async (
       input: HookInput,
       _toolUseId: string | undefined,
       _options: { signal: AbortSignal },
     ): Promise<HookJSONOutput> => {
-      // Narrow to PreToolUseHookInput — split into two guards for TypeScript narrowing
       if (input.hook_event_name !== "PreToolUse") {
         return { decision: "approve" };
       }
-      // Now input is narrowed to PreToolUseHookInput
       if (input.tool_name !== "Bash") {
         return { decision: "approve" };
       }
 
       const command = (input.tool_input as { command?: string })?.command ?? "";
 
-      // Check if command matches any confirm pattern
       const needsApproval = this.confirmPatterns.some((pattern) => command.includes(pattern));
       if (!needsApproval) {
         return { decision: "approve" };
       }
 
-      log.info("Tool requires approval", { toolUseId: input.tool_use_id, command });
+      log.info("Tool requires approval", { toolUseId: input.tool_use_id, sessionId, command });
 
-      // If no client connected, auto-deny
-      if (!this.client || this.client.readyState !== 1 /* OPEN */) {
-        log.warn("No client connected, auto-denying", { toolUseId: input.tool_use_id });
+      if (!this.sendDelegate) {
+        log.warn("No send delegate, auto-denying", { toolUseId: input.tool_use_id });
         return { decision: "block", reason: "No client connected to approve" };
       }
 
-      // Send approval request to client
       const approvalMsg: ServerMessage = {
         type: "tool_approval",
         toolUseId: input.tool_use_id,
         tool: "Bash",
         input: command,
+        sessionId,
       };
-      this.client.send(JSON.stringify(approvalMsg));
+      this.sendDelegate(approvalMsg);
 
-      // Block until client responds or timeout
       return new Promise((resolve) => {
         const timer = setTimeout(() => {
           log.warn("Approval timed out, auto-denying", { toolUseId: input.tool_use_id });
@@ -78,7 +78,7 @@ export class ToolGuardian {
           resolve({ decision: "block", reason: "Approval timed out (60s)" });
         }, 60_000);
 
-        this.pendingApprovals.set(input.tool_use_id, { resolve, timer });
+        this.pendingApprovals.set(input.tool_use_id, { resolve, timer, sessionId });
       });
     };
   }
