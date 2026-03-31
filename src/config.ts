@@ -177,6 +177,10 @@ export const config = {
     port: parseInt(optional("WS_PORT", String(ports.ws ?? portBase + 3)), 10),
     jwtSecret: optional("WS_JWT_SECRET", ""),
   },
+  adminApi: {
+    port: parseInt(optional("ADMIN_API_PORT", String(ports.adminApi ?? portBase + 4)), 10),
+    token: optional("ADMIN_API_TOKEN", ""),
+  },
   externalComms: {
     enabled: optional("EXTERNAL_COMMS_ENABLED", "false") === "true",
   },

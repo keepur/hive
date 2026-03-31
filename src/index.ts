@@ -26,6 +26,7 @@ import { setGeminiApiKey } from "./files/file-processor.js";
 import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
+import { AdminApi } from "./admin/admin-api.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
@@ -295,6 +296,20 @@ async function main(): Promise<void> {
   // Start watching for agent definition changes
   await registry.startWatching();
 
+  // Admin REST API
+  let adminApi: AdminApi | undefined;
+  if (config.adminApi.token) {
+    adminApi = new AdminApi(
+      config.adminApi.port,
+      config.adminApi.token,
+      agentDefsCollection as any,
+      db.collection("agent_definition_versions") as any,
+      () => reload(),
+    );
+    await adminApi.start();
+    log.info("Admin API started", { port: config.adminApi.port });
+  }
+
   // Periodic sweeper — state cleanup, message recovery, health metrics
   const retryQueue = new RetryQueue({
     maxAttempts: config.sweeper.retryMaxAttempts,
@@ -335,6 +350,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
     sweeper.stop();
+    adminApi?.stop();
     registry.stopWatching();
     await smsAdapter.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
