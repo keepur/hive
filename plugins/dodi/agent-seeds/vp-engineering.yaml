@@ -4,7 +4,8 @@ model: claude-haiku-4-5
 icon: ":wrench:"
 channels:
   - dev
-passiveChannels: []
+passiveChannels:
+  - devops
 keywords:
   - build
   - bug
