@@ -1,5 +1,4 @@
 import type { HookInput, HookJSONOutput, HookCallback } from "@anthropic-ai/claude-agent-sdk";
-import type { WebSocket } from "ws";
 import { createLogger } from "../logging/logger.js";
 import type { ServerMessage } from "./types.js";
 
@@ -14,17 +13,22 @@ interface PendingApproval {
 export class ToolGuardian {
   private pendingApprovals = new Map<string, PendingApproval>();
   private confirmPatterns: string[];
-  private client: WebSocket | null = null;
+  private sendDelegate: ((msg: ServerMessage) => void) | null = null;
 
   constructor(confirmPatterns: string[]) {
     this.confirmPatterns = confirmPatterns;
   }
 
-  setClient(ws: WebSocket | null): void {
-    this.client = ws;
-    if (!ws) {
+  /**
+   * Set the send delegate. Pass null on client disconnect.
+   * The delegate should route through SessionManager.send() so messages
+   * land in per-session output buffers when the client is disconnected.
+   */
+  setSendDelegate(send: ((msg: ServerMessage) => void) | null): void {
+    if (!send) {
       this.denyAll("Client disconnected");
     }
+    this.sendDelegate = send;
   }
 
   /**
@@ -53,8 +57,8 @@ export class ToolGuardian {
 
       log.info("Tool requires approval", { toolUseId: input.tool_use_id, sessionId, command });
 
-      if (!this.client || this.client.readyState !== 1) {
-        log.warn("No client connected, auto-denying", { toolUseId: input.tool_use_id });
+      if (!this.sendDelegate) {
+        log.warn("No send delegate, auto-denying", { toolUseId: input.tool_use_id });
         return { decision: "block", reason: "No client connected to approve" };
       }
 
@@ -65,7 +69,7 @@ export class ToolGuardian {
         input: command,
         sessionId,
       };
-      this.client.send(JSON.stringify(approvalMsg));
+      this.sendDelegate(approvalMsg);
 
       return new Promise((resolve) => {
         const timer = setTimeout(() => {

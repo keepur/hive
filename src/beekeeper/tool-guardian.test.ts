@@ -116,10 +116,8 @@ describe("ToolGuardian", () => {
       expect(result).toEqual({ decision: "block", reason: "No client connected to approve" });
     });
 
-    it("blocks matching commands when client WebSocket is not OPEN", async () => {
-      const closedWs = makeMockWs(3); // CLOSED state
-      guardian.setClient(closedWs as never);
-
+    it("blocks matching commands when no send delegate is set", async () => {
+      // No delegate set — guardian should auto-deny
       const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("rm -rf /tmp/old");
 
@@ -130,7 +128,7 @@ describe("ToolGuardian", () => {
 
     it("sends approval request to connected client for matching commands", async () => {
       const mockWs = makeMockWs(1);
-      guardian.setClient(mockWs as never);
+      guardian.setSendDelegate((msg) => mockWs.send(JSON.stringify(msg)));
 
       const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git push --force origin main", "tool-use-xyz");
@@ -155,7 +153,7 @@ describe("ToolGuardian", () => {
 
     it("auto-denies after 60 second timeout", async () => {
       const mockWs = makeMockWs(1);
-      guardian.setClient(mockWs as never);
+      guardian.setSendDelegate((msg) => mockWs.send(JSON.stringify(msg)));
 
       const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git reset --hard HEAD~1", "timeout-id");
@@ -174,7 +172,7 @@ describe("ToolGuardian", () => {
   describe("handleApproval()", () => {
     it("resolves pending approval with approve when approved=true", async () => {
       const mockWs = makeMockWs(1);
-      guardian.setClient(mockWs as never);
+      guardian.setSendDelegate((msg) => mockWs.send(JSON.stringify(msg)));
 
       const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("git push --force origin main", "approve-id");
@@ -189,7 +187,7 @@ describe("ToolGuardian", () => {
 
     it("resolves pending approval with block when approved=false", async () => {
       const mockWs = makeMockWs(1);
-      guardian.setClient(mockWs as never);
+      guardian.setSendDelegate((msg) => mockWs.send(JSON.stringify(msg)));
 
       const callback = guardian.createHookCallback("test-session");
       const input = makeBashInput("rm -rf /important", "deny-id");
@@ -208,10 +206,10 @@ describe("ToolGuardian", () => {
     });
   });
 
-  describe("setClient(null)", () => {
+  describe("setSendDelegate(null)", () => {
     it("auto-denies all pending approvals when client disconnects", async () => {
       const mockWs = makeMockWs(1);
-      guardian.setClient(mockWs as never);
+      guardian.setSendDelegate((msg) => mockWs.send(JSON.stringify(msg)));
 
       const callback = guardian.createHookCallback("test-session");
 
@@ -222,7 +220,7 @@ describe("ToolGuardian", () => {
       const result2Promise = callback(input2, undefined, { signal: DUMMY_ABORT_SIGNAL });
 
       // Disconnect client — triggers denyAll
-      guardian.setClient(null);
+      guardian.setSendDelegate(null);
 
       const [result1, result2] = await Promise.all([result1Promise, result2Promise]);
 
@@ -234,7 +232,7 @@ describe("ToolGuardian", () => {
   describe("denyAll()", () => {
     it("clears all pending approvals with the given reason", async () => {
       const mockWs = makeMockWs(1);
-      guardian.setClient(mockWs as never);
+      guardian.setSendDelegate((msg) => mockWs.send(JSON.stringify(msg)));
 
       const callback = guardian.createHookCallback("test-session");
 
