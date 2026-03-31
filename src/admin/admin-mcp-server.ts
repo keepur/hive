@@ -21,6 +21,9 @@ const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
 const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
 const AGENT_ID = process.env.AGENT_ID ?? "admin";
 
+// MongoDB _id filter casts: AgentDefinition uses string _id but the MongoDB driver
+// types filter._id as ObjectId. The `as any` casts on `{ _id: id as any }` throughout
+// this file are required to bridge this typing mismatch.
 const client = new MongoClient(MONGODB_URI);
 await client.connect();
 const db = client.db(MONGODB_DB);
@@ -227,12 +230,14 @@ server.registerTool(
       };
     }
 
+    // Block immutable fields
     if ("_id" in fields) {
       return {
         content: [{ type: "text", text: "Cannot change _id. Create a new agent instead." }],
         isError: true,
       };
     }
+    delete fields.createdAt;
 
     const changedFields = Object.keys(fields);
     await saveVersion(agent_id, changedFields);
@@ -462,9 +467,7 @@ server.registerTool(
     const existing = await agentDefs.findOne({ _id: agent_id as any });
     if (!existing) {
       return {
-        content: [
-          { type: "text", text: `Agent '${agent_id}' not found — cannot rollback a deleted agent.` },
-        ],
+        content: [{ type: "text", text: `Agent '${agent_id}' not found — cannot rollback a deleted agent.` }],
         isError: true,
       };
     }
