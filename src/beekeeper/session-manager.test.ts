@@ -100,7 +100,7 @@ describe("SessionManager", () => {
       expect(sessionInfo).toEqual({
         type: "session_info",
         sessionId: "sess-abc",
-        cwd: "/home/user/hive",
+        path: "/home/user/hive",
       });
     });
   });
@@ -331,8 +331,8 @@ describe("SessionManager", () => {
       expect((listMsg as any).sessions).toHaveLength(2);
       expect((listMsg as any).sessions).toEqual(
         expect.arrayContaining([
-          { sessionId: "sess-a", cwd: "/home/user/hive", state: "idle" },
-          { sessionId: "sess-b", cwd: "/home/user/other", state: "idle" },
+          { sessionId: "sess-a", path: "/home/user/hive", state: "idle" },
+          { sessionId: "sess-b", path: "/home/user/other", state: "idle" },
         ]),
       );
     });
@@ -412,7 +412,7 @@ describe("SessionManager", () => {
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const sessionInfo = sent.find((m: Record<string, unknown>) => m.type === "session_info");
       expect(sessionInfo?.sessionId).toBe("sess-buf");
-      expect(sessionInfo?.cwd).toBe("/tmp/test");
+      expect(sessionInfo?.path).toBe("/tmp/test");
     });
   });
 });

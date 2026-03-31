@@ -442,7 +442,7 @@ async function main(): Promise<void> {
             await sessionManager.sendMessage(msg.sessionId, msg.text);
             break;
           case "new_session":
-            await sessionManager.newSession(msg.cwd);
+            await sessionManager.newSession(msg.path);
             break;
           case "clear_session":
             await sessionManager.clearSession(msg.sessionId);
