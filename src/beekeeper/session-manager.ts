@@ -144,8 +144,8 @@ export class SessionManager {
         }
       }
     }
-    this.sessions.delete(sessionId);
     this.send({ type: "session_cleared", sessionId });
+    this.sessions.delete(sessionId);
     log.info("Session cleared", { sessionId });
     return true;
   }
