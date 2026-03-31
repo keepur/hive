@@ -221,7 +221,7 @@ describe("BeekeeperDeviceRegistry", () => {
 
       expect(code).toBe("123456");
       expect(mockCollection.updateOne).toHaveBeenCalledWith(
-        { _id: "device-123" },
+        { _id: "device-123", active: true },
         { $set: { pairingCode: "123456", pairingCodeExpiresAt: expect.any(Date) } },
       );
     });
