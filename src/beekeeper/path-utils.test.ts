@@ -58,6 +58,21 @@ describe("validatePath", () => {
     );
   });
 
+  it("rejects sibling directory with shared home prefix", () => {
+    // /Users/testusermalicious should NOT pass when home is /Users/testuser
+    mockRealpathSync.mockReturnValueOnce("/Users/testuser").mockReturnValueOnce("/Users/testusermalicious");
+
+    expect(() => validatePath("/Users/testusermalicious")).toThrow("Path is outside home directory");
+  });
+
+  it("allows home directory itself", () => {
+    mockRealpathSync.mockReturnValueOnce("/Users/testuser").mockReturnValueOnce("/Users/testuser");
+
+    const result = validatePath("~");
+
+    expect(result).toBe("/Users/testuser");
+  });
+
   it("throws 'not a directory' when path points to a file", () => {
     mockRealpathSync.mockReturnValueOnce("/Users/testuser").mockReturnValueOnce("/Users/testuser/somefile.txt");
     mockStatSync.mockReturnValue({ isDirectory: () => false } as ReturnType<typeof statSync>);

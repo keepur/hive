@@ -19,7 +19,7 @@ export function validatePath(inputPath: string): string {
     throw new Error(`Path does not exist: ${inputPath}`);
   }
 
-  if (!resolved.startsWith(home)) {
+  if (resolved !== home && !resolved.startsWith(home + "/")) {
     throw new Error(`Path is outside home directory: ${inputPath}`);
   }
 

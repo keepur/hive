@@ -9,7 +9,8 @@ import { ToolGuardian } from "./tool-guardian.js";
 import { SessionManager } from "./session-manager.js";
 import { BeekeeperDeviceRegistry, type BeekeeperDevice } from "./device-registry.js";
 import { validatePath } from "./path-utils.js";
-import { readdirSync, realpathSync } from "node:fs";
+import { readdirSync, realpathSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ClientMessage, ServerMessage } from "./types.js";
 
@@ -461,7 +462,17 @@ async function main(): Promise<void> {
             const raw = readdirSync(browseTarget, { withFileTypes: true });
             const entries = raw
               .filter((e) => !e.name.startsWith("."))
-              .map((e) => ({ name: e.name, isDirectory: e.isDirectory() }))
+              .map((e) => {
+                let isDirectory = e.isDirectory();
+                if (e.isSymbolicLink()) {
+                  try {
+                    isDirectory = statSync(join(browseTarget, e.name)).isDirectory();
+                  } catch {
+                    /* broken symlink — treat as file */
+                  }
+                }
+                return { name: e.name, isDirectory };
+              })
               .sort((a, b) => {
                 if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
                 return a.name.localeCompare(b.name);
