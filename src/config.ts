@@ -100,11 +100,7 @@ export const config = {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
     dbName: optional("MONGODB_DB", `hive_${instanceId}`),
   },
-  agents: {
-    defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
-    defaultModel: optional("DEFAULT_MODEL", "claude-sonnet-4-6"),
-    definitionsPath: optional("AGENTS_PATH", "./agents"),
-  },
+  defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
   google: {
     account: optional("GOOGLE_ACCOUNT", hive.google?.account ?? ""),
     client: optional("GOG_CLIENT", hive.google?.client ?? ""),
