@@ -30,39 +30,6 @@ export interface AgentConfig {
   systemPrompt: string;
 }
 
-export interface ArrayOverride {
-  replace?: string[];
-  add?: string[];
-  remove?: string[];
-}
-
-export interface ConfigOverride {
-  agentId: string;
-  channels?: ArrayOverride;
-  passiveChannels?: ArrayOverride;
-  keywords?: ArrayOverride;
-  coreServers?: ArrayOverride;
-  delegateServers?: ArrayOverride;
-  plugins?: ArrayOverride;
-  subscribe?: ArrayOverride;
-  isDefault?: boolean;
-  budgetUsd?: number;
-  maxTurns?: number;
-  maxConcurrent?: number;
-  timeoutMs?: number;
-  disabled?: boolean;
-  updatedAt: Date;
-  updatedBy: string;
-}
-
-export interface PromptOverride {
-  agentId: string;
-  soul?: string;
-  systemPrompt?: string;
-  updatedAt: Date;
-  updatedBy: string;
-}
-
 export type AgentStatus = "idle" | "processing" | "error" | "stopped";
 
 export interface AgentState {
