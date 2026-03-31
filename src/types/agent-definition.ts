@@ -71,8 +71,7 @@ export function toAgentConfig(doc: AgentDefinition): AgentConfig {
     name: doc.name,
     model: doc.model,
     channels: doc.channels ?? [],
-    passiveChannels:
-      doc.passiveChannels ?? AGENT_DEFINITION_DEFAULTS.passiveChannels,
+    passiveChannels: doc.passiveChannels ?? AGENT_DEFINITION_DEFAULTS.passiveChannels,
     keywords: doc.keywords ?? AGENT_DEFINITION_DEFAULTS.keywords,
     isDefault: doc.isDefault ?? false,
     schedule: doc.schedule ?? AGENT_DEFINITION_DEFAULTS.schedule,
@@ -83,15 +82,13 @@ export function toAgentConfig(doc: AgentDefinition): AgentConfig {
     coreServers: doc.coreServers ?? [],
     delegateServers: doc.delegateServers ?? [],
     plugins: doc.plugins,
-    maxConcurrent:
-      doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
+    maxConcurrent: doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
     timeoutMs: doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
     triageModel: doc.triageModel,
     dodiOpsMode: doc.dodiOpsMode,
     disabled: doc.disabled ?? false,
     subscribe: doc.subscribe ?? [],
-    delegatePrompts:
-      doc.delegatePrompts ?? AGENT_DEFINITION_DEFAULTS.delegatePrompts,
+    delegatePrompts: doc.delegatePrompts ?? AGENT_DEFINITION_DEFAULTS.delegatePrompts,
     soul: doc.soul ?? "",
     systemPrompt: doc.systemPrompt ?? "",
   };

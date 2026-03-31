@@ -48,9 +48,12 @@ async function main(): Promise<void> {
   await agentDefsCollection.createIndex({ channels: 1 });
   await agentDefsCollection.createIndex({ disabled: 1 });
 
-  // Forward-declare variables used in reload closure
+  // Forward-declare variables used in reload closure (assigned after reload() definition)
+  // eslint-disable-next-line prefer-const
   let registry: AgentRegistry;
+  // eslint-disable-next-line prefer-const
   let agentManager: AgentManager;
+  // eslint-disable-next-line prefer-const
   let scheduler: Scheduler;
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
 

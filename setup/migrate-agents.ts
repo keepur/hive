@@ -26,9 +26,7 @@ const mongoDb = process.env.MONGODB_DB || "hive";
 
 async function main() {
   if (!existsSync(AGENTS_DIR)) {
-    console.log(
-      `No agents/ directory found at ${AGENTS_DIR} — nothing to migrate.`
-    );
+    console.log(`No agents/ directory found at ${AGENTS_DIR} — nothing to migrate.`);
     return;
   }
 
@@ -38,48 +36,19 @@ async function main() {
 
   // Load existing overrides
   const modelOverrides = await db.collection("model_overrides").find().toArray();
-  const configOverrides = await db
-    .collection("agent_config_overrides")
-    .find()
-    .toArray();
-  const promptOverrides = await db
-    .collection("prompt_overrides")
-    .find()
-    .toArray();
-  const scheduleOverrides = await db
-    .collection("schedule_overrides")
-    .find()
-    .toArray();
+  const configOverrides = await db.collection("agent_config_overrides").find().toArray();
+  const promptOverrides = await db.collection("prompt_overrides").find().toArray();
+  const scheduleOverrides = await db.collection("schedule_overrides").find().toArray();
 
   const modelMap = new Map(
-    modelOverrides.map((d: Record<string, unknown>) => [
-      d.agentId as string,
-      d.model as string,
-    ])
+    modelOverrides.map((d: Record<string, unknown>) => [d.agentId as string, d.model as string]),
   );
-  const configMap = new Map(
-    configOverrides.map((d: Record<string, unknown>) => [
-      d.agentId as string,
-      d,
-    ])
-  );
-  const promptMap = new Map(
-    promptOverrides.map((d: Record<string, unknown>) => [
-      d.agentId as string,
-      d,
-    ])
-  );
-  const scheduleMap = new Map(
-    scheduleOverrides.map((d: Record<string, unknown>) => [
-      d.agentId as string,
-      d,
-    ])
-  );
+  const configMap = new Map(configOverrides.map((d: Record<string, unknown>) => [d.agentId as string, d]));
+  const promptMap = new Map(promptOverrides.map((d: Record<string, unknown>) => [d.agentId as string, d]));
+  const scheduleMap = new Map(scheduleOverrides.map((d: Record<string, unknown>) => [d.agentId as string, d]));
 
   const agentDefs = db.collection("agent_definitions");
-  const entries = readdirSync(AGENTS_DIR).filter((d) =>
-    statSync(join(AGENTS_DIR, d)).isDirectory()
-  );
+  const entries = readdirSync(AGENTS_DIR).filter((d) => statSync(join(AGENTS_DIR, d)).isDirectory());
 
   let migrated = 0;
   let skipped = 0;
@@ -105,13 +74,8 @@ async function main() {
     }
 
     // Read files
-    const raw = parseYaml(readFileSync(yamlPath, "utf-8")) as Record<
-      string,
-      unknown
-    >;
-    const soul = existsSync(join(agentDir, "soul.md"))
-      ? readFileSync(join(agentDir, "soul.md"), "utf-8")
-      : "";
+    const raw = parseYaml(readFileSync(yamlPath, "utf-8")) as Record<string, unknown>;
+    const soul = existsSync(join(agentDir, "soul.md")) ? readFileSync(join(agentDir, "soul.md"), "utf-8") : "";
     const systemPrompt = existsSync(join(agentDir, "system-prompt.md"))
       ? readFileSync(join(agentDir, "system-prompt.md"), "utf-8")
       : "";
@@ -139,8 +103,7 @@ async function main() {
     const def: AgentDefinition = {
       _id: agentId,
       name: (raw.name as string) || dirName,
-      model:
-        modelMap.get(agentId) ?? (raw.model as string) || "claude-sonnet-4-6",
+      model: (modelMap.get(agentId) ?? (raw.model as string)) || "claude-sonnet-4-6",
       icon: (raw.icon as string) || "",
       channels: (raw.channels as string[]) || [],
       passiveChannels: (raw.passiveChannels as string[]) || [],
@@ -148,8 +111,7 @@ async function main() {
       isDefault: (raw.isDefault as boolean) || false,
       coreServers,
       delegateServers,
-      delegatePrompts:
-        (raw.delegatePrompts as Record<string, string>) || {},
+      delegatePrompts: (raw.delegatePrompts as Record<string, string>) || {},
       plugins: (raw.plugins as string[]) || undefined,
       dodiOpsMode: (raw.dodiOpsMode as "full" | "readonly") || undefined,
       soul,
@@ -179,8 +141,7 @@ async function main() {
         "plugins",
         "subscribe",
       ]) {
-        const ov = (co[field] ??
-          (field === "coreServers" ? co.servers : undefined)) as
+        const ov = (co[field] ?? (field === "coreServers" ? co.servers : undefined)) as
           | {
               replace?: string[];
               add?: string[];
@@ -191,25 +152,16 @@ async function main() {
         if (ov.replace) {
           (def as Record<string, unknown>)[field] = [...ov.replace];
         } else {
-          const base = [
-            ...((
-              (def as Record<string, unknown>)[field] as string[] | undefined
-            ) ?? []),
-          ];
-          const added = ov.add
-            ? [...base, ...ov.add.filter((v: string) => !base.includes(v))]
-            : base;
-          const result = ov.remove
-            ? added.filter((v: string) => !ov.remove!.includes(v))
-            : added;
+          const base = [...(((def as Record<string, unknown>)[field] as string[] | undefined) ?? [])];
+          const added = ov.add ? [...base, ...ov.add.filter((v: string) => !base.includes(v))] : base;
+          const result = ov.remove ? added.filter((v: string) => !ov.remove!.includes(v)) : added;
           (def as Record<string, unknown>)[field] = result;
         }
       }
       if (co.isDefault !== undefined) def.isDefault = co.isDefault as boolean;
       if (co.budgetUsd !== undefined) def.budgetUsd = co.budgetUsd as number;
       if (co.maxTurns !== undefined) def.maxTurns = co.maxTurns as number;
-      if (co.maxConcurrent !== undefined)
-        def.maxConcurrent = co.maxConcurrent as number;
+      if (co.maxConcurrent !== undefined) def.maxConcurrent = co.maxConcurrent as number;
       if (co.timeoutMs !== undefined) def.timeoutMs = co.timeoutMs as number;
       if (co.disabled !== undefined) def.disabled = co.disabled as boolean;
     }
@@ -218,8 +170,7 @@ async function main() {
     const po = promptMap.get(agentId) as Record<string, unknown> | undefined;
     if (po) {
       if (po.soul !== undefined) def.soul = po.soul as string;
-      if (po.systemPrompt !== undefined)
-        def.systemPrompt = po.systemPrompt as string;
+      if (po.systemPrompt !== undefined) def.systemPrompt = po.systemPrompt as string;
     }
 
     // Apply schedule overrides
@@ -245,9 +196,7 @@ async function main() {
     migrated++;
   }
 
-  console.log(
-    `\n${DRY_RUN ? "DRY-RUN: " : ""}${migrated} agents migrated, ${skipped} skipped`
-  );
+  console.log(`\n${DRY_RUN ? "DRY-RUN: " : ""}${migrated} agents migrated, ${skipped} skipped`);
 
   if (!DRY_RUN) {
     await agentDefs.createIndex({ channels: 1 });

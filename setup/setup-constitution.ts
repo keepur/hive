@@ -36,7 +36,10 @@ async function main() {
 
   // Build team map from agent_definitions in MongoDB
   const team: Record<string, string> = {};
-  const agentDocs = await db.collection("agent_definitions").find({}, { projection: { _id: 1, name: 1 } }).toArray();
+  const agentDocs = await db
+    .collection("agent_definitions")
+    .find({}, { projection: { _id: 1, name: 1 } })
+    .toArray();
   for (const doc of agentDocs) {
     team[doc._id as string] = (doc as any).name ?? doc._id;
   }
@@ -64,10 +67,12 @@ async function main() {
       savedAt: existing.updatedAt,
       savedBy: existing.updatedBy || "system",
     });
-    await db.collection("memory").updateOne(
-      { path: "shared/constitution.md" },
-      { $set: { content, updatedAt: new Date(), updatedBy: "setup:constitution" } },
-    );
+    await db
+      .collection("memory")
+      .updateOne(
+        { path: "shared/constitution.md" },
+        { $set: { content, updatedAt: new Date(), updatedBy: "setup:constitution" } },
+      );
     console.log("  SYNC shared/constitution.md → MongoDB");
   } else if (!existing) {
     await db.collection("memory").insertOne({
