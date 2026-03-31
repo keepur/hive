@@ -5,7 +5,8 @@ export type ClientMessage =
   | { type: "switch_workspace"; workspace: string }
   | { type: "approve"; toolUseId: string }
   | { type: "deny"; toolUseId: string }
-  | { type: "ping" };
+  | { type: "ping" }
+  | { type: "browse" };
 
 // Server → Client messages
 export type ServerMessage =
