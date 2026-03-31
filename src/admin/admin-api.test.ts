@@ -131,13 +131,13 @@ describe("AdminApi", () => {
       expect(res.status).toBe(200);
     });
 
-    it("skips auth when token is empty", async () => {
+    it("rejects all requests when token is empty (auth always required)", async () => {
       const noAuthApi = new AdminApi(0, "", agentDefs as any, agentVersions as any, onReload);
       await noAuthApi.start();
       const addr = (noAuthApi as any).server.address();
       try {
         const res = await fetch(`http://localhost:${addr.port}/admin/agents`);
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(401);
       } finally {
         noAuthApi.stop();
       }
@@ -427,9 +427,9 @@ describe("AdminApi", () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.name).toBe("Old Name");
-      // saveVersion called for current state before rollback
+      // saveVersion called for current state before rollback, then updateOne to restore
       expect(agentVersions.insertOne).toHaveBeenCalled();
-      expect(agentDefs.replaceOne).toHaveBeenCalled();
+      expect(agentDefs.updateOne).toHaveBeenCalled();
       expect(onReload).toHaveBeenCalled();
     });
   });

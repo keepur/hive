@@ -10,6 +10,7 @@ const POLL_INTERVAL_MS = 30_000;
 
 export class AgentRegistry {
   private agents = new Map<string, AgentConfig>();
+  private disabledAgents: AgentConfig[] = [];
   private agentDefs: Collection<AgentDefinition>;
   private changeStream: ChangeStream | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -28,9 +29,16 @@ export class AgentRegistry {
     const added: string[] = [];
     const updated: string[] = [];
 
+    const newDisabled: AgentConfig[] = [];
+
     for (const doc of docs) {
       const config = toAgentConfig(doc);
       currentIds.add(config.id);
+
+      if (config.disabled) {
+        newDisabled.push(config);
+        continue;
+      }
 
       if (previousIds.has(config.id)) {
         updated.push(config.id);
@@ -41,6 +49,8 @@ export class AgentRegistry {
       this.agents.set(config.id, config);
       log.info("Loaded agent", { id: config.id, name: config.name });
     }
+
+    this.disabledAgents = newDisabled;
 
     const removed: string[] = [];
     for (const id of previousIds) {
@@ -155,7 +165,7 @@ export class AgentRegistry {
   }
 
   getDisabled(): AgentConfig[] {
-    return this.getAll().filter((a) => a.disabled);
+    return this.disabledAgents;
   }
 
   getSubscriberMap(): Record<string, string[]> {

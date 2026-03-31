@@ -154,12 +154,10 @@ server.registerTool(
       { $set: { schedule: newSchedule, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
-    try {
-      process.kill(process.ppid, "SIGUSR1");
-    } catch {}
+    // Change stream / polling picks up the write within 30s
 
     return {
-      content: [{ type: "text", text: `Added schedule: ${cron} → ${task}\nReason: ${reason}\nHot-reload triggered.` }],
+      content: [{ type: "text", text: `Added schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.` }],
     };
   },
 );
@@ -195,13 +193,11 @@ server.registerTool(
       { $set: { schedule: newSchedule, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
-    try {
-      process.kill(process.ppid, "SIGUSR1");
-    } catch {}
+    // Change stream / polling picks up the write within 30s
 
     return {
       content: [
-        { type: "text", text: `Removed schedule for task '${task}'.\nReason: ${reason}\nHot-reload triggered.` },
+        { type: "text", text: `Removed schedule for task '${task}'.\nReason: ${reason}\nChange will take effect within 30 seconds.` },
       ],
     };
   },
@@ -245,13 +241,11 @@ server.registerTool(
       { $set: { schedule: current, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
-    try {
-      process.kill(process.ppid, "SIGUSR1");
-    } catch {}
+    // Change stream / polling picks up the write within 30s
 
     return {
       content: [
-        { type: "text", text: `Updated schedule: ${cron} → ${task}\nReason: ${reason}\nHot-reload triggered.` },
+        { type: "text", text: `Updated schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.` },
       ],
     };
   },
