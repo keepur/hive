@@ -6,7 +6,7 @@
 
 ## Design
 
-Agent definitions move from the template→generate→file pipeline to **MongoDB documents**. Every agent starts blank and is shaped through conversation (soul, role, personality) and admin tooling (servers, channels, model). Agents evolve over time through self-authored soul notes.
+Agent definitions move from the template→generate→file pipeline to **MongoDB documents**. Every agent starts blank and is shaped through conversation (soul, role, personality) and admin tooling (servers, channels, model).
 
 ### What Goes Away
 
@@ -28,7 +28,7 @@ Agent definitions move from the template→generate→file pipeline to **MongoDB
 - **Sessions** — `sessions` collection, unchanged
 - **Admin MCP server** — expanded with agent CRUD tools
 - **Admin REST API** — expanded with agent CRUD endpoints (for beekeeper)
-- **AgentRunner** — minor change: `buildSystemPrompt` adds soul notes layer; rest unchanged
+- **AgentRunner** — unchanged (receives AgentConfig, doesn't care where it came from)
 - **AgentManager** — unchanged (manages runtime state)
 - **Dispatcher** — unchanged (routes via registry)
 
@@ -58,10 +58,9 @@ interface AgentDefinition {
   plugins?: string[];             // Claude Code plugin allowlist
   dodiOpsMode?: "full" | "readonly";
 
-  // Identity (two-layer)
-  soul: string;                   // Base identity — admin-owned, set at creation
-  soulNotes: SoulNote[];          // Agent-owned observations — agent can CRUD
-  systemPrompt: string;           // Auto-assembled (see below), or manual override
+  // Identity
+  soul: string;                   // Personality, voice, values — admin-owned
+  systemPrompt: string;           // Optional guardrails/workflow instructions — admin-owned
 
   // Scheduling
   schedule: ScheduleEntry[];      // Cron tasks
@@ -81,13 +80,6 @@ interface AgentDefinition {
   updatedBy: string;              // "beekeeper", "chief-of-staff", agent ID, etc.
 }
 
-interface SoulNote {
-  id: string;                     // UUID
-  content: string;                // The insight/learning
-  createdAt: Date;
-  updatedAt: Date;
-}
-
 interface ScheduleEntry {
   cron: string;
   task: string;
@@ -97,31 +89,42 @@ interface ScheduleEntry {
 **Collection**: `agent_definitions`
 **Indexes**: `{ _id: 1 }` (default), `{ channels: 1 }`, `{ disabled: 1 }`
 
-## Two-Layer Soul
+**Defaults** (applied by `toAgentConfig` when fields are absent — relevant for seeds and `agent_create`):
+- `maxConcurrent`: 3
+- `timeoutMs`: 300000 (5 min)
+- `budgetUsd`: 10
+- `maxTurns`: 200
+- `icon`: ""
+- `keywords`: []
+- `passiveChannels`: []
+- `delegatePrompts`: {}
+- `schedule`: []
 
-The agent's identity is split into two layers with clear ownership:
+## Version History
 
-| Layer | Owner | Mutability | Purpose |
-|-------|-------|-----------|---------|
-| `soul` | Admin (beekeeper, chief-of-staff, GUI) | Admin-only writes | Core personality, voice, values, role definition |
-| `soulNotes` | The agent itself | Agent CRUD via MCP tool | Learned insights, behavioral adjustments, self-knowledge |
+Every mutation to an agent definition is versioned, following the same pattern as `memory_versions`.
 
-**Assembly order in system prompt** (see [System Prompt Assembly](#system-prompt-assembly) for the full list including optional layers).
-
-The agent **cannot** modify `soul`. The agent **owns** `soulNotes` — it can add, edit, and delete its own notes. This preserves core identity while allowing growth.
-
-### Soul Note MCP Tool
-
-New tool on the **memory** MCP server (since it's already agent-identity-adjacent):
-
+```typescript
+interface AgentDefinitionVersion {
+  agentId: string;                // References agent_definitions._id
+  snapshot: AgentDefinition;      // Full document at time of change (includes updatedBy)
+  changedFields: string[];        // Which fields were modified
+  createdAt: Date;                // When this version was saved
+}
 ```
-soul_note_add    — Record a lasting insight about yourself
-soul_note_update — Revise an existing soul note
-soul_note_remove — Remove a soul note that no longer applies
-soul_note_list   — Review your current soul notes
+
+**Collection**: `agent_definition_versions`
+**Indexes**: `{ agentId: 1, createdAt: -1 }`
+
+**When a version is created**: on every `agent_update`, `agent_delete`, schedule change, or prompt change — any write to `agent_definitions`. The **previous** state is saved before the update is applied.
+
+**Rollback**: the admin MCP server and REST API expose:
+```
+agent_history  — List recent versions for an agent
+agent_rollback — Restore agent to a previous version
 ```
 
-These write directly to the `soulNotes` array on the agent's `agent_definitions` document.
+This protects against accidental soul wipes, bad config changes, or any mutation that needs to be undone. Versions are kept indefinitely (same retention as `memory_versions`).
 
 ## Agent CRUD
 
@@ -172,14 +175,18 @@ interface ServerInfo {
 Today: reads `agents/` directory, applies MongoDB overrides.
 After: reads `agent_definitions` collection directly.
 
+**Connection model:** `index.ts` creates a shared `MongoClient` and passes `db.collection("agent_definitions")` to the registry constructor. No self-managed connection — same pattern as other components that share the client.
+
 **Removed code:**
-- Constructor no longer takes `basePath` — takes MongoDB collection reference instead
+- Constructor no longer takes `basePath` — takes injected `Collection<AgentDefinition>` instead
 - `config.agents.definitionsPath` removed from `config.ts`
 - `getTemplate()` method removed (no override deltas to compute)
 - `applyConfigOverrides()` function removed
 - `ConfigOverride`, `PromptOverride` types removed from `agent-config.ts`
 - `templateConfigs` map removed
 - All four override collection references (`model_overrides`, `agent_config_overrides`, `prompt_overrides`, `schedule_overrides`) removed
+
+**Unchanged:** Query methods (`findByChannel`, `findByName`, `getSubscriberMap`, `getAll`, etc.) continue to work against the in-memory `agents` map populated by `load()`. No interface change for downstream consumers.
 
 ```typescript
 class AgentRegistry {
@@ -207,22 +214,22 @@ class AgentRegistry {
       channels: doc.channels,
       // ... direct field mapping, no overrides needed
       soul: doc.soul,
-      // Soul notes assembled into prompt by runner
-      soulNotes: doc.soulNotes,
       systemPrompt: doc.systemPrompt,
     };
   }
 }
 ```
 
-**Hot reload**: MongoDB change stream on `agent_definitions` replaces the file system watcher. Initialized in `AgentRegistry.connectDb()`. On change event:
-1. `registry.load()` — reload agent definitions
-2. `scheduler.reloadSchedules()` — pick up schedule changes
-3. `agentManager` notified of added/removed agents
+**Hot reload**: MongoDB change stream on `agent_definitions` replaces the file system watcher on `agents/`.
 
-`SIGUSR1` handler stays as a manual reload trigger (useful for debugging). The file system watcher on `agents/` is removed.
+The registry accepts an `onReload` callback at construction. `index.ts` passes the existing `reload()` closure (which already calls `registry.load()`, `scheduler.reloadSchedules()`, and notifies `agentManager`). The change stream / polling timer invokes this callback on changes. The `fs.watch(agentsDir, ...)` block in `index.ts` is removed entirely.
 
-Falls back to periodic polling (30s) if change streams aren't available (e.g., standalone MongoDB without replica set).
+`SIGUSR1` handler stays as a manual reload trigger (useful for debugging).
+
+**Polling fallback** (for standalone MongoDB without replica set — current dev setup):
+- On `connectDb()`, attempt `collection.watch()`. If it throws (no replica set), fall back to polling.
+- Polling: every 30s, query `agent_definitions` for documents with `updatedAt > lastPollTime`. If any found, trigger full `load()`.
+- Once set up, the mode (change stream vs polling) is fixed for the process lifetime — no hot-switching.
 
 ## Schedule MCP Server
 
@@ -230,15 +237,22 @@ Today `schedule-mcp-server.ts` reads/writes `schedule_overrides` as a separate l
 
 **Schedule MCP server changes:**
 - Reads/writes `agent_definitions.schedule` directly via MongoDB (no more `schedule_overrides` collection)
-- Runner passes `MONGODB_URI`, `DB_NAME`, and `AGENT_ID` as env vars (replacing `AGENT_SCHEDULE_DEFAULTS`)
+- Runner already passes `MONGODB_URI`, `MONGODB_DB`, and `AGENT_ID` to the schedule server — only change is dropping `AGENT_SCHEDULE_DEFAULTS`
 - Server reads current schedule from DB on each tool call — no stale-at-spawn-time issue
+- The entire `defaults`/merge pattern is removed — server reads only `agent_definitions.schedule` (single source)
 - `schedule: []` (empty array) = all jobs disabled, replacing the `null`-schedule sentinel
 
 **Scheduler changes:**
-- `reloadSchedules()` reads `agent_definitions.schedule` directly instead of layering `schedule_overrides` on top of agent config
+- `reloadSchedules()` reads schedules from `registry.getAll()` only — no separate `loadScheduleOverrides()` call
+- `scheduleOverrides` member, `ScheduleOverride` interface, and `schedule_overrides` index creation all removed
 - Two-layer merge logic removed — single authoritative field
 
-**Admin MCP server schedule tools** (`schedule_disable`, `schedule_set`, `schedule_reset`) also write to `agent_definitions.schedule` directly.
+**Admin MCP server changes:**
+- Existing override tools (`model_set`, `model_reset`, `config_set`, `config_reset`, `config_add`, `config_remove`, `prompt_set`, `prompt_reset`, `schedule_set`, `schedule_disable`, `schedule_reset`) are **removed**
+- Replaced by `agent_update` which writes any field on `agent_definitions` directly
+- `agent_enable`/`agent_disable` remain as convenience MCP tools + REST endpoints (`POST /admin/agents/:id/enable`, `POST /admin/agents/:id/disable`)
+- All four override collection references removed from admin server
+- Admin MCP server writes to `agent_definitions` directly via MongoDB (stdio subprocess, no REST round-trip). Runner passes `MONGODB_URI`, `MONGODB_DB` as env vars (already in the spawn block). `ADMIN_API_TOKEN` is only for the REST API surface — not needed by the MCP server.
 
 ## Constitution
 
@@ -271,33 +285,38 @@ After: `systemPrompt` as a separate authored field goes away for most agents. Th
 
 ```
 1. Date/time (auto)
-2. Soul — base identity (admin-authored)
-3. Soul notes — agent's learned insights (agent-authored)
+2. Soul — personality, voice, values (admin-authored)
+3. systemPrompt — optional guardrails/workflow instructions (admin-authored, when present)
 4. Constitution — shared rules (instance-level)
-5. systemPrompt — optional manual guardrails (when present)
-6. Server instructions — delegate namespace summaries (existing behavior from `buildSystemPrompt`)
-7. Agent memory — hot tier
+5. Server instructions — delegate namespace summaries (existing behavior from `buildSystemPrompt`)
+6. Agent memory — hot tier
 ```
 
-The `systemPrompt` field remains available as an **optional manual override** for cases where an admin needs to inject specific guardrails or workflow instructions that don't fit in the soul. When present, it's inserted between soul notes and constitution.
-
-"Server instructions" refers to the existing delegate namespace summaries already generated by `buildSystemPrompt()` — not a new mechanism. Each delegate server's description is listed so the agent knows what subagents are available.
+Same assembly as today minus the template rendering step. "Server instructions" refers to the existing delegate namespace summaries already generated by `buildSystemPrompt()` — not a new mechanism.
 
 ## hive.yaml Changes
 
-The `agents:` section in hive.yaml currently maps template IDs to names. This goes away — agent names live in the database.
+The `agents:` section in hive.yaml currently maps template IDs to names and holds `defaultAgent`. Agent names move to the database. `defaultAgent` stays in hive.yaml but moves to a top-level key:
 
 ```yaml
 # Before
 agents:
+  definitionsPath: "agents/"
+  defaultAgent: "executive-assistant"
   executive-assistant:
     name: "Rae"
   vp-engineering:
     name: "Jasper"
 
-# After — no agents section needed
-# Agents are created via API/MCP tools
+# After
+defaultAgent: "rae"   # Catch-all agent ID (used by conversation-search, dispatcher fallback)
+# Agent definitions live in MongoDB — no agents section needed
 ```
+
+`config.agents` block is removed entirely from `config.ts` — including `definitionsPath`, `defaultAgent`, and `defaultModel` (dead code). All references to `config.agents.defaultAgent` update to `config.defaultAgent`:
+- `src/index.ts` — dispatcher construction
+- `src/agents/agent-runner.ts` — conversation-search `DEFAULT_AGENT` env var
+- `src/agents/agent-runner.test.ts` — mock config object
 
 The rest of hive.yaml (business context, SMS config, ports, etc.) stays unchanged.
 
@@ -314,21 +333,36 @@ plugins/dodi/agent-seeds/
 
 `npm run setup` checks: does this agent ID exist in `agent_definitions`? If no, insert the seed. If yes, **skip** — DB is source of truth. Plugin upgrades that add new recommended servers or change defaults do NOT auto-apply to existing agents. This is intentional: once an agent exists, its definition is admin-owned. Plugin changelogs should note recommended manual updates.
 
+Seed files include all `AgentDefinition` fields including `delegatePrompts` (today these live in `delegate-prompts/*.md` template files — seeds inline them as YAML).
+
+## Migration
+
+One-time script: `npm run migrate:agents`
+
+For each agent directory in `agents/`:
+1. Read `agent.yaml`, `soul.md`, `system-prompt.md` (3 files)
+2. Read existing overrides from `model_overrides`, `agent_config_overrides`, `prompt_overrides`, `schedule_overrides`
+3. Merge into a single `AgentDefinition` document (overrides win over file values)
+4. Insert into `agent_definitions`
+
+After migration, verify agent count matches, then the old collections and `agents/` directory can be cleaned up.
+
 ## Scope & Non-Goals
 
 **In scope**:
 - `agent_definitions` collection + schema
+- `agent_definition_versions` collection (version history + rollback)
 - AgentRegistry rewrite (DB-backed)
-- Admin MCP tools for agent CRUD
-- Admin REST API for agent CRUD
-- Soul note MCP tools
+- Admin MCP tools for agent CRUD + history/rollback
+- Admin REST API for agent CRUD + history/rollback
 - System prompt assembly changes
+- Schedule MCP server rewrite (read/write `agent_definitions` directly)
 - Plugin seed mechanism
+- Migration script (read 3 files per agent from `agents/` + existing DB overrides → `agent_definitions`)
 - Remove template pipeline
 
 **Out of scope (future work)**:
 - Web admin GUI (API-first, GUI later)
+- Agent self-evolution / soul notes (needs its own design — deferred)
 - Agent capability bundles / composable roles
 - Agent cloning / forking
-- Conversational agent creation UX (beekeeper concern, not Hive concern)
-- Migration script for existing agents (separate task)
