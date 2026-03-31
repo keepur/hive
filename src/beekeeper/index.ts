@@ -246,6 +246,36 @@ async function main(): Promise<void> {
       const deviceId = deviceMatch[1];
       const action = deviceMatch[3];
 
+      // GET /devices/:id
+      if (req.method === "GET" && !action) {
+        try {
+          const device = await deviceRegistry.getDevice(deviceId);
+          if (!device) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Device not found" }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              deviceId: device._id,
+              name: device.name,
+              active: device.active,
+              paired: !!device.pairedAt,
+              pairedAt: device.pairedAt,
+              lastSeenAt: device.lastSeenAt,
+              connected: device._id === activeDeviceId && activeClient !== null,
+              hasPendingCode: !!device.pairingCode,
+            }),
+          );
+        } catch (err) {
+          log.error("Get device error", { error: String(err) });
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+        return;
+      }
+
       // PUT /devices/:id
       if (req.method === "PUT" && !action) {
         try {
@@ -334,27 +364,33 @@ async function main(): Promise<void> {
   const wss = new WebSocketServer({ noServer: true });
 
   server.on("upgrade", async (req, socket, head) => {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-    const token = url.searchParams.get("token") ?? req.headers.authorization?.replace("Bearer ", "");
+    try {
+      const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+      const token = url.searchParams.get("token") ?? req.headers.authorization?.replace("Bearer ", "");
 
-    if (!token) {
-      log.warn("WebSocket auth failed — no token");
-      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      if (!token) {
+        log.warn("WebSocket auth failed — no token");
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+
+      const device = await deviceRegistry.verifyToken(token);
+      if (!device) {
+        log.warn("WebSocket auth failed — invalid token");
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, device);
+      });
+    } catch (err) {
+      log.error("WebSocket upgrade error", { error: String(err) });
+      socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n");
       socket.destroy();
-      return;
     }
-
-    const device = await deviceRegistry.verifyToken(token);
-    if (!device) {
-      log.warn("WebSocket auth failed — invalid token");
-      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-      socket.destroy();
-      return;
-    }
-
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, device);
-    });
   });
 
   // --- Single client connection management ---
@@ -375,7 +411,9 @@ async function main(): Promise<void> {
     sessionManager.setClient(ws);
 
     // Update lastSeenAt
-    deviceRegistry.updateLastSeen(device._id).catch(() => {});
+    deviceRegistry
+      .updateLastSeen(device._id)
+      .catch((err) => log.warn("Failed to update lastSeenAt", { error: String(err) }));
 
     // Send current session info or start new session
     const sessionId = sessionManager.getSessionId();
@@ -401,7 +439,9 @@ async function main(): Promise<void> {
       try {
         switch (msg.type) {
           case "ping":
-            deviceRegistry.updateLastSeen(device._id).catch(() => {});
+            deviceRegistry
+              .updateLastSeen(device._id)
+              .catch((err) => log.warn("Failed to update lastSeenAt", { error: String(err) }));
             ws.send(JSON.stringify({ type: "pong" }));
             break;
           case "message":
