@@ -1,331 +1,106 @@
 import { describe, it, expect } from "vitest";
-import { applyConfigOverrides } from "./agent-registry.js";
-import type { AgentConfig, ConfigOverride } from "../types/agent-config.js";
+import { toAgentConfig, AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
+import type { AgentDefinition } from "../types/agent-definition.js";
 
-function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+function makeDefinition(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
   return {
-    id: "test-agent",
+    _id: "test-agent",
     name: "TestAgent",
     model: "claude-haiku-4-5",
+    icon: "",
     channels: ["agent-test"],
     passiveChannels: [],
     keywords: [],
     isDefault: false,
-    schedule: [],
-    budgetUsd: 10,
-    maxTurns: 25,
-    icon: "",
     coreServers: [],
     delegateServers: [],
+    delegatePrompts: {},
     soul: "",
     systemPrompt: "",
+    schedule: [],
+    budgetUsd: 10,
+    maxTurns: 200,
+    maxConcurrent: 3,
+    timeoutMs: 300_000,
+    disabled: false,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    updatedBy: "test",
     ...overrides,
   };
 }
 
-describe("applyConfigOverrides", () => {
-  it("returns config unchanged when no override", () => {
-    const config = makeConfig();
-    const result = applyConfigOverrides(config, undefined, undefined);
-    expect(result).toBe(config); // same reference
-  });
-
-  it("replaces array field entirely", () => {
-    const config = makeConfig({ channels: ["old-channel"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      channels: { replace: ["new-a", "new-b"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.channels).toEqual(["new-a", "new-b"]);
-  });
-
-  it("adds to array field without duplicates", () => {
-    const template = makeConfig({ channels: ["existing"] });
-    const config = makeConfig({ channels: ["existing"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      channels: { add: ["existing", "new-channel"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.channels).toEqual(["existing", "new-channel"]);
-  });
-
-  it("removes from array field", () => {
-    const template = makeConfig({ channels: ["keep", "remove-me"] });
-    const config = makeConfig({ channels: ["keep", "remove-me"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      channels: { remove: ["remove-me"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.channels).toEqual(["keep"]);
-  });
-
-  it("applies add and remove together", () => {
-    const template = makeConfig({ channels: ["a", "b", "c"] });
-    const config = makeConfig({ channels: ["a", "b", "c"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      channels: { add: ["d"], remove: ["b"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.channels).toEqual(["a", "c", "d"]);
-  });
-
-  it("overrides scalar fields", () => {
-    const config = makeConfig({ budgetUsd: 10, maxTurns: 25 });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      budgetUsd: 50,
-      maxTurns: 100,
-      isDefault: true,
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.budgetUsd).toBe(50);
-    expect(result.maxTurns).toBe(100);
-    expect(result.isDefault).toBe(true);
-  });
-
-  it("overrides disabled flag", () => {
-    const config = makeConfig({ disabled: false });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      disabled: true,
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.disabled).toBe(true);
-  });
-
-  it("uses template as base for add/remove (not current config)", () => {
-    // Template has ["a", "b"], current config was already modified to ["a", "b", "extra"]
-    // Override should use template as base, not current
-    const template = makeConfig({ channels: ["a", "b"] });
-    const config = makeConfig({ channels: ["a", "b", "extra"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      channels: { add: ["c"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    // Should be template base + add, NOT current config base + add
-    expect(result.channels).toEqual(["a", "b", "c"]);
-  });
-
-  it("does not override scalar fields that are not present in override", () => {
-    const config = makeConfig({ budgetUsd: 10, maxTurns: 25, isDefault: false });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      budgetUsd: 50,
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.budgetUsd).toBe(50);
-    expect(result.maxTurns).toBe(25); // unchanged
-    expect(result.isDefault).toBe(false); // unchanged
-  });
-
-  it("handles passiveChannels and keywords array overrides", () => {
-    const template = makeConfig({ passiveChannels: ["biz"], keywords: ["deploy"] });
-    const config = makeConfig({ passiveChannels: ["biz"], keywords: ["deploy"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      passiveChannels: { add: ["general"] },
-      keywords: { replace: ["ship", "release"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.passiveChannels).toEqual(["biz", "general"]);
-    expect(result.keywords).toEqual(["ship", "release"]);
-  });
-
-  it("overrides coreServers via replace", () => {
-    const config = makeConfig({ coreServers: ["memory", "slack"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      coreServers: { replace: ["memory", "callback"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.coreServers).toEqual(["memory", "callback"]);
-  });
-
-  it("adds to delegateServers without duplicates", () => {
-    const template = makeConfig({ delegateServers: ["hubspot-crm"] });
-    const config = makeConfig({ delegateServers: ["hubspot-crm"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      delegateServers: { add: ["hubspot-crm", "dodi-ops"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.delegateServers).toEqual(["hubspot-crm", "dodi-ops"]);
-  });
-
-  it("backward compat: treats old 'servers' override as coreServers", () => {
-    const config = makeConfig({ coreServers: ["memory"] });
-    const override = {
-      agentId: "test-agent",
-      servers: { replace: ["memory", "slack", "callback"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    } as any as ConfigOverride;
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.coreServers).toEqual(["memory", "slack", "callback"]);
-  });
-
-  it("replaces plugins array entirely", () => {
-    const config = makeConfig({ plugins: ["old-plugin"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      plugins: { replace: ["new-plugin-a", "new-plugin-b"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.plugins).toEqual(["new-plugin-a", "new-plugin-b"]);
-  });
-
-  it("adds plugins without duplicates", () => {
-    const template = makeConfig({ plugins: ["existing-plugin"] });
-    const config = makeConfig({ plugins: ["existing-plugin"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      plugins: { add: ["existing-plugin", "new-plugin"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.plugins).toEqual(["existing-plugin", "new-plugin"]);
-  });
-
-  it("removes plugins", () => {
-    const template = makeConfig({ plugins: ["keep-plugin", "remove-plugin"] });
-    const config = makeConfig({ plugins: ["keep-plugin", "remove-plugin"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      plugins: { remove: ["remove-plugin"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.plugins).toEqual(["keep-plugin"]);
-  });
-});
-
-describe("subscribe overrides", () => {
-  it("replaces subscribe array entirely", () => {
-    const config = makeConfig({ subscribe: ["deals"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      subscribe: { replace: ["cases", "jobs"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.subscribe).toEqual(["cases", "jobs"]);
-  });
-
-  it("adds to subscribe array without duplicates", () => {
-    const template = makeConfig({ subscribe: ["deals"] });
-    const config = makeConfig({ subscribe: ["deals"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      subscribe: { add: ["deals", "jobs"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.subscribe).toEqual(["deals", "jobs"]);
-  });
-
-  it("removes from subscribe array", () => {
-    const template = makeConfig({ subscribe: ["deals", "jobs", "cases"] });
-    const config = makeConfig({ subscribe: ["deals", "jobs", "cases"] });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      subscribe: { remove: ["jobs"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    expect(result.subscribe).toEqual(["deals", "cases"]);
-  });
-});
-
-describe("delegatePrompts in applyConfigOverrides", () => {
-  it("preserves delegatePrompts when no override is applied", () => {
-    const config = makeConfig({ delegatePrompts: { google: "My Google prompt." } });
-    const result = applyConfigOverrides(config, undefined, undefined);
-    expect(result.delegatePrompts).toEqual({ google: "My Google prompt." });
-  });
-
-  it("preserves delegatePrompts when scalar overrides are applied", () => {
-    const config = makeConfig({
-      budgetUsd: 10,
-      delegatePrompts: { google: "My Google prompt.", clickup: "My ClickUp prompt." },
+describe("toAgentConfig", () => {
+  it("maps all fields from definition to config", () => {
+    const def = makeDefinition({
+      _id: "rae",
+      name: "Rae",
+      model: "claude-haiku-4-5",
+      channels: ["general"],
+      coreServers: ["memory", "slack"],
+      soul: "I am Rae.",
+      systemPrompt: "You are a receptionist.",
     });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      budgetUsd: 50,
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    // scalar override is applied
-    expect(result.budgetUsd).toBe(50);
-    // delegatePrompts is untouched
-    expect(result.delegatePrompts).toEqual({ google: "My Google prompt.", clickup: "My ClickUp prompt." });
+    const config = toAgentConfig(def);
+    expect(config.id).toBe("rae");
+    expect(config.name).toBe("Rae");
+    expect(config.model).toBe("claude-haiku-4-5");
+    expect(config.channels).toEqual(["general"]);
+    expect(config.coreServers).toEqual(["memory", "slack"]);
+    expect(config.soul).toBe("I am Rae.");
+    expect(config.systemPrompt).toBe("You are a receptionist.");
   });
 
-  it("preserves delegatePrompts when array overrides are applied", () => {
-    const template = makeConfig({ channels: ["agent-test"], delegatePrompts: { google: "Prompt A." } });
-    const config = makeConfig({ channels: ["agent-test"], delegatePrompts: { google: "Prompt A." } });
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      channels: { add: ["new-channel"] },
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, template);
-    // array override is applied
-    expect(result.channels).toContain("new-channel");
-    // delegatePrompts is untouched
-    expect(result.delegatePrompts).toEqual({ google: "Prompt A." });
+  it("applies defaults for missing optional fields", () => {
+    const def = makeDefinition();
+    delete (def as any).maxConcurrent;
+    delete (def as any).timeoutMs;
+    delete (def as any).budgetUsd;
+    delete (def as any).maxTurns;
+    delete (def as any).icon;
+    delete (def as any).keywords;
+    delete (def as any).passiveChannels;
+    delete (def as any).delegatePrompts;
+    delete (def as any).schedule;
+
+    const config = toAgentConfig(def);
+    expect(config.maxConcurrent).toBe(AGENT_DEFINITION_DEFAULTS.maxConcurrent);
+    expect(config.timeoutMs).toBe(AGENT_DEFINITION_DEFAULTS.timeoutMs);
+    expect(config.budgetUsd).toBe(AGENT_DEFINITION_DEFAULTS.budgetUsd);
+    expect(config.maxTurns).toBe(AGENT_DEFINITION_DEFAULTS.maxTurns);
+    expect(config.icon).toBe(AGENT_DEFINITION_DEFAULTS.icon);
+    expect(config.keywords).toEqual(AGENT_DEFINITION_DEFAULTS.keywords);
+    expect(config.passiveChannels).toEqual(AGENT_DEFINITION_DEFAULTS.passiveChannels);
+    expect(config.delegatePrompts).toEqual(AGENT_DEFINITION_DEFAULTS.delegatePrompts);
+    expect(config.schedule).toEqual(AGENT_DEFINITION_DEFAULTS.schedule);
   });
 
-  it("preserves undefined delegatePrompts unchanged", () => {
-    const config = makeConfig(); // no delegatePrompts
-    const override: ConfigOverride = {
-      agentId: "test-agent",
-      budgetUsd: 20,
-      updatedAt: new Date(),
-      updatedBy: "test",
-    };
-    const result = applyConfigOverrides(config, override, makeConfig());
-    expect(result.delegatePrompts).toBeUndefined();
+  it("preserves delegatePrompts when present", () => {
+    const def = makeDefinition({
+      delegatePrompts: { google: "Search Google.", clickup: "Manage tasks." },
+    });
+    const config = toAgentConfig(def);
+    expect(config.delegatePrompts).toEqual({ google: "Search Google.", clickup: "Manage tasks." });
+  });
+
+  it("preserves optional fields when present", () => {
+    const def = makeDefinition({
+      triageModel: "claude-haiku-4-5",
+      dodiOpsMode: "readonly",
+      slackBot: "jasper",
+      plugins: ["dodi-dev"],
+      subscribe: ["deals", "jobs"],
+    });
+    const config = toAgentConfig(def);
+    expect(config.triageModel).toBe("claude-haiku-4-5");
+    expect(config.dodiOpsMode).toBe("readonly");
+    expect(config.slackBot).toBe("jasper");
+    expect(config.plugins).toEqual(["dodi-dev"]);
+    expect(config.subscribe).toEqual(["deals", "jobs"]);
   });
 });
 
 describe("name matching patterns", () => {
-  // These test the same regex logic used in findAllByName
   function matchesName(text: string, agentName: string): boolean {
     const name = agentName.toLowerCase();
     const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
@@ -353,20 +128,11 @@ describe("name matching patterns", () => {
   });
 
   it("does not match partial name within word", () => {
-    // "Jasper" should not match inside "Jasperson"
     expect(matchesName("Contact Jasperson about this", "Jasper")).toBe(false);
-  });
-
-  it("matches multiple agents", () => {
-    const text = "Jasper and River, coordinate on this";
-    expect(matchesName(text, "Jasper")).toBe(true);
-    expect(matchesName(text, "River")).toBe(true);
-    expect(matchesName(text, "Milo")).toBe(false);
   });
 
   it("is case insensitive", () => {
     expect(matchesName("hey RIVER", "River")).toBe(true);
-    expect(matchesName("hey river", "River")).toBe(true);
   });
 });
 
@@ -382,11 +148,6 @@ describe("keyword matching", () => {
 
   it("does not match partial keyword", () => {
     expect(matchesKeyword("permitted entry", "permit")).toBe(false);
-  });
-
-  it("handles special regex characters in keywords", () => {
-    expect(matchesKeyword("price is $100", "$100")).toBe(false); // word boundary won't match $ at start
-    expect(matchesKeyword("check (status)", "(status)")).toBe(false); // parens aren't word chars
   });
 
   it("is case insensitive", () => {

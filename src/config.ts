@@ -100,11 +100,7 @@ export const config = {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
     dbName: optional("MONGODB_DB", `hive_${instanceId}`),
   },
-  agents: {
-    defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
-    defaultModel: optional("DEFAULT_MODEL", "claude-sonnet-4-6"),
-    definitionsPath: optional("AGENTS_PATH", "./agents"),
-  },
+  defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
   google: {
     account: optional("GOOGLE_ACCOUNT", hive.google?.account ?? ""),
     client: optional("GOG_CLIENT", hive.google?.client ?? ""),
@@ -180,6 +176,10 @@ export const config = {
     enabled: optional("WS_ENABLED", "false") === "true",
     port: parseInt(optional("WS_PORT", String(ports.ws ?? portBase + 3)), 10),
     jwtSecret: optional("WS_JWT_SECRET", ""),
+  },
+  adminApi: {
+    port: parseInt(optional("ADMIN_API_PORT", String(ports.adminApi ?? portBase + 4)), 10),
+    token: optional("ADMIN_API_TOKEN", ""),
   },
   externalComms: {
     enabled: optional("EXTERNAL_COMMS_ENABLED", "false") === "true",

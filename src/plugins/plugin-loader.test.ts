@@ -36,7 +36,7 @@ describe("normalizeManifest", () => {
 
     expect(result.name).toBe("test-plugin");
     expect(result.description).toBe("A test plugin");
-    expect(result.agentsTemplates).toEqual(["agent-a", "agent-b"]);
+    expect(result.agentSeeds).toEqual(["agent-a", "agent-b"]);
     expect(result.mcpServers["my-server"]).toEqual({
       entry: "mcp-servers/my-server/index.ts",
       description: undefined,
@@ -65,7 +65,7 @@ describe("normalizeManifest", () => {
     expect(result.name).toBe("");
     expect(result.description).toBe("");
     expect(result.mcpServers).toEqual({});
-    expect(result.agentsTemplates).toEqual([]);
+    expect(result.agentSeeds).toEqual([]);
   });
 
   it("defaults missing server sub-fields", () => {
@@ -115,7 +115,7 @@ agents-templates:
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe("test");
     expect(result[0].manifest.mcpServers["my-server"].entry).toBe("mcp-servers/my-server/index.ts");
-    expect(result[0].manifest.agentsTemplates).toEqual(["my-agent"]);
+    expect(result[0].manifest.agentSeeds).toEqual(["my-agent"]);
   });
 
   it("sets dir to resolved plugin path", () => {
