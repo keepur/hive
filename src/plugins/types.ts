@@ -10,7 +10,7 @@ export interface PluginManifest {
   name: string;
   description?: string;
   mcpServers: Record<string, PluginMcpServer>;
-  agentsTemplates: string[];
+  agentSeeds: string[];
 }
 
 export interface LoadedPlugin {
