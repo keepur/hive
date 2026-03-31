@@ -16,6 +16,7 @@
     "update": "git pull && npm install && npm run build",
     "embed:hubspot": "npx tsx scripts/hubspot-embed.ts",
     "embed:dodi": "npx tsx scripts/dodi-embed.ts",
+    "migrate:agents": "npx tsx setup/migrate-agents.ts",
     "lint": "eslint src/ plugins/ setup/",
     "lint:fix": "eslint --fix src/ plugins/ setup/",
     "format": "prettier --write \"src/**/*.ts\" \"plugins/**/*.ts\" \"setup/**/*.ts\"",
