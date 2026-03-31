@@ -458,6 +458,17 @@ server.registerTool(
 
     const target = versions[version_index];
 
+    // Verify the agent still exists before rollback
+    const existing = await agentDefs.findOne({ _id: agent_id as any });
+    if (!existing) {
+      return {
+        content: [
+          { type: "text", text: `Agent '${agent_id}' not found — cannot rollback a deleted agent.` },
+        ],
+        isError: true,
+      };
+    }
+
     // Save current state before rollback
     await saveVersion(agent_id, ["ROLLBACK"]);
 
