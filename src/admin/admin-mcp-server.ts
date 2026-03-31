@@ -443,6 +443,13 @@ server.registerTool(
     },
   },
   async ({ agent_id, version_index }) => {
+    if (version_index < 0 || !Number.isInteger(version_index)) {
+      return {
+        content: [{ type: "text", text: "version_index must be a non-negative integer." }],
+        isError: true,
+      };
+    }
+
     const versions = await agentVersions
       .find({ agentId: agent_id })
       .sort({ createdAt: -1 })
