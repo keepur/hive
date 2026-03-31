@@ -476,7 +476,8 @@ async function main(): Promise<void> {
               .sort((a, b) => {
                 if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
                 return a.name.localeCompare(b.name);
-              });
+              })
+              .slice(0, 200);
             ws.send(JSON.stringify({ type: "browse_result", path: browseTarget, entries }));
             break;
           }
