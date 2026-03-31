@@ -5,6 +5,8 @@ model: claude-haiku-4-5
 channels:
   - dev
   - agent-{{agent.name_lower}}
+passiveChannels:
+  - devops
 keywords:
   - build
   - bug
