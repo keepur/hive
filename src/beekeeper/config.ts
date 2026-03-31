@@ -76,9 +76,19 @@ export function loadConfig(): BeekeeperConfig {
 
   const raw = parseYaml(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
 
-  const authToken = process.env.BEEKEEPER_AUTH_TOKEN;
-  if (!authToken) {
-    throw new Error("Missing required env var: BEEKEEPER_AUTH_TOKEN");
+  const jwtSecret = process.env.BEEKEEPER_JWT_SECRET;
+  if (!jwtSecret) {
+    throw new Error("Missing required env var: BEEKEEPER_JWT_SECRET");
+  }
+
+  const adminSecret = process.env.BEEKEEPER_ADMIN_SECRET;
+  if (!adminSecret) {
+    throw new Error("Missing required env var: BEEKEEPER_ADMIN_SECRET");
+  }
+
+  const mongoUri = process.env.MONGO_URI;
+  if (!mongoUri) {
+    throw new Error("Missing required env var: MONGO_URI");
   }
 
   // Expand ~ in workspace paths
@@ -117,7 +127,10 @@ export function loadConfig(): BeekeeperConfig {
       "git checkout -- .",
       "git clean -f",
     ],
-    authToken,
+    jwtSecret,
+    adminSecret,
+    mongoUri,
+    mongoDbName: (raw.mongo_db as string) ?? "hive",
     plugins: allPlugins,
   };
 }

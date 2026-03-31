@@ -22,6 +22,9 @@ export interface BeekeeperConfig {
   model: string;
   workspaces: Record<string, string>;
   confirmOperations: string[];
-  authToken: string;
+  jwtSecret: string;
+  adminSecret: string;
+  mongoUri: string;
+  mongoDbName: string;
   plugins?: string[];
 }
