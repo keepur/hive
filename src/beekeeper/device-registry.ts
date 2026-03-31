@@ -59,6 +59,7 @@ export class BeekeeperDeviceRegistry {
     const device = await this.collection.findOne({
       pairingCode: code,
       pairingCodeExpiresAt: { $gt: new Date() },
+      active: true,
     });
 
     if (!device) {
@@ -108,7 +109,7 @@ export class BeekeeperDeviceRegistry {
     const code = randomInt(100000, 1000000).toString();
     const expiresAt = new Date(Date.now() + PAIRING_CODE_TTL_MS);
     const result = await this.collection.updateOne(
-      { _id: deviceId },
+      { _id: deviceId, active: true },
       { $set: { pairingCode: code, pairingCodeExpiresAt: expiresAt } },
     );
     if (result.matchedCount === 0) {
