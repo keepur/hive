@@ -96,7 +96,11 @@ export class SessionManager {
 
     slot.cleared = true;
     if (slot.activeQuery) {
-      await slot.activeQuery.interrupt();
+      try {
+        await slot.activeQuery.interrupt();
+      } catch (err) {
+        log.error("Failed to interrupt session during clear", { sessionId, error: String(err) });
+      }
     }
     this.sessions.delete(sessionId);
     this.send({ type: "session_cleared", sessionId });
@@ -110,7 +114,7 @@ export class SessionManager {
   listSessions(): void {
     const sessions = Array.from(this.sessions.values()).map((s) => ({
       sessionId: s.sessionId,
-      cwd: s.cwd,
+      path: s.cwd,
       state: s.state,
     }));
     this.send({ type: "session_list", sessions });
@@ -119,10 +123,10 @@ export class SessionManager {
   /**
    * Get session info for reconnection.
    */
-  getActiveSessions(): Array<{ sessionId: string; cwd: string; state: "idle" | "busy" }> {
+  getActiveSessions(): Array<{ sessionId: string; path: string; state: "idle" | "busy" }> {
     return Array.from(this.sessions.values()).map((s) => ({
       sessionId: s.sessionId,
-      cwd: s.cwd,
+      path: s.cwd,
       state: s.state,
     }));
   }
@@ -133,8 +137,12 @@ export class SessionManager {
   async stopAll(): Promise<void> {
     for (const [sessionId, slot] of this.sessions) {
       if (slot.activeQuery) {
-        log.info("Stopping session", { sessionId });
-        await slot.activeQuery.interrupt();
+        try {
+          log.info("Stopping session", { sessionId });
+          await slot.activeQuery.interrupt();
+        } catch (err) {
+          log.error("Failed to stop session", { sessionId, error: String(err) });
+        }
       }
     }
     this.sessions.clear();
@@ -183,7 +191,7 @@ export class SessionManager {
           this.send({
             type: "session_info",
             sessionId: resolvedSessionId,
-            cwd: slot.cwd,
+            path: slot.cwd,
           });
         }
 
