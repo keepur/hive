@@ -32,10 +32,10 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
       }
     }
 
-    for (const tpl of manifest.agentsTemplates) {
-      const tplDir = join(pluginDir, "agents-templates", tpl);
-      if (!existsSync(tplDir)) {
-        log.warn("Plugin agent template not found", { plugin: name, template: tpl, path: tplDir });
+    for (const seed of manifest.agentSeeds) {
+      const seedPath = join(pluginDir, "agent-seeds", seed);
+      if (!existsSync(seedPath)) {
+        log.warn("Plugin agent seed not found", { plugin: name, seed, path: seedPath });
       }
     }
 
@@ -43,7 +43,7 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
     log.info("Plugin loaded", {
       plugin: name,
       mcpServers: Object.keys(manifest.mcpServers),
-      templates: manifest.agentsTemplates,
+      seeds: manifest.agentSeeds,
     });
   }
 
@@ -66,6 +66,6 @@ export function normalizeManifest(raw: any): PluginManifest {
         },
       ]),
     ),
-    agentsTemplates: raw["agents-templates"] ?? [],
+    agentSeeds: raw["agent-seeds"] ?? raw["agents-templates"] ?? [],
   };
 }
