@@ -58,6 +58,9 @@ async function main(): Promise<void> {
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
 
   const reload = async () => {
+    // Guard: reload may fire via change stream before agentManager/scheduler are assigned
+    if (!agentManager || !scheduler) return;
+
     log.info("Hot-reloading agent registry...");
     const result = await registry.load();
 

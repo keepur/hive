@@ -25,6 +25,8 @@ const MIN_INTERVAL_MINUTES = 15;
 interface AgentDefDoc {
   _id: string;
   schedule?: Array<{ cron: string; task: string }>;
+  scheduleLocked?: boolean;
+  scheduleLastReason?: string;
 }
 
 const client = new MongoClient(MONGODB_URI);
@@ -129,6 +131,19 @@ server.registerTool(
     }
 
     const doc = await agentDefs.findOne({ _id: AGENT_ID });
+
+    if (doc?.scheduleLocked) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Your schedule is locked by an admin. Contact the platform admin to unlock it.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
     const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
     if (current.length >= MAX_SCHEDULES) {
@@ -151,7 +166,7 @@ server.registerTool(
 
     await agentDefs.updateOne(
       { _id: AGENT_ID },
-      { $set: { schedule: newSchedule, updatedAt: new Date(), updatedBy: AGENT_ID } },
+      { $set: { schedule: newSchedule, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
     // Change stream / polling picks up the write within 30s
@@ -181,6 +196,14 @@ server.registerTool(
   },
   async ({ task, reason }) => {
     const doc = await agentDefs.findOne({ _id: AGENT_ID });
+
+    if (doc?.scheduleLocked) {
+      return {
+        content: [{ type: "text", text: "Your schedule is locked by an admin." }],
+        isError: true,
+      };
+    }
+
     const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
     const idx = current.findIndex((s) => s.task === task);
@@ -195,7 +218,7 @@ server.registerTool(
 
     await agentDefs.updateOne(
       { _id: AGENT_ID },
-      { $set: { schedule: newSchedule, updatedAt: new Date(), updatedBy: AGENT_ID } },
+      { $set: { schedule: newSchedule, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
     // Change stream / polling picks up the write within 30s
@@ -232,6 +255,14 @@ server.registerTool(
     }
 
     const doc = await agentDefs.findOne({ _id: AGENT_ID });
+
+    if (doc?.scheduleLocked) {
+      return {
+        content: [{ type: "text", text: "Your schedule is locked by an admin." }],
+        isError: true,
+      };
+    }
+
     const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
     const idx = current.findIndex((s) => s.task === task);
@@ -246,7 +277,7 @@ server.registerTool(
 
     await agentDefs.updateOne(
       { _id: AGENT_ID },
-      { $set: { schedule: current, updatedAt: new Date(), updatedBy: AGENT_ID } },
+      { $set: { schedule: current, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
     // Change stream / polling picks up the write within 30s

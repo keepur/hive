@@ -6,6 +6,10 @@ import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 
 const log = createLogger("admin-api");
 
+// MongoDB _id filter casts: AgentDefinition uses string _id but the MongoDB driver
+// types filter._id as ObjectId. The `as any` casts on `{ _id: id as any }` throughout
+// this file are required to bridge this typing mismatch.
+
 export class AdminApi {
   private server: ReturnType<typeof createServer>;
   private port: number;
@@ -197,8 +201,9 @@ export class AdminApi {
     const existing = await this.agentDefs.findOne({ _id: id as any });
     if (!existing) return this.json(res, 404, { error: "Agent not found" });
 
-    // Don't allow changing _id
+    // Don't allow changing immutable fields
     delete body._id;
+    delete body.createdAt;
 
     const changedFields = Object.keys(body);
     await this.saveVersion(id, changedFields);
@@ -245,6 +250,10 @@ export class AdminApi {
   private async rollbackAgent(id: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await this.readBody(req);
     const versionIndex = body.version_index ?? 0;
+
+    if (typeof versionIndex !== "number" || versionIndex < 0 || !Number.isInteger(versionIndex)) {
+      return this.json(res, 400, { error: "version_index must be a non-negative integer" });
+    }
 
     const versions = await this.agentVersions
       .find({ agentId: id })
