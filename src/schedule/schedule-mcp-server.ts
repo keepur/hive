@@ -3,10 +3,10 @@
 /**
  * Schedule MCP Server — self-service schedule management for agents.
  * Each agent can only manage their own schedules.
+ * Reads/writes agent_definitions.schedule directly (DB-native).
  *
  * Env vars:
  *   AGENT_ID                  — the calling agent's ID (scope lock)
- *   AGENT_SCHEDULE_DEFAULTS   — JSON-serialized default schedules from agent.yaml
  *   MONGODB_URI               — MongoDB connection string
  *   MONGODB_DB                — database name
  */
@@ -22,18 +22,17 @@ const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
 const MAX_SCHEDULES = 10;
 const MIN_INTERVAL_MINUTES = 15;
 
-// Parse defaults from agent.yaml (passed as JSON by agent-runner)
-let defaults: Array<{ cron: string; task: string }> = [];
-try {
-  defaults = JSON.parse(process.env.AGENT_SCHEDULE_DEFAULTS ?? "[]");
-} catch {
-  defaults = [];
+interface AgentDefDoc {
+  _id: string;
+  schedule?: Array<{ cron: string; task: string }>;
+  scheduleLocked?: boolean;
+  scheduleLastReason?: string;
 }
 
 const client = new MongoClient(MONGODB_URI);
 await client.connect();
 const db = client.db(MONGODB_DB);
-const scheduleOverrides = db.collection("schedule_overrides");
+const agentDefs = db.collection<AgentDefDoc>("agent_definitions");
 
 const server = new McpServer({
   name: "hive-schedule",
@@ -88,42 +87,23 @@ server.registerTool(
   "my_schedules",
   {
     title: "My Schedules",
-    description: "List your active schedules — shows both YAML defaults and any overrides you've set.",
+    description: "List your active schedules.",
     inputSchema: {},
   },
   async () => {
-    const override = (await scheduleOverrides.findOne({ agentId: AGENT_ID })) as any;
+    const doc = await agentDefs.findOne({ _id: AGENT_ID });
+    const schedule: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
     const lines: string[] = [];
     lines.push(`## Schedules for ${AGENT_ID}\n`);
 
-    if (override?.schedule === null) {
-      lines.push("**Status: ALL DISABLED** (schedule override set to null)\n");
-      lines.push("### YAML Defaults (inactive):");
-      for (const s of defaults) {
-        lines.push(`  ${s.cron} → ${s.task}`);
-      }
-    } else if (override?.schedule) {
-      lines.push("### Active (override):");
-      for (const s of override.schedule) {
-        lines.push(`  ${s.cron} → ${s.task}`);
-      }
-      const date =
-        override.updatedAt instanceof Date ? override.updatedAt.toISOString() : String(override.updatedAt ?? "");
-      lines.push(`\n_Last updated: ${date}_`);
-
-      if (defaults.length > 0) {
-        lines.push("\n### YAML Defaults (overridden):");
-        for (const s of defaults) {
-          lines.push(`  ${s.cron} → ${s.task}`);
-        }
-      }
+    if (schedule.length === 0) {
+      lines.push("No scheduled tasks configured.");
     } else {
-      lines.push("### Active (YAML defaults):");
-      for (const s of defaults) {
+      lines.push("### Active Schedules:");
+      for (const s of schedule) {
         lines.push(`  ${s.cron} → ${s.task}`);
       }
-      lines.push("\n_No overrides set — using YAML defaults._");
     }
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -150,22 +130,21 @@ server.registerTool(
       return { content: [{ type: "text", text: intervalError }], isError: true };
     }
 
-    const override = (await scheduleOverrides.findOne({ agentId: AGENT_ID })) as any;
+    const doc = await agentDefs.findOne({ _id: AGENT_ID });
 
-    // Block if schedule is explicitly disabled (null means admin/agent disabled all schedules)
-    if (override?.schedule === null) {
+    if (doc?.scheduleLocked) {
       return {
         content: [
           {
             type: "text",
-            text: "Your schedule is currently disabled. Use my_schedule_remove to clear the disable, or ask the platform admin to re-enable it first.",
+            text: "Your schedule is locked by an admin. Contact the platform admin to unlock it.",
           },
         ],
         isError: true,
       };
     }
 
-    const current: Array<{ cron: string; task: string }> = override?.schedule ?? [...defaults];
+    const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
     if (current.length >= MAX_SCHEDULES) {
       return {
@@ -185,25 +164,20 @@ server.registerTool(
 
     const newSchedule = [...current, { cron, task }];
 
-    await scheduleOverrides.updateOne(
-      { agentId: AGENT_ID },
-      {
-        $set: {
-          schedule: newSchedule,
-          updatedAt: new Date(),
-          updatedBy: AGENT_ID,
-          reason,
-        },
-      },
-      { upsert: true },
+    await agentDefs.updateOne(
+      { _id: AGENT_ID },
+      { $set: { schedule: newSchedule, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
-    try {
-      process.kill(process.ppid, "SIGUSR1");
-    } catch {}
+    // Change stream / polling picks up the write within 30s
 
     return {
-      content: [{ type: "text", text: `Added schedule: ${cron} → ${task}\nReason: ${reason}\nHot-reload triggered.` }],
+      content: [
+        {
+          type: "text",
+          text: `Added schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+        },
+      ],
     };
   },
 );
@@ -221,16 +195,16 @@ server.registerTool(
     },
   },
   async ({ task, reason }) => {
-    const override = (await scheduleOverrides.findOne({ agentId: AGENT_ID })) as any;
+    const doc = await agentDefs.findOne({ _id: AGENT_ID });
 
-    if (override?.schedule === null) {
+    if (doc?.scheduleLocked) {
       return {
-        content: [{ type: "text", text: "Your schedule is currently disabled. Nothing to remove." }],
+        content: [{ type: "text", text: "Your schedule is locked by an admin." }],
         isError: true,
       };
     }
 
-    const current: Array<{ cron: string; task: string }> = override?.schedule ?? [...defaults];
+    const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
     const idx = current.findIndex((s) => s.task === task);
     if (idx === -1) {
@@ -242,26 +216,19 @@ server.registerTool(
 
     const newSchedule = current.filter((_, i) => i !== idx);
 
-    await scheduleOverrides.updateOne(
-      { agentId: AGENT_ID },
-      {
-        $set: {
-          schedule: newSchedule,
-          updatedAt: new Date(),
-          updatedBy: AGENT_ID,
-          reason,
-        },
-      },
-      { upsert: true },
+    await agentDefs.updateOne(
+      { _id: AGENT_ID },
+      { $set: { schedule: newSchedule, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
-    try {
-      process.kill(process.ppid, "SIGUSR1");
-    } catch {}
+    // Change stream / polling picks up the write within 30s
 
     return {
       content: [
-        { type: "text", text: `Removed schedule for task '${task}'.\nReason: ${reason}\nHot-reload triggered.` },
+        {
+          type: "text",
+          text: `Removed schedule for task '${task}'.\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+        },
       ],
     };
   },
@@ -287,16 +254,16 @@ server.registerTool(
       return { content: [{ type: "text", text: intervalError }], isError: true };
     }
 
-    const override = (await scheduleOverrides.findOne({ agentId: AGENT_ID })) as any;
+    const doc = await agentDefs.findOne({ _id: AGENT_ID });
 
-    if (override?.schedule === null) {
+    if (doc?.scheduleLocked) {
       return {
-        content: [{ type: "text", text: "Your schedule is currently disabled. Nothing to update." }],
+        content: [{ type: "text", text: "Your schedule is locked by an admin." }],
         isError: true,
       };
     }
 
-    const current: Array<{ cron: string; task: string }> = override?.schedule ?? [...defaults];
+    const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
     const idx = current.findIndex((s) => s.task === task);
     if (idx === -1) {
@@ -308,26 +275,19 @@ server.registerTool(
 
     current[idx] = { cron, task };
 
-    await scheduleOverrides.updateOne(
-      { agentId: AGENT_ID },
-      {
-        $set: {
-          schedule: current,
-          updatedAt: new Date(),
-          updatedBy: AGENT_ID,
-          reason,
-        },
-      },
-      { upsert: true },
+    await agentDefs.updateOne(
+      { _id: AGENT_ID },
+      { $set: { schedule: current, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
-    try {
-      process.kill(process.ppid, "SIGUSR1");
-    } catch {}
+    // Change stream / polling picks up the write within 30s
 
     return {
       content: [
-        { type: "text", text: `Updated schedule: ${cron} → ${task}\nReason: ${reason}\nHot-reload triggered.` },
+        {
+          type: "text",
+          text: `Updated schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+        },
       ],
     };
   },

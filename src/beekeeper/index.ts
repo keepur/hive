@@ -434,6 +434,8 @@ async function main(): Promise<void> {
         return;
       }
 
+      log.info("WS message received", { type: msg.type, raw: raw.toString().slice(0, 200) });
+
       try {
         switch (msg.type) {
           case "ping":

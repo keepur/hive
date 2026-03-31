@@ -1,179 +1,62 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { parse as parseYaml } from "yaml";
 import { createLogger } from "../logging/logger.js";
-import type { AgentConfig, AgentSchedule, ConfigOverride, ArrayOverride, PromptOverride } from "../types/agent-config.js";
-import { MongoClient, type Collection, type Db } from "mongodb";
+import type { AgentConfig } from "../types/agent-config.js";
+import type { AgentDefinition } from "../types/agent-definition.js";
+import { toAgentConfig } from "../types/agent-definition.js";
+import type { Collection, ChangeStream } from "mongodb";
 
 const log = createLogger("agent-registry");
 
-interface ModelOverride {
-  agentId: string;
-  model: string;
-  updatedAt: Date;
-  updatedBy?: string;
-}
-
-/**
- * Apply config overrides to an agent config.
- * Pure transformation — takes config, override, and template snapshot; returns modified config.
- */
-export function applyConfigOverrides(
-  config: AgentConfig,
-  override: ConfigOverride | undefined,
-  template: AgentConfig | undefined,
-): AgentConfig {
-  if (!override) return config;
-
-  // Shallow copy to avoid mutating the cached MongoDB document
-  const ov = { ...override };
-
-  // Apply array field overrides
-  const arrayFields = ["channels", "passiveChannels", "keywords", "coreServers", "delegateServers", "plugins", "subscribe"] as const;
-
-  // Backward compat: old MongoDB override documents may have `servers` instead of `coreServers`
-  if ((ov as any).servers && !ov.coreServers) {
-    ov.coreServers = (ov as any).servers;
-  }
-  for (const field of arrayFields) {
-    const arrOverride = ov[field] as ArrayOverride | undefined;
-    if (!arrOverride) continue;
-
-    if (arrOverride.replace) {
-      (config as unknown as Record<string, unknown>)[field] = [...arrOverride.replace];
-    } else {
-      const base = [...((template?.[field] as string[]) || [])];
-      const added = arrOverride.add ? [...base, ...arrOverride.add.filter((v) => !base.includes(v))] : base;
-      const result = arrOverride.remove ? added.filter((v) => !arrOverride.remove!.includes(v)) : added;
-      (config as unknown as Record<string, unknown>)[field] = result;
-    }
-  }
-
-  // Apply scalar field overrides
-  if (ov.isDefault !== undefined) config.isDefault = ov.isDefault;
-  if (ov.budgetUsd !== undefined) config.budgetUsd = ov.budgetUsd;
-  if (ov.maxTurns !== undefined) config.maxTurns = ov.maxTurns;
-  if (ov.maxConcurrent !== undefined) config.maxConcurrent = ov.maxConcurrent;
-  if (ov.timeoutMs !== undefined) config.timeoutMs = ov.timeoutMs;
-  if (ov.disabled !== undefined) config.disabled = ov.disabled;
-
-  return config;
-}
+const POLL_INTERVAL_MS = 30_000;
 
 export class AgentRegistry {
   private agents = new Map<string, AgentConfig>();
-  private basePath: string;
-  private modelOverrides = new Map<string, string>();
-  private configOverrides = new Map<string, ConfigOverride>();
-  private promptOverrides = new Map<string, PromptOverride>();
-  private db?: Db;
-  private overridesCollection?: Collection<ModelOverride>;
-  private configOverridesCollection?: Collection<ConfigOverride>;
-  private promptOverridesCollection?: Collection<PromptOverride>;
-  private templateConfigs = new Map<string, AgentConfig>(); // pre-override snapshots
+  private disabledAgents: AgentConfig[] = [];
+  private agentDefs: Collection<AgentDefinition>;
+  private changeStream: ChangeStream | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private lastPollTime = new Date(0);
+  private onReload?: () => void;
 
-  constructor(basePath: string) {
-    this.basePath = resolve(basePath);
-  }
-
-  /** Connect to MongoDB for dynamic model overrides */
-  async connectDb(mongoUri: string, dbName: string): Promise<void> {
-    const client = new MongoClient(mongoUri);
-    await client.connect();
-    this.db = client.db(dbName);
-    this.overridesCollection = this.db.collection<ModelOverride>("model_overrides");
-    await this.overridesCollection.createIndex({ agentId: 1 }, { unique: true });
-    await this.loadModelOverrides();
-    log.info("Model overrides loaded from MongoDB");
-
-    this.configOverridesCollection = this.db.collection<ConfigOverride>("agent_config_overrides");
-    await this.configOverridesCollection.createIndex({ agentId: 1 }, { unique: true });
-    await this.loadConfigOverrides();
-    log.info("Config overrides loaded from MongoDB");
-
-    this.promptOverridesCollection = this.db.collection<PromptOverride>("prompt_overrides");
-    await this.promptOverridesCollection.createIndex({ agentId: 1 }, { unique: true });
-    await this.loadPromptOverrides();
-    log.info("Prompt overrides loaded from MongoDB");
-  }
-
-  private async loadModelOverrides(): Promise<void> {
-    if (!this.overridesCollection) return;
-    const docs = await this.overridesCollection.find().toArray();
-    this.modelOverrides.clear();
-    for (const doc of docs) {
-      this.modelOverrides.set(doc.agentId, doc.model);
-    }
-    if (docs.length > 0) {
-      log.info("Active model overrides", {
-        overrides: Object.fromEntries(this.modelOverrides),
-      });
-    }
-  }
-
-  private async loadConfigOverrides(): Promise<void> {
-    if (!this.configOverridesCollection) return;
-    const docs = await this.configOverridesCollection.find().toArray();
-    this.configOverrides.clear();
-    for (const doc of docs) {
-      this.configOverrides.set(doc.agentId, doc);
-    }
-    if (docs.length > 0) {
-      log.info("Active config overrides", {
-        agents: docs.map((d) => d.agentId),
-      });
-    }
-  }
-
-  private async loadPromptOverrides(): Promise<void> {
-    if (!this.promptOverridesCollection) return;
-    const docs = await this.promptOverridesCollection.find().toArray();
-    this.promptOverrides.clear();
-    for (const doc of docs) {
-      this.promptOverrides.set(doc.agentId, doc);
-    }
-    if (docs.length > 0) {
-      log.info("Active prompt overrides", {
-        agents: docs.map((d) => d.agentId),
-      });
-    }
+  constructor(agentDefs: Collection<AgentDefinition>, onReload?: () => void) {
+    this.agentDefs = agentDefs;
+    this.onReload = onReload;
   }
 
   async load(): Promise<{ added: string[]; updated: string[]; removed: string[] }> {
-    // Refresh overrides on every reload
-    await this.loadModelOverrides();
-    await this.loadConfigOverrides();
-    await this.loadPromptOverrides();
+    const docs = await this.agentDefs.find().toArray();
     const previousIds = new Set(this.agents.keys());
     const currentIds = new Set<string>();
     const added: string[] = [];
     const updated: string[] = [];
+    const removed: string[] = [];
+    const newDisabled: AgentConfig[] = [];
 
-    const entries = await readdir(this.basePath, { withFileTypes: true });
+    for (const doc of docs) {
+      const config = toAgentConfig(doc);
+      currentIds.add(config.id);
 
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-
-      const agentDir = join(this.basePath, entry.name);
-      try {
-        const config = await this.loadAgent(agentDir, entry.name);
-        currentIds.add(config.id);
-
-        if (previousIds.has(config.id)) {
-          updated.push(config.id);
-        } else {
-          added.push(config.id);
+      if (config.disabled) {
+        newDisabled.push(config);
+        if (this.agents.has(config.id)) {
+          this.agents.delete(config.id);
+          removed.push(config.id);
+          log.info("Disabled agent removed from active map", { id: config.id });
         }
-
-        this.agents.set(config.id, config);
-        log.info("Loaded agent", { id: config.id, name: config.name });
-      } catch (err) {
-        log.error("Failed to load agent", { dir: entry.name, error: String(err) });
+        continue;
       }
+
+      if (previousIds.has(config.id)) {
+        updated.push(config.id);
+      } else {
+        added.push(config.id);
+      }
+
+      this.agents.set(config.id, config);
+      log.info("Loaded agent", { id: config.id, name: config.name });
     }
 
-    // Remove agents whose directories were deleted
-    const removed: string[] = [];
+    this.disabledAgents = newDisabled;
+
     for (const id of previousIds) {
       if (!currentIds.has(id)) {
         this.agents.delete(id);
@@ -182,106 +65,55 @@ export class AgentRegistry {
       }
     }
 
+    this.lastPollTime = new Date();
     return { added, updated, removed };
   }
 
-  private async loadAgent(dir: string, dirName: string): Promise<AgentConfig> {
-    const yamlPath = join(dir, "agent.yaml");
-    const promptPath = join(dir, "system-prompt.md");
-    const soulPath = join(dir, "soul.md");
-
-    const yamlContent = await readFile(yamlPath, "utf-8");
-    const raw = parseYaml(yamlContent) as Record<string, unknown>;
-
-    const systemPrompt = await readFile(promptPath, "utf-8");
-    const soul = await readFile(soulPath, "utf-8").catch(() => "");
-
-    const agentId = (raw.id as string) || dirName;
-    const yamlModel = (raw.model as string) || "claude-sonnet-4-6";
-    const model = this.modelOverrides.get(agentId) ?? yamlModel;
-
-    if (this.modelOverrides.has(agentId)) {
-      log.info("Model override active", { agent: agentId, yaml: yamlModel, override: model });
-    }
-
-    // Parse tiered servers: flat array (backward compat) or { core, delegate } object
-    const rawServers = raw.servers;
-    let coreServers: string[];
-    let delegateServers: string[];
-
-    if (Array.isArray(rawServers)) {
-      // Backward compat: flat array = all core
-      coreServers = rawServers;
-      delegateServers = [];
-    } else if (rawServers && typeof rawServers === "object") {
-      const tiered = rawServers as { core?: string[]; delegate?: string[] };
-      coreServers = tiered.core ?? [];
-      delegateServers = tiered.delegate ?? [];
-    } else {
-      coreServers = [];
-      delegateServers = [];
-    }
-
-    const config: AgentConfig = {
-      id: agentId,
-      name: (raw.name as string) || dirName,
-      model,
-      channels: (raw.channels as string[]) || [],
-      passiveChannels: (raw.passiveChannels as string[]) || [],
-      keywords: (raw.keywords as string[]) || [],
-      isDefault: (raw.isDefault as boolean) || false,
-      schedule: (raw.schedule as AgentSchedule[]) || [],
-      budgetUsd: (raw.budgetUsd as number) || 10,
-      maxTurns: (raw.maxTurns as number) || 25,
-      icon: (raw.icon as string) || "",
-      slackBot: (raw.slackBot as string) || undefined,
-      coreServers,
-      delegateServers,
-      plugins: (raw.plugins as string[]) || undefined,
-      maxConcurrent: (raw.maxConcurrent as number) || undefined,
-      timeoutMs: (raw.timeoutMs as number) || undefined,
-      triageModel: (raw.triageModel as string) || undefined,
-      dodiOpsMode: (raw.dodiOpsMode as "full" | "readonly") || undefined,
-      disabled: (raw.disabled as boolean) || false,
-      subscribe: (raw.subscribe as string[]) || [],
-      delegatePrompts: (raw.delegatePrompts as Record<string, string>) || undefined,
-      soul,
-      systemPrompt,
-    };
-
-    // Save pre-override snapshot for comparison
-    this.templateConfigs.set(config.id, { ...config });
-
-    // Apply prompt overrides (soul and/or systemPrompt from MongoDB)
-    const promptOverride = this.promptOverrides.get(agentId);
-    if (promptOverride) {
-      if (promptOverride.soul !== undefined) config.soul = promptOverride.soul;
-      if (promptOverride.systemPrompt !== undefined) config.systemPrompt = promptOverride.systemPrompt;
-      log.info("Prompt override applied", {
-        agent: agentId,
-        fields: [
-          ...(promptOverride.soul !== undefined ? ["soul"] : []),
-          ...(promptOverride.systemPrompt !== undefined ? ["systemPrompt"] : []),
-        ],
+  async startWatching(): Promise<void> {
+    try {
+      this.changeStream = this.agentDefs.watch([], { fullDocument: "updateLookup" });
+      this.changeStream.on("change", () => {
+        log.info("Agent definition changed (change stream), triggering reload");
+        this.onReload?.();
       });
+      this.changeStream.on("error", (err) => {
+        log.warn("Change stream error, falling back to polling", { error: String(err) });
+        this.changeStream = null;
+        this.startPolling();
+      });
+      log.info("Agent registry watching via change stream");
+    } catch {
+      log.info("Change stream not available, using polling fallback");
+      this.startPolling();
     }
-
-    return this.applyOverrides(config);
   }
 
-  private applyOverrides(config: AgentConfig): AgentConfig {
-    const override = this.configOverrides.get(config.id);
-    const template = this.templateConfigs.get(config.id);
-    const result = applyConfigOverrides(config, override, template);
-    if (override) {
-      log.info("Config override applied", { agent: config.id });
-    }
-    return result;
+  private startPolling(): void {
+    this.pollTimer = setInterval(async () => {
+      try {
+        const changed = await this.agentDefs.countDocuments({
+          updatedAt: { $gt: this.lastPollTime },
+        });
+        if (changed > 0) {
+          log.info("Agent definitions changed (poll), triggering reload", { changed });
+          this.onReload?.();
+        }
+      } catch (err) {
+        log.error("Poll check failed", { error: String(err) });
+      }
+    }, POLL_INTERVAL_MS);
+    log.info("Agent registry watching via polling", { intervalMs: POLL_INTERVAL_MS });
   }
 
-  /** Get the pre-override template config for an agent */
-  getTemplate(id: string): AgentConfig | undefined {
-    return this.templateConfigs.get(id);
+  stopWatching(): void {
+    if (this.changeStream) {
+      this.changeStream.close().catch(() => {});
+      this.changeStream = null;
+    }
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
   }
 
   get(id: string): AgentConfig | undefined {
@@ -292,6 +124,10 @@ export class AgentRegistry {
     return Array.from(this.agents.values());
   }
 
+  async getAllDefinitions(): Promise<AgentDefinition[]> {
+    return this.agentDefs.find().toArray();
+  }
+
   listIds(): string[] {
     return Array.from(this.agents.keys());
   }
@@ -300,7 +136,6 @@ export class AgentRegistry {
     return this.getAll().find((a) => !a.disabled && a.channels.includes(channelName));
   }
 
-  /** Check if any agent has this channel as passive (listen but don't auto-route) */
   isPassiveChannel(channelName: string): boolean {
     return this.getAll().some((a) => !a.disabled && a.passiveChannels.includes(channelName));
   }
@@ -320,12 +155,10 @@ export class AgentRegistry {
     return this.findAllByName(text)[0];
   }
 
-  /** Return ALL agents whose names are mentioned in the text */
   findAllByName(text: string): AgentConfig[] {
     return this.getAll().filter((a) => {
       if (a.disabled) return false;
       const name = a.name.toLowerCase();
-      // Match "hey River", "River,", "@River", or just "River" at word boundaries
       const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
       return pattern.test(text);
     });
@@ -335,18 +168,15 @@ export class AgentRegistry {
     return this.getAll().find((a) => !a.disabled && a.isDefault);
   }
 
-  /** Get all disabled agents (for admin reporting) */
   getDisabled(): AgentConfig[] {
-    return this.getAll().filter((a) => a.disabled);
+    return this.disabledAgents;
   }
 
-  /** Build domain → subscriber agent IDs map from all agents' subscribe arrays */
   getSubscriberMap(): Record<string, string[]> {
     const map: Record<string, string[]> = {};
     for (const agent of this.getAll()) {
       if (agent.disabled) continue;
       for (const sub of agent.subscribe ?? []) {
-        // Support both domain-level ("deals") and action-level ("deals:won") subscriptions
         const domain = sub.includes(":") ? sub.split(":")[0] : sub;
         if (!map[domain]) map[domain] = [];
         if (!map[domain].includes(agent.id)) {
