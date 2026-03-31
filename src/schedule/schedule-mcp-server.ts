@@ -157,7 +157,12 @@ server.registerTool(
     // Change stream / polling picks up the write within 30s
 
     return {
-      content: [{ type: "text", text: `Added schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.` }],
+      content: [
+        {
+          type: "text",
+          text: `Added schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+        },
+      ],
     };
   },
 );
@@ -197,7 +202,10 @@ server.registerTool(
 
     return {
       content: [
-        { type: "text", text: `Removed schedule for task '${task}'.\nReason: ${reason}\nChange will take effect within 30 seconds.` },
+        {
+          type: "text",
+          text: `Removed schedule for task '${task}'.\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+        },
       ],
     };
   },
@@ -245,7 +253,10 @@ server.registerTool(
 
     return {
       content: [
-        { type: "text", text: `Updated schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.` },
+        {
+          type: "text",
+          text: `Updated schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+        },
       ],
     };
   },

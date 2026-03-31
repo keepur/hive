@@ -167,7 +167,9 @@ server.registerTool(
       isDefault: (f.isDefault as boolean) ?? false,
       coreServers: (f.coreServers as string[]) ?? [],
       delegateServers: (f.delegateServers as string[]) ?? [],
-      delegatePrompts: (f.delegatePrompts as Record<string, string>) ?? { ...AGENT_DEFINITION_DEFAULTS.delegatePrompts },
+      delegatePrompts: (f.delegatePrompts as Record<string, string>) ?? {
+        ...AGENT_DEFINITION_DEFAULTS.delegatePrompts,
+      },
       plugins: f.plugins as string[] | undefined,
       dodiOpsMode: f.dodiOpsMode as "full" | "readonly" | undefined,
       soul: (f.soul as string) ?? "",
@@ -189,7 +191,12 @@ server.registerTool(
     triggerReload();
 
     return {
-      content: [{ type: "text", text: `Agent '${_id}' (${name}) created with model ${model}. Change will take effect within 30 seconds.` }],
+      content: [
+        {
+          type: "text",
+          text: `Agent '${_id}' (${name}) created with model ${model}. Change will take effect within 30 seconds.`,
+        },
+      ],
     };
   },
 );
@@ -283,7 +290,12 @@ server.registerTool(
     triggerReload();
 
     return {
-      content: [{ type: "text", text: `Agent '${agent_id}' deleted. Version snapshot saved. Change will take effect within 30 seconds.` }],
+      content: [
+        {
+          type: "text",
+          text: `Agent '${agent_id}' deleted. Version snapshot saved. Change will take effect within 30 seconds.`,
+        },
+      ],
     };
   },
 );
@@ -318,7 +330,12 @@ server.registerTool(
     triggerReload();
 
     return {
-      content: [{ type: "text", text: `Agent '${agent_id}' enabled. Version saved. Change will take effect within 30 seconds.` }],
+      content: [
+        {
+          type: "text",
+          text: `Agent '${agent_id}' enabled. Version saved. Change will take effect within 30 seconds.`,
+        },
+      ],
     };
   },
 );
@@ -354,7 +371,12 @@ server.registerTool(
     triggerReload();
 
     return {
-      content: [{ type: "text", text: `Agent '${agent_id}' disabled. Version saved. Change will take effect within 30 seconds.` }],
+      content: [
+        {
+          type: "text",
+          text: `Agent '${agent_id}' disabled. Version saved. Change will take effect within 30 seconds.`,
+        },
+      ],
     };
   },
 );
