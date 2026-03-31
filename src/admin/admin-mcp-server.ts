@@ -42,10 +42,10 @@ async function saveVersion(agentId: string, changedFields: string[]): Promise<vo
   });
 }
 
+// Change stream / polling picks up DB writes within 30s — no explicit reload needed
 function triggerReload(): void {
-  try {
-    process.kill(process.ppid, "SIGUSR1");
-  } catch {}
+  // Intentionally empty — the registry's change stream or polling timer
+  // detects the updatedAt change and triggers reload automatically.
 }
 
 // ---------------------------------------------------------------------------
@@ -155,37 +155,41 @@ server.registerTool(
     }
 
     const now = new Date();
+    const f = fields ?? {};
     const doc: AgentDefinition = {
       _id,
       name,
       model,
-      icon: AGENT_DEFINITION_DEFAULTS.icon,
-      channels: [],
-      passiveChannels: [...AGENT_DEFINITION_DEFAULTS.passiveChannels],
-      keywords: [...AGENT_DEFINITION_DEFAULTS.keywords],
-      isDefault: false,
-      coreServers: [],
-      delegateServers: [],
-      delegatePrompts: { ...AGENT_DEFINITION_DEFAULTS.delegatePrompts },
-      soul: "",
-      systemPrompt: "",
-      schedule: [...AGENT_DEFINITION_DEFAULTS.schedule],
-      budgetUsd: AGENT_DEFINITION_DEFAULTS.budgetUsd,
-      maxTurns: AGENT_DEFINITION_DEFAULTS.maxTurns,
-      maxConcurrent: AGENT_DEFINITION_DEFAULTS.maxConcurrent,
-      timeoutMs: AGENT_DEFINITION_DEFAULTS.timeoutMs,
-      disabled: false,
+      icon: (f.icon as string) ?? AGENT_DEFINITION_DEFAULTS.icon,
+      channels: (f.channels as string[]) ?? [],
+      passiveChannels: (f.passiveChannels as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.passiveChannels],
+      keywords: (f.keywords as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.keywords],
+      isDefault: (f.isDefault as boolean) ?? false,
+      coreServers: (f.coreServers as string[]) ?? [],
+      delegateServers: (f.delegateServers as string[]) ?? [],
+      delegatePrompts: (f.delegatePrompts as Record<string, string>) ?? { ...AGENT_DEFINITION_DEFAULTS.delegatePrompts },
+      plugins: f.plugins as string[] | undefined,
+      dodiOpsMode: f.dodiOpsMode as "full" | "readonly" | undefined,
+      soul: (f.soul as string) ?? "",
+      systemPrompt: (f.systemPrompt as string) ?? "",
+      schedule: (f.schedule as Array<{ cron: string; task: string }>) ?? [...AGENT_DEFINITION_DEFAULTS.schedule],
+      subscribe: f.subscribe as string[] | undefined,
+      budgetUsd: (f.budgetUsd as number) ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
+      maxTurns: (f.maxTurns as number) ?? AGENT_DEFINITION_DEFAULTS.maxTurns,
+      maxConcurrent: (f.maxConcurrent as number) ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
+      timeoutMs: (f.timeoutMs as number) ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
+      disabled: (f.disabled as boolean) ?? false,
+      slackBot: f.slackBot as string | undefined,
       createdAt: now,
       updatedAt: now,
       updatedBy: AGENT_ID,
-      ...(fields ?? {}),
     };
 
     await agentDefs.insertOne(doc as any);
     triggerReload();
 
     return {
-      content: [{ type: "text", text: `Agent '${_id}' (${name}) created with model ${model}. Reload triggered.` }],
+      content: [{ type: "text", text: `Agent '${_id}' (${name}) created with model ${model}. Change will take effect within 30 seconds.` }],
     };
   },
 );
@@ -237,7 +241,7 @@ server.registerTool(
       content: [
         {
           type: "text",
-          text: `Agent '${agent_id}' updated: ${changedFields.join(", ")}. Version saved. Reload triggered.`,
+          text: `Agent '${agent_id}' updated: ${changedFields.join(", ")}. Version saved. Change will take effect within 30 seconds.`,
         },
       ],
     };
@@ -279,7 +283,7 @@ server.registerTool(
     triggerReload();
 
     return {
-      content: [{ type: "text", text: `Agent '${agent_id}' deleted. Version snapshot saved. Reload triggered.` }],
+      content: [{ type: "text", text: `Agent '${agent_id}' deleted. Version snapshot saved. Change will take effect within 30 seconds.` }],
     };
   },
 );
@@ -314,7 +318,7 @@ server.registerTool(
     triggerReload();
 
     return {
-      content: [{ type: "text", text: `Agent '${agent_id}' enabled. Version saved. Reload triggered.` }],
+      content: [{ type: "text", text: `Agent '${agent_id}' enabled. Version saved. Change will take effect within 30 seconds.` }],
     };
   },
 );
@@ -350,7 +354,7 @@ server.registerTool(
     triggerReload();
 
     return {
-      content: [{ type: "text", text: `Agent '${agent_id}' disabled. Version saved. Reload triggered.` }],
+      content: [{ type: "text", text: `Agent '${agent_id}' disabled. Version saved. Change will take effect within 30 seconds.` }],
     };
   },
 );
@@ -449,7 +453,7 @@ server.registerTool(
       content: [
         {
           type: "text",
-          text: `Agent '${agent_id}' rolled back to version from ${date}. Current state saved first. Reload triggered.`,
+          text: `Agent '${agent_id}' rolled back to version from ${date}. Current state saved first. Change will take effect within 30 seconds.`,
         },
       ],
     };

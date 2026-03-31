@@ -43,14 +43,12 @@ export class AdminApi {
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // Auth check
-    if (this.token) {
-      const auth = req.headers.authorization;
-      if (!auth || auth !== `Bearer ${this.token}`) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized" }));
-        return;
-      }
+    // Auth check — always required (index.ts only starts AdminApi when token is configured)
+    const auth = req.headers.authorization;
+    if (!auth || auth !== `Bearer ${this.token}`) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
     }
 
     const url = new URL(req.url ?? "/", `http://localhost:${this.port}`);
@@ -260,13 +258,19 @@ export class AdminApi {
     }
 
     // Save current state before rollback
+    const existing = await this.agentDefs.findOne({ _id: id as any });
+    if (!existing) return this.json(res, 404, { error: "Agent not found — cannot rollback a deleted agent" });
     await this.saveVersion(id, ["_rollback"]);
 
-    const snapshot = versions[0].snapshot;
-    await this.agentDefs.replaceOne({ _id: id as any }, snapshot as any, { upsert: true });
+    const { _id, ...snapshotFields } = versions[0].snapshot as any;
+    await this.agentDefs.updateOne(
+      { _id: id as any },
+      { $set: { ...snapshotFields, updatedAt: new Date(), updatedBy: "admin-api" } },
+    );
 
     this.onReload();
-    this.json(res, 200, snapshot);
+    const restored = await this.agentDefs.findOne({ _id: id as any });
+    this.json(res, 200, restored);
   }
 
   private async listServers(res: ServerResponse): Promise<void> {
