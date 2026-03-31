@@ -2,7 +2,7 @@ id: chief-of-staff
 name: "{{agent.name}}"
 icon: ":briefcase:"
 model: claude-opus-4-6
-disabled: true
+disabled: false
 channels:
   - agent-{{agent.name_lower}}
 keywords:
