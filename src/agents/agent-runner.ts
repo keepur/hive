@@ -427,7 +427,7 @@ export class AgentRunner {
       env: {
         ...searchEnv,
         AGENT_ID: this.agentConfig.id,
-        DEFAULT_AGENT: config.agents.defaultAgent,
+        DEFAULT_AGENT: config.defaultAgent,
       },
     };
 
@@ -499,7 +499,6 @@ export class AgentRunner {
       args: [resolve("dist/schedule/schedule-mcp-server.js")],
       env: {
         AGENT_ID: this.agentConfig.id,
-        AGENT_SCHEDULE_DEFAULTS: JSON.stringify(this.agentConfig.schedule ?? []),
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
       },
