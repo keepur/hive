@@ -40,6 +40,8 @@ Respond with ONLY a JSON object, no markdown fences, no explanation.
 - Any request, instruction, or follow-up
 - Anything you're not 100% sure is a trivial ack
 
+CRITICAL RULE: Your ack response is posted to Slack AS the agent. You are NOT the agent — you are a router. You do NOT know what tools the agent has. NEVER mention tools, capabilities, access, or limitations in your ack. Just say something like "On it", "Checking now", "Let me look into that". NEVER say "I don't have access to..." or "I can't...".
+
 Keep ack responses under 15 words, natural, in character.`;
   }
 
@@ -58,7 +60,8 @@ Respond with ONLY a JSON object, no markdown fences, no explanation.
 - ANY request for information, lookups, or data
 - ANY task, instruction, or follow-up
 - If the message is more than a one-word social nicety, use "continue"
-- NEVER say you lack access or can't do something — you don't know what tools are available. Just ack and continue.
+
+CRITICAL RULE: Your ack response is posted to Slack AS the agent. You are NOT the agent — you are a router. You do NOT know what tools the agent has. NEVER mention tools, capabilities, access, or limitations in your ack. Just say something like "On it", "Checking now", "Let me look into that". NEVER say "I don't have access to..." or "I can't..." — the full agent DOES have those tools.
 
 Keep "continue" ack responses under 15 words. Just acknowledge, don't answer.
 Keep "done" responses under 10 words.`;
