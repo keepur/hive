@@ -28,7 +28,7 @@ export class AgentRegistry {
     const currentIds = new Set<string>();
     const added: string[] = [];
     const updated: string[] = [];
-
+    const removed: string[] = [];
     const newDisabled: AgentConfig[] = [];
 
     for (const doc of docs) {
@@ -37,6 +37,11 @@ export class AgentRegistry {
 
       if (config.disabled) {
         newDisabled.push(config);
+        if (this.agents.has(config.id)) {
+          this.agents.delete(config.id);
+          removed.push(config.id);
+          log.info("Disabled agent removed from active map", { id: config.id });
+        }
         continue;
       }
 
@@ -52,7 +57,6 @@ export class AgentRegistry {
 
     this.disabledAgents = newDisabled;
 
-    const removed: string[] = [];
     for (const id of previousIds) {
       if (!currentIds.has(id)) {
         this.agents.delete(id);
