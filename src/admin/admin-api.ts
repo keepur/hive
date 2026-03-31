@@ -240,11 +240,7 @@ export class AdminApi {
   }
 
   private async agentHistory(id: string, limit: number, res: ServerResponse): Promise<void> {
-    const versions = await this.agentVersions
-      .find({ agentId: id })
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .toArray();
+    const versions = await this.agentVersions.find({ agentId: id }).sort({ createdAt: -1 }).limit(limit).toArray();
     this.json(res, 200, versions);
   }
 

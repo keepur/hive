@@ -15,9 +15,7 @@ const ROOT = resolve(import.meta.dirname, "..");
 const HIVE_CONFIG = resolve(process.env.HIVE_CONFIG ?? join(ROOT, "hive.yaml"));
 
 async function main() {
-  const config = existsSync(HIVE_CONFIG)
-    ? parseYaml(readFileSync(HIVE_CONFIG, "utf-8")) ?? {}
-    : {};
+  const config = existsSync(HIVE_CONFIG) ? (parseYaml(readFileSync(HIVE_CONFIG, "utf-8")) ?? {}) : {};
 
   const enabledPlugins: string[] = (config as any).plugins ?? [];
   const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";

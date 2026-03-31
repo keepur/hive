@@ -202,7 +202,9 @@ server.registerTool(
       "Update fields on an existing agent definition. Saves a version snapshot before mutation. Cannot change _id.",
     inputSchema: {
       agent_id: z.string().describe("The agent ID to update"),
-      fields: z.record(z.string(), z.any()).describe("Fields to update (e.g. { model: 'claude-sonnet-4-6', channels: ['general'] })"),
+      fields: z
+        .record(z.string(), z.any())
+        .describe("Fields to update (e.g. { model: 'claude-sonnet-4-6', channels: ['general'] })"),
     },
   },
   async ({ agent_id, fields }) => {
@@ -387,7 +389,9 @@ server.registerTool(
     });
 
     return {
-      content: [{ type: "text", text: `Version history for '${agent_id}' (${versions.length} entries):\n${lines.join("\n")}` }],
+      content: [
+        { type: "text", text: `Version history for '${agent_id}' (${versions.length} entries):\n${lines.join("\n")}` },
+      ],
     };
   },
 );
