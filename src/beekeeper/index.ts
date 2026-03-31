@@ -410,7 +410,7 @@ async function main(): Promise<void> {
 
     activeClient = ws;
     activeDeviceId = device._id;
-    guardian.setClient(ws);
+    guardian.setSendDelegate((msg) => sessionManager.send(msg));
     sessionManager.setClient(ws);
 
     // Update lastSeenAt
@@ -446,8 +446,21 @@ async function main(): Promise<void> {
             await sessionManager.sendMessage(msg.sessionId, msg.text);
             break;
           case "new_session": {
-            const validatedPath = validatePath(msg.path);
-            await sessionManager.newSession(validatedPath);
+            if (!msg.path || typeof msg.path !== "string") {
+              ws.send(JSON.stringify({ type: "error", message: "Missing required field: path" }));
+              break;
+            }
+            try {
+              const validatedPath = validatePath(msg.path);
+              await sessionManager.newSession(validatedPath);
+            } catch (err) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                }),
+              );
+            }
             break;
           }
           case "clear_session":
@@ -457,28 +470,37 @@ async function main(): Promise<void> {
             sessionManager.listSessions();
             break;
           case "browse": {
-            const home = realpathSync(homedir());
-            const browseTarget = msg.path ? validatePath(msg.path) : home;
-            const raw = readdirSync(browseTarget, { withFileTypes: true });
-            const entries = raw
-              .filter((e) => !e.name.startsWith("."))
-              .map((e) => {
-                let isDirectory = e.isDirectory();
-                if (e.isSymbolicLink()) {
-                  try {
-                    isDirectory = statSync(join(browseTarget, e.name)).isDirectory();
-                  } catch {
-                    /* broken symlink — treat as file */
+            try {
+              const home = realpathSync(homedir());
+              const browseTarget = msg.path ? validatePath(msg.path) : home;
+              const dirEntries = readdirSync(browseTarget, { withFileTypes: true });
+              const entries = dirEntries
+                .filter((e) => !e.name.startsWith("."))
+                .map((e) => {
+                  let isDirectory = e.isDirectory();
+                  if (e.isSymbolicLink()) {
+                    try {
+                      isDirectory = statSync(join(browseTarget, e.name)).isDirectory();
+                    } catch {
+                      /* broken symlink — treat as file */
+                    }
                   }
-                }
-                return { name: e.name, isDirectory };
-              })
-              .sort((a, b) => {
-                if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
-                return a.name.localeCompare(b.name);
-              })
-              .slice(0, 200);
-            ws.send(JSON.stringify({ type: "browse_result", path: browseTarget, entries }));
+                  return { name: e.name, isDirectory };
+                })
+                .sort((a, b) => {
+                  if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+                  return a.name.localeCompare(b.name);
+                })
+                .slice(0, 200);
+              ws.send(JSON.stringify({ type: "browse_result", path: browseTarget, entries }));
+            } catch (err) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                }),
+              );
+            }
             break;
           }
           case "approve":
@@ -506,7 +528,7 @@ async function main(): Promise<void> {
       if (activeClient === ws) {
         activeClient = null;
         activeDeviceId = null;
-        guardian.setClient(null);
+        guardian.setSendDelegate(null);
         sessionManager.setClient(null);
         // Sessions stay in memory — client can reconnect and resume
       }

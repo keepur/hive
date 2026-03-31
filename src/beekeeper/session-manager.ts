@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { WebSocket } from "ws";
 import { createLogger } from "../logging/logger.js";
@@ -12,6 +13,9 @@ export interface SessionSlot {
   activeQuery: Query | null;
   state: "idle" | "busy";
   cleared?: boolean;
+  /** Resolves when runQuery finishes after a clear/interrupt */
+  queryDone?: Promise<string>;
+  outputBuffer: ServerMessage[];
 }
 
 export class SessionManager {
@@ -19,7 +23,8 @@ export class SessionManager {
   private client: WebSocket | null = null;
   private guardian: ToolGuardian;
   private config: BeekeeperConfig;
-  private outputBuffer: ServerMessage[] = [];
+  /** Global buffer for messages not scoped to any session (e.g. session_list) */
+  private globalBuffer: ServerMessage[] = [];
 
   constructor(config: BeekeeperConfig, guardian: ToolGuardian) {
     this.config = config;
@@ -28,20 +33,46 @@ export class SessionManager {
 
   setClient(ws: WebSocket | null): void {
     this.client = ws;
-    if (ws && this.outputBuffer.length > 0) {
-      log.info("Draining buffered output", { count: this.outputBuffer.length });
-      for (const msg of this.outputBuffer) {
-        ws.send(JSON.stringify(msg));
+    if (ws) {
+      // Drain global buffer
+      if (this.globalBuffer.length > 0) {
+        log.info("Draining global buffer", { count: this.globalBuffer.length });
+        for (const msg of this.globalBuffer) {
+          ws.send(JSON.stringify(msg));
+        }
+        this.globalBuffer = [];
       }
-      this.outputBuffer = [];
+      // Drain per-session buffers
+      for (const slot of this.sessions.values()) {
+        if (slot.outputBuffer.length > 0) {
+          log.info("Draining session buffer", { sessionId: slot.sessionId, count: slot.outputBuffer.length });
+          for (const msg of slot.outputBuffer) {
+            ws.send(JSON.stringify(msg));
+          }
+          slot.outputBuffer = [];
+        }
+      }
     }
   }
 
-  private send(msg: ServerMessage): void {
+  /**
+   * Send a server message. Routes to the appropriate per-session buffer
+   * when no client is connected, or to the global buffer for non-session messages.
+   */
+  send(msg: ServerMessage): void {
     if (this.client && this.client.readyState === 1) {
       this.client.send(JSON.stringify(msg));
     } else {
-      this.outputBuffer.push(msg);
+      // Route to per-session buffer if the message has a sessionId
+      const sessionId = "sessionId" in msg ? (msg as { sessionId?: string }).sessionId : undefined;
+      if (sessionId) {
+        const slot = this.sessions.get(sessionId);
+        if (slot) {
+          slot.outputBuffer.push(msg);
+          return;
+        }
+      }
+      this.globalBuffer.push(msg);
     }
   }
 
@@ -50,12 +81,13 @@ export class SessionManager {
    */
   async newSession(cwd: string): Promise<string> {
     log.info("Creating new session", { cwd });
-    const pendingId = `pending-${Date.now()}`;
+    const pendingId = `pending-${randomUUID()}`;
     const slot: SessionSlot = {
       sessionId: pendingId,
       cwd,
       activeQuery: null,
       state: "idle",
+      outputBuffer: [],
     };
 
     // Register immediately so the session is visible during the inaugural query
@@ -84,7 +116,9 @@ export class SessionManager {
       this.send({ type: "error", message: "Session is busy", sessionId });
       return;
     }
-    await this.runQuery(slot, text);
+    const done = this.runQuery(slot, text);
+    slot.queryDone = done;
+    await done;
   }
 
   /**
@@ -100,6 +134,14 @@ export class SessionManager {
         await slot.activeQuery.interrupt();
       } catch (err) {
         log.error("Failed to interrupt session during clear", { sessionId, error: String(err) });
+      }
+      // Wait for runQuery to fully finish before removing from map
+      if (slot.queryDone) {
+        try {
+          await slot.queryDone;
+        } catch {
+          // Already handled inside runQuery
+        }
       }
     }
     this.sessions.delete(sessionId);
