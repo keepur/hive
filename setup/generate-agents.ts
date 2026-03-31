@@ -231,7 +231,7 @@ async function main() {
       ...ctx,
       agent: {
         name: agentName,
-        name_lower: agentName.toLowerCase(),
+        name_lower: agentName.toLowerCase().replace(/\s+/g, "-"),
         id: agentId,
       },
       team,
