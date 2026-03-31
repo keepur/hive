@@ -52,22 +52,6 @@ function discoverUserSkills(): string[] {
   return paths;
 }
 
-/**
- * Discover project-level skills from <workspace>/.claude/skills/.
- * Loads the .claude dir as a plugin so all skills under it are available.
- */
-function discoverProjectSkills(workspaces: Record<string, string>): string[] {
-  const paths: string[] = [];
-  for (const wsPath of Object.values(workspaces)) {
-    const dotClaude = join(wsPath, ".claude");
-    const skillsDir = join(dotClaude, "skills");
-    if (existsSync(skillsDir)) {
-      paths.push(dotClaude);
-    }
-  }
-  return paths;
-}
-
 export function loadConfig(): BeekeeperConfig {
   const configPath = resolve(process.env.BEEKEEPER_CONFIG ?? "./beekeeper.yaml");
   if (!existsSync(configPath)) {
@@ -91,33 +75,22 @@ export function loadConfig(): BeekeeperConfig {
     throw new Error("Missing required env var: MONGO_URI");
   }
 
-  // Expand ~ in workspace paths
-  const workspaces: Record<string, string> = {};
-  const rawWorkspaces = (raw.workspaces ?? {}) as Record<string, string>;
-  for (const [name, path] of Object.entries(rawWorkspaces)) {
-    workspaces[name] = path.replace(/^~/, process.env.HOME ?? "");
-  }
-
-  // Auto-discover: installed plugins + user skills + project skills + explicit extras
+  // Auto-discover: installed plugins + user skills + explicit extras
   const installedPlugins = discoverInstalledPlugins();
   const userSkills = discoverUserSkills();
-  const projectSkills = discoverProjectSkills(workspaces);
   const extraPlugins = (raw.plugins as string[])?.map((p) => p.replace(/^~/, process.env.HOME ?? "")) ?? [];
-  const allPlugins = [...new Set([...installedPlugins, ...userSkills, ...projectSkills, ...extraPlugins])];
+  const allPlugins = [...new Set([...installedPlugins, ...userSkills, ...extraPlugins])];
 
   log.info("Plugin discovery complete", {
     installed: installedPlugins.length,
     userSkills: userSkills.length,
-    projectSkills: projectSkills.length,
     extra: extraPlugins.length,
     total: allPlugins.length,
   });
 
   return {
     port: (raw.port as number) ?? 3099,
-    defaultWorkspace: (raw.default_workspace as string) ?? "hive",
     model: (raw.model as string) ?? "claude-opus-4-6",
-    workspaces,
     confirmOperations: (raw.confirm_operations as string[]) ?? [
       "git push --force",
       "git branch -D",
