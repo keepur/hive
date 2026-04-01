@@ -4,6 +4,7 @@ import type { WebSocket } from "ws";
 import { createLogger } from "../logging/logger.js";
 import type { ToolGuardian } from "./tool-guardian.js";
 import type { ServerMessage, BeekeeperConfig } from "./types.js";
+import { listWorkspaceSessions as scanWorkspaceSessions } from "./session-history.js";
 
 const log = createLogger("beekeeper-session");
 
@@ -171,6 +172,41 @@ export class SessionManager {
       path: s.cwd,
       state: s.state,
     }));
+  }
+
+  /**
+   * Resume a past session by ID. Lazy — no SDK call until user sends a message.
+   * If the session is already active, returns the existing session info.
+   */
+  resumeSession(sessionId: string, cwd: string): string {
+    // Already active — just return it
+    const existing = this.sessions.get(sessionId);
+    if (existing) {
+      log.info("Session already active, returning existing", { sessionId });
+      this.send({ type: "session_info", sessionId, path: existing.cwd });
+      return sessionId;
+    }
+
+    const slot: SessionSlot = {
+      sessionId,
+      cwd,
+      activeQuery: null,
+      state: "idle",
+      outputBuffer: [],
+    };
+    this.sessions.set(sessionId, slot);
+    this.send({ type: "session_info", sessionId, path: cwd });
+    log.info("Session resumed (lazy)", { sessionId, cwd });
+    return sessionId;
+  }
+
+  /**
+   * List historical sessions for a workspace from ~/.claude/projects/.
+   */
+  async listWorkspaceSessions(path: string): Promise<void> {
+    const activeIds = new Set(this.sessions.keys());
+    const sessions = await scanWorkspaceSessions(path, activeIds);
+    this.send({ type: "workspace_session_list", path, sessions });
   }
 
   /**
