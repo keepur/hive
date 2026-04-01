@@ -21,6 +21,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 
 import { SessionManager } from "./session-manager.js";
 import { ToolGuardian } from "./tool-guardian.js";
+import { QuestionRelayer } from "./question-relayer.js";
 import type { BeekeeperConfig } from "./types.js";
 
 function makeConfig(overrides: Partial<BeekeeperConfig> = {}): BeekeeperConfig {
@@ -64,17 +65,19 @@ function makeAsyncIterable(messages: Record<string, unknown>[]) {
 describe("SessionManager", () => {
   let config: BeekeeperConfig;
   let guardian: ToolGuardian;
+  let questionRelayer: QuestionRelayer;
 
   beforeEach(() => {
     vi.clearAllMocks();
     config = makeConfig();
     guardian = new ToolGuardian([]);
+    questionRelayer = new QuestionRelayer();
   });
 
   describe("newSession(cwd)", () => {
     it("eagerly spawns a session and sends session_info with cwd, returns sessionId", async () => {
       const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
+      const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
 
       mockQueryIterator.mockReturnValue(
@@ -109,7 +112,7 @@ describe("SessionManager", () => {
   describe("sendMessage(sessionId, text)", () => {
     it("streams text chunks to client", async () => {
       const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
+      const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
 
       // First spawn a session
@@ -158,7 +161,7 @@ describe("SessionManager", () => {
 
     it("sends error for unknown sessionId", async () => {
       const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
+      const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
 
       await manager.sendMessage("nonexistent-session", "Hi");
@@ -174,7 +177,7 @@ describe("SessionManager", () => {
 
     it("sends error when session is busy", async () => {
       const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
+      const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
 
       // Create a session that will stay busy (never resolves)
@@ -245,10 +248,10 @@ describe("SessionManager", () => {
       await manager.sendMessage("sess-busy", "Second");
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
-      const errorMsg = sent.find((m: Record<string, unknown>) => m.type === "error");
-      expect(errorMsg).toEqual({
-        type: "error",
-        message: "Session is busy",
+      const busyStatus = sent.find((m: Record<string, unknown>) => m.type === "status" && m.state === "busy");
+      expect(busyStatus).toEqual({
+        type: "status",
+        state: "busy",
         sessionId: "sess-busy",
       });
 
@@ -261,7 +264,7 @@ describe("SessionManager", () => {
   describe("clearSession(sessionId)", () => {
     it("removes session and sends session_cleared", async () => {
       const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
+      const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
 
       mockQueryIterator.mockReturnValue(
@@ -304,7 +307,7 @@ describe("SessionManager", () => {
   describe("listSessions()", () => {
     it("sends session_list message with active sessions", async () => {
       const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
+      const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
 
       mockQueryIterator.mockReturnValueOnce(
@@ -342,7 +345,7 @@ describe("SessionManager", () => {
   describe("error handling", () => {
     it("SDK failure sends error with sessionId", async () => {
       const ws = makeMockWs();
-      const manager = new SessionManager(config, guardian);
+      const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
 
       // Create a session first
@@ -386,7 +389,7 @@ describe("SessionManager", () => {
 
   describe("output buffering", () => {
     it("buffers messages when no client connected, drains on setClient()", async () => {
-      const manager = new SessionManager(config, guardian);
+      const manager = new SessionManager(config, guardian, questionRelayer);
 
       mockQueryIterator.mockReturnValue(
         makeAsyncIterable([

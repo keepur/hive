@@ -5,6 +5,7 @@ import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anth
 import type { WebSocket } from "ws";
 import { createLogger } from "../logging/logger.js";
 import type { ToolGuardian } from "./tool-guardian.js";
+import type { QuestionRelayer } from "./question-relayer.js";
 import type { ServerMessage, BeekeeperConfig } from "./types.js";
 import { listWorkspaceSessions as scanWorkspaceSessions } from "./session-history.js";
 
@@ -16,6 +17,7 @@ export interface SessionSlot {
   activeQuery: Query | null;
   state: "idle" | "busy";
   cleared?: boolean;
+  interrupted?: boolean;
   /** Resolves when runQuery finishes after a clear/interrupt */
   queryDone?: Promise<string>;
   outputBuffer: ServerMessage[];
@@ -25,14 +27,16 @@ export class SessionManager {
   private sessions = new Map<string, SessionSlot>();
   private clients = new Map<string, WebSocket>();
   private guardian: ToolGuardian;
+  private questionRelayer: QuestionRelayer;
   private config: BeekeeperConfig;
   private sessionsFile: string;
   /** Global buffer for messages sent when no clients are connected */
   private globalBuffer: ServerMessage[] = [];
 
-  constructor(config: BeekeeperConfig, guardian: ToolGuardian) {
+  constructor(config: BeekeeperConfig, guardian: ToolGuardian, questionRelayer: QuestionRelayer) {
     this.config = config;
     this.guardian = guardian;
+    this.questionRelayer = questionRelayer;
     this.sessionsFile = join(config.dataDir, "sessions.json");
   }
 
@@ -130,8 +134,13 @@ export class SessionManager {
       this.send({ type: "error", message: `Unknown session: ${sessionId}`, sessionId });
       return;
     }
+    // Check if this reply answers a pending question
+    if (this.questionRelayer.hasPending(sessionId)) {
+      this.questionRelayer.handleReply(sessionId, text);
+      return;
+    }
     if (slot.state === "busy") {
-      this.send({ type: "error", message: "Session is busy", sessionId });
+      this.send({ type: "status", state: "busy", sessionId });
       return;
     }
     const done = this.runQuery(slot, text);
@@ -147,6 +156,7 @@ export class SessionManager {
     if (!slot) return false;
 
     slot.cleared = true;
+    this.questionRelayer.denyPending(sessionId, "Session cleared");
     if (slot.activeQuery) {
       try {
         await slot.activeQuery.interrupt();
@@ -167,6 +177,28 @@ export class SessionManager {
     this.persistSessions();
     log.info("Session cleared", { sessionId });
     return true;
+  }
+
+  /**
+   * Cancel (interrupt without destroying) a specific session's active query.
+   */
+  async cancelQuery(sessionId: string): Promise<void> {
+    const slot = this.sessions.get(sessionId);
+    if (!slot || !slot.activeQuery) return;
+
+    // Clear pending question FIRST — closes reply-intercept window
+    this.questionRelayer.denyPending(sessionId, "Operation cancelled");
+
+    // Set interrupted flag BEFORE interrupt to suppress spurious empty final message
+    slot.interrupted = true;
+
+    // Then interrupt the SDK query
+    try {
+      await slot.activeQuery.interrupt();
+    } catch (err) {
+      log.error("Failed to interrupt session during cancel", { sessionId, error: String(err) });
+    }
+    // State transition handled by runQuery's finally block
   }
 
   /**
@@ -319,6 +351,7 @@ export class SessionManager {
     this.send({ type: "status", state: "thinking", sessionId: slot.sessionId });
 
     const guardianCallback = this.guardian.createHookCallback(slot.sessionId);
+    const questionCallback = this.questionRelayer.createHookCallback(slot.sessionId);
 
     try {
       const q = query({
@@ -335,6 +368,9 @@ export class SessionManager {
             PreToolUse: [
               {
                 hooks: [guardianCallback],
+              },
+              {
+                hooks: [questionCallback],
               },
             ],
           },
@@ -402,12 +438,15 @@ export class SessionManager {
         }
       }
 
-      this.send({
-        type: "message",
-        text: "",
-        sessionId: resolvedSessionId,
-        final: true,
-      });
+      // Suppress empty final message after interrupt — prevents empty bubble on client
+      if (!slot.interrupted) {
+        this.send({
+          type: "message",
+          text: "",
+          sessionId: resolvedSessionId,
+          final: true,
+        });
+      }
 
       return resolvedSessionId;
     } catch (err) {
@@ -421,6 +460,7 @@ export class SessionManager {
     } finally {
       slot.activeQuery = null;
       slot.state = "idle";
+      slot.interrupted = false;
       // Suppress status messages for cleared sessions — session_cleared is the terminal event
       if (!slot.cleared) {
         this.send({ type: "status", state: "idle", sessionId: slot.sessionId });

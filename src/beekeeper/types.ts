@@ -9,13 +9,14 @@ export type ClientMessage =
   | { type: "browse"; path?: string }
   | { type: "list_workspace_sessions"; path: string }
   | { type: "resume_session"; sessionId: string; path: string }
+  | { type: "cancel"; sessionId: string }
   | { type: "ping" };
 
 // Server → Client messages
 export type ServerMessage =
   | { type: "message"; text: string; sessionId: string; final: boolean }
   | { type: "tool_approval"; toolUseId: string; tool: string; input: string; sessionId: string }
-  | { type: "status"; state: "thinking" | "idle" | "tool_running"; sessionId: string }
+  | { type: "status"; state: "thinking" | "idle" | "tool_running" | "busy"; sessionId: string }
   | { type: "session_info"; sessionId: string; path: string }
   | { type: "session_list"; sessions: Array<{ sessionId: string; path: string; state: "idle" | "busy" }> }
   | { type: "session_cleared"; sessionId: string }
