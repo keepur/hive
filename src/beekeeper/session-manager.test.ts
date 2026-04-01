@@ -32,6 +32,7 @@ function makeConfig(overrides: Partial<BeekeeperConfig> = {}): BeekeeperConfig {
     adminSecret: "test-admin-secret",
     mongoUri: "mongodb://localhost:27017",
     mongoDbName: "test-db",
+    dataDir: "/tmp/beekeeper-test-data",
     ...overrides,
   };
 }

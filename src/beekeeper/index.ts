@@ -20,6 +20,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const guardian = new ToolGuardian(config.confirmOperations);
   const sessionManager = new SessionManager(config, guardian);
+  sessionManager.restoreSessions();
 
   // Connect device registry (fail to start if MongoDB unreachable)
   const deviceRegistry = new BeekeeperDeviceRegistry(config.mongoUri, config.mongoDbName, config.jwtSecret);
@@ -584,6 +585,7 @@ async function main(): Promise<void> {
   // --- Graceful shutdown ---
   const shutdown = async () => {
     log.info("Shutting down");
+    sessionManager.persistSessions();
     await sessionManager.stopAll();
     wss.close();
     server.close();
