@@ -20,14 +20,11 @@ export class ToolGuardian {
   }
 
   /**
-   * Set the send delegate. Pass null on client disconnect.
-   * The delegate should route through SessionManager.send() so messages
-   * land in per-session output buffers when the client is disconnected.
+   * Set the send delegate. Routes through SessionManager.send() which
+   * broadcasts to all connected clients or buffers when none are connected.
+   * Set once at startup — no need to clear on individual client disconnect.
    */
-  setSendDelegate(send: ((msg: ServerMessage) => void) | null): void {
-    if (!send) {
-      this.denyAll("Client disconnected");
-    }
+  setSendDelegate(send: (msg: ServerMessage) => void): void {
     this.sendDelegate = send;
   }
 

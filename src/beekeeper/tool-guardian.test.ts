@@ -206,29 +206,6 @@ describe("ToolGuardian", () => {
     });
   });
 
-  describe("setSendDelegate(null)", () => {
-    it("auto-denies all pending approvals when client disconnects", async () => {
-      const mockWs = makeMockWs(1);
-      guardian.setSendDelegate((msg) => mockWs.send(JSON.stringify(msg)));
-
-      const callback = guardian.createHookCallback("test-session");
-
-      const input1 = makeBashInput("git push --force", "id-1");
-      const input2 = makeBashInput("rm -rf /tmp", "id-2");
-
-      const result1Promise = callback(input1, undefined, { signal: DUMMY_ABORT_SIGNAL });
-      const result2Promise = callback(input2, undefined, { signal: DUMMY_ABORT_SIGNAL });
-
-      // Disconnect client — triggers denyAll
-      guardian.setSendDelegate(null);
-
-      const [result1, result2] = await Promise.all([result1Promise, result2Promise]);
-
-      expect(result1).toEqual({ decision: "block", reason: "Client disconnected" });
-      expect(result2).toEqual({ decision: "block", reason: "Client disconnected" });
-    });
-  });
-
   describe("denyAll()", () => {
     it("clears all pending approvals with the given reason", async () => {
       const mockWs = makeMockWs(1);

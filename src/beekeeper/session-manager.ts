@@ -21,10 +21,10 @@ export interface SessionSlot {
 
 export class SessionManager {
   private sessions = new Map<string, SessionSlot>();
-  private client: WebSocket | null = null;
+  private clients = new Map<string, WebSocket>();
   private guardian: ToolGuardian;
   private config: BeekeeperConfig;
-  /** Global buffer for messages not scoped to any session (e.g. session_list) */
+  /** Global buffer for messages sent when no clients are connected */
   private globalBuffer: ServerMessage[] = [];
 
   constructor(config: BeekeeperConfig, guardian: ToolGuardian) {
@@ -32,39 +32,51 @@ export class SessionManager {
     this.guardian = guardian;
   }
 
-  setClient(ws: WebSocket | null): void {
-    this.client = ws;
-    if (ws) {
-      // Drain global buffer
-      if (this.globalBuffer.length > 0) {
-        log.info("Draining global buffer", { count: this.globalBuffer.length });
-        for (const msg of this.globalBuffer) {
+  addClient(deviceId: string, ws: WebSocket): void {
+    this.clients.set(deviceId, ws);
+    // Drain global buffer to new client
+    if (this.globalBuffer.length > 0) {
+      log.info("Draining global buffer", { deviceId, count: this.globalBuffer.length });
+      for (const msg of this.globalBuffer) {
+        ws.send(JSON.stringify(msg));
+      }
+      this.globalBuffer = [];
+    }
+    // Drain per-session buffers to new client
+    for (const slot of this.sessions.values()) {
+      if (slot.outputBuffer.length > 0) {
+        log.info("Draining session buffer", { deviceId, sessionId: slot.sessionId, count: slot.outputBuffer.length });
+        for (const msg of slot.outputBuffer) {
           ws.send(JSON.stringify(msg));
         }
-        this.globalBuffer = [];
-      }
-      // Drain per-session buffers
-      for (const slot of this.sessions.values()) {
-        if (slot.outputBuffer.length > 0) {
-          log.info("Draining session buffer", { sessionId: slot.sessionId, count: slot.outputBuffer.length });
-          for (const msg of slot.outputBuffer) {
-            ws.send(JSON.stringify(msg));
-          }
-          slot.outputBuffer = [];
-        }
+        slot.outputBuffer = [];
       }
     }
   }
 
+  removeClient(deviceId: string): void {
+    this.clients.delete(deviceId);
+  }
+
+  get clientCount(): number {
+    return this.clients.size;
+  }
+
   /**
-   * Send a server message. Routes to the appropriate per-session buffer
-   * when no client is connected, or to the global buffer for non-session messages.
+   * Broadcast a server message to all connected clients.
+   * Buffers messages when no clients are connected.
    */
   send(msg: ServerMessage): void {
-    if (this.client && this.client.readyState === 1) {
-      this.client.send(JSON.stringify(msg));
-    } else {
-      // Route to per-session buffer if the message has a sessionId
+    const payload = JSON.stringify(msg);
+    let sent = false;
+    for (const ws of this.clients.values()) {
+      if (ws.readyState === 1) {
+        ws.send(payload);
+        sent = true;
+      }
+    }
+    if (!sent) {
+      // No connected clients — buffer the message
       const sessionId = "sessionId" in msg ? (msg as { sessionId?: string }).sessionId : undefined;
       if (sessionId) {
         const slot = this.sessions.get(sessionId);
