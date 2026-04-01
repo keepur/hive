@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { WebSocket } from "ws";
 import { createLogger } from "../logging/logger.js";
@@ -24,12 +26,14 @@ export class SessionManager {
   private clients = new Map<string, WebSocket>();
   private guardian: ToolGuardian;
   private config: BeekeeperConfig;
+  private sessionsFile: string;
   /** Global buffer for messages sent when no clients are connected */
   private globalBuffer: ServerMessage[] = [];
 
   constructor(config: BeekeeperConfig, guardian: ToolGuardian) {
     this.config = config;
     this.guardian = guardian;
+    this.sessionsFile = join(config.dataDir, "sessions.json");
   }
 
   addClient(deviceId: string, ws: WebSocket): void {
@@ -112,6 +116,7 @@ export class SessionManager {
     this.sessions.delete(pendingId);
     slot.sessionId = realId;
     this.sessions.set(realId, slot);
+    this.persistSessions();
     log.info("Session created", { sessionId: realId, cwd });
     return realId;
   }
@@ -159,6 +164,7 @@ export class SessionManager {
     }
     this.send({ type: "session_cleared", sessionId });
     this.sessions.delete(sessionId);
+    this.persistSessions();
     log.info("Session cleared", { sessionId });
     return true;
   }
@@ -207,6 +213,7 @@ export class SessionManager {
       outputBuffer: [],
     };
     this.sessions.set(sessionId, slot);
+    this.persistSessions();
     this.send({ type: "session_info", sessionId, path: cwd });
     log.info("Session resumed (lazy)", { sessionId, cwd });
     return sessionId;
@@ -219,6 +226,72 @@ export class SessionManager {
     const activeIds = new Set(this.sessions.keys());
     const sessions = await scanWorkspaceSessions(path, activeIds);
     this.send({ type: "workspace_session_list", path, sessions });
+  }
+
+  /**
+   * Persist session map to disk so sessions survive server restarts.
+   * Only saves sessionId and cwd — everything else is reconstructed lazily.
+   */
+  persistSessions(): void {
+    try {
+      const dir = dirname(this.sessionsFile);
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+      const data = Array.from(this.sessions.values())
+        .filter((s) => !s.sessionId.startsWith("pending-"))
+        .map((s) => ({ sessionId: s.sessionId, cwd: s.cwd }));
+      const tmpFile = this.sessionsFile + ".tmp";
+      writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+      renameSync(tmpFile, this.sessionsFile);
+      log.info("Persisted sessions", { count: data.length, path: this.sessionsFile });
+    } catch (err) {
+      log.error("Failed to persist sessions", { error: String(err) });
+    }
+  }
+
+  /**
+   * Restore sessions from disk after server restart.
+   * Registers each as a lazy session (no SDK call until a message is sent).
+   */
+  restoreSessions(): void {
+    if (!existsSync(this.sessionsFile)) {
+      log.info("No sessions file to restore", { path: this.sessionsFile });
+      return;
+    }
+    try {
+      const raw = readFileSync(this.sessionsFile, "utf-8");
+      if (!raw.trim()) {
+        log.info("Sessions file is empty, starting fresh");
+        return;
+      }
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        log.error("sessions.json is not an array, skipping restore");
+        return;
+      }
+      let restored = 0;
+      for (const entry of parsed) {
+        if (typeof entry?.sessionId !== "string" || typeof entry?.cwd !== "string") {
+          log.warn("Skipping invalid session entry", { entry });
+          continue;
+        }
+        if (this.sessions.has(entry.sessionId)) continue;
+        // Register slot directly — no persist or broadcast needed during restore
+        const slot: SessionSlot = {
+          sessionId: entry.sessionId,
+          cwd: entry.cwd,
+          activeQuery: null,
+          state: "idle",
+          outputBuffer: [],
+        };
+        this.sessions.set(entry.sessionId, slot);
+        restored++;
+      }
+      log.info("Restored sessions from disk", { count: restored, total: parsed.length });
+    } catch (err) {
+      log.error("Failed to restore sessions", { error: String(err) });
+    }
   }
 
   /**
