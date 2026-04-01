@@ -7,6 +7,8 @@ export type ClientMessage =
   | { type: "approve"; toolUseId: string }
   | { type: "deny"; toolUseId: string }
   | { type: "browse"; path?: string }
+  | { type: "list_workspace_sessions"; path: string }
+  | { type: "resume_session"; sessionId: string; path: string }
   | { type: "ping" };
 
 // Server → Client messages
@@ -18,6 +20,16 @@ export type ServerMessage =
   | { type: "session_list"; sessions: Array<{ sessionId: string; path: string; state: "idle" | "busy" }> }
   | { type: "session_cleared"; sessionId: string }
   | { type: "browse_result"; path: string; entries: Array<{ name: string; isDirectory: boolean }> }
+  | {
+      type: "workspace_session_list";
+      path: string;
+      sessions: Array<{
+        sessionId: string;
+        lastActiveAt: string;
+        preview: string;
+        active: boolean;
+      }>;
+    }
   | { type: "error"; message: string; sessionId?: string }
   | { type: "pong" };
 

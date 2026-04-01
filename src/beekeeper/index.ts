@@ -505,6 +505,47 @@ async function main(): Promise<void> {
             }
             break;
           }
+          case "list_workspace_sessions": {
+            if (!msg.path || typeof msg.path !== "string") {
+              ws.send(JSON.stringify({ type: "error", message: "Missing required field: path" }));
+              break;
+            }
+            try {
+              const validatedPath = validatePath(msg.path);
+              await sessionManager.listWorkspaceSessions(validatedPath);
+            } catch (err) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                }),
+              );
+            }
+            break;
+          }
+          case "resume_session": {
+            if (!msg.sessionId || !msg.path) {
+              ws.send(JSON.stringify({ type: "error", message: "Missing required fields: sessionId, path" }));
+              break;
+            }
+            const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            if (!UUID_RE.test(msg.sessionId)) {
+              ws.send(JSON.stringify({ type: "error", message: "Invalid sessionId format" }));
+              break;
+            }
+            try {
+              const validatedPath = validatePath(msg.path);
+              sessionManager.resumeSession(msg.sessionId, validatedPath);
+            } catch (err) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                }),
+              );
+            }
+            break;
+          }
           case "approve":
             guardian.handleApproval(msg.toolUseId, true);
             break;
