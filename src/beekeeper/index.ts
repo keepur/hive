@@ -6,6 +6,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createLogger } from "../logging/logger.js";
 import { loadConfig } from "./config.js";
 import { ToolGuardian } from "./tool-guardian.js";
+import { QuestionRelayer } from "./question-relayer.js";
 import { SessionManager } from "./session-manager.js";
 import { BeekeeperDeviceRegistry, type BeekeeperDevice } from "./device-registry.js";
 import { validatePath } from "./path-utils.js";
@@ -19,7 +20,8 @@ const log = createLogger("beekeeper");
 async function main(): Promise<void> {
   const config = loadConfig();
   const guardian = new ToolGuardian(config.confirmOperations);
-  const sessionManager = new SessionManager(config, guardian);
+  const questionRelayer = new QuestionRelayer();
+  const sessionManager = new SessionManager(config, guardian, questionRelayer);
   sessionManager.restoreSessions();
 
   // Connect device registry (fail to start if MongoDB unreachable)
@@ -31,6 +33,7 @@ async function main(): Promise<void> {
 
   // Set guardian delegate once — SessionManager handles broadcast/buffering
   guardian.setSendDelegate((msg) => sessionManager.send(msg));
+  questionRelayer.setSendDelegate((msg) => sessionManager.send(msg));
 
   // --- Helper functions ---
 
@@ -463,6 +466,9 @@ async function main(): Promise<void> {
           case "clear_session":
             await sessionManager.clearSession(msg.sessionId);
             break;
+          case "cancel":
+            await sessionManager.cancelQuery(msg.sessionId);
+            break;
           case "list_sessions":
             sessionManager.listSessions();
             break;
@@ -569,6 +575,10 @@ async function main(): Promise<void> {
         sessionManager.removeClient(device._id);
       }
       log.info("Client disconnected", { deviceId: device._id, remainingClients: connectedClients.size });
+      // If no clients remain, deny all pending questions — no one can answer them
+      if (connectedClients.size === 0) {
+        questionRelayer.denyAll("All clients disconnected");
+      }
       // Sessions stay in memory — any device can reconnect and resume
     });
 
@@ -586,6 +596,7 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     log.info("Shutting down");
     sessionManager.persistSessions();
+    questionRelayer.denyAll("Server shutting down");
     await sessionManager.stopAll();
     wss.close();
     server.close();
