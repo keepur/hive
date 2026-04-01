@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { homedir } from "node:os";
 import { parse as parseYaml } from "yaml";
 import type { BeekeeperConfig } from "./types.js";
 import { createLogger } from "../logging/logger.js";
@@ -104,6 +105,7 @@ export function loadConfig(): BeekeeperConfig {
     adminSecret,
     mongoUri,
     mongoDbName: (raw.mongo_db as string) ?? "hive",
+    dataDir: process.env.BEEKEEPER_DATA_DIR ?? (raw.data_dir as string) ?? join(homedir(), ".beekeeper", "data"),
     plugins: allPlugins,
   };
 }

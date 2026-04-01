@@ -41,5 +41,6 @@ export interface BeekeeperConfig {
   adminSecret: string;
   mongoUri: string;
   mongoDbName: string;
+  dataDir: string;
   plugins?: string[];
 }
