@@ -16,7 +16,12 @@ export type ClientMessage =
 export type ServerMessage =
   | { type: "message"; text: string; sessionId: string; final: boolean }
   | { type: "tool_approval"; toolUseId: string; tool: string; input: string; sessionId: string }
-  | { type: "status"; state: "thinking" | "idle" | "tool_running" | "busy"; sessionId: string }
+  | {
+      type: "status";
+      state: "thinking" | "idle" | "tool_running" | "tool_starting" | "busy";
+      sessionId: string;
+      toolName?: string;
+    }
   | { type: "session_info"; sessionId: string; path: string }
   | { type: "session_list"; sessions: Array<{ sessionId: string; path: string; state: "idle" | "busy" }> }
   | { type: "session_cleared"; sessionId: string }

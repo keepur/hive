@@ -396,6 +396,19 @@ export class SessionManager {
 
         if (msg.type === "stream_event") {
           const event = (msg as any).event;
+          if (event?.type === "content_block_start") {
+            const block = event.content_block;
+            if (block?.type === "thinking") {
+              this.send({ type: "status", state: "thinking", sessionId: resolvedSessionId });
+            } else if (block?.type === "tool_use" && typeof block.name === "string") {
+              this.send({
+                type: "status",
+                state: "tool_starting",
+                sessionId: resolvedSessionId,
+                toolName: block.name,
+              });
+            }
+          }
           if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
             this.send({
               type: "message",
@@ -407,7 +420,13 @@ export class SessionManager {
         }
 
         if (msg.type === "tool_progress") {
-          this.send({ type: "status", state: "tool_running", sessionId: resolvedSessionId });
+          const toolName = typeof (msg as any).tool_name === "string" ? (msg as any).tool_name : undefined;
+          this.send({
+            type: "status",
+            state: "tool_running",
+            sessionId: resolvedSessionId,
+            toolName,
+          });
         }
 
         if (msg.type === "assistant") {
