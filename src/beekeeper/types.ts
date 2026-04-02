@@ -22,6 +22,7 @@ export type ServerMessage =
       sessionId: string;
       toolName?: string;
     }
+  | { type: "tool_output"; toolName: string; output: string; toolUseId: string; sessionId: string }
   | { type: "session_info"; sessionId: string; path: string }
   | { type: "session_list"; sessions: Array<{ sessionId: string; path: string; state: "idle" | "busy" }> }
   | { type: "session_cleared"; sessionId: string }
