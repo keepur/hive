@@ -1,3 +1,5 @@
+import type { ResourceTierOverrides } from "../agents/model-router.js";
+
 export interface AgentSchedule {
   cron: string;
   task: string;
@@ -25,6 +27,7 @@ export interface AgentConfig {
   dodiOpsMode?: "full" | "readonly"; // Dodi Ops access level. Default: "full"
   disabled?: boolean; // Agent is offline — won't receive messages or run schedules
   subscribe?: string[]; // Event bus domain subscriptions (e.g., ["deals", "jobs"])
+  resourceTiers?: ResourceTierOverrides;
   delegatePrompts?: Record<string, string>;
   soul: string;
   systemPrompt: string;

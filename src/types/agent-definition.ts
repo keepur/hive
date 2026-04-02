@@ -1,5 +1,6 @@
 import type { AgentSchedule } from "./agent-config.js";
 import type { AgentConfig } from "./agent-config.js";
+import type { ResourceTierOverrides } from "../agents/model-router.js";
 
 export interface AgentDefinition {
   _id: string; // "rae", "jasper" — immutable after creation
@@ -36,6 +37,7 @@ export interface AgentDefinition {
   maxTurns: number;
   maxConcurrent: number;
   timeoutMs: number;
+  resourceTiers?: ResourceTierOverrides;
 
   // Lifecycle
   disabled: boolean;
@@ -88,6 +90,7 @@ export function toAgentConfig(doc: AgentDefinition): AgentConfig {
     dodiOpsMode: doc.dodiOpsMode,
     disabled: doc.disabled ?? false,
     subscribe: doc.subscribe ?? [],
+    resourceTiers: doc.resourceTiers,
     delegatePrompts: doc.delegatePrompts ?? AGENT_DEFINITION_DEFAULTS.delegatePrompts,
     soul: doc.soul ?? "",
     systemPrompt: doc.systemPrompt ?? "",
