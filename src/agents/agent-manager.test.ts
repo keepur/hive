@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Mock logger
 vi.mock("../logging/logger.js", () => ({
@@ -60,6 +60,7 @@ import { config as appConfig } from "../config.js";
 import type { RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { WorkItem } from "../types/work-item.js";
+import { routeModel } from "./model-router.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -698,6 +699,55 @@ describe("AgentManager", () => {
       const setCalls = sessionStore.set.mock.calls;
       const lastSetCall = setCalls[setCalls.length - 1];
       expect(lastSetCall[2]).toBe(reflectionSessionId);
+    });
+  });
+
+  describe("model router resource limits", () => {
+    beforeEach(() => {
+      (appConfig as any).modelRouter.enabled = true;
+    });
+
+    afterEach(() => {
+      (appConfig as any).modelRouter.enabled = false;
+    });
+
+    it("passes resource limits from router to runner.send()", async () => {
+      const mockRoute = {
+        tier: "opus" as const,
+        model: "claude-opus-4-6",
+        costUsd: 0.001,
+        durationMs: 50,
+        resourceLimits: { timeoutMs: 600_000, maxTurns: 200, budgetUsd: 50 },
+      };
+      vi.mocked(routeModel).mockResolvedValue(mockRoute);
+
+      const item = makeWorkItem();
+      await manager.sendMessage("agent-a", item);
+
+      expect(mockRunnerSend).toHaveBeenCalledWith(
+        expect.any(String),
+        undefined,
+        undefined,
+        expect.any(Object),
+        "claude-opus-4-6",
+        mockRoute.resourceLimits,
+      );
+    });
+
+    it("passes undefined resource limits when model router is disabled", async () => {
+      (appConfig as any).modelRouter.enabled = false;
+
+      const item = makeWorkItem();
+      await manager.sendMessage("agent-a", item);
+
+      expect(mockRunnerSend).toHaveBeenCalledWith(
+        expect.any(String),
+        undefined,
+        undefined,
+        expect.any(Object),
+        undefined,
+        undefined,
+      );
     });
   });
 });

@@ -873,3 +873,43 @@ describe("AgentRunner.buildSdkPlugins (via send)", () => {
     expect(options).not.toHaveProperty("plugins");
   });
 });
+
+// ── Resource limits override tests ───────────────────────────────
+describe("AgentRunner resource limits override (via send)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("uses resourceLimits when provided", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ maxTurns: 25, budgetUsd: 10, timeoutMs: 300_000 }),
+      memoryManager as any,
+    );
+
+    await runner.send("test", undefined, undefined, undefined, undefined, {
+      timeoutMs: 600_000,
+      maxTurns: 200,
+      budgetUsd: 50,
+    });
+
+    const options = getCapturedOptions();
+    expect(options.maxTurns).toBe(200);
+    expect(options.maxBudgetUsd).toBe(50);
+  });
+
+  it("falls back to agentConfig when resourceLimits not provided", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ maxTurns: 25, budgetUsd: 10 }),
+      memoryManager as any,
+    );
+
+    await runner.send("test");
+
+    const options = getCapturedOptions();
+    expect(options.maxTurns).toBe(25);
+    expect(options.maxBudgetUsd).toBe(10);
+  });
+});
