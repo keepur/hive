@@ -380,6 +380,7 @@ export class SessionManager {
 
       slot.activeQuery = q;
       let resolvedSessionId = slot.sessionId;
+      const toolNames = new Map<string, string>();
 
       for await (const message of q) {
         const msg = message as SDKMessage;
@@ -401,6 +402,7 @@ export class SessionManager {
             if (block?.type === "thinking") {
               this.send({ type: "status", state: "thinking", sessionId: resolvedSessionId });
             } else if (block?.type === "tool_use" && typeof block.name === "string") {
+              toolNames.set(block.id, block.name);
               this.send({
                 type: "status",
                 state: "tool_starting",
@@ -420,7 +422,11 @@ export class SessionManager {
         }
 
         if (msg.type === "tool_progress") {
-          const toolName = typeof (msg as any).tool_name === "string" ? (msg as any).tool_name : undefined;
+          const tp = msg as any;
+          const toolName = typeof tp.tool_name === "string" ? tp.tool_name : undefined;
+          if (toolName && typeof tp.tool_use_id === "string") {
+            toolNames.set(tp.tool_use_id, toolName);
+          }
           this.send({
             type: "status",
             state: "tool_running",
@@ -433,6 +439,41 @@ export class SessionManager {
           if ((msg as any).session_id) {
             resolvedSessionId = (msg as any).session_id;
             slot.sessionId = resolvedSessionId;
+          }
+        }
+
+        if (msg.type === "user") {
+          const userMsg = msg as any;
+          if (userMsg.isReplay || userMsg.isSynthetic) continue;
+          const content = userMsg.message?.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block.type !== "tool_result" || !block.tool_use_id) continue;
+              const toolName = toolNames.get(block.tool_use_id) ?? "unknown";
+              let output: string;
+              if (typeof block.content === "string") {
+                output = block.content;
+              } else if (Array.isArray(block.content)) {
+                output = block.content
+                  .filter((c: any) => c.type === "text" && typeof c.text === "string")
+                  .map((c: any) => c.text)
+                  .join("\n");
+              } else {
+                continue;
+              }
+              if (!output) continue;
+              const MAX_OUTPUT = 10_000;
+              if (output.length > MAX_OUTPUT) {
+                output = output.slice(0, MAX_OUTPUT) + "\n… (truncated)";
+              }
+              this.send({
+                type: "tool_output",
+                toolName,
+                output,
+                toolUseId: block.tool_use_id,
+                sessionId: resolvedSessionId,
+              });
+            }
           }
         }
 
