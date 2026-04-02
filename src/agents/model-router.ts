@@ -6,6 +6,39 @@ const log = createLogger("model-router");
 
 export type ModelTier = "haiku" | "sonnet" | "opus";
 
+export interface ResourceLimits {
+  timeoutMs: number;
+  maxTurns: number;
+  budgetUsd: number;
+}
+
+/** Per-agent override map — only specified fields override the tier default */
+export type ResourceTierOverrides = Partial<Record<ModelTier, Partial<ResourceLimits>>>;
+
+/** Global defaults per tier — these fire when no per-agent override exists */
+export const RESOURCE_TIER_DEFAULTS: Record<ModelTier, ResourceLimits> = {
+  haiku:  { timeoutMs: 120_000,  maxTurns: 20,  budgetUsd: 1  },
+  sonnet: { timeoutMs: 300_000,  maxTurns: 50,  budgetUsd: 5  },
+  opus:   { timeoutMs: 600_000,  maxTurns: 200, budgetUsd: 50 },
+};
+
+/**
+ * Resolve resource limits for a tier, applying per-agent overrides on top of global defaults.
+ */
+export function resolveResourceLimits(
+  tier: ModelTier,
+  agentOverrides?: ResourceTierOverrides,
+): ResourceLimits {
+  const defaults = RESOURCE_TIER_DEFAULTS[tier];
+  const overrides = agentOverrides?.[tier];
+  if (!overrides) return { ...defaults };
+  return {
+    timeoutMs: overrides.timeoutMs ?? defaults.timeoutMs,
+    maxTurns: overrides.maxTurns ?? defaults.maxTurns,
+    budgetUsd: overrides.budgetUsd ?? defaults.budgetUsd,
+  };
+}
+
 /** Ordered from least to most capable */
 const TIER_RANK: Record<ModelTier, number> = { haiku: 0, sonnet: 1, opus: 2 };
 
@@ -28,6 +61,7 @@ export interface ModelRouterResult {
   model: string;
   costUsd: number;
   durationMs: number;
+  resourceLimits: ResourceLimits;
 }
 
 const ROUTER_PROMPT = `You are a model router. Your job is to classify the complexity of a user message and decide which AI model tier should handle it.
@@ -76,13 +110,14 @@ function parseRouterOutput(text: string): ModelTier | null {
 export async function routeModel(
   text: string,
   ceilingModel: string,
+  resourceTierOverrides?: ResourceTierOverrides,
 ): Promise<ModelRouterResult> {
   const ceilingTier = modelToTier(ceilingModel);
   const routerModel = config.modelRouter.model;
 
   // If ceiling is already the cheapest tier, skip the call entirely
   if (ceilingTier === "haiku") {
-    return { tier: "haiku", model: TIER_MODELS.haiku, costUsd: 0, durationMs: 0 };
+    return { tier: "haiku", model: TIER_MODELS.haiku, costUsd: 0, durationMs: 0, resourceLimits: resolveResourceLimits("haiku", resourceTierOverrides) };
   }
 
   let q: Query | null = null;
@@ -145,7 +180,7 @@ export async function routeModel(
   } catch (err) {
     log.warn("Model router query failed, defaulting to sonnet", { error: String(err) });
     const fallbackTier = TIER_RANK[ceilingTier] >= TIER_RANK.sonnet ? "sonnet" : ceilingTier;
-    return { tier: fallbackTier, model: TIER_MODELS[fallbackTier], costUsd: 0, durationMs: 0 };
+    return { tier: fallbackTier, model: TIER_MODELS[fallbackTier], costUsd: 0, durationMs: 0, resourceLimits: resolveResourceLimits(fallbackTier, resourceTierOverrides) };
   } finally {
     clearTimeout(deadline);
     q = null;
@@ -155,7 +190,7 @@ export async function routeModel(
   if (!parsed) {
     log.warn("Model router parse failed, defaulting to sonnet", { rawText: resultText.slice(0, 200) });
     const fallbackTier = TIER_RANK[ceilingTier] >= TIER_RANK.sonnet ? "sonnet" : ceilingTier;
-    return { tier: fallbackTier, model: TIER_MODELS[fallbackTier], costUsd: 0, durationMs: 0 };
+    return { tier: fallbackTier, model: TIER_MODELS[fallbackTier], costUsd: 0, durationMs: 0, resourceLimits: resolveResourceLimits(fallbackTier, resourceTierOverrides) };
   }
 
   // Cap at ceiling
@@ -174,5 +209,5 @@ export async function routeModel(
     textPreview: text.slice(0, 100),
   });
 
-  return { tier: finalTier, model: TIER_MODELS[finalTier], costUsd, durationMs };
+  return { tier: finalTier, model: TIER_MODELS[finalTier], costUsd, durationMs, resourceLimits: resolveResourceLimits(finalTier, resourceTierOverrides) };
 }
