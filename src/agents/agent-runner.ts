@@ -432,6 +432,20 @@ export class AgentRunner {
       },
     };
 
+    // ── Code Search ──────────────────────────────────────────────
+    // Semantic search over codebase file index (Qdrant + MongoDB)
+    servers["code-search"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/code-index/code-search-mcp-server.js")],
+      env: {
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+        QDRANT_URL: process.env.QDRANT_URL ?? "http://localhost:6333",
+        OLLAMA_URL: process.env.OLLAMA_URL ?? "http://localhost:11434",
+      },
+    };
+
     // ── Plugin MCP Servers ──────────────────────────────────────────
     for (const plugin of this.plugins) {
       for (const [name, serverDef] of Object.entries(plugin.manifest.mcpServers)) {

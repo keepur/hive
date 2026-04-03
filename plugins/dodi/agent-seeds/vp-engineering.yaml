@@ -23,6 +23,7 @@ schedule:
 coreServers:
   - memory
   - conversation-search
+  - code-search
   - slack
   - keychain
   - background
