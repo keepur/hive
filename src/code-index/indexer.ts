@@ -222,9 +222,7 @@ export class CodeIndexer {
     if (files.length === 0) return [];
 
     const repo = files[0].repo;
-    const existing = await this.collection
-      .find({ repo }, { projection: { filePath: 1, gitSha: 1 } })
-      .toArray();
+    const existing = await this.collection.find({ repo }, { projection: { filePath: 1, gitSha: 1 } }).toArray();
     const shaMap = new Map(existing.map((r) => [r.filePath, r.gitSha]));
 
     return files.filter((f) => shaMap.get(f.filePath) !== f.gitSha);
@@ -332,11 +330,7 @@ ${fileContents.join("\n\n")}`;
         indexVersion: INDEX_VERSION,
       };
 
-      await this.collection.updateOne(
-        { repo: file.repo, filePath: file.filePath },
-        { $set: record },
-        { upsert: true },
-      );
+      await this.collection.updateOne({ repo: file.repo, filePath: file.filePath }, { $set: record }, { upsert: true });
 
       // Upsert Qdrant
       const payload: CodeIndexPayload = {
@@ -358,7 +352,9 @@ ${fileContents.join("\n\n")}`;
     for (const [repoName, currentFiles] of discoveredByRepo.entries()) {
       const currentPaths = new Set(currentFiles.map((f) => f.filePath));
 
-      const indexed = await this.collection.find({ repo: repoName }, { projection: { filePath: 1, qdrantPointId: 1 } }).toArray();
+      const indexed = await this.collection
+        .find({ repo: repoName }, { projection: { filePath: 1, qdrantPointId: 1 } })
+        .toArray();
       const toDelete = indexed.filter((r) => !currentPaths.has(r.filePath));
 
       if (toDelete.length > 0) {

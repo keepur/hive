@@ -289,10 +289,7 @@ export class CodeTaskManager {
     let effectivePrompt = body.prompt;
     if (this.options?.prefetcher) {
       try {
-        const context = await this.options.prefetcher.getContext(
-          body.prompt,
-          body.context.agentId,
-        );
+        const context = await this.options.prefetcher.getContext(body.prompt, body.context.agentId);
         if (context) {
           effectivePrompt = context + "\n\n---\n\n" + body.prompt;
         }

@@ -98,7 +98,8 @@ server.registerTool(
   "code_lookup",
   {
     title: "Code Lookup",
-    description: "Look up full index record for a specific file path. Returns summary, exports, dependencies, and role.",
+    description:
+      "Look up full index record for a specific file path. Returns summary, exports, dependencies, and role.",
     inputSchema: {
       filePath: z.string().describe("Relative file path, e.g. 'src/gateway/dispatcher.ts'"),
       repo: z.string().optional().describe("Which repo. Default: search both"),

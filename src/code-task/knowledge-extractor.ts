@@ -29,7 +29,8 @@ export class KnowledgeExtractor {
     if (!output?.result) return 0;
 
     // Truncate very long outputs to stay within Haiku context
-    const resultText = output.result.length > 30000 ? output.result.slice(0, 30000) + "\n[...truncated]" : output.result;
+    const resultText =
+      output.result.length > 30000 ? output.result.slice(0, 30000) + "\n[...truncated]" : output.result;
 
     const response = await this.anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",

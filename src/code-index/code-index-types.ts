@@ -55,7 +55,9 @@ export interface CodeSearchResult {
 const UUID_NAMESPACE = Buffer.from("6ba7b8109dad11d180b400c04fd430c8", "hex");
 
 export function deterministicUUID(input: string): string {
-  const hash = createHash("sha1").update(Buffer.concat([UUID_NAMESPACE, Buffer.from(input)])).digest();
+  const hash = createHash("sha1")
+    .update(Buffer.concat([UUID_NAMESPACE, Buffer.from(input)]))
+    .digest();
   // Set version 5 (bits 4-7 of byte 6)
   hash[6] = (hash[6] & 0x0f) | 0x50;
   // Set variant (bits 6-7 of byte 8)
@@ -67,4 +69,19 @@ export function deterministicUUID(input: string): string {
 export const INDEX_VERSION = 1;
 
 // ── File role classification hint for Haiku prompt ──
-export const ROLE_OPTIONS = ["entry", "config", "model", "service", "handler", "util", "test", "type-defs", "component", "hook", "middleware", "migration", "script", "other"] as const;
+export const ROLE_OPTIONS = [
+  "entry",
+  "config",
+  "model",
+  "service",
+  "handler",
+  "util",
+  "test",
+  "type-defs",
+  "component",
+  "hook",
+  "middleware",
+  "migration",
+  "script",
+  "other",
+] as const;

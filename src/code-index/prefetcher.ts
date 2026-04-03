@@ -86,9 +86,7 @@ export class CodeIndexPrefetcher {
           limit: 15, // fetch extra to account for post-filter
           with_payload: true,
           filter: {
-            must: [
-              { key: "agentId", match: { value: agentId } },
-            ],
+            must: [{ key: "agentId", match: { value: agentId } }],
           },
         });
 
