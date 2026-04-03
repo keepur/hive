@@ -3,6 +3,9 @@ import { MemoryStore } from "../memory/memory-store.js";
 import { MemoryEmbedder } from "../memory/memory-embedder.js";
 import type { MemoryRecordInput } from "../memory/memory-types.js";
 import type { ClaudeCodeOutput } from "./output-parser.js";
+import { createLogger } from "../logging/logger.js";
+
+const log = createLogger("knowledge-extractor");
 
 interface ExtractedInsight {
   filePath: string;
@@ -110,7 +113,7 @@ ${resultText}`,
 
         saved++;
       } catch (err) {
-        console.error(`Knowledge extractor: failed to save insight for ${topic}:`, err);
+        log.error("Failed to save insight", { topic, error: String(err) });
       }
     }
 

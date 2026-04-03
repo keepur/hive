@@ -102,7 +102,9 @@ export class CodeIndexPrefetcher {
               .toArray();
 
             if (records.length > 0) {
-              const lines = records.map((r: any) => `- ${r.topic.replace(/^code:/, "")}: ${r.content}`);
+              const lines = records.map(
+                (r) => `- ${String((r as Record<string, unknown>).topic ?? "").replace(/^code:/, "")}: ${String((r as Record<string, unknown>).content ?? "")}`,
+              );
               sections.push("**Previous session insights:**\n" + lines.join("\n"));
             }
           }

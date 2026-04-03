@@ -187,11 +187,13 @@ async function main(): Promise<void> {
     if (config.codeIndex.sessionKnowledge.enabled && memoryStore && memoryEmbedder) {
       // Reuse existing memoryStore + memoryEmbedder instances (no extra DB connections)
       knowledgeExtractor = new KnowledgeExtractor(memoryStore, memoryEmbedder);
+    } else if (config.codeIndex.sessionKnowledge.enabled && (!memoryStore || !memoryEmbedder)) {
+      log.warn("Code index session knowledge enabled but memory.structured is false — session knowledge disabled");
     }
 
     log.info("Code index integration enabled", {
       prefetch: true,
-      sessionKnowledge: config.codeIndex.sessionKnowledge.enabled,
+      sessionKnowledge: knowledgeExtractor !== undefined,
     });
   }
 

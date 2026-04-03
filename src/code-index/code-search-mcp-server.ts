@@ -47,7 +47,7 @@ server.registerTool(
     const queryVector = await embedOllama(OLLAMA_URL, query);
     const searchLimit = limit ?? 10;
 
-    const must: any[] = [];
+    const must: { key: string; match: { value: string } }[] = [];
     if (repo) must.push({ key: "repo", match: { value: repo } });
     if (role) must.push({ key: "role", match: { value: role } });
 
@@ -69,8 +69,11 @@ server.registerTool(
 
     // Enrich with full data from MongoDB for top results
     if (searchResults.length > 0) {
-      const repoFilePairs = searchResults.map((r) => ({ repo: r.repo, filePath: r.filePath }));
-      const fullRecords = await collection.find({ $or: repoFilePairs }).toArray();
+      const repoFilePairs = searchResults
+        .filter((r) => r.repo && r.filePath)
+        .map((r) => ({ repo: r.repo, filePath: r.filePath }));
+      const fullRecords =
+        repoFilePairs.length > 0 ? await collection.find({ $or: repoFilePairs }).toArray() : [];
       const recordMap = new Map(fullRecords.map((r) => [`${r.repo}:${r.filePath}`, r]));
 
       for (const result of searchResults) {
@@ -108,7 +111,7 @@ server.registerTool(
   async ({ filePath, repo }) => {
     await ensureConnected();
 
-    const query: any = { filePath };
+    const query: Partial<Pick<CodeIndexRecord, "filePath" | "repo">> = { filePath };
     if (repo) query.repo = repo;
 
     const record = await collection.findOne(query);
