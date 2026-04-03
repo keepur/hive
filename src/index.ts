@@ -101,11 +101,12 @@ async function main(): Promise<void> {
   // Structured memory lifecycle — opt-in via memory.structured in hive.yaml
   let memoryLifecycle: MemoryLifecycle | undefined;
   let memoryStore: MemoryStore | undefined;
+  let memoryEmbedder: MemoryEmbedder | undefined;
   if (config.memory.structured) {
     memoryStore = new MemoryStore(config.mongo.uri, config.mongo.dbName);
     await memoryStore.init();
     memoryManager.memoryStore = memoryStore;
-    const memoryEmbedder = new MemoryEmbedder();
+    memoryEmbedder = new MemoryEmbedder();
     memoryLifecycle = new MemoryLifecycle(memoryStore, memoryEmbedder, {
       hotBudgetTokens: config.memory.hotBudgetTokens,
       sweepIntervalHours: config.memory.sweepIntervalHours,
@@ -166,6 +167,36 @@ async function main(): Promise<void> {
   await bgTaskManager.scanOrphans();
   log.info("Background task manager started", { port: config.background.port });
 
+  // Code index prefetcher + knowledge extractor (optional — only when codeIndex enabled)
+  let prefetcher: import("./code-index/prefetcher.js").CodeIndexPrefetcher | undefined;
+  let knowledgeExtractor: import("./code-task/knowledge-extractor.js").KnowledgeExtractor | undefined;
+
+  if (config.codeIndex.enabled) {
+    const { CodeIndexPrefetcher } = await import("./code-index/prefetcher.js");
+    const { KnowledgeExtractor } = await import("./code-task/knowledge-extractor.js");
+
+    prefetcher = new CodeIndexPrefetcher({
+      mongoUri: config.mongo.uri,
+      dbName: config.mongo.dbName,
+      qdrantUrl: process.env.QDRANT_URL ?? "http://localhost:6333",
+      ollamaUrl: process.env.OLLAMA_URL ?? "http://localhost:11434",
+      scoreThreshold: config.codeIndex.scoreThreshold,
+      prefetchLimit: config.codeIndex.prefetchLimit,
+    });
+
+    if (config.codeIndex.sessionKnowledge.enabled && memoryStore && memoryEmbedder) {
+      // Reuse existing memoryStore + memoryEmbedder instances (no extra DB connections)
+      knowledgeExtractor = new KnowledgeExtractor(memoryStore, memoryEmbedder);
+    } else if (config.codeIndex.sessionKnowledge.enabled && (!memoryStore || !memoryEmbedder)) {
+      log.warn("Code index session knowledge enabled but memory.structured is false — session knowledge disabled");
+    }
+
+    log.info("Code index integration enabled", {
+      prefetch: true,
+      sessionKnowledge: knowledgeExtractor !== undefined,
+    });
+  }
+
   // Code task manager — agents can spawn Claude Code CLI sessions
   const codeTaskManager = new CodeTaskManager(
     config.codeTask.port,
@@ -177,6 +208,7 @@ async function main(): Promise<void> {
       dispatcher.dispatch(item).catch((err) => {
         log.error("Code task completion dispatch failed", { error: String(err) });
       }),
+    { prefetcher, knowledgeExtractor },
   );
   await codeTaskManager.start();
   await codeTaskManager.scanOrphans();
@@ -364,6 +396,7 @@ async function main(): Promise<void> {
     scheduler.stop();
     bgTaskManager.stop();
     codeTaskManager.stop();
+    await prefetcher?.close();
     meetingMonitor?.stop();
     agentManager.stopAll();
     await sessionStore.close();

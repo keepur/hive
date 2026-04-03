@@ -12,4 +12,5 @@ export const NAMESPACE_DESCRIPTIONS: Record<string, string> = {
   "github-issues": "GitHub issue tracking — create, search, update, comment on issues",
   quo: "Send and receive SMS messages via OpenPhone",
   tasks: "Task management — create, update, and track agent tasks",
+  "code-search": "Semantic search over codebase file index — find where functionality lives, file roles, exports",
 };
