@@ -601,7 +601,7 @@ async function main(): Promise<void> {
     wss.close();
     server.close();
     await deviceRegistry.close();
-    process.exit(0);
+    process.exit(1);
   };
 
   process.on("SIGTERM", shutdown);
