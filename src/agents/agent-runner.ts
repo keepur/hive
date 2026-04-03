@@ -8,6 +8,7 @@ import { config } from "../config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { NAMESPACE_DESCRIPTIONS } from "../delegate/namespace-descriptions.js";
+import type { ResourceLimits } from "./model-router.js";
 
 const log = createLogger("agent-runner");
 
@@ -680,7 +681,7 @@ export class AgentRunner {
     return getSkillsForAgent(this.skillIndex, this.agentConfig.id);
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits): Promise<RunResult> {
     const effectiveModel = modelOverride ?? this.agentConfig.model;
 
     log.info("Sending prompt to agent", {
@@ -713,8 +714,8 @@ export class AgentRunner {
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
 
-        maxTurns: this.agentConfig.maxTurns,
-        maxBudgetUsd: this.agentConfig.budgetUsd,
+        maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
+        maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
         thinking: { type: "disabled" },
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
@@ -745,7 +746,7 @@ export class AgentRunner {
     let activeToolStart: number | null = null;
     let activeToolName: string | null = null;
 
-    const timeoutMs = this.agentConfig.timeoutMs ?? 300_000; // 5 min default
+    const timeoutMs = resourceLimits?.timeoutMs ?? this.agentConfig.timeoutMs ?? 300_000; // 5 min default
     const deadline = setTimeout(() => {
       log.warn("Agent query timed out, aborting", {
         agent: this.agentConfig.id,
