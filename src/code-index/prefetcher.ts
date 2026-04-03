@@ -1,7 +1,7 @@
 import { QdrantClient } from "@qdrant/js-client-rest";
-import { MongoClient, type Collection } from "mongodb";
+import { MongoClient } from "mongodb";
 import { embedOllama } from "../search/embed-utils.js";
-import { CODE_INDEX_COLLECTION, type CodeIndexRecord } from "./code-index-types.js";
+import { CODE_INDEX_COLLECTION } from "./code-index-types.js";
 
 export interface PrefetcherOptions {
   mongoUri: string;
@@ -14,7 +14,6 @@ export interface PrefetcherOptions {
 
 export class CodeIndexPrefetcher {
   private mongo!: MongoClient;
-  private collection!: Collection<CodeIndexRecord>;
   private qdrant!: QdrantClient;
   private connected = false;
   private scoreThreshold: number;
@@ -29,7 +28,6 @@ export class CodeIndexPrefetcher {
     if (this.connected) return;
     this.mongo = new MongoClient(this.options.mongoUri);
     await this.mongo.connect();
-    this.collection = this.mongo.db(this.options.dbName).collection<CodeIndexRecord>("code_index");
     this.qdrant = new QdrantClient({ url: this.options.qdrantUrl });
     this.connected = true;
   }

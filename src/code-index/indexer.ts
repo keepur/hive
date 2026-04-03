@@ -1,12 +1,11 @@
 // src/code-index/indexer.ts
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve, extname } from "node:path";
-import { createHash } from "node:crypto";
 import { MongoClient, type Collection, type Db } from "mongodb";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import Anthropic from "@anthropic-ai/sdk";
-import { embedOllama, EMBED_MODEL } from "../search/embed-utils.js";
+import { embedOllama } from "../search/embed-utils.js";
 import {
   type CodeIndexRecord,
   type CodeIndexPayload,
@@ -176,7 +175,7 @@ export class CodeIndexer {
     const files: DiscoveredFile[] = [];
 
     // Use git ls-tree for SHA + path in one shot (no file reads needed for diffing)
-    const treeOutput = execSync("git ls-tree -r HEAD --format='%(objectname) %(path)'", {
+    const treeOutput = execFileSync("git", ["ls-tree", "-r", "HEAD", "--format=%(objectname) %(path)"], {
       cwd: repoPath,
       encoding: "utf-8",
       maxBuffer: 50 * 1024 * 1024,
