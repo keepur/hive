@@ -8,6 +8,8 @@ import { parseClaudeOutput, detectEscalation, resolveTaskStatus } from "./output
 import type { ClaudeCodeOutput, EscalationInfo } from "./output-parser.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
+import { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
+import { KnowledgeExtractor } from "./knowledge-extractor.js";
 
 const log = createLogger("code-task-manager");
 const RESULT_TAIL_CHARS = 2000;
@@ -52,6 +54,8 @@ interface CodeTask {
 export interface CodeTaskManagerOptions {
   /** Path to the claude CLI binary (default: "claude") */
   cliBin?: string;
+  prefetcher?: CodeIndexPrefetcher;
+  knowledgeExtractor?: KnowledgeExtractor;
 }
 
 export class CodeTaskManager {
@@ -61,6 +65,7 @@ export class CodeTaskManager {
   private maxConcurrent: number;
   private tasksDir: string;
   private cliBin: string;
+  private options: CodeTaskManagerOptions;
   private tasks = new Map<string, CodeTask>();
   private onComplete: (item: WorkItem) => void;
   private server: Server | null = null;
@@ -81,7 +86,8 @@ export class CodeTaskManager {
     this.maxConcurrent = maxConcurrent;
     this.tasksDir = tasksDir;
     this.onComplete = onComplete;
-    this.cliBin = options?.cliBin ?? "claude";
+    this.options = options ?? {};
+    this.cliBin = this.options.cliBin ?? "claude";
   }
 
   async start(): Promise<void> {
@@ -278,10 +284,28 @@ export class CodeTaskManager {
     const maxTurns = body.maxTurns ?? 100;
     const maxBudget = body.maxBudget ?? 5.0;
 
+    // Pre-fetch codebase context if available
+    // Use separate var — don't mutate body.prompt (it's used for task metadata/display)
+    let effectivePrompt = body.prompt;
+    if (this.options?.prefetcher) {
+      try {
+        const context = await this.options.prefetcher.getContext(
+          body.prompt,
+          body.context.agentId,
+        );
+        if (context) {
+          effectivePrompt = context + "\n\n---\n\n" + body.prompt;
+        }
+      } catch (err) {
+        // Don't block task spawn on prefetch failure
+        log.warn(`Prefetch failed for task, proceeding without context: ${err}`);
+      }
+    }
+
     // Append quality-gate requirement to new tasks (not resumes)
     const prompt = body.sessionId
-      ? body.prompt
-      : body.prompt +
+      ? effectivePrompt
+      : effectivePrompt +
         "\n\n---\n" +
         "IMPORTANT: After completing implementation, you MUST run /quality-gate before reporting done. " +
         "This includes test creation, lint, typecheck, and build verification. " +
@@ -560,6 +584,18 @@ export class CodeTaskManager {
         });
 
         this.onComplete(completionItem);
+
+        // Extract and persist code knowledge (fire-and-forget)
+        if (this.options?.knowledgeExtractor && task.status === "completed" && output) {
+          this.options.knowledgeExtractor
+            .extract(task.context.agentId, output)
+            .then((count) => {
+              if (count > 0) log.info(`Extracted ${count} code insights from task ${task.id}`);
+            })
+            .catch((err) => {
+              log.warn(`Knowledge extraction failed for task ${task.id}: ${err}`);
+            });
+        }
       })
       .catch((err) => {
         log.error("Failed to fire completion notification", { id: task.id, error: String(err) });
