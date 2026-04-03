@@ -23,6 +23,7 @@ coreServers:
   - crm-search
   - product-search
   - conversation-search
+  - code-search
   - callback
 delegateServers:
   - linear

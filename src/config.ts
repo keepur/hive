@@ -232,6 +232,20 @@ export const config = {
       10,
     ),
   },
+  codeIndex: {
+    enabled: hive.codeIndex?.enabled === true || process.env.CODE_INDEX_ENABLED === "true",
+    scoreThreshold: parseFloat(optional("CODE_INDEX_SCORE_THRESHOLD", String(hive.codeIndex?.scoreThreshold ?? 0.65))),
+    prefetchLimit: parseInt(optional("CODE_INDEX_PREFETCH_LIMIT", String(hive.codeIndex?.prefetchLimit ?? 8)), 10),
+    sessionKnowledge: {
+      enabled:
+        (hive.codeIndex?.sessionKnowledge?.enabled ?? true) && process.env.CODE_INDEX_SESSION_KNOWLEDGE !== "false",
+    },
+    repos:
+      (hive.codeIndex?.repos as Record<
+        string,
+        { path: string; include: string[]; extensions: string[]; exclude: string[] }
+      >) ?? {},
+  },
   events: {
     retentionDays: parseInt(optional("EVENT_RETENTION_DAYS", String(hive.events?.retentionDays ?? 30)), 10),
   },

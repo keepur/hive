@@ -29,6 +29,11 @@ export class MemoryStore {
     log.info("Memory store initialized", { db: this.dbName });
   }
 
+  /** Expose collection for advanced queries (e.g., knowledge extractor delete-before-save) */
+  getCollection(): Collection<MemoryRecord> {
+    return this.collection;
+  }
+
   async save(
     agentId: string,
     input: MemoryRecordInput,
