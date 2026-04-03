@@ -7,7 +7,7 @@ import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import { formatFilesForPrompt } from "../files/file-processor.js";
-import { routeModel } from "./model-router.js";
+import { routeModel, type ResourceLimits } from "./model-router.js";
 import { config as appConfig } from "../config.js";
 import { loadPlugins } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
@@ -163,20 +163,26 @@ export class AgentManager {
         // Model routing — classify complexity and pick the right model tier
         let modelOverride: string | undefined;
         let routerCostUsd = 0;
+        let resourceLimits: ResourceLimits | undefined;
         if (appConfig.modelRouter.enabled && item.message.sender !== "system") {
           try {
             const agentConfig = this.registry.get(agentId);
             if (agentConfig) {
-              const route = await routeModel(item.message.text, agentConfig.model);
+              const route = await routeModel(
+                item.message.text,
+                agentConfig.model,
+                agentConfig.resourceTiers,
+              );
               modelOverride = route.model !== agentConfig.model ? route.model : undefined;
               routerCostUsd = route.costUsd;
+              resourceLimits = route.resourceLimits;
             }
           } catch (err) {
             log.warn("Model router failed, using default", { agentId, error: String(err) });
           }
         }
 
-        const result = await runner.send(prompt, existingSession, item.onStream, bgContext, modelOverride);
+        const result = await runner.send(prompt, existingSession, item.onStream, bgContext, modelOverride, resourceLimits);
         result.costUsd += routerCostUsd;
 
         if (result.sessionId && !result.aborted) {
