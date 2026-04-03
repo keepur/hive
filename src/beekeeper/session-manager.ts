@@ -442,40 +442,8 @@ export class SessionManager {
           }
         }
 
-        if (msg.type === "user") {
-          const userMsg = msg as any;
-          if (userMsg.isReplay || userMsg.isSynthetic) continue;
-          const content = userMsg.message?.content;
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              if (block.type !== "tool_result" || !block.tool_use_id) continue;
-              const toolName = toolNames.get(block.tool_use_id) ?? "unknown";
-              let output: string;
-              if (typeof block.content === "string") {
-                output = block.content;
-              } else if (Array.isArray(block.content)) {
-                output = block.content
-                  .filter((c: any) => c.type === "text" && typeof c.text === "string")
-                  .map((c: any) => c.text)
-                  .join("\n");
-              } else {
-                continue;
-              }
-              if (!output) continue;
-              const MAX_OUTPUT = 10_000;
-              if (output.length > MAX_OUTPUT) {
-                output = output.slice(0, MAX_OUTPUT) + "\n… (truncated)";
-              }
-              this.send({
-                type: "tool_output",
-                toolName,
-                output,
-                toolUseId: block.tool_use_id,
-                sessionId: resolvedSessionId,
-              });
-            }
-          }
-        }
+        // Skip tool_output relay — status messages (tool_starting/tool_running)
+        // already show what's happening, and raw tool output is too verbose for the client.
 
         if (msg.type === "result") {
           const result = msg as SDKResultMessage;
