@@ -242,6 +242,10 @@ export class CodeIndexer {
         vectors: { size: testVector.length, distance: "Cosine" },
       });
       console.log(`Created Qdrant collection '${CODE_INDEX_COLLECTION}' (dim=${testVector.length})`);
+      // Create payload indexes for filtered searches
+      await this.qdrant.createPayloadIndex(CODE_INDEX_COLLECTION, { field_name: "repo", field_schema: "keyword" });
+      await this.qdrant.createPayloadIndex(CODE_INDEX_COLLECTION, { field_name: "role", field_schema: "keyword" });
+      await this.qdrant.createPayloadIndex(CODE_INDEX_COLLECTION, { field_name: "language", field_schema: "keyword" });
     }
     this.collectionReady = true;
   }
@@ -258,30 +262,34 @@ export class CodeIndexer {
       ? { [this.options.repoFilter]: this.options.repos[this.options.repoFilter] }
       : this.options.repos;
 
+    // Collect discovered files per repo — reused for both indexing and pruning (avoids double walk)
+    const discoveredByRepo = new Map<string, DiscoveredFile[]>();
+
     for (const [repoName, repoConfig] of Object.entries(repos)) {
       if (!repoConfig) {
         console.warn(`Repo '${repoName}' not found in config, skipping`);
         continue;
       }
       console.log(`\n=== Indexing ${repoName} (${repoConfig.path}) ===`);
-      const { indexed, skipped, failed } = await this.indexRepo(repoName, repoConfig);
+      const { indexed, skipped, failed, files } = await this.indexRepo(repoName, repoConfig);
+      discoveredByRepo.set(repoName, files);
       totalIndexed += indexed;
       totalSkipped += skipped;
       totalFailed += failed;
       console.log(`  ${repoName}: indexed=${indexed} skipped=${skipped} failed=${failed}`);
     }
 
-    // Clean up deleted files
-    await this.pruneDeletedFiles(repos);
+    // Clean up deleted files — uses already-discovered file lists
+    await this.pruneDeletedFiles(discoveredByRepo);
 
     return { indexed: totalIndexed, skipped: totalSkipped, failed: totalFailed };
   }
 
-  /** Index a single repo */
+  /** Index a single repo — returns discovered files for reuse in pruning */
   private async indexRepo(
     repoName: string,
     repoConfig: RepoConfig,
-  ): Promise<{ indexed: number; skipped: number; failed: number }> {
+  ): Promise<{ indexed: number; skipped: number; failed: number; files: DiscoveredFile[] }> {
     const files = this.discoverFiles(repoName, repoConfig);
     console.log(`  Discovered ${files.length} files`);
 
@@ -289,7 +297,7 @@ export class CodeIndexer {
     const changed = this.options.forceFullReindex ? files : await this.filterChanged(files);
     console.log(`  ${changed.length} files need (re)indexing`);
 
-    if (changed.length === 0) return { indexed: 0, skipped: files.length, failed: 0 };
+    if (changed.length === 0) return { indexed: 0, skipped: files.length, failed: 0, files };
 
     // Batch summarize
     let indexed = 0;
@@ -319,24 +327,27 @@ export class CodeIndexer {
       }
     }
 
-    return { indexed, skipped: files.length - changed.length, failed };
+    return { indexed, skipped: files.length - changed.length, failed, files };
   }
 
-  /** Walk repo for matching source files */
+  /** Walk repo for matching source files — uses git for SHAs (no file reads) */
   private discoverFiles(repoName: string, repoConfig: RepoConfig): DiscoveredFile[] {
     const repoPath = resolve(repoConfig.path.replace(/^~/, process.env.HOME ?? ""));
     const files: DiscoveredFile[] = [];
 
-    // Use git ls-files for .gitignore-aware file listing
-    const gitOutput = execSync("git ls-files --cached --others --exclude-standard", {
+    // Use git ls-tree for SHA + path in one shot (no file reads needed for diffing)
+    const treeOutput = execSync("git ls-tree -r HEAD --format='%(objectname) %(path)'", {
       cwd: repoPath,
       encoding: "utf-8",
       maxBuffer: 50 * 1024 * 1024,
     });
 
-    for (const line of gitOutput.split("\n")) {
-      const filePath = line.trim();
-      if (!filePath) continue;
+    // Separately get line counts via git diff --stat (cheaper than reading files)
+    // For line counts we'll defer to summarizeBatch which reads the file anyway
+    for (const line of treeOutput.split("\n")) {
+      const match = line.match(/^([0-9a-f]+) (.+)$/);
+      if (!match) continue;
+      const [, gitSha, filePath] = match;
 
       // Check include patterns (simple prefix match)
       const matchesInclude = repoConfig.include.some((inc) => {
@@ -357,18 +368,10 @@ export class CodeIndexer {
       if (excluded) continue;
 
       const absPath = resolve(repoPath, filePath);
-      let content: string;
-      try {
-        content = readFileSync(absPath, "utf-8");
-      } catch {
-        continue; // file might have been deleted between ls-files and read
-      }
-
-      const gitSha = createHash("sha1").update(content).digest("hex");
-      const lineCount = content.split("\n").length;
       const language = ext === ".tsx" ? "tsx" : ext === ".ts" ? "typescript" : "javascript";
 
-      files.push({ repo: repoName, filePath, absPath, gitSha, lineCount, language });
+      // lineCount deferred — set to 0 here, computed in summarizeBatch when file is read
+      files.push({ repo: repoName, filePath, absPath, gitSha, lineCount: 0, language });
     }
 
     return files;
@@ -387,12 +390,19 @@ export class CodeIndexer {
     return files.filter((f) => shaMap.get(f.filePath) !== f.gitSha);
   }
 
-  /** Group files into batches: small files (<=200 lines) batched 5-10, large files alone */
+  /** Group files into batches by file size — reads files to determine size, populates lineCount */
   private batchFiles(files: DiscoveredFile[]): DiscoveredFile[][] {
     const small: DiscoveredFile[] = [];
     const large: DiscoveredFile[] = [];
 
     for (const f of files) {
+      // Read file to determine line count (first read — content reused in summarizeBatch)
+      try {
+        const content = readFileSync(f.absPath, "utf-8");
+        f.lineCount = content.split("\n").length;
+      } catch {
+        f.lineCount = 0; // will be skipped in summarizeBatch if unreadable
+      }
       if (f.lineCount <= 200) small.push(f);
       else large.push(f);
     }
@@ -436,7 +446,7 @@ ${fileContents.join("\n\n")}`;
 
     const response = await this.anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 4096,
+      max_tokens: 8192,
       messages: [{ role: "user", content: prompt }],
     });
 
@@ -503,11 +513,9 @@ ${fileContents.join("\n\n")}`;
     }
   }
 
-  /** Remove index entries for files that no longer exist in the repo */
-  private async pruneDeletedFiles(repos: Record<string, RepoConfig | undefined>): Promise<void> {
-    for (const [repoName, repoConfig] of Object.entries(repos)) {
-      if (!repoConfig) continue;
-      const currentFiles = this.discoverFiles(repoName, repoConfig);
+  /** Remove index entries for files that no longer exist — uses pre-discovered file lists */
+  private async pruneDeletedFiles(discoveredByRepo: Map<string, DiscoveredFile[]>): Promise<void> {
+    for (const [repoName, currentFiles] of discoveredByRepo.entries()) {
       const currentPaths = new Set(currentFiles.map((f) => f.filePath));
 
       const indexed = await this.collection.find({ repo: repoName }, { projection: { filePath: 1, qdrantPointId: 1 } }).toArray();
@@ -570,6 +578,10 @@ const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 
 if (!MONGODB_URI) {
   console.error("MONGODB_URI is required");
+  process.exit(1);
+}
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error("ANTHROPIC_API_KEY is required (used for Haiku summarization)");
   process.exit(1);
 }
 
@@ -651,8 +663,10 @@ Run: `chmod +x scripts/code-index.ts`
 
 - [ ] **Step 3:** Verify
 
-Run: `npx tsc --noEmit`
-Expected: clean compilation (the script imports from src/ which is fine for tsx)
+Note: `scripts/` is not in tsconfig's `include` — `tsc --noEmit` won't check this file. Verify manually:
+
+Run: `npx tsx --eval "import '../scripts/code-index.ts'" 2>&1 | head -5`
+Expected: starts running (fails on missing env vars is fine — proves the imports resolve)
 
 - [ ] **Step 4:** Commit
 
@@ -891,10 +905,16 @@ export class CodeIndexPrefetcher {
 
     const sections: string[] = [];
 
+    // Embed prompt once — reuse for both searches
+    let queryVector: number[];
+    try {
+      queryVector = await embedOllama(this.options.ollamaUrl, prompt);
+    } catch {
+      return ""; // Ollama down — skip entirely
+    }
+
     // 1. Query code index
     try {
-      const queryVector = await embedOllama(this.options.ollamaUrl, prompt);
-
       const codeResults = await this.qdrant.search(CODE_INDEX_COLLECTION, {
         vector: queryVector,
         limit: this.prefetchLimit,
@@ -918,8 +938,6 @@ export class CodeIndexPrefetcher {
     // We filter by agentId in Qdrant and post-filter by topic prefix in application code.
     if (agentId) {
       try {
-        const queryVector = await embedOllama(this.options.ollamaUrl, prompt);
-
         const memResults = await this.qdrant.search("agent_memory", {
           vector: queryVector,
           limit: 15, // fetch extra to account for post-filter
@@ -997,18 +1015,10 @@ Post-completion Haiku extraction that persists code insights to the memory syste
 ```typescript
 // src/code-task/knowledge-extractor.ts
 import Anthropic from "@anthropic-ai/sdk";
-import { MongoClient, type Collection, type Db, ObjectId } from "mongodb";
 import { MemoryStore } from "../memory/memory-store.js";
 import { MemoryEmbedder } from "../memory/memory-embedder.js";
 import type { MemoryRecordInput } from "../memory/memory-types.js";
 import type { ClaudeCodeOutput } from "./output-parser.js";
-
-export interface KnowledgeExtractorOptions {
-  mongoUri: string;
-  dbName: string;
-  qdrantUrl: string;
-  ollamaUrl: string;
-}
 
 interface ExtractedInsight {
   filePath: string;
@@ -1019,21 +1029,12 @@ interface ExtractedInsight {
 
 export class KnowledgeExtractor {
   private anthropic: Anthropic;
-  private memoryStore: MemoryStore;
-  private memoryEmbedder: MemoryEmbedder;
 
-  constructor(private options: KnowledgeExtractorOptions) {
+  constructor(
+    private memoryStore: MemoryStore,
+    private memoryEmbedder: MemoryEmbedder,
+  ) {
     this.anthropic = new Anthropic();
-    this.memoryStore = new MemoryStore(options.mongoUri, options.dbName);
-    this.memoryEmbedder = new MemoryEmbedder(options.qdrantUrl, options.ollamaUrl);
-  }
-
-  async init(): Promise<void> {
-    await this.memoryStore.init();
-  }
-
-  async close(): Promise<void> {
-    await this.memoryStore.close();
   }
 
   /**
@@ -1148,17 +1149,12 @@ The knowledge extractor needs direct collection access for `deleteMany`. Add a p
 
 Note: `close()` already exists in `MemoryStore` (line 233). Do NOT add a duplicate.
 
-- [ ] **Step 3:** Add `remove()` method to MemoryEmbedder
+- [ ] **Step 3:** Verify `remove()` exists on MemoryEmbedder
 
-Add to `src/memory/memory-embedder.ts`:
+`MemoryEmbedder.remove()` already exists (added in PR #23, line ~70 of `memory-embedder.ts`). Do NOT add a duplicate. Just confirm it's there:
 
-```typescript
-  /** Remove a point from Qdrant by ID */
-  async remove(pointId: string): Promise<void> {
-    await this.ensureCollection();
-    await this.getClient().delete(COLLECTION, { points: [pointId] });
-  }
-```
+Run: `grep -n "async remove" src/memory/memory-embedder.ts`
+Expected: shows the existing `remove(pointId: string)` method
 
 - [ ] **Step 4:** Verify
 
@@ -1214,8 +1210,12 @@ this.cliBin = this.options.cliBin ?? "claude";
 
 In the `spawnTask` method, before the quality-gate append (before the line that appends "IMPORTANT: After completing implementation..."), add:
 
+Use a separate variable so the original `body.prompt` is preserved for task metadata (`.slice(0, 500)` truncation used in status display):
+
 ```typescript
     // Pre-fetch codebase context if available
+    // Use separate var — don't mutate body.prompt (it's used for task metadata/display)
+    let effectivePrompt = body.prompt;
     if (this.options?.prefetcher) {
       try {
         const context = await this.options.prefetcher.getContext(
@@ -1223,7 +1223,7 @@ In the `spawnTask` method, before the quality-gate append (before the line that 
           body.context.agentId,
         );
         if (context) {
-          body.prompt = context + "\n\n---\n\n" + body.prompt;
+          effectivePrompt = context + "\n\n---\n\n" + body.prompt;
         }
       } catch (err) {
         // Don't block task spawn on prefetch failure
@@ -1231,6 +1231,8 @@ In the `spawnTask` method, before the quality-gate append (before the line that 
       }
     }
 ```
+
+Then pass `effectivePrompt` to `buildArgs()` instead of `body.prompt`. Keep `body.prompt` for the `task.prompt = body.prompt.slice(0, 500)` metadata line.
 
 - [ ] **Step 3:** Add knowledge extraction call in `fireCompletion()`
 
@@ -1273,13 +1275,8 @@ Before the CodeTaskManager construction, add:
     });
 
     if (config.codeIndex.sessionKnowledge.enabled) {
-      knowledgeExtractor = new KnowledgeExtractor({
-        mongoUri: config.mongo.uri,
-        dbName: config.mongo.dbName,
-        qdrantUrl: process.env.QDRANT_URL ?? "http://localhost:6333",
-        ollamaUrl: process.env.OLLAMA_URL ?? "http://localhost:11434",
-      });
-      await knowledgeExtractor.init();
+      // Reuse existing memoryStore + memoryEmbedder instances (no extra DB connections)
+      knowledgeExtractor = new KnowledgeExtractor(memoryStore, memoryEmbedder);
     }
 
     log.info("Code index integration enabled", {
@@ -1306,6 +1303,15 @@ Then update the CodeTaskManager construction to pass options:
   );
 ```
 
+Also add cleanup to the existing shutdown handler (find the `process.on("SIGTERM", ...)` or shutdown function):
+
+```typescript
+  // In the shutdown handler, add:
+  await prefetcher?.close();
+```
+
+Note: `knowledgeExtractor` no longer needs its own cleanup — it shares the process-lifetime `memoryStore` and `memoryEmbedder` instances.
+
 - [ ] **Step 5:** Verify
 
 Run: `npx tsc --noEmit`
@@ -1324,6 +1330,7 @@ git commit -m "feat(code-index): wire prefetcher and knowledge extractor into Co
 
 **Files:**
 - Modify: `src/agents/agent-runner.ts`
+- Modify: `src/delegate/namespace-descriptions.ts`
 - Modify: `plugins/dodi/agent-seeds/vp-engineering.yaml`
 - Modify: `plugins/dodi/agent-seeds/product-manager.yaml`
 
@@ -1347,7 +1354,15 @@ In `agent-runner.ts`, after the `conversation-search` server block (after the `s
     };
 ```
 
-- [ ] **Step 2:** Add `code-search` to Jasper's coreServers in seed file
+- [ ] **Step 2:** Add namespace description for `code-search`
+
+In `src/delegate/namespace-descriptions.ts`, add to the `NAMESPACE_DESCRIPTIONS` map:
+
+```typescript
+"code-search": "Semantic search over codebase file index — find where functionality lives, file roles, exports",
+```
+
+- [ ] **Step 3:** Add `code-search` to Jasper's coreServers in seed file
 
 In `plugins/dodi/agent-seeds/vp-engineering.yaml`, add `code-search` to the `coreServers` list:
 
@@ -1361,7 +1376,7 @@ coreServers:
   - background
 ```
 
-- [ ] **Step 3:** Add `code-search` to Chloe's coreServers in seed file
+- [ ] **Step 4:** Add `code-search` to Chloe's coreServers in seed file
 
 In `plugins/dodi/agent-seeds/product-manager.yaml`, add `code-search` to the `coreServers` list:
 
@@ -1375,12 +1390,12 @@ coreServers:
   - code-search
 ```
 
-- [ ] **Step 4:** Regenerate agent directories from seeds
+- [ ] **Step 5:** Regenerate agent directories from seeds
 
 Run: `npm run setup:agents`
 Expected: agents/ directory updated with new coreServers
 
-- [ ] **Step 5:** Update live DB records
+- [ ] **Step 6:** Update live DB records
 
 Run the following to add `code-search` to the live agent definitions in MongoDB:
 
@@ -1403,15 +1418,15 @@ mongosh --eval '
 
 Note: Mokie lives in the personal instance — see Post-Merge manual steps for update command.
 
-- [ ] **Step 6:** Verify
+- [ ] **Step 7:** Verify
 
 Run: `npx tsc --noEmit`
 Expected: clean compilation
 
-- [ ] **Step 7:** Commit
+- [ ] **Step 8:** Commit
 
 ```bash
-git add src/agents/agent-runner.ts plugins/dodi/agent-seeds/vp-engineering.yaml plugins/dodi/agent-seeds/product-manager.yaml
+git add src/agents/agent-runner.ts src/delegate/namespace-descriptions.ts plugins/dodi/agent-seeds/vp-engineering.yaml plugins/dodi/agent-seeds/product-manager.yaml
 git commit -m "feat(code-index): wire code-search MCP server into agent-runner and enable for Jasper/Chloe"
 ```
 
