@@ -97,4 +97,33 @@ export class MemoryEmbedder {
       score: r.score,
     }));
   }
+
+  /**
+   * Find points similar to a given point (by its ID) within the same agent.
+   * Uses Qdrant's query API with recommend mode (positive example).
+   * Note: the older `recommend()` method is deprecated in the Qdrant client.
+   */
+  async findSimilar(
+    pointId: string,
+    agentId: string,
+    threshold: number,
+    limit: number = 10,
+  ): Promise<{ mongoId: string; score: number; pointId: string }[]> {
+    await this.ensureCollection();
+    const results = await this.getClient().query(COLLECTION, {
+      query: { recommend: { positive: [pointId] } },
+      filter: {
+        must: [{ key: "agentId", match: { value: agentId } }],
+      },
+      limit,
+      with_payload: true,
+      score_threshold: threshold,
+    });
+
+    return results.points.map((r) => ({
+      mongoId: r.payload?.mongoId as string,
+      score: r.score ?? 0,
+      pointId: typeof r.id === "string" ? r.id : String(r.id),
+    }));
+  }
 }
