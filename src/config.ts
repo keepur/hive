@@ -284,6 +284,10 @@ export const config = {
       optional("AUTODREAM_MAX_CONTRADICTIONS", String(hive.autoDream?.maxContradictionPairsPerRun ?? 30)),
       10,
     ),
+    maxPromotionsPerRun: parseInt(
+      optional("AUTODREAM_MAX_PROMOTIONS", String(hive.autoDream?.maxPromotionsPerRun ?? 10)),
+      10,
+    ),
   },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),

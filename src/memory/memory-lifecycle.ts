@@ -475,6 +475,8 @@ export class MemoryLifecycle {
     let promoted = 0;
 
     for (const [topic, records] of byTopic) {
+      if (promoted >= cfg.maxPromotionsPerRun) break;
+
       // Count distinct source threads
       const threads = new Set(records.map((r) => r.sourceThread).filter(Boolean));
       if (threads.size < cfg.patternMinCount) continue;
@@ -536,10 +538,11 @@ export class MemoryLifecycle {
         createdAt: Math.floor(Date.now() / 1000),
       });
 
-      promoted++;
+      // Supersede source interactions so they don't re-promote on next cycle.
+      const interactionIds = records.map((r) => r._id!);
+      await this.store.markSuperseded(interactionIds, factRecord._id!);
 
-      // Don't delete interactions — they have conversation context.
-      // They'll decay to cold naturally via the regular sweep scoring.
+      promoted++;
     }
 
     if (promoted > 0) {

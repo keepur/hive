@@ -187,6 +187,7 @@ export class MemoryStore {
       .find({
         agentId,
         type: "interaction",
+        tier: { $in: ["hot", "warm"] as MemoryTier[] },
         purged: { $ne: true },
         supersededBy: { $exists: false },
         summarized: false,
