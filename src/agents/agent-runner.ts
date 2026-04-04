@@ -62,18 +62,25 @@ export class AgentRunner {
   }
 
   private async buildSystemPrompt(activeDelegates?: string[]): Promise<string> {
+    // Prompt ordered for cache efficiency: static content first (cacheable prefix),
+    // dynamic content last (only invalidates suffix). API caches identical prefixes.
     const parts: string[] = [];
 
-    // Inject current date/time context so agents don't have to guess
-    const now = new Date();
-    const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
-    parts.push(`**Current date/time**: ${pacific} (Pacific Time)`);
+    // --- Static prefix (stable across turns → cacheable) ---
 
     if (this.agentConfig.soul) {
       parts.push(this.agentConfig.soul);
     }
 
     parts.push(this.agentConfig.systemPrompt);
+
+    // Constitution is always loaded — non-negotiable team rules
+    const constitution = await this.memoryManager.read("shared/constitution.md");
+    if (constitution) {
+      parts.push(constitution);
+    }
+
+    // --- Semi-static (stable within a session, changes on restart) ---
 
     // Inject delegate namespace summaries so the agent knows what subagents are available
     // Uses activeDelegates (actually constructed) rather than config (may include credential-gated servers)
@@ -88,11 +95,7 @@ export class AgentRunner {
       );
     }
 
-    // Constitution is always loaded — non-negotiable team rules
-    const constitution = await this.memoryManager.read("shared/constitution.md");
-    if (constitution) {
-      parts.push(constitution);
-    }
+    // --- Dynamic suffix (changes per turn → not cached) ---
 
     // Memory injection — prefer structured records, fall back to legacy blob
     const hotTierPrompt = await this.memoryManager.getHotTierPrompt(
@@ -120,6 +123,12 @@ export class AgentRunner {
         );
       }
     }
+
+    // Date/time last — changes every minute, so placing it at the end
+    // preserves the static prefix for prompt caching
+    const now = new Date();
+    const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+    parts.push(`**Current date/time**: ${pacific} (Pacific Time)`);
 
     return parts.join("\n\n---\n\n");
   }
