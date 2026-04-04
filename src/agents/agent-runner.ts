@@ -1,4 +1,4 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { createLogger } from "../logging/logger.js";
@@ -34,6 +34,13 @@ export interface RunResult {
   toolCalls: number;
   toolSummary: string;
   streamed: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  contextWindow: number; // Model's max context size (e.g. 200000), NOT current utilization
+  compactions: number;
+  preCompactTokens?: number; // Token count before last compaction (from compact_metadata.pre_tokens)
   error?: string;
   aborted?: boolean;
 }
@@ -695,6 +702,31 @@ export class AgentRunner {
     return getSkillsForAgent(this.skillIndex, this.agentConfig.id);
   }
 
+  private buildPreCompactHook(): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+    const agentName = this.agentConfig.name;
+    const agentId = this.agentConfig.id;
+
+    return {
+      PreCompact: [{
+        hooks: [async (_input, _toolUseId, _opts) => {
+          log.info("PreCompact hook fired", { agent: agentId });
+          return {
+            continue: true,
+            systemMessage: [
+              `You are ${agentName} (agent ID: ${agentId}). When summarizing this conversation for compaction:`,
+              "- Preserve your identity, role, and any behavioral instructions from your system prompt",
+              "- Keep all customer/contact names, deal details, and reference numbers",
+              "- Retain every decision made and commitment given — who decided what, and why",
+              "- Preserve active workflows: what's in progress, what's pending, next steps",
+              "- Keep tool call results that informed decisions (not raw API responses)",
+              "- Discard pleasantries, thinking-out-loud, and intermediate failed attempts",
+            ].join("\n"),
+          };
+        }],
+      }],
+    };
+  }
+
   async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits): Promise<RunResult> {
     const effectiveModel = modelOverride ?? this.agentConfig.model;
 
@@ -736,6 +768,9 @@ export class AgentRunner {
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
         ...(Object.keys(delegateAgents).length > 0 ? { agents: delegateAgents } : {}),
         ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
+        hooks: this.buildPreCompactHook(),
+        // Cast: AgentConfig stores string[] but SDK expects SdkBeta[] — intentional for forward compat
+        ...(this.agentConfig.betas?.length ? { betas: this.agentConfig.betas as any } : {}),
         env: {
           ...process.env,
           ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
@@ -754,6 +789,13 @@ export class AgentRunner {
     let streamed = false;
     let error: string | undefined;
     this._aborted = false;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheCreationTokens = 0;
+    let contextWindow = 0;
+    let compactions = 0;
+    let preCompactTokens: number | undefined;
 
     // Instrumentation
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
@@ -776,6 +818,27 @@ export class AgentRunner {
         if (msg.type === "system" && msg.subtype === "init") {
           resultSessionId = msg.session_id;
           log.debug("Session initialized", { sessionId: resultSessionId });
+        }
+
+        // Track compaction events
+        if (msg.type === "system" && msg.subtype === "compact_boundary") {
+          const meta = (msg as any).compact_metadata;
+          compactions++;
+          preCompactTokens = meta?.pre_tokens;
+          log.info("Context compacted", {
+            agent: this.agentConfig.id,
+            trigger: meta?.trigger,
+            preTokens: meta?.pre_tokens,
+            compactionNumber: compactions,
+          });
+        }
+
+        // Log compaction status changes
+        if (msg.type === "system" && msg.subtype === "status") {
+          const status = (msg as any).status;
+          if (status === "compacting") {
+            log.info("Compaction in progress", { agent: this.agentConfig.id });
+          }
         }
 
         // Stream text chunks in real-time
@@ -828,6 +891,25 @@ export class AgentRunner {
           costUsd = result.total_cost_usd;
           durationMs = result.duration_ms;
           resultSessionId = result.session_id;
+
+          // Extract token usage from SDK result
+          const usage = (result as any).usage;
+          if (usage) {
+            inputTokens = usage.input_tokens ?? 0;
+            outputTokens = usage.output_tokens ?? 0;
+            cacheReadTokens = usage.cache_read_input_tokens ?? 0;
+            cacheCreationTokens = usage.cache_creation_input_tokens ?? 0;
+          }
+
+          // Extract context window from model usage
+          const modelUsage = (result as any).modelUsage as Record<string, { contextWindow?: number }> | undefined;
+          if (modelUsage) {
+            for (const mu of Object.values(modelUsage)) {
+              if (mu.contextWindow && mu.contextWindow > contextWindow) {
+                contextWindow = mu.contextWindow;
+              }
+            }
+          }
 
           if (result.subtype === "success") {
             resultText = result.result || resultText;
@@ -897,11 +979,25 @@ export class AgentRunner {
       toolMs: totalToolMs,
       toolCalls: toolCalls.length,
       toolSummary: toolSummary || "none",
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      contextWindow,
+      compactions,
+      preCompactTokens,
       streamed,
       hasError: !!error,
     });
 
-    return { text: resultText, sessionId: resultSessionId, costUsd, durationMs, llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length, toolSummary: toolSummary || "none", streamed, error, aborted: this._aborted };
+    return {
+      text: resultText, sessionId: resultSessionId, costUsd, durationMs,
+      llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length,
+      toolSummary: toolSummary || "none", streamed,
+      inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+      contextWindow, compactions, preCompactTokens,
+      error, aborted: this._aborted,
+    };
   }
 
   private _aborted = false;
