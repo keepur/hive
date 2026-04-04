@@ -108,5 +108,7 @@ export class ActivityLogger {
       log.info("Draining activity buffer on shutdown", { count: this.buffer.length });
       await this.flush();
     }
+
+    this.connected = false;
   }
 }

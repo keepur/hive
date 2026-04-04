@@ -406,7 +406,7 @@ async function main(): Promise<void> {
     codeTaskManager.stop();
     await prefetcher?.close();
     meetingMonitor?.stop();
-    agentManager.stopAll();
+    agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
     if (activityLogger) await activityLogger.stop();
     await sessionStore.close();
     await memoryStore?.close();

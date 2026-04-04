@@ -339,18 +339,16 @@ describe("ActivityLogger", () => {
       await expect(logger.stop()).resolves.toBeUndefined();
     });
 
-    it("stops the periodic timer after stop", async () => {
+    it("drops records after stop (connected = false)", async () => {
       const logger = new ActivityLogger(mockDb as any, makeConfig({ flushIntervalMs: 1000 }));
       await logger.connect();
 
       await logger.stop();
 
-      // Record after stop — should be in buffer but timer won't fire
+      // Record after stop — dropped silently because connected is now false
       logger.record(makeRecord());
       await vi.advanceTimersByTimeAsync(5000);
 
-      // The record won't be flushed because the timer is cleared
-      // (record() still buffers because connected is true, but no timer to flush)
       expect(mockCollection.insertMany).not.toHaveBeenCalled();
     });
   });
