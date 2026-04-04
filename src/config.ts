@@ -259,6 +259,32 @@ export const config = {
     ),
     retentionDays: parseInt(optional("ACTIVITY_RETENTION_DAYS", String(hive.activity?.retentionDays ?? 90)), 10),
   },
+  autoDream: {
+    enabled: (hive.autoDream?.enabled ?? false) as boolean,
+    idleThresholdMinutes: parseInt(
+      optional("AUTODREAM_IDLE_THRESHOLD_MINUTES", String(hive.autoDream?.idleThresholdMinutes ?? 30)),
+      10,
+    ),
+    cooldownMinutes: parseInt(
+      optional("AUTODREAM_COOLDOWN_MINUTES", String(hive.autoDream?.cooldownMinutes ?? 60)),
+      10,
+    ),
+    similarityThreshold: parseFloat(
+      optional("AUTODREAM_SIMILARITY_THRESHOLD", String(hive.autoDream?.similarityThreshold ?? 0.85)),
+    ),
+    patternMinCount: parseInt(
+      optional("AUTODREAM_PATTERN_MIN_COUNT", String(hive.autoDream?.patternMinCount ?? 3)),
+      10,
+    ),
+    maxClustersPerRun: parseInt(
+      optional("AUTODREAM_MAX_CLUSTERS", String(hive.autoDream?.maxClustersPerRun ?? 20)),
+      10,
+    ),
+    maxContradictionPairsPerRun: parseInt(
+      optional("AUTODREAM_MAX_CONTRADICTIONS", String(hive.autoDream?.maxContradictionPairsPerRun ?? 30)),
+      10,
+    ),
+  },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),
   },
