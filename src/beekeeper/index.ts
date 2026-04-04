@@ -575,10 +575,6 @@ async function main(): Promise<void> {
         sessionManager.removeClient(device._id);
       }
       log.info("Client disconnected", { deviceId: device._id, remainingClients: connectedClients.size });
-      // If no clients remain, deny all pending questions — no one can answer them
-      if (connectedClients.size === 0) {
-        questionRelayer.denyAll("All clients disconnected");
-      }
       // Sessions stay in memory — any device can reconnect and resume
     });
 
@@ -596,7 +592,6 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     log.info("Shutting down");
     sessionManager.persistSessions();
-    questionRelayer.denyAll("Server shutting down");
     await sessionManager.stopAll();
     wss.close();
     server.close();

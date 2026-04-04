@@ -134,11 +134,6 @@ export class SessionManager {
       this.send({ type: "error", message: `Unknown session: ${sessionId}`, sessionId });
       return;
     }
-    // Check if this reply answers a pending question
-    if (this.questionRelayer.hasPending(sessionId)) {
-      this.questionRelayer.handleReply(sessionId, text);
-      return;
-    }
     if (slot.state === "busy") {
       this.send({ type: "status", state: "busy", sessionId });
       return;
@@ -156,7 +151,6 @@ export class SessionManager {
     if (!slot) return false;
 
     slot.cleared = true;
-    this.questionRelayer.denyPending(sessionId, "Session cleared");
     if (slot.activeQuery) {
       try {
         await slot.activeQuery.interrupt();
@@ -185,9 +179,6 @@ export class SessionManager {
   async cancelQuery(sessionId: string): Promise<void> {
     const slot = this.sessions.get(sessionId);
     if (!slot || !slot.activeQuery) return;
-
-    // Clear pending question FIRST — closes reply-intercept window
-    this.questionRelayer.denyPending(sessionId, "Operation cancelled");
 
     // Set interrupted flag BEFORE interrupt to suppress spurious empty final message
     slot.interrupted = true;

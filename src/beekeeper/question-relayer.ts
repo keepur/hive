@@ -4,22 +4,21 @@ import type { ServerMessage } from "./types.js";
 
 const log = createLogger("beekeeper-question-relayer");
 
-interface PendingQuestion {
-  resolve: (decision: HookJSONOutput) => void;
-  timer: ReturnType<typeof setTimeout>;
-  sessionId: string;
-  toolUseId: string;
-}
-
+/**
+ * Non-blocking question relay for beekeeper sessions.
+ *
+ * When the SDK calls AskUserQuestion, this hook:
+ * 1. Formats the question as plain text
+ * 2. Sends it to the client as a regular chat message
+ * 3. Immediately blocks the tool with a reason explaining the question was relayed
+ *
+ * The model sees the block reason, the turn completes normally (status → idle),
+ * and the user's reply arrives as the next message in the conversation.
+ * No blocking, no pending state, no timeouts.
+ */
 export class QuestionRelayer {
-  private pendingQuestions = new Map<string, PendingQuestion>();
   private sendDelegate: ((msg: ServerMessage) => void) | null = null;
 
-  /**
-   * Set the send delegate. Routes through SessionManager.send() which
-   * broadcasts to all connected clients or buffers when none are connected.
-   * Set once at startup — same pattern as ToolGuardian.
-   */
   setSendDelegate(send: (msg: ServerMessage) => void): void {
     this.sendDelegate = send;
   }
@@ -78,80 +77,12 @@ export class QuestionRelayer {
         final: true,
       });
 
-      // Supersede any existing pending question for this session
-      const existing = this.pendingQuestions.get(sessionId);
-      if (existing) {
-        clearTimeout(existing.timer);
-        existing.resolve({ decision: "block", reason: "Superseded by new question" });
-        this.pendingQuestions.delete(sessionId);
-        log.info("Superseded existing pending question", {
-          sessionId,
-          oldToolUseId: existing.toolUseId,
-        });
-      }
-
-      return new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          log.warn("Question timed out", { toolUseId: input.tool_use_id, sessionId });
-          this.pendingQuestions.delete(sessionId);
-          resolve({ decision: "block", reason: "Question timed out (5m)" });
-        }, 5 * 60_000);
-
-        this.pendingQuestions.set(sessionId, {
-          resolve,
-          timer,
-          sessionId,
-          toolUseId: input.tool_use_id,
-        });
-      });
+      log.info("Question relayed to client", { toolUseId: input.tool_use_id, sessionId });
+      return {
+        decision: "block",
+        reason:
+          "Question relayed to user as a chat message. Their answer will arrive as the next message in this conversation. Do NOT re-ask the question — just wait for the user's reply.",
+      };
     };
-  }
-
-  /**
-   * Resolve pending question with user's reply.
-   */
-  handleReply(sessionId: string, text: string): void {
-    const pending = this.pendingQuestions.get(sessionId);
-    if (!pending) {
-      log.warn("No pending question for reply", { sessionId });
-      return;
-    }
-
-    clearTimeout(pending.timer);
-    this.pendingQuestions.delete(sessionId);
-    log.info("Question answered", { sessionId, toolUseId: pending.toolUseId });
-    pending.resolve({ decision: "block", reason: `User answered: ${text}` });
-  }
-
-  /**
-   * Check if a question is pending for this session.
-   */
-  hasPending(sessionId: string): boolean {
-    return this.pendingQuestions.has(sessionId);
-  }
-
-  /**
-   * Clear one session's pending question (cancel/clear flow).
-   */
-  denyPending(sessionId: string, reason: string): void {
-    const pending = this.pendingQuestions.get(sessionId);
-    if (!pending) return;
-
-    clearTimeout(pending.timer);
-    this.pendingQuestions.delete(sessionId);
-    log.info("Denying pending question", { sessionId, toolUseId: pending.toolUseId, reason });
-    pending.resolve({ decision: "block", reason });
-  }
-
-  /**
-   * Clear ALL pending questions (shutdown flow).
-   */
-  denyAll(reason: string): void {
-    for (const [sessionId, pending] of this.pendingQuestions) {
-      clearTimeout(pending.timer);
-      log.info("Auto-denying pending question", { sessionId, toolUseId: pending.toolUseId, reason });
-      pending.resolve({ decision: "block", reason });
-    }
-    this.pendingQuestions.clear();
   }
 }
