@@ -98,29 +98,22 @@ async function main(): Promise<void> {
   const memoryManager = new MemoryManager(config.mongo.uri, config.mongo.dbName);
   await memoryManager.init();
 
-  // Structured memory lifecycle — opt-in via memory.structured in hive.yaml
-  let memoryLifecycle: MemoryLifecycle | undefined;
-  let memoryStore: MemoryStore | undefined;
-  let memoryEmbedder: MemoryEmbedder | undefined;
-  if (config.memory.structured) {
-    memoryStore = new MemoryStore(config.mongo.uri, config.mongo.dbName);
-    await memoryStore.init();
-    memoryManager.memoryStore = memoryStore;
-    memoryEmbedder = new MemoryEmbedder();
-    memoryLifecycle = new MemoryLifecycle(memoryStore, memoryEmbedder, {
-      hotBudgetTokens: config.memory.hotBudgetTokens,
-      sweepIntervalHours: config.memory.sweepIntervalHours,
-      hotThreshold: config.memory.hotThreshold,
-      warmThreshold: config.memory.warmThreshold,
-      recencyHalfLifeDays: config.memory.recencyHalfLifeDays,
-      coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
-      coldRetentionDays: config.memory.coldRetentionDays,
-      purgeRetentionDays: config.memory.purgeRetentionDays,
-    });
-    log.info("Structured memory lifecycle enabled");
-  } else {
-    log.info("Structured memory lifecycle disabled (legacy mode)");
-  }
+  // Structured memory lifecycle — always enabled
+  const memoryStore = new MemoryStore(config.mongo.uri, config.mongo.dbName);
+  await memoryStore.init();
+  memoryManager.memoryStore = memoryStore;
+  const memoryEmbedder = new MemoryEmbedder();
+  const memoryLifecycle = new MemoryLifecycle(memoryStore, memoryEmbedder, {
+    hotBudgetTokens: config.memory.hotBudgetTokens,
+    sweepIntervalHours: config.memory.sweepIntervalHours,
+    hotThreshold: config.memory.hotThreshold,
+    warmThreshold: config.memory.warmThreshold,
+    recencyHalfLifeDays: config.memory.recencyHalfLifeDays,
+    coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
+    coldRetentionDays: config.memory.coldRetentionDays,
+    purgeRetentionDays: config.memory.purgeRetentionDays,
+  });
+  log.info("Structured memory lifecycle enabled");
 
   const sessionStore = new SessionStore(config.mongo.uri);
   await sessionStore.connect(config.mongo.dbName);
@@ -184,11 +177,8 @@ async function main(): Promise<void> {
       prefetchLimit: config.codeIndex.prefetchLimit,
     });
 
-    if (config.codeIndex.sessionKnowledge.enabled && memoryStore && memoryEmbedder) {
-      // Reuse existing memoryStore + memoryEmbedder instances (no extra DB connections)
+    if (config.codeIndex.sessionKnowledge.enabled) {
       knowledgeExtractor = new KnowledgeExtractor(memoryStore, memoryEmbedder);
-    } else if (config.codeIndex.sessionKnowledge.enabled && (!memoryStore || !memoryEmbedder)) {
-      log.warn("Code index session knowledge enabled but memory.structured is false — session knowledge disabled");
     }
 
     log.info("Code index integration enabled", {
@@ -400,7 +390,7 @@ async function main(): Promise<void> {
     meetingMonitor?.stop();
     agentManager.stopAll();
     await sessionStore.close();
-    await memoryStore?.close();
+    await memoryStore.close();
     await slackAdapter.stop();
     await mongoClient.close();
     log.info("Hive shut down cleanly");
