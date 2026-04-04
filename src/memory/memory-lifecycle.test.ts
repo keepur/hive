@@ -55,6 +55,11 @@ function makeMockStore() {
     getAgentIds2: vi.fn(),
     init: vi.fn(),
     close: vi.fn(),
+    getByTiersForAgent: vi.fn().mockResolvedValue([]),
+    getFactsAndDecisionsByTopic: vi.fn().mockResolvedValue(new Map()),
+    getInteractionsByTopic: vi.fn().mockResolvedValue(new Map()),
+    markSuperseded: vi.fn().mockResolvedValue(undefined),
+    flagForReview: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -65,6 +70,7 @@ function makeMockEmbedder() {
     upsert: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),
     search: vi.fn().mockResolvedValue([]),
+    findSimilar: vi.fn().mockResolvedValue([]),
   };
 }
 
@@ -375,5 +381,63 @@ describe("MemoryLifecycle budget enforcement", () => {
     expect(overflowedIds).toContain(nonPinned2._id);
     // The pinned record should NOT have been overflowed
     expect(overflowedIds).not.toContain(pinnedRecord._id);
+  });
+});
+
+// ── dream() tests ────────────────────────────────────────────────────
+describe("dream()", () => {
+  let store: ReturnType<typeof makeMockStore>;
+  let embedder: ReturnType<typeof makeMockEmbedder>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store = makeMockStore();
+    embedder = makeMockEmbedder();
+  });
+
+  it("returns zeros when dreamConfig is not provided", async () => {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    const result = await lifecycle.dream();
+    expect(result).toEqual({ merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] });
+  });
+
+  it("returns zeros when dreamConfig.enabled is false", async () => {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, {
+      enabled: false,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+    });
+    const result = await lifecycle.dream();
+    expect(result).toEqual({ merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] });
+  });
+
+  it("catches per-agent errors without stopping other agents", async () => {
+    const dreamCfg = {
+      enabled: true,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+
+    // Mock getAgentIds returns two agents
+    store.getAgentIds.mockResolvedValue(["agent-a", "agent-b"]);
+    // First agent throws on getByTiersForAgent, second succeeds and returns empty (no work to do)
+    store.getByTiersForAgent
+      .mockRejectedValueOnce(new Error("db error"))
+      .mockResolvedValue([]);
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map());
+    store.getInteractionsByTopic.mockResolvedValue(new Map());
+
+    const result = await lifecycle.dream();
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain("agent-a");
   });
 });
