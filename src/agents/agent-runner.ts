@@ -175,23 +175,20 @@ export class AgentRunner {
     };
 
     // Structured Memory MCP server — semantic + temporal memory with vector search
-    // Only enabled when memory.structured is true in hive.yaml
-    if (config.memory.structured) {
-      servers["structured-memory"] = {
-        type: "stdio",
-        command: "node",
-        args: [resolve("dist/memory/structured-memory-mcp-server.js")],
-        env: {
-          AGENT_ID: this.agentConfig.id,
-          MONGODB_URI: config.mongo.uri,
-          MONGODB_DB: config.mongo.dbName,
-          CHANNEL_ID: context?.channelId ?? "",
-          THREAD_ID: context?.threadId ?? "",
-          QDRANT_URL: process.env.QDRANT_URL ?? "http://localhost:6333",
-          OLLAMA_URL: process.env.OLLAMA_URL ?? "http://localhost:11434",
-        },
-      };
-    }
+    servers["structured-memory"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/memory/structured-memory-mcp-server.js")],
+      env: {
+        AGENT_ID: this.agentConfig.id,
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+        CHANNEL_ID: context?.channelId ?? "",
+        THREAD_ID: context?.threadId ?? "",
+        QDRANT_URL: process.env.QDRANT_URL ?? "http://localhost:6333",
+        OLLAMA_URL: process.env.OLLAMA_URL ?? "http://localhost:11434",
+      },
+    };
 
     // Keychain MCP server — read-only access to macOS Keychain secrets
     servers["keychain"] = {
@@ -571,14 +568,25 @@ export class AgentRunner {
       }
     }
 
-    // Hard gate: strip external communication servers unless explicitly enabled
-    if (!config.externalComms.enabled) {
-      const externalServers = ["resend", "quo"];
-      for (const key of externalServers) {
+    // Autonomy gates — strip servers based on per-agent resolved flags
+    if (!this.agentConfig.autonomy.externalComms) {
+      for (const key of ["resend", "quo"]) {
         if (servers[key]) {
-          log.debug("External comms disabled — removing server", { server: key, agent: this.agentConfig.id });
+          log.debug("Autonomy: externalComms disabled — removing server", { server: key, agent: this.agentConfig.id });
           delete servers[key];
         }
+      }
+    }
+    if (!this.agentConfig.autonomy.codeTask) {
+      if (servers["code-task"]) {
+        log.debug("Autonomy: codeTask disabled — removing server", { server: "code-task", agent: this.agentConfig.id });
+        delete servers["code-task"];
+      }
+    }
+    if (!this.agentConfig.autonomy.codeAccess) {
+      if (servers["code-search"]) {
+        log.debug("Autonomy: codeAccess disabled — removing server", { server: "code-search", agent: this.agentConfig.id });
+        delete servers["code-search"];
       }
     }
 
@@ -600,15 +608,22 @@ export class AgentRunner {
 
     const agents: Record<string, AgentDefinition> = {};
 
-    // Same externalComms gate as buildMcpServers — block resend/quo in delegates too
-    const externalBlocked = !config.externalComms.enabled
-      ? new Set(["resend", "quo"])
-      : new Set<string>();
+    // Autonomy gates for delegate servers — same rules as core servers
+    const blockedDelegates = new Set<string>();
+    if (!this.agentConfig.autonomy.externalComms) {
+      blockedDelegates.add("resend");
+      blockedDelegates.add("quo");
+    }
+    if (!this.agentConfig.autonomy.codeTask) {
+      blockedDelegates.add("code-task");
+    }
+    if (!this.agentConfig.autonomy.codeAccess) {
+      blockedDelegates.add("code-search");
+    }
 
     for (const serverName of delegates) {
-      // Hard gate: strip external communication servers unless explicitly enabled
-      if (externalBlocked.has(serverName)) {
-        log.debug("External comms disabled — skipping delegate server", { server: serverName, agent: this.agentConfig.id });
+      if (blockedDelegates.has(serverName)) {
+        log.debug("Autonomy gate — skipping delegate server", { server: serverName, agent: this.agentConfig.id });
         continue;
       }
 

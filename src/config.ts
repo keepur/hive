@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
+import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
 
 // Load .env file — if HIVE_CONFIG is set (e.g., hive-personal.yaml), load matching .env
 // hive-personal.yaml → .env-personal, hive.yaml → .env
@@ -181,8 +182,10 @@ export const config = {
     port: parseInt(optional("ADMIN_API_PORT", String(ports.adminApi ?? portBase + 4)), 10),
     token: optional("ADMIN_API_TOKEN", ""),
   },
-  externalComms: {
-    enabled: optional("EXTERNAL_COMMS_ENABLED", "false") === "true",
+  autonomy: {
+    externalComms: (hive.autonomy?.externalComms ?? AUTONOMY_DEFAULTS.externalComms) as boolean,
+    codeTask: (hive.autonomy?.codeTask ?? AUTONOMY_DEFAULTS.codeTask) as boolean,
+    codeAccess: (hive.autonomy?.codeAccess ?? AUTONOMY_DEFAULTS.codeAccess) as boolean,
   },
   triage: {
     model: optional("TRIAGE_MODEL", "claude-haiku-4-5-20251001"),
@@ -204,7 +207,6 @@ export const config = {
     retryBaseDelayMs: parseInt(optional("SWEEPER_RETRY_BASE_DELAY_MS", "30000"), 10),
   },
   memory: {
-    structured: hive.memory?.structured === true || process.env.MEMORY_STRUCTURED === "true",
     hotBudgetTokens: parseInt(optional("MEMORY_HOT_BUDGET_TOKENS", String(hive.memory?.hotBudgetTokens ?? 3000)), 10),
     sweepIntervalHours: parseFloat(
       optional("MEMORY_SWEEP_INTERVAL_HOURS", String(hive.memory?.sweepIntervalHours ?? 6)),
@@ -226,7 +228,6 @@ export const config = {
       optional("MEMORY_PURGE_RETENTION_DAYS", String(hive.memory?.purgeRetentionDays ?? 7)),
       10,
     ),
-    reflectionEnabled: (hive.memory?.reflectionEnabled ?? true) && process.env.MEMORY_REFLECTION_ENABLED !== "false",
     reflectionMinTurns: parseInt(
       optional("MEMORY_REFLECTION_MIN_TURNS", String(hive.memory?.reflectionMinTurns ?? 3)),
       10,

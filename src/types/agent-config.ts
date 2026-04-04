@@ -1,4 +1,5 @@
 import type { ResourceTierOverrides } from "../agents/model-router.js";
+import type { AutonomyFlags } from "../agents/autonomy.js";
 
 export interface AgentSchedule {
   cron: string;
@@ -32,6 +33,7 @@ export interface AgentConfig {
   delegatePrompts?: Record<string, string>;
   soul: string;
   systemPrompt: string;
+  autonomy: AutonomyFlags; // resolved — always present
 }
 
 export type AgentStatus = "idle" | "processing" | "error" | "stopped";
