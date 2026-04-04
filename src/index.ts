@@ -104,16 +104,21 @@ async function main(): Promise<void> {
   await memoryStore.init();
   memoryManager.memoryStore = memoryStore;
   const memoryEmbedder = new MemoryEmbedder();
-  const memoryLifecycle = new MemoryLifecycle(memoryStore, memoryEmbedder, {
-    hotBudgetTokens: config.memory.hotBudgetTokens,
-    sweepIntervalHours: config.memory.sweepIntervalHours,
-    hotThreshold: config.memory.hotThreshold,
-    warmThreshold: config.memory.warmThreshold,
-    recencyHalfLifeDays: config.memory.recencyHalfLifeDays,
-    coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
-    coldRetentionDays: config.memory.coldRetentionDays,
-    purgeRetentionDays: config.memory.purgeRetentionDays,
-  }, config.autoDream);
+  const memoryLifecycle = new MemoryLifecycle(
+    memoryStore,
+    memoryEmbedder,
+    {
+      hotBudgetTokens: config.memory.hotBudgetTokens,
+      sweepIntervalHours: config.memory.sweepIntervalHours,
+      hotThreshold: config.memory.hotThreshold,
+      warmThreshold: config.memory.warmThreshold,
+      recencyHalfLifeDays: config.memory.recencyHalfLifeDays,
+      coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
+      coldRetentionDays: config.memory.coldRetentionDays,
+      purgeRetentionDays: config.memory.purgeRetentionDays,
+    },
+    config.autoDream,
+  );
   log.info("Structured memory lifecycle enabled");
 
   const sessionStore = new SessionStore(config.mongo.uri);

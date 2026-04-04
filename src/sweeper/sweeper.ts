@@ -202,7 +202,7 @@ export class Sweeper {
       const dreamCfg = this.config.dreamConfig;
       const cooldownMs = dreamCfg.cooldownMinutes * 60 * 1000;
       const now = Date.now();
-      const cooldownElapsed = (now - this.lastDreamAt) > cooldownMs;
+      const cooldownElapsed = now - this.lastDreamAt > cooldownMs;
 
       // (a) Post-sweep trigger: runs right after the regular memory lifecycle sweep
       const justSwept = this.memoryCycleCounter === 0; // counter was just reset above
@@ -212,9 +212,8 @@ export class Sweeper {
       if (cooldownElapsed && !justSwept) {
         const thresholdMs = dreamCfg.idleThresholdMinutes * 60 * 1000;
         const states = this.targets.agentManager.getAllStates();
-        allIdle = states.length > 0 && states.every(
-          (s) => s.status === "idle" && (now - s.lastActivity.getTime()) > thresholdMs,
-        );
+        allIdle =
+          states.length > 0 && states.every((s) => s.status === "idle" && now - s.lastActivity.getTime() > thresholdMs);
       }
 
       if (cooldownElapsed && (justSwept || allIdle)) {

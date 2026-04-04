@@ -4,7 +4,14 @@ import { createLogger } from "../logging/logger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { MemoryStore } from "./memory-store.js";
 import type { MemoryEmbedder } from "./memory-embedder.js";
-import type { MemoryRecord, MemoryLifecycleConfig, MemoryTier, DreamConfig, DreamResult, MemoryImportance } from "./memory-types.js";
+import type {
+  MemoryRecord,
+  MemoryLifecycleConfig,
+  MemoryTier,
+  DreamConfig,
+  DreamResult,
+  MemoryImportance,
+} from "./memory-types.js";
 import { IMPORTANCE_WEIGHTS, TYPE_WEIGHTS } from "./memory-types.js";
 
 const log = createLogger("memory-lifecycle");
@@ -269,12 +276,7 @@ export class MemoryLifecycle {
       if (processed.has(record.qdrantPointId)) continue;
 
       // Find similar records using Qdrant recommend
-      const similar = await this.embedder.findSimilar(
-        record.qdrantPointId,
-        agentId,
-        cfg.similarityThreshold,
-        10,
-      );
+      const similar = await this.embedder.findSimilar(record.qdrantPointId, agentId, cfg.similarityThreshold, 10);
 
       // Filter to only records we haven't already processed
       const cluster = similar.filter((s) => !processed.has(s.pointId));
@@ -290,9 +292,7 @@ export class MemoryLifecycle {
       const allRecords = [record, ...clusterRecords];
 
       // Haiku merge
-      const entries = allRecords
-        .map((r) => `- [${r.type}/${r.importance}] ${r.content}`)
-        .join("\n");
+      const entries = allRecords.map((r) => `- [${r.type}/${r.importance}] ${r.content}`).join("\n");
 
       const prompt = [
         "Merge the following duplicate or overlapping memories into a single consolidated record.",
@@ -474,9 +474,7 @@ export class MemoryLifecycle {
       const sorted = records.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
       const sample = sorted.slice(0, 10); // Cap prompt size
 
-      const entries = sample
-        .map((r) => `- [${r.importance}] ${r.content}`)
-        .join("\n");
+      const entries = sample.map((r) => `- [${r.importance}] ${r.content}`).join("\n");
 
       const prompt = [
         `These ${records.length} interactions across ${threads.size} conversations share topic "${topic}".`,

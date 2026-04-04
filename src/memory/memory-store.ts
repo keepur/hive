@@ -112,7 +112,9 @@ export class MemoryStore {
     // correctly as a string (alphabetical: critical < high < low < medium).
     // We need weighted sort: pinned first, then by importance weight desc, then recency.
     const WEIGHT: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
-    const records = await this.collection.find({ agentId, tier: "hot", purged: { $ne: true }, supersededBy: { $exists: false } }).toArray();
+    const records = await this.collection
+      .find({ agentId, tier: "hot", purged: { $ne: true }, supersededBy: { $exists: false } })
+      .toArray();
     return records.sort((a, b) => {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       const wDiff = (WEIGHT[b.importance] ?? 0) - (WEIGHT[a.importance] ?? 0);
@@ -141,7 +143,9 @@ export class MemoryStore {
   }
 
   async getAllNonPinned(agentId: string): Promise<MemoryRecord[]> {
-    return this.collection.find({ agentId, pinned: false, purged: { $ne: true }, supersededBy: { $exists: false } }).toArray();
+    return this.collection
+      .find({ agentId, pinned: false, purged: { $ne: true }, supersededBy: { $exists: false } })
+      .toArray();
   }
 
   /** Get all non-purged, non-superseded records in specified tiers for an agent */
@@ -200,19 +204,13 @@ export class MemoryStore {
   /** Mark records as superseded by a merged/winning record */
   async markSuperseded(ids: ObjectId[], supersededBy: ObjectId): Promise<void> {
     if (ids.length === 0) return;
-    await this.collection.updateMany(
-      { _id: { $in: ids } },
-      { $set: { supersededBy, tier: "cold" as MemoryTier } },
-    );
+    await this.collection.updateMany({ _id: { $in: ids } }, { $set: { supersededBy, tier: "cold" as MemoryTier } });
   }
 
   /** Flag records for human review (unresolvable contradictions) */
   async flagForReview(ids: ObjectId[]): Promise<void> {
     if (ids.length === 0) return;
-    await this.collection.updateMany(
-      { _id: { $in: ids } },
-      { $set: { needsReview: true } },
-    );
+    await this.collection.updateMany({ _id: { $in: ids } }, { $set: { needsReview: true } });
   }
 
   async getAllForAgent(agentId: string): Promise<MemoryRecord[]> {

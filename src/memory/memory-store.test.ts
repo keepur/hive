@@ -181,7 +181,12 @@ describe("MemoryStore", () => {
       mockToArray.mockResolvedValueOnce([]);
       await store.getHotTier("my-agent");
 
-      expect(mockFind).toHaveBeenCalledWith({ agentId: "my-agent", tier: "hot", purged: { $ne: true }, supersededBy: { $exists: false } });
+      expect(mockFind).toHaveBeenCalledWith({
+        agentId: "my-agent",
+        tier: "hot",
+        purged: { $ne: true },
+        supersededBy: { $exists: false },
+      });
     });
   });
 
@@ -242,7 +247,12 @@ describe("MemoryStore", () => {
     it("queries with purged: { $ne: true }", async () => {
       mockToArray.mockResolvedValueOnce([]);
       await store.getAllNonPinned("agent-1");
-      expect(mockFind).toHaveBeenCalledWith({ agentId: "agent-1", pinned: false, purged: { $ne: true }, supersededBy: { $exists: false } });
+      expect(mockFind).toHaveBeenCalledWith({
+        agentId: "agent-1",
+        pinned: false,
+        purged: { $ne: true },
+        supersededBy: { $exists: false },
+      });
     });
   });
 

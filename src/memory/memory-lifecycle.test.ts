@@ -430,9 +430,7 @@ describe("dream()", () => {
     // Mock getAgentIds returns two agents
     store.getAgentIds.mockResolvedValue(["agent-a", "agent-b"]);
     // First agent throws on getByTiersForAgent, second succeeds and returns empty (no work to do)
-    store.getByTiersForAgent
-      .mockRejectedValueOnce(new Error("db error"))
-      .mockResolvedValue([]);
+    store.getByTiersForAgent.mockRejectedValueOnce(new Error("db error")).mockResolvedValue([]);
     store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map());
     store.getInteractionsByTopic.mockResolvedValue(new Map());
 
