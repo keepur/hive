@@ -266,13 +266,13 @@ export class AgentManager {
         // Record failed turn in audit trail
         this.activityLogger?.record({
           agentId,
-          threadId,
+          threadId: item.message.threadId ?? item.message.id,
           timestamp: new Date(),
           sender: item.message.sender,
           senderName: item.message.senderName,
           channel: item.message.source.label,
           channelKind: item.message.source.kind,
-          model: modelOverride ?? config?.model ?? "unknown",
+          model: config?.model ?? "unknown",
           costUsd: 0,
           durationMs: 0,
           inputTokens: 0,
