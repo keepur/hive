@@ -246,7 +246,6 @@ export class AgentManager {
     const hasMemoryServer = allServers.includes("memory")
       || allServers.includes("structured-memory");
     if (
-      appConfig.memory.reflectionEnabled &&
       hasMemoryServer &&
       lastResult &&
       lastItem &&
