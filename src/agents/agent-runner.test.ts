@@ -154,6 +154,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     const servers = getCapturedServers();
 
     expect(servers).toHaveProperty("memory");
+    expect(servers).toHaveProperty("structured-memory"); // always paired with memory
     expect(servers).toHaveProperty("keychain");
     expect(servers).toHaveProperty("google");
     expect(servers).toHaveProperty("contacts");
@@ -616,6 +617,38 @@ describe("AgentRunner delegate subagents (via send)", () => {
     expect(options.agents).not.toHaveProperty("resend");
 
     (config.resend as any).apiKey = origResendKey;
+  });
+
+  it("excludes code-task from delegates when codeTask autonomy flag is false", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "code-task"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents).toHaveProperty("google");
+    expect(options.agents).not.toHaveProperty("code-task");
+  });
+
+  it("excludes code-search from delegates when codeAccess autonomy flag is false", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "code-search"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents).toHaveProperty("google");
+    expect(options.agents).not.toHaveProperty("code-search");
   });
 
   it("delegate servers are NOT in parent mcpServers", async () => {

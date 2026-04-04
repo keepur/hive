@@ -49,6 +49,9 @@ describe("toAgentConfig", () => {
     expect(config.coreServers).toEqual(["memory", "slack"]);
     expect(config.soul).toBe("I am Rae.");
     expect(config.systemPrompt).toBe("You are a receptionist.");
+    // autonomy is always present and resolved
+    expect(config.autonomy).toBeDefined();
+    expect(config.autonomy.externalComms).toBe(true);
   });
 
   it("applies defaults for missing optional fields", () => {
