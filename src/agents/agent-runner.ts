@@ -767,6 +767,7 @@ export class AgentRunner {
         ...(Object.keys(delegateAgents).length > 0 ? { agents: delegateAgents } : {}),
         ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
         hooks: this.buildPreCompactHook(),
+        ...(this.agentConfig.betas?.length ? { betas: this.agentConfig.betas as any } : {}),
         env: {
           ...process.env,
           ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
