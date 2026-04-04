@@ -13,6 +13,7 @@ import { loadPlugins } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { loadSkillIndex, type SkillIndex } from "./skill-loader.js";
 import { ConversationIndex } from "../search/conversation-index.js";
+import type { ActivityLogger } from "../activity/activity-logger.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -35,11 +36,13 @@ export class AgentManager {
   private sessionStore: SessionStore;
   private plugins: LoadedPlugin[];
   private skillIndex: SkillIndex;
+  private activityLogger?: ActivityLogger;
 
-  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore) {
+  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, activityLogger?: ActivityLogger) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
+    this.activityLogger = activityLogger;
     this.plugins = loadPlugins(appConfig.plugins, process.cwd());
     this.skillIndex = loadSkillIndex();
   }
@@ -231,12 +234,56 @@ export class AgentManager {
             response: result.text,
           }).catch(err => log.warn("Conversation indexing failed", { agentId, error: String(err) }));
         }
+
+        // Record activity for audit trail
+        this.activityLogger?.record({
+          agentId,
+          threadId,
+          timestamp: new Date(),
+          sender: item.message.sender,
+          senderName: item.message.senderName,
+          channel: item.message.source.label,
+          channelKind: item.message.source.kind,
+          model: modelOverride ?? config?.model ?? "unknown",
+          modelTier: undefined, // Model router tier not currently passed through
+          costUsd: result.costUsd,
+          durationMs: result.durationMs,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          contextWindow: result.contextWindow,
+          toolCalls: result.toolCalls,
+          toolSummary: result.toolSummary,
+          compactions: result.compactions,
+          streamed: result.streamed,
+          error: result.error,
+        });
       } catch (err) {
         const state = this.states.get(agentId);
         if (state) {
           state.errorCount++;
           state.lastActivity = new Date();
         }
+        // Record failed turn in audit trail
+        this.activityLogger?.record({
+          agentId,
+          threadId: item.message.threadId ?? item.message.id,
+          timestamp: new Date(),
+          sender: item.message.sender,
+          senderName: item.message.senderName,
+          channel: item.message.source.label,
+          channelKind: item.message.source.kind,
+          model: config?.model ?? "unknown",
+          costUsd: 0,
+          durationMs: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          contextWindow: 0,
+          toolCalls: 0,
+          toolSummary: "none",
+          compactions: 0,
+          streamed: false,
+          error: String(err),
+        });
         item.reject(err instanceof Error ? err : new Error(String(err)));
       }
     }
