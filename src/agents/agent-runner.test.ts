@@ -10,6 +10,7 @@ vi.mock("node:fs", () => ({
 
 // ── SDK mock ────────────────────────────────────────────────────────
 const mockQuery = vi.fn();
+let mockMessages: any[] | null = null; // Override per-test; null = default result
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: (...args: any[]) => {
@@ -17,14 +18,18 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
     return {
       close: vi.fn(),
       [Symbol.asyncIterator]: async function* () {
-        yield {
-          type: "result",
-          subtype: "success",
-          result: "test response",
-          total_cost_usd: 0.001,
-          duration_ms: 100,
-          session_id: "test-session",
-        };
+        if (mockMessages) {
+          for (const msg of mockMessages) yield msg;
+        } else {
+          yield {
+            type: "result",
+            subtype: "success",
+            result: "test response",
+            total_cost_usd: 0.001,
+            duration_ms: 100,
+            session_id: "test-session",
+          };
+        }
       },
     };
   },
@@ -137,6 +142,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMessages = null;
     memoryManager = makeMockMemoryManager();
   });
 
@@ -433,6 +439,7 @@ describe("AgentRunner.buildServerConfig", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMessages = null;
     memoryManager = makeMockMemoryManager();
   });
 
@@ -456,6 +463,7 @@ describe("AgentRunner delegate subagents (via send)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMessages = null;
     memoryManager = makeMockMemoryManager();
   });
 
@@ -691,6 +699,7 @@ describe("AgentRunner security hardening", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMessages = null;
     memoryManager = makeMockMemoryManager();
   });
 
@@ -880,6 +889,7 @@ describe("AgentRunner resource limits override (via send)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMessages = null;
     memoryManager = makeMockMemoryManager();
   });
 
@@ -911,5 +921,221 @@ describe("AgentRunner resource limits override (via send)", () => {
     const options = getCapturedOptions();
     expect(options.maxTurns).toBe(25);
     expect(options.maxBudgetUsd).toBe(10);
+  });
+});
+
+// ── Token tracking and compaction tests ──────────────────────────
+describe("AgentRunner token tracking and compaction (via send)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("extracts token usage from SDK result message", async () => {
+    mockMessages = [{
+      type: "result",
+      subtype: "success",
+      result: "response",
+      total_cost_usd: 0.01,
+      duration_ms: 200,
+      session_id: "s1",
+      usage: {
+        input_tokens: 1500,
+        output_tokens: 300,
+        cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 200,
+      },
+      modelUsage: {
+        "claude-haiku-4-5": {
+          inputTokens: 1500,
+          outputTokens: 300,
+          contextWindow: 200000,
+        },
+      },
+    }];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.inputTokens).toBe(1500);
+    expect(result.outputTokens).toBe(300);
+    expect(result.cacheReadTokens).toBe(500);
+    expect(result.cacheCreationTokens).toBe(200);
+    expect(result.contextWindow).toBe(200000);
+  });
+
+  it("defaults token fields to 0 when SDK result has no usage", async () => {
+    mockMessages = [{
+      type: "result",
+      subtype: "success",
+      result: "response",
+      total_cost_usd: 0.001,
+      duration_ms: 100,
+      session_id: "s1",
+    }];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.inputTokens).toBe(0);
+    expect(result.outputTokens).toBe(0);
+    expect(result.cacheReadTokens).toBe(0);
+    expect(result.cacheCreationTokens).toBe(0);
+    expect(result.contextWindow).toBe(0);
+    expect(result.compactions).toBe(0);
+  });
+
+  it("counts compaction events from compact_boundary messages", async () => {
+    mockMessages = [
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        compact_metadata: { trigger: "auto", pre_tokens: 180000 },
+        session_id: "s1",
+      },
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        compact_metadata: { trigger: "auto", pre_tokens: 190000 },
+        session_id: "s1",
+      },
+      {
+        type: "result",
+        subtype: "success",
+        result: "response",
+        total_cost_usd: 0.05,
+        duration_ms: 5000,
+        session_id: "s1",
+      },
+    ];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.compactions).toBe(2);
+    // preCompactTokens should be from the LAST compaction event
+    expect(result.preCompactTokens).toBe(190000);
+  });
+
+  it("preCompactTokens is undefined when no compaction occurs", async () => {
+    mockMessages = [{
+      type: "result",
+      subtype: "success",
+      result: "response",
+      total_cost_usd: 0.001,
+      duration_ms: 100,
+      session_id: "s1",
+    }];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.preCompactTokens).toBeUndefined();
+  });
+
+  it("picks largest contextWindow when multiple models used", async () => {
+    mockMessages = [{
+      type: "result",
+      subtype: "success",
+      result: "response",
+      total_cost_usd: 0.01,
+      duration_ms: 200,
+      session_id: "s1",
+      usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0 },
+      modelUsage: {
+        "claude-haiku-4-5": { contextWindow: 200000 },
+        "claude-sonnet-4-5": { contextWindow: 1000000 },
+      },
+    }];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.contextWindow).toBe(1000000);
+  });
+});
+
+// ── PreCompact hook tests ────────────────────────────────────────
+describe("AgentRunner PreCompact hook (via send)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("registers PreCompact hook in query options", async () => {
+    const runner = new AgentRunner(makeAgentConfig({ name: "Jasper" }), memoryManager as any);
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).toHaveProperty("hooks");
+    expect(options.hooks).toHaveProperty("PreCompact");
+    expect(options.hooks.PreCompact).toHaveLength(1);
+    expect(options.hooks.PreCompact[0].hooks).toHaveLength(1);
+  });
+
+  it("PreCompact hook returns agent-specific preservation instructions", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ id: "jasper", name: "Jasper" }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    const hookFn = options.hooks.PreCompact[0].hooks[0];
+    const result = await hookFn({}, undefined, { signal: new AbortController().signal });
+
+    expect(result.continue).toBe(true);
+    expect(result.systemMessage).toContain("Jasper");
+    expect(result.systemMessage).toContain("jasper");
+    expect(result.systemMessage).toContain("Preserve your identity");
+    expect(result.systemMessage).toContain("customer/contact names");
+    expect(result.systemMessage).toContain("active workflows");
+  });
+});
+
+// ── Betas passthrough tests ──────────────────────────────────────
+describe("AgentRunner betas passthrough (via send)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("passes betas to query options when configured", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ betas: ["context-1m-2025-08-07"] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.betas).toEqual(["context-1m-2025-08-07"]);
+  });
+
+  it("does not include betas when not configured", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).not.toHaveProperty("betas");
+  });
+
+  it("does not include betas when array is empty", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ betas: [] }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options).not.toHaveProperty("betas");
   });
 });

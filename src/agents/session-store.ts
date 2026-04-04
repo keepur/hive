@@ -8,6 +8,14 @@ interface SessionDoc {
   agentId: string;
   threadId: string;
   sessionId: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  contextWindow: number;
+  compactions: number; // Cumulative via $inc
+  lastCompactedAt?: Date;
+  preCompactTokens?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -111,15 +119,56 @@ export class SessionStore {
     }, undefined, `get(${agentId}:${threadId})`);
   }
 
-  async set(agentId: string, threadId: string, sessionId: string): Promise<void> {
+  async set(agentId: string, threadId: string, sessionId: string, tokenData?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    contextWindow: number;
+    compactions: number;
+    preCompactTokens?: number;
+  }): Promise<void> {
     await this.withRetry(async () => {
       const now = new Date();
+      const update: Record<string, any> = {
+        $set: {
+          agentId, threadId, sessionId, updatedAt: now,
+        },
+        $setOnInsert: {
+          createdAt: now,
+          compactions: 0,
+        },
+      };
+
+      if (tokenData) {
+        // Overwrite per-turn token stats
+        update.$set.inputTokens = tokenData.inputTokens;
+        update.$set.outputTokens = tokenData.outputTokens;
+        update.$set.cacheReadTokens = tokenData.cacheReadTokens;
+        update.$set.cacheCreationTokens = tokenData.cacheCreationTokens;
+        update.$set.contextWindow = tokenData.contextWindow;
+
+        // Compactions are cumulative — only $inc when this turn had compactions
+        if (tokenData.compactions > 0) {
+          update.$inc = { compactions: tokenData.compactions };
+          update.$set.lastCompactedAt = now;
+          if (tokenData.preCompactTokens !== undefined) {
+            update.$set.preCompactTokens = tokenData.preCompactTokens;
+          }
+          // Remove compactions from $setOnInsert since $inc handles both insert and update
+          delete update.$setOnInsert.compactions;
+        }
+      } else {
+        // No token data — set defaults on insert only
+        Object.assign(update.$setOnInsert, {
+          inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+          cacheCreationTokens: 0, contextWindow: 0,
+        });
+      }
+
       await this.collection.updateOne(
         { _id: `${agentId}:${threadId}` },
-        {
-          $set: { agentId, threadId, sessionId, updatedAt: now },
-          $setOnInsert: { createdAt: now },
-        },
+        update,
         { upsert: true },
       );
     }, undefined, `set(${agentId}:${threadId})`);
