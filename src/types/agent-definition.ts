@@ -1,6 +1,7 @@
 import type { AgentSchedule } from "./agent-config.js";
 import type { AgentConfig } from "./agent-config.js";
 import type { ResourceTierOverrides } from "../agents/model-router.js";
+import { resolveAutonomy, type AutonomyFlags } from "../agents/autonomy.js";
 
 export interface AgentDefinition {
   _id: string; // "rae", "jasper" — immutable after creation
@@ -40,6 +41,9 @@ export interface AgentDefinition {
   timeoutMs: number;
   resourceTiers?: ResourceTierOverrides;
 
+  // Autonomy — per-agent capability gates (can only restrict, never escalate beyond instance ceiling)
+  autonomy?: Partial<AutonomyFlags>;
+
   // Lifecycle
   disabled: boolean;
   slackBot?: string;
@@ -68,7 +72,7 @@ export const AGENT_DEFINITION_DEFAULTS = {
   schedule: [] as AgentSchedule[],
 } as const;
 
-export function toAgentConfig(doc: AgentDefinition): AgentConfig {
+export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<AutonomyFlags>): AgentConfig {
   return {
     id: doc._id,
     name: doc.name,
@@ -96,5 +100,6 @@ export function toAgentConfig(doc: AgentDefinition): AgentConfig {
     delegatePrompts: doc.delegatePrompts ?? AGENT_DEFINITION_DEFAULTS.delegatePrompts,
     soul: doc.soul ?? "",
     systemPrompt: doc.systemPrompt ?? "",
+    autonomy: resolveAutonomy(instanceAutonomy, doc.autonomy),
   };
 }
