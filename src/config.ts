@@ -249,6 +249,12 @@ export const config = {
   events: {
     retentionDays: parseInt(optional("EVENT_RETENTION_DAYS", String(hive.events?.retentionDays ?? 30)), 10),
   },
+  activity: {
+    enabled: (hive.activity?.enabled ?? true) && process.env.ACTIVITY_LOG_ENABLED !== "false",
+    bufferSize: parseInt(optional("ACTIVITY_BUFFER_SIZE", String(hive.activity?.bufferSize ?? 200)), 10),
+    flushIntervalMs: parseInt(optional("ACTIVITY_FLUSH_INTERVAL_MS", String(hive.activity?.flushIntervalMs ?? 30000)), 10),
+    retentionDays: parseInt(optional("ACTIVITY_RETENTION_DAYS", String(hive.activity?.retentionDays ?? 90)), 10),
+  },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),
   },
