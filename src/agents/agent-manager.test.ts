@@ -15,7 +15,7 @@ vi.mock("../config.js", () => ({
   config: {
     plugins: [],
     modelRouter: { enabled: false },
-    memory: { reflectionEnabled: true, reflectionMinTurns: 3 },
+    memory: { reflectionMinTurns: 3 },
   },
 }));
 
@@ -79,6 +79,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     icon: "",
     soul: "",
     systemPrompt: "",
+    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
     ...overrides,
   };
 }
@@ -649,28 +650,6 @@ describe("AgentManager", () => {
 
       // Only 3 calls — no reflection after error
       expect(mockRunnerSend).toHaveBeenCalledTimes(3);
-    });
-
-    it("skips reflection when reflectionEnabled is false", async () => {
-      const original = appConfig.memory.reflectionEnabled;
-      appConfig.memory.reflectionEnabled = false;
-      try {
-        const threadId = `thread-disabled-${Date.now()}`;
-        const item1 = makeWorkItem({ threadId });
-        const item2 = makeWorkItem({ threadId });
-        const item3 = makeWorkItem({ threadId });
-
-        const p1 = manager.sendMessage("agent-a", item1);
-        const p2 = manager.sendMessage("agent-a", item2);
-        const p3 = manager.sendMessage("agent-a", item3);
-
-        await Promise.all([p1, p2, p3]);
-
-        // Only 3 calls — no reflection when disabled
-        expect(mockRunnerSend).toHaveBeenCalledTimes(3);
-      } finally {
-        appConfig.memory.reflectionEnabled = original;
-      }
     });
 
     it("skips reflection when agent has no memory server", async () => {

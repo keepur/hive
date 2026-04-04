@@ -81,7 +81,7 @@ vi.mock("../config.js", () => ({
     codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
     anthropic: { apiKey: "test-key" },
     defaultAgent: "chief-of-staff",
-    externalComms: { enabled: true },
+    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
     triage: { enabled: false },
     browser: { cdpEndpoint: "" },
     memory: { hotBudgetTokens: 3000 },
@@ -118,6 +118,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     delegateServers: [],
     soul: "",
     systemPrompt: "You are a test agent.",
+    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
     ...overrides,
   };
 }
@@ -153,6 +154,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     const servers = getCapturedServers();
 
     expect(servers).toHaveProperty("memory");
+    expect(servers).toHaveProperty("structured-memory"); // always paired with memory
     expect(servers).toHaveProperty("keychain");
     expect(servers).toHaveProperty("google");
     expect(servers).toHaveProperty("contacts");
@@ -169,9 +171,9 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    // structured-memory only included when memory.structured is enabled
+    // structured-memory is auto-paired with memory (always registered)
     // schedule is always included as implicit core server
-    expect(Object.keys(servers)).toEqual(["memory", "keychain", "schedule"]);
+    expect(Object.keys(servers)).toEqual(["memory", "structured-memory", "keychain", "schedule"]);
   });
 
   it("empty coreServers means only implicit servers", async () => {
@@ -186,24 +188,79 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(Object.keys(servers)).toEqual(["schedule"]);
   });
 
-  it("removes resend and quo when external comms disabled", async () => {
+  it("removes resend and quo when externalComms autonomy flag is false", async () => {
     const { config } = await import("../config.js");
-    const orig = config.externalComms.enabled;
-    (config.externalComms as any).enabled = false;
-    (config.quo as any).apiKey = "test-quo-key";
+    const origResendKey = config.resend.apiKey;
+    const origQuoKey = (config.quo as any).apiKey;
     (config.resend as any).apiKey = "test-resend-key";
+    (config.quo as any).apiKey = "test-quo-key";
 
-    runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "keychain", "resend", "quo"],
+        autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
     await runner.send("hello");
     const servers = getCapturedServers();
-
     expect(servers).not.toHaveProperty("resend");
     expect(servers).not.toHaveProperty("quo");
 
-    // Restore
-    (config.externalComms as any).enabled = orig;
-    (config.quo as any).apiKey = "";
-    (config.resend as any).apiKey = "";
+    (config.resend as any).apiKey = origResendKey;
+    (config.quo as any).apiKey = origQuoKey;
+  });
+
+  it("removes code-task when codeTask autonomy flag is false", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "code-task"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers).not.toHaveProperty("code-task");
+  });
+
+  it("keeps code-task when codeTask autonomy flag is true", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "code-task"],
+        autonomy: { externalComms: true, codeTask: true, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers).toHaveProperty("code-task");
+  });
+
+  it("removes code-search when codeAccess autonomy flag is false", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "code-search"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers).not.toHaveProperty("code-search");
+  });
+
+  it("keeps code-search when codeAccess autonomy flag is true", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "code-search"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: true },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers).toHaveProperty("code-search");
   });
 
   it("injects plugin MCP servers with correct env", async () => {
@@ -540,17 +597,16 @@ describe("AgentRunner delegate subagents (via send)", () => {
     expect(options.agents["google"].model).toBe("inherit");
   });
 
-  it("excludes resend and quo from delegates when external comms disabled", async () => {
+  it("excludes resend and quo from delegates when externalComms autonomy flag is false", async () => {
     const { config } = await import("../config.js");
-    const orig = config.externalComms.enabled;
     const origResendKey = config.resend.apiKey;
-    (config.externalComms as any).enabled = false;
     (config.resend as any).apiKey = "test-key";
 
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["memory"],
         delegateServers: ["google", "resend"],
+        autonomy: { externalComms: false, codeTask: false, codeAccess: false },
       }),
       memoryManager as any,
     );
@@ -560,9 +616,39 @@ describe("AgentRunner delegate subagents (via send)", () => {
     expect(options.agents).toHaveProperty("google");
     expect(options.agents).not.toHaveProperty("resend");
 
-    // Restore
-    (config.externalComms as any).enabled = orig;
     (config.resend as any).apiKey = origResendKey;
+  });
+
+  it("excludes code-task from delegates when codeTask autonomy flag is false", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "code-task"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents).toHaveProperty("google");
+    expect(options.agents).not.toHaveProperty("code-task");
+  });
+
+  it("excludes code-search from delegates when codeAccess autonomy flag is false", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "code-search"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents).toHaveProperty("google");
+    expect(options.agents).not.toHaveProperty("code-search");
   });
 
   it("delegate servers are NOT in parent mcpServers", async () => {

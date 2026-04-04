@@ -2,6 +2,7 @@ import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import { toAgentConfig } from "../types/agent-definition.js";
+import { config as appConfig } from "../config.js";
 import type { Collection, ChangeStream } from "mongodb";
 
 const log = createLogger("agent-registry");
@@ -32,27 +33,27 @@ export class AgentRegistry {
     const newDisabled: AgentConfig[] = [];
 
     for (const doc of docs) {
-      const config = toAgentConfig(doc);
-      currentIds.add(config.id);
+      const agentConfig = toAgentConfig(doc, appConfig.autonomy);
+      currentIds.add(agentConfig.id);
 
-      if (config.disabled) {
-        newDisabled.push(config);
-        if (this.agents.has(config.id)) {
-          this.agents.delete(config.id);
-          removed.push(config.id);
-          log.info("Disabled agent removed from active map", { id: config.id });
+      if (agentConfig.disabled) {
+        newDisabled.push(agentConfig);
+        if (this.agents.has(agentConfig.id)) {
+          this.agents.delete(agentConfig.id);
+          removed.push(agentConfig.id);
+          log.info("Disabled agent removed from active map", { id: agentConfig.id });
         }
         continue;
       }
 
-      if (previousIds.has(config.id)) {
-        updated.push(config.id);
+      if (previousIds.has(agentConfig.id)) {
+        updated.push(agentConfig.id);
       } else {
-        added.push(config.id);
+        added.push(agentConfig.id);
       }
 
-      this.agents.set(config.id, config);
-      log.info("Loaded agent", { id: config.id, name: config.name });
+      this.agents.set(agentConfig.id, agentConfig);
+      log.info("Loaded agent", { id: agentConfig.id, name: agentConfig.name });
     }
 
     this.disabledAgents = newDisabled;

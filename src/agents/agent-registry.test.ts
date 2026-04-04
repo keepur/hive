@@ -41,7 +41,7 @@ describe("toAgentConfig", () => {
       soul: "I am Rae.",
       systemPrompt: "You are a receptionist.",
     });
-    const config = toAgentConfig(def);
+    const config = toAgentConfig(def, {});
     expect(config.id).toBe("rae");
     expect(config.name).toBe("Rae");
     expect(config.model).toBe("claude-haiku-4-5");
@@ -49,6 +49,9 @@ describe("toAgentConfig", () => {
     expect(config.coreServers).toEqual(["memory", "slack"]);
     expect(config.soul).toBe("I am Rae.");
     expect(config.systemPrompt).toBe("You are a receptionist.");
+    // autonomy is always present and resolved
+    expect(config.autonomy).toBeDefined();
+    expect(config.autonomy.externalComms).toBe(true);
   });
 
   it("applies defaults for missing optional fields", () => {
@@ -63,7 +66,7 @@ describe("toAgentConfig", () => {
     delete (def as any).delegatePrompts;
     delete (def as any).schedule;
 
-    const config = toAgentConfig(def);
+    const config = toAgentConfig(def, {});
     expect(config.maxConcurrent).toBe(AGENT_DEFINITION_DEFAULTS.maxConcurrent);
     expect(config.timeoutMs).toBe(AGENT_DEFINITION_DEFAULTS.timeoutMs);
     expect(config.budgetUsd).toBe(AGENT_DEFINITION_DEFAULTS.budgetUsd);
@@ -79,7 +82,7 @@ describe("toAgentConfig", () => {
     const def = makeDefinition({
       delegatePrompts: { google: "Search Google.", clickup: "Manage tasks." },
     });
-    const config = toAgentConfig(def);
+    const config = toAgentConfig(def, {});
     expect(config.delegatePrompts).toEqual({ google: "Search Google.", clickup: "Manage tasks." });
   });
 
@@ -91,12 +94,35 @@ describe("toAgentConfig", () => {
       plugins: ["dodi-dev"],
       subscribe: ["deals", "jobs"],
     });
-    const config = toAgentConfig(def);
+    const config = toAgentConfig(def, {});
     expect(config.triageModel).toBe("claude-haiku-4-5");
     expect(config.dodiOpsMode).toBe("readonly");
     expect(config.slackBot).toBe("jasper");
     expect(config.plugins).toEqual(["dodi-dev"]);
     expect(config.subscribe).toEqual(["deals", "jobs"]);
+  });
+});
+
+describe("toAgentConfig autonomy resolution", () => {
+  it("resolves autonomy flags from definition and instance ceiling", () => {
+    const def = makeDefinition({
+      autonomy: { externalComms: false },
+    });
+    const instanceCeiling = { externalComms: true, codeTask: true, codeAccess: false };
+    const config = toAgentConfig(def, instanceCeiling);
+
+    expect(config.autonomy.externalComms).toBe(false); // agent restricted
+    expect(config.autonomy.codeTask).toBe(true);       // inherits ceiling
+    expect(config.autonomy.codeAccess).toBe(false);    // ceiling is false
+  });
+
+  it("uses hardcoded defaults when no autonomy overrides", () => {
+    const def = makeDefinition();
+    const config = toAgentConfig(def, {});
+    // AUTONOMY_DEFAULTS: externalComms=true, codeTask=false, codeAccess=false
+    expect(config.autonomy.externalComms).toBe(true);
+    expect(config.autonomy.codeTask).toBe(false);
+    expect(config.autonomy.codeAccess).toBe(false);
   });
 });
 
