@@ -186,7 +186,13 @@ export class AgentManager {
         result.costUsd += routerCostUsd;
 
         if (result.sessionId && !result.aborted) {
-          this.sessionStore.set(agentId, threadId, result.sessionId);
+          this.sessionStore.set(agentId, threadId, result.sessionId, {
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            cacheReadTokens: result.cacheReadTokens,
+            contextWindow: result.contextWindow,
+            compactions: result.compactions,
+          });
         }
 
         const state = this.states.get(agentId)!;
@@ -272,7 +278,13 @@ export class AgentManager {
         // Persist session so next message picks up post-reflection state
         if (reflectionResult.sessionId && !reflectionResult.aborted) {
           const threadId = lastItem.message.threadId ?? lastItem.message.id;
-          this.sessionStore.set(agentId, threadId, reflectionResult.sessionId);
+          this.sessionStore.set(agentId, threadId, reflectionResult.sessionId, {
+            inputTokens: reflectionResult.inputTokens,
+            outputTokens: reflectionResult.outputTokens,
+            cacheReadTokens: reflectionResult.cacheReadTokens,
+            contextWindow: reflectionResult.contextWindow,
+            compactions: reflectionResult.compactions,
+          });
         }
       } catch (err) {
         log.warn("Reflection failed, non-critical", { agentId, threadKey, error: String(err) });

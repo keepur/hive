@@ -8,6 +8,11 @@ interface SessionDoc {
   agentId: string;
   threadId: string;
   sessionId: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  contextWindow: number;
+  compactions: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -111,14 +116,27 @@ export class SessionStore {
     }, undefined, `get(${agentId}:${threadId})`);
   }
 
-  async set(agentId: string, threadId: string, sessionId: string): Promise<void> {
+  async set(agentId: string, threadId: string, sessionId: string, tokenData?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    contextWindow: number;
+    compactions: number;
+  }): Promise<void> {
     await this.withRetry(async () => {
       const now = new Date();
       await this.collection.updateOne(
         { _id: `${agentId}:${threadId}` },
         {
-          $set: { agentId, threadId, sessionId, updatedAt: now },
-          $setOnInsert: { createdAt: now },
+          $set: {
+            agentId, threadId, sessionId, updatedAt: now,
+            ...(tokenData ?? {}),
+          },
+          $setOnInsert: {
+            createdAt: now,
+            // Defaults for new docs without token data
+            ...(!tokenData ? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, contextWindow: 0, compactions: 0 } : {}),
+          },
         },
         { upsert: true },
       );
