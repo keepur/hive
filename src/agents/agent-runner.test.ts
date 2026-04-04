@@ -197,7 +197,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     runner = new AgentRunner(
       makeAgentConfig({
-        coreServers: ["memory", "keychain", "resend"],
+        coreServers: ["memory", "keychain", "resend", "quo"],
         autonomy: { externalComms: false, codeTask: false, codeAccess: false },
       }),
       memoryManager as any,

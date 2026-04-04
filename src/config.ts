@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
+import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
 
 // Load .env file — if HIVE_CONFIG is set (e.g., hive-personal.yaml), load matching .env
 // hive-personal.yaml → .env-personal, hive.yaml → .env
@@ -182,9 +183,9 @@ export const config = {
     token: optional("ADMIN_API_TOKEN", ""),
   },
   autonomy: {
-    externalComms: (hive.autonomy?.externalComms ?? true) as boolean,
-    codeTask: (hive.autonomy?.codeTask ?? false) as boolean,
-    codeAccess: (hive.autonomy?.codeAccess ?? false) as boolean,
+    externalComms: (hive.autonomy?.externalComms ?? AUTONOMY_DEFAULTS.externalComms) as boolean,
+    codeTask: (hive.autonomy?.codeTask ?? AUTONOMY_DEFAULTS.codeTask) as boolean,
+    codeAccess: (hive.autonomy?.codeAccess ?? AUTONOMY_DEFAULTS.codeAccess) as boolean,
   },
   triage: {
     model: optional("TRIAGE_MODEL", "claude-haiku-4-5-20251001"),
