@@ -25,11 +25,11 @@ schedule:
 coreServers:
   - memory
   - slack
-  - contacts
-  - ops-search
   - conversation-search
   - callback
   - event-bus
+  - contacts
+  - ops-search
 delegateServers:
   - dodi-ops
   - hubspot-crm
@@ -37,8 +37,7 @@ delegateServers:
 subscribe:
   - deals
   - cases
-plugins:
-  - dodi-dev
+plugins: []
 soul: |
   # Soul: Production Support (four-brother)
 

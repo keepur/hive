@@ -25,11 +25,12 @@ schedule:
 coreServers:
   - memory
   - slack
+  - conversation-search
   - callback
   - event-bus
-  - conversation-search
   - crm-search
   - product-search
+  - ops-search
   - contacts
 delegateServers:
   - hubspot-crm
@@ -42,8 +43,7 @@ delegateServers:
 subscribe:
   - deals
   - jobs
-plugins:
-  - dodi-dev
+plugins: []
 soul: |
   # Soul: Customer Success
 

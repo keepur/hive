@@ -22,18 +22,16 @@ schedule:
 coreServers:
   - memory
   - slack
-  - contacts
-  - crm-search
   - conversation-search
+  - callback
+  - event-bus
   - keychain
   - background
-  - callback
 delegateServers:
   - linear
   - brave-search
   - google
-plugins:
-  - dodi-dev
+plugins: []
 soul: |
   # Soul: DevOps
 

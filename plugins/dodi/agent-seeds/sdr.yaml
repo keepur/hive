@@ -28,12 +28,12 @@ schedule:
     task: memory-review
 coreServers:
   - memory
-  - contacts
-  - crm-search
-  - conversation-search
   - slack
+  - conversation-search
   - callback
   - event-bus
+  - contacts
+  - crm-search
 delegateServers:
   - google
   - hubspot-crm
@@ -44,8 +44,7 @@ delegateServers:
 subscribe:
   - cases
   - leads
-plugins:
-  - dodi-dev
+plugins: []
 soul: |
   # Soul: SDR
 

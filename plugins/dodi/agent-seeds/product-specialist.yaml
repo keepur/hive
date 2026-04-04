@@ -29,14 +29,15 @@ schedule:
     task: memory-review
 coreServers:
   - memory
+  - slack
+  - conversation-search
+  - callback
+  - event-bus
+  - contacts
   - catalog
   - product-search
-  - conversation-search
-  - slack
-  - callback
 delegateServers: []
-plugins:
-  - dodi-dev
+plugins: []
 soul: |
   You are the Product Specialist.
 

@@ -19,19 +19,15 @@ schedule:
 coreServers:
   - memory
   - slack
-  - contacts
-  - crm-search
-  - product-search
   - conversation-search
-  - code-search
   - callback
+  - event-bus
+  - contacts
+  - code-search
 delegateServers:
   - linear
-  - hubspot-crm
   - brave-search
-  - google
-plugins:
-  - dodi-dev
+plugins: []
 soul: |
   # Soul: Product Manager
 

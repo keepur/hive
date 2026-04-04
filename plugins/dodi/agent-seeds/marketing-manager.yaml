@@ -20,12 +20,12 @@ schedule:
     task: memory-review
 coreServers:
   - memory
-  - contacts
-  - crm-search
-  - conversation-search
   - slack
+  - conversation-search
   - callback
   - event-bus
+  - contacts
+  - crm-search
 delegateServers:
   - google
   - hubspot-crm
@@ -33,8 +33,7 @@ delegateServers:
   - brave-search
   - permits
   - tasks
-plugins:
-  - dodi-dev
+plugins: []
 soul: |
   # Soul: Marketing Manager
 

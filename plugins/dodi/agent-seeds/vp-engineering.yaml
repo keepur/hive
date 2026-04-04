@@ -22,18 +22,19 @@ schedule:
     task: memory-review
 coreServers:
   - memory
-  - conversation-search
-  - code-search
   - slack
+  - conversation-search
+  - callback
+  - event-bus
+  - contacts
+  - code-search
+  - code-task
   - keychain
   - background
-  - callback
-  - code-task
 delegateServers:
   - linear
   - brave-search
-plugins:
-  - dodi-dev
+plugins: []
 soul: |
   # Soul: VP Engineering
 

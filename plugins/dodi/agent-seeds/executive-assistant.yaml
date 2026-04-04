@@ -19,6 +19,9 @@ coreServers:
   - memory
   - slack
   - conversation-search
+  - callback
+  - event-bus
+  - contacts
 delegateServers: []
 plugins: []
 soul: |
