@@ -113,7 +113,7 @@ async function main(): Promise<void> {
     coldSummaryMinRecords: config.memory.coldSummaryMinRecords,
     coldRetentionDays: config.memory.coldRetentionDays,
     purgeRetentionDays: config.memory.purgeRetentionDays,
-  });
+  }, config.autoDream);
   log.info("Structured memory lifecycle enabled");
 
   const sessionStore = new SessionStore(config.mongo.uri);
@@ -364,6 +364,7 @@ async function main(): Promise<void> {
       meetingSessionTtlMs: config.sweeper.meetingSessionTtlMs,
       cacheTtlMs: config.sweeper.cacheTtlMs,
       memorySweepIntervalHours: config.memory.sweepIntervalHours,
+      dreamConfig: config.autoDream,
     },
     {
       dispatcher,
