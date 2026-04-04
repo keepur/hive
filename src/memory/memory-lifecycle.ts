@@ -378,6 +378,9 @@ export class MemoryLifecycle {
     let resolved = 0;
     let flagged = 0;
     let pairsChecked = 0;
+    // Track records already resolved/flagged this run to avoid state corruption:
+    // a superseded record must not participate in later pair comparisons.
+    const eliminated = new Set<string>();
 
     for (const [topic, records] of byTopic) {
       if (pairsChecked >= cfg.maxContradictionPairsPerRun) break;
@@ -385,8 +388,10 @@ export class MemoryLifecycle {
 
       // Check all pairs within this topic
       for (let i = 0; i < records.length - 1; i++) {
+        if (eliminated.has(records[i]._id!.toString())) continue;
         for (let j = i + 1; j < records.length; j++) {
           if (pairsChecked >= cfg.maxContradictionPairsPerRun) break;
+          if (eliminated.has(records[j]._id!.toString())) continue;
 
           const a = records[i];
           const b = records[j];
@@ -434,12 +439,16 @@ export class MemoryLifecycle {
 
           if (verdict.includes("A_WINS")) {
             await this.store.markSuperseded([b._id!], a._id!);
+            eliminated.add(b._id!.toString());
             resolved++;
           } else if (verdict.includes("B_WINS")) {
             await this.store.markSuperseded([a._id!], b._id!);
+            eliminated.add(a._id!.toString());
             resolved++;
           } else if (verdict.includes("UNCLEAR")) {
             await this.store.flagForReview([a._id!, b._id!]);
+            eliminated.add(a._id!.toString());
+            eliminated.add(b._id!.toString());
             flagged += 2;
           }
           // "NO" = no contradiction, do nothing
