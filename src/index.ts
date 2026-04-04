@@ -27,6 +27,7 @@ import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
 import { AdminApi } from "./admin/admin-api.js";
+import { ActivityLogger } from "./activity/activity-logger.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
@@ -125,6 +126,13 @@ async function main(): Promise<void> {
   const sessionStore = new SessionStore(config.mongo.uri);
   await sessionStore.connect(config.mongo.dbName);
 
+  // Activity logger — queryable audit trail for agent turns
+  let activityLogger: ActivityLogger | undefined;
+  if (config.activity.enabled) {
+    activityLogger = new ActivityLogger(db, config.activity);
+    await activityLogger.connect();
+  }
+
   if (config.linear.apiKey) {
     const linearClient = new LinearClient(config.linear.apiKey, config.linear.teamId || undefined);
     log.info("Linear client configured");
@@ -143,7 +151,7 @@ async function main(): Promise<void> {
     });
   }
 
-  agentManager = new AgentManager(registry, memoryManager, sessionStore);
+  agentManager = new AgentManager(registry, memoryManager, sessionStore, activityLogger);
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
     registry,
@@ -399,6 +407,7 @@ async function main(): Promise<void> {
     await prefetcher?.close();
     meetingMonitor?.stop();
     agentManager.stopAll();
+    if (activityLogger) await activityLogger.stop();
     await sessionStore.close();
     await memoryStore?.close();
     await slackAdapter.stop();
