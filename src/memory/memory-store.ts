@@ -112,7 +112,7 @@ export class MemoryStore {
     // correctly as a string (alphabetical: critical < high < low < medium).
     // We need weighted sort: pinned first, then by importance weight desc, then recency.
     const WEIGHT: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
-    const records = await this.collection.find({ agentId, tier: "hot", purged: { $ne: true } }).toArray();
+    const records = await this.collection.find({ agentId, tier: "hot", purged: { $ne: true }, supersededBy: { $exists: false } }).toArray();
     return records.sort((a, b) => {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       const wDiff = (WEIGHT[b.importance] ?? 0) - (WEIGHT[a.importance] ?? 0);
@@ -141,7 +141,78 @@ export class MemoryStore {
   }
 
   async getAllNonPinned(agentId: string): Promise<MemoryRecord[]> {
-    return this.collection.find({ agentId, pinned: false, purged: { $ne: true } }).toArray();
+    return this.collection.find({ agentId, pinned: false, purged: { $ne: true }, supersededBy: { $exists: false } }).toArray();
+  }
+
+  /** Get all non-purged, non-superseded records in specified tiers for an agent */
+  async getByTiersForAgent(agentId: string, tiers: MemoryTier[]): Promise<MemoryRecord[]> {
+    return this.collection
+      .find({
+        agentId,
+        tier: { $in: tiers },
+        purged: { $ne: true },
+        summarized: false,
+        supersededBy: { $exists: false },
+      })
+      .toArray();
+  }
+
+  /** Get fact and decision records grouped by topic for an agent */
+  async getFactsAndDecisionsByTopic(agentId: string): Promise<Map<string, MemoryRecord[]>> {
+    const records = await this.collection
+      .find({
+        agentId,
+        type: { $in: ["fact", "decision"] },
+        purged: { $ne: true },
+        supersededBy: { $exists: false },
+        needsReview: { $ne: true },
+      })
+      .toArray();
+    const byTopic = new Map<string, MemoryRecord[]>();
+    for (const r of records) {
+      const list = byTopic.get(r.topic) ?? [];
+      list.push(r);
+      byTopic.set(r.topic, list);
+    }
+    return byTopic;
+  }
+
+  /** Get interaction records grouped by topic, with distinct sourceThread counts */
+  async getInteractionsByTopic(agentId: string): Promise<Map<string, MemoryRecord[]>> {
+    const records = await this.collection
+      .find({
+        agentId,
+        type: "interaction",
+        purged: { $ne: true },
+        supersededBy: { $exists: false },
+        summarized: false,
+      })
+      .toArray();
+    const byTopic = new Map<string, MemoryRecord[]>();
+    for (const r of records) {
+      const list = byTopic.get(r.topic) ?? [];
+      list.push(r);
+      byTopic.set(r.topic, list);
+    }
+    return byTopic;
+  }
+
+  /** Mark records as superseded by a merged/winning record */
+  async markSuperseded(ids: ObjectId[], supersededBy: ObjectId): Promise<void> {
+    if (ids.length === 0) return;
+    await this.collection.updateMany(
+      { _id: { $in: ids } },
+      { $set: { supersededBy, tier: "cold" as MemoryTier } },
+    );
+  }
+
+  /** Flag records for human review (unresolvable contradictions) */
+  async flagForReview(ids: ObjectId[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.collection.updateMany(
+      { _id: { $in: ids } },
+      { $set: { needsReview: true } },
+    );
   }
 
   async getAllForAgent(agentId: string): Promise<MemoryRecord[]> {
