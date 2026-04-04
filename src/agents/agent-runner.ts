@@ -767,6 +767,7 @@ export class AgentRunner {
         ...(Object.keys(delegateAgents).length > 0 ? { agents: delegateAgents } : {}),
         ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
         hooks: this.buildPreCompactHook(),
+        // Cast: AgentConfig stores string[] but SDK expects SdkBeta[] — intentional for forward compat
         ...(this.agentConfig.betas?.length ? { betas: this.agentConfig.betas as any } : {}),
         env: {
           ...process.env,
