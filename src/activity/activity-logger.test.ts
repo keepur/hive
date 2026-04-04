@@ -50,7 +50,9 @@ function makeMockDb(collection: ReturnType<typeof makeMockCollection>) {
   };
 }
 
-function makeConfig(overrides: Partial<{ enabled: boolean; bufferSize: number; flushIntervalMs: number; retentionDays: number }> = {}) {
+function makeConfig(
+  overrides: Partial<{ enabled: boolean; bufferSize: number; flushIntervalMs: number; retentionDays: number }> = {},
+) {
   return {
     enabled: true,
     bufferSize: 200,
