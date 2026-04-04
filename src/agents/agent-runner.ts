@@ -37,8 +37,10 @@ export interface RunResult {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  cacheCreationTokens: number;
   contextWindow: number; // Model's max context size (e.g. 200000), NOT current utilization
   compactions: number;
+  preCompactTokens?: number; // Token count before last compaction (from compact_metadata.pre_tokens)
   error?: string;
   aborted?: boolean;
 }
@@ -790,8 +792,10 @@ export class AgentRunner {
     let inputTokens = 0;
     let outputTokens = 0;
     let cacheReadTokens = 0;
+    let cacheCreationTokens = 0;
     let contextWindow = 0;
     let compactions = 0;
+    let preCompactTokens: number | undefined;
 
     // Instrumentation
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
@@ -820,6 +824,7 @@ export class AgentRunner {
         if (msg.type === "system" && msg.subtype === "compact_boundary") {
           const meta = (msg as any).compact_metadata;
           compactions++;
+          preCompactTokens = meta?.pre_tokens;
           log.info("Context compacted", {
             agent: this.agentConfig.id,
             trigger: meta?.trigger,
@@ -893,6 +898,7 @@ export class AgentRunner {
             inputTokens = usage.input_tokens ?? 0;
             outputTokens = usage.output_tokens ?? 0;
             cacheReadTokens = usage.cache_read_input_tokens ?? 0;
+            cacheCreationTokens = usage.cache_creation_input_tokens ?? 0;
           }
 
           // Extract context window from model usage
@@ -976,8 +982,10 @@ export class AgentRunner {
       inputTokens,
       outputTokens,
       cacheReadTokens,
+      cacheCreationTokens,
       contextWindow,
       compactions,
+      preCompactTokens,
       streamed,
       hasError: !!error,
     });
@@ -986,7 +994,8 @@ export class AgentRunner {
       text: resultText, sessionId: resultSessionId, costUsd, durationMs,
       llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length,
       toolSummary: toolSummary || "none", streamed,
-      inputTokens, outputTokens, cacheReadTokens, contextWindow, compactions,
+      inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+      contextWindow, compactions, preCompactTokens,
       error, aborted: this._aborted,
     };
   }

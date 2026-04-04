@@ -112,6 +112,7 @@ function makeRunResult(overrides: Partial<RunResult> = {}) {
     inputTokens: 100,
     outputTokens: 50,
     cacheReadTokens: 10,
+    cacheCreationTokens: 5,
     contextWindow: 200000,
     compactions: 0,
     ...overrides,
@@ -193,8 +194,10 @@ describe("AgentManager", () => {
         inputTokens: 100,
         outputTokens: 50,
         cacheReadTokens: 10,
+        cacheCreationTokens: 5,
         contextWindow: 200000,
         compactions: 0,
+        preCompactTokens: undefined,
       });
     });
 
@@ -246,8 +249,10 @@ describe("AgentManager", () => {
         inputTokens: 100,
         outputTokens: 50,
         cacheReadTokens: 10,
+        cacheCreationTokens: 5,
         contextWindow: 200000,
         compactions: 0,
+        preCompactTokens: undefined,
       });
     });
 

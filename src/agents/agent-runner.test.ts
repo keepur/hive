@@ -946,6 +946,7 @@ describe("AgentRunner token tracking and compaction (via send)", () => {
         input_tokens: 1500,
         output_tokens: 300,
         cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 200,
       },
       modelUsage: {
         "claude-haiku-4-5": {
@@ -962,6 +963,7 @@ describe("AgentRunner token tracking and compaction (via send)", () => {
     expect(result.inputTokens).toBe(1500);
     expect(result.outputTokens).toBe(300);
     expect(result.cacheReadTokens).toBe(500);
+    expect(result.cacheCreationTokens).toBe(200);
     expect(result.contextWindow).toBe(200000);
   });
 
@@ -981,6 +983,7 @@ describe("AgentRunner token tracking and compaction (via send)", () => {
     expect(result.inputTokens).toBe(0);
     expect(result.outputTokens).toBe(0);
     expect(result.cacheReadTokens).toBe(0);
+    expect(result.cacheCreationTokens).toBe(0);
     expect(result.contextWindow).toBe(0);
     expect(result.compactions).toBe(0);
   });
@@ -1013,6 +1016,24 @@ describe("AgentRunner token tracking and compaction (via send)", () => {
     const result = await runner.send("hello");
 
     expect(result.compactions).toBe(2);
+    // preCompactTokens should be from the LAST compaction event
+    expect(result.preCompactTokens).toBe(190000);
+  });
+
+  it("preCompactTokens is undefined when no compaction occurs", async () => {
+    mockMessages = [{
+      type: "result",
+      subtype: "success",
+      result: "response",
+      total_cost_usd: 0.001,
+      duration_ms: 100,
+      session_id: "s1",
+    }];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.preCompactTokens).toBeUndefined();
   });
 
   it("picks largest contextWindow when multiple models used", async () => {

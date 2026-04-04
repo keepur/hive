@@ -190,8 +190,10 @@ export class AgentManager {
             inputTokens: result.inputTokens,
             outputTokens: result.outputTokens,
             cacheReadTokens: result.cacheReadTokens,
+            cacheCreationTokens: result.cacheCreationTokens,
             contextWindow: result.contextWindow,
             compactions: result.compactions,
+            preCompactTokens: result.preCompactTokens,
           });
         }
 
@@ -282,8 +284,10 @@ export class AgentManager {
             inputTokens: reflectionResult.inputTokens,
             outputTokens: reflectionResult.outputTokens,
             cacheReadTokens: reflectionResult.cacheReadTokens,
+            cacheCreationTokens: reflectionResult.cacheCreationTokens,
             contextWindow: reflectionResult.contextWindow,
             compactions: reflectionResult.compactions,
+            preCompactTokens: reflectionResult.preCompactTokens,
           });
         }
       } catch (err) {
