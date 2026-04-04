@@ -109,6 +109,11 @@ function makeRunResult(overrides: Partial<RunResult> = {}) {
     toolSummary: "memory:1x/0.2s",
     streamed: false,
     aborted: false,
+    inputTokens: 100,
+    outputTokens: 50,
+    cacheReadTokens: 10,
+    contextWindow: 200000,
+    compactions: 0,
     ...overrides,
   };
 }
@@ -133,7 +138,7 @@ function makeMockSessionStore() {
     get: vi.fn().mockImplementation(async (agentId: string, threadId: string) => {
       return sessions.get(`${agentId}:${threadId}`);
     }),
-    set: vi.fn().mockImplementation(async (agentId: string, threadId: string, sessionId: string) => {
+    set: vi.fn().mockImplementation(async (agentId: string, threadId: string, sessionId: string, _tokenData?: any) => {
       sessions.set(`${agentId}:${threadId}`, sessionId);
     }),
     delete: vi.fn(),
@@ -184,7 +189,13 @@ describe("AgentManager", () => {
       const item = makeWorkItem({ threadId });
       await manager.sendMessage("agent-a", item);
 
-      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", threadId, "session-1");
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", threadId, "session-1", {
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 10,
+        contextWindow: 200000,
+        compactions: 0,
+      });
     });
 
     it("does not save session when aborted", async () => {
@@ -231,7 +242,13 @@ describe("AgentManager", () => {
       await manager.sendMessage("agent-a", item);
 
       // Session should be saved with message id as thread key
-      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", item.id, "session-1");
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", item.id, "session-1", {
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 10,
+        contextWindow: 200000,
+        compactions: 0,
+      });
     });
 
     it("increments error count on runner throw", async () => {
