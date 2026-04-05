@@ -14,6 +14,7 @@ import type { LoadedPlugin } from "../plugins/types.js";
 import { loadSkillIndex, type SkillIndex } from "./skill-loader.js";
 import { ConversationIndex } from "../search/conversation-index.js";
 import type { ActivityLogger } from "../activity/activity-logger.js";
+import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -37,12 +38,14 @@ export class AgentManager {
   private plugins: LoadedPlugin[];
   private skillIndex: SkillIndex;
   private activityLogger?: ActivityLogger;
+  private prefetcher?: CodeIndexPrefetcher;
 
-  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, activityLogger?: ActivityLogger) {
+  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
     this.activityLogger = activityLogger;
+    this.prefetcher = prefetcher;
     this.plugins = loadPlugins(appConfig.plugins, process.cwd());
     this.skillIndex = loadSkillIndex();
   }
@@ -51,7 +54,7 @@ export class AgentManager {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson);
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher);
   }
 
   reloadSkills(): void {

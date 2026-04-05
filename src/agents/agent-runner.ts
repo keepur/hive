@@ -9,6 +9,7 @@ import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import type { ResourceLimits } from "./model-router.js";
+import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 
 const log = createLogger("agent-runner");
 
@@ -52,13 +53,15 @@ export class AgentRunner {
   private skillIndex: SkillIndex;
   private activeQuery: Query | null = null;
   private eventSubscribersJson: string;
+  private prefetcher?: CodeIndexPrefetcher;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}") {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
     this.skillIndex = skillIndex;
     this.eventSubscribersJson = eventSubscribersJson;
+    this.prefetcher = prefetcher;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
