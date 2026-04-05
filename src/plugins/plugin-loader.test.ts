@@ -40,6 +40,8 @@ describe("normalizeManifest", () => {
     expect(result.mcpServers["my-server"]).toEqual({
       entry: "mcp-servers/my-server/index.ts",
       description: undefined,
+      usage: undefined,
+      notFor: undefined,
       env: ["API_KEY"],
       envMap: { SERVER_URL: "BASE_URL" },
       agentEnv: { MODE: "agentMode" },
@@ -68,6 +70,22 @@ describe("normalizeManifest", () => {
     expect(result.agentSeeds).toEqual([]);
   });
 
+  it("passes through usage and not-for fields from YAML", () => {
+    const raw = {
+      name: "guide-plugin",
+      "mcp-servers": {
+        "guide-server": {
+          entry: "mcp-servers/guide/index.ts",
+          usage: "Finding things by topic",
+          "not-for": "Creating records — use write-server instead",
+        },
+      },
+    };
+    const result = normalizeManifest(raw);
+    expect(result.mcpServers["guide-server"].usage).toBe("Finding things by topic");
+    expect(result.mcpServers["guide-server"].notFor).toBe("Creating records — use write-server instead");
+  });
+
   it("defaults missing server sub-fields", () => {
     const raw = {
       "mcp-servers": {
@@ -78,6 +96,8 @@ describe("normalizeManifest", () => {
     expect(result.mcpServers.simple).toEqual({
       entry: "index.ts",
       description: undefined,
+      usage: undefined,
+      notFor: undefined,
       env: [],
       envMap: {},
       agentEnv: {},

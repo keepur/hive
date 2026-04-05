@@ -84,10 +84,7 @@ export class AgentRunner {
 
     // Inject core server summaries so the agent knows what tools it has directly
     // Exclude infrastructure servers that are always present and self-explanatory
-    const INFRASTRUCTURE_SERVERS = new Set([
-      "schedule", "structured-memory",
-    ]);
-    const visibleCoreServers = coreServerNames.filter((s) => !INFRASTRUCTURE_SERVERS.has(s));
+    const visibleCoreServers = coreServerNames.filter((s) => !AgentRunner.INFRASTRUCTURE_SERVERS.has(s));
     if (visibleCoreServers.length > 0) {
       const lines = visibleCoreServers.map((s) => formatCatalogEntry(s, this.getServerCatalogEntry(s)));
       parts.push(
@@ -602,6 +599,11 @@ export class AgentRunner {
 
     return servers;
   }
+
+  // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory
+  private static readonly INFRASTRUCTURE_SERVERS = new Set([
+    "schedule", "structured-memory",
+  ]);
 
   // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)
   private static CONTEXT_DEPENDENT_SERVERS = new Set([

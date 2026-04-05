@@ -133,6 +133,10 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     description: "Agent management — list, view, update agent definitions",
     usage: "Viewing or modifying agent configurations",
   },
+  keychain: {
+    description: "Read secrets from macOS Keychain",
+    usage: "Retrieving API keys or credentials stored in the system keychain",
+  },
 };
 
 /** Format a catalog entry as a prompt line: "- name: description\n  → usage / notFor" */
