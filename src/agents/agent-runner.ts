@@ -1,6 +1,7 @@
 import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
@@ -748,23 +749,44 @@ export class AgentRunner {
   private buildPreCompactHook(): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
     const agentName = this.agentConfig.name;
     const agentId = this.agentConfig.id;
+    const prefetcher = this.prefetcher;
 
     return {
       PreCompact: [{
-        hooks: [async (_input, _toolUseId, _opts) => {
+        hooks: [async (input: any, _toolUseId, _opts) => {
           log.info("PreCompact hook fired", { agent: agentId });
-          return {
-            continue: true,
-            systemMessage: [
-              `You are ${agentName} (agent ID: ${agentId}). When summarizing this conversation for compaction:`,
-              "- Preserve your identity, role, and any behavioral instructions from your system prompt",
-              "- Keep all customer/contact names, deal details, and reference numbers",
-              "- Retain every decision made and commitment given — who decided what, and why",
-              "- Preserve active workflows: what's in progress, what's pending, next steps",
-              "- Keep tool call results that informed decisions (not raw API responses)",
-              "- Discard pleasantries, thinking-out-loud, and intermediate failed attempts",
-            ].join("\n"),
-          };
+
+          const baseInstructions = [
+            `You are ${agentName} (agent ID: ${agentId}). When summarizing this conversation for compaction:`,
+            "- Preserve your identity, role, and any behavioral instructions from your system prompt",
+            "- Keep all customer/contact names, deal details, and reference numbers",
+            "- Retain every decision made and commitment given — who decided what, and why",
+            "- Preserve active workflows: what's in progress, what's pending, next steps",
+            "- Keep tool call results that informed decisions (not raw API responses)",
+            "- Discard pleasantries, thinking-out-loud, and intermediate failed attempts",
+          ].join("\n");
+
+          // Attempt to inject code context (graceful — never blocks compaction)
+          let codeContext = "";
+          if (prefetcher && input?.transcript_path) {
+            try {
+              const transcript = await readFile(input.transcript_path, "utf-8");
+              if (transcript.length > 0) {
+                codeContext = await prefetcher.getCompactionContext(transcript, agentId);
+              }
+            } catch (err) {
+              log.warn("Code context extraction failed during compaction — proceeding without", {
+                agent: agentId,
+                error: String(err),
+              });
+            }
+          }
+
+          const systemMessage = codeContext
+            ? `${baseInstructions}\n\n${codeContext}`
+            : baseInstructions;
+
+          return { continue: true, systemMessage };
         }],
       }],
     };
