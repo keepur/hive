@@ -7,7 +7,7 @@ import type { MemoryManager } from "../memory/memory-manager.js";
 import { config } from "../config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
-import { NAMESPACE_DESCRIPTIONS } from "../delegate/namespace-descriptions.js";
+import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import type { ResourceLimits } from "./model-router.js";
 
 const log = createLogger("agent-runner");
@@ -61,7 +61,7 @@ export class AgentRunner {
     this.eventSubscribersJson = eventSubscribersJson;
   }
 
-  private async buildSystemPrompt(activeDelegates?: string[]): Promise<string> {
+  private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
     // Prompt ordered for cache efficiency: static content first (cacheable prefix),
     // dynamic content last (only invalidates suffix). API caches identical prefixes.
     const parts: string[] = [];
@@ -82,14 +82,21 @@ export class AgentRunner {
 
     // --- Semi-static (stable within a session, changes on restart) ---
 
+    // Inject core server summaries so the agent knows what tools it has directly
+    // Exclude infrastructure servers that are always present and self-explanatory
+    const visibleCoreServers = coreServerNames.filter((s) => !AgentRunner.INFRASTRUCTURE_SERVERS.has(s));
+    if (visibleCoreServers.length > 0) {
+      const lines = visibleCoreServers.map((s) => formatCatalogEntry(s, this.getServerCatalogEntry(s)));
+      parts.push(
+        `## Your tools\n\nDirect tools available to you:\n${lines.join("\n")}`,
+      );
+    }
+
     // Inject delegate namespace summaries so the agent knows what subagents are available
     // Uses activeDelegates (actually constructed) rather than config (may include credential-gated servers)
     const delegates = activeDelegates ?? [];
     if (delegates.length > 0) {
-      const lines = delegates.map((s) => {
-        const desc = this.getServerDescription(s);
-        return `- ${s}: ${desc}`;
-      });
+      const lines = delegates.map((s) => formatCatalogEntry(s, this.getServerCatalogEntry(s)));
       parts.push(
         `## Available via subagents\n\nUse the Agent tool to delegate tasks to these specialists:\n${lines.join("\n")}`,
       );
@@ -593,6 +600,11 @@ export class AgentRunner {
     return servers;
   }
 
+  // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory
+  private static readonly INFRASTRUCTURE_SERVERS = new Set([
+    "schedule", "structured-memory",
+  ]);
+
   // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)
   private static CONTEXT_DEPENDENT_SERVERS = new Set([
     "callback", "background", "code-task", "recall", "structured-memory", "memory",
@@ -644,8 +656,8 @@ export class AgentRunner {
         continue;
       }
 
-      // Get description from namespace registry or plugin manifest
-      const description = this.getServerDescription(serverName);
+      // Get description from server catalog or plugin manifest
+      const description = this.getServerCatalogEntry(serverName).description;
 
       // Use custom delegate prompt if available, otherwise generic
       const customPrompt = this.agentConfig.delegatePrompts?.[serverName];
@@ -674,22 +686,26 @@ export class AgentRunner {
   }
 
   /**
-   * Get a human-readable description for a server name.
-   * Checks namespace descriptions registry first, then plugin manifests.
+   * Get catalog metadata for a server name.
+   * Checks core server catalog first, then plugin manifests.
    */
-  private getServerDescription(serverName: string): string {
-    // Check core namespace descriptions
-    if (NAMESPACE_DESCRIPTIONS[serverName]) {
-      return NAMESPACE_DESCRIPTIONS[serverName];
+  private getServerCatalogEntry(serverName: string): ServerCatalogEntry {
+    // Check core server catalog
+    if (SERVER_CATALOG[serverName]) {
+      return SERVER_CATALOG[serverName];
     }
-    // Check plugin manifests for description
+    // Check plugin manifests
     for (const plugin of this.plugins) {
       const serverDef = plugin.manifest.mcpServers[serverName];
       if (serverDef?.description) {
-        return serverDef.description;
+        return {
+          description: serverDef.description,
+          usage: serverDef.usage,
+          notFor: serverDef.notFor,
+        };
       }
     }
-    return serverName;
+    return { description: serverName };
   }
 
   private buildSdkPlugins(): SdkPluginConfig[] {
@@ -766,7 +782,7 @@ export class AgentRunner {
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
     const delegateAgents = this.buildDelegateAgents(allServerConfigs);
-    const systemPrompt = await this.buildSystemPrompt(Object.keys(delegateAgents));
+    const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(delegateAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
 
     if (Object.keys(delegateAgents).length > 0) {
