@@ -244,11 +244,12 @@ export class CodeIndexPrefetcher {
         "Preserve references to these files and any decisions made about them.",
       );
     }
-    if (insightSections.length > 0) {
+    const cappedInsights = insightSections.slice(0, 10);
+    if (cappedInsights.length > 0) {
       parts.push(
         "",
         "Code insights from prior sessions:",
-        ...insightSections,
+        ...cappedInsights,
         "Preserve these insights if relevant to the conversation.",
       );
     }

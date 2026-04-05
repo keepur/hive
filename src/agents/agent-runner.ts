@@ -1,4 +1,4 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -753,7 +753,7 @@ export class AgentRunner {
 
     return {
       PreCompact: [{
-        hooks: [async (input: any, _toolUseId, _opts) => {
+        hooks: [async (input: HookInput, _toolUseId, _opts) => {
           log.info("PreCompact hook fired", { agent: agentId });
 
           const baseInstructions = [
