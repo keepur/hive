@@ -72,8 +72,7 @@ server.registerTool(
       const repoFilePairs = searchResults
         .filter((r) => r.repo && r.filePath)
         .map((r) => ({ repo: r.repo, filePath: r.filePath }));
-      const fullRecords =
-        repoFilePairs.length > 0 ? await collection.find({ $or: repoFilePairs }).toArray() : [];
+      const fullRecords = repoFilePairs.length > 0 ? await collection.find({ $or: repoFilePairs }).toArray() : [];
       const recordMap = new Map(fullRecords.map((r) => [`${r.repo}:${r.filePath}`, r]));
 
       for (const result of searchResults) {
