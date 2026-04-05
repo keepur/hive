@@ -10,6 +10,7 @@ import type { AgentManager } from "../agents/agent-manager.js";
 import type { RetryQueue } from "./retry-queue.js";
 import type { TaskClient } from "../tasks/task-client.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
+import type { DreamConfig } from "../memory/memory-types.js";
 
 const log = createLogger("sweeper");
 
@@ -28,6 +29,7 @@ export interface SweeperConfig {
   meetingSessionTtlMs: number;
   cacheTtlMs: number;
   memorySweepIntervalHours?: number;
+  dreamConfig?: DreamConfig;
 }
 
 export interface SweeperTargets {
@@ -53,6 +55,7 @@ export class Sweeper {
   private gatewayCycleCounter = 0;
   private memoryCycleCounter = 0;
   private memorySweepEvery: number;
+  private lastDreamAt = 0; // timestamp of last dream run
 
   private static readonly GATEWAY_SWEEP_EVERY = 12; // every 12th cycle (~1h at 5min interval)
 
@@ -189,6 +192,48 @@ export class Sweeper {
           results.push(await this.targets.memoryLifecycle.sweep());
         } catch (err) {
           results.push({ component: "memory-lifecycle", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
+        }
+      }
+    }
+
+    // 10. autoDream — proactive memory consolidation
+    // Trigger conditions: (a) after regular memory sweep, or (b) all agents idle for threshold
+    if (this.targets.memoryLifecycle && this.config.dreamConfig?.enabled) {
+      const dreamCfg = this.config.dreamConfig;
+      const cooldownMs = dreamCfg.cooldownMinutes * 60 * 1000;
+      const now = Date.now();
+      const cooldownElapsed = now - this.lastDreamAt > cooldownMs;
+
+      // (a) Post-sweep trigger: runs right after the regular memory lifecycle sweep
+      const justSwept = this.memoryCycleCounter === 0; // counter was just reset above
+
+      // (b) Idle trigger: all agents idle for threshold duration
+      let allIdle = false;
+      if (cooldownElapsed && !justSwept) {
+        const thresholdMs = dreamCfg.idleThresholdMinutes * 60 * 1000;
+        const states = this.targets.agentManager.getAllStates();
+        allIdle =
+          states.length > 0 && states.every((s) => s.status === "idle" && now - s.lastActivity.getTime() > thresholdMs);
+      }
+
+      if (cooldownElapsed && (justSwept || allIdle)) {
+        const trigger = justSwept ? "post-sweep" : "idle";
+        log.info("autoDream triggered", { trigger });
+        try {
+          const dreamResult = await this.targets.memoryLifecycle.dream();
+          this.lastDreamAt = Date.now();
+          const totalActions = dreamResult.merged + dreamResult.contradictions + dreamResult.promoted;
+          if (totalActions > 0 || dreamResult.errors.length > 0) {
+            results.push({
+              component: "autodream",
+              pruned: dreamResult.merged + dreamResult.contradictions,
+              retried: dreamResult.promoted,
+              bytesFreed: 0,
+              errors: dreamResult.errors,
+            });
+          }
+        } catch (err) {
+          results.push({ component: "autodream", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
         }
       }
     }

@@ -55,6 +55,11 @@ function makeMockStore() {
     getAgentIds2: vi.fn(),
     init: vi.fn(),
     close: vi.fn(),
+    getByTiersForAgent: vi.fn().mockResolvedValue([]),
+    getFactsAndDecisionsByTopic: vi.fn().mockResolvedValue(new Map()),
+    getInteractionsByTopic: vi.fn().mockResolvedValue(new Map()),
+    markSuperseded: vi.fn().mockResolvedValue(undefined),
+    flagForReview: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -65,6 +70,7 @@ function makeMockEmbedder() {
     upsert: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),
     search: vi.fn().mockResolvedValue([]),
+    findSimilar: vi.fn().mockResolvedValue([]),
   };
 }
 
@@ -375,5 +381,235 @@ describe("MemoryLifecycle budget enforcement", () => {
     expect(overflowedIds).toContain(nonPinned2._id);
     // The pinned record should NOT have been overflowed
     expect(overflowedIds).not.toContain(pinnedRecord._id);
+  });
+});
+
+// ── dream() tests ────────────────────────────────────────────────────
+describe("dream()", () => {
+  let store: ReturnType<typeof makeMockStore>;
+  let embedder: ReturnType<typeof makeMockEmbedder>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store = makeMockStore();
+    embedder = makeMockEmbedder();
+  });
+
+  it("returns zeros when dreamConfig is not provided", async () => {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    const result = await lifecycle.dream();
+    expect(result).toEqual({ merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] });
+  });
+
+  it("returns zeros when dreamConfig.enabled is false", async () => {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, {
+      enabled: false,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+    });
+    const result = await lifecycle.dream();
+    expect(result).toEqual({ merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] });
+  });
+
+  it("catches per-agent errors without stopping other agents", async () => {
+    const dreamCfg = {
+      enabled: true,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+
+    // Mock getAgentIds returns two agents
+    store.getAgentIds.mockResolvedValue(["agent-a", "agent-b"]);
+    // First agent throws on getByTiersForAgent, second succeeds and returns empty (no work to do)
+    store.getByTiersForAgent.mockRejectedValueOnce(new Error("db error")).mockResolvedValue([]);
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map());
+    store.getInteractionsByTopic.mockResolvedValue(new Map());
+
+    const result = await lifecycle.dream();
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain("agent-a");
+  });
+
+  // ── Happy-path: mergeDuplicates ───────────────────────────────────
+  it("merges duplicate cluster and supersedes originals", async () => {
+    const dreamCfg = {
+      enabled: true,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+
+    const rec1 = makeRecord({ agentId: "a1", qdrantPointId: "pt-1", importance: "high" });
+    const rec2 = makeRecord({ agentId: "a1", qdrantPointId: "pt-2", importance: "medium" });
+    const mergedId = new ObjectId();
+
+    store.getAgentIds.mockResolvedValue(["a1"]);
+    store.getByTiersForAgent.mockResolvedValue([rec1, rec2]);
+    // pt-1 finds pt-2 as similar
+    embedder.findSimilar.mockResolvedValueOnce([{ mongoId: rec2._id!.toString(), score: 0.9, pointId: "pt-2" }]);
+    // pt-2 already processed — returns empty
+    embedder.findSimilar.mockResolvedValueOnce([]);
+    store.getByIds.mockResolvedValue([rec2]);
+    store.save.mockResolvedValue({ _id: mergedId });
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map());
+    store.getInteractionsByTopic.mockResolvedValue(new Map());
+
+    const result = await lifecycle.dream();
+
+    expect(result.merged).toBe(2); // both originals counted
+    expect(store.save).toHaveBeenCalledWith(
+      "a1",
+      expect.objectContaining({ type: "fact", topic: "general", importance: "high" }),
+      expect.any(String),
+    );
+    expect(store.markSuperseded).toHaveBeenCalledWith([rec1._id!, rec2._id!], mergedId);
+    expect(embedder.upsert).toHaveBeenCalled();
+  });
+
+  // ── Happy-path: detectContradictions ──────────────────────────────
+  it("resolves contradiction with A_WINS and supersedes loser", async () => {
+    const { query: mockQuery } = await import("@anthropic-ai/claude-agent-sdk");
+    const dreamCfg = {
+      enabled: true,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+
+    const recA = makeRecord({ agentId: "a1", type: "fact", topic: "pricing" });
+    const recB = makeRecord({ agentId: "a1", type: "fact", topic: "pricing" });
+
+    store.getAgentIds.mockResolvedValue(["a1"]);
+    store.getByTiersForAgent.mockResolvedValue([]); // no duplicates
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map([["pricing", [recA, recB]]]));
+    store.getInteractionsByTopic.mockResolvedValue(new Map());
+
+    // SDK mock: first call is for merge (skipped, no duplicates), second for contradiction
+    // The global mock returns "Summary text" — override for this test
+    (mockQuery as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield { type: "result", subtype: "success", result: "A_WINS" };
+      },
+    });
+
+    const result = await lifecycle.dream();
+
+    expect(result.contradictions).toBe(1);
+    expect(store.markSuperseded).toHaveBeenCalledWith([recB._id!], recA._id!);
+  });
+
+  // ── Happy-path: detectContradictions — eliminated record skipped ──
+  it("skips superseded records in later contradiction pairs", async () => {
+    const { query: mockQuery } = await import("@anthropic-ai/claude-agent-sdk");
+    const dreamCfg = {
+      enabled: true,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+
+    const recA = makeRecord({ agentId: "a1", type: "fact", topic: "t" });
+    const recB = makeRecord({ agentId: "a1", type: "fact", topic: "t" });
+    const recC = makeRecord({ agentId: "a1", type: "fact", topic: "t" });
+
+    store.getAgentIds.mockResolvedValue(["a1"]);
+    store.getByTiersForAgent.mockResolvedValue([]);
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map([["t", [recA, recB, recC]]]));
+    store.getInteractionsByTopic.mockResolvedValue(new Map());
+
+    // Pair (A,B): B loses. Pair (A,C): no contradiction. Pair (B,C): should be SKIPPED.
+    (mockQuery as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({
+        close: vi.fn(),
+        [Symbol.asyncIterator]: async function* () {
+          yield { type: "result", subtype: "success", result: "A_WINS" };
+        },
+      })
+      .mockReturnValueOnce({
+        close: vi.fn(),
+        [Symbol.asyncIterator]: async function* () {
+          yield { type: "result", subtype: "success", result: "NO" };
+        },
+      });
+
+    const result = await lifecycle.dream();
+
+    // Only 1 resolved (A beats B). B is eliminated so (B,C) never evaluated.
+    expect(result.contradictions).toBe(1);
+    // markSuperseded called exactly once (B superseded by A)
+    expect(store.markSuperseded).toHaveBeenCalledTimes(1);
+    expect(store.markSuperseded).toHaveBeenCalledWith([recB._id!], recA._id!);
+    // Only 2 LLM calls: (A,B) and (A,C). NOT (B,C).
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+  });
+
+  // ── Happy-path: promotePatterns ───────────────────────────────────
+  it("promotes pattern to fact and supersedes source interactions", async () => {
+    const dreamCfg = {
+      enabled: true,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+
+    const interactions = [
+      makeRecord({ agentId: "a1", type: "interaction", topic: "greetings", sourceThread: "t1" }),
+      makeRecord({ agentId: "a1", type: "interaction", topic: "greetings", sourceThread: "t2" }),
+      makeRecord({ agentId: "a1", type: "interaction", topic: "greetings", sourceThread: "t3" }),
+    ];
+    const factId = new ObjectId();
+
+    store.getAgentIds.mockResolvedValue(["a1"]);
+    store.getByTiersForAgent.mockResolvedValue([]); // no duplicates
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map()); // no contradictions
+    store.getInteractionsByTopic.mockResolvedValue(new Map([["greetings", interactions]]));
+    store.save.mockResolvedValue({ _id: factId });
+
+    const result = await lifecycle.dream();
+
+    expect(result.promoted).toBe(1);
+    // Saved a fact on topic "greetings"
+    expect(store.save).toHaveBeenCalledWith(
+      "a1",
+      expect.objectContaining({ type: "fact", topic: "greetings", importance: "medium" }),
+      expect.any(String),
+    );
+    // Source interactions superseded by the new fact
+    expect(store.markSuperseded).toHaveBeenCalledWith(
+      interactions.map((r) => r._id!),
+      factId,
+    );
   });
 });
