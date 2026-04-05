@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { writeFile, unlink } from "node:fs/promises";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 
@@ -1339,6 +1340,118 @@ describe("AgentRunner PreCompact hook (via send)", () => {
     expect(result.systemMessage).toContain("Preserve your identity");
     expect(result.systemMessage).toContain("customer/contact names");
     expect(result.systemMessage).toContain("active workflows");
+  });
+
+  // ── Code-aware PreCompact hook tests ────────────────────────────
+
+  describe("PreCompact code context (code-aware compaction)", () => {
+    const transcriptPath = "/tmp/test-transcript-agent-runner-89.txt";
+
+    afterEach(async () => {
+      try {
+        await unlink(transcriptPath);
+      } catch {
+        // file may not exist in all tests — that is fine
+      }
+    });
+
+    it("without prefetcher returns base instructions only (backward compat)", async () => {
+      await writeFile(transcriptPath, "User: hello\nAssistant: hi");
+
+      const runner = new AgentRunner(
+        makeAgentConfig({ id: "jasper", name: "Jasper" }),
+        memoryManager as any,
+        // no prefetcher argument — backward-compat path
+      );
+      await runner.send("hello");
+      const options = getCapturedOptions();
+
+      const hookFn = options.hooks.PreCompact[0].hooks[0];
+      const result = await hookFn(
+        { transcript_path: transcriptPath, trigger: "auto" },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+
+      expect(result.continue).toBe(true);
+      expect(result.systemMessage).toContain("Preserve your identity");
+      // No code context injected — message should be exactly the base instructions
+      expect(result.systemMessage).not.toContain("code files");
+      expect(result.systemMessage).not.toContain("Relevant code");
+    });
+
+    it("with prefetcher appends code context to base instructions", async () => {
+      await writeFile(transcriptPath, "User: can you fix the bug in agent-runner.ts?\nAssistant: sure");
+
+      const mockPrefetcher = {
+        getCompactionContext: vi.fn().mockResolvedValue(
+          "Relevant code files referenced:\n- src/agents/agent-runner.ts",
+        ),
+      };
+
+      const runner = new AgentRunner(
+        makeAgentConfig({ id: "jasper", name: "Jasper" }),
+        memoryManager as any,
+        [],       // plugins
+        new Map(), // skillIndex
+        "{}",     // eventSubscribersJson
+        mockPrefetcher as any,
+      );
+      await runner.send("hello");
+      const options = getCapturedOptions();
+
+      const hookFn = options.hooks.PreCompact[0].hooks[0];
+      const result = await hookFn(
+        { transcript_path: transcriptPath, trigger: "auto" },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+
+      expect(result.continue).toBe(true);
+      // Base instructions present
+      expect(result.systemMessage).toContain("Preserve your identity");
+      // Code context appended
+      expect(result.systemMessage).toContain("Relevant code files referenced");
+      expect(result.systemMessage).toContain("agent-runner.ts");
+      // Prefetcher was called with the transcript text and agent ID
+      expect(mockPrefetcher.getCompactionContext).toHaveBeenCalledWith(
+        expect.stringContaining("fix the bug"),
+        "jasper",
+      );
+    });
+
+    it("survives prefetcher failure and falls back to base instructions", async () => {
+      await writeFile(transcriptPath, "User: deploy the service\nAssistant: deploying");
+
+      const mockPrefetcher = {
+        getCompactionContext: vi.fn().mockRejectedValue(new Error("Qdrant is down")),
+      };
+
+      const runner = new AgentRunner(
+        makeAgentConfig({ id: "jasper", name: "Jasper" }),
+        memoryManager as any,
+        [],
+        new Map(),
+        "{}",
+        mockPrefetcher as any,
+      );
+      await runner.send("hello");
+      const options = getCapturedOptions();
+
+      const hookFn = options.hooks.PreCompact[0].hooks[0];
+      // Should not throw — graceful fallback
+      const result = await hookFn(
+        { transcript_path: transcriptPath, trigger: "auto" },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+
+      expect(result.continue).toBe(true);
+      // Falls back to base instructions only
+      expect(result.systemMessage).toContain("Preserve your identity");
+      // No code context in the output
+      expect(result.systemMessage).not.toContain("Relevant code");
+    });
   });
 });
 

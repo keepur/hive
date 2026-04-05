@@ -149,30 +149,6 @@ async function main(): Promise<void> {
     });
   }
 
-  agentManager = new AgentManager(registry, memoryManager, sessionStore, activityLogger);
-  const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
-  const dispatcher = new Dispatcher(
-    registry,
-    agentManager,
-    healthReporter,
-    config.defaultAgent,
-    taskLedger.isConfigured ? taskLedger : undefined,
-  );
-
-  // Background task manager — agents can spawn detached background processes
-  const bgTaskManager = new BackgroundTaskManager(
-    config.background.port,
-    config.background.authToken,
-    config.tasksDir.background,
-    (item) =>
-      dispatcher.dispatch(item).catch((err) => {
-        log.error("Background task completion dispatch failed", { error: String(err) });
-      }),
-  );
-  await bgTaskManager.start();
-  await bgTaskManager.scanOrphans();
-  log.info("Background task manager started", { port: config.background.port });
-
   // Code index prefetcher + knowledge extractor (optional — only when codeIndex enabled)
   let prefetcher: import("./code-index/prefetcher.js").CodeIndexPrefetcher | undefined;
   let knowledgeExtractor: import("./code-task/knowledge-extractor.js").KnowledgeExtractor | undefined;
@@ -199,6 +175,30 @@ async function main(): Promise<void> {
       sessionKnowledge: knowledgeExtractor !== undefined,
     });
   }
+
+  agentManager = new AgentManager(registry, memoryManager, sessionStore, activityLogger, prefetcher);
+  const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
+  const dispatcher = new Dispatcher(
+    registry,
+    agentManager,
+    healthReporter,
+    config.defaultAgent,
+    taskLedger.isConfigured ? taskLedger : undefined,
+  );
+
+  // Background task manager — agents can spawn detached background processes
+  const bgTaskManager = new BackgroundTaskManager(
+    config.background.port,
+    config.background.authToken,
+    config.tasksDir.background,
+    (item) =>
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("Background task completion dispatch failed", { error: String(err) });
+      }),
+  );
+  await bgTaskManager.start();
+  await bgTaskManager.scanOrphans();
+  log.info("Background task manager started", { port: config.background.port });
 
   // Code task manager — agents can spawn Claude Code CLI sessions
   const codeTaskManager = new CodeTaskManager(
