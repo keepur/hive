@@ -778,6 +778,163 @@ describe("AgentRunner delegate subagents (via send)", () => {
   });
 });
 
+// ── Server catalog prompt tests ───────────────────────────────────
+describe("AgentRunner server catalog prompt (via send)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("injects core server catalog into system prompt as 'Your tools'", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "contacts"],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).toContain("## Your tools");
+    expect(options.systemPrompt).toContain("memory:");
+    expect(options.systemPrompt).toContain("contacts:");
+  });
+
+  it("includes usage hints in core tools section", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "contacts"],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).toContain("Use for:");
+  });
+
+  it("includes notFor hints in core tools section", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["contacts"],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    // contacts has a notFor field
+    expect(options.systemPrompt).toContain("Not for:");
+  });
+
+  it("excludes infrastructure servers from 'Your tools' section", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "schedule"],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    // schedule is infrastructure — should not appear in "Your tools"
+    // memory should appear
+    expect(options.systemPrompt).toContain("memory:");
+    expect(options.systemPrompt).not.toMatch(/- schedule:/);
+  });
+
+  it("excludes structured-memory from 'Your tools' section", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    // structured-memory is auto-paired infrastructure
+    expect(options.systemPrompt).not.toMatch(/- structured-memory:/);
+  });
+
+  it("does not show 'Your tools' when only infrastructure servers present", async () => {
+    // Agent with only schedule (implicit) — no visible core servers
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: [],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).not.toContain("## Your tools");
+  });
+
+  it("includes usage hints in delegate subagent summaries", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).toContain("Available via subagents");
+    expect(options.systemPrompt).toContain("google:");
+    expect(options.systemPrompt).toContain("Use for:");
+  });
+
+  it("falls back to plugin manifest description for unknown servers", async () => {
+    const plugin: LoadedPlugin = {
+      name: "custom-plugin",
+      dir: "/plugins/custom-plugin",
+      manifest: {
+        name: "custom-plugin",
+        description: "Custom",
+        mcpServers: {
+          "custom-tool": {
+            entry: "mcp-servers/custom/index.ts",
+            description: "A custom tool for testing",
+            usage: "Testing things",
+            notFor: "Production use",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+    };
+
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["custom-tool"],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+      [plugin],
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).toContain("custom-tool: A custom tool for testing");
+    expect(options.systemPrompt).toContain("Use for: Testing things.");
+    expect(options.systemPrompt).toContain("Not for: Production use.");
+  });
+});
+
 // ── Security hardening tests ─────────────────────────────────────
 describe("AgentRunner security hardening", () => {
   let runner: AgentRunner;

@@ -3,9 +3,11 @@ description: DodiHome cabinet manufacturing integrations
 mcp-servers:
   hubspot-crm:
     entry: mcp-servers/hubspot-crm/hubspot-crm-mcp-server.ts
+    description: "Search and manage CRM — deals, contacts, companies, notes, tasks, activities"
     env: [HUBSPOT_API_KEY]
   dodi-ops:
     entry: mcp-servers/dodi-ops/dodi-ops-mcp-server.ts
+    description: "Production operations — jobs, cases, designs, cutlists, comments, attachments"
     env: [TASK_LEDGER_API_URL, TASK_LEDGER_API_KEY]
     env-map:
       DODI_OPS_API_URL: TASK_LEDGER_API_URL
@@ -15,21 +17,26 @@ mcp-servers:
       DODI_OPS_AGENT_ID: id
   catalog:
     entry: mcp-servers/catalog/catalog-mcp-server.ts
+    description: "Product catalog — parts, families, pricing"
     env: [TASK_LEDGER_API_URL, TASK_LEDGER_API_KEY]
     env-map:
       CATALOG_API_URL: TASK_LEDGER_API_URL
       CATALOG_API_KEY: TASK_LEDGER_API_KEY
   permits:
     entry: mcp-servers/permits/permit-mcp-server.ts
+    description: "Permit pipeline data — active permits by jurisdiction, status, owner"
     env: [PERMITS_MONGO_URI]
   crm-search:
     entry: mcp-servers/crm-search/crm-search-mcp-server.ts
+    description: "Semantic search across CRM deals by topic or keyword"
     env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY, KB_BACKEND]
   product-search:
     entry: mcp-servers/product-search/product-search-mcp-server.ts
+    description: "Semantic search across product catalog — find products by description or attributes"
     env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
   ops-search:
     entry: mcp-servers/ops-search/ops-search-mcp-server.ts
+    description: "Semantic search across operational data — find jobs, cases, designs by description"
     env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
 agent-seeds:
   - sdr
