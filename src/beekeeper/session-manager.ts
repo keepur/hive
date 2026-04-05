@@ -17,10 +17,16 @@ export interface SessionSlot {
   activeQuery: Query | null;
   state: "idle" | "busy";
   cleared?: boolean;
+  clearing?: boolean;
   interrupted?: boolean;
   /** Resolves when runQuery finishes after a clear/interrupt */
   queryDone?: Promise<string>;
   outputBuffer: ServerMessage[];
+}
+
+interface CommandDef {
+  description: string;
+  handler: (sessionId: string, args: string[], slot: SessionSlot) => Promise<void>;
 }
 
 export class SessionManager {
@@ -32,12 +38,27 @@ export class SessionManager {
   private sessionsFile: string;
   /** Global buffer for messages sent when no clients are connected */
   private globalBuffer: ServerMessage[] = [];
+  private commands = new Map<string, CommandDef>();
 
   constructor(config: BeekeeperConfig, guardian: ToolGuardian, questionRelayer: QuestionRelayer) {
     this.config = config;
     this.guardian = guardian;
     this.questionRelayer = questionRelayer;
     this.sessionsFile = join(config.dataDir, "sessions.json");
+
+    // Register slash commands
+    this.commands.set("clear", {
+      description: "Reset context and start a fresh session",
+      handler: (sessionId, _args, slot) => this.handleClear(sessionId, slot),
+    });
+    this.commands.set("help", {
+      description: "Show available commands",
+      handler: (sessionId) => this.handleHelp(sessionId),
+    });
+    this.commands.set("status", {
+      description: "Show current session info",
+      handler: (sessionId, _args, slot) => this.handleStatus(sessionId, slot),
+    });
   }
 
   addClient(deviceId: string, ws: WebSocket): void {
@@ -114,7 +135,9 @@ export class SessionManager {
     // Register immediately so the session is visible during the inaugural query
     this.sessions.set(pendingId, slot);
 
-    const realId = await this.runQuery(slot, "You are now connected. Briefly acknowledge readiness.");
+    const done = this.runQuery(slot, "You are now connected. Briefly acknowledge readiness.");
+    slot.queryDone = done;
+    const realId = await done;
 
     // Replace pending key with real session ID
     this.sessions.delete(pendingId);
@@ -134,6 +157,20 @@ export class SessionManager {
       this.send({ type: "error", message: `Unknown session: ${sessionId}`, sessionId });
       return;
     }
+
+    // Slash command detection — runs BEFORE busy check
+    if (text.startsWith("/")) {
+      const parts = text.trimEnd().split(/\s+/);
+      const name = parts[0].slice(1).toLowerCase();
+      const cmd = this.commands.get(name);
+      if (cmd) {
+        log.info("Executing slash command", { sessionId, command: name });
+        await cmd.handler(sessionId, parts.slice(1), slot);
+        return;
+      }
+      // Unknown command — fall through to SDK as normal text
+    }
+
     if (slot.state === "busy") {
       this.send({ type: "status", state: "busy", sessionId });
       return;
@@ -332,6 +369,90 @@ export class SessionManager {
       }
     }
     this.sessions.clear();
+  }
+
+  /**
+   * /help — list available slash commands.
+   */
+  private async handleHelp(sessionId: string): Promise<void> {
+    const lines = ["Available commands:"];
+    for (const [name, def] of this.commands) {
+      lines.push(`  /${name}  — ${def.description}`);
+    }
+    this.send({ type: "message", text: lines.join("\n"), sessionId, final: true });
+  }
+
+  /**
+   * /status — show session metadata.
+   */
+  private async handleStatus(sessionId: string, slot: SessionSlot): Promise<void> {
+    const lines = [
+      `Session: ${slot.sessionId}`,
+      `Workspace: ${slot.cwd}`,
+      `State: ${slot.state}`,
+    ];
+    this.send({ type: "message", text: lines.join("\n"), sessionId, final: true });
+  }
+
+  /**
+   * /clear — destroy the current session and create a fresh one.
+   *
+   * Flow:
+   * 1. Tear down the old session inline (interrupt if busy, remove from map)
+   * 2. Send context_cleared to client (after slot deletion so it routes to
+   *    globalBuffer when offline, not the now-deleted per-session buffer)
+   * 3. Call newSession(cwd) — spawns fresh SDK session
+   *
+   * Does NOT call clearSession() — that emits session_cleared which would
+   * create confusing duplicate signals for the client.
+   *
+   * Guarded by slot.clearing to prevent concurrent /clear calls from
+   * creating duplicate sessions.
+   */
+  private async handleClear(sessionId: string, slot: SessionSlot): Promise<void> {
+    // Guard against concurrent /clear calls on the same session
+    if (slot.clearing) return;
+    slot.clearing = true;
+
+    const cwd = slot.cwd;
+
+    // 1. Tear down old session inline
+    slot.cleared = true;
+    if (slot.activeQuery) {
+      try {
+        await slot.activeQuery.interrupt();
+      } catch (err) {
+        log.error("Failed to interrupt session during /clear", { sessionId, error: String(err) });
+      }
+    }
+    // Await queryDone independently — activeQuery is nulled in runQuery's finally
+    // block before queryDone resolves, so the guard must be separate to avoid a race.
+    if (slot.queryDone) {
+      try {
+        await slot.queryDone;
+      } catch {
+        // Already handled inside runQuery
+      }
+    }
+    this.sessions.delete(sessionId);
+    this.persistSessions();
+    log.info("Session torn down for /clear", { sessionId });
+
+    // 2. Notify client to wipe the chat view — sent AFTER slot deletion so
+    // send() routes to globalBuffer (not the now-deleted per-session buffer).
+    // This ensures context_cleared survives client disconnection.
+    this.send({ type: "context_cleared", oldSessionId: sessionId, sessionId });
+
+    // 3. Create fresh session on same workspace
+    try {
+      await this.newSession(cwd);
+    } catch (err) {
+      log.error("Failed to create new session after /clear", { cwd, error: String(err) });
+      this.send({
+        type: "error",
+        message: `Context cleared but failed to start new session: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
   }
 
   /**
