@@ -696,6 +696,200 @@ describe("SessionManager", () => {
       expect(sessionInfo.sessionId).toBe("sess-cleared");
     });
 
+    it("/status works when session is busy — reports busy state", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      // Make the session busy
+      let resolveQuery: (() => void) | undefined;
+      const hangingIterable = {
+        async *[Symbol.asyncIterator]() {
+          await new Promise<void>((resolve) => {
+            resolveQuery = resolve;
+          });
+          yield {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-cmd",
+            total_cost_usd: 0,
+            duration_ms: 50,
+          };
+        },
+        interrupt: vi.fn(),
+      };
+      mockQueryIterator.mockReturnValueOnce(hangingIterable);
+
+      const queryPromise = manager.sendMessage(sessionId, "Make me busy");
+      await new Promise((r) => setTimeout(r, 10));
+
+      ws.send.mockClear();
+
+      // /status should work despite busy state and report busy
+      await manager.sendMessage(sessionId, "/status");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      const statusMsg = sent.find(
+        (m: Record<string, unknown>) => m.type === "message" && typeof m.text === "string" && (m.text as string).includes("State:"),
+      );
+      expect(statusMsg).toBeDefined();
+      expect(statusMsg.text).toContain("busy");
+      expect(statusMsg.final).toBe(true);
+
+      // Clean up
+      resolveQuery?.();
+      await queryPromise;
+    });
+
+    it("\"/\" alone (empty command name) falls through to SDK as normal text", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          {
+            type: "stream_event",
+            event: { type: "content_block_delta", delta: { type: "text_delta", text: "Just a slash" } },
+          },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-cmd",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      await manager.sendMessage(sessionId, "/");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      // Should NOT see any command response (no context_cleared, no help text)
+      expect(sent.find((m: Record<string, unknown>) => m.type === "context_cleared")).toBeUndefined();
+      // Should see the SDK response — fell through to normal query
+      const textMsg = sent.find((m: Record<string, unknown>) => m.type === "message" && m.text === "Just a slash");
+      expect(textMsg).toBeDefined();
+    });
+
+    it("\"/ clear\" (space after slash) falls through to SDK — not parsed as /clear", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          {
+            type: "stream_event",
+            event: { type: "content_block_delta", delta: { type: "text_delta", text: "Not a command" } },
+          },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-cmd",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      await manager.sendMessage(sessionId, "/ clear");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      // Should NOT trigger /clear
+      expect(sent.find((m: Record<string, unknown>) => m.type === "context_cleared")).toBeUndefined();
+      // Should see SDK response
+      const textMsg = sent.find((m: Record<string, unknown>) => m.type === "message" && m.text === "Not a command");
+      expect(textMsg).toBeDefined();
+    });
+
+    it("/help with trailing whitespace still works", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      await manager.sendMessage(sessionId, "/help   ");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      const helpMsg = sent.find(
+        (m: Record<string, unknown>) => m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Available commands"),
+      );
+      expect(helpMsg).toBeDefined();
+      expect(helpMsg.final).toBe(true);
+    });
+
+    it("/clear when interrupt() throws — logs error but still creates new session", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      // Make the session busy with a hanging query whose interrupt() throws
+      let resolveQuery: (() => void) | undefined;
+      const hangingIterable = {
+        async *[Symbol.asyncIterator]() {
+          await new Promise<void>((resolve) => {
+            resolveQuery = resolve;
+          });
+          yield {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-cmd",
+            total_cost_usd: 0,
+            duration_ms: 50,
+          };
+        },
+        interrupt: vi.fn(() => {
+          resolveQuery?.();
+          throw new Error("interrupt failed");
+        }),
+      };
+      mockQueryIterator.mockReturnValueOnce(hangingIterable);
+
+      const queryPromise = manager.sendMessage(sessionId, "Make me busy");
+      await new Promise((r) => setTimeout(r, 10));
+
+      ws.send.mockClear();
+
+      // Mock for the new session created by /clear
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-after-err" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-after-err",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      // /clear should succeed despite interrupt() throwing
+      await manager.sendMessage(sessionId, "/clear");
+      await queryPromise;
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+
+      // context_cleared should still be sent
+      const cleared = sent.find((m: Record<string, unknown>) => m.type === "context_cleared");
+      expect(cleared).toBeDefined();
+
+      // New session should be created despite the error
+      const sessionInfo = sent.find((m: Record<string, unknown>) => m.type === "session_info");
+      expect(sessionInfo).toBeDefined();
+      expect(sessionInfo.sessionId).toBe("sess-after-err");
+    });
+
     it("text not starting with / goes to SDK normally", async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian, questionRelayer);
