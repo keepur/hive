@@ -407,10 +407,7 @@ export class SessionManager {
   private async handleClear(sessionId: string, slot: SessionSlot): Promise<void> {
     const cwd = slot.cwd;
 
-    // 1. Notify client to wipe the chat view
-    this.send({ type: "context_cleared", oldSessionId: sessionId, sessionId });
-
-    // 2. Tear down old session inline
+    // 1. Tear down old session inline
     slot.cleared = true;
     if (slot.activeQuery) {
       try {
@@ -431,6 +428,11 @@ export class SessionManager {
     this.sessions.delete(sessionId);
     this.persistSessions();
     log.info("Session torn down for /clear", { sessionId });
+
+    // 2. Notify client to wipe the chat view — sent AFTER slot deletion so
+    // send() routes to globalBuffer (not the now-deleted per-session buffer).
+    // This ensures context_cleared survives client disconnection.
+    this.send({ type: "context_cleared", oldSessionId: sessionId, sessionId });
 
     // 3. Create fresh session on same workspace
     await this.newSession(cwd);
