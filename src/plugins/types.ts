@@ -1,6 +1,10 @@
 export interface PluginMcpServer {
   entry: string;
   description?: string;
+  /** When to use this server — guidance for agents */
+  usage?: string;
+  /** Common misuse — "for X, use Y instead" */
+  notFor?: string;
   env?: string[]; // pass-through from base env (same name)
   envMap?: Record<string, string>; // rename: SERVER_VAR -> BASE_VAR
   agentEnv?: Record<string, string>;
