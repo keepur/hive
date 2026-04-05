@@ -103,7 +103,8 @@ export class CodeIndexPrefetcher {
 
             if (records.length > 0) {
               const lines = records.map(
-                (r) => `- ${String((r as Record<string, unknown>).topic ?? "").replace(/^code:/, "")}: ${String((r as Record<string, unknown>).content ?? "")}`,
+                (r) =>
+                  `- ${String((r as Record<string, unknown>).topic ?? "").replace(/^code:/, "")}: ${String((r as Record<string, unknown>).content ?? "")}`,
               );
               sections.push("**Previous session insights:**\n" + lines.join("\n"));
             }
@@ -126,7 +127,8 @@ export class CodeIndexPrefetcher {
 
   /** Extract probable file paths from conversation text */
   private extractFilePaths(text: string): string[] {
-    const pathRegex = /(?:^|\s|`|"|')((src|plugins|dist|docs|scripts|setup|skills|service|agents-templates|test)\/.{1,200}\.(ts|tsx|js|jsx|json|yaml|yml|md))\b/gm;
+    const pathRegex =
+      /(?:^|\s|`|"|')((src|plugins|dist|docs|scripts|setup|skills|service|agents-templates|test)\/.{1,200}\.(ts|tsx|js|jsx|json|yaml|yml|md))\b/gm;
     const paths = new Set<string>();
     let match: RegExpExecArray | null;
     while ((match = pathRegex.exec(text)) !== null) {

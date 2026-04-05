@@ -4,8 +4,16 @@ import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "./s
 describe("SERVER_CATALOG", () => {
   it("contains entries for all commonly used servers", () => {
     const expected = [
-      "hubspot-crm", "google", "memory", "contacts", "slack",
-      "brave-search", "resend", "catalog", "crm-search", "keychain",
+      "hubspot-crm",
+      "google",
+      "memory",
+      "contacts",
+      "slack",
+      "brave-search",
+      "resend",
+      "catalog",
+      "crm-search",
+      "keychain",
     ];
     for (const name of expected) {
       expect(SERVER_CATALOG[name]).toBeDefined();
