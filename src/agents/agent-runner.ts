@@ -770,8 +770,11 @@ export class AgentRunner {
           let codeContext = "";
           if (prefetcher && input?.transcript_path) {
             try {
-              const transcript = await readFile(input.transcript_path, "utf-8");
-              if (transcript.length > 0) {
+              const raw = await readFile(input.transcript_path, "utf-8");
+              if (raw.length > 0) {
+                // Cap input — this hook fires on large sessions; Layer 1 regex scans the full string
+                const MAX_TRANSCRIPT_BYTES = 200_000;
+                const transcript = raw.length > MAX_TRANSCRIPT_BYTES ? raw.slice(-MAX_TRANSCRIPT_BYTES) : raw;
                 codeContext = await prefetcher.getCompactionContext(transcript, agentId);
               }
             } catch (err) {
