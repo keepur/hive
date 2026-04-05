@@ -102,7 +102,7 @@ export class AgentRunner {
     if (delegates.length > 0) {
       const lines = delegates.map((s) => formatCatalogEntry(s, this.getServerCatalogEntry(s)));
       parts.push(
-        `## Available via subagents\n\nUse the Agent tool to delegate tasks to these specialists:\n${lines.join("\n")}`,
+        `## Available via subagents\n\nYou have additional capabilities through delegation. If a task involves any of these domains, use the Agent tool — do NOT say you lack access:\n${lines.join("\n")}`,
       );
     }
 
