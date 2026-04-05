@@ -418,12 +418,14 @@ export class SessionManager {
       } catch (err) {
         log.error("Failed to interrupt session during /clear", { sessionId, error: String(err) });
       }
-      if (slot.queryDone) {
-        try {
-          await slot.queryDone;
-        } catch {
-          // Already handled inside runQuery
-        }
+    }
+    // Await queryDone independently — activeQuery is nulled in runQuery's finally
+    // block before queryDone resolves, so the guard must be separate to avoid a race.
+    if (slot.queryDone) {
+      try {
+        await slot.queryDone;
+      } catch {
+        // Already handled inside runQuery
       }
     }
     this.sessions.delete(sessionId);
