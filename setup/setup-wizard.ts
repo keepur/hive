@@ -469,7 +469,7 @@ async function main() {
   console.log(`  Dev mode:   npm run dev  (from ${ROOT})`);
   console.log(`  Redeploy:   bash ${ROOT}/service/deploy.sh`);
   console.log("");
-  console.log("Your chief-of-staff agent is in agents/chief-of-staff/.");
+  console.log("Your chief-of-staff agent is stored in the agent_definitions collection.");
   console.log("Additional agents can be created through the chief of staff.");
   console.log("");
 
@@ -584,20 +584,9 @@ async function doAgent(hive: Record<string, any>) {
   hive.agents["chief-of-staff"] = { name: agentName };
   saveHiveYaml(hive);
 
-  // Generate only chief-of-staff from templates
-  console.log("  Generating agent from template...");
-  execSync("npx tsx setup/generate-agents.ts", { cwd: ROOT, stdio: "inherit" });
-
-  // Remove any other agents that got generated
-  const { readdirSync, rmSync } = await import("node:fs");
-  const agentsDir = join(ROOT, "agents");
-  if (existsSync(agentsDir)) {
-    for (const dir of readdirSync(agentsDir)) {
-      if (dir !== "chief-of-staff") {
-        rmSync(join(agentsDir, dir), { recursive: true, force: true });
-      }
-    }
-  }
+  // Seed chief-of-staff into agent_definitions via setup:seeds
+  console.log("  Seeding agent definition...");
+  execSync("npx tsx setup/setup-seeds.ts", { cwd: ROOT, stdio: "inherit" });
 
   console.log(`  ✓ ${agentName} (Chief of Staff) is ready`);
 }
@@ -617,7 +606,7 @@ async function doConstitution(hive: Record<string, any>) {
   if (!hive.constitution) hive.constitution = {};
 
   // 1. Agent management
-  console.log(`── Agent files (agents/ directory)`);
+  console.log(`── Agent definitions (agent_definitions collection)`);
   console.log(`${cosName} can create new agents, edit their personality and config,`);
   console.log(`and manage the team roster.\n`);
   hive.constitution.cosCanManageAgents = true;
@@ -779,13 +768,6 @@ async function doDeploy(deployDir: string) {
     const { copyFileSync } = await import("node:fs");
     copyFileSync(hiveSrc, join(deployDir, "hive.yaml"));
     console.log("  ✓ hive.yaml");
-  }
-
-  // agents/
-  const agentsSrc = join(ROOT, "agents");
-  if (existsSync(agentsSrc)) {
-    execSync(`rsync -a --delete "${agentsSrc}/" "${join(deployDir, "agents")}/"`, { stdio: "pipe" });
-    console.log("  ✓ agents/");
   }
 
   // dist/ (build output)

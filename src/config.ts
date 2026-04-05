@@ -260,7 +260,7 @@ export const config = {
     retentionDays: parseInt(optional("ACTIVITY_RETENTION_DAYS", String(hive.activity?.retentionDays ?? 90)), 10),
   },
   autoDream: {
-    enabled: (hive.autoDream?.enabled ?? false) as boolean,
+    enabled: (hive.autoDream?.enabled ?? true) as boolean,
     idleThresholdMinutes: parseInt(
       optional("AUTODREAM_IDLE_THRESHOLD_MINUTES", String(hive.autoDream?.idleThresholdMinutes ?? 30)),
       10,
