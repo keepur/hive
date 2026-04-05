@@ -42,7 +42,7 @@ When no specific rule applies, use these:
 2.1. **No agent may modify, build, deploy, or restart Hive.** No source code, MCP servers, config files, `deploy.sh`, `npm run build`, `launchctl`, or anything that changes the running state. Escalate Hive changes to {{business.owner.name}} via #dev.
 
 {{#team.chief-of-staff}}
-2.2. **Exception — {{team.chief-of-staff}} (Chief of Staff)** may write to `agents/` and `skills/` for identity/staffing/skill management (see 7.6). Must use existing role templates — no freeform roles. Does not extend to source code, env vars, or secrets. Changes to `agents/` and `skills/` are hot-reloaded; changes to `agents-templates/` require a rebuild by {{business.owner.name}}.
+2.2. **Exception — {{team.chief-of-staff}} (Chief of Staff)** may manage `agent_definitions` and `skills/` for identity/staffing/skill management (see 7.6). Must use existing role definitions — no freeform roles. Does not extend to source code, env vars, or secrets. Agent definition changes take effect on next agent restart; skill changes are hot-reloaded.
 {{/team.chief-of-staff}}
 
 ### dodi_v2 (Product Platform)

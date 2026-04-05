@@ -23,17 +23,16 @@ source "$DEPLOY_DIR/.env"
 
 # --- Load instances ---
 declare -a INSTANCES=()
-while IFS='|' read -r id config agents_path label logs_dir ports; do
+while IFS='|' read -r id config _agents_path label logs_dir ports; do
   [[ "$id" =~ ^[[:space:]]*# ]] && continue  # skip comments
   [[ -z "$id" ]] && continue                  # skip blank lines
   # Trim whitespace
   id=$(echo "$id" | xargs)
   config=$(echo "$config" | xargs)
-  agents_path=$(echo "$agents_path" | xargs)
   label=$(echo "$label" | xargs)
   logs_dir=$(echo "$logs_dir" | xargs)
   ports=$(echo "$ports" | xargs)
-  INSTANCES+=("$id|$config|$agents_path|$label|$logs_dir|$ports")
+  INSTANCES+=("$id|$config|$label|$logs_dir|$ports")
 done < "$INSTANCES_CONF"
 
 if [[ ${#INSTANCES[@]} -eq 0 ]]; then
@@ -161,44 +160,16 @@ run_cmd rsync -a --delete "$BUILD_DIR/dist/" "$DEPLOY_DIR/dist/"
 FAILED_INSTANCES=()
 
 for inst in "${INSTANCES[@]}"; do
-  IFS='|' read -r id config agents_path label logs_dir ports <<< "$inst"
+  IFS='|' read -r id config label logs_dir ports <<< "$inst"
 
   echo ""
   echo "--- Phase 2: Deploy instance '$id' ---"
-  echo "  config=$config agents=$agents_path label=$label logs=$logs_dir ports=$ports"
+  echo "  config=$config label=$label logs=$logs_dir ports=$ports"
 
   cd "$DEPLOY_DIR"
 
   # Ensure logs dir exists
   mkdir -p "$DEPLOY_DIR/$logs_dir"
-
-  # Derive MONGODB_DB from instance id
-  mongo_db="hive_${id}"
-
-  # Generate agents for this instance
-  echo "  Generating agents..."
-  cd "$BUILD_DIR"
-  if ! HIVE_CONFIG="$DEPLOY_DIR/$config" \
-       AGENTS_PATH="$DEPLOY_DIR/$agents_path" \
-       MONGODB_DB="$mongo_db" \
-       run_cmd npx tsx setup/generate-agents.ts; then
-    echo "  ERROR: Agent generation failed for $id"
-    FAILED_INSTANCES+=("$id")
-    continue
-  fi
-
-  cd "$DEPLOY_DIR"
-
-  # Backup current agents for this instance
-  if [[ -d "$DEPLOY_DIR/$agents_path" ]]; then
-    run_cmd rm -rf "$DEPLOY_DIR/${agents_path}.bak"
-    run_cmd cp -a "$DEPLOY_DIR/$agents_path" "$DEPLOY_DIR/${agents_path}.bak"
-  fi
-
-  # Sync agents from build output
-  if [[ -d "$BUILD_DIR/$agents_path" ]]; then
-    run_cmd rsync -a --delete "$BUILD_DIR/$agents_path/" "$DEPLOY_DIR/$agents_path/"
-  fi
 
   # Restart this instance
   echo "  Restarting $label..."
@@ -208,30 +179,12 @@ for inst in "${INSTANCES[@]}"; do
   # Health check
   echo "  Checking health..."
   if ! health_check "$DEPLOY_DIR/$logs_dir/hive.log"; then
-    echo "  Health check FAILED for $id — rolling back agents..."
-
-    if [[ -d "$DEPLOY_DIR/${agents_path}.bak" ]]; then
-      run_cmd rm -rf "$DEPLOY_DIR/$agents_path"
-      run_cmd mv "$DEPLOY_DIR/${agents_path}.bak" "$DEPLOY_DIR/$agents_path"
-    fi
-
-    kill_ports "$ports"
-    run_cmd launchctl kickstart -k "gui/$(id -u)/$label"
-
-    if health_check "$DEPLOY_DIR/$logs_dir/hive.log"; then
-      echo "  Rollback succeeded for $id."
-    else
-      echo "  CRITICAL: Rollback ALSO failed for $id."
-    fi
-
+    echo "  Health check FAILED for $id"
     FAILED_INSTANCES+=("$id")
     continue
   fi
 
   echo "  Instance '$id' is healthy."
-
-  # Cleanup backup
-  run_cmd rm -rf "$DEPLOY_DIR/${agents_path}.bak"
 done
 
 # =============================================================================

@@ -3,7 +3,7 @@
  * Sync Claude Code plugins from cache/marketplaces → plugins/claude-code/.
  *
  * Usage:
- *   npx tsx setup/generate-agents.ts
+ *   npx tsx setup/sync-plugins.ts
  */
 
 import { existsSync, mkdirSync, readdirSync, statSync, cpSync, rmSync } from "node:fs";

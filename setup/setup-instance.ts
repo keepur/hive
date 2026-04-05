@@ -203,7 +203,7 @@ async function main() {
 
   console.log("\n✓ Instance configured. Next steps:");
   console.log("  1. Edit .env with your Slack tokens and API keys");
-  console.log("  2. npm run setup:agents    — generate agent configs");
+  console.log("  2. npm run setup:seeds     — seed agent definitions into MongoDB");
   console.log("  3. npm run setup:plist     — generate LaunchAgent plists");
   console.log("  4. service/install.sh      — install and start service");
   console.log("");

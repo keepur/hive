@@ -1,11 +1,11 @@
 /**
- * Shared template renderer for Hive agent generation and setup wizard.
+ * Shared template renderer for Hive setup wizard (constitution templates, etc.).
  *
  * Supports:
  *   {{key.sub-key}}                    – dot-path variable substitution (hyphens OK)
  *   {{#path.to.key}}...{{/path.to.key}} – conditional blocks (truthy = render, falsy = remove)
  *   {{^path.to.key}}...{{/path.to.key}} – inverted blocks (falsy = render, truthy = remove)
- *   {{#sms_section}}...{{/sms_section}} – special SMS block (kept in generate-agents)
+ *   {{#sms_section}}...{{/sms_section}} – special SMS block
  */
 
 import { createHash } from "node:crypto";
