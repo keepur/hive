@@ -17,6 +17,7 @@ export interface SessionSlot {
   activeQuery: Query | null;
   state: "idle" | "busy";
   cleared?: boolean;
+  clearing?: boolean;
   interrupted?: boolean;
   /** Resolves when runQuery finishes after a clear/interrupt */
   queryDone?: Promise<string>;
@@ -397,14 +398,22 @@ export class SessionManager {
    * /clear — destroy the current session and create a fresh one.
    *
    * Flow:
-   * 1. Send context_cleared to client FIRST (so it can wipe the chat view)
-   * 2. Tear down the old session inline (interrupt if busy, remove from map)
+   * 1. Tear down the old session inline (interrupt if busy, remove from map)
+   * 2. Send context_cleared to client (after slot deletion so it routes to
+   *    globalBuffer when offline, not the now-deleted per-session buffer)
    * 3. Call newSession(cwd) — spawns fresh SDK session
    *
    * Does NOT call clearSession() — that emits session_cleared which would
    * create confusing duplicate signals for the client.
+   *
+   * Guarded by slot.clearing to prevent concurrent /clear calls from
+   * creating duplicate sessions.
    */
   private async handleClear(sessionId: string, slot: SessionSlot): Promise<void> {
+    // Guard against concurrent /clear calls on the same session
+    if (slot.clearing) return;
+    slot.clearing = true;
+
     const cwd = slot.cwd;
 
     // 1. Tear down old session inline
@@ -435,7 +444,15 @@ export class SessionManager {
     this.send({ type: "context_cleared", oldSessionId: sessionId, sessionId });
 
     // 3. Create fresh session on same workspace
-    await this.newSession(cwd);
+    try {
+      await this.newSession(cwd);
+    } catch (err) {
+      log.error("Failed to create new session after /clear", { cwd, error: String(err) });
+      this.send({
+        type: "error",
+        message: `Context cleared but failed to start new session: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
   }
 
   /**

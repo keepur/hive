@@ -890,6 +890,81 @@ describe("SessionManager", () => {
       expect(sessionInfo.sessionId).toBe("sess-after-err");
     });
 
+    it("/clear when newSession() SDK fails — sends error, does not throw", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      // Mock newSession's query to throw — runQuery catches internally
+      mockQueryIterator.mockReturnValueOnce({
+        // eslint-disable-next-line require-yield
+        async *[Symbol.asyncIterator]() {
+          throw new Error("SDK connection failed");
+        },
+        interrupt: vi.fn(),
+      });
+
+      // Should not throw — handleClear wraps newSession in try/catch
+      await manager.sendMessage(sessionId, "/clear");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+
+      // context_cleared should still be sent
+      const cleared = sent.find((m: Record<string, unknown>) => m.type === "context_cleared");
+      expect(cleared).toBeDefined();
+
+      // Error from runQuery should reach the client
+      const errorMsg = sent.find((m: Record<string, unknown>) => m.type === "error");
+      expect(errorMsg).toBeDefined();
+      expect(errorMsg.message).toContain("SDK connection failed");
+
+      // Old session should be gone
+      ws.send.mockClear();
+      await manager.sendMessage(sessionId, "after clear");
+      const errorSent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+      expect(errorSent.find((m: Record<string, unknown>) => m.type === "error")).toBeDefined();
+    });
+
+    it("concurrent /clear calls — second call is a no-op", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      // Mock for the new session created by first /clear
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-only-one" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-only-one",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      // Fire two /clear calls concurrently
+      const [result1, result2] = await Promise.all([
+        manager.sendMessage(sessionId, "/clear"),
+        manager.sendMessage(sessionId, "/clear"),
+      ]);
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+
+      // Only ONE context_cleared should be sent
+      const clearedMessages = sent.filter((m: Record<string, unknown>) => m.type === "context_cleared");
+      expect(clearedMessages).toHaveLength(1);
+
+      // Only ONE new session should be created
+      const sessionInfoMessages = sent.filter((m: Record<string, unknown>) => m.type === "session_info");
+      expect(sessionInfoMessages).toHaveLength(1);
+      expect(sessionInfoMessages[0].sessionId).toBe("sess-only-one");
+    });
+
     it("text not starting with / goes to SDK normally", async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian, questionRelayer);
