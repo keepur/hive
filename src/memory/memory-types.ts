@@ -26,6 +26,7 @@ export interface MemoryRecord {
   qdrantPointId: string;
   purged?: boolean;
   purgedAt?: Date;
+  needsReview?: boolean; // Contradiction detection couldn't resolve automatically
 }
 
 export interface MemoryRecordInput {
@@ -64,6 +65,25 @@ export interface MemoryLifecycleConfig {
   coldSummaryMinRecords: number;
   coldRetentionDays: number;
   purgeRetentionDays: number;
+}
+
+export interface DreamConfig {
+  enabled: boolean;
+  idleThresholdMinutes: number;
+  cooldownMinutes: number;
+  similarityThreshold: number;
+  patternMinCount: number;
+  maxClustersPerRun: number;
+  maxContradictionPairsPerRun: number;
+  maxPromotionsPerRun: number;
+}
+
+export interface DreamResult {
+  merged: number;
+  contradictions: number;
+  promoted: number;
+  flaggedForReview: number;
+  errors: string[];
 }
 
 export const IMPORTANCE_WEIGHTS: Record<MemoryImportance, number> = {
