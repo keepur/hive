@@ -33,3 +33,6 @@ jobs:
 
       - name: Test
         run: npm run test
+        env:
+          SLACK_APP_TOKEN: xapp-test-placeholder
+          SLACK_BOT_TOKEN: xoxb-test-placeholder
