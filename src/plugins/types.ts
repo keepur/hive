@@ -15,6 +15,8 @@ export interface PluginManifest {
   description?: string;
   mcpServers: Record<string, PluginMcpServer>;
   agentSeeds: string[];
+  /** Optional: path to a JS module that exports registerCommands(registry) for Team slash commands */
+  registerCommands?: string;
 }
 
 export interface LoadedPlugin {

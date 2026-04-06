@@ -305,6 +305,32 @@ async function main(): Promise<void> {
     log.info("iMessage adapter started");
   }
 
+  // Set AgentRunner registry ref for Team MCP server
+  const { AgentRunner } = await import("./agents/agent-runner.js");
+  AgentRunner.registryRef = registry;
+
+  // Team layer — channels, DMs, commands
+  let teamStore: import("./team/team-store.js").TeamStore | undefined;
+  let commandRegistry: import("./team/command-registry.js").CommandRegistry | undefined;
+
+  if (config.team.enabled) {
+    const { TeamStore } = await import("./team/team-store.js");
+    const { CommandRegistry } = await import("./team/command-registry.js");
+
+    teamStore = new TeamStore(config.mongo.uri, config.mongo.dbName);
+    await teamStore.connect();
+
+    commandRegistry = new CommandRegistry(teamStore);
+    dispatcher.setTeamStore(teamStore);
+
+    log.info("Team layer initialized");
+  }
+
+  if (commandRegistry) {
+    const { registerPluginCommands } = await import("./plugins/plugin-loader.js");
+    await registerPluginCommands(agentManager.getPlugins(), commandRegistry);
+  }
+
   // WebSocket adapter — mobile app channel
   let wsAdapter: import("./channels/ws/ws-adapter.js").WsAdapter | undefined;
   if (config.ws.enabled && config.ws.jwtSecret) {
@@ -314,7 +340,7 @@ async function main(): Promise<void> {
     const deviceRegistry = new DeviceRegistry(config.mongo.uri, config.mongo.dbName, config.ws.jwtSecret);
     await deviceRegistry.connect();
 
-    wsAdapter = new WsAdapter(config.ws.port, deviceRegistry, config.ws.jwtSecret);
+    wsAdapter = new WsAdapter(config.ws.port, deviceRegistry, config.ws.jwtSecret, teamStore, commandRegistry);
     dispatcher.registerAdapter(wsAdapter);
     await wsAdapter.start((item) => {
       dispatcher.dispatch(item).catch((err) => {
@@ -397,6 +423,7 @@ async function main(): Promise<void> {
     await smsAdapter.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
     if (wsAdapter) await wsAdapter.stop();
+    if (teamStore) await teamStore.close();
     scheduler.stop();
     bgTaskManager.stop();
     codeTaskManager.stop();

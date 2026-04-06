@@ -69,5 +69,25 @@ export function normalizeManifest(raw: any): PluginManifest {
       ]),
     ),
     agentSeeds: raw["agent-seeds"] ?? raw["agents-templates"] ?? [],
+    registerCommands: raw["register-commands"] ?? undefined,
   };
+}
+
+export async function registerPluginCommands(
+  plugins: LoadedPlugin[],
+  registry: import("../team/command-registry.js").CommandRegistry,
+): Promise<void> {
+  for (const plugin of plugins) {
+    if (!plugin.manifest.registerCommands) continue;
+    try {
+      const modulePath = resolve(plugin.dir, "dist", plugin.manifest.registerCommands);
+      const mod = await import(modulePath);
+      if (typeof mod.registerCommands === "function") {
+        mod.registerCommands(registry);
+        log.info("Plugin commands registered", { plugin: plugin.name });
+      }
+    } catch (err) {
+      log.warn("Failed to load plugin commands", { plugin: plugin.name, error: String(err) });
+    }
+  }
 }

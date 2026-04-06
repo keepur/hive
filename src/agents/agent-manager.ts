@@ -50,6 +50,10 @@ export class AgentManager {
     this.skillIndex = loadSkillIndex();
   }
 
+  getPlugins(): LoadedPlugin[] {
+    return this.plugins;
+  }
+
   private createRunner(agentId: string): AgentRunner {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);

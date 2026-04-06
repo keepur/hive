@@ -178,6 +178,9 @@ export const config = {
     port: parseInt(optional("WS_PORT", String(ports.ws ?? portBase + 3)), 10),
     jwtSecret: optional("WS_JWT_SECRET", ""),
   },
+  team: {
+    enabled: optional("TEAM_ENABLED", "false") === "true",
+  },
   adminApi: {
     port: parseInt(optional("ADMIN_API_PORT", String(ports.adminApi ?? portBase + 4)), 10),
     token: optional("ADMIN_API_TOKEN", ""),
