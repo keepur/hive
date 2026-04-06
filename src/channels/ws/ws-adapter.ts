@@ -5,9 +5,11 @@ import { createLogger } from "../../logging/logger.js";
 import type { ChannelAdapter } from "../channel-adapter.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../../types/work-item.js";
 import type { DeviceRegistry, Device } from "./device-registry.js";
-import type { ServerMessage } from "./protocol.js";
-import { parseClientMessage } from "./protocol.js";
-import { processImageBuffer } from "../../files/file-processor.js";
+import type { ServerMessage, ClientTeamMessage, ClientTeamImage, ClientTeamFile, ClientJoin, ClientLeave, ClientCommand, ClientCommandList, ClientChannelList, ClientHistory } from "./protocol.js";
+import { parseClientMessage, isTeamMessage } from "./protocol.js";
+import { processImageBuffer, processFileBuffer } from "../../files/file-processor.js";
+import type { TeamStore } from "../../team/team-store.js";
+import type { CommandRegistry } from "../../team/command-registry.js";
 
 const log = createLogger("ws-adapter");
 
@@ -23,11 +25,21 @@ export class WsAdapter implements ChannelAdapter {
   private connections = new Map<string, WebSocket>(); // deviceId -> ws
   private pendingMessages = new Map<string, ServerMessage[]>(); // deviceId -> queued messages
   private onWorkItem!: (item: WorkItem) => void;
+  private teamStore?: TeamStore;
+  private commandRegistry?: CommandRegistry;
 
-  constructor(port: number, deviceRegistry: DeviceRegistry, adminSecret: string) {
+  constructor(
+    port: number,
+    deviceRegistry: DeviceRegistry,
+    adminSecret: string,
+    teamStore?: TeamStore,
+    commandRegistry?: CommandRegistry,
+  ) {
     this.port = port;
     this.deviceRegistry = deviceRegistry;
     this.adminSecret = adminSecret;
+    this.teamStore = teamStore;
+    this.commandRegistry = commandRegistry;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
@@ -365,6 +377,49 @@ export class WsAdapter implements ChannelAdapter {
             return;
           }
 
+          // Non-content Team messages — handle before isTeamMessage check
+          if (msg.type === "command") {
+            await this.handleCommand(ws, msg, device, deviceId);
+            return;
+          }
+
+          if (msg.type === "command_list") {
+            await this.handleCommandList(ws, msg);
+            return;
+          }
+
+          if (msg.type === "channel_list") {
+            await this.handleChannelList(ws, msg, deviceId);
+            return;
+          }
+
+          if (msg.type === "history") {
+            await this.handleHistory(ws, msg);
+            return;
+          }
+
+          if (msg.type === "join") {
+            await this.handleJoin(ws, msg, deviceId);
+            return;
+          }
+
+          if (msg.type === "leave") {
+            await this.handleLeave(ws, msg, deviceId);
+            return;
+          }
+
+          // Team content messages (message/image/file with channelId)
+          if (isTeamMessage(msg)) {
+            if (msg.type === "message") {
+              await this.handleTeamMessage(ws, msg as ClientTeamMessage, device, deviceId);
+            } else if (msg.type === "image") {
+              await this.handleTeamImage(ws, msg as ClientTeamImage, device, deviceId);
+            } else if (msg.type === "file") {
+              await this.handleTeamFile(ws, msg as ClientTeamFile, device, deviceId);
+            }
+            return;
+          }
+
           if (msg.type === "message") {
             this.send(ws, { type: "ack", id: msg.id });
 
@@ -457,13 +512,28 @@ export class WsAdapter implements ChannelAdapter {
     }
 
     const text = result.error ? `Error: ${result.error}` : result.text;
+    const channelId = result.workItem.meta?.channelId as string | undefined;
 
+    // Save agent response to team_messages if this was a Team conversation
+    if (channelId && this.teamStore) {
+      await this.teamStore.saveMessage({
+        channelId,
+        senderId: result.agentId,
+        senderType: "agent",
+        senderName: result.agentId,
+        text,
+        createdAt: new Date(),
+      });
+    }
+
+    // Include channelId in response so client knows which channel it belongs to
     const msg: ServerMessage = {
       type: "message",
       text,
       agentId: result.agentId,
       agentName: result.agentId,
       replyTo: result.workItem.id,
+      ...(channelId ? { channelId } : {}),
     };
 
     const ws = this.connections.get(deviceId);
@@ -513,6 +583,347 @@ export class WsAdapter implements ChannelAdapter {
   /** Number of currently connected devices */
   get connectionCount(): number {
     return this.connections.size;
+  }
+
+  // ── Team message handlers ──────────────────────────────────────────
+
+  private async handleTeamMessage(
+    ws: WebSocket,
+    msg: ClientTeamMessage,
+    device: Device,
+    deviceId: string,
+  ): Promise<void> {
+    this.send(ws, { type: "ack", id: msg.id });
+
+    // Save to team_messages
+    if (this.teamStore) {
+      await this.teamStore.saveMessage({
+        channelId: msg.channelId,
+        threadId: msg.threadId,
+        senderId: deviceId,
+        senderType: "person",
+        senderName: device.name,
+        text: msg.text,
+        createdAt: new Date(),
+      });
+    }
+
+    // Resolve target agent from channel membership
+    const channel = await this.teamStore?.getChannel(msg.channelId);
+    const targetAgentId =
+      channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+
+    const workItem: WorkItem = {
+      id: msg.id || randomUUID(),
+      text: msg.text,
+      source: {
+        kind: "team",
+        id: msg.channelId,
+        label: `team:${channel?.name ?? msg.channelId}`,
+        adapterId: "ws",
+      },
+      sender: deviceId,
+      senderName: device.name,
+      threadId: msg.threadId ?? `team:${msg.channelId}`,
+      timestamp: new Date(),
+      meta: {
+        deviceId,
+        channelId: msg.channelId,
+        ...(targetAgentId ? { targetAgentId } : { defaultAgentId: device.defaultAgentId }),
+      },
+    };
+
+    this.onWorkItem(workItem);
+  }
+
+  private async handleTeamImage(
+    ws: WebSocket,
+    msg: ClientTeamImage,
+    device: Device,
+    deviceId: string,
+  ): Promise<void> {
+    this.send(ws, { type: "ack", id: msg.id });
+
+    const buffer = Buffer.from(msg.data, "base64");
+    const mimetype = guessMimetype(msg.filename);
+
+    try {
+      const processed = await processImageBuffer(buffer, msg.filename, mimetype);
+
+      if (this.teamStore) {
+        await this.teamStore.saveMessage({
+          channelId: msg.channelId,
+          senderId: deviceId,
+          senderType: "person",
+          senderName: device.name,
+          text: `[Photo: ${msg.filename}]`,
+          files: [
+            {
+              name: processed.name,
+              mimetype: processed.mimetype,
+              size: processed.size,
+              storageKey: processed.localPath,
+              isImage: true,
+            },
+          ],
+          createdAt: new Date(),
+        });
+      }
+
+      const channel = await this.teamStore?.getChannel(msg.channelId);
+      const targetAgentId =
+        channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+
+      const workItem: WorkItem = {
+        id: msg.id || randomUUID(),
+        text: `[Photo: ${msg.filename}]`,
+        source: {
+          kind: "team",
+          id: msg.channelId,
+          label: `team:${channel?.name ?? msg.channelId}`,
+          adapterId: "ws",
+        },
+        sender: deviceId,
+        senderName: device.name,
+        threadId: `team:${msg.channelId}`,
+        timestamp: new Date(),
+        files: [processed],
+        meta: {
+          deviceId,
+          channelId: msg.channelId,
+          ...(targetAgentId ? { targetAgentId } : { defaultAgentId: device.defaultAgentId }),
+        },
+      };
+
+      this.onWorkItem(workItem);
+    } catch (imgErr) {
+      log.error("Team image processing failed", {
+        deviceId,
+        filename: msg.filename,
+        error: String(imgErr),
+      });
+      this.send(ws, { type: "error", message: "Failed to process image" });
+    }
+  }
+
+  private async handleTeamFile(
+    ws: WebSocket,
+    msg: ClientTeamFile,
+    device: Device,
+    deviceId: string,
+  ): Promise<void> {
+    this.send(ws, { type: "ack", id: msg.id });
+
+    const buffer = Buffer.from(msg.data, "base64");
+
+    try {
+      // Use shared file processor — handles PDF, DOCX, XLSX, text, images
+      const processed = msg.mimetype.startsWith("image/")
+        ? await processImageBuffer(buffer, msg.filename, msg.mimetype)
+        : await processFileBuffer(buffer, msg.filename, msg.mimetype);
+
+      if (this.teamStore) {
+        await this.teamStore.saveMessage({
+          channelId: msg.channelId,
+          senderId: deviceId,
+          senderType: "person",
+          senderName: device.name,
+          text: `[File: ${msg.filename}]`,
+          files: [
+            {
+              name: processed.name,
+              mimetype: processed.mimetype,
+              size: processed.size,
+              storageKey: processed.localPath,
+              isImage: processed.isImage,
+            },
+          ],
+          createdAt: new Date(),
+        });
+      }
+
+      const channel = await this.teamStore?.getChannel(msg.channelId);
+      const targetAgentId =
+        channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+
+      const workItem: WorkItem = {
+        id: msg.id || randomUUID(),
+        text: `[File: ${msg.filename}]`,
+        source: {
+          kind: "team",
+          id: msg.channelId,
+          label: `team:${channel?.name ?? msg.channelId}`,
+          adapterId: "ws",
+        },
+        sender: deviceId,
+        senderName: device.name,
+        threadId: `team:${msg.channelId}`,
+        timestamp: new Date(),
+        files: [processed],
+        meta: {
+          deviceId,
+          channelId: msg.channelId,
+          ...(targetAgentId ? { targetAgentId } : { defaultAgentId: device.defaultAgentId }),
+        },
+      };
+
+      this.onWorkItem(workItem);
+    } catch (err) {
+      log.error("Team file processing failed", {
+        deviceId,
+        filename: msg.filename,
+        error: String(err),
+      });
+      this.send(ws, { type: "error", message: "Failed to process file" });
+    }
+  }
+
+  private async handleCommand(
+    ws: WebSocket,
+    msg: ClientCommand,
+    device: Device,
+    deviceId: string,
+  ): Promise<void> {
+    this.send(ws, { type: "ack", id: msg.id });
+
+    if (!this.commandRegistry) {
+      this.send(ws, { type: "error", message: "Commands not available" });
+      return;
+    }
+
+    const { found, result } = await this.commandRegistry.execute(msg.name, {
+      channelId: msg.channelId,
+      senderId: deviceId,
+      senderName: device.name,
+      args: msg.args,
+    });
+
+    if (!found) {
+      // Fall through to agent as normal text
+      await this.handleTeamMessage(
+        ws,
+        {
+          type: "message",
+          channelId: msg.channelId,
+          text: `/${msg.name} ${msg.args.join(" ")}`.trim(),
+          id: msg.id,
+        },
+        device,
+        deviceId,
+      );
+      return;
+    }
+
+    // Save command + result as a message
+    if (this.teamStore && result) {
+      await this.teamStore.saveMessage({
+        channelId: msg.channelId,
+        senderId: "system",
+        senderType: "agent",
+        senderName: "system",
+        text: result,
+        command: { name: msg.name, args: msg.args, result },
+        createdAt: new Date(),
+      });
+    }
+
+    // Send result back as a regular message
+    this.send(ws, {
+      type: "message",
+      text: result ?? "Done.",
+      agentId: "system",
+      agentName: "system",
+      replyTo: msg.id,
+    });
+  }
+
+  private async handleCommandList(ws: WebSocket, msg: ClientCommandList): Promise<void> {
+    const commands = this.commandRegistry?.list() ?? [];
+    this.send(ws, {
+      type: "command_list",
+      commands: commands.map((c) => ({
+        name: c.name,
+        description: c.description,
+        args: c.args,
+      })),
+      id: msg.id,
+    });
+  }
+
+  private async handleChannelList(
+    ws: WebSocket,
+    msg: ClientChannelList,
+    deviceId: string,
+  ): Promise<void> {
+    const channels = (await this.teamStore?.listChannels(deviceId)) ?? [];
+    this.send(ws, {
+      type: "channel_list",
+      channels: channels.map((c) => ({
+        id: c._id,
+        type: c.type,
+        name: c.name,
+        members: c.members,
+      })),
+      id: msg.id,
+    });
+  }
+
+  private async handleHistory(ws: WebSocket, msg: ClientHistory): Promise<void> {
+    if (!this.teamStore) {
+      this.send(ws, { type: "error", message: "Team store not available" });
+      return;
+    }
+
+    const { messages, hasMore } = await this.teamStore.getHistory(msg.channelId, {
+      before: msg.before,
+      limit: msg.limit,
+    });
+
+    this.send(ws, {
+      type: "history",
+      channelId: msg.channelId,
+      messages: messages.map((m) => ({
+        id: m._id ?? "",
+        senderId: m.senderId,
+        senderType: m.senderType,
+        senderName: m.senderName,
+        text: m.text,
+        threadId: m.threadId,
+        createdAt: m.createdAt.toISOString(),
+      })),
+      hasMore,
+      id: msg.id,
+    });
+  }
+
+  private async handleJoin(ws: WebSocket, msg: ClientJoin, deviceId: string): Promise<void> {
+    const ok = await this.teamStore?.joinChannel(msg.channelId, deviceId);
+    if (ok) {
+      this.send(ws, {
+        type: "channel_event",
+        channelId: msg.channelId,
+        event: "joined",
+        detail: { memberId: deviceId },
+        id: msg.id,
+      });
+    } else {
+      this.send(ws, { type: "error", message: "Failed to join channel" });
+    }
+  }
+
+  private async handleLeave(ws: WebSocket, msg: ClientLeave, deviceId: string): Promise<void> {
+    const ok = await this.teamStore?.leaveChannel(msg.channelId, deviceId);
+    if (ok) {
+      this.send(ws, {
+        type: "channel_event",
+        channelId: msg.channelId,
+        event: "left",
+        detail: { memberId: deviceId },
+        id: msg.id,
+      });
+    } else {
+      this.send(ws, { type: "error", message: "Failed to leave channel" });
+    }
   }
 
   private async verifyDeviceToken(req: IncomingMessage): Promise<Device | null> {

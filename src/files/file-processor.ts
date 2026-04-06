@@ -280,6 +280,75 @@ export async function processImageBuffer(buffer: Buffer, filename: string, mimet
   };
 }
 
+/** Process a raw file buffer (non-image) into a ProcessedFile — PDF, DOCX, XLSX, text, etc. */
+export async function processFileBuffer(
+  buffer: Buffer,
+  filename: string,
+  mimetype: string,
+): Promise<ProcessedFile> {
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const localPath = join(DOWNLOAD_DIR, `team-${Date.now()}-${safeName}`);
+  writeFileSync(localPath, buffer);
+
+  const ext = extname(filename).slice(1).toLowerCase();
+  const isImage = IMAGE_TYPES.has(ext) || mimetype.startsWith("image/");
+
+  // Images — use processImageBuffer instead
+  if (isImage) {
+    return processImageBuffer(buffer, filename, mimetype);
+  }
+
+  // Text-based files
+  if (TEXT_TYPES.has(ext) || mimetype.startsWith("text/")) {
+    const text = buffer.toString("utf-8");
+    return { name: filename, mimetype, size: buffer.length, localPath, textContent: truncate(text), isImage: false };
+  }
+
+  // PDF
+  if (ext === "pdf" || mimetype === "application/pdf") {
+    try {
+      const pdfModule = await import("pdf-parse");
+      const pdfParse = (pdfModule as any).default ?? pdfModule;
+      const result = await pdfParse(buffer);
+      return { name: filename, mimetype, size: buffer.length, localPath, textContent: truncate(result.text), isImage: false };
+    } catch (e: any) {
+      log.warn("PDF parse failed", { name: filename, error: e.message });
+      return { name: filename, mimetype, size: buffer.length, localPath, textContent: "[PDF — could not extract text]", isImage: false };
+    }
+  }
+
+  // DOCX
+  if (ext === "docx" || mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    try {
+      const mammoth = await import("mammoth");
+      const result = await mammoth.extractRawText({ buffer });
+      return { name: filename, mimetype, size: buffer.length, localPath, textContent: truncate(result.value), isImage: false };
+    } catch (e: any) {
+      log.warn("DOCX parse failed", { name: filename, error: e.message });
+      return { name: filename, mimetype, size: buffer.length, localPath, textContent: "[DOCX — could not extract text]", isImage: false };
+    }
+  }
+
+  // XLSX
+  if (ext === "xlsx" || ext === "xls" || mimetype.includes("spreadsheet")) {
+    try {
+      const XLSX = await import("xlsx");
+      const workbook = XLSX.read(buffer, { type: "buffer" });
+      const sheets = workbook.SheetNames.map((name) => {
+        const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[name]);
+        return `--- Sheet: ${name} ---\n${csv}`;
+      });
+      return { name: filename, mimetype, size: buffer.length, localPath, textContent: truncate(sheets.join("\n\n")), isImage: false };
+    } catch (e: any) {
+      log.warn("XLSX parse failed", { name: filename, error: e.message });
+      return { name: filename, mimetype, size: buffer.length, localPath, textContent: "[Spreadsheet — could not extract content]", isImage: false };
+    }
+  }
+
+  // Unsupported
+  return { name: filename, mimetype, size: buffer.length, localPath, textContent: null, isImage: false };
+}
+
 /** Format processed files as text to append to the agent prompt */
 export function formatFilesForPrompt(files: ProcessedFile[]): string {
   if (files.length === 0) return "";
