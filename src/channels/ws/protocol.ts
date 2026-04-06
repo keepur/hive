@@ -302,8 +302,6 @@ export function parseClientMessage(raw: string): ClientMessage | null {
 }
 
 /** Type guard: does this message have a channelId (Team-aware)? */
-export function isTeamMessage(
-  msg: ClientMessage,
-): msg is ClientTeamMessage | ClientTeamImage | ClientTeamFile {
+export function isTeamMessage(msg: ClientMessage): msg is ClientTeamMessage | ClientTeamImage | ClientTeamFile {
   return "channelId" in msg;
 }

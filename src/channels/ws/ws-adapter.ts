@@ -5,7 +5,18 @@ import { createLogger } from "../../logging/logger.js";
 import type { ChannelAdapter } from "../channel-adapter.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../../types/work-item.js";
 import type { DeviceRegistry, Device } from "./device-registry.js";
-import type { ServerMessage, ClientTeamMessage, ClientTeamImage, ClientTeamFile, ClientJoin, ClientLeave, ClientCommand, ClientCommandList, ClientChannelList, ClientHistory } from "./protocol.js";
+import type {
+  ServerMessage,
+  ClientTeamMessage,
+  ClientTeamImage,
+  ClientTeamFile,
+  ClientJoin,
+  ClientLeave,
+  ClientCommand,
+  ClientCommandList,
+  ClientChannelList,
+  ClientHistory,
+} from "./protocol.js";
 import { parseClientMessage, isTeamMessage } from "./protocol.js";
 import { processImageBuffer, processFileBuffer } from "../../files/file-processor.js";
 import type { TeamStore } from "../../team/team-store.js";
@@ -610,8 +621,7 @@ export class WsAdapter implements ChannelAdapter {
 
     // Resolve target agent from channel membership
     const channel = await this.teamStore?.getChannel(msg.channelId);
-    const targetAgentId =
-      channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+    const targetAgentId = channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
 
     const workItem: WorkItem = {
       id: msg.id || randomUUID(),
@@ -636,12 +646,7 @@ export class WsAdapter implements ChannelAdapter {
     this.onWorkItem(workItem);
   }
 
-  private async handleTeamImage(
-    ws: WebSocket,
-    msg: ClientTeamImage,
-    device: Device,
-    deviceId: string,
-  ): Promise<void> {
+  private async handleTeamImage(ws: WebSocket, msg: ClientTeamImage, device: Device, deviceId: string): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
 
     const buffer = Buffer.from(msg.data, "base64");
@@ -671,8 +676,7 @@ export class WsAdapter implements ChannelAdapter {
       }
 
       const channel = await this.teamStore?.getChannel(msg.channelId);
-      const targetAgentId =
-        channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+      const targetAgentId = channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
 
       const workItem: WorkItem = {
         id: msg.id || randomUUID(),
@@ -706,12 +710,7 @@ export class WsAdapter implements ChannelAdapter {
     }
   }
 
-  private async handleTeamFile(
-    ws: WebSocket,
-    msg: ClientTeamFile,
-    device: Device,
-    deviceId: string,
-  ): Promise<void> {
+  private async handleTeamFile(ws: WebSocket, msg: ClientTeamFile, device: Device, deviceId: string): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
 
     const buffer = Buffer.from(msg.data, "base64");
@@ -743,8 +742,7 @@ export class WsAdapter implements ChannelAdapter {
       }
 
       const channel = await this.teamStore?.getChannel(msg.channelId);
-      const targetAgentId =
-        channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+      const targetAgentId = channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
 
       const workItem: WorkItem = {
         id: msg.id || randomUUID(),
@@ -778,12 +776,7 @@ export class WsAdapter implements ChannelAdapter {
     }
   }
 
-  private async handleCommand(
-    ws: WebSocket,
-    msg: ClientCommand,
-    device: Device,
-    deviceId: string,
-  ): Promise<void> {
+  private async handleCommand(ws: WebSocket, msg: ClientCommand, device: Device, deviceId: string): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
 
     if (!this.commandRegistry) {
@@ -850,11 +843,7 @@ export class WsAdapter implements ChannelAdapter {
     });
   }
 
-  private async handleChannelList(
-    ws: WebSocket,
-    msg: ClientChannelList,
-    deviceId: string,
-  ): Promise<void> {
+  private async handleChannelList(ws: WebSocket, msg: ClientChannelList, deviceId: string): Promise<void> {
     const channels = (await this.teamStore?.listChannels(deviceId)) ?? [];
     this.send(ws, {
       type: "channel_list",

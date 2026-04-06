@@ -168,9 +168,7 @@ export class Scheduler {
     // Team requests: check every 5 seconds for agent-to-agent messages
     if (config.team.enabled && this.db) {
       this.teamTimer = setInterval(() => {
-        this.fireTeamRequests().catch((err) =>
-          log.error("Team request check failed", { error: String(err) }),
-        );
+        this.fireTeamRequests().catch((err) => log.error("Team request check failed", { error: String(err) }));
       }, 5_000);
     }
 
@@ -416,17 +414,13 @@ export class Scheduler {
   private async fireTeamRequests(): Promise<void> {
     if (!this.db) return;
 
-    const pending = await this.db
-      .collection("team_pending_requests")
-      .find({ status: "pending" })
-      .toArray();
+    const pending = await this.db.collection("team_pending_requests").find({ status: "pending" }).toArray();
 
     for (const req of pending) {
       // Atomically mark as fired
-      const updated = await this.db.collection("team_pending_requests").findOneAndUpdate(
-        { _id: req._id, status: "pending" },
-        { $set: { status: "fired", firedAt: new Date() } },
-      );
+      const updated = await this.db
+        .collection("team_pending_requests")
+        .findOneAndUpdate({ _id: req._id, status: "pending" }, { $set: { status: "fired", firedAt: new Date() } });
       if (!updated) continue;
 
       const item: WorkItem = {
@@ -453,9 +447,11 @@ export class Scheduler {
           if (this.onDispatch) {
             this.onDispatch(item);
           } else {
-            this.agentManager.sendMessage(req.targetAgentId as string, item).catch((err: unknown) =>
-              log.error("Fire-and-forget team message failed", { target: req.targetAgentId, error: String(err) }),
-            );
+            this.agentManager
+              .sendMessage(req.targetAgentId as string, item)
+              .catch((err: unknown) =>
+                log.error("Fire-and-forget team message failed", { target: req.targetAgentId, error: String(err) }),
+              );
           }
         } else if (req.type === "request_response") {
           // For request/response, dispatch and capture the response
@@ -473,10 +469,9 @@ export class Scheduler {
           });
 
           // Signal the waiting send_message tool
-          await this.db.collection("team_pending_requests").updateOne(
-            { _id: req._id },
-            { $set: { status: "completed", response: result.text } },
-          );
+          await this.db
+            .collection("team_pending_requests")
+            .updateOne({ _id: req._id }, { $set: { status: "completed", response: result.text } });
         }
       } catch (err) {
         log.error("Team request dispatch failed", {
@@ -485,10 +480,9 @@ export class Scheduler {
           error: String(err),
         });
         // Mark as failed so it's not retried
-        await this.db.collection("team_pending_requests").updateOne(
-          { _id: req._id },
-          { $set: { status: "failed", error: String(err) } },
-        );
+        await this.db
+          .collection("team_pending_requests")
+          .updateOne({ _id: req._id }, { $set: { status: "failed", error: String(err) } });
       }
     }
 

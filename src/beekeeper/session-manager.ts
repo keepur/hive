@@ -386,11 +386,7 @@ export class SessionManager {
    * /status — show session metadata.
    */
   private async handleStatus(sessionId: string, slot: SessionSlot): Promise<void> {
-    const lines = [
-      `Session: ${slot.sessionId}`,
-      `Workspace: ${slot.cwd}`,
-      `State: ${slot.state}`,
-    ];
+    const lines = [`Session: ${slot.sessionId}`, `Workspace: ${slot.cwd}`, `State: ${slot.state}`];
     this.send({ type: "message", text: lines.join("\n"), sessionId, final: true });
   }
 
