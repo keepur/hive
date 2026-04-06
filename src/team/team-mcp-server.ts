@@ -57,7 +57,10 @@ server.registerTool(
       "Send a direct message to another agent. Use this for coordination, " +
       "handoffs, or requesting information from a specialist. " +
       "Fire-and-forget by default (expectReply: false). " +
-      "Set expectReply: true to wait for a response (60s timeout).",
+      "Set expectReply: true to wait for a response (60s timeout). " +
+      "WARNING: expectReply blocks your session until the target responds — " +
+      "do NOT use expectReply:true if the target agent might also be waiting on you " +
+      "(deadlock). Prefer fire-and-forget for most coordination.",
     inputSchema: {
       targetAgentId: z.string().describe("Agent ID to send to (e.g., 'jessica', 'sige')"),
       text: z.string().describe("Message text"),
@@ -118,6 +121,27 @@ server.registerTool(
 
       return {
         content: [{ type: "text" as const, text: `Message sent to ${targetAgentId}.` }],
+      };
+    }
+
+    // Deadlock guard: if the target already has a pending request_response targeting us, refuse
+    const reverseRequest = await pendingRequests.findOne({
+      fromAgentId: targetAgentId,
+      targetAgentId: AGENT_ID,
+      type: "request_response",
+      status: { $in: ["pending", "fired"] },
+    });
+    if (reverseRequest) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Deadlock prevented: ${targetAgentId} is already waiting for a reply from you. ` +
+              `Use expectReply: false instead, or respond to their request first.`,
+          },
+        ],
+        isError: true,
       };
     }
 
