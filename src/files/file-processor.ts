@@ -281,11 +281,7 @@ export async function processImageBuffer(buffer: Buffer, filename: string, mimet
 }
 
 /** Process a raw file buffer (non-image) into a ProcessedFile — PDF, DOCX, XLSX, text, etc. */
-export async function processFileBuffer(
-  buffer: Buffer,
-  filename: string,
-  mimetype: string,
-): Promise<ProcessedFile> {
+export async function processFileBuffer(buffer: Buffer, filename: string, mimetype: string): Promise<ProcessedFile> {
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
   const localPath = join(DOWNLOAD_DIR, `team-${Date.now()}-${safeName}`);
   writeFileSync(localPath, buffer);
@@ -310,10 +306,24 @@ export async function processFileBuffer(
       const pdfModule = await import("pdf-parse");
       const pdfParse = (pdfModule as any).default ?? pdfModule;
       const result = await pdfParse(buffer);
-      return { name: filename, mimetype, size: buffer.length, localPath, textContent: truncate(result.text), isImage: false };
+      return {
+        name: filename,
+        mimetype,
+        size: buffer.length,
+        localPath,
+        textContent: truncate(result.text),
+        isImage: false,
+      };
     } catch (e: any) {
       log.warn("PDF parse failed", { name: filename, error: e.message });
-      return { name: filename, mimetype, size: buffer.length, localPath, textContent: "[PDF — could not extract text]", isImage: false };
+      return {
+        name: filename,
+        mimetype,
+        size: buffer.length,
+        localPath,
+        textContent: "[PDF — could not extract text]",
+        isImage: false,
+      };
     }
   }
 
@@ -322,10 +332,24 @@ export async function processFileBuffer(
     try {
       const mammoth = await import("mammoth");
       const result = await mammoth.extractRawText({ buffer });
-      return { name: filename, mimetype, size: buffer.length, localPath, textContent: truncate(result.value), isImage: false };
+      return {
+        name: filename,
+        mimetype,
+        size: buffer.length,
+        localPath,
+        textContent: truncate(result.value),
+        isImage: false,
+      };
     } catch (e: any) {
       log.warn("DOCX parse failed", { name: filename, error: e.message });
-      return { name: filename, mimetype, size: buffer.length, localPath, textContent: "[DOCX — could not extract text]", isImage: false };
+      return {
+        name: filename,
+        mimetype,
+        size: buffer.length,
+        localPath,
+        textContent: "[DOCX — could not extract text]",
+        isImage: false,
+      };
     }
   }
 
@@ -338,10 +362,24 @@ export async function processFileBuffer(
         const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[name]);
         return `--- Sheet: ${name} ---\n${csv}`;
       });
-      return { name: filename, mimetype, size: buffer.length, localPath, textContent: truncate(sheets.join("\n\n")), isImage: false };
+      return {
+        name: filename,
+        mimetype,
+        size: buffer.length,
+        localPath,
+        textContent: truncate(sheets.join("\n\n")),
+        isImage: false,
+      };
     } catch (e: any) {
       log.warn("XLSX parse failed", { name: filename, error: e.message });
-      return { name: filename, mimetype, size: buffer.length, localPath, textContent: "[Spreadsheet — could not extract content]", isImage: false };
+      return {
+        name: filename,
+        mimetype,
+        size: buffer.length,
+        localPath,
+        textContent: "[Spreadsheet — could not extract content]",
+        isImage: false,
+      };
     }
   }
 

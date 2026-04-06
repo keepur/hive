@@ -167,7 +167,10 @@ export class Dispatcher {
 
     // 4. Triage gate — fast Haiku response for interactive channels (skip for system/scheduled)
     const isInteractive =
-      (item.source.kind === "slack" || item.source.kind === "sms" || item.source.kind === "imessage" || item.source.kind === "team") &&
+      (item.source.kind === "slack" ||
+        item.source.kind === "sms" ||
+        item.source.kind === "imessage" ||
+        item.source.kind === "team") &&
       item.sender !== "system";
     let processingStarted = false;
     if (isInteractive && config.triage.enabled && agentConfig && !skipTriage) {
@@ -484,7 +487,10 @@ export class Dispatcher {
     const agentConfig = this.registry.get(agentId);
 
     const isInteractive =
-      (item.source.kind === "slack" || item.source.kind === "sms" || item.source.kind === "imessage" || item.source.kind === "team") &&
+      (item.source.kind === "slack" ||
+        item.source.kind === "sms" ||
+        item.source.kind === "imessage" ||
+        item.source.kind === "team") &&
       item.sender !== "system";
 
     // Skip triage for fan-out — go straight to full agent

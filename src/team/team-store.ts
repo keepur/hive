@@ -2,7 +2,7 @@
 
 import { MongoClient, type Db, type Collection, ObjectId } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import type { TeamChannel, TeamMessage, TeamMessageFile } from "./types.js";
+import type { TeamChannel, TeamMessage } from "./types.js";
 import { dmChannelId } from "./types.js";
 
 const log = createLogger("team-store");
@@ -58,7 +58,7 @@ export class TeamStore {
     return channel;
   }
 
-  async getOrCreateDm(participantA: string, participantB: string, creatorName: string): Promise<TeamChannel> {
+  async getOrCreateDm(participantA: string, participantB: string, _creatorName: string): Promise<TeamChannel> {
     const id = dmChannelId(participantA, participantB);
     const existing = await this.channels.findOne({ _id: id });
     if (existing) return existing;
@@ -103,10 +103,7 @@ export class TeamStore {
   }
 
   async renameChannel(channelId: string, name: string): Promise<boolean> {
-    const result = await this.channels.updateOne(
-      { _id: channelId },
-      { $set: { name, updatedAt: new Date() } },
-    );
+    const result = await this.channels.updateOne({ _id: channelId }, { $set: { name, updatedAt: new Date() } });
     return result.modifiedCount > 0;
   }
 
@@ -117,10 +114,7 @@ export class TeamStore {
     await this.messages.insertOne(doc as any);
 
     // Touch channel updatedAt
-    await this.channels.updateOne(
-      { _id: msg.channelId },
-      { $set: { updatedAt: new Date() } },
-    );
+    await this.channels.updateOne({ _id: msg.channelId }, { $set: { updatedAt: new Date() } });
 
     return doc;
   }

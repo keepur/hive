@@ -11,13 +11,9 @@ vi.mock("../logging/logger.js", () => ({
 }));
 
 // ── TeamStore mock ──────────────────────────────────────────────────
-const mockGetOrCreateDm = vi
-  .fn()
-  .mockResolvedValue({ _id: "dm:a:b", type: "dm", members: ["a", "b"] });
+const mockGetOrCreateDm = vi.fn().mockResolvedValue({ _id: "dm:a:b", type: "dm", members: ["a", "b"] });
 const mockRenameChannel = vi.fn().mockResolvedValue(true);
-const mockGetChannel = vi
-  .fn()
-  .mockResolvedValue({ _id: "general", name: "#general", members: ["agent-a", "agent-b"] });
+const mockGetChannel = vi.fn().mockResolvedValue({ _id: "general", name: "#general", members: ["agent-a", "agent-b"] });
 
 const mockTeamStore = {
   getOrCreateDm: mockGetOrCreateDm,
