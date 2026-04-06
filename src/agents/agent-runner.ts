@@ -632,7 +632,7 @@ export class AgentRunner {
 
   // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory
   private static readonly INFRASTRUCTURE_SERVERS = new Set([
-    "schedule", "structured-memory",
+    "schedule", "structured-memory", "team",
   ]);
 
   // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)

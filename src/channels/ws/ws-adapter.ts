@@ -914,6 +914,15 @@ export class WsAdapter implements ChannelAdapter {
   }
 
   private async handleJoin(ws: WebSocket, msg: ClientJoin, deviceId: string): Promise<void> {
+    // DM channels are private — only the two original participants may be members
+    if (msg.channelId.startsWith("dm:")) {
+      const channel = await this.teamStore?.getChannel(msg.channelId);
+      if (!channel || !channel.members.includes(deviceId)) {
+        this.send(ws, { type: "error", message: "Cannot join a DM you are not part of" });
+        return;
+      }
+    }
+    // Non-DM channels are open-join for now (agents/devices can self-add)
     const ok = await this.teamStore?.joinChannel(msg.channelId, deviceId);
     if (ok) {
       this.send(ws, {
