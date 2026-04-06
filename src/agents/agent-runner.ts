@@ -535,6 +535,9 @@ export class AgentRunner {
 
     // Team MCP server — agent-to-agent direct messaging
     if (config.team.enabled) {
+      if (!AgentRunner.registryRef) {
+        log.warn("Team enabled but registryRef not set — agents will get empty AGENT_IDS");
+      }
       servers["team"] = {
         type: "stdio",
         command: "node",

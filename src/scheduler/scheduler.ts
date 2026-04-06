@@ -108,9 +108,10 @@ export class Scheduler {
       { createdAt: 1 },
       { expireAfterSeconds: config.events.retentionDays * 86400 },
     );
-    // Team pending requests index
+    // Team pending requests indexes
     if (config.team.enabled) {
       await this.db.collection("team_pending_requests").createIndex({ status: 1, createdAt: -1 });
+      await this.db.collection("team_pending_requests").createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 });
     }
     log.info("Callback store connected", { db: dbName });
   }
@@ -486,11 +487,7 @@ export class Scheduler {
       }
     }
 
-    // TTL cleanup — remove completed/failed requests older than 1 hour
-    await this.db.collection("team_pending_requests").deleteMany({
-      status: { $in: ["completed", "failed"] },
-      createdAt: { $lt: new Date(Date.now() - 3600_000) },
-    });
+    // TTL cleanup handled by MongoDB TTL index on createdAt (expireAfterSeconds: 3600)
   }
 }
 

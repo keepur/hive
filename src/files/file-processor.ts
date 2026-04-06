@@ -107,6 +107,68 @@ const TEXT_TYPES = new Set([
   "log",
 ]);
 
+/**
+ * Extract text content from a buffer based on file type.
+ * Shared by downloadAndProcess (Slack) and processFileBuffer (Team/WS).
+ * Returns extracted text or null for unsupported types.
+ */
+async function extractContent(
+  buffer: Buffer,
+  filename: string,
+  mimetype: string,
+): Promise<{ textContent: string | null; isImage: false } | null> {
+  const ext = extname(filename).slice(1).toLowerCase();
+
+  // Text-based files
+  if (TEXT_TYPES.has(ext) || mimetype.startsWith("text/")) {
+    return { textContent: truncate(buffer.toString("utf-8")), isImage: false };
+  }
+
+  // PDF
+  if (ext === "pdf" || mimetype === "application/pdf") {
+    try {
+      const pdfModule = await import("pdf-parse");
+      const pdfParse = (pdfModule as any).default ?? pdfModule;
+      const result = await pdfParse(buffer);
+      return { textContent: truncate(result.text), isImage: false };
+    } catch (e: any) {
+      log.warn("PDF parse failed", { name: filename, error: e.message });
+      return { textContent: "[PDF — could not extract text]", isImage: false };
+    }
+  }
+
+  // DOCX
+  if (ext === "docx" || mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    try {
+      const mammoth = await import("mammoth");
+      const result = await mammoth.extractRawText({ buffer });
+      return { textContent: truncate(result.value), isImage: false };
+    } catch (e: any) {
+      log.warn("DOCX parse failed", { name: filename, error: e.message });
+      return { textContent: "[DOCX — could not extract text]", isImage: false };
+    }
+  }
+
+  // XLSX
+  if (ext === "xlsx" || ext === "xls" || mimetype.includes("spreadsheet")) {
+    try {
+      const XLSX = await import("xlsx");
+      const workbook = XLSX.read(buffer, { type: "buffer" });
+      const sheets = workbook.SheetNames.map((name) => {
+        const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[name]);
+        return `--- Sheet: ${name} ---\n${csv}`;
+      });
+      return { textContent: truncate(sheets.join("\n\n")), isImage: false };
+    } catch (e: any) {
+      log.warn("XLSX parse failed", { name: filename, error: e.message });
+      return { textContent: "[Spreadsheet — could not extract content]", isImage: false };
+    }
+  }
+
+  // Unsupported
+  return null;
+}
+
 export async function downloadAndProcess(file: SlackFile, botToken: string): Promise<ProcessedFile | null> {
   const url = file.url_private_download || file.url_private;
   if (!url) {
@@ -158,100 +220,10 @@ export async function downloadAndProcess(file: SlackFile, botToken: string): Pro
       };
     }
 
-    // Text-based files
-    if (TEXT_TYPES.has(ext) || file.mimetype.startsWith("text/")) {
-      const text = buffer.toString("utf-8");
-      return {
-        name: file.name,
-        mimetype: file.mimetype,
-        size: file.size,
-        localPath,
-        textContent: truncate(text),
-        isImage: false,
-      };
-    }
-
-    // PDF
-    if (ext === "pdf" || file.mimetype === "application/pdf") {
-      try {
-        const pdfModule = await import("pdf-parse");
-        const pdfParse = (pdfModule as any).default ?? pdfModule;
-        const result = await pdfParse(buffer);
-        return {
-          name: file.name,
-          mimetype: file.mimetype,
-          size: file.size,
-          localPath,
-          textContent: truncate(result.text),
-          isImage: false,
-        };
-      } catch (e: any) {
-        log.warn("PDF parse failed", { name: file.name, error: e.message });
-        return {
-          name: file.name,
-          mimetype: file.mimetype,
-          size: file.size,
-          localPath,
-          textContent: "[PDF — could not extract text]",
-          isImage: false,
-        };
-      }
-    }
-
-    // DOCX
-    if (ext === "docx" || file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-      try {
-        const mammoth = await import("mammoth");
-        const result = await mammoth.extractRawText({ buffer });
-        return {
-          name: file.name,
-          mimetype: file.mimetype,
-          size: file.size,
-          localPath,
-          textContent: truncate(result.value),
-          isImage: false,
-        };
-      } catch (e: any) {
-        log.warn("DOCX parse failed", { name: file.name, error: e.message });
-        return {
-          name: file.name,
-          mimetype: file.mimetype,
-          size: file.size,
-          localPath,
-          textContent: "[DOCX — could not extract text]",
-          isImage: false,
-        };
-      }
-    }
-
-    // XLSX
-    if (ext === "xlsx" || ext === "xls" || file.mimetype.includes("spreadsheet")) {
-      try {
-        const XLSX = await import("xlsx");
-        const workbook = XLSX.read(buffer, { type: "buffer" });
-        const sheets = workbook.SheetNames.map((name) => {
-          const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[name]);
-          return `--- Sheet: ${name} ---\n${csv}`;
-        });
-        return {
-          name: file.name,
-          mimetype: file.mimetype,
-          size: file.size,
-          localPath,
-          textContent: truncate(sheets.join("\n\n")),
-          isImage: false,
-        };
-      } catch (e: any) {
-        log.warn("XLSX parse failed", { name: file.name, error: e.message });
-        return {
-          name: file.name,
-          mimetype: file.mimetype,
-          size: file.size,
-          localPath,
-          textContent: "[Spreadsheet — could not extract content]",
-          isImage: false,
-        };
-      }
+    // Non-image content extraction (text, PDF, DOCX, XLSX)
+    const extracted = await extractContent(buffer, file.name, file.mimetype);
+    if (extracted) {
+      return { name: file.name, mimetype: file.mimetype, size: file.size, localPath, ...extracted };
     }
 
     // Unsupported type
@@ -294,93 +266,10 @@ export async function processFileBuffer(buffer: Buffer, filename: string, mimety
     return processImageBuffer(buffer, filename, mimetype);
   }
 
-  // Text-based files
-  if (TEXT_TYPES.has(ext) || mimetype.startsWith("text/")) {
-    const text = buffer.toString("utf-8");
-    return { name: filename, mimetype, size: buffer.length, localPath, textContent: truncate(text), isImage: false };
-  }
-
-  // PDF
-  if (ext === "pdf" || mimetype === "application/pdf") {
-    try {
-      const pdfModule = await import("pdf-parse");
-      const pdfParse = (pdfModule as any).default ?? pdfModule;
-      const result = await pdfParse(buffer);
-      return {
-        name: filename,
-        mimetype,
-        size: buffer.length,
-        localPath,
-        textContent: truncate(result.text),
-        isImage: false,
-      };
-    } catch (e: any) {
-      log.warn("PDF parse failed", { name: filename, error: e.message });
-      return {
-        name: filename,
-        mimetype,
-        size: buffer.length,
-        localPath,
-        textContent: "[PDF — could not extract text]",
-        isImage: false,
-      };
-    }
-  }
-
-  // DOCX
-  if (ext === "docx" || mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-    try {
-      const mammoth = await import("mammoth");
-      const result = await mammoth.extractRawText({ buffer });
-      return {
-        name: filename,
-        mimetype,
-        size: buffer.length,
-        localPath,
-        textContent: truncate(result.value),
-        isImage: false,
-      };
-    } catch (e: any) {
-      log.warn("DOCX parse failed", { name: filename, error: e.message });
-      return {
-        name: filename,
-        mimetype,
-        size: buffer.length,
-        localPath,
-        textContent: "[DOCX — could not extract text]",
-        isImage: false,
-      };
-    }
-  }
-
-  // XLSX
-  if (ext === "xlsx" || ext === "xls" || mimetype.includes("spreadsheet")) {
-    try {
-      const XLSX = await import("xlsx");
-      const workbook = XLSX.read(buffer, { type: "buffer" });
-      const sheets = workbook.SheetNames.map((name) => {
-        const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[name]);
-        return `--- Sheet: ${name} ---\n${csv}`;
-      });
-      return {
-        name: filename,
-        mimetype,
-        size: buffer.length,
-        localPath,
-        textContent: truncate(sheets.join("\n\n")),
-        isImage: false,
-      };
-    } catch (e: any) {
-      log.warn("XLSX parse failed", { name: filename, error: e.message });
-      return {
-        name: filename,
-        mimetype,
-        size: buffer.length,
-        localPath,
-        textContent: "[Spreadsheet — could not extract content]",
-        isImage: false,
-      };
-    }
+  // Non-image content extraction (text, PDF, DOCX, XLSX)
+  const extracted = await extractContent(buffer, filename, mimetype);
+  if (extracted) {
+    return { name: filename, mimetype, size: buffer.length, localPath, ...extracted };
   }
 
   // Unsupported

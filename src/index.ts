@@ -424,6 +424,7 @@ async function main(): Promise<void> {
     await smsAdapter.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
     if (wsAdapter) await wsAdapter.stop();
+    if (teamStore) await teamStore.close();
     scheduler.stop();
     bgTaskManager.stop();
     codeTaskManager.stop();

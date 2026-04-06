@@ -405,7 +405,7 @@ export class WsAdapter implements ChannelAdapter {
           }
 
           if (msg.type === "history") {
-            await this.handleHistory(ws, msg);
+            await this.handleHistory(ws, msg, deviceId);
             return;
           }
 
@@ -596,6 +596,22 @@ export class WsAdapter implements ChannelAdapter {
     return this.connections.size;
   }
 
+  // ── Team helpers ───────────────────────────────────────────────────
+
+  /** Verify device is a member of the channel. Returns false and sends error if not. */
+  private async verifyChannelMembership(ws: WebSocket, channelId: string, deviceId: string): Promise<boolean> {
+    const channel = await this.teamStore?.getChannel(channelId);
+    if (!channel) {
+      this.send(ws, { type: "error", message: "Channel not found" });
+      return false;
+    }
+    if (!channel.members.includes(deviceId)) {
+      this.send(ws, { type: "error", message: "Not a member of this channel" });
+      return false;
+    }
+    return true;
+  }
+
   // ── Team message handlers ──────────────────────────────────────────
 
   private async handleTeamMessage(
@@ -605,6 +621,8 @@ export class WsAdapter implements ChannelAdapter {
     deviceId: string,
   ): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
+
+    if (!(await this.verifyChannelMembership(ws, msg.channelId, deviceId))) return;
 
     // Save to team_messages
     if (this.teamStore) {
@@ -648,6 +666,8 @@ export class WsAdapter implements ChannelAdapter {
 
   private async handleTeamImage(ws: WebSocket, msg: ClientTeamImage, device: Device, deviceId: string): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
+
+    if (!(await this.verifyChannelMembership(ws, msg.channelId, deviceId))) return;
 
     const buffer = Buffer.from(msg.data, "base64");
     const mimetype = guessMimetype(msg.filename);
@@ -712,6 +732,8 @@ export class WsAdapter implements ChannelAdapter {
 
   private async handleTeamFile(ws: WebSocket, msg: ClientTeamFile, device: Device, deviceId: string): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
+
+    if (!(await this.verifyChannelMembership(ws, msg.channelId, deviceId))) return;
 
     const buffer = Buffer.from(msg.data, "base64");
 
@@ -857,11 +879,13 @@ export class WsAdapter implements ChannelAdapter {
     });
   }
 
-  private async handleHistory(ws: WebSocket, msg: ClientHistory): Promise<void> {
+  private async handleHistory(ws: WebSocket, msg: ClientHistory, deviceId: string): Promise<void> {
     if (!this.teamStore) {
       this.send(ws, { type: "error", message: "Team store not available" });
       return;
     }
+
+    if (!(await this.verifyChannelMembership(ws, msg.channelId, deviceId))) return;
 
     const { messages, hasMore } = await this.teamStore.getHistory(msg.channelId, {
       before: msg.before,
