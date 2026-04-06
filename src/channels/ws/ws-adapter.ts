@@ -598,18 +598,22 @@ export class WsAdapter implements ChannelAdapter {
 
   // ── Team helpers ───────────────────────────────────────────────────
 
-  /** Verify device is a member of the channel. Returns false and sends error if not. */
-  private async verifyChannelMembership(ws: WebSocket, channelId: string, deviceId: string): Promise<boolean> {
+  /** Verify device is a member of the channel. Returns the channel on success, null on failure. */
+  private async verifyChannelMembership(
+    ws: WebSocket,
+    channelId: string,
+    deviceId: string,
+  ): Promise<import("../../team/types.js").TeamChannel | null> {
     const channel = await this.teamStore?.getChannel(channelId);
     if (!channel) {
       this.send(ws, { type: "error", message: "Channel not found" });
-      return false;
+      return null;
     }
     if (!channel.members.includes(deviceId)) {
       this.send(ws, { type: "error", message: "Not a member of this channel" });
-      return false;
+      return null;
     }
-    return true;
+    return channel;
   }
 
   // ── Team message handlers ──────────────────────────────────────────
@@ -622,7 +626,8 @@ export class WsAdapter implements ChannelAdapter {
   ): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
 
-    if (!(await this.verifyChannelMembership(ws, msg.channelId, deviceId))) return;
+    const channel = await this.verifyChannelMembership(ws, msg.channelId, deviceId);
+    if (!channel) return;
 
     // Save to team_messages
     if (this.teamStore) {
@@ -638,8 +643,7 @@ export class WsAdapter implements ChannelAdapter {
     }
 
     // Resolve target agent from channel membership
-    const channel = await this.teamStore?.getChannel(msg.channelId);
-    const targetAgentId = channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+    const targetAgentId = channel.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
 
     const workItem: WorkItem = {
       id: msg.id || randomUUID(),
@@ -667,7 +671,8 @@ export class WsAdapter implements ChannelAdapter {
   private async handleTeamImage(ws: WebSocket, msg: ClientTeamImage, device: Device, deviceId: string): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
 
-    if (!(await this.verifyChannelMembership(ws, msg.channelId, deviceId))) return;
+    const channel = await this.verifyChannelMembership(ws, msg.channelId, deviceId);
+    if (!channel) return;
 
     const buffer = Buffer.from(msg.data, "base64");
     const mimetype = guessMimetype(msg.filename);
@@ -695,8 +700,7 @@ export class WsAdapter implements ChannelAdapter {
         });
       }
 
-      const channel = await this.teamStore?.getChannel(msg.channelId);
-      const targetAgentId = channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+      const targetAgentId = channel.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
 
       const workItem: WorkItem = {
         id: msg.id || randomUUID(),
@@ -733,7 +737,8 @@ export class WsAdapter implements ChannelAdapter {
   private async handleTeamFile(ws: WebSocket, msg: ClientTeamFile, device: Device, deviceId: string): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
 
-    if (!(await this.verifyChannelMembership(ws, msg.channelId, deviceId))) return;
+    const channel = await this.verifyChannelMembership(ws, msg.channelId, deviceId);
+    if (!channel) return;
 
     const buffer = Buffer.from(msg.data, "base64");
 
@@ -763,8 +768,7 @@ export class WsAdapter implements ChannelAdapter {
         });
       }
 
-      const channel = await this.teamStore?.getChannel(msg.channelId);
-      const targetAgentId = channel?.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
+      const targetAgentId = channel.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
 
       const workItem: WorkItem = {
         id: msg.id || randomUUID(),
