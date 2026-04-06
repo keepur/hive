@@ -58,7 +58,7 @@ export class TeamStore {
     return channel;
   }
 
-  async getOrCreateDm(participantA: string, participantB: string, _creatorName: string): Promise<TeamChannel> {
+  async getOrCreateDm(participantA: string, participantB: string, creatorName?: string): Promise<TeamChannel> {
     const id = dmChannelId(participantA, participantB);
     const existing = await this.channels.findOne({ _id: id });
     if (existing) return existing;
@@ -66,7 +66,7 @@ export class TeamStore {
     const dm: TeamChannel = {
       _id: id,
       type: "dm",
-      name: `DM`,
+      name: creatorName ? `DM with ${creatorName}` : `DM: ${participantA} & ${participantB}`,
       members: [participantA, participantB].sort(),
       createdBy: participantA,
       createdAt: new Date(),
@@ -89,6 +89,7 @@ export class TeamStore {
   async leaveChannel(channelId: string, memberId: string): Promise<boolean> {
     const result = await this.channels.updateOne(
       { _id: channelId },
+      // `as any` needed: MongoDB driver types don't infer $pull on string arrays correctly
       { $pull: { members: memberId } as any, $set: { updatedAt: new Date() } },
     );
     return result.modifiedCount > 0;

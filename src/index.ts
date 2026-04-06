@@ -328,8 +328,7 @@ async function main(): Promise<void> {
 
   if (commandRegistry) {
     const { registerPluginCommands } = await import("./plugins/plugin-loader.js");
-    const plugins = (await import("./plugins/plugin-loader.js")).loadPlugins(config.plugins, process.cwd());
-    await registerPluginCommands(plugins, commandRegistry);
+    await registerPluginCommands(agentManager.getPlugins(), commandRegistry);
   }
 
   // WebSocket adapter — mobile app channel
