@@ -55,6 +55,7 @@ export class Scheduler {
   private cronTimer: ReturnType<typeof setInterval> | null = null;
   private callbackTimer: ReturnType<typeof setInterval> | null = null;
   private eventTimer: ReturnType<typeof setInterval> | null = null;
+  private teamTimer: ReturnType<typeof setInterval> | null = null;
   private agentManager: AgentManager;
   private memoryManager: MemoryManager;
   private healthReporter: HealthReporter;
@@ -107,6 +108,10 @@ export class Scheduler {
       { createdAt: 1 },
       { expireAfterSeconds: config.events.retentionDays * 86400 },
     );
+    // Team pending requests index
+    if (config.team.enabled) {
+      await this.db.collection("team_pending_requests").createIndex({ status: 1, createdAt: -1 });
+    }
     log.info("Callback store connected", { db: dbName });
   }
 
@@ -160,11 +165,21 @@ export class Scheduler {
       }, 30_000);
     }
 
+    // Team requests: check every 5 seconds for agent-to-agent messages
+    if (config.team.enabled && this.db) {
+      this.teamTimer = setInterval(() => {
+        this.fireTeamRequests().catch((err) =>
+          log.error("Team request check failed", { error: String(err) }),
+        );
+      }, 5_000);
+    }
+
     log.info("Scheduler started", {
       heartbeatMs: config.scheduler.heartbeatIntervalMs,
       cronJobs: this.cronJobs.length,
       callbacksEnabled: !!this.callbackCollection,
       eventsEnabled: !!this.eventsCollection,
+      teamEnabled: config.team.enabled,
     });
   }
 
@@ -184,6 +199,10 @@ export class Scheduler {
     if (this.eventTimer) {
       clearInterval(this.eventTimer);
       this.eventTimer = null;
+    }
+    if (this.teamTimer) {
+      clearInterval(this.teamTimer);
+      this.teamTimer = null;
     }
     this.mongoClient?.close().catch(() => {});
     log.info("Scheduler stopped");
@@ -392,6 +411,92 @@ export class Scheduler {
         }
       }
     }
+  }
+
+  private async fireTeamRequests(): Promise<void> {
+    if (!this.db) return;
+
+    const pending = await this.db
+      .collection("team_pending_requests")
+      .find({ status: "pending" })
+      .toArray();
+
+    for (const req of pending) {
+      // Atomically mark as fired
+      const updated = await this.db.collection("team_pending_requests").findOneAndUpdate(
+        { _id: req._id, status: "pending" },
+        { $set: { status: "fired", firedAt: new Date() } },
+      );
+      if (!updated) continue;
+
+      const item: WorkItem = {
+        id: `team-${String(req._id)}`,
+        text: req.text as string,
+        source: {
+          kind: "internal" as ChannelKind,
+          id: req.channelId as string,
+          label: `internal:${req.fromAgentId}→${req.targetAgentId}`,
+        },
+        sender: req.fromAgentId as string,
+        senderName: req.fromAgentId as string,
+        threadId: `internal:${req.channelId}:${req.threadId}`,
+        timestamp: new Date(),
+        meta: {
+          targetAgentId: req.targetAgentId,
+          teamRequestId: String(req._id),
+          teamRequestType: req.type,
+        },
+      };
+
+      try {
+        if (req.type === "fire_and_forget") {
+          if (this.onDispatch) {
+            this.onDispatch(item);
+          } else {
+            this.agentManager.sendMessage(req.targetAgentId as string, item).catch((err: unknown) =>
+              log.error("Fire-and-forget team message failed", { target: req.targetAgentId, error: String(err) }),
+            );
+          }
+        } else if (req.type === "request_response") {
+          // For request/response, dispatch and capture the response
+          const result = await this.agentManager.sendMessage(req.targetAgentId as string, item);
+
+          // Save the response to team_messages
+          await this.db.collection("team_messages").insertOne({
+            channelId: req.channelId,
+            threadId: req.threadId,
+            senderId: req.targetAgentId,
+            senderType: "agent",
+            senderName: req.targetAgentId,
+            text: result.text,
+            createdAt: new Date(),
+          });
+
+          // Signal the waiting send_message tool
+          await this.db.collection("team_pending_requests").updateOne(
+            { _id: req._id },
+            { $set: { status: "completed", response: result.text } },
+          );
+        }
+      } catch (err) {
+        log.error("Team request dispatch failed", {
+          requestId: String(req._id),
+          target: req.targetAgentId,
+          error: String(err),
+        });
+        // Mark as failed so it's not retried
+        await this.db.collection("team_pending_requests").updateOne(
+          { _id: req._id },
+          { $set: { status: "failed", error: String(err) } },
+        );
+      }
+    }
+
+    // TTL cleanup — remove completed/failed requests older than 1 hour
+    await this.db.collection("team_pending_requests").deleteMany({
+      status: { $in: ["completed", "failed"] },
+      createdAt: { $lt: new Date(Date.now() - 3600_000) },
+    });
   }
 }
 
