@@ -451,7 +451,8 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const helpMsg = sent.find(
-        (m: Record<string, unknown>) => m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Available commands"),
+        (m: Record<string, unknown>) =>
+          m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Available commands"),
       );
       expect(helpMsg).toBeDefined();
       expect(helpMsg.text).toContain("/clear");
@@ -470,7 +471,8 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const statusMsg = sent.find(
-        (m: Record<string, unknown>) => m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Session:"),
+        (m: Record<string, unknown>) =>
+          m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Session:"),
       );
       expect(statusMsg).toBeDefined();
       expect(statusMsg.text).toContain("sess-cmd");
@@ -592,7 +594,8 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const helpMsg = sent.find(
-        (m: Record<string, unknown>) => m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Available commands"),
+        (m: Record<string, unknown>) =>
+          m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Available commands"),
       );
       expect(helpMsg).toBeDefined();
 
@@ -732,7 +735,8 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const statusMsg = sent.find(
-        (m: Record<string, unknown>) => m.type === "message" && typeof m.text === "string" && (m.text as string).includes("State:"),
+        (m: Record<string, unknown>) =>
+          m.type === "message" && typeof m.text === "string" && (m.text as string).includes("State:"),
       );
       expect(statusMsg).toBeDefined();
       expect(statusMsg.text).toContain("busy");
@@ -743,7 +747,7 @@ describe("SessionManager", () => {
       await queryPromise;
     });
 
-    it("\"/\" alone (empty command name) falls through to SDK as normal text", async () => {
+    it('"/" alone (empty command name) falls through to SDK as normal text', async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
@@ -776,7 +780,7 @@ describe("SessionManager", () => {
       expect(textMsg).toBeDefined();
     });
 
-    it("\"/ clear\" (space after slash) falls through to SDK — not parsed as /clear", async () => {
+    it('"/ clear" (space after slash) falls through to SDK — not parsed as /clear', async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
@@ -819,7 +823,8 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const helpMsg = sent.find(
-        (m: Record<string, unknown>) => m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Available commands"),
+        (m: Record<string, unknown>) =>
+          m.type === "message" && typeof m.text === "string" && (m.text as string).includes("Available commands"),
       );
       expect(helpMsg).toBeDefined();
       expect(helpMsg.final).toBe(true);
