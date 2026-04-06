@@ -31,6 +31,7 @@ All repos under **[dodi-hq](https://github.com/dodi-hq)** use the same plugin-dr
 
 - All changes go through PRs into `main`
 - `npm run check` must pass before submitting
+- **CI**: GitHub Actions runs `npm run check` on every PR and push to `main` (self-hosted ARM64 runner on Mac Mini)
 - Deploy: `/deploy` pushes `main` → `deploy` with pre-flight checks
 
 ## Project Overview
@@ -103,6 +104,7 @@ Slack MCP uses the official Slack HTTP MCP server (`https://mcp.slack.com/mcp`),
 - **Deploy script**: `~/services/hive/deploy.sh` — pulls, builds, syncs agents, restarts. Supports `--rollback`.
 - Editing source in dev does NOT affect the running service
 - Service restart: `launchctl kickstart -k "gui/$(id -u)/com.hive.agent"`
+- **CI runner**: `~/services/github-runner/` — self-hosted GitHub Actions runner, LaunchAgent (`com.github.actions-runner`)
 
 ## Commands
 
