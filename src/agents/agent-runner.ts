@@ -48,6 +48,8 @@ export interface RunResult {
 }
 
 export class AgentRunner {
+  static registryRef?: import("./agent-registry.js").AgentRegistry;
+
   private agentConfig: AgentConfig;
   private memoryManager: MemoryManager;
   private plugins: LoadedPlugin[];
@@ -531,6 +533,26 @@ export class AgentRunner {
       },
     };
 
+    // Team MCP server — agent-to-agent direct messaging
+    if (config.team.enabled) {
+      if (!AgentRunner.registryRef) {
+        log.warn("Team enabled but registryRef not set — agents will get empty AGENT_IDS");
+      }
+      servers["team"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/team/team-mcp-server.js")],
+        env: {
+          AGENT_ID: this.agentConfig.id,
+          MONGODB_URI: config.mongo.uri,
+          MONGODB_DB: config.mongo.dbName,
+          AGENT_IDS: JSON.stringify(
+            AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
+          ),
+        },
+      };
+    }
+
     // Schedule MCP server — self-service schedule management for each agent
     servers["schedule"] = {
       type: "stdio",
@@ -573,6 +595,10 @@ export class AgentRunner {
     }
     // schedule is an implicit core server — available to all agents unconditionally
     coreSet.add("schedule");
+    // team is an implicit core server when team layer is enabled
+    if (config.team.enabled) {
+      coreSet.add("team");
+    }
     for (const key of Object.keys(servers)) {
       if (!coreSet.has(key)) {
         delete servers[key];
@@ -606,7 +632,7 @@ export class AgentRunner {
 
   // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory
   private static readonly INFRASTRUCTURE_SERVERS = new Set([
-    "schedule", "structured-memory",
+    "schedule", "structured-memory", "team",
   ]);
 
   // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)

@@ -43,6 +43,7 @@ export class Dispatcher {
   private auditChannelId?: string;
   private taskLedger?: TaskLedger;
   private retryQueue?: RetryQueue;
+  private teamStore?: import("../team/team-store.js").TeamStore;
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
 
@@ -66,6 +67,10 @@ export class Dispatcher {
 
   setRetryQueue(queue: RetryQueue): void {
     this.retryQueue = queue;
+  }
+
+  setTeamStore(store: import("../team/team-store.js").TeamStore): void {
+    this.teamStore = store;
   }
 
   setAuditChannel(adapter: ChannelAdapter, channelId: string): void {
@@ -162,7 +167,10 @@ export class Dispatcher {
 
     // 4. Triage gate — fast Haiku response for interactive channels (skip for system/scheduled)
     const isInteractive =
-      (item.source.kind === "slack" || item.source.kind === "sms" || item.source.kind === "imessage") &&
+      (item.source.kind === "slack" ||
+        item.source.kind === "sms" ||
+        item.source.kind === "imessage" ||
+        item.source.kind === "team") &&
       item.sender !== "system";
     let processingStarted = false;
     if (isInteractive && config.triage.enabled && agentConfig && !skipTriage) {
@@ -326,6 +334,11 @@ export class Dispatcher {
       return [{ agentId: targetAgentId, skipTriage: false }];
     }
 
+    // 0.5 Team routing — DMs resolve to channel member, channels use @mention or triage
+    if (item.source.kind === "team") {
+      return this.resolveFromTeam(item);
+    }
+
     // 1. Dedicated channel mapping — always route to channel owner
     //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
     //    Checked before thread logic so dedicated channels never become multi-agent
@@ -408,6 +421,53 @@ export class Dispatcher {
     return [];
   }
 
+  private async resolveFromTeam(item: WorkItem): Promise<{ agentId: string; skipTriage: boolean }[]> {
+    const channelId = item.meta?.channelId as string | undefined;
+    if (!channelId || !this.teamStore) {
+      // Fall back to default agent
+      const defaultId = item.meta?.defaultAgentId as string | undefined;
+      if (defaultId && this.registry.get(defaultId)) return [{ agentId: defaultId, skipTriage: false }];
+      return [];
+    }
+
+    const channel = await this.teamStore.getChannel(channelId);
+    if (!channel) {
+      log.warn("Team channel not found", { channelId });
+      return [];
+    }
+
+    // DMs — route to the other member (the agent)
+    if (channel.type === "dm") {
+      const agentId = channel.members.find((m) => m !== item.sender);
+      if (agentId && this.registry.get(agentId)) {
+        return [{ agentId, skipTriage: true }]; // DMs skip triage — direct
+      }
+      log.warn("DM agent not found in registry", { channelId, members: channel.members });
+      return [];
+    }
+
+    // Channels — check for @mentions first
+    const mentioned = this.registry.findAllByName(item.text);
+    if (mentioned.length > 0) {
+      // Only include agents that are members of this channel
+      const channelMembers = new Set(channel.members);
+      const validMentions = mentioned.filter((a) => channelMembers.has(a.id));
+      if (validMentions.length > 0) {
+        return validMentions.map((a) => ({ agentId: a.id, skipTriage: true }));
+      }
+    }
+
+    // No mention — route to first agent member of the channel (lightweight default)
+    // In future, could use triage to pick best responder
+    const agentMembers = channel.members.filter((m) => this.registry.get(m));
+    if (agentMembers.length > 0) {
+      return [{ agentId: agentMembers[0], skipTriage: false }];
+    }
+
+    log.warn("No agent members in Team channel", { channelId });
+    return [];
+  }
+
   /** Dispatch a single work item to a single agent (used for fan-out) */
   private async dispatchToAgent(item: WorkItem, resolved: { agentId: string; skipTriage: boolean }): Promise<void> {
     const { agentId, skipTriage } = resolved;
@@ -427,7 +487,10 @@ export class Dispatcher {
     const agentConfig = this.registry.get(agentId);
 
     const isInteractive =
-      (item.source.kind === "slack" || item.source.kind === "sms" || item.source.kind === "imessage") &&
+      (item.source.kind === "slack" ||
+        item.source.kind === "sms" ||
+        item.source.kind === "imessage" ||
+        item.source.kind === "team") &&
       item.sender !== "system";
 
     // Skip triage for fan-out — go straight to full agent
