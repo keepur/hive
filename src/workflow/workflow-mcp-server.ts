@@ -301,6 +301,14 @@ server.registerTool(
         };
       }
 
+      // Terminal states are final — cannot transition away from done/cancelled
+      if (isTerminal(task.state)) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot transition from terminal state: ${task.state}` }],
+          isError: true,
+        };
+      }
+
       if (!validateTransition(task.state, newState)) {
         return {
           content: [{ type: "text" as const, text: `Invalid transition: ${task.state} → ${newState}` }],
@@ -404,8 +412,12 @@ server.registerTool(
     try {
       const task = await tasks.findOne({ _id: taskId });
       if (!task) return { content: [{ type: "text" as const, text: "Task not found" }], isError: true };
-      if (task.state === TaskState.CANCELLED) {
-        return { content: [{ type: "text" as const, text: "Task already cancelled" }] };
+      // Terminal states are final — cannot cancel a done or already-cancelled task
+      if (isTerminal(task.state)) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot cancel task in terminal state: ${task.state}` }],
+          isError: true,
+        };
       }
 
       const updateFields: Record<string, unknown> = {
@@ -570,7 +582,9 @@ server.registerTool(
         authorName: AGENT_ID, // Agent ID as name for now
         createdAt: new Date(),
       };
-      await comments.insertOne(comment as any);
+      // WorkflowTaskComment is structurally compatible with Document but TS needs the cast
+      // because _id is string (not ObjectId) — we use UUID-based _id for consistency
+      await comments.insertOne(comment as unknown as Parameters<typeof comments.insertOne>[0]);
 
       return { content: [{ type: "text" as const, text: JSON.stringify(comment, null, 2) }] };
     } catch (err) {
