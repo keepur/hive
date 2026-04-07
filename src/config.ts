@@ -181,6 +181,9 @@ export const config = {
   team: {
     enabled: optional("TEAM_ENABLED", "false") === "true",
   },
+  workflow: {
+    enabled: optional("WORKFLOW_ENABLED", "false") === "true",
+  },
   adminApi: {
     port: parseInt(optional("ADMIN_API_PORT", String(ports.adminApi ?? portBase + 4)), 10),
     token: optional("ADMIN_API_TOKEN", ""),
