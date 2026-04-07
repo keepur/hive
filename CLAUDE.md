@@ -70,16 +70,17 @@ Message (Slack/SMS/WebSocket/Scheduler)
 - `src/slack/slack-gateway.ts` — Socket Mode listener, message filtering
 
 ### MCP Servers (stdio subprocesses per agent session)
-All in `src/` — each agent only gets servers listed in its `agent.yaml` `servers` field:
+All in `src/` — each agent only gets servers listed in its `coreServers`/`delegateServers` fields in the agent definition:
 - `memory-mcp-server.ts` — read/write/list/history/rollback agent memory (MongoDB)
 - `google/google-mcp-server.ts` — Gmail + Calendar + Drive via `gog` CLI
 - `keychain-mcp-server.ts` — macOS Keychain read-only
 - `contacts-mcp-server.ts` — contact lookups (MongoDB)
 - `github/github-issues-mcp-server.ts` — GitHub Issues tracking via `gh` CLI
-- `linear-mcp-server.ts` — Linear issue tracking (being removed)
+- `linear/linear-mcp-server.ts` — Linear issue tracking
 - `search/crm-search-mcp-server.ts` — vector search over CRM data
 - `search/product-search-mcp-server.ts` — vector search over product catalog
 - `search/ops-search-mcp-server.ts` — vector search over ops data
+- `search/conversation-search-mcp-server.ts` — semantic search over past conversations
 - `tasks/task-mcp-server.ts` — dodi_v2 task CRUD
 - `background/background-task-mcp-server.ts` — spawn detached long-running commands
 - `recall/recall-mcp-server.ts` — meeting participation via Recall.ai
@@ -88,8 +89,15 @@ All in `src/` — each agent only gets servers listed in its `agent.yaml` `serve
 - `callback-mcp-server.ts` — timer callbacks for delayed responses
 - `admin-mcp-server.ts` — agent CRUD + version history, model overrides
 - `clickup/clickup-mcp-server.ts` — ClickUp task management
+- `events/event-bus-mcp-server.ts` — cross-agent event bus (publish events, subscriber delivery)
+- `team/team-mcp-server.ts` — direct agent-to-agent messaging (feature flag: `team.enabled`)
+- `code-index/code-search-mcp-server.ts` — semantic code search over file index
+- `code-task/code-task-mcp-server.ts` — delegate coding to Claude Code CLI sessions
+- `memory/structured-memory-mcp-server.ts` — tiered memory with semantic recall (auto-paired with memory server)
 
 Slack MCP uses the official Slack HTTP MCP server (`https://mcp.slack.com/mcp`), not a local stdio server.
+
+Browser automation uses Playwright via CDP endpoint (`BROWSER_CDP_ENDPOINT` config) — not a local stdio server.
 
 ### Plugin MCP Servers (`plugins/dodi/`)
 - `dodi-ops-mcp-server.ts` — dodi_v2 REST API (persons, projects, designs, jobs, cases, comments, attachments, cutlists)
@@ -101,7 +109,7 @@ Slack MCP uses the official Slack HTTP MCP server (`https://mcp.slack.com/mcp`),
 
 - **Dev**: `~/github/hive` — edit, test, commit, push
 - **Deploy**: `~/services/hive` — separate clone, compiled JS, launchd points here
-- **Deploy script**: `~/services/hive/deploy.sh` — pulls, builds, syncs agents, restarts. Supports `--rollback`.
+- **Deploy script**: `~/services/hive/service/deploy.sh` — pulls, builds, syncs agents, restarts. Supports `--rollback`.
 - Editing source in dev does NOT affect the running service
 - Service restart: `launchctl kickstart -k "gui/$(id -u)/com.hive.agent"`
 - **CI runner**: `~/services/github-runner/` — self-hosted GitHub Actions runner, LaunchAgent (`com.github.actions-runner`)
@@ -114,7 +122,7 @@ npm run build          # Compile TypeScript (core + plugins)
 npm run setup:seeds    # Import plugin agent seeds → MongoDB
 npm run setup:constitution  # Render constitution template → MongoDB
 npm run setup:plugins  # Sync Claude Code plugins from cache
-npm run migrate:agents # One-time migration from files to DB
+npm run migrate:agents:legacy  # One-time migration from files to DB (legacy)
 npm run typecheck      # TypeScript strict check
 npm run lint           # ESLint
 npm run format         # Prettier
