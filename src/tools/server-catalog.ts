@@ -90,6 +90,10 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     description: "Publish events to the cross-agent event bus",
     usage: "Notifying other agents about state changes or completed work",
   },
+  workflow: {
+    description: "Plan and task management — create plans, assign tasks, track dependencies",
+    usage: "Coordinating multi-step work across agents and humans",
+  },
   "product-search": {
     description: "Semantic search across product catalog — find products by description or attributes",
     usage: "Finding products when you don't know the exact part ID",
