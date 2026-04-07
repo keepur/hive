@@ -553,6 +553,21 @@ export class AgentRunner {
       };
     }
 
+    // Workflow MCP server — plan/task management
+    if (config.workflow.enabled) {
+      servers["workflow"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/workflow/workflow-mcp-server.js")],
+        env: {
+          AGENT_ID: this.agentConfig.id,
+          MONGODB_URI: config.mongo.uri,
+          MONGODB_DB: config.mongo.dbName,
+          EVENT_SUBSCRIBERS: this.eventSubscribersJson,
+        },
+      };
+    }
+
     // Schedule MCP server — self-service schedule management for each agent
     servers["schedule"] = {
       type: "stdio",
@@ -598,6 +613,10 @@ export class AgentRunner {
     // team is an implicit core server when team layer is enabled
     if (config.team.enabled) {
       coreSet.add("team");
+    }
+    // workflow is an implicit core server when workflow layer is enabled
+    if (config.workflow.enabled) {
+      coreSet.add("workflow");
     }
     for (const key of Object.keys(servers)) {
       if (!coreSet.has(key)) {
