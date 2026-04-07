@@ -87,6 +87,7 @@ vi.mock("../config.js", () => ({
     browser: { cdpEndpoint: "" },
     memory: { hotBudgetTokens: 3000 },
     team: { enabled: false },
+    workflow: { enabled: false },
   },
 }));
 
