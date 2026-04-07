@@ -90,7 +90,13 @@ function makeMockRegistry() {
         if (a.disabled) return false;
         const name = a.name.toLowerCase();
         const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
-        return pattern.test(text);
+        if (pattern.test(text)) return true;
+        if (name.includes(" ")) {
+          const firstName = name.split(" ")[0];
+          const firstNamePattern = new RegExp(`(?:^|hey\\s+|@)${firstName}\\b|\\b${firstName}[,:]`, "i");
+          return firstNamePattern.test(text);
+        }
+        return false;
       });
     },
     findAllByName: (text: string) => {
@@ -98,7 +104,13 @@ function makeMockRegistry() {
         if (a.disabled) return false;
         const name = a.name.toLowerCase();
         const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
-        return pattern.test(text);
+        if (pattern.test(text)) return true;
+        if (name.includes(" ")) {
+          const firstName = name.split(" ")[0];
+          const firstNamePattern = new RegExp(`(?:^|hey\\s+|@)${firstName}\\b|\\b${firstName}[,:]`, "i");
+          return firstNamePattern.test(text);
+        }
+        return false;
       });
     },
     isPassiveChannel: (ch: string) =>
