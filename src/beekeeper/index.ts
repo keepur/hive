@@ -14,6 +14,7 @@ import { readdirSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ClientMessage, ServerMessage } from "./types.js";
+import { handleImage, handleFile } from "./file-handler.js";
 
 const log = createLogger("beekeeper");
 
@@ -371,7 +372,7 @@ async function main(): Promise<void> {
   });
 
   // --- WebSocket server with JWT auth on upgrade ---
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 15 * 1024 * 1024 });
 
   server.on("upgrade", async (req, socket, head) => {
     try {
@@ -432,7 +433,14 @@ async function main(): Promise<void> {
         return;
       }
 
-      log.info("WS message received", { type: msg.type, raw: raw.toString().slice(0, 200) });
+      const logMeta: Record<string, unknown> = { type: msg.type };
+      if (msg.type === "image" || msg.type === "file") {
+        logMeta.sessionId = (msg as { sessionId?: string }).sessionId;
+        logMeta.filename = (msg as { filename?: string }).filename;
+      } else {
+        logMeta.raw = raw.toString().slice(0, 200);
+      }
+      log.info("WS message received", logMeta);
 
       try {
         switch (msg.type) {
@@ -553,6 +561,44 @@ async function main(): Promise<void> {
           case "deny":
             guardian.handleApproval(msg.toolUseId, false);
             break;
+          case "image": {
+            if (!msg.sessionId || typeof msg.sessionId !== "string") {
+              ws.send(JSON.stringify({ type: "error", message: "Missing required field: sessionId" }));
+              break;
+            }
+            try {
+              const prompt = await handleImage(msg.data, msg.filename);
+              await sessionManager.sendMessage(msg.sessionId, prompt);
+            } catch (err) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                  sessionId: msg.sessionId,
+                }),
+              );
+            }
+            break;
+          }
+          case "file": {
+            if (!msg.sessionId || typeof msg.sessionId !== "string") {
+              ws.send(JSON.stringify({ type: "error", message: "Missing required field: sessionId" }));
+              break;
+            }
+            try {
+              const prompt = await handleFile(msg.data, msg.filename, msg.mimetype);
+              await sessionManager.sendMessage(msg.sessionId, prompt);
+            } catch (err) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                  sessionId: msg.sessionId,
+                }),
+              );
+            }
+            break;
+          }
           default:
             ws.send(JSON.stringify({ type: "error", message: "Unknown message type" }));
         }
