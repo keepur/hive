@@ -82,21 +82,7 @@ export class VoiceAdapter {
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // Health check
-    if (req.method === "GET" && req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", activeCalls: this.sessions.size }));
-      return;
-    }
-
-    // Only accept POST /v1/chat/completions
-    if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Not found" }));
-      return;
-    }
-
-    // Authenticate — fail-closed
+    // Authenticate all requests — fail-closed
     if (!this.serverSecret) {
       log.error("Voice endpoint called but VAPI_SERVER_SECRET not configured — rejecting");
       res.writeHead(403, { "Content-Type": "application/json" });
@@ -109,6 +95,20 @@ export class VoiceAdapter {
       log.warn("Voice request rejected — invalid server secret");
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+
+    // Health check (behind auth)
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", activeCalls: this.sessions.size }));
+      return;
+    }
+
+    // Only accept POST /v1/chat/completions
+    if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
       return;
     }
 
@@ -204,9 +204,10 @@ export class VoiceAdapter {
       // tool_calls format) is deferred to Phase 2 when live tool calling is wired.
       for await (const event of stream) {
         if (event.type === "content_block_delta") {
-          const delta = event.delta as any;
+          // SDK types content_block_delta.delta as a union — narrow to text_delta
+          const delta = event.delta as { type: string; text?: string };
           if (delta.type === "text_delta") {
-            res.write(formatSSETextChunk(completionId, delta.text, model));
+            res.write(formatSSETextChunk(completionId, delta.text ?? "", model));
           }
         }
       }
