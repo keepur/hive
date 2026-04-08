@@ -15,8 +15,14 @@ import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 
 const log = createLogger("agent-runner");
 
-/** Cached instance capabilities — config doesn't change at runtime */
-const cachedCapabilities = JSON.stringify(buildInstanceCapabilities());
+/** Cached instance capabilities — lazily computed, config doesn't change at runtime */
+let _cachedCapabilities: string | undefined;
+function getCachedCapabilities(): string {
+  if (!_cachedCapabilities) {
+    _cachedCapabilities = JSON.stringify(buildInstanceCapabilities());
+  }
+  return _cachedCapabilities;
+}
 
 export type StreamCallback = (chunk: string) => void;
 
@@ -578,7 +584,7 @@ export class AgentRunner {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
         AGENT_ID: this.agentConfig.id,
-        INSTANCE_CAPABILITIES: cachedCapabilities,
+        INSTANCE_CAPABILITIES: getCachedCapabilities(),
       },
     };
 
