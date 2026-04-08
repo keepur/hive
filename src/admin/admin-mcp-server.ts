@@ -560,8 +560,8 @@ server.registerTool(
         : ["  (none — all servers configured)"]),
       "",
       "## Integrations",
-      ...Object.entries(instanceCapabilities.integrations).map(([name, info]) =>
-        `  ${info.configured ? "✓" : "✗"} ${name}${info.detail ? ` (${info.detail})` : ""}`,
+      ...Object.entries(instanceCapabilities.integrations).map(
+        ([name, info]) => `  ${info.configured ? "✓" : "✗"} ${name}${info.detail ? ` (${info.detail})` : ""}`,
       ),
       "",
       "## Active Channels",

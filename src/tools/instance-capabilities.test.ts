@@ -119,9 +119,24 @@ describe("SERVER_CREDENTIAL_CHECKS invariant", () => {
 
     // These are the servers we define credential checks for — must all be in the catalog
     const credentialCheckServers = [
-      "google", "resend", "brave-search", "linear", "clickup", "github-issues",
-      "quo", "recall", "hubspot-crm", "permits", "code-task", "code-search",
-      "browser", "catalog", "dodi-ops", "tasks", "product-search", "ops-search",
+      "google",
+      "resend",
+      "brave-search",
+      "linear",
+      "clickup",
+      "github-issues",
+      "quo",
+      "recall",
+      "hubspot-crm",
+      "permits",
+      "code-task",
+      "code-search",
+      "browser",
+      "catalog",
+      "dodi-ops",
+      "tasks",
+      "product-search",
+      "ops-search",
     ];
 
     for (const server of credentialCheckServers) {
