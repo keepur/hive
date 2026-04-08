@@ -512,9 +512,20 @@ server.registerTool(
 // instance_capabilities
 // ---------------------------------------------------------------------------
 
-const instanceCapabilities: InstanceCapabilities = process.env.INSTANCE_CAPABILITIES
-  ? JSON.parse(process.env.INSTANCE_CAPABILITIES)
-  : { instanceId: "unknown", servers: { configured: [], unconfigured: [] }, integrations: {} };
+const FALLBACK_CAPABILITIES: InstanceCapabilities = {
+  instanceId: "unknown",
+  servers: { configured: [], unconfigured: [] },
+  integrations: {},
+};
+
+let instanceCapabilities: InstanceCapabilities = FALLBACK_CAPABILITIES;
+try {
+  if (process.env.INSTANCE_CAPABILITIES) {
+    instanceCapabilities = JSON.parse(process.env.INSTANCE_CAPABILITIES);
+  }
+} catch {
+  // Malformed JSON — use fallback
+}
 
 server.registerTool(
   "instance_capabilities",
@@ -547,15 +558,13 @@ server.registerTool(
         : ["  (none — all servers configured)"]),
       "",
       "## Integrations",
-      ...Object.entries(instanceCapabilities.integrations).map(
-        ([name, info]) =>
-          `  ${(info as { configured: boolean; detail?: string }).configured ? "✓" : "✗"} ${name}${(info as { configured: boolean; detail?: string }).detail ? ` (${(info as { configured: boolean; detail?: string }).detail})` : ""}`,
-      ),
+      ...Object.entries(instanceCapabilities.integrations).map(([name, info]) => {
+        const { configured, detail } = info as { configured: boolean; detail?: string };
+        return `  ${configured ? "✓" : "✗"} ${name}${detail ? ` (${detail})` : ""}`;
+      }),
       "",
       "## Active Channels",
-      ...(allChannels.size > 0
-        ? [...allChannels].sort().map((ch) => `  #${ch}`)
-        : ["  (no channels assigned)"]),
+      ...(allChannels.size > 0 ? [...allChannels].sort().map((ch) => `  #${ch}`) : ["  (no channels assigned)"]),
     ];
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
