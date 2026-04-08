@@ -104,10 +104,7 @@ export class VoiceAdapter {
       return;
     }
 
-    const providedSecret =
-      (req.headers["x-vapi-secret"] as string) ??
-      (req.headers["server-secret"] as string) ??
-      "";
+    const providedSecret = (req.headers["x-vapi-secret"] as string) ?? (req.headers["server-secret"] as string) ?? "";
     if (providedSecret !== this.serverSecret) {
       log.warn("Voice request rejected — invalid server secret");
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -156,14 +153,10 @@ export class VoiceAdapter {
 
     // Build system prompt with call context
     const callMeta = request.call?.metadata as Record<string, string> | undefined;
-    const systemPrompt = await buildVoiceSystemPrompt(
-      agentConfig,
-      this.memoryManager,
-      {
-        goal: callMeta?.goal,
-        context: callMeta?.context,
-      },
-    );
+    const systemPrompt = await buildVoiceSystemPrompt(agentConfig, this.memoryManager, {
+      goal: callMeta?.goal,
+      context: callMeta?.context,
+    });
 
     // Translate OpenAI → Claude
     const { system, messages } = openaiToClaude(request.messages, systemPrompt);
