@@ -188,6 +188,16 @@ export const config = {
     port: parseInt(optional("ADMIN_API_PORT", String(ports.adminApi ?? portBase + 4)), 10),
     token: optional("ADMIN_API_TOKEN", ""),
   },
+  voice: {
+    enabled: !!hive.voice?.provider,
+    provider: (hive.voice?.provider as string) ?? "",
+    publicUrl: (hive.voice?.publicUrl as string) ?? "",
+    phoneNumberId: (hive.voice?.phoneNumberId as string) ?? "",
+    assistants: (hive.voice?.assistants ?? {}) as Record<string, string>,
+    apiKey: optional("VAPI_API_KEY", ""),
+    serverSecret: optional("VAPI_SERVER_SECRET", ""),
+    port: parseInt(optional("VOICE_PORT", String(ports.voice ?? portBase + 5)), 10),
+  },
   autonomy: {
     externalComms: (hive.autonomy?.externalComms ?? AUTONOMY_DEFAULTS.externalComms) as boolean,
     codeTask: (hive.autonomy?.codeTask ?? AUTONOMY_DEFAULTS.codeTask) as boolean,
