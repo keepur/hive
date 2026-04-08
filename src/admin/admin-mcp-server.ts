@@ -521,7 +521,10 @@ const FALLBACK_CAPABILITIES: InstanceCapabilities = {
 let instanceCapabilities: InstanceCapabilities = FALLBACK_CAPABILITIES;
 try {
   if (process.env.INSTANCE_CAPABILITIES) {
-    instanceCapabilities = JSON.parse(process.env.INSTANCE_CAPABILITIES);
+    const parsed = JSON.parse(process.env.INSTANCE_CAPABILITIES);
+    if (parsed && typeof parsed === "object" && "servers" in parsed) {
+      instanceCapabilities = parsed as InstanceCapabilities;
+    }
   }
 } catch {
   // Malformed JSON — use fallback
@@ -538,7 +541,7 @@ server.registerTool(
   async () => {
     // Fetch current agent count and channel list from DB
     const agentCount = await agentDefs.countDocuments();
-    const agents = await agentDefs.find().toArray();
+    const agents = await agentDefs.find({}, { projection: { channels: 1, passiveChannels: 1 } }).toArray();
     const allChannels = new Set<string>();
     for (const a of agents) {
       for (const ch of a.channels ?? []) allChannels.add(ch);
