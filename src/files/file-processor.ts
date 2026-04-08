@@ -112,7 +112,7 @@ const TEXT_TYPES = new Set([
  * Shared by downloadAndProcess (Slack) and processFileBuffer (Team/WS).
  * Returns extracted text or null for unsupported types.
  */
-async function extractContent(
+export async function extractContent(
   buffer: Buffer,
   filename: string,
   mimetype: string,
