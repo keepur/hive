@@ -350,6 +350,16 @@ async function main(): Promise<void> {
     log.info("WebSocket adapter started", { port: config.ws.port });
   }
 
+  // Voice adapter — Vapi phone integration (custom LLM endpoint)
+  let voiceAdapter: import("./channels/voice/voice-adapter.js").VoiceAdapter | undefined;
+  if (config.voice.enabled && config.voice.serverSecret) {
+    const { VoiceAdapter } = await import("./channels/voice/voice-adapter.js");
+
+    voiceAdapter = new VoiceAdapter(config.voice.port, config.voice.serverSecret, registry, memoryManager);
+    await voiceAdapter.start();
+    log.info("Voice adapter started", { port: config.voice.port });
+  }
+
   // Start scheduler (with callback support via MongoDB)
   scheduler = new Scheduler(agentManager, memoryManager, healthReporter, registry, (item) => {
     dispatcher.dispatch(item).catch((err) => {
@@ -423,6 +433,7 @@ async function main(): Promise<void> {
     await smsAdapter.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
     if (wsAdapter) await wsAdapter.stop();
+    voiceAdapter?.stop();
     if (teamStore) await teamStore.close();
     scheduler.stop();
     bgTaskManager.stop();
