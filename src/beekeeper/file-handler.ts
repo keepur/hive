@@ -33,12 +33,10 @@ export function decodeAndValidate(data: string, filename: string): { buffer: Buf
   }
   const safeName = sanitizeFilename(filename);
 
-  let buffer: Buffer;
-  try {
-    buffer = Buffer.from(data, "base64");
-  } catch {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
     throw new Error("Invalid base64 data");
   }
+  const buffer = Buffer.from(data, "base64");
 
   if (buffer.length > MAX_FILE_SIZE) {
     throw new Error(`File too large: ${formatSize(buffer.length)} (max ${formatSize(MAX_FILE_SIZE)})`);
