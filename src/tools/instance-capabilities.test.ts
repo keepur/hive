@@ -106,3 +106,23 @@ describe("buildInstanceCapabilities", () => {
     expect(overlap).toEqual([]);
   });
 });
+
+// Invariant test — ensure credential checks stay in sync with server catalog
+describe("SERVER_CREDENTIAL_CHECKS invariant", () => {
+  it("all credential check entries exist in SERVER_CATALOG", async () => {
+    // Import directly to inspect the mapping keys
+    const { SERVER_CATALOG } = await import("./server-catalog.js");
+    const catalogKeys = new Set(Object.keys(SERVER_CATALOG));
+
+    // These are the servers we define credential checks for — must all be in the catalog
+    const credentialCheckServers = [
+      "google", "resend", "brave-search", "linear", "clickup", "github-issues",
+      "quo", "recall", "hubspot-crm", "permits", "code-task", "code-search",
+      "browser", "catalog", "dodi-ops", "tasks", "product-search", "ops-search",
+    ];
+
+    for (const server of credentialCheckServers) {
+      expect(catalogKeys, `SERVER_CREDENTIAL_CHECKS has '${server}' but SERVER_CATALOG does not`).toContain(server);
+    }
+  });
+});
