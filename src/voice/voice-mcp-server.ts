@@ -57,7 +57,9 @@ server.tool(
     "Provide a clear goal describing what you want to accomplish on the call.",
   {
     to: z.string().describe("Recipient phone number in E.164 format (e.g., +14155551234)"),
-    goal: z.string().describe("What you want to accomplish on this call — this is injected into your system prompt during the call"),
+    goal: z
+      .string()
+      .describe("What you want to accomplish on this call — this is injected into your system prompt during the call"),
     context: z.string().optional().describe("Additional context for the call (order details, customer history, etc.)"),
   },
   async ({ to, goal, context }) => {
@@ -70,7 +72,9 @@ server.tool(
 
     if (!VAPI_PHONE_NUMBER_ID) {
       return {
-        content: [{ type: "text" as const, text: "Error: No outbound phone number configured. Set VAPI_PHONE_NUMBER_ID." }],
+        content: [
+          { type: "text" as const, text: "Error: No outbound phone number configured. Set VAPI_PHONE_NUMBER_ID." },
+        ],
         isError: true,
       };
     }
@@ -124,11 +128,7 @@ server.tool(
     try {
       const call = (await vapiRequest("GET", `/call/${call_id}`)) as any;
 
-      const lines: string[] = [
-        `Call ID: ${call.id}`,
-        `Status: ${call.status}`,
-        `Type: ${call.type}`,
-      ];
+      const lines: string[] = [`Call ID: ${call.id}`, `Status: ${call.status}`, `Type: ${call.type}`];
 
       if (call.startedAt) lines.push(`Started: ${call.startedAt}`);
       if (call.endedAt) lines.push(`Ended: ${call.endedAt}`);
