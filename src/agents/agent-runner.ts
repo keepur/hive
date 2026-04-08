@@ -251,6 +251,26 @@ export class AgentRunner {
       };
     }
 
+    // Voice MCP server — outbound phone calls via Vapi
+    if (config.voice.enabled && config.voice.apiKey) {
+      // Resolve the Vapi assistant ID for this agent (reverse lookup from config.voice.assistants)
+      const vapiAssistantId = Object.entries(config.voice.assistants)
+        .find(([_, hiveId]) => hiveId === this.agentConfig.id)?.[0] ?? "";
+
+      servers["voice"] = {
+        type: "stdio",
+        command: "node",
+        args: [resolve("dist/voice/voice-mcp-server.js")],
+        env: {
+          VAPI_API_KEY: config.voice.apiKey,
+          VAPI_PHONE_NUMBER_ID: config.voice.phoneNumberId,
+          VAPI_ASSISTANT_ID: vapiAssistantId,
+          AGENT_ID: this.agentConfig.id,
+          AGENT_NAME: this.agentConfig.name,
+        },
+      };
+    }
+
     // Contacts MCP server — centralized contact lookup (MongoDB)
     servers["contacts"] = {
       type: "stdio",
