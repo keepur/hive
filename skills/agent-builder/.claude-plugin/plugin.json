@@ -1,0 +1,9 @@
+{
+  "name": "agent-builder",
+  "description": "Guided agent creation from natural conversation — structured intake, persona shaping, and minimal-by-default agent definitions",
+  "version": "0.1.0",
+  "author": {
+    "name": "Hive",
+    "email": "engineering@keepur.com"
+  }
+}
