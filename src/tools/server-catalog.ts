@@ -64,6 +64,10 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     description: "Send and receive SMS messages via OpenPhone",
     usage: "Texting customers or team members",
   },
+  voice: {
+    description: "Make outbound phone calls via Vapi",
+    usage: "Calling customers, scheduling appointments, following up by phone",
+  },
   tasks: {
     description: "Task management — create, update, and track agent tasks",
     usage: "Managing your own task queue",
