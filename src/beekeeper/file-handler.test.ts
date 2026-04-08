@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
@@ -25,6 +25,10 @@ describe("decodeAndValidate", () => {
   it("throws on missing filename", () => {
     const data = Buffer.from("hello").toString("base64");
     expect(() => decodeAndValidate(data, "")).toThrow("Missing required field: filename");
+  });
+
+  it("throws on invalid base64 data", () => {
+    expect(() => decodeAndValidate("not!valid@base64", "test.txt")).toThrow("Invalid base64 data");
   });
 
   it("throws on oversized file", () => {
