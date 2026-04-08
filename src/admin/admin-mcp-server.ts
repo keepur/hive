@@ -526,8 +526,8 @@ try {
       instanceCapabilities = parsed as InstanceCapabilities;
     }
   }
-} catch {
-  // Malformed JSON — use fallback
+} catch (err) {
+  console.error("[hive-admin] Failed to parse INSTANCE_CAPABILITIES, using fallback:", err);
 }
 
 server.registerTool(
