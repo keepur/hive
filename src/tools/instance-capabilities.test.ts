@@ -52,13 +52,11 @@ describe("buildInstanceCapabilities", () => {
   });
 
   it("classifies servers with valid credentials as configured", () => {
-    // google has accounts, resend has apiKey, linear has apiKey, github has repo, taskLedger has apiUrl
+    // google has accounts, resend has apiKey, linear has apiKey, github has repo
     expect(result.servers.configured).toContain("google");
     expect(result.servers.configured).toContain("resend");
     expect(result.servers.configured).toContain("linear");
     expect(result.servers.configured).toContain("github-issues");
-    expect(result.servers.configured).toContain("catalog");
-    expect(result.servers.configured).toContain("tasks");
     expect(result.servers.configured).toContain("hubspot-crm");
   });
 
@@ -72,8 +70,13 @@ describe("buildInstanceCapabilities", () => {
     expect(result.servers.unconfigured).toContain("code-search");
   });
 
-  it("marks permits as unconfigured when using default URI", () => {
+  it("marks servers with default URIs as unconfigured", () => {
+    // permits has default mongo URI, taskLedger has default localhost URL
     expect(result.servers.unconfigured).toContain("permits");
+    expect(result.servers.unconfigured).toContain("catalog");
+    expect(result.servers.unconfigured).toContain("tasks");
+    expect(result.servers.unconfigured).toContain("dodi-ops");
+    expect(result.servers.unconfigured).toContain("ops-search");
   });
 
   it("always classifies code-task as configured", () => {

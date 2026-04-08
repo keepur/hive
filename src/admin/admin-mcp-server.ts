@@ -539,8 +539,7 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    // Fetch current agent count and channel list from DB
-    const agentCount = await agentDefs.countDocuments();
+    // Fetch channel list from DB (projection: only channels fields)
     const agents = await agentDefs.find({}, { projection: { channels: 1, passiveChannels: 1 } }).toArray();
     const allChannels = new Set<string>();
     for (const a of agents) {
@@ -550,7 +549,7 @@ server.registerTool(
 
     const lines: string[] = [
       `Instance: ${instanceCapabilities.instanceId}`,
-      `Agents: ${agentCount}`,
+      `Agents: ${agents.length}`,
       "",
       "## Configured Servers",
       ...instanceCapabilities.servers.configured.map((s: string) => `  ✓ ${s}`),
@@ -561,10 +560,9 @@ server.registerTool(
         : ["  (none — all servers configured)"]),
       "",
       "## Integrations",
-      ...Object.entries(instanceCapabilities.integrations).map(([name, info]) => {
-        const { configured, detail } = info as { configured: boolean; detail?: string };
-        return `  ${configured ? "✓" : "✗"} ${name}${detail ? ` (${detail})` : ""}`;
-      }),
+      ...Object.entries(instanceCapabilities.integrations).map(([name, info]) =>
+        `  ${info.configured ? "✓" : "✗"} ${name}${info.detail ? ` (${info.detail})` : ""}`,
+      ),
       "",
       "## Active Channels",
       ...(allChannels.size > 0 ? [...allChannels].sort().map((ch) => `  #${ch}`) : ["  (no channels assigned)"]),
