@@ -76,7 +76,7 @@ export function openaiToClaude(
             type: "tool_use",
             id: tc.id,
             name: tc.function.name,
-            input: JSON.parse(tc.function.arguments || "{}"),
+            input: safeParse(tc.function.arguments),
           });
         }
         messages.push({ role: "assistant", content } as unknown as Anthropic.MessageCreateParams["messages"][number]);
@@ -215,4 +215,15 @@ export function formatNonStreamingResponse(id: string, text: string, model: stri
       },
     ],
   };
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+function safeParse(json: string | undefined): Record<string, unknown> {
+  if (!json) return {};
+  try {
+    return JSON.parse(json);
+  } catch {
+    return {};
+  }
 }
