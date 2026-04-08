@@ -16,6 +16,8 @@ import { z } from "zod";
 import { MongoClient } from "mongodb";
 import type { AgentDefinition, AgentDefinitionVersion } from "../types/agent-definition.js";
 import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
+import type { AutonomyFlags } from "../agents/autonomy.js";
+import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
 const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
@@ -185,6 +187,9 @@ server.registerTool(
       timeoutMs: (f.timeoutMs as number) ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
       disabled: (f.disabled as boolean) ?? false,
       slackBot: f.slackBot as string | undefined,
+      autonomy: f.autonomy as Partial<AutonomyFlags> | undefined,
+      resourceTiers: f.resourceTiers as AgentDefinition["resourceTiers"],
+      betas: f.betas as string[] | undefined,
       createdAt: now,
       updatedAt: now,
       updatedBy: AGENT_ID,
@@ -500,6 +505,70 @@ server.registerTool(
         },
       ],
     };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// instance_capabilities
+// ---------------------------------------------------------------------------
+
+const FALLBACK_CAPABILITIES: InstanceCapabilities = {
+  instanceId: "unknown",
+  servers: { configured: [], unconfigured: [] },
+  integrations: {},
+};
+
+let instanceCapabilities: InstanceCapabilities = FALLBACK_CAPABILITIES;
+try {
+  if (process.env.INSTANCE_CAPABILITIES) {
+    const parsed = JSON.parse(process.env.INSTANCE_CAPABILITIES);
+    if (parsed && typeof parsed === "object" && "servers" in parsed) {
+      instanceCapabilities = parsed as InstanceCapabilities;
+    }
+  }
+} catch (err) {
+  console.error("[hive-admin] Failed to parse INSTANCE_CAPABILITIES, using fallback:", err);
+}
+
+server.registerTool(
+  "instance_capabilities",
+  {
+    title: "Instance Capabilities",
+    description:
+      "Report what servers, integrations, and channels are configured on this Hive instance. Use this before creating agents to check what capabilities are available.",
+    inputSchema: {},
+  },
+  async () => {
+    // Fetch channel list from DB (projection: only channels fields)
+    const agents = await agentDefs.find({}, { projection: { channels: 1, passiveChannels: 1 } }).toArray();
+    const allChannels = new Set<string>();
+    for (const a of agents) {
+      for (const ch of a.channels ?? []) allChannels.add(ch);
+      for (const ch of a.passiveChannels ?? []) allChannels.add(ch);
+    }
+
+    const lines: string[] = [
+      `Instance: ${instanceCapabilities.instanceId}`,
+      `Agents: ${agents.length}`,
+      "",
+      "## Configured Servers",
+      ...instanceCapabilities.servers.configured.map((s: string) => `  ✓ ${s}`),
+      "",
+      "## Unconfigured Servers (missing credentials)",
+      ...(instanceCapabilities.servers.unconfigured.length > 0
+        ? instanceCapabilities.servers.unconfigured.map((s: string) => `  ✗ ${s}`)
+        : ["  (none — all servers configured)"]),
+      "",
+      "## Integrations",
+      ...Object.entries(instanceCapabilities.integrations).map(
+        ([name, info]) => `  ${info.configured ? "✓" : "✗"} ${name}${info.detail ? ` (${info.detail})` : ""}`,
+      ),
+      "",
+      "## Active Channels",
+      ...(allChannels.size > 0 ? [...allChannels].sort().map((ch) => `  #${ch}`) : ["  (no channels assigned)"]),
+    ];
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   },
 );
 
