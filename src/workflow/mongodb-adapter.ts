@@ -1,9 +1,9 @@
 import type { Collection, Document, Filter, UpdateFilter } from "mongodb";
-import type { ICollectionAdapter, FindOptions, UpdateResult, DeleteResult } from "@dodi/fsm-persistence";
+import type { ICollectionAdapter, FindOptions, UpdateResult, DeleteResult } from "@dodi-hq/fsm-persistence";
 
 /**
  * MongoDB native driver adapter implementing ICollectionAdapter.
- * Bridges @dodi/fsm-persistence's generic interface to mongodb's Collection.
+ * Bridges @dodi-hq/fsm-persistence's generic interface to mongodb's Collection.
  */
 export class MongoDBAdapter<T extends Document> implements ICollectionAdapter<T> {
   constructor(private collection: Collection<T>) {}

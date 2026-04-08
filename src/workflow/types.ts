@@ -1,4 +1,4 @@
-import type { IWorkflowTask, IWorkflowPlan, TaskAssignee } from "@dodi/task-core";
+import type { IWorkflowTask, IWorkflowPlan, TaskAssignee } from "@dodi-hq/task-core";
 
 // Re-export shared types
 export type { IWorkflowTask, IWorkflowPlan, TaskAssignee };
