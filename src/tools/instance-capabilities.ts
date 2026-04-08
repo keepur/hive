@@ -39,11 +39,11 @@ const SERVER_CREDENTIAL_CHECKS: Record<string, () => boolean> = {
   "code-task": () => true,
   "code-search": () => !!config.codeIndex?.enabled,
   browser: () => !!config.browser?.cdpEndpoint,
-  catalog: () => !!config.taskLedger?.apiUrl,
-  "dodi-ops": () => !!config.taskLedger?.apiUrl,
-  tasks: () => !!config.taskLedger?.apiUrl,
+  catalog: () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
+  "dodi-ops": () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
+  tasks: () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
   "product-search": () => !!config.hubspot?.apiKey,
-  "ops-search": () => !!config.taskLedger?.apiUrl,
+  "ops-search": () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
 };
 
 /** Infrastructure servers — always available, don't need credential checks */
