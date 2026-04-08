@@ -242,7 +242,7 @@ export class AgentRunner {
     }
 
     // Voice MCP server — outbound phone calls via Vapi
-    if (config.voice.apiKey) {
+    if (config.voice.enabled && config.voice.apiKey) {
       // Resolve the Vapi assistant ID for this agent (reverse lookup from config.voice.assistants)
       const vapiAssistantId = Object.entries(config.voice.assistants)
         .find(([_, hiveId]) => hiveId === this.agentConfig.id)?.[0] ?? "";
