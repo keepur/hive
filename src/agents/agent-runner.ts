@@ -9,10 +9,14 @@ import { config } from "../config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
+import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 
 const log = createLogger("agent-runner");
+
+/** Cached instance capabilities — config doesn't change at runtime */
+const cachedCapabilities = JSON.stringify(buildInstanceCapabilities());
 
 export type StreamCallback = (chunk: string) => void;
 
@@ -574,6 +578,7 @@ export class AgentRunner {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
         AGENT_ID: this.agentConfig.id,
+        INSTANCE_CAPABILITIES: cachedCapabilities,
       },
     };
 
