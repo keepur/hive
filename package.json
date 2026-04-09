@@ -1,8 +1,18 @@
 {
-  "name": "hive",
+  "name": "@keepur/hive",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "bin": {
+    "hive": "pkg/cli.min.js"
+  },
+  "files": [
+    "pkg/",
+    "seeds/",
+    "templates/"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "build": "tsc && tsc -p tsconfig.plugins.json",
     "build:plugins": "tsc -p tsconfig.plugins.json",
