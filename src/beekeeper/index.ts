@@ -435,8 +435,8 @@ async function main(): Promise<void> {
 
       const logMeta: Record<string, unknown> = { type: msg.type };
       if (msg.type === "image" || msg.type === "file") {
-        logMeta.sessionId = (msg as { sessionId?: string }).sessionId;
-        logMeta.filename = (msg as { filename?: string }).filename;
+        logMeta.sessionId = msg.sessionId;
+        logMeta.filename = msg.filename;
       }
       log.info("WS message received", logMeta);
 

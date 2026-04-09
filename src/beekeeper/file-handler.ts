@@ -11,6 +11,12 @@ mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB decoded
 
+let fileCounter = 0;
+function uniqueSuffix(): string {
+  fileCounter = (fileCounter + 1) % 1_000_000;
+  return `${Date.now()}-${fileCounter}`;
+}
+
 function sanitizeFilename(filename: string): string {
   return filename.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
@@ -31,10 +37,13 @@ export function decodeAndValidate(data: string, filename: string): { buffer: Buf
   }
   const safeName = sanitizeFilename(filename);
 
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
+  if (!data || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) {
     throw new Error("Invalid base64 data");
   }
   const buffer = Buffer.from(data, "base64");
+  if (buffer.length === 0) {
+    throw new Error("Invalid base64 data");
+  }
 
   if (buffer.length > MAX_FILE_SIZE) {
     throw new Error(`File too large: ${formatSize(buffer.length)} (max ${formatSize(MAX_FILE_SIZE)})`);
@@ -48,7 +57,7 @@ export function decodeAndValidate(data: string, filename: string): { buffer: Buf
  */
 export async function handleImage(data: string, filename: string): Promise<string> {
   const { buffer, safeName } = decodeAndValidate(data, filename);
-  const localPath = join(DOWNLOAD_DIR, `${Date.now()}-${safeName}`);
+  const localPath = join(DOWNLOAD_DIR, `${uniqueSuffix()}-${safeName}`);
   writeFileSync(localPath, buffer);
   log.info("Image saved", { filename: safeName, size: buffer.length, path: localPath });
 
@@ -61,7 +70,7 @@ export async function handleImage(data: string, filename: string): Promise<strin
  */
 export async function handleFile(data: string, filename: string, mimetype: string): Promise<string> {
   const { buffer, safeName } = decodeAndValidate(data, filename);
-  const localPath = join(DOWNLOAD_DIR, `${Date.now()}-${safeName}`);
+  const localPath = join(DOWNLOAD_DIR, `${uniqueSuffix()}-${safeName}`);
   writeFileSync(localPath, buffer);
   log.info("File saved", { filename: safeName, mimetype, size: buffer.length, path: localPath });
 
@@ -80,5 +89,5 @@ export async function handleFile(data: string, filename: string, mimetype: strin
   }
 
   // Unsupported type — metadata only
-  return `📎 File: ${filename} (${formatSize(buffer.length)}, ${mimetype}) — unsupported format, file saved at ${localPath}`;
+  return `📎 File: ${filename} (${formatSize(buffer.length)}, ${mimetype}) — unsupported format, content not extracted`;
 }
