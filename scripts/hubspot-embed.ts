@@ -634,13 +634,6 @@ async function processObjectType(
   };
 
   for await (const doc of cursor) {
-    // Track max extractedAt for watermark
-    if (doc.extractedAt) {
-      if (!maxExtractedAt || doc.extractedAt > maxExtractedAt) {
-        maxExtractedAt = doc.extractedAt;
-      }
-    }
-
     const text = truncate(textBuilder(doc, ctx));
     if (!text || text.length < 5) {
       skipped++;
@@ -648,6 +641,13 @@ async function processObjectType(
     }
 
     batch.push({ doc, text });
+
+    // Only advance the watermark for docs that actually make it into a
+    // batch — skipped docs should remain revisitable on the next run in
+    // case the skip was due to a transient text-build issue.
+    if (doc.extractedAt && (!maxExtractedAt || doc.extractedAt > maxExtractedAt)) {
+      maxExtractedAt = doc.extractedAt;
+    }
 
     if (batch.length >= EMBED_BATCH_SIZE) {
       await flushBatch();
