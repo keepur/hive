@@ -437,8 +437,6 @@ async function main(): Promise<void> {
       if (msg.type === "image" || msg.type === "file") {
         logMeta.sessionId = (msg as { sessionId?: string }).sessionId;
         logMeta.filename = (msg as { filename?: string }).filename;
-      } else {
-        logMeta.raw = raw.toString().slice(0, 200);
       }
       log.info("WS message received", logMeta);
 
@@ -570,6 +568,11 @@ async function main(): Promise<void> {
               const prompt = await handleImage(msg.data, msg.filename);
               await sessionManager.sendMessage(msg.sessionId, prompt);
             } catch (err) {
+              log.error("Image upload failed", {
+                sessionId: msg.sessionId,
+                filename: msg.filename,
+                error: err instanceof Error ? err.message : String(err),
+              });
               ws.send(
                 JSON.stringify({
                   type: "error",
@@ -589,6 +592,12 @@ async function main(): Promise<void> {
               const prompt = await handleFile(msg.data, msg.filename, msg.mimetype);
               await sessionManager.sendMessage(msg.sessionId, prompt);
             } catch (err) {
+              log.error("File upload failed", {
+                sessionId: msg.sessionId,
+                filename: msg.filename,
+                mimetype: msg.mimetype,
+                error: err instanceof Error ? err.message : String(err),
+              });
               ws.send(
                 JSON.stringify({
                   type: "error",
