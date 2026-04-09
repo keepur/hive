@@ -18,7 +18,7 @@
     "build:plugins": "tsc -p tsconfig.plugins.json",
     "start": "node dist/index.js",
     "dev": "npx tsx src/index.ts",
-    "setup": "npx tsx setup/setup-wizard.ts",
+    "setup": "npx tsx src/setup/wizard.ts",
     "setup:instance": "npx tsx setup/setup-instance.ts",
     "setup:prereqs": "bash setup/install-prereqs.sh",
     "setup:constitution": "npx tsx setup/setup-constitution.ts",

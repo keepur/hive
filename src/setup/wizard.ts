@@ -17,9 +17,9 @@ import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
 
-const ROOT = resolve(import.meta.dirname, "..");
-const ENV_PATH = join(ROOT, ".env");
-const HIVE_YAML_PATH = join(ROOT, "hive.yaml");
+const ROOT = resolve(import.meta.dirname, "../..");
+let ENV_PATH = join(ROOT, ".env");
+let HIVE_YAML_PATH = join(ROOT, "hive.yaml");
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -136,17 +136,34 @@ function isSlackDone(env: Record<string, string>): boolean {
   return !!(env.SLACK_APP_TOKEN && env.SLACK_BOT_TOKEN);
 }
 
-function isAgentDone(): boolean {
-  return existsSync(join(ROOT, "agents", "chief-of-staff", "agent.yaml"));
+async function isAgentDone(): Promise<boolean> {
+  try {
+    const client = new MongoClient(process.env.MONGODB_URI ?? "mongodb://localhost:27017");
+    await client.connect();
+    const db = client.db(process.env.MONGODB_DB ?? "hive");
+    const agent = await db.collection("agent_definitions").findOne({ _id: "chief-of-staff" as any });
+    await client.close();
+    return !!agent;
+  } catch {
+    return false;
+  }
 }
 
-function isBuildDone(): boolean {
-  return existsSync(join(ROOT, "dist", "index.js"));
+function isBuildDone(targetDir: string): boolean {
+  if (existsSync(resolve(import.meta.dirname, "..", "pkg", "server.min.js"))) return true;
+  return existsSync(resolve(targetDir, "dist", "index.js"));
 }
 
 // ── Main ───────────────────────────────────────────────────────────
 
-async function main() {
+export async function runWizard(
+  targetDir: string = ROOT,
+  templatesDir: string = resolve(ROOT, "setup", "templates"),
+): Promise<void> {
+  // Update module-level paths for the target directory
+  ENV_PATH = join(targetDir, ".env");
+  HIVE_YAML_PATH = join(targetDir, "hive.yaml");
+
   banner();
 
   const env = loadEnv();
@@ -156,8 +173,8 @@ async function main() {
   const completedSections: string[] = [];
   if (isBusinessDone(hive)) completedSections.push("Business info");
   if (isSlackDone(env)) completedSections.push("Slack");
-  if (isAgentDone()) completedSections.push("Agent setup");
-  if (isBuildDone()) completedSections.push("Build");
+  if (await isAgentDone()) completedSections.push("Agent setup");
+  if (isBuildDone(targetDir)) completedSections.push("Build");
 
   if (completedSections.length > 0) {
     console.log("Resuming setup. Already completed:");
@@ -348,7 +365,7 @@ async function main() {
   // ── 4.5 Plugins ─────────────────────────────────────────────────
   section("Plugins");
 
-  const pluginsDir = join(ROOT, "plugins");
+  const pluginsDir = join(targetDir, "plugins");
   if (existsSync(pluginsDir)) {
     const available = readdirSync(pluginsDir).filter((d) => {
       return existsSync(join(pluginsDir, d, "plugin.yaml"));
@@ -384,7 +401,7 @@ async function main() {
   saveHiveYaml(hive);
 
   // ── 5. Agent Setup ────────────────────────────────────────────────
-  if (isAgentDone()) {
+  if (await isAgentDone()) {
     console.log("\nChief of Staff agent: ✓ already set up");
     const redo = await confirm("Regenerate agent from template?", false);
     if (redo) {
@@ -401,12 +418,12 @@ async function main() {
 
   // ── 7. Seed Memory to MongoDB ─────────────────────────────────────
   section("Memory (MongoDB)");
-  await doMemory(hive);
+  await doMemory(hive, templatesDir);
 
   // ── 8. Build ──────────────────────────────────────────────────────
   section("Build");
 
-  if (isBuildDone()) {
+  if (isBuildDone(targetDir)) {
     console.log("Build output exists.");
     const rebuild = await confirm("Rebuild?", true);
     if (!rebuild) {
@@ -650,7 +667,7 @@ async function doConstitution(hive: Record<string, any>) {
   console.log("\n  ✓ Constitution preferences saved (hive.yaml)");
 }
 
-async function doMemory(hive: Record<string, any>) {
+async function doMemory(hive: Record<string, any>, templatesDir: string) {
   const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
   const mongoDb = process.env.MONGODB_DB || "hive";
 
@@ -690,9 +707,13 @@ async function doMemory(hive: Record<string, any>) {
     console.log("  ✓ shared/business-context.md");
 
     // Constitution
-    const constitutionTplPath = join(ROOT, "setup", "templates", "constitution.md.tpl");
+    const constitutionTplPath = join(templatesDir, "constitution.md.tpl");
     if (existsSync(constitutionTplPath)) {
-      const { render: renderTemplate } = await import("./template-renderer.ts");
+      // Dynamic import — template-renderer lives outside src/ rootDir
+      const rendererPath = join(ROOT, "setup", "template-renderer.ts");
+      const { render: renderTemplate } = (await import(rendererPath)) as {
+        render: (tpl: string, ctx: Record<string, any>) => string;
+      };
       const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
 
       const team: Record<string, string> = {};
@@ -789,8 +810,12 @@ async function doDeploy(deployDir: string) {
   console.log(`\n  ✓ Deploy directory ready: ${deployDir}`);
 }
 
-main().catch((err) => {
-  console.error("Setup failed:", err);
-  rl.close();
-  process.exit(1);
-});
+// Backward compat — run directly if executed as main
+const isMain = import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  runWizard().catch((err) => {
+    console.error("Setup failed:", err);
+    rl.close();
+    process.exit(1);
+  });
+}
