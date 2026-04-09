@@ -212,6 +212,7 @@ export class HubSpotApiClient {
     closeDateAfter?: string;
     closeDateBefore?: string;
     limit?: number;
+    activeOnly?: boolean;
   }): Promise<HubSpotObject[]> {
     log.info("Listing deals", { options });
 
@@ -221,6 +222,15 @@ export class HubSpotApiClient {
 
     if (options.stages && options.stages.length > 0) {
       filters.push({ propertyName: "dealstage", operator: "IN", values: options.stages });
+    } else if (options.activeOnly !== false) {
+      // Default: exclude closed deals unless caller explicitly picks stages or opts in to closed.
+      // Closed deals are retained in the dataset (they may reopen), but unfiltered list calls
+      // should surface active pipeline by default.
+      filters.push({
+        propertyName: "dealstage",
+        operator: "NOT_IN",
+        values: ["closedwon", "closedlost"],
+      });
     }
     if (options.closeDateAfter) {
       filters.push({ propertyName: "closedate", operator: "GTE", value: options.closeDateAfter });
@@ -232,7 +242,7 @@ export class HubSpotApiClient {
     const body = {
       filterGroups: [{ filters }],
       properties: DEAL_PROPERTIES,
-      sorts: [{ propertyName: "dealname", direction: "ASCENDING" }],
+      sorts: [{ propertyName: "hs_lastmodifieddate", direction: "DESCENDING" }],
       limit: options.limit ?? 100,
     };
 
