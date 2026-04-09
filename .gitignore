@@ -16,6 +16,7 @@ logs/
 service/com.hive.*.plist
 coverage/
 .qdrant-initialized
+pkg/
 
 # Spike test scratch files (recreated each test run)
 src/archetypes/fixtures/spike-b/DENIED_target.txt
