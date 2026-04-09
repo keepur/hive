@@ -12,7 +12,7 @@
 
 import { createInterface } from "node:readline";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
@@ -264,13 +264,13 @@ async function main() {
     // Check if gog is installed
     let gogInstalled = false;
     try {
-      execSync("which gog", { stdio: "pipe" });
+      execFileSync("which", ["gog"], { stdio: "pipe" });
       gogInstalled = true;
       console.log("  ✓ gog CLI found");
     } catch {
       console.log("  gog CLI not found. Installing via Homebrew...");
       try {
-        execSync("brew install gog", { stdio: "inherit" });
+        execFileSync("brew", ["install", "gog"], { stdio: "inherit" });
         gogInstalled = true;
         console.log("  ✓ gog CLI installed");
       } catch {
@@ -281,7 +281,7 @@ async function main() {
     if (gogInstalled) {
       // Check existing accounts
       try {
-        const authList = execSync("gog auth list 2>&1", { encoding: "utf-8" }).trim();
+        const authList = execFileSync("gog", ["auth", "list"], { encoding: "utf-8", stdio: "pipe" }).trim();
         if (authList && !authList.includes("no accounts")) {
           console.log("\n  Authenticated accounts:");
           console.log(`  ${authList.replace(/\n/g, "\n  ")}`);
@@ -297,7 +297,7 @@ async function main() {
           console.log(`\n  Opening browser for ${email}...`);
           console.log("  Complete the OAuth flow in your browser, then come back here.\n");
           try {
-            execSync(`gog auth add "${email}"`, { stdio: "inherit" });
+            execFileSync("gog", ["auth", "add", email], { stdio: "inherit" });
             console.log(`  ✓ ${email} authenticated`);
           } catch {
             console.log(`  ⚠ Authentication failed for ${email}. You can retry later: gog auth add ${email}`);
@@ -312,10 +312,11 @@ async function main() {
       // Verify it works
       if (env.GOOGLE_ACCOUNT) {
         try {
-          execSync(`gog gmail search "is:unread" -a "${env.GOOGLE_ACCOUNT}" --json --results-only --no-input 2>&1`, {
-            encoding: "utf-8",
-            timeout: 15_000,
-          });
+          execFileSync(
+            "gog",
+            ["gmail", "search", "is:unread", "-a", env.GOOGLE_ACCOUNT, "--json", "--results-only", "--no-input"],
+            { encoding: "utf-8", timeout: 15_000 },
+          );
           console.log(`  ✓ Gmail access verified for ${env.GOOGLE_ACCOUNT}`);
         } catch {
           console.log(`  ⚠ Could not verify Gmail access — check authentication later`);
@@ -449,7 +450,11 @@ async function main() {
   if (installService) {
     try {
       // Generate plists pointing to the deploy directory
-      execSync(`HIVE_DEPLOY_DIR="${deployDir}" bash service/install.sh`, { cwd: ROOT, stdio: "inherit" });
+      execFileSync("bash", ["service/install.sh"], {
+        cwd: ROOT,
+        stdio: "inherit",
+        env: { ...process.env, HIVE_DEPLOY_DIR: deployDir },
+      });
     } catch {
       console.log("  ⚠ Service installation failed — you can start manually:");
       console.log(`     cd ${deployDir} && npm start`);
@@ -543,8 +548,9 @@ async function doSlack(env: Record<string, string>) {
   // Validate
   if (env.SLACK_APP_TOKEN && env.SLACK_BOT_TOKEN) {
     try {
-      const result = execSync(
-        `curl -s -H "Authorization: Bearer ${env.SLACK_BOT_TOKEN}" https://slack.com/api/auth.test`,
+      const result = execFileSync(
+        "curl",
+        ["-s", "-H", `Authorization: Bearer ${env.SLACK_BOT_TOKEN}`, "https://slack.com/api/auth.test"],
         { encoding: "utf-8" },
       );
       const json = JSON.parse(result);
@@ -586,7 +592,7 @@ async function doAgent(hive: Record<string, any>) {
 
   // Seed chief-of-staff into agent_definitions via setup:seeds
   console.log("  Seeding agent definition...");
-  execSync("npx tsx setup/setup-seeds.ts", { cwd: ROOT, stdio: "inherit" });
+  execFileSync("npx", ["tsx", "setup/setup-seeds.ts"], { cwd: ROOT, stdio: "inherit" });
 
   console.log(`  ✓ ${agentName} (Chief of Staff) is ready`);
 }
@@ -716,7 +722,7 @@ async function doMemory(hive: Record<string, any>) {
 async function doBuild() {
   console.log("  Compiling TypeScript...");
   try {
-    execSync("npm run build", { cwd: ROOT, stdio: "pipe" });
+    execFileSync("npm", ["run", "build"], { cwd: ROOT, stdio: "pipe" });
     console.log("  ✓ Build complete");
   } catch (err) {
     console.log("  ⚠ Build failed:");
@@ -733,14 +739,14 @@ async function doDeploy(deployDir: string) {
     const parentDir = resolve(deployDir, "..");
     mkdir(parentDir, { recursive: true });
 
-    const remoteUrl = execSync("git remote get-url origin", { cwd: ROOT, encoding: "utf-8" }).trim();
-    execSync(`git clone "${remoteUrl}" "${deployDir}"`, { stdio: "inherit" });
+    const remoteUrl = execFileSync("git", ["remote", "get-url", "origin"], { cwd: ROOT, encoding: "utf-8" }).trim();
+    execFileSync("git", ["clone", remoteUrl, deployDir], { stdio: "inherit" });
     console.log("  ✓ Repository cloned");
   } else {
     // Pull latest
     console.log("  Pulling latest...");
     try {
-      execSync("git pull --ff-only", { cwd: deployDir, stdio: "inherit" });
+      execFileSync("git", ["pull", "--ff-only"], { cwd: deployDir, stdio: "inherit" });
     } catch {
       console.log("  ⚠ git pull failed — continuing with existing code");
     }
@@ -748,7 +754,7 @@ async function doDeploy(deployDir: string) {
 
   // Install production dependencies
   console.log("  Installing production dependencies...");
-  execSync("npm install --omit=dev", { cwd: deployDir, stdio: "pipe" });
+  execFileSync("npm", ["install", "--omit=dev"], { cwd: deployDir, stdio: "pipe" });
   console.log("  ✓ Dependencies installed");
 
   // Copy instance-specific files (not in git)
@@ -773,7 +779,7 @@ async function doDeploy(deployDir: string) {
   // dist/ (build output)
   const distSrc = join(ROOT, "dist");
   if (existsSync(distSrc)) {
-    execSync(`rsync -a --delete "${distSrc}/" "${join(deployDir, "dist")}/"`, { stdio: "pipe" });
+    execFileSync("rsync", ["-a", "--delete", `${distSrc}/`, `${join(deployDir, "dist")}/`], { stdio: "pipe" });
     console.log("  ✓ dist/");
   }
 
