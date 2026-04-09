@@ -168,8 +168,10 @@ server.registerTool(
   {
     title: "List HubSpot Deals",
     description:
-      "List deals from the Sales Pipeline with optional filters. " +
-      "Filter by stage(s) and/or close date range to get a complete list of matching deals. " +
+      "List deals from the Sales Pipeline, sorted by most-recently-modified first. " +
+      "By default, excludes closed-won and closed-lost deals — pass activeOnly=false " +
+      "(or an explicit `stages` list including closed stages) to include them. " +
+      "Filter by stage(s) and/or close date range to narrow results. " +
       "Stage IDs: S0 Prospect (appointmentscheduled), S1 Meeting (qualifiedtobuy), " +
       "S2 Discovery (15520138), S3 Evaluation (15520119), S4 Proposal (decisionmakerboughtin), " +
       "S5 Invoice (63682726), Sales Nurture (149783667), Closed won (closedwon), Closed lost (closedlost).",
@@ -177,7 +179,18 @@ server.registerTool(
       stages: z
         .array(z.string())
         .optional()
-        .describe('Deal stage IDs to filter by (e.g. ["15520138", "15520119", "decisionmakerboughtin", "149783667"])'),
+        .describe(
+          'Deal stage IDs to filter by (e.g. ["15520138", "15520119", "decisionmakerboughtin", "149783667"]). ' +
+            "When set, overrides the default activeOnly exclusion.",
+        ),
+      activeOnly: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          "When true (default), excludes closed-won and closed-lost deals. " +
+            "Set to false to include closed deals. Ignored if `stages` is provided.",
+        ),
       closeDateAfter: z
         .string()
         .optional()
@@ -189,9 +202,9 @@ server.registerTool(
       limit: z.number().optional().default(100).describe("Max deals to return (default 100)"),
     },
   },
-  async ({ stages, closeDateAfter, closeDateBefore, limit }) => {
+  async ({ stages, activeOnly, closeDateAfter, closeDateBefore, limit }) => {
     try {
-      const deals = await client.listDeals({ stages, closeDateAfter, closeDateBefore, limit });
+      const deals = await client.listDeals({ stages, activeOnly, closeDateAfter, closeDateBefore, limit });
 
       if (deals.length === 0) {
         return { content: [{ type: "text", text: "No deals found matching those filters." }] };
