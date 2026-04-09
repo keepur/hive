@@ -10,6 +10,8 @@ export type ClientMessage =
   | { type: "list_workspace_sessions"; path: string }
   | { type: "resume_session"; sessionId: string; path: string }
   | { type: "cancel"; sessionId: string }
+  | { type: "image"; sessionId: string; data: string; filename: string }
+  | { type: "file"; sessionId: string; data: string; filename: string; mimetype: string }
   | { type: "ping" };
 
 // Server → Client messages
