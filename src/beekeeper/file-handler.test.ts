@@ -75,7 +75,7 @@ describe("handleFile", () => {
 
     expect(result).toContain("📎 File: data.bin");
     expect(result).toContain("unsupported format");
-    expect(result).toContain("file saved at");
+    expect(result).toContain("content not extracted");
   });
 
   it("treats image sent via file type as image", async () => {
