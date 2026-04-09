@@ -2,7 +2,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { join, extname } from "node:path";
 import { tmpdir } from "node:os";
 import { createLogger } from "../logging/logger.js";
-import { extractContent } from "../files/file-processor.js";
+import { extractContent, IMAGE_TYPES } from "../files/file-processor.js";
 
 const log = createLogger("beekeeper-file-handler");
 
@@ -10,8 +10,6 @@ const DOWNLOAD_DIR = join(tmpdir(), "bk-files");
 mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB decoded
-
-const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic"]);
 
 function sanitizeFilename(filename: string): string {
   return filename.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -69,7 +67,7 @@ export async function handleFile(data: string, filename: string, mimetype: strin
 
   // Check if this is actually an image sent via the "file" type
   const ext = extname(filename).slice(1).toLowerCase();
-  if (IMAGE_EXTENSIONS.has(ext) || mimetype.startsWith("image/")) {
+  if (IMAGE_TYPES.has(ext) || mimetype.startsWith("image/")) {
     return `The user attached an image: ${filename}\nRead this file before responding (it is an image): ${localPath}`;
   }
 
