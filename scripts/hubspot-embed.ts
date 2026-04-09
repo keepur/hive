@@ -38,7 +38,10 @@ const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 const QDRANT_URL = process.env.QDRANT_URL ?? "http://localhost:6333";
 const MONGODB_STAGING_URI = process.env.MONGODB_STAGING_URI ?? "mongodb://localhost:27017/hubspot";
 
-const QDRANT_UPSERT_BATCH = 100;
+const QDRANT_UPSERT_BATCH = 50;
+const QDRANT_MAX_RETRIES = 5;
+const QDRANT_RETRY_BASE_MS = 1000;
+const QDRANT_RETRY_MAX_MS = 15_000;
 const OLLAMA_MAX_RETRIES = 5;
 const OLLAMA_RETRY_DELAY_MS = 5000;
 const EMBED_TEXT_MAX = 1000;
@@ -489,21 +492,56 @@ function buildPayload(
 
 // ── Qdrant Upsert ───────────────────────────────────────────────────────────
 
+function isRetryableQdrantError(err: any): boolean {
+  const msg = String(err?.message ?? "");
+  const causeCode = err?.cause?.code ?? "";
+  return (
+    msg.includes("fetch failed") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("ETIMEDOUT") ||
+    msg.includes("ECONNREFUSED") ||
+    msg.includes("EAI_AGAIN") ||
+    causeCode === "ECONNRESET" ||
+    causeCode === "ETIMEDOUT" ||
+    causeCode === "ECONNREFUSED" ||
+    causeCode === "UND_ERR_SOCKET"
+  );
+}
+
+async function upsertWithRetry(
+  qdrant: QdrantClient,
+  collection: string,
+  points: { id: string; vector: number[]; payload: Record<string, any> }[],
+): Promise<void> {
+  for (let attempt = 1; attempt <= QDRANT_MAX_RETRIES; attempt++) {
+    try {
+      await qdrant.upsert(collection, { wait: true, points });
+      return;
+    } catch (err: any) {
+      if (attempt === QDRANT_MAX_RETRIES || !isRetryableQdrantError(err)) {
+        throw err;
+      }
+      const delay = Math.min(QDRANT_RETRY_BASE_MS * 2 ** (attempt - 1), QDRANT_RETRY_MAX_MS);
+      console.warn(
+        `  Qdrant upsert attempt ${attempt}/${QDRANT_MAX_RETRIES} failed (${err.message}) — retrying in ${delay}ms`,
+      );
+      await sleep(delay);
+    }
+  }
+}
+
 async function upsertPoints(
   qdrant: QdrantClient,
   collection: string,
   points: { id: string; vector: number[]; payload: Record<string, any> }[],
 ): Promise<void> {
   for (let i = 0; i < points.length; i += QDRANT_UPSERT_BATCH) {
-    const slice = points.slice(i, i + QDRANT_UPSERT_BATCH);
-    await qdrant.upsert(collection, {
-      wait: true,
-      points: slice.map((p) => ({
-        id: p.id,
-        vector: p.vector,
-        payload: p.payload,
-      })),
-    });
+    const slice = points.slice(i, i + QDRANT_UPSERT_BATCH).map((p) => ({
+      id: p.id,
+      vector: p.vector,
+      payload: p.payload,
+    }));
+    await upsertWithRetry(qdrant, collection, slice);
   }
 }
 
@@ -547,6 +585,14 @@ async function processObjectType(
   let maxExtractedAt: Date | null = null;
   const startMs = Date.now();
 
+  const persistWatermark = async (at: Date) => {
+    await metaCol.updateOne(
+      { objectType },
+      { $set: { lastEmbedAt: at, updatedAt: new Date() } },
+      { upsert: true },
+    );
+  };
+
   const flushBatch = async () => {
     if (batch.length === 0) return;
 
@@ -578,6 +624,13 @@ async function processObjectType(
     await upsertPoints(qdrant, qdrantCol, points);
     embedded += batch.length;
     batch = [];
+
+    // Persist watermark after each successful flush so partial progress
+    // survives crashes mid-run — next run resumes from here instead of
+    // re-embedding everything.
+    if (maxExtractedAt) {
+      await persistWatermark(maxExtractedAt);
+    }
   };
 
   for await (const doc of cursor) {
