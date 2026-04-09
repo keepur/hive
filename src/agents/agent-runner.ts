@@ -1,6 +1,7 @@
 import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import { getArchetype, type ArchetypeDefinition } from "../archetypes/registry.js";
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../logging/logger.js";
@@ -8,6 +9,7 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
+import { hiveHome } from "../paths.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
@@ -57,6 +59,51 @@ export interface RunResult {
   preCompactTokens?: number; // Token count before last compaction (from compact_metadata.pre_tokens)
   error?: string;
   aborted?: boolean;
+}
+
+/**
+ * Base directory for built-in MCP server bundles.
+ * Dev: <repo>/dist/agents/ → parent = <repo>/dist/
+ * npm: <package>/pkg/ → server.min.js is in pkg/, dirname = pkg/
+ * We detect mode by checking for pkg/mcp/ existence.
+ */
+const DIST_DIR = existsSync(resolve(import.meta.dirname, "mcp"))
+  ? import.meta.dirname
+  : resolve(import.meta.dirname, "..");
+
+const MCP_BUNDLE_MAP: Record<string, string> = {
+  "memory/memory-mcp-server.js": "memory.min.js",
+  "memory/structured-memory-mcp-server.js": "structured-memory.min.js",
+  "keychain/keychain-mcp-server.js": "keychain.min.js",
+  "google/google-mcp-server.js": "google.min.js",
+  "quo/quo-mcp-server.js": "quo.min.js",
+  "voice/voice-mcp-server.js": "voice.min.js",
+  "contacts/contacts-mcp-server.js": "contacts.min.js",
+  "tasks/task-mcp-server.js": "task.min.js",
+  "resend/resend-mcp-server.js": "resend.min.js",
+  "linear/linear-mcp-server.js": "linear.min.js",
+  "github/github-issues-mcp-server.js": "github-issues.min.js",
+  "clickup/clickup-mcp-server.js": "clickup.min.js",
+  "recall/recall-mcp-server.js": "recall.min.js",
+  "background/background-task-mcp-server.js": "background-task.min.js",
+  "callback/callback-mcp-server.js": "callback.min.js",
+  "code-task/code-task-mcp-server.js": "code-task.min.js",
+  "search/conversation-search-mcp-server.js": "search-conversation.min.js",
+  "code-index/code-search-mcp-server.js": "code-search.min.js",
+  "events/event-bus-mcp-server.js": "event-bus.min.js",
+  "team/team-mcp-server.js": "team.min.js",
+  "workflow/workflow-mcp-server.js": "workflow.min.js",
+  "schedule/schedule-mcp-server.js": "schedule.min.js",
+  "admin/admin-mcp-server.js": "admin.min.js",
+};
+
+function mcpPath(devSubpath: string): string {
+  const bundleName = MCP_BUNDLE_MAP[devSubpath];
+  if (bundleName) {
+    const pkgBundle = resolve(DIST_DIR, "mcp", bundleName);
+    if (existsSync(pkgBundle)) return pkgBundle;
+  }
+  return resolve(DIST_DIR, devSubpath);
 }
 
 export class AgentRunner {
@@ -235,7 +282,7 @@ export class AgentRunner {
     servers["memory"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/memory/memory-mcp-server.js")],
+      args: [mcpPath("memory/memory-mcp-server.js")],
       env: {
         AGENT_ID: this.agentConfig.id,
         MONGODB_URI: config.mongo.uri,
@@ -248,7 +295,7 @@ export class AgentRunner {
     servers["structured-memory"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/memory/structured-memory-mcp-server.js")],
+      args: [mcpPath("memory/structured-memory-mcp-server.js")],
       env: {
         AGENT_ID: this.agentConfig.id,
         MONGODB_URI: config.mongo.uri,
@@ -264,7 +311,7 @@ export class AgentRunner {
     servers["keychain"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/keychain/keychain-mcp-server.js")],
+      args: [mcpPath("keychain/keychain-mcp-server.js")],
     };
 
     // Google MCP server — Gmail + Calendar via gog CLI
@@ -274,7 +321,7 @@ export class AgentRunner {
     servers["google"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/google/google-mcp-server.js")],
+      args: [mcpPath("google/google-mcp-server.js")],
       env: {
         ...(gogAccount ? { GOG_ACCOUNT: gogAccount } : {}),
         ...(gogClient ? { GOG_CLIENT: gogClient } : {}),
@@ -289,7 +336,7 @@ export class AgentRunner {
       servers["quo"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/quo/quo-mcp-server.js")],
+        args: [mcpPath("quo/quo-mcp-server.js")],
         env: {
           QUO_API_KEY: config.quo.apiKey,
           ...(config.quo.phoneNumberId ? { QUO_PHONE_NUMBER_ID: config.quo.phoneNumberId } : {}),
@@ -307,7 +354,7 @@ export class AgentRunner {
       servers["voice"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/voice/voice-mcp-server.js")],
+        args: [mcpPath("voice/voice-mcp-server.js")],
         env: {
           VAPI_API_KEY: config.voice.apiKey,
           VAPI_PHONE_NUMBER_ID: config.voice.phoneNumberId,
@@ -322,7 +369,7 @@ export class AgentRunner {
     servers["contacts"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/contacts/contacts-mcp-server.js")],
+      args: [mcpPath("contacts/contacts-mcp-server.js")],
       env: {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
@@ -335,7 +382,7 @@ export class AgentRunner {
       servers["tasks"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/tasks/task-mcp-server.js")],
+        args: [mcpPath("tasks/task-mcp-server.js")],
         env: {
           TASK_LEDGER_API_URL: config.taskLedger.apiUrl,
           TASK_LEDGER_API_KEY: taskKey,
@@ -348,7 +395,10 @@ export class AgentRunner {
       servers["brave-search"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("node_modules/brave-search-mcp/dist/index.js")],
+        args: [(() => {
+          const require = createRequire(import.meta.url);
+          return require.resolve("brave-search-mcp/dist/index.js");
+        })()],
         env: {
           BRAVE_API_KEY: config.brave.apiKey,
         },
@@ -367,7 +417,7 @@ export class AgentRunner {
       servers["resend"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/resend/resend-mcp-server.js")],
+        args: [mcpPath("resend/resend-mcp-server.js")],
         env: {
           RESEND_API_KEY: config.resend.apiKey,
           RESEND_FROM_ADDRESS: agentFromAddress,
@@ -388,7 +438,7 @@ export class AgentRunner {
       servers["linear"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/linear/linear-mcp-server.js")],
+        args: [mcpPath("linear/linear-mcp-server.js")],
         env,
       };
     }
@@ -405,7 +455,7 @@ export class AgentRunner {
       servers["github-issues"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/github/github-issues-mcp-server.js")],
+        args: [mcpPath("github/github-issues-mcp-server.js")],
         env: ghEnv,
       };
     }
@@ -415,7 +465,7 @@ export class AgentRunner {
       servers["clickup"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/clickup/clickup-mcp-server.js")],
+        args: [mcpPath("clickup/clickup-mcp-server.js")],
         env: {
           CLICKUP_API_TOKEN: config.clickup.apiToken,
         },
@@ -427,7 +477,7 @@ export class AgentRunner {
       servers["recall"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/recall/recall-mcp-server.js")],
+        args: [mcpPath("recall/recall-mcp-server.js")],
         env: {
           RECALL_API_KEY: config.recall.apiKey,
           RECALL_API_REGION: config.recall.region,
@@ -463,7 +513,7 @@ export class AgentRunner {
     servers["background"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/background/background-task-mcp-server.js")],
+      args: [mcpPath("background/background-task-mcp-server.js")],
       env: {
         BG_TASK_API: `http://127.0.0.1:${config.background.port}`,
         BG_AUTH_TOKEN: config.background.authToken,
@@ -482,7 +532,7 @@ export class AgentRunner {
     servers["callback"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/callback/callback-mcp-server.js")],
+      args: [mcpPath("callback/callback-mcp-server.js")],
       env: {
         CB_AGENT_ID: this.agentConfig.id,
         CB_ADAPTER_ID: context?.adapterId ?? "",
@@ -501,7 +551,7 @@ export class AgentRunner {
     servers["code-task"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/code-task/code-task-mcp-server.js")],
+      args: [mcpPath("code-task/code-task-mcp-server.js")],
       env: {
         CT_TASK_API: `http://127.0.0.1:${config.codeTask.port}`,
         CT_AUTH_TOKEN: config.codeTask.authToken,
@@ -527,7 +577,7 @@ export class AgentRunner {
     servers["conversation-search"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/search/conversation-search-mcp-server.js")],
+      args: [mcpPath("search/conversation-search-mcp-server.js")],
       env: {
         ...searchEnv,
         AGENT_ID: this.agentConfig.id,
@@ -540,7 +590,7 @@ export class AgentRunner {
     servers["code-search"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/code-index/code-search-mcp-server.js")],
+      args: [mcpPath("code-index/code-search-mcp-server.js")],
       env: {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
@@ -558,9 +608,10 @@ export class AgentRunner {
           });
           continue;
         }
-        const compiledPath = resolve(
-          `dist/plugins/${plugin.name}/${serverDef.entry.replace(/\.ts$/, ".js")}`,
-        );
+        const devPath = resolve(DIST_DIR, `plugins/${plugin.name}/${serverDef.entry.replace(/\.ts$/, ".js")}`);
+        const npmPath = resolve(hiveHome, "plugins", "node_modules", plugin.name, "dist", "mcp",
+          serverDef.entry.replace(/\.ts$/, ".min.js").replace(/^.*\//, ""));
+        const compiledPath = existsSync(npmPath) ? npmPath : devPath;
 
         // Base env available to all plugin servers
         const pluginTaskKey = config.taskLedger.agentKeys[this.agentConfig.id] ?? config.taskLedger.apiKey;
@@ -601,7 +652,7 @@ export class AgentRunner {
     servers["event-bus"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/events/event-bus-mcp-server.js")],
+      args: [mcpPath("events/event-bus-mcp-server.js")],
       env: {
         AGENT_ID: this.agentConfig.id,
         MONGODB_URI: config.mongo.uri,
@@ -617,7 +668,7 @@ export class AgentRunner {
     servers["team"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/team/team-mcp-server.js")],
+      args: [mcpPath("team/team-mcp-server.js")],
       env: {
         AGENT_ID: this.agentConfig.id,
         MONGODB_URI: config.mongo.uri,
@@ -633,7 +684,7 @@ export class AgentRunner {
       servers["workflow"] = {
         type: "stdio",
         command: "node",
-        args: [resolve("dist/workflow/workflow-mcp-server.js")],
+        args: [mcpPath("workflow/workflow-mcp-server.js")],
         env: {
           AGENT_ID: this.agentConfig.id,
           MONGODB_URI: config.mongo.uri,
@@ -647,7 +698,7 @@ export class AgentRunner {
     servers["schedule"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/schedule/schedule-mcp-server.js")],
+      args: [mcpPath("schedule/schedule-mcp-server.js")],
       env: {
         AGENT_ID: this.agentConfig.id,
         MONGODB_URI: config.mongo.uri,
@@ -659,7 +710,7 @@ export class AgentRunner {
     servers["admin"] = {
       type: "stdio",
       command: "node",
-      args: [resolve("dist/admin/admin-mcp-server.js")],
+      args: [mcpPath("admin/admin-mcp-server.js")],
       env: {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
@@ -836,7 +887,7 @@ export class AgentRunner {
     if (!pluginNames?.length) return [];
 
     const sdkPlugins: SdkPluginConfig[] = [];
-    const pluginsDir = resolve("plugins/claude-code");
+    const pluginsDir = resolve(DIST_DIR, "..", "plugins", "claude-code");
 
     for (const name of pluginNames) {
       if (name.includes("/") || name.includes("\\") || name === ".." || name.startsWith(".")) {
