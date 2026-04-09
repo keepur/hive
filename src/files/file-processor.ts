@@ -40,7 +40,7 @@ export interface ProcessedFile {
   isImage: boolean;
 }
 
-const IMAGE_TYPES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+export const IMAGE_TYPES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic"]);
 
 let geminiApiKey = "";
 const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
@@ -112,7 +112,7 @@ const TEXT_TYPES = new Set([
  * Shared by downloadAndProcess (Slack) and processFileBuffer (Team/WS).
  * Returns extracted text or null for unsupported types.
  */
-async function extractContent(
+export async function extractContent(
   buffer: Buffer,
   filename: string,
   mimetype: string,
