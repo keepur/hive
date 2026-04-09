@@ -31,6 +31,14 @@ describe("decodeAndValidate", () => {
     expect(() => decodeAndValidate("not!valid@base64", "test.txt")).toThrow("Invalid base64 data");
   });
 
+  it("throws on empty base64 data", () => {
+    expect(() => decodeAndValidate("", "test.txt")).toThrow("Invalid base64 data");
+  });
+
+  it("throws on base64 with length not divisible by 4", () => {
+    expect(() => decodeAndValidate("abc", "test.txt")).toThrow("Invalid base64 data");
+  });
+
   it("throws on oversized file", () => {
     // Create a buffer just over 10 MB
     const bigBuffer = Buffer.alloc(10 * 1024 * 1024 + 1);
