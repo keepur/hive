@@ -3,6 +3,8 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import { toAgentConfig } from "../types/agent-definition.js";
 import { config as appConfig } from "../config.js";
+import { getArchetype } from "../archetypes/registry.js";
+import "../archetypes/index.js";
 import type { Collection, ChangeStream } from "mongodb";
 
 const log = createLogger("agent-registry");
@@ -36,6 +38,9 @@ export class AgentRegistry {
       const agentConfig = toAgentConfig(doc, appConfig.autonomy);
       currentIds.add(agentConfig.id);
 
+      // Disabled check first — skip all validation for disabled agents.
+      // Without this, a disabled agent with invalid archetypeConfig would
+      // fail validation and get evicted instead of being quietly skipped.
       if (agentConfig.disabled) {
         newDisabled.push(agentConfig);
         if (this.agents.has(agentConfig.id)) {
@@ -44,6 +49,41 @@ export class AgentRegistry {
           log.info("Disabled agent removed from active map", { id: agentConfig.id });
         }
         continue;
+      }
+
+      // Archetype validation (fail-closed on invalid archetypeConfig)
+      if (agentConfig.archetype) {
+        const def = getArchetype(agentConfig.archetype);
+        if (!def) {
+          // Graceful degradation — unknown archetype runs as unstructured.
+          log.warn("Unknown archetype — loading agent as unstructured", {
+            id: agentConfig.id,
+            archetype: agentConfig.archetype,
+          });
+          agentConfig.archetype = undefined;
+          agentConfig.archetypeConfig = undefined;
+        } else {
+          try {
+            // Replace raw blob with archetype-validated typed config.
+            agentConfig.archetypeConfig = def.validateConfig(agentConfig.archetypeConfig) as Record<string, unknown>;
+          } catch (err) {
+            log.error("Archetype config validation failed — agent will not load", {
+              id: agentConfig.id,
+              archetype: agentConfig.archetype,
+              error: String(err),
+            });
+            // Fail-closed: evict any previously-loaded version so a stale valid
+            // config doesn't keep serving requests after the DB doc goes bad.
+            if (this.agents.has(agentConfig.id)) {
+              this.agents.delete(agentConfig.id);
+              removed.push(agentConfig.id);
+              log.warn("Evicted previously-loaded agent due to archetype validation failure", {
+                id: agentConfig.id,
+              });
+            }
+            continue;
+          }
+        }
       }
 
       if (previousIds.has(agentConfig.id)) {

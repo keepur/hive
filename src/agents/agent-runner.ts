@@ -1,10 +1,12 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { getArchetype, type ArchetypeDefinition } from "../archetypes/registry.js";
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
+import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
@@ -67,6 +69,7 @@ export class AgentRunner {
   private activeQuery: Query | null = null;
   private eventSubscribersJson: string;
   private prefetcher?: CodeIndexPrefetcher;
+  private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher) {
     this.agentConfig = agentConfig;
@@ -86,6 +89,26 @@ export class AgentRunner {
 
     if (this.agentConfig.soul) {
       parts.push(this.agentConfig.soul);
+    }
+
+    // Archetype card (static — cacheable prefix). Lives between soul and systemPrompt
+    // so the archetype defines the discipline and the agent's own systemPrompt reads
+    // as instance-specific flavor layered on top.
+    const archetypeDef = this.getArchetypeDef();
+    if (archetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        const card = archetypeDef.systemPromptCard({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+        });
+        if (card) parts.push(card);
+      } catch (err) {
+        log.error("Archetype systemPromptCard threw — omitting card", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
     }
 
     parts.push(this.agentConfig.systemPrompt);
@@ -185,7 +208,30 @@ export class AgentRunner {
       };
     }
 
-    // Memory MCP server — gives the agent read/write access to its own memory
+    // Memory MCP server — gives the agent read/write access to its own memory.
+    // Archetypes may add additional filesystem-backed scopes (workshop, workspace, etc.)
+    // via memoryScopes(ctx). Self-mongo is always present as the first scope so the
+    // legacy behavior is preserved even if the archetype throws.
+    const memoryScopes: ScopeDecl[] = [{ id: "self", backing: "mongo" }];
+    const memoryArchetypeDef = this.getArchetypeDef();
+    if (memoryArchetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        const extra = memoryArchetypeDef.memoryScopes({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+        });
+        for (const s of extra) {
+          if (s.id !== "self") memoryScopes.push(s);
+        }
+      } catch (err) {
+        log.error("Archetype memoryScopes threw — using self-only", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
+    }
+
     servers["memory"] = {
       type: "stdio",
       command: "node",
@@ -194,6 +240,7 @@ export class AgentRunner {
         AGENT_ID: this.agentConfig.id,
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
+        MEMORY_SCOPES_JSON: JSON.stringify(memoryScopes),
       },
     };
 
@@ -822,14 +869,68 @@ export class AgentRunner {
     return getSkillsForAgent(this.skillIndex, this.agentConfig.id);
   }
 
-  private buildPreCompactHook(): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+  private getArchetypeDef(): ArchetypeDefinition | null {
+    if (this._archetypeDef === undefined) {
+      this._archetypeDef = this.agentConfig.archetype
+        ? getArchetype(this.agentConfig.archetype) ?? null
+        : null;
+      if (this.agentConfig.archetype && !this._archetypeDef) {
+        log.warn("Archetype referenced by agent not registered — running unstructured", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+        });
+      }
+    }
+    return this._archetypeDef;
+  }
+
+  private buildHooks(context?: WorkItemContext): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+    const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
+      PreCompact: this.buildPreCompactMatcher(),
+    };
+
+    const archetypeDef = this.getArchetypeDef();
+    if (archetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        const pre = archetypeDef.preToolUseHooks({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+          workItemContext: context,
+        });
+        if (pre.length > 0) {
+          hooks.PreToolUse = pre;
+        }
+      } catch (err) {
+        // Fail-closed: if the archetype can't produce its hooks, install a
+        // deny-all PreToolUse hook rather than running without enforcement.
+        // A missing hook set would silently disable archetype tool policy.
+        log.error("Archetype preToolUseHooks threw — installing deny-all PreToolUse hook", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+        hooks.PreToolUse = [{
+          hooks: [async () => ({
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              permissionDecision: "deny",
+              permissionDecisionReason: `Archetype hook initialization failed (${String(err)}). All tool calls blocked until the archetype is fixed.`,
+            },
+          })],
+        }];
+      }
+    }
+
+    return hooks;
+  }
+
+  private buildPreCompactMatcher(): HookCallbackMatcher[] {
     const agentName = this.agentConfig.name;
     const agentId = this.agentConfig.id;
     const prefetcher = this.prefetcher;
 
-    return {
-      PreCompact: [{
-        hooks: [async (input: HookInput, _toolUseId, _opts) => {
+    return [{
+      hooks: [async (input: HookInput, _toolUseId, _opts) => {
           log.info("PreCompact hook fired", { agent: agentId });
 
           const baseInstructions = [
@@ -867,8 +968,7 @@ export class AgentRunner {
 
           return { continue: true, systemMessage };
         }],
-      }],
-    };
+      }];
   }
 
   async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits): Promise<RunResult> {
@@ -896,6 +996,44 @@ export class AgentRunner {
       });
     }
 
+    // Archetype session options (cwd, settingSources, etc.)
+    let archetypeExtra: Partial<SdkQueryOptions> = {};
+    const archetypeDefForSession = this.getArchetypeDef();
+    if (archetypeDefForSession && this.agentConfig.archetypeConfig) {
+      try {
+        archetypeExtra = archetypeDefForSession.sessionOptions({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+          workItemContext: context,
+        });
+      } catch (err) {
+        log.error("Archetype sessionOptions threw — ignoring", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
+    }
+
+    // Validate archetype cwd at session start — fail loud if workshop was deleted
+    // between agent load and session start (spec Runtime Failure Mode 1).
+    if (typeof archetypeExtra.cwd === "string") {
+      const cwd = archetypeExtra.cwd;
+      let st: ReturnType<typeof statSync>;
+      try {
+        st = statSync(cwd);
+      } catch (err) {
+        const msg = `Archetype cwd unavailable at session start — refusing to run: ${cwd} (${String(err)})`;
+        log.error(msg, { agent: this.agentConfig.id });
+        throw new Error(msg);
+      }
+      if (!st.isDirectory()) {
+        const msg = `Archetype cwd is not a directory: ${cwd}`;
+        log.error(msg, { agent: this.agentConfig.id });
+        throw new Error(msg);
+      }
+    }
+
     const q = query({
       prompt,
       options: {
@@ -907,12 +1045,18 @@ export class AgentRunner {
         maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
         maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
         thinking: { type: "disabled" },
+        // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
+        // may return arbitrary SDK options, but we explicitly pick only the safe ones
+        // so a rogue archetype can't override security invariants (permissionMode,
+        // maxTurns, etc.) or runtime wiring (mcpServers, hooks, env, etc.).
+        ...(archetypeExtra.cwd ? { cwd: archetypeExtra.cwd } : {}),
+        ...(archetypeExtra.settingSources ? { settingSources: archetypeExtra.settingSources } : {}),
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
         ...(Object.keys(delegateAgents).length > 0 ? { agents: delegateAgents } : {}),
         ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
-        hooks: this.buildPreCompactHook(),
+        hooks: this.buildHooks(context),
         // Cast: AgentConfig stores string[] but SDK expects SdkBeta[] — intentional for forward compat
         ...(this.agentConfig.betas?.length ? { betas: this.agentConfig.betas as any } : {}),
         env: {
