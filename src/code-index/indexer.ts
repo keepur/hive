@@ -4,7 +4,6 @@ import { readFileSync } from "node:fs";
 import { resolve, extname } from "node:path";
 import { MongoClient, type Collection, type Db } from "mongodb";
 import { QdrantClient } from "@qdrant/js-client-rest";
-import Anthropic from "@anthropic-ai/sdk";
 import { embedOllama } from "../search/embed-utils.js";
 import {
   type CodeIndexRecord,
@@ -47,7 +46,6 @@ export class CodeIndexer {
   private db!: Db;
   private collection!: Collection<CodeIndexRecord>;
   private qdrant!: QdrantClient;
-  private anthropic!: Anthropic;
   private collectionReady = false;
 
   constructor(private options: IndexerOptions) {}
@@ -64,7 +62,6 @@ export class CodeIndexer {
     await this.collection.createIndex({ indexedAt: 1 });
 
     this.qdrant = new QdrantClient({ url: this.options.qdrantUrl });
-    this.anthropic = new Anthropic();
   }
 
   async close(): Promise<void> {
@@ -259,7 +256,7 @@ export class CodeIndexer {
     return batches;
   }
 
-  /** Call Haiku to summarize a batch of files */
+  /** Call Gemma4 (local Ollama) to summarize a batch of files */
   private async summarizeBatch(files: DiscoveredFile[]): Promise<Map<string, FileSummary>> {
     const fileContents = files.map((f) => {
       let content = readFileSync(f.absPath, "utf-8");
@@ -281,16 +278,23 @@ Return a JSON array of objects. Only JSON, no other text.
 
 ${fileContents.join("\n\n")}`;
 
-    const response = await this.anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 8192,
-      messages: [{ role: "user", content: prompt }],
+    const response = await fetch(`${this.options.ollamaUrl}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gemma4:e4b",
+        messages: [{ role: "user", content: prompt }],
+        stream: false,
+        options: { num_ctx: 32768 },
+      }),
     });
 
-    const text = response.content[0].type === "text" ? response.content[0].text : "";
+    if (!response.ok) throw new Error(`Ollama error ${response.status}: ${await response.text()}`);
+    const body = (await response.json()) as { message?: { content?: string } };
+    const text = body.message?.content ?? "";
     // Extract JSON from response (may be wrapped in ```json blocks)
     const jsonMatch = text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) throw new Error(`No JSON array in Haiku response for batch starting with ${files[0].filePath}`);
+    if (!jsonMatch) throw new Error(`No JSON array in Gemma response for batch starting with ${files[0].filePath}`);
 
     const parsed: FileSummary[] = JSON.parse(jsonMatch[0]);
     const map = new Map<string, FileSummary>();

@@ -20,10 +20,6 @@ if (!MONGODB_URI) {
   console.error("MONGODB_URI is required");
   process.exit(1);
 }
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error("ANTHROPIC_API_KEY is required (used for Haiku summarization)");
-  process.exit(1);
-}
 
 // Parse CLI args
 const args = process.argv.slice(2);
