@@ -160,6 +160,37 @@ describe("SessionManager", () => {
       expect(sessionInfo).toBeDefined();
       expect(sessionInfo.path).toBe("/tmp/test");
     });
+
+    it("swaps the pending session key for the real SDK session id", async () => {
+      // Guards against regressions in the pending-* → real ID map-key swap
+      // inside newSession. If the swap is skipped or uses the wrong key, stale
+      // pending-* entries would leak to clients via listSessions/getActiveSessions.
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+
+      mockQueryIterator.mockReturnValue(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-real" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "Ready",
+            session_id: "sess-real",
+            total_cost_usd: 0.001,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      await manager.newSession("/tmp/test");
+      await drainWelcome(manager, "sess-real");
+
+      const active = manager.getActiveSessions();
+      expect(active).toHaveLength(1);
+      expect(active[0].sessionId).toBe("sess-real");
+      expect(active.find((s) => s.sessionId.startsWith("pending-"))).toBeUndefined();
+    });
   });
 
   describe("sendMessage(sessionId, text)", () => {
