@@ -188,9 +188,7 @@ export class SessionManager {
     //   - SDK returns a `result` before emitting `system/init` (donePromise resolves)
     donePromise.finally(() => {
       if (!initFired) {
-        initDeferred.reject(
-          new Error("Session never initialized (SDK completed without init event)"),
-        );
+        initDeferred.reject(new Error("Session never initialized (SDK completed without init event)"));
       }
     });
     // Swallow any unhandled rejection on donePromise itself. runQuery has a

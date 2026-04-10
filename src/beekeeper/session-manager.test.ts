@@ -67,9 +67,9 @@ function makeAsyncIterable(messages: Record<string, unknown>[]) {
 // right after creation must wait for the welcome stream to drain so the
 // session is idle before further assertions.
 async function drainWelcome(manager: SessionManager, sessionId: string): Promise<void> {
-  const slot = (
-    manager as unknown as { sessions: Map<string, { queryDone?: Promise<unknown> }> }
-  ).sessions.get(sessionId);
+  const slot = (manager as unknown as { sessions: Map<string, { queryDone?: Promise<unknown> }> }).sessions.get(
+    sessionId,
+  );
   if (slot?.queryDone) {
     try {
       await slot.queryDone;
@@ -151,9 +151,7 @@ describe("SessionManager", () => {
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
 
       // status(thinking) is emitted
-      expect(
-        sent.find((m: Record<string, unknown>) => m.type === "status" && m.state === "thinking"),
-      ).toBeDefined();
+      expect(sent.find((m: Record<string, unknown>) => m.type === "status" && m.state === "thinking")).toBeDefined();
 
       // session_info for the new sessionId is emitted
       const sessionInfo = sent.find(
@@ -629,8 +627,7 @@ describe("SessionManager", () => {
       expect(newSessionInfo).toBeUndefined();
 
       const newThinking = sent.find(
-        (m: Record<string, unknown>) =>
-          m.type === "status" && m.state === "thinking" && m.sessionId === "sess-new",
+        (m: Record<string, unknown>) => m.type === "status" && m.state === "thinking" && m.sessionId === "sess-new",
       );
       expect(newThinking).toBeUndefined();
 
