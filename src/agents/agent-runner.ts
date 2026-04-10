@@ -959,6 +959,25 @@ export class AgentRunner {
       });
     }
 
+    // Archetype session options (cwd, settingSources, etc.)
+    let archetypeExtra: Partial<SdkQueryOptions> = {};
+    const archetypeDefForSession = this.getArchetypeDef();
+    if (archetypeDefForSession && this.agentConfig.archetypeConfig) {
+      try {
+        archetypeExtra = archetypeDefForSession.sessionOptions({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+          workItemContext: context,
+        });
+      } catch (err) {
+        log.error("Archetype sessionOptions threw — ignoring", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
+    }
+
     const q = query({
       prompt,
       options: {
@@ -970,6 +989,15 @@ export class AgentRunner {
         maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
         maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
         thinking: { type: "disabled" },
+        // Archetype-owned SDK options merged here. Placement is deliberate:
+        //   - Core invariants above (permissionMode, maxTurns, maxBudgetUsd, thinking)
+        //     are Hive guarantees the archetype MUST NOT override.
+        //   - Runtime wiring below (includePartialMessages, resume, mcpServers, agents,
+        //     plugins, hooks, betas, env) is dispatcher/agent-runner territory the
+        //     archetype MUST NOT clobber.
+        //   - Legitimate archetype keys: `cwd`, `settingSources`. Everything else is
+        //     off-limits by convention.
+        ...archetypeExtra,
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
