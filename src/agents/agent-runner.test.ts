@@ -1543,6 +1543,37 @@ describe("buildSystemPrompt — archetype card", () => {
     expect(prompt).toContain("SYSPROMPT_MARKER");
   });
 
+  it("buildHooks includes PreCompact by default", () => {
+    const runner = makeRunner({ soul: "", systemPrompt: "" });
+    const hooks = (runner as any).buildHooks();
+    expect(hooks.PreCompact).toBeDefined();
+    expect(Array.isArray(hooks.PreCompact)).toBe(true);
+    expect(hooks.PreToolUse).toBeUndefined();
+  });
+
+  it("buildHooks merges archetype PreToolUse hooks", () => {
+    registerArchetype({
+      id: "hooked",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [
+        { matcher: "Edit", hooks: [async () => ({ continue: true })] },
+      ],
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "",
+      systemPrompt: "",
+      archetype: "hooked",
+      archetypeConfig: {},
+    });
+    const hooks = (runner as any).buildHooks();
+    expect(hooks.PreCompact).toBeDefined();
+    expect(hooks.PreToolUse).toHaveLength(1);
+    expect(hooks.PreToolUse[0].matcher).toBe("Edit");
+  });
+
   it("omits card gracefully when archetype systemPromptCard throws", async () => {
     registerArchetype({
       id: "throws",
