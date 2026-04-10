@@ -33,6 +33,9 @@ export interface AgentConfig {
   delegatePrompts?: Record<string, string>;
   soul: string;
   systemPrompt: string;
+  archetype?: string;                       // discipline id
+  title?: string;                           // customer-facing title
+  archetypeConfig?: Record<string, unknown>; // opaque blob, validated by archetype on load
   autonomy: AutonomyFlags; // resolved — always present
 }
 
