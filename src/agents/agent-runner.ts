@@ -6,6 +6,7 @@ import { readFile } from "node:fs/promises";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
+import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
@@ -207,7 +208,30 @@ export class AgentRunner {
       };
     }
 
-    // Memory MCP server — gives the agent read/write access to its own memory
+    // Memory MCP server — gives the agent read/write access to its own memory.
+    // Archetypes may add additional filesystem-backed scopes (workshop, workspace, etc.)
+    // via memoryScopes(ctx). Self-mongo is always present as the first scope so the
+    // legacy behavior is preserved even if the archetype throws.
+    const memoryScopes: ScopeDecl[] = [{ id: "self", backing: "mongo" }];
+    const memoryArchetypeDef = this.getArchetypeDef();
+    if (memoryArchetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        const extra = memoryArchetypeDef.memoryScopes({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+        });
+        for (const s of extra) {
+          if (s.id !== "self") memoryScopes.push(s);
+        }
+      } catch (err) {
+        log.error("Archetype memoryScopes threw — using self-only", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
+    }
+
     servers["memory"] = {
       type: "stdio",
       command: "node",
@@ -216,6 +240,7 @@ export class AgentRunner {
         AGENT_ID: this.agentConfig.id,
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
+        MEMORY_SCOPES_JSON: JSON.stringify(memoryScopes),
       },
     };
 
