@@ -1,6 +1,7 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { getArchetype, type ArchetypeDefinition } from "../archetypes/registry.js";
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -67,6 +68,7 @@ export class AgentRunner {
   private activeQuery: Query | null = null;
   private eventSubscribersJson: string;
   private prefetcher?: CodeIndexPrefetcher;
+  private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher) {
     this.agentConfig = agentConfig;
@@ -86,6 +88,26 @@ export class AgentRunner {
 
     if (this.agentConfig.soul) {
       parts.push(this.agentConfig.soul);
+    }
+
+    // Archetype card (static — cacheable prefix). Lives between soul and systemPrompt
+    // so the archetype defines the discipline and the agent's own systemPrompt reads
+    // as instance-specific flavor layered on top.
+    const archetypeDef = this.getArchetypeDef();
+    if (archetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        const card = archetypeDef.systemPromptCard({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+        });
+        if (card) parts.push(card);
+      } catch (err) {
+        log.error("Archetype systemPromptCard threw — omitting card", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
     }
 
     parts.push(this.agentConfig.systemPrompt);
@@ -820,6 +842,21 @@ export class AgentRunner {
 
   private buildNativeSkills(): SdkPluginConfig[] {
     return getSkillsForAgent(this.skillIndex, this.agentConfig.id);
+  }
+
+  private getArchetypeDef(): ArchetypeDefinition | null {
+    if (this._archetypeDef === undefined) {
+      this._archetypeDef = this.agentConfig.archetype
+        ? getArchetype(this.agentConfig.archetype) ?? null
+        : null;
+      if (this.agentConfig.archetype && !this._archetypeDef) {
+        log.warn("Archetype referenced by agent not registered — running unstructured", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+        });
+      }
+    }
+    return this._archetypeDef;
   }
 
   private buildPreCompactHook(): Partial<Record<HookEvent, HookCallbackMatcher[]>> {

@@ -139,6 +139,11 @@ function getCapturedOptions(): Record<string, any> {
 
 // ── Import after mocks ──────────────────────────────────────────────
 import { AgentRunner } from "./agent-runner.js";
+import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
+
+function makeRunner(overrides: Partial<AgentConfig> = {}): AgentRunner {
+  return new AgentRunner(makeAgentConfig(overrides), makeMockMemoryManager() as any);
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 describe("AgentRunner.buildMcpServers (via send)", () => {
@@ -1496,5 +1501,68 @@ describe("AgentRunner betas passthrough (via send)", () => {
     const options = getCapturedOptions();
 
     expect(options).not.toHaveProperty("betas");
+  });
+});
+
+// ── Archetype card injection ─────────────────────────────────────
+describe("buildSystemPrompt — archetype card", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetRegistryForTests();
+  });
+
+  it("injects card between soul and systemPrompt", async () => {
+    registerArchetype({
+      id: "stub",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "ARCH_CARD_MARKER",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "SOUL_MARKER",
+      systemPrompt: "SYSPROMPT_MARKER",
+      archetype: "stub",
+      archetypeConfig: {},
+    });
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    const soulIdx = prompt.indexOf("SOUL_MARKER");
+    const cardIdx = prompt.indexOf("ARCH_CARD_MARKER");
+    const sysIdx = prompt.indexOf("SYSPROMPT_MARKER");
+    expect(soulIdx).toBeGreaterThanOrEqual(0);
+    expect(cardIdx).toBeGreaterThan(soulIdx);
+    expect(sysIdx).toBeGreaterThan(cardIdx);
+  });
+
+  it("no card when archetype unset", async () => {
+    const runner = makeRunner({ soul: "SOUL_MARKER", systemPrompt: "SYSPROMPT_MARKER" });
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    expect(prompt).not.toContain("ARCH_CARD_MARKER");
+    expect(prompt).toContain("SOUL_MARKER");
+    expect(prompt).toContain("SYSPROMPT_MARKER");
+  });
+
+  it("omits card gracefully when archetype systemPromptCard throws", async () => {
+    registerArchetype({
+      id: "throws",
+      validateConfig: (c) => c,
+      systemPromptCard: () => {
+        throw new Error("boom");
+      },
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "SOUL_MARKER",
+      systemPrompt: "SYSPROMPT_MARKER",
+      archetype: "throws",
+      archetypeConfig: {},
+    });
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    expect(prompt).toContain("SOUL_MARKER");
+    expect(prompt).toContain("SYSPROMPT_MARKER");
+    expect(prompt).not.toContain("ARCH_CARD_MARKER");
   });
 });
