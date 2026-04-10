@@ -33,6 +33,16 @@ describe("FsMemoryStore", () => {
     expect(idx).not.toContain("old");
   });
 
+  it("dedupes repeat index writes for nested paths (regression)", () => {
+    store.write("sub/topic.md", "v1", "- [Topic](sub/topic.md) — old");
+    store.write("sub/topic.md", "v2", "- [Topic](sub/topic.md) — new");
+    const idx = readFileSync(join(dir, "MEMORY.md"), "utf-8");
+    const matches = idx.match(/sub\/topic\.md/g);
+    expect(matches).toHaveLength(1); // only one entry, not duplicated
+    expect(idx).toContain("new");
+    expect(idx).not.toContain("old");
+  });
+
   it("reads null for missing files", () => {
     expect(store.read("missing.md")).toBeNull();
   });
