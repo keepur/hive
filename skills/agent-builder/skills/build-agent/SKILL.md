@@ -55,6 +55,16 @@ Things you do NOT ask about:
 
 Draft the soul (5-15 lines) and show it: *"Here's how I'd describe them — does this feel right?"*
 
+**Soul format — non-negotiable.** Write the soul in **second person**, opening with:
+
+```
+# Soul: <Name>
+
+You are <Name>, <role> at <business>.
+```
+
+This is not stylistic. The soul gets injected into internal classifier prompts (triage, model-router) that say *"You are NOT the agent — you are a router."* A 2nd-person soul ("You are Nora...") overrides that framing and the classifier responds in character. A 3rd-person soul ("Nora is...") reinforces the router framing — the classifier drops out of character and posts router internals to Slack as the agent ("I'm the router, not Nora — what do you need?"). This has happened. Do not let it happen again.
+
 ### Step 3: Map to Capabilities
 
 Using common sense and business context from memory, determine what the agent needs:
@@ -64,6 +74,22 @@ Using common sense and business context from memory, determine what the agent ne
 - Scheduled tasks (daily reports, follow-up sweeps)
 
 You are a frontier model. Use your judgment — don't need a lookup table. An inbox manager needs email access. A sales coordinator needs CRM access. This is obvious.
+
+### Step 3.5: Channels — Home Base and Listening Posts
+
+Every agent needs a **home base** channel they own, and may have **listening posts** — channels they passively monitor without owning.
+
+**Home base** (`channels` field):
+- Convention: `#agent-<name>` (e.g. `#agent-jordan`). This is where the user DMs the agent, where direct mentions land, and where threaded conversations live.
+- Ask: *"Where should <Name> live? I'd suggest a dedicated `#agent-<name>` channel — that becomes their inbox. Sound good, or do you want them to sit somewhere else?"*
+- If the channel doesn't exist yet, note it for Step 9 (the user has to create it in Slack and invite the bot — you can't do this for them).
+- Never empty. An agent with no channels is unreachable.
+
+**Listening posts** (`passiveChannels` field):
+- These are channels where the agent reads everything but only responds when directly addressed by name. Use this when the agent needs ambient awareness of work happening in shared team channels — not for channels they should actively own.
+- Ask: *"Are there any team channels <Name> should listen in on so she has context when someone pings her? For example, if she's handling purchasing, she might want to be in `#purchasing` and `#production` so she knows what's being ordered without people having to re-explain."*
+- **Do not guess.** If the user doesn't know or doesn't care, leave `passiveChannels` empty — easier to add later than to have an agent silently lurking somewhere unexpected.
+- Each passive channel also needs the bot invited in Slack (note for Step 9).
 
 ### Step 4: Check Instance
 
@@ -102,18 +128,20 @@ If it takes more than 2-3 rounds, pause: *"I want to make sure I get this right.
 Before creating:
 1. Slugify the name to an `_id` (lowercase, hyphens: "Jordan" → "jordan", "Sales Rep" → "sales-rep")
 2. Check for collision via `agent_list` — if the ID exists, ask the user or append a suffix
-3. Pick a channel — ask which existing channel the agent should be on, or note that a new channel needs to be created manually
+3. Validate every name in `coreServers` and `delegateServers` against the `instance_capabilities` response from Step 4. Names that don't match a real server are silently dropped at runtime — the agent will load fine but the tool just won't exist. Common foot-gun: `tasks` is not a server, the actual id is `task-ledger`.
 
 Call `agent_create` with:
 - `_id`: slugified name
 - `name`: display name
 - `model`: `claude-haiku-4-5` by default. Use `claude-sonnet-4-6` only for agents that need nuanced customer-facing communication, complex reasoning, or multi-step coordination.
 - `fields`:
-  - `soul`: the persona from step 2
+  - `icon`: a Slack emoji shortcode like `:clipboard:`, `:wrench:`, `:briefcase:`, `:art:`. **Never empty.** This prefixes the agent's Slack messages and sets `icon_emoji` on bot posts — without it, the agent has no visual identity in Slack.
+  - `soul`: the persona from step 2 (must be 2nd person, see Step 2)
   - `systemPrompt`: concise role definition + boundaries + tool usage guidelines (you write this from the conversation — keep it under 50 lines to start)
-  - `coreServers`: minimum servers needed — always include `memory`, `slack`, `conversation-search`, `callback`, `event-bus`, `contacts`. Add others based on the job.
-  - `delegateServers`: servers the agent can delegate to subagents (sparingly)
-  - `channels`: at least one channel (never empty — agent would be unreachable)
+  - `coreServers`: minimum servers needed — always include `memory`, `slack`, `conversation-search`, `callback`, `event-bus`, `contacts`. Add others based on the job. Validated against `instance_capabilities`.
+  - `delegateServers`: servers the agent can delegate to subagents (sparingly). Validated against `instance_capabilities`.
+  - `channels`: home base from Step 3.5. Never empty.
+  - `passiveChannels`: listening posts from Step 3.5 (may be empty).
   - `schedule`: cron tasks if needed
   - `autonomy`: `{ externalComms: false }` unless the user explicitly approved outbound email/SMS
   - `budgetUsd`: 10 (default)
@@ -121,11 +149,24 @@ Call `agent_create` with:
 
 ### Step 9: Introduce
 
-After creation:
-- Tell the user where to find the agent and how to message them
-- If a new Slack channel is needed, tell them: *"You'll need to create #agent-jordan in Slack and invite the bot. Once that's done, Jordan is ready."*
-- Suggest one thing to try: *"Try asking Jordan to check your inbox right now."*
-- Remind them: *"If Jordan needs more access or you want to change how they work, just let me know."*
+After creation, give the user an explicit channel handoff. Spell out exactly which channels need to be created and which need the bot invited:
+
+> *"I've set Jordan up to live in `#agent-jordan` and listen in on `#purchasing` and `#production`. You'll need to:*
+> 1. *Create `#agent-jordan` in Slack if it doesn't exist*
+> 2. *Invite the Hive bot to all three channels*
+>
+> *Once that's done, Jordan is reachable. Try asking him to check your inbox right now. If he needs more access or you want to change how he works, just let me know."*
+
+You cannot create Slack channels or invite the bot for the user — they have to do this themselves.
+
+### Step 9.5: Verify
+
+Before declaring done, send the new agent a test message in their home base channel (or ask the user to). Confirm two things:
+
+1. **The response includes the icon prefix** (e.g. `:clipboard: *Jordan*: ...`). If it doesn't, the `icon` field is empty or invalid — fix it.
+2. **The agent identifies as themselves**, not as "the router" or "Claude" or "the message triage agent." If it leaks classifier internals, the soul is probably 3rd person — rewrite it in 2nd person and re-test.
+
+If either check fails, fix the agent definition before moving on. The hot-reload is automatic via MongoDB change stream — no restart needed.
 
 ## Guardrails
 
@@ -138,6 +179,11 @@ Follow these strictly:
 5. **When in doubt, leave it out.** An agent that does one thing well beats one that does five things poorly.
 6. **Name them like a person.** Not "Email Handler Bot" — a name like you'd give a new hire.
 7. **Default to restrictive.** Haiku model, low budget, limited servers, externalComms off. Upgrade based on evidence.
+8. **Soul is 2nd person.** Always opens with `# Soul: <Name>\n\nYou are <Name>...`. 3rd-person souls break the triage classifier.
+9. **Icon is set.** Never empty. Pick a Slack emoji that fits the role.
+10. **Server names are validated** against `instance_capabilities` before `agent_create` is called.
+11. **Channels are explicit.** Ask about home base AND listening posts. Don't guess passive channels.
+12. **Verify after creating.** Test message in their home base. Confirm icon prefix and in-character identity before declaring done.
 
 ## Reference Examples
 
@@ -189,6 +235,6 @@ These are calibration, not templates. Use them to understand what good agents lo
 
 **Agent definition:**
 - model: `claude-haiku-4-5`
-- coreServers: `memory`, `slack`, `tasks`, `conversation-search`, `callback`, `event-bus`, `contacts`
+- coreServers: `memory`, `slack`, `task-ledger`, `conversation-search`, `callback`, `event-bus`, `contacts`
 - autonomy: `{ externalComms: false }`
 - schedule: `[{ cron: "0 9 * * 1-5", task: "daily-status-check" }, { cron: "0 16 * * 5", task: "weekly-summary" }]`
