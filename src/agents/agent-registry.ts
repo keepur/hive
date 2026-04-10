@@ -3,6 +3,8 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import { toAgentConfig } from "../types/agent-definition.js";
 import { config as appConfig } from "../config.js";
+import { getArchetype } from "../archetypes/registry.js";
+import "../archetypes/index.js";
 import type { Collection, ChangeStream } from "mongodb";
 
 const log = createLogger("agent-registry");
@@ -35,6 +37,33 @@ export class AgentRegistry {
     for (const doc of docs) {
       const agentConfig = toAgentConfig(doc, appConfig.autonomy);
       currentIds.add(agentConfig.id);
+
+      // Archetype validation (fail-closed on invalid archetypeConfig)
+      if (agentConfig.archetype) {
+        const def = getArchetype(agentConfig.archetype);
+        if (!def) {
+          // Graceful degradation — unknown archetype runs as unstructured.
+          log.warn("Unknown archetype — loading agent as unstructured", {
+            id: agentConfig.id,
+            archetype: agentConfig.archetype,
+          });
+          agentConfig.archetype = undefined;
+          agentConfig.archetypeConfig = undefined;
+        } else {
+          try {
+            // Replace raw blob with archetype-validated typed config.
+            agentConfig.archetypeConfig = def.validateConfig(agentConfig.archetypeConfig) as Record<string, unknown>;
+          } catch (err) {
+            log.error("Archetype config validation failed — agent will not load", {
+              id: agentConfig.id,
+              archetype: agentConfig.archetype,
+              error: String(err),
+            });
+            // Fail-closed: skip this agent entirely, do not add to active map.
+            continue;
+          }
+        }
+      }
 
       if (agentConfig.disabled) {
         newDisabled.push(agentConfig);

@@ -1,6 +1,19 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import { toAgentConfig, AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
+import type { Collection } from "mongodb";
+
+// Stub required env vars before src/config.ts is imported transitively by agent-registry.
+process.env.SLACK_APP_TOKEN ??= "xapp-test";
+process.env.SLACK_BOT_TOKEN ??= "xoxb-test";
+process.env.MONGODB_URI ??= "mongodb://localhost:27017";
+process.env.OPENPHONE_API_KEY ??= "test";
+
+type AgentRegistryModule = typeof import("./agent-registry.js");
+type ArchetypesRegistryModule = typeof import("../archetypes/registry.js");
+let AgentRegistry: AgentRegistryModule["AgentRegistry"];
+let registerArchetype: ArchetypesRegistryModule["registerArchetype"];
+let __resetRegistryForTests: ArchetypesRegistryModule["__resetRegistryForTests"];
 
 function makeDefinition(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
   return {
@@ -159,6 +172,86 @@ describe("name matching patterns", () => {
 
   it("is case insensitive", () => {
     expect(matchesName("hey RIVER", "River")).toBe(true);
+  });
+});
+
+function makeFakeCollection(docs: AgentDefinition[]): Collection<AgentDefinition> {
+  return {
+    find: () => ({ toArray: async () => docs }),
+  } as unknown as Collection<AgentDefinition>;
+}
+
+describe("AgentRegistry archetype validation on load", () => {
+  beforeAll(async () => {
+    const archetypes = await import("../archetypes/registry.js");
+    registerArchetype = archetypes.registerArchetype;
+    __resetRegistryForTests = archetypes.__resetRegistryForTests;
+    const registryModule = await import("./agent-registry.js");
+    AgentRegistry = registryModule.AgentRegistry;
+  });
+
+  beforeEach(() => {
+    __resetRegistryForTests();
+    registerArchetype({
+      id: "test-arch",
+      validateConfig: (c: unknown) => {
+        const cfg = (c ?? {}) as { workshop?: string };
+        if (typeof cfg.workshop !== "string") {
+          throw new Error("missing workshop");
+        }
+        return cfg;
+      },
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+  });
+
+  it("loads agent with valid archetypeConfig and reflects validator return value", async () => {
+    const def = makeDefinition({
+      _id: "valid-agent",
+      archetype: "test-arch",
+      archetypeConfig: { workshop: "/tmp/workshop" },
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const result = await registry.load();
+
+    expect(result.added).toContain("valid-agent");
+    const loaded = registry.get("valid-agent");
+    expect(loaded).toBeDefined();
+    expect(loaded?.archetype).toBe("test-arch");
+    expect(loaded?.archetypeConfig).toEqual({ workshop: "/tmp/workshop" });
+  });
+
+  it("fails closed on invalid archetypeConfig (agent not added to active map)", async () => {
+    const def = makeDefinition({
+      _id: "invalid-agent",
+      archetype: "test-arch",
+      archetypeConfig: {},
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const result = await registry.load();
+
+    expect(result.added).not.toContain("invalid-agent");
+    expect(registry.get("invalid-agent")).toBeUndefined();
+    expect(registry.getAll().map((a) => a.id)).not.toContain("invalid-agent");
+  });
+
+  it("degrades gracefully on unknown archetype id", async () => {
+    const def = makeDefinition({
+      _id: "unknown-arch-agent",
+      archetype: "missing",
+      archetypeConfig: { workshop: "/tmp/x" },
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const result = await registry.load();
+
+    expect(result.added).toContain("unknown-arch-agent");
+    const loaded = registry.get("unknown-arch-agent");
+    expect(loaded).toBeDefined();
+    expect(loaded?.archetype).toBeUndefined();
+    expect(loaded?.archetypeConfig).toBeUndefined();
   });
 });
 
