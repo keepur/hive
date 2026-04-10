@@ -1599,3 +1599,83 @@ describe("buildSystemPrompt — archetype card", () => {
     expect(prompt).not.toContain("ARCH_CARD_MARKER");
   });
 });
+
+// ── Archetype sessionOptions + cwd validation ───────────────────
+describe("AgentRunner — archetype sessionOptions + cwd guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetRegistryForTests();
+    mockStatSync.mockReset();
+    mockStatSync.mockReturnValue({ isDirectory: () => true });
+  });
+
+  afterEach(() => {
+    __resetRegistryForTests();
+    mockStatSync.mockReset();
+    mockStatSync.mockReturnValue({ isDirectory: () => true });
+  });
+
+  it("merges archetype sessionOptions (cwd + settingSources) into SDK query options", async () => {
+    registerArchetype({
+      id: "with-session",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({ cwd: "/tmp/exists", settingSources: ["project"] }),
+    });
+    const runner = makeRunner({
+      archetype: "with-session",
+      archetypeConfig: {},
+    });
+    await runner.send("hello");
+    const options = getCapturedOptions();
+    expect(options.cwd).toBe("/tmp/exists");
+    expect(options.settingSources).toEqual(["project"]);
+  });
+
+  it("throws when statSync errors on the archetype cwd", async () => {
+    mockStatSync.mockImplementation(() => {
+      throw new Error("ENOENT");
+    });
+    registerArchetype({
+      id: "missing-cwd",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({ cwd: "/tmp/missing" }),
+    });
+    const runner = makeRunner({
+      archetype: "missing-cwd",
+      archetypeConfig: {},
+    });
+    await expect(runner.send("hello")).rejects.toThrow(/\/tmp\/missing/);
+  });
+
+  it("throws when archetype cwd exists but is not a directory", async () => {
+    mockStatSync.mockReturnValue({ isDirectory: () => false });
+    registerArchetype({
+      id: "file-cwd",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({ cwd: "/tmp/file" }),
+    });
+    const runner = makeRunner({
+      archetype: "file-cwd",
+      archetypeConfig: {},
+    });
+    await expect(runner.send("hello")).rejects.toThrow(/not a directory/);
+  });
+
+  it("does not invoke statSync when no archetype is configured", async () => {
+    mockStatSync.mockClear();
+    const runner = makeRunner({});
+    await runner.send("hello");
+    expect(mockStatSync.mock.calls.length).toBe(0);
+    const options = getCapturedOptions();
+    expect(options.cwd).toBeUndefined();
+  });
+});
