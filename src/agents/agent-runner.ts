@@ -859,14 +859,41 @@ export class AgentRunner {
     return this._archetypeDef;
   }
 
-  private buildPreCompactHook(): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+  private buildHooks(context?: WorkItemContext): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+    const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
+      PreCompact: this.buildPreCompactMatcher(),
+    };
+
+    const archetypeDef = this.getArchetypeDef();
+    if (archetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        const pre = archetypeDef.preToolUseHooks({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+          workItemContext: context,
+        });
+        if (pre.length > 0) {
+          hooks.PreToolUse = pre;
+        }
+      } catch (err) {
+        log.error("Archetype preToolUseHooks threw — omitting PreToolUse hooks", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
+    }
+
+    return hooks;
+  }
+
+  private buildPreCompactMatcher(): HookCallbackMatcher[] {
     const agentName = this.agentConfig.name;
     const agentId = this.agentConfig.id;
     const prefetcher = this.prefetcher;
 
-    return {
-      PreCompact: [{
-        hooks: [async (input: HookInput, _toolUseId, _opts) => {
+    return [{
+      hooks: [async (input: HookInput, _toolUseId, _opts) => {
           log.info("PreCompact hook fired", { agent: agentId });
 
           const baseInstructions = [
@@ -904,8 +931,7 @@ export class AgentRunner {
 
           return { continue: true, systemMessage };
         }],
-      }],
-    };
+      }];
   }
 
   async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits): Promise<RunResult> {
@@ -949,7 +975,7 @@ export class AgentRunner {
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
         ...(Object.keys(delegateAgents).length > 0 ? { agents: delegateAgents } : {}),
         ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
-        hooks: this.buildPreCompactHook(),
+        hooks: this.buildHooks(context),
         // Cast: AgentConfig stores string[] but SDK expects SdkBeta[] — intentional for forward compat
         ...(this.agentConfig.betas?.length ? { betas: this.agentConfig.betas as any } : {}),
         env: {
