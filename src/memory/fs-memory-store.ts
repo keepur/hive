@@ -1,11 +1,4 @@
-import {
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  writeFileSync,
-  existsSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join, basename } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -74,9 +67,7 @@ export class FsMemoryStore {
   /** Read-modify-write MEMORY.md under atomic rename. Dedups by filename. */
   private updateIndex(filename: string, indexLine: string): void {
     const memoryMd = join(this.dir, "MEMORY.md");
-    const existing = existsSync(memoryMd)
-      ? readFileSync(memoryMd, "utf-8")
-      : "# Memory\n";
+    const existing = existsSync(memoryMd) ? readFileSync(memoryMd, "utf-8") : "# Memory\n";
     const lines = existing.split("\n");
     // Remove any prior line referencing this file
     const filtered = lines.filter((l) => !l.includes(`(${filename})`));

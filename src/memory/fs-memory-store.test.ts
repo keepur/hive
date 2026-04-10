@@ -20,15 +20,9 @@ describe("FsMemoryStore", () => {
   });
 
   it("writes a memory file and adds an index line", () => {
-    store.write(
-      "topic-a.md",
-      "---\nname: topic-a\n---\nbody",
-      "- [A](topic-a.md) — about A",
-    );
+    store.write("topic-a.md", "---\nname: topic-a\n---\nbody", "- [A](topic-a.md) — about A");
     expect(readFileSync(join(dir, "topic-a.md"), "utf-8")).toContain("body");
-    expect(readFileSync(join(dir, "MEMORY.md"), "utf-8")).toContain(
-      "- [A](topic-a.md) — about A",
-    );
+    expect(readFileSync(join(dir, "MEMORY.md"), "utf-8")).toContain("- [A](topic-a.md) — about A");
   });
 
   it("dedupes repeat index writes for same filename", () => {

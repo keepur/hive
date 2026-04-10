@@ -17,7 +17,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(__dirname, "fixtures/spike-a");
 const SENTINEL = "SPIKE_A_SENTINEL_7f3c9a";
 
-describe("Spike A — settingSources project loads CLAUDE.md", () => {
+// Skip when running inside a Claude Code session — the SDK refuses to nest
+// (`CLAUDECODE` is set by the parent harness). Run this test standalone with:
+//   env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT npx vitest run src/archetypes/spike-settings-sources.test.ts
+const SKIP_NESTED = !!process.env.CLAUDECODE;
+
+describe.skipIf(SKIP_NESTED)("Spike A — settingSources project loads CLAUDE.md", () => {
   it("CLAUDE.md content is visible to the model", async () => {
     const q = query({
       prompt:
