@@ -1679,3 +1679,85 @@ describe("AgentRunner — archetype sessionOptions + cwd guard", () => {
     expect(options.cwd).toBeUndefined();
   });
 });
+
+describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetRegistryForTests();
+  });
+  afterEach(() => __resetRegistryForTests());
+
+  it("defaults to self-mongo only when no archetype is set", async () => {
+    const runner = makeRunner({ coreServers: ["memory"] });
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
+  });
+
+  it("leads with self-mongo and appends archetype scopes", async () => {
+    registerArchetype({
+      id: "scoped",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [
+        { id: "workshop", backing: "filesystem", dir: "/tmp/workshop" },
+        { id: "workspace:dodi_v2", backing: "filesystem", dir: "/tmp/dodi" },
+      ],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({ archetype: "scoped", archetypeConfig: {}, coreServers: ["memory"] });
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
+    expect(scopes).toHaveLength(3);
+    expect(scopes.find((s: { id: string }) => s.id === "workshop")).toEqual({
+      id: "workshop",
+      backing: "filesystem",
+      dir: "/tmp/workshop",
+    });
+    expect(scopes.find((s: { id: string }) => s.id === "workspace:dodi_v2")).toBeDefined();
+  });
+
+  it("dedupes self when an archetype incorrectly returns its own self entry", async () => {
+    registerArchetype({
+      id: "with-self",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [
+        { id: "self", backing: "filesystem", dir: "/tmp/should-be-filtered" },
+        { id: "workshop", backing: "filesystem", dir: "/tmp/workshop" },
+      ],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({ archetype: "with-self", archetypeConfig: {}, coreServers: ["memory"] });
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    const selfEntries = scopes.filter((s: { id: string }) => s.id === "self");
+    expect(selfEntries).toHaveLength(1);
+    expect(selfEntries[0]).toEqual({ id: "self", backing: "mongo" });
+    expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
+  });
+
+  it("falls back to self-mongo only when memoryScopes throws", async () => {
+    registerArchetype({
+      id: "throwing",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => {
+        throw new Error("intentional");
+      },
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({ archetype: "throwing", archetypeConfig: {}, coreServers: ["memory"] });
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
+  });
+});
