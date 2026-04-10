@@ -61,7 +61,7 @@ export interface CodeTaskManagerOptions {
 export class CodeTaskManager {
   private port: number;
   private authToken: string;
-  private pluginDir: string;
+  private pluginDirs: string[];
   private maxConcurrent: number;
   private tasksDir: string;
   private cliBin: string;
@@ -74,7 +74,7 @@ export class CodeTaskManager {
   constructor(
     port: number,
     authToken: string,
-    pluginDir: string,
+    pluginDirs: string[],
     maxConcurrent: number,
     tasksDir: string,
     onComplete: (item: WorkItem) => void,
@@ -82,7 +82,7 @@ export class CodeTaskManager {
   ) {
     this.port = port;
     this.authToken = authToken;
-    this.pluginDir = pluginDir;
+    this.pluginDirs = pluginDirs;
     this.maxConcurrent = maxConcurrent;
     this.tasksDir = tasksDir;
     this.onComplete = onComplete;
@@ -392,7 +392,10 @@ export class CodeTaskManager {
       args.push("-p", params.prompt);
     }
 
-    args.push("--plugin-dir", this.pluginDir, "--output-format", "json", "--dangerously-skip-permissions");
+    for (const dir of this.pluginDirs) {
+      args.push("--plugin-dir", dir);
+    }
+    args.push("--output-format", "json", "--dangerously-skip-permissions");
 
     args.push("--max-turns", String(params.maxTurns));
     args.push("--max-budget-usd", String(params.maxBudget));

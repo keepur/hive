@@ -45,7 +45,10 @@ coreServers:
 delegateServers:
   - linear
   - brave-search
-plugins: []
+plugins:
+  - dodi-dev
+  - superpowers
+  - claude-md-management
 soul: |
   # Soul: VP Engineering
 

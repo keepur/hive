@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
@@ -21,6 +21,20 @@ function required(key: string): string {
 
 function optional(key: string, fallback: string): string {
   return process.env[key] || fallback;
+}
+
+/** Auto-discover all plugin dirs under plugins/claude-code/, or use explicit list from hive.yaml */
+function discoverPluginDirs(yamlDirs?: string[]): string[] {
+  // Explicit list in hive.yaml takes precedence
+  if (yamlDirs?.length) {
+    return yamlDirs.map((d) => resolve(d.replace(/^~/, process.env.HOME ?? "/tmp")));
+  }
+  // Auto-scan plugins/claude-code/*/
+  const parentDir = resolve("plugins/claude-code");
+  if (!existsSync(parentDir)) return [];
+  return readdirSync(parentDir)
+    .map((name) => resolve(parentDir, name))
+    .filter((p) => statSync(p).isDirectory());
 }
 
 // Load hive.yaml instance config
@@ -167,7 +181,7 @@ export const config = {
   codeTask: {
     port: parseInt(optional("CODE_TASK_PORT", String(ports.codeTask ?? portBase + 2)), 10),
     authToken: optional("CODE_TASK_AUTH_TOKEN", "") || randomUUID(),
-    pluginDir: optional("CODE_TASK_PLUGIN_DIR", resolve("plugins/claude-code/dodi-dev")),
+    pluginDirs: discoverPluginDirs((hive.codeTask as Record<string, unknown>)?.pluginDirs as string[] | undefined),
     defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-4-6"),
     defaultMaxTurns: parseInt(optional("CODE_TASK_MAX_TURNS", "100"), 10),
     defaultMaxBudget: parseFloat(optional("CODE_TASK_MAX_BUDGET", "5.00")),

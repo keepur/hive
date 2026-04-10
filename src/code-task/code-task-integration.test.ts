@@ -23,7 +23,7 @@ const FIXTURES = resolve(__dirname, "test-fixtures");
 
 const PORT = 39300;
 const AUTH_TOKEN = "test-integration";
-const PLUGIN_DIR = "/tmp/fake-plugin-dir";
+const PLUGIN_DIRS = ["/tmp/fake-plugin-dir"];
 const TASKS_DIR = `/tmp/hive-code-tasks-integ-${process.pid}`;
 
 function headers(extra?: Record<string, string>) {
@@ -79,7 +79,7 @@ describe("integration: full lifecycle", () => {
     manager = new CodeTaskManager(
       port,
       AUTH_TOKEN,
-      PLUGIN_DIR,
+      PLUGIN_DIRS,
       2,
       TASKS_DIR,
       (item) => {
@@ -141,7 +141,7 @@ describe("integration: escalation lifecycle", () => {
     manager = new CodeTaskManager(
       port,
       AUTH_TOKEN,
-      PLUGIN_DIR,
+      PLUGIN_DIRS,
       2,
       TASKS_DIR,
       (item) => {
@@ -195,7 +195,7 @@ describe("integration: failure lifecycle", () => {
     manager = new CodeTaskManager(
       port,
       AUTH_TOKEN,
-      PLUGIN_DIR,
+      PLUGIN_DIRS,
       2,
       TASKS_DIR,
       (item) => {
@@ -238,7 +238,7 @@ describe("integration: concurrency with real processes", () => {
 
   beforeAll(async () => {
     // Use slow fixture — stays running for 30s
-    manager = new CodeTaskManager(port, AUTH_TOKEN, PLUGIN_DIR, 1, TASKS_DIR, () => {}, {
+    manager = new CodeTaskManager(port, AUTH_TOKEN, PLUGIN_DIRS, 1, TASKS_DIR, () => {}, {
       cliBin: resolve(FIXTURES, "fake-claude-slow.sh"),
     });
     await manager.start();
