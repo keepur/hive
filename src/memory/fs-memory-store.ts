@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -39,12 +39,23 @@ export class FsMemoryStore {
     return readFileSync(abs, "utf-8");
   }
 
-  /** List .md files in the store (excluding MEMORY.md). */
+  /** List .md files in the store (excluding MEMORY.md), recursing into subdirectories. */
   list(): string[] {
     if (!existsSync(this.dir)) return [];
-    return readdirSync(this.dir)
-      .filter((f) => f.endsWith(".md") && f !== "MEMORY.md")
-      .sort();
+    return this.listRecursive(this.dir, "");
+  }
+
+  private listRecursive(base: string, prefix: string): string[] {
+    const results: string[] = [];
+    for (const entry of readdirSync(base, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        results.push(...this.listRecursive(join(base, entry.name), rel));
+      } else if (entry.name.endsWith(".md") && rel !== "MEMORY.md") {
+        results.push(rel);
+      }
+    }
+    return results.sort();
   }
 
   /**
@@ -83,7 +94,17 @@ export class FsMemoryStore {
     mkdirSync(dirname(abs), { recursive: true });
     const tmp = `${abs}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     writeFileSync(tmp, content, "utf-8");
-    renameSync(tmp, abs);
+    try {
+      renameSync(tmp, abs);
+    } catch (err) {
+      // Clean up temp file on rename failure to avoid leaked .tmp files
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // Best-effort cleanup — ignore if tmp already gone
+      }
+      throw err;
+    }
   }
 
   private safeJoin(relPath: string): string {
