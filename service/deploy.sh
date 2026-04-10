@@ -108,12 +108,53 @@ echo ""
 echo "--- Phase 1: Build ---"
 echo "Current deployed SHA: $PREV_SHA"
 
-# Preserve agent-made changes before pulling
+# Preserve agent-made changes before pulling.
+# Skill edits made in the deploy dir are committed to MAIN (the source of truth),
+# regardless of what branch the deploy dir happens to be on. The change reaches
+# runtime on the next /deploy + deploy.sh run — not this one.
 if [[ -n "$(git status --porcelain skills/ 2>/dev/null)" ]]; then
-  echo "Agent-made skill changes detected — committing and pushing..."
+  echo "Agent-made skill changes detected — committing to main..."
+  ORIGINAL_BRANCH=$(git branch --show-current)
+  if [[ -z "$ORIGINAL_BRANCH" ]]; then
+    notify "Deploy aborted. Deploy dir is in detached HEAD; cannot auto-commit skill changes."
+    exit 1
+  fi
+
+  if ! run_cmd git stash push --include-untracked -m "deploy-auto-skills" -- skills/; then
+    notify "Deploy aborted. Could not stash agent-made skill changes."
+    exit 1
+  fi
+
+  if ! run_cmd git fetch origin main; then
+    run_cmd git stash pop || true
+    notify "Deploy aborted. Could not fetch main."
+    exit 1
+  fi
+
+  if ! run_cmd git checkout main; then
+    run_cmd git stash pop || true
+    notify "Deploy aborted. Could not check out main to preserve skill changes."
+    exit 1
+  fi
+
+  if ! run_cmd git pull --ff-only; then
+    run_cmd git checkout "$ORIGINAL_BRANCH"
+    run_cmd git stash pop || true
+    notify "Deploy aborted. Could not fast-forward main."
+    exit 1
+  fi
+
+  if ! run_cmd git stash pop; then
+    notify "Deploy aborted. Conflict applying agent-made skill changes onto main. Resolve manually in $DEPLOY_DIR."
+    exit 1
+  fi
+
   run_cmd git add skills/
   run_cmd git commit -m "chore: preserve agent-made skill changes (auto-commit by deploy)"
-  run_cmd git push
+  run_cmd git push origin main
+
+  # Switch back to the original branch — this deploy run uses whatever is on that branch.
+  run_cmd git checkout "$ORIGINAL_BRANCH"
 fi
 
 echo "Pulling latest in build dir..."
