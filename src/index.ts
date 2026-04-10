@@ -204,7 +204,7 @@ async function main(): Promise<void> {
   const codeTaskManager = new CodeTaskManager(
     config.codeTask.port,
     config.codeTask.authToken,
-    config.codeTask.pluginDir,
+    config.codeTask.pluginDirs,
     config.codeTask.maxConcurrent,
     config.tasksDir.code,
     (item) =>
