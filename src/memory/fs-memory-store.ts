@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, existsSync } from "node:fs";
-import { dirname, join, basename } from "node:path";
+import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
 /**
@@ -60,7 +60,9 @@ export class FsMemoryStore {
     const abs = this.safeJoin(relPath);
     this.atomicWrite(abs, content);
     if (indexLine !== null) {
-      this.updateIndex(basename(abs), indexLine);
+      // Use the caller's relPath for dedup — basename(abs) would strip directory
+      // prefixes, causing the filter to miss links like "(subdir/topic.md)".
+      this.updateIndex(relPath, indexLine);
     }
   }
 
