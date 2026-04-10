@@ -59,7 +59,15 @@ export class AgentRegistry {
               archetype: agentConfig.archetype,
               error: String(err),
             });
-            // Fail-closed: skip this agent entirely, do not add to active map.
+            // Fail-closed: evict any previously-loaded version so a stale valid
+            // config doesn't keep serving requests after the DB doc goes bad.
+            if (this.agents.has(agentConfig.id)) {
+              this.agents.delete(agentConfig.id);
+              removed.push(agentConfig.id);
+              log.warn("Evicted previously-loaded agent due to archetype validation failure", {
+                id: agentConfig.id,
+              });
+            }
             continue;
           }
         }
