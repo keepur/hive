@@ -978,6 +978,22 @@ export class AgentRunner {
       }
     }
 
+    // Validate archetype cwd at session start — fail loud if workshop was deleted
+    // between agent load and session start (spec Runtime Failure Mode 1).
+    if (typeof archetypeExtra.cwd === "string") {
+      const cwd = archetypeExtra.cwd;
+      try {
+        const st = statSync(cwd);
+        if (!st.isDirectory()) {
+          throw new Error(`archetype cwd is not a directory: ${cwd}`);
+        }
+      } catch (err) {
+        const msg = `Archetype cwd unavailable at session start — refusing to run: ${cwd} (${String(err)})`;
+        log.error(msg, { agent: this.agentConfig.id });
+        throw new Error(msg);
+      }
+    }
+
     const q = query({
       prompt,
       options: {
