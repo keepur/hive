@@ -17,6 +17,7 @@
     "migrate:agents:legacy": "npx tsx setup/migrate-agents.ts",
     "setup:plist": "npx tsx setup/generate-plist.ts",
     "update": "git pull && npm install && npm run build",
+    "reindex": "npx tsx scripts/code-index.ts",
     "embed:hubspot": "npx tsx scripts/hubspot-embed.ts",
     "embed:dodi": "npx tsx scripts/dodi-embed.ts",
     "lint": "eslint src/ plugins/ setup/",
