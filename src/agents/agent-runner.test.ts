@@ -1576,6 +1576,32 @@ describe("buildSystemPrompt — archetype card", () => {
     expect(hooks.PreToolUse[0].matcher).toBe("Edit");
   });
 
+  it("buildHooks installs deny-all when preToolUseHooks throws (fail-closed)", () => {
+    registerArchetype({
+      id: "hook-throws",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => {
+        throw new Error("hook init boom");
+      },
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "",
+      systemPrompt: "",
+      archetype: "hook-throws",
+      archetypeConfig: {},
+    });
+    const hooks = (runner as any).buildHooks();
+    expect(hooks.PreCompact).toBeDefined();
+    // Should have a deny-all hook, not undefined (fail-open)
+    expect(hooks.PreToolUse).toBeDefined();
+    expect(hooks.PreToolUse).toHaveLength(1);
+    // No matcher = matches all tools
+    expect(hooks.PreToolUse[0].matcher).toBeUndefined();
+  });
+
   it("omits card gracefully when archetype systemPromptCard throws", async () => {
     registerArchetype({
       id: "throws",

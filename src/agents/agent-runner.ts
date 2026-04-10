@@ -901,11 +901,23 @@ export class AgentRunner {
           hooks.PreToolUse = pre;
         }
       } catch (err) {
-        log.error("Archetype preToolUseHooks threw — omitting PreToolUse hooks", {
+        // Fail-closed: if the archetype can't produce its hooks, install a
+        // deny-all PreToolUse hook rather than running without enforcement.
+        // A missing hook set would silently disable archetype tool policy.
+        log.error("Archetype preToolUseHooks threw — installing deny-all PreToolUse hook", {
           agent: this.agentConfig.id,
           archetype: this.agentConfig.archetype,
           error: String(err),
         });
+        hooks.PreToolUse = [{
+          hooks: [async () => ({
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              permissionDecision: "deny",
+              permissionDecisionReason: `Archetype hook initialization failed (${String(err)}). All tool calls blocked until the archetype is fixed.`,
+            },
+          })],
+        }];
       }
     }
 
@@ -1007,13 +1019,16 @@ export class AgentRunner {
     // between agent load and session start (spec Runtime Failure Mode 1).
     if (typeof archetypeExtra.cwd === "string") {
       const cwd = archetypeExtra.cwd;
+      let st: ReturnType<typeof statSync>;
       try {
-        const st = statSync(cwd);
-        if (!st.isDirectory()) {
-          throw new Error(`archetype cwd is not a directory: ${cwd}`);
-        }
+        st = statSync(cwd);
       } catch (err) {
         const msg = `Archetype cwd unavailable at session start — refusing to run: ${cwd} (${String(err)})`;
+        log.error(msg, { agent: this.agentConfig.id });
+        throw new Error(msg);
+      }
+      if (!st.isDirectory()) {
+        const msg = `Archetype cwd is not a directory: ${cwd}`;
         log.error(msg, { agent: this.agentConfig.id });
         throw new Error(msg);
       }

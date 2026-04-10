@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 
 /**
@@ -90,6 +90,15 @@ export class FsMemoryStore {
     if (relPath.includes("..") || relPath.startsWith("/")) {
       throw new Error(`FsMemoryStore: invalid relative path ${relPath}`);
     }
-    return join(this.dir, relPath);
+    const joined = join(this.dir, relPath);
+    // Resolve symlinks in the result and verify it's still inside our dir.
+    // Without this, a symlink at `this.dir/link → /etc` would bypass the
+    // ".." check above and allow reads/writes outside the store root.
+    const resolved = resolve(joined);
+    const resolvedDir = resolve(this.dir);
+    if (!resolved.startsWith(resolvedDir + "/") && resolved !== resolvedDir) {
+      throw new Error(`FsMemoryStore: resolved path escapes store root: ${relPath}`);
+    }
+    return joined;
   }
 }
