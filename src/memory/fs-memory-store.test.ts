@@ -53,6 +53,13 @@ describe("FsMemoryStore", () => {
     expect(store.list()).toEqual(["a.md", "b.md"]);
   });
 
+  it("lists nested .md files with relative paths", () => {
+    store.write("top.md", "t", "- t");
+    store.write("sub/nested.md", "n", "- n");
+    store.write("sub/deep/leaf.md", "l", "- l");
+    expect(store.list()).toEqual(["sub/deep/leaf.md", "sub/nested.md", "top.md"]);
+  });
+
   it("rejects path traversal", () => {
     expect(() => store.write("../escape.md", "", null)).toThrow();
     expect(() => store.read("../escape.md")).toThrow();

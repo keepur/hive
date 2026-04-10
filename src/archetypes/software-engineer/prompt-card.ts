@@ -69,7 +69,9 @@ export function systemPromptCard(ctx: ArchetypePromptContext<SoftwareEngineerCon
       `(problem, approach, acceptance criteria). The description must be implementable by someone ` +
       `who wasn't in the brainstorm.\n` +
       `3. **Code Task** \u2014 Delegate implementation to \`code_task\` with the ticket context. ` +
-      `Paste the ticket body into the prompt so the inner session has the full spec inline.\n` +
+      `Paste the ticket body into the prompt so the inner session has the full spec inline. ` +
+      `Use \`code_status\` to check progress. If the session reports NEEDS_CONTEXT or BLOCKED, ` +
+      `respond via \`code_respond\` with your answer and context.\n` +
       `4. **Review** \u2014 Verify the work meets the spec. Check the PR and CI status, then ` +
       `comment on the tracker ticket with the result.`,
   );

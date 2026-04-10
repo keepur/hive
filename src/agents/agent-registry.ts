@@ -38,6 +38,19 @@ export class AgentRegistry {
       const agentConfig = toAgentConfig(doc, appConfig.autonomy);
       currentIds.add(agentConfig.id);
 
+      // Disabled check first — skip all validation for disabled agents.
+      // Without this, a disabled agent with invalid archetypeConfig would
+      // fail validation and get evicted instead of being quietly skipped.
+      if (agentConfig.disabled) {
+        newDisabled.push(agentConfig);
+        if (this.agents.has(agentConfig.id)) {
+          this.agents.delete(agentConfig.id);
+          removed.push(agentConfig.id);
+          log.info("Disabled agent removed from active map", { id: agentConfig.id });
+        }
+        continue;
+      }
+
       // Archetype validation (fail-closed on invalid archetypeConfig)
       if (agentConfig.archetype) {
         const def = getArchetype(agentConfig.archetype);
@@ -71,16 +84,6 @@ export class AgentRegistry {
             continue;
           }
         }
-      }
-
-      if (agentConfig.disabled) {
-        newDisabled.push(agentConfig);
-        if (this.agents.has(agentConfig.id)) {
-          this.agents.delete(agentConfig.id);
-          removed.push(agentConfig.id);
-          log.info("Disabled agent removed from active map", { id: agentConfig.id });
-        }
-        continue;
       }
 
       if (previousIds.has(agentConfig.id)) {
