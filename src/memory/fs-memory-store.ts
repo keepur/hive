@@ -99,6 +99,6 @@ export class FsMemoryStore {
     if (!resolved.startsWith(resolvedDir + "/") && resolved !== resolvedDir) {
       throw new Error(`FsMemoryStore: resolved path escapes store root: ${relPath}`);
     }
-    return joined;
+    return resolved;
   }
 }
