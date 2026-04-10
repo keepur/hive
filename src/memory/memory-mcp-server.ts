@@ -39,9 +39,7 @@ let router: ScopeRouter;
 try {
   router = new ScopeRouter(parseScopesEnv(process.env.MEMORY_SCOPES_JSON));
 } catch (err) {
-  process.stderr.write(
-    `memory-mcp-server: invalid MEMORY_SCOPES_JSON, falling back to self-only: ${String(err)}\n`,
-  );
+  process.stderr.write(`memory-mcp-server: invalid MEMORY_SCOPES_JSON, falling back to self-only: ${String(err)}\n`);
   router = new ScopeRouter([]);
 }
 
@@ -68,9 +66,11 @@ server.registerTool(
     title: "Read Memory",
     description: `Read a file from your memory. Defaults to self (your Mongo memory under "agents/${AGENT_ID}/" and "shared/"). Filesystem scopes available: ${scopeListDescription}.`,
     inputSchema: {
-      path: z.string().describe(
-        `Path. For scope=self: "agents/${AGENT_ID}/foo.md" or "shared/contacts.md". For filesystem scopes: filename relative to the scope dir.`,
-      ),
+      path: z
+        .string()
+        .describe(
+          `Path. For scope=self: "agents/${AGENT_ID}/foo.md" or "shared/contacts.md". For filesystem scopes: filename relative to the scope dir.`,
+        ),
       scope: z
         .string()
         .optional()
@@ -128,9 +128,11 @@ server.registerTool(
     title: "Write Memory",
     description: `Write content to a memory file. Defaults to self (Mongo, "agents/${AGENT_ID}/"). Filesystem scopes available: ${scopeListDescription}.`,
     inputSchema: {
-      path: z.string().describe(
-        `Path. For scope=self: "agents/${AGENT_ID}/foo.md". For filesystem scopes: filename relative to the scope dir.`,
-      ),
+      path: z
+        .string()
+        .describe(
+          `Path. For scope=self: "agents/${AGENT_ID}/foo.md". For filesystem scopes: filename relative to the scope dir.`,
+        ),
       content: z.string().describe("The full content to write to the file"),
       scope: z
         .string()
@@ -171,9 +173,7 @@ server.registerTool(
       const decl = router.get(scope);
       if (!decl) {
         return {
-          content: [
-            { type: "text", text: `Unknown scope: ${scope}. Valid: ${scopeListDescription}` },
-          ],
+          content: [{ type: "text", text: `Unknown scope: ${scope}. Valid: ${scopeListDescription}` }],
           isError: true,
         };
       }
@@ -202,7 +202,9 @@ server.registerTool(
       path: z
         .string()
         .optional()
-        .describe(`Directory to list (self scope only), defaults to "agents/${AGENT_ID}/". Ignored for filesystem scopes.`),
+        .describe(
+          `Directory to list (self scope only), defaults to "agents/${AGENT_ID}/". Ignored for filesystem scopes.`,
+        ),
       scope: z
         .string()
         .optional()
@@ -238,9 +240,7 @@ server.registerTool(
       const decl = router.get(scope);
       if (!decl) {
         return {
-          content: [
-            { type: "text", text: `Unknown scope: ${scope}. Valid: ${scopeListDescription}` },
-          ],
+          content: [{ type: "text", text: `Unknown scope: ${scope}. Valid: ${scopeListDescription}` }],
           isError: true,
         };
       }
@@ -270,10 +270,7 @@ server.registerTool(
     inputSchema: {
       path: z.string().describe("File path to view history for"),
       limit: z.number().optional().describe("Max versions to return (default 10)"),
-      scope: z
-        .string()
-        .optional()
-        .describe(`Scope id. Defaults to "self". Only "self" is supported for history.`),
+      scope: z.string().optional().describe(`Scope id. Defaults to "self". Only "self" is supported for history.`),
     },
   },
   async ({ path, limit, scope }) => {
@@ -330,10 +327,7 @@ server.registerTool(
     inputSchema: {
       path: z.string().describe("File path to rollback"),
       version_index: z.number().describe("Version index from memory_history (0 = most recent previous version)"),
-      scope: z
-        .string()
-        .optional()
-        .describe(`Scope id. Defaults to "self". Only "self" is supported for rollback.`),
+      scope: z.string().optional().describe(`Scope id. Defaults to "self". Only "self" is supported for rollback.`),
     },
   },
   async ({ path, version_index, scope }) => {

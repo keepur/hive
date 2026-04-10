@@ -23,9 +23,7 @@ describe("parseScopesEnv", () => {
   });
 
   it("rejects filesystem scope with relative dir", () => {
-    const json = JSON.stringify([
-      { id: "workshop", backing: "filesystem", dir: "rel" },
-    ]);
+    const json = JSON.stringify([{ id: "workshop", backing: "filesystem", dir: "rel" }]);
     expect(() => parseScopesEnv(json)).toThrow();
   });
 
@@ -47,9 +45,7 @@ describe("ScopeRouter", () => {
   });
 
   it("requireFs throws with valid list on unknown scope", () => {
-    const router = new ScopeRouter([
-      { id: "workshop", backing: "filesystem", dir: "/tmp/x" },
-    ]);
+    const router = new ScopeRouter([{ id: "workshop", backing: "filesystem", dir: "/tmp/x" }]);
     expect(() => router.requireFs("typo")).toThrow(/typo.*workshop/);
   });
 });

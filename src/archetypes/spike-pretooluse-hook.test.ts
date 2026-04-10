@@ -26,12 +26,17 @@ const FIXTURE = resolve(__dirname, "fixtures/spike-b");
 const TARGET = resolve(FIXTURE, "DENIED_target.txt");
 const INITIAL = "initial content — must not change";
 
+// Skip when running inside a Claude Code session — the SDK refuses to nest
+// (`CLAUDECODE` is set by the parent harness). Run this test standalone with:
+//   env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT npx vitest run src/archetypes/spike-pretooluse-hook.test.ts
+const SKIP_NESTED = !!process.env.CLAUDECODE;
+
 beforeEach(() => {
   mkdirSync(FIXTURE, { recursive: true });
   writeFileSync(TARGET, INITIAL, "utf-8");
 });
 
-describe("Spike B — PreToolUse hook fires under bypassPermissions", () => {
+describe.skipIf(SKIP_NESTED)("Spike B — PreToolUse hook fires under bypassPermissions", () => {
   it("denies Edit, file unchanged, agent sees error", async () => {
     let fired = 0;
     const denyHook: HookCallbackMatcher = {

@@ -31,8 +31,8 @@ export interface AgentDefinition {
   systemPrompt: string;
 
   // Archetype (optional — unset = unstructured agent, current behavior)
-  archetype?: string;                       // discipline id, e.g. "software-engineer"
-  title?: string;                           // customer-facing title, e.g. "VP Engineering"
+  archetype?: string; // discipline id, e.g. "software-engineer"
+  title?: string; // customer-facing title, e.g. "VP Engineering"
   archetypeConfig?: Record<string, unknown>; // opaque blob, validated by the archetype
 
   // Scheduling
