@@ -5,8 +5,10 @@ import type { LoadedPlugin } from "../plugins/types.js";
 
 // ── node:fs mock ─────────────────────────────────────────────────────
 const mockExistsSync = vi.fn().mockReturnValue(true);
+const mockStatSync = vi.fn().mockReturnValue({ isDirectory: () => true });
 vi.mock("node:fs", () => ({
   existsSync: (...args: any[]) => mockExistsSync(...args),
+  statSync: (...args: any[]) => mockStatSync(...args),
 }));
 
 // ── SDK mock ────────────────────────────────────────────────────────
@@ -139,6 +141,11 @@ function getCapturedOptions(): Record<string, any> {
 
 // ── Import after mocks ──────────────────────────────────────────────
 import { AgentRunner } from "./agent-runner.js";
+import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
+
+function makeRunner(overrides: Partial<AgentConfig> = {}): AgentRunner {
+  return new AgentRunner(makeAgentConfig(overrides), makeMockMemoryManager() as any);
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 describe("AgentRunner.buildMcpServers (via send)", () => {
@@ -1496,5 +1503,287 @@ describe("AgentRunner betas passthrough (via send)", () => {
     const options = getCapturedOptions();
 
     expect(options).not.toHaveProperty("betas");
+  });
+});
+
+// ── Archetype card injection ─────────────────────────────────────
+describe("buildSystemPrompt — archetype card", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetRegistryForTests();
+  });
+
+  it("injects card between soul and systemPrompt", async () => {
+    registerArchetype({
+      id: "stub",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "ARCH_CARD_MARKER",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "SOUL_MARKER",
+      systemPrompt: "SYSPROMPT_MARKER",
+      archetype: "stub",
+      archetypeConfig: {},
+    });
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    const soulIdx = prompt.indexOf("SOUL_MARKER");
+    const cardIdx = prompt.indexOf("ARCH_CARD_MARKER");
+    const sysIdx = prompt.indexOf("SYSPROMPT_MARKER");
+    expect(soulIdx).toBeGreaterThanOrEqual(0);
+    expect(cardIdx).toBeGreaterThan(soulIdx);
+    expect(sysIdx).toBeGreaterThan(cardIdx);
+  });
+
+  it("no card when archetype unset", async () => {
+    const runner = makeRunner({ soul: "SOUL_MARKER", systemPrompt: "SYSPROMPT_MARKER" });
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    expect(prompt).not.toContain("ARCH_CARD_MARKER");
+    expect(prompt).toContain("SOUL_MARKER");
+    expect(prompt).toContain("SYSPROMPT_MARKER");
+  });
+
+  it("buildHooks includes PreCompact by default", () => {
+    const runner = makeRunner({ soul: "", systemPrompt: "" });
+    const hooks = (runner as any).buildHooks();
+    expect(hooks.PreCompact).toBeDefined();
+    expect(Array.isArray(hooks.PreCompact)).toBe(true);
+    expect(hooks.PreToolUse).toBeUndefined();
+  });
+
+  it("buildHooks merges archetype PreToolUse hooks", () => {
+    registerArchetype({
+      id: "hooked",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [
+        { matcher: "Edit", hooks: [async () => ({ continue: true })] },
+      ],
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "",
+      systemPrompt: "",
+      archetype: "hooked",
+      archetypeConfig: {},
+    });
+    const hooks = (runner as any).buildHooks();
+    expect(hooks.PreCompact).toBeDefined();
+    expect(hooks.PreToolUse).toHaveLength(1);
+    expect(hooks.PreToolUse[0].matcher).toBe("Edit");
+  });
+
+  it("buildHooks installs deny-all when preToolUseHooks throws (fail-closed)", () => {
+    registerArchetype({
+      id: "hook-throws",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => {
+        throw new Error("hook init boom");
+      },
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "",
+      systemPrompt: "",
+      archetype: "hook-throws",
+      archetypeConfig: {},
+    });
+    const hooks = (runner as any).buildHooks();
+    expect(hooks.PreCompact).toBeDefined();
+    // Should have a deny-all hook, not undefined (fail-open)
+    expect(hooks.PreToolUse).toBeDefined();
+    expect(hooks.PreToolUse).toHaveLength(1);
+    // No matcher = matches all tools
+    expect(hooks.PreToolUse[0].matcher).toBeUndefined();
+  });
+
+  it("omits card gracefully when archetype systemPromptCard throws", async () => {
+    registerArchetype({
+      id: "throws",
+      validateConfig: (c) => c,
+      systemPromptCard: () => {
+        throw new Error("boom");
+      },
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "SOUL_MARKER",
+      systemPrompt: "SYSPROMPT_MARKER",
+      archetype: "throws",
+      archetypeConfig: {},
+    });
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    expect(prompt).toContain("SOUL_MARKER");
+    expect(prompt).toContain("SYSPROMPT_MARKER");
+    expect(prompt).not.toContain("ARCH_CARD_MARKER");
+  });
+});
+
+// ── Archetype sessionOptions + cwd validation ───────────────────
+describe("AgentRunner — archetype sessionOptions + cwd guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetRegistryForTests();
+    mockStatSync.mockReset();
+    mockStatSync.mockReturnValue({ isDirectory: () => true });
+  });
+
+  afterEach(() => {
+    __resetRegistryForTests();
+    mockStatSync.mockReset();
+    mockStatSync.mockReturnValue({ isDirectory: () => true });
+  });
+
+  it("merges archetype sessionOptions (cwd + settingSources) into SDK query options", async () => {
+    registerArchetype({
+      id: "with-session",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({ cwd: "/tmp/exists", settingSources: ["project"] }),
+    });
+    const runner = makeRunner({
+      archetype: "with-session",
+      archetypeConfig: {},
+    });
+    await runner.send("hello");
+    const options = getCapturedOptions();
+    expect(options.cwd).toBe("/tmp/exists");
+    expect(options.settingSources).toEqual(["project"]);
+  });
+
+  it("throws when statSync errors on the archetype cwd", async () => {
+    mockStatSync.mockImplementation(() => {
+      throw new Error("ENOENT");
+    });
+    registerArchetype({
+      id: "missing-cwd",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({ cwd: "/tmp/missing" }),
+    });
+    const runner = makeRunner({
+      archetype: "missing-cwd",
+      archetypeConfig: {},
+    });
+    await expect(runner.send("hello")).rejects.toThrow(/\/tmp\/missing/);
+  });
+
+  it("throws when archetype cwd exists but is not a directory", async () => {
+    mockStatSync.mockReturnValue({ isDirectory: () => false });
+    registerArchetype({
+      id: "file-cwd",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({ cwd: "/tmp/file" }),
+    });
+    const runner = makeRunner({
+      archetype: "file-cwd",
+      archetypeConfig: {},
+    });
+    await expect(runner.send("hello")).rejects.toThrow(/not a directory/);
+  });
+
+  it("does not invoke statSync when no archetype is configured", async () => {
+    mockStatSync.mockClear();
+    const runner = makeRunner({});
+    await runner.send("hello");
+    expect(mockStatSync.mock.calls.length).toBe(0);
+    const options = getCapturedOptions();
+    expect(options.cwd).toBeUndefined();
+  });
+});
+
+describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetRegistryForTests();
+  });
+  afterEach(() => __resetRegistryForTests());
+
+  it("defaults to self-mongo only when no archetype is set", async () => {
+    const runner = makeRunner({ coreServers: ["memory"] });
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
+  });
+
+  it("leads with self-mongo and appends archetype scopes", async () => {
+    registerArchetype({
+      id: "scoped",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [
+        { id: "workshop", backing: "filesystem", dir: "/tmp/workshop" },
+        { id: "workspace:dodi_v2", backing: "filesystem", dir: "/tmp/dodi" },
+      ],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({ archetype: "scoped", archetypeConfig: {}, coreServers: ["memory"] });
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
+    expect(scopes).toHaveLength(3);
+    expect(scopes.find((s: { id: string }) => s.id === "workshop")).toEqual({
+      id: "workshop",
+      backing: "filesystem",
+      dir: "/tmp/workshop",
+    });
+    expect(scopes.find((s: { id: string }) => s.id === "workspace:dodi_v2")).toBeDefined();
+  });
+
+  it("dedupes self when an archetype incorrectly returns its own self entry", async () => {
+    registerArchetype({
+      id: "with-self",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [
+        { id: "self", backing: "filesystem", dir: "/tmp/should-be-filtered" },
+        { id: "workshop", backing: "filesystem", dir: "/tmp/workshop" },
+      ],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({ archetype: "with-self", archetypeConfig: {}, coreServers: ["memory"] });
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    const selfEntries = scopes.filter((s: { id: string }) => s.id === "self");
+    expect(selfEntries).toHaveLength(1);
+    expect(selfEntries[0]).toEqual({ id: "self", backing: "mongo" });
+    expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
+  });
+
+  it("falls back to self-mongo only when memoryScopes throws", async () => {
+    registerArchetype({
+      id: "throwing",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => {
+        throw new Error("intentional");
+      },
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({ archetype: "throwing", archetypeConfig: {}, coreServers: ["memory"] });
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
   });
 });

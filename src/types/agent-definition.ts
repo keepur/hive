@@ -30,6 +30,11 @@ export interface AgentDefinition {
   soul: string;
   systemPrompt: string;
 
+  // Archetype (optional — unset = unstructured agent, current behavior)
+  archetype?: string; // discipline id, e.g. "software-engineer"
+  title?: string; // customer-facing title, e.g. "VP Engineering"
+  archetypeConfig?: Record<string, unknown>; // opaque blob, validated by the archetype
+
   // Scheduling
   schedule: AgentSchedule[];
   subscribe?: string[];
@@ -100,6 +105,9 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     delegatePrompts: doc.delegatePrompts ?? AGENT_DEFINITION_DEFAULTS.delegatePrompts,
     soul: doc.soul ?? "",
     systemPrompt: doc.systemPrompt ?? "",
+    archetype: doc.archetype,
+    title: doc.title,
+    archetypeConfig: doc.archetypeConfig,
     autonomy: resolveAutonomy(instanceAutonomy, doc.autonomy),
   };
 }
