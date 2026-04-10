@@ -238,6 +238,37 @@ describe("AgentRegistry archetype validation on load", () => {
     expect(registry.getAll().map((a) => a.id)).not.toContain("invalid-agent");
   });
 
+  it("evicts a previously-loaded agent when its archetypeConfig becomes invalid on reload", async () => {
+    // Round 1: doc is valid, agent loads.
+    const validDef = makeDefinition({
+      _id: "evicted-agent",
+      archetype: "test-arch",
+      archetypeConfig: { workshop: "/tmp/workshop" },
+    });
+    const docs: AgentDefinition[] = [validDef];
+    const collection = {
+      find: () => ({ toArray: async () => docs }),
+    } as unknown as Collection<AgentDefinition>;
+
+    const registry = new AgentRegistry(collection);
+    await registry.load();
+    expect(registry.get("evicted-agent")).toBeDefined();
+
+    // Round 2: same id, but archetypeConfig is now invalid (simulates DB corruption
+    // or a beekeeper edit gone wrong). The previously-loaded valid version must
+    // NOT keep serving requests.
+    docs[0] = makeDefinition({
+      _id: "evicted-agent",
+      archetype: "test-arch",
+      archetypeConfig: {}, // missing workshop — validateConfig throws
+    });
+    const result = await registry.load();
+
+    expect(result.removed).toContain("evicted-agent");
+    expect(registry.get("evicted-agent")).toBeUndefined();
+    expect(registry.getAll().map((a) => a.id)).not.toContain("evicted-agent");
+  });
+
   it("degrades gracefully on unknown archetype id", async () => {
     const def = makeDefinition({
       _id: "unknown-arch-agent",
