@@ -124,6 +124,44 @@ describe("SessionManager", () => {
         path: "/home/user/hive",
       });
     });
+
+    it("non-clear path still emits status(thinking) and session_info on init", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+
+      mockQueryIterator.mockReturnValue(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-plain" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "Ready",
+            session_id: "sess-plain",
+            total_cost_usd: 0.001,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      // Call newSession WITHOUT suppressClientSignals (the non-clear path).
+      await manager.newSession("/tmp/test");
+      await drainWelcome(manager, "sess-plain");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+
+      // status(thinking) is emitted
+      expect(
+        sent.find((m: Record<string, unknown>) => m.type === "status" && m.state === "thinking"),
+      ).toBeDefined();
+
+      // session_info for the new sessionId is emitted
+      const sessionInfo = sent.find(
+        (m: Record<string, unknown>) => m.type === "session_info" && m.sessionId === "sess-plain",
+      );
+      expect(sessionInfo).toBeDefined();
+      expect(sessionInfo.path).toBe("/tmp/test");
+    });
   });
 
   describe("sendMessage(sessionId, text)", () => {
@@ -544,6 +582,112 @@ describe("SessionManager", () => {
       const errorSent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       const errorMsg = errorSent.find((m: Record<string, unknown>) => m.type === "error");
       expect(errorMsg?.message).toContain("Unknown session");
+    });
+
+    it("/clear: session_replaced fires before any new-session signals reach the client", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      // Fresh session mock: init event, then a text delta from the welcome stream, then result.
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-new" },
+          {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "Ready." },
+            },
+            session_id: "sess-new",
+          },
+          {
+            type: "result",
+            subtype: "success",
+            result: "Ready.",
+            session_id: "sess-new",
+            total_cost_usd: 0.001,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      ws.send.mockClear();
+      await manager.sendMessage(sessionId, "/clear");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+
+      // (a) session_replaced must appear on the wire
+      const replacedIdx = sent.findIndex((m: Record<string, unknown>) => m.type === "session_replaced");
+      expect(replacedIdx).toBeGreaterThanOrEqual(0);
+
+      // (b) No session_info or status(thinking) for the new sessionId is ever emitted (suppressed)
+      const newSessionInfo = sent.find(
+        (m: Record<string, unknown>) => m.type === "session_info" && m.sessionId === "sess-new",
+      );
+      expect(newSessionInfo).toBeUndefined();
+
+      const newThinking = sent.find(
+        (m: Record<string, unknown>) =>
+          m.type === "status" && m.state === "thinking" && m.sessionId === "sess-new",
+      );
+      expect(newThinking).toBeUndefined();
+
+      // (c) Every welcome-stream message for the new sessionId arrives AFTER session_replaced.
+      //     Ordering is deterministic because onInit resolves the init deferred synchronously
+      //     from inside runQuery's for-await loop, which queues newSession's continuation
+      //     (and therefore handleClear's session_replaced emit) as a microtask BEFORE the
+      //     for-await loop's next iteration is scheduled.
+      const newSessionMessageIndices = sent
+        .map((m: Record<string, unknown>, idx: number) => ({ m, idx }))
+        .filter(({ m }: { m: Record<string, unknown> }) => m.type === "message" && m.sessionId === "sess-new")
+        .map(({ idx }: { idx: number }) => idx);
+      expect(newSessionMessageIndices.length).toBeGreaterThan(0);
+      for (const idx of newSessionMessageIndices) {
+        expect(idx).toBeGreaterThan(replacedIdx);
+      }
+    });
+
+    it("/clear: when SDK completes without emitting init, sends error and does not hang", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+      const sessionId = await setupSession(manager, ws);
+
+      // Pathological mock: SDK yields a result without ever emitting system/init.
+      mockQueryIterator.mockReturnValueOnce(
+        makeAsyncIterable([
+          {
+            type: "result",
+            subtype: "error",
+            result: "",
+            session_id: "never-initialized",
+            total_cost_usd: 0,
+            duration_ms: 5,
+          },
+        ]),
+      );
+
+      ws.send.mockClear();
+      await manager.sendMessage(sessionId, "/clear");
+
+      const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
+
+      // An error message matching the handleClear failure path must be emitted.
+      // Note: runQuery also emits a leaked "Session ended: error" for the
+      // pathological SDK result (known + acceptable leak documented in the spec);
+      // we specifically assert against the authoritative handleClear error here.
+      const errorMsg = sent.find(
+        (m: Record<string, unknown>) =>
+          m.type === "error" &&
+          typeof m.message === "string" &&
+          /failed to start new session/i.test(m.message as string),
+      );
+      expect(errorMsg).toBeDefined();
+
+      // No session_replaced was emitted
+      expect(sent.find((m: Record<string, unknown>) => m.type === "session_replaced")).toBeUndefined();
     });
 
     it("unknown /command falls through to SDK as normal text", async () => {
