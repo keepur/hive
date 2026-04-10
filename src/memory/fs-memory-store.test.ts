@@ -54,6 +54,12 @@ describe("FsMemoryStore", () => {
     expect(() => store.read("../escape.md")).toThrow();
   });
 
+  it("constructor rejects relative paths (raw input, not resolved)", () => {
+    expect(() => new FsMemoryStore(".")).toThrow(/absolute/);
+    expect(() => new FsMemoryStore("relative/dir")).toThrow(/absolute/);
+    expect(() => new FsMemoryStore("")).toThrow(/absolute/);
+  });
+
   it("write is atomic (no partial file on concurrent reads)", () => {
     // Smoke test — race the writer against a reader, assert reader never sees "".
     store.write("r.md", "full content", null);

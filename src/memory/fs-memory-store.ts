@@ -6,7 +6,7 @@ import {
   writeFileSync,
   existsSync,
 } from "node:fs";
-import { dirname, join, resolve, basename } from "node:path";
+import { dirname, join, basename } from "node:path";
 import { randomBytes } from "node:crypto";
 
 /**
@@ -24,8 +24,10 @@ import { randomBytes } from "node:crypto";
  */
 export class FsMemoryStore {
   constructor(private readonly dir: string) {
-    if (!resolve(dir).startsWith("/")) {
-      throw new Error(`FsMemoryStore requires absolute path, got ${dir}`);
+    // Check the raw input — resolve() would silently turn "." into the cwd
+    // and let a relative path slip through.
+    if (typeof dir !== "string" || !dir.startsWith("/")) {
+      throw new Error(`FsMemoryStore requires absolute path, got ${String(dir)}`);
     }
   }
 
