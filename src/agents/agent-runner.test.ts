@@ -5,8 +5,10 @@ import type { LoadedPlugin } from "../plugins/types.js";
 
 // ── node:fs mock ─────────────────────────────────────────────────────
 const mockExistsSync = vi.fn().mockReturnValue(true);
+const mockStatSync = vi.fn().mockReturnValue({ isDirectory: () => true });
 vi.mock("node:fs", () => ({
   existsSync: (...args: any[]) => mockExistsSync(...args),
+  statSync: (...args: any[]) => mockStatSync(...args),
 }));
 
 // ── SDK mock ────────────────────────────────────────────────────────
