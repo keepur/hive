@@ -62,6 +62,23 @@ function makeAsyncIterable(messages: Record<string, unknown>[]) {
   return iterable;
 }
 
+// newSession() now returns as soon as `system/init` fires; the welcome
+// stream continues in the background. Tests that interact with the session
+// right after creation must wait for the welcome stream to drain so the
+// session is idle before further assertions.
+async function drainWelcome(manager: SessionManager, sessionId: string): Promise<void> {
+  const slot = (
+    manager as unknown as { sessions: Map<string, { queryDone?: Promise<unknown> }> }
+  ).sessions.get(sessionId);
+  if (slot?.queryDone) {
+    try {
+      await slot.queryDone;
+    } catch {
+      // handled inside runQuery
+    }
+  }
+}
+
 describe("SessionManager", () => {
   let config: BeekeeperConfig;
   let guardian: ToolGuardian;
@@ -123,6 +140,7 @@ describe("SessionManager", () => {
         ]),
       );
       const sessionId = await manager.newSession("/tmp/test");
+      await drainWelcome(manager, sessionId);
       ws.send.mockClear();
 
       // Now send a message using sessionId
@@ -215,6 +233,7 @@ describe("SessionManager", () => {
       // Resolve the first query to complete session creation
       resolveQuery?.();
       await newSessionPromise;
+      await drainWelcome(manager, "sess-busy");
 
       // Now make the next query hang
       let resolveSecond: (() => void) | undefined;
@@ -282,6 +301,7 @@ describe("SessionManager", () => {
       );
 
       const sessionId = await manager.newSession("/tmp/test");
+      await drainWelcome(manager, sessionId);
       ws.send.mockClear();
 
       const result = await manager.clearSession(sessionId);
@@ -316,7 +336,8 @@ describe("SessionManager", () => {
           { type: "result", subtype: "success", result: "", session_id: "sess-a", total_cost_usd: 0, duration_ms: 10 },
         ]),
       );
-      await manager.newSession("/home/user/hive");
+      const idA = await manager.newSession("/home/user/hive");
+      await drainWelcome(manager, idA);
 
       mockQueryIterator.mockReturnValueOnce(
         makeAsyncIterable([
@@ -324,7 +345,8 @@ describe("SessionManager", () => {
           { type: "result", subtype: "success", result: "", session_id: "sess-b", total_cost_usd: 0, duration_ms: 10 },
         ]),
       );
-      await manager.newSession("/home/user/other");
+      const idB = await manager.newSession("/home/user/other");
+      await drainWelcome(manager, idB);
 
       ws.send.mockClear();
       manager.listSessions();
@@ -363,6 +385,7 @@ describe("SessionManager", () => {
         ]),
       );
       const sessionId = await manager.newSession("/tmp/test");
+      await drainWelcome(manager, sessionId);
       ws.send.mockClear();
 
       // Make next query throw
@@ -437,6 +460,7 @@ describe("SessionManager", () => {
         ]),
       );
       const sessionId = await manager.newSession("/tmp/test");
+      await drainWelcome(manager, sessionId);
       ws.send.mockClear();
       return sessionId;
     }
@@ -481,7 +505,7 @@ describe("SessionManager", () => {
       expect(statusMsg.final).toBe(true);
     });
 
-    it("/clear sends context_cleared, destroys session, creates new one", async () => {
+    it("/clear sends session_replaced, destroys session, creates new one", async () => {
       const ws = makeMockWs();
       const manager = new SessionManager(config, guardian, questionRelayer);
       manager.addClient("test-device", ws as never);
@@ -506,13 +530,13 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
 
-      // context_cleared should be the FIRST message sent
-      expect(sent[0]).toEqual({ type: "context_cleared", oldSessionId: sessionId, sessionId });
+      const replaced = sent.find((m: Record<string, unknown>) => m.type === "session_replaced");
+      expect(replaced).toBeDefined();
+      expect(replaced.oldSessionId).toBe(sessionId);
+      expect(replaced.newSessionId).toBe("sess-fresh");
+      expect(replaced.path).toBeDefined();
 
-      // New session_info should appear
-      const sessionInfo = sent.find((m: Record<string, unknown>) => m.type === "session_info");
-      expect(sessionInfo).toBeDefined();
-      expect(sessionInfo.sessionId).toBe("sess-fresh");
+      expect(sent.find((m: Record<string, unknown>) => m.type === "context_cleared")).toBeUndefined();
 
       // Old session should be gone
       ws.send.mockClear();
@@ -549,8 +573,8 @@ describe("SessionManager", () => {
       await manager.sendMessage(sessionId, "/unknown foo bar");
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
-      // Should NOT see context_cleared or any command response
-      expect(sent.find((m: Record<string, unknown>) => m.type === "context_cleared")).toBeUndefined();
+      // Should NOT see session_replaced or any command response
+      expect(sent.find((m: Record<string, unknown>) => m.type === "session_replaced")).toBeUndefined();
       // Should see the SDK response streamed through
       const textMsg = sent.find(
         (m: Record<string, unknown>) => m.type === "message" && m.text === "I don't know that command",
@@ -627,7 +651,11 @@ describe("SessionManager", () => {
       await manager.sendMessage(sessionId, "/CLEAR");
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
-      expect(sent[0]).toEqual({ type: "context_cleared", oldSessionId: sessionId, sessionId });
+      const replaced = sent.find((m: Record<string, unknown>) => m.type === "session_replaced");
+      expect(replaced).toBeDefined();
+      expect(replaced.oldSessionId).toBe(sessionId);
+      expect(typeof replaced.newSessionId).toBe("string");
+      expect(replaced.path).toBeDefined();
     });
 
     it("/clear works when session is busy — interrupts active query", async () => {
@@ -689,14 +717,11 @@ describe("SessionManager", () => {
       // interrupt() should have been called
       expect(hangingIterable.interrupt).toHaveBeenCalled();
 
-      // context_cleared should appear
-      const cleared = sent.find((m: Record<string, unknown>) => m.type === "context_cleared");
-      expect(cleared).toEqual({ type: "context_cleared", oldSessionId: sessionId, sessionId });
-
-      // New session should exist
-      const sessionInfo = sent.find((m: Record<string, unknown>) => m.type === "session_info");
-      expect(sessionInfo).toBeDefined();
-      expect(sessionInfo.sessionId).toBe("sess-cleared");
+      const replaced = sent.find((m: Record<string, unknown>) => m.type === "session_replaced");
+      expect(replaced).toBeDefined();
+      expect(replaced.oldSessionId).toBe(sessionId);
+      expect(typeof replaced.newSessionId).toBe("string");
+      expect(replaced.path).toBeDefined();
     });
 
     it("/status works when session is busy — reports busy state", async () => {
@@ -773,8 +798,8 @@ describe("SessionManager", () => {
       await manager.sendMessage(sessionId, "/");
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
-      // Should NOT see any command response (no context_cleared, no help text)
-      expect(sent.find((m: Record<string, unknown>) => m.type === "context_cleared")).toBeUndefined();
+      // Should NOT see any command response (no session_replaced, no help text)
+      expect(sent.find((m: Record<string, unknown>) => m.type === "session_replaced")).toBeUndefined();
       // Should see the SDK response — fell through to normal query
       const textMsg = sent.find((m: Record<string, unknown>) => m.type === "message" && m.text === "Just a slash");
       expect(textMsg).toBeDefined();
@@ -807,7 +832,7 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
       // Should NOT trigger /clear
-      expect(sent.find((m: Record<string, unknown>) => m.type === "context_cleared")).toBeUndefined();
+      expect(sent.find((m: Record<string, unknown>) => m.type === "session_replaced")).toBeUndefined();
       // Should see SDK response
       const textMsg = sent.find((m: Record<string, unknown>) => m.type === "message" && m.text === "Not a command");
       expect(textMsg).toBeDefined();
@@ -885,14 +910,11 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
 
-      // context_cleared should still be sent
-      const cleared = sent.find((m: Record<string, unknown>) => m.type === "context_cleared");
-      expect(cleared).toBeDefined();
-
-      // New session should be created despite the error
-      const sessionInfo = sent.find((m: Record<string, unknown>) => m.type === "session_info");
-      expect(sessionInfo).toBeDefined();
-      expect(sessionInfo.sessionId).toBe("sess-after-err");
+      const replaced = sent.find((m: Record<string, unknown>) => m.type === "session_replaced");
+      expect(replaced).toBeDefined();
+      expect(replaced.oldSessionId).toBe(sessionId);
+      expect(typeof replaced.newSessionId).toBe("string");
+      expect(replaced.path).toBeDefined();
     });
 
     it("/clear when newSession() SDK fails — sends error, does not throw", async () => {
@@ -915,14 +937,8 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
 
-      // context_cleared should still be sent
-      const cleared = sent.find((m: Record<string, unknown>) => m.type === "context_cleared");
-      expect(cleared).toBeDefined();
-
-      // Error from runQuery should reach the client
-      const errorMsg = sent.find((m: Record<string, unknown>) => m.type === "error");
-      expect(errorMsg).toBeDefined();
-      expect(errorMsg.message).toContain("SDK connection failed");
+      expect(sent.find((m: Record<string, unknown>) => m.type === "error")).toBeDefined();
+      expect(sent.find((m: Record<string, unknown>) => m.type === "session_replaced")).toBeUndefined();
 
       // Old session should be gone
       ws.send.mockClear();
@@ -960,14 +976,9 @@ describe("SessionManager", () => {
 
       const sent = ws.send.mock.calls.map((c: [string]) => JSON.parse(c[0]));
 
-      // Only ONE context_cleared should be sent
-      const clearedMessages = sent.filter((m: Record<string, unknown>) => m.type === "context_cleared");
-      expect(clearedMessages).toHaveLength(1);
-
-      // Only ONE new session should be created
-      const sessionInfoMessages = sent.filter((m: Record<string, unknown>) => m.type === "session_info");
-      expect(sessionInfoMessages).toHaveLength(1);
-      expect(sessionInfoMessages[0].sessionId).toBe("sess-only-one");
+      const replacedMessages = sent.filter((m: Record<string, unknown>) => m.type === "session_replaced");
+      expect(replacedMessages).toHaveLength(1);
+      expect(replacedMessages[0].newSessionId).toBe("sess-only-one");
     });
 
     it("text not starting with / goes to SDK normally", async () => {

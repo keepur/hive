@@ -28,7 +28,7 @@ export type ServerMessage =
   | { type: "session_info"; sessionId: string; path: string }
   | { type: "session_list"; sessions: Array<{ sessionId: string; path: string; state: "idle" | "busy" }> }
   | { type: "session_cleared"; sessionId: string }
-  | { type: "context_cleared"; oldSessionId: string; sessionId: string }
+  | { type: "session_replaced"; oldSessionId: string; newSessionId: string; path: string }
   | { type: "browse_result"; path: string; entries: Array<{ name: string; isDirectory: boolean }> }
   | {
       type: "workspace_session_list";

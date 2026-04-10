@@ -29,6 +29,36 @@ interface CommandDef {
   handler: (sessionId: string, args: string[], slot: SessionSlot) => Promise<void>;
 }
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (err: unknown) => void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+interface RunQueryOptions {
+  /**
+   * When true, suppress the initial `status(thinking)` emit and the
+   * `session_info` emit on SDK init. Used by /clear to avoid leaking
+   * intermediate new-session signals to the client before session_replaced.
+   */
+  suppressClientSignals?: boolean;
+  /**
+   * Called synchronously when the SDK's `system/init` message arrives,
+   * carrying the real session_id. Used by newSession() to return early.
+   */
+  onInit?: (realSessionId: string) => void;
+}
+
 export class SessionManager {
   private sessions = new Map<string, SessionSlot>();
   private clients = new Map<string, WebSocket>();
@@ -119,9 +149,15 @@ export class SessionManager {
   }
 
   /**
-   * Create a new session in the given cwd. Spawns SDK eagerly.
+   * Create a new session in the given cwd. Spawns SDK and returns as soon as
+   * the `system/init` event fires (carrying the real session_id). The welcome
+   * query continues streaming in the background.
+   *
+   * When called from /clear, pass `suppressClientSignals: true` so the
+   * bootstrap query does not leak `status(thinking)` or `session_info` to the
+   * client before handleClear can emit session_replaced.
    */
-  async newSession(cwd: string): Promise<string> {
+  async newSession(cwd: string, opts?: { suppressClientSignals?: boolean }): Promise<string> {
     log.info("Creating new session", { cwd });
     const pendingId = `pending-${randomUUID()}`;
     const slot: SessionSlot = {
@@ -135,11 +171,42 @@ export class SessionManager {
     // Register immediately so the session is visible during the inaugural query
     this.sessions.set(pendingId, slot);
 
-    const done = this.runQuery(slot, "You are now connected. Briefly acknowledge readiness.");
-    slot.queryDone = done;
-    const realId = await done;
+    const initDeferred = createDeferred<string>();
+    let initFired = false;
 
-    // Replace pending key with real session ID
+    const donePromise = this.runQuery(slot, "You are now connected. Briefly acknowledge readiness.", {
+      suppressClientSignals: opts?.suppressClientSignals,
+      onInit: (realId) => {
+        initFired = true;
+        initDeferred.resolve(realId);
+      },
+    });
+
+    // If runQuery settles without init ever firing, reject the init deferred
+    // so newSession() doesn't hang forever. Covers both:
+    //   - SDK throws/errors before init (donePromise rejects)
+    //   - SDK returns a `result` before emitting `system/init` (donePromise resolves)
+    donePromise.finally(() => {
+      if (!initFired) {
+        initDeferred.reject(
+          new Error("Session never initialized (SDK completed without init event)"),
+        );
+      }
+    });
+    // Swallow any unhandled rejection on donePromise itself. runQuery has a
+    // top-level try/catch that normally converts errors to error-message sends
+    // and a normal return, so this is defensive. In the init-never-fires path
+    // the caller awaits initDeferred.promise (which we rejected above), and
+    // nothing else awaits donePromise in that path — avoid the unhandled
+    // rejection warning.
+    donePromise.catch(() => {});
+
+    slot.queryDone = donePromise;
+
+    const realId = await initDeferred.promise;
+
+    // Swap the map key from pending to real. Welcome stream continues in the
+    // background and now routes via this slot's outputBuffer when offline.
     this.sessions.delete(pendingId);
     slot.sessionId = realId;
     this.sessions.set(realId, slot);
@@ -391,16 +458,21 @@ export class SessionManager {
   }
 
   /**
-   * /clear — destroy the current session and create a fresh one.
+   * /clear — destroy the current session and create a fresh one, then emit
+   * a single atomic session_replaced message so the client can swap sessions
+   * without ambiguity.
    *
    * Flow:
-   * 1. Tear down the old session inline (interrupt if busy, remove from map)
-   * 2. Send context_cleared to client (after slot deletion so it routes to
-   *    globalBuffer when offline, not the now-deleted per-session buffer)
-   * 3. Call newSession(cwd) — spawns fresh SDK session
+   * 1. Tear down old session inline (interrupt if busy, await, remove from map)
+   * 2. Create fresh session with suppressClientSignals so no intermediate
+   *    status/session_info reaches the client before session_replaced
+   * 3. Emit session_replaced { oldSessionId, newSessionId, path }
+   * 4. Welcome stream continues in the background and lands on the client
+   *    naturally under the new sessionId
    *
-   * Does NOT call clearSession() — that emits session_cleared which would
-   * create confusing duplicate signals for the client.
+   * On newSession() failure (including the init-never-fires case), emit an
+   * error and do NOT emit session_replaced. Client stays in its loading state
+   * and the user can retry manually.
    *
    * Guarded by slot.clearing to prevent concurrent /clear calls from
    * creating duplicate sessions.
@@ -411,6 +483,7 @@ export class SessionManager {
     slot.clearing = true;
 
     const cwd = slot.cwd;
+    const oldSessionId = sessionId;
 
     // 1. Tear down old session inline
     slot.cleared = true;
@@ -434,29 +507,39 @@ export class SessionManager {
     this.persistSessions();
     log.info("Session torn down for /clear", { sessionId });
 
-    // 2. Notify client to wipe the chat view — sent AFTER slot deletion so
-    // send() routes to globalBuffer (not the now-deleted per-session buffer).
-    // This ensures context_cleared survives client disconnection.
-    this.send({ type: "context_cleared", oldSessionId: sessionId, sessionId });
-
-    // 3. Create fresh session on same workspace
+    // 2. Create fresh session with client signals suppressed so nothing about
+    //    the new session reaches the client before session_replaced.
+    let newSessionId: string;
     try {
-      await this.newSession(cwd);
+      newSessionId = await this.newSession(cwd, { suppressClientSignals: true });
     } catch (err) {
       log.error("Failed to create new session after /clear", { cwd, error: String(err) });
       this.send({
         type: "error",
         message: `Context cleared but failed to start new session: ${err instanceof Error ? err.message : String(err)}`,
       });
+      return;
     }
+
+    // 3. Emit the atomic swap signal. The welcome stream continues in the
+    //    background and lands under newSessionId, which the client has now
+    //    adopted.
+    this.send({
+      type: "session_replaced",
+      oldSessionId,
+      newSessionId,
+      path: cwd,
+    });
   }
 
   /**
    * Run a query in a session slot.
    */
-  private async runQuery(slot: SessionSlot, text: string): Promise<string> {
+  private async runQuery(slot: SessionSlot, text: string, opts?: RunQueryOptions): Promise<string> {
     slot.state = "busy";
-    this.send({ type: "status", state: "thinking", sessionId: slot.sessionId });
+    if (!opts?.suppressClientSignals) {
+      this.send({ type: "status", state: "thinking", sessionId: slot.sessionId });
+    }
 
     const guardianCallback = this.guardian.createHookCallback(slot.sessionId);
     const questionCallback = this.questionRelayer.createHookCallback(slot.sessionId);
@@ -496,11 +579,14 @@ export class SessionManager {
         if (msg.type === "system" && (msg as any).subtype === "init") {
           resolvedSessionId = (msg as any).session_id;
           slot.sessionId = resolvedSessionId;
-          this.send({
-            type: "session_info",
-            sessionId: resolvedSessionId,
-            path: slot.cwd,
-          });
+          if (!opts?.suppressClientSignals) {
+            this.send({
+              type: "session_info",
+              sessionId: resolvedSessionId,
+              path: slot.cwd,
+            });
+          }
+          opts?.onInit?.(resolvedSessionId);
         }
 
         if (msg.type === "stream_event") {
