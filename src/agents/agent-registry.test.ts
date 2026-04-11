@@ -255,7 +255,7 @@ describe("AgentRegistry archetype validation on load", () => {
     expect(registry.get("evicted-agent")).toBeDefined();
 
     // Round 2: same id, but archetypeConfig is now invalid (simulates DB corruption
-    // or a beekeeper edit gone wrong). The previously-loaded valid version must
+    // or a relay edit gone wrong). The previously-loaded valid version must
     // NOT keep serving requests.
     docs[0] = makeDefinition({
       _id: "evicted-agent",
