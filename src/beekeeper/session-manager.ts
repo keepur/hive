@@ -22,6 +22,10 @@ export interface SessionSlot {
   /** Resolves when runQuery finishes after a clear/interrupt */
   queryDone?: Promise<string>;
   outputBuffer: ServerMessage[];
+  /** When the current query started (null if idle) */
+  queryStartedAt: number | null;
+  /** Last time any activity occurred (query start, message sent, etc.) */
+  lastActivityAt: number;
 }
 
 interface CommandDef {
@@ -183,6 +187,8 @@ export class SessionManager {
       activeQuery: null,
       state: "idle",
       outputBuffer: [],
+      queryStartedAt: null,
+      lastActivityAt: Date.now(),
     };
 
     // Register immediately so the session is visible during the inaugural query
@@ -353,6 +359,8 @@ export class SessionManager {
       activeQuery: null,
       state: "idle",
       outputBuffer: [],
+      queryStartedAt: null,
+      lastActivityAt: Date.now(),
     };
     this.sessions.set(sessionId, slot);
     this.persistSessions();
@@ -426,6 +434,8 @@ export class SessionManager {
           activeQuery: null,
           state: "idle",
           outputBuffer: [],
+          queryStartedAt: null,
+          lastActivityAt: Date.now(),
         };
         this.sessions.set(entry.sessionId, slot);
         restored++;
@@ -434,6 +444,72 @@ export class SessionManager {
     } catch (err) {
       log.error("Failed to restore sessions", { error: String(err) });
     }
+  }
+
+  /**
+   * Reap stale sessions:
+   * - Busy sessions whose query has run longer than maxQueryLifetimeMs get interrupted
+   * - Idle sessions with no activity for longer than idleSessionTtlMs get removed
+   *
+   * Returns counts for logging.
+   */
+  async reapStaleSessions(opts: {
+    maxQueryLifetimeMs: number;
+    idleSessionTtlMs: number;
+  }): Promise<{ interruptedQueries: number; prunedIdleSessions: number }> {
+    const now = Date.now();
+    let interruptedQueries = 0;
+    let prunedIdleSessions = 0;
+    const toPrune: string[] = [];
+
+    for (const [sessionId, slot] of this.sessions) {
+      // Reap long-running queries
+      if (slot.state === "busy" && slot.queryStartedAt && slot.activeQuery) {
+        const queryAge = now - slot.queryStartedAt;
+        if (queryAge > opts.maxQueryLifetimeMs) {
+          log.warn("Reaping stale beekeeper query", {
+            sessionId,
+            queryAgeHours: (queryAge / 3_600_000).toFixed(1),
+          });
+          try {
+            slot.interrupted = true;
+            await slot.activeQuery.interrupt();
+          } catch (err) {
+            log.error("Failed to interrupt stale session", { sessionId, error: String(err) });
+          }
+          interruptedQueries++;
+        }
+        continue; // Don't prune busy sessions for idleness
+      }
+
+      // Prune idle sessions with no recent activity
+      if (slot.state === "idle") {
+        const idleTime = now - slot.lastActivityAt;
+        if (idleTime > opts.idleSessionTtlMs) {
+          log.info("Pruning idle beekeeper session", {
+            sessionId,
+            idleHours: (idleTime / 3_600_000).toFixed(1),
+          });
+          toPrune.push(sessionId);
+          prunedIdleSessions++;
+        }
+      }
+    }
+
+    // Delete after iteration to avoid mutating the map during for-of
+    for (const id of toPrune) {
+      this.sessions.delete(id);
+    }
+
+    if (prunedIdleSessions > 0) {
+      this.persistSessions();
+    }
+
+    if (interruptedQueries > 0 || prunedIdleSessions > 0) {
+      log.info("Beekeeper reap complete", { interruptedQueries, prunedIdleSessions });
+    }
+
+    return { interruptedQueries, prunedIdleSessions };
   }
 
   /**
@@ -552,6 +628,8 @@ export class SessionManager {
    */
   private async runQuery(slot: SessionSlot, text: string, opts?: RunQueryOptions): Promise<string> {
     slot.state = "busy";
+    slot.queryStartedAt = Date.now();
+    slot.lastActivityAt = Date.now();
     if (!opts?.suppressClientSignals) {
       this.send({ type: "status", state: "thinking", sessionId: slot.sessionId });
     }
@@ -698,6 +776,8 @@ export class SessionManager {
       slot.activeQuery = null;
       slot.state = "idle";
       slot.interrupted = false;
+      slot.queryStartedAt = null;
+      slot.lastActivityAt = Date.now();
       // Suppress status messages for cleared sessions — session_cleared is the terminal event
       if (!slot.cleared) {
         this.send({ type: "status", state: "idle", sessionId: slot.sessionId });

@@ -54,8 +54,8 @@ beforeAll(async () => {
   await manager.start();
 });
 
-afterAll(() => {
-  manager.stop();
+afterAll(async () => {
+  await manager.stop();
 });
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -151,5 +151,95 @@ describe("structured spawn (no shell)", () => {
 
     const body = await res.json();
     expect(body).toHaveProperty("id");
+  });
+});
+
+// ── Process Lifecycle Tests ────────────────────────────────────────
+
+describe("stop() — process cleanup", () => {
+  it("sends SIGTERM to running tasks on stop", async () => {
+    const stopMgr = new BackgroundTaskManager(PORT + 10, AUTH_TOKEN, TASKS_DIR, () => {});
+    await stopMgr.start();
+
+    // Spawn a long-running process
+    const res = await fetch(`http://127.0.0.1:${PORT + 10}/tasks`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${AUTH_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        command: "sleep",
+        args: ["60"],
+        context: makeContext(),
+      }),
+    });
+    expect(res.status).toBe(200);
+    const { id } = await res.json();
+
+    // Verify it's running
+    const statusRes = await fetch(`http://127.0.0.1:${PORT + 10}/tasks/${id}`, {
+      headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+    });
+    const status = await statusRes.json();
+    expect(status.status).toBe("running");
+
+    // Stop should kill it
+    await stopMgr.stop();
+
+    // The PID should no longer be alive
+    const tasks = (stopMgr as unknown as { tasks: Map<string, { pid: number | null }> }).tasks;
+    const task = tasks.get(id);
+    if (task?.pid) {
+      let alive = true;
+      try {
+        process.kill(task.pid, 0);
+      } catch {
+        alive = false;
+      }
+      expect(alive).toBe(false);
+    }
+  });
+
+  it("stop() is safe to call with no running tasks", async () => {
+    const emptyMgr = new BackgroundTaskManager(PORT + 11, AUTH_TOKEN, TASKS_DIR, () => {});
+    await emptyMgr.start();
+    // Should not throw
+    await emptyMgr.stop();
+  });
+
+  it("stop() handles already-dead processes gracefully", async () => {
+    const deadMgr = new BackgroundTaskManager(PORT + 12, AUTH_TOKEN, TASKS_DIR, () => {});
+    await deadMgr.start();
+
+    // Spawn a fast-exiting process
+    const res = await fetch(`http://127.0.0.1:${PORT + 12}/tasks`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${AUTH_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        command: "echo",
+        args: ["done"],
+        context: makeContext(),
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    // Wait for it to finish — use the dead manager's port
+    const { id } = await res.json();
+    const start = Date.now();
+    while (Date.now() - start < 10000) {
+      const r = await fetch(`http://127.0.0.1:${PORT + 12}/tasks/${id}`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      const b = await r.json();
+      if (b.status !== "running") break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    // Stop should not throw even though the process is already dead
+    await deadMgr.stop();
   });
 });

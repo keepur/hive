@@ -137,6 +137,22 @@ export class Sweeper {
       } catch (err) {
         results.push({ component: "code-task-manager", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
       }
+
+      // 4c. Reap stale code-task processes (past max lifetime, no recent stderr activity)
+      try {
+        const { reaped, spared } = await this.targets.codeTaskManager.reapStale();
+        if (reaped > 0 || spared > 0) {
+          results.push({
+            component: "code-task-reaper",
+            pruned: reaped,
+            retried: 0,
+            bytesFreed: 0,
+            errors: spared > 0 ? [`${spared} task(s) spared — still active past TTL`] : [],
+          });
+        }
+      } catch (err) {
+        results.push({ component: "code-task-reaper", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
+      }
     }
 
     // 5. Meeting monitor — remove ended sessions
