@@ -61,7 +61,7 @@ interface RunQueryOptions {
 
 export class SessionManager {
   private sessions = new Map<string, SessionSlot>();
-  private clients = new Map<string, WebSocket>();
+  private clients = new Map<string, Set<WebSocket>>();
   private guardian: ToolGuardian;
   private questionRelayer: QuestionRelayer;
   private config: BeekeeperConfig;
@@ -92,7 +92,12 @@ export class SessionManager {
   }
 
   addClient(deviceId: string, ws: WebSocket): void {
-    this.clients.set(deviceId, ws);
+    let clientSet = this.clients.get(deviceId);
+    if (!clientSet) {
+      clientSet = new Set();
+      this.clients.set(deviceId, clientSet);
+    }
+    clientSet.add(ws);
     // Drain global buffer to new client
     if (this.globalBuffer.length > 0) {
       log.info("Draining global buffer", { deviceId, count: this.globalBuffer.length });
@@ -113,12 +118,22 @@ export class SessionManager {
     }
   }
 
-  removeClient(deviceId: string): void {
-    this.clients.delete(deviceId);
+  removeClient(deviceId: string, ws: WebSocket): void {
+    const clientSet = this.clients.get(deviceId);
+    if (clientSet) {
+      clientSet.delete(ws);
+      if (clientSet.size === 0) {
+        this.clients.delete(deviceId);
+      }
+    }
   }
 
   get clientCount(): number {
-    return this.clients.size;
+    let count = 0;
+    for (const clientSet of this.clients.values()) {
+      count += clientSet.size;
+    }
+    return count;
   }
 
   /**
@@ -128,10 +143,12 @@ export class SessionManager {
   send(msg: ServerMessage): void {
     const payload = JSON.stringify(msg);
     let sent = false;
-    for (const ws of this.clients.values()) {
-      if (ws.readyState === 1) {
-        ws.send(payload);
-        sent = true;
+    for (const clientSet of this.clients.values()) {
+      for (const ws of clientSet) {
+        if (ws.readyState === 1) {
+          ws.send(payload);
+          sent = true;
+        }
       }
     }
     if (!sent) {
