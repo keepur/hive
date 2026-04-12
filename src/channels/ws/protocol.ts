@@ -84,6 +84,11 @@ export interface ClientHistory {
   id: string;
 }
 
+export interface ClientAgentList {
+  type: "agent_list";
+  id: string;
+}
+
 export type ClientMessage =
   | ClientTextMessage
   | ClientImageMessage
@@ -96,7 +101,8 @@ export type ClientMessage =
   | ClientCommand
   | ClientCommandList
   | ClientChannelList
-  | ClientHistory;
+  | ClientHistory
+  | ClientAgentList;
 
 // ── Server → Client ─────────────────────────────────────────────────────
 
@@ -164,6 +170,34 @@ export interface ServerChannelEvent {
   id: string;
 }
 
+export interface AgentInfo {
+  id: string;
+  name: string;
+  icon: string;
+  title: string | null;
+  model: string;
+  status: "idle" | "processing" | "error" | "stopped";
+  tools: string[];
+  schedule: { cron: string; task: string }[];
+  channels: string[];
+  messagesProcessed: number;
+  lastActivity: string | null; // ISO 8601, null when agent has never received a message
+}
+
+export interface ServerAgentList {
+  type: "agent_list";
+  agents: AgentInfo[];
+  id: string;
+}
+
+// Phase 2 — defined now, added to ServerMessage union later
+export interface ServerAgentStatus {
+  type: "agent_status";
+  agentId: string;
+  status: "idle" | "processing" | "error" | "stopped";
+  id: string;
+}
+
 export type ServerMessage =
   | ServerTextMessage
   | ServerAck
@@ -172,7 +206,8 @@ export type ServerMessage =
   | ServerChannelList
   | ServerCommandList
   | ServerHistory
-  | ServerChannelEvent;
+  | ServerChannelEvent
+  | ServerAgentList;
 
 // ── Parsing ─────────────────────────────────────────────────────────────
 
@@ -293,6 +328,12 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           limit: typeof msg.limit === "number" ? msg.limit : undefined,
           id: msg.id,
         };
+      }
+      return null;
+
+    case "agent_list":
+      if (typeof msg.id === "string") {
+        return { type: "agent_list", id: msg.id };
       }
       return null;
 
