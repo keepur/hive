@@ -16,13 +16,23 @@ import type {
   ClientCommandList,
   ClientChannelList,
   ClientHistory,
+  AgentInfo,
 } from "./protocol.js";
 import { parseClientMessage, isTeamMessage } from "./protocol.js";
 import { processImageBuffer, processFileBuffer } from "../../files/file-processor.js";
 import type { TeamStore } from "../../team/team-store.js";
 import type { CommandRegistry } from "../../team/command-registry.js";
+import type { AgentRegistry } from "../../agents/agent-registry.js";
+import type { AgentManager } from "../../agents/agent-manager.js";
 
 const log = createLogger("ws-adapter");
+
+export interface WsAdapterDeps {
+  teamStore?: TeamStore;
+  commandRegistry?: CommandRegistry;
+  agentRegistry: AgentRegistry;
+  agentManager: AgentManager;
+}
 
 export class WsAdapter implements ChannelAdapter {
   readonly id = "ws";
@@ -38,19 +48,17 @@ export class WsAdapter implements ChannelAdapter {
   private onWorkItem!: (item: WorkItem) => void;
   private teamStore?: TeamStore;
   private commandRegistry?: CommandRegistry;
+  private agentRegistry: AgentRegistry;
+  private agentManager: AgentManager;
 
-  constructor(
-    port: number,
-    deviceRegistry: DeviceRegistry,
-    adminSecret: string,
-    teamStore?: TeamStore,
-    commandRegistry?: CommandRegistry,
-  ) {
+  constructor(port: number, deviceRegistry: DeviceRegistry, adminSecret: string, deps: WsAdapterDeps) {
     this.port = port;
     this.deviceRegistry = deviceRegistry;
     this.adminSecret = adminSecret;
-    this.teamStore = teamStore;
-    this.commandRegistry = commandRegistry;
+    this.teamStore = deps.teamStore;
+    this.commandRegistry = deps.commandRegistry;
+    this.agentRegistry = deps.agentRegistry;
+    this.agentManager = deps.agentManager;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
@@ -419,6 +427,12 @@ export class WsAdapter implements ChannelAdapter {
             return;
           }
 
+          if (msg.type === "agent_list") {
+            const agents = this.buildAgentList();
+            this.send(ws, { type: "agent_list", agents, id: msg.id });
+            return;
+          }
+
           // Team content messages (message/image/file with channelId)
           if (isTeamMessage(msg)) {
             if (msg.type === "message") {
@@ -614,6 +628,26 @@ export class WsAdapter implements ChannelAdapter {
       return null;
     }
     return channel;
+  }
+
+  /** Build the agent roster with runtime status for client consumption. */
+  private buildAgentList(): AgentInfo[] {
+    return this.agentRegistry.getAll().map((agent) => {
+      const state = this.agentManager.getState(agent.id);
+      return {
+        id: agent.id,
+        name: agent.name,
+        icon: agent.icon,
+        title: agent.title ?? null,
+        model: agent.model,
+        status: state?.status ?? "idle",
+        tools: [...new Set([...agent.coreServers, ...agent.delegateServers])].sort(),
+        schedule: agent.schedule.map((s) => ({ cron: s.cron, task: s.task })),
+        channels: agent.channels,
+        messagesProcessed: state?.messagesProcessed ?? 0,
+        lastActivity: state ? state.lastActivity.toISOString() : null,
+      };
+    });
   }
 
   // ── Team message handlers ──────────────────────────────────────────
