@@ -1183,4 +1183,224 @@ describe("SessionManager", () => {
       expect(textMsg).toBeDefined();
     });
   });
+
+  // ── Session Reaping Tests ──────────────────────────────────────────
+
+  describe("reapStaleSessions()", () => {
+    it("interrupts queries running longer than maxQueryLifetimeMs", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+
+      // Create a query that hangs (never yields result)
+      let resolveQuery: (() => void) | undefined;
+      const hangingIterable = {
+        async *[Symbol.asyncIterator]() {
+          yield { type: "system", subtype: "init", session_id: "sess-stale" };
+          // Hang until resolved
+          await new Promise<void>((r) => {
+            resolveQuery = r;
+          });
+        },
+        interrupt: vi.fn(() => {
+          resolveQuery?.();
+        }),
+      };
+
+      mockQueryIterator.mockReturnValue(hangingIterable);
+      const sessionId = await manager.newSession("/tmp/test");
+
+      // The welcome query is now busy and hanging
+      const sessions = (
+        manager as unknown as { sessions: Map<string, { state: string; queryStartedAt: number | null }> }
+      ).sessions;
+      const slot = sessions.get(sessionId);
+      expect(slot?.state).toBe("busy");
+
+      // Backdate queryStartedAt to simulate an old query
+      if (slot) {
+        slot.queryStartedAt = Date.now() - 10 * 60 * 60 * 1000; // 10 hours ago
+      }
+
+      const result = await manager.reapStaleSessions({
+        maxQueryLifetimeMs: 8 * 60 * 60 * 1000, // 8h
+        idleSessionTtlMs: 72 * 60 * 60 * 1000,
+      });
+
+      expect(result.interruptedQueries).toBe(1);
+      expect(hangingIterable.interrupt).toHaveBeenCalled();
+
+      // Wait for runQuery to finish
+      if (slot && (slot as Record<string, unknown>).queryDone) {
+        try {
+          await (slot as Record<string, unknown>).queryDone;
+        } catch {
+          // expected
+        }
+      }
+    });
+
+    it("does not interrupt queries within maxQueryLifetimeMs", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+
+      let resolveQuery: (() => void) | undefined;
+      const hangingIterable = {
+        async *[Symbol.asyncIterator]() {
+          yield { type: "system", subtype: "init", session_id: "sess-fresh" };
+          await new Promise<void>((r) => {
+            resolveQuery = r;
+          });
+        },
+        interrupt: vi.fn(() => {
+          resolveQuery?.();
+        }),
+      };
+
+      mockQueryIterator.mockReturnValue(hangingIterable);
+      const sessionId = await manager.newSession("/tmp/test");
+
+      // queryStartedAt is recent (just created) — should not be reaped
+      const result = await manager.reapStaleSessions({
+        maxQueryLifetimeMs: 8 * 60 * 60 * 1000,
+        idleSessionTtlMs: 72 * 60 * 60 * 1000,
+      });
+
+      expect(result.interruptedQueries).toBe(0);
+      expect(hangingIterable.interrupt).not.toHaveBeenCalled();
+
+      // Cleanup
+      resolveQuery?.();
+      const sessions = (manager as unknown as { sessions: Map<string, Record<string, unknown>> }).sessions;
+      const slot = sessions.get(sessionId);
+      if (slot?.queryDone) {
+        try {
+          await slot.queryDone;
+        } catch {
+          // expected
+        }
+      }
+    });
+
+    it("prunes idle sessions older than idleSessionTtlMs", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+
+      mockQueryIterator.mockReturnValue(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-idle" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-idle",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      const sessionId = await manager.newSession("/tmp/test");
+      await drainWelcome(manager, sessionId);
+
+      // Backdate lastActivityAt
+      const sessions = (manager as unknown as { sessions: Map<string, { lastActivityAt: number }> }).sessions;
+      const slot = sessions.get(sessionId);
+      if (slot) {
+        slot.lastActivityAt = Date.now() - 100 * 60 * 60 * 1000; // 100 hours ago
+      }
+
+      const result = await manager.reapStaleSessions({
+        maxQueryLifetimeMs: 8 * 60 * 60 * 1000,
+        idleSessionTtlMs: 72 * 60 * 60 * 1000, // 72h
+      });
+
+      expect(result.prunedIdleSessions).toBe(1);
+      expect(sessions.has(sessionId)).toBe(false);
+    });
+
+    it("does not prune idle sessions within idleSessionTtlMs", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+
+      mockQueryIterator.mockReturnValue(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-recent" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-recent",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      const sessionId = await manager.newSession("/tmp/test");
+      await drainWelcome(manager, sessionId);
+
+      // lastActivityAt is recent — should not be pruned
+      const result = await manager.reapStaleSessions({
+        maxQueryLifetimeMs: 8 * 60 * 60 * 1000,
+        idleSessionTtlMs: 72 * 60 * 60 * 1000,
+      });
+
+      expect(result.prunedIdleSessions).toBe(0);
+      const sessions = (manager as unknown as { sessions: Map<string, unknown> }).sessions;
+      expect(sessions.has(sessionId)).toBe(true);
+    });
+
+    it("returns zeros when nothing is stale", async () => {
+      const manager = new SessionManager(config, guardian, questionRelayer);
+
+      const result = await manager.reapStaleSessions({
+        maxQueryLifetimeMs: 8 * 60 * 60 * 1000,
+        idleSessionTtlMs: 72 * 60 * 60 * 1000,
+      });
+
+      expect(result.interruptedQueries).toBe(0);
+      expect(result.prunedIdleSessions).toBe(0);
+    });
+  });
+
+  describe("session slot tracking fields", () => {
+    it("sets queryStartedAt when runQuery begins and clears on completion", async () => {
+      const ws = makeMockWs();
+      const manager = new SessionManager(config, guardian, questionRelayer);
+      manager.addClient("test-device", ws as never);
+
+      mockQueryIterator.mockReturnValue(
+        makeAsyncIterable([
+          { type: "system", subtype: "init", session_id: "sess-track" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "",
+            session_id: "sess-track",
+            total_cost_usd: 0,
+            duration_ms: 10,
+          },
+        ]),
+      );
+
+      const sessionId = await manager.newSession("/tmp/test");
+      await drainWelcome(manager, sessionId);
+
+      const sessions = (
+        manager as unknown as {
+          sessions: Map<string, { queryStartedAt: number | null; lastActivityAt: number }>;
+        }
+      ).sessions;
+      const slot = sessions.get(sessionId);
+
+      // After query completes, queryStartedAt should be null
+      expect(slot?.queryStartedAt).toBeNull();
+      // lastActivityAt should be recent
+      expect(slot?.lastActivityAt).toBeGreaterThan(Date.now() - 5000);
+    });
+  });
 });

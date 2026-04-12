@@ -186,6 +186,8 @@ export const config = {
     defaultMaxTurns: parseInt(optional("CODE_TASK_MAX_TURNS", "100"), 10),
     defaultMaxBudget: parseFloat(optional("CODE_TASK_MAX_BUDGET", "5.00")),
     maxConcurrent: parseInt(optional("CODE_TASK_MAX_CONCURRENT", "2"), 10),
+    maxLifetimeMs: parseInt(optional("CODE_TASK_MAX_LIFETIME_MS", String(8 * 60 * 60 * 1000)), 10),
+    staleGraceMs: parseInt(optional("CODE_TASK_STALE_GRACE_MS", String(30 * 60 * 1000)), 10),
   },
   ws: {
     enabled: optional("WS_ENABLED", "false") === "true",

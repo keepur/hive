@@ -9,6 +9,7 @@ import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("bg-task-manager");
 const LOG_TAIL_LINES = 100;
+const KILL_WAIT_MS = 5_000;
 
 export interface BackgroundTaskContext {
   agentId: string;
@@ -112,18 +113,53 @@ export class BackgroundTaskManager {
     }
   }
 
-  stop(): void {
-    for (const [id, timer] of this.orphanPollers) {
+  async stop(): Promise<void> {
+    for (const [, timer] of this.orphanPollers) {
       clearInterval(timer);
     }
     this.orphanPollers.clear();
+
+    // Kill all running processes on shutdown
+    const running = [...this.tasks.values()].filter((t) => t.status === "running" && t.pid);
+    if (running.length > 0) {
+      log.info("Sending SIGTERM to running background tasks", { count: running.length });
+      for (const task of running) {
+        this.killProcess(task.pid!, "SIGTERM");
+      }
+
+      // Wait for graceful exit, then SIGKILL stragglers
+      await this.sleep(KILL_WAIT_MS);
+      for (const task of running) {
+        if (task.pid && this.isProcessAlive(task.pid)) {
+          log.warn("Background task did not exit after SIGTERM, sending SIGKILL", {
+            id: task.id,
+            pid: task.pid,
+          });
+          this.killProcess(task.pid, "SIGKILL");
+        }
+      }
+    }
 
     if (this.server) {
       this.server.close();
       this.server = null;
     }
 
-    log.info("Background task manager stopped");
+    log.info("Background task manager stopped", { killed: running.length });
+  }
+
+  private killProcess(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
+    try {
+      process.kill(pid, signal);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+        log.warn("Failed to send signal to process", { pid, signal, error: String(err) });
+      }
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {

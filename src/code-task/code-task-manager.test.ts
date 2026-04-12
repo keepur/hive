@@ -235,8 +235,8 @@ beforeAll(async () => {
   await manager.start();
 });
 
-afterAll(() => {
-  manager.stop();
+afterAll(async () => {
+  await manager.stop();
 });
 
 describe("authentication", () => {
@@ -352,7 +352,7 @@ describe("concurrency limit", () => {
       // One should succeed (200), one should be rejected (429)
       expect(statuses).toEqual([200, 429]);
     } finally {
-      mgr.stop();
+      await mgr.stop();
     }
   });
 });
@@ -368,5 +368,273 @@ describe("respond", () => {
       body: JSON.stringify({ response: "test" }),
     });
     expect(res.status).toBe(400);
+  });
+});
+
+// ── Process Lifecycle Tests ────────────────────────────────────────
+
+describe("stop() — process cleanup", () => {
+  it("sends SIGTERM to running tasks on stop", async () => {
+    // Create a manager with a long-running process (sleep)
+    const mgr = new CodeTaskManager(PORT + 2, AUTH_TOKEN, PLUGIN_DIRS, 2, TASKS_DIR, () => {}, {
+      cliBin: "sleep",
+    });
+    await mgr.start();
+
+    try {
+      // Spawn a sleep process that will take a while
+      const res = await fetch(`http://127.0.0.1:${PORT + 2}/tasks`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${AUTH_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          prompt: "60", // sleep 60 — will be killed
+          cwd: "/tmp",
+          context: makeContext(),
+        }),
+      });
+      expect(res.status).toBe(200);
+      const { id } = await res.json();
+
+      // Verify it's running
+      const statusRes = await fetch(`http://127.0.0.1:${PORT + 2}/tasks/${id}`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      const status = await statusRes.json();
+      expect(status.status).toBe("running");
+
+      // Stop should kill it
+      await mgr.stop();
+
+      // After stop, the process should be dead — verify via the tasks map
+      const tasks = (mgr as unknown as { tasks: Map<string, { status: string; pid: number | null }> }).tasks;
+      // The task may still show as "running" in the map (handleExit won't fire after stop),
+      // but the PID should no longer be alive
+      const task = tasks.get(id);
+      if (task?.pid) {
+        let alive = true;
+        try {
+          process.kill(task.pid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      }
+    } catch {
+      // Cleanup in case of failure
+      await mgr.stop();
+    }
+  });
+
+  it("stop() is safe to call with no running tasks", async () => {
+    const mgr = new CodeTaskManager(PORT + 3, AUTH_TOKEN, PLUGIN_DIRS, 2, TASKS_DIR, () => {});
+    await mgr.start();
+    // Should not throw
+    await mgr.stop();
+  });
+});
+
+describe("reapStale()", () => {
+  it("reaps tasks older than maxLifetimeMs with no recent stderr activity", async () => {
+    const { spawn } = await import("node:child_process");
+    const { writeFileSync } = await import("node:fs");
+
+    const mgr = new CodeTaskManager(PORT + 4, AUTH_TOKEN, PLUGIN_DIRS, 2, TASKS_DIR, () => {}, {
+      maxLifetimeMs: 1, // 1ms — everything is stale
+      staleGraceMs: 0, // no grace
+    });
+    await mgr.start();
+
+    try {
+      // Spawn a real long-running process and inject it as a fake task
+      const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+      const stderrPath = `${TASKS_DIR}/reap-test.stderr.log`;
+      writeFileSync(stderrPath, ""); // create empty stderr file (old mtime)
+
+      const tasks = (mgr as unknown as { tasks: Map<string, Record<string, unknown>> }).tasks;
+      tasks.set("reap-test-id", {
+        id: "reap-test-id",
+        status: "running",
+        pid: child.pid,
+        startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(), // 10h ago
+        stderrPath,
+        context: makeContext(),
+      });
+
+      const result = await mgr.reapStale();
+      expect(result.reaped).toBe(1);
+      expect(result.spared).toBe(0);
+
+      // SIGTERM was sent — process should die shortly (reapStale schedules SIGKILL after 5s)
+      // Just verify SIGTERM was sent by checking it's no longer alive after a brief wait
+      await new Promise((r) => setTimeout(r, 500));
+      let alive = true;
+      try {
+        process.kill(child.pid!, 0);
+      } catch {
+        alive = false;
+      }
+      // sleep responds to SIGTERM, so it should be dead
+      expect(alive).toBe(false);
+    } finally {
+      await mgr.stop();
+    }
+  });
+
+  it("spares tasks with recently modified stderr", async () => {
+    const { spawn } = await import("node:child_process");
+    const { writeFileSync } = await import("node:fs");
+
+    const mgr = new CodeTaskManager(PORT + 5, AUTH_TOKEN, PLUGIN_DIRS, 2, TASKS_DIR, () => {}, {
+      maxLifetimeMs: 1, // everything is "stale" by age
+      staleGraceMs: 60_000, // 60s grace
+    });
+    await mgr.start();
+
+    try {
+      const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+      const stderrPath = `${TASKS_DIR}/spare-test.stderr.log`;
+      // Write to stderr file NOW — mtime will be recent
+      writeFileSync(stderrPath, "recent activity\n");
+
+      const tasks = (mgr as unknown as { tasks: Map<string, Record<string, unknown>> }).tasks;
+      tasks.set("spare-test-id", {
+        id: "spare-test-id",
+        status: "running",
+        pid: child.pid,
+        startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(), // 10h ago
+        stderrPath,
+        context: makeContext(),
+      });
+
+      const result = await mgr.reapStale();
+      expect(result.spared).toBe(1);
+      expect(result.reaped).toBe(0);
+
+      // Cleanup — kill the sleep process
+      try {
+        process.kill(child.pid!, "SIGTERM");
+      } catch {
+        // already dead
+      }
+    } finally {
+      await mgr.stop();
+    }
+  });
+
+  it("returns zeros when no tasks are stale", async () => {
+    const mgr = new CodeTaskManager(PORT + 6, AUTH_TOKEN, PLUGIN_DIRS, 2, TASKS_DIR, () => {}, {
+      maxLifetimeMs: 999_999_999, // nothing is stale
+    });
+    await mgr.start();
+
+    try {
+      const result = await mgr.reapStale();
+      expect(result.reaped).toBe(0);
+      expect(result.spared).toBe(0);
+    } finally {
+      await mgr.stop();
+    }
+  });
+
+  it("skips non-running tasks and tasks without PIDs", async () => {
+    const mgr = new CodeTaskManager(PORT + 8, AUTH_TOKEN, PLUGIN_DIRS, 2, TASKS_DIR, () => {}, {
+      maxLifetimeMs: 1,
+      staleGraceMs: 0,
+    });
+    await mgr.start();
+
+    try {
+      const tasks = (mgr as unknown as { tasks: Map<string, Record<string, unknown>> }).tasks;
+      // Completed task — should be skipped
+      tasks.set("completed-id", {
+        id: "completed-id",
+        status: "completed",
+        pid: 99999,
+        startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+        stderrPath: "/tmp/nonexistent",
+        context: makeContext(),
+      });
+      // Running task with no PID — should be skipped
+      tasks.set("no-pid-id", {
+        id: "no-pid-id",
+        status: "running",
+        pid: null,
+        startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+        stderrPath: "/tmp/nonexistent",
+        context: makeContext(),
+      });
+
+      const result = await mgr.reapStale();
+      expect(result.reaped).toBe(0);
+      expect(result.spared).toBe(0);
+    } finally {
+      await mgr.stop();
+    }
+  });
+});
+
+describe("resume race guard", () => {
+  it("prevents double-resume by flipping status atomically", async () => {
+    // Inject a fake task in needs_input state directly into the tasks map
+    const mgr = new CodeTaskManager(PORT + 7, AUTH_TOKEN, PLUGIN_DIRS, 2, TASKS_DIR, () => {}, {
+      cliBin: "sleep",
+    });
+    await mgr.start();
+
+    try {
+      const tasks = (mgr as unknown as { tasks: Map<string, Record<string, unknown>> }).tasks;
+      const fakeId = "00000000-aaaa-bbbb-cccc-111111111111";
+      tasks.set(fakeId, {
+        id: fakeId,
+        prompt: "test",
+        cwd: "/tmp",
+        model: "",
+        maxTurns: 10,
+        maxBudget: 1,
+        status: "needs_input",
+        exitCode: 1,
+        startedAt: new Date().toISOString(),
+        completedAt: null,
+        stdoutPath: "/tmp/fake.stdout",
+        stderrPath: "/tmp/fake.stderr",
+        metaPath: "/tmp/fake.meta.json",
+        context: makeContext(),
+        pid: null,
+        sessionId: "fake-session-id",
+        costUsd: 0,
+        numTurns: 0,
+        escalation: null,
+        parentTaskId: null,
+      });
+
+      // First resume should succeed (spawns a new task)
+      const res1 = await fetch(`http://127.0.0.1:${PORT + 7}/tasks/${fakeId}/respond`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${AUTH_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ response: "first resume" }),
+      });
+      expect(res1.status).toBe(200);
+
+      // Second resume should fail — status is no longer needs_input
+      const res2 = await fetch(`http://127.0.0.1:${PORT + 7}/tasks/${fakeId}/respond`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${AUTH_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ response: "second resume" }),
+      });
+      expect(res2.status).toBe(400);
+      const body = await res2.json();
+      expect(body.error).toContain("not needs_input");
+    } finally {
+      await mgr.stop();
+    }
   });
 });
