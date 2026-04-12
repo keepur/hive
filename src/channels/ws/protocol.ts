@@ -2,6 +2,8 @@
  * WebSocket protocol message types for native client adapters (iOS/macOS + Team layer).
  */
 
+import type { AgentStatus } from "../../types/agent-config.js";
+
 // ── Client → Server ─────────────────────────────────────────────────────
 
 export interface ClientTextMessage {
@@ -176,7 +178,7 @@ export interface AgentInfo {
   icon: string;
   title: string | null;
   model: string;
-  status: "idle" | "processing" | "error" | "stopped";
+  status: AgentStatus;
   tools: string[];
   schedule: { cron: string; task: string }[];
   channels: string[];
