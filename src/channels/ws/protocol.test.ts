@@ -222,3 +222,38 @@ describe("parseClientMessage — Team extensions", () => {
     expect((msg as any).args).toEqual(["123", "true"]);
   });
 });
+
+describe("parseClientMessage — agent_list", () => {
+  it("parses valid agent_list request", () => {
+    const msg = parseClientMessage(
+      JSON.stringify({
+        type: "agent_list",
+        id: "abc",
+      }),
+    );
+    expect(msg).toBeTruthy();
+    expect(msg!.type).toBe("agent_list");
+    expect((msg as any).id).toBe("abc");
+  });
+
+  it("rejects agent_list with missing id field", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "agent_list",
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it("rejects agent_list with non-string id", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "agent_list",
+          id: 123,
+        }),
+      ),
+    ).toBeNull();
+  });
+});
