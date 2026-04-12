@@ -49,9 +49,16 @@ const mockDeviceRegistry = {
   updateLastSeen: vi.fn(),
 } as any;
 
+function makeAdapter(agentRegistry: any, agentManager: any) {
+  return new WsAdapter(3200, mockDeviceRegistry, "test-secret", { agentRegistry, agentManager });
+}
+
 describe("WsAdapter.buildAgentList()", () => {
-  it("returns empty array when no agentRegistry", () => {
-    const adapter = new WsAdapter(3200, mockDeviceRegistry, "test-secret", undefined, undefined, undefined, undefined);
+  it("returns empty array when registry has no agents", () => {
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([]) },
+      { getState: vi.fn().mockReturnValue(undefined) },
+    );
 
     const result = (adapter as any).buildAgentList();
     expect(result).toEqual([]);
@@ -67,22 +74,9 @@ describe("WsAdapter.buildAgentList()", () => {
       channels: ["general", "support"],
     });
 
-    const mockAgentRegistry = {
-      getAll: vi.fn().mockReturnValue([agent]),
-    } as any;
-
-    const mockAgentManager = {
-      getState: vi.fn().mockReturnValue(undefined),
-    } as any;
-
-    const adapter = new WsAdapter(
-      3200,
-      mockDeviceRegistry,
-      "test-secret",
-      undefined,
-      undefined,
-      mockAgentRegistry,
-      mockAgentManager,
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([agent]) },
+      { getState: vi.fn().mockReturnValue(undefined) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -103,22 +97,9 @@ describe("WsAdapter.buildAgentList()", () => {
       lastActivity: new Date("2026-04-12T10:00:00.000Z"),
     };
 
-    const mockAgentRegistry = {
-      getAll: vi.fn().mockReturnValue([agent]),
-    } as any;
-
-    const mockAgentManager = {
-      getState: vi.fn().mockReturnValue(state),
-    } as any;
-
-    const adapter = new WsAdapter(
-      3200,
-      mockDeviceRegistry,
-      "test-secret",
-      undefined,
-      undefined,
-      mockAgentRegistry,
-      mockAgentManager,
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([agent]) },
+      { getState: vi.fn().mockReturnValue(state) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -130,22 +111,9 @@ describe("WsAdapter.buildAgentList()", () => {
   it("uses defaults when agent has no runtime state", () => {
     const agent = makeAgent({ id: "milo" });
 
-    const mockAgentRegistry = {
-      getAll: vi.fn().mockReturnValue([agent]),
-    } as any;
-
-    const mockAgentManager = {
-      getState: vi.fn().mockReturnValue(undefined),
-    } as any;
-
-    const adapter = new WsAdapter(
-      3200,
-      mockDeviceRegistry,
-      "test-secret",
-      undefined,
-      undefined,
-      mockAgentRegistry,
-      mockAgentManager,
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([agent]) },
+      { getState: vi.fn().mockReturnValue(undefined) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -160,22 +128,9 @@ describe("WsAdapter.buildAgentList()", () => {
       delegateServers: ["memory", "brave-search", "crm-search"],
     });
 
-    const mockAgentRegistry = {
-      getAll: vi.fn().mockReturnValue([agent]),
-    } as any;
-
-    const mockAgentManager = {
-      getState: vi.fn().mockReturnValue(undefined),
-    } as any;
-
-    const adapter = new WsAdapter(
-      3200,
-      mockDeviceRegistry,
-      "test-secret",
-      undefined,
-      undefined,
-      mockAgentRegistry,
-      mockAgentManager,
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([agent]) },
+      { getState: vi.fn().mockReturnValue(undefined) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -190,22 +145,9 @@ describe("WsAdapter.buildAgentList()", () => {
       ],
     });
 
-    const mockAgentRegistry = {
-      getAll: vi.fn().mockReturnValue([agent]),
-    } as any;
-
-    const mockAgentManager = {
-      getState: vi.fn().mockReturnValue(undefined),
-    } as any;
-
-    const adapter = new WsAdapter(
-      3200,
-      mockDeviceRegistry,
-      "test-secret",
-      undefined,
-      undefined,
-      mockAgentRegistry,
-      mockAgentManager,
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([agent]) },
+      { getState: vi.fn().mockReturnValue(undefined) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -218,22 +160,9 @@ describe("WsAdapter.buildAgentList()", () => {
   it("maps title to null when undefined", () => {
     const agent = makeAgent({ title: undefined });
 
-    const mockAgentRegistry = {
-      getAll: vi.fn().mockReturnValue([agent]),
-    } as any;
-
-    const mockAgentManager = {
-      getState: vi.fn().mockReturnValue(undefined),
-    } as any;
-
-    const adapter = new WsAdapter(
-      3200,
-      mockDeviceRegistry,
-      "test-secret",
-      undefined,
-      undefined,
-      mockAgentRegistry,
-      mockAgentManager,
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([agent]) },
+      { getState: vi.fn().mockReturnValue(undefined) },
     );
 
     const result = (adapter as any).buildAgentList();

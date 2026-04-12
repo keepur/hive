@@ -16,7 +16,6 @@ import type {
   ClientCommandList,
   ClientChannelList,
   ClientHistory,
-  ClientAgentList,
   AgentInfo,
 } from "./protocol.js";
 import { parseClientMessage, isTeamMessage } from "./protocol.js";
@@ -27,6 +26,13 @@ import type { AgentRegistry } from "../../agents/agent-registry.js";
 import type { AgentManager } from "../../agents/agent-manager.js";
 
 const log = createLogger("ws-adapter");
+
+export interface WsAdapterDeps {
+  teamStore?: TeamStore;
+  commandRegistry?: CommandRegistry;
+  agentRegistry: AgentRegistry;
+  agentManager: AgentManager;
+}
 
 export class WsAdapter implements ChannelAdapter {
   readonly id = "ws";
@@ -42,25 +48,17 @@ export class WsAdapter implements ChannelAdapter {
   private onWorkItem!: (item: WorkItem) => void;
   private teamStore?: TeamStore;
   private commandRegistry?: CommandRegistry;
-  private agentRegistry?: AgentRegistry;
-  private agentManager?: AgentManager;
+  private agentRegistry: AgentRegistry;
+  private agentManager: AgentManager;
 
-  constructor(
-    port: number,
-    deviceRegistry: DeviceRegistry,
-    adminSecret: string,
-    teamStore?: TeamStore,
-    commandRegistry?: CommandRegistry,
-    agentRegistry?: AgentRegistry,
-    agentManager?: AgentManager,
-  ) {
+  constructor(port: number, deviceRegistry: DeviceRegistry, adminSecret: string, deps: WsAdapterDeps) {
     this.port = port;
     this.deviceRegistry = deviceRegistry;
     this.adminSecret = adminSecret;
-    this.teamStore = teamStore;
-    this.commandRegistry = commandRegistry;
-    this.agentRegistry = agentRegistry;
-    this.agentManager = agentManager;
+    this.teamStore = deps.teamStore;
+    this.commandRegistry = deps.commandRegistry;
+    this.agentRegistry = deps.agentRegistry;
+    this.agentManager = deps.agentManager;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
@@ -430,10 +428,6 @@ export class WsAdapter implements ChannelAdapter {
           }
 
           if (msg.type === "agent_list") {
-            if (!this.agentRegistry) {
-              this.send(ws, { type: "error", message: "Agent registry not available" });
-              return;
-            }
             const agents = this.buildAgentList();
             this.send(ws, { type: "agent_list", agents, id: msg.id });
             return;
@@ -638,10 +632,8 @@ export class WsAdapter implements ChannelAdapter {
 
   /** Build the agent roster with runtime status for client consumption. */
   private buildAgentList(): AgentInfo[] {
-    if (!this.agentRegistry) return [];
-
     return this.agentRegistry.getAll().map((agent) => {
-      const state = this.agentManager?.getState(agent.id);
+      const state = this.agentManager.getState(agent.id);
       return {
         id: agent.id,
         name: agent.name,
