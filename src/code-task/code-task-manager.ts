@@ -1,6 +1,6 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile, readdir, stat, unlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, stat, unlink, open } from "node:fs/promises";
 import { openSync, closeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../logging/logger.js";
@@ -14,6 +14,7 @@ import { KnowledgeExtractor } from "./knowledge-extractor.js";
 const log = createLogger("code-task-manager");
 const RESULT_TAIL_CHARS = 2000;
 const LOG_TAIL_LINES = 100;
+const KILL_WAIT_MS = 5_000;
 
 export interface CodeTaskContext {
   agentId: string;
@@ -56,6 +57,10 @@ export interface CodeTaskManagerOptions {
   cliBin?: string;
   prefetcher?: CodeIndexPrefetcher;
   knowledgeExtractor?: KnowledgeExtractor;
+  /** Kill processes older than this (default: 8h) */
+  maxLifetimeMs?: number;
+  /** If stderr was modified within this window, skip reaping (default: 30min) */
+  staleGraceMs?: number;
 }
 
 export class CodeTaskManager {
@@ -149,18 +154,98 @@ export class CodeTaskManager {
     }
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     for (const [, timer] of this.orphanPollers) {
       clearInterval(timer);
     }
     this.orphanPollers.clear();
+
+    // Kill all running processes on shutdown
+    const running = [...this.tasks.values()].filter((t) => t.status === "running" && t.pid);
+    if (running.length > 0) {
+      log.info("Sending SIGTERM to running code tasks", { count: running.length });
+      for (const task of running) {
+        this.killProcess(task.pid!, "SIGTERM");
+      }
+
+      // Wait for graceful exit, then SIGKILL stragglers
+      await this.sleep(KILL_WAIT_MS);
+      for (const task of running) {
+        if (task.pid && this.isProcessAlive(task.pid)) {
+          log.warn("Code task did not exit after SIGTERM, sending SIGKILL", {
+            id: task.id,
+            pid: task.pid,
+          });
+          this.killProcess(task.pid, "SIGKILL");
+        }
+      }
+    }
 
     if (this.server) {
       this.server.close();
       this.server = null;
     }
 
-    log.info("Code task manager stopped");
+    log.info("Code task manager stopped", { killed: running.length });
+  }
+
+  /**
+   * Reap stale processes that have exceeded maxLifetimeMs.
+   * Spares processes whose stderr file was recently modified (still active).
+   * Called from the sweeper on each cycle.
+   */
+  async reapStale(): Promise<{ reaped: number; spared: number }> {
+    const maxLifetimeMs = this.options.maxLifetimeMs ?? 8 * 60 * 60 * 1000;
+    const staleGraceMs = this.options.staleGraceMs ?? 30 * 60 * 1000;
+    const now = Date.now();
+    let reaped = 0;
+    let spared = 0;
+
+    for (const task of this.tasks.values()) {
+      if (task.status !== "running" || !task.pid) continue;
+
+      const age = now - new Date(task.startedAt).getTime();
+      if (age < maxLifetimeMs) continue;
+
+      // Check if stderr was recently modified (sign of active work)
+      const recentlyActive = await this.isFileRecentlyModified(task.stderrPath, staleGraceMs);
+      if (recentlyActive) {
+        log.info("Stale code task spared — stderr still active", {
+          id: task.id,
+          pid: task.pid,
+          ageHours: (age / 3_600_000).toFixed(1),
+        });
+        spared++;
+        continue;
+      }
+
+      log.warn("Reaping stale code task", {
+        id: task.id,
+        pid: task.pid,
+        ageHours: (age / 3_600_000).toFixed(1),
+      });
+
+      this.killProcess(task.pid, "SIGTERM");
+
+      // Give it a moment, then force-kill
+      setTimeout(() => {
+        if (task.pid && this.isProcessAlive(task.pid)) {
+          log.warn("Stale code task did not exit after SIGTERM, sending SIGKILL", {
+            id: task.id,
+            pid: task.pid,
+          });
+          this.killProcess(task.pid, "SIGKILL");
+        }
+      }, KILL_WAIT_MS);
+
+      reaped++;
+    }
+
+    if (reaped > 0 || spared > 0) {
+      log.info("Stale reap complete", { reaped, spared });
+    }
+
+    return { reaped, spared };
   }
 
   // ── HTTP ────────────────────────────────────────────────────────────
@@ -418,6 +503,9 @@ export class CodeTaskManager {
     if (!original.sessionId) {
       throw new Error(`Task ${taskId} has no session ID for resume`);
     }
+
+    // Atomically mark as resuming to prevent double-resume race
+    original.status = "running";
 
     // Spawn a new task that resumes the original session
     return this.spawnTask({
@@ -725,6 +813,31 @@ export class CodeTaskManager {
     }, 5_000);
 
     this.orphanPollers.set(taskId, timer);
+  }
+
+  private killProcess(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
+    try {
+      process.kill(pid, signal);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+        log.warn("Failed to send signal to process", { pid, signal, error: String(err) });
+      }
+    }
+  }
+
+  private async isFileRecentlyModified(filePath: string, windowMs: number): Promise<boolean> {
+    try {
+      const fh = await open(filePath, "r");
+      const st = await fh.stat();
+      await fh.close();
+      return Date.now() - st.mtimeMs < windowMs;
+    } catch {
+      return false;
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private readBody(req: IncomingMessage): Promise<string> {

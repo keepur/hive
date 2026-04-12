@@ -654,9 +654,23 @@ async function main(): Promise<void> {
     log.info("Beekeeper is running", { port: config.port });
   });
 
+  // --- Session reaper (runs every 5 minutes) ---
+  const REAP_INTERVAL_MS = 5 * 60 * 1000;
+  const MAX_QUERY_LIFETIME_MS = 8 * 60 * 60 * 1000; // 8 hours
+  const IDLE_SESSION_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
+  const reapTimer = setInterval(() => {
+    sessionManager
+      .reapStaleSessions({
+        maxQueryLifetimeMs: MAX_QUERY_LIFETIME_MS,
+        idleSessionTtlMs: IDLE_SESSION_TTL_MS,
+      })
+      .catch((err) => log.error("Session reaper failed", { error: String(err) }));
+  }, REAP_INTERVAL_MS);
+
   // --- Graceful shutdown ---
   const shutdown = async () => {
     log.info("Shutting down");
+    clearInterval(reapTimer);
     sessionManager.persistSessions();
     await sessionManager.stopAll();
     wss.close();

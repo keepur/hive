@@ -211,7 +211,12 @@ async function main(): Promise<void> {
       dispatcher.dispatch(item).catch((err) => {
         log.error("Code task completion dispatch failed", { error: String(err) });
       }),
-    { prefetcher, knowledgeExtractor },
+    {
+      prefetcher,
+      knowledgeExtractor,
+      maxLifetimeMs: config.codeTask.maxLifetimeMs,
+      staleGraceMs: config.codeTask.staleGraceMs,
+    },
   );
   await codeTaskManager.start();
   await codeTaskManager.scanOrphans();
@@ -441,8 +446,8 @@ async function main(): Promise<void> {
     voiceAdapter?.stop();
     if (teamStore) await teamStore.close();
     scheduler.stop();
-    bgTaskManager.stop();
-    codeTaskManager.stop();
+    await bgTaskManager.stop();
+    await codeTaskManager.stop();
     await prefetcher?.close();
     meetingMonitor?.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
