@@ -190,14 +190,6 @@ export interface ServerAgentList {
   id: string;
 }
 
-// Phase 2 — defined now, added to ServerMessage union later
-export interface ServerAgentStatus {
-  type: "agent_status";
-  agentId: string;
-  status: "idle" | "processing" | "error" | "stopped";
-  id: string;
-}
-
 export type ServerMessage =
   | ServerTextMessage
   | ServerAck
