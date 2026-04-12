@@ -54,8 +54,8 @@ beforeAll(async () => {
   await manager.start();
 });
 
-afterAll(() => {
-  manager.stop();
+afterAll(async () => {
+  await manager.stop();
 });
 
 // ── Tests ───────────────────────────────────────────────────────────

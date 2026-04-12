@@ -75,6 +75,7 @@ export class CodeTaskManager {
   private onComplete: (item: WorkItem) => void;
   private server: Server | null = null;
   private orphanPollers = new Map<string, ReturnType<typeof setInterval>>();
+  private reapTimers = new Set<ReturnType<typeof setTimeout>>();
 
   constructor(
     port: number,
@@ -160,6 +161,12 @@ export class CodeTaskManager {
     }
     this.orphanPollers.clear();
 
+    // Clear any pending SIGKILL timers from reapStale()
+    for (const timer of this.reapTimers) {
+      clearTimeout(timer);
+    }
+    this.reapTimers.clear();
+
     // Kill all running processes on shutdown
     const running = [...this.tasks.values()].filter((t) => t.status === "running" && t.pid);
     if (running.length > 0) {
@@ -226,9 +233,11 @@ export class CodeTaskManager {
       });
 
       this.killProcess(task.pid, "SIGTERM");
+      task.status = "orphaned";
 
-      // Give it a moment, then force-kill
-      setTimeout(() => {
+      // Give it a moment, then force-kill (tracked so stop() can cancel)
+      const timer = setTimeout(() => {
+        this.reapTimers.delete(timer);
         if (task.pid && this.isProcessAlive(task.pid)) {
           log.warn("Stale code task did not exit after SIGTERM, sending SIGKILL", {
             id: task.id,
@@ -237,6 +246,7 @@ export class CodeTaskManager {
           this.killProcess(task.pid, "SIGKILL");
         }
       }, KILL_WAIT_MS);
+      this.reapTimers.add(timer);
 
       reaped++;
     }

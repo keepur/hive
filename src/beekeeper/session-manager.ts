@@ -460,6 +460,7 @@ export class SessionManager {
     const now = Date.now();
     let interruptedQueries = 0;
     let prunedIdleSessions = 0;
+    const toPrune: string[] = [];
 
     for (const [sessionId, slot] of this.sessions) {
       // Reap long-running queries
@@ -489,10 +490,15 @@ export class SessionManager {
             sessionId,
             idleHours: (idleTime / 3_600_000).toFixed(1),
           });
-          this.sessions.delete(sessionId);
+          toPrune.push(sessionId);
           prunedIdleSessions++;
         }
       }
+    }
+
+    // Delete after iteration to avoid mutating the map during for-of
+    for (const id of toPrune) {
+      this.sessions.delete(id);
     }
 
     if (prunedIdleSessions > 0) {
