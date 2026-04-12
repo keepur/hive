@@ -653,7 +653,7 @@ export class WsAdapter implements ChannelAdapter {
         schedule: agent.schedule.map((s) => ({ cron: s.cron, task: s.task })),
         channels: agent.channels,
         messagesProcessed: state?.messagesProcessed ?? 0,
-        lastActivity: state?.lastActivity?.toISOString() ?? null,
+        lastActivity: state ? state.lastActivity.toISOString() : null,
       };
     });
   }
