@@ -29,8 +29,8 @@ async function main(): Promise<void> {
   const deviceRegistry = new BeekeeperDeviceRegistry(config.mongoUri, config.mongoDbName, config.jwtSecret);
   await deviceRegistry.connect();
 
-  // Track connected devices (multiple clients allowed)
-  const connectedClients = new Map<string, WebSocket>();
+  // Track connected devices — multiple connections per device allowed
+  const connectedClients = new Map<string, Set<WebSocket>>();
 
   // Set guardian delegate once — SessionManager handles broadcast/buffering
   guardian.setSendDelegate((msg) => sessionManager.send(msg));
@@ -328,10 +328,12 @@ async function main(): Promise<void> {
             res.end(JSON.stringify({ error: "Device not found or already inactive" }));
             return;
           }
-          // Force-disconnect if this device is connected
-          const deviceWs = connectedClients.get(deviceId);
-          if (deviceWs) {
-            deviceWs.close(1000, "Device deactivated");
+          // Force-disconnect all connections for this device
+          const deviceWsSet = connectedClients.get(deviceId);
+          if (deviceWsSet) {
+            for (const clientWs of deviceWsSet) {
+              clientWs.close(1000, "Device deactivated");
+            }
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
@@ -407,9 +409,14 @@ async function main(): Promise<void> {
   // --- Multi-client connection management ---
 
   wss.on("connection", (ws: WebSocket, device: BeekeeperDevice) => {
-    log.info("Client connected", { deviceId: device._id, name: device.name, totalClients: connectedClients.size + 1 });
+    log.info("Client connected", { deviceId: device._id, name: device.name });
 
-    connectedClients.set(device._id, ws);
+    let clientSet = connectedClients.get(device._id);
+    if (!clientSet) {
+      clientSet = new Set();
+      connectedClients.set(device._id, clientSet);
+    }
+    clientSet.add(ws);
     sessionManager.addClient(device._id, ws);
 
     // Update lastSeenAt
@@ -623,13 +630,17 @@ async function main(): Promise<void> {
     });
 
     ws.on("close", () => {
-      // Guard: only remove if this specific ws is still the registered client.
-      // A stale close from an old socket must not evict a newer connection.
-      if (connectedClients.get(device._id) === ws) {
-        connectedClients.delete(device._id);
-        sessionManager.removeClient(device._id);
+      const closeSet = connectedClients.get(device._id);
+      if (closeSet) {
+        closeSet.delete(ws);
+        if (closeSet.size === 0) {
+          connectedClients.delete(device._id);
+        }
       }
-      log.info("Client disconnected", { deviceId: device._id, remainingClients: connectedClients.size });
+      sessionManager.removeClient(device._id, ws);
+      let totalConnections = 0;
+      for (const s of connectedClients.values()) totalConnections += s.size;
+      log.info("Client disconnected", { deviceId: device._id, remainingClients: totalConnections });
       // Sessions stay in memory — any device can reconnect and resume
     });
 
