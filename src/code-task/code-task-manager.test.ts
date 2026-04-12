@@ -352,7 +352,7 @@ describe("concurrency limit", () => {
       // One should succeed (200), one should be rejected (429)
       expect(statuses).toEqual([200, 429]);
     } finally {
-      mgr.stop();
+      await mgr.stop();
     }
   });
 });
