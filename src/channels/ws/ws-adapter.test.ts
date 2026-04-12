@@ -51,15 +51,7 @@ const mockDeviceRegistry = {
 
 describe("WsAdapter.buildAgentList()", () => {
   it("returns empty array when no agentRegistry", () => {
-    const adapter = new WsAdapter(
-      3200,
-      mockDeviceRegistry,
-      "test-secret",
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-    );
+    const adapter = new WsAdapter(3200, mockDeviceRegistry, "test-secret", undefined, undefined, undefined, undefined);
 
     const result = (adapter as any).buildAgentList();
     expect(result).toEqual([]);
