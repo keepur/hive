@@ -340,7 +340,15 @@ async function main(): Promise<void> {
     const deviceRegistry = new DeviceRegistry(config.mongo.uri, config.mongo.dbName, config.ws.jwtSecret);
     await deviceRegistry.connect();
 
-    wsAdapter = new WsAdapter(config.ws.port, deviceRegistry, config.ws.jwtSecret, teamStore, commandRegistry, registry, agentManager);
+    wsAdapter = new WsAdapter(
+      config.ws.port,
+      deviceRegistry,
+      config.ws.jwtSecret,
+      teamStore,
+      commandRegistry,
+      registry,
+      agentManager,
+    );
     dispatcher.registerAdapter(wsAdapter);
     await wsAdapter.start((item) => {
       dispatcher.dispatch(item).catch((err) => {
