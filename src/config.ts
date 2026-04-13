@@ -221,11 +221,6 @@ export const config = {
     codeTask: (hive.autonomy?.codeTask ?? AUTONOMY_DEFAULTS.codeTask) as boolean,
     codeAccess: (hive.autonomy?.codeAccess ?? AUTONOMY_DEFAULTS.codeAccess) as boolean,
   },
-  triage: {
-    model: optional("TRIAGE_MODEL", "claude-haiku-4-5-20251001"),
-    timeoutMs: parseInt(optional("TRIAGE_TIMEOUT_MS", "10000"), 10),
-    enabled: optional("TRIAGE_ENABLED", "true") === "true",
-  },
   modelRouter: {
     enabled: optional("MODEL_ROUTER_ENABLED", "true") === "true",
     model: optional("MODEL_ROUTER_MODEL", "claude-haiku-4-5-20251001"),

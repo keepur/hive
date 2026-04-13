@@ -12,13 +12,7 @@ vi.mock("../logging/logger.js", () => ({
 }));
 
 vi.mock("../config.js", () => ({
-  config: {
-    triage: { enabled: false },
-  },
-}));
-
-vi.mock("../agents/triage.js", () => ({
-  triage: vi.fn(),
+  config: {},
 }));
 
 // ---------------------------------------------------------------------------

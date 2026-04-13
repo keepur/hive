@@ -357,8 +357,7 @@ export class WsAdapter implements ChannelAdapter {
 
   async onProcessingStart(item: WorkItem): Promise<void> {
     // App-source items don't know their target agent until after resolveAgents runs.
-    // Skip the typing indicator rather than emit an empty-agentId frame. Triage's
-    // "On it..." ack already handles the latency feel.
+    // Skip the typing indicator rather than emit an empty-agentId frame.
     if (item.source.kind === "app") return;
 
     const deviceId = item.meta?.deviceId as string;

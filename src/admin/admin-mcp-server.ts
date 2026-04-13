@@ -104,7 +104,6 @@ server.registerTool(
 
     const lines: string[] = [`Agent: ${doc._id}`, `Name: ${doc.name}`, `Icon: ${doc.icon || "(none)"}`];
     lines.push(`Model: ${doc.model}`);
-    if (doc.triageModel) lines.push(`Triage Model: ${doc.triageModel}`);
     lines.push(`Channels: [${(doc.channels ?? []).join(", ")}]`);
     lines.push(`Passive Channels: [${(doc.passiveChannels ?? []).join(", ")}]`);
     lines.push(`Keywords: [${(doc.keywords ?? []).join(", ")}]`);

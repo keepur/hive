@@ -85,7 +85,6 @@ vi.mock("../config.js", () => ({
     anthropic: { apiKey: "test-key" },
     defaultAgent: "chief-of-staff",
     autonomy: { externalComms: true, codeTask: false, codeAccess: false },
-    triage: { enabled: false },
     browser: { cdpEndpoint: "" },
     memory: { hotBudgetTokens: 3000 },
     team: { enabled: false },
