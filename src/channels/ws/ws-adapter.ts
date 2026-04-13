@@ -321,13 +321,20 @@ export class WsAdapter implements ChannelAdapter {
     const text = result.error ? `Error: ${result.error}` : result.text;
     const channelId = result.workItem.meta?.channelId as string | undefined;
 
+    // Resolve the human-readable display name for the handling agent. Falls
+    // back to the id if the agent isn't in the registry (shouldn't happen in
+    // practice — the dispatcher already resolved this agent to deliver the
+    // result — but the fallback keeps us honest and avoids blank strings in
+    // client chat headers).
+    const agentName = this.agentRegistry.get(result.agentId)?.name ?? result.agentId;
+
     // Save agent response to team_messages if this was a Team conversation
     if (channelId) {
       await this.teamStore.saveMessage({
         channelId,
         senderId: result.agentId,
         senderType: "agent",
-        senderName: result.agentId,
+        senderName: agentName,
         text,
         createdAt: new Date(),
       });
@@ -338,7 +345,7 @@ export class WsAdapter implements ChannelAdapter {
       type: "message",
       text,
       agentId: result.agentId,
-      agentName: result.agentId,
+      agentName,
       replyTo: result.workItem.id,
       ...(channelId ? { channelId } : {}),
     };
@@ -355,24 +362,22 @@ export class WsAdapter implements ChannelAdapter {
     }
   }
 
-  async onProcessingStart(item: WorkItem): Promise<void> {
-    // App-source items don't know their target agent until after resolveAgents runs.
-    // Skip the typing indicator rather than emit an empty-agentId frame.
-    if (item.source.kind === "app") return;
-
+  async onProcessingStart(item: WorkItem, agentId: string): Promise<void> {
+    // The dispatcher passes the resolved handler id directly — we no longer
+    // need to re-derive it from `item.meta`. Pre-KPR-12 this function used a
+    // `"unknown"` literal fallback and an early-return for app-source items
+    // because triage hadn't resolved yet; both are now unnecessary and have
+    // been removed.
     const deviceId = item.meta?.deviceId as string;
     if (!deviceId) return;
 
     const ws = this.connections.get(deviceId);
     if (ws && ws.readyState === WebSocket.OPEN) {
-      this.send(ws, {
-        type: "typing",
-        agentId: (item.meta?.defaultAgentId as string) ?? "unknown",
-      });
+      this.send(ws, { type: "typing", agentId });
     }
   }
 
-  async onProcessingEnd(_item: WorkItem): Promise<void> {
+  async onProcessingEnd(_item: WorkItem, _agentId: string): Promise<void> {
     // No-op — typing indicator is implicitly cleared when the message arrives
   }
 

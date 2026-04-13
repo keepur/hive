@@ -20,9 +20,14 @@ export interface ChannelAdapter {
   /** Clean shutdown */
   stop(): Promise<void>;
 
-  /** Optional: show "agent is thinking" state */
-  onProcessingStart?(item: WorkItem): Promise<void>;
+  /**
+   * Optional: show "agent is thinking" state. `agentId` is the resolved
+   * handler id from the dispatcher — guaranteed non-empty and already
+   * checked against the registry. Adapters that surface a typing indicator
+   * should use this rather than re-deriving from `item.meta`.
+   */
+  onProcessingStart?(item: WorkItem, agentId: string): Promise<void>;
 
   /** Optional: processing complete, clear indicators */
-  onProcessingEnd?(item: WorkItem): Promise<void>;
+  onProcessingEnd?(item: WorkItem, agentId: string): Promise<void>;
 }

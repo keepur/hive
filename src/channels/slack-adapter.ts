@@ -142,7 +142,7 @@ export class SlackAdapter implements ChannelAdapter {
     await this.gateway.postMessage(channel, text, replyThread, identity);
   }
 
-  async onProcessingStart(item: WorkItem): Promise<void> {
+  async onProcessingStart(item: WorkItem, _agentId: string): Promise<void> {
     const isIntegrationMsg = item.sender?.startsWith("B") || item.sender === "integration";
     const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string);
 
@@ -151,7 +151,7 @@ export class SlackAdapter implements ChannelAdapter {
     }
   }
 
-  async onProcessingEnd(item: WorkItem): Promise<void> {
+  async onProcessingEnd(item: WorkItem, _agentId: string): Promise<void> {
     const isIntegrationMsg = item.sender?.startsWith("B") || item.sender === "integration";
     const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string);
 

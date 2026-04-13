@@ -165,7 +165,7 @@ export class Dispatcher {
     const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
 
     // 4. Full agent processing
-    await adapter?.onProcessingStart?.(item);
+    await adapter?.onProcessingStart?.(item, agentId);
     try {
       const runResult = await this.agentManager.sendMessage(agentId, item);
 
@@ -239,7 +239,7 @@ export class Dispatcher {
       }
       log.error("Dispatch failed", { agentId, error: String(err) });
     } finally {
-      await adapter?.onProcessingEnd?.(item);
+      await adapter?.onProcessingEnd?.(item, agentId);
     }
   }
 
