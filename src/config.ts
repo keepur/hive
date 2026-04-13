@@ -193,9 +193,6 @@ export const config = {
     enabled: optional("WS_ENABLED", "false") === "true",
     port: parseInt(optional("WS_PORT", String(ports.ws ?? portBase + 3)), 10),
   },
-  team: {
-    enabled: optional("TEAM_ENABLED", "false") === "true",
-  },
   beekeeper: {
     port: parseInt(optional("BEEKEEPER_PORT", String((hive.beekeeper as { port?: number })?.port ?? 8420)), 10),
   },
