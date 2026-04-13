@@ -197,6 +197,9 @@ export const config = {
   team: {
     enabled: optional("TEAM_ENABLED", "false") === "true",
   },
+  beekeeper: {
+    port: parseInt(optional("BEEKEEPER_PORT", String((hive.beekeeper as { port?: number })?.port ?? 8420)), 10),
+  },
   workflow: {
     enabled: optional("WORKFLOW_ENABLED", "false") === "true",
   },

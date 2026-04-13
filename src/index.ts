@@ -360,6 +360,22 @@ async function main(): Promise<void> {
     log.info("WebSocket adapter started", { port: config.ws.port });
   }
 
+  // Beekeeper federation — advertise this Hive instance to sibling Beekeeper
+  // on loopback. Gated on ws.enabled since there's nothing to advertise
+  // without a running WS adapter.
+  let beekeeperRegistration: { stop: () => void } | undefined;
+  if (config.ws.enabled) {
+    const { startBeekeeperRegistration } = await import("./beekeeper-client.js");
+    beekeeperRegistration = startBeekeeperRegistration({
+      beekeeperPort: config.beekeeper.port,
+      wsPort: config.ws.port,
+    });
+    log.info("Beekeeper registration loop started", {
+      beekeeperPort: config.beekeeper.port,
+      wsPort: config.ws.port,
+    });
+  }
+
   // Voice adapter — Vapi phone integration (custom LLM endpoint)
   let voiceAdapter: import("./channels/voice/voice-adapter.js").VoiceAdapter | undefined;
   if (config.voice.enabled && config.voice.serverSecret) {
@@ -442,6 +458,7 @@ async function main(): Promise<void> {
     registry.stopWatching();
     await smsAdapter.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
+    beekeeperRegistration?.stop();
     if (wsAdapter) await wsAdapter.stop();
     voiceAdapter?.stop();
     if (teamStore) await teamStore.close();
