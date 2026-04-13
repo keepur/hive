@@ -42,6 +42,7 @@
     "@dodi-hq/fsm-persistence": "^0.1.1",
     "@dodi-hq/task-core": "^0.1.1",
     "@dodi-hq/workflow-core": "^0.1.1",
+    "@keepur/beekeeper": "git+https://github.com/keepur/beekeeper.git",
     "@linear/sdk": "^76.0.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@qdrant/js-client-rest": "^1.17.0",
