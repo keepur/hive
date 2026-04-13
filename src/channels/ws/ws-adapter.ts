@@ -559,8 +559,8 @@ export class WsAdapter implements ChannelAdapter {
     });
 
     await new Promise<void>((resolve) => {
-      this.server.listen(this.port, () => {
-        log.info("WebSocket server listening", { port: this.port });
+      this.server.listen(this.port, "127.0.0.1", () => {
+        log.info("WebSocket server listening", { port: this.port, host: "127.0.0.1" });
         resolve();
       });
     });
