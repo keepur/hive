@@ -611,24 +611,22 @@ export class AgentRunner {
     };
 
     // Team MCP server — agent-to-agent direct messaging
-    if (config.team.enabled) {
-      if (!AgentRunner.registryRef) {
-        log.warn("Team enabled but registryRef not set — agents will get empty AGENT_IDS");
-      }
-      servers["team"] = {
-        type: "stdio",
-        command: "node",
-        args: [resolve("dist/team/team-mcp-server.js")],
-        env: {
-          AGENT_ID: this.agentConfig.id,
-          MONGODB_URI: config.mongo.uri,
-          MONGODB_DB: config.mongo.dbName,
-          AGENT_IDS: JSON.stringify(
-            AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
-          ),
-        },
-      };
+    if (!AgentRunner.registryRef) {
+      log.warn("registryRef not set — agents will get empty AGENT_IDS for team server");
     }
+    servers["team"] = {
+      type: "stdio",
+      command: "node",
+      args: [resolve("dist/team/team-mcp-server.js")],
+      env: {
+        AGENT_ID: this.agentConfig.id,
+        MONGODB_URI: config.mongo.uri,
+        MONGODB_DB: config.mongo.dbName,
+        AGENT_IDS: JSON.stringify(
+          AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
+        ),
+      },
+    };
 
     // Workflow MCP server — plan/task management
     if (config.workflow.enabled) {
@@ -688,10 +686,8 @@ export class AgentRunner {
     }
     // schedule is an implicit core server — available to all agents unconditionally
     coreSet.add("schedule");
-    // team is an implicit core server when team layer is enabled
-    if (config.team.enabled) {
-      coreSet.add("team");
-    }
+    // team is an implicit core server — available to all agents unconditionally
+    coreSet.add("team");
     // workflow is an implicit core server when workflow layer is enabled
     if (config.workflow.enabled) {
       coreSet.add("workflow");
