@@ -4,6 +4,7 @@ model: claude-haiku-4-5
 icon: ":rocket:"
 channels:
   - agent-milo
+homeBase: agent-sdr
 passiveChannels: []
 keywords:
   - lead

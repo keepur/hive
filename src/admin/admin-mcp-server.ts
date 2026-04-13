@@ -159,14 +159,27 @@ server.registerTool(
       };
     }
 
-    const now = new Date();
     const f = fields ?? {};
+    if (typeof f.homeBase !== "string" || (f.homeBase as string).trim() === "") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Missing required field: homeBase (primary channel for scheduled delivery, e.g. 'agent-${_id}').`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const now = new Date();
     const doc: AgentDefinition = {
       _id,
       name,
       model,
       icon: (f.icon as string) ?? AGENT_DEFINITION_DEFAULTS.icon,
       channels: (f.channels as string[]) ?? [],
+      homeBase: (f.homeBase as string).trim(),
       passiveChannels: (f.passiveChannels as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.passiveChannels],
       keywords: (f.keywords as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.keywords],
       isDefault: (f.isDefault as boolean) ?? false,

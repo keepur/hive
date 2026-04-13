@@ -4,6 +4,7 @@ model: claude-sonnet-4-6
 icon: ":wrench:"
 channels:
   - agent-wyatt
+homeBase: agent-product-specialist
 passiveChannels: []
 keywords:
   - catalog

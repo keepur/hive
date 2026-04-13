@@ -4,6 +4,7 @@ model: claude-sonnet-4-6
 icon: ":hammer_and_wrench:"
 channels:
   - agent-sige
+homeBase: agent-production-support
 passiveChannels: []
 keywords:
   - production

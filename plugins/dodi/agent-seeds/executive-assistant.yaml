@@ -4,6 +4,7 @@ model: claude-haiku-4-5
 icon: ":incoming_envelope:"
 channels:
   - general
+homeBase: agent-executive-assistant
 passiveChannels: []
 keywords: []
 isDefault: true
