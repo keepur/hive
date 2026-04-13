@@ -40,8 +40,8 @@ interface Device {
 }
 
 export interface WsAdapterDeps {
-  teamStore?: TeamStore;
-  commandRegistry?: CommandRegistry;
+  teamStore: TeamStore;
+  commandRegistry: CommandRegistry;
   agentRegistry: AgentRegistry;
   agentManager: AgentManager;
 }
@@ -56,8 +56,8 @@ export class WsAdapter implements ChannelAdapter {
   private connections = new Map<string, WebSocket>(); // deviceId -> ws
   private pendingMessages = new Map<string, ServerMessage[]>(); // deviceId -> queued messages
   private onWorkItem!: (item: WorkItem) => void;
-  private teamStore?: TeamStore;
-  private commandRegistry?: CommandRegistry;
+  private teamStore: TeamStore;
+  private commandRegistry: CommandRegistry;
   private agentRegistry: AgentRegistry;
   private agentManager: AgentManager;
 
@@ -405,7 +405,7 @@ export class WsAdapter implements ChannelAdapter {
     channelId: string,
     deviceId: string,
   ): Promise<import("../../team/types.js").TeamChannel | null> {
-    const channel = await this.teamStore?.getChannel(channelId);
+    const channel = await this.teamStore.getChannel(channelId);
     if (!channel) {
       this.send(ws, { type: "error", message: "Channel not found" });
       return null;
@@ -451,17 +451,15 @@ export class WsAdapter implements ChannelAdapter {
     if (!channel) return;
 
     // Save to team_messages
-    if (this.teamStore) {
-      await this.teamStore.saveMessage({
-        channelId: msg.channelId,
-        threadId: msg.threadId,
-        senderId: deviceId,
-        senderType: "person",
-        senderName: device.name,
-        text: msg.text,
-        createdAt: new Date(),
-      });
-    }
+    await this.teamStore.saveMessage({
+      channelId: msg.channelId,
+      threadId: msg.threadId,
+      senderId: deviceId,
+      senderType: "person",
+      senderName: device.name,
+      text: msg.text,
+      createdAt: new Date(),
+    });
 
     // Resolve target agent from channel membership
     const targetAgentId = channel.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
@@ -501,25 +499,23 @@ export class WsAdapter implements ChannelAdapter {
     try {
       const processed = await processImageBuffer(buffer, msg.filename, mimetype);
 
-      if (this.teamStore) {
-        await this.teamStore.saveMessage({
-          channelId: msg.channelId,
-          senderId: deviceId,
-          senderType: "person",
-          senderName: device.name,
-          text: `[Photo: ${msg.filename}]`,
-          files: [
-            {
-              name: processed.name,
-              mimetype: processed.mimetype,
-              size: processed.size,
-              storageKey: processed.localPath,
-              isImage: true,
-            },
-          ],
-          createdAt: new Date(),
-        });
-      }
+      await this.teamStore.saveMessage({
+        channelId: msg.channelId,
+        senderId: deviceId,
+        senderType: "person",
+        senderName: device.name,
+        text: `[Photo: ${msg.filename}]`,
+        files: [
+          {
+            name: processed.name,
+            mimetype: processed.mimetype,
+            size: processed.size,
+            storageKey: processed.localPath,
+            isImage: true,
+          },
+        ],
+        createdAt: new Date(),
+      });
 
       const targetAgentId = channel.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
 
@@ -569,25 +565,23 @@ export class WsAdapter implements ChannelAdapter {
         ? await processImageBuffer(buffer, msg.filename, msg.mimetype)
         : await processFileBuffer(buffer, msg.filename, msg.mimetype);
 
-      if (this.teamStore) {
-        await this.teamStore.saveMessage({
-          channelId: msg.channelId,
-          senderId: deviceId,
-          senderType: "person",
-          senderName: device.name,
-          text: `[File: ${msg.filename}]`,
-          files: [
-            {
-              name: processed.name,
-              mimetype: processed.mimetype,
-              size: processed.size,
-              storageKey: processed.localPath,
-              isImage: processed.isImage,
-            },
-          ],
-          createdAt: new Date(),
-        });
-      }
+      await this.teamStore.saveMessage({
+        channelId: msg.channelId,
+        senderId: deviceId,
+        senderType: "person",
+        senderName: device.name,
+        text: `[File: ${msg.filename}]`,
+        files: [
+          {
+            name: processed.name,
+            mimetype: processed.mimetype,
+            size: processed.size,
+            storageKey: processed.localPath,
+            isImage: processed.isImage,
+          },
+        ],
+        createdAt: new Date(),
+      });
 
       const targetAgentId = channel.type === "dm" ? channel.members.find((m) => m !== deviceId) : undefined;
 
@@ -626,36 +620,22 @@ export class WsAdapter implements ChannelAdapter {
   private async handleCommand(ws: WebSocket, msg: ClientCommand, device: Device, deviceId: string): Promise<void> {
     this.send(ws, { type: "ack", id: msg.id });
 
-    if (!this.commandRegistry) {
-      this.send(ws, { type: "error", message: "Commands not available" });
+    // Unknown command → explicit error, no fallthrough to handleTeamMessage
+    // (KPR-11: fallthrough previously produced the misleading "Channel not found").
+    if (!this.commandRegistry.has(msg.name)) {
+      this.send(ws, { type: "error", message: `Unknown command: /${msg.name}` });
       return;
     }
 
-    const { found, result } = await this.commandRegistry.execute(msg.name, {
+    const { result } = await this.commandRegistry.execute(msg.name, {
       channelId: msg.channelId,
       senderId: deviceId,
       senderName: device.name,
       args: msg.args,
     });
 
-    if (!found) {
-      // Fall through to agent as normal text
-      await this.handleTeamMessage(
-        ws,
-        {
-          type: "message",
-          channelId: msg.channelId,
-          text: `/${msg.name} ${msg.args.join(" ")}`.trim(),
-          id: msg.id,
-        },
-        device,
-        deviceId,
-      );
-      return;
-    }
-
     // Save command + result as a message
-    if (this.teamStore && result) {
+    if (result) {
       await this.teamStore.saveMessage({
         channelId: msg.channelId,
         senderId: "system",
@@ -678,7 +658,7 @@ export class WsAdapter implements ChannelAdapter {
   }
 
   private async handleCommandList(ws: WebSocket, msg: ClientCommandList): Promise<void> {
-    const commands = this.commandRegistry?.list() ?? [];
+    const commands = this.commandRegistry.list();
     this.send(ws, {
       type: "command_list",
       commands: commands.map((c) => ({
@@ -691,7 +671,7 @@ export class WsAdapter implements ChannelAdapter {
   }
 
   private async handleChannelList(ws: WebSocket, msg: ClientChannelList, deviceId: string): Promise<void> {
-    const channels = (await this.teamStore?.listChannels(deviceId)) ?? [];
+    const channels = await this.teamStore.listChannels(deviceId);
     this.send(ws, {
       type: "channel_list",
       channels: channels.map((c) => ({
@@ -705,11 +685,6 @@ export class WsAdapter implements ChannelAdapter {
   }
 
   private async handleHistory(ws: WebSocket, msg: ClientHistory, deviceId: string): Promise<void> {
-    if (!this.teamStore) {
-      this.send(ws, { type: "error", message: "Team store not available" });
-      return;
-    }
-
     if (!(await this.verifyChannelMembership(ws, msg.channelId, deviceId))) return;
 
     const { messages, hasMore } = await this.teamStore.getHistory(msg.channelId, {
@@ -737,14 +712,14 @@ export class WsAdapter implements ChannelAdapter {
   private async handleJoin(ws: WebSocket, msg: ClientJoin, deviceId: string): Promise<void> {
     // DM channels are private — only the two original participants may be members
     if (msg.channelId.startsWith("dm:")) {
-      const channel = await this.teamStore?.getChannel(msg.channelId);
+      const channel = await this.teamStore.getChannel(msg.channelId);
       if (!channel || !channel.members.includes(deviceId)) {
         this.send(ws, { type: "error", message: "Cannot join a DM you are not part of" });
         return;
       }
     }
     // Non-DM channels are open-join for now (agents/devices can self-add)
-    const ok = await this.teamStore?.joinChannel(msg.channelId, deviceId);
+    const ok = await this.teamStore.joinChannel(msg.channelId, deviceId);
     if (ok) {
       this.send(ws, {
         type: "channel_event",
@@ -759,7 +734,7 @@ export class WsAdapter implements ChannelAdapter {
   }
 
   private async handleLeave(ws: WebSocket, msg: ClientLeave, deviceId: string): Promise<void> {
-    const ok = await this.teamStore?.leaveChannel(msg.channelId, deviceId);
+    const ok = await this.teamStore.leaveChannel(msg.channelId, deviceId);
     if (ok) {
       this.send(ws, {
         type: "channel_event",
