@@ -74,11 +74,27 @@ function makeMockRegistry() {
     keywords: ["marketing"],
     isDefault: false,
   });
+  agents.set("production-support", {
+    id: "production-support",
+    name: "Sige",
+    channels: ["agent-sige"],
+    passiveChannels: [],
+    keywords: [],
+    catches: ["dodi-shop"],
+    isDefault: false,
+  });
 
   return {
     get: (id: string) => agents.get(id),
     getAll: () => Array.from(agents.values()),
     findByChannel: (ch: string) => Array.from(agents.values()).find((a) => !a.disabled && a.channels.includes(ch)),
+    findByOrigin: (slug: string) => {
+      for (const a of Array.from(agents.values())) {
+        if (a.disabled) continue;
+        if ((a.catches ?? []).includes(slug)) return a;
+      }
+      return undefined;
+    },
     findByKeyword: (text: string) => {
       const lower = text.toLowerCase();
       return Array.from(agents.values()).find(
@@ -589,5 +605,68 @@ describe("Multi-agent threads", () => {
 
     expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
     expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item2);
+  });
+});
+
+describe("origin routing", () => {
+  let dispatcher: Dispatcher;
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let agentManager: ReturnType<typeof makeMockAgentManager>;
+  let adapter: ReturnType<typeof makeMockAdapter>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workItemCounter = 0;
+    registry = makeMockRegistry();
+    agentManager = makeMockAgentManager();
+    const healthReporter = makeMockHealthReporter();
+    adapter = makeMockAdapter();
+    dispatcher = new Dispatcher(
+      registry as any,
+      agentManager as any,
+      healthReporter as any,
+      "executive-assistant",
+    );
+    dispatcher.registerAdapter(adapter as any);
+  });
+
+  it("routes app-source WorkItem to the catching agent", async () => {
+    const item = makeWorkItem({
+      source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+      text: "hi from shop floor",
+      meta: { origin: "dodi-shop", deviceId: "dev1" },
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("production-support", item);
+  });
+
+  it("drops when origin is unknown", async () => {
+    const item = makeWorkItem({
+      source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+      text: "hi",
+      meta: { origin: "nonexistent", deviceId: "dev1" },
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("origin wins over name addressing", async () => {
+    const item = makeWorkItem({
+      source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+      text: "hey Jasper can you check this",
+      meta: { origin: "dodi-shop", deviceId: "dev1" },
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("production-support", item);
+  });
+
+  it("explicit targetAgentId beats origin", async () => {
+    const item = makeWorkItem({
+      source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+      text: "please handle this",
+      meta: { origin: "dodi-shop", targetAgentId: "executive-assistant", deviceId: "dev1" },
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
   });
 });
