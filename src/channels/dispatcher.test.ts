@@ -259,6 +259,19 @@ describe("Dispatcher routing", () => {
     expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
   });
 
+  it("passes resolved agentId to onProcessingStart and onProcessingEnd hooks", async () => {
+    // Contract lock: adapters receive the resolved handler id from the
+    // dispatcher, so they never need to re-derive it from item.meta.
+    // Pre-KPR-12 the adapter had to guess because triage resolved after
+    // this call; post-KPR-12 routing is direct and the id is known.
+    const item = makeWorkItem({
+      meta: { targetAgentId: "jasper" },
+    });
+    await dispatcher.dispatch(item);
+    expect(adapter.onProcessingStart).toHaveBeenCalledWith(item, "jasper");
+    expect(adapter.onProcessingEnd).toHaveBeenCalledWith(item, "jasper");
+  });
+
   it("routes by channel mapping", async () => {
     const item = makeWorkItem({
       source: { kind: "slack", id: "C456", label: "agent-jasper" },
