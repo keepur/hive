@@ -6,10 +6,20 @@ import type { TeamStore } from "./team-store.js";
 
 const log = createLogger("command-registry");
 
+/**
+ * Narrow resolver for the `/dm` command. Built in src/index.ts as a closure
+ * over AgentRegistry.getAll(). Accepts either an agent id (exact match) or
+ * display name (case-insensitive); returns null on no match.
+ */
+export type AgentResolver = (idOrName: string) => { id: string; name: string } | null;
+
 export class CommandRegistry {
   private commands = new Map<string, TeamCommandHandler>();
 
-  constructor(private teamStore: TeamStore) {
+  constructor(
+    private teamStore: TeamStore,
+    private resolveAgent: AgentResolver,
+  ) {
     this.registerCoreCommands();
   }
 
@@ -23,6 +33,10 @@ export class CommandRegistry {
 
   get(name: string): TeamCommandHandler | undefined {
     return this.commands.get(name);
+  }
+
+  has(name: string): boolean {
+    return this.commands.has(name);
   }
 
   list(): TeamCommandDef[] {
@@ -58,15 +72,17 @@ export class CommandRegistry {
 
     this.register({
       def: {
-        name: "new",
+        name: "dm",
         source: "core",
-        description: "Create a new DM with an agent",
-        args: [{ name: "agent", required: true, description: "Agent ID to start a DM with" }],
+        description: "Open or create a DM with an agent",
+        args: [{ name: "agent", required: true, description: "Agent id or display name" }],
       },
       execute: async (ctx) => {
-        const targetAgent = ctx.args[0];
-        if (!targetAgent) return "Usage: /new <agent-id>";
-        const dm = await this.teamStore.getOrCreateDm(ctx.senderId, targetAgent, ctx.senderName);
+        const input = ctx.args[0];
+        if (!input) return "Usage: /dm <agent-id-or-name>";
+        const agent = this.resolveAgent(input);
+        if (!agent) return `Unknown agent: ${input}`;
+        const dm = await this.teamStore.getOrCreateDm(ctx.senderId, agent.id, ctx.senderName);
         return `DM ready: ${dm._id}`;
       },
     });
