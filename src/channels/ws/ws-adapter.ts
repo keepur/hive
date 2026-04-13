@@ -36,6 +36,7 @@ interface Device {
   _id: string;
   name: string;
   defaultAgentId: string;
+  origin?: string;
 }
 
 export interface WsAdapterDeps {
@@ -131,10 +132,12 @@ export class WsAdapter implements ChannelAdapter {
         return;
       }
 
-      // Synthetic device — Beekeeper only proxies channel=team traffic, which
-      // always carries targetAgentId on the wire, so defaultAgentId is a
-      // safety-net default and should never actually be read.
-      const device: Device = { _id: deviceId, name, defaultAgentId: "" };
+      const origin = url.searchParams.get("origin") ?? undefined;
+
+      // Synthetic device — loopback traffic comes from beekeeper's team proxy.
+      // Routing on the app path uses meta.origin, populated below from the
+      // connection-level origin tag that beekeeper forwards via query param.
+      const device: Device = { _id: deviceId, name, defaultAgentId: "", origin };
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         this.wss.emit("connection", ws, req, device);
       });
@@ -241,6 +244,7 @@ export class WsAdapter implements ChannelAdapter {
               meta: {
                 deviceId,
                 defaultAgentId: device.defaultAgentId,
+                origin: device.origin,
               },
             };
 
@@ -273,6 +277,7 @@ export class WsAdapter implements ChannelAdapter {
                 meta: {
                   deviceId,
                   defaultAgentId: device.defaultAgentId,
+                  origin: device.origin,
                 },
               };
 
@@ -351,6 +356,11 @@ export class WsAdapter implements ChannelAdapter {
   }
 
   async onProcessingStart(item: WorkItem): Promise<void> {
+    // App-source items don't know their target agent until after resolveAgents runs.
+    // Skip the typing indicator rather than emit an empty-agentId frame. Triage's
+    // "On it..." ack already handles the latency feel.
+    if (item.source.kind === "app") return;
+
     const deviceId = item.meta?.deviceId as string;
     if (!deviceId) return;
 

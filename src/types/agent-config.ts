@@ -12,6 +12,7 @@ export interface AgentConfig {
   model: string;
   channels: string[];
   homeBase?: string;
+  catches?: string[]; // origin slugs this agent owns (e.g. ["dodi-shop"])
   passiveChannels: string[];
   keywords: string[];
   isDefault: boolean;

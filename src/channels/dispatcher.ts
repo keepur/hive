@@ -339,6 +339,23 @@ export class Dispatcher {
       return this.resolveFromTeam(item);
     }
 
+    // 0.6 Origin routing — single-purpose apps declare identity via connect-time tag
+    //     Must run before channel/thread/name so shop-floor messages can't accidentally
+    //     land on an agent whose name appears in the text.
+    const origin = item.meta?.origin as string | undefined;
+    if (origin) {
+      const match = this.registry.findByOrigin(origin);
+      if (match) {
+        return [{ agentId: match.id, skipTriage: false }];
+      }
+      log.warn("Origin not routed", {
+        origin,
+        deviceId: item.meta?.deviceId as string | undefined,
+        text: item.text.slice(0, 50),
+      });
+      return [];
+    }
+
     // 1. Dedicated channel mapping — always route to channel owner
     //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
     //    Checked before thread logic so dedicated channels never become multi-agent
