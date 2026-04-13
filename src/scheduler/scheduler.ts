@@ -312,7 +312,7 @@ export class Scheduler {
       };
 
       if (this.onDispatch) {
-        // Route through dispatcher for full pipeline (triage, agent, delivery)
+        // Route through dispatcher for full pipeline (agent, delivery)
         this.onDispatch(workItem);
       } else {
         // Fallback: direct to agent manager (no response routing)
