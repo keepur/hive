@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { WsAdapter } from "./ws-adapter.js";
+import { EventEmitter } from "node:events";
 import type { AgentConfig, AgentState } from "../../types/agent-config.js";
 
 vi.mock("../../logging/logger.js", () => ({
@@ -167,5 +168,160 @@ describe("WsAdapter.buildAgentList()", () => {
 
     const result = (adapter as any).buildAgentList();
     expect(result[0].title).toBeNull();
+  });
+});
+
+describe("WsAdapter upgrade handler", () => {
+  let adapter: WsAdapter | undefined;
+
+  afterEach(async () => {
+    if (adapter) {
+      await adapter.stop();
+      adapter = undefined;
+    }
+  });
+
+  function makeFakeSocket(remoteAddress: string) {
+    const socket = new EventEmitter() as EventEmitter & {
+      remoteAddress: string;
+      writtenChunks: string[];
+      destroyed: boolean;
+      write: (chunk: string) => void;
+      destroy: () => void;
+    };
+    socket.remoteAddress = remoteAddress;
+    socket.writtenChunks = [];
+    socket.destroyed = false;
+    socket.write = (chunk: string) => {
+      socket.writtenChunks.push(chunk);
+    };
+    socket.destroy = () => {
+      socket.destroyed = true;
+    };
+    return socket;
+  }
+
+  async function startAdapter(deviceRegistry: any) {
+    adapter = new WsAdapter(0, deviceRegistry, "test-secret", {
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+    });
+    await adapter.start(() => {});
+    return adapter;
+  }
+
+  function getUpgradeListener(a: WsAdapter): (req: any, socket: any, head: Buffer) => void {
+    const server = (a as any).server;
+    const listeners = server.listeners("upgrade");
+    return listeners[listeners.length - 1];
+  }
+
+  it("accepts internal=1 from ::ffff:127.0.0.1 and surfaces deviceId/name", async () => {
+    const deviceRegistry = {
+      verifyToken: vi.fn(),
+      updateLastSeen: vi.fn(),
+    } as any;
+    const a = await startAdapter(deviceRegistry);
+
+    // Capture the emitted connection so we can inspect the synthetic Device.
+    const wss = (a as any).wss;
+    const handleUpgradeSpy = vi.spyOn(wss, "handleUpgrade").mockImplementation(((
+      _req: any,
+      _socket: any,
+      _head: any,
+      cb: any,
+    ) => {
+      const fakeWs = new EventEmitter() as any;
+      fakeWs.close = vi.fn();
+      fakeWs.send = vi.fn();
+      cb(fakeWs);
+    }) as any);
+
+    const emittedDevices: any[] = [];
+    wss.on("connection", (_ws: any, _req: any, device: any) => {
+      emittedDevices.push(device);
+    });
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=bk-abc&name=beekeeper",
+      headers: {},
+      socket: { remoteAddress: "::ffff:127.0.0.1" },
+    };
+    const socket = makeFakeSocket("::ffff:127.0.0.1");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(handleUpgradeSpy).toHaveBeenCalledTimes(1);
+    expect(socket.destroyed).toBe(false);
+    expect(emittedDevices).toHaveLength(1);
+    expect(emittedDevices[0]._id).toBe("bk-abc");
+    expect(emittedDevices[0].name).toBe("beekeeper");
+    expect(emittedDevices[0].defaultAgentId).toBe("");
+  });
+
+  it("rejects internal=1 from non-loopback with 403", async () => {
+    const deviceRegistry = {
+      verifyToken: vi.fn(),
+      updateLastSeen: vi.fn(),
+    } as any;
+    const a = await startAdapter(deviceRegistry);
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=bk-abc&name=beekeeper",
+      headers: {},
+      socket: { remoteAddress: "203.0.113.7" },
+    };
+    const socket = makeFakeSocket("203.0.113.7");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(socket.destroyed).toBe(true);
+    expect(socket.writtenChunks.join("")).toContain("403 Forbidden");
+    expect(deviceRegistry.verifyToken).not.toHaveBeenCalled();
+  });
+
+  it("legacy ?token=<valid> path still works with no internal param", async () => {
+    const deviceRegistry = {
+      verifyToken: vi.fn().mockResolvedValue({
+        _id: "device-1",
+        name: "iPhone",
+        defaultAgentId: "rae",
+      }),
+      updateLastSeen: vi.fn(),
+    } as any;
+    const a = await startAdapter(deviceRegistry);
+
+    const wss = (a as any).wss;
+    const handleUpgradeSpy = vi.spyOn(wss, "handleUpgrade").mockImplementation(((
+      _req: any,
+      _socket: any,
+      _head: any,
+      cb: any,
+    ) => {
+      const fakeWs = new EventEmitter() as any;
+      fakeWs.close = vi.fn();
+      fakeWs.send = vi.fn();
+      cb(fakeWs);
+    }) as any);
+
+    const emittedDevices: any[] = [];
+    wss.on("connection", (_ws: any, _req: any, device: any) => {
+      emittedDevices.push(device);
+    });
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?token=valid-jwt",
+      headers: {},
+      socket: { remoteAddress: "203.0.113.7" },
+    };
+    const socket = makeFakeSocket("203.0.113.7");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(deviceRegistry.verifyToken).toHaveBeenCalledWith("valid-jwt");
+    expect(handleUpgradeSpy).toHaveBeenCalledTimes(1);
+    expect(socket.destroyed).toBe(false);
+    expect(emittedDevices).toHaveLength(1);
+    expect(emittedDevices[0]._id).toBe("device-1");
   });
 });

@@ -341,6 +341,42 @@ export class WsAdapter implements ChannelAdapter {
     this.server.on("upgrade", async (req, socket, head) => {
       // Extract token from query string ?token=... or Authorization header
       const url = new URL(req.url ?? "/", `http://localhost:${this.port}`);
+
+      // Phase A: loopback-only internal proxy path used by sibling Beekeeper.
+      // Beekeeper terminates external auth and forwards frames over 127.0.0.1,
+      // so we trust the connection on loopback and surface deviceId/name as
+      // query params. Synthetic Device shape — no registry bookkeeping.
+      if (url.searchParams.get("internal") === "1") {
+        const remote = req.socket.remoteAddress ?? "";
+        const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+        if (!isLoopback) {
+          socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+          socket.destroy();
+          return;
+        }
+        const deviceId = url.searchParams.get("deviceId");
+        const name = url.searchParams.get("name");
+        if (!deviceId || !name) {
+          socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+          socket.destroy();
+          return;
+        }
+        // Minimal synthetic device — Beekeeper only proxies channel=team
+        // traffic, which always carries targetAgentId on the wire, so
+        // defaultAgentId is a safety-net default and should never actually
+        // be read. Cast is intentional (DOD-Phase-A).
+        const device = {
+          _id: deviceId,
+          name,
+          defaultAgentId: "",
+        } as Device;
+        this.wss.handleUpgrade(req, socket, head, (ws) => {
+          (ws as WebSocket & { __internal?: boolean }).__internal = true;
+          this.wss.emit("connection", ws, req, device);
+        });
+        return;
+      }
+
       const token = url.searchParams.get("token") ?? req.headers.authorization?.replace("Bearer ", "");
 
       if (!token) {
@@ -363,7 +399,8 @@ export class WsAdapter implements ChannelAdapter {
 
     this.wss.on("connection", (ws: WebSocket, _req: IncomingMessage, device: Device) => {
       const deviceId = device._id;
-      log.info("Device connected", { deviceId, name: device.name });
+      const isInternal = (ws as WebSocket & { __internal?: boolean }).__internal === true;
+      log.info("Device connected", { deviceId, name: device.name, internal: isInternal });
 
       // Drain any pending messages from before reconnect
       const pending = this.pendingMessages.get(deviceId);
@@ -381,7 +418,7 @@ export class WsAdapter implements ChannelAdapter {
         existing.close(1000, "Replaced by new connection");
       }
       this.connections.set(deviceId, ws);
-      this.deviceRegistry.updateLastSeen(deviceId);
+      if (!isInternal) this.deviceRegistry.updateLastSeen(deviceId);
 
       ws.on("message", async (raw: Buffer | ArrayBuffer | Buffer[]) => {
         try {
@@ -392,7 +429,7 @@ export class WsAdapter implements ChannelAdapter {
           }
 
           if (msg.type === "ping") {
-            this.deviceRegistry.updateLastSeen(deviceId);
+            if (!isInternal) this.deviceRegistry.updateLastSeen(deviceId);
             return;
           }
 
