@@ -15,6 +15,7 @@ export interface AgentDefinition {
 
   // Routing
   channels: string[];
+  homeBase?: string; // Primary channel for scheduler delivery; required at agent_create boundary
   passiveChannels: string[];
   keywords: string[];
   isDefault: boolean;
@@ -83,6 +84,7 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     name: doc.name,
     model: doc.model,
     channels: doc.channels ?? [],
+    homeBase: doc.homeBase,
     passiveChannels: doc.passiveChannels ?? AGENT_DEFINITION_DEFAULTS.passiveChannels,
     keywords: doc.keywords ?? AGENT_DEFINITION_DEFAULTS.keywords,
     isDefault: doc.isDefault ?? false,
