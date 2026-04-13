@@ -13,6 +13,7 @@ const POLL_INTERVAL_MS = 30_000;
 
 export class AgentRegistry {
   private agents = new Map<string, AgentConfig>();
+  private originToAgent = new Map<string, string>();
   private disabledAgents: AgentConfig[] = [];
   private agentDefs: Collection<AgentDefinition>;
   private changeStream: ChangeStream | null = null;
@@ -107,6 +108,7 @@ export class AgentRegistry {
     }
 
     this.lastPollTime = new Date();
+    this.rebuildOriginIndex();
     return { added, updated, removed };
   }
 
@@ -146,6 +148,25 @@ export class AgentRegistry {
     log.info("Agent registry watching via polling", { intervalMs: POLL_INTERVAL_MS });
   }
 
+  private rebuildOriginIndex(): void {
+    this.originToAgent.clear();
+    // Sort by id so conflict resolution is deterministic regardless of Map iteration order.
+    const sorted = [...this.agents.values()].sort((a, b) => a.id.localeCompare(b.id));
+    for (const agent of sorted) {
+      for (const slug of agent.catches ?? []) {
+        if (this.originToAgent.has(slug)) {
+          log.error("Origin conflict — first sorted agent wins", {
+            origin: slug,
+            winner: this.originToAgent.get(slug),
+            loser: agent.id,
+          });
+          continue;
+        }
+        this.originToAgent.set(slug, agent.id);
+      }
+    }
+  }
+
   stopWatching(): void {
     if (this.changeStream) {
       this.changeStream.close().catch(() => {});
@@ -175,6 +196,11 @@ export class AgentRegistry {
 
   findByChannel(channelName: string): AgentConfig | undefined {
     return this.getAll().find((a) => !a.disabled && a.channels.includes(channelName));
+  }
+
+  findByOrigin(slug: string): AgentConfig | undefined {
+    const agentId = this.originToAgent.get(slug);
+    return agentId ? this.agents.get(agentId) : undefined;
   }
 
   isPassiveChannel(channelName: string): boolean {

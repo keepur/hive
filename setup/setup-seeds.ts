@@ -56,6 +56,7 @@ async function main() {
         name: raw.name ?? raw._id,
         model: raw.model ?? "claude-sonnet-4-6",
         icon: raw.icon ?? AGENT_DEFINITION_DEFAULTS.icon,
+        catches: raw.catches,
         channels: raw.channels ?? [],
         passiveChannels: raw.passiveChannels ?? AGENT_DEFINITION_DEFAULTS.passiveChannels,
         keywords: raw.keywords ?? AGENT_DEFINITION_DEFAULTS.keywords,

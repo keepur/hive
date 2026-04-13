@@ -260,6 +260,134 @@ describe("WsAdapter upgrade handler", () => {
     expect(socket.writtenChunks.join("")).toContain("403 Forbidden");
   });
 
+  it("upgrade with ?origin=dodi-shop surfaces origin on synthetic Device", async () => {
+    const a = await startAdapter();
+
+    const wss = (a as any).wss;
+    vi.spyOn(wss, "handleUpgrade").mockImplementation(((_req: any, _socket: any, _head: any, cb: any) => {
+      const fakeWs = new EventEmitter() as any;
+      fakeWs.close = vi.fn();
+      fakeWs.send = vi.fn();
+      cb(fakeWs);
+    }) as any);
+
+    const emittedDevices: any[] = [];
+    wss.on("connection", (_ws: any, _req: any, device: any) => {
+      emittedDevices.push(device);
+    });
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=dev1&name=Shop&origin=dodi-shop",
+      headers: {},
+      socket: { remoteAddress: "::ffff:127.0.0.1" },
+    };
+    const socket = makeFakeSocket("::ffff:127.0.0.1");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(emittedDevices).toHaveLength(1);
+    expect(emittedDevices[0]._id).toBe("dev1");
+    expect(emittedDevices[0].origin).toBe("dodi-shop");
+  });
+
+  it("upgrade without origin leaves device.origin undefined", async () => {
+    const a = await startAdapter();
+
+    const wss = (a as any).wss;
+    vi.spyOn(wss, "handleUpgrade").mockImplementation(((_req: any, _socket: any, _head: any, cb: any) => {
+      const fakeWs = new EventEmitter() as any;
+      fakeWs.close = vi.fn();
+      fakeWs.send = vi.fn();
+      cb(fakeWs);
+    }) as any);
+
+    const emittedDevices: any[] = [];
+    wss.on("connection", (_ws: any, _req: any, device: any) => {
+      emittedDevices.push(device);
+    });
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=dev1&name=Shop",
+      headers: {},
+      socket: { remoteAddress: "::ffff:127.0.0.1" },
+    };
+    const socket = makeFakeSocket("::ffff:127.0.0.1");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(emittedDevices[0].origin).toBeUndefined();
+  });
+
+  it("emits WorkItem with meta.origin='dodi-shop' on type:message", async () => {
+    adapter = new WsAdapter(0, {
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+    });
+    const captured: any[] = [];
+    await adapter.start((item) => captured.push(item));
+
+    const wss = (adapter as any).wss;
+    const fakeWs = new EventEmitter() as any;
+    fakeWs.close = vi.fn();
+    fakeWs.send = vi.fn();
+    const device = { _id: "dev1", name: "Shop", defaultAgentId: "", origin: "dodi-shop" };
+    wss.emit("connection", fakeWs, {} as any, device);
+
+    fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+    // allow microtasks to flush the async message handler
+    await new Promise((r) => setImmediate(r));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].id).toBe("m1");
+    expect(captured[0].text).toBe("hi");
+    expect(captured[0].source.kind).toBe("app");
+    expect(captured[0].meta?.origin).toBe("dodi-shop");
+  });
+
+  it("emits WorkItem with meta.origin='dodi-shop' on type:image", async () => {
+    const { processImageBuffer } = await import("../../files/file-processor.js");
+    (processImageBuffer as any).mockResolvedValue({
+      filename: "photo.jpg",
+      mimetype: "image/jpeg",
+      size: 4,
+      kind: "image",
+      content: "stub",
+    });
+
+    adapter = new WsAdapter(0, {
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+    });
+    const captured: any[] = [];
+    await adapter.start((item) => captured.push(item));
+
+    const wss = (adapter as any).wss;
+    const fakeWs = new EventEmitter() as any;
+    fakeWs.close = vi.fn();
+    fakeWs.send = vi.fn();
+    const device = { _id: "dev1", name: "Shop", defaultAgentId: "", origin: "dodi-shop" };
+    wss.emit("connection", fakeWs, {} as any, device);
+
+    fakeWs.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({
+          type: "image",
+          id: "img1",
+          filename: "photo.jpg",
+          data: Buffer.from("test").toString("base64"),
+        }),
+      ),
+    );
+    // allow async image processing + onWorkItem
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].id).toBe("img1");
+    expect(captured[0].source.kind).toBe("app");
+    expect(captured[0].meta?.origin).toBe("dodi-shop");
+  });
+
   it("rejects upgrade without ?internal=1 with 404", async () => {
     const a = await startAdapter();
 

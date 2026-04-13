@@ -304,3 +304,66 @@ describe("keyword matching", () => {
     expect(matchesKeyword("PERMIT needed", "permit")).toBe(true);
   });
 });
+
+describe("origin routing", () => {
+  it("findByOrigin returns the catching agent", async () => {
+    const registry = new AgentRegistry(
+      makeFakeCollection([
+        makeDefinition({ _id: "production-support", name: "Sige", catches: ["dodi-shop"] }),
+        makeDefinition({ _id: "executive-assistant", name: "Rae" }),
+      ]),
+    );
+    await registry.load();
+    expect(registry.findByOrigin("dodi-shop")?.id).toBe("production-support");
+  });
+
+  it("findByOrigin returns undefined for unknown slug", async () => {
+    const registry = new AgentRegistry(
+      makeFakeCollection([
+        makeDefinition({ _id: "production-support", name: "Sige", catches: ["dodi-shop"] }),
+      ]),
+    );
+    await registry.load();
+    expect(registry.findByOrigin("unknown")).toBeUndefined();
+  });
+
+  it("first-sorted agent wins on origin conflict", async () => {
+    const registry = new AgentRegistry(
+      makeFakeCollection([
+        makeDefinition({ _id: "zeta", name: "Zeta", catches: ["shared"] }),
+        makeDefinition({ _id: "alpha", name: "Alpha", catches: ["shared"] }),
+      ]),
+    );
+    await registry.load();
+    expect(registry.findByOrigin("shared")?.id).toBe("alpha");
+  });
+
+  it("disabled agents do not catch origins", async () => {
+    const registry = new AgentRegistry(
+      makeFakeCollection([
+        makeDefinition({
+          _id: "production-support",
+          name: "Sige",
+          catches: ["dodi-shop"],
+          disabled: true,
+        }),
+      ]),
+    );
+    await registry.load();
+    expect(registry.findByOrigin("dodi-shop")).toBeUndefined();
+  });
+
+  it("reload picks up new catches entries", async () => {
+    // makeFakeCollection returns a closure over a mutable docs array — mutate
+    // it directly between load() calls to simulate a DB update.
+    const docs = [makeDefinition({ _id: "production-support", name: "Sige" })];
+    const col = makeFakeCollection(docs);
+    const registry = new AgentRegistry(col);
+    await registry.load();
+    expect(registry.findByOrigin("dodi-shop")).toBeUndefined();
+
+    docs[0] = makeDefinition({ _id: "production-support", name: "Sige", catches: ["dodi-shop"] });
+    await registry.load();
+    expect(registry.findByOrigin("dodi-shop")?.id).toBe("production-support");
+  });
+});
