@@ -225,8 +225,14 @@ export class Scheduler {
         }
 
         log.info("Triggering scheduled task", { agentId: job.agentId, task: job.task });
-        // Use agent-{id} channel (dedicated), not channels[0] which may be SMS/shared
-        const homeChannel = agent?.channels.find((ch) => ch.startsWith("agent-")) ?? `agent-${job.agentId}`;
+        const homeChannel = agent?.homeBase ?? agent?.channels?.[0];
+        if (!homeChannel) {
+          log.error("Cannot dispatch scheduled task — agent has no homeBase or channels", {
+            agentId: job.agentId,
+            task: job.task,
+          });
+          continue;
+        }
 
         const workItem: WorkItem = {
           id: `sched:${job.agentId}:${job.task}:${Date.now()}`,
@@ -377,13 +383,14 @@ export class Scheduler {
           sourceAgent: event.sourceAgentId,
         });
 
+        const targetHomeBase = agent.homeBase ?? `agent-${delivery.agentId}`;
         const workItem: WorkItem = {
           id: `event:${eventId}:${delivery.agentId}`,
           text: `[Event: ${event.type} from ${sourceName}]\n\n${JSON.stringify(event.payload)}`,
           source: {
             kind: "internal" as ChannelKind,
-            id: `agent-${delivery.agentId}`,
-            label: `agent-${delivery.agentId}`,
+            id: targetHomeBase,
+            label: targetHomeBase,
           },
           sender: "system",
           threadId: `event:${eventId}:${delivery.agentId}:${now.getTime()}`,
