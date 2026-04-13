@@ -5,8 +5,6 @@ import type { AgentManager } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
-import { triage } from "../agents/triage.js";
-import { config } from "../config.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
 
@@ -148,7 +146,7 @@ export class Dispatcher {
       return;
     }
 
-    const { agentId, skipTriage } = activeList[0];
+    const { agentId } = activeList[0];
 
     const threadId = item.threadId ?? item.id;
     this.threadAgentMap.set(threadId, agentId);
@@ -163,84 +161,9 @@ export class Dispatcher {
     }
 
     const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
-    const agentConfig = this.registry.get(agentId);
 
-    // 4. Triage gate — fast Haiku response for interactive channels (skip for system/scheduled)
-    const isInteractive =
-      (item.source.kind === "slack" ||
-        item.source.kind === "sms" ||
-        item.source.kind === "imessage" ||
-        item.source.kind === "team") &&
-      item.sender !== "system";
-    let processingStarted = false;
-    if (isInteractive && config.triage.enabled && agentConfig && !skipTriage) {
-      await adapter?.onProcessingStart?.(item);
-      processingStarted = true;
-      try {
-        const triageResult = await triage(item.text, agentConfig, {
-          isThread: !!item.meta?.slackThreadTs,
-        });
-
-        if (triageResult.action === "done") {
-          const workResult: WorkResult = {
-            text: triageResult.response,
-            agentId,
-            workItem: item,
-            costUsd: triageResult.costUsd,
-            durationMs: triageResult.durationMs,
-          };
-          if (adapter) {
-            try {
-              await adapter.deliver(workResult);
-            } catch (err) {
-              log.warn("Triage delivery failed, queuing for retry", { error: String(err) });
-              this.retryQueue?.enqueue(workResult, adapter);
-            }
-          }
-          if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
-            await this.postAuditLog(workResult);
-          }
-          log.info("Triage handled message", {
-            agentId,
-            source: item.source.kind,
-            costUsd: triageResult.costUsd,
-            durationMs: triageResult.durationMs,
-          });
-          await adapter?.onProcessingEnd?.(item);
-          return;
-        }
-
-        // action === "continue" — post ack immediately, then proceed to full agent
-        // Skip ack in threads — "Thinking..." indicator is already visible and the ack
-        // creates a redundant 2-turn feel (ack + real response)
-        const isThread = !!item.meta?.slackThreadTs;
-        if (adapter && !isThread) {
-          const ackResult: WorkResult = {
-            text: triageResult.response,
-            agentId,
-            workItem: item,
-            costUsd: triageResult.costUsd,
-            durationMs: triageResult.durationMs,
-          };
-          try {
-            await adapter.deliver(ackResult);
-          } catch (err) {
-            log.warn("Triage ack delivery failed, queuing for retry", { error: String(err) });
-            this.retryQueue?.enqueue(ackResult, adapter);
-          }
-        }
-        log.info("Triage ack posted, continuing to full agent", {
-          agentId,
-          source: item.source.kind,
-          ack: triageResult.response.slice(0, 80),
-        });
-      } catch (err) {
-        log.warn("Triage failed, falling through to full agent", { error: String(err) });
-      }
-    }
-
-    // 5. Full agent processing
-    if (!processingStarted) await adapter?.onProcessingStart?.(item);
+    // 4. Full agent processing
+    await adapter?.onProcessingStart?.(item);
     try {
       const runResult = await this.agentManager.sendMessage(agentId, item);
 
@@ -326,15 +249,15 @@ export class Dispatcher {
     }
   }
 
-  private async resolveAgents(item: WorkItem): Promise<{ agentId: string; skipTriage: boolean }[]> {
+  private async resolveAgents(item: WorkItem): Promise<{ agentId: string }[]> {
     // 0. Explicit target — callbacks and internal routing specify exact agent
     //    Always returns single agent, even in multi-agent threads
     const targetAgentId = item.meta?.targetAgentId as string | undefined;
     if (targetAgentId && this.registry.get(targetAgentId)) {
-      return [{ agentId: targetAgentId, skipTriage: false }];
+      return [{ agentId: targetAgentId }];
     }
 
-    // 0.5 Team routing — DMs resolve to channel member, channels use @mention or triage
+    // 0.5 Team routing — DMs resolve to channel member, channels use @mention
     if (item.source.kind === "team") {
       return this.resolveFromTeam(item);
     }
@@ -346,7 +269,7 @@ export class Dispatcher {
     if (origin) {
       const match = this.registry.findByOrigin(origin);
       if (match) {
-        return [{ agentId: match.id, skipTriage: false }];
+        return [{ agentId: match.id }];
       }
       log.warn("Origin not routed", {
         origin,
@@ -360,7 +283,7 @@ export class Dispatcher {
     //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
     //    Checked before thread logic so dedicated channels never become multi-agent
     const channelAgent = this.registry.findByChannel(item.source.label);
-    if (channelAgent) return [{ agentId: channelAgent.id, skipTriage: false }];
+    if (channelAgent) return [{ agentId: channelAgent.id }];
 
     // 2. Thread participant resolution — scan for new mentions in existing threads
     if (item.threadId) {
@@ -372,7 +295,7 @@ export class Dispatcher {
       if (existingParticipants) {
         for (const id of newMentionIds) existingParticipants.add(id);
         this.threadAgentLastSeen.set(item.threadId, Date.now());
-        return [...existingParticipants].map((agentId) => ({ agentId, skipTriage: false }));
+        return [...existingParticipants].map((agentId) => ({ agentId }));
       }
 
       // 2b. Existing single-agent thread — check for single→multi transition
@@ -389,11 +312,11 @@ export class Dispatcher {
             threadId: item.threadId,
             participants: [...participants],
           });
-          return [...participants].map((agentId) => ({ agentId, skipTriage: false }));
+          return [...participants].map((agentId) => ({ agentId }));
         }
         // Single-agent continuity (unchanged behavior)
         this.threadAgentLastSeen.set(item.threadId, Date.now());
-        return [{ agentId: existing, skipTriage: false }];
+        return [{ agentId: existing }];
       }
 
       // 2c. No in-memory affinity — check persisted sessions (survives restart)
@@ -404,12 +327,12 @@ export class Dispatcher {
           const participants = new Set(validAgents);
           this.threadParticipants.set(item.threadId, participants);
           this.threadAgentLastSeen.set(item.threadId, Date.now());
-          return [...participants].map((agentId) => ({ agentId, skipTriage: false }));
+          return [...participants].map((agentId) => ({ agentId }));
         }
         if (validAgents.length === 1) {
           this.threadAgentMap.set(item.threadId, validAgents[0]);
           this.threadAgentLastSeen.set(item.threadId, Date.now());
-          return [{ agentId: validAgents[0], skipTriage: false }];
+          return [{ agentId: validAgents[0] }];
         }
       }
     }
@@ -418,19 +341,16 @@ export class Dispatcher {
     //    May return multiple agents if several are mentioned in the same message
     const allNamed = this.registry.findAllByName(item.text);
     if (allNamed.length > 0) {
-      return allNamed.map((a) => ({
-        agentId: a.id,
-        skipTriage: a.passiveChannels.includes(item.source.label),
-      }));
+      return allNamed.map((a) => ({ agentId: a.id }));
     }
 
     // 4. Adapter-specific default (e.g. DMs to Jasper's bot → vp-engineering)
     const adapterDefault = item.meta?.defaultAgentId as string | undefined;
-    if (adapterDefault && this.registry.get(adapterDefault)) return [{ agentId: adapterDefault, skipTriage: false }];
+    if (adapterDefault && this.registry.get(adapterDefault)) return [{ agentId: adapterDefault }];
 
     // 5. Keyword match — disabled (too many false positives in shared channels)
     // const keyword = this.registry.findByKeyword(item.text);
-    // if (keyword) return [{ agentId: keyword.id, skipTriage: false }];
+    // if (keyword) return [{ agentId: keyword.id }];
 
     // 6. No match — drop unless it's a dedicated channel or DM
     //    Agents must be explicitly addressed (name mention, dedicated channel, thread continuity, or DM)
@@ -438,12 +358,12 @@ export class Dispatcher {
     return [];
   }
 
-  private async resolveFromTeam(item: WorkItem): Promise<{ agentId: string; skipTriage: boolean }[]> {
+  private async resolveFromTeam(item: WorkItem): Promise<{ agentId: string }[]> {
     const channelId = item.meta?.channelId as string | undefined;
     if (!channelId || !this.teamStore) {
       // Fall back to default agent
       const defaultId = item.meta?.defaultAgentId as string | undefined;
-      if (defaultId && this.registry.get(defaultId)) return [{ agentId: defaultId, skipTriage: false }];
+      if (defaultId && this.registry.get(defaultId)) return [{ agentId: defaultId }];
       return [];
     }
 
@@ -457,7 +377,7 @@ export class Dispatcher {
     if (channel.type === "dm") {
       const agentId = channel.members.find((m) => m !== item.sender);
       if (agentId && this.registry.get(agentId)) {
-        return [{ agentId, skipTriage: true }]; // DMs skip triage — direct
+        return [{ agentId }];
       }
       log.warn("DM agent not found in registry", { channelId, members: channel.members });
       return [];
@@ -470,15 +390,14 @@ export class Dispatcher {
       const channelMembers = new Set(channel.members);
       const validMentions = mentioned.filter((a) => channelMembers.has(a.id));
       if (validMentions.length > 0) {
-        return validMentions.map((a) => ({ agentId: a.id, skipTriage: true }));
+        return validMentions.map((a) => ({ agentId: a.id }));
       }
     }
 
     // No mention — route to first agent member of the channel (lightweight default)
-    // In future, could use triage to pick best responder
     const agentMembers = channel.members.filter((m) => this.registry.get(m));
     if (agentMembers.length > 0) {
-      return [{ agentId: agentMembers[0], skipTriage: false }];
+      return [{ agentId: agentMembers[0] }];
     }
 
     log.warn("No agent members in Team channel", { channelId });
@@ -486,8 +405,8 @@ export class Dispatcher {
   }
 
   /** Dispatch a single work item to a single agent (used for fan-out) */
-  private async dispatchToAgent(item: WorkItem, resolved: { agentId: string; skipTriage: boolean }): Promise<void> {
-    const { agentId, skipTriage } = resolved;
+  private async dispatchToAgent(item: WorkItem, resolved: { agentId: string }): Promise<void> {
+    const { agentId } = resolved;
 
     const threadId = item.threadId ?? item.id;
     // Refresh TTL for multi-agent threads (affinity already set by resolveAgents)
@@ -501,46 +420,6 @@ export class Dispatcher {
     }
 
     const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
-    const agentConfig = this.registry.get(agentId);
-
-    const isInteractive =
-      (item.source.kind === "slack" ||
-        item.source.kind === "sms" ||
-        item.source.kind === "imessage" ||
-        item.source.kind === "team") &&
-      item.sender !== "system";
-
-    // Skip triage for fan-out — go straight to full agent
-    if (isInteractive && config.triage.enabled && agentConfig && !skipTriage) {
-      try {
-        const triageResult = await triage(item.text, agentConfig, {
-          isThread: !!item.meta?.slackThreadTs,
-        });
-        if (triageResult.action === "done") {
-          const workResult: WorkResult = {
-            text: triageResult.response,
-            agentId,
-            workItem: item,
-            costUsd: triageResult.costUsd,
-            durationMs: triageResult.durationMs,
-          };
-          if (adapter) {
-            try {
-              await adapter.deliver(workResult);
-            } catch (err) {
-              this.retryQueue?.enqueue(workResult, adapter);
-            }
-          }
-          if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
-            await this.postAuditLog(workResult);
-          }
-          return;
-        }
-        // "continue" — no ack for fan-out, proceed to full agent
-      } catch (err) {
-        log.warn("Triage failed in fan-out, falling through to full agent", { agentId, error: String(err) });
-      }
-    }
 
     try {
       const runResult = await this.agentManager.sendMessage(agentId, item);
