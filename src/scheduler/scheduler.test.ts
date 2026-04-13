@@ -106,10 +106,7 @@ interface CronJobInternal {
   lastRun: Date | null;
 }
 
-function injectJobAndFire(
-  scheduler: Scheduler,
-  job: CronJobInternal,
-): void {
+function injectJobAndFire(scheduler: Scheduler, job: CronJobInternal): void {
   // checkCronJobs is private; cast to any for unit-test access — this is
   // intentional to avoid adding a public test-only surface to production code.
   const s = scheduler as any;
