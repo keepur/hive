@@ -322,7 +322,7 @@ export class WsAdapter implements ChannelAdapter {
     const channelId = result.workItem.meta?.channelId as string | undefined;
 
     // Save agent response to team_messages if this was a Team conversation
-    if (channelId && this.teamStore) {
+    if (channelId) {
       await this.teamStore.saveMessage({
         channelId,
         senderId: result.agentId,
