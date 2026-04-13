@@ -222,7 +222,17 @@ describe("resolveTaskStatus", () => {
 
 // ── CodeTaskManager HTTP API Tests ──────────────────────────────────
 
-const PORT = 39102;
+// Port ranges must stay disjoint across test files — vitest runs files in
+// parallel workers that share the OS port space, so overlapping hardcoded
+// ports cause non-deterministic EADDRINUSE flakes. Current map:
+//   background-task-manager.test.ts : 39100, 39110–39112
+//   code-task-manager.test.ts       : 39121–39128  (PORT + 1..8, see below)
+//   meeting-monitor.test.ts         : 39200, 39201
+//   code-task-integration.test.ts   : 39300+
+// This file previously used PORT=39102 and its PORT+8 slot (39110) collided
+// with background-task-manager's PORT+10 — moving PORT forward by 18 gives
+// a clean range with plenty of headroom before meeting-monitor.
+const PORT = 39120;
 const AUTH_TOKEN = "test-token-ct";
 const BASE = `http://127.0.0.1:${PORT}`;
 const PLUGIN_DIRS = ["/tmp/fake-plugin-dir"];
