@@ -7,7 +7,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/node</string>
-    <string>/Users/mokie/services/hive/dist/beekeeper/index.js</string>
+    <string>/Users/mokie/services/hive/node_modules/@keepur/beekeeper/dist/cli.js</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/mokie/services/hive</string>
