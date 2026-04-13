@@ -264,12 +264,7 @@ describe("WsAdapter upgrade handler", () => {
     const a = await startAdapter();
 
     const wss = (a as any).wss;
-    vi.spyOn(wss, "handleUpgrade").mockImplementation(((
-      _req: any,
-      _socket: any,
-      _head: any,
-      cb: any,
-    ) => {
+    vi.spyOn(wss, "handleUpgrade").mockImplementation(((_req: any, _socket: any, _head: any, cb: any) => {
       const fakeWs = new EventEmitter() as any;
       fakeWs.close = vi.fn();
       fakeWs.send = vi.fn();
@@ -299,12 +294,7 @@ describe("WsAdapter upgrade handler", () => {
     const a = await startAdapter();
 
     const wss = (a as any).wss;
-    vi.spyOn(wss, "handleUpgrade").mockImplementation(((
-      _req: any,
-      _socket: any,
-      _head: any,
-      cb: any,
-    ) => {
+    vi.spyOn(wss, "handleUpgrade").mockImplementation(((_req: any, _socket: any, _head: any, cb: any) => {
       const fakeWs = new EventEmitter() as any;
       fakeWs.close = vi.fn();
       fakeWs.send = vi.fn();

@@ -621,12 +621,7 @@ describe("origin routing", () => {
     agentManager = makeMockAgentManager();
     const healthReporter = makeMockHealthReporter();
     adapter = makeMockAdapter();
-    dispatcher = new Dispatcher(
-      registry as any,
-      agentManager as any,
-      healthReporter as any,
-      "executive-assistant",
-    );
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
     dispatcher.registerAdapter(adapter as any);
   });
 
