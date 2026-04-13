@@ -19,3 +19,14 @@ coverage/
 
 # Spike test scratch files (recreated each test run)
 src/archetypes/fixtures/spike-b/DENIED_target.txt
+
+# Personal / machine-local state — not shared across the team. These
+# files were being picked up by `git add -A` and nearly landed in a
+# commit by mistake; keep the pattern list tight so `git status` stays
+# readable but new personal files in the same categories don't leak.
+.env-personal
+hive-personal.yaml
+agents-personal/
+mokie-*.png
+.playwright-mcp/
+test-results/
