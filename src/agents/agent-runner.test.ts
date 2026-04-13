@@ -183,8 +183,8 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     const servers = getCapturedServers();
 
     // structured-memory is auto-paired with memory (always registered)
-    // schedule is always included as implicit core server
-    expect(Object.keys(servers)).toEqual(["memory", "structured-memory", "keychain", "schedule"]);
+    // schedule + team are always included as implicit core servers (KPR-11)
+    expect(Object.keys(servers)).toEqual(["memory", "structured-memory", "keychain", "team", "schedule"]);
   });
 
   it("empty coreServers means only implicit servers", async () => {
@@ -195,8 +195,8 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    // schedule is always included as implicit core server
-    expect(Object.keys(servers)).toEqual(["schedule"]);
+    // schedule + team are always included as implicit core servers (KPR-11)
+    expect(Object.keys(servers)).toEqual(["team", "schedule"]);
   });
 
   it("removes resend and quo when externalComms autonomy flag is false", async () => {
