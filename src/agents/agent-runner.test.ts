@@ -88,7 +88,6 @@ vi.mock("../config.js", () => ({
     triage: { enabled: false },
     browser: { cdpEndpoint: "" },
     memory: { hotBudgetTokens: 3000 },
-    team: { enabled: false },
     workflow: { enabled: false },
     voice: { apiKey: "", phoneNumberId: "", assistants: {} },
   },

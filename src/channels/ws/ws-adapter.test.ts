@@ -39,8 +39,32 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   };
 }
 
+/**
+ * Minimal noop team deps — the existing upgrade/auth/origin tests don't
+ * exercise team command paths, but WsAdapterDeps now requires them (KPR-11).
+ */
+function noopTeamDeps() {
+  return {
+    teamStore: {
+      getChannel: vi.fn().mockResolvedValue(null),
+      listChannels: vi.fn().mockResolvedValue([]),
+      getHistory: vi.fn().mockResolvedValue({ messages: [], hasMore: false }),
+      saveMessage: vi.fn().mockResolvedValue(undefined),
+      getOrCreateDm: vi.fn(),
+      renameChannel: vi.fn(),
+      joinChannel: vi.fn(),
+      leaveChannel: vi.fn(),
+    } as any,
+    commandRegistry: {
+      has: vi.fn().mockReturnValue(false),
+      list: vi.fn().mockReturnValue([]),
+      execute: vi.fn().mockResolvedValue({ found: false }),
+    } as any,
+  };
+}
+
 function makeAdapter(agentRegistry: any, agentManager: any) {
-  return new WsAdapter(3200, { agentRegistry, agentManager });
+  return new WsAdapter(3200, { ...noopTeamDeps(), agentRegistry, agentManager });
 }
 
 describe("WsAdapter.buildAgentList()", () => {
@@ -192,6 +216,7 @@ describe("WsAdapter upgrade handler", () => {
 
   async function startAdapter() {
     adapter = new WsAdapter(0, {
+      ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
       agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
     });
@@ -320,6 +345,7 @@ describe("WsAdapter upgrade handler", () => {
 
   it("emits WorkItem with meta.origin='dodi-shop' on type:message", async () => {
     adapter = new WsAdapter(0, {
+      ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
       agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
     });
@@ -355,6 +381,7 @@ describe("WsAdapter upgrade handler", () => {
     });
 
     adapter = new WsAdapter(0, {
+      ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
       agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
     });
