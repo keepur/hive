@@ -109,10 +109,8 @@ export class Scheduler {
       { expireAfterSeconds: config.events.retentionDays * 86400 },
     );
     // Team pending requests indexes
-    if (config.team.enabled) {
-      await this.db.collection("team_pending_requests").createIndex({ status: 1, createdAt: -1 });
-      await this.db.collection("team_pending_requests").createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 });
-    }
+    await this.db.collection("team_pending_requests").createIndex({ status: 1, createdAt: -1 });
+    await this.db.collection("team_pending_requests").createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 });
     log.info("Callback store connected", { db: dbName });
   }
 
@@ -167,7 +165,7 @@ export class Scheduler {
     }
 
     // Team requests: check every 5 seconds for agent-to-agent messages
-    if (config.team.enabled && this.db) {
+    if (this.db) {
       this.teamTimer = setInterval(() => {
         this.fireTeamRequests().catch((err) => log.error("Team request check failed", { error: String(err) }));
       }, 5_000);
@@ -178,7 +176,6 @@ export class Scheduler {
       cronJobs: this.cronJobs.length,
       callbacksEnabled: !!this.callbackCollection,
       eventsEnabled: !!this.eventsCollection,
-      teamEnabled: config.team.enabled,
     });
   }
 
