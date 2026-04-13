@@ -41,6 +41,7 @@ function makeMockRegistry() {
     channels: ["general", "agent-rae"],
     passiveChannels: ["biz"],
     keywords: [],
+    homeBase: "agent-rae",
     isDefault: true,
   });
   agents.set("chief-of-staff", {
@@ -75,6 +76,7 @@ function makeMockRegistry() {
     passiveChannels: [],
     keywords: [],
     catches: ["dodi-shop"],
+    homeBase: "agent-sige",
     isDefault: false,
   });
 
@@ -686,5 +688,81 @@ describe("origin routing", () => {
     });
     await dispatcher.dispatch(item);
     expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
+  });
+});
+
+describe("per-agent audit routing", () => {
+  let dispatcher: Dispatcher;
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let agentManager: ReturnType<typeof makeMockAgentManager>;
+  let slackAdapter: ReturnType<typeof makeMockAdapter>;
+  let wsAdapter: ReturnType<typeof makeMockAdapter>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workItemCounter = 0;
+    registry = makeMockRegistry();
+    agentManager = makeMockAgentManager();
+    const healthReporter = makeMockHealthReporter();
+    slackAdapter = makeMockAdapter();
+    wsAdapter = { ...makeMockAdapter(), id: "ws", kind: "app" as any };
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
+    dispatcher.registerAdapter(slackAdapter as any);
+    dispatcher.registerAdapter(wsAdapter as any);
+  });
+
+  function auditCall() {
+    return slackAdapter.deliver.mock.calls.find((c: any[]) => c[0]?.workItem?.source?.label === "audit");
+  }
+
+  it("posts audit to the handling agent's homeBase channel", async () => {
+    dispatcher.setAuditChannel(
+      slackAdapter as any,
+      new Map([
+        ["agent-sige", "C-SIGE"],
+        ["agent-jessica", "C-JESSICA"],
+      ]),
+      "C-JESSICA",
+    );
+    await dispatcher.dispatch(
+      makeWorkItem({
+        source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+        text: "hi",
+        meta: { origin: "dodi-shop", deviceId: "dev1" },
+      }),
+    );
+    const call = auditCall();
+    expect(call).toBeDefined();
+    expect(call![0].workItem.source.id).toBe("C-SIGE");
+  });
+
+  it("falls back to the global channel when homeBase is not resolvable", async () => {
+    dispatcher.setAuditChannel(
+      slackAdapter as any,
+      new Map([["agent-jessica", "C-JESSICA"]]), // no agent-sige
+      "C-JESSICA",
+    );
+    await dispatcher.dispatch(
+      makeWorkItem({
+        source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+        text: "hi",
+        meta: { origin: "dodi-shop", deviceId: "dev1" },
+      }),
+    );
+    const call = auditCall();
+    expect(call).toBeDefined();
+    expect(call![0].workItem.source.id).toBe("C-JESSICA");
+  });
+
+  it("skips audit when neither homeBase nor fallback resolves", async () => {
+    dispatcher.setAuditChannel(slackAdapter as any, new Map(), undefined);
+    await dispatcher.dispatch(
+      makeWorkItem({
+        source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+        text: "hi",
+        meta: { origin: "dodi-shop", deviceId: "dev1" },
+      }),
+    );
+    expect(auditCall()).toBeUndefined();
   });
 });
