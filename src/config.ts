@@ -192,7 +192,6 @@ export const config = {
   ws: {
     enabled: optional("WS_ENABLED", "false") === "true",
     port: parseInt(optional("WS_PORT", String(ports.ws ?? portBase + 3)), 10),
-    jwtSecret: optional("WS_JWT_SECRET", ""),
   },
   team: {
     enabled: optional("TEAM_ENABLED", "false") === "true",
