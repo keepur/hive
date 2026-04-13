@@ -4,7 +4,6 @@ import { randomUUID } from "node:crypto";
 import { createLogger } from "../../logging/logger.js";
 import type { ChannelAdapter } from "../channel-adapter.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../../types/work-item.js";
-import type { DeviceRegistry, Device } from "./device-registry.js";
 import type {
   ServerMessage,
   ClientTeamMessage,
@@ -27,6 +26,18 @@ import type { AgentManager } from "../../agents/agent-manager.js";
 
 const log = createLogger("ws-adapter");
 
+/**
+ * Synthetic device identity for the WS connection. Post-Phase-B, Hive's WS
+ * adapter no longer owns a device registry — `@keepur/beekeeper` does. The
+ * upgrade handler receives `deviceId` and `name` as loopback query params
+ * from the Beekeeper proxy and builds this struct on the fly.
+ */
+interface Device {
+  _id: string;
+  name: string;
+  defaultAgentId: string;
+}
+
 export interface WsAdapterDeps {
   teamStore?: TeamStore;
   commandRegistry?: CommandRegistry;
@@ -39,8 +50,6 @@ export class WsAdapter implements ChannelAdapter {
   readonly kind: ChannelKind = "app";
 
   private port: number;
-  private deviceRegistry: DeviceRegistry;
-  private adminSecret: string;
   private server!: Server;
   private wss!: WebSocketServer;
   private connections = new Map<string, WebSocket>(); // deviceId -> ws
@@ -51,10 +60,8 @@ export class WsAdapter implements ChannelAdapter {
   private agentRegistry: AgentRegistry;
   private agentManager: AgentManager;
 
-  constructor(port: number, deviceRegistry: DeviceRegistry, adminSecret: string, deps: WsAdapterDeps) {
+  constructor(port: number, deps: WsAdapterDeps) {
     this.port = port;
-    this.deviceRegistry = deviceRegistry;
-    this.adminSecret = adminSecret;
     this.teamStore = deps.teamStore;
     this.commandRegistry = deps.commandRegistry;
     this.agentRegistry = deps.agentRegistry;
@@ -78,256 +85,11 @@ export class WsAdapter implements ChannelAdapter {
 
       const url = new URL(req.url ?? "/", `http://localhost:${this.port}`);
 
-      // POST /pair — exchange pairing code for JWT (+ optional name)
-      if (req.method === "POST" && url.pathname === "/pair") {
-        try {
-          const body = await readBody(req);
-          let parsed: { code?: string; name?: string };
-          try {
-            parsed = JSON.parse(body);
-          } catch {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Invalid JSON" }));
-            return;
-          }
-
-          if (!parsed.code || typeof parsed.code !== "string") {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Missing required field: code" }));
-            return;
-          }
-
-          const name = typeof parsed.name === "string" ? parsed.name.trim() : undefined;
-          const result = await this.deviceRegistry.verifyPairingCode(parsed.code, name || undefined);
-          if (!result) {
-            res.writeHead(401, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Invalid or expired pairing code" }));
-            return;
-          }
-
-          log.info("Device paired", { deviceId: result.device._id, name: result.device.name });
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              token: result.token,
-              deviceId: result.device._id,
-              deviceName: result.device.name,
-              defaultAgentId: result.device.defaultAgentId,
-            }),
-          );
-        } catch (err) {
-          log.error("Pair endpoint error", { error: String(err) });
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-        return;
-      }
-
-      // GET /health
+      // GET /health — the only HTTP surface. Pair, /me, and /devices all
+      // live in @keepur/beekeeper now.
       if (req.method === "GET" && url.pathname === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "ok", connections: this.connections.size }));
-        return;
-      }
-
-      // --- Device self-service (requires device JWT) ---
-
-      // PUT /me — update own name (authenticated device)
-      if (req.method === "PUT" && url.pathname === "/me") {
-        try {
-          const device = await this.verifyDeviceToken(req);
-          if (!device) {
-            res.writeHead(401);
-            res.end("Unauthorized");
-            return;
-          }
-
-          const body = await readBody(req);
-          const parsed = JSON.parse(body) as { name?: string };
-          const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
-          if (!name) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Missing required field: name" }));
-            return;
-          }
-
-          const updated = await this.deviceRegistry.updateDevice(device._id, { name });
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ deviceId: device._id, name: updated?.name ?? name }));
-        } catch (err) {
-          log.error("PUT /me error", { error: String(err) });
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-        return;
-      }
-
-      // GET /me — get own device info (authenticated device)
-      if (req.method === "GET" && url.pathname === "/me") {
-        try {
-          const device = await this.verifyDeviceToken(req);
-          if (!device) {
-            res.writeHead(401);
-            res.end("Unauthorized");
-            return;
-          }
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              deviceId: device._id,
-              name: device.name,
-              defaultAgentId: device.defaultAgentId,
-            }),
-          );
-        } catch (err) {
-          log.error("GET /me error", { error: String(err) });
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-        return;
-      }
-
-      // --- Admin API (requires Bearer <adminSecret>) ---
-      const isAdmin = this.verifyAdmin(req);
-
-      // POST /devices — create a new device, returns pairing code
-      if (req.method === "POST" && url.pathname === "/devices") {
-        if (!isAdmin) {
-          res.writeHead(401);
-          res.end("Unauthorized");
-          return;
-        }
-        try {
-          const body = await readBody(req);
-          const parsed = JSON.parse(body) as { name?: string; defaultAgentId?: string };
-          const name = parsed.name || "Unnamed Device";
-          const agentId = parsed.defaultAgentId || "production-support";
-          const device = await this.deviceRegistry.createDevice(name, agentId);
-          res.writeHead(201, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              deviceId: device._id,
-              name: device.name,
-              pairingCode: device.pairingCode,
-              expiresAt: device.pairingCodeExpiresAt,
-              defaultAgentId: device.defaultAgentId,
-            }),
-          );
-        } catch (err) {
-          log.error("Create device error", { error: String(err) });
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-        return;
-      }
-
-      // GET /devices — list all devices
-      if (req.method === "GET" && url.pathname === "/devices") {
-        if (!isAdmin) {
-          res.writeHead(401);
-          res.end("Unauthorized");
-          return;
-        }
-        try {
-          const devices = await this.deviceRegistry.listDevices();
-          const list = devices.map((d) => ({
-            deviceId: d._id,
-            name: d.name,
-            defaultAgentId: d.defaultAgentId,
-            active: d.active,
-            paired: !!d.pairedAt,
-            pairedAt: d.pairedAt,
-            lastSeenAt: d.lastSeenAt,
-            connected: this.connections.has(d._id),
-            hasPendingCode: !!d.pairingCode,
-          }));
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(list));
-        } catch (err) {
-          log.error("List devices error", { error: String(err) });
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-        return;
-      }
-
-      // Routes with device ID: /devices/:id/...
-      const deviceMatch = url.pathname.match(/^\/devices\/([^/]+)(\/(.+))?$/);
-      if (deviceMatch && isAdmin) {
-        const deviceId = deviceMatch[1];
-        const action = deviceMatch[3]; // e.g. "refresh-code"
-
-        // PUT /devices/:id — update device fields (name, defaultAgentId)
-        if (req.method === "PUT" && !action) {
-          try {
-            const body = await readBody(req);
-            const parsed = JSON.parse(body) as { name?: string; defaultAgentId?: string };
-            const fields: Record<string, string> = {};
-            if (parsed.name) fields.name = parsed.name;
-            if (parsed.defaultAgentId) fields.defaultAgentId = parsed.defaultAgentId;
-            if (Object.keys(fields).length === 0) {
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "No fields to update" }));
-              return;
-            }
-            const device = await this.deviceRegistry.updateDevice(deviceId, fields);
-            if (!device) {
-              res.writeHead(404, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "Device not found" }));
-              return;
-            }
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ deviceId: device._id, name: device.name, defaultAgentId: device.defaultAgentId }));
-          } catch (err) {
-            log.error("Update device error", { error: String(err) });
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-          return;
-        }
-
-        // DELETE /devices/:id — deactivate device
-        if (req.method === "DELETE" && !action) {
-          try {
-            const ok = await this.deviceRegistry.deactivateDevice(deviceId);
-            if (!ok) {
-              res.writeHead(404, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "Device not found or already inactive" }));
-              return;
-            }
-            // Disconnect if currently connected
-            const ws = this.connections.get(deviceId);
-            if (ws) {
-              ws.close(1000, "Device deactivated");
-              this.connections.delete(deviceId);
-            }
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: true }));
-          } catch (err) {
-            log.error("Deactivate device error", { error: String(err) });
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-          return;
-        }
-
-        // POST /devices/:id/refresh-code — generate a new pairing code
-        if (req.method === "POST" && action === "refresh-code") {
-          try {
-            const code = await this.deviceRegistry.refreshPairingCode(deviceId);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ pairingCode: code }));
-          } catch (err) {
-            log.error("Refresh code error", { error: String(err) });
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-          return;
-        }
-      } else if (deviceMatch && !isAdmin) {
-        res.writeHead(401);
-        res.end("Unauthorized");
         return;
       }
 
@@ -338,60 +100,41 @@ export class WsAdapter implements ChannelAdapter {
     // WebSocket server — handle upgrade manually for auth
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 10 * 1024 * 1024 }); // 10 MB max message size
 
-    this.server.on("upgrade", async (req, socket, head) => {
-      // Extract token from query string ?token=... or Authorization header
+    this.server.on("upgrade", (req, socket, head) => {
       const url = new URL(req.url ?? "/", `http://localhost:${this.port}`);
 
-      // Phase A: loopback-only internal proxy path used by sibling Beekeeper.
-      // Beekeeper terminates external auth and forwards frames over 127.0.0.1,
-      // so we trust the connection on loopback and surface deviceId/name as
-      // query params. Synthetic Device shape — no registry bookkeeping.
-      if (url.searchParams.get("internal") === "1") {
-        const remote = req.socket.remoteAddress ?? "";
-        const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
-        if (!isLoopback) {
-          socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-          socket.destroy();
-          return;
-        }
-        const deviceId = url.searchParams.get("deviceId");
-        const name = url.searchParams.get("name");
-        if (!deviceId || !name) {
-          socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-          socket.destroy();
-          return;
-        }
-        // Minimal synthetic device — Beekeeper only proxies channel=team
-        // traffic, which always carries targetAgentId on the wire, so
-        // defaultAgentId is a safety-net default and should never actually
-        // be read. Cast is intentional (DOD-Phase-A).
-        const device = {
-          _id: deviceId,
-          name,
-          defaultAgentId: "",
-        } as Device;
-        this.wss.handleUpgrade(req, socket, head, (ws) => {
-          (ws as WebSocket & { __internal?: boolean }).__internal = true;
-          this.wss.emit("connection", ws, req, device);
-        });
-        return;
-      }
-
-      const token = url.searchParams.get("token") ?? req.headers.authorization?.replace("Bearer ", "");
-
-      if (!token) {
-        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      // Only path in or out: loopback-only internal proxy from sibling
+      // Beekeeper, which terminates external auth and forwards frames over
+      // 127.0.0.1. We trust the connection on loopback and read deviceId /
+      // name off query params. The adapter also binds to 127.0.0.1 only, so
+      // the loopback check is defense in depth — the OS-level bind is the
+      // primary gate, but we keep the check in case bind config drifts.
+      if (url.searchParams.get("internal") !== "1") {
+        socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
         socket.destroy();
         return;
       }
 
-      const device = await this.deviceRegistry.verifyToken(token);
-      if (!device) {
-        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      const remote = req.socket.remoteAddress ?? "";
+      const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+      if (!isLoopback) {
+        socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
         socket.destroy();
         return;
       }
 
+      const deviceId = url.searchParams.get("deviceId");
+      const name = url.searchParams.get("name");
+      if (!deviceId || !name) {
+        socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+
+      // Synthetic device — Beekeeper only proxies channel=team traffic, which
+      // always carries targetAgentId on the wire, so defaultAgentId is a
+      // safety-net default and should never actually be read.
+      const device: Device = { _id: deviceId, name, defaultAgentId: "" };
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         this.wss.emit("connection", ws, req, device);
       });
@@ -399,8 +142,7 @@ export class WsAdapter implements ChannelAdapter {
 
     this.wss.on("connection", (ws: WebSocket, _req: IncomingMessage, device: Device) => {
       const deviceId = device._id;
-      const isInternal = (ws as WebSocket & { __internal?: boolean }).__internal === true;
-      log.info("Device connected", { deviceId, name: device.name, internal: isInternal });
+      log.info("Device connected", { deviceId, name: device.name });
 
       // Drain any pending messages from before reconnect
       const pending = this.pendingMessages.get(deviceId);
@@ -418,7 +160,6 @@ export class WsAdapter implements ChannelAdapter {
         existing.close(1000, "Replaced by new connection");
       }
       this.connections.set(deviceId, ws);
-      if (!isInternal) this.deviceRegistry.updateLastSeen(deviceId);
 
       ws.on("message", async (raw: Buffer | ArrayBuffer | Buffer[]) => {
         try {
@@ -429,7 +170,6 @@ export class WsAdapter implements ChannelAdapter {
           }
 
           if (msg.type === "ping") {
-            if (!isInternal) this.deviceRegistry.updateLastSeen(deviceId);
             return;
           }
 
@@ -1023,34 +763,11 @@ export class WsAdapter implements ChannelAdapter {
     }
   }
 
-  private async verifyDeviceToken(req: IncomingMessage): Promise<Device | null> {
-    const auth = req.headers.authorization;
-    const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
-    if (!token) return null;
-    return this.deviceRegistry.verifyToken(token);
-  }
-
-  private verifyAdmin(req: IncomingMessage): boolean {
-    const auth = req.headers.authorization;
-    if (!auth) return false;
-    return auth === `Bearer ${this.adminSecret}`;
-  }
-
   private send(ws: WebSocket, msg: ServerMessage): void {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
   }
-}
-
-/** Read the full request body as a string. */
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
-  });
 }
 
 /** Guess MIME type from filename extension. */

@@ -39,19 +39,8 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   };
 }
 
-const mockDeviceRegistry = {
-  verifyPairingCode: vi.fn(),
-  createDevice: vi.fn(),
-  listDevices: vi.fn(),
-  updateDevice: vi.fn(),
-  deactivateDevice: vi.fn(),
-  refreshPairingCode: vi.fn(),
-  verifyToken: vi.fn(),
-  updateLastSeen: vi.fn(),
-} as any;
-
 function makeAdapter(agentRegistry: any, agentManager: any) {
-  return new WsAdapter(3200, mockDeviceRegistry, "test-secret", { agentRegistry, agentManager });
+  return new WsAdapter(3200, { agentRegistry, agentManager });
 }
 
 describe("WsAdapter.buildAgentList()", () => {
@@ -201,8 +190,8 @@ describe("WsAdapter upgrade handler", () => {
     return socket;
   }
 
-  async function startAdapter(deviceRegistry: any) {
-    adapter = new WsAdapter(0, deviceRegistry, "test-secret", {
+  async function startAdapter() {
+    adapter = new WsAdapter(0, {
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
       agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
     });
@@ -217,11 +206,7 @@ describe("WsAdapter upgrade handler", () => {
   }
 
   it("accepts internal=1 from ::ffff:127.0.0.1 and surfaces deviceId/name", async () => {
-    const deviceRegistry = {
-      verifyToken: vi.fn(),
-      updateLastSeen: vi.fn(),
-    } as any;
-    const a = await startAdapter(deviceRegistry);
+    const a = await startAdapter();
 
     // Capture the emitted connection so we can inspect the synthetic Device.
     const wss = (a as any).wss;
@@ -260,11 +245,7 @@ describe("WsAdapter upgrade handler", () => {
   });
 
   it("rejects internal=1 from non-loopback with 403", async () => {
-    const deviceRegistry = {
-      verifyToken: vi.fn(),
-      updateLastSeen: vi.fn(),
-    } as any;
-    const a = await startAdapter(deviceRegistry);
+    const a = await startAdapter();
 
     const upgrade = getUpgradeListener(a);
     const req: any = {
@@ -277,51 +258,21 @@ describe("WsAdapter upgrade handler", () => {
 
     expect(socket.destroyed).toBe(true);
     expect(socket.writtenChunks.join("")).toContain("403 Forbidden");
-    expect(deviceRegistry.verifyToken).not.toHaveBeenCalled();
   });
 
-  it("legacy ?token=<valid> path still works with no internal param", async () => {
-    const deviceRegistry = {
-      verifyToken: vi.fn().mockResolvedValue({
-        _id: "device-1",
-        name: "iPhone",
-        defaultAgentId: "rae",
-      }),
-      updateLastSeen: vi.fn(),
-    } as any;
-    const a = await startAdapter(deviceRegistry);
-
-    const wss = (a as any).wss;
-    const handleUpgradeSpy = vi.spyOn(wss, "handleUpgrade").mockImplementation(((
-      _req: any,
-      _socket: any,
-      _head: any,
-      cb: any,
-    ) => {
-      const fakeWs = new EventEmitter() as any;
-      fakeWs.close = vi.fn();
-      fakeWs.send = vi.fn();
-      cb(fakeWs);
-    }) as any);
-
-    const emittedDevices: any[] = [];
-    wss.on("connection", (_ws: any, _req: any, device: any) => {
-      emittedDevices.push(device);
-    });
+  it("rejects upgrade without ?internal=1 with 404", async () => {
+    const a = await startAdapter();
 
     const upgrade = getUpgradeListener(a);
     const req: any = {
-      url: "/?token=valid-jwt",
+      url: "/?token=anything",
       headers: {},
-      socket: { remoteAddress: "203.0.113.7" },
+      socket: { remoteAddress: "127.0.0.1" },
     };
-    const socket = makeFakeSocket("203.0.113.7");
+    const socket = makeFakeSocket("127.0.0.1");
     await upgrade(req, socket, Buffer.alloc(0));
 
-    expect(deviceRegistry.verifyToken).toHaveBeenCalledWith("valid-jwt");
-    expect(handleUpgradeSpy).toHaveBeenCalledTimes(1);
-    expect(socket.destroyed).toBe(false);
-    expect(emittedDevices).toHaveLength(1);
-    expect(emittedDevices[0]._id).toBe("device-1");
+    expect(socket.destroyed).toBe(true);
+    expect(socket.writtenChunks.join("")).toContain("404 Not Found");
   });
 });
