@@ -48,7 +48,6 @@ All repos under **[dodi-hq](https://github.com/dodi-hq)** use the same plugin-dr
 Message (Slack/SMS/WebSocket/Scheduler)
   → Channel Adapter (slack, sms, ws)
   → Dispatcher (routing, dedup, status interception)
-  → Triage (fast Haiku for simple queries, interactive channels only)
   → Model Router (Haiku/Sonnet classification, respects agent ceiling)
   → Agent Manager (concurrency limits, per-thread serialization)
   → Agent Runner (spawns Claude session + MCP servers)
@@ -62,7 +61,6 @@ Message (Slack/SMS/WebSocket/Scheduler)
 - `src/agents/agent-manager.ts` — concurrency, thread queues, agent state
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB
 - `src/agents/session-store.ts` — manages agent session state in MongoDB
-- `src/agents/triage.ts` — fast Haiku classifier (done/continue)
 - `src/agents/model-router.ts` — complexity classifier for model selection
 - `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue
 - `src/channels/slack-adapter.ts` — Slack events → WorkItems → delivery
@@ -181,6 +179,5 @@ Admin MCP tools or the REST API manage agent CRUD. Plugin seeds (`plugins/<name>
 - `hive.yaml` and `.env` are gitignored — exist separately in dev and deploy dirs
 - Slack file downloads: auth header stripped on redirect — must follow redirects manually
 - Thread deduplication: 60s window prevents double-processing
-- Triage is disabled in threads (no context available for classification)
 - Agent concurrency default: 3 threads. Excess messages deferred and retried on sweep.
 - MongoDB collections: `memory`, `memory_versions`, `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `model_overrides`, `devices`, `agent_callbacks`, `contacts`
