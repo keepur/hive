@@ -203,6 +203,7 @@ server.registerTool(
       autonomy: f.autonomy as Partial<AutonomyFlags> | undefined,
       resourceTiers: f.resourceTiers as AgentDefinition["resourceTiers"],
       betas: f.betas as string[] | undefined,
+      catches: f.catches as string[] | undefined,
       createdAt: now,
       updatedAt: now,
       updatedBy: AGENT_ID,

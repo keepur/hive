@@ -655,6 +655,35 @@ describe("origin routing", () => {
     expect(agentManager.sendMessage).toHaveBeenCalledWith("production-support", item);
   });
 
+  it("team-source WorkItem with meta.origin is routed by team logic, not origin", async () => {
+    // Stub team store: DM channel between user and production-support (not the origin target).
+    // If origin routing were consulted, it would match production-support via the catches list —
+    // so we pick a DIFFERENT agent (jasper) as the DM counterpart to prove origin is ignored.
+    const teamStore = {
+      getChannel: vi.fn().mockResolvedValue({
+        _id: "dm-1",
+        type: "dm",
+        members: ["user-1", "jasper"],
+      }),
+    };
+    dispatcher.setTeamStore(teamStore as any);
+
+    // findByOrigin spy to assert it was NOT consulted
+    const findByOriginSpy = vi.spyOn(registry, "findByOrigin");
+
+    const item = makeWorkItem({
+      source: { kind: "team", id: "dm-1", label: "dm", adapterId: "ws" },
+      sender: "user-1",
+      text: "hello",
+      meta: { channelId: "dm-1", origin: "dodi-shop" },
+    });
+    await dispatcher.dispatch(item);
+
+    expect(teamStore.getChannel).toHaveBeenCalledWith("dm-1");
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+    expect(findByOriginSpy).not.toHaveBeenCalled();
+  });
+
   it("explicit targetAgentId beats origin", async () => {
     const item = makeWorkItem({
       source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
