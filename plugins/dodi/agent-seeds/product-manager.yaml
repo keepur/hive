@@ -5,6 +5,7 @@ icon: ":bulb:"
 channels:
   - product
   - bugs
+homeBase: agent-product-manager
 passiveChannels: []
 keywords: []
 isDefault: false
