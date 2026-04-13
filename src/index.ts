@@ -340,16 +340,14 @@ async function main(): Promise<void> {
     await registerPluginCommands(agentManager.getPlugins(), commandRegistry);
   }
 
-  // WebSocket adapter — mobile app channel
+  // WebSocket adapter — loopback-only, proxied through @keepur/beekeeper.
+  // Beekeeper terminates external auth and forwards frames via
+  // ws://127.0.0.1:<port>/?internal=1&deviceId=...&name=...
   let wsAdapter: import("./channels/ws/ws-adapter.js").WsAdapter | undefined;
-  if (config.ws.enabled && config.ws.jwtSecret) {
-    const { DeviceRegistry } = await import("./channels/ws/device-registry.js");
+  if (config.ws.enabled) {
     const { WsAdapter } = await import("./channels/ws/ws-adapter.js");
 
-    const deviceRegistry = new DeviceRegistry(config.mongo.uri, config.mongo.dbName, config.ws.jwtSecret);
-    await deviceRegistry.connect();
-
-    wsAdapter = new WsAdapter(config.ws.port, deviceRegistry, config.ws.jwtSecret, {
+    wsAdapter = new WsAdapter(config.ws.port, {
       teamStore,
       commandRegistry,
       agentRegistry: registry,
