@@ -11,6 +11,7 @@ export interface AgentConfig {
   name: string;
   model: string;
   channels: string[];
+  homeBase?: string;
   passiveChannels: string[];
   keywords: string[];
   isDefault: boolean;
