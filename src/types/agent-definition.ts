@@ -10,7 +10,6 @@ export interface AgentDefinition {
 
   // LLM
   model: string;
-  triageModel?: string;
   betas?: string[];
 
   // Routing
@@ -100,7 +99,6 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     plugins: doc.plugins,
     maxConcurrent: doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
     timeoutMs: doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
-    triageModel: doc.triageModel,
     betas: doc.betas,
     dodiOpsMode: doc.dodiOpsMode,
     disabled: doc.disabled ?? false,
