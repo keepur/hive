@@ -260,6 +260,74 @@ describe("WsAdapter upgrade handler", () => {
     expect(socket.writtenChunks.join("")).toContain("403 Forbidden");
   });
 
+  it("upgrade with ?origin=dodi-shop surfaces origin on synthetic Device", async () => {
+    const a = await startAdapter();
+
+    const wss = (a as any).wss;
+    vi.spyOn(wss, "handleUpgrade").mockImplementation(((
+      _req: any,
+      _socket: any,
+      _head: any,
+      cb: any,
+    ) => {
+      const fakeWs = new EventEmitter() as any;
+      fakeWs.close = vi.fn();
+      fakeWs.send = vi.fn();
+      cb(fakeWs);
+    }) as any);
+
+    const emittedDevices: any[] = [];
+    wss.on("connection", (_ws: any, _req: any, device: any) => {
+      emittedDevices.push(device);
+    });
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=dev1&name=Shop&origin=dodi-shop",
+      headers: {},
+      socket: { remoteAddress: "::ffff:127.0.0.1" },
+    };
+    const socket = makeFakeSocket("::ffff:127.0.0.1");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(emittedDevices).toHaveLength(1);
+    expect(emittedDevices[0]._id).toBe("dev1");
+    expect(emittedDevices[0].origin).toBe("dodi-shop");
+  });
+
+  it("upgrade without origin leaves device.origin undefined", async () => {
+    const a = await startAdapter();
+
+    const wss = (a as any).wss;
+    vi.spyOn(wss, "handleUpgrade").mockImplementation(((
+      _req: any,
+      _socket: any,
+      _head: any,
+      cb: any,
+    ) => {
+      const fakeWs = new EventEmitter() as any;
+      fakeWs.close = vi.fn();
+      fakeWs.send = vi.fn();
+      cb(fakeWs);
+    }) as any);
+
+    const emittedDevices: any[] = [];
+    wss.on("connection", (_ws: any, _req: any, device: any) => {
+      emittedDevices.push(device);
+    });
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=dev1&name=Shop",
+      headers: {},
+      socket: { remoteAddress: "::ffff:127.0.0.1" },
+    };
+    const socket = makeFakeSocket("::ffff:127.0.0.1");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(emittedDevices[0].origin).toBeUndefined();
+  });
+
   it("rejects upgrade without ?internal=1 with 404", async () => {
     const a = await startAdapter();
 
