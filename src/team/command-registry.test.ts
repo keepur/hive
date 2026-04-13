@@ -56,6 +56,13 @@ describe("CommandRegistry", () => {
     expect(names).not.toContain("new");
   });
 
+  it("has() reports registered commands accurately", () => {
+    expect(registry.has("dm")).toBe(true);
+    expect(registry.has("help")).toBe(true);
+    expect(registry.has("new")).toBe(false);
+    expect(registry.has("nonexistent")).toBe(false);
+  });
+
   it("executes /help and returns command list", async () => {
     const { found, result } = await registry.execute("help", {
       channelId: "test",

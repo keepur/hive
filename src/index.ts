@@ -328,6 +328,8 @@ async function main(): Promise<void> {
 
   // Narrow resolver closure — keeps CommandRegistry decoupled from AgentRegistry.
   // Exact id wins; otherwise case-insensitive display name match.
+  // NOTE: `registry.getAll()` is called inside the closure on every invocation
+  // so hot-reloaded agents (SIGUSR1) become visible immediately. Don't hoist.
   const resolveAgent = (input: string): { id: string; name: string } | null => {
     const all = registry.getAll();
     const byId = all.find((a) => a.id === input);
