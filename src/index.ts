@@ -268,19 +268,33 @@ async function main(): Promise<void> {
   });
   log.info("Slack adapter connected");
 
-  // Set Slack audit channel for app/SMS notifications
-  const auditChannelName = config.slack.auditChannel;
-  if (auditChannelName) {
-    try {
-      const channels = await slack.client.conversations.list({ types: "public_channel", limit: 200 });
-      const auditCh = (channels.channels ?? []).find((c: any) => c.name === auditChannelName);
-      if (auditCh?.id) {
-        dispatcher.setAuditChannel(slackAdapter, auditCh.id);
-        log.info("Audit channel configured", { channel: auditChannelName, id: auditCh.id });
+  // Audit routing: every agent mirrors non-Slack conversations to their own
+  // homeBase channel. The global slack.auditChannel (if set) is the fallback
+  // for agents whose homeBase can't be resolved.
+  try {
+    const channelIdByName = new Map<string, string>();
+    let cursor: string | undefined = undefined;
+    do {
+      const page = await slack.client.conversations.list({
+        types: "public_channel",
+        limit: 1000,
+        cursor,
+      });
+      for (const c of page.channels ?? []) {
+        if (c.name && c.id) channelIdByName.set(c.name, c.id);
       }
-    } catch (err) {
-      log.warn("Failed to configure audit channel", { error: String(err) });
-    }
+      cursor = page.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+    const fallbackName = config.slack.auditChannel;
+    const fallbackId = fallbackName ? channelIdByName.get(fallbackName) : undefined;
+    dispatcher.setAuditChannel(slackAdapter, channelIdByName, fallbackId);
+    log.info("Audit channel configured", {
+      channels: channelIdByName.size,
+      fallback: fallbackName || null,
+      fallbackResolved: Boolean(fallbackId),
+    });
+  } catch (err) {
+    log.warn("Failed to configure audit channel", { error: String(err) });
   }
 
   // SMS adapter — direct path, bypasses Slack

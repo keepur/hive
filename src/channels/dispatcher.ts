@@ -38,7 +38,8 @@ export class Dispatcher {
   private threadAgentLastSeen = new Map<string, number>();
   private recentMessageIds = new Map<string, number>(); // messageTs -> timestamp (dedup)
   private auditAdapter?: ChannelAdapter;
-  private auditChannelId?: string;
+  private auditChannelIds?: Map<string, string>; // slack channel name → id
+  private fallbackAuditChannelId?: string;
   private taskLedger?: TaskLedger;
   private retryQueue?: RetryQueue;
   private teamStore?: import("../team/team-store.js").TeamStore;
@@ -71,9 +72,10 @@ export class Dispatcher {
     this.teamStore = store;
   }
 
-  setAuditChannel(adapter: ChannelAdapter, channelId: string): void {
+  setAuditChannel(adapter: ChannelAdapter, channelIdByName: Map<string, string>, fallbackChannelId?: string): void {
     this.auditAdapter = adapter;
-    this.auditChannelId = channelId;
+    this.auditChannelIds = channelIdByName;
+    this.fallbackAuditChannelId = fallbackChannelId;
   }
 
   async dispatch(item: WorkItem): Promise<void> {
@@ -493,10 +495,23 @@ export class Dispatcher {
   }
 
   private async postAuditLog(result: WorkResult): Promise<void> {
-    if (!this.auditAdapter || !this.auditChannelId) return;
+    if (!this.auditAdapter || !this.auditChannelIds) return;
 
     const agentConfig = this.registry.get(result.agentId);
     const agentName = agentConfig?.name ?? result.agentId;
+    const homeBase = agentConfig?.homeBase;
+    const channelId = (homeBase ? this.auditChannelIds.get(homeBase) : undefined) ?? this.fallbackAuditChannelId;
+    if (!channelId) {
+      log.warn("No audit channel resolved for agent", {
+        agentId: result.agentId,
+        homeBase,
+      });
+      return;
+    }
+    // Skip if the audit would post back into the same channel the message came from.
+    if (result.workItem.source.kind === "slack" && result.workItem.source.id === channelId) {
+      return;
+    }
     const icon =
       result.workItem.source.kind === "sms"
         ? ":phone:"
@@ -511,7 +526,7 @@ export class Dispatcher {
     const auditItem: WorkItem = {
       id: `audit:${result.workItem.id}`,
       text: `${icon} *${agentName}* handled ${result.workItem.source.kind} from ${senderDisplay}:\n> ${summary}\n_($${result.costUsd.toFixed(3)} \u00b7 ${(result.durationMs / 1000).toFixed(1)}s)_`,
-      source: { kind: "internal", id: this.auditChannelId, label: "audit" },
+      source: { kind: "internal", id: channelId, label: "audit" },
       sender: "system",
       timestamp: new Date(),
       // Preserve thread info from original message so audit logs are threaded
