@@ -99,9 +99,7 @@ describe("migration001BackfillHomeBase", () => {
   });
 
   it("preserves existing homeBase — $exists:false filter excludes it", async () => {
-    const coll = makeCollection([
-      { _id: "mokie", channels: ["agent-mokie"], homeBase: "mokie-huang" },
-    ]);
+    const coll = makeCollection([{ _id: "mokie", channels: ["agent-mokie"], homeBase: "mokie-huang" }]);
     const db = makeDb(coll);
 
     await migration001BackfillHomeBase.run(db, log as never);

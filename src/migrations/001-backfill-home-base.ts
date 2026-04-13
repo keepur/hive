@@ -10,8 +10,7 @@ export const migration001BackfillHomeBase = {
     let updated = 0;
     let skipped = 0;
     for await (const doc of cursor) {
-      const homeBase =
-        doc.channels?.find((ch) => ch.startsWith("agent-")) ?? doc.channels?.[0];
+      const homeBase = doc.channels?.find((ch) => ch.startsWith("agent-")) ?? doc.channels?.[0];
       if (!homeBase) {
         log.warn("Cannot backfill homeBase — no channels", { agentId: doc._id });
         skipped++;
