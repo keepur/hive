@@ -28,6 +28,7 @@ import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
 import { AdminApi } from "./admin/admin-api.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
+import { runMigrations } from "./migrations/run-migrations.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
@@ -48,6 +49,9 @@ async function main(): Promise<void> {
   const agentDefsCollection = db.collection("agent_definitions");
   await agentDefsCollection.createIndex({ channels: 1 });
   await agentDefsCollection.createIndex({ disabled: 1 });
+
+  // Run DB migrations (fatal on failure — downstream code depends on migrated shape)
+  await runMigrations(db);
 
   // Forward-declare variables used in reload closure (assigned after reload() definition)
   // eslint-disable-next-line prefer-const
