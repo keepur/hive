@@ -39,8 +39,32 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   };
 }
 
+/**
+ * Minimal noop team deps — the existing upgrade/auth/origin tests don't
+ * exercise team command paths, but WsAdapterDeps now requires them (KPR-11).
+ */
+function noopTeamDeps() {
+  return {
+    teamStore: {
+      getChannel: vi.fn().mockResolvedValue(null),
+      listChannels: vi.fn().mockResolvedValue([]),
+      getHistory: vi.fn().mockResolvedValue({ messages: [], hasMore: false }),
+      saveMessage: vi.fn().mockResolvedValue(undefined),
+      getOrCreateDm: vi.fn(),
+      renameChannel: vi.fn(),
+      joinChannel: vi.fn(),
+      leaveChannel: vi.fn(),
+    } as any,
+    commandRegistry: {
+      has: vi.fn().mockReturnValue(false),
+      list: vi.fn().mockReturnValue([]),
+      execute: vi.fn().mockResolvedValue({ found: false }),
+    } as any,
+  };
+}
+
 function makeAdapter(agentRegistry: any, agentManager: any) {
-  return new WsAdapter(3200, { agentRegistry, agentManager });
+  return new WsAdapter(3200, { ...noopTeamDeps(), agentRegistry, agentManager });
 }
 
 describe("WsAdapter.buildAgentList()", () => {
@@ -192,6 +216,7 @@ describe("WsAdapter upgrade handler", () => {
 
   async function startAdapter() {
     adapter = new WsAdapter(0, {
+      ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
       agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
     });
@@ -320,6 +345,7 @@ describe("WsAdapter upgrade handler", () => {
 
   it("emits WorkItem with meta.origin='dodi-shop' on type:message", async () => {
     adapter = new WsAdapter(0, {
+      ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
       agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
     });
@@ -355,6 +381,7 @@ describe("WsAdapter upgrade handler", () => {
     });
 
     adapter = new WsAdapter(0, {
+      ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
       agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
     });
@@ -402,5 +429,115 @@ describe("WsAdapter upgrade handler", () => {
 
     expect(socket.destroyed).toBe(true);
     expect(socket.writtenChunks.join("")).toContain("404 Not Found");
+  });
+});
+
+describe("WsAdapter.handleCommand (KPR-11)", () => {
+  const fakeDevice = { _id: "dev1", name: "Shopper", defaultAgentId: "" };
+
+  function makeFakeWs() {
+    const sent: any[] = [];
+    return {
+      sent,
+      ws: {
+        readyState: 1, // WebSocket.OPEN
+        send: (data: string) => sent.push(JSON.parse(data)),
+      } as any,
+    };
+  }
+
+  function makeAdapterWithCommandDeps(overrides: {
+    registryHas: (name: string) => boolean;
+    execute?: (name: string, ctx: any) => Promise<{ found: boolean; result?: string }>;
+    saveMessage?: (msg: any) => Promise<void>;
+  }) {
+    const saveMessage = overrides.saveMessage ?? vi.fn().mockResolvedValue(undefined);
+    const execute = overrides.execute ?? vi.fn().mockResolvedValue({ found: true, result: "ok" });
+    const deps = {
+      teamStore: {
+        getChannel: vi.fn().mockResolvedValue(null),
+        listChannels: vi.fn().mockResolvedValue([]),
+        getHistory: vi.fn().mockResolvedValue({ messages: [], hasMore: false }),
+        saveMessage,
+        getOrCreateDm: vi.fn(),
+        renameChannel: vi.fn(),
+        joinChannel: vi.fn(),
+        leaveChannel: vi.fn(),
+      } as any,
+      commandRegistry: {
+        has: vi.fn((name: string) => overrides.registryHas(name)),
+        list: vi.fn().mockReturnValue([]),
+        execute,
+      } as any,
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+    };
+    const adapter = new WsAdapter(0, deps);
+    return { adapter, deps, saveMessage, execute };
+  }
+
+  it("unknown command acks once and returns explicit error without saving", async () => {
+    const { adapter, deps, saveMessage, execute } = makeAdapterWithCommandDeps({
+      registryHas: () => false,
+    });
+    const { ws, sent } = makeFakeWs();
+    const msg = { type: "command" as const, channelId: "c1", name: "nonexistent", args: [], id: "m1" };
+
+    await (adapter as any).handleCommand(ws, msg, fakeDevice, fakeDevice._id);
+
+    // Single ack, single error, nothing else
+    const acks = sent.filter((m) => m.type === "ack");
+    const errors = sent.filter((m) => m.type === "error");
+    expect(acks).toHaveLength(1);
+    expect(acks[0]).toEqual({ type: "ack", id: "m1" });
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toBe("Unknown command: /nonexistent");
+    // No fallthrough to execute or save
+    expect(execute).not.toHaveBeenCalled();
+    expect(saveMessage).not.toHaveBeenCalled();
+    // has() was consulted
+    expect(deps.commandRegistry.has).toHaveBeenCalledWith("nonexistent");
+  });
+
+  it("known command acks once, executes, saves result, and replies", async () => {
+    const { adapter, saveMessage, execute } = makeAdapterWithCommandDeps({
+      registryHas: () => true,
+      execute: vi.fn().mockResolvedValue({ found: true, result: "DM ready: dm:a:b" }),
+    });
+    const { ws, sent } = makeFakeWs();
+    const msg = { type: "command" as const, channelId: "c1", name: "dm", args: ["jessica"], id: "m2" };
+
+    await (adapter as any).handleCommand(ws, msg, fakeDevice, fakeDevice._id);
+
+    expect(sent.filter((m) => m.type === "ack")).toHaveLength(1);
+    expect(execute).toHaveBeenCalledWith("dm", {
+      channelId: "c1",
+      senderId: fakeDevice._id,
+      senderName: fakeDevice.name,
+      args: ["jessica"],
+    });
+    expect(saveMessage).toHaveBeenCalledTimes(1);
+    const replies = sent.filter((m) => m.type === "message");
+    expect(replies).toHaveLength(1);
+    expect(replies[0].text).toBe("DM ready: dm:a:b");
+    expect(replies[0].replyTo).toBe("m2");
+  });
+
+  it("known command with empty result does NOT save a system message", async () => {
+    const { adapter, saveMessage } = makeAdapterWithCommandDeps({
+      registryHas: () => true,
+      execute: vi.fn().mockResolvedValue({ found: true, result: undefined }),
+    });
+    const { ws, sent } = makeFakeWs();
+    const msg = { type: "command" as const, channelId: "c1", name: "help", args: [], id: "m3" };
+
+    await (adapter as any).handleCommand(ws, msg, fakeDevice, fakeDevice._id);
+
+    // Ack + reply go out, but no save-as-system-message
+    expect(sent.filter((m) => m.type === "ack")).toHaveLength(1);
+    expect(saveMessage).not.toHaveBeenCalled();
+    const replies = sent.filter((m) => m.type === "message");
+    expect(replies).toHaveLength(1);
+    expect(replies[0].text).toBe("Done.");
   });
 });

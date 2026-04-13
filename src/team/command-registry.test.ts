@@ -21,6 +21,18 @@ const mockTeamStore = {
   getChannel: mockGetChannel,
 } as any;
 
+// ── AgentResolver stub ──────────────────────────────────────────────
+const KNOWN_AGENTS = [
+  { id: "jessica", name: "Jessica" },
+  { id: "chloe", name: "Chloe" },
+];
+const mockResolver = vi.fn((input: string) => {
+  const byId = KNOWN_AGENTS.find((a) => a.id === input);
+  if (byId) return byId;
+  const byName = KNOWN_AGENTS.find((a) => a.name.toLowerCase() === input.toLowerCase());
+  return byName ?? null;
+});
+
 import { CommandRegistry } from "./command-registry.js";
 
 describe("CommandRegistry", () => {
@@ -28,16 +40,27 @@ describe("CommandRegistry", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    registry = new CommandRegistry(mockTeamStore);
+    registry = new CommandRegistry(mockTeamStore, mockResolver);
   });
 
   it("has core commands registered", () => {
-    const commands = registry.list();
-    const names = commands.map((c) => c.name);
+    const names = registry.list().map((c) => c.name);
     expect(names).toContain("help");
-    expect(names).toContain("new");
+    expect(names).toContain("dm");
     expect(names).toContain("rename");
     expect(names).toContain("members");
+  });
+
+  it("does NOT register legacy /new", () => {
+    const names = registry.list().map((c) => c.name);
+    expect(names).not.toContain("new");
+  });
+
+  it("has() reports registered commands accurately", () => {
+    expect(registry.has("dm")).toBe(true);
+    expect(registry.has("help")).toBe(true);
+    expect(registry.has("new")).toBe(false);
+    expect(registry.has("nonexistent")).toBe(false);
   });
 
   it("executes /help and returns command list", async () => {
@@ -49,7 +72,7 @@ describe("CommandRegistry", () => {
     });
     expect(found).toBe(true);
     expect(result).toContain("/help");
-    expect(result).toContain("/new");
+    expect(result).toContain("/dm");
   });
 
   it("returns found=false for unknown commands", async () => {
@@ -62,8 +85,8 @@ describe("CommandRegistry", () => {
     expect(found).toBe(false);
   });
 
-  it("executes /new and creates DM", async () => {
-    const { found, result } = await registry.execute("new", {
+  it("/dm with valid agent id creates DM", async () => {
+    const { found, result } = await registry.execute("dm", {
       channelId: "test",
       senderId: "user-1",
       senderName: "User",
@@ -74,15 +97,40 @@ describe("CommandRegistry", () => {
     expect(mockGetOrCreateDm).toHaveBeenCalledWith("user-1", "jessica", "User");
   });
 
-  it("/new returns usage when no agent specified", async () => {
-    const { found, result } = await registry.execute("new", {
+  it("/dm with display name (case-insensitive) creates DM", async () => {
+    const { found, result } = await registry.execute("dm", {
+      channelId: "test",
+      senderId: "user-1",
+      senderName: "User",
+      args: ["CHLOE"],
+    });
+    expect(found).toBe(true);
+    expect(result).toContain("DM ready");
+    expect(mockGetOrCreateDm).toHaveBeenCalledWith("user-1", "chloe", "User");
+  });
+
+  it("/dm with unknown agent returns error, no DB write", async () => {
+    const { found, result } = await registry.execute("dm", {
+      channelId: "test",
+      senderId: "user-1",
+      senderName: "User",
+      args: ["not-a-real-agent"],
+    });
+    expect(found).toBe(true);
+    expect(result).toBe("Unknown agent: not-a-real-agent");
+    expect(mockGetOrCreateDm).not.toHaveBeenCalled();
+  });
+
+  it("/dm with no args returns usage", async () => {
+    const { found, result } = await registry.execute("dm", {
       channelId: "test",
       senderId: "user-1",
       senderName: "User",
       args: [],
     });
     expect(found).toBe(true);
-    expect(result).toContain("Usage");
+    expect(result).toContain("Usage: /dm");
+    expect(mockGetOrCreateDm).not.toHaveBeenCalled();
   });
 
   it("executes /rename", async () => {
@@ -114,9 +162,6 @@ describe("CommandRegistry", () => {
       def: { name: "order-status", source: "skill", description: "Check order status" },
       execute: async (ctx) => `Order ${ctx.args[0]} is shipped`,
     });
-
-    const commands = registry.list();
-    expect(commands.find((c) => c.name === "order-status")).toBeDefined();
 
     const { found, result } = await registry.execute("order-status", {
       channelId: "test",

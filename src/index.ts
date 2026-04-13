@@ -318,27 +318,34 @@ async function main(): Promise<void> {
   const { AgentRunner } = await import("./agents/agent-runner.js");
   AgentRunner.registryRef = registry;
 
-  // Team layer — channels, DMs, commands
-  let teamStore: import("./team/team-store.js").TeamStore | undefined;
-  let commandRegistry: import("./team/command-registry.js").CommandRegistry | undefined;
+  // Team layer — channels, DMs, commands. Always on when mongo is available;
+  // no feature gate (KPR-11).
+  const { TeamStore } = await import("./team/team-store.js");
+  const { CommandRegistry } = await import("./team/command-registry.js");
 
-  if (config.team.enabled) {
-    const { TeamStore } = await import("./team/team-store.js");
-    const { CommandRegistry } = await import("./team/command-registry.js");
+  const teamStore = new TeamStore(config.mongo.uri, config.mongo.dbName);
+  await teamStore.connect();
 
-    teamStore = new TeamStore(config.mongo.uri, config.mongo.dbName);
-    await teamStore.connect();
+  // Narrow resolver closure — keeps CommandRegistry decoupled from AgentRegistry.
+  // Exact id wins; otherwise case-insensitive display name match.
+  // NOTE: `registry.getAll()` is called inside the closure on every invocation
+  // so hot-reloaded agents (SIGUSR1) become visible immediately. Don't hoist.
+  const resolveAgent = (input: string): { id: string; name: string } | null => {
+    const all = registry.getAll();
+    const byId = all.find((a) => a.id === input);
+    if (byId) return { id: byId.id, name: byId.name };
+    const lower = input.toLowerCase();
+    const byName = all.find((a) => a.name.toLowerCase() === lower);
+    return byName ? { id: byName.id, name: byName.name } : null;
+  };
 
-    commandRegistry = new CommandRegistry(teamStore);
-    dispatcher.setTeamStore(teamStore);
+  const commandRegistry = new CommandRegistry(teamStore, resolveAgent);
+  dispatcher.setTeamStore(teamStore);
 
-    log.info("Team layer initialized");
-  }
+  log.info("Team layer initialized");
 
-  if (commandRegistry) {
-    const { registerPluginCommands } = await import("./plugins/plugin-loader.js");
-    await registerPluginCommands(agentManager.getPlugins(), commandRegistry);
-  }
+  const { registerPluginCommands } = await import("./plugins/plugin-loader.js");
+  await registerPluginCommands(agentManager.getPlugins(), commandRegistry);
 
   // WebSocket adapter — loopback-only, proxied through @keepur/beekeeper.
   // Beekeeper terminates external auth and forwards frames via
@@ -463,7 +470,7 @@ async function main(): Promise<void> {
     beekeeperRegistration?.stop();
     if (wsAdapter) await wsAdapter.stop();
     voiceAdapter?.stop();
-    if (teamStore) await teamStore.close();
+    await teamStore.close();
     scheduler.stop();
     await bgTaskManager.stop();
     await codeTaskManager.stop();
