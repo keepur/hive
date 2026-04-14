@@ -4,13 +4,10 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
+import { hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
 
-// Load .env file — if HIVE_CONFIG is set (e.g., hive-personal.yaml), load matching .env
-// hive-personal.yaml → .env-personal, hive.yaml → .env
-const hiveConfigFile = process.env.HIVE_CONFIG ?? "";
-const dotenvPath = hiveConfigFile.match(/^hive-(.+)\.yaml$/)
-  ? `.env-${hiveConfigFile.match(/^hive-(.+)\.yaml$/)![1]}`
-  : ".env";
+// Load .env from resolved hive home
+const dotenvPath = resolveDotenvPath(hiveHome);
 dotenv.config({ path: dotenvPath });
 
 function required(key: string): string {
@@ -23,22 +20,22 @@ function optional(key: string, fallback: string): string {
   return process.env[key] || fallback;
 }
 
-/** Auto-discover all plugin dirs under plugins/claude-code/, or use explicit list from hive.yaml */
+/** Auto-discover all plugin dirs under <hiveHome>/plugins/claude-code/, or use explicit list from hive.yaml */
 function discoverPluginDirs(yamlDirs?: string[]): string[] {
   // Explicit list in hive.yaml takes precedence
   if (yamlDirs?.length) {
     return yamlDirs.map((d) => resolve(d.replace(/^~/, process.env.HOME ?? "/tmp")));
   }
-  // Auto-scan plugins/claude-code/*/
-  const parentDir = resolve("plugins/claude-code");
+  // Auto-scan <hiveHome>/plugins/claude-code/*/
+  const parentDir = resolve(hiveHome, "plugins/claude-code");
   if (!existsSync(parentDir)) return [];
   return readdirSync(parentDir)
     .map((name) => resolve(parentDir, name))
     .filter((p) => statSync(p).isDirectory());
 }
 
-// Load hive.yaml instance config
-const hiveConfigPath = resolve(process.env.HIVE_CONFIG ?? "./hive.yaml");
+// Load hive.yaml from resolved hive home
+const hiveConfigPath = resolveConfigFile(hiveHome);
 let hive: Record<string, any> = {};
 if (existsSync(hiveConfigPath)) {
   hive = parseYaml(readFileSync(hiveConfigPath, "utf-8")) ?? {};
