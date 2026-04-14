@@ -13,18 +13,30 @@ interface Prereq {
 const execOpts = { encoding: "utf-8" as const, stdio: "pipe" as const };
 
 function commandExists(cmd: string): boolean {
-  try { execFileSync("which", [cmd], execOpts); return true; } catch { return false; }
+  try {
+    execFileSync("which", [cmd], execOpts);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function brewInstalled(formula: string): boolean {
-  try { execFileSync("brew", ["list", formula], execOpts); return true; } catch { return false; }
+  try {
+    execFileSync("brew", ["list", formula], execOpts);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function brewServiceRunning(name: string): boolean {
   try {
     const output = execFileSync("brew", ["services", "list"], execOpts);
     return output.split("\n").some((l) => l.startsWith(name) && l.includes("started"));
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -39,7 +51,9 @@ async function httpProbe(url: string, timeoutMs = 1500): Promise<boolean> {
     const res = await fetch(url, { signal: ctrl.signal });
     clearTimeout(t);
     return res.ok;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 const prereqs: Prereq[] = [
@@ -47,7 +61,12 @@ const prereqs: Prereq[] = [
     name: "Xcode CLI Tools",
     required: true,
     check: () => {
-      try { execFileSync("xcode-select", ["-p"], execOpts); return true; } catch { return false; }
+      try {
+        execFileSync("xcode-select", ["-p"], execOpts);
+        return true;
+      } catch {
+        return false;
+      }
     },
     install: () => {
       console.log("  Installing Xcode CLI Tools (this opens a system dialog)...");
@@ -63,9 +82,11 @@ const prereqs: Prereq[] = [
     install: () => {
       console.log("  Installing Homebrew...");
       const tmpScript = resolve(tmpdir(), "brew-install.sh");
-      const script = execFileSync("curl", ["-fsSL",
-        "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"],
-        { encoding: "utf-8" });
+      const script = execFileSync(
+        "curl",
+        ["-fsSL", "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"],
+        { encoding: "utf-8" },
+      );
       writeFileSync(tmpScript, script, { mode: 0o755 });
       execFileSync("/bin/bash", [tmpScript], { stdio: "inherit" });
       unlinkSync(tmpScript);
@@ -113,7 +134,9 @@ const prereqs: Prereq[] = [
       try {
         const list = execFileSync("ollama", ["list"], execOpts);
         return list.includes("bge-large") && list.includes("gemma4:e4b");
-      } catch { return false; }
+      } catch {
+        return false;
+      }
     },
     install: () => {
       console.log("  ⚠ Pulling Ollama models — ~10 GB total, several minutes on first run.");
