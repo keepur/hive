@@ -22,8 +22,15 @@ export async function runDoctor(): Promise<void> {
     { name: "Node.js >= 22", required: true, test: () => parseInt(process.versions.node.split(".")[0]) >= 22 },
     { name: "Homebrew", required: true, test: () => commandExists("brew") },
     { name: "MongoDB", required: true, test: () => serviceRunning("mongodb-community") },
-    { name: "Ollama", required: false, test: () => serviceRunning("ollama") },
-    { name: "Qdrant", required: false, test: () => serviceRunning("qdrant") },
+    { name: "Ollama", required: true, test: () => serviceRunning("ollama") },
+    { name: "Ollama models (bge-large, gemma4:e4b)", required: true, test: () => {
+      if (!commandExists("ollama")) return false;
+      try {
+        const list = execFileSync("ollama", ["list"], { encoding: "utf-8" });
+        return list.includes("bge-large") && list.includes("gemma4:e4b");
+      } catch { return false; }
+    }},
+    { name: "Qdrant", required: true, test: () => serviceRunning("qdrant") },
     { name: "gh CLI", required: false, test: () => commandExists("gh") },
     { name: "gog CLI", required: false, test: () => commandExists("gog") },
     { name: "Xcode CLI Tools", required: true, test: () => {

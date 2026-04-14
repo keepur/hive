@@ -82,7 +82,7 @@ const prereqs: Prereq[] = [
   },
   {
     name: "Ollama",
-    required: false,
+    required: true,
     check: () => commandExists("ollama"),
     install: () => {
       console.log("  Installing Ollama...");
@@ -91,25 +91,26 @@ const prereqs: Prereq[] = [
     },
   },
   {
-    name: "Ollama models (bge-large, qwen2.5:3b)",
-    required: false,
+    name: "Ollama models (bge-large, gemma4:e4b)",
+    required: true,
     check: () => {
       if (!commandExists("ollama")) return false;
       try {
         const list = execFileSync("ollama", ["list"], execOpts);
-        return list.includes("bge-large") && list.includes("qwen2.5:3b");
+        return list.includes("bge-large") && list.includes("gemma4:e4b");
       } catch { return false; }
     },
     install: () => {
-      console.log("  Pulling bge-large...");
+      console.log("  ⚠ Pulling Ollama models — ~10 GB total, several minutes on first run.");
+      console.log("  Pulling bge-large (~670 MB)...");
       execFileSync("ollama", ["pull", "bge-large"], { stdio: "inherit" });
-      console.log("  Pulling qwen2.5:3b...");
-      execFileSync("ollama", ["pull", "qwen2.5:3b"], { stdio: "inherit" });
+      console.log("  Pulling gemma4:e4b (~9.6 GB)...");
+      execFileSync("ollama", ["pull", "gemma4:e4b"], { stdio: "inherit" });
     },
   },
   {
     name: "Qdrant",
-    required: false,
+    required: true,
     check: () => brewServiceRunning("qdrant"),
     install: () => {
       if (!brewInstalled("qdrant")) {
