@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 interface Prereq {
   name: string;
   required: boolean;
-  check: () => boolean;
+  check: () => boolean | Promise<boolean>;
   install: () => void;
 }
 
@@ -24,6 +24,21 @@ function brewServiceRunning(name: string): boolean {
   try {
     const output = execFileSync("brew", ["services", "list"], execOpts);
     return output.split("\n").some((l) => l.startsWith(name) && l.includes("started"));
+  } catch { return false; }
+}
+
+/**
+ * Probe an HTTP endpoint with a short timeout. Authoritative liveness check
+ * for daemons that may run via brew services, bare process, or any other
+ * mechanism — port-bound is port-bound.
+ */
+async function httpProbe(url: string, timeoutMs = 1500): Promise<boolean> {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t);
+    return res.ok;
   } catch { return false; }
 }
 
@@ -83,7 +98,7 @@ const prereqs: Prereq[] = [
   {
     name: "Ollama",
     required: true,
-    check: () => commandExists("ollama"),
+    check: () => httpProbe("http://127.0.0.1:11434/api/tags"),
     install: () => {
       console.log("  Installing Ollama...");
       execFileSync("brew", ["install", "ollama"], { stdio: "inherit" });
@@ -111,7 +126,7 @@ const prereqs: Prereq[] = [
   {
     name: "Qdrant",
     required: true,
-    check: () => brewServiceRunning("qdrant"),
+    check: () => httpProbe("http://127.0.0.1:6333/"),
     install: () => {
       if (!brewInstalled("qdrant")) {
         console.log("  Installing Qdrant...");
@@ -137,14 +152,14 @@ export async function installPrereqs(): Promise<void> {
   let failures = 0;
   for (const prereq of prereqs) {
     const label = prereq.required ? "" : " (optional)";
-    if (prereq.check()) {
+    if (await prereq.check()) {
       console.log(`  ✓ ${prereq.name}${label}`);
       continue;
     }
     console.log(`  ✗ ${prereq.name}${label} — installing...`);
     try {
       prereq.install();
-      if (prereq.check()) {
+      if (await prereq.check()) {
         console.log(`  ✓ ${prereq.name} — installed`);
       } else if (prereq.required) {
         console.error(`  ✗ ${prereq.name} — install failed`);
