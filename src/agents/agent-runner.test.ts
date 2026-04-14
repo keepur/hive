@@ -4,8 +4,13 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 
 // ── node:fs mock ─────────────────────────────────────────────────────
-const mockExistsSync = vi.fn().mockReturnValue(true);
-const mockStatSync = vi.fn().mockReturnValue({ isDirectory: () => true });
+// vi.hoisted() runs before vi.mock factory, avoiding the TDZ error that
+// occurs when paths.ts (imported transitively) calls existsSync at module
+// load time before plain const-declared mocks are initialized.
+const { mockExistsSync, mockStatSync } = vi.hoisted(() => ({
+  mockExistsSync: vi.fn().mockReturnValue(true),
+  mockStatSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
+}));
 vi.mock("node:fs", () => ({
   existsSync: (...args: any[]) => mockExistsSync(...args),
   statSync: (...args: any[]) => mockStatSync(...args),
@@ -388,8 +393,10 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    // Should still be core memory server, not the plugin one
-    expect(servers.memory.args[0]).toContain("dist/memory/memory-mcp-server.js");
+    // Should still be core memory server, not the plugin one.
+    // Path differs by mode: dev (dist/memory/memory-mcp-server.js) vs npm bundle (mcp/memory.min.js).
+    expect(servers.memory.args[0]).toMatch(/memory[/-](?:memory-mcp-server\.js|min\.js)$|mcp\/memory\.min\.js$/);
+    expect(servers.memory.args[0]).not.toContain("/plugins/");
   });
 
   it("uses per-agent task ledger key when available", async () => {

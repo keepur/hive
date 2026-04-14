@@ -12,14 +12,17 @@
 
 import { createInterface } from "node:readline";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
 
-const ROOT = resolve(import.meta.dirname, "..");
-const ENV_PATH = join(ROOT, ".env");
-const HIVE_YAML_PATH = join(ROOT, "hive.yaml");
+// Resolved per-invocation inside runWizard(). The module-level defaults
+// would be wrong in npm-bundled mode (where `../..` from this file is not
+// the repo root), so start empty and assert they are set before use.
+const DEV_ROOT = resolve(import.meta.dirname, "../..");
+let ENV_PATH = "";
+let HIVE_YAML_PATH = "";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -136,17 +139,34 @@ function isSlackDone(env: Record<string, string>): boolean {
   return !!(env.SLACK_APP_TOKEN && env.SLACK_BOT_TOKEN);
 }
 
-function isAgentDone(): boolean {
-  return existsSync(join(ROOT, "agents", "chief-of-staff", "agent.yaml"));
+async function isAgentDone(): Promise<boolean> {
+  try {
+    const client = new MongoClient(process.env.MONGODB_URI ?? "mongodb://localhost:27017");
+    await client.connect();
+    const db = client.db(process.env.MONGODB_DB ?? "hive");
+    const agent = await db.collection("agent_definitions").findOne({ _id: "chief-of-staff" as any });
+    await client.close();
+    return !!agent;
+  } catch {
+    return false;
+  }
 }
 
-function isBuildDone(): boolean {
-  return existsSync(join(ROOT, "dist", "index.js"));
+function isBuildDone(targetDir: string): boolean {
+  if (existsSync(resolve(import.meta.dirname, "..", "pkg", "server.min.js"))) return true;
+  return existsSync(resolve(targetDir, "dist", "index.js"));
 }
 
 // ── Main ───────────────────────────────────────────────────────────
 
-async function main() {
+export async function runWizard(
+  targetDir: string = DEV_ROOT,
+  templatesDir: string = resolve(DEV_ROOT, "setup", "templates"),
+): Promise<void> {
+  // Update module-level paths for the target directory
+  ENV_PATH = join(targetDir, ".env");
+  HIVE_YAML_PATH = join(targetDir, "hive.yaml");
+
   banner();
 
   const env = loadEnv();
@@ -156,8 +176,8 @@ async function main() {
   const completedSections: string[] = [];
   if (isBusinessDone(hive)) completedSections.push("Business info");
   if (isSlackDone(env)) completedSections.push("Slack");
-  if (isAgentDone()) completedSections.push("Agent setup");
-  if (isBuildDone()) completedSections.push("Build");
+  if (await isAgentDone()) completedSections.push("Agent setup");
+  if (isBuildDone(targetDir)) completedSections.push("Build");
 
   if (completedSections.length > 0) {
     console.log("Resuming setup. Already completed:");
@@ -264,13 +284,13 @@ async function main() {
     // Check if gog is installed
     let gogInstalled = false;
     try {
-      execSync("which gog", { stdio: "pipe" });
+      execFileSync("which", ["gog"], { stdio: "pipe" });
       gogInstalled = true;
       console.log("  ✓ gog CLI found");
     } catch {
       console.log("  gog CLI not found. Installing via Homebrew...");
       try {
-        execSync("brew install gog", { stdio: "inherit" });
+        execFileSync("brew", ["install", "gog"], { stdio: "inherit" });
         gogInstalled = true;
         console.log("  ✓ gog CLI installed");
       } catch {
@@ -281,7 +301,7 @@ async function main() {
     if (gogInstalled) {
       // Check existing accounts
       try {
-        const authList = execSync("gog auth list 2>&1", { encoding: "utf-8" }).trim();
+        const authList = execFileSync("gog", ["auth", "list"], { encoding: "utf-8", stdio: "pipe" }).trim();
         if (authList && !authList.includes("no accounts")) {
           console.log("\n  Authenticated accounts:");
           console.log(`  ${authList.replace(/\n/g, "\n  ")}`);
@@ -297,7 +317,7 @@ async function main() {
           console.log(`\n  Opening browser for ${email}...`);
           console.log("  Complete the OAuth flow in your browser, then come back here.\n");
           try {
-            execSync(`gog auth add "${email}"`, { stdio: "inherit" });
+            execFileSync("gog", ["auth", "add", email], { stdio: "inherit" });
             console.log(`  ✓ ${email} authenticated`);
           } catch {
             console.log(`  ⚠ Authentication failed for ${email}. You can retry later: gog auth add ${email}`);
@@ -312,10 +332,11 @@ async function main() {
       // Verify it works
       if (env.GOOGLE_ACCOUNT) {
         try {
-          execSync(`gog gmail search "is:unread" -a "${env.GOOGLE_ACCOUNT}" --json --results-only --no-input 2>&1`, {
-            encoding: "utf-8",
-            timeout: 15_000,
-          });
+          execFileSync(
+            "gog",
+            ["gmail", "search", "is:unread", "-a", env.GOOGLE_ACCOUNT, "--json", "--results-only", "--no-input"],
+            { encoding: "utf-8", timeout: 15_000 },
+          );
           console.log(`  ✓ Gmail access verified for ${env.GOOGLE_ACCOUNT}`);
         } catch {
           console.log(`  ⚠ Could not verify Gmail access — check authentication later`);
@@ -347,7 +368,7 @@ async function main() {
   // ── 4.5 Plugins ─────────────────────────────────────────────────
   section("Plugins");
 
-  const pluginsDir = join(ROOT, "plugins");
+  const pluginsDir = join(targetDir, "plugins");
   if (existsSync(pluginsDir)) {
     const available = readdirSync(pluginsDir).filter((d) => {
       return existsSync(join(pluginsDir, d, "plugin.yaml"));
@@ -383,7 +404,7 @@ async function main() {
   saveHiveYaml(hive);
 
   // ── 5. Agent Setup ────────────────────────────────────────────────
-  if (isAgentDone()) {
+  if (await isAgentDone()) {
     console.log("\nChief of Staff agent: ✓ already set up");
     const redo = await confirm("Regenerate agent from template?", false);
     if (redo) {
@@ -400,12 +421,12 @@ async function main() {
 
   // ── 7. Seed Memory to MongoDB ─────────────────────────────────────
   section("Memory (MongoDB)");
-  await doMemory(hive);
+  await doMemory(hive, templatesDir);
 
   // ── 8. Build ──────────────────────────────────────────────────────
   section("Build");
 
-  if (isBuildDone()) {
+  if (isBuildDone(targetDir)) {
     console.log("Build output exists.");
     const rebuild = await confirm("Rebuild?", true);
     if (!rebuild) {
@@ -433,7 +454,7 @@ async function main() {
     }
   } else {
     console.log("Hive runs from a separate deploy directory (not this dev repo).");
-    console.log(`  Dev:    ${ROOT}`);
+    console.log(`  Dev:    ${DEV_ROOT}`);
     console.log(`  Deploy: ${deployDir}`);
     console.log("");
     const setupDeploy = await confirm("Set up the deploy directory now?", true);
@@ -449,7 +470,11 @@ async function main() {
   if (installService) {
     try {
       // Generate plists pointing to the deploy directory
-      execSync(`HIVE_DEPLOY_DIR="${deployDir}" bash service/install.sh`, { cwd: ROOT, stdio: "inherit" });
+      execFileSync("bash", ["service/install.sh"], {
+        cwd: DEV_ROOT,
+        stdio: "inherit",
+        env: { ...process.env, HIVE_DEPLOY_DIR: deployDir },
+      });
     } catch {
       console.log("  ⚠ Service installation failed — you can start manually:");
       console.log(`     cd ${deployDir} && npm start`);
@@ -466,8 +491,8 @@ async function main() {
   console.log(`  Deploy dir: ${deployDir}`);
   console.log(`  Start:      cd ${deployDir} && npm start`);
   console.log(`  Logs:       tail -f ${deployDir}/logs/hive.log`);
-  console.log(`  Dev mode:   npm run dev  (from ${ROOT})`);
-  console.log(`  Redeploy:   bash ${ROOT}/service/deploy.sh`);
+  console.log(`  Dev mode:   npm run dev  (from ${DEV_ROOT})`);
+  console.log(`  Redeploy:   bash ${DEV_ROOT}/service/deploy.sh`);
   console.log("");
   console.log("Your chief-of-staff agent is stored in the agent_definitions collection.");
   console.log("Additional agents can be created through the chief of staff.");
@@ -513,7 +538,7 @@ async function doSlack(env: Record<string, string>) {
   console.log("4. Choose YAML format and paste this manifest:");
   console.log("");
   console.log("─── Copy everything below this line ───");
-  console.log(readFileSync(join(ROOT, "setup", "slack-manifest.yaml"), "utf-8"));
+  console.log(readFileSync(join(DEV_ROOT, "setup", "slack-manifest.yaml"), "utf-8"));
   console.log("─── Copy everything above this line ───");
   console.log("");
   console.log('5. Click "Create"');
@@ -543,8 +568,9 @@ async function doSlack(env: Record<string, string>) {
   // Validate
   if (env.SLACK_APP_TOKEN && env.SLACK_BOT_TOKEN) {
     try {
-      const result = execSync(
-        `curl -s -H "Authorization: Bearer ${env.SLACK_BOT_TOKEN}" https://slack.com/api/auth.test`,
+      const result = execFileSync(
+        "curl",
+        ["-s", "-H", `Authorization: Bearer ${env.SLACK_BOT_TOKEN}`, "https://slack.com/api/auth.test"],
         { encoding: "utf-8" },
       );
       const json = JSON.parse(result);
@@ -586,7 +612,7 @@ async function doAgent(hive: Record<string, any>) {
 
   // Seed chief-of-staff into agent_definitions via setup:seeds
   console.log("  Seeding agent definition...");
-  execSync("npx tsx setup/setup-seeds.ts", { cwd: ROOT, stdio: "inherit" });
+  execFileSync("npx", ["tsx", "setup/setup-seeds.ts"], { cwd: DEV_ROOT, stdio: "inherit" });
 
   console.log(`  ✓ ${agentName} (Chief of Staff) is ready`);
 }
@@ -644,7 +670,7 @@ async function doConstitution(hive: Record<string, any>) {
   console.log("\n  ✓ Constitution preferences saved (hive.yaml)");
 }
 
-async function doMemory(hive: Record<string, any>) {
+async function doMemory(hive: Record<string, any>, templatesDir: string) {
   const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
   const mongoDb = process.env.MONGODB_DB || "hive";
 
@@ -684,9 +710,13 @@ async function doMemory(hive: Record<string, any>) {
     console.log("  ✓ shared/business-context.md");
 
     // Constitution
-    const constitutionTplPath = join(ROOT, "setup", "templates", "constitution.md.tpl");
+    const constitutionTplPath = join(templatesDir, "constitution.md.tpl");
     if (existsSync(constitutionTplPath)) {
-      const { render: renderTemplate } = await import("./template-renderer.ts");
+      // Dynamic import — template-renderer lives outside src/ rootDir
+      const rendererPath = join(DEV_ROOT, "setup", "template-renderer.ts");
+      const { render: renderTemplate } = (await import(rendererPath)) as {
+        render: (tpl: string, ctx: Record<string, any>) => string;
+      };
       const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
 
       const team: Record<string, string> = {};
@@ -716,7 +746,7 @@ async function doMemory(hive: Record<string, any>) {
 async function doBuild() {
   console.log("  Compiling TypeScript...");
   try {
-    execSync("npm run build", { cwd: ROOT, stdio: "pipe" });
+    execFileSync("npm", ["run", "build"], { cwd: DEV_ROOT, stdio: "pipe" });
     console.log("  ✓ Build complete");
   } catch (err) {
     console.log("  ⚠ Build failed:");
@@ -733,14 +763,14 @@ async function doDeploy(deployDir: string) {
     const parentDir = resolve(deployDir, "..");
     mkdir(parentDir, { recursive: true });
 
-    const remoteUrl = execSync("git remote get-url origin", { cwd: ROOT, encoding: "utf-8" }).trim();
-    execSync(`git clone "${remoteUrl}" "${deployDir}"`, { stdio: "inherit" });
+    const remoteUrl = execFileSync("git", ["remote", "get-url", "origin"], { cwd: DEV_ROOT, encoding: "utf-8" }).trim();
+    execFileSync("git", ["clone", remoteUrl, deployDir], { stdio: "inherit" });
     console.log("  ✓ Repository cloned");
   } else {
     // Pull latest
     console.log("  Pulling latest...");
     try {
-      execSync("git pull --ff-only", { cwd: deployDir, stdio: "inherit" });
+      execFileSync("git", ["pull", "--ff-only"], { cwd: deployDir, stdio: "inherit" });
     } catch {
       console.log("  ⚠ git pull failed — continuing with existing code");
     }
@@ -748,14 +778,14 @@ async function doDeploy(deployDir: string) {
 
   // Install production dependencies
   console.log("  Installing production dependencies...");
-  execSync("npm install --omit=dev", { cwd: deployDir, stdio: "pipe" });
+  execFileSync("npm", ["install", "--omit=dev"], { cwd: deployDir, stdio: "pipe" });
   console.log("  ✓ Dependencies installed");
 
   // Copy instance-specific files (not in git)
   console.log("  Syncing config and build output...");
 
   // .env
-  const envSrc = join(ROOT, ".env");
+  const envSrc = join(DEV_ROOT, ".env");
   if (existsSync(envSrc)) {
     const { copyFileSync } = await import("node:fs");
     copyFileSync(envSrc, join(deployDir, ".env"));
@@ -763,7 +793,7 @@ async function doDeploy(deployDir: string) {
   }
 
   // hive.yaml
-  const hiveSrc = join(ROOT, "hive.yaml");
+  const hiveSrc = join(DEV_ROOT, "hive.yaml");
   if (existsSync(hiveSrc)) {
     const { copyFileSync } = await import("node:fs");
     copyFileSync(hiveSrc, join(deployDir, "hive.yaml"));
@@ -771,9 +801,9 @@ async function doDeploy(deployDir: string) {
   }
 
   // dist/ (build output)
-  const distSrc = join(ROOT, "dist");
+  const distSrc = join(DEV_ROOT, "dist");
   if (existsSync(distSrc)) {
-    execSync(`rsync -a --delete "${distSrc}/" "${join(deployDir, "dist")}/"`, { stdio: "pipe" });
+    execFileSync("rsync", ["-a", "--delete", `${distSrc}/`, `${join(deployDir, "dist")}/`], { stdio: "pipe" });
     console.log("  ✓ dist/");
   }
 
@@ -783,8 +813,12 @@ async function doDeploy(deployDir: string) {
   console.log(`\n  ✓ Deploy directory ready: ${deployDir}`);
 }
 
-main().catch((err) => {
-  console.error("Setup failed:", err);
-  rl.close();
-  process.exit(1);
-});
+// Backward compat — run directly if executed as main
+const isMain = import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  runWizard().catch((err) => {
+    console.error("Setup failed:", err);
+    rl.close();
+    process.exit(1);
+  });
+}

@@ -1,14 +1,24 @@
 {
-  "name": "hive",
+  "name": "@keepur/hive",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "bin": {
+    "hive": "pkg/cli.min.js"
+  },
+  "files": [
+    "pkg/",
+    "seeds/",
+    "templates/"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "build": "tsc && tsc -p tsconfig.plugins.json",
     "build:plugins": "tsc -p tsconfig.plugins.json",
     "start": "node dist/index.js",
     "dev": "npx tsx src/index.ts",
-    "setup": "npx tsx setup/setup-wizard.ts",
+    "setup": "npx tsx src/setup/wizard.ts",
     "setup:instance": "npx tsx setup/setup-instance.ts",
     "setup:prereqs": "bash setup/install-prereqs.sh",
     "setup:constitution": "npx tsx setup/setup-constitution.ts",
@@ -28,7 +38,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test"
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test",
+    "bundle": "npm run build && npx tsx build/bundle.ts",
+    "prepublishOnly": "npm run bundle"
   },
   "lint-staged": {
     "*.ts": [
@@ -39,10 +51,6 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.63",
     "@anthropic-ai/sdk": "^0.82.0",
-    "@dodi-hq/fsm-persistence": "^0.1.1",
-    "@dodi-hq/task-core": "^0.1.1",
-    "@dodi-hq/workflow-core": "^0.1.1",
-    "@keepur/beekeeper": "git+https://github.com/keepur/beekeeper.git",
     "@linear/sdk": "^76.0.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@qdrant/js-client-rest": "^1.17.0",
@@ -64,6 +72,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.0",
     "eslint": "^9.0.0",
     "eslint-config-prettier": "^10.0.0",
     "husky": "^9.0.0",
