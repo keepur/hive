@@ -17,9 +17,12 @@ import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
 
-const ROOT = resolve(import.meta.dirname, "../..");
-let ENV_PATH = join(ROOT, ".env");
-let HIVE_YAML_PATH = join(ROOT, "hive.yaml");
+// Resolved per-invocation inside runWizard(). The module-level defaults
+// would be wrong in npm-bundled mode (where `../..` from this file is not
+// the repo root), so start empty and assert they are set before use.
+const DEV_ROOT = resolve(import.meta.dirname, "../..");
+let ENV_PATH = "";
+let HIVE_YAML_PATH = "";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -157,8 +160,8 @@ function isBuildDone(targetDir: string): boolean {
 // ── Main ───────────────────────────────────────────────────────────
 
 export async function runWizard(
-  targetDir: string = ROOT,
-  templatesDir: string = resolve(ROOT, "setup", "templates"),
+  targetDir: string = DEV_ROOT,
+  templatesDir: string = resolve(DEV_ROOT, "setup", "templates"),
 ): Promise<void> {
   // Update module-level paths for the target directory
   ENV_PATH = join(targetDir, ".env");
@@ -451,7 +454,7 @@ export async function runWizard(
     }
   } else {
     console.log("Hive runs from a separate deploy directory (not this dev repo).");
-    console.log(`  Dev:    ${ROOT}`);
+    console.log(`  Dev:    ${DEV_ROOT}`);
     console.log(`  Deploy: ${deployDir}`);
     console.log("");
     const setupDeploy = await confirm("Set up the deploy directory now?", true);
@@ -468,7 +471,7 @@ export async function runWizard(
     try {
       // Generate plists pointing to the deploy directory
       execFileSync("bash", ["service/install.sh"], {
-        cwd: ROOT,
+        cwd: DEV_ROOT,
         stdio: "inherit",
         env: { ...process.env, HIVE_DEPLOY_DIR: deployDir },
       });
@@ -488,8 +491,8 @@ export async function runWizard(
   console.log(`  Deploy dir: ${deployDir}`);
   console.log(`  Start:      cd ${deployDir} && npm start`);
   console.log(`  Logs:       tail -f ${deployDir}/logs/hive.log`);
-  console.log(`  Dev mode:   npm run dev  (from ${ROOT})`);
-  console.log(`  Redeploy:   bash ${ROOT}/service/deploy.sh`);
+  console.log(`  Dev mode:   npm run dev  (from ${DEV_ROOT})`);
+  console.log(`  Redeploy:   bash ${DEV_ROOT}/service/deploy.sh`);
   console.log("");
   console.log("Your chief-of-staff agent is stored in the agent_definitions collection.");
   console.log("Additional agents can be created through the chief of staff.");
@@ -535,7 +538,7 @@ async function doSlack(env: Record<string, string>) {
   console.log("4. Choose YAML format and paste this manifest:");
   console.log("");
   console.log("─── Copy everything below this line ───");
-  console.log(readFileSync(join(ROOT, "setup", "slack-manifest.yaml"), "utf-8"));
+  console.log(readFileSync(join(DEV_ROOT, "setup", "slack-manifest.yaml"), "utf-8"));
   console.log("─── Copy everything above this line ───");
   console.log("");
   console.log('5. Click "Create"');
@@ -609,7 +612,7 @@ async function doAgent(hive: Record<string, any>) {
 
   // Seed chief-of-staff into agent_definitions via setup:seeds
   console.log("  Seeding agent definition...");
-  execFileSync("npx", ["tsx", "setup/setup-seeds.ts"], { cwd: ROOT, stdio: "inherit" });
+  execFileSync("npx", ["tsx", "setup/setup-seeds.ts"], { cwd: DEV_ROOT, stdio: "inherit" });
 
   console.log(`  ✓ ${agentName} (Chief of Staff) is ready`);
 }
@@ -710,7 +713,7 @@ async function doMemory(hive: Record<string, any>, templatesDir: string) {
     const constitutionTplPath = join(templatesDir, "constitution.md.tpl");
     if (existsSync(constitutionTplPath)) {
       // Dynamic import — template-renderer lives outside src/ rootDir
-      const rendererPath = join(ROOT, "setup", "template-renderer.ts");
+      const rendererPath = join(DEV_ROOT, "setup", "template-renderer.ts");
       const { render: renderTemplate } = (await import(rendererPath)) as {
         render: (tpl: string, ctx: Record<string, any>) => string;
       };
@@ -743,7 +746,7 @@ async function doMemory(hive: Record<string, any>, templatesDir: string) {
 async function doBuild() {
   console.log("  Compiling TypeScript...");
   try {
-    execFileSync("npm", ["run", "build"], { cwd: ROOT, stdio: "pipe" });
+    execFileSync("npm", ["run", "build"], { cwd: DEV_ROOT, stdio: "pipe" });
     console.log("  ✓ Build complete");
   } catch (err) {
     console.log("  ⚠ Build failed:");
@@ -760,7 +763,7 @@ async function doDeploy(deployDir: string) {
     const parentDir = resolve(deployDir, "..");
     mkdir(parentDir, { recursive: true });
 
-    const remoteUrl = execFileSync("git", ["remote", "get-url", "origin"], { cwd: ROOT, encoding: "utf-8" }).trim();
+    const remoteUrl = execFileSync("git", ["remote", "get-url", "origin"], { cwd: DEV_ROOT, encoding: "utf-8" }).trim();
     execFileSync("git", ["clone", remoteUrl, deployDir], { stdio: "inherit" });
     console.log("  ✓ Repository cloned");
   } else {
@@ -782,7 +785,7 @@ async function doDeploy(deployDir: string) {
   console.log("  Syncing config and build output...");
 
   // .env
-  const envSrc = join(ROOT, ".env");
+  const envSrc = join(DEV_ROOT, ".env");
   if (existsSync(envSrc)) {
     const { copyFileSync } = await import("node:fs");
     copyFileSync(envSrc, join(deployDir, ".env"));
@@ -790,7 +793,7 @@ async function doDeploy(deployDir: string) {
   }
 
   // hive.yaml
-  const hiveSrc = join(ROOT, "hive.yaml");
+  const hiveSrc = join(DEV_ROOT, "hive.yaml");
   if (existsSync(hiveSrc)) {
     const { copyFileSync } = await import("node:fs");
     copyFileSync(hiveSrc, join(deployDir, "hive.yaml"));
@@ -798,7 +801,7 @@ async function doDeploy(deployDir: string) {
   }
 
   // dist/ (build output)
-  const distSrc = join(ROOT, "dist");
+  const distSrc = join(DEV_ROOT, "dist");
   if (existsSync(distSrc)) {
     execFileSync("rsync", ["-a", "--delete", `${distSrc}/`, `${join(deployDir, "dist")}/`], { stdio: "pipe" });
     console.log("  ✓ dist/");
