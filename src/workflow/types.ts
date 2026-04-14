@@ -1,4 +1,4 @@
-import type { IWorkflowTask, IWorkflowPlan, TaskAssignee } from "@dodi-hq/task-core";
+import type { IWorkflowTask, IWorkflowPlan, TaskAssignee } from "./task-core.js";
 
 // Re-export shared types
 export type { IWorkflowTask, IWorkflowPlan, TaskAssignee };

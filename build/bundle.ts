@@ -33,11 +33,6 @@ const external = [
   "pdf-parse",
   "mammoth",
   "xlsx",
-  // Dodi internal packages
-  "@dodi-hq/task-core",
-  "@dodi-hq/workflow-core",
-  "@dodi-hq/fsm-persistence",
-  "@dodi/workflow-core",
   // Third-party MCP servers (resolved via createRequire at runtime)
   "brave-search-mcp",
 ];

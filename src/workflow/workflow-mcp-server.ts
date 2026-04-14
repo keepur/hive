@@ -23,8 +23,8 @@ import {
   resolveDependencies,
   detectCycle,
   computeInitialState,
-} from "@dodi-hq/task-core";
-import type { IWorkflowTask, IWorkflowPlan } from "@dodi-hq/task-core";
+} from "./task-core.js";
+import type { IWorkflowTask, IWorkflowPlan } from "./task-core.js";
 import { MongoDBAdapter } from "./mongodb-adapter.js";
 import { WorkflowEventEmitter } from "./event-emitter.js";
 import { computePlanStatus } from "./types.js";
