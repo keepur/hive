@@ -703,6 +703,50 @@ describe("AgentManager", () => {
     });
   });
 
+  describe("prompt prefix (KPR-23)", () => {
+    // NOTE: ws-adapter emits `source.label: "team:<channel>"` (and `"app:<device>"`
+    // for the app path). That prefix is pre-existing and appears verbatim in the
+    // prompt — slack-adapter emits a bare channel name, so the display shapes
+    // differ across channels. Not KPR-23's job to normalize that.
+    it("includes user:<id> in prompt prefix when meta.user is set", async () => {
+      const item: WorkItem = {
+        id: "m1",
+        text: "hey",
+        source: { kind: "team", id: "c1", label: "team:general", adapterId: "ws" } as any,
+        sender: "dev1",
+        senderName: "Shop",
+        threadId: "team:c1",
+        timestamp: new Date(),
+        meta: { deviceId: "dev1", channelId: "c1", user: "may-keepur" },
+      };
+
+      await manager.sendMessage("agent-a", item);
+
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
+      expect(capturedPrompt).toBe("[user:may-keepur via Shop in #team:general]: hey");
+    });
+
+    it("omits user: segment when meta.user is absent", async () => {
+      const item: WorkItem = {
+        id: "m2",
+        text: "hey",
+        source: { kind: "team", id: "c1", label: "team:general", adapterId: "ws" } as any,
+        sender: "dev1",
+        senderName: "Shop",
+        threadId: "team:c1",
+        timestamp: new Date(),
+        meta: { deviceId: "dev1", channelId: "c1" },
+      };
+
+      await manager.sendMessage("agent-a", item);
+
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
+      expect(capturedPrompt).toBe("[Shop in #team:general]: hey");
+    });
+  });
+
   describe("model router resource limits", () => {
     beforeEach(() => {
       (appConfig as any).modelRouter.enabled = true;
