@@ -3,6 +3,7 @@ import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { createLogger } from "../logging/logger.js";
 import type { LoadedPlugin, PluginManifest } from "./types.js";
+import { HIVE_PLUGIN_API_VERSION } from "./api-version.js";
 
 const log = createLogger("plugin-loader");
 
@@ -20,6 +21,18 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
 
     const raw = parseYaml(readFileSync(manifestPath, "utf-8"));
     const manifest = normalizeManifest(raw);
+
+    if (manifest.hiveApi) {
+      const compatible = isHiveApiCompatible(manifest.hiveApi, HIVE_PLUGIN_API_VERSION);
+      if (!compatible) {
+        log.warn("Plugin declares incompatible hiveApi range, skipping", {
+          plugin: name,
+          requires: manifest.hiveApi,
+          running: HIVE_PLUGIN_API_VERSION,
+        });
+        continue;
+      }
+    }
 
     for (const [serverName, serverDef] of Object.entries(manifest.mcpServers)) {
       const entryPath = join(pluginDir, serverDef.entry);
@@ -50,10 +63,31 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
   return plugins;
 }
 
+/**
+ * Minimal semver range check. Supports caret ranges ("^1.0.0") and exact
+ * versions ("1.0.0"). Anything else is treated as accept-any with a warn.
+ */
+function isHiveApiCompatible(range: string, version: string): boolean {
+  const trimmed = range.trim();
+  if (trimmed === version) return true;
+  if (trimmed.startsWith("^")) {
+    const want = trimmed.slice(1).split(".").map(Number);
+    const have = version.split(".").map(Number);
+    if (want.length < 1 || have.length < 1) return false;
+    if (want[0] !== have[0]) return false;
+    if ((have[1] ?? 0) < (want[1] ?? 0)) return false;
+    if ((have[1] ?? 0) === (want[1] ?? 0) && (have[2] ?? 0) < (want[2] ?? 0)) return false;
+    return true;
+  }
+  log.warn("Unrecognized hiveApi range syntax, accepting", { range });
+  return true;
+}
+
 export function normalizeManifest(raw: any): PluginManifest {
   return {
     name: raw.name ?? "",
     description: raw.description ?? "",
+    hiveApi: raw.hiveApi ?? raw["hive-api"] ?? undefined,
     mcpServers: Object.fromEntries(
       Object.entries(raw["mcp-servers"] ?? {}).map(([k, v]: [string, any]) => [
         k,
