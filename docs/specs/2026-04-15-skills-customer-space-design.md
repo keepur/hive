@@ -181,13 +181,14 @@ agents: [chief-of-staff]
 workflow: morning-briefing          # runtime grouping; used by the installer's projection rule
 origin:
   type: registry                    # or: agent-authored
-  source: github.com/keepur/hive-skills
+  source: https://github.com/keepur/hive-skills
   base-version: 9c4f2a8b             # git commit SHA at install or last-accepted-upgrade
   base-tag: skills-v1.0              # optional: git tag pointing at base-version, if any
+  base-content-hash: a3f2c9d4e8b15726f04c8d3a19e72b68d5410c7f3e9b4a6d2c8f7e501b9a3d6c    # SHA-256 per registry spec §8.3, used for modification detection
   installed-at: 2026-04-15T09:14:22Z
   modified: false                    # flips to true as soon as the customer edits the file
 author:
-  agent-id: chief-of-staff          # only for agent-authored skills
+  agent-id: chief-of-staff          # (agent-authored example — origin.type would be 'agent-authored' in this case; the author block is only present for agent-authored skills)
   authored-at: 2026-04-15T14:22:11Z
   reason: "weekly sales recap pattern for Acme"  # optional, one line
 ---
@@ -247,7 +248,7 @@ The `state` branch gives us version control and an audit trail for customer-owne
 
 - It is an audit-only artifact. Nothing depends on it being pushed anywhere, nothing reads it remotely, nothing uses it for deploy synchronization. If it is lost (disk failure, accidental `rm -rf .git`), the skills themselves are still present in the working tree and the hive continues to function; only the audit history is gone.
 - It is not cryptographically signed or verified. If a malicious actor has write access to the filesystem, they can rewrite the branch history. This is audit, not security.
-- It must never cover engine-owned paths. The `state` branch commits only touch files inside allowlisted customer-writable paths (§7.4). A commit that somehow picked up a change under `dist/` would be a bug in the write guard — the boot-time integrity check in §7.3 catches this independently as a package drift.
+- It must never cover engine-owned paths. The `state` branch commits only touch files inside allowlisted customer-writable paths (§7.3). A commit that somehow picked up a change under `dist/` would be a bug in the write guard — the boot-time integrity check in §7.3 catches this independently as a package drift.
 
 The design lesson from KPR-29: **do not conflate per-instance audit state with shared deploy orchestration.** The current `deploy` branch on hive is serving as both ("auto-commit on deploy" plus "what instances pull"), and the mingling is the root cause of the incident. The `state` branch is strictly per-instance and strictly local.
 
@@ -414,7 +415,7 @@ The short architectural summary, carried into this spec so the ownership model i
 
 ### 11.2 Mongo-native skills (not planned)
 
-The `2026-04-14-skills-system-design.md` §9 deferred question about migrating agent-authored skills to Mongo is not revisited by this spec. Filesystem remains the authoritative storage for all customer-space skills, consistent with the §4.4 write-tool-based authorship model. The §9 deferral condition ("if filesystem storage turns out to have lifecycle problems") has not been triggered — the problems we observed were ownership partition problems, not storage substrate problems, and the partition plus the instance-local audit branch in §7.2 address them fully.
+The `2026-04-14-skills-system-design.md` §9 deferred question about migrating agent-authored skills to Mongo is not revisited by this spec. Filesystem remains the authoritative storage for all customer-space skills, consistent with the §5.3 write-tool-based authorship model. The §9 deferral condition ("if filesystem storage turns out to have lifecycle problems") has not been triggered — the problems we observed were ownership partition problems, not storage substrate problems, and the partition plus the instance-local audit branch in §7.2 address them fully.
 
 If at some future point we need cross-instance query capabilities over skills (for fleet-wide curation, analytics, or promotion pattern detection across all customer hives), the right mechanism is a separate metadata index in Mongo — pointing at filesystem content rather than replacing it — not a migration of the content itself. That is a follow-on concern for the registry spec and beyond, not part of this spec.
 
@@ -428,7 +429,7 @@ If at some future point we need cross-instance query capabilities over skills (f
 
 - **§5.2 (origin categories):** amend to remove category 1 ("Shipped with Hive core"). The remaining three categories are re-numbered and their definitions are cross-referenced to §5 of this spec: "See `2026-04-15-skills-customer-space-design.md` §5 for the current ownership model."
 - **§6 (What Changes in Code):** §6.1 "Plugin-bundled skills" is unchanged — this spec preserves the plugin-bundled loader scan. §6.2 "Hot reload on SIGUSR1" is unchanged and continues to apply to both plugin and customer-space skills. Add a new subsection §6.3 "Customer-space skills" that describes the write guard (§6.3 of this spec), the customer-space scan path (§6.4 of this spec), and the removal of the old `<repo>/skills/` scan (§6.5 of this spec).
-- **§7 (CLI Surface):** move from "Reserved, Not Built" to "Specified in the follow-on registry spec." `hive skill add/list/upgrade/remove` are now load-bearing and are part of the registry spec's scope. Update the section framing but leave the CLI shape itself for the registry spec to finalize.
+- **§7 (CLI Surface):** no direct amendment from this spec. The registry spec `2026-04-15-skills-registry-design.md` §14.1 specifies the §7 amendment — moving it from 'Reserved, Not Built' to 'Specified in the registry spec,' with the full CLI surface for `hive skill add/list/upgrade/remove` defined there. This spec establishes *that* the CLI is load-bearing (§11.1); the registry spec establishes *what* the CLI looks like.
 - **§8 (Agent-Authored Skill Promotion):** the per-hive promotion model (beekeeper reads, flips `agents:` frontmatter, SIGUSR1 reload) is preserved as-is. Cross-instance promotion to the default Keepur registry is deferred to the registry spec. Add a cross-reference noting that this spec moves agent-authored skills into `<instance-dir>/skills/` (customer space) rather than `<repo>/skills/` (package space).
 - **§9 (Open Questions Deferred):** the "Mongo storage for agent-authored skills" item is still deferred; this spec documents that the deferral condition has not been triggered. Add a cross-reference.
 
