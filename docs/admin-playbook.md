@@ -313,3 +313,28 @@ Template changes require `npm run setup:agents` + SIGUSR1. MongoDB changes requi
 | `memory` | Agent memory records (includes shared/constitution.md) |
 | `memory_versions` | Memory version history |
 | `agent_sessions` | Active agent session state |
+
+---
+
+## Deploy Upgrades with Migration Steps
+
+Some releases require a one-shot migration or env-var change before restart. Run these from `~/services/hive` (the deploy clone) **before** `launchctl kickstart`.
+
+### Issue #135 — core decontamination (2026-04-15)
+
+Two manual steps required before restart:
+
+1. **Set `RESEND_DEFAULT_BCC` in `.env`.** The old `HUBSPOT_BCC_OUTGOING` env var is no longer read (removing it was necessary because the name itself contaminated the customer bundle). Copy the existing value:
+   ```bash
+   grep HUBSPOT_BCC_OUTGOING .env  # note the current value
+   echo "RESEND_DEFAULT_BCC=<value>" >> .env
+   ```
+   Without this, all outbound agent email silently stops being BCC'd.
+
+2. **Migrate legacy `dodiOpsMode` on existing agent documents.** The field moved from a typed top-level field into `metadata.dodiOpsMode`. Existing Mongo docs still have the old shape; without migration, `production-support` silently loses its readonly mode on dodi-ops.
+   ```bash
+   node scripts/migrate-agent-metadata.mjs
+   ```
+   Idempotent. Safe to re-run. Reports what it touched.
+
+Then restart the service as usual (`launchctl kickstart -k "gui/$(id -u)/com.hive.agent"`).
