@@ -101,13 +101,13 @@ describe("toAgentConfig", () => {
 
   it("preserves optional fields when present", () => {
     const def = makeDefinition({
-      dodiOpsMode: "readonly",
+      metadata: { dodiOpsMode: "readonly" },
       slackBot: "jasper",
       plugins: ["dodi-dev"],
       subscribe: ["deals", "jobs"],
     });
     const config = toAgentConfig(def, {});
-    expect(config.dodiOpsMode).toBe("readonly");
+    expect((config.metadata as { dodiOpsMode: string }).dodiOpsMode).toBe("readonly");
     expect(config.slackBot).toBe("jasper");
     expect(config.plugins).toEqual(["dodi-dev"]);
     expect(config.subscribe).toEqual(["deals", "jobs"]);

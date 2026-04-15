@@ -101,7 +101,7 @@ async function main() {
   }
 
   // Prompt for instance ID
-  const defaultId = currentId ?? "dodi";
+  const defaultId = currentId ?? "hive";
   const idInput = await rl.question(`Instance ID (lowercase, no spaces) [${defaultId}]: `);
   const instanceId = idInput.trim() || defaultId;
 

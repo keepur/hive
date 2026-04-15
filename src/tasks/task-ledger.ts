@@ -6,7 +6,7 @@ const log = createLogger("task-ledger");
 
 /**
  * Auto-tracks invisible agent work (scheduled jobs, background tasks, meetings, email)
- * as tasks in the dodi_v2 task ledger. Fire-and-forget — never blocks the message pipeline.
+ * as tasks in the configured task ledger backend. Fire-and-forget — never blocks the message pipeline.
  */
 export class TaskLedger {
   private threadTaskMap = new Map<string, string>(); // threadId → taskId

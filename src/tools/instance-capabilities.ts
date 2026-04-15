@@ -7,6 +7,7 @@
  */
 
 import { config } from "../config.js";
+import type { LoadedPlugin } from "../plugins/types.js";
 import { SERVER_CATALOG } from "./server-catalog.js";
 
 export interface InstanceCapabilities {
@@ -15,7 +16,6 @@ export interface InstanceCapabilities {
     configured: string[];
     unconfigured: string[];
   };
-  integrations: Record<string, { configured: boolean; detail?: string }>;
 }
 
 /**
@@ -34,16 +34,10 @@ const SERVER_CREDENTIAL_CHECKS: Record<string, () => boolean> = {
   "github-issues": () => !!config.github?.repo,
   quo: () => !!config.quo?.apiKey,
   recall: () => !!config.recall?.apiKey,
-  "hubspot-crm": () => !!config.hubspot?.apiKey,
-  permits: () => (config.permits?.mongoUri ?? "") !== "mongodb://localhost:27017/permits",
   "code-task": () => true,
   "code-search": () => !!config.codeIndex?.enabled,
   browser: () => !!config.browser?.cdpEndpoint,
-  catalog: () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
-  "dodi-ops": () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
   tasks: () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
-  "product-search": () => !!config.hubspot?.apiKey,
-  "ops-search": () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
 };
 
 /** Infrastructure servers — always available, don't need credential checks */
@@ -65,7 +59,7 @@ const INFRASTRUCTURE_SERVERS = new Set([
  * Result is JSON-serialized and passed to admin MCP server via env var.
  * Config is immutable at runtime, so the result is stable across calls.
  */
-export function buildInstanceCapabilities(): InstanceCapabilities {
+export function buildInstanceCapabilities(plugins: LoadedPlugin[] = []): InstanceCapabilities {
   const configured: string[] = [];
   const unconfigured: string[] = [];
 
@@ -82,32 +76,21 @@ export function buildInstanceCapabilities(): InstanceCapabilities {
     }
   }
 
-  // Build human-readable integration summary
-  const googleAccounts = config.google?.accounts ?? {};
-  const integrations: Record<string, { configured: boolean; detail?: string }> = {
-    google: {
-      configured: Object.keys(googleAccounts).length > 0 || !!config.google?.account,
-      detail: Object.keys(googleAccounts).length > 0 ? `${Object.keys(googleAccounts).length} account(s)` : undefined,
-    },
-    slack: { configured: true },
-    email: { configured: !!config.resend?.apiKey },
-    sms: { configured: !!config.quo?.apiKey },
-    crm: { configured: !!config.hubspot?.apiKey },
-    "issue-tracking": {
-      configured: !!config.linear?.apiKey || !!config.github?.repo,
-      detail:
-        [config.linear?.apiKey ? "Linear" : "", config.github?.repo ? "GitHub Issues" : ""]
-          .filter(Boolean)
-          .join(", ") || undefined,
-    },
-    "web-search": { configured: !!config.brave?.apiKey },
-    browser: { configured: !!config.browser?.cdpEndpoint },
-    "video-meetings": { configured: !!config.recall?.apiKey },
-  };
+  // Plugin servers — generic check: configured iff every declared env var is non-empty
+  for (const plugin of plugins) {
+    for (const [serverName, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
+      const requiredEnv = serverDef.env ?? [];
+      const hasAll = requiredEnv.length === 0 || requiredEnv.every((envVar) => !!process.env[envVar]);
+      if (hasAll) {
+        configured.push(serverName);
+      } else {
+        unconfigured.push(serverName);
+      }
+    }
+  }
 
   return {
     instanceId: config.instance?.id ?? "unknown",
     servers: { configured, unconfigured },
-    integrations,
   };
 }

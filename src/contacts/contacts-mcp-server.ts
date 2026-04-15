@@ -32,7 +32,7 @@ interface ContactDoc {
   role?: string;
   tags: string[];
   notes?: string;
-  source: string; // hubspot, quo, google, manual
+  source: string; // e.g. crm, sms, email, manual
   sourceId?: string;
   createdAt: Date;
   updatedAt: Date;
@@ -297,7 +297,7 @@ server.registerTool(
     description: "List contacts, optionally filtered by tag or source.",
     inputSchema: {
       tag: z.string().optional().describe("Filter by tag (e.g. homeowner, contractor)"),
-      source: z.string().optional().describe("Filter by source (hubspot, quo, google, manual)"),
+      source: z.string().optional().describe("Filter by source system (e.g. crm, sms, email, manual)"),
       limit: z.number().optional().default(25).describe("Max results (default 25)"),
     },
   },

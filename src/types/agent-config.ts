@@ -27,7 +27,7 @@ export interface AgentConfig {
   maxConcurrent?: number; // Max concurrent threads. Default 3
   timeoutMs?: number; // Response timeout in ms. Default 300000 (5 min)
   betas?: string[]; // SDK beta features. Note: "context-1m-2025-08-07" retires 2026-04-30
-  dodiOpsMode?: "full" | "readonly"; // Dodi Ops access level. Default: "full"
+  metadata?: Record<string, unknown>; // plugin-managed bag — read via agent-env dotted paths
   disabled?: boolean; // Agent is offline — won't receive messages or run schedules
   subscribe?: string[]; // Event bus domain subscriptions (e.g., ["deals", "jobs"])
   resourceTiers?: ResourceTierOverrides;

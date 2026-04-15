@@ -19,13 +19,15 @@ import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 
 const log = createLogger("agent-runner");
 
-/** Cached instance capabilities — lazily computed, config doesn't change at runtime */
-let _cachedCapabilities: string | undefined;
-function getCachedCapabilities(): string {
-  if (!_cachedCapabilities) {
-    _cachedCapabilities = JSON.stringify(buildInstanceCapabilities());
-  }
-  return _cachedCapabilities;
+/**
+ * Build instance capabilities JSON for injection into the admin MCP server.
+ * Computed per-runner rather than cached: the build is cheap (a single pass
+ * over static catalog keys plus the runner's plugin list), and caching off
+ * the first caller's plugins would produce stale results if different
+ * runners saw different plugin sets — a latent test isolation hazard.
+ */
+function buildCapabilitiesJson(plugins: LoadedPlugin[]): string {
+  return JSON.stringify(buildInstanceCapabilities(plugins));
 }
 
 export type StreamCallback = (chunk: string) => void;
@@ -422,7 +424,7 @@ export class AgentRunner {
           RESEND_API_KEY: config.resend.apiKey,
           RESEND_FROM_ADDRESS: agentFromAddress,
           RESEND_DEFAULT_CC: config.resend.defaultCc,
-          HUBSPOT_BCC: config.resend.hubspotBcc,
+          RESEND_DEFAULT_BCC: config.resend.defaultBcc,
         },
       };
     }
@@ -635,8 +637,8 @@ export class AgentRunner {
           if (env[sourceVar]) env[targetVar] = env[sourceVar];
         }
 
-        for (const [envVar, fieldName] of Object.entries(serverDef.agentEnv ?? {})) {
-          env[envVar] = String((this.agentConfig as any)[fieldName] ?? "");
+        for (const [envVar, fieldPath] of Object.entries(serverDef.agentEnv ?? {})) {
+          env[envVar] = AgentRunner.resolveAgentEnvPath(this.agentConfig, fieldPath);
         }
 
         servers[name] = {
@@ -715,7 +717,7 @@ export class AgentRunner {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
         AGENT_ID: this.agentConfig.id,
-        INSTANCE_CAPABILITIES: getCachedCapabilities(),
+        INSTANCE_CAPABILITIES: buildCapabilitiesJson(this.plugins),
       },
     };
 
@@ -772,6 +774,26 @@ export class AgentRunner {
     }
 
     return servers;
+  }
+
+  /**
+   * Resolve an agent-env path against the agent config. Supports dotted paths
+   * for nested objects (e.g. "metadata.dodiOpsMode"). Walks left-to-right; any
+   * missing intermediate key yields "". No fallback to top-level fields — a
+   * misconfigured key surfaces as an empty value, which the plugin must
+   * handle defensively (per spec §5.3 resolver semantics).
+   *
+   * Flat (non-dotted) keys still resolve against top-level fields, preserving
+   * backward compatibility with manifests that have not migrated.
+   */
+  private static resolveAgentEnvPath(config: AgentConfig, path: string): string {
+    const parts = path.split(".");
+    let current: unknown = config;
+    for (const part of parts) {
+      if (current == null || typeof current !== "object") return "";
+      current = (current as Record<string, unknown>)[part];
+    }
+    return current == null ? "" : String(current);
   }
 
   // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory

@@ -146,14 +146,11 @@ export const config = {
     apiKey: optional("RESEND_API_KEY", ""),
     fromAddress: optional("RESEND_FROM_ADDRESS", ""),
     defaultCc: optional("RESEND_DEFAULT_CC", ""),
-    hubspotBcc: optional("HUBSPOT_BCC_OUTGOING", ""),
+    defaultBcc: optional("RESEND_DEFAULT_BCC", ""),
     emailDomain: optional("RESEND_EMAIL_DOMAIN", hive.resend?.emailDomain ?? ""),
     businessName: optional("RESEND_BUSINESS_NAME", hive.resend?.businessName ?? ""),
   },
   plugins: (hive.plugins ?? []) as string[],
-  hubspot: {
-    apiKey: optional("HUBSPOT_API_KEY", ""),
-  },
   gemini: {
     apiKey: optional("GEMINI_API_KEY", ""),
     visionModel: optional("GEMINI_VISION_MODEL", "gemini-2.5-flash"),

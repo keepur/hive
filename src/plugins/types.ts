@@ -13,6 +13,8 @@ export interface PluginMcpServer {
 export interface PluginManifest {
   name: string;
   description?: string;
+  /** Semver range the plugin requires. Optional during transition; missing == accept-any. */
+  hiveApi?: string;
   mcpServers: Record<string, PluginMcpServer>;
   agentSeeds: string[];
   /** Optional: path to a JS module that exports registerCommands(registry) for Team slash commands */
