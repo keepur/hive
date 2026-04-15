@@ -230,7 +230,7 @@ describe("WsAdapter upgrade handler", () => {
     return listeners[listeners.length - 1];
   }
 
-  it("accepts internal=1 from ::ffff:127.0.0.1 and surfaces deviceId/name", async () => {
+  it("accepts internal=1 from ::ffff:127.0.0.1 and surfaces deviceId/label", async () => {
     const a = await startAdapter();
 
     // Capture the emitted connection so we can inspect the synthetic Device.
@@ -254,7 +254,7 @@ describe("WsAdapter upgrade handler", () => {
 
     const upgrade = getUpgradeListener(a);
     const req: any = {
-      url: "/?internal=1&deviceId=bk-abc&name=beekeeper",
+      url: "/?internal=1&deviceId=bk-abc&label=beekeeper",
       headers: {},
       socket: { remoteAddress: "::ffff:127.0.0.1" },
     };
@@ -265,8 +265,84 @@ describe("WsAdapter upgrade handler", () => {
     expect(socket.destroyed).toBe(false);
     expect(emittedDevices).toHaveLength(1);
     expect(emittedDevices[0]._id).toBe("bk-abc");
-    expect(emittedDevices[0].name).toBe("beekeeper");
+    expect(emittedDevices[0].label).toBe("beekeeper");
+    expect(emittedDevices[0].user).toBeUndefined();
     expect(emittedDevices[0].defaultAgentId).toBe("");
+  });
+
+  it("accepts transitional ?name= fallback when ?label= is absent", async () => {
+    const a = await startAdapter();
+
+    const wss = (a as any).wss;
+    vi.spyOn(wss, "handleUpgrade").mockImplementation(((_req: any, _socket: any, _head: any, cb: any) => {
+      const fakeWs = new EventEmitter() as any;
+      fakeWs.close = vi.fn();
+      fakeWs.send = vi.fn();
+      cb(fakeWs);
+    }) as any);
+
+    const emittedDevices: any[] = [];
+    wss.on("connection", (_ws: any, _req: any, device: any) => {
+      emittedDevices.push(device);
+    });
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=bk-abc&name=beekeeper",
+      headers: {},
+      socket: { remoteAddress: "::ffff:127.0.0.1" },
+    };
+    const socket = makeFakeSocket("::ffff:127.0.0.1");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(socket.destroyed).toBe(false);
+    expect(emittedDevices).toHaveLength(1);
+    expect(emittedDevices[0].label).toBe("beekeeper");
+  });
+
+  it("surfaces server-asserted ?user= on the synthetic Device", async () => {
+    const a = await startAdapter();
+
+    const wss = (a as any).wss;
+    vi.spyOn(wss, "handleUpgrade").mockImplementation(((_req: any, _socket: any, _head: any, cb: any) => {
+      const fakeWs = new EventEmitter() as any;
+      fakeWs.close = vi.fn();
+      fakeWs.send = vi.fn();
+      cb(fakeWs);
+    }) as any);
+
+    const emittedDevices: any[] = [];
+    wss.on("connection", (_ws: any, _req: any, device: any) => {
+      emittedDevices.push(device);
+    });
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=dev1&label=Shop&user=may-keepur",
+      headers: {},
+      socket: { remoteAddress: "::ffff:127.0.0.1" },
+    };
+    const socket = makeFakeSocket("::ffff:127.0.0.1");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(emittedDevices).toHaveLength(1);
+    expect(emittedDevices[0].user).toBe("may-keepur");
+  });
+
+  it("rejects upgrade with deviceId but no label or name with 400", async () => {
+    const a = await startAdapter();
+
+    const upgrade = getUpgradeListener(a);
+    const req: any = {
+      url: "/?internal=1&deviceId=bk-abc",
+      headers: {},
+      socket: { remoteAddress: "127.0.0.1" },
+    };
+    const socket = makeFakeSocket("127.0.0.1");
+    await upgrade(req, socket, Buffer.alloc(0));
+
+    expect(socket.destroyed).toBe(true);
+    expect(socket.writtenChunks.join("")).toContain("400 Bad Request");
   });
 
   it("rejects internal=1 from non-loopback with 403", async () => {
@@ -274,7 +350,7 @@ describe("WsAdapter upgrade handler", () => {
 
     const upgrade = getUpgradeListener(a);
     const req: any = {
-      url: "/?internal=1&deviceId=bk-abc&name=beekeeper",
+      url: "/?internal=1&deviceId=bk-abc&label=beekeeper",
       headers: {},
       socket: { remoteAddress: "203.0.113.7" },
     };
@@ -303,7 +379,7 @@ describe("WsAdapter upgrade handler", () => {
 
     const upgrade = getUpgradeListener(a);
     const req: any = {
-      url: "/?internal=1&deviceId=dev1&name=Shop&origin=dodi-shop",
+      url: "/?internal=1&deviceId=dev1&label=Shop&origin=dodi-shop",
       headers: {},
       socket: { remoteAddress: "::ffff:127.0.0.1" },
     };
@@ -333,7 +409,7 @@ describe("WsAdapter upgrade handler", () => {
 
     const upgrade = getUpgradeListener(a);
     const req: any = {
-      url: "/?internal=1&deviceId=dev1&name=Shop",
+      url: "/?internal=1&deviceId=dev1&label=Shop",
       headers: {},
       socket: { remoteAddress: "::ffff:127.0.0.1" },
     };
@@ -356,7 +432,7 @@ describe("WsAdapter upgrade handler", () => {
     const fakeWs = new EventEmitter() as any;
     fakeWs.close = vi.fn();
     fakeWs.send = vi.fn();
-    const device = { _id: "dev1", name: "Shop", defaultAgentId: "", origin: "dodi-shop" };
+    const device = { _id: "dev1", label: "Shop", defaultAgentId: "", origin: "dodi-shop" };
     wss.emit("connection", fakeWs, {} as any, device);
 
     fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
@@ -392,7 +468,7 @@ describe("WsAdapter upgrade handler", () => {
     const fakeWs = new EventEmitter() as any;
     fakeWs.close = vi.fn();
     fakeWs.send = vi.fn();
-    const device = { _id: "dev1", name: "Shop", defaultAgentId: "", origin: "dodi-shop" };
+    const device = { _id: "dev1", label: "Shop", defaultAgentId: "", origin: "dodi-shop" };
     wss.emit("connection", fakeWs, {} as any, device);
 
     fakeWs.emit(
@@ -432,8 +508,128 @@ describe("WsAdapter upgrade handler", () => {
   });
 });
 
+describe("WsAdapter team meta.user propagation (KPR-23)", () => {
+  let adapter: WsAdapter | undefined;
+
+  afterEach(async () => {
+    if (adapter) {
+      await adapter.stop();
+      adapter = undefined;
+    }
+  });
+
+  it("puts device.user on WorkItem.meta.user for team messages", async () => {
+    const teamDeps = noopTeamDeps();
+    (teamDeps.teamStore.getChannel as any).mockResolvedValue({
+      _id: "c1",
+      type: "channel",
+      name: "general",
+      members: ["dev1"],
+    });
+
+    adapter = new WsAdapter(0, {
+      ...teamDeps,
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+    });
+
+    const captured: any[] = [];
+    await adapter.start((item) => captured.push(item));
+
+    const device = { _id: "dev1", label: "Shop", user: "may-keepur", defaultAgentId: "", origin: undefined };
+    const wss = (adapter as any).wss;
+    const fakeWs = new EventEmitter() as any;
+    fakeWs.close = vi.fn();
+    fakeWs.send = vi.fn();
+    wss.emit("connection", fakeWs, {} as any, device);
+
+    fakeWs.emit(
+      "message",
+      Buffer.from(JSON.stringify({ type: "message", id: "m1", channelId: "c1", text: "hi team" })),
+    );
+    await new Promise((r) => setImmediate(r));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].meta?.user).toBe("may-keepur");
+    expect(captured[0].meta?.channelId).toBe("c1");
+  });
+
+  it("omits meta.user when device.user is undefined (transitional beekeeper)", async () => {
+    const teamDeps = noopTeamDeps();
+    (teamDeps.teamStore.getChannel as any).mockResolvedValue({
+      _id: "c1",
+      type: "channel",
+      name: "general",
+      members: ["dev1"],
+    });
+
+    adapter = new WsAdapter(0, {
+      ...teamDeps,
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+    });
+
+    const captured: any[] = [];
+    await adapter.start((item) => captured.push(item));
+
+    const device = { _id: "dev1", label: "Shop", user: undefined, defaultAgentId: "", origin: undefined };
+    const wss = (adapter as any).wss;
+    const fakeWs = new EventEmitter() as any;
+    fakeWs.close = vi.fn();
+    fakeWs.send = vi.fn();
+    wss.emit("connection", fakeWs, {} as any, device);
+
+    fakeWs.emit(
+      "message",
+      Buffer.from(JSON.stringify({ type: "message", id: "m1", channelId: "c1", text: "hi team" })),
+    );
+    await new Promise((r) => setImmediate(r));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].meta?.user).toBeUndefined();
+  });
+
+  it("ignores client-supplied `user` inside forwarded frames", async () => {
+    const teamDeps = noopTeamDeps();
+    (teamDeps.teamStore.getChannel as any).mockResolvedValue({
+      _id: "c1",
+      type: "channel",
+      name: "general",
+      members: ["dev1"],
+    });
+
+    adapter = new WsAdapter(0, {
+      ...teamDeps,
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+    });
+
+    const captured: any[] = [];
+    await adapter.start((item) => captured.push(item));
+
+    const device = { _id: "dev1", label: "Shop", user: "may-keepur", defaultAgentId: "", origin: undefined };
+    const wss = (adapter as any).wss;
+    const fakeWs = new EventEmitter() as any;
+    fakeWs.close = vi.fn();
+    fakeWs.send = vi.fn();
+    wss.emit("connection", fakeWs, {} as any, device);
+
+    // Frame carries a rogue `user` field — must be dropped.
+    fakeWs.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({ type: "message", id: "m1", channelId: "c1", text: "hi", user: "attacker" }),
+      ),
+    );
+    await new Promise((r) => setImmediate(r));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].meta?.user).toBe("may-keepur");
+  });
+});
+
 describe("WsAdapter.handleCommand (KPR-11)", () => {
-  const fakeDevice = { _id: "dev1", name: "Shopper", defaultAgentId: "" };
+  const fakeDevice = { _id: "dev1", label: "Shopper", defaultAgentId: "" };
 
   function makeFakeWs() {
     const sent: any[] = [];
@@ -513,7 +709,7 @@ describe("WsAdapter.handleCommand (KPR-11)", () => {
     expect(execute).toHaveBeenCalledWith("dm", {
       channelId: "c1",
       senderId: fakeDevice._id,
-      senderName: fakeDevice.name,
+      senderName: fakeDevice.label,
       args: ["jessica"],
     });
     expect(saveMessage).toHaveBeenCalledTimes(1);
