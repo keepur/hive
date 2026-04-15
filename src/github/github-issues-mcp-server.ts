@@ -5,7 +5,7 @@
  * Gives agents the ability to list/create/update/search/close issues and manage labels.
  *
  * Env vars:
- *   GITHUB_REPO  — owner/repo (required, e.g. "dodihome/hive")
+ *   GITHUB_REPO  — owner/repo (required, e.g. "owner/repo")
  *   GH_TOKEN     — GitHub personal access token (optional if gh CLI is already authed)
  */
 

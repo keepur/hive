@@ -274,15 +274,15 @@ export class Sweeper {
       components: results.map((r) => `${r.component}:${r.pruned}p/${r.retried}r`).join(" "),
     });
 
-    // Report to dodi_v2
+    // Report to task ledger backend
     if (this.taskClient?.isConfigured && !isQuiet) {
-      await this.reportToDodi(durationMs, totalPruned, totalRetried, totalBytesFreed, totalErrors);
+      await this.reportToTaskLedger(durationMs, totalPruned, totalRetried, totalBytesFreed, totalErrors);
     }
 
     return results;
   }
 
-  private async reportToDodi(
+  private async reportToTaskLedger(
     durationMs: number,
     totalPruned: number,
     totalRetried: number,
@@ -318,7 +318,7 @@ export class Sweeper {
         await this.taskClient!.updateTask(this.taskId, { state: "NEEDS_ATTENTION" });
       }
     } catch (err) {
-      log.warn("Failed to report to dodi_v2", { error: String(err) });
+      log.warn("Failed to report to task ledger", { error: String(err) });
     }
   }
 
