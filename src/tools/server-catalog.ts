@@ -12,15 +12,6 @@ export interface ServerCatalogEntry {
  * Plugin servers define their own metadata in plugin.yaml manifests.
  */
 export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
-  "hubspot-crm": {
-    description: "Search and manage CRM — deals, contacts, companies, notes, tasks, activities",
-    usage: "Reading/writing individual CRM records by ID or specific criteria",
-    notFor: "Broad topic searches across deals — use crm-search instead",
-  },
-  "dodi-ops": {
-    description: "Production operations — jobs, cases, designs, cutlists, comments, attachments",
-    usage: "Reading/writing operational records in the dodi platform",
-  },
   clickup: {
     description: "Task management — tasks, lists, spaces, comments, custom fields",
     usage: "Creating and managing project tasks",
@@ -42,19 +33,11 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
   contacts: {
     description: "Contact lookups by name, email, or phone",
     usage: "Quick lookups of people in the contact directory",
-    notFor: "CRM deal/company data — use hubspot-crm or crm-search instead",
-  },
-  permits: {
-    description: "Permit pipeline data — active permits by jurisdiction, status, owner",
-    usage: "Looking up building permits for lead generation or status checks",
+    notFor: "CRM deal/company data — use a CRM plugin's tools instead",
   },
   linear: {
     description: "Issue tracking and project management",
     usage: "Creating, searching, and updating engineering issues",
-  },
-  catalog: {
-    description: "Product catalog — parts, families, pricing",
-    usage: "Looking up product specs, pricing, and part details",
   },
   "github-issues": {
     description: "GitHub issue tracking — create, search, update, comment on issues",
@@ -97,21 +80,6 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
   workflow: {
     description: "Plan and task management — create plans, assign tasks, track dependencies",
     usage: "Coordinating multi-step work across agents and humans",
-  },
-  "product-search": {
-    description: "Semantic search across product catalog — find products by description or attributes",
-    usage: "Finding products when you don't know the exact part ID",
-    notFor: "Looking up specific parts by ID — use catalog instead",
-  },
-  "ops-search": {
-    description: "Semantic search across operational data — find jobs, cases, designs by description",
-    usage: "Broad discovery across ops data by topic or keyword",
-    notFor: "Reading/writing specific records — use dodi-ops for targeted operations",
-  },
-  "crm-search": {
-    description: "Semantic search across CRM deals by topic or keyword",
-    usage: "Broad discovery queries across deals and contacts",
-    notFor: "Reading/writing specific records — use hubspot-crm for targeted CRUD",
   },
   callback: {
     description: "Schedule future self-invocations",

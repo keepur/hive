@@ -527,7 +527,6 @@ server.registerTool(
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
   servers: { configured: [], unconfigured: [] },
-  integrations: {},
 };
 
 let instanceCapabilities: InstanceCapabilities = FALLBACK_CAPABILITIES;
@@ -570,11 +569,6 @@ server.registerTool(
       ...(instanceCapabilities.servers.unconfigured.length > 0
         ? instanceCapabilities.servers.unconfigured.map((s: string) => `  ✗ ${s}`)
         : ["  (none — all servers configured)"]),
-      "",
-      "## Integrations",
-      ...Object.entries(instanceCapabilities.integrations).map(
-        ([name, info]) => `  ${info.configured ? "✓" : "✗"} ${name}${info.detail ? ` (${info.detail})` : ""}`,
-      ),
       "",
       "## Active Channels",
       ...(allChannels.size > 0 ? [...allChannels].sort().map((ch) => `  #${ch}`) : ["  (no channels assigned)"]),

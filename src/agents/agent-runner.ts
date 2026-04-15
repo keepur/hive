@@ -21,9 +21,9 @@ const log = createLogger("agent-runner");
 
 /** Cached instance capabilities — lazily computed, config doesn't change at runtime */
 let _cachedCapabilities: string | undefined;
-function getCachedCapabilities(): string {
+function getCachedCapabilities(plugins: LoadedPlugin[]): string {
   if (!_cachedCapabilities) {
-    _cachedCapabilities = JSON.stringify(buildInstanceCapabilities());
+    _cachedCapabilities = JSON.stringify(buildInstanceCapabilities(plugins));
   }
   return _cachedCapabilities;
 }
@@ -715,7 +715,7 @@ export class AgentRunner {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
         AGENT_ID: this.agentConfig.id,
-        INSTANCE_CAPABILITIES: getCachedCapabilities(),
+        INSTANCE_CAPABILITIES: getCachedCapabilities(this.plugins),
       },
     };
 
