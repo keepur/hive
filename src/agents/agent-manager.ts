@@ -159,11 +159,21 @@ export class AgentManager {
           slackThreadTs: (item.message.meta?.slackThreadTs as string) ?? "",
         };
 
-        // Prepend sender identity so the agent knows who they're talking to
+        // Prepend sender identity so the agent knows who they're talking to.
+        // For team channel (KPR-23): `meta.user` is the server-asserted
+        // identity forwarded by beekeeper after JWT verification. When set,
+        // surface it so agents treat it as "the user I'm talking with,"
+        // distinct from the cosmetic device label.
         const senderLabel = item.message.senderName ?? item.message.sender;
-        let prompt = item.message.senderName
-          ? `[${senderLabel} in #${item.message.source.label}]: ${item.message.text}`
-          : item.message.text;
+        const userId = item.message.meta?.user as string | undefined;
+        let prompt: string;
+        if (userId) {
+          prompt = `[user:${userId} via ${senderLabel} in #${item.message.source.label}]: ${item.message.text}`;
+        } else if (item.message.senderName) {
+          prompt = `[${senderLabel} in #${item.message.source.label}]: ${item.message.text}`;
+        } else {
+          prompt = item.message.text;
+        }
 
         // Append file attachments to prompt
         if (item.message.files?.length) {
