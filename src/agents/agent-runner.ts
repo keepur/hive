@@ -19,13 +19,15 @@ import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 
 const log = createLogger("agent-runner");
 
-/** Cached instance capabilities — lazily computed, config doesn't change at runtime */
-let _cachedCapabilities: string | undefined;
-function getCachedCapabilities(plugins: LoadedPlugin[]): string {
-  if (!_cachedCapabilities) {
-    _cachedCapabilities = JSON.stringify(buildInstanceCapabilities(plugins));
-  }
-  return _cachedCapabilities;
+/**
+ * Build instance capabilities JSON for injection into the admin MCP server.
+ * Computed per-runner rather than cached: the build is cheap (a single pass
+ * over static catalog keys plus the runner's plugin list), and caching off
+ * the first caller's plugins would produce stale results if different
+ * runners saw different plugin sets — a latent test isolation hazard.
+ */
+function buildCapabilitiesJson(plugins: LoadedPlugin[]): string {
+  return JSON.stringify(buildInstanceCapabilities(plugins));
 }
 
 export type StreamCallback = (chunk: string) => void;
@@ -715,7 +717,7 @@ export class AgentRunner {
         MONGODB_URI: config.mongo.uri,
         MONGODB_DB: config.mongo.dbName,
         AGENT_ID: this.agentConfig.id,
-        INSTANCE_CAPABILITIES: getCachedCapabilities(this.plugins),
+        INSTANCE_CAPABILITIES: buildCapabilitiesJson(this.plugins),
       },
     };
 
