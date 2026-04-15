@@ -624,6 +624,44 @@ describe("WsAdapter team meta.user propagation (KPR-23)", () => {
     expect(captured).toHaveLength(1);
     expect(captured[0].meta?.user).toBe("may-keepur");
   });
+
+  it("never promotes a frame-level `user` when device.user is undefined", async () => {
+    // Hardening case: if the URL-asserted identity is absent (transitional
+    // beekeeper), a rogue frame-level `user` field MUST NOT be used as a
+    // fallback. The only trusted source is the URL query param.
+    const teamDeps = noopTeamDeps();
+    (teamDeps.teamStore.getChannel as any).mockResolvedValue({
+      _id: "c1",
+      type: "channel",
+      name: "general",
+      members: ["dev1"],
+    });
+
+    adapter = new WsAdapter(0, {
+      ...teamDeps,
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+    });
+
+    const captured: any[] = [];
+    await adapter.start((item) => captured.push(item));
+
+    const device = { _id: "dev1", label: "Shop", user: undefined, defaultAgentId: "", origin: undefined };
+    const wss = (adapter as any).wss;
+    const fakeWs = new EventEmitter() as any;
+    fakeWs.close = vi.fn();
+    fakeWs.send = vi.fn();
+    wss.emit("connection", fakeWs, {} as any, device);
+
+    fakeWs.emit(
+      "message",
+      Buffer.from(JSON.stringify({ type: "message", id: "m1", channelId: "c1", text: "hi", user: "attacker" })),
+    );
+    await new Promise((r) => setImmediate(r));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].meta?.user).toBeUndefined();
+  });
 });
 
 describe("WsAdapter.handleCommand (KPR-11)", () => {
