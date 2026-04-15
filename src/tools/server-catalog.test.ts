@@ -3,15 +3,7 @@ import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "./s
 
 describe("SERVER_CATALOG", () => {
   it("contains entries for all commonly used servers", () => {
-    const expected = [
-      "google",
-      "memory",
-      "contacts",
-      "slack",
-      "brave-search",
-      "resend",
-      "keychain",
-    ];
+    const expected = ["google", "memory", "contacts", "slack", "brave-search", "resend", "keychain"];
     for (const name of expected) {
       expect(SERVER_CATALOG[name]).toBeDefined();
       expect(SERVER_CATALOG[name].description).toBeTruthy();
