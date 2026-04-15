@@ -43,7 +43,7 @@ export class KnowledgeExtractor {
           role: "user",
           content: `Extract code insights from this completed coding session. For each source file the session read or modified, note:
 - filePath: the relative file path
-- repo: which repo (hive or dodi_v2), infer from the working directory or file paths
+- repo: which repository this file belongs to, inferred from the working directory or file paths
 - insight: what was learned — what the file does, key patterns, gotchas, architectural decisions. Be specific and useful for a future session working on the same code.
 - wasModified: true if the file was created or edited, false if only read
 
