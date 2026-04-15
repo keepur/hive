@@ -200,6 +200,21 @@ export async function downloadAndProcess(file: SlackFile, botToken: string): Pro
     }
 
     const buffer = Buffer.from(await res.arrayBuffer());
+
+    // Detect Slack error responses returned as 200 with text body
+    // (e.g., "The requested file could not be found.") — typically auth scope or expired file
+    if (buffer.length < 100 && buffer.length > 0) {
+      const text = buffer.toString("utf-8").trim();
+      if (text.includes("requested") && text.includes("file") && text.includes("not found")) {
+        log.error("Slack file error response", {
+          id: file.id,
+          name: file.name,
+          errorText: text,
+          bufferSize: buffer.length,
+        });
+        return null;
+      }
+    }
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
     const localPath = join(DOWNLOAD_DIR, `${file.id}-${safeName}`);
     writeFileSync(localPath, buffer);
