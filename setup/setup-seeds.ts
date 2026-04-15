@@ -65,7 +65,7 @@ async function main() {
         delegateServers: raw.delegateServers ?? [],
         delegatePrompts: raw.delegatePrompts ?? AGENT_DEFINITION_DEFAULTS.delegatePrompts,
         plugins: raw.plugins,
-        dodiOpsMode: raw.dodiOpsMode,
+        metadata: raw.metadata,
         soul: raw.soul ?? "",
         systemPrompt: raw.systemPrompt ?? "",
         schedule: raw.schedule ?? AGENT_DEFINITION_DEFAULTS.schedule,
