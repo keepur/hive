@@ -1,6 +1,6 @@
 # Plugin Architecture Design
 
-**Status:** Draft — pending review
+**Status:** Locked — 2026-04-15 (4 review rounds)
 **Author:** Mokie + Claude (brainstorm session 2026-04-14)
 **Related:** Issue #135 (core decontamination), #137 (skills, follow-on), #138 (native tasks, follow-on), #139 (vault/honeypot, long-term)
 
@@ -109,7 +109,7 @@ skills: []                # Reserved — contract defined in #137
 
 | Field | Type | Required | Purpose |
 |-------|------|----------|---------|
-| `name` | string | yes | Must start with `hive-plugin-` by convention; used as the plugin identifier everywhere |
+| `name` | string | yes | Must start with `hive-plugin-` by convention; used as the plugin identifier everywhere. Note: `agent-runner.ts` resolves server paths from the on-disk *directory name*, not the manifest `name` — they should match, but transitional in-tree plugins (e.g. `plugins/dodi/` with `name: dodi`) are not load-bearing failures and can be corrected at extraction time. |
 | `description` | string | yes | One-line human summary for the beekeeper |
 | `version` | semver | yes | Plugin version, informational and used for upgrade checks |
 | `hiveApi` | semver range | yes | Minimum compatible Hive core API version; hive refuses to load incompatible plugins |
@@ -121,9 +121,9 @@ skills: []                # Reserved — contract defined in #137
 | `mcp-servers.<name>.not-for` | string | no | Common misuse — "for X, use Y instead" |
 | `mcp-servers.<name>.env` | string[] | no | Env var names to forward from the base process |
 | `mcp-servers.<name>.env-map` | Record<string,string> | no | Rename vars: `{TARGET: SOURCE}` — e.g. `DODI_OPS_API_URL: TASK_LEDGER_API_URL` |
-| `mcp-servers.<name>.agent-env` | Record<string,string> | no | Pull values from the calling agent's config. Supports dotted paths (e.g. `metadata.dodiOpsMode`) |
+| `mcp-servers.<name>.agent-env` | Record<string,string> | no | Pull values from the calling agent's config. Target supports dotted paths (e.g. `metadata.dodiOpsMode`) per §5.3 — note that dotted-path support is implemented as part of #135 (steps 4 and 5 land atomically); flat keys are the only thing that resolves before that lands. |
 | `skills` | string[] | reserved | Declared in spec, semantics defined by #137 |
-| `register-commands` | string | no | Path to JS module exporting `registerCommands(registry)` for team slash commands |
+| `register-commands` | string | no | Path to JS module exporting `registerCommands(registry)` for team slash commands. The `registry` parameter is a `CommandRegistry` instance (class defined in `src/team/command-registry.ts`); the loader invokes the export at plugin load. Registration failures are logged as warnings and do not prevent the plugin from loading — a broken slash-command should not disable the rest of the plugin's MCP servers. |
 
 **Capability tag discipline.** Tags are free-form (§9.3) but matching is a plain string intersection, so a plugin that advertises `crm-search` is *not* a match for an archetype that requires `crm`. When adding a plugin or an archetype, check that the tags line up with what already exists in the ecosystem. This is deliberately informal — future work may add LLM-assisted fuzzy matching if it proves annoying — but it's a footgun worth knowing about now.
 
@@ -139,6 +139,8 @@ interface AgentDefinition {
 ```
 
 Plugins read from this bag via `agent-env` manifest mappings that support dotted paths (`metadata.dodiOpsMode`). Core never interprets the bag. This lets plugins stash per-agent configuration (access levels, mode flags, routing hints) without asking core to know about them.
+
+**Resolver semantics.** When `agent-env` declares a value with dotted-path syntax, the agent runner walks the path left-to-right against the calling agent's `AgentConfig`. Any missing intermediate key yields the empty string `""` — there is no fallback to a top-level field of the same name, and no error is raised. A misconfigured key produces a server that runs with empty config (which the plugin should defensively handle), rather than silently masking the typo by hitting a different field. Flat keys (no dot) continue to resolve as today against top-level `AgentConfig` fields, for backward compatibility with existing manifests during the transition.
 
 ### 5.4 What a plugin is NOT
 
@@ -192,10 +194,11 @@ Third-party systems we ship as defaults and never plan to replace:
 | Subsystem | Today | Target |
 |-----------|-------|--------|
 | `config.hubspot` block | In core `config.ts` | Deleted. Plugin's MCP servers read `process.env.HUBSPOT_API_KEY` directly. |
-| `config.resend.hubspotBcc` | In core `config.ts` | Renamed to generic `RESEND_DEFAULT_BCC` with fallback to old var for deploy continuity. Resend itself becomes a plugin; core keeps no knowledge of it. |
+| `config.resend.hubspotBcc` | In core `config.ts` | Renamed end-to-end: the `config.ts` field becomes `resend.defaultBcc`, the env var read becomes `RESEND_DEFAULT_BCC` (with `HUBSPOT_BCC_OUTGOING` honored as a fallback for deploy continuity), and the env key passed to the resend MCP server at spawn time in `agent-runner.ts` becomes `RESEND_DEFAULT_BCC`. All three sites must change together — leaving any of them as `HUBSPOT_BCC*` defeats the bundle decontamination. Resend itself becomes a plugin in a follow-on round. |
 | `dodiOpsMode` on AgentDefinition | Typed core field | Replaced by `metadata: Record<string, unknown>`. Plugin reads via `agent-env: DODI_OPS_MODE: metadata.dodiOpsMode`. |
 | `SERVER_CATALOG` entries for hubspot-crm, dodi-ops, catalog, permits, crm-search, product-search, ops-search | Hardcoded in `src/tools/server-catalog.ts` | Deleted. Plugin manifest fallback in `agent-runner.getServerCatalogEntry` renders the same text from plugin YAML. |
 | `SERVER_CREDENTIAL_CHECKS` for hubspot/dodi/permits/catalog/product-search/ops-search | Hardcoded in `src/tools/instance-capabilities.ts` | Deleted. Plugin servers are considered "configured" when every env var named in their manifest `env:` list is non-empty in `process.env`. Core iterates installed plugins and runs this check generically — no plugin-specific knowledge in core. |
+| `integrations` block in `InstanceCapabilities` (`crm`, `email`, `sms`, `browser` flags derived from `config.hubspot?.apiKey` etc.) | Hardcoded against core config fields | Removed in #135. The generic `servers.configured` / `servers.unconfigured` arrays produced by the new credential check are the only capability surface; admin/beekeeper displays read from those arrays. We do not rebuild a typed integrations map — adding one would re-create the same plugin-specific knowledge the spec is removing. |
 | `task-mcp-server` comments about `dodi_v2` | In core | Sanitized to generic language. Full rewrite tracked in #138. |
 | `plugins/dodi/` in hive repo | In-tree | Extracted to two private git repos (`hive-plugin-dodi-ops`, `hive-plugin-hubspot`). Hive core ships zero plugins. |
 | Dodi agent seeds (9 templates) | In `plugins/dodi/agent-seeds/` | Discarded. Only `software-engineer` survives as a canonical archetype example. Live agent definitions already exist in dodi-hive's Mongo and don't need a source-of-truth file. |
@@ -219,7 +222,7 @@ The CLI supports three installation paths:
 
 2. **Local path (dev mode)** — `hive plugin add ./plugins/dodi-ops` installs from a local directory for development on first-party plugins without publishing. Intended for plugin authors actively building, not for beekeepers deploying. Symlinked or copied, TBD at implementation time.
 
-3. **Raw git URL (developer escape hatch, not the paved path)** — `hive plugin add --dev-mode github.com/someone/hive-plugin-foo` clones the repo, builds it, and installs it. **Requires an explicit `--dev-mode` flag.** The CLI prints a security warning before proceeding: "You are installing a plugin from an uncurated source. This plugin will have the same credential access as any other plugin. Do not use in production." In production hive deployments, this path should be disabled via instance config (`plugins.allowRawUrl: false`). It exists so plugin authors can test unpublished work and so the dev loop isn't artificially blocked on registry publication — not so random GitHub plugins flow into production hives.
+3. **Raw git URL (developer escape hatch, not the paved path)** — `hive plugin add --dev-mode github.com/someone/hive-plugin-foo` clones the repo, builds it, and installs it. **Requires an explicit `--dev-mode` flag.** The CLI prints a security warning before proceeding: "You are installing a plugin from an uncurated source. This plugin will have the same credential access as any other plugin. Do not use in production." In production hive deployments, this path should be disabled via instance config — `hive.yaml` adds a top-level `plugins.allowRawUrl` boolean (default `true` in dev, recommended `false` in production deploys; when `false`, the CLI exits non-zero before clone). It exists so plugin authors can test unpublished work and so the dev loop isn't artificially blocked on registry publication — not so random GitHub plugins flow into production hives.
 
 **How a beekeeper gets a plugin they found on the internet.** The workflow is not "paste the URL into `hive plugin add`." It is: read the plugin source, verify it looks safe, either (a) submit it to the Keepur registry for public curation, (b) add it to a locally-maintained registry file, or (c) fork it into a repo the beekeeper controls and add that to their registry. All three routes end at the same gate — a curated registry the beekeeper has chosen to trust — and none of them involve pasting URLs into production hives on first sight.
 
@@ -227,19 +230,25 @@ This is a philosophical shift from "distribution is open, trust is user-judged" 
 
 ### 7.3 Installation layout
 
-Installed plugins live at:
+Installed plugins live under a per-instance `plugins/` directory, using the standard Node `node_modules` layout that `npm install --prefix` produces:
 
 ```
-<instance-dir>/plugins/<name>/
+<instance-dir>/plugins/node_modules/<package-name>/
 ```
 
-For example, `~/services/hive/plugins/hive-plugin-hubspot/`. Per-instance, not shared across instances on the same machine. Not in `node_modules`. Not in the hive core repo. The beekeeper can `ls` this directory and see exactly what's installed on this hive.
+For example, `~/services/hive/plugins/node_modules/@keepur/hive-plugin-hubspot/`. Per-instance, not shared across instances on the same machine. Not in the hive core repo. The beekeeper can `ls plugins/node_modules/` and see exactly what's installed on this hive.
 
-**Source of truth.** The Mongo composition record (§8.1) is authoritative for *which plugins this hive runs*. The filesystem directory is where the code lives so it can be loaded. At boot, hive reads the composition record and loads each listed plugin from its expected path. If a directory exists on disk that isn't in the composition record, it's ignored with a warning in the log — orphan directories do not auto-register. If the composition record lists a plugin whose directory is missing, the plugin is skipped with a clear error and boot continues. This split keeps the DB as the declarative source of truth while letting the filesystem be the mutable cache the installer writes to.
+This matches the path `src/agents/agent-runner.ts` already resolves at runtime (`<hiveHome>/plugins/node_modules/<package>/dist/mcp/...`). For local in-tree development, plugins under `<repo>/plugins/<name>/` are still discovered via the existing dev path resolution; the layouts coexist during the transitional period (in-tree dodi ↔ npm-installed third-party plugins).
+
+**Source of truth.** The long-term model is a Mongo composition record (§8.1) that's authoritative for *which plugins this hive runs*; the filesystem is where the code lives so it can be loaded. **In the #135 timeframe**, the source of truth is still the `plugins:` array in `hive.yaml` (read by `loadPlugins(appConfig.plugins, ...)` in `agent-manager.ts`). The composition record is follow-on infrastructure — see §11 "Explicit non-scope" and §8.1. The reconciliation rules described below apply to both source-of-truth modes.
+
+Reconciliation rules: if a directory exists on disk that isn't in the composition (or `hive.yaml`), it's ignored with a warning in the log — orphan directories do not auto-register. If the source of truth lists a plugin whose directory is missing, the plugin is skipped with a clear error and boot continues. This split keeps declarative configuration separate from the mutable cache the installer writes to.
 
 ### 7.4 Compatibility check
 
 On load, the plugin loader reads `hiveApi` from the manifest and compares against the running hive's API version (exposed as a constant in core). Mismatch → plugin is logged as incompatible and skipped; hive still boots. The `hiveApi` version is bumped when core changes break the plugin contract (manifest schema changes, agent-runner env-resolution changes, etc.).
+
+**Initial value.** The starting `hiveApi` version is `1.0.0`, which will be exposed as `HIVE_PLUGIN_API_VERSION` from `src/plugins/api-version.ts` (added as part of #135's loader work). Plugin manifests should declare `hiveApi: "^1.0.0"` until a breaking core change forces a major bump. The dotted-path resolver added in §5.3 is part of the 1.0.0 contract — plugins that rely on it can declare `hiveApi: "^1.0.0"` without further qualification.
 
 ### 7.5 Upgrade and removal
 
@@ -294,7 +303,7 @@ Stored in `hive_composition` collection. Read at boot, updated on `hive plugin a
 
 ### 9.1 Two paths, one output
 
-**Archetype-driven** — the beekeeper picks an archetype (`software-engineer`, `executive-assistant`, etc). The archetype declares a minimum capability kit: `requires: [ticketing, code-search]`. The onboarding flow matches those requirements against installed plugins' `capabilities` tags. If the hive has no plugin providing `ticketing`, creation is blocked with a clear error ("install a ticketing plugin first, e.g. `hive plugin add linear`"). If multiple plugins provide `ticketing`, the flow either picks the first or prompts the beekeeper.
+**Archetype-driven** — the beekeeper picks an archetype (`software-engineer`, `executive-assistant`, etc). The archetype declares a minimum capability kit: `requires: [ticketing, code-search]`. The onboarding flow matches those requirements against installed plugins' `capabilities` tags. If the hive has no plugin providing `ticketing`, creation is blocked with a clear error: the admin MCP `agent_create` tool returns a structured error with the missing capability and a suggested install command, and the `hive agent create` CLI exits non-zero printing the same hint ("install a ticketing plugin first, e.g. `hive plugin add linear`"). If multiple plugins provide `ticketing`, the flow either picks the first or prompts the beekeeper.
 
 **Purely composite** — the beekeeper creates an agent from a blank slate, hand-picks tools, writes the system prompt, and the result is whatever they composed. No minimum enforcement. No archetype label.
 
@@ -340,9 +349,9 @@ The #135 implementation plan, written after this spec is locked, is a mechanical
 
 1. Delete plugin-specific entries from `src/tools/server-catalog.ts` (hubspot-crm, dodi-ops, catalog, permits, crm-search, product-search, ops-search).
 2. Delete plugin-specific credential checks from `src/tools/instance-capabilities.ts`.
-3. Delete `config.hubspot` block from `src/config.ts`. Rename `resend.hubspotBcc` → `resend.defaultBcc` with env var fallback.
+3. Delete `config.hubspot` block from `src/config.ts`. Rename `resend.hubspotBcc` → `resend.defaultBcc` end-to-end (config field, env var read with `HUBSPOT_BCC_OUTGOING` fallback, env key passed at `agent-runner.ts` server-spawn site). See §6.4 row for the three sites.
 4. Replace `dodiOpsMode` field on `AgentDefinition` / `AgentConfig` with `metadata: Record<string, unknown>`.
-5. Extend agent runner's `agent-env` resolver to support dotted paths (`metadata.dodiOpsMode`).
+5. Extend agent runner's `agent-env` resolver to support dotted paths (`metadata.dodiOpsMode`) per §5.3 resolver semantics. **Steps 4 and 5 must land atomically in the same PR** — without the dotted-path resolver, removing `dodiOpsMode` from `AgentConfig` would silently make the existing `DODI_OPS_MODE: dodiOpsMode` flat lookup return `""` and break dodi-hive at runtime. Update `src/agents/agent-runner.test.ts` (currently asserts the flat-field path at line ~353) in the same step.
 6. Update `plugins/dodi/plugin.yaml` to carry `usage` / `not-for` for every server and change `agent-env` to use dotted paths.
 7. Update dodi agent seeds that reference `dodiOpsMode` to use `metadata.dodiOpsMode`.
 8. Sanitize `dodi_v2` comments in `src/tasks/task-ledger.ts` and `src/tasks/task-mcp-server.ts`.
@@ -355,6 +364,8 @@ Physical extraction of `plugins/dodi/` out of the hive repo into separate git re
 - Linear extraction to a plugin. Linear remains integration-core until #138 (native tasks) ships, at which point it gets extracted in a separate PR.
 - Resend extraction to a plugin. Resend demotion to a plugin is an eventual cleanup, not part of this fix. The #135 plan only renames `HUBSPOT_BCC` → `RESEND_DEFAULT_BCC` and removes the `config.hubspot` block; the resend MCP server itself stays in `src/` for this round.
 - Google, Slack, Quo, Keychain — all remain integration-core per §6.2.
+- **`hive_composition` MongoDB collection.** §8 describes the target source-of-truth model, but #135 ships with `hive.yaml`'s `plugins:` array still acting as the plugin list (read by `loadPlugins(appConfig.plugins, ...)` in `agent-manager.ts`). Migration from `config.plugins` to `hive_composition` is follow-on work scheduled with the physical plugin extraction. The §7.3 reconciliation rules apply to either source-of-truth mode.
+- **Removing `agent-seeds` from `plugin.yaml` and `agentSeeds` from `PluginManifest`.** §5.4 prohibits seeds inside plugins under the target model, but during the #135 transitional window `plugins/dodi/plugin.yaml` still lists its 9 seeds and `src/plugins/plugin-loader.ts` still validates those paths. Both go away when `plugins/dodi/` physically extracts. Until then, the loader's seed-validation path stays — touching it now is wasted churn.
 
 ## 12. Open Questions Deferred to Follow-On Specs
 
