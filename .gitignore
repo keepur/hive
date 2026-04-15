@@ -31,3 +31,4 @@ agents-personal/
 mokie-*.png
 .playwright-mcp/
 test-results/
+.mcp.json
