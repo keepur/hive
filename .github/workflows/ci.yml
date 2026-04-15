@@ -38,3 +38,6 @@ jobs:
         env:
           SLACK_APP_TOKEN: xapp-test-placeholder
           SLACK_BOT_TOKEN: xoxb-test-placeholder
+
+      - name: Bundle decontamination check
+        run: npm run check:bundle

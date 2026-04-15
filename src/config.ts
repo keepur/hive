@@ -146,7 +146,7 @@ export const config = {
     apiKey: optional("RESEND_API_KEY", ""),
     fromAddress: optional("RESEND_FROM_ADDRESS", ""),
     defaultCc: optional("RESEND_DEFAULT_CC", ""),
-    defaultBcc: optional("RESEND_DEFAULT_BCC", optional("HUBSPOT_BCC_OUTGOING", "")),
+    defaultBcc: optional("RESEND_DEFAULT_BCC", ""),
     emailDomain: optional("RESEND_EMAIL_DOMAIN", hive.resend?.emailDomain ?? ""),
     businessName: optional("RESEND_BUSINESS_NAME", hive.resend?.businessName ?? ""),
   },
