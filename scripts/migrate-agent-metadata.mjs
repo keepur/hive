@@ -33,7 +33,9 @@ if (existsSync(envPath)) {
 const uri = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
 const dbName = process.env.MONGODB_DB ?? `hive_${process.env.INSTANCE_ID ?? "hive"}`;
 
-console.log(`Connecting to ${uri} / ${dbName}...`);
+// Redact credentials from the URI before logging (CLAUDE.md log-redaction rule).
+const redactedUri = uri.replace(/\/\/[^@/]+@/, "//<redacted>@");
+console.log(`Connecting to ${redactedUri} / ${dbName}...`);
 const client = new MongoClient(uri);
 await client.connect();
 
@@ -61,7 +63,7 @@ try {
 
   console.log(`\nMigrated ${result.modifiedCount} document(s).`);
 
-  const remaining = await agentDefs.countDocuments({ [legacyField]: { $exists: true } });
+  const remaining = await agentDefs.countDocuments({ dodiOpsMode: { $exists: true } });
   if (remaining > 0) {
     console.error(`ERROR: ${remaining} documents still have the legacy field. Migration incomplete.`);
     process.exit(1);
