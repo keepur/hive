@@ -29,12 +29,16 @@ const log = createLogger("ws-adapter");
 /**
  * Synthetic device identity for the WS connection. Post-Phase-B, Hive's WS
  * adapter no longer owns a device registry — `@keepur/beekeeper` does. The
- * upgrade handler receives `deviceId` and `name` as loopback query params
- * from the Beekeeper proxy and builds this struct on the fly.
+ * upgrade handler receives `deviceId`, `label` (cosmetic display name), and
+ * `user` (server-asserted identity, JWT-verified upstream) as loopback query
+ * params from the Beekeeper team proxy and builds this struct on the fly.
+ * `user` is optional during the transition — older deployed beekeepers don't
+ * emit it yet.
  */
 interface Device {
   _id: string;
-  name: string;
+  label: string;
+  user?: string;
   defaultAgentId: string;
   origin?: string;
 }
@@ -125,8 +129,14 @@ export class WsAdapter implements ChannelAdapter {
       }
 
       const deviceId = url.searchParams.get("deviceId");
-      const name = url.searchParams.get("name");
-      if (!deviceId || !name) {
+      // Transitional: deployed beekeeper still sends `name=`. Beekeeper PR #11
+      // renamed it to `label=`. Accept either; remove the `name` fallback in a
+      // follow-up once both sides are deployed.
+      const label = url.searchParams.get("label") ?? url.searchParams.get("name");
+      // Server-asserted identity from beekeeper (after JWT verification).
+      // Optional during rollout — deployed beekeeper doesn't emit it yet.
+      const user = url.searchParams.get("user") ?? undefined;
+      if (!deviceId || !label) {
         socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
         socket.destroy();
         return;
@@ -137,7 +147,7 @@ export class WsAdapter implements ChannelAdapter {
       // Synthetic device — loopback traffic comes from beekeeper's team proxy.
       // Routing on the app path uses meta.origin, populated below from the
       // connection-level origin tag that beekeeper forwards via query param.
-      const device: Device = { _id: deviceId, name, defaultAgentId: "", origin };
+      const device: Device = { _id: deviceId, label, user, defaultAgentId: "", origin };
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         this.wss.emit("connection", ws, req, device);
       });
@@ -145,7 +155,7 @@ export class WsAdapter implements ChannelAdapter {
 
     this.wss.on("connection", (ws: WebSocket, _req: IncomingMessage, device: Device) => {
       const deviceId = device._id;
-      log.info("Device connected", { deviceId, name: device.name });
+      log.info("Device connected", { deviceId, label: device.label });
 
       // Drain any pending messages from before reconnect
       const pending = this.pendingMessages.get(deviceId);
@@ -213,7 +223,11 @@ export class WsAdapter implements ChannelAdapter {
             return;
           }
 
-          // Team content messages (message/image/file with channelId)
+          // Team content messages (message/image/file with channelId).
+          // Note: identity comes from `device.user` (URL-asserted upstream by
+          // beekeeper JWT verification). Any `user` field inside the frame is
+          // client-supplied and MUST be ignored — parseClientMessage drops it
+          // via its typed schema.
           if (isTeamMessage(msg)) {
             if (msg.type === "message") {
               await this.handleTeamMessage(ws, msg as ClientTeamMessage, device, deviceId);
@@ -234,11 +248,11 @@ export class WsAdapter implements ChannelAdapter {
               source: {
                 kind: "app",
                 id: deviceId,
-                label: `app:${device.name}`,
+                label: `app:${device.label}`,
                 adapterId: "ws",
               },
               sender: deviceId,
-              senderName: device.name,
+              senderName: device.label,
               threadId: `app:${deviceId}`,
               timestamp: new Date(),
               meta: {
@@ -266,11 +280,11 @@ export class WsAdapter implements ChannelAdapter {
                 source: {
                   kind: "app",
                   id: deviceId,
-                  label: `app:${device.name}`,
+                  label: `app:${device.label}`,
                   adapterId: "ws",
                 },
                 sender: deviceId,
-                senderName: device.name,
+                senderName: device.label,
                 threadId: `app:${deviceId}`,
                 timestamp: new Date(),
                 files: [processed],
@@ -460,7 +474,7 @@ export class WsAdapter implements ChannelAdapter {
       threadId: msg.threadId,
       senderId: deviceId,
       senderType: "person",
-      senderName: device.name,
+      senderName: device.label,
       text: msg.text,
       createdAt: new Date(),
     });
@@ -478,12 +492,13 @@ export class WsAdapter implements ChannelAdapter {
         adapterId: "ws",
       },
       sender: deviceId,
-      senderName: device.name,
+      senderName: device.label,
       threadId: msg.threadId ?? `team:${msg.channelId}`,
       timestamp: new Date(),
       meta: {
         deviceId,
         channelId: msg.channelId,
+        ...(device.user ? { user: device.user } : {}),
         ...(targetAgentId ? { targetAgentId } : { defaultAgentId: device.defaultAgentId }),
       },
     };
@@ -507,7 +522,7 @@ export class WsAdapter implements ChannelAdapter {
         channelId: msg.channelId,
         senderId: deviceId,
         senderType: "person",
-        senderName: device.name,
+        senderName: device.label,
         text: `[Photo: ${msg.filename}]`,
         files: [
           {
@@ -533,13 +548,14 @@ export class WsAdapter implements ChannelAdapter {
           adapterId: "ws",
         },
         sender: deviceId,
-        senderName: device.name,
+        senderName: device.label,
         threadId: `team:${msg.channelId}`,
         timestamp: new Date(),
         files: [processed],
         meta: {
           deviceId,
           channelId: msg.channelId,
+          ...(device.user ? { user: device.user } : {}),
           ...(targetAgentId ? { targetAgentId } : { defaultAgentId: device.defaultAgentId }),
         },
       };
@@ -573,7 +589,7 @@ export class WsAdapter implements ChannelAdapter {
         channelId: msg.channelId,
         senderId: deviceId,
         senderType: "person",
-        senderName: device.name,
+        senderName: device.label,
         text: `[File: ${msg.filename}]`,
         files: [
           {
@@ -599,13 +615,14 @@ export class WsAdapter implements ChannelAdapter {
           adapterId: "ws",
         },
         sender: deviceId,
-        senderName: device.name,
+        senderName: device.label,
         threadId: `team:${msg.channelId}`,
         timestamp: new Date(),
         files: [processed],
         meta: {
           deviceId,
           channelId: msg.channelId,
+          ...(device.user ? { user: device.user } : {}),
           ...(targetAgentId ? { targetAgentId } : { defaultAgentId: device.defaultAgentId }),
         },
       };
@@ -634,7 +651,7 @@ export class WsAdapter implements ChannelAdapter {
     const { result } = await this.commandRegistry.execute(msg.name, {
       channelId: msg.channelId,
       senderId: deviceId,
-      senderName: device.name,
+      senderName: device.label,
       args: msg.args,
     });
 
