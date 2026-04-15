@@ -162,4 +162,81 @@ agents-templates:
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe("good");
   });
+
+  it("loads a plugin with no hiveApi field (optional)", () => {
+    const manifestYaml = `name: no-api\n`;
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["no-api"], "/root");
+    expect(result).toHaveLength(1);
+    expect(result[0].manifest.hiveApi).toBeUndefined();
+  });
+
+  it("loads a plugin whose hiveApi caret range accepts the current version", () => {
+    // HIVE_PLUGIN_API_VERSION is "1.0.0"; "^1.0.0" accepts 1.x.y
+    const manifestYaml = `name: compat\nhiveApi: "^1.0.0"\n`;
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["compat"], "/root");
+    expect(result).toHaveLength(1);
+    expect(result[0].manifest.hiveApi).toBe("^1.0.0");
+  });
+
+  it("loads a plugin whose hiveApi is an exact version match", () => {
+    const manifestYaml = `name: exact\nhiveApi: "1.0.0"\n`;
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["exact"], "/root");
+    expect(result).toHaveLength(1);
+  });
+
+  it("skips a plugin whose hiveApi caret requires a newer major version", () => {
+    // HIVE_PLUGIN_API_VERSION is "1.0.0"; "^2.0.0" does not accept 1.x.y
+    const manifestYaml = `name: future\nhiveApi: "^2.0.0"\n`;
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["future"], "/root");
+    expect(result).toEqual([]);
+  });
+
+  it("skips a plugin whose hiveApi caret requires a newer minor version", () => {
+    // HIVE_PLUGIN_API_VERSION is "1.0.0"; "^1.5.0" requires >= 1.5.0
+    const manifestYaml = `name: needs-features\nhiveApi: "^1.5.0"\n`;
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["needs-features"], "/root");
+    expect(result).toEqual([]);
+  });
+
+  it("accepts unrecognized hiveApi range syntax (lenient fallback)", () => {
+    // Non-caret, non-exact: logged as warn but plugin still loads
+    const manifestYaml = `name: weird\nhiveApi: ">=1.0.0"\n`;
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["weird"], "/root");
+    expect(result).toHaveLength(1);
+  });
+});
+
+describe("normalizeManifest hiveApi field", () => {
+  it("picks up hiveApi camelCase form", () => {
+    const result = normalizeManifest({ name: "t", hiveApi: "^1.0.0" });
+    expect(result.hiveApi).toBe("^1.0.0");
+  });
+
+  it("picks up hive-api kebab-case form as fallback", () => {
+    const result = normalizeManifest({ name: "t", "hive-api": "^1.2.3" });
+    expect(result.hiveApi).toBe("^1.2.3");
+  });
+
+  it("leaves hiveApi undefined when absent", () => {
+    const result = normalizeManifest({ name: "t" });
+    expect(result.hiveApi).toBeUndefined();
+  });
 });
