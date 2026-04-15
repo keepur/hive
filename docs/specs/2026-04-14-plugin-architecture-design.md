@@ -209,13 +209,21 @@ The core `@keepur/hive` npm tarball ships **zero plugins**. No `plugins/` direct
 
 Each plugin is its own git repository, versioned independently.
 
-### 7.2 `hive plugin add <source>`
+### 7.2 `hive plugin add <source>` — registry is the paved path
 
-The CLI supports three installation sources:
+**Hive's security posture treats runnable content as employees, not drop-ins.** A plugin ships an MCP server, and the MCP server is the legitimate credential holder under the Honeypot + Keychain model (§10, #139). A malicious plugin can exfil secrets directly — architecture alone cannot stop it. The only meaningful defense is gating which plugins are allowed to run in the first place, and registries are the trust boundary. For that reason, plugin installation is **registry-first by design**, with raw-URL install as a clearly-marked developer-mode escape hatch.
 
-1. **Git URL** — `hive plugin add github.com/keepur/hive-plugin-hubspot` clones the repo, runs its build, validates the manifest, and installs into the per-instance plugin directory. Works with public repos and with private repos via existing git auth (SSH keys, gh CLI token, etc.).
-2. **Short name via registry file** — `hive plugin add hubspot` looks up `hubspot` in a JSON registry file (default: `plugins.keepur.dev/registry.json`), resolves to a git URL, and proceeds as above. The registry URL is configurable per-instance so third parties can host their own. The registry file is plain JSON, low infrastructure, no hosted service required.
-3. **Local path** — `hive plugin add ./plugins/dodi-ops` installs from a local directory, for development on first-party plugins without publishing. Symlinked or copied, TBD at implementation time.
+The CLI supports three installation paths:
+
+1. **Registry short name (paved path)** — `hive plugin add hubspot` looks up `hubspot` in a JSON registry file the beekeeper has configured and trusts. The default registry is Keepur-hosted (`plugins.keepur.dev/registry.json`); third parties can host their own registries and the beekeeper can add them via `hive registry add <url>`; local-file registries are also supported for on-premise curation. The beekeeper's trust relationship is with the *registry curator*, not with individual plugin authors. If you trust Keepur, you trust the plugins Keepur lists. If you trust another curator, you can add their registry to your trust set.
+
+2. **Local path (dev mode)** — `hive plugin add ./plugins/dodi-ops` installs from a local directory for development on first-party plugins without publishing. Intended for plugin authors actively building, not for beekeepers deploying. Symlinked or copied, TBD at implementation time.
+
+3. **Raw git URL (developer escape hatch, not the paved path)** — `hive plugin add --dev-mode github.com/someone/hive-plugin-foo` clones the repo, builds it, and installs it. **Requires an explicit `--dev-mode` flag.** The CLI prints a security warning before proceeding: "You are installing a plugin from an uncurated source. This plugin will have the same credential access as any other plugin. Do not use in production." In production hive deployments, this path should be disabled via instance config (`plugins.allowRawUrl: false`). It exists so plugin authors can test unpublished work and so the dev loop isn't artificially blocked on registry publication — not so random GitHub plugins flow into production hives.
+
+**How a beekeeper gets a plugin they found on the internet.** The workflow is not "paste the URL into `hive plugin add`." It is: read the plugin source, verify it looks safe, either (a) submit it to the Keepur registry for public curation, (b) add it to a locally-maintained registry file, or (c) fork it into a repo the beekeeper controls and add that to their registry. All three routes end at the same gate — a curated registry the beekeeper has chosen to trust — and none of them involve pasting URLs into production hives on first sight.
+
+This is a philosophical shift from "distribution is open, trust is user-judged" to "distribution is curated by default." It's worth the friction because the alternative is a single malicious plugin becoming game-over for a customer hive.
 
 ### 7.3 Installation layout
 
