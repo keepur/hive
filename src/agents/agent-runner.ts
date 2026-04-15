@@ -422,7 +422,7 @@ export class AgentRunner {
           RESEND_API_KEY: config.resend.apiKey,
           RESEND_FROM_ADDRESS: agentFromAddress,
           RESEND_DEFAULT_CC: config.resend.defaultCc,
-          HUBSPOT_BCC: config.resend.hubspotBcc,
+          RESEND_DEFAULT_BCC: config.resend.defaultBcc,
         },
       };
     }

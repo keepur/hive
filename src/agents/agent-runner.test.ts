@@ -73,7 +73,7 @@ vi.mock("../config.js", () => ({
       businessName: "TestBiz",
       fromAddress: "",
       defaultCc: "",
-      hubspotBcc: "",
+      defaultBcc: "",
     },
     linear: { apiKey: "", teamId: "" },
     clickup: { apiToken: "" },
