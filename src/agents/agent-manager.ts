@@ -163,13 +163,15 @@ export class AgentManager {
         // For team channel (KPR-23): `meta.user` is the server-asserted
         // identity forwarded by beekeeper after JWT verification. When set,
         // surface it so agents treat it as "the user I'm talking with,"
-        // distinct from the cosmetic device label.
+        // distinct from the cosmetic device label. Scoped to team-channel
+        // sources only (KPR-27) — no other adapter has authority to assert
+        // a user identity, and a stray `meta.user` from slack/sms/scheduler
+        // must not leak into the prompt.
         const senderLabel = item.message.senderName ?? item.message.sender;
-        // `meta.user` is only ever set from a URL query param on the WS
-        // upgrade handshake (ws-adapter reads `url.searchParams.get("user")`),
-        // so it's always `string | undefined` in practice. The cast matches
-        // the nearby `slackTs`/`deviceId` reads against the same `meta` bag.
-        const userId = item.message.meta?.user as string | undefined;
+        const userId =
+          item.message.source.kind === "team"
+            ? (item.message.meta?.user as string | undefined)
+            : undefined;
         let prompt: string;
         if (userId) {
           prompt = `[user:${userId} via ${senderLabel} in #${item.message.source.label}]: ${item.message.text}`;
