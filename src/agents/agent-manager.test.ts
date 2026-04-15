@@ -745,6 +745,26 @@ describe("AgentManager", () => {
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
       expect(capturedPrompt).toBe("[Shop in #team:general]: hey");
     });
+
+    it("ignores meta.user on non-team sources (KPR-27)", async () => {
+      const item: WorkItem = {
+        id: "m3",
+        text: "hey",
+        source: { kind: "slack", id: "C123", label: "general" },
+        sender: "U999",
+        senderName: "Mallory",
+        threadId: "t-slack",
+        timestamp: new Date(),
+        meta: { user: "spoofed-user" },
+      };
+
+      await manager.sendMessage("agent-a", item);
+
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
+      expect(capturedPrompt).not.toContain("user:spoofed-user");
+      expect(capturedPrompt).toBe("[Mallory in #general]: hey");
+    });
   });
 
   describe("model router resource limits", () => {
