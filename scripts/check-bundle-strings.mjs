@@ -7,7 +7,7 @@
  * a customer running `hive doctor` should see zero references to dodi,
  * hubspot, or cabinet in their installed copy.
  */
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const FORBIDDEN = ["dodi", "hubspot", "cabinet"];
@@ -18,15 +18,27 @@ if (!existsSync(PKG_DIR)) {
   process.exit(1);
 }
 
-const bundleFiles = readdirSync(PKG_DIR).filter((f) => f.endsWith(".min.js"));
+function collectMinJs(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    if (statSync(full).isDirectory()) {
+      out.push(...collectMinJs(full));
+    } else if (entry.endsWith(".min.js")) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+const bundleFiles = collectMinJs(PKG_DIR);
 if (bundleFiles.length === 0) {
   console.error(`error: no .min.js files found in ${PKG_DIR}/`);
   process.exit(1);
 }
 
 let totalHits = 0;
-for (const file of bundleFiles) {
-  const path = join(PKG_DIR, file);
+for (const path of bundleFiles) {
   const content = readFileSync(path, "utf8").toLowerCase();
   for (const term of FORBIDDEN) {
     const matches = content.split(term).length - 1;
