@@ -12,8 +12,6 @@ vi.mock("../config.js", () => ({
     github: { repo: "org/repo" },
     quo: { apiKey: "" },
     recall: { apiKey: "" },
-    hubspot: { apiKey: "hub_test" },
-    permits: { mongoUri: "mongodb://localhost:27017/permits" },
     codeIndex: { enabled: false },
     browser: { cdpEndpoint: "" },
     taskLedger: { apiUrl: "http://localhost:3002" },
@@ -57,7 +55,6 @@ describe("buildInstanceCapabilities", () => {
     expect(result.servers.configured).toContain("resend");
     expect(result.servers.configured).toContain("linear");
     expect(result.servers.configured).toContain("github-issues");
-    expect(result.servers.configured).toContain("hubspot-crm");
   });
 
   it("classifies servers with missing credentials as unconfigured", () => {
@@ -71,37 +68,12 @@ describe("buildInstanceCapabilities", () => {
   });
 
   it("marks servers with default URIs as unconfigured", () => {
-    // permits has default mongo URI, taskLedger has default localhost URL
-    expect(result.servers.unconfigured).toContain("permits");
-    expect(result.servers.unconfigured).toContain("catalog");
+    // taskLedger has default localhost URL
     expect(result.servers.unconfigured).toContain("tasks");
-    expect(result.servers.unconfigured).toContain("dodi-ops");
-    expect(result.servers.unconfigured).toContain("ops-search");
   });
 
   it("always classifies code-task as configured", () => {
     expect(result.servers.configured).toContain("code-task");
-  });
-
-  it("builds integration summary correctly", () => {
-    expect(result.integrations.google).toEqual({
-      configured: true,
-      detail: "1 account(s)",
-    });
-    expect(result.integrations.slack).toEqual({ configured: true });
-    expect(result.integrations.email).toEqual({ configured: true });
-    expect(result.integrations.sms).toEqual({ configured: false });
-    expect(result.integrations.crm).toEqual({ configured: true });
-    expect(result.integrations["web-search"]).toEqual({ configured: false });
-    expect(result.integrations.browser).toEqual({ configured: false });
-    expect(result.integrations["video-meetings"]).toEqual({ configured: false });
-  });
-
-  it("reports issue-tracking with detail when both Linear and GitHub are configured", () => {
-    expect(result.integrations["issue-tracking"]).toEqual({
-      configured: true,
-      detail: "Linear, GitHub Issues",
-    });
   });
 
   it("does not include servers in both configured and unconfigured", () => {
@@ -127,16 +99,10 @@ describe("SERVER_CREDENTIAL_CHECKS invariant", () => {
       "github-issues",
       "quo",
       "recall",
-      "hubspot-crm",
-      "permits",
       "code-task",
       "code-search",
       "browser",
-      "catalog",
-      "dodi-ops",
       "tasks",
-      "product-search",
-      "ops-search",
     ];
 
     for (const server of credentialCheckServers) {

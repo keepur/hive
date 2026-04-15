@@ -111,7 +111,6 @@ server.registerTool(
     lines.push(`Core Servers: [${(doc.coreServers ?? []).join(", ")}]`);
     lines.push(`Delegate Servers: [${(doc.delegateServers ?? []).join(", ")}]`);
     if (doc.plugins?.length) lines.push(`Plugins: [${doc.plugins.join(", ")}]`);
-    if (doc.dodiOpsMode) lines.push(`Dodi Ops Mode: ${doc.dodiOpsMode}`);
     lines.push(`Schedule: ${JSON.stringify(doc.schedule ?? [])}`);
     if (doc.subscribe?.length) lines.push(`Subscribe: [${doc.subscribe.join(", ")}]`);
     lines.push(`Budget: $${doc.budgetUsd ?? AGENT_DEFINITION_DEFAULTS.budgetUsd}`);
@@ -188,7 +187,7 @@ server.registerTool(
         ...AGENT_DEFINITION_DEFAULTS.delegatePrompts,
       },
       plugins: f.plugins as string[] | undefined,
-      dodiOpsMode: f.dodiOpsMode as "full" | "readonly" | undefined,
+      metadata: f.metadata as Record<string, unknown> | undefined,
       soul: (f.soul as string) ?? "",
       systemPrompt: (f.systemPrompt as string) ?? "",
       schedule: (f.schedule as Array<{ cron: string; task: string }>) ?? [...AGENT_DEFINITION_DEFAULTS.schedule],
@@ -528,7 +527,6 @@ server.registerTool(
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
   servers: { configured: [], unconfigured: [] },
-  integrations: {},
 };
 
 let instanceCapabilities: InstanceCapabilities = FALLBACK_CAPABILITIES;
@@ -571,11 +569,6 @@ server.registerTool(
       ...(instanceCapabilities.servers.unconfigured.length > 0
         ? instanceCapabilities.servers.unconfigured.map((s: string) => `  ✗ ${s}`)
         : ["  (none — all servers configured)"]),
-      "",
-      "## Integrations",
-      ...Object.entries(instanceCapabilities.integrations).map(
-        ([name, info]) => `  ${info.configured ? "✓" : "✗"} ${name}${info.detail ? ` (${info.detail})` : ""}`,
-      ),
       "",
       "## Active Channels",
       ...(allChannels.size > 0 ? [...allChannels].sort().map((ch) => `  #${ch}`) : ["  (no channels assigned)"]),

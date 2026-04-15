@@ -36,7 +36,12 @@ server.registerTool(
       "Semantic search over the codebase index. Returns matching source files with summaries, exports, and relevance scores. Use to find where specific functionality lives.",
     inputSchema: {
       query: z.string().describe("Natural language query, e.g. 'where is agent routing handled?'"),
-      repo: z.enum(["hive", "dodi_v2"]).optional().describe("Filter to a specific repo. Default: search both"),
+      repo: z
+        .string()
+        .optional()
+        .describe(
+          "Filter to a specific repo by name (matches the `repo` field on indexed records). Default: search all indexed repos.",
+        ),
       role: z.string().optional().describe("Filter by file role: entry, config, model, service, handler, util, etc."),
       limit: z.number().min(1).max(50).optional().describe("Max results. Default: 10"),
     },

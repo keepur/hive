@@ -21,7 +21,8 @@ maxTurns: 25
 maxConcurrent: 3
 timeoutMs: 300000
 disabled: false
-dodiOpsMode: readonly
+metadata:
+  dodiOpsMode: readonly
 schedule:
   - cron: "0 6 * * 0"
     task: memory-review

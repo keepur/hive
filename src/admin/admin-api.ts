@@ -175,7 +175,7 @@ export class AdminApi {
       delegateServers: body.delegateServers ?? [],
       delegatePrompts: body.delegatePrompts ?? AGENT_DEFINITION_DEFAULTS.delegatePrompts,
       plugins: body.plugins,
-      dodiOpsMode: body.dodiOpsMode,
+      metadata: body.metadata,
       soul: body.soul ?? "",
       systemPrompt: body.systemPrompt ?? "",
       schedule: body.schedule ?? AGENT_DEFINITION_DEFAULTS.schedule,

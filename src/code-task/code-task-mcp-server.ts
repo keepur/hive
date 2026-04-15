@@ -77,7 +77,7 @@ server.registerTool(
     description:
       "Spawn a Claude Code CLI session as a background task. Returns immediately with a task ID. " +
       "The session runs in the given working directory with full access to CLAUDE.md, project skills, " +
-      "and dodi-dev plugin skills. You will be notified in this thread when the session completes or needs input. " +
+      "and any configured plugin skills. You will be notified in this thread when the session completes or needs input. " +
       "Use for any coding work: implementing features, fixing bugs, running tests, creating PRs.",
     inputSchema: {
       prompt: z.string().describe("What to do — task description, plan reference, ticket context"),

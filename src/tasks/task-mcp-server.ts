@@ -3,7 +3,7 @@
 /**
  * Task Ledger MCP Server — runs as a stdio subprocess inside each agent's Claude Code session.
  * Gives agents the ability to create, read, update, query, and comment on tasks
- * in dodi_v2's task system.
+ * in the configured task ledger backend.
  *
  * Env vars:
  *   TASK_LEDGER_API_URL — base URL for the task API (default: http://localhost:3002)

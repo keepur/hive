@@ -25,7 +25,12 @@ export interface AgentDefinition {
   delegateServers: string[];
   delegatePrompts: Record<string, string>;
   plugins?: string[];
-  dodiOpsMode?: "full" | "readonly";
+  /**
+   * Plugin-managed per-agent settings. Core never reads this field — plugins
+   * pull values via `agent-env` manifest mappings (e.g. `metadata.dodiOpsMode`).
+   * Free-form to avoid coupling core to plugin schemas.
+   */
+  metadata?: Record<string, unknown>;
 
   // Identity
   soul: string;
@@ -100,7 +105,7 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     maxConcurrent: doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
     timeoutMs: doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
     betas: doc.betas,
-    dodiOpsMode: doc.dodiOpsMode,
+    metadata: doc.metadata,
     disabled: doc.disabled ?? false,
     subscribe: doc.subscribe ?? [],
     resourceTiers: doc.resourceTiers,

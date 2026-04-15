@@ -86,7 +86,7 @@ server.registerTool(
         .enum(["backlog", "unstarted", "started", "completed", "canceled"])
         .optional()
         .describe("Filter by workflow state type"),
-      assigneeEmail: z.string().optional().describe("Filter by assignee email address (e.g. bot@dodihome.com)"),
+      assigneeEmail: z.string().optional().describe("Filter by assignee email address (e.g. user@example.com)"),
       limit: z.number().optional().default(25).describe("Max results to return"),
     },
   },
