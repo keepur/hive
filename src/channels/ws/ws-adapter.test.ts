@@ -617,9 +617,7 @@ describe("WsAdapter team meta.user propagation (KPR-23)", () => {
     // Frame carries a rogue `user` field — must be dropped.
     fakeWs.emit(
       "message",
-      Buffer.from(
-        JSON.stringify({ type: "message", id: "m1", channelId: "c1", text: "hi", user: "attacker" }),
-      ),
+      Buffer.from(JSON.stringify({ type: "message", id: "m1", channelId: "c1", text: "hi", user: "attacker" })),
     );
     await new Promise((r) => setImmediate(r));
 
