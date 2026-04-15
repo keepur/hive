@@ -350,7 +350,11 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
             entry: "mcp-servers/ae/index.ts",
             env: [],
             envMap: {},
-            agentEnv: { CUSTOM_MODE: "dodiOpsMode", CUSTOM_ID: "id" },
+            agentEnv: {
+              CUSTOM_ID: "id",                      // flat
+              CUSTOM_MODE: "metadata.dodiOpsMode",  // dotted
+              CUSTOM_MISSING: "metadata.notThere",  // dotted miss
+            },
           },
         },
         agentSeeds: [],
@@ -358,15 +362,19 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     };
 
     runner = new AgentRunner(
-      makeAgentConfig({ dodiOpsMode: "readonly", coreServers: ["agent-env-server"] }),
+      makeAgentConfig({
+        metadata: { dodiOpsMode: "readonly" },
+        coreServers: ["agent-env-server"],
+      }),
       memoryManager as any,
       [plugin],
     );
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    expect(servers["agent-env-server"].env.CUSTOM_MODE).toBe("readonly");
     expect(servers["agent-env-server"].env.CUSTOM_ID).toBe("test-agent");
+    expect(servers["agent-env-server"].env.CUSTOM_MODE).toBe("readonly");
+    expect(servers["agent-env-server"].env.CUSTOM_MISSING).toBe("");
   });
 
   it("skips plugin server that conflicts with core server name", async () => {

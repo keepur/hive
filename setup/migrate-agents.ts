@@ -113,7 +113,7 @@ async function main() {
       delegateServers,
       delegatePrompts: (raw.delegatePrompts as Record<string, string>) || {},
       plugins: (raw.plugins as string[]) || undefined,
-      dodiOpsMode: (raw.dodiOpsMode as "full" | "readonly") || undefined,
+      metadata: (raw.metadata as Record<string, unknown>) || undefined,
       soul,
       systemPrompt,
       schedule: (raw.schedule as AgentDefinition["schedule"]) || [],

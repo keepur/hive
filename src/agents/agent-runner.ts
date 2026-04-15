@@ -635,8 +635,8 @@ export class AgentRunner {
           if (env[sourceVar]) env[targetVar] = env[sourceVar];
         }
 
-        for (const [envVar, fieldName] of Object.entries(serverDef.agentEnv ?? {})) {
-          env[envVar] = String((this.agentConfig as any)[fieldName] ?? "");
+        for (const [envVar, fieldPath] of Object.entries(serverDef.agentEnv ?? {})) {
+          env[envVar] = AgentRunner.resolveAgentEnvPath(this.agentConfig, fieldPath);
         }
 
         servers[name] = {
@@ -772,6 +772,26 @@ export class AgentRunner {
     }
 
     return servers;
+  }
+
+  /**
+   * Resolve an agent-env path against the agent config. Supports dotted paths
+   * for nested objects (e.g. "metadata.dodiOpsMode"). Walks left-to-right; any
+   * missing intermediate key yields "". No fallback to top-level fields — a
+   * misconfigured key surfaces as an empty value, which the plugin must
+   * handle defensively (per spec §5.3 resolver semantics).
+   *
+   * Flat (non-dotted) keys still resolve against top-level fields, preserving
+   * backward compatibility with manifests that have not migrated.
+   */
+  private static resolveAgentEnvPath(config: AgentConfig, path: string): string {
+    const parts = path.split(".");
+    let current: unknown = config;
+    for (const part of parts) {
+      if (current == null || typeof current !== "object") return "";
+      current = (current as Record<string, unknown>)[part];
+    }
+    return current == null ? "" : String(current);
   }
 
   // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory
