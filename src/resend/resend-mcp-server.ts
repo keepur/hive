@@ -10,7 +10,7 @@
  *   RESEND_API_KEY      — required, from Resend dashboard
  *   RESEND_FROM_ADDRESS — from address (configured in .env)
  *   RESEND_DEFAULT_CC   — default CC address (configured in .env)
- *   HUBSPOT_BCC         — HubSpot BCC address for outgoing email logging
+ *   RESEND_DEFAULT_BCC  — default BCC address applied to outgoing email
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -22,7 +22,7 @@ import { z } from "zod";
 const API_KEY = process.env.RESEND_API_KEY ?? "";
 const FROM_ADDRESS = process.env.RESEND_FROM_ADDRESS ?? "";
 const DEFAULT_CC = process.env.RESEND_DEFAULT_CC ?? "";
-const HUBSPOT_BCC = process.env.HUBSPOT_BCC ?? "";
+const DEFAULT_BCC = process.env.RESEND_DEFAULT_BCC ?? "";
 
 const server = new McpServer({
   name: "hive-resend",
@@ -83,9 +83,9 @@ server.registerTool(
         for (const addr of extras) ccList.add(addr);
       }
 
-      // Build BCC list — HubSpot logging
+      // Build BCC list — default BCC
       const bccList: string[] = [];
-      if (HUBSPOT_BCC) bccList.push(HUBSPOT_BCC);
+      if (DEFAULT_BCC) bccList.push(DEFAULT_BCC);
 
       // Build attachments — read files from disk and base64 encode
       const emailAttachments: { filename: string; content: string }[] = [];
@@ -145,7 +145,7 @@ server.registerTool(
         ...(emailAttachments.length > 0
           ? [`  Attachments: ${emailAttachments.map((a) => a.filename).join(", ")}`]
           : []),
-        ...(HUBSPOT_BCC ? [`  HubSpot: logged via BCC`] : []),
+        ...(DEFAULT_BCC ? [`  Default BCC applied`] : []),
         `  Resend ID: ${data.id}`,
       ].join("\n");
 
