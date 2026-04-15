@@ -165,6 +165,11 @@ Admin MCP tools or the REST API manage agent CRUD. Plugin seeds (`plugins/<name>
 
 ## Security (DOD-212)
 
+**Posture: agents are employees, not hangout partners you met at an overnight party.** Everything that runs on a hive — plugins, skills, MCP servers, agent seeds — is assumed to have access to sensitive business operations and (under the Honeypot + Keychain model) the legitimate path to credentials. There is no "trusted enough to try, too harmless to worry about." If it runs, it's an employee, and employees come through curated channels.
+
+- **Curated distribution is the paved path.** Both plugins and skills are installed from registries (Keepur-hosted default, third-party registries configurable, local registry files supported). Raw git URL or raw file install exists only as a developer-mode escape hatch and is not how production hives get code. If you find yourself designing something where the user "just drops in a skill from a GitHub gist," stop — that's outside the framework. See `docs/specs/2026-04-14-plugin-architecture-design.md` for the full contract.
+- **Credentials are never in cloud-model-facing context.** Long-term home is the Honeypot + Keychain model (#139). MCP servers read credentials from Keychain at spawn via API; cloud-model agents have no Keychain read entitlement. Agents invoke *capabilities* (call a tool, get a result), they never hold secrets. Until Honeypot ships, credentials live in `.env` — do not add agent-visible paths that would let filesystem Read tools exfil `.env`.
+- **Plugins carry more risk than skills.** A plugin ships an MCP server, and the MCP server is the legitimate credential holder. A malicious plugin can exfil secrets directly. A malicious skill can cause business-operational harm but cannot reach credentials under the architectural model. Registry curation matters more for plugins than for skills — not less.
 - **No shell execution**: Use `execFileSync(binary, argsArray)`, never `execSync(shellString)`
 - **Agent permissions**: `bypassPermissions` mode — all SDK tools (Bash, Read, Write, Edit, etc.) and MCP tools available to all agents. Per-agent guardrails are enforced via system prompts, not tool blocking.
 - **Background task API**: Bearer token auth on all endpoints (`BG_TASK_AUTH_TOKEN`)
