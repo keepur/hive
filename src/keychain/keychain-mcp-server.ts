@@ -4,12 +4,17 @@
  * Keychain MCP Server — read-only access to macOS Keychain secrets.
  * Agents can retrieve secrets but only the CEO can store them (via `security add-generic-password`).
  *
- * All Hive secrets use service name "hive". Store them like:
- *   security add-generic-password -s "hive" -a "rae-virtual-card" -w "4111111111111111" -U
- *   security add-generic-password -s "hive" -a "google-oauth-token" -w "ya29.xxx" -U
+ * Secrets are scoped by a service-name prefix set via KEYCHAIN_SERVICE (e.g. "hive/dodi").
+ * Tools accept an optional `service` argument; if omitted it defaults to the prefix. When
+ * provided, it must start with the prefix — this keeps instances isolated and prevents
+ * agents from reading arbitrary keychain entries.
+ *
+ * Example (instance id "dodi" → prefix "hive/dodi"):
+ *   security add-generic-password -s "hive/dodi/db/readonly" -a "hive-readonly" -w "..." -U
+ *   security add-generic-password -s "hive/dodi/api/stripe" -a "live-key"       -w "..." -U
  *
  * Env vars:
- *   KEYCHAIN_SERVICE — service name filter (default: "hive")
+ *   KEYCHAIN_SERVICE — service-name prefix (default: "hive")
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -17,31 +22,56 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { execFileSync } from "node:child_process";
 
-const SERVICE = process.env.KEYCHAIN_SERVICE ?? "hive";
+const SERVICE_PREFIX = process.env.KEYCHAIN_SERVICE ?? "hive";
 
 const server = new McpServer({
   name: "hive-keychain",
-  version: "0.1.0",
+  version: "0.2.0",
 });
+
+function resolveService(service: string | undefined): { ok: true; service: string } | { ok: false; error: string } {
+  const svc = service ?? SERVICE_PREFIX;
+  if (svc !== SERVICE_PREFIX && !svc.startsWith(SERVICE_PREFIX + "/")) {
+    return {
+      ok: false,
+      error: `service "${svc}" is outside this instance's allowed prefix "${SERVICE_PREFIX}"`,
+    };
+  }
+  return { ok: true, service: svc };
+}
 
 server.registerTool(
   "secret_get",
   {
     title: "Get Secret",
-    description: `Retrieve a secret from macOS Keychain. All Hive secrets are stored under service "${SERVICE}".`,
+    description: `Retrieve a secret from macOS Keychain. Secrets for this instance live under service-prefix "${SERVICE_PREFIX}" — pass the full service name (e.g. "${SERVICE_PREFIX}/db/readonly") plus the account. If service is omitted it defaults to "${SERVICE_PREFIX}".`,
     inputSchema: {
-      account: z.string().describe('The account/label for the secret, e.g. "rae-virtual-card", "google-oauth-token"'),
+      account: z.string().describe('The account/label for the secret, e.g. "hive-readonly", "google-oauth-token"'),
+      service: z
+        .string()
+        .optional()
+        .describe(
+          `Full service name for the secret. Must start with "${SERVICE_PREFIX}". Defaults to "${SERVICE_PREFIX}".`,
+        ),
     },
   },
-  async ({ account }) => {
+  async ({ account, service }) => {
+    const resolved = resolveService(service);
+    if (!resolved.ok) {
+      return { content: [{ type: "text", text: resolved.error }], isError: true };
+    }
     try {
-      const password = execFileSync("security", ["find-generic-password", "-s", SERVICE, "-a", account, "-w"], {
-        encoding: "utf-8",
-        timeout: 5000,
-      }).trim();
+      const password = execFileSync(
+        "security",
+        ["find-generic-password", "-s", resolved.service, "-a", account, "-w"],
+        { encoding: "utf-8", timeout: 5000 },
+      ).trim();
       return { content: [{ type: "text", text: password }] };
     } catch {
-      return { content: [{ type: "text", text: `Secret not found: ${account}` }], isError: true };
+      return {
+        content: [{ type: "text", text: `Secret not found: service="${resolved.service}" account="${account}"` }],
+        isError: true,
+      };
     }
   },
 );
@@ -50,34 +80,46 @@ server.registerTool(
   "secret_list",
   {
     title: "List Secrets",
-    description: `List available secret names in macOS Keychain under service "${SERVICE}". Returns account names only, not the values.`,
-    inputSchema: {},
+    description: `List secrets in macOS Keychain whose service starts with "${SERVICE_PREFIX}" (or a narrower prefix you provide via "service"). Returns "service\taccount" lines — values are never returned.`,
+    inputSchema: {
+      service: z
+        .string()
+        .optional()
+        .describe(
+          `Narrow the listing to services starting with this prefix. Must start with "${SERVICE_PREFIX}". Defaults to "${SERVICE_PREFIX}".`,
+        ),
+    },
   },
-  async () => {
+  async ({ service }) => {
+    const resolved = resolveService(service);
+    if (!resolved.ok) {
+      return { content: [{ type: "text", text: resolved.error }], isError: true };
+    }
     try {
-      // Dump all generic passwords, filter for our service, extract account names
       const raw = execFileSync("security", ["dump-keychain"], { encoding: "utf-8", timeout: 5000 });
-      const accounts: string[] = [];
+      const entries: string[] = [];
       const blocks = raw.split("keychain:");
       for (const block of blocks) {
-        if (block.includes(`"svce"<blob>="${SERVICE}"`)) {
-          const acctMatch = block.match(/"acct"<blob>="([^"]+)"/);
-          if (acctMatch) accounts.push(acctMatch[1]);
-        }
+        const svceMatch = block.match(/"svce"<blob>="([^"]+)"/);
+        if (!svceMatch) continue;
+        const svce = svceMatch[1];
+        if (svce !== resolved.service && !svce.startsWith(resolved.service + "/")) continue;
+        const acctMatch = block.match(/"acct"<blob>="([^"]+)"/);
+        if (acctMatch) entries.push(`${svce}\t${acctMatch[1]}`);
       }
-      if (accounts.length === 0) {
+      if (entries.length === 0) {
         return {
           content: [
             {
               type: "text",
-              text: 'No secrets stored yet. The CEO can add them with:\nsecurity add-generic-password -s "hive" -a "name" -w "value" -U',
+              text: `No secrets found under "${resolved.service}". The CEO can add them with:\nsecurity add-generic-password -s "${resolved.service}/<name>" -a "<account>" -w "<value>" -U`,
             },
           ],
         };
       }
-      return { content: [{ type: "text", text: accounts.join("\n") }] };
+      return { content: [{ type: "text", text: entries.join("\n") }] };
     } catch {
-      return { content: [{ type: "text", text: "No secrets found for this service." }] };
+      return { content: [{ type: "text", text: "Failed to read keychain." }], isError: true };
     }
   },
 );

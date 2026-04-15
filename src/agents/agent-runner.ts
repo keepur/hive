@@ -310,10 +310,14 @@ export class AgentRunner {
     };
 
     // Keychain MCP server — read-only access to macOS Keychain secrets
+    // Scoped per-instance via KEYCHAIN_SERVICE prefix so instances can't read each other's secrets.
     servers["keychain"] = {
       type: "stdio",
       command: "node",
       args: [mcpPath("keychain/keychain-mcp-server.js")],
+      env: {
+        KEYCHAIN_SERVICE: `hive/${config.instance.id}`,
+      },
     };
 
     // Google MCP server — Gmail + Calendar via gog CLI
