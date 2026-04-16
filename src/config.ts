@@ -51,11 +51,10 @@ const instanceId = (hive.instance?.id as string) ?? "hive";
 function fromKeychain(key: string): string {
   if (process.platform !== "darwin") return "";
   try {
-    return execFileSync(
-      "security",
-      ["find-generic-password", "-s", `hive/${instanceId}/${key}`, "-w"],
-      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
-    ).trim();
+    return execFileSync("security", ["find-generic-password", "-s", `hive/${instanceId}/${key}`, "-w"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
   } catch {
     return "";
   }
