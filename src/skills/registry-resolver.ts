@@ -75,10 +75,8 @@ export function resolveRegistry(spec: ParsedSkillSpec, registries: RegistryConfi
     return { name: found.name, url: found.url };
   }
 
-  const defaultReg = registries.find((r) => r.default) ?? registries[0];
-  if (!defaultReg) {
-    throw new Error("No skill registries configured. Add one with: hive registry add <url>");
-  }
+  const BUILTIN_DEFAULT = { name: "keepur-default", url: "https://github.com/keepur/hive-skills" };
+  const defaultReg = registries.find((r) => r.default) ?? registries[0] ?? BUILTIN_DEFAULT;
   log.debug("resolved default registry", { registryName: defaultReg.name, url: defaultReg.url });
   return { name: defaultReg.name, url: defaultReg.url };
 }

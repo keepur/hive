@@ -68,7 +68,8 @@ export function partialClone(url: string): CloneResult {
       });
       // Checkout HEAD so files are available
       execFileSync("git", ["checkout"], { cwd: tmpDir, stdio: "pipe" });
-    } catch {
+    } catch (firstErr) {
+      log.debug("Blobless clone failed, falling back to full clone", { error: String(firstErr) });
       rmSync(tmpDir, { recursive: true, force: true });
       execFileSync("git", ["clone", url, tmpDir], {
         stdio: "pipe",
