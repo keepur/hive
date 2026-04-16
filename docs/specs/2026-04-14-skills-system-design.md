@@ -1,6 +1,7 @@
 # Skills System Design
 
 **Status:** Draft — pending review
+**Amended:** 2026-04-15 by `docs/specs/2026-04-15-skills-customer-space-design.md` §12.1 and `docs/specs/2026-04-15-skills-registry-design.md` §14.1. See §§5.2, 6, 7, 8, 9, 4.2 for the amended content and §§1, 4.1, 4.3, 4.4 for downstream consistency updates.
 **Author:** Mokie + Claude (brainstorm session 2026-04-14)
 **Related:** #137 (this ticket, now narrowed to documentation + small loader extensions), plugin architecture spec (`docs/specs/2026-04-14-plugin-architecture-design.md`)
 
@@ -8,7 +9,7 @@
 
 ## 1. Problem
 
-Skills already work in Hive today. `src/agents/skill-loader.ts` scans a `skills/` directory, parses SKILL.md frontmatter, and attaches matching skills to each agent via the Claude Agent SDK's local-plugin loading path. Agents invoke skills at runtime the same way they invoke any other SDK-provided playbook. Five workflows and thirteen skills exist in the repo today, including a real multi-agent coordination example (`morning-briefing`) that dispatches work across five department agents.
+Skills already work in Hive today. `src/agents/skill-loader.ts` scans a `skills/` directory, parses SKILL.md frontmatter, and attaches matching skills to each agent via the Claude Agent SDK's local-plugin loading path. Agents invoke skills at runtime the same way they invoke any other SDK-provided playbook. Five workflows and thirteen skills existed in the repo at the time of writing (2026-04-14), including a real multi-agent coordination example (`morning-briefing`) that dispatches work across five department agents. *As of 2026-04-15, those skills are being triaged for the default Keepur registry per `2026-04-15-skills-customer-space-design.md` §10.3 — they are not long-term inhabitants of the `<repo>/skills/` tree, and future hive versions will ship with that directory removed from the package manifest.*
 
 The problem is not that skills are missing. The problem is that skills are **undocumented as a first-class concept**, so:
 
@@ -50,13 +51,15 @@ skills/
 
 Two-level nesting. The outer `<workflow-name>` directory groups related skills. The inner `skills/` level is required by the Claude Agent SDK's local-plugin loading format — we cannot flatten it without reimplementing skill loading from scratch, which is not worth it. Treat the workflow level as a file-organization convenience, not a semantic unit.
 
-Current workflows in the repo:
+Workflows that existed in the repo at the time of writing (2026-04-14), for historical reference:
 
 - `agent-builder/` — `build-agent`
 - `inbound-triage/` — `inbound-lead-triage`
 - `jasper-reports/` — `deploy-report`, `blocker-alert`
 - `morning-briefing/` — `morning-briefing`, `sales-standup-prep`, `cs-standup-prep`, `dev-standup-prep`, `marketing-standup-prep`, `production-standup-prep`
 - `project-tools/` — `quality-gate`, `dev-servers`, `create-tests`
+
+Under the current design (`2026-04-15-skills-customer-space-design.md`), the `<repo>/skills/` tree is not the authoritative location for customer-owned skills at runtime — that role belongs to `<instance-dir>/skills/`. The enumeration above is historical and reflects the state of the repo on 2026-04-14, before the customer-space partition was specified.
 
 ### 4.2 SKILL.md format
 
@@ -80,10 +83,15 @@ Frontmatter fields:
 | `name` | yes | Skill identifier, must be unique within its workflow |
 | `description` | yes | One-line summary shown to agents during discovery |
 | `agents` | yes | List of agent IDs that can see this skill, or `[all]` for hive-wide visibility |
+| `workflow` | recommended | Runtime workflow-grouping directory name. Used by the installer's projection rule per `2026-04-15-skills-registry-design.md` §7.2. Required for registry-published skills; recommended for agent-authored with installer fallback (skill becomes its own single-skill workflow when absent). |
 
 Body is free-form markdown. Agents read the prose and execute whatever it describes. Structure is a property of the prose, not the loader — a skill can be a rigid step-by-step list, a loose guidance document, or anything in between.
 
+Customer-space SKILL.md files additionally carry `origin:` and `author:` metadata defined by `2026-04-15-skills-customer-space-design.md` §6.2, which is the authoritative contract for the customer-space frontmatter shape.
+
 ### 4.3 Loader behavior
+
+**Forward pointer for the KPR-29 loader model:** the current §4.3 description reflects the loader's 2026-04-14 behavior, which scans `<repo>/skills/` only. Under the end-state defined by `2026-04-15-skills-customer-space-design.md` §6.4, the loader scans `<plugin-dir>/skills/` for each installed plugin (added in §6.1 of this spec, ships with #137) *and* `<instance-dir>/skills/` for customer-space content (§6.3 of this spec, ships with KPR-29). The `<repo>/skills/` scan is removed entirely when KPR-29 ships. Readers implementing #137 should retain the `<repo>/skills/` scan as-is and only add the plugin-tree scan.
 
 `src/agents/skill-loader.ts` exposes `loadSkillIndex(skillsDir)` and `getSkillsForAgent(index, agentId)`.
 
@@ -100,7 +108,7 @@ Body is free-form markdown. Agents read the prose and execute whatever it descri
 Agents have filesystem tools under `bypassPermissions` and can write new SKILL.md files directly. No special MCP tool is required. An agent authoring a skill for itself:
 
 1. Picks a workflow directory (or creates a new one).
-2. Writes `skills/<workflow>/skills/<skill-name>/SKILL.md` with frontmatter setting `agents: [<self-id>]`.
+2. Writes a SKILL.md with frontmatter setting `agents: [<self-id>]` at `<instance-dir>/skills/<workflow>/skills/<skill-name>/SKILL.md` (customer space under the KPR-29 model; historical pre-KPR-29 path was `<repo>/skills/<workflow>/skills/<skill-name>/SKILL.md`). Under KPR-29's write guard (`2026-04-15-skills-customer-space-design.md` §6.3) the filesystem Write tool enforces that SKILL.md writes land only inside `<instance-dir>/skills/`, so the historical path is no longer even reachable for agent-authored content.
 3. The skill is picked up on the next skill-index reload (currently requires a Hive restart or SIGUSR1 + loader hot reload — see §6.2).
 
 This is how Milo writes his own morning-briefing helpers today. It's crude but it works, and it's consistent with how the rest of the hive treats agent authorship — agents have real tools and use them.
@@ -119,15 +127,15 @@ That narrower threat model is the reason the skill spec does not need per-skill 
 
 ### 5.2 Origin categories
 
-Every skill on a hive falls into exactly one of four origin categories:
+Every skill on a hive falls into exactly one of three origin categories:
 
-1. **Shipped with Hive core.** Lives in the `skills/` directory of the hive repo. Distributed through the same channel as the rest of the core code. If you trust Hive enough to run it, you trust its bundled skills.
+1. **Shipped inside a plugin.** Lives in the plugin's `skills/` subdirectory and is loaded by the skill loader when the plugin is installed. Trust is inherited from the plugin — if you trust the plugin enough to install it, you trust its skills.
 
-2. **Shipped inside a plugin.** Lives in the plugin's `skills/` subdirectory and is loaded by the skill loader when the plugin is installed. Trust is inherited from the plugin — if you trust the plugin enough to install it, you trust its skills.
+2. **Installed from a skill registry.** Same pattern as plugins: a JSON registry file (Keepur-hosted default, third-party registries configurable, local file registries supported) maps skill short-names to downloadable sources. `hive skill add <name>` resolves against the registries the beekeeper has configured. The curator of the registry is the reviewer of record.
 
-3. **Installed from a skill registry.** Same pattern as plugins: a JSON registry file (Keepur-hosted default, third-party registries configurable, local file registries supported) maps skill short-names to downloadable sources. `hive skill add <name>` resolves against the registries the beekeeper has configured. The curator of the registry is the reviewer of record.
+3. **Agent-authored at runtime.** An agent writes a skill for itself via the Write tool. Private to the authoring agent by default (`agents: [<self-id>]`). Promotion to other agents or hive-wide requires the beekeeper reading the skill and flipping the `agents:` field. There is no automated promotion path.
 
-4. **Agent-authored at runtime.** An agent writes a skill for itself via the Write tool. Private to the authoring agent by default (`agents: [<self-id>]`). Promotion to other agents or hive-wide requires the beekeeper reading the skill and flipping the `agents:` field. There is no automated promotion path.
+See `2026-04-15-skills-customer-space-design.md` §5 for the full ownership model under the current design. This spec's origin-category list is the historical four-category model; the "Shipped with Hive core" category has since been collapsed (`2026-04-15-skills-customer-space-design.md` §5.4) because the core tarball ships zero skills — what used to be "shipped" is now "available in the default Keepur registry" per the registry spec.
 
 **There is no raw-URL install path for skills.** Unlike plugins, which have a `--dev-mode` escape hatch for plugin authors testing unpublished work, skills do not need one: a plugin author iterating on a skill is either (a) editing a file already in their workspace that gets picked up on the next reload, or (b) iterating on a plugin-bundled skill via the plugin's own dev-mode install. There is no legitimate use case for "paste a skill URL into a production hive," so the path simply does not exist. This asymmetry vs plugins is intentional.
 
@@ -136,6 +144,8 @@ Every skill on a hive falls into exactly one of four origin categories:
 Same workflow as plugins: read it, verify it, adapt it for a business-agent context if needed (many internet skills are written for developer agents and need retargeting), then either submit upstream to a registry the beekeeper trusts or add it to a local registry file. The skill enters the hive through deliberate adoption, not a one-click install.
 
 ## 6. What Changes in Code
+
+> **Scope note.** This section describes the full end-state loader work, not all of which ships in a single ticket. **§6.1 (Plugin-bundled skills) and §6.2 (Hot reload on SIGUSR1) ship with hive issue #137** — the ticket this spec was originally filed for. **§6.3 (Customer-space skills) ships with KPR-29**, the follow-on ticket that owns the customer-space ownership partition and the registry CLI. A future reader picking up #137 should implement §6.1 and §6.2 only; §6.3 is intentionally out of scope for #137.
 
 Two small code changes are required to wire the existing loader into the plugin architecture and to support hot reload. Both are forward compatible with the existing skills today.
 
@@ -151,29 +161,31 @@ Ordering: core-bundled skills are loaded first, plugin-bundled skills are loaded
 
 No new file. The signal handler in `src/index.ts` already calls the agent-registry reload path; it just needs an additional call to rebuild the skill index and re-bind it into the agent runner's state.
 
-## 7. CLI Surface (Reserved, Not Built)
+### 6.3 Customer-space skills (KPR-29 scope, not #137)
 
-When registries actually exist, the beekeeper will install and manage skills via:
+`2026-04-15-skills-customer-space-design.md` §6.3–§6.5 defines a third change to `src/agents/skill-loader.ts`: remove the existing `<repo>/skills/` scan (§6.5 of that spec), add a scan of `<instance-dir>/skills/` (§6.4), and add a write guard on agent SKILL.md writes that captures provenance and enforces the customer-space path constraint (§6.3). Combined with the boot-time integrity check in that spec's §7, this partitions the filesystem so agent-authored content lives in customer space while the package tree stays in its shipped shape.
 
-```
-hive skill add <name>          # install from a configured registry
-hive skill remove <name>       # delete from this hive's skills directory
-hive skill list                # show installed skills with origin + visibility
-hive skill enable <name> --agent <agent-id>
-hive skill disable <name> --agent <agent-id>
-```
+**This subsection is KPR-29's scope, not #137's.** #137 ships with the `<repo>/skills/` scan still in place alongside the new plugin-bundled scan from §6.1 — the two coexist during the transition window, and KPR-29 later removes the `<repo>/skills/` scan when it introduces the customer-space path. See `2026-04-15-skills-customer-space-design.md` §12.1 for the full list of amendments this spec will receive when KPR-29 ships.
 
-The plugin architecture spec already defines the registry mechanism (§7.2 of that spec). Skill registries use the same JSON format and the same trust model — just pointing at skill packages instead of plugin packages.
+## 7. CLI Surface (Specified in registry spec)
 
-**None of these CLI commands are implemented in this round.** They are reserved here so that when the first skill registry materializes, the CLI shape is not re-litigated. Reserving the surface is free; building it before there's content is wasted work.
+The skill registry CLI commands are specified in `2026-04-15-skills-registry-design.md` §7 through §11, which owns the full contract for `hive skill add`, `hive skill remove`, `hive skill list`, and `hive skill upgrade`. That spec covers:
 
-Agent-visibility management (`hive skill enable --agent`) is a future convenience for the beekeeper. Today the equivalent is editing the `agents:` frontmatter field in the SKILL.md file directly. That remains valid indefinitely as a manual path.
+- Command signatures, flags, and output format
+- Multi-registry configuration and resolution (via `hive registry add/list/remove`)
+- Upgrade-with-diff semantics (three-way merge when modified, two-way degraded fallback)
+- Fetch-layer error handling
+- Offline and local-path installs via `file://` URLs
+
+**Registry model asymmetry with plugins.** `2026-04-15-skills-customer-space-design.md` §4.4 documents why the skills registry posture is deliberately simpler than the plugin registry posture from `2026-04-14-plugin-architecture-design.md` §7.2: skills have a narrower threat model (business-operational harm only, not credential exfiltration) because credentials are held by plugin MCP servers, not by skills. Consequently, the skills registry supports arbitrary git URLs with no `--dev-mode` flag or trust-curation gate, and the default registry is a plain open-source GitHub repo (`github.com/keepur/hive-skills`) rather than a curated JSON manifest.
+
+**Still future work:** `hive skill enable --agent <agent-id>` and `hive skill disable --agent <agent-id>` remain unimplemented. The manual equivalent today is editing the `agents:` frontmatter field in the installed SKILL.md file directly. That manual path remains valid indefinitely as a fallback.
 
 ## 8. Agent-Authored Skill Promotion
 
 Today's workflow:
 
-1. Agent writes a SKILL.md with `agents: [<self>]`.
+1. Agent writes a SKILL.md with `agents: [<self>]` at `<instance-dir>/skills/<workflow>/skills/<skill-name>/SKILL.md` (customer space, per `2026-04-15-skills-customer-space-design.md` §5.3 and §6.3 — the write guard enforces the customer-space path constraint and injects `origin.type: agent-authored` plus author provenance metadata). Under the historical pre-KPR-29 model the path was `<repo>/skills/...`, but KPR-29 relocates customer-owned content to `<instance-dir>/skills/` and partitions the filesystem so agent writes cannot land outside customer space.
 2. Skill index reloads, the agent can now invoke the skill.
 3. Beekeeper discovers the skill (by looking at the filesystem, or by the agent mentioning it in conversation).
 4. Beekeeper reads the skill's prose and decides whether to promote.
@@ -187,7 +199,7 @@ This is a manual, low-ceremony process and it is sufficient for the next 3+ mont
 ## 9. Open Questions Deferred
 
 - **Registry content.** No skill registries exist today. When the first one lights up, the CLI surface from §7 needs to be implemented and the registry JSON format needs to match the plugin registry format. Same ticket, later.
-- **Mongo storage for agent-authored skills.** If filesystem storage turns out to have lifecycle problems (skills accumulating with no cleanup, hard to query across agents, etc.), migrate agent-authored skills to Mongo in a dedicated collection with the same shape as the filesystem SKILL.md. Not needed now.
+- **Mongo storage for agent-authored skills.** If filesystem storage turns out to have lifecycle problems (skills accumulating with no cleanup, hard to query across agents, etc.), migrate agent-authored skills to Mongo in a dedicated collection with the same shape as the filesystem SKILL.md. Not needed now. *Update 2026-04-15: the deferral condition ("if filesystem storage turns out to have lifecycle problems") has not been triggered. The problems observed on Mike's mac-mini and in the retroactive discovery of the current `skills/` tree turned out to be ownership-partition problems, not storage-substrate problems, and KPR-29's customer-space model addresses them fully without requiring Mongo. See `2026-04-15-skills-customer-space-design.md` §11.2.*
 - **Retargeting skills from developer-agent context to business-agent context.** Most Claude Code skills in the wild are written for dev workflows. A hypothetical "skill adaptation assistant" that helps a beekeeper retarget an internet skill for a CRM or CS agent is interesting future work but not load-bearing for anything on the critical path.
 
 ## 10. Acceptance Criteria
@@ -197,5 +209,5 @@ This spec is done when:
 1. The current skill system is documented authoritatively enough that a new contributor can understand what skills are, how to write one, and how they load — without reading the loader source.
 2. The trust and distribution posture for skills is written down in one place and consistent with the plugin architecture spec.
 3. The two small code changes in §6 are specified clearly enough to be implemented without further design.
-4. The CLI surface is reserved so future registry work doesn't need a new spec round.
+4. The CLI surface is cross-referenced to `2026-04-15-skills-registry-design.md` §7–§11, which is the authoritative source for `hive skill add/list/upgrade/remove` and `hive registry add/list/remove` semantics. This spec's §7 is a forward pointer, not the contract.
 5. The agent-authored promotion workflow is stated explicitly, so there's no ambiguity about who the gate is.
