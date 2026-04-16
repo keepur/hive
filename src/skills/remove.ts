@@ -26,7 +26,7 @@ export async function removeSkill(
   skillsDir: string,
   hiveHome: string,
   opts: RemoveOptions = {},
-): Promise<void> {
+): Promise<boolean> {
   const installed = findInstalledSkill(skillName, skillsDir);
   if (!installed) {
     throw new Error(`Skill "${skillName}" is not installed.`);
@@ -49,12 +49,12 @@ export async function removeSkill(
           const confirmed = await opts.confirmFn(message);
           if (!confirmed) {
             log.info("Skill removal aborted by user", { name: skillName });
-            return;
+            return false;
           }
         } else {
-          log.warn(message);
-          log.warn("Use --force to skip this prompt.");
-          return;
+          console.log(message);
+          console.log("Use --force to skip this prompt.");
+          return false;
         }
       }
     } catch {
@@ -84,4 +84,5 @@ export async function removeSkill(
   );
 
   log.info("Skill removed", { name: skillName, workflow: installed.workflow });
+  return true;
 }

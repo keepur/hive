@@ -4,7 +4,7 @@ import type { SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { createLogger } from "../logging/logger.js";
 import { computeContentHash } from "../skills/content-hash.js";
-import { readSkillMd } from "../skills/frontmatter.js";
+import { readSkillMd, writeSkillMd } from "../skills/frontmatter.js";
 
 const log = createLogger("skill-loader");
 
@@ -282,12 +282,16 @@ function detectModifiedSkills(
       if (!existsSync(skillMdPath)) continue;
 
       try {
-        const { frontmatter } = readSkillMd(skillMdPath);
+        const { frontmatter, body } = readSkillMd(skillMdPath);
         if (!frontmatter.origin?.["base-content-hash"]) continue;
 
         const currentHash = computeContentHash(skillPath);
         if (currentHash !== frontmatter.origin["base-content-hash"]) {
-          frontmatter.origin.modified = true;
+          if (!frontmatter.origin.modified) {
+            frontmatter.origin.modified = true;
+            // Persist to disk so upgrade flow can read the flag
+            writeSkillMd(skillMdPath, frontmatter, body);
+          }
           modified.add(skillPath);
           log.warn("Registry-installed skill has been modified", {
             workflow,
