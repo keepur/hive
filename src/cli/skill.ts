@@ -87,8 +87,10 @@ export async function runSkill(subcommand?: string, ...args: string[]): Promise<
         return answer.toLowerCase() === "y";
       };
 
-      await removeSkill(name, skillsDir, hiveHome, { force, confirmFn });
-      console.log(`Removed ${name}`);
+      const removed = await removeSkill(name, skillsDir, hiveHome, { force, confirmFn });
+      if (removed) {
+        console.log(`Removed ${name}`);
+      }
       break;
     }
 

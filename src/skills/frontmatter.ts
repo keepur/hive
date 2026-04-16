@@ -155,15 +155,15 @@ export function serializeFrontmatter(
   body: string,
 ): string {
   const lines: string[] = [];
-  lines.push(`name: ${fm.name}`);
-  lines.push(`description: ${fm.description}`);
+  lines.push(`name: ${yamlQuote(fm.name)}`);
+  lines.push(`description: ${yamlQuote(fm.description)}`);
 
   // Agents in inline format
   const agentsStr = fm.agents.join(", ");
   lines.push(`agents: [${agentsStr}]`);
 
   if (fm.workflow) {
-    lines.push(`workflow: ${fm.workflow}`);
+    lines.push(`workflow: ${yamlQuote(fm.workflow)}`);
   }
 
   if (fm.origin) {
@@ -185,8 +185,16 @@ function serializeNested(
 ): void {
   for (const [key, val] of Object.entries(obj)) {
     if (val === undefined) continue;
-    lines.push(`  ${key}: ${String(val)}`);
+    lines.push(`  ${key}: ${yamlQuote(String(val))}`);
   }
+}
+
+/** Quote a YAML scalar if it contains characters that would break re-parsing. */
+function yamlQuote(s: string): string {
+  if (s.includes(":") || s.includes("#") || s.includes('"')) {
+    return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  }
+  return s;
 }
 
 /**

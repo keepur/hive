@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, statSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, statSync, rmSync, mkdtempSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { tmpdir } from "node:os";
 import { createLogger } from "../logging/logger.js";
 
 const log = createLogger("registry-fetch");
@@ -22,10 +23,11 @@ export function verifyGitAvailable(): void {
 }
 
 export function shallowClone(url: string): CloneResult {
-  const tmpDir = resolve("/tmp", `hive-skill-install-${Date.now()}`);
+  const parent = mkdtempSync(join(tmpdir(), "hive-skill-install-"));
+  const tmpDir = join(parent, "repo");
   const cleanup = () => {
     try {
-      rmSync(tmpDir, { recursive: true, force: true });
+      rmSync(parent, { recursive: true, force: true });
     } catch {
       /* best effort */
     }
@@ -50,10 +52,11 @@ export function shallowClone(url: string): CloneResult {
 }
 
 export function partialClone(url: string): CloneResult {
-  const tmpDir = resolve("/tmp", `hive-skill-upgrade-${Date.now()}`);
+  const parent = mkdtempSync(join(tmpdir(), "hive-skill-upgrade-"));
+  const tmpDir = join(parent, "repo");
   const cleanup = () => {
     try {
-      rmSync(tmpDir, { recursive: true, force: true });
+      rmSync(parent, { recursive: true, force: true });
     } catch {
       /* best effort */
     }
