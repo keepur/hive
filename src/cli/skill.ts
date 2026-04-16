@@ -140,11 +140,8 @@ function listInstalled(): void {
       try {
         const { frontmatter } = readSkillMd(mdPath);
         const originType = frontmatter.origin?.type ?? "unknown";
-        const modified =
-          frontmatter.origin?.modified !== undefined ? String(frontmatter.origin.modified) : "-";
-        console.log(
-          `  ${skill.padEnd(25)} ${workflow.padEnd(20)} ${originType.padEnd(15)} ${modified}`,
-        );
+        const modified = frontmatter.origin?.modified !== undefined ? String(frontmatter.origin.modified) : "-";
+        console.log(`  ${skill.padEnd(25)} ${workflow.padEnd(20)} ${originType.padEnd(15)} ${modified}`);
       } catch {
         console.log(`  ${skill.padEnd(25)} ${workflow.padEnd(20)} ${"?".padEnd(15)} ?`);
       }
@@ -163,8 +160,7 @@ async function listAvailable(args: string[]): Promise<void> {
     ? [
         {
           name: fromArg,
-          url:
-            config.skillRegistries.find((r) => r.name === fromArg)?.url ?? fromArg,
+          url: config.skillRegistries.find((r) => r.name === fromArg)?.url ?? fromArg,
         },
       ]
     : config.skillRegistries;
