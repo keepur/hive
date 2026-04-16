@@ -22,30 +22,39 @@ export function getModifiedSkills(): Set<string> {
 type CollisionEntry = { source: string; path: string };
 
 /**
- * Scan plugin-bundled skills and customer-space skills, build a map of
- * agentId → SdkPluginConfig[] for that agent's workflows.
+ * Scan seed-bundled skills, plugin-bundled skills, and customer-space skills,
+ * build a map of agentId → SdkPluginConfig[] for that agent's workflows.
  *
- * Collisions are detected on bare workflow directory name. Customer space wins
- * over plugins (shadow); earlier plugins win over later plugins (input order
- * from hive.yaml is preserved by loadPlugins in src/plugins/plugin-loader.ts).
+ * Precedence (high to low): customer > seeds > plugins.
+ * Customer space always wins (shadow). Among non-customer sources, first
+ * registered wins — seeds are scanned before plugins so they take priority.
  * Customer→customer collisions are errors — neither version loads.
  */
 export function loadSkillIndex(
   customerSkillsDir: string,
   plugins?: LoadedPlugin[],
+  seedDirs?: string[],
 ): SkillIndex {
   const index: SkillIndex = new Map();
   const universalPlugins: SdkPluginConfig[] = [];
   const collisionMap = new Map<string, CollisionEntry>();
 
-  // Plugins first, in hive.yaml order
+  // Seeds first — win over plugins (first-in-wins among non-customer sources)
+  for (const seedDir of seedDirs ?? []) {
+    const seedSkillsDir = join(seedDir, "skills");
+    if (!existsSync(seedSkillsDir)) continue;
+    const seedName = seedDir.split("/").pop() ?? "seed";
+    scanWorkflowsFrom(seedSkillsDir, `seed:${seedName}`, collisionMap, index, universalPlugins, false);
+  }
+
+  // Plugins second — lose to seeds (first-in-wins), lose to customer (winsCollisions)
   for (const plugin of plugins ?? []) {
     const pluginSkillsDir = join(plugin.dir, "skills");
     if (!existsSync(pluginSkillsDir)) continue;
     scanWorkflowsFrom(pluginSkillsDir, plugin.name, collisionMap, index, universalPlugins, false);
   }
 
-  // Customer space second — wins collisions with plugins
+  // Customer space last — wins all collisions
   if (existsSync(customerSkillsDir)) {
     scanWorkflowsFrom(customerSkillsDir, "customer", collisionMap, index, universalPlugins, true);
   } else {
