@@ -151,15 +151,41 @@ Two small code changes are required to wire the existing loader into the plugin 
 
 ### 6.1 Plugin-bundled skills
 
-`src/agents/skill-loader.ts` currently scans only the top-level `skills/` directory. Extend it to also scan `<plugin-dir>/skills/` for each loaded plugin. The loader receives the list of loaded plugins (already available in the runtime — plugins are loaded before the skill index is built). For each plugin, if the plugin directory contains a `skills/` subdirectory with the same two-level layout, load those skills into the same index.
+`src/agents/skill-loader.ts` currently scans only the top-level `skills/` directory via `loadSkillIndex(skillsDir?: string): SkillIndex`, called with no argument from `AgentManager` (which relies on the default `resolve("skills")`). Extend it to also scan `<plugin-dir>/skills/` for each loaded plugin.
 
-Ordering: core-bundled skills are loaded first, plugin-bundled skills are loaded after. Name collisions between core and plugin skills are logged as warnings and core wins (because core is explicitly opinionated and plugins should not shadow it). Name collisions between two plugins are logged as warnings and the first-loaded plugin wins (order of plugin installation, preserved in the composition record).
+**Signature change.** Change `loadSkillIndex` to accept an optional second argument:
+
+```ts
+loadSkillIndex(skillsDir?: string, plugins?: LoadedPlugin[]): SkillIndex
+```
+
+where `LoadedPlugin` is the existing type from `src/plugins/types.ts` (its `dir` field is the absolute path used as `<plugin-dir>`). When `plugins` is provided, after scanning `skillsDir` the loader iterates the list in order, and for each plugin whose `<plugin-dir>/skills/` exists, scans it using the same two-level layout (`<workflow>/skills/<skill>/SKILL.md`) and merges results into the same index.
+
+**Call-site change.** `AgentManager` constructs the index at `src/agents/agent-manager.ts` line 50 and rebuilds it in `reloadSkills()` (lines 64–70). Both call sites must pass `this.plugins` (already populated at line 49, before the initial `loadSkillIndex()` call). No other callers exist.
+
+**Collision rule.** Collision is detected at the **workflow-directory-name level** (not the frontmatter `name:` field). This matches how the loader already groups skills: one `SdkPluginConfig` per workflow directory, keyed by path. Detection approach:
+
+- The loader maintains an in-memory `Map<string, { source: "core" | pluginName; path: string }>` during the load pass, keyed by the **bare workflow directory entry name** as returned by `readdirSync` (e.g., `"morning-briefing"`), not by the full absolute path. Using the bare name is what makes the collision fire — two plugins each shipping a `morning-briefing/` workflow resolve to different absolute paths but must be detected as a collision.
+- Before registering a workflow, check the map. If absent, insert and proceed. If present, this is a collision: log a warning via the existing `log.warn(...)` helper and skip registration of the new workflow.
+- Ordering: core (`<repo>/skills/`) is scanned first, then plugins in the order they appear in the `plugins` array. Input order is preserved by `loadPlugins` in `src/plugins/plugin-loader.ts` (it iterates the input `pluginNames` array and pushes to the result in sequence), and `pluginNames` originates from `hive.yaml` config order. This gives the precedence the spec requires: core > first-loaded plugin > later-loaded plugin, deterministically from the config file.
+- Warning log shape (structured, matching the rest of the codebase). The `workflow` field is the bare directory name used as the collision-map key:
+  ```ts
+  log.warn("Skill workflow collision — keeping first, skipping second", {
+    workflow,                                                       // e.g. "morning-briefing"
+    kept: { source: "core" | <pluginName>, path: <absolutePath> },
+    skipped: { source: <pluginName>, path: <absolutePath> },
+  });
+  ```
+
+**Note on pre-existing debug log.** `skill-loader.ts` line 36 currently logs `"Workflow missing .claude/skills/, skipping"` — the `.claude/` fragment is stale (actual check is `<workflow>/skills/`). Fix the message in the same PR to avoid confusion when debugging plugin-dir scans.
 
 ### 6.2 Hot reload on SIGUSR1
 
-`src/index.ts` handles SIGUSR1 to reload agent definitions from Mongo. Extend the same signal handler to also rebuild the skill index. This makes agent-authored skills effective without a restart: agent writes SKILL.md → admin sends SIGUSR1 (or the agent can ask the admin MCP tool to signal reload) → new skill is available on next agent turn.
+**Status: already implemented; no code change required for this subsection.** As of the current codebase, `src/index.ts` `reload()` at lines 65–93 already calls `agentManager.reloadSkills()` at line 92, and the SIGUSR1 handler wires to `reload()`. `AgentManager.reloadSkills()` at `src/agents/agent-manager.ts` lines 64–70 calls `loadSkillIndex()` and replaces `this.skillIndex`. Agent-authored SKILL.md writes become effective on the next SIGUSR1 (or on the existing `fs.watch` trigger for `<repo>/skills/`) without a restart.
 
-No new file. The signal handler in `src/index.ts` already calls the agent-registry reload path; it just needs an additional call to rebuild the skill index and re-bind it into the agent runner's state.
+The #137 implementer should verify this behavior end-to-end (write a SKILL.md, send SIGUSR1, confirm the skill is picked up) and make sure the §6.1 signature change flows through `reloadSkills()` — i.e., `reloadSkills()` must also pass `this.plugins` to `loadSkillIndex()` so hot reload sees plugin-bundled skills, not just core skills. That is the only §6.2-adjacent code touch this ticket needs.
+
+This subsection is retained in the spec for documentation completeness and to make the hot-reload guarantee explicit — a future reader looking for "how do agent-authored skills become live" should find the answer here.
 
 ### 6.3 Customer-space skills (KPR-29 scope, not #137)
 
