@@ -397,13 +397,16 @@ async function main(): Promise<void> {
   let beekeeperRegistration: { stop: () => void } | undefined;
   if (config.ws.enabled) {
     const { startBeekeeperRegistration } = await import("./beekeeper-client.js");
+    const capabilityName = `hive-${config.instance.id}`;
     beekeeperRegistration = startBeekeeperRegistration({
       beekeeperPort: config.beekeeper.port,
       wsPort: config.ws.port,
+      capabilityName,
     });
     log.info("Beekeeper registration loop started", {
       beekeeperPort: config.beekeeper.port,
       wsPort: config.ws.port,
+      capabilityName,
     });
   }
 

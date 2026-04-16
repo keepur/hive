@@ -17,6 +17,8 @@ const log = createLogger("beekeeper-client");
 export interface BeekeeperRegistrationOptions {
   beekeeperPort: number;
   wsPort: number;
+  /** Capability name to register with beekeeper. Defaults to "hive". */
+  capabilityName?: string;
   /** Test-only override. Defaults to 30_000. */
   intervalMs?: number;
 }
@@ -31,7 +33,7 @@ export function startBeekeeperRegistration(opts: BeekeeperRegistrationOptions): 
 
   const url = `http://127.0.0.1:${beekeeperPort}/internal/register-capability`;
   const payload = {
-    name: "hive",
+    name: opts.capabilityName ?? "hive",
     localWsUrl: `ws://127.0.0.1:${wsPort}`,
     healthUrl: `http://127.0.0.1:${wsPort}/health`,
   };
