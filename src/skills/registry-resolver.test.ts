@@ -76,7 +76,11 @@ describe("resolveRegistry", () => {
     expect(result).toEqual({ name: "first", url: "https://github.com/a/b" });
   });
 
-  it("throws when no registries are configured", () => {
-    expect(() => resolveRegistry({ name: "some-skill" }, [])).toThrow(/No skill registries configured/);
+  it("falls back to built-in Keepur default when no registries are configured", () => {
+    const result = resolveRegistry({ name: "some-skill" }, []);
+    expect(result).toEqual({
+      name: "keepur-default",
+      url: "https://github.com/keepur/hive-skills",
+    });
   });
 });
