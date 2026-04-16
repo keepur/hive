@@ -98,10 +98,15 @@ export function commitToState(hiveHome: string, files: string[], message: string
       return; // Nothing changed
     }
 
-    // Create the commit object
-    const authorArg = authorName ? `${authorName} <${authorName}@hive>` : "hive <hive@localhost>";
-    const commitArgs = ["commit-tree", tree, "-p", parent, "-m", message, "--author", authorArg];
-    const commitSha = gitPlumb(...commitArgs);
+    // Create the commit object.
+    // git commit-tree does NOT support --author; authorship is set via env vars.
+    const authorEnv = authorName
+      ? { GIT_AUTHOR_NAME: authorName, GIT_AUTHOR_EMAIL: `${authorName}@hive`, GIT_COMMITTER_NAME: authorName, GIT_COMMITTER_EMAIL: `${authorName}@hive` }
+      : { GIT_AUTHOR_NAME: "hive", GIT_AUTHOR_EMAIL: "hive@localhost", GIT_COMMITTER_NAME: "hive", GIT_COMMITTER_EMAIL: "hive@localhost" };
+    const commitSha = execFileSync("git", ["commit-tree", tree, "-p", parent, "-m", message], {
+      env: { ...env, ...authorEnv },
+      encoding: "utf-8",
+    }).trim();
 
     // Advance the state branch ref
     gitPlumb("update-ref", "refs/heads/state", commitSha);
@@ -159,8 +164,11 @@ export function commitRemovalToState(hiveHome: string, files: string[], message:
       return; // Nothing changed
     }
 
-    // Create the commit object
-    const commitSha = gitPlumb("commit-tree", tree, "-p", parent, "-m", message);
+    // Create the commit object (git commit-tree uses env vars for authorship)
+    const commitSha = execFileSync("git", ["commit-tree", tree, "-p", parent, "-m", message], {
+      env: { ...env, GIT_AUTHOR_NAME: "hive", GIT_AUTHOR_EMAIL: "hive@localhost", GIT_COMMITTER_NAME: "hive", GIT_COMMITTER_EMAIL: "hive@localhost" },
+      encoding: "utf-8",
+    }).trim();
 
     // Advance the state branch ref
     gitPlumb("update-ref", "refs/heads/state", commitSha);
