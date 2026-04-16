@@ -503,6 +503,7 @@ server.registerTool(
     title: "List HubSpot Tasks",
     description:
       "List tasks from HubSpot CRM with optional filters. " +
+      "By default returns only open tasks (NOT_STARTED, IN_PROGRESS) sorted by most recent due date. " +
       "Filter by status, owner, and/or due date range. " +
       "Use this to find overdue tasks, tasks due today/tomorrow, or all open tasks across the pipeline.",
     inputSchema: {
@@ -510,12 +511,17 @@ server.registerTool(
       ownerId: z.string().optional().describe("Filter by HubSpot owner ID"),
       dueAfter: z.string().optional().describe("Only tasks due on or after this date (ISO format, e.g. 2026-03-14)"),
       dueBefore: z.string().optional().describe("Only tasks due on or before this date (ISO format, e.g. 2026-03-15)"),
+      includeCompleted: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Include completed tasks (default: only open tasks)"),
       limit: z.number().optional().default(100).describe("Max tasks to return (default 100)"),
     },
   },
-  async ({ status, ownerId, dueAfter, dueBefore, limit }) => {
+  async ({ status, ownerId, dueAfter, dueBefore, includeCompleted, limit }) => {
     try {
-      const tasks = await client.listTasks({ status, ownerId, dueAfter, dueBefore, limit });
+      const tasks = await client.listTasks({ status, ownerId, dueAfter, dueBefore, includeCompleted, limit });
 
       if (tasks.length === 0) {
         return { content: [{ type: "text", text: "No tasks found matching those filters." }] };

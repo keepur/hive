@@ -306,6 +306,7 @@ export class HubSpotApiClient {
     dueBefore?: string;
     dueAfter?: string;
     limit?: number;
+    includeCompleted?: boolean;
   }): Promise<HubSpotObject[]> {
     log.info("Listing tasks", { options });
 
@@ -313,6 +314,14 @@ export class HubSpotApiClient {
 
     if (options.status) {
       filters.push({ propertyName: "hs_task_status", operator: "EQ", value: options.status });
+    } else if (options.includeCompleted !== true) {
+      // Default: exclude completed tasks unless caller explicitly asks for them
+      // or filters by a specific status. Mirrors listDeals activeOnly behavior.
+      filters.push({
+        propertyName: "hs_task_status",
+        operator: "IN",
+        values: ["NOT_STARTED", "IN_PROGRESS"],
+      });
     }
     if (options.ownerId) {
       filters.push({ propertyName: "hubspot_owner_id", operator: "EQ", value: options.ownerId });
@@ -334,7 +343,7 @@ export class HubSpotApiClient {
         "hs_timestamp",
         "hubspot_owner_id",
       ],
-      sorts: [{ propertyName: "hs_timestamp", direction: "ASCENDING" }],
+      sorts: [{ propertyName: "hs_timestamp", direction: "DESCENDING" }],
       limit: options.limit ?? 100,
     };
 
