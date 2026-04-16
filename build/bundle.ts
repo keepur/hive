@@ -94,7 +94,7 @@ await build({
 });
 
 // Copy non-JS assets to setup/
-const setupAssets = ["setup/install-prereqs.sh", "setup/slack-manifest.yaml"];
+const setupAssets = ["setup/slack-manifest.yaml"];
 for (const asset of setupAssets) {
   const src = resolve(asset);
   const dest = resolve(PKG_DIR, asset);
