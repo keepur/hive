@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { join } from "node:path";
 import type { SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { createLogger } from "../logging/logger.js";
@@ -11,33 +11,34 @@ export type SkillIndex = Map<string, SdkPluginConfig[]>;
 type CollisionEntry = { source: string; path: string };
 
 /**
- * Scan core skills/ and (optionally) plugin-bundled skills, build a map of
+ * Scan plugin-bundled skills and customer-space skills, build a map of
  * agentId → SdkPluginConfig[] for that agent's workflows.
  *
- * Collisions are detected on bare workflow directory name. Core wins over
- * plugins; earlier plugins win over later plugins (input order from hive.yaml
- * is preserved by loadPlugins in src/plugins/plugin-loader.ts).
+ * Collisions are detected on bare workflow directory name. Customer space wins
+ * over plugins (shadow); earlier plugins win over later plugins (input order
+ * from hive.yaml is preserved by loadPlugins in src/plugins/plugin-loader.ts).
+ * Customer→customer collisions are errors — neither version loads.
  */
 export function loadSkillIndex(
-  skillsDir: string = resolve("skills"),
+  customerSkillsDir: string,
   plugins?: LoadedPlugin[],
 ): SkillIndex {
   const index: SkillIndex = new Map();
   const universalPlugins: SdkPluginConfig[] = [];
   const collisionMap = new Map<string, CollisionEntry>();
 
-  // Core first
-  if (existsSync(skillsDir)) {
-    scanWorkflowsFrom(skillsDir, "core", collisionMap, index, universalPlugins);
-  } else {
-    log.debug("No core skills directory found", { path: skillsDir });
-  }
-
-  // Then plugins, in hive.yaml order
+  // Plugins first, in hive.yaml order
   for (const plugin of plugins ?? []) {
     const pluginSkillsDir = join(plugin.dir, "skills");
     if (!existsSync(pluginSkillsDir)) continue;
-    scanWorkflowsFrom(pluginSkillsDir, plugin.name, collisionMap, index, universalPlugins);
+    scanWorkflowsFrom(pluginSkillsDir, plugin.name, collisionMap, index, universalPlugins, false);
+  }
+
+  // Customer space second — wins collisions with plugins
+  if (existsSync(customerSkillsDir)) {
+    scanWorkflowsFrom(customerSkillsDir, "customer", collisionMap, index, universalPlugins, true);
+  } else {
+    log.debug("No customer skills directory found", { path: customerSkillsDir });
   }
 
   // Merge universal plugins into every agent's list + expose via sentinel
@@ -58,8 +59,40 @@ export function loadSkillIndex(
 }
 
 /**
- * Scan one top-level skills directory (core or plugin), register non-colliding
+ * Remove all index entries that reference the given workflow path.
+ * Used when customer-space shadows a plugin-bundled workflow.
+ */
+function removeWorkflowFromIndex(
+  workflowPath: string,
+  index: SkillIndex,
+  universalPlugins: SdkPluginConfig[],
+): void {
+  // Remove from per-agent entries
+  for (const [agentId, configs] of index) {
+    const filtered = configs.filter((c) => c.path !== workflowPath);
+    if (filtered.length !== configs.length) {
+      if (filtered.length === 0) {
+        index.delete(agentId);
+      } else {
+        index.set(agentId, filtered);
+      }
+    }
+  }
+
+  // Remove from universalPlugins array (mutate in place)
+  for (let i = universalPlugins.length - 1; i >= 0; i--) {
+    if (universalPlugins[i]!.path === workflowPath) {
+      universalPlugins.splice(i, 1);
+    }
+  }
+}
+
+/**
+ * Scan one top-level skills directory (plugin or customer), register non-colliding
  * workflows into the index, and append to universalPlugins for hive-wide skills.
+ *
+ * When winsCollisions is true (customer space), collisions with non-customer
+ * sources shadow the existing entry. Customer→customer collisions are errors.
  */
 function scanWorkflowsFrom(
   rootDir: string,
@@ -67,6 +100,7 @@ function scanWorkflowsFrom(
   collisionMap: Map<string, CollisionEntry>,
   index: SkillIndex,
   universalPlugins: SdkPluginConfig[],
+  winsCollisions: boolean,
 ): void {
   let workflows: string[];
   try {
@@ -93,14 +127,38 @@ function scanWorkflowsFrom(
 
     const existing = collisionMap.get(workflow);
     if (existing) {
-      log.warn("Skill workflow collision — keeping first, skipping second", {
-        workflow,
-        kept: existing,
-        skipped: { source, path: workflowPath },
-      });
-      continue;
+      if (winsCollisions && existing.source !== "customer") {
+        // Customer shadows plugin — remove plugin's entries and replace
+        log.warn("Customer skill shadows plugin-bundled skill", {
+          workflow,
+          shadowed: existing,
+          customer: { source, path: workflowPath },
+        });
+        removeWorkflowFromIndex(existing.path, index, universalPlugins);
+        collisionMap.set(workflow, { source, path: workflowPath });
+      } else if (winsCollisions && existing.source === "customer") {
+        // Customer→customer collision — error, load neither
+        log.error("Customer skill collision — both skipped", {
+          workflow,
+          first: existing,
+          second: { source, path: workflowPath },
+        });
+        // Remove the first customer version that was already loaded
+        removeWorkflowFromIndex(existing.path, index, universalPlugins);
+        collisionMap.delete(workflow);
+        continue;
+      } else {
+        // Plugin→plugin collision — first wins
+        log.warn("Skill workflow collision — keeping first, skipping second", {
+          workflow,
+          kept: existing,
+          skipped: { source, path: workflowPath },
+        });
+        continue;
+      }
+    } else {
+      collisionMap.set(workflow, { source, path: workflowPath });
     }
-    collisionMap.set(workflow, { source, path: workflowPath });
 
     const pluginConfig: SdkPluginConfig = { type: "local", path: workflowPath };
 

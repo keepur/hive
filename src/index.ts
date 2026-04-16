@@ -1,5 +1,5 @@
 import { existsSync, watch } from "node:fs";
-import { resolve } from "node:path";
+import { skillsDir } from "./paths.js";
 import { MongoClient } from "mongodb";
 import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
@@ -242,7 +242,6 @@ async function main(): Promise<void> {
   }
 
   // Watch skills/ directory for changes — debounced to 500ms
-  const skillsDir = resolve("skills");
   if (existsSync(skillsDir)) {
     watch(skillsDir, { recursive: true }, () => {
       if (reloadTimer) clearTimeout(reloadTimer);
