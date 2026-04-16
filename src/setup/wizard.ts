@@ -17,6 +17,7 @@ import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
 import { render as renderTemplate } from "./template-renderer.js";
+import { seedsDir } from "../paths.js";
 
 // Resolved per-invocation inside runWizard().
 let ENV_PATH = "";
@@ -409,12 +410,12 @@ export async function runWizard(
     console.log("\nChief of Staff agent: ✓ already set up");
     const redo = await confirm("Regenerate agent from template?", false);
     if (redo) {
-      await doAgent(hive, pkgRoot);
+      await doAgent(hive);
     } else {
       console.log("  ✓ Skipped");
     }
   } else {
-    await doAgent(hive, pkgRoot);
+    await doAgent(hive);
   }
 
   // ── 6. Constitution ──────────────────────────────────────────────
@@ -635,24 +636,69 @@ async function doAnthropic(env: Record<string, string>) {
   console.log("  ✓ Anthropic key saved (.env)");
 }
 
-async function doAgent(hive: Record<string, any>, pkgRoot: string) {
+async function doAgent(hive: Record<string, any>): Promise<void> {
   section("Chief of Staff Agent");
 
   console.log("Hive starts with a Chief of Staff — your primary agent.");
   console.log("Additional agents are created through it as needed.\n");
 
   const agentName = await ask("Name your Chief of Staff", "Mokie");
+  const channelName = await ask("Slack channel for your CoS", `agent-${agentName.toLowerCase()}`);
 
-  // Store agent name in hive.yaml for template rendering
+  // Store in hive.yaml for constitution rendering
   if (!hive.agents) hive.agents = {};
   hive.agents["chief-of-staff"] = { name: agentName };
   saveHiveYaml(hive);
 
-  // Seed chief-of-staff into agent_definitions via setup:seeds
-  console.log("  Seeding agent definition...");
-  execFileSync("npx", ["tsx", "setup/setup-seeds.ts"], { cwd: pkgRoot, stdio: "inherit" });
+  // Read seed YAML
+  const seedPath = resolve(seedsDir, "chief-of-staff", "agent.yaml");
+  if (!existsSync(seedPath)) {
+    console.log(`  ⚠ Seed not found: ${seedPath}`);
+    console.log("  You can seed the agent manually later.");
+    return;
+  }
 
-  console.log(`  ✓ ${agentName} (Chief of Staff) is ready`);
+  const raw = parseYaml(readFileSync(seedPath, "utf-8")) as Record<string, any>;
+
+  // Customize from user input
+  raw.name = agentName;
+  raw.channels = [channelName];
+
+  // Insert into MongoDB
+  const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
+  const hiveConfig = loadHiveYaml();
+  const instanceId = (hiveConfig.instance?.id as string) ?? "hive";
+  const mongoDb = process.env.MONGODB_DB || `hive_${instanceId}`;
+
+  try {
+    const client = new MongoClient(mongoUri);
+    await client.connect();
+    const db = client.db(mongoDb);
+    const agentDefs = db.collection("agent_definitions");
+
+    const existing = await agentDefs.findOne({ _id: raw._id });
+    if (existing) {
+      console.log(`  Agent "${raw._id}" already exists in DB — updating name and channel.`);
+      await agentDefs.updateOne(
+        { _id: raw._id },
+        { $set: { name: agentName, channels: [channelName], updatedAt: new Date(), updatedBy: "setup-wizard" } },
+      );
+    } else {
+      const now = new Date();
+      await agentDefs.insertOne({
+        ...raw,
+        createdAt: now,
+        updatedAt: now,
+        updatedBy: "setup-wizard",
+      });
+    }
+
+    await client.close();
+    console.log(`  ✓ ${agentName} (Chief of Staff) seeded to MongoDB`);
+  } catch (err) {
+    console.log(`  ⚠ Failed to seed agent: ${err}`);
+    console.log("  Make sure MongoDB is running (brew services start mongodb-community)");
+  }
 }
 
 async function doConstitution(hive: Record<string, any>) {
