@@ -533,6 +533,11 @@ async function doSlack(env: Record<string, string>) {
   console.log("You need a Slack app with Socket Mode enabled.");
   console.log("");
   console.log("1. Go to: https://api.slack.com/apps");
+  try {
+    execFileSync("open", ["https://api.slack.com/apps"], { stdio: "pipe" });
+  } catch {
+    // Non-macOS or no browser — user can copy the URL
+  }
   console.log('2. Click "Create New App" → "From a manifest"');
   console.log("3. Select your workspace");
   console.log("4. Choose YAML format and paste this manifest:");
@@ -586,6 +591,23 @@ async function doSlack(env: Record<string, string>) {
   }
 
   saveEnv(env);
+
+  // Also store in Keychain for honeypot-based credential flow
+  try {
+    if (env.SLACK_APP_TOKEN) {
+      execFileSync("honeypot", ["set", "SLACK_APP_TOKEN", env.SLACK_APP_TOKEN], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    }
+    if (env.SLACK_BOT_TOKEN) {
+      execFileSync("honeypot", ["set", "SLACK_BOT_TOKEN", env.SLACK_BOT_TOKEN], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    }
+  } catch {
+    // honeypot may not be on PATH — .env is the primary store
+  }
+
   console.log("  ✓ Slack tokens saved (.env)");
 }
 
@@ -594,6 +616,16 @@ async function doAnthropic(env: Record<string, string>) {
   console.log("");
   env.ANTHROPIC_API_KEY = await ask("Anthropic API Key (sk-ant-...)", env.ANTHROPIC_API_KEY || "");
   saveEnv(env);
+
+  // Also store in Keychain for honeypot-based credential flow
+  try {
+    execFileSync("honeypot", ["set", "ANTHROPIC_API_KEY", env.ANTHROPIC_API_KEY], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch {
+    // honeypot may not be on PATH (dev mode) — .env is sufficient
+  }
+
   console.log("  ✓ Anthropic key saved (.env)");
 }
 
