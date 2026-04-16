@@ -90,7 +90,7 @@ Email with link + short guide
 **What's missing**:
 - [ ] Xcode Command Line Tools (`xcode-select --install`) — needed for `better-sqlite3` native compilation
 - [ ] Ollama (`brew install ollama` + `brew services start ollama`)
-- [ ] Ollama models (`ollama pull bge-large`, `ollama pull qwen2.5:3b`)
+- [ ] Ollama models (`ollama pull bge-large`, `ollama pull gemma4:e4b`)
 - [ ] Qdrant (`brew install qdrant` + `brew services start qdrant`)
 - [ ] `gh` CLI (optional, for GitHub Issues MCP)
 - [ ] Required vs optional distinction: Homebrew/Node/MongoDB/Ollama/Qdrant/models are required. gh is optional.
