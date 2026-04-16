@@ -1,100 +1,157 @@
 import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 import type { SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
+import type { LoadedPlugin } from "../plugins/types.js";
 import { createLogger } from "../logging/logger.js";
 
 const log = createLogger("skill-loader");
 
 export type SkillIndex = Map<string, SdkPluginConfig[]>;
 
+type CollisionEntry = { source: string; path: string };
+
 /**
- * Scan skills/ for workflow directories, parse SKILL.md frontmatter,
- * build a map of agentId → SdkPluginConfig[] for that agent's workflows.
+ * Scan core skills/ and (optionally) plugin-bundled skills, build a map of
+ * agentId → SdkPluginConfig[] for that agent's workflows.
+ *
+ * Collisions are detected on bare workflow directory name. Core wins over
+ * plugins; earlier plugins win over later plugins (input order from hive.yaml
+ * is preserved by loadPlugins in src/plugins/plugin-loader.ts).
  */
-export function loadSkillIndex(skillsDir: string = resolve("skills")): SkillIndex {
+export function loadSkillIndex(
+  skillsDir: string = resolve("skills"),
+  plugins?: LoadedPlugin[],
+): SkillIndex {
   const index: SkillIndex = new Map();
+  const universalPlugins: SdkPluginConfig[] = [];
+  const collisionMap = new Map<string, CollisionEntry>();
 
-  if (!existsSync(skillsDir)) {
-    log.debug("No skills directory found", { path: skillsDir });
-    return index;
+  // Core first
+  if (existsSync(skillsDir)) {
+    scanWorkflowsFrom(skillsDir, "core", collisionMap, index, universalPlugins);
+  } else {
+    log.debug("No core skills directory found", { path: skillsDir });
   }
 
-  try {
-    // Collect workflows that apply to "all" agents
-    const universalPlugins: SdkPluginConfig[] = [];
-
-    // Each top-level dir in skills/ is a workflow
-    const workflows = readdirSync(skillsDir).filter((d) =>
-      statSync(join(skillsDir, d)).isDirectory(),
-    );
-
-    for (const workflow of workflows) {
-      const workflowPath = join(skillsDir, workflow);
-      const skillsSubdir = join(workflowPath, "skills");
-
-      if (!existsSync(skillsSubdir)) {
-        log.debug("Workflow missing .claude/skills/, skipping", { workflow });
-        continue;
-      }
-
-      const pluginConfig: SdkPluginConfig = { type: "local", path: workflowPath };
-
-      // Scan each skill inside the workflow for agents frontmatter
-      const agentIds = new Set<string>();
-      let hasAll = false;
-
-      const skillDirs = readdirSync(skillsSubdir).filter((d) =>
-        statSync(join(skillsSubdir, d)).isDirectory(),
-      );
-
-      for (const skillDir of skillDirs) {
-        const skillMd = join(skillsSubdir, skillDir, "SKILL.md");
-        if (!existsSync(skillMd)) continue;
-
-        const agents = parseAgentsFromFrontmatter(readFileSync(skillMd, "utf-8"));
-        for (const agent of agents) {
-          if (agent === "all") {
-            hasAll = true;
-          } else {
-            agentIds.add(agent);
-          }
-        }
-      }
-
-      if (hasAll) {
-        universalPlugins.push(pluginConfig);
-        log.debug("Workflow registered as universal", { workflow, skills: skillDirs.length });
-      } else if (agentIds.size > 0) {
-        for (const agentId of agentIds) {
-          const existing = index.get(agentId) ?? [];
-          existing.push(pluginConfig);
-          index.set(agentId, existing);
-        }
-        log.debug("Workflow registered", { workflow, agents: [...agentIds], skills: skillDirs.length });
-      }
-    }
-
-    // Merge universal plugins into every agent's list
-    if (universalPlugins.length > 0) {
-      // Get all agent IDs currently in the index
-      const allAgentIds = new Set(index.keys());
-      // Also need to handle agents with no workflow-specific skills —
-      // they'll get universal plugins when looked up via getSkillsForAgent()
-      for (const agentId of allAgentIds) {
-        const existing = index.get(agentId)!;
-        existing.push(...universalPlugins);
-      }
-      // Store universal plugins under a sentinel key for agents not yet in the index
-      index.set("__universal__", universalPlugins);
-    }
-
-    const totalWorkflows = workflows.filter((w) => existsSync(join(skillsDir, w, "skills"))).length;
-    log.info("Skill index loaded", { workflows: totalWorkflows, agents: index.size - (index.has("__universal__") ? 1 : 0) });
-  } catch (err) {
-    log.warn("Failed to load skill index, returning empty index", { error: String(err) });
+  // Then plugins, in hive.yaml order
+  for (const plugin of plugins ?? []) {
+    const pluginSkillsDir = join(plugin.dir, "skills");
+    if (!existsSync(pluginSkillsDir)) continue;
+    scanWorkflowsFrom(pluginSkillsDir, plugin.name, collisionMap, index, universalPlugins);
   }
+
+  // Merge universal plugins into every agent's list + expose via sentinel
+  if (universalPlugins.length > 0) {
+    for (const agentId of [...index.keys()]) {
+      const existing = index.get(agentId)!;
+      existing.push(...universalPlugins);
+    }
+    index.set("__universal__", universalPlugins);
+  }
+
+  log.info("Skill index loaded", {
+    workflows: collisionMap.size,
+    agents: index.size - (index.has("__universal__") ? 1 : 0),
+  });
 
   return index;
+}
+
+/**
+ * Scan one top-level skills directory (core or plugin), register non-colliding
+ * workflows into the index, and append to universalPlugins for hive-wide skills.
+ */
+function scanWorkflowsFrom(
+  rootDir: string,
+  source: string,
+  collisionMap: Map<string, CollisionEntry>,
+  index: SkillIndex,
+  universalPlugins: SdkPluginConfig[],
+): void {
+  let workflows: string[];
+  try {
+    workflows = readdirSync(rootDir).filter((d) => {
+      try {
+        return statSync(join(rootDir, d)).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+  } catch (err) {
+    log.warn("Failed to read skills directory", { source, path: rootDir, error: String(err) });
+    return;
+  }
+
+  for (const workflow of workflows) {
+    const workflowPath = join(rootDir, workflow);
+    const skillsSubdir = join(workflowPath, "skills");
+
+    if (!existsSync(skillsSubdir)) {
+      log.debug("Workflow missing skills/ subdirectory, skipping", { source, workflow });
+      continue;
+    }
+
+    const existing = collisionMap.get(workflow);
+    if (existing) {
+      log.warn("Skill workflow collision — keeping first, skipping second", {
+        workflow,
+        kept: existing,
+        skipped: { source, path: workflowPath },
+      });
+      continue;
+    }
+    collisionMap.set(workflow, { source, path: workflowPath });
+
+    const pluginConfig: SdkPluginConfig = { type: "local", path: workflowPath };
+
+    const agentIds = new Set<string>();
+    let hasAll = false;
+
+    let skillDirs: string[];
+    try {
+      skillDirs = readdirSync(skillsSubdir).filter((d) => {
+        try {
+          return statSync(join(skillsSubdir, d)).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+    } catch (err) {
+      log.warn("Failed to read workflow skills subdir", { source, workflow, error: String(err) });
+      continue;
+    }
+
+    for (const skillDir of skillDirs) {
+      const skillMd = join(skillsSubdir, skillDir, "SKILL.md");
+      if (!existsSync(skillMd)) continue;
+
+      const agents = parseAgentsFromFrontmatter(readFileSync(skillMd, "utf-8"));
+      for (const agent of agents) {
+        if (agent === "all") {
+          hasAll = true;
+        } else {
+          agentIds.add(agent);
+        }
+      }
+    }
+
+    if (hasAll) {
+      universalPlugins.push(pluginConfig);
+      log.debug("Workflow registered as universal", { source, workflow, skills: skillDirs.length });
+    } else if (agentIds.size > 0) {
+      for (const agentId of agentIds) {
+        const existing = index.get(agentId) ?? [];
+        existing.push(pluginConfig);
+        index.set(agentId, existing);
+      }
+      log.debug("Workflow registered", {
+        source,
+        workflow,
+        agents: [...agentIds],
+        skills: skillDirs.length,
+      });
+    }
+  }
 }
 
 /**
