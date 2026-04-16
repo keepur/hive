@@ -47,7 +47,7 @@ export class AgentManager {
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
     this.plugins = loadPlugins(appConfig.plugins, process.cwd());
-    this.skillIndex = loadSkillIndex();
+    this.skillIndex = loadSkillIndex(undefined, this.plugins);
   }
 
   getPlugins(): LoadedPlugin[] {
@@ -63,7 +63,7 @@ export class AgentManager {
 
   reloadSkills(): void {
     try {
-      this.skillIndex = loadSkillIndex();
+      this.skillIndex = loadSkillIndex(undefined, this.plugins);
     } catch (err) {
       log.warn("Skill reload failed, retaining previous index", { error: String(err) });
     }
