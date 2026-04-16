@@ -1,10 +1,11 @@
 import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { createLogger } from "../logging/logger.js";
 import { computeContentHash } from "../skills/content-hash.js";
 import { readSkillMd, writeSkillMd } from "../skills/frontmatter.js";
+import { commitToState } from "../skills/instance-git.js";
 
 const log = createLogger("skill-loader");
 
@@ -61,7 +62,7 @@ export function loadSkillIndex(
   }
 
   // Post-scan: detect customer modifications to registry-installed skills
-  _modifiedSkills = detectModifiedSkills(collisionMap);
+  _modifiedSkills = detectModifiedSkills(collisionMap, customerSkillsDir);
 
   log.info("Skill index loaded", {
     workflows: collisionMap.size,
@@ -256,8 +257,10 @@ export function getSkillsForAgent(index: SkillIndex, agentId: string): SdkPlugin
  */
 function detectModifiedSkills(
   collisionMap: Map<string, CollisionEntry>,
+  customerSkillsDir: string,
 ): Set<string> {
   const modified = new Set<string>();
+  const hiveHome = resolve(customerSkillsDir, "..");
 
   for (const [workflow, entry] of collisionMap) {
     // Only check customer-space skills — never write to plugin directories
@@ -294,6 +297,12 @@ function detectModifiedSkills(
             frontmatter.origin.modified = true;
             // Persist to disk so upgrade flow can read the flag
             writeSkillMd(skillMdPath, frontmatter, body);
+            // Audit the modification detection on the state branch
+            commitToState(
+              hiveHome,
+              [relative(hiveHome, skillMdPath)],
+              `detect-modified: ${skillDir} content hash changed`,
+            );
           }
           modified.add(skillPath);
           log.warn("Registry-installed skill has been modified", {

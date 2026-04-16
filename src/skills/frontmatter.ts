@@ -135,7 +135,9 @@ function parseNestedBlock(lines: string[], startIdx: number): Record<string, str
 
 function unquote(s: string): string {
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    return s.slice(1, -1);
+    const inner = s.slice(1, -1);
+    // Unescape sequences that yamlQuote may have produced
+    return inner.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
   }
   return s;
 }

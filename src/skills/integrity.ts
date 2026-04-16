@@ -17,7 +17,11 @@ export function verifyPackageIntegrity(hiveHome: string, hiveMetaDir: string): {
     return { ok: true, warnings: [] };
   }
 
-  const snapshot: SnapshotEntry[] = JSON.parse(readFileSync(snapshotPath, "utf-8"));
+  const parsed = JSON.parse(readFileSync(snapshotPath, "utf-8"));
+  if (!Array.isArray(parsed)) {
+    return { ok: false, warnings: [`installed-snapshot.json is malformed (expected array, got ${typeof parsed})`] };
+  }
+  const snapshot: SnapshotEntry[] = parsed;
   const drift: string[] = [];
 
   for (const entry of snapshot) {
