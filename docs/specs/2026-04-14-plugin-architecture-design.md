@@ -102,7 +102,7 @@ mcp-servers:
     not-for: "Reading/writing specific records — use hubspot-crm for targeted CRUD"
     env: [OLLAMA_URL, QDRANT_URL, MONGODB_ATLAS_URI, VOYAGEAI_API_KEY]
 
-skills: []                # Reserved — contract defined in #137
+skills: []                # Workflow dirs bundled in <pluginDir>/skills/ — see below
 ```
 
 **Field contract:**
@@ -122,7 +122,7 @@ skills: []                # Reserved — contract defined in #137
 | `mcp-servers.<name>.env` | string[] | no | Env var names to forward from the base process |
 | `mcp-servers.<name>.env-map` | Record<string,string> | no | Rename vars: `{TARGET: SOURCE}` — e.g. `DODI_OPS_API_URL: TASK_LEDGER_API_URL` |
 | `mcp-servers.<name>.agent-env` | Record<string,string> | no | Pull values from the calling agent's config. Target supports dotted paths (e.g. `metadata.dodiOpsMode`) per §5.3 — note that dotted-path support is implemented as part of #135 (steps 4 and 5 land atomically); flat keys are the only thing that resolves before that lands. |
-| `skills` | string[] | reserved | Declared in spec, semantics defined by #137 |
+| `skills` | string[] | no | List of workflow directory names bundled in `<pluginDir>/skills/`. Each entry is a workflow dir following the standard two-level layout (`skills/<workflow>/skills/<skill>/SKILL.md`). The skill loader scans these at boot and merges them into the shared skill index. Customer-space skills at `<hiveHome>/skills/` shadow plugin-bundled skills on workflow-name collision — see `2026-04-15-skills-customer-space-design.md` for the ownership model and collision semantics. |
 | `register-commands` | string | no | Path to JS module exporting `registerCommands(registry)` for team slash commands. The `registry` parameter is a `CommandRegistry` instance (class defined in `src/team/command-registry.ts`); the loader invokes the export at plugin load. Registration failures are logged as warnings and do not prevent the plugin from loading — a broken slash-command should not disable the rest of the plugin's MCP servers. |
 
 **Capability tag discipline.** Tags are free-form (§9.3) but matching is a plain string intersection, so a plugin that advertises `crm-search` is *not* a match for an archetype that requires `crm`. When adding a plugin or an archetype, check that the tags line up with what already exists in the ecosystem. This is deliberately informal — future work may add LLM-assisted fuzzy matching if it proves annoying — but it's a footgun worth knowing about now.
@@ -369,7 +369,7 @@ Physical extraction of `plugins/dodi/` out of the hive repo into separate git re
 
 ## 12. Open Questions Deferred to Follow-On Specs
 
-- **Skills contract (#137)**: what a skill *is* in Hive, tier 1 vs tier 2, storage, authoring UX, composition with existing Claude Code skills. The `skills` field in plugin manifest is reserved but unspecified.
+- **Skills contract (#137)**: now specified in `2026-04-14-skills-system-design.md`. Plugin-bundled skills live in `<pluginDir>/skills/`; customer-owned skills (agent-authored and registry-installed) live in `<hiveHome>/skills/` per `2026-04-15-skills-customer-space-design.md`. Registry distribution is covered by `2026-04-15-skills-registry-design.md`.
 - **Native task system (#138)**: schema, FSM, Mongo collection layout, migration from current Linear usage.
 - **Vault / Honeypot (#139)**: transport, local-model termination, Keychain placement, plugin consumption API.
 - **Plugin hot reload semantics**: today SIGUSR1 reloads agent definitions. Does `hive plugin upgrade` need a separate signal, or is SIGUSR1 enough? Minor implementation detail, not architectural.

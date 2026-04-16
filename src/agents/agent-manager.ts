@@ -12,6 +12,7 @@ import { config as appConfig } from "../config.js";
 import { loadPlugins } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { loadSkillIndex, type SkillIndex } from "./skill-loader.js";
+import { skillsDir } from "../paths.js";
 import { ConversationIndex } from "../search/conversation-index.js";
 import type { ActivityLogger } from "../activity/activity-logger.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
@@ -47,7 +48,7 @@ export class AgentManager {
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
     this.plugins = loadPlugins(appConfig.plugins, process.cwd());
-    this.skillIndex = loadSkillIndex(undefined, this.plugins);
+    this.skillIndex = loadSkillIndex(skillsDir, this.plugins);
   }
 
   getPlugins(): LoadedPlugin[] {
@@ -63,7 +64,7 @@ export class AgentManager {
 
   reloadSkills(): void {
     try {
-      this.skillIndex = loadSkillIndex(undefined, this.plugins);
+      this.skillIndex = loadSkillIndex(skillsDir, this.plugins);
     } catch (err) {
       log.warn("Skill reload failed, retaining previous index", { error: String(err) });
     }
