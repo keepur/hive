@@ -137,7 +137,7 @@ function unquote(s: string): string {
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
     const inner = s.slice(1, -1);
     // Unescape sequences that yamlQuote may have produced
-    return inner.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    return inner.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
   }
   return s;
 }
