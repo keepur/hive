@@ -48,6 +48,12 @@ const instanceId = (hive.instance?.id as string) ?? "hive";
 const portBase = (hive.instance?.portBase as number) ?? 3100;
 const ports = (hive.instance?.ports as Record<string, number>) ?? {};
 
+export interface RegistryConfig {
+  name: string;
+  url: string;
+  default?: boolean;
+}
+
 export interface SmsLine {
   id: string;
   label: string;
@@ -151,6 +157,9 @@ export const config = {
     businessName: optional("RESEND_BUSINESS_NAME", hive.resend?.businessName ?? ""),
   },
   plugins: (hive.plugins ?? []) as string[],
+  skillRegistries: (hive.skillRegistries as RegistryConfig[] | undefined) ?? [
+    { name: "keepur-default", url: "https://github.com/keepur/hive-skills", default: true },
+  ],
   gemini: {
     apiKey: optional("GEMINI_API_KEY", ""),
     visionModel: optional("GEMINI_VISION_MODEL", "gemini-2.5-flash"),

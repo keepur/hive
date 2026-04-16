@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSkillIndex, getSkillsForAgent } from "./skill-loader.js";
+import { loadSkillIndex, getSkillsForAgent, getModifiedSkills } from "./skill-loader.js";
+import { computeContentHash } from "../skills/content-hash.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 
 function writeSkill(
@@ -43,48 +44,63 @@ describe("loadSkillIndex", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("loads core-only skills", () => {
-    const core = join(tmp, "core-skills");
-    writeSkill(core, "alpha", "one", ["milo"]);
+  it("loads customer-space skills", () => {
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "alpha", "one", ["milo"]);
 
-    const index = loadSkillIndex(core);
+    const index = loadSkillIndex(customer);
 
     expect(getSkillsForAgent(index, "milo")).toHaveLength(1);
     expect(getSkillsForAgent(index, "other")).toHaveLength(0);
   });
 
-  it("loads plugin-bundled skills alongside core", () => {
-    const core = join(tmp, "core-skills");
-    writeSkill(core, "alpha", "core-skill", ["milo"]);
+  it("loads plugin-bundled skills alongside customer", () => {
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "alpha", "customer-skill", ["milo"]);
 
     const pluginDir = join(tmp, "plugin-a");
     writeSkill(join(pluginDir, "skills"), "beta", "plugin-skill", ["milo"]);
 
-    const index = loadSkillIndex(core, [makePlugin("plugin-a", pluginDir)]);
+    const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
 
     const miloSkills = getSkillsForAgent(index, "milo");
     expect(miloSkills).toHaveLength(2);
     expect(miloSkills.map((s) => s.path).sort()).toEqual(
-      [join(core, "alpha"), join(pluginDir, "skills", "beta")].sort(),
+      [join(customer, "alpha"), join(pluginDir, "skills", "beta")].sort(),
     );
   });
 
-  it("core wins collision vs plugin", () => {
-    const core = join(tmp, "core-skills");
-    writeSkill(core, "shared", "core-version", ["milo"]);
+  it("customer skill shadows plugin-bundled skill", () => {
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "shared", "customer-version", ["milo"]);
 
     const pluginDir = join(tmp, "plugin-a");
     writeSkill(join(pluginDir, "skills"), "shared", "plugin-version", ["milo"]);
 
-    const index = loadSkillIndex(core, [makePlugin("plugin-a", pluginDir)]);
+    const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
 
     const paths = getSkillsForAgent(index, "milo").map((s) => s.path);
-    expect(paths).toEqual([join(core, "shared")]);
+    expect(paths).toEqual([join(customer, "shared")]);
+  });
+
+  it("customer skill shadows plugin universal skill", () => {
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "shared", "customer-all", ["all"]);
+
+    const pluginDir = join(tmp, "plugin-a");
+    writeSkill(join(pluginDir, "skills"), "shared", "plugin-all", ["all"]);
+
+    const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
+
+    // Customer version should win — only one universal skill
+    const universal = getSkillsForAgent(index, "brand-new");
+    expect(universal).toHaveLength(1);
+    expect(universal[0]!.path).toBe(join(customer, "shared"));
   });
 
   it("first-loaded plugin wins collision vs later plugin", () => {
-    const core = join(tmp, "core-skills");
-    mkdirSync(core, { recursive: true });
+    const customer = join(tmp, "customer-skills");
+    mkdirSync(customer, { recursive: true });
 
     const pluginA = join(tmp, "plugin-a");
     writeSkill(join(pluginA, "skills"), "shared", "a-version", ["milo"]);
@@ -92,7 +108,7 @@ describe("loadSkillIndex", () => {
     const pluginB = join(tmp, "plugin-b");
     writeSkill(join(pluginB, "skills"), "shared", "b-version", ["milo"]);
 
-    const index = loadSkillIndex(core, [
+    const index = loadSkillIndex(customer, [
       makePlugin("plugin-a", pluginA),
       makePlugin("plugin-b", pluginB),
     ]);
@@ -102,42 +118,85 @@ describe("loadSkillIndex", () => {
   });
 
   it("ignores plugins with no skills/ subdir", () => {
-    const core = join(tmp, "core-skills");
-    writeSkill(core, "alpha", "one", ["milo"]);
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "alpha", "one", ["milo"]);
 
     const pluginDir = join(tmp, "plugin-no-skills");
     mkdirSync(pluginDir, { recursive: true });
 
-    const index = loadSkillIndex(core, [makePlugin("plugin-no-skills", pluginDir)]);
+    const index = loadSkillIndex(customer, [makePlugin("plugin-no-skills", pluginDir)]);
     expect(getSkillsForAgent(index, "milo")).toHaveLength(1);
   });
 
-  it("universal skills merge across core and plugins", () => {
-    const core = join(tmp, "core-skills");
-    writeSkill(core, "alpha", "for-milo", ["milo"]);
+  it("universal skills merge across customer and plugins", () => {
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "alpha", "for-milo", ["milo"]);
 
     const pluginDir = join(tmp, "plugin-a");
     writeSkill(join(pluginDir, "skills"), "beta", "for-all", ["all"]);
 
-    const index = loadSkillIndex(core, [makePlugin("plugin-a", pluginDir)]);
+    const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
 
     expect(getSkillsForAgent(index, "milo")).toHaveLength(2);
     expect(getSkillsForAgent(index, "brand-new")).toHaveLength(1);
   });
 
   it("hot reload picks up a newly-written plugin skill", () => {
-    const core = join(tmp, "core-skills");
-    mkdirSync(core, { recursive: true });
+    const customer = join(tmp, "customer-skills");
+    mkdirSync(customer, { recursive: true });
 
     const pluginDir = join(tmp, "plugin-a");
     mkdirSync(join(pluginDir, "skills"), { recursive: true });
 
-    const before = loadSkillIndex(core, [makePlugin("plugin-a", pluginDir)]);
+    const before = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
     expect(getSkillsForAgent(before, "milo")).toHaveLength(0);
 
     writeSkill(join(pluginDir, "skills"), "beta", "new-skill", ["milo"]);
 
-    const after = loadSkillIndex(core, [makePlugin("plugin-a", pluginDir)]);
+    const after = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
     expect(getSkillsForAgent(after, "milo")).toHaveLength(1);
+  });
+
+  it("detects customer modifications to registry-installed skills on reload", () => {
+    const customer = join(tmp, "customer-skills");
+    const skillDir = join(customer, "alpha", "skills", "one");
+    mkdirSync(skillDir, { recursive: true });
+
+    // Write a skill with origin metadata — compute base hash first
+    const initialBody = "# One\nInitial content\n";
+    const initialSkillMd = [
+      "---",
+      "name: one",
+      "description: test",
+      "agents: [milo]",
+      "origin:",
+      "  type: registry",
+      "  source: keepur/test-skills",
+      "  base-content-hash: PLACEHOLDER",
+      "---",
+      initialBody,
+    ].join("\n");
+    writeFileSync(join(skillDir, "SKILL.md"), initialSkillMd);
+
+    // Compute the base content hash from the initial state
+    const baseHash = computeContentHash(skillDir);
+
+    // Rewrite with the correct base hash
+    const skillMdWithHash = initialSkillMd.replace("PLACEHOLDER", baseHash);
+    writeFileSync(join(skillDir, "SKILL.md"), skillMdWithHash);
+
+    // First load — hashes match, no modification detected
+    loadSkillIndex(customer);
+    expect(getModifiedSkills().size).toBe(0);
+
+    // Now modify the skill content
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      skillMdWithHash.replace("Initial content", "Modified content"),
+    );
+
+    // Reload — modification should be detected
+    loadSkillIndex(customer);
+    expect(getModifiedSkills().has(skillDir)).toBe(true);
   });
 });

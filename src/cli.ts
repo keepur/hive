@@ -39,6 +39,14 @@ Commands:
   plugin add <pkg>  Install a plugin package
   plugin list       List installed plugins
   plugin remove     Uninstall a plugin
+  skill add <spec>  Install a skill from a registry
+  skill list        List installed skills
+  skill upgrade     Upgrade installed skills
+  skill remove      Remove an installed skill
+  skill search      Search for skills
+  registry add      Add a skill registry
+  registry list     List configured registries
+  registry remove   Remove a registry
 
 Options:
   --config <path>   Path to hive.yaml
@@ -108,6 +116,20 @@ switch (command) {
     const target = positionals[2];
     const { runPlugin } = await import("./cli/plugin.js");
     await runPlugin(subcommand, target);
+    break;
+  }
+  case "skill": {
+    const subcommand = positionals[1];
+    const args = positionals.slice(2);
+    const { runSkill } = await import("./cli/skill.js");
+    await runSkill(subcommand, ...args);
+    break;
+  }
+  case "registry": {
+    const subcommand = positionals[1];
+    const args = positionals.slice(2);
+    const { runRegistry } = await import("./cli/registry.js");
+    await runRegistry(subcommand, ...args);
     break;
   }
   default:
