@@ -3,10 +3,20 @@ import { join } from "node:path";
 import type { SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { createLogger } from "../logging/logger.js";
+import { computeContentHash } from "../skills/content-hash.js";
+import { readSkillMd } from "../skills/frontmatter.js";
 
 const log = createLogger("skill-loader");
 
 export type SkillIndex = Map<string, SdkPluginConfig[]>;
+
+/** Set of skill directory paths detected as modified from their registry base. */
+let _modifiedSkills: Set<string> = new Set();
+
+/** Returns the set of skill paths that were detected as modified on last load. */
+export function getModifiedSkills(): Set<string> {
+  return _modifiedSkills;
+}
 
 type CollisionEntry = { source: string; path: string };
 
@@ -49,6 +59,9 @@ export function loadSkillIndex(
     }
     index.set("__universal__", universalPlugins);
   }
+
+  // Post-scan: detect customer modifications to registry-installed skills
+  _modifiedSkills = detectModifiedSkills(collisionMap);
 
   log.info("Skill index loaded", {
     workflows: collisionMap.size,
@@ -232,6 +245,65 @@ export function getSkillsForAgent(index: SkillIndex, agentId: string): SdkPlugin
   }
 
   return agentSkills;
+}
+
+/**
+ * After skills are loaded, check each skill with an origin block containing
+ * a base-content-hash. If the current content hash differs, mark the skill
+ * as modified (in-memory only) and log a warning.
+ *
+ * Returns the set of modified skill directory paths for testability.
+ */
+function detectModifiedSkills(
+  collisionMap: Map<string, CollisionEntry>,
+): Set<string> {
+  const modified = new Set<string>();
+
+  for (const [workflow, entry] of collisionMap) {
+    const skillsSubdir = join(entry.path, "skills");
+    if (!existsSync(skillsSubdir)) continue;
+
+    let skillDirs: string[];
+    try {
+      skillDirs = readdirSync(skillsSubdir).filter((d) => {
+        try {
+          return statSync(join(skillsSubdir, d)).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+    } catch {
+      continue;
+    }
+
+    for (const skillDir of skillDirs) {
+      const skillPath = join(skillsSubdir, skillDir);
+      const skillMdPath = join(skillPath, "SKILL.md");
+      if (!existsSync(skillMdPath)) continue;
+
+      try {
+        const { frontmatter } = readSkillMd(skillMdPath);
+        if (!frontmatter.origin?.["base-content-hash"]) continue;
+
+        const currentHash = computeContentHash(skillPath);
+        if (currentHash !== frontmatter.origin["base-content-hash"]) {
+          frontmatter.origin.modified = true;
+          modified.add(skillPath);
+          log.warn("Registry-installed skill has been modified", {
+            workflow,
+            skill: skillDir,
+            source: frontmatter.origin.source,
+            baseHash: frontmatter.origin["base-content-hash"],
+            currentHash,
+          });
+        }
+      } catch {
+        // If we can't parse frontmatter, skip silently
+      }
+    }
+  }
+
+  return modified;
 }
 
 /**

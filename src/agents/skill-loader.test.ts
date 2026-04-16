@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSkillIndex, getSkillsForAgent } from "./skill-loader.js";
+import { loadSkillIndex, getSkillsForAgent, getModifiedSkills } from "./skill-loader.js";
+import { computeContentHash } from "../skills/content-hash.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 
 function writeSkill(
@@ -154,5 +155,48 @@ describe("loadSkillIndex", () => {
 
     const after = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
     expect(getSkillsForAgent(after, "milo")).toHaveLength(1);
+  });
+
+  it("detects customer modifications to registry-installed skills on reload", () => {
+    const customer = join(tmp, "customer-skills");
+    const skillDir = join(customer, "alpha", "skills", "one");
+    mkdirSync(skillDir, { recursive: true });
+
+    // Write a skill with origin metadata — compute base hash first
+    const initialBody = "# One\nInitial content\n";
+    const initialSkillMd = [
+      "---",
+      "name: one",
+      "description: test",
+      "agents: [milo]",
+      "origin:",
+      "  type: registry",
+      "  source: keepur/test-skills",
+      "  base-content-hash: PLACEHOLDER",
+      "---",
+      initialBody,
+    ].join("\n");
+    writeFileSync(join(skillDir, "SKILL.md"), initialSkillMd);
+
+    // Compute the base content hash from the initial state
+    const baseHash = computeContentHash(skillDir);
+
+    // Rewrite with the correct base hash
+    const skillMdWithHash = initialSkillMd.replace("PLACEHOLDER", baseHash);
+    writeFileSync(join(skillDir, "SKILL.md"), skillMdWithHash);
+
+    // First load — hashes match, no modification detected
+    loadSkillIndex(customer);
+    expect(getModifiedSkills().size).toBe(0);
+
+    // Now modify the skill content
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      skillMdWithHash.replace("Initial content", "Modified content"),
+    );
+
+    // Reload — modification should be detected
+    loadSkillIndex(customer);
+    expect(getModifiedSkills().has(skillDir)).toBe(true);
   });
 });
