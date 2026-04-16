@@ -1123,7 +1123,9 @@ export class AgentRunner {
         // so a rogue archetype can't override security invariants (permissionMode,
         // maxTurns, etc.) or runtime wiring (mcpServers, hooks, env, etc.).
         ...(archetypeExtra.cwd ? { cwd: archetypeExtra.cwd } : {}),
-        ...(archetypeExtra.settingSources ? { settingSources: archetypeExtra.settingSources } : {}),
+        // Default to SDK isolation mode (no user/project settings, no user-installed plugins).
+        // Archetypes may opt in to specific sources (e.g. ["project"] for CLAUDE.md access).
+        settingSources: archetypeExtra.settingSources ?? [],
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
