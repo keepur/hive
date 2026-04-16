@@ -38,3 +38,9 @@ export function resolveDotenvPath(hiveHome: string): string {
 
 /** The resolved hive home directory (computed once at import time). */
 export const hiveHome = resolveHiveHome();
+
+/** Customer-space skills directory. */
+export const skillsDir = resolve(hiveHome, "skills");
+
+/** Instance-local metadata directory (.hive/). */
+export const hiveMetaDir = resolve(hiveHome, ".hive");
