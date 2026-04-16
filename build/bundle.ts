@@ -55,8 +55,7 @@ await build({
   entryPoints: { cli: "dist/cli.js" },
 });
 
-// Main server
-// TODO: Add "setup/wizard": "dist/setup/wizard.js" once src/setup/wizard.ts is created (Task 7)
+// Main server (wizard is bundled into cli.min.js via dynamic imports)
 await build({
   ...shared,
   entryPoints: {

@@ -3,12 +3,14 @@
   "version": "0.1.0",
   "type": "module",
   "bin": {
-    "hive": "pkg/cli.min.js"
+    "hive": "pkg/cli.min.js",
+    "honeypot": "scripts/honeypot"
   },
   "files": [
     "pkg/",
     "seeds/",
-    "templates/"
+    "templates/",
+    "scripts/honeypot"
   ],
   "engines": {
     "node": ">=22.0.0"
