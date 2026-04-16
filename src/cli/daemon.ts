@@ -91,6 +91,9 @@ export async function startDaemon(pkgRoot: string): Promise<void> {
   writeFileSync(plistPath, plist);
   console.log(`Generated plist: ${plistPath}`);
 
+  // Ensure ~/Library/LaunchAgents/ exists and create symlink
+  const launchAgentsDir = resolve(linkPath, "..");
+  mkdirSync(launchAgentsDir, { recursive: true });
   if (existsSync(linkPath)) unlinkSync(linkPath);
   symlinkSync(plistPath, linkPath);
 

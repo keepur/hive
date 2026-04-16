@@ -1,9 +1,9 @@
 _id: chief-of-staff
-name: Mokie
+name: Chief
 model: opus
 icon: ":bee:"
 channels:
-  - agent-mokie
+  - agent-chief
 passiveChannels: []
 keywords: []
 isDefault: false
