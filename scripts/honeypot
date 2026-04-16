@@ -1,0 +1,186 @@
+#!/bin/bash
+set -euo pipefail
+
+# honeypot — macOS Keychain credential wrapper for Hive
+#
+# Stores secrets scoped to the Hive instance under service prefix "hive/<id>/".
+# The keychain MCP server (keychain-mcp-server.ts) reads these at runtime.
+# Coexists with .env — either source works, Keychain is preferred for new installs.
+#
+# Usage:
+#   honeypot set ANTHROPIC_API_KEY           # prompt for value (hidden input)
+#   honeypot set SLACK_BOT_TOKEN "xoxb-..."  # inline value
+#   honeypot get ANTHROPIC_API_KEY           # print value
+#   honeypot list                            # show stored keys (no values)
+#   honeypot rm ANTHROPIC_API_KEY            # delete
+#   honeypot doctor                          # check required keys are present
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Resolve instance ID from hive.yaml
+resolve_instance_id() {
+  local yaml=""
+  if [ -n "${HIVE_HOME:-}" ] && [ -f "${HIVE_HOME}/hive.yaml" ]; then
+    yaml="${HIVE_HOME}/hive.yaml"
+  elif [ -f "./hive.yaml" ]; then
+    yaml="./hive.yaml"
+  elif [ -f "${HOME}/.hive/hive.yaml" ]; then
+    yaml="${HOME}/.hive/hive.yaml"
+  fi
+
+  if [ -n "$yaml" ]; then
+    # Extract instance.id from YAML (simple grep — no yq dependency)
+    local id
+    id=$(grep -A5 '^instance:' "$yaml" 2>/dev/null | grep 'id:' | head -1 | sed 's/.*id: *//' | tr -d '[:space:]"'"'")
+    if [ -n "$id" ]; then
+      echo "$id"
+      return
+    fi
+  fi
+  echo "hive"
+}
+
+INSTANCE_ID=$(resolve_instance_id)
+PREFIX="hive/${INSTANCE_ID}"
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  set)
+    key="${1:-}"
+    value="${2:-}"
+    if [ -z "$key" ]; then
+      echo "Usage: honeypot set <KEY> [value]"
+      exit 1
+    fi
+    if [ -z "$value" ]; then
+      printf "Enter value for %s: " "$key"
+      read -rs value
+      echo ""
+      if [ -z "$value" ]; then
+        echo -e "${RED}Error:${NC} empty value"
+        exit 1
+      fi
+    fi
+    security add-generic-password \
+      -s "${PREFIX}/${key}" \
+      -a "$key" \
+      -w "$value" \
+      -U 2>/dev/null || \
+    security add-generic-password \
+      -s "${PREFIX}/${key}" \
+      -a "$key" \
+      -w "$value"
+    echo -e "${GREEN}+${NC} ${PREFIX}/${key}"
+    ;;
+
+  get)
+    key="${1:-}"
+    if [ -z "$key" ]; then
+      echo "Usage: honeypot get <KEY>"
+      exit 1
+    fi
+    security find-generic-password \
+      -s "${PREFIX}/${key}" \
+      -a "$key" \
+      -w 2>/dev/null || {
+      echo -e "${RED}Not found:${NC} ${PREFIX}/${key}"
+      exit 1
+    }
+    ;;
+
+  rm|remove|delete)
+    key="${1:-}"
+    if [ -z "$key" ]; then
+      echo "Usage: honeypot rm <KEY>"
+      exit 1
+    fi
+    security delete-generic-password \
+      -s "${PREFIX}/${key}" \
+      -a "$key" &>/dev/null && \
+      echo -e "${GREEN}-${NC} ${PREFIX}/${key}" || {
+      echo -e "${RED}Not found:${NC} ${PREFIX}/${key}"
+      exit 1
+    }
+    ;;
+
+  list|ls)
+    echo -e "${DIM}Secrets under ${PREFIX}/:${NC}"
+    echo ""
+    # Extract service names matching our prefix from keychain dump
+    entries=$(security dump-keychain 2>/dev/null | \
+      grep "0x00000007" | \
+      sed 's/.*<blob>="\([^"]*\)".*/\1/' | \
+      grep "^${PREFIX}/" | \
+      sort -u || true)
+    if [ -n "$entries" ]; then
+      echo "$entries" | while IFS= read -r svc; do
+        echo "  ${svc#${PREFIX}/}"
+      done
+    else
+      echo "  (none)"
+    fi
+    ;;
+
+  doctor)
+    echo -e "Checking required credentials for ${YELLOW}${INSTANCE_ID}${NC}..."
+    echo ""
+    required=("ANTHROPIC_API_KEY" "SLACK_APP_TOKEN" "SLACK_BOT_TOKEN")
+    recommended=("MONGODB_URI")
+    all_good=true
+
+    for key in "${required[@]}"; do
+      if security find-generic-password -s "${PREFIX}/${key}" -a "$key" -w &>/dev/null; then
+        echo -e "  ${GREEN}ok${NC}  $key"
+      else
+        echo -e "  ${RED}--${NC}  $key  ${DIM}(required)${NC}"
+        all_good=false
+      fi
+    done
+
+    for key in "${recommended[@]}"; do
+      if security find-generic-password -s "${PREFIX}/${key}" -a "$key" -w &>/dev/null; then
+        echo -e "  ${GREEN}ok${NC}  $key"
+      else
+        echo -e "  ${YELLOW}--${NC}  $key  ${DIM}(recommended)${NC}"
+      fi
+    done
+
+    echo ""
+    if $all_good; then
+      echo -e "${GREEN}All required credentials present.${NC}"
+    else
+      echo -e "Run ${YELLOW}honeypot set <KEY>${NC} to add missing credentials."
+      exit 1
+    fi
+    ;;
+
+  help|--help|-h)
+    cat <<'HELP'
+honeypot — macOS Keychain credential store for Hive
+
+Usage:
+  honeypot set <KEY> [value]    Store a credential (prompts if value omitted)
+  honeypot get <KEY>            Retrieve a credential
+  honeypot list                 Show stored keys (no values)
+  honeypot rm <KEY>             Delete a credential
+  honeypot doctor               Check required credentials are present
+  honeypot help                 This message
+
+Credentials are stored in macOS Keychain under "hive/<instance-id>/<KEY>"
+and are readable by the Hive keychain MCP server at runtime.
+
+HELP
+    ;;
+
+  *)
+    echo "Unknown command: $cmd"
+    echo "Run 'honeypot help' for usage."
+    exit 1
+    ;;
+esac
