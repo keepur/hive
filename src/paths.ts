@@ -44,3 +44,13 @@ export const skillsDir = resolve(hiveHome, "skills");
 
 /** Instance-local metadata directory (.hive/). */
 export const hiveMetaDir = resolve(hiveHome, ".hive");
+
+/**
+ * Core agent seeds directory (ships with the npm package).
+ * Resolved from the package root, not from hiveHome — seeds are immutable
+ * package content, not customer-space data.
+ *
+ * Dev: import.meta.dirname = <repo>/src/ → resolve("..", "seeds") = <repo>/seeds/
+ * Bundled: import.meta.dirname = <package>/pkg/ → resolve("..", "seeds") = <package>/seeds/
+ */
+export const seedsDir = resolve(import.meta.dirname, "..", "seeds");

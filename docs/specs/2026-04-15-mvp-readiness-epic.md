@@ -30,7 +30,7 @@ Email with link + short guide
 | 1 | Core npm package + build pipeline | **Scaffolded** (cli.ts, bundle.ts exist) | Yes |
 | 2 | `hive init` wizard (end-to-end) | **Partial** (setup-instance.ts exists, needs integration) | Yes |
 | 3 | Prereqs installer | **Partial** (missing Ollama, Qdrant, models, Xcode CLI) | Yes |
-| 4 | Chief of Staff ships with core | **Not started** (core currently ships zero seeds) | Yes |
+| 4 | Chief of Staff ships with core (seed + bundled skills) | **Not started** (core currently ships zero seeds) | Yes |
 | 5 | Agent runner path resolution | **Not started** (still resolves from cwd) | Yes |
 | 6 | Plugin architecture implementation | **Spec locked** (#135 decontamination done) | Yes |
 | 7 | Skills registry operational | **Spec locked** | Yes — CoS needs skills |
@@ -41,7 +41,7 @@ Email with link + short guide
 | 12 | `hive update` | **Scaffolded** (CLI wired, impl TBD) | Should-have |
 | 13 | `hive start --daemon` (LaunchAgent) | **Scaffolded** (CLI wired, impl TBD) | Should-have |
 | 14 | Monitoring / health signal | **Not started** | Should-have |
-| 15 | Agent builder skill | **Spec ready** | Should-have (CoS can create agents via admin tools as fallback) |
+| 15 | Agent builder skill | **Spec ready** — now bundled with CoS seed (Track 4) | Yes (moved from should-have; ships as CoS bundled skill) |
 | 16 | Customer-facing docs + install guide | **Not started** | Yes |
 | 17 | npm publish pipeline | **Not started** (manual is fine for now) | Yes |
 | 18 | License decision | **Not made** | Yes |
@@ -90,7 +90,7 @@ Email with link + short guide
 **What's missing**:
 - [ ] Xcode Command Line Tools (`xcode-select --install`) — needed for `better-sqlite3` native compilation
 - [ ] Ollama (`brew install ollama` + `brew services start ollama`)
-- [ ] Ollama models (`ollama pull bge-large`, `ollama pull qwen2.5:3b`)
+- [ ] Ollama models (`ollama pull bge-large`, `ollama pull gemma4:e4b`)
 - [ ] Qdrant (`brew install qdrant` + `brew services start qdrant`)
 - [ ] `gh` CLI (optional, for GitHub Issues MCP)
 - [ ] Required vs optional distinction: Homebrew/Node/MongoDB/Ollama/Qdrant/models are required. gh is optional.
@@ -99,21 +99,34 @@ Email with link + short guide
 
 **Depends on**: Nothing. Can start immediately.
 
-### Track 4: Chief of Staff Ships with Core
+### Track 4: Chief of Staff Ships with Core (Seed + Bundled Skills)
 
-**Current state**: Core ships zero agent seeds. The "core ships nothing" principle was established for plugins and skills, but CoS is different — it IS the product's front door.
+**Current state**: Core ships zero agent seeds and zero skills. The "core ships nothing" principle was established for plugins and skills, but CoS is different — it IS the product's front door.
 
-**Decision needed**: CoS must ship with core. This is a reversal of the "zero seeds" direction for this one agent.
+**Decision**: CoS must ship with core — both the agent seed AND its essential skills. This is a reversal of the "zero seeds" and "zero skills" direction specifically for CoS. The onboarding experience cannot depend on a registry fetch, network availability, or a second install step. If CoS can't onboard, interview, set up credentials, and build a team on first boot, there is no product.
+
+**Amendment to `2026-04-15-skills-customer-space-design.md`**: §5.4 collapsed the "shipped with core" skill category entirely. This track reintroduces a narrow exception: **seed-bundled skills** — skills that ship inside a core agent seed directory (e.g., `seeds/chief-of-staff/skills/`). These follow the same loader pattern as plugin-bundled skills (#147): the skill scanner already supports scanning plugin skill dirs, extending it to scan seed skill dirs is the same mechanism. Seed-bundled skills are immutable from the customer's perspective, same as plugin-bundled skills. This does NOT reopen the general "shipped with core" category — it is scoped to agent seeds that ship with the core package, and currently that means only CoS.
 
 **What's needed**:
+
+Agent seed:
 - [ ] CoS agent seed: `seeds/chief-of-staff/agent.yaml` + `seeds/chief-of-staff/system-prompt.md`
 - [ ] CoS soul: onboarding-focused personality that interviews new users, inventories capabilities, guides credential setup, recommends team structure
-- [ ] CoS must know about the plugin/skills registry — it needs to tell users what's available
 - [ ] `hive init` seeds CoS into MongoDB as the final setup step
 - [ ] CoS needs access to: memory, admin (to create agents), Google (post-OAuth), schedule, team (to introduce new agents)
-- [ ] Onboarding skill: structured conversation flow that the CoS executes on first contact with a new user
 
-**Depends on**: Track 6 (plugin architecture — CoS needs to know what plugins exist), Track 7 (skills registry — CoS needs to install skills)
+Bundled skills (ship in `seeds/chief-of-staff/skills/`, loaded by skill scanner at boot):
+- [ ] **Onboarding** — structured first-contact interview. Learns about the business, team, products, services. Writes findings to `shared/business-context.md` (MongoDB memory) so all future agents inherit the full business context immediately. This is user-generated data — it lives in the DB, not in a config file.
+- [ ] **Credential setup** — guides user through `honeypot set` for each service (Anthropic key already done by wizard; this covers Google OAuth, plugin API keys, and any post-init credentials). Conversational walkthrough, not a checklist dump.
+- [ ] **Agent builder** — conversational agent creation via admin MCP tools. User describes what they need, CoS proposes a role, configures the agent, introduces it to the team. Without this, the "Build Your Team" promise from the day-one experience is hollow.
+- [ ] **Capability inventory** — knows what's installed (agents, MCP servers, plugins, skills), what's available in the registry, and what each component does. Can answer "what can you do?" and "what else is available?"
+
+Skill loader changes (follow-on to KPR-29, which is already merged):
+- [ ] Extend skill scanner to scan `seeds/<agent>/skills/` directories, same pattern as plugin-bundled skill scanning from #147
+- [ ] Seed-bundled skills use origin `"seed"` (or `"core"`) in the collision map, with precedence: core seeds > plugins > registry-installed > agent-authored
+- [ ] Amend `2026-04-15-skills-customer-space-design.md` §5.4 to document the seed-bundled exception
+
+**Depends on**: Track 9 (HIVE_HOME — seed paths must resolve correctly from global install). Does NOT depend on Track 6 (plugin arch) or Track 7 (skills registry) — CoS skills are bundled, not fetched.
 
 ### Track 5: Agent Runner Path Resolution
 
@@ -236,7 +249,7 @@ Email with link + short guide
 ### Track 15: Agent Builder Skill
 
 **Spec**: `2026-04-08-agent-builder-design.md` (ready)
-**Should-have.** CoS can create agents via admin MCP tools as a fallback, but the agent builder skill makes it conversational and guided.
+**Now bundled with CoS (Track 4).** Promoted from should-have to must-have. Ships as a CoS seed-bundled skill in `seeds/chief-of-staff/skills/`. The agent builder is the mechanism by which CoS delivers the "Build Your Team" promise from the day-one experience — it cannot be deferred to a registry fetch.
 
 ### Track 16: Customer-Facing Docs
 
@@ -297,7 +310,7 @@ Tracks 1 + 3 + 4 + 5 + 9 + 10 + 2 + 17 + 18
 
 Track 10 is partially done (`scripts/honeypot` exists, keychain MCP server already reads from it). Remaining work is integration into `hive init` and `src/config.ts` Keychain fallback.
 
-**That path does NOT require**: plugin registry, skills registry, Google OAuth, agent builder, monitoring, docs beyond the install email. Those come in the days/weeks after, delivered via `hive update`.
+**That path does NOT require**: plugin registry, skills registry, Google OAuth, monitoring, docs beyond the install email. Those come in the days/weeks after, delivered via `hive update`. CoS ships with bundled skills (onboarding, credential setup, agent builder, capability inventory) so the skills registry is not on the critical path for Phase 0.
 
 ---
 
@@ -305,9 +318,9 @@ Track 10 is partially done (`scripts/honeypot` exists, keychain MCP server alrea
 
 ### Phase 0: "Hello World" (Target: ship ASAP)
 
-The CEO installs, runs `hive init`, and talks to CoS in Slack. CoS has memory, can schedule, can create agents via admin tools. No plugins, no skills registry, no Google yet.
+The CEO installs, runs `hive init`, and talks to CoS in Slack. CoS has memory, can schedule, can create agents via admin tools. CoS ships with bundled skills (onboarding, credential setup, agent builder, capability inventory) — no registry fetch required. No plugins, no skills registry, no Google yet.
 
-**Tracks**: 1, 2, 3, 4, 5, 9, 10 (Anthropic + Slack only), 13, 17, 18, 19
+**Tracks**: 1, 2, 3, 4 (incl. 15), 5, 9, 10 (Anthropic + Slack only), 13, 17, 18, 19
 **Docs**: One-page install guide in the email
 
 ### Phase 1: "Capable Assistant" (Target: 1 week after Phase 0)
@@ -318,9 +331,9 @@ CoS can connect to Google (email, calendar, drive). `hive doctor` works. `hive u
 
 ### Phase 2: "Build Your Team" (Target: 2 weeks after Phase 0)
 
-Plugin registry operational. CoS can recommend and install plugins. Agent builder skill lets CoS create custom agents conversationally. Skills registry operational.
+Plugin registry operational. CoS can recommend and install plugins from registries. Skills registry operational. (Agent builder already ships with CoS in Phase 0 as a bundled skill.)
 
-**Tracks**: 6, 7, 8, 15
+**Tracks**: 6, 7, 8
 
 ### Phase 3: "Production Ready"
 
@@ -332,7 +345,7 @@ Monitoring. Full docs. Upgrade compat checking. Health heartbeats. Customer-spac
 
 ## KPR-29 Dependency
 
-KPR-29 (in flight) introduces the `hive_composition` MongoDB collection — the authoritative manifest of what's installed on an instance. This spec consumes that collection:
+KPR-29 (merged) introduced the `hive_composition` MongoDB collection — the authoritative manifest of what's installed on an instance. This spec consumes that collection:
 
 - `hive init` writes the initial composition row (instance identity, empty plugins/skills)
 - `hive plugin add` updates composition
@@ -341,9 +354,14 @@ KPR-29 (in flight) introduces the `hive_composition` MongoDB collection — the 
 
 If KPR-29's schema shifts, only the composition-touching code in Tracks 2, 6, 7, and 11 needs updating. The installer flow and build pipeline are unaffected.
 
+### Post-KPR-29: Seed-Bundled Skills
+
+KPR-29 shipped the skill scanner with support for plugin-bundled skills (#147) and the customer-space layout. Track 4 requires a **follow-on change**: extend the skill scanner to also scan `seeds/<agent>/skills/` directories using the same pattern. This reintroduces a narrow exception to the "tarball ships zero skills" rule (`2026-04-15-skills-customer-space-design.md` §5.4) — scoped to core agent seeds only (currently just CoS). The customer-space spec must be amended to document this exception.
+
 ## Open Decisions (Need Answers Before Phase 0)
 
-1. ~~**License**~~ — **Resolved: closed-source.** Minified bundles only, no LICENSE file, no source. npm package ships `pkg/` (minified), `seeds/`, `templates/`, `scripts/honeypot`. No `src/`, no `dist/`, no tests.
+1. ~~**License**~~ — **Resolved: closed-source.** Minified bundles only, no LICENSE file, no source. npm package ships `pkg/` (minified), `seeds/` (agent seeds + bundled skills), `templates/`, `scripts/honeypot`. No `src/`, no `dist/`, no tests.
 2. ~~**Version**~~ — **Resolved: `0.1.0`.** Preview release.
 3. ~~**What MCP servers are "core" vs "plugin"?**~~ — **Resolved in #135.** Dodi-specific servers (dodi-ops, hubspot-crm, crm-search, product-search, ops-search, permits, catalog) are plugins. Everything else stays in core: Google, Linear, ClickUp, GitHub Issues, Resend, Quo, memory, contacts, schedule, admin, callback, keychain, search-conversation, background-task, recall, task, event-bus, team, code-search, code-task, workflow, voice, structured-memory. CoS has Google on day one.
-4. ~~**CoS credential writing**~~ — **Resolved: `scripts/honeypot`.** A macOS Keychain wrapper that stores credentials under `hive/<instance-id>/<KEY>`. The keychain MCP server already reads these entries. `hive init` uses `honeypot set` for Anthropic + Slack tokens. CoS guides users to run `honeypot set` for post-init credentials (Google OAuth, plugin API keys). Coexists with `.env` for existing deploys.
+4. ~~**CoS skills distribution**~~ — **Resolved: seed-bundled.** CoS ships with bundled skills in `seeds/chief-of-staff/skills/` — onboarding, credential setup, agent builder, capability inventory. These are loaded by the skill scanner at boot, same pattern as plugin-bundled skills. Amends `2026-04-15-skills-customer-space-design.md` §5.4 (narrow exception to "tarball ships zero skills" for core agent seeds only). Requires follow-on change to the skill scanner shipped in KPR-29.
+5. ~~**CoS credential writing**~~ — **Resolved: `scripts/honeypot`.** A macOS Keychain wrapper that stores credentials under `hive/<instance-id>/<KEY>`. The keychain MCP server already reads these entries. `hive init` uses `honeypot set` for Anthropic + Slack tokens. CoS guides users to run `honeypot set` for post-init credentials (Google OAuth, plugin API keys). Coexists with `.env` for existing deploys.
