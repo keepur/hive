@@ -95,13 +95,13 @@ export function parseFrontmatter(content: string): {
         fm.agents = [unquote(value)];
       }
     } else if (key === "origin") {
-      fm.origin = parseNestedBlock(lines, i) as SkillOrigin;
+      fm.origin = parseNestedBlock(lines, i) as unknown as SkillOrigin;
       // Skip indented children
       while (i + 1 < lines.length && lines[i + 1]!.match(/^\s+\S/)) {
         i++;
       }
     } else if (key === "author") {
-      fm.author = parseNestedBlock(lines, i) as SkillAuthor;
+      fm.author = parseNestedBlock(lines, i) as unknown as SkillAuthor;
       while (i + 1 < lines.length && lines[i + 1]!.match(/^\s+\S/)) {
         i++;
       }
@@ -181,7 +181,7 @@ export function serializeFrontmatter(
 
 function serializeNested(
   lines: string[],
-  obj: Record<string, string | boolean | undefined>,
+  obj: SkillOrigin | SkillAuthor,
 ): void {
   for (const [key, val] of Object.entries(obj)) {
     if (val === undefined) continue;
