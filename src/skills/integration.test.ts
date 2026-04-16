@@ -1,13 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import {
-  mkdtempSync,
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-  rmSync,
-  existsSync,
-} from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installSkill } from "./install.js";
@@ -71,11 +64,7 @@ function createMockRegistry(
 /**
  * Update a skill in the mock registry and commit.
  */
-function updateRegistrySkill(
-  repoDir: string,
-  skillName: string,
-  newContent: string,
-): void {
+function updateRegistrySkill(repoDir: string, skillName: string, newContent: string): void {
   const skillMdPath = join(repoDir, "skills", skillName, "SKILL.md");
   const existing = readFileSync(skillMdPath, "utf-8");
   // Replace just the body content after the frontmatter
@@ -119,31 +108,18 @@ describe("skills integration: install → upgrade → remove", () => {
     ]);
 
     // --- Step 1: Install the skill ---
-    const result = installSkill(
-      url,
-      "greet-customer",
-      targetSkillsDir,
-      targetHiveHome,
-    );
+    const result = installSkill(url, "greet-customer", targetSkillsDir, targetHiveHome);
 
     expect(result.name).toBe("greet-customer");
     expect(result.workflow).toBe("customer-support");
 
     // --- Step 2: Verify projection into workflow directory ---
-    const expectedPath = join(
-      targetSkillsDir,
-      "customer-support",
-      "skills",
-      "greet-customer",
-    );
+    const expectedPath = join(targetSkillsDir, "customer-support", "skills", "greet-customer");
     expect(result.targetPath).toBe(expectedPath);
     expect(existsSync(join(expectedPath, "SKILL.md"))).toBe(true);
 
     // --- Step 3: Verify origin metadata ---
-    const installedContent = readFileSync(
-      join(expectedPath, "SKILL.md"),
-      "utf-8",
-    );
+    const installedContent = readFileSync(join(expectedPath, "SKILL.md"), "utf-8");
     const { frontmatter } = parseFrontmatter(installedContent);
 
     expect(frontmatter.origin).toBeDefined();
@@ -157,20 +133,14 @@ describe("skills integration: install → upgrade → remove", () => {
     const index = loadSkillIndex(targetSkillsDir);
     const csSkills = getSkillsForAgent(index, "customer-success");
     expect(csSkills.length).toBeGreaterThan(0);
-    expect(csSkills.some((s) => s.path.includes("customer-support"))).toBe(
-      true,
-    );
+    expect(csSkills.some((s) => s.path.includes("customer-support"))).toBe(true);
 
     // Agent not in the list should not get this skill (it's not "all")
     const otherSkills = getSkillsForAgent(index, "sdr");
     expect(otherSkills.length).toBe(0);
 
     // --- Step 5: Simulate upgrade ---
-    updateRegistrySkill(
-      repoDir,
-      "greet-customer",
-      "Greet the customer warmly and ask how their day is going.",
-    );
+    updateRegistrySkill(repoDir, "greet-customer", "Greet the customer warmly and ask how their day is going.");
 
     const upgradeResult = await upgradeSkill(
       "greet-customer",
@@ -184,10 +154,7 @@ describe("skills integration: install → upgrade → remove", () => {
     expect(upgradeResult.newVersion).not.toBe(upgradeResult.oldVersion);
 
     // --- Step 6: Verify content was updated ---
-    const upgradedContent = readFileSync(
-      join(expectedPath, "SKILL.md"),
-      "utf-8",
-    );
+    const upgradedContent = readFileSync(join(expectedPath, "SKILL.md"), "utf-8");
     expect(upgradedContent).toContain("ask how their day is going");
 
     const { frontmatter: upgradedFm } = parseFrontmatter(upgradedContent);

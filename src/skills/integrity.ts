@@ -47,7 +47,15 @@ export function verifyPackageIntegrity(hiveHome: string, hiveMetaDir: string): {
 
 export function checkAllowlistDrift(hiveHome: string): void {
   const ALLOWLISTED = ["skills", "plugins", ".hive", ".env", "hive.yaml", "hive-"];
-  const PACKAGE_PATHS = new Set(["dist", "node_modules", "package.json", "package-lock.json", "pkg", "seeds", "templates"]);
+  const PACKAGE_PATHS = new Set([
+    "dist",
+    "node_modules",
+    "package.json",
+    "package-lock.json",
+    "pkg",
+    "seeds",
+    "templates",
+  ]);
 
   try {
     const entries = readdirSync(hiveHome);

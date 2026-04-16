@@ -1,17 +1,6 @@
-import {
-  existsSync,
-  readFileSync,
-  cpSync,
-  mkdirSync,
-  readdirSync,
-} from "node:fs";
+import { existsSync, readFileSync, cpSync, mkdirSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
-import {
-  partialClone,
-  lsRemoteHead,
-  checkoutSha,
-  findTagForSha,
-} from "./registry-fetch.js";
+import { partialClone, lsRemoteHead, checkoutSha, findTagForSha } from "./registry-fetch.js";
 import { readSkillMd, writeSkillMd } from "./frontmatter.js";
 import { computeContentHash } from "./content-hash.js";
 import { commitToState } from "./instance-git.js";
@@ -19,12 +8,7 @@ import { createLogger } from "../logging/logger.js";
 
 const log = createLogger("skill-upgrade");
 
-export type UpgradeAction =
-  | "up-to-date"
-  | "applied"
-  | "kept"
-  | "taken"
-  | "removed-upstream";
+export type UpgradeAction = "up-to-date" | "applied" | "kept" | "taken" | "removed-upstream";
 
 export interface UpgradeResult {
   name: string;
@@ -36,10 +20,7 @@ export interface UpgradeResult {
 /**
  * Find an installed skill by name, searching all workflows in customer space.
  */
-export function findInstalledSkill(
-  name: string,
-  skillsDir: string,
-): { path: string; workflow: string } | null {
+export function findInstalledSkill(name: string, skillsDir: string): { path: string; workflow: string } | null {
   if (!existsSync(skillsDir)) return null;
 
   for (const workflow of readdirSync(skillsDir)) {
@@ -70,27 +51,16 @@ export async function upgradeSkill(
   skillName: string,
   skillsDir: string,
   hiveHome: string,
-  promptFn: (
-    yours: string,
-    theirs: string,
-    base?: string,
-  ) => Promise<"keep" | "take">,
+  promptFn: (yours: string, theirs: string, base?: string) => Promise<"keep" | "take">,
 ): Promise<UpgradeResult> {
   const installed = findInstalledSkill(skillName, skillsDir);
   if (!installed) {
-    throw new Error(
-      `Skill "${skillName}" is not installed or is not registry-sourced.`,
-    );
+    throw new Error(`Skill "${skillName}" is not installed or is not registry-sourced.`);
   }
 
   const { frontmatter } = readSkillMd(join(installed.path, "SKILL.md"));
   const origin = frontmatter.origin;
-  if (
-    !origin ||
-    origin.type !== "registry" ||
-    !origin.source ||
-    !origin["base-version"]
-  ) {
+  if (!origin || origin.type !== "registry" || !origin.source || !origin["base-version"]) {
     throw new Error(`Skill "${skillName}" has no registry origin metadata.`);
   }
 
@@ -118,9 +88,7 @@ export async function upgradeSkill(
       cpSync(skillSrcDir, installed.path, { recursive: true });
       const newHash = computeContentHash(installed.path);
       const tag = findTagForSha(clone.dir, remoteHead);
-      const { frontmatter: updatedFm, body } = readSkillMd(
-        join(installed.path, "SKILL.md"),
-      );
+      const { frontmatter: updatedFm, body } = readSkillMd(join(installed.path, "SKILL.md"));
       updatedFm.origin = {
         ...updatedFm.origin!,
         "base-version": remoteHead,
@@ -132,11 +100,7 @@ export async function upgradeSkill(
       writeSkillMd(join(installed.path, "SKILL.md"), updatedFm, body);
 
       const relPath = relative(hiveHome, installed.path);
-      commitToState(
-        hiveHome,
-        [relPath],
-        `upgrade: ${skillName} ${oldVersion.slice(0, 8)} → ${remoteHead.slice(0, 8)}`,
-      );
+      commitToState(hiveHome, [relPath], `upgrade: ${skillName} ${oldVersion.slice(0, 8)} → ${remoteHead.slice(0, 8)}`);
 
       return {
         name: skillName,
@@ -169,12 +133,7 @@ export async function upgradeSkill(
 
     // Take upstream — backup modified skill first if no base available
     if (!base) {
-      const backupDir = join(
-        hiveHome,
-        ".hive",
-        "skill-backups",
-        `${skillName}-${Date.now()}`,
-      );
+      const backupDir = join(hiveHome, ".hive", "skill-backups", `${skillName}-${Date.now()}`);
       mkdirSync(backupDir, { recursive: true });
       cpSync(installed.path, backupDir, { recursive: true });
       log.info("Backed up modified skill before upgrade", {
@@ -185,9 +144,7 @@ export async function upgradeSkill(
     cpSync(skillSrcDir, installed.path, { recursive: true });
     const newHash = computeContentHash(installed.path);
     const tag = findTagForSha(clone.dir, remoteHead);
-    const { frontmatter: updatedFm, body } = readSkillMd(
-      join(installed.path, "SKILL.md"),
-    );
+    const { frontmatter: updatedFm, body } = readSkillMd(join(installed.path, "SKILL.md"));
     updatedFm.origin = {
       ...updatedFm.origin!,
       "base-version": remoteHead,

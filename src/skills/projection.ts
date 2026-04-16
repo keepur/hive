@@ -18,10 +18,6 @@ export function extractWorkflow(skillMdPath: string, skillName: string): string 
  * Compute the runtime target path for a skill.
  * Registry: skills/<name>/ → Runtime: <skillsDir>/<workflow>/skills/<name>/
  */
-export function projectToRuntime(
-  skillsDir: string,
-  workflow: string,
-  skillName: string,
-): string {
+export function projectToRuntime(skillsDir: string, workflow: string, skillName: string): string {
   return join(skillsDir, workflow, "skills", skillName);
 }

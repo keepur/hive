@@ -43,10 +43,7 @@ describe("resolveRegistry", () => {
   ];
 
   it("returns inline URL directly without consulting configured registries", () => {
-    const result = resolveRegistry(
-      { name: "my-skill", inlineUrl: "https://github.com/foo/bar" },
-      registries,
-    );
+    const result = resolveRegistry({ name: "my-skill", inlineUrl: "https://github.com/foo/bar" }, registries);
     expect(result.url).toBe("https://github.com/foo/bar");
     expect(result.name).toBe("foo-bar");
   });
@@ -57,9 +54,9 @@ describe("resolveRegistry", () => {
   });
 
   it("throws for an unknown registry name", () => {
-    expect(() =>
-      resolveRegistry({ name: "quality-gate", registryName: "no-such-registry" }, registries),
-    ).toThrow(/Unknown registry: "no-such-registry"/);
+    expect(() => resolveRegistry({ name: "quality-gate", registryName: "no-such-registry" }, registries)).toThrow(
+      /Unknown registry: "no-such-registry"/,
+    );
   });
 
   it("uses the default registry when no prefix is given", () => {
@@ -80,8 +77,6 @@ describe("resolveRegistry", () => {
   });
 
   it("throws when no registries are configured", () => {
-    expect(() => resolveRegistry({ name: "some-skill" }, [])).toThrow(
-      /No skill registries configured/,
-    );
+    expect(() => resolveRegistry({ name: "some-skill" }, [])).toThrow(/No skill registries configured/);
   });
 });

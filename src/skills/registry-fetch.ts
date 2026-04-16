@@ -16,9 +16,7 @@ export function verifyGitAvailable(): void {
   try {
     execFileSync("git", ["--version"], { stdio: "pipe" });
   } catch {
-    throw new Error(
-      "git is required for skill installation but was not found. Install git and retry.",
-    );
+    throw new Error("git is required for skill installation but was not found. Install git and retry.");
   }
 }
 
@@ -64,11 +62,10 @@ export function partialClone(url: string): CloneResult {
 
   try {
     try {
-      execFileSync(
-        "git",
-        ["clone", "--filter=blob:none", "--no-checkout", url, tmpDir],
-        { stdio: "pipe", timeout: 120_000 },
-      );
+      execFileSync("git", ["clone", "--filter=blob:none", "--no-checkout", url, tmpDir], {
+        stdio: "pipe",
+        timeout: 120_000,
+      });
       // Checkout HEAD so files are available
       execFileSync("git", ["checkout"], { cwd: tmpDir, stdio: "pipe" });
     } catch {
@@ -109,9 +106,7 @@ export function listSkillsInClone(cloneDir: string): string[] {
   return readdirSync(skillsPath).filter((entry) => {
     try {
       const full = join(skillsPath, entry);
-      return (
-        statSync(full).isDirectory() && existsSync(join(full, "SKILL.md"))
-      );
+      return statSync(full).isDirectory() && existsSync(join(full, "SKILL.md"));
     } catch {
       return false;
     }
@@ -122,20 +117,13 @@ export function checkoutSha(cloneDir: string, sha: string): void {
   execFileSync("git", ["checkout", sha], { cwd: cloneDir, stdio: "pipe" });
 }
 
-export function findTagForSha(
-  cloneDir: string,
-  sha: string,
-): string | undefined {
+export function findTagForSha(cloneDir: string, sha: string): string | undefined {
   try {
-    const tag = execFileSync(
-      "git",
-      ["describe", "--tags", "--exact-match", sha],
-      {
-        cwd: cloneDir,
-        stdio: "pipe",
-        encoding: "utf-8",
-      },
-    ).trim();
+    const tag = execFileSync("git", ["describe", "--tags", "--exact-match", sha], {
+      cwd: cloneDir,
+      stdio: "pipe",
+      encoding: "utf-8",
+    }).trim();
     return tag || undefined;
   } catch {
     return undefined;

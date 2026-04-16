@@ -31,9 +31,7 @@ workflow: morning-briefing
 # Sales Standup Prep
 `,
     );
-    expect(extractWorkflow(skillMd, "sales-standup-prep")).toBe(
-      "morning-briefing",
-    );
+    expect(extractWorkflow(skillMd, "sales-standup-prep")).toBe("morning-briefing");
   });
 
   it("falls back to skill name when no workflow field", () => {
@@ -65,14 +63,12 @@ agents: [all]
 
 describe("projectToRuntime", () => {
   it("maps skill name and workflow to nested runtime path", () => {
-    expect(
-      projectToRuntime("/inst/skills", "morning-briefing", "sales-standup-prep"),
-    ).toBe("/inst/skills/morning-briefing/skills/sales-standup-prep");
+    expect(projectToRuntime("/inst/skills", "morning-briefing", "sales-standup-prep")).toBe(
+      "/inst/skills/morning-briefing/skills/sales-standup-prep",
+    );
   });
 
   it("handles degenerate case where workflow equals skill name", () => {
-    expect(projectToRuntime("/inst/skills", "my-skill", "my-skill")).toBe(
-      "/inst/skills/my-skill/skills/my-skill",
-    );
+    expect(projectToRuntime("/inst/skills", "my-skill", "my-skill")).toBe("/inst/skills/my-skill/skills/my-skill");
   });
 });
