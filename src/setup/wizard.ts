@@ -158,11 +158,7 @@ function isBuildDone(targetDir: string): boolean {
 
 // ── Main ───────────────────────────────────────────────────────────
 
-export async function runWizard(
-  targetDir: string,
-  templatesDir: string,
-  pkgRoot: string,
-): Promise<void> {
+export async function runWizard(targetDir: string, templatesDir: string, pkgRoot: string): Promise<void> {
   // Update module-level paths for the target directory
   ENV_PATH = join(targetDir, ".env");
   HIVE_YAML_PATH = join(targetDir, "hive.yaml");
@@ -913,4 +909,3 @@ async function doDeploy(deployDir: string, pkgRoot: string) {
 
   console.log(`\n  ✓ Deploy directory ready: ${deployDir}`);
 }
-
