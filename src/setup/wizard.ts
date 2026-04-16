@@ -619,9 +619,11 @@ async function doAnthropic(env: Record<string, string>) {
 
   // Also store in Keychain for honeypot-based credential flow
   try {
-    execFileSync("honeypot", ["set", "ANTHROPIC_API_KEY", env.ANTHROPIC_API_KEY], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    if (env.ANTHROPIC_API_KEY) {
+      execFileSync("honeypot", ["set", "ANTHROPIC_API_KEY", env.ANTHROPIC_API_KEY], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    }
   } catch {
     // honeypot may not be on PATH (dev mode) — .env is sufficient
   }
