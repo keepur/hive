@@ -142,7 +142,7 @@ async function isAgentDone(): Promise<boolean> {
   try {
     const client = new MongoClient(process.env.MONGODB_URI ?? "mongodb://localhost:27017");
     await client.connect();
-    const db = client.db(process.env.MONGODB_DB ?? "hive");
+    const db = client.db(process.env.MONGODB_DB ?? "hive_hive");
     const agent = await db.collection("agent_definitions").findOne({ _id: "chief-of-staff" as any });
     await client.close();
     return !!agent;
@@ -774,7 +774,7 @@ async function doConstitution(hive: Record<string, any>) {
 
 async function doMemory(hive: Record<string, any>, templatesDir: string) {
   const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
-  const mongoDb = process.env.MONGODB_DB || "hive";
+  const mongoDb = process.env.MONGODB_DB || "hive_hive";
 
   console.log("Seeding shared memory to MongoDB...");
 
