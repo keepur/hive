@@ -16,6 +16,7 @@ import { execFileSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
+import { render as renderTemplate } from "./template-renderer.js";
 
 // Resolved per-invocation inside runWizard(). The module-level defaults
 // would be wrong in npm-bundled mode (where `../..` from this file is not
@@ -746,11 +747,6 @@ async function doMemory(hive: Record<string, any>, templatesDir: string) {
     // Constitution
     const constitutionTplPath = join(templatesDir, "constitution.md.tpl");
     if (existsSync(constitutionTplPath)) {
-      // Dynamic import — template-renderer lives outside src/ rootDir
-      const rendererPath = join(DEV_ROOT, "setup", "template-renderer.ts");
-      const { render: renderTemplate } = (await import(rendererPath)) as {
-        render: (tpl: string, ctx: Record<string, any>) => string;
-      };
       const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
 
       const team: Record<string, string> = {};
