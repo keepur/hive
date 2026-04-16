@@ -199,4 +199,75 @@ describe("loadSkillIndex", () => {
     loadSkillIndex(customer);
     expect(getModifiedSkills().has(skillDir)).toBe(true);
   });
+
+  it("loads seed-bundled skills", () => {
+    const customer = join(tmp, "customer-skills");
+    mkdirSync(customer, { recursive: true });
+
+    const seedDir = join(tmp, "chief-of-staff");
+    writeSkill(join(seedDir, "skills"), "onboarding", "onboarding-skill", ["chief-of-staff"]);
+
+    const index = loadSkillIndex(customer, [], [seedDir]);
+
+    expect(getSkillsForAgent(index, "chief-of-staff")).toHaveLength(1);
+    expect(getSkillsForAgent(index, "chief-of-staff")[0]!.path).toBe(
+      join(seedDir, "skills", "onboarding"),
+    );
+  });
+
+  it("seed skill wins over plugin skill (same workflow name)", () => {
+    const customer = join(tmp, "customer-skills");
+    mkdirSync(customer, { recursive: true });
+
+    const seedDir = join(tmp, "chief-of-staff");
+    writeSkill(join(seedDir, "skills"), "onboarding", "seed-version", ["chief-of-staff"]);
+
+    const pluginDir = join(tmp, "plugin-a");
+    writeSkill(join(pluginDir, "skills"), "onboarding", "plugin-version", ["chief-of-staff"]);
+
+    const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)], [seedDir]);
+
+    const paths = getSkillsForAgent(index, "chief-of-staff").map((s) => s.path);
+    expect(paths).toEqual([join(seedDir, "skills", "onboarding")]);
+  });
+
+  it("customer skill shadows seed-bundled skill", () => {
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "onboarding", "customer-version", ["chief-of-staff"]);
+
+    const seedDir = join(tmp, "chief-of-staff");
+    writeSkill(join(seedDir, "skills"), "onboarding", "seed-version", ["chief-of-staff"]);
+
+    const index = loadSkillIndex(customer, [], [seedDir]);
+
+    const paths = getSkillsForAgent(index, "chief-of-staff").map((s) => s.path);
+    expect(paths).toEqual([join(customer, "onboarding")]);
+  });
+
+  it("ignores seed dirs with no skills/ subdirectory", () => {
+    const customer = join(tmp, "customer-skills");
+    mkdirSync(customer, { recursive: true });
+
+    const seedDir = join(tmp, "empty-seed");
+    mkdirSync(seedDir, { recursive: true });
+
+    const index = loadSkillIndex(customer, [], [seedDir]);
+    expect(index.size).toBe(0);
+  });
+
+  it("loads skills from multiple seed dirs", () => {
+    const customer = join(tmp, "customer-skills");
+    mkdirSync(customer, { recursive: true });
+
+    const seedA = join(tmp, "seed-a");
+    writeSkill(join(seedA, "skills"), "alpha", "skill-a", ["agent-a"]);
+
+    const seedB = join(tmp, "seed-b");
+    writeSkill(join(seedB, "skills"), "beta", "skill-b", ["agent-b"]);
+
+    const index = loadSkillIndex(customer, [], [seedA, seedB]);
+
+    expect(getSkillsForAgent(index, "agent-a")).toHaveLength(1);
+    expect(getSkillsForAgent(index, "agent-b")).toHaveLength(1);
+  });
 });
