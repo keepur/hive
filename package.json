@@ -20,7 +20,7 @@
     "build:plugins": "tsc -p tsconfig.plugins.json",
     "start": "node dist/index.js",
     "dev": "npx tsx src/index.ts",
-    "setup": "npx tsx src/setup/wizard.ts",
+    "setup": "npx tsx src/cli.ts init",
     "setup:instance": "npx tsx setup/setup-instance.ts",
     "setup:constitution": "npx tsx setup/setup-constitution.ts",
     "setup:seeds": "npx tsx setup/setup-seeds.ts",
