@@ -1,6 +1,9 @@
 import { existsSync, watch } from "node:fs";
-import { skillsDir } from "./paths.js";
+import { skillsDir, hiveHome, hiveMetaDir } from "./paths.js";
 import { MongoClient } from "mongodb";
+import { initInstanceGit } from "./skills/instance-git.js";
+import { verifyPackageIntegrity, checkAllowlistDrift } from "./skills/integrity.js";
+import { checkUpgradeNotice } from "./skills/upgrade-notice.js";
 import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
@@ -33,6 +36,12 @@ const log = createLogger("index");
 
 async function main(): Promise<void> {
   log.info("Hive starting up", { instance: config.instance.id, portBase: config.instance.portBase });
+
+  // Boot-time integrity + upgrade checks
+  verifyPackageIntegrity(hiveHome, hiveMetaDir);
+  checkAllowlistDrift(hiveHome);
+  initInstanceGit(hiveHome);
+  checkUpgradeNotice(hiveMetaDir, skillsDir);
 
   // Initialize Gemini vision for image processing
   if (config.gemini.apiKey) {
