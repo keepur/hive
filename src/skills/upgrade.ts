@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, cpSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, cpSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { partialClone, lsRemoteHead, checkoutSha, findTagForSha } from "./registry-fetch.js";
 import { readSkillMd, writeSkillMd } from "./frontmatter.js";
@@ -25,7 +25,11 @@ export function findInstalledSkill(name: string, skillsDir: string): { path: str
 
   for (const workflow of readdirSync(skillsDir)) {
     const workflowDir = join(skillsDir, workflow);
-    if (!existsSync(workflowDir)) continue;
+    try {
+      if (!statSync(workflowDir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
 
     const skillPath = join(workflowDir, "skills", name);
     if (existsSync(join(skillPath, "SKILL.md"))) {
@@ -111,8 +115,15 @@ export async function upgradeSkill(
     }
 
     // Modified — prompt customer
+    // Capture upstream content BEFORE checking out the base version,
+    // because checkoutSha will overwrite the clone's working tree.
     const yours = readFileSync(join(installed.path, "SKILL.md"), "utf-8");
     const theirs = readFileSync(join(skillSrcDir, "SKILL.md"), "utf-8");
+
+    // Save a copy of the upstream skill directory before checkout changes it
+    const theirsCopyDir = join(clone.dir, ".hive-theirs-copy", skillName);
+    mkdirSync(theirsCopyDir, { recursive: true });
+    cpSync(skillSrcDir, theirsCopyDir, { recursive: true });
 
     let base: string | undefined;
     try {
@@ -141,7 +152,8 @@ export async function upgradeSkill(
       });
     }
 
-    cpSync(skillSrcDir, installed.path, { recursive: true });
+    // Copy from the saved upstream snapshot (not skillSrcDir which now points at the base version)
+    cpSync(theirsCopyDir, installed.path, { recursive: true });
     const newHash = computeContentHash(installed.path);
     const tag = findTagForSha(clone.dir, remoteHead);
     const { frontmatter: updatedFm, body } = readSkillMd(join(installed.path, "SKILL.md"));

@@ -260,6 +260,9 @@ function detectModifiedSkills(
   const modified = new Set<string>();
 
   for (const [workflow, entry] of collisionMap) {
+    // Only check customer-space skills — never write to plugin directories
+    if (entry.source !== "customer") continue;
+
     const skillsSubdir = join(entry.path, "skills");
     if (!existsSync(skillsSubdir)) continue;
 
