@@ -12,13 +12,36 @@ import { config as appConfig } from "../config.js";
 import { loadPlugins } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { loadSkillIndex, type SkillIndex } from "./skill-loader.js";
-import { skillsDir } from "../paths.js";
+import { skillsDir, seedsDir } from "../paths.js";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { ConversationIndex } from "../search/conversation-index.js";
 import type { ActivityLogger } from "../activity/activity-logger.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
+
+/**
+ * Discover seed directories that contain skills.
+ * Returns absolute paths to seed dirs (e.g., ["<repo>/seeds/chief-of-staff"]).
+ */
+function discoverSeedDirs(rootSeedsDir: string): string[] {
+  if (!existsSync(rootSeedsDir)) return [];
+  try {
+    return readdirSync(rootSeedsDir)
+      .map((d) => join(rootSeedsDir, d))
+      .filter((p) => {
+        try {
+          return statSync(p).isDirectory() && existsSync(join(p, "skills"));
+        } catch {
+          return false;
+        }
+      });
+  } catch {
+    return [];
+  }
+}
 
 interface QueuedMessage {
   message: WorkItem;
@@ -37,6 +60,7 @@ export class AgentManager {
   private memoryManager: MemoryManager;
   private sessionStore: SessionStore;
   private plugins: LoadedPlugin[];
+  private seedDirs: string[];
   private skillIndex: SkillIndex;
   private activityLogger?: ActivityLogger;
   private prefetcher?: CodeIndexPrefetcher;
@@ -48,7 +72,8 @@ export class AgentManager {
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
     this.plugins = loadPlugins(appConfig.plugins, process.cwd());
-    this.skillIndex = loadSkillIndex(skillsDir, this.plugins);
+    this.seedDirs = discoverSeedDirs(seedsDir);
+    this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
   }
 
   getPlugins(): LoadedPlugin[] {
@@ -64,7 +89,7 @@ export class AgentManager {
 
   reloadSkills(): void {
     try {
-      this.skillIndex = loadSkillIndex(skillsDir, this.plugins);
+      this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
     } catch (err) {
       log.warn("Skill reload failed, retaining previous index", { error: String(err) });
     }
