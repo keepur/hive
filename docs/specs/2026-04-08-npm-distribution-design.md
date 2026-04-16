@@ -1,8 +1,10 @@
 # Hive npm Distribution
 
 **Date**: 2026-04-08
-**Status**: Reviewed
+**Status**: Superseded 2026-04-15 — see `2026-04-15-hive-distribution-design.md`
 **Scope**: Package Hive as `@keepur/hive` on npm — closed-source, minified, CLI-driven install
+
+> **Superseded.** This spec predates the plugin-architecture (2026-04-14), skills-system (2026-04-14), skills-registry (2026-04-15), and skills-customer-space (2026-04-15) specs, and predates the Beekeeper extraction. Several load-bearing assumptions are no longer true: plugins are now distributed via a git-backed registry (not npm), core ships zero agent seeds (including no chief-of-staff), and skills are a parallel distribution channel that didn't exist when this was written. Kept for historical context only.
 
 ## Problem
 
