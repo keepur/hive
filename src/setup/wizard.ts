@@ -174,6 +174,25 @@ export async function runWizard(
   const env = loadEnv();
   const hive = loadHiveYaml();
 
+  // ── Instance defaults (must run before resume detection) ──────────
+  if (!hive.instance?.id) {
+    hive.instance = {
+      id: "hive",
+      type: "business",
+    };
+    hive.ports = hive.ports ?? {
+      ws: 3200,
+      bgTask: 3201,
+    };
+    saveHiveYaml(hive);
+  }
+
+  // Set MongoDB database name for all downstream operations
+  const instanceId = (hive.instance?.id as string) ?? "hive";
+  if (!process.env.MONGODB_DB) {
+    process.env.MONGODB_DB = `hive_${instanceId}`;
+  }
+
   // Check for resumed session
   const completedSections: string[] = [];
   if (isBusinessDone(hive)) completedSections.push("Business info");
