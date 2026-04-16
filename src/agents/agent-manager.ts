@@ -12,7 +12,7 @@ import { config as appConfig } from "../config.js";
 import { loadPlugins } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { loadSkillIndex, type SkillIndex } from "./skill-loader.js";
-import { skillsDir, seedsDir } from "../paths.js";
+import { skillsDir, seedsDir, hiveHome } from "../paths.js";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { ConversationIndex } from "../search/conversation-index.js";
@@ -71,7 +71,7 @@ export class AgentManager {
     this.sessionStore = sessionStore;
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
-    this.plugins = loadPlugins(appConfig.plugins, process.cwd());
+    this.plugins = loadPlugins(appConfig.plugins, hiveHome);
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
   }
