@@ -22,9 +22,7 @@ export function isInsideCustomerSpace(path: string): boolean {
  * Extract workflow and skill name from a runtime path inside customer space.
  * Returns null if the path doesn't match the expected layout.
  */
-export function parseSkillPath(
-  path: string,
-): { workflow: string; name: string } | null {
+export function parseSkillPath(path: string): { workflow: string; name: string } | null {
   const resolved = resolve(path);
   const base = resolve(skillsDir);
   if (!resolved.startsWith(base + "/")) return null;

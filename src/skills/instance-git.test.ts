@@ -1,20 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import {
-  mkdtempSync,
-  mkdirSync,
-  writeFileSync,
-  rmSync,
-  existsSync,
-  unlinkSync,
-} from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import {
-  initInstanceGit,
-  commitToState,
-  commitRemovalToState,
-} from "./instance-git.js";
+import { initInstanceGit, commitToState, commitRemovalToState } from "./instance-git.js";
 
 /** Helper to run git commands against the test instance repo. */
 function git(hiveHome: string, ...args: string[]): string {
@@ -65,12 +54,7 @@ describe("instance-git", () => {
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(join(skillDir, "SKILL.md"), "# Test skill");
 
-    commitToState(
-      tmp,
-      ["skills/test-skill/SKILL.md"],
-      "install: test-skill@1.0.0",
-      "admin",
-    );
+    commitToState(tmp, ["skills/test-skill/SKILL.md"], "install: test-skill@1.0.0", "admin");
 
     const logOutput = git(tmp, "log", "--oneline", "-1", "--format=%s|%an");
     const [subject, author] = logOutput.split("|");
@@ -96,9 +80,7 @@ describe("instance-git", () => {
 
   it("commitToState handles uninitialized repo gracefully", () => {
     // Should not throw — just warns and returns
-    expect(() =>
-      commitToState(tmp, ["skills/foo/SKILL.md"], "should not throw"),
-    ).not.toThrow();
+    expect(() => commitToState(tmp, ["skills/foo/SKILL.md"], "should not throw")).not.toThrow();
   });
 
   it("commitRemovalToState records file removals", () => {
@@ -113,11 +95,7 @@ describe("instance-git", () => {
     // Remove the file from disk
     unlinkSync(join(skillDir, "SKILL.md"));
 
-    commitRemovalToState(
-      tmp,
-      ["skills/doomed/SKILL.md"],
-      "remove: doomed skill",
-    );
+    commitRemovalToState(tmp, ["skills/doomed/SKILL.md"], "remove: doomed skill");
 
     const logOutput = git(tmp, "log", "--oneline");
     const lines = logOutput.split("\n").filter(Boolean);

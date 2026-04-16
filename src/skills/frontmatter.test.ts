@@ -2,13 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  parseFrontmatter,
-  serializeFrontmatter,
-  readSkillMd,
-  writeSkillMd,
-  stripOriginBlock,
-} from "./frontmatter.js";
+import { parseFrontmatter, serializeFrontmatter, readSkillMd, writeSkillMd, stripOriginBlock } from "./frontmatter.js";
 
 describe("parseFrontmatter", () => {
   it("parses inline agents format", () => {
@@ -103,9 +97,7 @@ body`;
   });
 
   it("throws on missing frontmatter", () => {
-    expect(() => parseFrontmatter("no frontmatter here")).toThrow(
-      "No YAML frontmatter found",
-    );
+    expect(() => parseFrontmatter("no frontmatter here")).toThrow("No YAML frontmatter found");
   });
 });
 

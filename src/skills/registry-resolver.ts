@@ -33,9 +33,7 @@ export function parseSkillSpec(spec: string): ParsedSkillSpec {
   }
 
   // GitHub web URL convenience form
-  const ghMatch = spec.match(
-    /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(?:tree|blob)\/[^/]+\/skills\/([^/]+)/,
-  );
+  const ghMatch = spec.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(?:tree|blob)\/[^/]+\/skills\/([^/]+)/);
   if (ghMatch) {
     return {
       name: ghMatch[3]!,
@@ -58,10 +56,7 @@ export function parseSkillSpec(spec: string): ParsedSkillSpec {
 /**
  * Resolve which registry to use for a skill install/upgrade.
  */
-export function resolveRegistry(
-  spec: ParsedSkillSpec,
-  registries: RegistryConfig[],
-): ResolvedRegistry {
+export function resolveRegistry(spec: ParsedSkillSpec, registries: RegistryConfig[]): ResolvedRegistry {
   if (spec.inlineUrl) {
     const name = inferRegistryName(spec.inlineUrl);
     log.debug("resolved inline registry", { inlineUrl: spec.inlineUrl, name });

@@ -1,10 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
-import {
-  skillRuntimePath,
-  isInsideCustomerSpace,
-  parseSkillPath,
-} from "./skill-paths.js";
+import { skillRuntimePath, isInsideCustomerSpace, parseSkillPath } from "./skill-paths.js";
 import { skillsDir } from "../paths.js";
 
 describe("skillRuntimePath", () => {
@@ -16,9 +12,7 @@ describe("skillRuntimePath", () => {
 
 describe("isInsideCustomerSpace", () => {
   it("returns true for a path inside skills dir", () => {
-    expect(isInsideCustomerSpace(join(skillsDir, "wf", "skills", "foo"))).toBe(
-      true,
-    );
+    expect(isInsideCustomerSpace(join(skillsDir, "wf", "skills", "foo"))).toBe(true);
   });
 
   it("returns true for the skills dir itself", () => {
@@ -44,13 +38,7 @@ describe("parseSkillPath", () => {
   });
 
   it("extracts from a deeper path inside a skill dir", () => {
-    const path = join(
-      skillsDir,
-      "dodi-dev",
-      "skills",
-      "brainstorm",
-      "SKILL.md",
-    );
+    const path = join(skillsDir, "dodi-dev", "skills", "brainstorm", "SKILL.md");
     expect(parseSkillPath(path)).toEqual({
       workflow: "dodi-dev",
       name: "brainstorm",

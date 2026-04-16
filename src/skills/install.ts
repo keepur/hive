@@ -1,16 +1,6 @@
-import {
-  cpSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import {
-  shallowClone,
-  listSkillsInClone,
-  findTagForSha,
-} from "./registry-fetch.js";
+import { shallowClone, listSkillsInClone, findTagForSha } from "./registry-fetch.js";
 import { extractWorkflow, projectToRuntime } from "./projection.js";
 import { parseFrontmatter, serializeFrontmatter } from "./frontmatter.js";
 import { computeContentHash } from "./content-hash.js";
@@ -80,9 +70,7 @@ export function installSkill(
     // Record install metadata
     const contentHash = computeContentHash(targetPath);
     const tag = findTagForSha(clone.dir, clone.headSha);
-    const { frontmatter, body } = parseFrontmatter(
-      readFileSync(join(targetPath, "SKILL.md"), "utf-8"),
-    );
+    const { frontmatter, body } = parseFrontmatter(readFileSync(join(targetPath, "SKILL.md"), "utf-8"));
 
     frontmatter.origin = {
       type: "registry",
@@ -94,10 +82,7 @@ export function installSkill(
       modified: false,
     };
 
-    writeFileSync(
-      join(targetPath, "SKILL.md"),
-      serializeFrontmatter(frontmatter, body),
-    );
+    writeFileSync(join(targetPath, "SKILL.md"), serializeFrontmatter(frontmatter, body));
 
     // Commit to state branch
     const relPath = relative(targetHiveHome, targetPath);

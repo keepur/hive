@@ -1,13 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import {
-  mkdtempSync,
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-  rmSync,
-  existsSync,
-} from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { installSkill } from "./install.js";
@@ -18,10 +11,7 @@ import { parseFrontmatter } from "./frontmatter.js";
  * Create a local file:// git repo that acts as a mock skill registry.
  * Returns the file:// URL suitable for shallowClone.
  */
-function createMockRegistry(
-  tmp: string,
-  skills: { name: string; workflow?: string; content?: string }[],
-): string {
+function createMockRegistry(tmp: string, skills: { name: string; workflow?: string; content?: string }[]): string {
   const repoDir = join(tmp, "registry");
   mkdirSync(repoDir, { recursive: true });
   execFileSync("git", ["init"], { cwd: repoDir, stdio: "pipe" });
@@ -78,53 +68,32 @@ describe("installSkill", () => {
   });
 
   it("installs a skill with workflow field into the correct path", () => {
-    const url = createMockRegistry(tmp, [
-      { name: "deploy", workflow: "devops" },
-    ]);
+    const url = createMockRegistry(tmp, [{ name: "deploy", workflow: "devops" }]);
 
     const result = installSkill(url, "deploy", targetSkillsDir, targetHiveHome);
 
     expect(result.name).toBe("deploy");
     expect(result.workflow).toBe("devops");
-    expect(result.targetPath).toBe(
-      join(targetSkillsDir, "devops", "skills", "deploy"),
-    );
+    expect(result.targetPath).toBe(join(targetSkillsDir, "devops", "skills", "deploy"));
     expect(existsSync(join(result.targetPath, "SKILL.md"))).toBe(true);
   });
 
   it("installs a skill without workflow field using skill name as workflow", () => {
     const url = createMockRegistry(tmp, [{ name: "standalone" }]);
 
-    const result = installSkill(
-      url,
-      "standalone",
-      targetSkillsDir,
-      targetHiveHome,
-    );
+    const result = installSkill(url, "standalone", targetSkillsDir, targetHiveHome);
 
     expect(result.workflow).toBe("standalone");
-    expect(result.targetPath).toBe(
-      join(targetSkillsDir, "standalone", "skills", "standalone"),
-    );
+    expect(result.targetPath).toBe(join(targetSkillsDir, "standalone", "skills", "standalone"));
     expect(existsSync(join(result.targetPath, "SKILL.md"))).toBe(true);
   });
 
   it("records origin metadata in installed SKILL.md", () => {
-    const url = createMockRegistry(tmp, [
-      { name: "tracked", workflow: "ops" },
-    ]);
+    const url = createMockRegistry(tmp, [{ name: "tracked", workflow: "ops" }]);
 
-    const result = installSkill(
-      url,
-      "tracked",
-      targetSkillsDir,
-      targetHiveHome,
-    );
+    const result = installSkill(url, "tracked", targetSkillsDir, targetHiveHome);
 
-    const content = readFileSync(
-      join(result.targetPath, "SKILL.md"),
-      "utf-8",
-    );
+    const content = readFileSync(join(result.targetPath, "SKILL.md"), "utf-8");
     const { frontmatter } = parseFrontmatter(content);
 
     expect(frontmatter.origin).toBeDefined();
@@ -139,27 +108,21 @@ describe("installSkill", () => {
   it("throws when skill does not exist in registry", () => {
     const url = createMockRegistry(tmp, [{ name: "real-skill" }]);
 
-    expect(() =>
-      installSkill(url, "missing-skill", targetSkillsDir, targetHiveHome),
-    ).toThrow(/Skill "missing-skill" not found/);
+    expect(() => installSkill(url, "missing-skill", targetSkillsDir, targetHiveHome)).toThrow(
+      /Skill "missing-skill" not found/,
+    );
 
-    expect(() =>
-      installSkill(url, "missing-skill", targetSkillsDir, targetHiveHome),
-    ).toThrow(/real-skill/);
+    expect(() => installSkill(url, "missing-skill", targetSkillsDir, targetHiveHome)).toThrow(/real-skill/);
   });
 
   it("throws when skill is already installed", () => {
-    const url = createMockRegistry(tmp, [
-      { name: "dupe", workflow: "common" },
-    ]);
+    const url = createMockRegistry(tmp, [{ name: "dupe", workflow: "common" }]);
 
     // First install succeeds
     installSkill(url, "dupe", targetSkillsDir, targetHiveHome);
 
     // Second install fails
-    expect(() =>
-      installSkill(url, "dupe", targetSkillsDir, targetHiveHome),
-    ).toThrow(/already installed/);
+    expect(() => installSkill(url, "dupe", targetSkillsDir, targetHiveHome)).toThrow(/already installed/);
   });
 
   it("cleans up clone temp dir even on failure", () => {
@@ -178,34 +141,26 @@ describe("installSkill", () => {
     // but we verify no throw from cleanup in the finally block)
     // The fact that no error was thrown about cleanup is sufficient.
     // We also verify the error was the expected one, not a cleanup failure.
-    expect(() =>
-      installSkill(url, "nonexistent", targetSkillsDir, targetHiveHome),
-    ).toThrow(/not found/);
+    expect(() => installSkill(url, "nonexistent", targetSkillsDir, targetHiveHome)).toThrow(/not found/);
   });
 
   it("commits to the instance-git state branch", () => {
-    const url = createMockRegistry(tmp, [
-      { name: "committed", workflow: "flow" },
-    ]);
+    const url = createMockRegistry(tmp, [{ name: "committed", workflow: "flow" }]);
 
     installSkill(url, "committed", targetSkillsDir, targetHiveHome);
 
     // Check the state branch log
     const gitDir = resolve(targetHiveHome, ".hive", "git");
-    const logOutput = execFileSync(
-      "git",
-      ["log", "--oneline", "-1", "--format=%s"],
-      {
-        cwd: targetHiveHome,
-        env: {
-          ...process.env,
-          GIT_DIR: gitDir,
-          GIT_WORK_TREE: targetHiveHome,
-        },
-        stdio: "pipe",
-        encoding: "utf-8",
+    const logOutput = execFileSync("git", ["log", "--oneline", "-1", "--format=%s"], {
+      cwd: targetHiveHome,
+      env: {
+        ...process.env,
+        GIT_DIR: gitDir,
+        GIT_WORK_TREE: targetHiveHome,
       },
-    ).trim();
+      stdio: "pipe",
+      encoding: "utf-8",
+    }).trim();
 
     expect(logOutput).toContain("install: flow/committed from");
   });

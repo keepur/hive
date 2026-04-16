@@ -113,10 +113,7 @@ export function parseFrontmatter(content: string): {
   return { frontmatter: fm, body };
 }
 
-function parseNestedBlock(
-  lines: string[],
-  startIdx: number,
-): Record<string, string | boolean> {
+function parseNestedBlock(lines: string[], startIdx: number): Record<string, string | boolean> {
   const result: Record<string, string | boolean> = {};
   let i = startIdx + 1;
   while (i < lines.length && lines[i]!.match(/^\s+\S/)) {
@@ -137,10 +134,7 @@ function parseNestedBlock(
 }
 
 function unquote(s: string): string {
-  if (
-    (s.startsWith('"') && s.endsWith('"')) ||
-    (s.startsWith("'") && s.endsWith("'"))
-  ) {
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
     return s.slice(1, -1);
   }
   return s;
@@ -150,10 +144,7 @@ function unquote(s: string): string {
  * Serialize a SkillFrontmatter and body back into SKILL.md content.
  * Field order: name, description, agents (inline), workflow, origin, author.
  */
-export function serializeFrontmatter(
-  fm: SkillFrontmatter,
-  body: string,
-): string {
+export function serializeFrontmatter(fm: SkillFrontmatter, body: string): string {
   const lines: string[] = [];
   lines.push(`name: ${yamlQuote(fm.name)}`);
   lines.push(`description: ${yamlQuote(fm.description)}`);
@@ -179,10 +170,7 @@ export function serializeFrontmatter(
   return `---\n${lines.join("\n")}\n---\n${body}`;
 }
 
-function serializeNested(
-  lines: string[],
-  obj: SkillOrigin | SkillAuthor,
-): void {
+function serializeNested(lines: string[], obj: SkillOrigin | SkillAuthor): void {
   for (const [key, val] of Object.entries(obj)) {
     if (val === undefined) continue;
     lines.push(`  ${key}: ${yamlQuote(String(val))}`);
@@ -211,11 +199,7 @@ export function readSkillMd(path: string): {
 /**
  * Write a SKILL.md file with the given frontmatter and body.
  */
-export function writeSkillMd(
-  path: string,
-  fm: SkillFrontmatter,
-  body: string,
-): void {
+export function writeSkillMd(path: string, fm: SkillFrontmatter, body: string): void {
   writeFileSync(path, serializeFrontmatter(fm, body), "utf-8");
 }
 

@@ -36,9 +36,7 @@ export async function removeSkill(
   if (existsSync(skillMdPath)) {
     try {
       const { frontmatter } = readSkillMd(skillMdPath);
-      const isModified =
-        frontmatter.origin?.modified === true ||
-        frontmatter.origin?.type === "agent-authored";
+      const isModified = frontmatter.origin?.modified === true || frontmatter.origin?.type === "agent-authored";
 
       if (isModified && !opts.force) {
         const message =
@@ -77,11 +75,7 @@ export async function removeSkill(
     }
   }
 
-  commitRemovalToState(
-    hiveHome,
-    [relPath],
-    `remove: ${installed.workflow}/${skillName}`,
-  );
+  commitRemovalToState(hiveHome, [relPath], `remove: ${installed.workflow}/${skillName}`);
 
   log.info("Skill removed", { name: skillName, workflow: installed.workflow });
   return true;

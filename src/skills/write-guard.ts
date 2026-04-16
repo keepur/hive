@@ -30,11 +30,7 @@ export function isSkillWrite(path: string): boolean {
  * Returns the (possibly modified) content to write.
  * Throws if the path violates the customer-space constraint.
  */
-export function processSkillWrite(
-  path: string,
-  content: string,
-  ctx: WriteGuardContext,
-): string {
+export function processSkillWrite(path: string, content: string, ctx: WriteGuardContext): string {
   const resolved = resolve(path);
 
   if (!isInsideCustomerSpace(resolved)) {
@@ -70,9 +66,7 @@ export function processSkillWrite(
 
   // Commit to state branch
   const relPath = relative(hiveHome, resolved);
-  const message = isNew
-    ? `agent-authored: ${relPath}${ctx.reason ? ` — ${ctx.reason}` : ""}`
-    : `update: ${relPath}`;
+  const message = isNew ? `agent-authored: ${relPath}${ctx.reason ? ` — ${ctx.reason}` : ""}` : `update: ${relPath}`;
   commitToState(hiveHome, [relPath], message, ctx.agentId);
 
   return finalContent;

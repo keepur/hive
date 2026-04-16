@@ -57,12 +57,7 @@ function gitCmd(hiveHome: string, ...args: string[]): string {
  * Commit a file change to the 'state' branch.
  * Used by the write guard and install/upgrade/remove flows.
  */
-export function commitToState(
-  hiveHome: string,
-  files: string[],
-  message: string,
-  authorName?: string,
-): void {
+export function commitToState(hiveHome: string, files: string[], message: string, authorName?: string): void {
   const gitDir = resolve(hiveHome, ".hive", "git");
   if (!existsSync(gitDir)) {
     log.warn("Instance git not initialized — skipping state commit");
@@ -87,9 +82,7 @@ export function commitToState(
       // diff --quiet exits non-zero when there are staged changes — expected
     }
 
-    const authorArg = authorName
-      ? `${authorName} <${authorName}@hive>`
-      : "hive <hive@localhost>";
+    const authorArg = authorName ? `${authorName} <${authorName}@hive>` : "hive <hive@localhost>";
     gitCmd(hiveHome, "commit", "--author", authorArg, "-m", message);
     log.debug("State branch commit", { message, files: files.length });
   } catch (err) {
@@ -103,11 +96,7 @@ export function commitToState(
 /**
  * Commit a removal to the 'state' branch.
  */
-export function commitRemovalToState(
-  hiveHome: string,
-  files: string[],
-  message: string,
-): void {
+export function commitRemovalToState(hiveHome: string, files: string[], message: string): void {
   const gitDir = resolve(hiveHome, ".hive", "git");
   if (!existsSync(gitDir)) return;
 
