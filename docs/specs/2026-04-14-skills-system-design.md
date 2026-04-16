@@ -59,7 +59,7 @@ Workflows that existed in the repo at the time of writing (2026-04-14), for hist
 - `morning-briefing/` — `morning-briefing`, `sales-standup-prep`, `cs-standup-prep`, `dev-standup-prep`, `marketing-standup-prep`, `production-standup-prep`
 - `project-tools/` — `quality-gate`, `dev-servers`, `create-tests`
 
-Under the current design (`2026-04-15-skills-customer-space-design.md`), the `<repo>/skills/` tree is not the authoritative location for customer-owned skills at runtime — that role belongs to `<instance-dir>/skills/`. The enumeration above is historical and reflects the state of the repo on 2026-04-14, before the customer-space partition was specified.
+Under the current design (`2026-04-15-skills-customer-space-design.md`), the `<repo>/skills/` tree is not the authoritative location for customer-owned skills at runtime — that role belongs to `<hiveHome>/skills/` (the instance directory, e.g. `~/services/hive/skills/`). The `skills/` directory at both the repo root and the instance root is gitignored; shipped skills are no longer stored there but instead bundled inside plugins at `<pluginDir>/skills/` or installed from the Keepur registry into customer space. The enumeration above is historical and reflects the state of the repo on 2026-04-14, before the customer-space partition was specified. See `2026-04-15-skills-customer-space-design.md` for the ownership model and `2026-04-15-skills-registry-design.md` for registry-based distribution.
 
 ### 4.2 SKILL.md format
 
