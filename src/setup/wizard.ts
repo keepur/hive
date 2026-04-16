@@ -18,10 +18,7 @@ import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
 import { render as renderTemplate } from "./template-renderer.js";
 
-// Resolved per-invocation inside runWizard(). The module-level defaults
-// would be wrong in npm-bundled mode (where `../..` from this file is not
-// the repo root), so start empty and assert they are set before use.
-const DEV_ROOT = resolve(import.meta.dirname, "../..");
+// Resolved per-invocation inside runWizard().
 let ENV_PATH = "";
 let HIVE_YAML_PATH = "";
 
@@ -161,12 +158,15 @@ function isBuildDone(targetDir: string): boolean {
 // ── Main ───────────────────────────────────────────────────────────
 
 export async function runWizard(
-  targetDir: string = DEV_ROOT,
-  templatesDir: string = resolve(DEV_ROOT, "setup", "templates"),
+  targetDir: string,
+  templatesDir: string,
+  pkgRoot: string,
 ): Promise<void> {
   // Update module-level paths for the target directory
   ENV_PATH = join(targetDir, ".env");
   HIVE_YAML_PATH = join(targetDir, "hive.yaml");
+
+  const isBundled = existsSync(resolve(pkgRoot, "pkg", "server.min.js"));
 
   banner();
 
@@ -213,10 +213,10 @@ export async function runWizard(
     if (!redo) {
       console.log("  ✓ Skipped");
     } else {
-      await doSlack(env);
+      await doSlack(env, pkgRoot);
     }
   } else {
-    await doSlack(env);
+    await doSlack(env, pkgRoot);
   }
 
   // ── 3. Anthropic ──────────────────────────────────────────────────
@@ -409,12 +409,12 @@ export async function runWizard(
     console.log("\nChief of Staff agent: ✓ already set up");
     const redo = await confirm("Regenerate agent from template?", false);
     if (redo) {
-      await doAgent(hive);
+      await doAgent(hive, pkgRoot);
     } else {
       console.log("  ✓ Skipped");
     }
   } else {
-    await doAgent(hive);
+    await doAgent(hive, pkgRoot);
   }
 
   // ── 6. Constitution ──────────────────────────────────────────────
@@ -433,10 +433,10 @@ export async function runWizard(
     if (!rebuild) {
       console.log("  ✓ Skipped");
     } else {
-      await doBuild();
+      await doBuild(pkgRoot);
     }
   } else {
-    await doBuild();
+    await doBuild(pkgRoot);
   }
 
   // ── 9. Deploy Clone ──────────────────────────────────────────────
@@ -449,18 +449,18 @@ export async function runWizard(
     console.log(`Deploy directory exists: ${deployDir}`);
     const redeploy = await confirm("Sync latest build and config?", true);
     if (redeploy) {
-      await doDeploy(deployDir);
+      await doDeploy(deployDir, pkgRoot);
     } else {
       console.log("  ✓ Skipped");
     }
   } else {
     console.log("Hive runs from a separate deploy directory (not this dev repo).");
-    console.log(`  Dev:    ${DEV_ROOT}`);
+    console.log(`  Dev:    ${pkgRoot}`);
     console.log(`  Deploy: ${deployDir}`);
     console.log("");
     const setupDeploy = await confirm("Set up the deploy directory now?", true);
     if (setupDeploy) {
-      await doDeploy(deployDir);
+      await doDeploy(deployDir, pkgRoot);
     }
   }
 
@@ -472,7 +472,7 @@ export async function runWizard(
     try {
       // Generate plists pointing to the deploy directory
       execFileSync("bash", ["service/install.sh"], {
-        cwd: DEV_ROOT,
+        cwd: pkgRoot,
         stdio: "inherit",
         env: { ...process.env, HIVE_DEPLOY_DIR: deployDir },
       });
@@ -492,8 +492,8 @@ export async function runWizard(
   console.log(`  Deploy dir: ${deployDir}`);
   console.log(`  Start:      cd ${deployDir} && npm start`);
   console.log(`  Logs:       tail -f ${deployDir}/logs/hive.log`);
-  console.log(`  Dev mode:   npm run dev  (from ${DEV_ROOT})`);
-  console.log(`  Redeploy:   bash ${DEV_ROOT}/service/deploy.sh`);
+  console.log(`  Dev mode:   npm run dev  (from ${pkgRoot})`);
+  console.log(`  Redeploy:   bash ${pkgRoot}/service/deploy.sh`);
   console.log("");
   console.log("Your chief-of-staff agent is stored in the agent_definitions collection.");
   console.log("Additional agents can be created through the chief of staff.");
@@ -528,7 +528,7 @@ async function doBusiness(hive: Record<string, any>) {
   console.log("\n  ✓ Business info saved (hive.yaml)");
 }
 
-async function doSlack(env: Record<string, string>) {
+async function doSlack(env: Record<string, string>, pkgRoot: string) {
   section("Slack App Setup");
 
   console.log("You need a Slack app with Socket Mode enabled.");
@@ -544,7 +544,10 @@ async function doSlack(env: Record<string, string>) {
   console.log("4. Choose YAML format and paste this manifest:");
   console.log("");
   console.log("─── Copy everything below this line ───");
-  console.log(readFileSync(join(DEV_ROOT, "setup", "slack-manifest.yaml"), "utf-8"));
+  const manifestPath = existsSync(resolve(pkgRoot, "pkg", "setup", "slack-manifest.yaml"))
+    ? resolve(pkgRoot, "pkg", "setup", "slack-manifest.yaml")
+    : resolve(pkgRoot, "setup", "slack-manifest.yaml");
+  console.log(readFileSync(manifestPath, "utf-8"));
   console.log("─── Copy everything above this line ───");
   console.log("");
   console.log('5. Click "Create"');
@@ -632,7 +635,7 @@ async function doAnthropic(env: Record<string, string>) {
   console.log("  ✓ Anthropic key saved (.env)");
 }
 
-async function doAgent(hive: Record<string, any>) {
+async function doAgent(hive: Record<string, any>, pkgRoot: string) {
   section("Chief of Staff Agent");
 
   console.log("Hive starts with a Chief of Staff — your primary agent.");
@@ -647,7 +650,7 @@ async function doAgent(hive: Record<string, any>) {
 
   // Seed chief-of-staff into agent_definitions via setup:seeds
   console.log("  Seeding agent definition...");
-  execFileSync("npx", ["tsx", "setup/setup-seeds.ts"], { cwd: DEV_ROOT, stdio: "inherit" });
+  execFileSync("npx", ["tsx", "setup/setup-seeds.ts"], { cwd: pkgRoot, stdio: "inherit" });
 
   console.log(`  ✓ ${agentName} (Chief of Staff) is ready`);
 }
@@ -773,10 +776,10 @@ async function doMemory(hive: Record<string, any>, templatesDir: string) {
   }
 }
 
-async function doBuild() {
+async function doBuild(pkgRoot: string) {
   console.log("  Compiling TypeScript...");
   try {
-    execFileSync("npm", ["run", "build"], { cwd: DEV_ROOT, stdio: "pipe" });
+    execFileSync("npm", ["run", "build"], { cwd: pkgRoot, stdio: "pipe" });
     console.log("  ✓ Build complete");
   } catch (err) {
     console.log("  ⚠ Build failed:");
@@ -784,7 +787,7 @@ async function doBuild() {
   }
 }
 
-async function doDeploy(deployDir: string) {
+async function doDeploy(deployDir: string, pkgRoot: string) {
   const { mkdirSync: mkdir } = await import("node:fs");
 
   if (!existsSync(join(deployDir, "package.json"))) {
@@ -793,7 +796,7 @@ async function doDeploy(deployDir: string) {
     const parentDir = resolve(deployDir, "..");
     mkdir(parentDir, { recursive: true });
 
-    const remoteUrl = execFileSync("git", ["remote", "get-url", "origin"], { cwd: DEV_ROOT, encoding: "utf-8" }).trim();
+    const remoteUrl = execFileSync("git", ["remote", "get-url", "origin"], { cwd: pkgRoot, encoding: "utf-8" }).trim();
     execFileSync("git", ["clone", remoteUrl, deployDir], { stdio: "inherit" });
     console.log("  ✓ Repository cloned");
   } else {
@@ -815,7 +818,7 @@ async function doDeploy(deployDir: string) {
   console.log("  Syncing config and build output...");
 
   // .env
-  const envSrc = join(DEV_ROOT, ".env");
+  const envSrc = join(pkgRoot, ".env");
   if (existsSync(envSrc)) {
     const { copyFileSync } = await import("node:fs");
     copyFileSync(envSrc, join(deployDir, ".env"));
@@ -823,7 +826,7 @@ async function doDeploy(deployDir: string) {
   }
 
   // hive.yaml
-  const hiveSrc = join(DEV_ROOT, "hive.yaml");
+  const hiveSrc = join(pkgRoot, "hive.yaml");
   if (existsSync(hiveSrc)) {
     const { copyFileSync } = await import("node:fs");
     copyFileSync(hiveSrc, join(deployDir, "hive.yaml"));
@@ -831,7 +834,7 @@ async function doDeploy(deployDir: string) {
   }
 
   // dist/ (build output)
-  const distSrc = join(DEV_ROOT, "dist");
+  const distSrc = join(pkgRoot, "dist");
   if (existsSync(distSrc)) {
     execFileSync("rsync", ["-a", "--delete", `${distSrc}/`, `${join(deployDir, "dist")}/`], { stdio: "pipe" });
     console.log("  ✓ dist/");
@@ -843,12 +846,3 @@ async function doDeploy(deployDir: string) {
   console.log(`\n  ✓ Deploy directory ready: ${deployDir}`);
 }
 
-// Backward compat — run directly if executed as main
-const isMain = import.meta.url === `file://${process.argv[1]}`;
-if (isMain) {
-  runWizard().catch((err) => {
-    console.error("Setup failed:", err);
-    rl.close();
-    process.exit(1);
-  });
-}

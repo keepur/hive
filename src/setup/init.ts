@@ -21,5 +21,5 @@ export async function runSetupWizard(pkgRoot: string): Promise<void> {
   process.env.HIVE_HOME = hiveHome;
 
   const { runWizard } = await import("./wizard.js");
-  await runWizard(hiveHome, templatesDir);
+  await runWizard(hiveHome, templatesDir, pkgRoot);
 }
