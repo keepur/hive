@@ -41,9 +41,7 @@ export async function runRegistry(subcommand?: string, ...args: string[]): Promi
       const registries = config.skillRegistries ?? [];
 
       if (registries.length === 0) {
-        console.log(
-          "No registries configured. Using built-in default: https://github.com/keepur/hive-skills",
-        );
+        console.log("No registries configured. Using built-in default: https://github.com/keepur/hive-skills");
         return;
       }
 
@@ -101,5 +99,8 @@ function writeConfig(path: string, data: any): void {
 function inferName(url: string): string {
   const cleaned = url.replace(/\.git$/, "").replace(/\/$/, "");
   const parts = cleaned.split("/").filter(Boolean);
-  return parts.slice(-2).join("-").replace(/^github\.com-/, "");
+  return parts
+    .slice(-2)
+    .join("-")
+    .replace(/^github\.com-/, "");
 }
