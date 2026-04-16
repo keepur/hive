@@ -615,7 +615,7 @@ export class AgentRunner {
           continue;
         }
         const devPath = resolve(DIST_DIR, `plugins/${plugin.name}/${serverDef.entry.replace(/\.ts$/, ".js")}`);
-        const npmPath = resolve(hiveHome, "plugins", "node_modules", plugin.name, "dist", "mcp",
+        const npmPath = resolve(hiveHome, "plugins", plugin.name, "dist", "mcp",
           serverDef.entry.replace(/\.ts$/, ".min.js").replace(/^.*\//, ""));
         const compiledPath = existsSync(npmPath) ? npmPath : devPath;
 

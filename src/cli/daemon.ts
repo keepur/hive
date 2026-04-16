@@ -91,15 +91,24 @@ export async function startDaemon(pkgRoot: string): Promise<void> {
   writeFileSync(plistPath, plist);
   console.log(`Generated plist: ${plistPath}`);
 
+  // Ensure ~/Library/LaunchAgents/ exists and create symlink
+  const launchAgentsDir = resolve(linkPath, "..");
+  mkdirSync(launchAgentsDir, { recursive: true });
   if (existsSync(linkPath)) unlinkSync(linkPath);
   symlinkSync(plistPath, linkPath);
+
+  // Unload first if already loaded (idempotent restart)
+  try {
+    execFileSync("launchctl", ["unload", linkPath], { stdio: "pipe" });
+  } catch {
+    // Not loaded — fine
+  }
 
   try {
     execFileSync("launchctl", ["load", linkPath], { stdio: "inherit" });
     console.log(`Started ${label}`);
   } catch {
-    console.error(`Failed to start ${label}. Check: launchctl list | grep hive`);
-    process.exit(1);
+    throw new Error(`Failed to start ${label}. Check: launchctl list | grep hive`);
   }
 }
 
@@ -117,5 +126,13 @@ export async function stopDaemon(): Promise<void> {
     console.log(`Stopped ${label}`);
   } catch {
     console.error(`Failed to stop ${label}`);
+  }
+
+  // Clean up symlink
+  try {
+    if (existsSync(linkPath)) unlinkSync(linkPath);
+    console.log(`Removed ${linkPath}`);
+  } catch {
+    // Non-critical — stale symlink won't cause harm
   }
 }

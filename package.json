@@ -3,12 +3,14 @@
   "version": "0.1.0",
   "type": "module",
   "bin": {
-    "hive": "pkg/cli.min.js"
+    "hive": "pkg/cli.min.js",
+    "honeypot": "scripts/honeypot"
   },
   "files": [
     "pkg/",
     "seeds/",
-    "templates/"
+    "templates/",
+    "scripts/honeypot"
   ],
   "engines": {
     "node": ">=22.0.0"
@@ -18,9 +20,8 @@
     "build:plugins": "tsc -p tsconfig.plugins.json",
     "start": "node dist/index.js",
     "dev": "npx tsx src/index.ts",
-    "setup": "npx tsx src/setup/wizard.ts",
+    "setup": "npx tsx src/cli.ts init",
     "setup:instance": "npx tsx setup/setup-instance.ts",
-    "setup:prereqs": "bash setup/install-prereqs.sh",
     "setup:constitution": "npx tsx setup/setup-constitution.ts",
     "setup:seeds": "npx tsx setup/setup-seeds.ts",
     "setup:plugins": "npx tsx setup/sync-plugins.ts",
@@ -39,7 +40,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run test",
-    "check:bundle": "npm run bundle && node scripts/check-bundle-strings.mjs",
+    "check:bundle": "npm run bundle && node scripts/check-bundle-strings.mjs && node scripts/check-bundle-pack.mjs && node scripts/check-bundle-runtime.mjs",
     "bundle": "npm run build && npx tsx build/bundle.ts",
     "prepublishOnly": "npm run bundle"
   },

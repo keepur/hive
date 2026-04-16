@@ -55,8 +55,7 @@ await build({
   entryPoints: { cli: "dist/cli.js" },
 });
 
-// Main server
-// TODO: Add "setup/wizard": "dist/setup/wizard.js" once src/setup/wizard.ts is created (Task 7)
+// Main server (wizard is bundled into cli.min.js via dynamic imports)
 await build({
   ...shared,
   entryPoints: {
@@ -95,7 +94,7 @@ await build({
 });
 
 // Copy non-JS assets to setup/
-const setupAssets = ["setup/install-prereqs.sh", "setup/slack-manifest.yaml"];
+const setupAssets = ["setup/slack-manifest.yaml"];
 for (const asset of setupAssets) {
   const src = resolve(asset);
   const dest = resolve(PKG_DIR, asset);
