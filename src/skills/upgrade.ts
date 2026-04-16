@@ -84,6 +84,11 @@ export async function upgradeSkill(
         name: skillName,
         source: origin.source,
       });
+      commitToState(
+        hiveHome,
+        [relative(hiveHome, installed.path)],
+        `upgrade-check: ${installed.workflow}/${skillName} removed from upstream registry`,
+      );
       return { name: skillName, action: "removed-upstream", oldVersion };
     }
 

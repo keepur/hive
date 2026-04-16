@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { resolve, join } from "node:path";
 import { createLogger } from "../logging/logger.js";
 
 const log = createLogger("instance-git");
@@ -55,7 +55,8 @@ function gitCmd(hiveHome: string, ...args: string[]): string {
 
 /**
  * Commit a file change to the 'state' branch.
- * Used by the write guard and install/upgrade/remove flows.
+ * Uses a temporary GIT_INDEX_FILE so we never switch branches or modify
+ * the live working tree's index.
  */
 export function commitToState(hiveHome: string, files: string[], message: string, authorName?: string): void {
   const gitDir = resolve(hiveHome, ".hive", "git");
@@ -64,66 +65,116 @@ export function commitToState(hiveHome: string, files: string[], message: string
     return;
   }
 
+  const tmpIndex = join(gitDir, "state-index.tmp");
+  const env = { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: hiveHome, GIT_INDEX_FILE: tmpIndex };
+  const gitPlumb = (...args: string[]): string =>
+    execFileSync("git", [...args], { cwd: hiveHome, env, stdio: "pipe", encoding: "utf-8" }).trim();
+
   try {
-    const branch = gitCmd(hiveHome, "rev-parse", "--abbrev-ref", "HEAD");
-    if (branch !== "state") {
-      gitCmd(hiveHome, "checkout", "state");
-    }
+    // Read the current state branch tree into the temp index
+    gitPlumb("read-tree", "state");
 
+    // Stage files into the temp index (reads from working tree via GIT_WORK_TREE)
     for (const file of files) {
-      gitCmd(hiveHome, "add", "--force", file);
+      gitPlumb("add", "--force", "--", file);
     }
 
-    // Check if there's anything to commit
+    // Remove common junk files that recursive add may have staged
     try {
-      gitCmd(hiveHome, "diff", "--cached", "--quiet");
-      return; // Nothing staged
+      gitPlumb("rm", "--cached", "--ignore-unmatch", "-r", "--", "**/.DS_Store");
     } catch {
-      // diff --quiet exits non-zero when there are staged changes — expected
+      // Ignore — no .DS_Store files staged
     }
 
+    // Write a tree object from the temp index
+    const tree = gitPlumb("write-tree");
+
+    // Get current state branch tip as parent
+    const parent = gitPlumb("rev-parse", "state");
+
+    // Check if tree differs from parent's tree
+    const parentTree = gitPlumb("rev-parse", "state^{tree}");
+    if (tree === parentTree) {
+      return; // Nothing changed
+    }
+
+    // Create the commit object
     const authorArg = authorName ? `${authorName} <${authorName}@hive>` : "hive <hive@localhost>";
-    gitCmd(hiveHome, "commit", "--author", authorArg, "-m", message);
+    const commitArgs = ["commit-tree", tree, "-p", parent, "-m", message, "--author", authorArg];
+    const commitSha = gitPlumb(...commitArgs);
+
+    // Advance the state branch ref
+    gitPlumb("update-ref", "refs/heads/state", commitSha);
+
     log.debug("State branch commit", { message, files: files.length });
   } catch (err) {
     log.warn("Failed to commit to state branch", {
       error: String(err),
       message,
     });
+  } finally {
+    try {
+      if (existsSync(tmpIndex)) unlinkSync(tmpIndex);
+    } catch {
+      // best effort cleanup
+    }
   }
 }
 
 /**
  * Commit a removal to the 'state' branch.
+ * Uses a temporary GIT_INDEX_FILE so we never switch branches or modify
+ * the live working tree's index.
  */
 export function commitRemovalToState(hiveHome: string, files: string[], message: string): void {
   const gitDir = resolve(hiveHome, ".hive", "git");
   if (!existsSync(gitDir)) return;
 
+  const tmpIndex = join(gitDir, "state-index.tmp");
+  const env = { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: hiveHome, GIT_INDEX_FILE: tmpIndex };
+  const gitPlumb = (...args: string[]): string =>
+    execFileSync("git", [...args], { cwd: hiveHome, env, stdio: "pipe", encoding: "utf-8" }).trim();
+
   try {
-    const branch = gitCmd(hiveHome, "rev-parse", "--abbrev-ref", "HEAD");
-    if (branch !== "state") gitCmd(hiveHome, "checkout", "state");
+    // Read the current state branch tree into the temp index
+    gitPlumb("read-tree", "state");
 
     for (const file of files) {
       try {
-        gitCmd(hiveHome, "rm", "-r", "--cached", file);
+        gitPlumb("rm", "-r", "--cached", "--", file);
       } catch {
         // File might not be tracked
       }
     }
 
-    try {
-      gitCmd(hiveHome, "diff", "--cached", "--quiet");
-      return;
-    } catch {
-      // Has staged changes
+    // Write a tree object from the temp index
+    const tree = gitPlumb("write-tree");
+
+    // Get current state branch tip as parent
+    const parent = gitPlumb("rev-parse", "state");
+
+    // Check if tree differs from parent's tree
+    const parentTree = gitPlumb("rev-parse", "state^{tree}");
+    if (tree === parentTree) {
+      return; // Nothing changed
     }
 
-    gitCmd(hiveHome, "commit", "-m", message);
+    // Create the commit object
+    const commitSha = gitPlumb("commit-tree", tree, "-p", parent, "-m", message);
+
+    // Advance the state branch ref
+    gitPlumb("update-ref", "refs/heads/state", commitSha);
+
     log.debug("State branch removal commit", { message });
   } catch (err) {
     log.warn("Failed to commit removal to state branch", {
       error: String(err),
     });
+  } finally {
+    try {
+      if (existsSync(tmpIndex)) unlinkSync(tmpIndex);
+    } catch {
+      // best effort cleanup
+    }
   }
 }
