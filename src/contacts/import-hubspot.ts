@@ -11,8 +11,8 @@
 import { MongoClient } from "mongodb";
 import { parse } from "csv-parse/sync";
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { hiveHome, resolveConfigFile } from "../paths.js";
 
 const CONTACT_TYPE_MAP: Record<string, string> = {
   Homeowner: "homeowner",
@@ -55,7 +55,7 @@ async function main() {
   }
 
   // Load hive.yaml for instance-aware db name
-  const hiveConfigPath = resolve(process.cwd(), process.env.HIVE_CONFIG ?? "hive.yaml");
+  const hiveConfigPath = resolveConfigFile(hiveHome);
   let hiveConfig: Record<string, any> = {};
   if (existsSync(hiveConfigPath)) {
     hiveConfig = parseYaml(readFileSync(hiveConfigPath, "utf-8")) ?? {};
