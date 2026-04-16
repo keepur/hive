@@ -94,6 +94,13 @@ export async function startDaemon(pkgRoot: string): Promise<void> {
   if (existsSync(linkPath)) unlinkSync(linkPath);
   symlinkSync(plistPath, linkPath);
 
+  // Unload first if already loaded (idempotent restart)
+  try {
+    execFileSync("launchctl", ["unload", linkPath], { stdio: "pipe" });
+  } catch {
+    // Not loaded — fine
+  }
+
   try {
     execFileSync("launchctl", ["load", linkPath], { stdio: "inherit" });
     console.log(`Started ${label}`);
@@ -117,5 +124,13 @@ export async function stopDaemon(): Promise<void> {
     console.log(`Stopped ${label}`);
   } catch {
     console.error(`Failed to stop ${label}`);
+  }
+
+  // Clean up symlink
+  try {
+    if (existsSync(linkPath)) unlinkSync(linkPath);
+    console.log(`Removed ${linkPath}`);
+  } catch {
+    // Non-critical — stale symlink won't cause harm
   }
 }
