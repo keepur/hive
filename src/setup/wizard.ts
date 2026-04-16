@@ -139,10 +139,13 @@ function isSlackDone(env: Record<string, string>): boolean {
 }
 
 async function isAgentDone(): Promise<boolean> {
+  // MONGODB_DB is guaranteed set by runWizard() before this is called
+  const dbName = process.env.MONGODB_DB;
+  if (!dbName) return false;
   try {
     const client = new MongoClient(process.env.MONGODB_URI ?? "mongodb://localhost:27017");
     await client.connect();
-    const db = client.db(process.env.MONGODB_DB ?? "hive_hive");
+    const db = client.db(dbName);
     const agent = await db.collection("agent_definitions").findOne({ _id: "chief-of-staff" as any });
     await client.close();
     return !!agent;
@@ -593,15 +596,13 @@ async function doSlack(env: Record<string, string>, pkgRoot: string) {
     env.SLACK_MCP_TOKEN = await ask("Slack MCP Token (xoxp-...)", env.SLACK_MCP_TOKEN || "");
   }
 
-  // Validate
+  // Validate — use fetch() instead of curl to avoid leaking token to process listings
   if (env.SLACK_APP_TOKEN && env.SLACK_BOT_TOKEN) {
     try {
-      const result = execFileSync(
-        "curl",
-        ["-s", "-H", `Authorization: Bearer ${env.SLACK_BOT_TOKEN}`, "https://slack.com/api/auth.test"],
-        { encoding: "utf-8" },
-      );
-      const json = JSON.parse(result);
+      const res = await fetch("https://slack.com/api/auth.test", {
+        headers: { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+      });
+      const json = (await res.json()) as { ok: boolean; user?: string; team?: string; error?: string };
       if (json.ok) {
         console.log(`\n  ✓ Slack connected as: ${json.user} in ${json.team}`);
       } else {
@@ -660,7 +661,7 @@ async function doAgent(hive: Record<string, any>): Promise<void> {
   console.log("Hive starts with a Chief of Staff — your primary agent.");
   console.log("Additional agents are created through it as needed.\n");
 
-  const agentName = await ask("Name your Chief of Staff", "Mokie");
+  const agentName = await ask("Name your Chief of Staff", "Chief");
   const channelName = await ask("Slack channel for your CoS", `agent-${agentName.toLowerCase()}`);
 
   // Store in hive.yaml for constitution rendering
@@ -774,7 +775,8 @@ async function doConstitution(hive: Record<string, any>) {
 
 async function doMemory(hive: Record<string, any>, templatesDir: string) {
   const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
-  const mongoDb = process.env.MONGODB_DB || "hive_hive";
+  // MONGODB_DB is guaranteed set by runWizard() instance-defaults block
+  const mongoDb = process.env.MONGODB_DB!;
 
   console.log("Seeding shared memory to MongoDB...");
 
@@ -881,7 +883,7 @@ async function doDeploy(deployDir: string, pkgRoot: string) {
   // Copy instance-specific files (not in git)
   console.log("  Syncing config and build output...");
 
-  // .env
+  // .env — safe because deploy clone inherits .gitignore which excludes .env
   const envSrc = join(pkgRoot, ".env");
   if (existsSync(envSrc)) {
     const { copyFileSync } = await import("node:fs");
