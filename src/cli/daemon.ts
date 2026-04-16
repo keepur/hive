@@ -105,8 +105,7 @@ export async function startDaemon(pkgRoot: string): Promise<void> {
     execFileSync("launchctl", ["load", linkPath], { stdio: "inherit" });
     console.log(`Started ${label}`);
   } catch {
-    console.error(`Failed to start ${label}. Check: launchctl list | grep hive`);
-    process.exit(1);
+    throw new Error(`Failed to start ${label}. Check: launchctl list | grep hive`);
   }
 }
 
