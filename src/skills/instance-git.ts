@@ -101,8 +101,18 @@ export function commitToState(hiveHome: string, files: string[], message: string
     // Create the commit object.
     // git commit-tree does NOT support --author; authorship is set via env vars.
     const authorEnv = authorName
-      ? { GIT_AUTHOR_NAME: authorName, GIT_AUTHOR_EMAIL: `${authorName}@hive`, GIT_COMMITTER_NAME: authorName, GIT_COMMITTER_EMAIL: `${authorName}@hive` }
-      : { GIT_AUTHOR_NAME: "hive", GIT_AUTHOR_EMAIL: "hive@localhost", GIT_COMMITTER_NAME: "hive", GIT_COMMITTER_EMAIL: "hive@localhost" };
+      ? {
+          GIT_AUTHOR_NAME: authorName,
+          GIT_AUTHOR_EMAIL: `${authorName}@hive`,
+          GIT_COMMITTER_NAME: authorName,
+          GIT_COMMITTER_EMAIL: `${authorName}@hive`,
+        }
+      : {
+          GIT_AUTHOR_NAME: "hive",
+          GIT_AUTHOR_EMAIL: "hive@localhost",
+          GIT_COMMITTER_NAME: "hive",
+          GIT_COMMITTER_EMAIL: "hive@localhost",
+        };
     const commitSha = execFileSync("git", ["commit-tree", tree, "-p", parent, "-m", message], {
       env: { ...env, ...authorEnv },
       encoding: "utf-8",
@@ -166,7 +176,13 @@ export function commitRemovalToState(hiveHome: string, files: string[], message:
 
     // Create the commit object (git commit-tree uses env vars for authorship)
     const commitSha = execFileSync("git", ["commit-tree", tree, "-p", parent, "-m", message], {
-      env: { ...env, GIT_AUTHOR_NAME: "hive", GIT_AUTHOR_EMAIL: "hive@localhost", GIT_COMMITTER_NAME: "hive", GIT_COMMITTER_EMAIL: "hive@localhost" },
+      env: {
+        ...env,
+        GIT_AUTHOR_NAME: "hive",
+        GIT_AUTHOR_EMAIL: "hive@localhost",
+        GIT_COMMITTER_NAME: "hive",
+        GIT_COMMITTER_EMAIL: "hive@localhost",
+      },
       encoding: "utf-8",
     }).trim();
 
