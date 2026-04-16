@@ -426,42 +426,46 @@ export async function runWizard(
   await doMemory(hive, templatesDir);
 
   // ── 8. Build ──────────────────────────────────────────────────────
-  section("Build");
+  if (!isBundled) {
+    section("Build");
 
-  if (isBuildDone(targetDir)) {
-    console.log("Build output exists.");
-    const rebuild = await confirm("Rebuild?", true);
-    if (!rebuild) {
-      console.log("  ✓ Skipped");
+    if (isBuildDone(targetDir)) {
+      console.log("Build output exists.");
+      const rebuild = await confirm("Rebuild?", true);
+      if (!rebuild) {
+        console.log("  ✓ Skipped");
+      } else {
+        await doBuild(pkgRoot);
+      }
     } else {
       await doBuild(pkgRoot);
     }
-  } else {
-    await doBuild(pkgRoot);
   }
 
-  // ── 9. Deploy Clone ──────────────────────────────────────────────
-  section("Deploy");
+  // ── 9. Deploy ──────────────────────────────────────────────────────
+  if (!isBundled) {
+    section("Deploy");
 
-  const deployDir = join(process.env.HOME ?? "/tmp", "services", "hive");
-  const deployExists = existsSync(join(deployDir, "package.json"));
+    const deployDir = join(process.env.HOME ?? "/tmp", "services", "hive");
+    const deployExists = existsSync(join(deployDir, "package.json"));
 
-  if (deployExists) {
-    console.log(`Deploy directory exists: ${deployDir}`);
-    const redeploy = await confirm("Sync latest build and config?", true);
-    if (redeploy) {
-      await doDeploy(deployDir, pkgRoot);
+    if (deployExists) {
+      console.log(`Deploy directory exists: ${deployDir}`);
+      const redeploy = await confirm("Sync latest build and config?", true);
+      if (redeploy) {
+        await doDeploy(deployDir, pkgRoot);
+      } else {
+        console.log("  ✓ Skipped");
+      }
     } else {
-      console.log("  ✓ Skipped");
-    }
-  } else {
-    console.log("Hive runs from a separate deploy directory (not this dev repo).");
-    console.log(`  Dev:    ${pkgRoot}`);
-    console.log(`  Deploy: ${deployDir}`);
-    console.log("");
-    const setupDeploy = await confirm("Set up the deploy directory now?", true);
-    if (setupDeploy) {
-      await doDeploy(deployDir, pkgRoot);
+      console.log("Hive runs from a separate deploy directory (not this dev repo).");
+      console.log(`  Dev:    ${pkgRoot}`);
+      console.log(`  Deploy: ${deployDir}`);
+      console.log("");
+      const setupDeploy = await confirm("Set up the deploy directory now?", true);
+      if (setupDeploy) {
+        await doDeploy(deployDir, pkgRoot);
+      }
     }
   }
 
@@ -471,15 +475,11 @@ export async function runWizard(
   const installService = await confirm("Install Hive as a LaunchAgent (starts on login)?");
   if (installService) {
     try {
-      // Generate plists pointing to the deploy directory
-      execFileSync("bash", ["service/install.sh"], {
-        cwd: pkgRoot,
-        stdio: "inherit",
-        env: { ...process.env, HIVE_DEPLOY_DIR: deployDir },
-      });
-    } catch {
-      console.log("  ⚠ Service installation failed — you can start manually:");
-      console.log(`     cd ${deployDir} && npm start`);
+      const { startDaemon } = await import("../cli/daemon.js");
+      await startDaemon(pkgRoot);
+    } catch (err) {
+      console.log(`  ⚠ Service installation failed: ${err}`);
+      console.log(`     You can start manually: hive start`);
     }
   }
 
@@ -490,11 +490,14 @@ export async function runWizard(
   console.log("╚══════════════════════════════════════════════╝");
   console.log("");
   console.log("Quick reference:");
-  console.log(`  Deploy dir: ${deployDir}`);
-  console.log(`  Start:      cd ${deployDir} && npm start`);
-  console.log(`  Logs:       tail -f ${deployDir}/logs/hive.log`);
-  console.log(`  Dev mode:   npm run dev  (from ${pkgRoot})`);
-  console.log(`  Redeploy:   bash ${pkgRoot}/service/deploy.sh`);
+  console.log(`  Config dir:  ${targetDir}`);
+  console.log(`  Start:       hive start`);
+  console.log(`  Daemon:      hive start --daemon`);
+  console.log(`  Stop:        hive stop`);
+  console.log(`  Health:      hive doctor`);
+  if (!isBundled) {
+    console.log(`  Dev mode:    npm run dev  (from ${pkgRoot})`);
+  }
   console.log("");
   console.log("Your chief-of-staff agent is stored in the agent_definitions collection.");
   console.log("Additional agents can be created through the chief of staff.");
