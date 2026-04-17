@@ -11,14 +11,26 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
   const plugins: LoadedPlugin[] = [];
 
   for (const name of pluginNames) {
-    const pluginDir = resolve(rootDir, "plugins", name);
-    const manifestPath = join(pluginDir, "plugin.yaml");
+    // Dual-path resolution: npm-installed (node_modules/) first, in-tree fallback second
+    const npmDir = resolve(rootDir, "plugins", "node_modules", name);
+    const inTreeDir = resolve(rootDir, "plugins", name);
+    const npmManifest = join(npmDir, "plugin.yaml");
+    const inTreeManifest = join(inTreeDir, "plugin.yaml");
 
-    if (!existsSync(manifestPath)) {
-      log.warn("Plugin manifest not found, skipping", { plugin: name, path: manifestPath });
+    let pluginDir: string;
+    if (existsSync(npmManifest)) {
+      pluginDir = npmDir;
+    } else if (existsSync(inTreeManifest)) {
+      pluginDir = inTreeDir;
+    } else {
+      log.warn("Plugin manifest not found, skipping", {
+        plugin: name,
+        tried: [npmManifest, inTreeManifest],
+      });
       continue;
     }
 
+    const manifestPath = join(pluginDir, "plugin.yaml");
     const raw = parseYaml(readFileSync(manifestPath, "utf-8"));
     const manifest = normalizeManifest(raw);
 
@@ -67,7 +79,7 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
  * Minimal semver range check. Supports caret ranges ("^1.0.0") and exact
  * versions ("1.0.0"). Anything else is treated as accept-any with a warn.
  */
-function isHiveApiCompatible(range: string, version: string): boolean {
+export function isHiveApiCompatible(range: string, version: string): boolean {
   const trimmed = range.trim();
   if (trimmed === version) return true;
   if (trimmed.startsWith("^")) {

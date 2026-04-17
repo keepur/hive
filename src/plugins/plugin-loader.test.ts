@@ -140,12 +140,16 @@ agents-templates:
 
   it("sets dir to resolved plugin path", () => {
     const manifestYaml = `name: foo\n`;
-    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(existsSync).mockImplementation((path: any) => {
+      const p = String(path);
+      // In-tree path exists (no node_modules match)
+      if (p.includes("node_modules")) return false;
+      return p.endsWith("plugin.yaml") || p.includes("foo");
+    });
     vi.mocked(readFileSync).mockReturnValue(manifestYaml);
 
     const result = loadPlugins(["foo"], "/root");
     expect(result).toHaveLength(1);
-    // dir should be /root/plugins/foo (resolved)
     expect(result[0].dir).toContain("plugins");
     expect(result[0].dir).toContain("foo");
   });
@@ -221,6 +225,47 @@ agents-templates:
 
     const result = loadPlugins(["weird"], "/root");
     expect(result).toHaveLength(1);
+  });
+
+  it("resolves npm-installed plugin via node_modules/ path", () => {
+    const manifestYaml = `name: npm-plugin\nhiveApi: "^1.0.0"\n`;
+    vi.mocked(existsSync).mockImplementation((path: any) => {
+      // Manifest exists at node_modules path, not in-tree
+      return String(path).includes("node_modules/npm-plugin/plugin.yaml");
+    });
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["npm-plugin"], "/root");
+    expect(result).toHaveLength(1);
+    expect(result[0].dir).toContain("node_modules");
+    expect(result[0].dir).toContain("npm-plugin");
+  });
+
+  it("falls back to in-tree path when node_modules path missing", () => {
+    const manifestYaml = `name: intree\n`;
+    vi.mocked(existsSync).mockImplementation((path: any) => {
+      const p = String(path);
+      // Only in-tree manifest exists
+      if (p.includes("node_modules")) return false;
+      return p.includes("intree");
+    });
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["intree"], "/root");
+    expect(result).toHaveLength(1);
+    expect(result[0].dir).not.toContain("node_modules");
+  });
+
+  it("resolves scoped npm package names", () => {
+    const manifestYaml = `name: "@keepur/hive-plugin-foo"\nhiveApi: "^1.0.0"\n`;
+    vi.mocked(existsSync).mockImplementation((path: any) => {
+      return String(path).includes("node_modules/@keepur/hive-plugin-foo/plugin.yaml");
+    });
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["@keepur/hive-plugin-foo"], "/root");
+    expect(result).toHaveLength(1);
+    expect(result[0].dir).toContain("@keepur");
   });
 });
 
