@@ -38,7 +38,7 @@ describe("requiredEnvVarsFromConfig", () => {
     // Smoke test: if someone refactors config.ts in a way that breaks the
     // required("KEY") pattern, doctor would silently stop reporting missing
     // env. Pin the current known-required set.
-    const real = requiredEnvVarsFromConfig(join(__dirname, "../config.ts"));
+    const real = requiredEnvVarsFromConfig(join(import.meta.dirname, "../config.ts"));
     expect(real).toEqual(["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]);
   });
 });
