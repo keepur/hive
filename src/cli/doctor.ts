@@ -37,7 +37,11 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
   console.log(`  service path: ${servicePath ?? "(LaunchAgent plist not found)"}`);
   console.log("");
 
-  const requiredEnv = requiredEnvVarsFromConfig(resolve(import.meta.dirname, "../config.ts"));
+  // Always read the source config.ts from the repo root. `src/` is preserved
+  // in both dev (tsx) and deploy (cloned repo with dist/ alongside src/) so
+  // `<dir>/../../src/config.ts` resolves correctly from both `src/cli/` and
+  // `dist/cli/`.
+  const requiredEnv = requiredEnvVarsFromConfig(resolve(import.meta.dirname, "../../src/config.ts"));
 
   const checks: Check[] = [
     // ── Prereqs (preserved from existing doctor) ─────────────────────────
@@ -135,7 +139,10 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
         const st = launchctlPrint("com.hive.agent");
         return st.loaded && st.state === "running" && st.pid !== null && pidAlive(st.pid);
       },
-      remedy: "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hive.agent.plist && launchctl kickstart -k gui/$(id -u)/com.hive.agent",
+      remedy: (() => {
+        const uid = process.getuid?.() ?? 0;
+        return `launchctl bootstrap gui/${uid} ~/Library/LaunchAgents/com.hive.agent.plist && launchctl kickstart -k gui/${uid}/com.hive.agent`;
+      })(),
     },
     {
       name: "Slack auth.test",
