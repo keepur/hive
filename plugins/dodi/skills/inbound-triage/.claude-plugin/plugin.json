@@ -1,9 +1,0 @@
-{
-  "name": "inbound-triage",
-  "description": "Inbound lead triage and customer acknowledgment workflows for the SDR",
-  "version": "0.1.0",
-  "author": {
-    "name": "Dodi HQ",
-    "email": "may@dodihome.com"
-  }
-}

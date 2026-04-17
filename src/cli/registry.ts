@@ -1,10 +1,7 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { hiveHome } from "../paths.js";
+import { readConfig, writeConfig, configPath } from "./hive-config.js";
 
 export async function runRegistry(subcommand?: string, ...args: string[]): Promise<void> {
-  const configPath = resolve(hiveHome, process.env.HIVE_CONFIG || "hive.yaml");
+  const cfgPath = configPath();
 
   switch (subcommand) {
     case "add": {
@@ -18,7 +15,7 @@ export async function runRegistry(subcommand?: string, ...args: string[]): Promi
       const name = asIdx >= 0 && args[asIdx + 1] ? args[asIdx + 1] : inferName(url);
       const isDefault = args.includes("--default");
 
-      const config = readConfig(configPath);
+      const config = readConfig(cfgPath);
       if (!config.skillRegistries) config.skillRegistries = [];
 
       if (config.skillRegistries.some((r: { name: string }) => r.name === name)) {
@@ -31,13 +28,13 @@ export async function runRegistry(subcommand?: string, ...args: string[]): Promi
       }
 
       config.skillRegistries.push({ name, url, ...(isDefault ? { default: true } : {}) });
-      writeConfig(configPath, config);
+      writeConfig(config, cfgPath);
       console.log(`Added registry "${name}" (${url})${isDefault ? " [default]" : ""}`);
       break;
     }
 
     case "list": {
-      const config = readConfig(configPath);
+      const config = readConfig(cfgPath);
       const registries = config.skillRegistries ?? [];
 
       if (registries.length === 0) {
@@ -61,7 +58,7 @@ export async function runRegistry(subcommand?: string, ...args: string[]): Promi
         process.exit(1);
       }
 
-      const config = readConfig(configPath);
+      const config = readConfig(cfgPath);
       if (!config.skillRegistries) {
         console.error("No registries configured.");
         process.exit(1);
@@ -74,7 +71,7 @@ export async function runRegistry(subcommand?: string, ...args: string[]): Promi
       }
 
       config.skillRegistries.splice(idx, 1);
-      writeConfig(configPath, config);
+      writeConfig(config, cfgPath);
       console.log(`Removed registry "${name}". Installed skills from this registry are unaffected.`);
       break;
     }
@@ -83,17 +80,6 @@ export async function runRegistry(subcommand?: string, ...args: string[]): Promi
       console.error("Usage: hive registry <add|list|remove>");
       process.exit(1);
   }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function readConfig(path: string): any {
-  if (!existsSync(path)) return {};
-  return parseYaml(readFileSync(path, "utf-8")) ?? {};
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function writeConfig(path: string, data: any): void {
-  writeFileSync(path, stringifyYaml(data, { lineWidth: 0 }));
 }
 
 function inferName(url: string): string {
