@@ -79,7 +79,7 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
  * Minimal semver range check. Supports caret ranges ("^1.0.0") and exact
  * versions ("1.0.0"). Anything else is treated as accept-any with a warn.
  */
-function isHiveApiCompatible(range: string, version: string): boolean {
+export function isHiveApiCompatible(range: string, version: string): boolean {
   const trimmed = range.trim();
   if (trimmed === version) return true;
   if (trimmed.startsWith("^")) {
