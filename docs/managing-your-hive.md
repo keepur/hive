@@ -10,11 +10,11 @@ Plugins ship MCP servers and agent seeds. Each plugin is a separately-published 
 
 ```
 $ hive plugin list
-NAME                              VERSION    SOURCE
-@keepur/hive-plugin-google        1.2.0      npm
-@keepur/hive-plugin-linear        1.1.0      npm
-@keepur/hive-plugin-github        1.0.3      npm
-dodi                              -          local
+Installed plugins:
+
+  @keepur/hive-plugin-google  v0.1.0  (hiveApi ^1.0.0)
+  @keepur/hive-plugin-linear  v0.1.0  (hiveApi ^1.0.0)
+  @keepur/hive-plugin-github  v0.1.0  (hiveApi ^1.0.0)
 ```
 
 ### Install a plugin
@@ -54,12 +54,13 @@ Skills are reusable workflow patterns (prompts + steps) that any agent can invok
 
 ```
 $ hive skill list
-NAME              REGISTRY            VERSION
-morning-briefing  keepur/hive-skills  1.0.0
-quality-gate      keepur/hive-skills  1.0.1
+Installed skills:
+
+  morning-briefing           keepur/hive-skills   registry         -
+  quality-gate               keepur/hive-skills   registry         -
 
 $ hive skill add build-agent
-added build-agent from keepur/hive-skills
+Installed keepur/hive-skills/build-agent
 
 $ hive skill remove morning-briefing
 removed morning-briefing
