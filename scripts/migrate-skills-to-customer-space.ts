@@ -6,10 +6,10 @@
  * Run on each deployment after updating to the version that removes
  * plugins/dodi/skills/ from the repo.
  *
- * Usage: npx tsx scripts/migrate-skills-to-customer-space.ts [source-dir]
+ * Usage: npx tsx scripts/migrate-skills-to-customer-space.ts <source-dir>
  *
- * source-dir defaults to ./plugins/dodi/skills/ (for running before deploy)
- * or can point to a backup of the old skills directory.
+ * source-dir is required — point it to a backup of the old plugins/dodi/skills/
+ * directory (the skills were deleted from the repo in this PR).
  */
 
 import { cpSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
@@ -17,8 +17,13 @@ import { join, resolve, relative } from "node:path";
 import { readSkillMd, writeSkillMd } from "../src/skills/frontmatter.js";
 import { commitToState } from "../src/skills/instance-git.js";
 
-// Resolve paths
-const sourceDir = process.argv[2] ?? resolve("plugins", "dodi", "skills");
+// Resolve paths — source-dir is required (the skills/ dir was deleted from the repo)
+const sourceDir = process.argv[2];
+if (!sourceDir) {
+  console.error("Usage: npx tsx scripts/migrate-skills-to-customer-space.ts <source-dir>");
+  console.error("  source-dir: path to the old plugins/dodi/skills/ directory (backed up before deploy)");
+  process.exit(1);
+}
 const hiveHome = process.env.HIVE_HOME ?? process.cwd();
 const targetSkillsDir = resolve(hiveHome, "skills");
 
@@ -61,8 +66,7 @@ for (const suite of readdirSync(sourceDir)) {
           frontmatter.author = {
             "agent-id": "migrated-from-plugin",
             "authored-at": timestamp,
-            reason:
-              "Migrated from plugins/dodi/skills/ — agent-authored content restored to customer space",
+            reason: "Migrated from plugins/dodi/skills/ — agent-authored content restored to customer space",
           };
           writeSkillMd(skillMdPath, frontmatter, body);
           console.log(`  ✓ ${suite}/skills/${skill}/SKILL.md — metadata injected`);
