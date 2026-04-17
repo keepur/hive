@@ -15,8 +15,18 @@ import {
   resolveServicePath,
   slackAuthOk,
 } from "./doctor-checks.js";
-import { config } from "../config.js";
 import { hiveHome } from "../paths.js";
+
+type HiveConfig = typeof import("../config.js").config;
+
+async function tryLoadConfig(): Promise<{ config: HiveConfig | null; error: string | null }> {
+  try {
+    const mod = await import("../config.js");
+    return { config: mod.config, error: null };
+  } catch (err) {
+    return { config: null, error: err instanceof Error ? err.message : String(err) };
+  }
+}
 
 const GROUP_TITLES: Record<CheckGroup, string> = {
   prereq: "Prereqs",
@@ -42,6 +52,12 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
   // `<dir>/../../src/config.ts` resolves correctly from both `src/cli/` and
   // `dist/cli/`.
   const requiredEnv = requiredEnvVarsFromConfig(resolve(import.meta.dirname, "../../src/config.ts"));
+
+  // Config must be loaded lazily — it throws on missing required env vars at
+  // module eval time, which is exactly the fresh-box failure mode `hive doctor`
+  // is supposed to surface. A crash here would prevent the env checks below
+  // from ever printing.
+  const { config, error: configError } = await tryLoadConfig();
 
   const checks: Check[] = [
     // ── Prereqs (preserved from existing doctor) ─────────────────────────
@@ -93,13 +109,13 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     },
     // ── Config ───────────────────────────────────────────────────────────
     {
-      name: "hive.yaml loads",
+      name: "config loads (hive.yaml + required env)",
       group: "config",
       required: true,
-      // If we got here, `import { config }` already succeeded. Use a trivial
-      // truthy check — schema validation is performed by config.ts on import.
-      test: () => typeof config.instance?.id === "string" && config.instance.id.length > 0,
-      remedy: "Check hive.yaml at the hive home and run `hive init` if missing.",
+      test: () => config !== null,
+      remedy: configError
+        ? `config.ts threw: ${configError}. Set missing env vars in ~/.hive/.env and ensure hive.yaml exists.`
+        : "Check hive.yaml at the hive home and run `hive init` if missing.",
     },
     ...requiredEnv.map<Check>((key) => ({
       name: `env: ${key}`,
@@ -109,26 +125,32 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       remedy: `Set ${key} in ~/.hive/.env`,
     })),
     // ── Agents ───────────────────────────────────────────────────────────
+    // All agent checks short-circuit to false when config failed to load —
+    // we can't know the Mongo URI or default-agent id without it. The config
+    // group's own failure line explains why.
     {
       name: "MongoDB reachable",
       group: "agents",
       required: true,
-      test: () => mongoReachable(config.mongo.uri, config.mongo.dbName),
+      test: () => (config ? mongoReachable(config.mongo.uri, config.mongo.dbName) : false),
       remedy: "Start Mongo (`brew services start mongodb-community`) and verify MONGODB_URI.",
     },
     {
       name: "At least one agent exists",
       group: "agents",
       required: true,
-      test: () => hasAnyAgent(config.mongo.uri, config.mongo.dbName),
+      test: () => (config ? hasAnyAgent(config.mongo.uri, config.mongo.dbName) : false),
       remedy: "Run `npm run setup:seeds` to import plugin agent seeds.",
     },
     {
-      name: `default agent exists (${config.defaultAgent})`,
+      name: `default agent exists${config ? ` (${config.defaultAgent})` : ""}`,
       group: "agents",
       required: true,
-      test: () => defaultAgentExists(config.mongo.uri, config.mongo.dbName, config.defaultAgent),
-      remedy: `Set DEFAULT_AGENT to an existing agent id or seed '${config.defaultAgent}'.`,
+      test: () =>
+        config ? defaultAgentExists(config.mongo.uri, config.mongo.dbName, config.defaultAgent) : false,
+      remedy: config
+        ? `Set DEFAULT_AGENT to an existing agent id or seed '${config.defaultAgent}'.`
+        : "Config failed to load — see Config group.",
     },
     // ── Services ─────────────────────────────────────────────────────────
     {
@@ -148,7 +170,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       name: "Slack auth.test",
       group: "services",
       required: true,
-      test: () => slackAuthOk(config.slack.botToken),
+      test: () => (config ? slackAuthOk(config.slack.botToken) : false),
       remedy: "Verify SLACK_BOT_TOKEN in .env and that the token still has the expected scopes.",
     },
   ];
