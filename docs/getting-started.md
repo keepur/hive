@@ -50,7 +50,9 @@ Paste both back into the wizard when prompted.
 
 **5. Agent setup.** Names your Chief of Staff bot user and seeds it to MongoDB.
 
-**6-9. Build + deploy.** The wizard compiles the codebase, sets up the LaunchAgent service, and starts it. This takes a few minutes. You're done when you see:
+**6. Constitution.** Asks whether agents can send external communications (email, SMS). You can change this later.
+
+**7-10. Memory, build, deploy, service.** Seeds shared memory, compiles the codebase, sets up the LaunchAgent service, and starts it. This takes a few minutes. You're done when you see:
 
 ```
 ╔══════════════════════════════════════════════╗
