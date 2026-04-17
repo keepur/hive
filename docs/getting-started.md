@@ -35,16 +35,16 @@ npm i -g @keepur/hive && hive init
 
 The wizard walks you through several sections. Here's what to expect at each one:
 
-**1. Business info.** Your company name, what you do, team size. This context helps your Chief of Staff understand your business from day one.
+**1. Business info.** Your company name, what you do, location, timezone, business hours, and your name/role. This context helps your Chief of Staff understand your business from day one.
 
-**2. Slack.** The wizard prints a Slack manifest URL. Open it in your browser, click **Create App**, and install it to your workspace. Slack will then show you two tokens:
+**2. Slack.** The wizard opens `https://api.slack.com/apps` in your browser and prints a YAML manifest in the terminal. Click **Create New App** → **From a manifest**, choose YAML format, and paste the manifest. After creating the app, install it to your workspace. Slack will then show you two tokens:
 
 - **App-Level Token** (starts with `xapp-`)
 - **Bot Token** (starts with `xoxb-`)
 
 Paste both back into the wizard when prompted.
 
-**3. Anthropic API key.** Paste the key from [console.anthropic.com](https://console.anthropic.com/). It's stored in your local `.env` and never sent anywhere except Anthropic.
+**3. Anthropic API key.** If you have the Claude CLI installed and authenticated, the wizard detects it and uses that session automatically — no API key needed. Otherwise, paste a key from [console.anthropic.com](https://console.anthropic.com/). Either way, credentials are stored in your local `.env` and never sent anywhere except Anthropic.
 
 **4. Optional integrations.** Google, Linear, GitHub, etc. You can skip all of these and add them later via `hive plugin add`. The wizard also offers to install plugins from the registry.
 
@@ -52,7 +52,7 @@ Paste both back into the wizard when prompted.
 
 **6. Constitution.** Asks whether agents can send external communications (email, SMS). You can change this later.
 
-**7-10. Memory, build, deploy, service.** Seeds shared memory, compiles the codebase, sets up the LaunchAgent service, and starts it. This takes a few minutes. You're done when you see:
+**7-10. Memory and service.** Seeds shared memory, sets up the LaunchAgent service, and starts it. (If you installed via npm, the build and deploy steps are already handled — the wizard skips them automatically.) This takes a few minutes. You're done when you see:
 
 ```
 ╔══════════════════════════════════════════════╗

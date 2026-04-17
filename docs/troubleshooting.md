@@ -157,7 +157,13 @@ If the plugin is ahead of core (its required range is newer than any released co
 
 (This check is non-required — it only fires if a plugin needs it.)
 
-**Fix:** the Google plugin depends on the `gog` CLI, which ships separately. Install it per its own README, then ensure its install location is on the PATH the hive LaunchAgent sees (`/opt/homebrew/bin` is included by default; custom locations need the LaunchAgent plist updated). Restart:
+**Fix:** the Google plugin depends on the `gog` CLI, which ships separately. Install it via Homebrew:
+
+```bash
+brew install gog
+```
+
+Ensure its install location is on the PATH the hive LaunchAgent sees (`/opt/homebrew/bin` is included by default; custom locations need the LaunchAgent plist updated). Then restart:
 
 ```bash
 hive stop
