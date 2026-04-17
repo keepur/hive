@@ -44,6 +44,6 @@ fi
 log "Installing @keepur/hive..."
 npm i -g @keepur/hive
 
-# 5. Hand off to interactive setup
+# 5. Hand off to interactive setup (reopen stdin from TTY so the wizard can prompt)
 log "Launching 'hive init'..."
-exec hive init
+exec hive init </dev/tty
