@@ -18,7 +18,7 @@ The final gate before onboarding real CEOs. Phase 1 (#159) shipped plugin archit
 
 ## Audience
 
-Technical CEOs / independent business managers, ~5-10 trust-gate cohort. First impressions are permanent. They have great connections; word travels fast. They are not testers.
+Technical CEOs / independent business managers, ~5-10 trust-gate cohort. ("Trust-gate cohort" = the first hand-picked customers whose opinions shape word-of-mouth in their professional networks; their experience determines whether hive earns broader distribution.) First impressions are permanent. They have great connections; word travels fast. They are not testers.
 
 ## Scope
 
@@ -74,6 +74,7 @@ Four docs + one email template. Lives in the hive repo, renders on github.com/ke
 ### Track 17 — npm publish pipeline
 
 1. **`install/bootstrap.sh`** — Bare-metal Mac install script. ~40-60 lines bash.
+   - Detects Xcode Command Line Tools → if missing, defers to Homebrew's installer which prompts for them as a prereq (no separate `xcode-select --install` step in this script — Homebrew handles it and surfaces the dialog)
    - Detects existing Homebrew → installs if missing
    - Detects existing Node ≥22 → installs via `brew install node@22` if missing or older
    - Runs `npm i -g @keepur/hive`
@@ -83,7 +84,8 @@ Four docs + one email template. Lives in the hive repo, renders on github.com/ke
 
 2. **`.github/workflows/publish.yml`** — Tag-driven publish on self-hosted ARM64 runner.
    - Trigger: `push` event with tag matching `v*`
-   - Steps: checkout → `npm ci` → `npm run check` → `npm run build` → `npm pack --dry-run` (logged for audit) → `npm publish --access public`
+   - Steps: checkout → `npm ci` → `npm run check` → `npm run build` → `npm pack --dry-run` (logged for audit) → `npm publish --access public --provenance`
+   - `--provenance` attaches a signed build attestation linking the npm tarball to this workflow run + commit SHA. Cheap supply-chain hardening; visible on the npm package page. Requires `id-token: write` permission in the workflow.
    - Auth: `NPM_TOKEN` repo secret (added to `keepur/hive` GitHub repo settings as part of this phase)
    - On failure: workflow exits non-zero, no publish happens. Tag stays in git.
    - No GitHub Release creation in this phase (manual via `gh release create` if/when wanted)
@@ -142,8 +144,8 @@ Four docs + one email template. Lives in the hive repo, renders on github.com/ke
 4. `install/bootstrap.sh` exists, is executable, and runs end-to-end on a fresh macOS user account: installs Homebrew + Node, runs `npm i -g @keepur/hive`, hands off to `hive init`.
 5. `.github/workflows/publish.yml` exists. Pushing a `v*` tag on a clean main triggers the workflow on the self-hosted runner; the workflow runs `npm run check`, builds, audits the pack, and publishes to npm with the `NPM_TOKEN` secret.
 6. `docs/runbooks/fresh-install-publish-smoke.md` exists with the procedure documented above.
-7. The fresh-install publish smoke runbook has been executed once (operator + date recorded) before tagging `v0.1.0`.
-8. `@keepur/hive@0.1.0` is published on npm and `npm i -g @keepur/hive` from a fresh machine succeeds.
+7. The fresh-install publish smoke runbook has been executed once (operator + date recorded in the runbook log section) before any maintainer pushes the `v0.1.0` tag. The smoke entry MUST precede the tag push — these are sequenced, not parallel.
+8. `@keepur/hive@0.1.0` is published on npm (with provenance attestation visible on the package page) and `npm i -g @keepur/hive` from a fresh machine succeeds.
 9. End-to-end DoD: a maintainer (May or another tester) follows the email + `getting-started.md` on a fresh macOS user account and is talking to CoS in Slack within 20 minutes, with no source-tree access and no out-of-band help.
 
 ## Risks & open questions
