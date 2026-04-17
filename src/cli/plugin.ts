@@ -10,6 +10,25 @@ import { isHiveApiCompatible } from "../plugins/plugin-loader.js";
 
 const pluginsDir = resolve(hiveHome, "plugins");
 
+/**
+ * Resolve a plugin's version. `plugin.yaml` doesn't carry `version:` — the
+ * canonical source is the sibling `package.json`. Fall back to the manifest
+ * only if `package.json` is missing or unreadable.
+ */
+function resolvePluginVersion(manifestPath: string, manifestRaw: unknown): string {
+  const pkgPath = join(manifestPath, "..", "package.json");
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+      if (typeof pkg?.version === "string") return pkg.version;
+    } catch {
+      // fall through to manifest
+    }
+  }
+  const manifest = manifestRaw as { version?: unknown } | null | undefined;
+  return typeof manifest?.version === "string" ? manifest.version : "unknown";
+}
+
 export async function runPlugin(subcommand?: string, target?: string): Promise<void> {
   switch (subcommand) {
     case "add":
@@ -64,7 +83,7 @@ function pluginAdd(target?: string): void {
     process.exit(1);
   }
 
-  const version = raw?.version ?? "unknown";
+  const version = resolvePluginVersion(manifestPath, raw);
 
   // Step 3: Update hive.yaml (rollback npm install on failure)
   const cfgPath = configPath();
@@ -170,7 +189,7 @@ function pluginList(): void {
 
     try {
       const raw = parseYaml(readFileSync(manifestPath, "utf-8"));
-      const version = raw?.version ?? "?";
+      const version = resolvePluginVersion(manifestPath, raw);
       const hiveApi = raw?.hiveApi ?? raw?.["hive-api"] ?? "";
       const tag = isInTree ? "  [in-tree]" : "";
       console.log(`  ${name}  v${version}${hiveApi ? `  (hiveApi ${hiveApi})` : ""}${tag}`);
