@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -32,6 +32,14 @@ describe("requiredEnvVarsFromConfig", () => {
       const d = optional("MONGODB_URI", "mongodb://localhost:27017");
     `);
     expect(requiredEnvVarsFromConfig(p)).toEqual(["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]);
+  });
+
+  it("matches the real src/config.ts — derivation stays in sync with the loader", () => {
+    // Smoke test: if someone refactors config.ts in a way that breaks the
+    // required("KEY") pattern, doctor would silently stop reporting missing
+    // env. Pin the current known-required set.
+    const real = requiredEnvVarsFromConfig(join(__dirname, "../config.ts"));
+    expect(real).toEqual(["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]);
   });
 });
 
@@ -70,10 +78,46 @@ describe("pidAlive", () => {
 });
 
 describe("resolveServicePath", () => {
+  const originalHome = process.env.HOME;
+  let tmpHome: string;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), "doctor-home-"));
+    process.env.HOME = tmpHome;
+  });
+  afterEach(() => {
+    process.env.HOME = originalHome;
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
   it("returns null when plist is missing", () => {
-    // LaunchAgent plist path is constant, just expect a non-throw.
-    const p = resolveServicePath("com.hive.nonexistent.agent");
-    expect(p).toBeNull();
+    expect(resolveServicePath("com.hive.nonexistent.agent")).toBeNull();
+  });
+
+  it("parses WorkingDirectory from a real plist layout", () => {
+    const dir = join(tmpHome, "Library", "LaunchAgents");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "com.hive.test.plist"),
+      `<?xml version="1.0"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.hive.test</string>
+  <key>WorkingDirectory</key><string>/Users/mokie/services/hive</string>
+</dict>
+</plist>`,
+    );
+    expect(resolveServicePath("com.hive.test")).toBe("/Users/mokie/services/hive");
+  });
+
+  it("expands ~ in WorkingDirectory", () => {
+    const dir = join(tmpHome, "Library", "LaunchAgents");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "com.hive.test2.plist"),
+      `<plist><dict><key>WorkingDirectory</key><string>~/services/hive</string></dict></plist>`,
+    );
+    expect(resolveServicePath("com.hive.test2")).toBe(join(tmpHome, "services/hive"));
   });
 });
 
