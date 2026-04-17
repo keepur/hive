@@ -3,12 +3,7 @@ import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import {
-  launchctlPrint,
-  pidAlive,
-  requiredEnvVarsFromConfig,
-  resolveServicePath,
-} from "./doctor-checks.js";
+import { launchctlPrint, pidAlive, requiredEnvVarsFromConfig, resolveServicePath } from "./doctor-checks.js";
 
 // execFileSync and fetch are mocked per-test via vi.mock for subprocess checks.
 vi.mock("node:child_process", async () => {
@@ -20,17 +15,22 @@ const execMock = vi.mocked(execFileSync);
 
 describe("requiredEnvVarsFromConfig", () => {
   let dir: string;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "doctor-")); });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "doctor-"));
+  });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   it("extracts only required() keys, ignoring optional()", () => {
     const p = join(dir, "config.ts");
-    writeFileSync(p, `
+    writeFileSync(
+      p,
+      `
       const a = required("SLACK_APP_TOKEN");
       const b = required("SLACK_BOT_TOKEN");
       const c = optional("ANTHROPIC_API_KEY", "");
       const d = optional("MONGODB_URI", "mongodb://localhost:27017");
-    `);
+    `,
+    );
     expect(requiredEnvVarsFromConfig(p)).toEqual(["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]);
   });
 
@@ -47,23 +47,29 @@ describe("launchctlPrint", () => {
   beforeEach(() => execMock.mockReset());
 
   it("parses running + pid", () => {
-    execMock.mockReturnValueOnce(`{
+    execMock.mockReturnValueOnce(
+      `{
       state = running
       pid = 12345
-    }` as unknown as Buffer);
+    }` as unknown as Buffer,
+    );
     const st = launchctlPrint("com.hive.agent");
     expect(st).toEqual({ loaded: true, state: "running", pid: 12345 });
   });
 
   it("parses not-running state", () => {
-    execMock.mockReturnValueOnce(`{
+    execMock.mockReturnValueOnce(
+      `{
       state = not running
-    }` as unknown as Buffer);
+    }` as unknown as Buffer,
+    );
     expect(launchctlPrint("com.hive.agent")).toEqual({ loaded: true, state: "not running", pid: null });
   });
 
   it("returns loaded:false when launchctl fails (agent not bootstrapped)", () => {
-    execMock.mockImplementationOnce(() => { throw new Error("Could not find service"); });
+    execMock.mockImplementationOnce(() => {
+      throw new Error("Could not find service");
+    });
     expect(launchctlPrint("com.hive.agent")).toEqual({ loaded: false, state: "unknown", pid: null });
   });
 });
