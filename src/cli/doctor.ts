@@ -1,54 +1,62 @@
+import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
+import {
+  type Check,
+  type CheckGroup,
+  brewServiceRunning,
+  commandExists,
+  defaultAgentExists,
+  hasAnyAgent,
+  httpProbe,
+  launchctlPrint,
+  mongoReachable,
+  pidAlive,
+  requiredEnvVarsFromConfig,
+  resolveServicePath,
+  slackAuthOk,
+} from "./doctor-checks.js";
+import { config } from "../config.js";
+import { hiveHome } from "../paths.js";
 
-interface Check {
-  name: string;
-  required: boolean;
-  test: () => boolean | Promise<boolean>;
-}
+const GROUP_TITLES: Record<CheckGroup, string> = {
+  prereq: "Prereqs",
+  config: "Config",
+  agents: "Agents",
+  services: "Services",
+};
 
-function commandExists(cmd: string): boolean {
-  try {
-    execFileSync("which", [cmd], { encoding: "utf-8" });
-    return true;
-  } catch {
-    return false;
-  }
-}
+export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void> {
+  const verbose = !!opts.verbose;
 
-function serviceRunning(name: string): boolean {
-  try {
-    const output = execFileSync("brew", ["services", "list"], { encoding: "utf-8" });
-    return output.split("\n").some((l) => l.startsWith(name) && l.includes("started"));
-  } catch {
-    return false;
-  }
-}
+  // Resolved service path header — spec: doctor inspects the deploy clone via
+  // LaunchAgent, which may differ from the CWD. Print both up front.
+  const servicePath = resolveServicePath("com.hive.agent");
+  console.log(`hive doctor`);
+  console.log(`  cwd:          ${process.cwd()}`);
+  console.log(`  hive home:    ${hiveHome}`);
+  console.log(`  service path: ${servicePath ?? "(LaunchAgent plist not found)"}`);
+  console.log("");
 
-/**
- * Probe an HTTP endpoint with a short timeout. Use for daemons that may run
- * via brew services, bare process, or any other mechanism — port-bound is
- * port-bound.
- */
-async function httpProbe(url: string, timeoutMs = 1500): Promise<boolean> {
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeoutMs);
-    const res = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(t);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
+  const requiredEnv = requiredEnvVarsFromConfig(resolve(import.meta.dirname, "../config.ts"));
 
-export async function runDoctor(): Promise<void> {
   const checks: Check[] = [
-    { name: "Node.js >= 22", required: true, test: () => parseInt(process.versions.node.split(".")[0]) >= 22 },
-    { name: "Homebrew", required: true, test: () => commandExists("brew") },
-    { name: "MongoDB", required: true, test: () => serviceRunning("mongodb-community") },
-    { name: "Ollama", required: true, test: () => httpProbe("http://127.0.0.1:11434/api/tags") },
+    // ── Prereqs (preserved from existing doctor) ─────────────────────────
+    {
+      name: "Node.js >= 22",
+      group: "prereq",
+      required: true,
+      test: () => parseInt(process.versions.node.split(".")[0]) >= 22,
+      remedy: "Install Node 22+: brew install node@22 && brew link --overwrite node@22",
+    },
+    { name: "Homebrew", group: "prereq", required: true, test: () => commandExists("brew"),
+      remedy: "Install: /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"" },
+    { name: "MongoDB (brew services)", group: "prereq", required: true, test: () => brewServiceRunning("mongodb-community"),
+      remedy: "brew services start mongodb-community  # informational; live reachability is checked under Agents" },
+    { name: "Ollama", group: "prereq", required: true, test: () => httpProbe("http://127.0.0.1:11434/api/tags"),
+      remedy: "brew install ollama && brew services start ollama" },
     {
       name: "Ollama models (bge-large, gemma4:e4b)",
+      group: "prereq",
       required: true,
       test: () => {
         if (!commandExists("ollama")) return false;
@@ -59,12 +67,15 @@ export async function runDoctor(): Promise<void> {
           return false;
         }
       },
+      remedy: "ollama pull bge-large && ollama pull gemma4:e4b",
     },
-    { name: "Qdrant", required: true, test: () => httpProbe("http://127.0.0.1:6333/") },
-    { name: "gh CLI", required: false, test: () => commandExists("gh") },
-    { name: "gog CLI", required: false, test: () => commandExists("gog") },
+    { name: "Qdrant", group: "prereq", required: true, test: () => httpProbe("http://127.0.0.1:6333/"),
+      remedy: "brew install qdrant && brew services start qdrant" },
+    { name: "gh CLI", group: "prereq", required: false, test: () => commandExists("gh") },
+    { name: "gog CLI", group: "prereq", required: false, test: () => commandExists("gog") },
     {
       name: "Xcode CLI Tools",
+      group: "prereq",
       required: true,
       test: () => {
         try {
@@ -74,18 +85,86 @@ export async function runDoctor(): Promise<void> {
           return false;
         }
       },
+      remedy: "xcode-select --install",
+    },
+    // ── Config ───────────────────────────────────────────────────────────
+    {
+      name: "hive.yaml loads",
+      group: "config",
+      required: true,
+      // If we got here, `import { config }` already succeeded. Use a trivial
+      // truthy check — schema validation is performed by config.ts on import.
+      test: () => typeof config.instance?.id === "string" && config.instance.id.length > 0,
+      remedy: "Check hive.yaml at the hive home and run `hive init` if missing.",
+    },
+    ...requiredEnv.map<Check>((key) => ({
+      name: `env: ${key}`,
+      group: "config",
+      required: true,
+      test: () => !!process.env[key],
+      remedy: `Set ${key} in ~/.hive/.env`,
+    })),
+    // ── Agents ───────────────────────────────────────────────────────────
+    {
+      name: "MongoDB reachable",
+      group: "agents",
+      required: true,
+      test: () => mongoReachable(config.mongo.uri, config.mongo.dbName),
+      remedy: "Start Mongo (`brew services start mongodb-community`) and verify MONGODB_URI.",
+    },
+    {
+      name: "At least one agent exists",
+      group: "agents",
+      required: true,
+      test: () => hasAnyAgent(config.mongo.uri, config.mongo.dbName),
+      remedy: "Run `npm run setup:seeds` to import plugin agent seeds.",
+    },
+    {
+      name: `default agent exists (${config.defaultAgent})`,
+      group: "agents",
+      required: true,
+      test: () => defaultAgentExists(config.mongo.uri, config.mongo.dbName, config.defaultAgent),
+      remedy: `Set DEFAULT_AGENT to an existing agent id or seed '${config.defaultAgent}'.`,
+    },
+    // ── Services ─────────────────────────────────────────────────────────
+    {
+      name: "LaunchAgent com.hive.agent running",
+      group: "services",
+      required: true,
+      test: () => {
+        const st = launchctlPrint("com.hive.agent");
+        return st.loaded && st.state === "running" && st.pid !== null && pidAlive(st.pid);
+      },
+      remedy: "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hive.agent.plist && launchctl kickstart -k gui/$(id -u)/com.hive.agent",
+    },
+    {
+      name: "Slack auth.test",
+      group: "services",
+      required: true,
+      test: () => slackAuthOk(config.slack.botToken),
+      remedy: "Verify SLACK_BOT_TOKEN in .env and that the token still has the expected scopes.",
     },
   ];
+
   let allPassed = true;
+  let currentGroup: CheckGroup | null = null;
   for (const check of checks) {
+    if (check.group !== currentGroup) {
+      console.log(`\n${GROUP_TITLES[check.group]}`);
+      currentGroup = check.group;
+    }
     const ok = await check.test();
     const icon = ok ? "✓" : check.required ? "✗" : "○";
     const label = check.required ? "" : " (optional)";
     console.log(`  ${icon} ${check.name}${label}`);
+    if (!ok && verbose && check.remedy) {
+      console.log(`      → ${check.remedy}`);
+    }
     if (!ok && check.required) allPassed = false;
   }
+
   if (!allPassed) {
-    console.log("\nSome required checks failed. Run 'hive init' to install prerequisites.");
+    console.log("\nSome required checks failed. Run with --verbose for remedy hints.");
     process.exit(1);
   }
   console.log("\nAll checks passed.");
