@@ -59,9 +59,7 @@ function pluginAdd(target?: string): void {
   const hiveApi: string | undefined = raw?.hiveApi ?? raw?.["hive-api"];
 
   if (hiveApi && !isHiveApiCompatible(hiveApi, HIVE_PLUGIN_API_VERSION)) {
-    console.error(
-      `Plugin requires hiveApi ${hiveApi} but this hive is ${HIVE_PLUGIN_API_VERSION}.`,
-    );
+    console.error(`Plugin requires hiveApi ${hiveApi} but this hive is ${HIVE_PLUGIN_API_VERSION}.`);
     rollbackInstall(target);
     process.exit(1);
   }
@@ -86,9 +84,7 @@ function pluginAdd(target?: string): void {
     console.log("Start hive to activate the plugin.");
   }
 
-  console.log(
-    `✓ Installed ${target} (v${version}${hiveApi ? `, hiveApi ${hiveApi}` : ""})`,
-  );
+  console.log(`✓ Installed ${target} (v${version}${hiveApi ? `, hiveApi ${hiveApi}` : ""})`);
 }
 
 function pluginRemove(target?: string): void {
@@ -171,9 +167,7 @@ function pluginList(): void {
       const version = raw?.version ?? "?";
       const hiveApi = raw?.hiveApi ?? raw?.["hive-api"] ?? "";
       const tag = isInTree ? "  [in-tree]" : "";
-      console.log(
-        `  ${name}  v${version}${hiveApi ? `  (hiveApi ${hiveApi})` : ""}${tag}`,
-      );
+      console.log(`  ${name}  v${version}${hiveApi ? `  (hiveApi ${hiveApi})` : ""}${tag}`);
     } catch {
       console.log(`  ${name}  ⚠ failed to read plugin.yaml`);
     }
