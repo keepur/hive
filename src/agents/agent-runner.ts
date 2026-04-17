@@ -614,10 +614,16 @@ export class AgentRunner {
           });
           continue;
         }
-        const devPath = resolve(DIST_DIR, `plugins/${plugin.name}/${serverDef.entry.replace(/\.ts$/, ".js")}`);
-        const npmPath = resolve(hiveHome, "plugins", plugin.name, "dist", "mcp",
-          serverDef.entry.replace(/\.ts$/, ".min.js").replace(/^.*\//, ""));
-        const compiledPath = existsSync(npmPath) ? npmPath : devPath;
+        // Three-path resolution, first that exists wins:
+        // 1. Dev build from source (wins during active development)
+        // 2. npm-installed under node_modules/ (new — for hive plugin add)
+        // 3. In-tree fallback (legacy — plugins/dodi/ without node_modules)
+        const entryJs = serverDef.entry.replace(/\.ts$/, ".js");
+        const entryMin = serverDef.entry.replace(/\.ts$/, ".min.js").replace(/^.*\//, "");
+        const devPath = resolve(DIST_DIR, `plugins/${plugin.name}/${entryJs}`);
+        const npmPath = resolve(hiveHome, "plugins", "node_modules", plugin.name, "dist", "mcp", entryMin);
+        const inTreePath = resolve(hiveHome, "plugins", plugin.name, "dist", "mcp", entryMin);
+        const compiledPath = [devPath, npmPath, inTreePath].find((p) => existsSync(p)) ?? devPath;
 
         // Base env available to all plugin servers
         const pluginTaskKey = config.taskLedger.agentKeys[this.agentConfig.id] ?? config.taskLedger.apiKey;
