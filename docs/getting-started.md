@@ -33,24 +33,29 @@ npm i -g @keepur/hive && hive init
 
 ## Running `hive init`
 
-The wizard walks you through four prompts.
+The wizard walks you through several sections. Here's what to expect at each one:
 
-**1. Anthropic API key.** Paste the key from [console.anthropic.com](https://console.anthropic.com/). It's stored in your local `.env` and never sent anywhere except Anthropic.
+**1. Business info.** Your company name, what you do, team size. This context helps your Chief of Staff understand your business from day one.
 
-**2. Slack app.** The wizard prints a Slack manifest URL. Open it in your browser, click **Create App**, and install it to your workspace. Slack will then show you two tokens:
+**2. Slack.** The wizard prints a Slack manifest URL. Open it in your browser, click **Create App**, and install it to your workspace. Slack will then show you two tokens:
 
 - **App-Level Token** (starts with `xapp-`)
 - **Bot Token** (starts with `xoxb-`)
 
 Paste both back into the wizard when prompted.
 
-**3. Instance config.** Ports, instance ID, data directories. Defaults are fine for single-user installs — press Enter through them.
+**3. Anthropic API key.** Paste the key from [console.anthropic.com](https://console.anthropic.com/). It's stored in your local `.env` and never sent anywhere except Anthropic.
 
-**4. Wait.** The wizard pulls models, seeds your Chief of Staff agent, and starts the service. You're done when you see:
+**4. Optional integrations.** Google, Linear, GitHub, etc. You can skip all of these and add them later via `hive plugin add`. The wizard also offers to install plugins from the registry.
+
+**5. Agent setup.** Names your Chief of Staff bot user and seeds it to MongoDB.
+
+**6-9. Build + deploy.** The wizard compiles the codebase, sets up the LaunchAgent service, and starts it. This takes a few minutes. You're done when you see:
 
 ```
-Hive is running
-Chief of Staff seeded
+╔══════════════════════════════════════════════╗
+║              Hive is ready!                  ║
+╚══════════════════════════════════════════════╝
 ```
 
 ## First Slack message
