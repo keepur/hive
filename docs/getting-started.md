@@ -9,7 +9,7 @@ Stand up your own Hive instance, connect it to Slack, and get a first reply from
 - Admin access to a Slack workspace (you'll create a Slack app inside it)
 - ~20 minutes
 
-The bootstrap script installs Homebrew, Node 22, MongoDB, Ollama, and Qdrant on your behalf. Nothing else needs to be set up first.
+The bootstrap script installs Homebrew and Node 22, then hands off to `hive init` which installs the remaining prerequisites (MongoDB, Ollama, Qdrant) as part of the setup wizard.
 
 **Heads-up if you already have Node:** the bootstrap runs `brew link --force --overwrite node@22` when your existing Node is older than 22. That replaces the `node` and `npm` symlinks in your Homebrew prefix. If you actively rely on a different Node version managed via nvm, asdf, or fnm, use the "Already have Node 22" path below instead.
 
@@ -55,7 +55,7 @@ Chief of Staff seeded
 
 ## First Slack message
 
-Open Slack. The wizard told you the bot user's name (default: Mokie). Either DM that user or @mention them in a channel they're in. You should see a greeting reply within about 10 seconds.
+Open Slack. The wizard told you the bot user's name (default: Chief). Either DM that user or @mention them in a channel they're in. You should see a greeting reply within about 10 seconds.
 
 Nothing happened? See [troubleshooting.md](./troubleshooting.md).
 
@@ -65,10 +65,10 @@ Install the Google plugin and authorize it:
 
 ```
 hive plugin add @keepur/hive-plugin-google
-gog auth login
+gog auth add you@yourdomain.com
 ```
 
-`gog auth login` opens a browser window — sign in with the Google account you want your agents to use (typically a dedicated bot account, not your personal one).
+Replace `you@yourdomain.com` with the Google account you want your agents to use (typically a dedicated bot account, not your personal one). `gog auth add` opens a browser window for OAuth consent.
 
 To verify, ask your Chief of Staff in Slack:
 

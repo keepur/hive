@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/bootstrap.
 npm i -g @keepur/hive && hive init
 ```
 
-The bootstrap installs Homebrew, Node 22, MongoDB, Ollama, and Qdrant, then drops you into the `hive init` wizard. Budget about 20 minutes end-to-end.
+The bootstrap installs Homebrew and Node 22, then drops you into the `hive init` wizard which handles the rest (MongoDB, Ollama, Qdrant). Budget about 20 minutes end-to-end.
 
 ## Documentation
 

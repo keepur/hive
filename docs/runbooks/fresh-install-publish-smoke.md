@@ -21,7 +21,7 @@ For a release candidate (before tag-push), the package under test must already b
 | 1 | On fresh user account, run: `curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/bootstrap.sh \| bash` (only valid for option A — for option B, install manually then run `hive init`) | Homebrew installs (prompts for Xcode CLI), Node 22 installs, `@keepur/hive` installs, `hive init` launches |
 | 2 | Complete `hive init` interactively: enter Anthropic key, follow Slack manifest URL, paste tokens, accept defaults for instance config | Wizard exits clean, LaunchAgent loaded |
 | 3 | In the configured Slack workspace, send a DM to the Chief of Staff agent | CoS responds within ~10 seconds |
-| 4 | Run: `hive plugin add @keepur/hive-plugin-google` | Installs, validates, restarts, prints "is now active" |
+| 4 | Run: `hive plugin add @keepur/hive-plugin-google` | Installs, validates, prints `✓ Restarting hive... done` (or `Start hive to activate the plugin.` if service isn't running) |
 | 5 | Run: `hive doctor` | All required checks green |
 
 ## Sign-off
