@@ -618,11 +618,14 @@ export class AgentRunner {
         // 1. Dev build from source (wins during active development)
         // 2. npm-installed under node_modules/ (new — for hive plugin add)
         // 3. In-tree fallback (legacy — plugins/dodi/ without node_modules)
+        // Preserve source directory structure in all three paths so two entries
+        // like mcp-servers/foo/index.ts and mcp-servers/bar/index.ts don't collide
+        // on the same basename.
         const entryJs = serverDef.entry.replace(/\.ts$/, ".js");
-        const entryMin = serverDef.entry.replace(/\.ts$/, ".min.js").replace(/^.*\//, "");
+        const entryMin = serverDef.entry.replace(/\.ts$/, ".min.js");
         const devPath = resolve(DIST_DIR, `plugins/${plugin.name}/${entryJs}`);
-        const npmPath = resolve(hiveHome, "plugins", "node_modules", plugin.name, "dist", "mcp", entryMin);
-        const inTreePath = resolve(hiveHome, "plugins", plugin.name, "dist", "mcp", entryMin);
+        const npmPath = resolve(hiveHome, "plugins", "node_modules", plugin.name, "dist", entryMin);
+        const inTreePath = resolve(hiveHome, "plugins", plugin.name, "dist", entryMin);
         const compiledPath = [devPath, npmPath, inTreePath].find((p) => existsSync(p)) ?? devPath;
 
         // Base env available to all plugin servers

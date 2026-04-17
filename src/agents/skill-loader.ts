@@ -302,17 +302,8 @@ function detectModifiedSkills(
 
         const currentHash = computeContentHash(skillPath);
         if (currentHash !== frontmatter.origin["base-content-hash"]) {
-          if (!frontmatter.origin.modified) {
-            frontmatter.origin.modified = true;
-            // Persist to disk so upgrade flow can read the flag
-            writeSkillMd(skillMdPath, frontmatter, body);
-            // Audit the modification detection on the state branch
-            commitToState(
-              hiveHome,
-              [relative(hiveHome, skillMdPath)],
-              `detect-modified: ${skillDir} content hash changed`,
-            );
-          }
+          // Record in-memory first so state is consistent even if the disk
+          // persistence below fails (permissions, read-only FS, etc).
           modified.add(skillPath);
           log.warn("Registry-installed skill has been modified", {
             workflow,
@@ -321,6 +312,27 @@ function detectModifiedSkills(
             baseHash: frontmatter.origin["base-content-hash"],
             currentHash,
           });
+
+          if (!frontmatter.origin.modified) {
+            frontmatter.origin.modified = true;
+            // The write below triggers fs.watch; loadSkillIndex re-entering is
+            // safe because on the next pass frontmatter.origin.modified is
+            // already true, so this branch is skipped and no further write
+            // occurs. The 500ms debounce in index.ts coalesces the trigger.
+            try {
+              writeSkillMd(skillMdPath, frontmatter, body);
+              commitToState(
+                hiveHome,
+                [relative(hiveHome, skillMdPath)],
+                `detect-modified: ${skillDir} content hash changed`,
+              );
+            } catch (err) {
+              log.error("Failed to persist modified flag to disk", {
+                path: skillMdPath,
+                error: String(err),
+              });
+            }
+          }
         }
       } catch {
         // If we can't parse frontmatter, skip silently
