@@ -10,6 +10,7 @@ const { positionals, values } = parseArgs({
     daemon: { type: "boolean", default: false },
     config: { type: "string" },
     version: { type: "boolean", short: "v", default: false },
+    verbose: { type: "boolean", default: false },
   },
 });
 
@@ -108,7 +109,7 @@ switch (command) {
   }
   case "doctor": {
     const { runDoctor } = await import("./cli/doctor.js");
-    await runDoctor();
+    await runDoctor({ verbose: !!values.verbose });
     break;
   }
   case "plugin": {
