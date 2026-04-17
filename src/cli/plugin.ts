@@ -66,13 +66,19 @@ function pluginAdd(target?: string): void {
 
   const version = raw?.version ?? "unknown";
 
-  // Step 3: Update hive.yaml
+  // Step 3: Update hive.yaml (rollback npm install on failure)
   const cfgPath = configPath();
   const config = readConfig(cfgPath);
   if (!config.plugins) config.plugins = [];
   if (!config.plugins.includes(target)) {
     config.plugins.push(target);
-    writeConfig(config, cfgPath);
+    try {
+      writeConfig(config, cfgPath);
+    } catch (err) {
+      console.error(`Failed to update hive.yaml: ${String(err)}`);
+      rollbackInstall(target);
+      process.exit(1);
+    }
     console.log("✓ Updated hive.yaml");
   }
 
