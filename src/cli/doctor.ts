@@ -68,12 +68,28 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       test: () => parseInt(process.versions.node.split(".")[0]) >= 22,
       remedy: "Install Node 22+: brew install node@22 && brew link --overwrite node@22",
     },
-    { name: "Homebrew", group: "prereq", required: true, test: () => commandExists("brew"),
-      remedy: "Install: /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"" },
-    { name: "MongoDB (brew services)", group: "prereq", required: true, test: () => brewServiceRunning("mongodb-community"),
-      remedy: "brew services start mongodb-community  # informational; live reachability is checked under Agents" },
-    { name: "Ollama", group: "prereq", required: true, test: () => httpProbe("http://127.0.0.1:11434/api/tags"),
-      remedy: "brew install ollama && brew services start ollama" },
+    {
+      name: "Homebrew",
+      group: "prereq",
+      required: true,
+      test: () => commandExists("brew"),
+      remedy:
+        'Install: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
+    },
+    {
+      name: "MongoDB (brew services)",
+      group: "prereq",
+      required: true,
+      test: () => brewServiceRunning("mongodb-community"),
+      remedy: "brew services start mongodb-community  # informational; live reachability is checked under Agents",
+    },
+    {
+      name: "Ollama",
+      group: "prereq",
+      required: true,
+      test: () => httpProbe("http://127.0.0.1:11434/api/tags"),
+      remedy: "brew install ollama && brew services start ollama",
+    },
     {
       name: "Ollama models (bge-large, gemma4:e4b)",
       group: "prereq",
@@ -89,8 +105,13 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       },
       remedy: "ollama pull bge-large && ollama pull gemma4:e4b",
     },
-    { name: "Qdrant", group: "prereq", required: true, test: () => httpProbe("http://127.0.0.1:6333/"),
-      remedy: "brew install qdrant && brew services start qdrant" },
+    {
+      name: "Qdrant",
+      group: "prereq",
+      required: true,
+      test: () => httpProbe("http://127.0.0.1:6333/"),
+      remedy: "brew install qdrant && brew services start qdrant",
+    },
     { name: "gh CLI", group: "prereq", required: false, test: () => commandExists("gh") },
     { name: "gog CLI", group: "prereq", required: false, test: () => commandExists("gog") },
     {
@@ -146,8 +167,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       name: `default agent exists${config ? ` (${config.defaultAgent})` : ""}`,
       group: "agents",
       required: true,
-      test: () =>
-        config ? defaultAgentExists(config.mongo.uri, config.mongo.dbName, config.defaultAgent) : false,
+      test: () => (config ? defaultAgentExists(config.mongo.uri, config.mongo.dbName, config.defaultAgent) : false),
       remedy: config
         ? `Set DEFAULT_AGENT to an existing agent id or seed '${config.defaultAgent}'.`
         : "Config failed to load — see Config group.",
