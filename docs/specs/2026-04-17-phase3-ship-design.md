@@ -39,7 +39,7 @@ Four docs + one email template. Lives in the hive repo, renders on github.com/ke
    - Both install paths walked through with expected output
    - `hive init` walkthrough: Anthropic key prompt → Slack manifest URL → token prompt → instance config → seed CoS → start service
    - First Slack message: where CoS appears, what it says first
-   - Google OAuth walkthrough: `hive plugin add @keepur/hive-plugin-google` → `gog auth login` → CoS confirms in Slack
+   - Google OAuth walkthrough: `hive plugin add @keepur/hive-plugin-google` → `gog auth add <email>` → CoS confirms in Slack
    - Expected total time: under 20 minutes
 
 3. **`docs/managing-your-hive.md`** — Day-two operations.

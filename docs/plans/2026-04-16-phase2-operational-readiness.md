@@ -156,7 +156,7 @@ GOG_CLIENT=personal              # gog OAuth client name
 
 ## Prereqs
 
-- `gog` CLI installed and authenticated (`gog auth login <account>`).
+- `gog` CLI installed and authenticated (`gog auth add <account>`).
 
 ## Curation
 
