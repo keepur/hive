@@ -1,9 +1,36 @@
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { createInterface } from "node:readline";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { resolveHiveHome } from "../paths.js";
 import { installPrereqs } from "../cli/prereqs.js";
+
+/**
+ * Scan sibling hive installs for used portBase values and return the next free
+ * 100-slot starting at 3100. Prevents collisions between instances on one machine.
+ */
+function pickPortBase(home: string): number {
+  const used = new Set<number>();
+  const servicesRoot = resolve(home, "services", "hive");
+  if (existsSync(servicesRoot)) {
+    for (const dir of readdirSync(servicesRoot)) {
+      const yamlPath = join(servicesRoot, dir, "hive.yaml");
+      if (!existsSync(yamlPath)) continue;
+      try {
+        const parsed = parseYaml(readFileSync(yamlPath, "utf-8")) ?? {};
+        const pb = parsed?.instance?.portBase;
+        // Treat a missing portBase as the implicit default 3100 (see config.ts).
+        used.add(typeof pb === "number" ? pb : 3100);
+      } catch {
+        // ignore unreadable siblings
+      }
+    }
+  }
+  for (let base = 3100; base < 3900; base += 100) {
+    if (!used.has(base)) return base;
+  }
+  return 3100;
+}
 
 function slugify(s: string): string {
   return s
@@ -47,14 +74,14 @@ async function chooseHomeAndInstance(home: string): Promise<string> {
 
     mkdirSync(hiveHome, { recursive: true });
 
+    const portBase = pickPortBase(home);
     const skeleton = {
-      instance: { id: instanceId, type: "business" },
-      ports: { ws: 3200, bgTask: 3201 },
+      instance: { id: instanceId, type: "business", portBase },
       business: { name: businessName },
     };
     writeFileSync(join(hiveHome, "hive.yaml"), toYaml(skeleton));
 
-    console.log(`\n✓ Created ${hiveHome}/hive.yaml (instance.id: ${instanceId})\n`);
+    console.log(`\n✓ Created ${hiveHome}/hive.yaml (instance.id: ${instanceId}, portBase: ${portBase})\n`);
     return hiveHome;
   } finally {
     rl.close();
