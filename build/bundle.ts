@@ -47,6 +47,9 @@ const shared = {
   format: "esm" as const,
   external,
   logLevel: "info" as const,
+  banner: {
+    js: "import { createRequire as __hiveCreateRequire } from 'module'; const require = __hiveCreateRequire(import.meta.url);",
+  },
 };
 
 // CLI entry point (shebang preserved from source)
