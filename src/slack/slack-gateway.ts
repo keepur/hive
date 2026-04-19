@@ -589,6 +589,61 @@ export class SlackGateway {
     this.outboundTsCache.register(channel, ts);
   }
 
+  /**
+   * Post a single message with explicit signature, intended for the internal API.
+   * Bypasses the split/file-upload logic of postMessage (caller controls size).
+   * Registers the returned ts in the outbound echo cache.
+   */
+  async postForInternalApi(
+    channel: string,
+    text: string,
+    threadTs?: string,
+    blocks?: unknown[],
+  ): Promise<string | undefined> {
+    try {
+      const result = await this.web.chat.postMessage({
+        channel,
+        text,
+        thread_ts: threadTs,
+        unfurl_links: false,
+        ...(blocks ? { blocks: blocks as any } : {}),
+      });
+      if (result.ok && result.ts) {
+        const cacheChannel = (result.channel as string | undefined) ?? channel;
+        this.outboundTsCache.register(cacheChannel, result.ts);
+      }
+      return result.ts;
+    } catch (err) {
+      log.error("Failed to post message (internal api)", { channel, error: String(err) });
+      throw err;
+    }
+  }
+
+  /** Thin pass-through over conversations.history, for the internal Slack API. */
+  async historyForChannel(channel: string, limit?: number): Promise<unknown[]> {
+    const res = await this.web.conversations.history({ channel, limit });
+    return (res.messages as unknown[]) ?? [];
+  }
+
+  /** Thin pass-through over conversations.list with optional client-side name filter. */
+  async listConversations(query?: string): Promise<unknown[]> {
+    const res = await this.web.conversations.list({
+      limit: 1000,
+      exclude_archived: true,
+      types: "public_channel,private_channel",
+    });
+    const channels = (res.channels as any[]) ?? [];
+    if (!query) return channels;
+    const q = query.toLowerCase();
+    return channels.filter((ch) => typeof ch.name === "string" && ch.name.toLowerCase().includes(q));
+  }
+
+  /** Thin pass-through over users.info, for the internal Slack API. */
+  async userInfo(user: string): Promise<unknown> {
+    const res = await this.web.users.info({ user });
+    return res.user;
+  }
+
   isOutboundEcho(channel: string, ts: string): boolean {
     return this.outboundTsCache.has(channel, ts);
   }
