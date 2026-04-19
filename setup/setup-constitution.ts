@@ -56,11 +56,14 @@ async function main() {
     if (delimiterIdx !== -1) {
       // Section 2 exists — preserve it, only replace Section 1
       const existingSection2 = existing.content.slice(delimiterIdx);
-      const newSection1 = renderedBootstrap.slice(
-        0,
-        renderedBootstrap.indexOf(SECTION_2_DELIMITER),
-      );
-      content = newSection1 + existingSection2;
+      const delimiterInBootstrap = renderedBootstrap.indexOf(SECTION_2_DELIMITER);
+      if (delimiterInBootstrap === -1) {
+        // Bootstrap template missing delimiter — replace entirely rather than corrupt
+        content = renderedBootstrap;
+      } else {
+        const newSection1 = renderedBootstrap.slice(0, delimiterInBootstrap);
+        content = newSection1 + existingSection2;
+      }
     } else {
       // No delimiter — pre-onboarding state, replace entirely
       content = renderedBootstrap;
