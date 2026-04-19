@@ -9,6 +9,7 @@ import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
 import { SlackGateway } from "./slack/slack-gateway.js";
+import { SlackInternalApi } from "./slack/slack-internal-api.js";
 import { MemoryManager } from "./memory/memory-manager.js";
 import { Scheduler } from "./scheduler/scheduler.js";
 import { HealthReporter } from "./health/health-reporter.js";
@@ -276,6 +277,19 @@ async function main(): Promise<void> {
   });
   log.info("Slack adapter connected");
 
+  // Slack internal API — HTTP bridge for local slack MCP server
+  let slackInternalApi: SlackInternalApi | null = null;
+  if (config.slack.localMcpServer) {
+    slackInternalApi = new SlackInternalApi({
+      port: config.slackInternal.port,
+      authToken: config.slackInternal.authToken,
+      gateway: slack,
+      agentManager,
+    });
+    await slackInternalApi.start();
+    log.info("Slack internal API started", { port: config.slackInternal.port });
+  }
+
   // Audit routing: every agent mirrors non-Slack conversations to their own
   // homeBase channel. The global slack.auditChannel (if set) is the fallback
   // for agents whose homeBase can't be resolved.
@@ -506,6 +520,7 @@ async function main(): Promise<void> {
     await sessionStore.close();
     await memoryStore.close();
     await slackAdapter.stop();
+    if (slackInternalApi) await slackInternalApi.stop();
     await mongoClient.close();
     log.info("Hive shut down cleanly");
     process.exit(0);
