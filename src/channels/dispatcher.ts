@@ -354,10 +354,35 @@ export class Dispatcher {
     // const keyword = this.registry.findByKeyword(item.text);
     // if (keyword) return [{ agentId: keyword.id }];
 
-    // 6. No match — drop unless it's a dedicated channel or DM
+    // 6. DM fallback — Slack DMs (channel id starts with "D") and Team DMs should
+    //    always land on the default agent when nothing else claims them. Without this,
+    //    first-contact DMs silently drop because no agent has the ad-hoc channel in its
+    //    `channels` array.
+    if (this.isDirectMessage(item) && this.registry.get(this.defaultAgentId)) {
+      log.info("DM routed to default agent", {
+        agentId: this.defaultAgentId,
+        channel: item.source.id,
+      });
+      return [{ agentId: this.defaultAgentId }];
+    }
+
+    // 7. No match — drop unless it's a dedicated channel or DM
     //    Agents must be explicitly addressed (name mention, dedicated channel, thread continuity, or DM)
     log.debug("No agent matched — dropping", { channel: item.source.label });
     return [];
+  }
+
+  /**
+   * Detect DMs across supported channel kinds.
+   *   - Slack DMs: source.id starts with "D"
+   *   - Team DMs: meta.channelType === "im" OR source.id starts with "dm:"
+   */
+  private isDirectMessage(item: WorkItem): boolean {
+    if (item.source.kind === "slack" && item.source.id.startsWith("D")) return true;
+    if (item.meta?.channelType === "im") return true;
+    if (item.source.kind === "team" && typeof item.source.id === "string" && item.source.id.startsWith("dm:"))
+      return true;
+    return false;
   }
 
   private async resolveFromTeam(item: WorkItem): Promise<{ agentId: string }[]> {

@@ -1,9 +1,36 @@
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { createInterface } from "node:readline";
+import { execFileSync } from "node:child_process";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { resolveHiveHome } from "../paths.js";
 import { installPrereqs } from "../cli/prereqs.js";
+
+/** Ports allocated per instance starting at portBase. Must match config.ts port offsets. */
+const PORTS_PER_INSTANCE = 10;
+
+/**
+ * Check whether a TCP port has a LISTEN-ing process on loopback. Uses lsof.
+ * Returns true if busy, false if free. If lsof is missing (ENOENT), returns
+ * false so callers fall back to yaml-only behavior.
+ */
+function isPortBusy(port: number): boolean {
+  try {
+    const out = execFileSync("lsof", ["-iTCP:" + port, "-sTCP:LISTEN", "-t"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf-8",
+    });
+    return out.trim().length > 0;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // lsof missing — treat as "free" so we don't block the picker
+      return false;
+    }
+    // Non-zero exit = no LISTENers found, which is what we want (free)
+    return false;
+  }
+}
 
 /**
  * Scan sibling hive installs for used portBase values and return the next free
@@ -27,7 +54,17 @@ function pickPortBase(home: string): number {
     }
   }
   for (let base = 3100; base < 3900; base += 100) {
-    if (!used.has(base)) return base;
+    // Cheap yaml-scan filter first
+    if (used.has(base)) continue;
+    // Confirm with lsof — env-var overrides (e.g. WS_PORT=3200) are invisible to yaml scan
+    let anyBusy = false;
+    for (let offset = 0; offset < PORTS_PER_INSTANCE; offset++) {
+      if (isPortBusy(base + offset)) {
+        anyBusy = true;
+        break;
+      }
+    }
+    if (!anyBusy) return base;
   }
   return 3100;
 }
