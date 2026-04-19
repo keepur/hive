@@ -377,6 +377,26 @@ describe("Dispatcher routing", () => {
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
   });
+
+  it("routes Slack DM with no channel match to default agent (KPR-35)", async () => {
+    // DM channels in Slack start with "D" and are never in any agent's `channels` array.
+    // Without the fallback these first-contact messages silently drop.
+    const item = makeWorkItem({
+      text: "hello, anyone home?",
+      source: { kind: "slack", id: "D123ABC", label: "directmessage" },
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
+  });
+
+  it("does not fall back for non-DM channels with no match", async () => {
+    const item = makeWorkItem({
+      text: "random chatter",
+      source: { kind: "slack", id: "C999", label: "random" },
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------

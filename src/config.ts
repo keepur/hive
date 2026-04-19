@@ -97,11 +97,6 @@ export const config = {
     mcpToken: optional("SLACK_MCP_TOKEN", ""),
     auditChannel: optional("SLACK_AUDIT_CHANNEL", hive.slack?.auditChannel ?? ""),
   },
-  slackJasper: {
-    appToken: optional("SLACK_JASPER_APP_TOKEN", ""),
-    botToken: optional("SLACK_JASPER_BOT_TOKEN", ""),
-    mcpToken: optional("SLACK_JASPER_MCP_TOKEN", ""),
-  },
   anthropic: {
     apiKey: optional("ANTHROPIC_API_KEY", ""),
   },
