@@ -173,21 +173,12 @@ export async function runWizard(targetDir: string, templatesDir: string, pkgRoot
   const env = loadEnv();
   const hive = loadHiveYaml();
 
-  // ── Instance defaults (must run before resume detection) ──────────
-  if (!hive.instance?.id) {
-    hive.instance = {
-      id: "hive",
-      type: "business",
-    };
-    hive.ports = hive.ports ?? {
-      ws: 3200,
-      bgTask: 3201,
-    };
-    saveHiveYaml(hive);
+  // Instance id must be set by caller (init.ts chooseHomeAndInstance, or a pre-existing hive.yaml).
+  const instanceId = hive.instance?.id as string | undefined;
+  if (!instanceId) {
+    console.error(`Error: hive.yaml is missing instance.id. Re-run 'hive init'.`);
+    process.exit(1);
   }
-
-  // Set MongoDB database name for all downstream operations
-  const instanceId = (hive.instance?.id as string) ?? "hive";
   if (!process.env.MONGODB_DB) {
     process.env.MONGODB_DB = `hive_${instanceId}`;
   }
