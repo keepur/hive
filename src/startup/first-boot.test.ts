@@ -18,11 +18,11 @@ function mockMemoryManager(flagValue: string | null, throwOnRead = false, throwO
 
 function mockRegistry(homeBase?: string, channels?: string[]) {
   return {
-    get: vi.fn().mockReturnValue(
-      homeBase || channels
-        ? { _id: "chief-of-staff", homeBase, channels: channels ?? [] }
-        : undefined,
-    ),
+    get: vi
+      .fn()
+      .mockReturnValue(
+        homeBase || channels ? { _id: "chief-of-staff", homeBase, channels: channels ?? [] } : undefined,
+      ),
   } as unknown as AgentRegistry;
 }
 
@@ -43,11 +43,7 @@ describe("checkFirstBoot", () => {
 
     await checkFirstBoot(mem, reg, disp, channelMap);
 
-    expect(mem.write).toHaveBeenCalledWith(
-      "hive/first-boot-greeting-sent",
-      expect.any(String),
-      "system",
-    );
+    expect(mem.write).toHaveBeenCalledWith("hive/first-boot-greeting-sent", expect.any(String), "system");
     expect(disp.dispatch).toHaveBeenCalledTimes(1);
     const workItem = (disp.dispatch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(workItem.meta.targetAgentId).toBe("chief-of-staff");
