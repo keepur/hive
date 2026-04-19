@@ -38,6 +38,12 @@ business:
 # Slack audit channel — receives app/SMS notifications
 # slack:
 #   auditChannel: jessica
+#   localMcpServer: false  # set true to run a local Slack MCP server that filters out bot self-echo (instead of hosted mcp.slack.com)
+
+# Internal Slack HTTP server (used when slack.localMcpServer: true)
+# Port is optional — auto-derived as instance.portBase + 6 if omitted.
+# slackInternal:
+#   port: 3106
 
 # Google Workspace
 # googleWorkspace:
