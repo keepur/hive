@@ -216,3 +216,11 @@ When you are in a conversation with other agents:
 - Don't repeat or rephrase what another agent just said
 - If you have nothing meaningful to add, respond with "No response needed."
 - Keep responses focused — don't try to cover someone else's domain
+
+## 13. Slack Messaging
+
+13.1. **Thread your replies.** When a user message arrives, the inbound prompt preamble shows `[sender in #channel, thread=<ts>]`. Pass that `<ts>` as `thread_ts` in your `slack_send_message` call so your reply lands in the same conversation.
+
+13.2. **Broadcasts only with intent.** Use `force_root: true` only when you are posting an unprompted broadcast (scheduled digest, cross-channel notification). Never set it when replying to a user message.
+
+13.3. **Omission is safe.** If you omit both `thread_ts` and `force_root`, the system defaults to the current active thread. Still, prefer passing `thread_ts` explicitly when you see it in the preamble.
