@@ -804,18 +804,34 @@ async function doMemory(hive: Record<string, any>, templatesDir: string) {
     );
     console.log("  ✓ shared/business-context.md");
 
-    // Constitution
-    const constitutionTplPath = join(templatesDir, "constitution.md.tpl");
+    // Constitution (bootstrap template — Section 1 preamble only, Section 2 authored by CoS during onboarding)
+    const SECTION_2_DELIMITER = "<!-- SECTION 2: OPERATIONAL -->";
+    const constitutionTplPath = join(templatesDir, "constitution-bootstrap.md.tpl");
     if (existsSync(constitutionTplPath)) {
       const constitutionTpl = readFileSync(constitutionTplPath, "utf-8");
+      const rendered = renderTemplate(constitutionTpl, { business: biz });
 
-      const team: Record<string, string> = {};
-      for (const [id, def] of Object.entries(hive.agents ?? {})) {
-        team[id] = (def as any).name ?? id;
+      // Re-run safety: preserve Section 2 if it was authored by CoS
+      const existing = await memory.findOne({ path: "shared/constitution.md" });
+      let content: string;
+
+      if (existing) {
+        const delimiterIdx = existing.content.indexOf(SECTION_2_DELIMITER);
+        if (delimiterIdx !== -1) {
+          // Section 2 exists — preserve it, only replace Section 1
+          const existingSection2 = existing.content.slice(delimiterIdx);
+          const delimiterInRendered = rendered.indexOf(SECTION_2_DELIMITER);
+          if (delimiterInRendered === -1) {
+            content = rendered;
+          } else {
+            content = rendered.slice(0, delimiterInRendered) + existingSection2;
+          }
+        } else {
+          content = rendered;
+        }
+      } else {
+        content = rendered;
       }
-
-      const constitutionCtx = { business: biz, team };
-      const content = renderTemplate(constitutionTpl, constitutionCtx);
 
       await memory.updateOne(
         { path: "shared/constitution.md" },
