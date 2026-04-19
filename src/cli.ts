@@ -1,7 +1,47 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { resolve } from "node:path";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { existsSync, readFileSync, statSync, readdirSync } from "node:fs";
+import { resolveHiveHome } from "./paths.js";
+
+/**
+ * Guard `hive start` against running with no configured instance. Without a real
+ * hive.yaml we fall through to built-in defaults (portBase 3100, id "hive") and
+ * crash on port collision — so bail out with an actionable message.
+ */
+function ensureHiveInstallOrExit(): string {
+  const home = resolveHiveHome();
+  if (existsSync(join(home, "hive.yaml"))) return home;
+
+  const lines: string[] = [
+    `No Hive install found at ${home}.`,
+    `  Run \`hive init\` to set up a new instance, or`,
+    `  pass --config <path/to/hive.yaml> to use an existing one, or`,
+    `  set HIVE_HOME to an existing install directory.`,
+  ];
+
+  // Scan ~/services/hive for existing installs and list as hints
+  const userHome = process.env.HOME ?? "/tmp";
+  const servicesRoot = resolve(userHome, "services", "hive");
+  const found: string[] = [];
+  if (existsSync(servicesRoot)) {
+    try {
+      for (const dir of readdirSync(servicesRoot)) {
+        const yamlPath = join(servicesRoot, dir, "hive.yaml");
+        if (existsSync(yamlPath)) found.push(join(servicesRoot, dir));
+      }
+    } catch {
+      // ignore — hint is best-effort
+    }
+  }
+  if (found.length > 0) {
+    lines.push("");
+    lines.push(`Available installs: ${found.join(", ")}`);
+  }
+
+  console.error(lines.join("\n"));
+  process.exit(1);
+}
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
@@ -77,6 +117,7 @@ switch (command) {
     break;
   }
   case "start": {
+    const hiveHome = ensureHiveInstallOrExit();
     if (values.daemon) {
       const { startDaemon } = await import("./cli/daemon.js");
       await startDaemon(PKG_ROOT);
@@ -87,7 +128,7 @@ switch (command) {
         : resolve(PKG_ROOT, "dist", "index.js");
       execFileSync(process.execPath, [serverPath], {
         stdio: "inherit",
-        env: { ...process.env, HIVE_HOME: process.env.HIVE_HOME ?? "" },
+        env: { ...process.env, HIVE_HOME: hiveHome },
       });
     }
     break;
