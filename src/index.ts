@@ -32,6 +32,7 @@ import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
 import { AdminApi } from "./admin/admin-api.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
+import { checkFirstBoot } from "./startup/first-boot.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
@@ -279,12 +280,12 @@ async function main(): Promise<void> {
   // Audit routing: every agent mirrors non-Slack conversations to their own
   // homeBase channel. The global slack.auditChannel (if set) is the fallback
   // for agents whose homeBase can't be resolved.
+  const channelIdByName = new Map<string, string>();
   try {
-    const channelIdByName = new Map<string, string>();
     let cursor: string | undefined = undefined;
     do {
       const page = await slack.client.conversations.list({
-        types: "public_channel",
+        types: "public_channel,private_channel",
         limit: 1000,
         cursor,
       });
@@ -515,6 +516,11 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => shutdown("SIGINT"));
 
   log.info("Hive is running");
+
+  // First-boot: greet owner and offer onboarding if this is a fresh hive
+  checkFirstBoot(memoryManager, registry, dispatcher, channelIdByName).catch((err) => {
+    log.error("First-boot check failed", { error: String(err) });
+  });
 }
 
 process.on("unhandledRejection", (reason) => {
