@@ -13,11 +13,13 @@ vi.mock("../logging/logger.js", () => ({
 // Track all chat.postMessage calls and files.uploadV2 calls
 const postMessageMock = vi.fn().mockResolvedValue({ ts: "1234.5678" });
 const uploadV2Mock = vi.fn().mockResolvedValue({ ok: true });
+const conversationsListMock = vi.fn();
 
 vi.mock("@slack/web-api", () => ({
   WebClient: vi.fn().mockImplementation(() => ({
     chat: { postMessage: postMessageMock },
     files: { uploadV2: uploadV2Mock },
+    conversations: { list: conversationsListMock },
   })),
 }));
 
@@ -172,6 +174,19 @@ describe("SlackGateway.postMessage — message length handling", () => {
     }
   });
 
+  it("registers outbound ts in echo cache on successful post", async () => {
+    postMessageMock.mockResolvedValueOnce({ ok: true, ts: "9999.0001", channel: "C777" });
+    await gateway.postMessage("C777", "hello");
+    expect(gateway.isOutboundEcho("C777", "9999.0001")).toBe(true);
+  });
+
+  it("uses the returned res.channel as the cache key when different from request", async () => {
+    postMessageMock.mockResolvedValueOnce({ ok: true, ts: "8888.0002", channel: "CRET" });
+    await gateway.postMessage("CREQ", "hi");
+    expect(gateway.isOutboundEcho("CRET", "8888.0002")).toBe(true);
+    expect(gateway.isOutboundEcho("CREQ", "8888.0002")).toBe(false);
+  });
+
   it("trims summary to sentence boundary for file upload", async () => {
     const text = "First sentence. Second sentence. Third sentence is very long. " + "x".repeat(8000);
     await gateway.postMessage("C123", text);
@@ -181,5 +196,107 @@ describe("SlackGateway.postMessage — message length handling", () => {
     // Should end at a sentence boundary, not mid-word
     const beforeAttached = summaryText.split("\n\n_(full response attached)_")[0];
     expect(beforeAttached).toMatch(/[.!?]$/);
+  });
+});
+
+describe("SlackGateway — outbound echo suppression", () => {
+  let gateway: SlackGateway;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  it("registerOutboundTs makes isOutboundEcho return true for the same channel+ts", () => {
+    gateway.registerOutboundTs("C1", "1.1");
+    expect(gateway.isOutboundEcho("C1", "1.1")).toBe(true);
+  });
+
+  it("isOutboundEcho returns false for a different channel", () => {
+    gateway.registerOutboundTs("C1", "1.1");
+    expect(gateway.isOutboundEcho("C2", "1.1")).toBe(false);
+  });
+
+  it("isOutboundEcho returns false for a different ts", () => {
+    gateway.registerOutboundTs("C1", "1.1");
+    expect(gateway.isOutboundEcho("C1", "2.2")).toBe(false);
+  });
+
+  it("isOutboundEcho returns false when nothing has been registered", () => {
+    expect(gateway.isOutboundEcho("C1", "1.1")).toBe(false);
+  });
+});
+
+describe("SlackGateway.resolveChannelId", () => {
+  let gateway: SlackGateway;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  it("returns the input as-is when it already looks like an ID (C/D/G prefix)", async () => {
+    await expect(gateway.resolveChannelId("C12345")).resolves.toBe("C12345");
+    await expect(gateway.resolveChannelId("D99999")).resolves.toBe("D99999");
+    await expect(gateway.resolveChannelId("G11111")).resolves.toBe("G11111");
+    expect(conversationsListMock).not.toHaveBeenCalled();
+  });
+
+  it("resolves a channel name to its ID via conversations.list", async () => {
+    conversationsListMock.mockResolvedValueOnce({
+      channels: [
+        { id: "C100", name: "general" },
+        { id: "C200", name: "agent-river" },
+      ],
+      response_metadata: {},
+    });
+    const id = await gateway.resolveChannelId("agent-river");
+    expect(id).toBe("C200");
+  });
+
+  it("strips a leading # and resolves the bare name", async () => {
+    conversationsListMock.mockResolvedValueOnce({
+      channels: [{ id: "C300", name: "team" }],
+      response_metadata: {},
+    });
+    const id = await gateway.resolveChannelId("#team");
+    expect(id).toBe("C300");
+  });
+
+  it("caches resolved ids and does not re-fetch on subsequent lookups", async () => {
+    conversationsListMock.mockResolvedValueOnce({
+      channels: [{ id: "C400", name: "ops" }],
+      response_metadata: {},
+    });
+    await gateway.resolveChannelId("ops");
+    await gateway.resolveChannelId("ops");
+    expect(conversationsListMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns null when the name is not found", async () => {
+    conversationsListMock.mockResolvedValueOnce({ channels: [], response_metadata: {} });
+    const id = await gateway.resolveChannelId("nonexistent");
+    expect(id).toBeNull();
+  });
+
+  it("returns null and logs a warning on API error", async () => {
+    conversationsListMock.mockRejectedValueOnce(new Error("missing_scope"));
+    const id = await gateway.resolveChannelId("whatever");
+    expect(id).toBeNull();
+  });
+
+  it("paginates through cursors", async () => {
+    conversationsListMock
+      .mockResolvedValueOnce({
+        channels: [{ id: "C500", name: "a" }],
+        response_metadata: { next_cursor: "PAGE2" },
+      })
+      .mockResolvedValueOnce({
+        channels: [{ id: "C600", name: "target" }],
+        response_metadata: { next_cursor: "" },
+      });
+    const id = await gateway.resolveChannelId("target");
+    expect(id).toBe("C600");
+    expect(conversationsListMock).toHaveBeenCalledTimes(2);
   });
 });

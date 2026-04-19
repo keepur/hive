@@ -4,6 +4,7 @@ import { createLogger } from "../logging/logger.js";
 import type { IncomingMessage } from "../types/agent-config.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import { downloadAndProcess, type SlackFile, type ProcessedFile } from "../files/file-processor.js";
+import { OutboundTsCache } from "./outbound-ts-cache.js";
 
 const log = createLogger("slack-gateway");
 
@@ -35,6 +36,8 @@ export class SlackGateway {
   private peerBotUserIds = new Set<string>(); // bot user IDs from other gateways
   private peerBotIds = new Set<string>(); // bot IDs (Bxxx) from other gateways
   private channelNameCache = new Map<string, string>(); // id → name
+  private channelIdCache = new Map<string, string>(); // name → id (inverse of channelNameCache, populated lazily)
+  private outboundTsCache = new OutboundTsCache();
   private userNameCache = new Map<string, string>(); // userId → display name
   private integrationChannels = new Set<string>(); // channel names that accept bot messages
   private botToken: string;
@@ -106,6 +109,12 @@ export class SlackGateway {
       if (this.peerBotUserIds.has(event.user)) return;
       if (event.bot_id && event.bot_id === this.botId) return;
       if (event.bot_id && this.peerBotIds.has(event.bot_id)) return;
+
+      // Suppress self-echoes from agent-initiated sends routed through the local Slack API.
+      if (event.ts && event.channel && this.outboundTsCache.has(event.channel, event.ts)) {
+        log.info("Outbound echo suppressed", { channel: event.channel, ts: event.ts });
+        return;
+      }
 
       // For bot messages or messages with subtypes, only allow in integration channels
       if (event.bot_id || event.subtype) {
@@ -375,6 +384,10 @@ export class SlackGateway {
           username: identity.name,
           ...iconOpts,
         });
+        if (result.ok && result.ts) {
+          const cacheChannel = (result.channel as string | undefined) ?? channel;
+          this.outboundTsCache.register(cacheChannel, result.ts);
+        }
         return result.ts;
       } catch (err) {
         log.warn("Failed to post with identity, falling back to plain post", { error: String(err) });
@@ -388,6 +401,10 @@ export class SlackGateway {
         thread_ts: threadTs,
         unfurl_links: false,
       });
+      if (result.ok && result.ts) {
+        const cacheChannel = (result.channel as string | undefined) ?? channel;
+        this.outboundTsCache.register(cacheChannel, result.ts);
+      }
       return result.ts;
     } catch (err) {
       log.error("Failed to post message", { channel, error: String(err) });
@@ -566,6 +583,47 @@ export class SlackGateway {
       resolved = resolved.replace(match[0], `@${name}`);
     }
     return resolved;
+  }
+
+  registerOutboundTs(channel: string, ts: string): void {
+    this.outboundTsCache.register(channel, ts);
+  }
+
+  isOutboundEcho(channel: string, ts: string): boolean {
+    return this.outboundTsCache.has(channel, ts);
+  }
+
+  async resolveChannelId(nameOrId: string): Promise<string | null> {
+    // Accept either C… (already an ID) or a bare name like "agent-river"
+    if (nameOrId.startsWith("C") || nameOrId.startsWith("D") || nameOrId.startsWith("G")) {
+      return nameOrId;
+    }
+    const name = nameOrId.replace(/^#/, "");
+    const cached = this.channelIdCache.get(name);
+    if (cached) return cached;
+    try {
+      // Fetch via conversations.list, populate both caches as we see entries.
+      let cursor: string | undefined;
+      do {
+        const res = await this.web.conversations.list({
+          limit: 1000,
+          cursor,
+          exclude_archived: true,
+          types: "public_channel,private_channel",
+        });
+        for (const ch of res.channels ?? []) {
+          if (ch.id && ch.name) {
+            this.channelNameCache.set(ch.id, ch.name);
+            this.channelIdCache.set(ch.name, ch.id);
+          }
+        }
+        cursor = (res as any).response_metadata?.next_cursor || undefined;
+      } while (cursor);
+    } catch (err) {
+      log.warn("channel id resolve failed", { name, error: (err as Error).message });
+      return null;
+    }
+    return this.channelIdCache.get(name) ?? null;
   }
 
   private async resolveChannelName(channelId: string): Promise<string> {
