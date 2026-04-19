@@ -27,7 +27,7 @@ const required = [
   "pkg/cli.min.js",
   "pkg/server.min.js",
   "seeds/chief-of-staff/agent.yaml",
-  "templates/constitution.md.tpl",
+  "templates/constitution-bootstrap.md.tpl",
   "scripts/honeypot",
 ];
 
