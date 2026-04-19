@@ -227,6 +227,63 @@ describe("SlackGateway — outbound echo suppression", () => {
   });
 });
 
+describe("SlackGateway — gateway-level echo filter", () => {
+  // Capture handlers registered via socket.on, and provide auth.test so start() works
+  const socketHandlers = new Map<string, (arg: { event: any; ack: () => Promise<void> }) => Promise<void>>();
+  const authTestMock = vi.fn().mockResolvedValue({ user_id: "UBOT", bot_id: "BBOT" });
+
+  let gateway: SlackGateway;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    socketHandlers.clear();
+
+    const { WebClient } = await import("@slack/web-api");
+    (WebClient as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      chat: { postMessage: postMessageMock },
+      files: { uploadV2: uploadV2Mock },
+      conversations: { list: conversationsListMock },
+      auth: { test: authTestMock },
+    }));
+
+    const { SocketModeClient } = await import("@slack/socket-mode");
+    (SocketModeClient as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      on: vi.fn((evt: string, handler: any) => {
+        socketHandlers.set(evt, handler);
+      }),
+      start: vi.fn(),
+      disconnect: vi.fn(),
+    }));
+
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+    await gateway.start();
+  });
+
+  it("drops inbound message whose ts+channel match a pre-registered outbound", async () => {
+    const messageHandler = vi.fn();
+    gateway.onMessage(messageHandler);
+
+    // Pre-register an outbound ts+channel — simulates a bot-token post we've already sent.
+    gateway.registerOutboundTs("C999", "1700000000.000100");
+
+    const handler = socketHandlers.get("message");
+    expect(handler).toBeTypeOf("function");
+
+    await handler!({
+      event: {
+        ts: "1700000000.000100",
+        channel: "C999",
+        user: "UHUMAN",
+        text: "this is actually our own outbound, echoed back",
+      },
+      ack: async () => {},
+    });
+
+    // Echo suppression should prevent the message handler from being called.
+    expect(messageHandler).not.toHaveBeenCalled();
+  });
+});
+
 describe("SlackGateway.resolveChannelId", () => {
   let gateway: SlackGateway;
 

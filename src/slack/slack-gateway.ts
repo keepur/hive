@@ -309,6 +309,7 @@ export class SlackGateway {
         thread_ts: threadTs,
       });
       if (result.channel && result.ts) {
+        this.outboundTsCache.register(result.channel, result.ts);
         return { channel: result.channel, ts: result.ts };
       }
       return undefined;
