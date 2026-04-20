@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toAgentConfig, type AgentDefinition } from "./agent-definition.js";
+import { toAgentConfig, type AgentDefinition, AGENT_DEFINITION_DEFAULTS } from "./agent-definition.js";
 
 // Stub required env vars before src/config.ts is imported transitively.
 process.env.SLACK_APP_TOKEN ??= "xapp-test";
@@ -66,5 +66,41 @@ describe("toAgentConfig — archetype passthrough", () => {
     toAgentConfig(def);
     const after = JSON.stringify(def);
     expect(after).toBe(before);
+  });
+});
+
+describe("AGENT_DEFINITION_DEFAULTS", () => {
+  it("exposes the functional-team-member coreServers baseline", () => {
+    expect(AGENT_DEFINITION_DEFAULTS.coreServers).toEqual([
+      "memory",
+      "structured-memory",
+      "keychain",
+      "event-bus",
+      "contacts",
+    ]);
+  });
+
+  it("defaults delegateServers to empty", () => {
+    expect(AGENT_DEFINITION_DEFAULTS.delegateServers).toEqual([]);
+  });
+});
+
+describe("toAgentConfig — coreServers/delegateServers fallback", () => {
+  it("falls back to the baseline when a definition is missing coreServers", () => {
+    // Simulate a malformed/legacy definition that lacks coreServers (upstream callers
+    // guarantee the field, but toAgentConfig is defensive).
+    const def = makeDefinition();
+    const legacy = { ...def } as AgentDefinition & { coreServers?: string[] };
+    delete (legacy as { coreServers?: string[] }).coreServers;
+    const cfg = toAgentConfig(legacy);
+    expect(cfg.coreServers).toEqual([...AGENT_DEFINITION_DEFAULTS.coreServers]);
+  });
+
+  it("falls back to the delegateServers baseline when missing", () => {
+    const def = makeDefinition();
+    const legacy = { ...def } as AgentDefinition & { delegateServers?: string[] };
+    delete (legacy as { delegateServers?: string[] }).delegateServers;
+    const cfg = toAgentConfig(legacy);
+    expect(cfg.delegateServers).toEqual([...AGENT_DEFINITION_DEFAULTS.delegateServers]);
   });
 });
