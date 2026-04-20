@@ -98,29 +98,39 @@ function makeMockRegistry() {
       );
     },
     findByName: (text: string) => {
+      const matchesName = (name: string, t: string) => {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const pattern = new RegExp(`(?:^|hey\\s+|@)${escaped}\\b|\\b${escaped}[,:]`, "i");
+        return pattern.test(t);
+      };
       return Array.from(agents.values()).find((a) => {
         if (a.disabled) return false;
-        const name = a.name.toLowerCase();
-        const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
-        if (pattern.test(text)) return true;
-        if (name.includes(" ")) {
-          const firstName = name.split(" ")[0];
-          const firstNamePattern = new RegExp(`(?:^|hey\\s+|@)${firstName}\\b|\\b${firstName}[,:]`, "i");
-          return firstNamePattern.test(text);
+        if (matchesName(a.name, text)) return true;
+        if (a.name.includes(" ")) {
+          const firstName = a.name.split(" ")[0];
+          if (matchesName(firstName, text)) return true;
+        }
+        for (const alias of a.aliases ?? []) {
+          if (matchesName(alias, text)) return true;
         }
         return false;
       });
     },
     findAllByName: (text: string) => {
+      const matchesName = (name: string, t: string) => {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const pattern = new RegExp(`(?:^|hey\\s+|@)${escaped}\\b|\\b${escaped}[,:]`, "i");
+        return pattern.test(t);
+      };
       return Array.from(agents.values()).filter((a) => {
         if (a.disabled) return false;
-        const name = a.name.toLowerCase();
-        const pattern = new RegExp(`(?:^|hey\\s+|@)${name}\\b|\\b${name}[,:]`, "i");
-        if (pattern.test(text)) return true;
-        if (name.includes(" ")) {
-          const firstName = name.split(" ")[0];
-          const firstNamePattern = new RegExp(`(?:^|hey\\s+|@)${firstName}\\b|\\b${firstName}[,:]`, "i");
-          return firstNamePattern.test(text);
+        if (matchesName(a.name, text)) return true;
+        if (a.name.includes(" ")) {
+          const firstName = a.name.split(" ")[0];
+          if (matchesName(firstName, text)) return true;
+        }
+        for (const alias of a.aliases ?? []) {
+          if (matchesName(alias, text)) return true;
         }
         return false;
       });
