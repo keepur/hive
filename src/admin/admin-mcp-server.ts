@@ -18,6 +18,7 @@ import type { AgentDefinition, AgentDefinitionVersion } from "../types/agent-def
 import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AutonomyFlags } from "../agents/autonomy.js";
 import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
+import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
 const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
@@ -137,18 +138,43 @@ server.registerTool(
   {
     title: "Create Agent",
     description:
-      "Create a new agent definition. Required: _id, name, model. Optional fields get sensible defaults. Must also provide soul and systemPrompt (or they default to empty strings).",
+      "Create a new agent definition. Required: _id, name, model, homeBase. Archetype is optional — pass it when the role is a discipline with shared infrastructure (see list_archetypes). Soul/systemPrompt shape the agent's voice and role; if omitted they default to empty strings. Additional tuning (channels, schedule, budget, autonomy, archetypeConfig, etc.) goes in `fields`.",
     inputSchema: {
       _id: z.string().describe("Agent ID (lowercase with hyphens, e.g. 'my-agent')"),
       name: z.string().describe("Display name for the agent"),
       model: z.string().describe("Model to use (e.g. 'claude-sonnet-4-6', 'claude-haiku-4-5')"),
+      homeBase: z
+        .string()
+        .describe(
+          "Primary Slack channel for scheduler delivery and default identity (e.g. 'agent-<id>'). The channel must exist in Slack.",
+        ),
+      soul: z
+        .string()
+        .optional()
+        .describe("Personality / voice / character definition (5-15 lines). Shapes how the agent talks."),
+      systemPrompt: z
+        .string()
+        .optional()
+        .describe(
+          "Role definition and guardrails. Concise. Instance-specific flavor — archetype framing layers underneath.",
+        ),
+      archetype: z
+        .string()
+        .optional()
+        .describe("Discipline id from list_archetypes (e.g. 'software-engineer'). Omit for plain unstructured agents."),
+      title: z
+        .string()
+        .optional()
+        .describe("Customer-facing title (e.g. 'VP Engineering'). Typically paired with archetype."),
       fields: z
         .record(z.string(), z.any())
         .optional()
-        .describe("Additional fields to set (channels, soul, systemPrompt, servers, etc.)"),
+        .describe(
+          "Additional fields (channels, passiveChannels, schedule, coreServers override, delegateServers, plugins, autonomy, archetypeConfig, budgetUsd, maxTurns, etc.)",
+        ),
     },
   },
-  async ({ _id, name, model, fields }) => {
+  async ({ _id, name, model, homeBase, soul, systemPrompt, archetype, title, fields }) => {
     const existing = await agentDefs.findOne({ _id: _id as any });
     if (existing) {
       return {
@@ -157,8 +183,7 @@ server.registerTool(
       };
     }
 
-    const f = fields ?? {};
-    if (typeof f.homeBase !== "string" || (f.homeBase as string).trim() === "") {
+    if (!homeBase || homeBase.trim() === "") {
       return {
         content: [
           {
@@ -170,6 +195,15 @@ server.registerTool(
       };
     }
 
+    if (archetype !== undefined && !getArchetype(archetype)) {
+      const known = listArchetypeIds().join(", ") || "(none registered)";
+      return {
+        content: [{ type: "text", text: `Unknown archetype: "${archetype}". Known: ${known}.` }],
+        isError: true,
+      };
+    }
+
+    const f = fields ?? {};
     const now = new Date();
     const doc: AgentDefinition = {
       _id,
@@ -177,19 +211,22 @@ server.registerTool(
       model,
       icon: (f.icon as string) ?? AGENT_DEFINITION_DEFAULTS.icon,
       channels: (f.channels as string[]) ?? [],
-      homeBase: (f.homeBase as string).trim(),
+      homeBase: homeBase.trim(),
       passiveChannels: (f.passiveChannels as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.passiveChannels],
       keywords: (f.keywords as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.keywords],
       isDefault: (f.isDefault as boolean) ?? false,
-      coreServers: (f.coreServers as string[]) ?? [],
-      delegateServers: (f.delegateServers as string[]) ?? [],
+      coreServers: (f.coreServers as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.coreServers],
+      delegateServers: (f.delegateServers as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.delegateServers],
       delegatePrompts: (f.delegatePrompts as Record<string, string>) ?? {
         ...AGENT_DEFINITION_DEFAULTS.delegatePrompts,
       },
       plugins: f.plugins as string[] | undefined,
       metadata: f.metadata as Record<string, unknown> | undefined,
-      soul: (f.soul as string) ?? "",
-      systemPrompt: (f.systemPrompt as string) ?? "",
+      soul: soul ?? (f.soul as string) ?? "",
+      systemPrompt: systemPrompt ?? (f.systemPrompt as string) ?? "",
+      archetype,
+      title,
+      archetypeConfig: f.archetypeConfig as Record<string, unknown> | undefined,
       schedule: (f.schedule as Array<{ cron: string; task: string }>) ?? [...AGENT_DEFINITION_DEFAULTS.schedule],
       subscribe: f.subscribe as string[] | undefined,
       budgetUsd: (f.budgetUsd as number) ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
@@ -214,7 +251,7 @@ server.registerTool(
       content: [
         {
           type: "text",
-          text: `Agent '${_id}' (${name}) created with model ${model}. Change will take effect within 30 seconds.`,
+          text: `Agent '${_id}' (${name}) created with model ${model}${archetype ? ` — archetype ${archetype}` : ""}. Change will take effect within 30 seconds.`,
         },
       ],
     };
@@ -230,15 +267,26 @@ server.registerTool(
   {
     title: "Update Agent",
     description:
-      "Update fields on an existing agent definition. Saves a version snapshot before mutation. Cannot change _id.",
+      "Update fields on an existing agent definition. Saves a version snapshot before mutation. Cannot change _id. Creation-boundary fields (homeBase, archetype, title, soul, systemPrompt) are promoted to top-level for discoverability; everything else goes in `fields`.",
     inputSchema: {
       agent_id: z.string().describe("The agent ID to update"),
+      homeBase: z.string().optional().describe("Primary Slack channel for scheduler delivery."),
+      soul: z.string().optional().describe("Personality / voice / character definition."),
+      systemPrompt: z.string().optional().describe("Role definition and guardrails."),
+      archetype: z
+        .string()
+        .optional()
+        .describe(
+          "Discipline id from list_archetypes. Pass null-style empty string to clear (note: fields.archetype: null also works via the fields bag).",
+        ),
+      title: z.string().optional().describe("Customer-facing title."),
       fields: z
         .record(z.string(), z.any())
-        .describe("Fields to update (e.g. { model: 'claude-sonnet-4-6', channels: ['general'] })"),
+        .optional()
+        .describe("Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.)"),
     },
   },
-  async ({ agent_id, fields }) => {
+  async ({ agent_id, homeBase, soul, systemPrompt, archetype, title, fields }) => {
     const existing = await agentDefs.findOne({ _id: agent_id as any });
     if (!existing) {
       return {
@@ -247,21 +295,41 @@ server.registerTool(
       };
     }
 
-    // Block immutable fields
-    if ("_id" in fields) {
+    const merged: Record<string, unknown> = { ...(fields ?? {}) };
+    if (homeBase !== undefined) merged.homeBase = homeBase;
+    if (soul !== undefined) merged.soul = soul;
+    if (systemPrompt !== undefined) merged.systemPrompt = systemPrompt;
+    if (archetype !== undefined) merged.archetype = archetype;
+    if (title !== undefined) merged.title = title;
+
+    if ("_id" in merged) {
       return {
         content: [{ type: "text", text: "Cannot change _id. Create a new agent instead." }],
         isError: true,
       };
     }
-    delete fields.createdAt;
+    delete merged.createdAt;
 
-    const changedFields = Object.keys(fields);
+    if (typeof merged.archetype === "string" && merged.archetype.length > 0 && !getArchetype(merged.archetype)) {
+      const known = listArchetypeIds().join(", ") || "(none registered)";
+      return {
+        content: [{ type: "text", text: `Unknown archetype: "${merged.archetype}". Known: ${known}.` }],
+        isError: true,
+      };
+    }
+
+    const changedFields = Object.keys(merged);
+    if (changedFields.length === 0) {
+      return {
+        content: [{ type: "text", text: `No fields to update for '${agent_id}'.` }],
+        isError: true,
+      };
+    }
     await saveVersion(agent_id, changedFields);
 
     await agentDefs.updateOne(
       { _id: agent_id as any },
-      { $set: { ...fields, updatedAt: new Date(), updatedBy: AGENT_ID } },
+      { $set: { ...merged, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
     triggerReload();
@@ -575,6 +643,38 @@ server.registerTool(
     ];
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// list_archetypes
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "list_archetypes",
+  {
+    title: "List Archetypes",
+    description:
+      "List registered agent archetypes with self-descriptions. Use this to decide whether an agent you are creating is a discipline-bound archetype (e.g. software-engineer) or a plain unstructured agent.",
+    inputSchema: {},
+  },
+  async () => {
+    const ids = listArchetypeIds();
+    const catalog = ids
+      .map((id) => {
+        const def = getArchetype(id);
+        if (!def) return null;
+        return {
+          id: def.id,
+          description: def.description ?? null,
+          whenToUse: def.whenToUse ?? null,
+          configSchema: def.configSchema ?? null,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+    return {
+      content: [{ type: "text", text: JSON.stringify(catalog, null, 2) }],
+    };
   },
 );
 

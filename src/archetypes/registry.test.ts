@@ -5,6 +5,7 @@ import {
   listArchetypeIds,
   __resetRegistryForTests,
   type ArchetypeDefinition,
+  type ArchetypeConfigFieldSchema,
 } from "./registry.js";
 
 function stub(id: string, overrides: Partial<ArchetypeDefinition> = {}): ArchetypeDefinition {
@@ -45,5 +46,34 @@ describe("archetype registry", () => {
       archetypeConfig: {},
     });
     expect(card).toBe("second");
+  });
+
+  it("registers an archetype without description/whenToUse/configSchema (back-compat)", () => {
+    registerArchetype(stub("legacy"));
+    const def = getArchetype("legacy");
+    expect(def).toBeDefined();
+    expect(def?.description).toBeUndefined();
+    expect(def?.whenToUse).toBeUndefined();
+    expect(def?.configSchema).toBeUndefined();
+  });
+
+  it("surfaces description/whenToUse/configSchema when provided", () => {
+    registerArchetype(
+      stub("software-engineer", {
+        description: "Owns codebases.",
+        whenToUse: "When the role centers on shipping code.",
+        configSchema: {
+          workshop: {
+            type: "string",
+            required: true,
+            description: "Engineering root.",
+          } satisfies ArchetypeConfigFieldSchema,
+        },
+      }),
+    );
+    const def = getArchetype("software-engineer");
+    expect(def?.description).toBe("Owns codebases.");
+    expect(def?.whenToUse).toBe("When the role centers on shipping code.");
+    expect(def?.configSchema?.workshop.required).toBe(true);
   });
 });
