@@ -55,7 +55,7 @@ Using common sense and memory, determine what the agent needs:
 
 **Then: discipline vs role-shape detection.** Call `list_archetypes`. For each returned archetype, compare the owner's described role against its `whenToUse`. If there's a clear match, plan to set `archetype` + `title` on the agent. Otherwise, create a plain agent (no archetype). Most agents are plain — they're defined by their soul and system prompt. A few roles are disciplines with shared infrastructure (e.g. `software-engineer` owns codebases and ships code through PRs, not free-text Edit).
 
-For MVP this collapses to: *"Is the agent primarily a software engineer?"* New archetypes expand the space automatically via `list_archetypes`.
+Let `list_archetypes` drive the decision — don't hardcode assumptions about which archetypes exist. Compare the owner's described role against each returned `whenToUse` independently.
 
 **SE archetype branch** — if `archetype: "software-engineer"`, ask one extra question:
 
@@ -99,7 +99,7 @@ Present the agent as a person, not a config:
 
 **ID collision check first.** Slugify the name (lowercase, hyphens) and call `agent_list` to ensure no collision. If taken, append a suffix or ask the owner for a variant. `_id` is immutable after creation.
 
-Call `agent_create` with the Phase 1 top-level schema:
+Call `agent_create` with these top-level fields:
 
 - `_id` — slug (checked above)
 - `name` — display name
