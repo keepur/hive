@@ -6,6 +6,7 @@ import { resolveAutonomy, type AutonomyFlags } from "../agents/autonomy.js";
 export interface AgentDefinition {
   _id: string; // "rae", "jasper" — immutable after creation
   name: string;
+  aliases?: string[]; // Short names / nicknames for name-based routing (e.g. ["Sam"] for "Samantha")
   icon: string;
 
   // LLM
@@ -89,6 +90,7 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
   return {
     id: doc._id,
     name: doc.name,
+    aliases: doc.aliases ?? [],
     model: doc.model,
     channels: doc.channels ?? [],
     homeBase: doc.homeBase,

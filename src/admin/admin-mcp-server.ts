@@ -210,6 +210,7 @@ server.registerTool(
     const doc: AgentDefinition = {
       _id,
       name,
+      aliases: f.aliases as string[] | undefined,
       model,
       icon: (f.icon as string) ?? AGENT_DEFINITION_DEFAULTS.icon,
       channels: (f.channels as string[]) ?? [],

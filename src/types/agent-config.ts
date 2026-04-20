@@ -9,6 +9,7 @@ export interface AgentSchedule {
 export interface AgentConfig {
   id: string;
   name: string;
+  aliases: string[];
   model: string;
   channels: string[];
   homeBase?: string;
