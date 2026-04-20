@@ -7,20 +7,152 @@ agents:
 
 # Agent Builder
 
-Create new agents conversationally. The owner describes what they need, you propose a role, configure the agent, and introduce it to the team.
+Create a new agent through a structured conversation. The owner describes what they need; you map it to a minimal agent definition, confirm, create it, and hand it off. One agent per invocation.
 
 ## When to use
 
-When the owner asks to create a new agent, add a team member, or needs help with a task that would be better handled by a dedicated agent.
+When the owner asks to create a new agent, add a team member, or describes ongoing work that would be better handled by a dedicated agent. Do NOT use this skill for modifying existing agents — that's a normal admin conversation using `agent_update` directly.
 
-## What to do
+## Prerequisites
 
-1. Understand what the owner needs — what problem, what domain, what tools
-2. Propose a role with a name, personality, and capabilities
-3. Confirm the proposal with the owner
-4. Create the agent definition using admin MCP tools:
-   - Set appropriate model ceiling (haiku for simple routing, sonnet for complex work)
-   - Assign relevant MCP servers from core servers
-   - Write a soul (personality) and system prompt (role/guardrails)
-   - Create a Slack channel for the agent
-5. Introduce the new agent to the owner in Slack
+By the time you invoke this skill, you should already have business context in memory (what the business does, team size, tools, communication channels). Reference it; don't re-gather it.
+
+**Fallback:** if memory is empty (fresh instance, first-time user), ask 1–2 orienting questions before starting — *"Before I build this, I need a bit of context. What does your business do, and how do you mainly communicate with customers?"* Do not turn this into a full onboarding session.
+
+## Flow
+
+Nine steps. One question at a time. Keep the loop tight — if confirmation takes more than 2–3 rounds, pause and ask: *"I want to get this right. Can you describe a typical day where this agent would help?"*
+
+### 1. INTAKE — the one job
+
+Detect which persona the owner is closer to and adapt:
+- **Outcomes/deliverables** ("I need someone who owns the weekly pipeline report") → *"What do you want this agent to deliver?"*
+- **Pain points/tasks** ("I spend three hours a day answering the same questions") → *"What do you do every day that's mechanical and eats your time?"*
+
+Get the **one job** — not a job description. If the owner describes multiple jobs ("sales AND calendar AND bookkeeping"), scope to one: *"Let's start with the one that would save you the most time. Which of those hurts the most?"*
+
+### 2. PERSONA — who they are
+
+This is the only step the owner drives. Shift from job to person:
+
+> *"Before I build this, let's talk about who they are. Any preferences on personality — formal and concise, or warm and conversational? Any other traits that matter?"*
+
+Depth follows owner interest:
+- **Cares a lot** → explore name, gender/pronouns, communication style, professional background, personality traits, boundaries. Go as deep as they want.
+- **Indifferent** ("just make them helpful") → pick reasonable defaults matching the business tone. Move on.
+
+Never ask about: model, technical capabilities, system-prompt details. You decide those.
+
+Draft the `soul` from the conversation (5–15 lines: personality, voice, values). Show it back: *"Here's how I'd describe them — does this feel right?"*
+
+### 3. MAP — capabilities needed
+
+Using common sense and memory, determine what the agent needs:
+- Communication channels (email, SMS, Slack, etc.)
+- Data access (CRM, calendar, catalog, etc.)
+- Actions (send emails, create tasks, update records, etc.)
+- Scheduled work (daily reports, sweeps)
+
+**Then: discipline vs role-shape detection.** Call `list_archetypes`. For each returned archetype, compare the owner's described role against its `whenToUse`. If there's a clear match, plan to set `archetype` + `title` on the agent. Otherwise, create a plain agent (no archetype). Most agents are plain — they're defined by their soul and system prompt. A few roles are disciplines with shared infrastructure (e.g. `software-engineer` owns codebases and ships code through PRs, not free-text Edit).
+
+For MVP this collapses to: *"Is the agent primarily a software engineer?"* New archetypes expand the space automatically via `list_archetypes`.
+
+**SE archetype branch** — if `archetype: "software-engineer"`, ask one extra question:
+
+> *"What's your engineering root directory? That's where the engineer will prototype and where codebases live. Default: `~/dev`."*
+
+Expand `~` to absolute path. Verify the directory exists before proceeding (prefer an admin helper if available; otherwise flag to the owner and proceed only after they confirm). Pass as `archetypeConfig: { workshop: "/absolute/path", workspaces: [] }`. **Do NOT ask about `workspaces`** — workspace registration is a separate future admin flow; it stays empty at creation.
+
+### 4. CHECK — what's configured
+
+Call `instance_capabilities`. See which MCP servers, integrations, and channels are live on this hive. Don't propose capabilities that require unconfigured integrations without flagging them.
+
+### 5. GAP — missing integrations
+
+If the owner's needs require something not configured:
+- **Set up now** (e.g. "Do you have a Google Workspace account? I can connect it.") → ask.
+- **Can't set up now** (integration doesn't exist) → scope the agent without it, note it as a future enhancement.
+- **Not needed yet** → leave it out. Don't preemptively ask *"do you also want…?"*
+
+### 6. PROPOSE — plain language
+
+Present the agent as a person, not a config:
+
+> *"Here's what I'd build:*
+>
+> ***Name:** Jordan*
+> ***Role:** Handles your customer email — reads incoming messages, drafts responses based on your product info, flags anything that needs your personal attention.*
+> ***Access:** Your Gmail inbox, product catalog, can send replies on your behalf.*
+> ***Schedule:** Checks inbox every 30 minutes during business hours.*
+>
+> *Sound right, or would you change anything?"*
+
+**Never surface:** MCP, server, autonomy, tool, system prompt, model tier, Haiku, Sonnet, Opus, coreServers, archetype, configSchema. The owner sees a person.
+
+### 7. CONFIRM — approve or tweak
+
+- Owner says yes → CREATE.
+- Owner says "but also…" → incorporate and re-propose.
+- Owner says "actually no" → back to INTAKE.
+
+### 8. CREATE — call `agent_create`
+
+**ID collision check first.** Slugify the name (lowercase, hyphens) and call `agent_list` to ensure no collision. If taken, append a suffix or ask the owner for a variant. `_id` is immutable after creation.
+
+Call `agent_create` with the Phase 1 top-level schema:
+
+- `_id` — slug (checked above)
+- `name` — display name
+- `model` — your choice (Haiku default; Sonnet for nuanced customer-facing or coordination work). Owner never sees this.
+- `homeBase` — `agent-<id>` (you will tell the owner to create this Slack channel in step 9)
+- `soul` — the draft from step 2
+- `systemPrompt` — concise role + guardrails; instance-specific flavor. For archetype agents, keep it short — the archetype card layers framing underneath.
+- `archetype` — set only when step 3's detection matched. Omit for plain agents.
+- `title` — customer-facing title paired with archetype (e.g. "VP Engineering"). Omit for plain agents.
+- `fields` — everything else:
+  - `channels` — if the owner named specific channels beyond homeBase
+  - `schedule` — cron tasks if applicable
+  - `archetypeConfig` — for SE: `{ workshop, workspaces: [] }`
+  - **`autonomy: { externalComms: false }`** — ALWAYS pass this explicitly unless the owner approved outbound comms (email/SMS) in the conversation. The system default is `true`; you must opt out.
+
+**Do NOT pass `coreServers`.** Phase 1's default (`memory`, `structured-memory`, `keychain`, `event-bus`, `contacts`) applies automatically. Override only if the owner's specifically approved tooling changes the baseline.
+
+### 9. INTRODUCE — hand-off
+
+Tell the owner:
+1. **Channel provisioning gap** — Hive agent channels are Slack channels that must exist. You cannot create them. Say: *"I need you (or a Slack admin) to create the #agent-jordan channel and invite the bot. Once that's done, Jordan is ready."* If no dedicated channel is wanted, tell them which existing channel the agent lives in.
+2. **One concrete thing to try** — *"Try asking Jordan to check your inbox right now."*
+3. **Invitation to iterate** — *"If Jordan needs more access or you want to change how they work, just let me know."*
+
+## Guardrails
+
+1. **One job, not a job description.** Single most important thing. Everything else is later.
+2. **Start minimal.** Fewest servers, simplest schedule, tightest scope. Easier to add than remove.
+3. **Don't offer what wasn't asked.** Owner didn't mention email → don't suggest email capabilities.
+4. **No jargon.** Never expose: MCP, server, autonomy, tool, system prompt, model tier, Haiku/Sonnet/Opus, coreServers, archetype.
+5. **When in doubt, leave it out.** An agent that does one thing well beats one that does five things poorly.
+6. **Name them like a person.** Not "Email Handler Bot" — a name you'd give a new hire.
+7. **Default to restrictive.** Haiku ceiling, low budget, limited servers, `externalComms: false`. Upgrade based on evidence.
+
+## Reference examples (for calibration, not copy)
+
+**Inbound communicator** — monitors a channel, responds to incoming messages, escalates what it can't handle.
+- Servers: communication channel + relevant data access + memory baseline. No schedule. `externalComms: true` only if owner approved replies.
+
+**Scheduled reporter** — gathers data on a schedule, produces a digest, posts to a channel.
+- Servers: data sources + slack (implicit) + memory baseline. Cron schedule. `externalComms: false` (posts internally).
+
+**Outbound coordinator** — proactively reaches out (follow-ups, reminders, outreach).
+- Servers: CRM + email/SMS + calendar + memory baseline. Multiple schedules. `externalComms: true` (owner explicitly approved outbound).
+
+**Internal operator** — manages tasks, tracks work, coordinates between people.
+- Servers: task ledger + CRM + memory baseline. Cron sweeps. `externalComms: false`.
+
+Use these as pattern-matching anchors for capability profiles — not templates to copy.
+
+## Out of scope
+
+- Modifying existing agents (use `agent_update` directly in a normal conversation).
+- Creating multiple agents per invocation.
+- Configuring new MCP servers or credentials (use the `credential-setup` skill).
+- Auto-provisioning Slack channels (human admin step; flag it in INTRODUCE).
