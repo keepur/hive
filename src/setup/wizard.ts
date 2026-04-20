@@ -619,6 +619,11 @@ async function doSlack(env: Record<string, string>, pkgRoot: string) {
         stdio: ["pipe", "pipe", "pipe"],
       });
     }
+    if (env.SLACK_MCP_TOKEN) {
+      execFileSync("honeypot", ["set", "SLACK_MCP_TOKEN", env.SLACK_MCP_TOKEN], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    }
   } catch {
     // honeypot may not be on PATH — .env is the primary store
   }
