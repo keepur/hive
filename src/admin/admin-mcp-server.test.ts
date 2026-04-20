@@ -160,7 +160,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
     const handler = registeredTools.get("agent_create")!;
     expect(handler).toBeDefined();
 
-    const result = await handler({ _id: "new-agent", name: "New Agent", model: "haiku", fields: {} });
+    const result = await handler({ _id: "new-agent", name: "New Agent", model: "haiku", homeBase: undefined });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/homeBase/);
@@ -173,7 +173,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
       _id: "new-agent",
       name: "New Agent",
       model: "haiku",
-      fields: { homeBase: "" },
+      homeBase: "",
     });
 
     expect(result.isError).toBe(true);
@@ -187,7 +187,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
       _id: "new-agent",
       name: "New Agent",
       model: "haiku",
-      fields: { homeBase: "   " },
+      homeBase: "   ",
     });
 
     expect(result.isError).toBe(true);
@@ -201,7 +201,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
       _id: "trimmed-agent",
       name: "Trimmed Agent",
       model: "haiku",
-      fields: { homeBase: "  agent-foo  " },
+      homeBase: "  agent-foo  ",
     });
 
     expect(result.isError).toBeFalsy();
@@ -215,7 +215,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
   it("rejects agent_create when fields is omitted entirely", async () => {
     const handler = registeredTools.get("agent_create")!;
 
-    const result = await handler({ _id: "new-agent", name: "New Agent", model: "haiku" });
+    const result = await handler({ _id: "new-agent", name: "New Agent", model: "haiku", homeBase: undefined });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/homeBase/);
@@ -229,11 +229,89 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
       _id: "existing-agent",
       name: "Dupe",
       model: "haiku",
-      fields: { homeBase: "agent-existing" },
+      homeBase: "agent-existing",
     });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/already exists/);
+  });
+});
+
+describe("agent_create — schema promotion and archetype support", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = new Map();
+  });
+
+  it("applies coreServers baseline when not provided", async () => {
+    const handler = registeredTools.get("agent_create");
+    const res = await handler!({
+      _id: "new-agent",
+      name: "New",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-new",
+    });
+    expect(res.isError).toBeFalsy();
+    const doc = agentDocsStore.get("new-agent");
+    expect(doc.coreServers).toEqual(["memory", "structured-memory", "keychain", "event-bus", "contacts"]);
+    expect(doc.delegateServers).toEqual([]);
+  });
+
+  it("honors explicit coreServers override", async () => {
+    const handler = registeredTools.get("agent_create");
+    await handler!({
+      _id: "explicit-server-agent",
+      name: "X",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-x",
+      fields: { coreServers: ["admin"] },
+    });
+    expect(agentDocsStore.get("explicit-server-agent").coreServers).toEqual(["admin"]);
+  });
+
+  it("writes archetype, title, and archetypeConfig into the document", async () => {
+    const handler = registeredTools.get("agent_create");
+    await handler!({
+      _id: "alex-test",
+      name: "Alex",
+      model: "claude-sonnet-4-6",
+      homeBase: "agent-alex",
+      archetype: "software-engineer",
+      title: "Head of Product",
+      fields: {
+        archetypeConfig: { workshop: "/tmp", workspaces: [] },
+      },
+    });
+    const doc = agentDocsStore.get("alex-test");
+    expect(doc.archetype).toBe("software-engineer");
+    expect(doc.title).toBe("Head of Product");
+    expect(doc.archetypeConfig).toEqual({ workshop: "/tmp", workspaces: [] });
+  });
+
+  it("rejects unknown archetype", async () => {
+    const handler = registeredTools.get("agent_create");
+    const res = await handler!({
+      _id: "bad-archetype",
+      name: "Bad",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-bad",
+      archetype: "bookkeeper",
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Unknown archetype");
+    expect(agentDocsStore.has("bad-archetype")).toBe(false);
+  });
+
+  it("still requires homeBase", async () => {
+    const handler = registeredTools.get("agent_create");
+    const res = await handler!({
+      _id: "no-home",
+      name: "No",
+      model: "claude-haiku-4-5",
+      homeBase: "",
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("homeBase");
   });
 });
 
