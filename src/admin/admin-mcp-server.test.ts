@@ -439,6 +439,61 @@ describe("agent_create — archetype edge cases", () => {
   });
 });
 
+describe("verify_path", () => {
+  it("returns exists+isDirectory for a real directory", async () => {
+    const handler = registeredTools.get("verify_path");
+    expect(handler).toBeDefined();
+    const res = await handler!({ path: "/tmp" });
+    expect(res.isError).toBeFalsy();
+    const payload = JSON.parse(res.content[0].text as string);
+    expect(payload.exists).toBe(true);
+    expect(payload.isDirectory).toBe(true);
+    expect(payload.resolved).toBe("/tmp");
+  });
+
+  it("returns isDirectory=false for a path that is a file, not a directory", async () => {
+    const { writeFileSync, mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "verify-path-"));
+    const filePath = join(dir, "f.txt");
+    writeFileSync(filePath, "x");
+    try {
+      const handler = registeredTools.get("verify_path");
+      const res = await handler!({ path: filePath });
+      expect(res.isError).toBeFalsy();
+      const payload = JSON.parse(res.content[0].text as string);
+      expect(payload.exists).toBe(true);
+      expect(payload.isDirectory).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns exists=false for a missing path without erroring", async () => {
+    const handler = registeredTools.get("verify_path");
+    const res = await handler!({ path: "/definitely/does/not/exist/anywhere-xyz-123" });
+    expect(res.isError).toBeFalsy();
+    const payload = JSON.parse(res.content[0].text as string);
+    expect(payload.exists).toBe(false);
+    expect(payload.isDirectory).toBe(false);
+  });
+
+  it("rejects non-absolute paths as isError", async () => {
+    const handler = registeredTools.get("verify_path");
+    const res = await handler!({ path: "relative/path" });
+    expect(res.isError).toBe(true);
+    const payload = JSON.parse(res.content[0].text as string);
+    expect(payload.error).toContain("absolute");
+  });
+
+  it("rejects empty path as isError", async () => {
+    const handler = registeredTools.get("verify_path");
+    const res = await handler!({ path: "" });
+    expect(res.isError).toBe(true);
+  });
+});
+
 describe("agent_update — archetype clear semantics", () => {
   it("accepts empty-string archetype as an explicit clear (skips registry validation)", async () => {
     agentDocsStore.set("to-clear", {
