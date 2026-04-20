@@ -138,18 +138,43 @@ server.registerTool(
   {
     title: "Create Agent",
     description:
-      "Create a new agent definition. Required: _id, name, model. Optional fields get sensible defaults. Must also provide soul and systemPrompt (or they default to empty strings).",
+      "Create a new agent definition. Required: _id, name, model, homeBase. Archetype is optional — pass it when the role is a discipline with shared infrastructure (see list_archetypes). Soul/systemPrompt shape the agent's voice and role; if omitted they default to empty strings. Additional tuning (channels, schedule, budget, autonomy, archetypeConfig, etc.) goes in `fields`.",
     inputSchema: {
       _id: z.string().describe("Agent ID (lowercase with hyphens, e.g. 'my-agent')"),
       name: z.string().describe("Display name for the agent"),
       model: z.string().describe("Model to use (e.g. 'claude-sonnet-4-6', 'claude-haiku-4-5')"),
+      homeBase: z
+        .string()
+        .describe(
+          "Primary Slack channel for scheduler delivery and default identity (e.g. 'agent-<id>'). The channel must exist in Slack.",
+        ),
+      soul: z
+        .string()
+        .optional()
+        .describe("Personality / voice / character definition (5-15 lines). Shapes how the agent talks."),
+      systemPrompt: z
+        .string()
+        .optional()
+        .describe("Role definition and guardrails. Concise. Instance-specific flavor — archetype framing layers underneath."),
+      archetype: z
+        .string()
+        .optional()
+        .describe(
+          "Discipline id from list_archetypes (e.g. 'software-engineer'). Omit for plain unstructured agents.",
+        ),
+      title: z
+        .string()
+        .optional()
+        .describe("Customer-facing title (e.g. 'VP Engineering'). Typically paired with archetype."),
       fields: z
         .record(z.string(), z.any())
         .optional()
-        .describe("Additional fields to set (channels, soul, systemPrompt, servers, etc.)"),
+        .describe(
+          "Additional fields (channels, passiveChannels, schedule, coreServers override, delegateServers, plugins, autonomy, archetypeConfig, budgetUsd, maxTurns, etc.)",
+        ),
     },
   },
-  async ({ _id, name, model, fields }) => {
+  async ({ _id, name, model, homeBase, soul, systemPrompt, archetype, title, fields }) => {
     const existing = await agentDefs.findOne({ _id: _id as any });
     if (existing) {
       return {
@@ -158,8 +183,7 @@ server.registerTool(
       };
     }
 
-    const f = fields ?? {};
-    if (typeof f.homeBase !== "string" || (f.homeBase as string).trim() === "") {
+    if (!homeBase || homeBase.trim() === "") {
       return {
         content: [
           {
@@ -171,6 +195,15 @@ server.registerTool(
       };
     }
 
+    if (archetype !== undefined && !getArchetype(archetype)) {
+      const known = listArchetypeIds().join(", ") || "(none registered)";
+      return {
+        content: [{ type: "text", text: `Unknown archetype: "${archetype}". Known: ${known}.` }],
+        isError: true,
+      };
+    }
+
+    const f = fields ?? {};
     const now = new Date();
     const doc: AgentDefinition = {
       _id,
@@ -178,19 +211,22 @@ server.registerTool(
       model,
       icon: (f.icon as string) ?? AGENT_DEFINITION_DEFAULTS.icon,
       channels: (f.channels as string[]) ?? [],
-      homeBase: (f.homeBase as string).trim(),
+      homeBase: homeBase.trim(),
       passiveChannels: (f.passiveChannels as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.passiveChannels],
       keywords: (f.keywords as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.keywords],
       isDefault: (f.isDefault as boolean) ?? false,
-      coreServers: (f.coreServers as string[]) ?? [],
-      delegateServers: (f.delegateServers as string[]) ?? [],
+      coreServers: (f.coreServers as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.coreServers],
+      delegateServers: (f.delegateServers as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.delegateServers],
       delegatePrompts: (f.delegatePrompts as Record<string, string>) ?? {
         ...AGENT_DEFINITION_DEFAULTS.delegatePrompts,
       },
       plugins: f.plugins as string[] | undefined,
       metadata: f.metadata as Record<string, unknown> | undefined,
-      soul: (f.soul as string) ?? "",
-      systemPrompt: (f.systemPrompt as string) ?? "",
+      soul: soul ?? (f.soul as string) ?? "",
+      systemPrompt: systemPrompt ?? (f.systemPrompt as string) ?? "",
+      archetype,
+      title,
+      archetypeConfig: f.archetypeConfig as Record<string, unknown> | undefined,
       schedule: (f.schedule as Array<{ cron: string; task: string }>) ?? [...AGENT_DEFINITION_DEFAULTS.schedule],
       subscribe: f.subscribe as string[] | undefined,
       budgetUsd: (f.budgetUsd as number) ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
@@ -215,7 +251,7 @@ server.registerTool(
       content: [
         {
           type: "text",
-          text: `Agent '${_id}' (${name}) created with model ${model}. Change will take effect within 30 seconds.`,
+          text: `Agent '${_id}' (${name}) created with model ${model}${archetype ? ` — archetype ${archetype}` : ""}. Change will take effect within 30 seconds.`,
         },
       ],
     };
