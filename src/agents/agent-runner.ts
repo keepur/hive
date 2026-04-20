@@ -754,6 +754,11 @@ export class AgentRunner {
     coreSet.add("schedule");
     // team is an implicit core server — available to all agents unconditionally
     coreSet.add("team");
+    // slack is an implicit core server — it's the default comms channel for every agent.
+    // The server itself is only built when SLACK_MCP_TOKEN is configured (see buildAllServerConfigs),
+    // so this is a no-op for Slack-less instances. Agents that should not post to Slack can be
+    // gated via an autonomy flag rather than by omitting the server.
+    coreSet.add("slack");
     // workflow is an implicit core server when workflow layer is enabled
     if (config.workflow.enabled) {
       coreSet.add("workflow");
