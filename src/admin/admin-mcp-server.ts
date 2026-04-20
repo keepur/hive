@@ -14,6 +14,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { MongoClient } from "mongodb";
+import { statSync } from "node:fs";
+import { isAbsolute, resolve as resolvePath } from "node:path";
 import type { AgentDefinition, AgentDefinitionVersion } from "../types/agent-definition.js";
 import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AutonomyFlags } from "../agents/autonomy.js";
@@ -675,6 +677,75 @@ server.registerTool(
     return {
       content: [{ type: "text", text: JSON.stringify(catalog, null, 2) }],
     };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// verify_path
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "verify_path",
+  {
+    title: "Verify Filesystem Path",
+    description:
+      "Check that an absolute filesystem path exists and is a directory. Used by the agent-builder skill to validate archetype-config paths (e.g. software-engineer `workshop`) before agent creation, so the caller catches typos at creation time instead of at agent-load time.",
+    inputSchema: {
+      path: z
+        .string()
+        .describe(
+          "Absolute filesystem path to verify. Must start with '/'. Tilde (~) is not expanded — callers must pre-expand.",
+        ),
+    },
+  },
+  async ({ path }) => {
+    if (typeof path !== "string" || path.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ exists: false, isDirectory: false, error: "path must be a non-empty string" }),
+          },
+        ],
+        isError: true,
+      };
+    }
+    if (!isAbsolute(path)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              exists: false,
+              isDirectory: false,
+              error: `path must be absolute (start with '/'); got "${path}"`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const resolved = resolvePath(path);
+    try {
+      const st = statSync(resolved);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ exists: true, isDirectory: st.isDirectory(), resolved }),
+          },
+        ],
+      };
+    } catch {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ exists: false, isDirectory: false, resolved }),
+          },
+        ],
+      };
+    }
   },
 );
 
