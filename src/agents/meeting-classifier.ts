@@ -34,7 +34,7 @@ Rules:
 
 Respond with ONLY a JSON object: { "respond": ["agent-id-1", "agent-id-2"] }`;
 
-function parseClassifierOutput(
+export function parseClassifierOutput(
   text: string,
   validIds: Set<string>,
 ): string[] | null {
