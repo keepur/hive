@@ -1,3 +1,37 @@
+# Agent Creation UX — Phase 2 Implementation Plan
+
+> **For agentic workers:** Use dodi-dev:implement to execute this plan.
+
+**Goal:** Replace the 170-word stub `agent-builder` SKILL.md with the materialized 9-step conversational flow (INTAKE → PERSONA → MAP → CHECK → GAP → PROPOSE → CONFIRM → CREATE → INTRODUCE), wired to the Phase 1 admin surface (`list_archetypes`, `instance_capabilities`, promoted `agent_create` schema).
+
+**Architecture:** Single-file change. SKILL.md is read from disk at session start by the chief-of-staff — no code changes, no DB migration, no `setup:seeds` re-run. The Phase 1 surface is already live (commit a228ce0), so the skill can reference `list_archetypes`, the `coreServers` baseline, and the top-level `agent_create` fields verbatim.
+
+**Tech Stack:** Markdown (skill prompt). No tests — per spec §"Phase 2 validation", correctness is validated manually by Hermi creating a test agent and verifying the resulting document.
+
+**Spec:** [2026-04-20-agent-creation-ux-design.md](../specs/2026-04-20-agent-creation-ux-design.md) §Phase 2 (lines 186–246). Authoritative design: [2026-04-08-agent-builder-design.md](../specs/2026-04-08-agent-builder-design.md).
+
+---
+
+## File Structure
+
+| File | Change | Responsibility |
+|---|---|---|
+| `seeds/chief-of-staff/skills/agent-builder/skills/agent-builder/SKILL.md` | Rewrite | Full 9-step flow, discipline detection via `list_archetypes`, SE archetype branch (workshop only), guardrails, explicit defaults, 4 reference profiles. |
+
+---
+
+### Task 1: Rewrite the agent-builder SKILL.md
+
+**Files:**
+- Modify: `seeds/chief-of-staff/skills/agent-builder/skills/agent-builder/SKILL.md` (full rewrite; replace everything below the frontmatter)
+
+**Preserve:** frontmatter exactly as-is (`name`, `description`, `agents` — other sibling skills under `seeds/chief-of-staff/skills/*/skills/*/SKILL.md` all follow the same shape, confirmed by reading the current file and `capability-inventory`/`credential-setup`/`onboarding` peers).
+
+**Replace the body with:**
+
+- [ ] **Step 1:** Overwrite the file with the following content.
+
+```markdown
 ---
 name: agent-builder
 description: Conversational agent creation — propose roles, configure agents, introduce them to the team
@@ -55,7 +89,7 @@ Using common sense and memory, determine what the agent needs:
 
 **Then: discipline vs role-shape detection.** Call `list_archetypes`. For each returned archetype, compare the owner's described role against its `whenToUse`. If there's a clear match, plan to set `archetype` + `title` on the agent. Otherwise, create a plain agent (no archetype). Most agents are plain — they're defined by their soul and system prompt. A few roles are disciplines with shared infrastructure (e.g. `software-engineer` owns codebases and ships code through PRs, not free-text Edit).
 
-Let `list_archetypes` drive the decision — don't hardcode assumptions about which archetypes exist. Compare the owner's described role against each returned `whenToUse` independently.
+For MVP this collapses to: *"Is the agent primarily a software engineer?"* New archetypes expand the space automatically via `list_archetypes`.
 
 **SE archetype branch** — if `archetype: "software-engineer"`, ask one extra question:
 
@@ -99,7 +133,7 @@ Present the agent as a person, not a config:
 
 **ID collision check first.** Slugify the name (lowercase, hyphens) and call `agent_list` to ensure no collision. If taken, append a suffix or ask the owner for a variant. `_id` is immutable after creation.
 
-Call `agent_create` with these top-level fields:
+Call `agent_create` with the Phase 1 top-level schema:
 
 - `_id` — slug (checked above)
 - `name` — display name
@@ -156,3 +190,41 @@ Use these as pattern-matching anchors for capability profiles — not templates 
 - Creating multiple agents per invocation.
 - Configuring new MCP servers or credentials (use the `credential-setup` skill).
 - Auto-provisioning Slack channels (human admin step; flag it in INTRODUCE).
+```
+
+- [ ] **Step 2:** Verify the frontmatter is intact and the file is well-formed.
+
+Run: `head -10 seeds/chief-of-staff/skills/agent-builder/skills/agent-builder/SKILL.md`
+
+Expected: the four-line YAML frontmatter (`name: agent-builder`, `description: …`, `agents:`, `  - chief-of-staff`) followed by `---` and `# Agent Builder`.
+
+- [ ] **Step 3:** Sanity check that no code references the old skill content.
+
+Run: `Grep pattern="Understand what the owner needs" path="."`
+
+Expected: no matches (confirms the stub is fully replaced).
+
+- [ ] **Step 4:** Run the repo check (markdown is not linted, but prettier/format may touch the file; catches anything unexpected).
+
+Run: `cd ~/github/hive && npm run check`
+
+Expected: all green. If prettier reformats the markdown, accept its output — the content is what matters, not the exact wrapping.
+
+- [ ] **Step 5:** Commit.
+
+```bash
+git add seeds/chief-of-staff/skills/agent-builder/skills/agent-builder/SKILL.md
+git commit -m "feat(agent-builder): materialize Phase 2 skill — 9-step flow, archetype detection, guardrails (KPR-42)"
+```
+
+---
+
+## Notes for the implementer
+
+- This is a single-file prose change. No typecheck/test risk beyond what `npm run check` catches.
+- The frontmatter (`name`, `description`, `agents`) stays exactly as it is today — sibling skills in `seeds/chief-of-staff/skills/*/skills/*/SKILL.md` all share this shape, and the chief-of-staff loader expects it.
+- Skill content must reference Phase 1 tool names exactly as shipped: `list_archetypes`, `instance_capabilities`, `agent_create`, `agent_update`, `agent_list`. Top-level `agent_create` params are `_id`, `name`, `model`, `homeBase`, `soul`, `systemPrompt`, `archetype`, `title`, `fields`.
+- The `autonomy.externalComms: false` instruction is load-bearing — the system default is `true`, and Phase 2 must opt agents out unless the owner explicitly approves outbound comms. Call this out in the CREATE step and in the guardrails.
+- Do NOT add `coreServers` to the skill's default payload — Phase 1's baseline (`memory`, `structured-memory`, `keychain`, `event-bus`, `contacts`) applies on its own. Mentioning it in the skill would couple the skill to a list that may drift.
+- Deployment: no `setup:seeds` re-run; skill markdown is read from disk at session start. After merge + deploy, Hermi picks up the new skill on her next message.
+- Validation is manual (per spec): have Hermi create a test agent; confirm archetype (if applicable), coreServers populated, soul/systemPrompt shaped from conversation, `autonomy.externalComms: false` unless explicitly approved.
