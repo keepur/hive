@@ -38,7 +38,21 @@ export interface ArchetypeSessionContext<C> {
   workItemContext?: WorkItemContext;
 }
 
-export interface ArchetypeDefinition<Config = unknown> {
+/** Shape describing one archetypeConfig field for skill discovery. */
+export interface ArchetypeConfigFieldSchema {
+  type: "string" | "number" | "boolean" | "array" | "object";
+  required: boolean;
+  description: string;
+}
+
+/** Self-description surfaced by list_archetypes. All fields optional for back-compat. */
+export interface ArchetypeDescription {
+  description?: string;
+  whenToUse?: string;
+  configSchema?: Record<string, ArchetypeConfigFieldSchema>;
+}
+
+export interface ArchetypeDefinition<Config = unknown> extends ArchetypeDescription {
   /** Stable discipline id, e.g. "software-engineer". */
   id: string;
 
