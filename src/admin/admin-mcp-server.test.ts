@@ -110,6 +110,8 @@ vi.mock("mongodb", () => ({
 
 // Import the server module — triggers top-level await (mocked) and tool registration
 await import("./admin-mcp-server.js");
+// Ensure the software-engineer archetype is registered in the registry
+await import("../archetypes/software-engineer/index.js");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -270,5 +272,24 @@ describe("admin-mcp-server — agent_update homeBase passthrough", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found/);
+  });
+});
+
+describe("list_archetypes", () => {
+  it("returns the registered archetype catalog with discovery fields", async () => {
+    const handler = registeredTools.get("list_archetypes");
+    expect(handler).toBeDefined();
+    const result = await handler!({});
+    const text = result.content[0].text as string;
+    const catalog = JSON.parse(text) as Array<{
+      id: string;
+      description: string | null;
+      whenToUse: string | null;
+      configSchema: Record<string, unknown> | null;
+    }>;
+    const se = catalog.find((c) => c.id === "software-engineer");
+    expect(se).toBeDefined();
+    expect(se?.description).toContain("codebases");
+    expect(se?.configSchema).toHaveProperty("workshop");
   });
 });
