@@ -21,7 +21,6 @@ schedule:
     task: memory-review
 coreServers:
   - memory
-  - slack
   - conversation-search
   - callback
   - event-bus
