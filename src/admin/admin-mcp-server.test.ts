@@ -415,6 +415,43 @@ describe("list_archetypes", () => {
     const se = catalog.find((c) => c.id === "software-engineer");
     expect(se).toBeDefined();
     expect(se?.description).toContain("codebases");
+    expect(se?.whenToUse).toContain("production code");
     expect(se?.configSchema).toHaveProperty("workshop");
+    expect(se?.configSchema?.workshop).toMatchObject({ type: "string", required: true });
+    expect(se?.configSchema?.workspaces).toMatchObject({ type: "array", required: false });
+  });
+});
+
+describe("agent_create — archetype edge cases", () => {
+  it("accepts archetype without archetypeConfig (validateConfig runs at load time, not create)", async () => {
+    const handler = registeredTools.get("agent_create");
+    const res = await handler!({
+      _id: "se-no-config",
+      name: "NoConfig",
+      model: "claude-sonnet-4-6",
+      homeBase: "agent-nc",
+      archetype: "software-engineer",
+    });
+    expect(res.isError).toBeFalsy();
+    const doc = agentDocsStore.get("se-no-config");
+    expect(doc.archetype).toBe("software-engineer");
+    expect(doc.archetypeConfig).toBeUndefined();
+  });
+});
+
+describe("agent_update — archetype clear semantics", () => {
+  it("accepts empty-string archetype as an explicit clear (skips registry validation)", async () => {
+    agentDocsStore.set("to-clear", {
+      _id: "to-clear",
+      name: "TC",
+      model: "claude-sonnet-4-6",
+      homeBase: "agent-tc",
+      archetype: "software-engineer",
+    });
+    const handler = registeredTools.get("agent_update");
+    const res = await handler!({ agent_id: "to-clear", archetype: "" });
+    expect(res.isError).toBeFalsy();
+    const doc = agentDocsStore.get("to-clear");
+    expect(doc.archetype).toBe("");
   });
 });
