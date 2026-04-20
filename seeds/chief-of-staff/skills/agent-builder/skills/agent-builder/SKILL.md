@@ -61,7 +61,7 @@ Let `list_archetypes` drive the decision — don't hardcode assumptions about wh
 
 > *"What's your engineering root directory? That's where the engineer will prototype and where codebases live. Default: `~/dev`."*
 
-Expand `~` to absolute path. Verify the directory exists before proceeding (prefer an admin helper if available; otherwise flag to the owner and proceed only after they confirm). Pass as `archetypeConfig: { workshop: "/absolute/path", workspaces: [] }`. **Do NOT ask about `workspaces`** — workspace registration is a separate future admin flow; it stays empty at creation.
+Expand `~` to an absolute path (e.g. `~/dev` → `/Users/<owner>/dev`). Then call `verify_path` with the absolute path — the tool returns `{ exists, isDirectory, resolved }`. If `exists` is false or `isDirectory` is false, tell the owner the path wasn't found and ask for a different one (or for them to create it first). Only proceed with creation once `verify_path` returns `exists: true` and `isDirectory: true`. Pass as `archetypeConfig: { workshop: "/absolute/path", workspaces: [] }`. **Do NOT ask about `workspaces`** — workspace registration is a separate future admin flow; it stays empty at creation.
 
 ### 4. CHECK — what's configured
 
