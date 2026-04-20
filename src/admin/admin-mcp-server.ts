@@ -267,15 +267,26 @@ server.registerTool(
   {
     title: "Update Agent",
     description:
-      "Update fields on an existing agent definition. Saves a version snapshot before mutation. Cannot change _id.",
+      "Update fields on an existing agent definition. Saves a version snapshot before mutation. Cannot change _id. Creation-boundary fields (homeBase, archetype, title, soul, systemPrompt) are promoted to top-level for discoverability; everything else goes in `fields`.",
     inputSchema: {
       agent_id: z.string().describe("The agent ID to update"),
+      homeBase: z.string().optional().describe("Primary Slack channel for scheduler delivery."),
+      soul: z.string().optional().describe("Personality / voice / character definition."),
+      systemPrompt: z.string().optional().describe("Role definition and guardrails."),
+      archetype: z
+        .string()
+        .optional()
+        .describe(
+          "Discipline id from list_archetypes. Pass null-style empty string to clear (note: fields.archetype: null also works via the fields bag).",
+        ),
+      title: z.string().optional().describe("Customer-facing title."),
       fields: z
         .record(z.string(), z.any())
-        .describe("Fields to update (e.g. { model: 'claude-sonnet-4-6', channels: ['general'] })"),
+        .optional()
+        .describe("Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.)"),
     },
   },
-  async ({ agent_id, fields }) => {
+  async ({ agent_id, homeBase, soul, systemPrompt, archetype, title, fields }) => {
     const existing = await agentDefs.findOne({ _id: agent_id as any });
     if (!existing) {
       return {
@@ -284,21 +295,41 @@ server.registerTool(
       };
     }
 
-    // Block immutable fields
-    if ("_id" in fields) {
+    const merged: Record<string, unknown> = { ...(fields ?? {}) };
+    if (homeBase !== undefined) merged.homeBase = homeBase;
+    if (soul !== undefined) merged.soul = soul;
+    if (systemPrompt !== undefined) merged.systemPrompt = systemPrompt;
+    if (archetype !== undefined) merged.archetype = archetype;
+    if (title !== undefined) merged.title = title;
+
+    if ("_id" in merged) {
       return {
         content: [{ type: "text", text: "Cannot change _id. Create a new agent instead." }],
         isError: true,
       };
     }
-    delete fields.createdAt;
+    delete merged.createdAt;
 
-    const changedFields = Object.keys(fields);
+    if (typeof merged.archetype === "string" && merged.archetype.length > 0 && !getArchetype(merged.archetype)) {
+      const known = listArchetypeIds().join(", ") || "(none registered)";
+      return {
+        content: [{ type: "text", text: `Unknown archetype: "${merged.archetype}". Known: ${known}.` }],
+        isError: true,
+      };
+    }
+
+    const changedFields = Object.keys(merged);
+    if (changedFields.length === 0) {
+      return {
+        content: [{ type: "text", text: `No fields to update for '${agent_id}'.` }],
+        isError: true,
+      };
+    }
     await saveVersion(agent_id, changedFields);
 
     await agentDefs.updateOne(
       { _id: agent_id as any },
-      { $set: { ...fields, updatedAt: new Date(), updatedBy: AGENT_ID } },
+      { $set: { ...merged, updatedAt: new Date(), updatedBy: AGENT_ID } },
     );
 
     triggerReload();

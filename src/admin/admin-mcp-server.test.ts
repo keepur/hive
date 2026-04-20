@@ -351,6 +351,53 @@ describe("admin-mcp-server — agent_update homeBase passthrough", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found/);
   });
+
+  it("accepts archetype via top-level promotion", async () => {
+    agentDocsStore.set("alex-test", {
+      _id: "alex-test",
+      name: "Alex",
+      model: "claude-sonnet-4-6",
+      homeBase: "agent-alex",
+      coreServers: ["memory"],
+    });
+    const handler = registeredTools.get("agent_update");
+    const res = await handler!({
+      agent_id: "alex-test",
+      archetype: "software-engineer",
+      title: "Head of Product",
+      fields: { archetypeConfig: { workshop: "/tmp", workspaces: [] } },
+    });
+    expect(res.isError).toBeFalsy();
+    const doc = agentDocsStore.get("alex-test");
+    expect(doc.archetype).toBe("software-engineer");
+    expect(doc.title).toBe("Head of Product");
+    expect(doc.archetypeConfig).toEqual({ workshop: "/tmp", workspaces: [] });
+  });
+
+  it("rejects unknown archetype on update", async () => {
+    agentDocsStore.set("someone", {
+      _id: "someone",
+      name: "S",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-s",
+    });
+    const handler = registeredTools.get("agent_update");
+    const res = await handler!({ agent_id: "someone", archetype: "bookkeeper" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Unknown archetype");
+  });
+
+  it("errors when no updatable fields are provided", async () => {
+    agentDocsStore.set("empty-update", {
+      _id: "empty-update",
+      name: "E",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-e",
+    });
+    const handler = registeredTools.get("agent_update");
+    const res = await handler!({ agent_id: "empty-update" });
+    expect(res.isError).toBe(true);
+  });
 });
 
 describe("list_archetypes", () => {
