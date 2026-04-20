@@ -7,6 +7,11 @@ import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
+import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
+import {
+  classifyMeetingMessage,
+  type RosterMember,
+} from "../agents/meeting-classifier.js";
 
 const log = createLogger("dispatcher");
 
@@ -27,6 +32,16 @@ const NON_RESPONSE_PATTERNS = [
   /^n\/a\.?$/i,
 ];
 
+/** Extended resolved-agent type carrying optional conference metadata */
+interface ResolvedAgent {
+  agentId: string;
+  conferenceMode?: boolean;
+  conferenceHumanTs?: string;
+  conferenceRound?: number; // 0 = human-triggered, 1 = peer reaction
+  threadContext?: string;
+  meetingPreamble?: string;
+}
+
 export class Dispatcher {
   private adapters = new Map<string, ChannelAdapter>();
   private registry: AgentRegistry;
@@ -43,6 +58,10 @@ export class Dispatcher {
   private taskLedger?: TaskLedger;
   private retryQueue?: RetryQueue;
   private teamStore?: import("../team/team-store.js").TeamStore;
+  private slackAdapter?: SlackAdapter;
+  private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
+  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — tracks which agents reacted in round 1
+  private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
 
@@ -76,6 +95,10 @@ export class Dispatcher {
     this.auditAdapter = adapter;
     this.auditChannelIds = channelIdByName;
     this.fallbackAuditChannelId = fallbackChannelId;
+  }
+
+  setSlackAdapter(adapter: SlackAdapter): void {
+    this.slackAdapter = adapter;
   }
 
   async dispatch(item: WorkItem): Promise<void> {
@@ -138,12 +161,15 @@ export class Dispatcher {
     // Fan-out: if multiple agents resolved, dispatch to each concurrently
     if (activeList.length > 1) {
       const threadId = item.threadId ?? item.id;
-      // Persist participant set so follow-up messages fan out to all participants
-      if (!this.threadParticipants.has(threadId)) {
+      // Conference mode tracks roster separately — don't write to threadParticipants
+      const isConference = activeList.some((r) => r.conferenceMode);
+      if (!isConference && !this.threadParticipants.has(threadId)) {
         this.threadParticipants.set(threadId, new Set(activeList.map((r) => r.agentId)));
       }
       this.threadAgentLastSeen.set(threadId, Date.now());
-      log.info("Multi-agent fan-out", { agents: activeList.map((r) => r.agentId) });
+      log.info(isConference ? "Conference fan-out" : "Multi-agent fan-out", {
+        agents: activeList.map((r) => r.agentId),
+      });
       await Promise.all(activeList.map((r) => this.dispatchToAgent(item, r)));
       return;
     }
@@ -251,7 +277,7 @@ export class Dispatcher {
     }
   }
 
-  private async resolveAgents(item: WorkItem): Promise<{ agentId: string }[]> {
+  private async resolveAgents(item: WorkItem): Promise<ResolvedAgent[]> {
     // 0. Explicit target — callbacks and internal routing specify exact agent
     //    Always returns single agent, even in multi-agent threads
     const targetAgentId = item.meta?.targetAgentId as string | undefined;
@@ -279,6 +305,11 @@ export class Dispatcher {
         text: item.text.slice(0, 50),
       });
       return [];
+    }
+
+    // 0.7 Conference channel — meeting mode with classifier-gated fan-out
+    if (item.source.kind === "slack" && item.source.label.startsWith("conf-")) {
+      return this.resolveConferenceAgents(item);
     }
 
     // 1. Dedicated channel mapping — always route to channel owner
@@ -432,24 +463,49 @@ export class Dispatcher {
   }
 
   /** Dispatch a single work item to a single agent (used for fan-out) */
-  private async dispatchToAgent(item: WorkItem, resolved: { agentId: string }): Promise<void> {
+  private async dispatchToAgent(item: WorkItem, resolved: ResolvedAgent): Promise<void> {
     const { agentId } = resolved;
 
-    const threadId = item.threadId ?? item.id;
+    // Conference mode: inject thread context + preamble into the WorkItem
+    let effectiveItem = item;
+    if (resolved.conferenceMode) {
+      const contextPrefix = [
+        resolved.meetingPreamble,
+        "",
+        resolved.threadContext,
+        "",
+        "---",
+        `[New message]:`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+      effectiveItem = {
+        ...item,
+        text: `${contextPrefix}\n${item.text}`,
+        meta: {
+          ...item.meta,
+          conferenceMode: true,
+          conferenceHumanTs: resolved.conferenceHumanTs,
+          conferenceRound: resolved.conferenceRound,
+        },
+      };
+    }
+
+    const threadId = effectiveItem.threadId ?? effectiveItem.id;
     // Refresh TTL for multi-agent threads (affinity already set by resolveAgents)
     this.threadAgentLastSeen.set(threadId, Date.now());
 
-    const tracked = this.taskLedger?.shouldTrack(item) ?? false;
+    const tracked = this.taskLedger?.shouldTrack(effectiveItem) ?? false;
     if (tracked) {
-      this.taskLedger!.onDispatch(item, agentId).catch((err) =>
+      this.taskLedger!.onDispatch(effectiveItem, agentId).catch((err) =>
         log.warn("Task ledger dispatch failed", { error: String(err) }),
       );
     }
 
-    const adapter = this.adapters.get(item.source.adapterId ?? item.source.kind);
+    const adapter = this.adapters.get(effectiveItem.source.adapterId ?? effectiveItem.source.kind);
 
     try {
-      const runResult = await this.agentManager.sendMessage(agentId, item);
+      const runResult = await this.agentManager.sendMessage(agentId, effectiveItem);
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
@@ -459,7 +515,7 @@ export class Dispatcher {
         const workResult: WorkResult = {
           text: runResult.text || "_No response._",
           agentId,
-          workItem: item,
+          workItem: effectiveItem,
           costUsd: runResult.costUsd,
           durationMs: runResult.durationMs,
           error: runResult.error,
@@ -471,12 +527,30 @@ export class Dispatcher {
             this.retryQueue?.enqueue(workResult, adapter);
           }
         }
+
+        // Conference mode: trigger depth-1 peer reactions
+        if (
+          resolved.conferenceMode &&
+          resolved.conferenceRound === 0 &&
+          !isNonResponse
+        ) {
+          this.triggerConferenceReactions(
+            runResult.text,
+            effectiveItem,
+            agentId,
+          ).catch((err) =>
+            log.warn("Conference reaction trigger failed", {
+              error: String(err),
+            }),
+          );
+        }
+
         if (tracked) {
           this.taskLedger!.onComplete(workResult).catch((err) =>
             log.warn("Task ledger complete failed", { error: String(err) }),
           );
         }
-        if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
+        if (this.auditAdapter && effectiveItem.source.kind !== this.auditAdapter.kind) {
           await this.postAuditLog(workResult);
         }
         log.info("Fan-out dispatch complete", {
@@ -489,7 +563,7 @@ export class Dispatcher {
       const errorResult: WorkResult = {
         text: `Something went wrong: ${String(err)}`,
         agentId,
-        workItem: item,
+        workItem: effectiveItem,
         costUsd: 0,
         durationMs: 0,
         error: String(err),
@@ -512,11 +586,266 @@ export class Dispatcher {
       if (ts < cutoff) {
         this.threadAgentMap.delete(id);
         this.threadParticipants.delete(id);
+        this.meetingRosters.delete(id);
+        this.meetingReactionTracker.delete(id);
         this.threadAgentLastSeen.delete(id);
         pruned++;
       }
     }
     return { component: "dispatcher", pruned, retried: 0, bytesFreed: 0, errors: [] };
+  }
+
+  private async resolveConferenceAgents(
+    item: WorkItem,
+  ): Promise<ResolvedAgent[]> {
+    const threadId = item.threadId ?? item.id;
+
+    // Build/update roster from name mentions
+    const roster = this.meetingRosters.get(threadId) ?? new Set<string>();
+    const newMentions = this.registry.findAllByName(item.text);
+    for (const agent of newMentions) {
+      roster.add(agent.id);
+    }
+    this.meetingRosters.set(threadId, roster);
+    this.threadAgentLastSeen.set(threadId, Date.now());
+
+    if (roster.size === 0) {
+      log.debug("Conference channel — no roster yet", {
+        channel: item.source.label,
+        threadId,
+      });
+      return [];
+    }
+
+    // Build roster member list for classifier
+    const rosterMembers: RosterMember[] = [];
+    for (const agentId of roster) {
+      const agent = this.registry.get(agentId);
+      if (!agent || agent.disabled) continue;
+      rosterMembers.push({
+        agentId: agent.id,
+        name: agent.name,
+        title: agent.title,
+        role: agent.soul.split("\n")[0], // first line of soul as role summary
+      });
+    }
+
+    if (rosterMembers.length === 0) {
+      return [];
+    }
+
+    // Fetch thread context for injection and classifier recency
+    let threadContext = "";
+    let recentMessages = "";
+    if (this.slackAdapter) {
+      const channelId = item.source.id;
+      const threadTs =
+        (item.meta?.slackThreadTs as string) ??
+        (item.meta?.slackTs as string) ??
+        threadId;
+      const history = await this.slackAdapter.fetchThreadHistory(
+        channelId,
+        threadTs,
+      );
+      threadContext = this.formatThreadContext(
+        history,
+        item.source.label,
+        rosterMembers,
+      );
+      // Last 5 messages for classifier recency context
+      recentMessages = history
+        .slice(-5)
+        .map((m) => `${m.author}: ${m.text.slice(0, 200)}`)
+        .join("\n");
+    }
+
+    // Run classifier
+    const classification = await classifyMeetingMessage(
+      item.text,
+      rosterMembers,
+      recentMessages,
+    );
+
+    log.info("Conference classifier result", {
+      channel: item.source.label,
+      threadId,
+      roster: [...roster],
+      selected: classification.respondAgentIds,
+      costUsd: classification.costUsd,
+    });
+
+    const preamble = this.buildMeetingPreamble(
+      item.source.label,
+      rosterMembers,
+    );
+
+    return classification.respondAgentIds.map((agentId) => ({
+      agentId,
+      conferenceMode: true,
+      conferenceHumanTs: item.meta?.slackTs as string,
+      conferenceRound: 0,
+      threadContext,
+      meetingPreamble: preamble,
+    }));
+  }
+
+  private formatThreadContext(
+    history: ThreadMessage[],
+    channelName: string,
+    roster: RosterMember[],
+  ): string {
+    if (history.length === 0) return "";
+
+    const participantNames = roster.map((r) => r.name).join(", ");
+    const header = `[Meeting thread in #${channelName} — participants: ${participantNames}]`;
+
+    // If thread is very long, include first 5 + last 100 messages
+    let messages = history;
+    if (history.length > 105) {
+      const first = history.slice(0, 5);
+      const last = history.slice(-100);
+      messages = [...first, ...last];
+    }
+
+    const formatted = messages
+      .map((m) => {
+        const ago = this.formatTimeAgo(m.timestamp);
+        return `${m.author} (${ago}): ${m.text}`;
+      })
+      .join("\n");
+
+    return `${header}\n\n${formatted}`;
+  }
+
+  private formatTimeAgo(timestamp: Date): string {
+    const seconds = Math.floor((Date.now() - timestamp.getTime()) / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} min ago`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ago`;
+  }
+
+  private buildMeetingPreamble(
+    channelName: string,
+    roster: RosterMember[],
+  ): string {
+    const names = roster.map((r) => r.name).join(", ");
+    return `You are in a meeting in #${channelName} with ${names}.
+
+Meeting rules:
+- Be concise — others are also responding.
+- Build on what's been said. Don't repeat points already made.
+- If you have nothing meaningful to add, respond with "No response needed."
+- Stay in your lane — don't cover someone else's domain unless asked.
+- Address others by name when responding to their points.`;
+  }
+
+  private async triggerConferenceReactions(
+    responseText: string,
+    originalItem: WorkItem,
+    respondingAgentId: string,
+  ): Promise<void> {
+    const threadId = originalItem.threadId ?? originalItem.id;
+    const humanTs = originalItem.meta?.conferenceHumanTs as string;
+    if (!humanTs) return;
+
+    const roster = this.meetingRosters.get(threadId);
+    if (!roster) return;
+
+    // Get or create reaction tracker for this thread + human message
+    if (!this.meetingReactionTracker.has(threadId)) {
+      this.meetingReactionTracker.set(threadId, new Map());
+    }
+    const threadTracker = this.meetingReactionTracker.get(threadId)!;
+    const reacted = threadTracker.get(humanTs) ?? new Set<string>();
+    threadTracker.set(humanTs, reacted);
+
+    // Build roster of peers who haven't reacted yet.
+    // IMPORTANT: Claim peers in `reacted` synchronously BEFORE the async classifier call
+    // to prevent concurrent round-0 responders from double-triggering the same peer.
+    const peerMembers: RosterMember[] = [];
+    for (const agentId of roster) {
+      if (agentId === respondingAgentId) continue;
+      if (reacted.has(agentId)) continue;
+      const agent = this.registry.get(agentId);
+      if (!agent || agent.disabled) continue;
+      reacted.add(agentId); // claim before await — prevents race with concurrent calls
+      peerMembers.push({
+        agentId: agent.id,
+        name: agent.name,
+        title: agent.title,
+        role: agent.soul.split("\n")[0],
+      });
+    }
+
+    if (peerMembers.length === 0) return;
+
+    // Classify which peers should react to this response
+    const classification = await classifyMeetingMessage(
+      responseText,
+      peerMembers,
+    );
+
+    if (classification.respondAgentIds.length === 0) return;
+
+    log.info("Conference depth-1 reactions", {
+      threadId,
+      respondingAgent: respondingAgentId,
+      peers: classification.respondAgentIds,
+    });
+
+    // Re-fetch thread context (now includes the round-0 response)
+    let threadContext = "";
+    let preamble = "";
+    if (this.slackAdapter) {
+      const channelId = originalItem.source.id;
+      const threadTs =
+        (originalItem.meta?.slackThreadTs as string) ??
+        (originalItem.meta?.slackTs as string) ??
+        threadId;
+      const history = await this.slackAdapter.fetchThreadHistory(
+        channelId,
+        threadTs,
+      );
+      const allRosterMembers: RosterMember[] = [];
+      for (const agentId of roster) {
+        const agent = this.registry.get(agentId);
+        if (!agent || agent.disabled) continue;
+        allRosterMembers.push({
+          agentId: agent.id,
+          name: agent.name,
+          title: agent.title,
+          role: agent.soul.split("\n")[0],
+        });
+      }
+      threadContext = this.formatThreadContext(
+        history,
+        originalItem.source.label,
+        allRosterMembers,
+      );
+      preamble = this.buildMeetingPreamble(
+        originalItem.source.label,
+        allRosterMembers,
+      );
+    }
+
+    // Dispatch reactions concurrently (peers already claimed in reacted set above)
+    const reactionDispatches = classification.respondAgentIds.map(
+      (agentId) => {
+        const resolved: ResolvedAgent = {
+          agentId,
+          conferenceMode: true,
+          conferenceHumanTs: humanTs,
+          conferenceRound: 1,
+          threadContext,
+          meetingPreamble: preamble,
+        };
+        return this.dispatchToAgent(originalItem, resolved);
+      },
+    );
+
+    await Promise.all(reactionDispatches);
   }
 
   private async postAuditLog(result: WorkResult): Promise<void> {

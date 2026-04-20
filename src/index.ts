@@ -270,6 +270,7 @@ async function main(): Promise<void> {
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
   const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack");
   dispatcher.registerAdapter(slackAdapter);
+  dispatcher.setSlackAdapter(slackAdapter);
   await slackAdapter.start((item) => {
     dispatcher.dispatch(item).catch((err) => {
       log.error("Slack dispatch failed", { error: String(err), source: item.source.label });
