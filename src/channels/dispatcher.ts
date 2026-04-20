@@ -155,16 +155,27 @@ export class Dispatcher {
     });
     if (activeList.length === 0) return;
 
+    // Conference mode: always route through dispatchToAgent for context injection
+    const isConference = activeList.some((r) => r.conferenceMode);
+    if (isConference) {
+      const threadId = item.threadId ?? item.id;
+      this.threadAgentLastSeen.set(threadId, Date.now());
+      log.info("Conference fan-out", {
+        agents: activeList.map((r) => r.agentId),
+      });
+      await Promise.all(activeList.map((r) => this.dispatchToAgent(item, r)));
+      return;
+    }
+
     // Fan-out: if multiple agents resolved, dispatch to each concurrently
     if (activeList.length > 1) {
       const threadId = item.threadId ?? item.id;
-      // Conference mode tracks roster separately — don't write to threadParticipants
-      const isConference = activeList.some((r) => r.conferenceMode);
-      if (!isConference && !this.threadParticipants.has(threadId)) {
+      // Persist participant set so follow-up messages fan out to all participants
+      if (!this.threadParticipants.has(threadId)) {
         this.threadParticipants.set(threadId, new Set(activeList.map((r) => r.agentId)));
       }
       this.threadAgentLastSeen.set(threadId, Date.now());
-      log.info(isConference ? "Conference fan-out" : "Multi-agent fan-out", {
+      log.info("Multi-agent fan-out", {
         agents: activeList.map((r) => r.agentId),
       });
       await Promise.all(activeList.map((r) => this.dispatchToAgent(item, r)));
@@ -520,7 +531,7 @@ export class Dispatcher {
 
         // Conference mode: trigger depth-1 peer reactions
         if (resolved.conferenceMode && resolved.conferenceRound === 0 && !isNonResponse) {
-          this.triggerConferenceReactions(runResult.text, effectiveItem, agentId).catch((err) =>
+          this.triggerConferenceReactions(runResult.text, item, agentId).catch((err) =>
             log.warn("Conference reaction trigger failed", {
               error: String(err),
             }),

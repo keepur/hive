@@ -199,7 +199,24 @@ describe("Conference channel routing", () => {
     await dispatcher.dispatch(item);
 
     // The classifier mock returns ["jasper"], so sendMessage should be called for jasper
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+    // with the conference-enriched item (context injected)
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
+    expect(agentManager.sendMessage).toHaveBeenCalledWith(
+      "jasper",
+      expect.objectContaining({
+        source: item.source,
+        sender: item.sender,
+        meta: expect.objectContaining({
+          conferenceMode: true,
+          conferenceRound: 0,
+          conferenceHumanTs: "1234.5678",
+        }),
+      }),
+    );
+    // Verify the original text is included in the enriched text
+    const enrichedItem = agentManager.sendMessage.mock.calls[0][1];
+    expect(enrichedItem.text).toContain("Jasper, what's the engineering status?");
+    expect(enrichedItem.text).toContain("Meeting rules:");
   });
 
   it("non-conference channels skip conference routing", async () => {
@@ -282,7 +299,11 @@ describe("Conference channel routing", () => {
     // The roster was already built from the first message (jasper + river),
     // so the classifier is called with that roster, and returns just jasper
     expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item2);
+    const enrichedItem2 = agentManager.sendMessage.mock.calls[0][1];
+    expect(enrichedItem2.meta).toEqual(
+      expect.objectContaining({ conferenceMode: true, conferenceRound: 0 }),
+    );
+    expect(enrichedItem2.text).toContain("any updates on that?");
   });
 
   it("disabled agents are filtered from roster", async () => {
@@ -316,7 +337,11 @@ describe("Conference channel routing", () => {
     const roster = callArgs[1];
     expect(roster.every((r: any) => r.agentId !== "chief-of-staff")).toBe(true);
 
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+    const enrichedItem = agentManager.sendMessage.mock.calls[0][1];
+    expect(enrichedItem.meta).toEqual(
+      expect.objectContaining({ conferenceMode: true, conferenceRound: 0 }),
+    );
+    expect(enrichedItem.text).toContain("Mokie, and Jasper, what do you think?");
   });
 
   it("delivers agent response to the conference channel", async () => {

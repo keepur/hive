@@ -203,6 +203,7 @@ export class SlackAdapter implements ChannelAdapter {
       });
 
       const messages: ThreadMessage[] = [];
+      const userNameCache = new Map<string, string>(); // userId → display name
       for (const msg of result.messages ?? []) {
         if (!msg.text && !msg.blocks) continue;
 
@@ -217,14 +218,20 @@ export class SlackAdapter implements ChannelAdapter {
           author = nameMatch ? nameMatch[1] : ((raw["username"] as string | undefined) ?? "Agent");
           isBot = true;
         } else if (msg.user) {
-          // Human message — resolve display name
-          try {
-            const userInfo = await this.gateway.client.users.info({
-              user: msg.user,
-            });
-            author = userInfo.user?.real_name ?? userInfo.user?.name ?? msg.user;
-          } catch {
-            author = msg.user;
+          // Human message — resolve display name (cached per invocation)
+          const cached = userNameCache.get(msg.user);
+          if (cached) {
+            author = cached;
+          } else {
+            try {
+              const userInfo = await this.gateway.client.users.info({
+                user: msg.user,
+              });
+              author = userInfo.user?.real_name ?? userInfo.user?.name ?? msg.user;
+            } catch {
+              author = msg.user;
+            }
+            userNameCache.set(msg.user, author);
           }
         }
 
