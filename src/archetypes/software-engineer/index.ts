@@ -16,8 +16,7 @@ registerArchetype<SoftwareEngineerConfig>({
     workshop: {
       type: "string",
       required: true,
-      description:
-        "Absolute filesystem path — the engineer's bounded root directory (e.g. /Users/you/dev).",
+      description: "Absolute filesystem path — the engineer's bounded root directory (e.g. /Users/you/dev).",
     },
     workspaces: {
       type: "array",

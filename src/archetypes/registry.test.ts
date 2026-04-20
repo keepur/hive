@@ -63,7 +63,11 @@ describe("archetype registry", () => {
         description: "Owns codebases.",
         whenToUse: "When the role centers on shipping code.",
         configSchema: {
-          workshop: { type: "string", required: true, description: "Engineering root." } satisfies ArchetypeConfigFieldSchema,
+          workshop: {
+            type: "string",
+            required: true,
+            description: "Engineering root.",
+          } satisfies ArchetypeConfigFieldSchema,
         },
       }),
     );

@@ -155,13 +155,13 @@ server.registerTool(
       systemPrompt: z
         .string()
         .optional()
-        .describe("Role definition and guardrails. Concise. Instance-specific flavor — archetype framing layers underneath."),
+        .describe(
+          "Role definition and guardrails. Concise. Instance-specific flavor — archetype framing layers underneath.",
+        ),
       archetype: z
         .string()
         .optional()
-        .describe(
-          "Discipline id from list_archetypes (e.g. 'software-engineer'). Omit for plain unstructured agents.",
-        ),
+        .describe("Discipline id from list_archetypes (e.g. 'software-engineer'). Omit for plain unstructured agents."),
       title: z
         .string()
         .optional()
