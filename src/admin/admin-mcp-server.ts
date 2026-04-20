@@ -18,6 +18,7 @@ import type { AgentDefinition, AgentDefinitionVersion } from "../types/agent-def
 import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AutonomyFlags } from "../agents/autonomy.js";
 import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
+import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
 const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
@@ -575,6 +576,38 @@ server.registerTool(
     ];
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// list_archetypes
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "list_archetypes",
+  {
+    title: "List Archetypes",
+    description:
+      "List registered agent archetypes with self-descriptions. Use this to decide whether an agent you are creating is a discipline-bound archetype (e.g. software-engineer) or a plain unstructured agent.",
+    inputSchema: {},
+  },
+  async () => {
+    const ids = listArchetypeIds();
+    const catalog = ids
+      .map((id) => {
+        const def = getArchetype(id);
+        if (!def) return null;
+        return {
+          id: def.id,
+          description: def.description ?? null,
+          whenToUse: def.whenToUse ?? null,
+          configSchema: def.configSchema ?? null,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+    return {
+      content: [{ type: "text", text: JSON.stringify(catalog, null, 2) }],
+    };
   },
 );
 
