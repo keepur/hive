@@ -9,6 +9,13 @@
  * provided, it must start with the prefix — this keeps instances isolated and prevents
  * agents from reading arbitrary keychain entries.
  *
+ * Naming convention: the `honeypot` CLI stores each secret under a full service name
+ * `<prefix>/<KEY>` with the account set to `<KEY>` (e.g. service="hive/dodi/GITHUB_TOKEN",
+ * account="GITHUB_TOKEN"). `secret_get` requires that exact full service name — the
+ * default (bare prefix) only matches a secret literally stored at the prefix itself.
+ * The reliable pattern is: call `secret_list` first, then pass a row's service+account
+ * verbatim into `secret_get`.
+ *
  * Example (instance id "dodi" → prefix "hive/dodi"):
  *   security add-generic-password -s "hive/dodi/db/readonly" -a "hive-readonly" -w "..." -U
  *   security add-generic-password -s "hive/dodi/api/stripe" -a "live-key"       -w "..." -U
@@ -44,14 +51,18 @@ server.registerTool(
   "secret_get",
   {
     title: "Get Secret",
-    description: `Retrieve a secret from macOS Keychain. Secrets for this instance live under service-prefix "${SERVICE_PREFIX}" — pass the full service name (e.g. "${SERVICE_PREFIX}/db/readonly") plus the account. If service is omitted it defaults to "${SERVICE_PREFIX}".`,
+    description: `Retrieve a secret from macOS Keychain. Lookup is an EXACT match on service+account — not a prefix search. Secrets stored by the \`honeypot\` CLI use service="${SERVICE_PREFIX}/<KEY>" and account="<KEY>" (e.g. service="${SERVICE_PREFIX}/GITHUB_TOKEN", account="GITHUB_TOKEN"). If you don't know the exact service name, call \`secret_list\` first and pass a row's service+account verbatim. The \`service\` default ("${SERVICE_PREFIX}") only matches a secret literally stored at the bare prefix, which is uncommon.`,
     inputSchema: {
-      account: z.string().describe('The account/label for the secret, e.g. "hive-readonly", "google-oauth-token"'),
+      account: z
+        .string()
+        .describe(
+          'The account/label the secret was stored under. For honeypot-stored secrets, this equals the key name (e.g. "GITHUB_TOKEN", "SLACK_BOT_TOKEN").',
+        ),
       service: z
         .string()
         .optional()
         .describe(
-          `Full service name for the secret. Must start with "${SERVICE_PREFIX}". Defaults to "${SERVICE_PREFIX}".`,
+          `Exact service name the secret is stored under — typically "${SERVICE_PREFIX}/<KEY>". Must start with "${SERVICE_PREFIX}". Defaults to "${SERVICE_PREFIX}" (bare prefix) only as a fallback; usually you should pass the full service shown by secret_list.`,
         ),
     },
   },
@@ -69,7 +80,14 @@ server.registerTool(
       return { content: [{ type: "text", text: password }] };
     } catch {
       return {
-        content: [{ type: "text", text: `Secret not found: service="${resolved.service}" account="${account}"` }],
+        content: [
+          {
+            type: "text",
+            text:
+              `Secret not found: service="${resolved.service}" account="${account}". ` +
+              `Lookup is an exact match on both fields. If you passed only the account (defaulting service to "${SERVICE_PREFIX}"), try the full service — honeypot stores under "${SERVICE_PREFIX}/<KEY>". Run secret_list to see exact service+account pairs.`,
+          },
+        ],
         isError: true,
       };
     }
@@ -112,7 +130,7 @@ server.registerTool(
           content: [
             {
               type: "text",
-              text: `No secrets found under "${resolved.service}". The CEO can add them with:\nsecurity add-generic-password -s "${resolved.service}/<name>" -a "<account>" -w "<value>" -U`,
+              text: `No secrets found under "${resolved.service}". The CEO can add them with:\n  honeypot set <KEY>\n…or directly:\n  security add-generic-password -s "${resolved.service}/<KEY>" -a "<KEY>" -w "<value>" -U`,
             },
           ],
         };
