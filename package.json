@@ -1,6 +1,6 @@
 {
   "name": "@keepur/hive",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "hiveApi": "1.0.0",
   "type": "module",
   "bin": {
