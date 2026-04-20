@@ -194,10 +194,7 @@ export class SlackAdapter implements ChannelAdapter {
    * Fetch thread replies for context injection into conference channel agents.
    * Returns messages formatted with author names and timestamps.
    */
-  async fetchThreadHistory(
-    channelId: string,
-    threadTs: string,
-  ): Promise<ThreadMessage[]> {
+  async fetchThreadHistory(channelId: string, threadTs: string): Promise<ThreadMessage[]> {
     try {
       const result = await this.gateway.client.conversations.replies({
         channel: channelId,
@@ -217,7 +214,7 @@ export class SlackAdapter implements ChannelAdapter {
           // Bot message — try to extract agent name from formatted response
           // Agent responses are formatted as "icon *Name*: text"
           const nameMatch = msg.text?.match(/^\S+\s\*([^*]+)\*:/);
-          author = nameMatch ? nameMatch[1] : (raw["username"] as string | undefined) ?? "Agent";
+          author = nameMatch ? nameMatch[1] : ((raw["username"] as string | undefined) ?? "Agent");
           isBot = true;
         } else if (msg.user) {
           // Human message — resolve display name

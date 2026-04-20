@@ -99,19 +99,13 @@ function makeMockRegistry() {
   return {
     get: (id: string) => agents.get(id),
     getAll: () => Array.from(agents.values()),
-    findByChannel: (ch: string) =>
-      Array.from(agents.values()).find(
-        (a) => !a.disabled && a.channels.includes(ch),
-      ),
+    findByChannel: (ch: string) => Array.from(agents.values()).find((a) => !a.disabled && a.channels.includes(ch)),
     findByOrigin: (_slug: string) => undefined,
     findByKeyword: (_text: string) => undefined,
     findByName: (text: string) => {
       const matchesName = (name: string, t: string) => {
         const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const pattern = new RegExp(
-          `(?:^|hey\\s+|@)${escaped}\\b|\\b${escaped}[,:]`,
-          "i",
-        );
+        const pattern = new RegExp(`(?:^|hey\\s+|@)${escaped}\\b|\\b${escaped}[,:]`, "i");
         return pattern.test(t);
       };
       return Array.from(agents.values()).find((a) => {
@@ -122,10 +116,7 @@ function makeMockRegistry() {
     findAllByName: (text: string) => {
       const matchesName = (name: string, t: string) => {
         const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const pattern = new RegExp(
-          `(?:^|hey\\s+|@)${escaped}\\b|\\b${escaped}[,:]`,
-          "i",
-        );
+        const pattern = new RegExp(`(?:^|hey\\s+|@)${escaped}\\b|\\b${escaped}[,:]`, "i");
         return pattern.test(t);
       };
       return Array.from(agents.values()).filter((a) => {
@@ -194,12 +185,7 @@ describe("Conference channel routing", () => {
     adapter = makeMockAdapter();
     mockSlackAdapter = makeMockSlackAdapter();
 
-    dispatcher = new Dispatcher(
-      registry as any,
-      agentManager as any,
-      healthReporter as any,
-      "executive-assistant",
-    );
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
     dispatcher.registerAdapter(adapter as any);
     dispatcher.setSlackAdapter(mockSlackAdapter as any);
   });
@@ -225,10 +211,7 @@ describe("Conference channel routing", () => {
 
     // Should route via normal channel mapping (general -> executive-assistant)
     // but text mentions Jasper so name routing wins
-    expect(agentManager.sendMessage).toHaveBeenCalledWith(
-      "executive-assistant",
-      item,
-    );
+    expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
   });
 
   it("empty roster returns no agents", async () => {
@@ -245,9 +228,7 @@ describe("Conference channel routing", () => {
   });
 
   it("conference fan-out does not write to threadParticipants", async () => {
-    const { classifyMeetingMessage } = await import(
-      "../agents/meeting-classifier.js"
-    );
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
 
     // First call: round-0 returns both agents
     // Subsequent calls (peer reactions): return empty to suppress depth-1
@@ -275,9 +256,7 @@ describe("Conference channel routing", () => {
 
     // Round-0 dispatches to jasper and river
     expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
-    const calledAgents = agentManager.sendMessage.mock.calls.map(
-      (c: any[]) => c[0],
-    );
+    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
 
@@ -316,9 +295,7 @@ describe("Conference channel routing", () => {
 
     // The classifier should only receive Jasper in roster (Mokie is disabled)
     // Mock returns jasper
-    const { classifyMeetingMessage } = await import(
-      "../agents/meeting-classifier.js"
-    );
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
     (classifyMeetingMessage as any).mockResolvedValueOnce({
       respondAgentIds: ["jasper"],
       costUsd: 0.001,
@@ -330,9 +307,7 @@ describe("Conference channel routing", () => {
     // Verify classifier was called with only jasper in roster (Mokie filtered)
     expect(classifyMeetingMessage).toHaveBeenCalledWith(
       item.text,
-      expect.arrayContaining([
-        expect.objectContaining({ agentId: "jasper" }),
-      ]),
+      expect.arrayContaining([expect.objectContaining({ agentId: "jasper" })]),
       expect.any(String),
     );
 
@@ -345,9 +320,7 @@ describe("Conference channel routing", () => {
   });
 
   it("delivers agent response to the conference channel", async () => {
-    const { classifyMeetingMessage } = await import(
-      "../agents/meeting-classifier.js"
-    );
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
     // Reset to known state: round-0 returns jasper, peer reactions return empty
     (classifyMeetingMessage as any)
       .mockResolvedValueOnce({
