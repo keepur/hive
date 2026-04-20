@@ -322,7 +322,7 @@ export class Dispatcher {
 
     // 1. Dedicated channel mapping — always route to channel owner
     //    Prevents name collisions (e.g. customer "Jasper" routing to agent Jasper in #agent-jessica)
-    //    Checked before thread logic so dedicated channels never become multi-agent
+    //    Note: conf-* channels are intercepted above (step 0.7) before this check
     const channelAgent = this.registry.findByChannel(item.source.label);
     if (channelAgent) return [{ agentId: channelAgent.id }];
 
@@ -531,7 +531,7 @@ export class Dispatcher {
 
         // Conference mode: trigger depth-1 peer reactions
         if (resolved.conferenceMode && resolved.conferenceRound === 0 && !isNonResponse) {
-          this.triggerConferenceReactions(runResult.text, item, agentId).catch((err) =>
+          this.triggerConferenceReactions(runResult.text, item, agentId, resolved.conferenceHumanTs!).catch((err) =>
             log.warn("Conference reaction trigger failed", {
               error: String(err),
             }),
@@ -712,10 +712,9 @@ Meeting rules:
     responseText: string,
     originalItem: WorkItem,
     respondingAgentId: string,
+    humanTs: string,
   ): Promise<void> {
     const threadId = originalItem.threadId ?? originalItem.id;
-    const humanTs = originalItem.meta?.conferenceHumanTs as string;
-    if (!humanTs) return;
 
     const roster = this.meetingRosters.get(threadId);
     if (!roster) return;
@@ -750,6 +749,14 @@ Meeting rules:
 
     // Classify which peers should react to this response
     const classification = await classifyMeetingMessage(responseText, peerMembers);
+
+    // Release peers that weren't selected — they can still be triggered by other round-0 responders
+    const selectedSet = new Set(classification.respondAgentIds);
+    for (const member of peerMembers) {
+      if (!selectedSet.has(member.agentId)) {
+        reacted.delete(member.agentId);
+      }
+    }
 
     if (classification.respondAgentIds.length === 0) return;
 
