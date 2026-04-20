@@ -8,10 +8,7 @@ import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
 import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
-import {
-  classifyMeetingMessage,
-  type RosterMember,
-} from "../agents/meeting-classifier.js";
+import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
 
 const log = createLogger("dispatcher");
 
@@ -469,14 +466,7 @@ export class Dispatcher {
     // Conference mode: inject thread context + preamble into the WorkItem
     let effectiveItem = item;
     if (resolved.conferenceMode) {
-      const contextPrefix = [
-        resolved.meetingPreamble,
-        "",
-        resolved.threadContext,
-        "",
-        "---",
-        `[New message]:`,
-      ]
+      const contextPrefix = [resolved.meetingPreamble, "", resolved.threadContext, "", "---", `[New message]:`]
         .filter(Boolean)
         .join("\n");
       effectiveItem = {
@@ -529,16 +519,8 @@ export class Dispatcher {
         }
 
         // Conference mode: trigger depth-1 peer reactions
-        if (
-          resolved.conferenceMode &&
-          resolved.conferenceRound === 0 &&
-          !isNonResponse
-        ) {
-          this.triggerConferenceReactions(
-            runResult.text,
-            effectiveItem,
-            agentId,
-          ).catch((err) =>
+        if (resolved.conferenceMode && resolved.conferenceRound === 0 && !isNonResponse) {
+          this.triggerConferenceReactions(runResult.text, effectiveItem, agentId).catch((err) =>
             log.warn("Conference reaction trigger failed", {
               error: String(err),
             }),
@@ -595,9 +577,7 @@ export class Dispatcher {
     return { component: "dispatcher", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 
-  private async resolveConferenceAgents(
-    item: WorkItem,
-  ): Promise<ResolvedAgent[]> {
+  private async resolveConferenceAgents(item: WorkItem): Promise<ResolvedAgent[]> {
     const threadId = item.threadId ?? item.id;
 
     // Build/update roster from name mentions
@@ -639,19 +619,9 @@ export class Dispatcher {
     let recentMessages = "";
     if (this.slackAdapter) {
       const channelId = item.source.id;
-      const threadTs =
-        (item.meta?.slackThreadTs as string) ??
-        (item.meta?.slackTs as string) ??
-        threadId;
-      const history = await this.slackAdapter.fetchThreadHistory(
-        channelId,
-        threadTs,
-      );
-      threadContext = this.formatThreadContext(
-        history,
-        item.source.label,
-        rosterMembers,
-      );
+      const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId;
+      const history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
+      threadContext = this.formatThreadContext(history, item.source.label, rosterMembers);
       // Last 5 messages for classifier recency context
       recentMessages = history
         .slice(-5)
@@ -660,11 +630,7 @@ export class Dispatcher {
     }
 
     // Run classifier
-    const classification = await classifyMeetingMessage(
-      item.text,
-      rosterMembers,
-      recentMessages,
-    );
+    const classification = await classifyMeetingMessage(item.text, rosterMembers, recentMessages);
 
     log.info("Conference classifier result", {
       channel: item.source.label,
@@ -674,10 +640,7 @@ export class Dispatcher {
       costUsd: classification.costUsd,
     });
 
-    const preamble = this.buildMeetingPreamble(
-      item.source.label,
-      rosterMembers,
-    );
+    const preamble = this.buildMeetingPreamble(item.source.label, rosterMembers);
 
     return classification.respondAgentIds.map((agentId) => ({
       agentId,
@@ -689,11 +652,7 @@ export class Dispatcher {
     }));
   }
 
-  private formatThreadContext(
-    history: ThreadMessage[],
-    channelName: string,
-    roster: RosterMember[],
-  ): string {
+  private formatThreadContext(history: ThreadMessage[], channelName: string, roster: RosterMember[]): string {
     if (history.length === 0) return "";
 
     const participantNames = roster.map((r) => r.name).join(", ");
@@ -726,10 +685,7 @@ export class Dispatcher {
     return `${hours}h ago`;
   }
 
-  private buildMeetingPreamble(
-    channelName: string,
-    roster: RosterMember[],
-  ): string {
+  private buildMeetingPreamble(channelName: string, roster: RosterMember[]): string {
     const names = roster.map((r) => r.name).join(", ");
     return `You are in a meeting in #${channelName} with ${names}.
 
@@ -782,10 +738,7 @@ Meeting rules:
     if (peerMembers.length === 0) return;
 
     // Classify which peers should react to this response
-    const classification = await classifyMeetingMessage(
-      responseText,
-      peerMembers,
-    );
+    const classification = await classifyMeetingMessage(responseText, peerMembers);
 
     if (classification.respondAgentIds.length === 0) return;
 
@@ -801,13 +754,8 @@ Meeting rules:
     if (this.slackAdapter) {
       const channelId = originalItem.source.id;
       const threadTs =
-        (originalItem.meta?.slackThreadTs as string) ??
-        (originalItem.meta?.slackTs as string) ??
-        threadId;
-      const history = await this.slackAdapter.fetchThreadHistory(
-        channelId,
-        threadTs,
-      );
+        (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId;
+      const history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
       const allRosterMembers: RosterMember[] = [];
       for (const agentId of roster) {
         const agent = this.registry.get(agentId);
@@ -819,31 +767,22 @@ Meeting rules:
           role: agent.soul.split("\n")[0],
         });
       }
-      threadContext = this.formatThreadContext(
-        history,
-        originalItem.source.label,
-        allRosterMembers,
-      );
-      preamble = this.buildMeetingPreamble(
-        originalItem.source.label,
-        allRosterMembers,
-      );
+      threadContext = this.formatThreadContext(history, originalItem.source.label, allRosterMembers);
+      preamble = this.buildMeetingPreamble(originalItem.source.label, allRosterMembers);
     }
 
     // Dispatch reactions concurrently (peers already claimed in reacted set above)
-    const reactionDispatches = classification.respondAgentIds.map(
-      (agentId) => {
-        const resolved: ResolvedAgent = {
-          agentId,
-          conferenceMode: true,
-          conferenceHumanTs: humanTs,
-          conferenceRound: 1,
-          threadContext,
-          meetingPreamble: preamble,
-        };
-        return this.dispatchToAgent(originalItem, resolved);
-      },
-    );
+    const reactionDispatches = classification.respondAgentIds.map((agentId) => {
+      const resolved: ResolvedAgent = {
+        agentId,
+        conferenceMode: true,
+        conferenceHumanTs: humanTs,
+        conferenceRound: 1,
+        threadContext,
+        meetingPreamble: preamble,
+      };
+      return this.dispatchToAgent(originalItem, resolved);
+    });
 
     await Promise.all(reactionDispatches);
   }
