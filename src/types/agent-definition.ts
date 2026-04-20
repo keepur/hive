@@ -81,6 +81,8 @@ export const AGENT_DEFINITION_DEFAULTS = {
   passiveChannels: [] as string[],
   delegatePrompts: {} as Record<string, string>,
   schedule: [] as AgentSchedule[],
+  coreServers: ["memory", "structured-memory", "keychain", "event-bus", "contacts"] satisfies readonly string[],
+  delegateServers: [] satisfies readonly string[],
 } as const;
 
 export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<AutonomyFlags>): AgentConfig {
