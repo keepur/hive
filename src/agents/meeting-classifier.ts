@@ -155,7 +155,8 @@ export async function classifyMeetingMessage(
       const msg = message as SDKMessage;
 
       if (msg.type === "assistant") {
-        const content = (msg as any).message?.content;
+        // SDK SDKMessage union doesn't expose .message.content after type narrowing — runtime shape is correct
+        const content = (msg as any).message?.content; // eslint-disable-line @typescript-eslint/no-explicit-any
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === "text") {

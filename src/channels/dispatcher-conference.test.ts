@@ -300,9 +300,7 @@ describe("Conference channel routing", () => {
     // so the classifier is called with that roster, and returns just jasper
     expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
     const enrichedItem2 = agentManager.sendMessage.mock.calls[0][1];
-    expect(enrichedItem2.meta).toEqual(
-      expect.objectContaining({ conferenceMode: true, conferenceRound: 0 }),
-    );
+    expect(enrichedItem2.meta).toEqual(expect.objectContaining({ conferenceMode: true, conferenceRound: 0 }));
     expect(enrichedItem2.text).toContain("any updates on that?");
   });
 
@@ -338,9 +336,7 @@ describe("Conference channel routing", () => {
     expect(roster.every((r: any) => r.agentId !== "chief-of-staff")).toBe(true);
 
     const enrichedItem = agentManager.sendMessage.mock.calls[0][1];
-    expect(enrichedItem.meta).toEqual(
-      expect.objectContaining({ conferenceMode: true, conferenceRound: 0 }),
-    );
+    expect(enrichedItem.meta).toEqual(expect.objectContaining({ conferenceMode: true, conferenceRound: 0 }));
     expect(enrichedItem.text).toContain("Mokie, and Jasper, what do you think?");
   });
 
