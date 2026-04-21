@@ -59,4 +59,4 @@ hive skill remove <name>   # Remove a skill
 
 Hive is closed-source commercial software, distributed in public beta under the [Hive Preview License](LICENSE). Evaluation is permitted; production use requires an invited early-cohort license or a commercial agreement.
 
-For access or commercial licensing, contact may@keepur.io.
+For access or commercial licensing, contact beta@keepur.io.
