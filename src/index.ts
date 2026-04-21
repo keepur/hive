@@ -33,6 +33,8 @@ import { AdminApi } from "./admin/admin-api.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
 import { checkFirstBoot } from "./startup/first-boot.js";
+import { SlackInternalApi } from "./slack/slack-internal-api.js";
+import { preflightBotScopes } from "./slack/slack-scope-preflight.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
@@ -307,6 +309,20 @@ async function main(): Promise<void> {
     log.warn("Failed to configure audit channel", { error: String(err) });
   }
 
+  // Slack internal API — local HTTP server for agent-side Slack MCP tools
+  let slackInternalApi: SlackInternalApi | null = null;
+  if (config.slack.localMcpServer) {
+    await preflightBotScopes(config.slack.botToken);
+    slackInternalApi = new SlackInternalApi({
+      port: config.slackInternal.port,
+      authToken: config.slackInternal.authToken,
+      gateway: slack,
+      agentManager,
+    });
+    await slackInternalApi.start();
+    log.info("Slack internal API started", { port: config.slackInternal.port });
+  }
+
   // SMS adapter — direct path, bypasses Slack
   const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines);
   dispatcher.registerAdapter(smsAdapter);
@@ -493,6 +509,7 @@ async function main(): Promise<void> {
     adminApi?.stop();
     registry.stopWatching();
     await smsAdapter.stop();
+    if (slackInternalApi) await slackInternalApi.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
     beekeeperRegistration?.stop();
     if (wsAdapter) await wsAdapter.stop();
