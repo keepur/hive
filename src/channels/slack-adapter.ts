@@ -16,6 +16,13 @@ const DEFAULT_PROMPTS = [
   { title: "Quick note", message: "I need to remember something..." },
 ];
 
+export interface ThreadMessage {
+  author: string;
+  text: string;
+  timestamp: Date;
+  isBot: boolean;
+}
+
 export class SlackAdapter implements ChannelAdapter {
   readonly id: string;
   readonly kind: ChannelKind = "slack";
@@ -181,5 +188,69 @@ export class SlackAdapter implements ChannelAdapter {
   /** Expose the Slack WebClient for external use (e.g. audit channel resolution) */
   get client(): WebClient {
     return this.gateway.client;
+  }
+
+  /**
+   * Fetch thread replies for context injection into conference channel agents.
+   * Returns messages formatted with author names and timestamps.
+   */
+  async fetchThreadHistory(channelId: string, threadTs: string): Promise<ThreadMessage[]> {
+    try {
+      const result = await this.gateway.client.conversations.replies({
+        channel: channelId,
+        ts: threadTs,
+        limit: 200,
+      });
+
+      const messages: ThreadMessage[] = [];
+      const userNameCache = new Map<string, string>(); // userId → display name
+      for (const msg of result.messages ?? []) {
+        if (!msg.text && !msg.blocks) continue;
+
+        let author = "Unknown";
+        let isBot = false;
+
+        const raw = msg as unknown as Record<string, unknown>;
+        if (msg.bot_id || raw["subtype"] === "bot_message") {
+          // Bot message — try to extract agent name from formatted response
+          // Agent responses are formatted as "icon *Name*: text"
+          const nameMatch = msg.text?.match(/^\S+\s\*([^*]+)\*:/);
+          author = nameMatch ? nameMatch[1] : ((raw["username"] as string | undefined) ?? "Agent");
+          isBot = true;
+        } else if (msg.user) {
+          // Human message — resolve display name (cached per invocation)
+          const cached = userNameCache.get(msg.user);
+          if (cached) {
+            author = cached;
+          } else {
+            try {
+              const userInfo = await this.gateway.client.users.info({
+                user: msg.user,
+              });
+              author = userInfo.user?.real_name ?? userInfo.user?.name ?? msg.user;
+            } catch {
+              author = msg.user;
+            }
+            userNameCache.set(msg.user, author);
+          }
+        }
+
+        messages.push({
+          author,
+          text: msg.text ?? "",
+          timestamp: new Date(parseFloat(msg.ts ?? "0") * 1000),
+          isBot,
+        });
+      }
+
+      return messages;
+    } catch (err) {
+      log.warn("Failed to fetch thread history", {
+        channelId,
+        threadTs,
+        error: String(err),
+      });
+      return [];
+    }
   }
 }
