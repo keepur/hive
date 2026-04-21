@@ -24,29 +24,20 @@ afterEach(() => {
 
 describe("preflightBotScopes", () => {
   it("resolves without error when all required scopes are present", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: true }, REQUIRED_BOT_SCOPES.join(","))),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: true }, REQUIRED_BOT_SCOPES.join(","))));
     await expect(preflightBotScopes("xoxb-token")).resolves.toBeUndefined();
   });
 
   it("resolves when granted scopes include extra scopes beyond the required set", async () => {
     const allScopes = [...REQUIRED_BOT_SCOPES, "reactions:read", "files:read"].join(",");
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: true }, allScopes)),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: true }, allScopes)));
     await expect(preflightBotScopes("xoxb-token")).resolves.toBeUndefined();
   });
 
   it("throws listing all missing scopes in a single error when some are absent from the header", async () => {
     // Provide only a subset of the required scopes — the rest should appear in one error
     const partial = "chat:write,channels:history";
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: true }, partial)),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: true }, partial)));
     const err = await preflightBotScopes("xoxb-token").catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     const msg = (err as Error).message;
@@ -59,31 +50,18 @@ describe("preflightBotScopes", () => {
   });
 
   it("throws with the Slack error when body.ok is false", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: false, error: "invalid_auth" }, "chat:write")),
-    );
-    await expect(preflightBotScopes("xoxb-bad-token")).rejects.toThrow(
-      "Slack auth.test failed: invalid_auth",
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: false, error: "invalid_auth" }, "chat:write")));
+    await expect(preflightBotScopes("xoxb-bad-token")).rejects.toThrow("Slack auth.test failed: invalid_auth");
   });
 
   it("throws with 'unknown' error when body.ok is false and no error field is present", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: false }, "chat:write")),
-    );
-    await expect(preflightBotScopes("xoxb-bad-token")).rejects.toThrow(
-      "Slack auth.test failed: unknown",
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: false }, "chat:write")));
+    await expect(preflightBotScopes("xoxb-bad-token")).rejects.toThrow("Slack auth.test failed: unknown");
   });
 
   it("fails closed when x-oauth-scopes header is absent (treats every scope as missing)", async () => {
     // No scopeHeader arg → header is not set at all
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: true })),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: true })));
     const err = await preflightBotScopes("xoxb-token").catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     const msg = (err as Error).message;
@@ -95,28 +73,19 @@ describe("preflightBotScopes", () => {
   });
 
   it("fails closed when x-oauth-scopes header is empty string", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: true }, "")),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: true }, "")));
     await expect(preflightBotScopes("xoxb-token")).rejects.toThrow(/missing required scopes:/);
   });
 
   it("accepts a custom required list and only checks those scopes", async () => {
     const custom = ["chat:write", "channels:read"] as const;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: true }, "chat:write,channels:read")),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: true }, "chat:write,channels:read")));
     await expect(preflightBotScopes("xoxb-token", custom)).resolves.toBeUndefined();
   });
 
   it("trims whitespace from scope header entries", async () => {
     const spacedScopes = REQUIRED_BOT_SCOPES.map((s) => `  ${s}  `).join(",");
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(makeResponse({ ok: true }, spacedScopes)),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: true }, spacedScopes)));
     await expect(preflightBotScopes("xoxb-token")).resolves.toBeUndefined();
   });
 });

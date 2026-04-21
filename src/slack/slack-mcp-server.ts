@@ -87,9 +87,7 @@ server.registerTool(
     inputSchema: {
       channel: z
         .string()
-        .describe(
-          "Channel ID (C…/D…/G…) or bare channel name (e.g. agent-river). The server resolves names to IDs.",
-        ),
+        .describe("Channel ID (C…/D…/G…) or bare channel name (e.g. agent-river). The server resolves names to IDs."),
       text: z.string().describe("Message text (Slack mrkdwn supported)."),
       thread_ts: z
         .string()
@@ -102,9 +100,7 @@ server.registerTool(
       force_root: z
         .boolean()
         .optional()
-        .describe(
-          "Post at channel root even when a thread is active. Use only for unprompted broadcasts.",
-        ),
+        .describe("Post at channel root even when a thread is active. Use only for unprompted broadcasts."),
     },
   },
   async ({ channel, text, thread_ts, blocks, force_root }) => {
@@ -135,9 +131,7 @@ server.registerTool(
     title: "Read Slack Channel",
     description: "Fetch recent messages from a Slack channel. Returns message history in reverse-chronological order.",
     inputSchema: {
-      channel: z
-        .string()
-        .describe("Channel ID (C…/D…/G…) or bare name (e.g. agent-river)."),
+      channel: z.string().describe("Channel ID (C…/D…/G…) or bare name (e.g. agent-river)."),
       limit: z
         .number()
         .int()
@@ -174,13 +168,7 @@ server.registerTool(
       "calls will return a not-implemented response.",
     inputSchema: {
       query: z.string().describe("Search query string."),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(100)
-        .optional()
-        .describe("Maximum number of results to return."),
+      limit: z.number().int().min(1).max(100).optional().describe("Maximum number of results to return."),
     },
   },
   async ({ query, limit }) => {
@@ -207,10 +195,7 @@ server.registerTool(
     title: "List Slack Channels",
     description: "List available Slack channels, optionally filtered by name prefix or substring.",
     inputSchema: {
-      query: z
-        .string()
-        .optional()
-        .describe("Optional name filter — returns channels whose name contains this string."),
+      query: z.string().optional().describe("Optional name filter — returns channels whose name contains this string."),
     },
   },
   async ({ query }) => {
@@ -236,9 +221,7 @@ server.registerTool(
     title: "Read Slack User Profile",
     description: "Look up a Slack user's profile by user ID (U…) or display name.",
     inputSchema: {
-      user: z
-        .string()
-        .describe("Slack user ID (U…) or display name to look up."),
+      user: z.string().describe("Slack user ID (U…) or display name to look up."),
     },
   },
   async ({ user }) => {

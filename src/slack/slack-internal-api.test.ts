@@ -228,12 +228,7 @@ describe("SlackInternalApi — /internal/slack/send", () => {
     const ctx = await startApi(gw, makeAgentManager());
 
     try {
-      const res = await post(
-        ctx.port,
-        "/internal/slack/send",
-        { channel: "no-such-channel", text: "hi" },
-        ctx.token,
-      );
+      const res = await post(ctx.port, "/internal/slack/send", { channel: "no-such-channel", text: "hi" }, ctx.token);
       expect(res.status).toBe(400);
       expect(res.body).toMatchObject({ ok: false, error: "unknown channel: no-such-channel" });
     } finally {
@@ -249,12 +244,7 @@ describe("SlackInternalApi — /internal/slack/send", () => {
     const ctx = await startApi(gw, agentManager);
 
     try {
-      await post(
-        ctx.port,
-        "/internal/slack/send",
-        { agent_id: "river", channel: "C123", text: "hello" },
-        ctx.token,
-      );
+      await post(ctx.port, "/internal/slack/send", { agent_id: "river", channel: "C123", text: "hello" }, ctx.token);
       // No matching WorkItem for C123 — threadTs should be undefined
       expect(gw.postAndRegister).toHaveBeenCalledWith("C123", "hello", undefined);
     } finally {
