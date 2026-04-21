@@ -815,4 +815,133 @@ describe("AgentManager", () => {
       );
     });
   });
+
+  describe("preamble thread hint (KPR-48)", () => {
+    it("includes thread=<ts> from meta.slackThreadTs in senderName branch", async () => {
+      const item: WorkItem = {
+        id: "kpr48-m1",
+        text: "hello",
+        source: { kind: "slack", id: "C123", label: "general" },
+        sender: "U001",
+        senderName: "Alice",
+        threadId: "t1",
+        timestamp: new Date(),
+        meta: { slackThreadTs: "1700000001.000100", slackTs: "1700000002.000200" },
+      };
+
+      await manager.sendMessage("agent-a", item);
+
+      const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
+      // slackThreadTs takes priority over slackTs
+      expect(capturedPrompt).toBe("[Alice in #general, thread=1700000001.000100]: hello");
+    });
+
+    it("falls back to meta.slackTs when slackThreadTs is absent", async () => {
+      const item: WorkItem = {
+        id: "kpr48-m2",
+        text: "hello",
+        source: { kind: "slack", id: "C123", label: "general" },
+        sender: "U001",
+        senderName: "Alice",
+        threadId: "t2",
+        timestamp: new Date(),
+        meta: { slackTs: "1700000003.000300" },
+      };
+
+      await manager.sendMessage("agent-a", item);
+
+      const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
+      expect(capturedPrompt).toBe("[Alice in #general, thread=1700000003.000300]: hello");
+    });
+
+    it("omits thread hint when no slack meta is present", async () => {
+      const item: WorkItem = {
+        id: "kpr48-m3",
+        text: "hello",
+        source: { kind: "slack", id: "C123", label: "general" },
+        sender: "U001",
+        senderName: "Alice",
+        threadId: "t3",
+        timestamp: new Date(),
+        meta: {},
+      };
+
+      await manager.sendMessage("agent-a", item);
+
+      const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
+      expect(capturedPrompt).toBe("[Alice in #general]: hello");
+      expect(capturedPrompt).not.toContain("thread=");
+    });
+
+    it("omits thread hint when meta is undefined", async () => {
+      const item: WorkItem = {
+        id: "kpr48-m4",
+        text: "hello",
+        source: { kind: "slack", id: "C123", label: "general" },
+        sender: "U001",
+        senderName: "Alice",
+        threadId: "t4",
+        timestamp: new Date(),
+      };
+
+      await manager.sendMessage("agent-a", item);
+
+      const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
+      expect(capturedPrompt).toBe("[Alice in #general]: hello");
+      expect(capturedPrompt).not.toContain("thread=");
+    });
+
+    it("does NOT add thread hint to team-channel userId branch", async () => {
+      // userId branch is a different if-branch; thread hint should not appear there
+      const item: WorkItem = {
+        id: "kpr48-m5",
+        text: "hey",
+        source: { kind: "team", id: "c1", label: "team:general", adapterId: "ws" } as any,
+        sender: "dev1",
+        senderName: "Shop",
+        threadId: "team:c1",
+        timestamp: new Date(),
+        meta: { deviceId: "dev1", channelId: "c1", user: "may-keepur", slackTs: "1700000004.000400" },
+      };
+
+      await manager.sendMessage("agent-a", item);
+
+      const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
+      // The userId branch fires; thread hint is not added
+      expect(capturedPrompt).toBe("[user:may-keepur via Shop in #team:general]: hey");
+      expect(capturedPrompt).not.toContain("thread=");
+    });
+  });
+
+  describe("getActiveWorkItems (KPR-48)", () => {
+    it("returns empty array when agent has no active work", () => {
+      expect(manager.getActiveWorkItems("agent-a")).toEqual([]);
+    });
+
+    it("tracks a WorkItem while its processing is in-flight", async () => {
+      let capturedDuringProcessing: WorkItem[] = [];
+      mockRunnerSend.mockImplementation(async () => {
+        capturedDuringProcessing = manager.getActiveWorkItems("agent-a");
+        return makeRunResult();
+      });
+
+      const item = makeWorkItem({ source: { kind: "slack", id: "C123", label: "general" } });
+      await manager.sendMessage("agent-a", item);
+
+      expect(capturedDuringProcessing).toHaveLength(1);
+      expect(capturedDuringProcessing[0]!.id).toBe(item.id);
+      // After completion, the list is cleared
+      expect(manager.getActiveWorkItems("agent-a")).toEqual([]);
+    });
+
+    it("clears WorkItem from active list after the item throws", async () => {
+      mockRunnerSend.mockRejectedValue(new Error("bang"));
+
+      const item = makeWorkItem();
+      await expect(manager.sendMessage("agent-a", item)).rejects.toThrow("bang");
+
+      // finally block must have run
+      expect(manager.getActiveWorkItems("agent-a")).toEqual([]);
+    });
+  });
 });
