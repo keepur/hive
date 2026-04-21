@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hive bootstrap installer for macOS.
 # Idempotent: safe to re-run if it bails partway.
-# Usage: curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/bootstrap.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/bootstrap.sh | bash
 
 set -euo pipefail
 

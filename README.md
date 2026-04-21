@@ -10,7 +10,7 @@ It runs on a Mac you already own. One Anthropic key, one Slack workspace, one in
 
 ```
 # Fresh Mac
-curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/bootstrap.sh | bash
 
 # Already have Node 22
 npm i -g @keepur/hive && hive init
@@ -20,9 +20,9 @@ The bootstrap installs Homebrew and Node 22, then drops you into the `hive init`
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — install + first conversation
-- [Managing your hive](docs/managing-your-hive.md) — plugins, skills, day-two ops
-- [Troubleshooting](docs/troubleshooting.md) — when things break
+- [Getting started](https://github.com/keepur/hive-docs/blob/main/docs/getting-started.md) — install + first conversation
+- [Managing your hive](https://github.com/keepur/hive-docs/blob/main/docs/managing-your-hive.md) — plugins, skills, day-two ops
+- [Troubleshooting](https://github.com/keepur/hive-docs/blob/main/docs/troubleshooting.md) — when things break
 
 ## What you get
 
@@ -57,6 +57,6 @@ hive skill remove <name>   # Remove a skill
 
 ## License
 
-Hive is closed-source commercial software, distributed in public beta under the [Hive Preview License](LICENSE). Evaluation is permitted; production use requires an invited early-cohort license or a commercial agreement.
+Hive is closed-source commercial software, distributed in public beta under the [Hive Preview License](https://github.com/keepur/hive-docs/blob/main/LICENSE). Evaluation is permitted; production use requires an invited early-cohort license or a commercial agreement.
 
 For access or commercial licensing, contact beta@keepur.io.
