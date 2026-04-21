@@ -38,6 +38,11 @@ business:
 # Slack audit channel — receives app/SMS notifications
 # slack:
 #   auditChannel: jessica
+#   localMcpServer: false   # set true to use local bot-token Slack MCP instead of hosted MCP
+
+# slackInternal:
+#   # port auto-derived from instance portBase if omitted
+#   # port: 3106
 
 # Google Workspace
 # googleWorkspace:
