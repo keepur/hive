@@ -153,8 +153,11 @@ export class SlackInternalApi {
 
     const result = await this.gateway.postAndRegister(resolvedChannelId, text, threadTs);
 
+    const payload = result.ok
+      ? { ok: true as const, ts: result.ts, channel: resolvedChannelId }
+      : { ok: false as const, error: result.error };
     res.writeHead(result.ok ? 200 : 500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(result));
+    res.end(JSON.stringify(payload));
   }
 
   private async handleRead(body: Record<string, unknown>, res: ServerResponse): Promise<void> {

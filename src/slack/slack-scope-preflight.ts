@@ -2,9 +2,14 @@ import { createLogger } from "../logging/logger.js";
 
 const log = createLogger("slack-scope-preflight");
 
+// chat:write.customize is required by slack-adapter's identity-mode delivery path
+// (SlackGateway.postSingle passes `username`/`icon_url` to chat.postMessage when the
+// adapter supplies an identity). Without it, identity-mode posts silently fall back
+// to plain bot posts — preflight here fails loud rather than degrading silently.
 export const REQUIRED_BOT_SCOPES = [
   "chat:write",
   "chat:write.public",
+  "chat:write.customize",
   "channels:history",
   "channels:read",
   "users:read",
