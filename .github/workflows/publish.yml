@@ -34,6 +34,9 @@ jobs:
         run: npm ci
 
       - name: Run checks
+        env:
+          SLACK_APP_TOKEN: xapp-test-placeholder
+          SLACK_BOT_TOKEN: xoxb-test-placeholder
         run: npm run check
 
       - name: Build
