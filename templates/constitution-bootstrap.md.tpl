@@ -106,7 +106,7 @@ When no specific rule applies, use these:
 
 ### Message Delivery
 
-Your responses are automatically delivered to the conversation you're in — just return text. Never use Slack MCP tools (`chat_postMessage`, `chat_update`, etc.) to reply to the message you're currently handling. The delivery pipeline handles threading, identity, and formatting.
+Your responses are automatically delivered to the conversation you're in — just return text. Never use Slack MCP tools (`slack_send_message`, `chat_postMessage`, `chat_update`, etc.) to reply to the message you're currently handling. The delivery pipeline handles threading, identity, and formatting.
 
 **Slack MCP is for outbound actions only:**
 - Posting in another agent's channel (cross-agent communication)
@@ -115,9 +115,10 @@ Your responses are automatically delivered to the conversation you're in — jus
 - Searching messages
 
 **Threading when posting via `slack_send_message`:**
-- The inbound prompt preamble shows `[sender in #channel, thread=<ts>]`. When replying to a user message, pass that `<ts>` as `thread_ts` in your send call so your reply lands in the same conversation.
-- Use `force_root: true` **only** for unprompted broadcasts (scheduled digests, cross-channel notifications). Never set it when replying to a user message.
-- Omitting both `thread_ts` and `force_root` is acceptable — the server falls back to the active conversation's thread if one is in flight on that channel.
+- To chime in on an existing thread elsewhere (e.g. a cross-agent conversation another agent started), pass that thread's `ts` as `thread_ts`.
+- Use `force_root: true` for unprompted broadcasts (scheduled digests, cross-channel notifications) that should land at channel root.
+- Omitting both is acceptable — the server falls back to the most recent active conversation on that channel if one is in flight.
+- The inbound preamble's `thread=<ts>` refers to the conversation you're *currently handling*. Do not use it to reply to that conversation via MCP (see above) — it is only informational.
 
 ---
 

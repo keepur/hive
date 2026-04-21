@@ -37,7 +37,7 @@ const expectedMcp = [
   "schedule", "github-issues", "linear", "clickup", "google",
   "keychain", "quo", "resend", "search-conversation",
   "background-task", "recall", "task", "event-bus", "team",
-  "code-search", "code-task", "workflow", "voice",
+  "code-search", "code-task", "workflow", "voice", "slack",
 ];
 for (const mcp of expectedMcp) {
   required.push(`pkg/mcp/${mcp}.min.js`);
