@@ -64,6 +64,8 @@ export class AgentManager {
   private skillIndex: SkillIndex;
   private activityLogger?: ActivityLogger;
   private prefetcher?: CodeIndexPrefetcher;
+  // Keyed by agentId → list of currently in-flight WorkItems (one per active thread).
+  private activeWorkItems = new Map<string, WorkItem[]>();
 
   constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher) {
     this.registry = registry;
@@ -78,6 +80,10 @@ export class AgentManager {
 
   getPlugins(): LoadedPlugin[] {
     return this.plugins;
+  }
+
+  getActiveWorkItems(agentId: string): WorkItem[] {
+    return this.activeWorkItems.get(agentId) ?? [];
   }
 
   private createRunner(agentId: string): AgentRunner {
@@ -171,6 +177,10 @@ export class AgentManager {
 
     while (queue.length > 0) {
       const item = queue.shift()!;
+      // Track active WorkItem for the Slack internal API threading fallback.
+      const activeList = this.activeWorkItems.get(agentId) ?? [];
+      activeList.push(item.message);
+      this.activeWorkItems.set(agentId, activeList);
       try {
         const threadId = item.message.threadId ?? item.message.id;
         const existingSession = await this.sessionStore.get(agentId, threadId);
@@ -202,7 +212,11 @@ export class AgentManager {
         if (userId) {
           prompt = `[user:${userId} via ${senderLabel} in #${item.message.source.label}]: ${item.message.text}`;
         } else if (item.message.senderName) {
-          prompt = `[${senderLabel} in #${item.message.source.label}]: ${item.message.text}`;
+          const slackThreadTs = item.message.meta?.slackThreadTs as string | undefined;
+          const slackTs = item.message.meta?.slackTs as string | undefined;
+          const threadTs = slackThreadTs ?? slackTs;
+          const threadHint = threadTs ? `, thread=${threadTs}` : "";
+          prompt = `[${senderLabel} in #${item.message.source.label}${threadHint}]: ${item.message.text}`;
         } else {
           prompt = item.message.text;
         }
@@ -334,6 +348,10 @@ export class AgentManager {
           error: String(err),
         });
         item.reject(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        const remaining = (this.activeWorkItems.get(agentId) ?? []).filter((w) => w.id !== item.message.id);
+        if (remaining.length === 0) this.activeWorkItems.delete(agentId);
+        else this.activeWorkItems.set(agentId, remaining);
       }
     }
 
