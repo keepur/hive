@@ -597,15 +597,18 @@ export class SlackGateway {
    * `postSingle` / `postSplit` / `postAsFile` based on text length and funnels into `postSingle`
    * where the cache write happens. Returns the first chunk's ts (sufficient for the caller —
    * every chunk's ts is registered independently).
+   *
+   * Caller should resolve `channel` to a Slack channel ID first (via `resolveChannelId`) — this
+   * method does not re-resolve, and does not return a canonical channel ID.
    */
   async postAndRegister(
     channel: string,
     text: string,
     threadTs?: string,
-  ): Promise<{ ok: boolean; ts?: string; channel?: string; error?: string }> {
+  ): Promise<{ ok: boolean; ts?: string; error?: string }> {
     try {
       const ts = await this.postMessage(channel, text, threadTs);
-      if (ts) return { ok: true, ts, channel };
+      if (ts) return { ok: true, ts };
       return { ok: false, error: "postMessage returned no ts" };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
