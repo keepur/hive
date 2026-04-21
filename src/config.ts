@@ -96,6 +96,7 @@ export const config = {
     botToken: required("SLACK_BOT_TOKEN"),
     mcpToken: optional("SLACK_MCP_TOKEN", ""),
     auditChannel: optional("SLACK_AUDIT_CHANNEL", hive.slack?.auditChannel ?? ""),
+    localMcpServer: Boolean(hive.slack?.localMcpServer ?? false),
   },
   anthropic: {
     apiKey: optional("ANTHROPIC_API_KEY", ""),
@@ -190,6 +191,10 @@ export const config = {
   background: {
     port: parseInt(optional("BG_TASK_PORT", String(ports.background ?? portBase)), 10),
     authToken: optional("BG_TASK_AUTH_TOKEN", "") || randomUUID(),
+  },
+  slackInternal: {
+    port: parseInt(optional("SLACK_INTERNAL_PORT", String(ports.slackInternal ?? portBase + 6)), 10),
+    authToken: optional("SLACK_INTERNAL_TOKEN", "") || randomUUID(),
   },
   codeTask: {
     port: parseInt(optional("CODE_TASK_PORT", String(ports.codeTask ?? portBase + 2)), 10),
