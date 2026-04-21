@@ -20,7 +20,7 @@ The bootstrap script installs Homebrew and Node 22, then hands off to `hive init
 Run:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/bootstrap.sh | bash
 ```
 
 Homebrew may pop up a system dialog asking to install Xcode Command Line Tools. Accept it and wait for it to finish — it's a one-time install and can take several minutes. The bootstrap script picks back up automatically and continues into `hive init`.

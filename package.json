@@ -4,6 +4,15 @@
   "hiveApi": "1.0.0",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/keepur/hive-docs.git"
+  },
+  "homepage": "https://github.com/keepur/hive-docs#readme",
+  "bugs": {
+    "url": "https://github.com/keepur/hive-docs/issues",
+    "email": "beta@keepur.io"
+  },
   "bin": {
     "hive": "pkg/cli.min.js",
     "honeypot": "scripts/honeypot"
