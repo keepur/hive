@@ -57,4 +57,6 @@ hive skill remove <name>   # Remove a skill
 
 ## License
 
-Closed-source preview release. Access is by invitation during the early cohort. To request access, email May at may@dodihome.com.
+Hive is closed-source commercial software, distributed in public beta under the [Hive Preview License](LICENSE). Evaluation is permitted; production use requires an invited early-cohort license or a commercial agreement.
+
+For access or commercial licensing, contact may@keepur.io.

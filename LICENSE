@@ -1,0 +1,42 @@
+Hive Preview License
+Copyright (c) 2026 Keepur, Inc. All rights reserved.
+
+This software is distributed as a closed-source commercial preview. Its
+availability on npm or any other public channel does not grant any license
+beyond what is expressly stated below.
+
+1. EVALUATION AND EARLY-COHORT USE. Keepur, Inc. ("Keepur") grants invited
+   early-cohort participants a non-exclusive, non-transferable, revocable
+   license to install and run the software for their own internal business
+   operations, for the duration of their invitation. Parties who are not
+   invited cohort participants may download and inspect the package for the
+   sole purpose of evaluation.
+
+2. RESTRICTIONS. Except as permitted by a separate written agreement with
+   Keepur, you may not:
+     (a) redistribute, sublicense, sell, rent, lease, or transfer the
+         software or any portion of it;
+     (b) modify, reverse engineer, decompile, disassemble, or create
+         derivative works, except to the extent this restriction is
+         prohibited by applicable law;
+     (c) offer the software, or any portion of it, as a hosted or managed
+         service to third parties;
+     (d) use the software to build a product or service that competes with
+         offerings from Keepur;
+     (e) remove or alter copyright, trademark, or other proprietary notices.
+
+3. NO WARRANTY. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+4. LIMITATION OF LIABILITY. IN NO EVENT SHALL KEEPUR BE LIABLE FOR ANY
+   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+   ARISING OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+5. TERMINATION. This license terminates automatically if you breach any of
+   its terms. Upon termination, you must cease all use of the software and
+   destroy all copies in your possession or control.
+
+Commercial licenses with expanded rights and support are available. For
+access or commercial licensing, contact may@keepur.io.
