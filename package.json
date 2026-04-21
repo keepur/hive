@@ -19,6 +19,7 @@
   "scripts": {
     "build": "tsc && tsc -p tsconfig.plugins.json",
     "build:plugins": "tsc -p tsconfig.plugins.json",
+    "postversion": "git push --follow-tags",
     "start": "node dist/index.js",
     "dev": "npx tsx src/index.ts",
     "setup": "npx tsx src/cli.ts init",
