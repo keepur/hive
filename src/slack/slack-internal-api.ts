@@ -97,7 +97,14 @@ export class SlackInternalApi {
   }
 
   private async handleSend(body: Record<string, unknown>, res: ServerResponse): Promise<void> {
-    const { agent_id, channel, text, thread_ts, blocks: _blocks, force_root } = body as {
+    const {
+      agent_id,
+      channel,
+      text,
+      thread_ts,
+      blocks: _blocks,
+      force_root,
+    } = body as {
       agent_id?: string;
       channel?: string;
       text?: string;
@@ -140,9 +147,7 @@ export class SlackInternalApi {
       if (channelItems.length > 0) {
         // Pick the most recently started (last in array — T4 appends in order).
         const latest = channelItems[channelItems.length - 1];
-        threadTs =
-          (latest.meta?.slackThreadTs as string | undefined) ??
-          (latest.meta?.slackTs as string | undefined);
+        threadTs = (latest.meta?.slackThreadTs as string | undefined) ?? (latest.meta?.slackTs as string | undefined);
       }
     }
 

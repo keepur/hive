@@ -670,10 +670,7 @@ export class SlackGateway {
    * Read recent messages from a channel. Used by the Slack internal HTTP API.
    * Returns the messages array from conversations.history, or undefined on error.
    */
-  async readChannel(
-    channel: string,
-    limit = 50,
-  ): Promise<ConversationsHistoryResponse["messages"] | undefined> {
+  async readChannel(channel: string, limit = 50): Promise<ConversationsHistoryResponse["messages"] | undefined> {
     try {
       const res = await this.web.conversations.history({ channel, limit });
       return res.messages;
@@ -708,9 +705,7 @@ export class SlackGateway {
             }
           }
         }
-        cursor =
-          (res as { response_metadata?: { next_cursor?: string } }).response_metadata?.next_cursor ||
-          undefined;
+        cursor = (res as { response_metadata?: { next_cursor?: string } }).response_metadata?.next_cursor || undefined;
       } while (cursor);
     } catch (err) {
       log.warn("listChannels failed", { query, error: (err as Error).message });
