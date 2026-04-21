@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { SlackGateway } from "./slack-gateway.js";
 
 vi.mock("../logging/logger.js", () => ({
@@ -11,13 +11,15 @@ vi.mock("../logging/logger.js", () => ({
 }));
 
 // Track all chat.postMessage calls and files.uploadV2 calls
-const postMessageMock = vi.fn().mockResolvedValue({ ts: "1234.5678" });
+const postMessageMock = vi.fn().mockResolvedValue({ ok: true, ts: "1234.5678", channel: "C123" });
 const uploadV2Mock = vi.fn().mockResolvedValue({ ok: true });
+const conversationsListMock = vi.fn().mockResolvedValue({ channels: [], response_metadata: { next_cursor: "" } });
 
 vi.mock("@slack/web-api", () => ({
   WebClient: vi.fn().mockImplementation(() => ({
     chat: { postMessage: postMessageMock },
     files: { uploadV2: uploadV2Mock },
+    conversations: { list: conversationsListMock },
   })),
 }));
 
@@ -181,5 +183,111 @@ describe("SlackGateway.postMessage — message length handling", () => {
     // Should end at a sentence boundary, not mid-word
     const beforeAttached = summaryText.split("\n\n_(full response attached)_")[0];
     expect(beforeAttached).toMatch(/[.!?]$/);
+  });
+});
+
+describe("SlackGateway — outbound echo suppression", () => {
+  let gateway: SlackGateway;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("registerOutboundTs + isOutboundEcho round-trip", () => {
+    gateway.registerOutboundTs("C1", "1111.2222");
+    expect(gateway.isOutboundEcho("C1", "1111.2222")).toBe(true);
+    expect(gateway.isOutboundEcho("C1", "9999.9999")).toBe(false);
+    expect(gateway.isOutboundEcho("C2", "1111.2222")).toBe(false);
+  });
+
+  it("postMessage registers the returned ts in the cache", async () => {
+    postMessageMock.mockResolvedValueOnce({ ok: true, ts: "5555.6666", channel: "C123" });
+    await gateway.postMessage("C123", "hello");
+    expect(gateway.isOutboundEcho("C123", "5555.6666")).toBe(true);
+  });
+
+  it("postAndRegister returns ok+ts on success", async () => {
+    postMessageMock.mockResolvedValueOnce({ ok: true, ts: "7777.8888", channel: "C456" });
+    const result = await gateway.postAndRegister("C456", "hello world");
+    expect(result.ok).toBe(true);
+    expect(result.ts).toBe("7777.8888");
+  });
+
+  it("postAndRegister returns ok:false when postMessage returns no ts", async () => {
+    postMessageMock.mockResolvedValueOnce({ ok: false, ts: undefined, channel: undefined });
+    const result = await gateway.postAndRegister("C456", "hello world");
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("postMessage returned no ts");
+  });
+});
+
+describe("SlackGateway — resolveChannelId", () => {
+  let gateway: SlackGateway;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  it("returns C… IDs unchanged without hitting the API", async () => {
+    const result = await gateway.resolveChannelId("C0123456789");
+    expect(result).toBe("C0123456789");
+    expect(conversationsListMock).not.toHaveBeenCalled();
+  });
+
+  it("returns D… IDs unchanged without hitting the API", async () => {
+    const result = await gateway.resolveChannelId("D9876543210");
+    expect(result).toBe("D9876543210");
+    expect(conversationsListMock).not.toHaveBeenCalled();
+  });
+
+  it("returns G… IDs unchanged without hitting the API", async () => {
+    const result = await gateway.resolveChannelId("G1122334455");
+    expect(result).toBe("G1122334455");
+    expect(conversationsListMock).not.toHaveBeenCalled();
+  });
+
+  it("hits conversations.list for a bare channel name and populates both caches", async () => {
+    conversationsListMock.mockResolvedValueOnce({
+      channels: [
+        { id: "C111AAA", name: "agent-river" },
+        { id: "C222BBB", name: "general" },
+      ],
+      response_metadata: { next_cursor: "" },
+    });
+
+    const result = await gateway.resolveChannelId("agent-river");
+    expect(result).toBe("C111AAA");
+    expect(conversationsListMock).toHaveBeenCalledTimes(1);
+
+    // Second call should use cache — no additional API call
+    const result2 = await gateway.resolveChannelId("agent-river");
+    expect(result2).toBe("C111AAA");
+    expect(conversationsListMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("strips leading # from channel name before lookup", async () => {
+    conversationsListMock.mockResolvedValueOnce({
+      channels: [{ id: "C333CCC", name: "agent-milo" }],
+      response_metadata: { next_cursor: "" },
+    });
+
+    const result = await gateway.resolveChannelId("#agent-milo");
+    expect(result).toBe("C333CCC");
+  });
+
+  it("returns null for an unknown channel name", async () => {
+    conversationsListMock.mockResolvedValueOnce({
+      channels: [],
+      response_metadata: { next_cursor: "" },
+    });
+
+    const result = await gateway.resolveChannelId("nonexistent-channel");
+    expect(result).toBeNull();
   });
 });
