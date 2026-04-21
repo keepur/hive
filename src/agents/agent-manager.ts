@@ -64,6 +64,10 @@ export class AgentManager {
   private skillIndex: SkillIndex;
   private activityLogger?: ActivityLogger;
   private prefetcher?: CodeIndexPrefetcher;
+  // Keyed by agentId → list of currently in-flight WorkItems (one per active thread).
+  private activeWorkItems = new Map<string, WorkItem[]>();
+  // Keyed by channelId → timestamps of new-session spawns (within 60s window).
+  private spawnWindow = new Map<string, number[]>();
 
   constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher) {
     this.registry = registry;
@@ -80,6 +84,10 @@ export class AgentManager {
     return this.plugins;
   }
 
+  getActiveWorkItems(agentId: string): WorkItem[] {
+    return this.activeWorkItems.get(agentId) ?? [];
+  }
+
   private createRunner(agentId: string): AgentRunner {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
@@ -92,6 +100,22 @@ export class AgentManager {
       this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
     } catch (err) {
       log.warn("Skill reload failed, retaining previous index", { error: String(err) });
+    }
+  }
+
+  private recordSpawn(channelId: string): void {
+    const now = Date.now();
+    const windowMs = 60_000;
+    const spawns = (this.spawnWindow.get(channelId) ?? []).filter((t) => now - t < windowMs);
+    spawns.push(now);
+    this.spawnWindow.set(channelId, spawns);
+    if (spawns.length > 3) {
+      log.warn("Session spawn rate exceeded", { channelId, count: spawns.length, windowSec: 60 });
+    }
+    // Bounded memory: cap at 200 channels, drop oldest on overflow.
+    if (this.spawnWindow.size > 200) {
+      const firstKey = this.spawnWindow.keys().next().value;
+      if (firstKey) this.spawnWindow.delete(firstKey);
     }
   }
 
@@ -171,9 +195,14 @@ export class AgentManager {
 
     while (queue.length > 0) {
       const item = queue.shift()!;
+      // Track active WorkItem for the Slack internal API threading fallback.
+      const activeList = this.activeWorkItems.get(agentId) ?? [];
+      activeList.push(item.message);
+      this.activeWorkItems.set(agentId, activeList);
       try {
         const threadId = item.message.threadId ?? item.message.id;
         const existingSession = await this.sessionStore.get(agentId, threadId);
+        if (!existingSession) this.recordSpawn(item.message.source.id);
 
         const bgContext: WorkItemContext = {
           adapterId: item.message.source.adapterId ?? item.message.source.kind,
@@ -202,7 +231,11 @@ export class AgentManager {
         if (userId) {
           prompt = `[user:${userId} via ${senderLabel} in #${item.message.source.label}]: ${item.message.text}`;
         } else if (item.message.senderName) {
-          prompt = `[${senderLabel} in #${item.message.source.label}]: ${item.message.text}`;
+          const slackThreadTs = item.message.meta?.slackThreadTs as string | undefined;
+          const slackTs = item.message.meta?.slackTs as string | undefined;
+          const threadTs = slackThreadTs ?? slackTs;
+          const threadHint = threadTs ? `, thread=${threadTs}` : "";
+          prompt = `[${senderLabel} in #${item.message.source.label}${threadHint}]: ${item.message.text}`;
         } else {
           prompt = item.message.text;
         }
@@ -334,6 +367,10 @@ export class AgentManager {
           error: String(err),
         });
         item.reject(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        const remaining = (this.activeWorkItems.get(agentId) ?? []).filter((w) => w.id !== item.message.id);
+        if (remaining.length === 0) this.activeWorkItems.delete(agentId);
+        else this.activeWorkItems.set(agentId, remaining);
       }
     }
 

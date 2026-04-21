@@ -1,9 +1,11 @@
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
+import type { ConversationsHistoryResponse, UsersInfoResponse } from "@slack/web-api";
 import { createLogger } from "../logging/logger.js";
 import type { IncomingMessage } from "../types/agent-config.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import { downloadAndProcess, type SlackFile, type ProcessedFile } from "../files/file-processor.js";
+import { OutboundTsCache } from "./outbound-ts-cache.js";
 
 const log = createLogger("slack-gateway");
 
@@ -35,7 +37,9 @@ export class SlackGateway {
   private peerBotUserIds = new Set<string>(); // bot user IDs from other gateways
   private peerBotIds = new Set<string>(); // bot IDs (Bxxx) from other gateways
   private channelNameCache = new Map<string, string>(); // id → name
+  private channelIdCache = new Map<string, string>(); // name → id (inverse of channelNameCache, lazy-populated)
   private userNameCache = new Map<string, string>(); // userId → display name
+  private outboundTsCache = new OutboundTsCache();
   private integrationChannels = new Set<string>(); // channel names that accept bot messages
   private botToken: string;
 
@@ -106,6 +110,12 @@ export class SlackGateway {
       if (this.peerBotUserIds.has(event.user)) return;
       if (event.bot_id && event.bot_id === this.botId) return;
       if (event.bot_id && this.peerBotIds.has(event.bot_id)) return;
+
+      // Suppress self-echoes from agent-initiated sends routed through the local Slack API.
+      if (event.ts && event.channel && this.outboundTsCache.has(event.channel, event.ts)) {
+        log.info("Outbound echo suppressed", { channel: event.channel, ts: event.ts });
+        return;
+      }
 
       // For bot messages or messages with subtypes, only allow in integration channels
       if (event.bot_id || event.subtype) {
@@ -375,6 +385,9 @@ export class SlackGateway {
           username: identity.name,
           ...iconOpts,
         });
+        if (result.ok && result.ts && result.channel) {
+          this.outboundTsCache.register(result.channel, result.ts);
+        }
         return result.ts;
       } catch (err) {
         log.warn("Failed to post with identity, falling back to plain post", { error: String(err) });
@@ -388,6 +401,9 @@ export class SlackGateway {
         thread_ts: threadTs,
         unfurl_links: false,
       });
+      if (result.ok && result.ts && result.channel) {
+        this.outboundTsCache.register(result.channel, result.ts);
+      }
       return result.ts;
     } catch (err) {
       log.error("Failed to post message", { channel, error: String(err) });
@@ -568,6 +584,75 @@ export class SlackGateway {
     return resolved;
   }
 
+  registerOutboundTs(channel: string, ts: string): void {
+    this.outboundTsCache.register(channel, ts);
+  }
+
+  isOutboundEcho(channel: string, ts: string): boolean {
+    return this.outboundTsCache.has(channel, ts);
+  }
+
+  /**
+   * Public entry for the Slack internal HTTP API. Delegates to `postMessage`, which picks
+   * `postSingle` / `postSplit` / `postAsFile` based on text length and funnels into `postSingle`
+   * where the cache write happens. Returns the first chunk's ts (sufficient for the caller —
+   * every chunk's ts is registered independently).
+   *
+   * Caller should resolve `channel` to a Slack channel ID first (via `resolveChannelId`) — this
+   * method does not re-resolve, and does not return a canonical channel ID.
+   */
+  async postAndRegister(
+    channel: string,
+    text: string,
+    threadTs?: string,
+  ): Promise<{ ok: boolean; ts?: string; error?: string }> {
+    try {
+      const ts = await this.postMessage(channel, text, threadTs);
+      if (ts) return { ok: true, ts };
+      return { ok: false, error: "postMessage returned no ts" };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  /**
+   * Resolve a channel name or ID to a Slack channel ID.
+   * - Inputs starting with C, D, or G are returned unchanged (already an ID).
+   * - Otherwise looks up via channelIdCache (lazy-populated from conversations.list).
+   * - Returns null if the channel name cannot be resolved.
+   */
+  async resolveChannelId(nameOrId: string): Promise<string | null> {
+    if (nameOrId.startsWith("C") || nameOrId.startsWith("D") || nameOrId.startsWith("G")) {
+      return nameOrId;
+    }
+    const name = nameOrId.replace(/^#/, "");
+    const cached = this.channelIdCache.get(name);
+    if (cached) return cached;
+    try {
+      // Fetch via conversations.list, populate both caches as we see entries.
+      let cursor: string | undefined;
+      do {
+        const res = await this.web.conversations.list({
+          limit: 1000,
+          cursor,
+          exclude_archived: true,
+          types: "public_channel,private_channel",
+        });
+        for (const ch of (res.channels as Array<{ id?: string; name?: string }>) ?? []) {
+          if (ch.id && ch.name) {
+            this.channelNameCache.set(ch.id, ch.name);
+            this.channelIdCache.set(ch.name, ch.id);
+          }
+        }
+        cursor = (res as { response_metadata?: { next_cursor?: string } }).response_metadata?.next_cursor || undefined;
+      } while (cursor);
+    } catch (err) {
+      log.warn("channel id resolve failed", { name, error: (err as Error).message });
+      return null;
+    }
+    return this.channelIdCache.get(name) ?? null;
+  }
+
   private async resolveChannelName(channelId: string): Promise<string> {
     const cached = this.channelNameCache.get(channelId);
     if (cached) return cached;
@@ -584,9 +669,71 @@ export class SlackGateway {
     }
   }
 
+  /**
+   * Read recent messages from a channel. Used by the Slack internal HTTP API.
+   * Returns the messages array from conversations.history, or undefined on error.
+   */
+  async readChannel(channel: string, limit = 50): Promise<ConversationsHistoryResponse["messages"] | undefined> {
+    try {
+      const res = await this.web.conversations.history({ channel, limit });
+      return res.messages;
+    } catch (err) {
+      log.warn("readChannel failed", { channel, error: (err as Error).message });
+      return undefined;
+    }
+  }
+
+  /**
+   * List channels, optionally filtered by a substring query on the name.
+   * Used by the Slack internal HTTP API.
+   */
+  async listChannels(query?: string): Promise<Array<{ id: string; name: string }>> {
+    const results: Array<{ id: string; name: string }> = [];
+    try {
+      let cursor: string | undefined;
+      do {
+        const res = await this.web.conversations.list({
+          limit: 1000,
+          cursor,
+          exclude_archived: true,
+          types: "public_channel,private_channel",
+        });
+        for (const ch of (res.channels as Array<{ id?: string; name?: string }>) ?? []) {
+          if (ch.id && ch.name) {
+            // Populate the name/id caches as a side-effect
+            this.channelNameCache.set(ch.id, ch.name);
+            this.channelIdCache.set(ch.name, ch.id);
+            if (!query || ch.name.includes(query)) {
+              results.push({ id: ch.id, name: ch.name });
+            }
+          }
+        }
+        cursor = (res as { response_metadata?: { next_cursor?: string } }).response_metadata?.next_cursor || undefined;
+      } while (cursor);
+    } catch (err) {
+      log.warn("listChannels failed", { query, error: (err as Error).message });
+    }
+    return results;
+  }
+
+  /**
+   * Look up a Slack user by user ID. Used by the Slack internal HTTP API.
+   * Returns the user object, or undefined on error.
+   */
+  async readUser(user: string): Promise<UsersInfoResponse["user"] | undefined> {
+    try {
+      const res = await this.web.users.info({ user });
+      return res.user;
+    } catch (err) {
+      log.warn("readUser failed", { user, error: (err as Error).message });
+      return undefined;
+    }
+  }
+
   sweep(): SweepResult {
-    const pruned = this.channelNameCache.size + this.userNameCache.size;
+    const pruned = this.channelNameCache.size + this.channelIdCache.size + this.userNameCache.size;
     this.channelNameCache.clear();
+    this.channelIdCache.clear();
     this.userNameCache.clear();
     return { component: "slack-gateway", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }

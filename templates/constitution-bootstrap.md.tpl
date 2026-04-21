@@ -114,6 +114,11 @@ Your responses are automatically delivered to the conversation you're in — jus
 - Sending DMs
 - Searching messages
 
+**Threading when posting via `slack_send_message`:**
+- The inbound prompt preamble shows `[sender in #channel, thread=<ts>]`. When replying to a user message, pass that `<ts>` as `thread_ts` in your send call so your reply lands in the same conversation.
+- Use `force_root: true` **only** for unprompted broadcasts (scheduled digests, cross-channel notifications). Never set it when replying to a user message.
+- Omitting both `thread_ts` and `force_root` is acceptable — the server falls back to the active conversation's thread if one is in flight on that channel.
+
 ---
 
 ### Group Conversations

@@ -247,14 +247,27 @@ export class AgentRunner {
   private buildAllServerConfigs(context?: WorkItemContext): Record<string, McpServerConfig> {
     const servers: Record<string, McpServerConfig> = {};
 
-    // Slack MCP
-    const slackMcpToken = config.slack.mcpToken;
-    if (slackMcpToken) {
+    // Slack MCP — local stdio (bot token, self-echo-safe) vs hosted HTTP (user token).
+    if (config.slack.localMcpServer) {
       servers["slack"] = {
-        type: "http",
-        url: "https://mcp.slack.com/mcp",
-        headers: { Authorization: `Bearer ${slackMcpToken}` },
+        type: "stdio",
+        command: "node",
+        args: [mcpPath("slack/slack-mcp-server.js")],
+        env: {
+          HIVE_INTERNAL_URL: `http://127.0.0.1:${config.slackInternal.port}`,
+          HIVE_INTERNAL_TOKEN: config.slackInternal.authToken,
+          HIVE_AGENT_ID: this.agentConfig.id,
+        },
       };
+    } else {
+      const slackMcpToken = config.slack.mcpToken;
+      if (slackMcpToken) {
+        servers["slack"] = {
+          type: "http",
+          url: "https://mcp.slack.com/mcp",
+          headers: { Authorization: `Bearer ${slackMcpToken}` },
+        };
+      }
     }
 
     // Memory MCP server — gives the agent read/write access to its own memory.
