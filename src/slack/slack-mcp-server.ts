@@ -78,12 +78,11 @@ server.registerTool(
     title: "Send Slack Message",
     description:
       "Send a message to a Slack channel or DM. " +
-      "When replying to a user message, pass the `thread_ts` value from the inbound preamble " +
-      "(shown as `thread=<ts>`) so your reply lands in the same conversation thread. " +
-      "Use `force_root: true` only for unprompted broadcasts (scheduled digests, cross-channel notifications) — " +
-      "never when replying to a user. " +
-      "Omitting both `thread_ts` and `force_root` is fine; the server falls back to the active WorkItem thread " +
-      "if one is in flight on that channel.",
+      "Do NOT use this tool to reply to the message you're currently handling — return text instead and the delivery pipeline handles threading. " +
+      "This tool is for outbound actions: posting in another agent's channel, chiming into an existing cross-agent thread, DMs, or broadcasts. " +
+      "To thread into a specific conversation elsewhere, pass its `ts` as `thread_ts`. " +
+      "Use `force_root: true` for unprompted broadcasts (scheduled digests, cross-channel notifications) that should land at channel root. " +
+      "Omitting both is fine; the server falls back to the active WorkItem thread if one is in flight on that channel.",
     inputSchema: {
       channel: z
         .string()
@@ -92,7 +91,10 @@ server.registerTool(
       thread_ts: z
         .string()
         .optional()
-        .describe("Reply in this thread. Pass the `thread=<ts>` value from the inbound preamble."),
+        .describe(
+          "Post inside an existing thread elsewhere (e.g. a cross-agent conversation). " +
+            "Do not pass the inbound preamble's `thread=<ts>` to reply to the current conversation — return text instead.",
+        ),
       blocks: z
         .array(z.record(z.string(), z.unknown()))
         .optional()
