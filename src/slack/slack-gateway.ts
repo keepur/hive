@@ -1,5 +1,6 @@
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
+import type { ConversationsHistoryResponse, UsersInfoResponse } from "@slack/web-api";
 import { createLogger } from "../logging/logger.js";
 import type { IncomingMessage } from "../types/agent-config.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
@@ -662,6 +663,72 @@ export class SlackGateway {
       // DMs and some channels don't have names — use the ID
       this.channelNameCache.set(channelId, channelId);
       return channelId;
+    }
+  }
+
+  /**
+   * Read recent messages from a channel. Used by the Slack internal HTTP API.
+   * Returns the messages array from conversations.history, or undefined on error.
+   */
+  async readChannel(
+    channel: string,
+    limit = 50,
+  ): Promise<ConversationsHistoryResponse["messages"] | undefined> {
+    try {
+      const res = await this.web.conversations.history({ channel, limit });
+      return res.messages;
+    } catch (err) {
+      log.warn("readChannel failed", { channel, error: (err as Error).message });
+      return undefined;
+    }
+  }
+
+  /**
+   * List channels, optionally filtered by a substring query on the name.
+   * Used by the Slack internal HTTP API.
+   */
+  async listChannels(query?: string): Promise<Array<{ id: string; name: string }>> {
+    const results: Array<{ id: string; name: string }> = [];
+    try {
+      let cursor: string | undefined;
+      do {
+        const res = await this.web.conversations.list({
+          limit: 1000,
+          cursor,
+          exclude_archived: true,
+          types: "public_channel,private_channel",
+        });
+        for (const ch of (res.channels as Array<{ id?: string; name?: string }>) ?? []) {
+          if (ch.id && ch.name) {
+            // Populate the name/id caches as a side-effect
+            this.channelNameCache.set(ch.id, ch.name);
+            this.channelIdCache.set(ch.name, ch.id);
+            if (!query || ch.name.includes(query)) {
+              results.push({ id: ch.id, name: ch.name });
+            }
+          }
+        }
+        cursor =
+          (res as { response_metadata?: { next_cursor?: string } }).response_metadata?.next_cursor ||
+          undefined;
+      } while (cursor);
+    } catch (err) {
+      log.warn("listChannels failed", { query, error: (err as Error).message });
+    }
+    return results;
+  }
+
+  /**
+   * Look up a Slack user by user ID. Used by the Slack internal HTTP API.
+   * Returns the user object, or undefined on error.
+   */
+  async readUser(user: string): Promise<UsersInfoResponse["user"] | undefined> {
+    try {
+      const res = await this.web.users.info({ user });
+      return res.user;
+    } catch (err) {
+      log.warn("readUser failed", { user, error: (err as Error).message });
+      return undefined;
     }
   }
 
