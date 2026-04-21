@@ -34,6 +34,7 @@ import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
 import { checkFirstBoot } from "./startup/first-boot.js";
 import { SlackInternalApi } from "./slack/slack-internal-api.js";
+import { preflightBotScopes } from "./slack/slack-scope-preflight.js";
 const log = createLogger("index");
 
 async function main(): Promise<void> {
@@ -311,6 +312,7 @@ async function main(): Promise<void> {
   // Slack internal API — local HTTP server for agent-side Slack MCP tools
   let slackInternalApi: SlackInternalApi | null = null;
   if (config.slack.localMcpServer) {
+    await preflightBotScopes(config.slack.botToken);
     slackInternalApi = new SlackInternalApi({
       port: config.slackInternal.port,
       authToken: config.slackInternal.authToken,
