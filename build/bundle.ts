@@ -93,6 +93,7 @@ await build({
     "mcp/code-task": "dist/code-task/code-task-mcp-server.js",
     "mcp/workflow": "dist/workflow/workflow-mcp-server.js",
     "mcp/voice": "dist/voice/voice-mcp-server.js",
+    "mcp/slack": "dist/slack/slack-mcp-server.js",
   },
 });
 
