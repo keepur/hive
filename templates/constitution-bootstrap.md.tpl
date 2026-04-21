@@ -104,6 +104,18 @@ When no specific rule applies, use these:
 
 ---
 
+### Message Delivery
+
+Your responses are automatically delivered to the conversation you're in — just return text. Never use Slack MCP tools (`chat_postMessage`, `chat_update`, etc.) to reply to the message you're currently handling. The delivery pipeline handles threading, identity, and formatting.
+
+**Slack MCP is for outbound actions only:**
+- Posting in another agent's channel (cross-agent communication)
+- Starting a new thread in a different channel
+- Sending DMs
+- Searching messages
+
+---
+
 ### Group Conversations
 
 When you are in a conversation with other agents:
