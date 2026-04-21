@@ -449,7 +449,7 @@ describe("stop() — process cleanup", () => {
 describe("reapStale()", () => {
   it("reaps tasks older than maxLifetimeMs with no recent stderr activity", async () => {
     const { spawn } = await import("node:child_process");
-    const { writeFileSync } = await import("node:fs");
+    const { writeFileSync, utimesSync } = await import("node:fs");
 
     const mgr = new CodeTaskManager(PORT + 4, AUTH_TOKEN, PLUGIN_DIRS, 2, TASKS_DIR, () => {}, {
       maxLifetimeMs: 1, // 1ms — everything is stale
@@ -461,7 +461,10 @@ describe("reapStale()", () => {
       // Spawn a real long-running process and inject it as a fake task
       const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
       const stderrPath = `${TASKS_DIR}/reap-test.stderr.log`;
-      writeFileSync(stderrPath, ""); // create empty stderr file (old mtime)
+      writeFileSync(stderrPath, "");
+      // Backdate mtime so isFileRecentlyModified can't flip true on CI clock noise
+      const pastSec = Math.floor((Date.now() - 3_600_000) / 1000);
+      utimesSync(stderrPath, pastSec, pastSec);
 
       const tasks = (mgr as unknown as { tasks: Map<string, Record<string, unknown>> }).tasks;
       tasks.set("reap-test-id", {
