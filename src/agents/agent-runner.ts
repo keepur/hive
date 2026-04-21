@@ -97,6 +97,7 @@ const MCP_BUNDLE_MAP: Record<string, string> = {
   "workflow/workflow-mcp-server.js": "workflow.min.js",
   "schedule/schedule-mcp-server.js": "schedule.min.js",
   "admin/admin-mcp-server.js": "admin.min.js",
+  "slack/slack-mcp-server.js": "slack.min.js",
 };
 
 function mcpPath(devSubpath: string): string {
