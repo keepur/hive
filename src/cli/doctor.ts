@@ -136,7 +136,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       required: true,
       test: () => config !== null,
       remedy: configError
-        ? `config.ts threw: ${configError}. Set missing env vars in ~/.hive/.env and ensure hive.yaml exists.`
+        ? `config.ts threw: ${configError}. Set missing env vars in <HIVE_HOME>/.env and ensure hive.yaml exists.`
         : "Check hive.yaml at the hive home and run `hive init` if missing.",
     },
     ...requiredEnv.map<Check>((key) => ({
@@ -144,7 +144,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       group: "config",
       required: true,
       test: () => !!process.env[key],
-      remedy: `Set ${key} in ~/.hive/.env`,
+      remedy: `Set ${key} in <HIVE_HOME>/.env`,
     })),
     // ── Agents ───────────────────────────────────────────────────────────
     // All agent checks short-circuit to false when config failed to load —
