@@ -46,10 +46,7 @@ describe("expandRule", () => {
     mkdirSync(join(hive, "agents", "river", "scratch"), { recursive: true });
     mkdirSync(join(hive, "agents", "jasper", "workshop"), { recursive: true });
     const expanded = expandRule(hive, "agents/*/scratch").sort();
-    expect(expanded).toEqual([
-      join(hive, "agents", "milo", "scratch"),
-      join(hive, "agents", "river", "scratch"),
-    ]);
+    expect(expanded).toEqual([join(hive, "agents", "milo", "scratch"), join(hive, "agents", "river", "scratch")]);
   });
 
   it("returns empty when parent doesn't exist", () => {
@@ -74,10 +71,7 @@ describe("RetentionSweeper.sweep", () => {
   it("reports age-over candidates in dry-run mode without deleting", async () => {
     touch(join(hive, "data", "old.csv"), 10);
     touch(join(hive, "data", "new.csv"), 1);
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { data: { days: 7 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { data: { days: 7 } } }), { hiveHome: hive, report });
     const r = await sweeper.sweep();
     expect(r.dryRun).toBe(true);
     expect(r.candidates.map((c) => c.path)).toEqual([join(hive, "data", "old.csv")]);
@@ -88,10 +82,10 @@ describe("RetentionSweeper.sweep", () => {
 
   it("deletes candidates when enabled", async () => {
     touch(join(hive, "data", "old.csv"), 10);
-    const sweeper = new RetentionSweeper(
-      baseCfg({ enabled: true, paths: { data: { days: 7 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ enabled: true, paths: { data: { days: 7 } } }), {
+      hiveHome: hive,
+      report,
+    });
     const r = await sweeper.sweep();
     expect(r.deleted.map((c) => c.path)).toEqual([join(hive, "data", "old.csv")]);
     expect(existsSync(join(hive, "data", "old.csv"))).toBe(false);
@@ -101,20 +95,17 @@ describe("RetentionSweeper.sweep", () => {
     mkdirSync(join(hive, "data"), { recursive: true });
     writeFileSync(join(hive, "data", ".retention-days"), "30\n");
     touch(join(hive, "data", "old.csv"), 10); // 10 < 30, so NOT a candidate
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { data: { days: 7 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { data: { days: 7 } } }), { hiveHome: hive, report });
     const r = await sweeper.sweep();
     expect(r.candidates).toEqual([]);
   });
 
   it("skips rules with days=0 (keep forever)", async () => {
     touch(join(hive, "agents", "milo", "reports", "standup.md"), 365);
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { "agents/*/reports": { days: 0 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { "agents/*/reports": { days: 0 } } }), {
+      hiveHome: hive,
+      report,
+    });
     const r = await sweeper.sweep();
     expect(r.candidates).toEqual([]);
   });
@@ -122,10 +113,10 @@ describe("RetentionSweeper.sweep", () => {
   it("expands star rules into per-agent roots", async () => {
     touch(join(hive, "agents", "milo", "scratch", "old.txt"), 10);
     touch(join(hive, "agents", "river", "scratch", "old.txt"), 10);
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { "agents/*/scratch": { days: 7 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { "agents/*/scratch": { days: 7 } } }), {
+      hiveHome: hive,
+      report,
+    });
     const r = await sweeper.sweep();
     expect(r.candidates.map((c) => c.path).sort()).toEqual([
       join(hive, "agents", "milo", "scratch", "old.txt"),
@@ -137,10 +128,7 @@ describe("RetentionSweeper.sweep", () => {
     mkdirSync(join(hive, "data"), { recursive: true });
     writeFileSync(join(hive, "data", ".retention-days"), "not-a-number");
     touch(join(hive, "data", "old.csv"), 10);
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { data: { days: 7 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { data: { days: 7 } } }), { hiveHome: hive, report });
     const r = await sweeper.sweep();
     expect(r.candidates.map((c) => c.path)).toEqual([join(hive, "data", "old.csv")]);
   });
