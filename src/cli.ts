@@ -120,7 +120,7 @@ switch (command) {
     const hiveHome = ensureHiveInstallOrExit();
     if (values.daemon) {
       const { startDaemon } = await import("./cli/daemon.js");
-      await startDaemon(PKG_ROOT);
+      await startDaemon();
     } else {
       const { execFileSync } = await import("node:child_process");
       const serverPath = existsSync(resolve(PKG_ROOT, "pkg", "server.min.js"))
