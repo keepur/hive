@@ -9,7 +9,7 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
-import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
+import { engineDir, hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
@@ -649,8 +649,8 @@ export class AgentRunner {
         const entryJs = serverDef.entry.replace(/\.ts$/, ".js");
         const entryMin = serverDef.entry.replace(/\.ts$/, ".min.js");
         const devPath = resolve(DIST_DIR, `plugins/${plugin.name}/${entryJs}`);
-        const npmPath = resolve(hiveHome, "plugins", "node_modules", plugin.name, "dist", entryMin);
-        const inTreePath = resolve(hiveHome, "plugins", plugin.name, "dist", entryMin);
+        const npmPath = resolve(engineDir, "plugins", "node_modules", plugin.name, "dist", entryMin);
+        const inTreePath = resolve(engineDir, "plugins", plugin.name, "dist", entryMin);
         const compiledPath = [devPath, npmPath, inTreePath].find((p) => existsSync(p)) ?? devPath;
 
         // Base env available to all plugin servers
