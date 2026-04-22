@@ -1,5 +1,6 @@
 import { existsSync, watch } from "node:fs";
-import { skillsDir, hiveHome, hiveMetaDir } from "./paths.js";
+import { resolve } from "node:path";
+import { skillsDir, hiveHome, hiveStateDir, engineDir } from "./paths.js";
 import { MongoClient } from "mongodb";
 import { initInstanceGit } from "./skills/instance-git.js";
 import { verifyPackageIntegrity, checkAllowlistDrift } from "./skills/integrity.js";
@@ -42,10 +43,22 @@ async function main(): Promise<void> {
   log.info("Hive starting up", { instance: config.instance.id, portBase: config.instance.portBase });
 
   // Boot-time integrity + upgrade checks
-  verifyPackageIntegrity(hiveHome, hiveMetaDir);
+  // Refuse to boot if both 0.1.x and 0.2.0 engine layouts exist side-by-side
+  // (catches botched manual upgrades where someone extracted a 0.2.0 tarball
+  // over a 0.1.x instance without removing the old dist/).
+  if (existsSync(resolve(hiveHome, "dist", "index.js")) && existsSync(resolve(engineDir, "dist", "index.js"))) {
+    log.error(
+      "Conflicting engine layouts detected — both <hiveHome>/dist/ and <hiveHome>/.hive/dist/ exist. " +
+        "Remove the old <hiveHome>/dist/ before starting 0.2.0.",
+      { hiveHome, engineDir },
+    );
+    process.exit(1);
+  }
+
+  verifyPackageIntegrity(hiveHome, hiveStateDir);
   checkAllowlistDrift(hiveHome);
   initInstanceGit(hiveHome);
-  checkUpgradeNotice(hiveMetaDir, skillsDir);
+  checkUpgradeNotice(hiveStateDir, skillsDir);
 
   // Initialize Gemini vision for image processing
   if (config.gemini.apiKey) {
