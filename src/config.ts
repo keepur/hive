@@ -286,12 +286,18 @@ export const config = {
     if (!Number.isFinite(defaultDays) || defaultDays < 0) {
       throw new Error(`Invalid retention.defaults.days: ${defaultDays}`);
     }
+    const intervalMs = parseInt(
+      optional("RETENTION_INTERVAL_MS", String(hive.retention?.intervalMs ?? 7 * 24 * 3600_000)),
+      10,
+    );
+    // Guard against YAML like `intervalMs: weekly` (parseInt → NaN) — setInterval(fn, NaN)
+    // in Node clamps to 1ms and fires continuously, which would hammer the fs + Slack.
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      throw new Error(`Invalid retention.intervalMs: must be a positive integer (got ${intervalMs})`);
+    }
     return {
       enabled: Boolean(hive.retention?.enabled ?? false),
-      intervalMs: parseInt(
-        optional("RETENTION_INTERVAL_MS", String(hive.retention?.intervalMs ?? 7 * 24 * 3600_000)),
-        10,
-      ),
+      intervalMs,
       defaultDays,
       paths,
     } satisfies RetentionConfig;
