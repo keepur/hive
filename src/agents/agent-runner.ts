@@ -9,7 +9,7 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
-import { hiveHome, agentScratchDir } from "../paths.js";
+import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
@@ -516,12 +516,23 @@ export class AgentRunner {
       };
     }
 
-    // Browser — Playwright MCP connected to user's Chrome via CDP
+    // Browser — Playwright MCP connected to user's Chrome via CDP.
+    // Per-agent `--output-dir` (snapshots/traces/screenshots) and
+    // `--user-data-dir` (profile) scope browser state to the agent's namespace
+    // and keep `.playwright-mcp/` out of HIVE_HOME. The SDK's McpStdioServerConfig
+    // has no cwd field, so CLI flags are the path — see KPR-51 design spec.
     if (config.browser.cdpEndpoint) {
+      const pwDir = agentPlaywrightDir(this.agentConfig.id, hiveHome);
+      mkdirSync(pwDir, { recursive: true });
       servers["browser"] = {
         type: "stdio",
         command: "npx",
-        args: ["@playwright/mcp@latest", "--cdp-endpoint", config.browser.cdpEndpoint],
+        args: [
+          "@playwright/mcp@latest",
+          "--cdp-endpoint", config.browser.cdpEndpoint,
+          "--output-dir", pwDir,
+          "--user-data-dir", resolve(pwDir, "user-data"),
+        ],
         env: {
           PATH: process.env.PATH ?? "",
           HOME: process.env.HOME ?? "",
