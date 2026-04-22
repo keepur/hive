@@ -191,8 +191,10 @@ run_cmd npm install --omit=dev
 
 # Sync shared artifacts (dist, plugins)
 echo "Syncing shared build output..."
-run_cmd rsync -a --delete "$BUILD_DIR/dist/" "$DEPLOY_DIR/dist/"
-[[ -d "$BUILD_DIR/plugins/claude-code" ]] && run_cmd rsync -a --delete "$BUILD_DIR/plugins/claude-code/" "$DEPLOY_DIR/plugins/claude-code/"
+# Ensure engine dir exists (wipe-and-replace target)
+run_cmd mkdir -p "$DEPLOY_DIR/.hive"
+run_cmd rsync -a --delete "$BUILD_DIR/dist/" "$DEPLOY_DIR/.hive/dist/"
+[[ -d "$BUILD_DIR/plugins/claude-code" ]] && run_cmd rsync -a --delete "$BUILD_DIR/plugins/claude-code/" "$DEPLOY_DIR/.hive/plugins/claude-code/"
 
 # =============================================================================
 # Phase 2: Deploy each instance

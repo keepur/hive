@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
-import { hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
+import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
 
 // Load .env from resolved hive home
 const dotenvPath = resolveDotenvPath(hiveHome);
@@ -21,14 +21,14 @@ function optional(key: string, fallback: string): string {
   return process.env[key] || fromKeychain(key) || fallback;
 }
 
-/** Auto-discover all plugin dirs under <hiveHome>/plugins/claude-code/, or use explicit list from hive.yaml */
+/** Auto-discover all plugin dirs under <engineDir>/plugins/claude-code/, or use explicit list from hive.yaml */
 function discoverPluginDirs(yamlDirs?: string[]): string[] {
   // Explicit list in hive.yaml takes precedence
   if (yamlDirs?.length) {
     return yamlDirs.map((d) => resolve(d.replace(/^~/, process.env.HOME ?? "/tmp")));
   }
-  // Auto-scan <hiveHome>/plugins/claude-code/*/
-  const parentDir = resolve(hiveHome, "plugins/claude-code");
+  // Auto-scan <engineDir>/plugins/claude-code/*/
+  const parentDir = resolve(engineDir, "plugins/claude-code");
   if (!existsSync(parentDir)) return [];
   return readdirSync(parentDir)
     .map((name) => resolve(parentDir, name))

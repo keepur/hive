@@ -26,14 +26,14 @@ describe("resolveHiveHome", () => {
     expect(resolveHiveHome()).toBe(process.cwd());
   });
 
-  it("falls back to ~/.hive/", async () => {
+  it("falls back to ~/hive/", async () => {
     vi.stubEnv("HIVE_HOME", "");
     vi.doMock("node:fs", () => ({
       existsSync: () => false,
     }));
     const { resolveHiveHome } = await import("../paths.js");
     const home = process.env.HOME ?? "/tmp";
-    expect(resolveHiveHome()).toBe(resolve(home, ".hive"));
+    expect(resolveHiveHome()).toBe(resolve(home, "hive"));
   });
 });
 

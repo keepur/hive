@@ -10,8 +10,8 @@ interface SnapshotEntry {
   hash: string;
 }
 
-export function verifyPackageIntegrity(hiveHome: string, hiveMetaDir: string): { ok: boolean; warnings: string[] } {
-  const snapshotPath = resolve(hiveMetaDir, "installed-snapshot.json");
+export function verifyPackageIntegrity(hiveHome: string, hiveStateDir: string): { ok: boolean; warnings: string[] } {
+  const snapshotPath = resolve(hiveStateDir, "installed-snapshot.json");
   if (!existsSync(snapshotPath)) {
     log.warn("No installed-snapshot.json — skipping integrity check (first install?)");
     return { ok: true, warnings: [] };
@@ -50,25 +50,28 @@ export function verifyPackageIntegrity(hiveHome: string, hiveMetaDir: string): {
 }
 
 export function checkAllowlistDrift(hiveHome: string): void {
-  const ALLOWLISTED = ["skills", "plugins", ".hive", ".env", "hive.yaml", "hive-"];
-  const PACKAGE_PATHS = new Set([
-    "dist",
-    "node_modules",
-    "package.json",
-    "package-lock.json",
-    "pkg",
-    "seeds",
-    "templates",
-  ]);
+  const ALLOWLISTED = [
+    "skills",
+    "plugins",
+    "workflow",
+    "data",
+    "agents",
+    "logs",
+    ".hive",
+    ".hive-state",
+    ".env",
+    "hive.yaml",
+    "hive-",
+    "beekeeper.yaml",
+    ".hive-generated.json",
+  ];
 
   try {
     const entries = readdirSync(hiveHome);
     const warnings: string[] = [];
 
     for (const entry of entries) {
-      if (PACKAGE_PATHS.has(entry)) continue;
-      if (entry.startsWith(".") && entry !== ".hive") continue;
-      if (ALLOWLISTED.some((p) => entry.startsWith(p.replace("/", "")))) continue;
+      if (ALLOWLISTED.some((p) => entry.startsWith(p))) continue;
       warnings.push(entry);
     }
 
@@ -80,7 +83,7 @@ export function checkAllowlistDrift(hiveHome: string): void {
   }
 }
 
-export function writeSnapshot(packageRoot: string, declaredFiles: string[]): void {
+export function writeSnapshot(stateDir: string, packageRoot: string, declaredFiles: string[]): void {
   const entries: SnapshotEntry[] = [];
   for (const file of declaredFiles) {
     const fullPath = resolve(packageRoot, file);
@@ -92,9 +95,8 @@ export function writeSnapshot(packageRoot: string, declaredFiles: string[]): voi
       entries.push({ path: file, hash: createHash("sha256").update(content).digest("hex") });
     }
   }
-  const snapshotDir = resolve(packageRoot, ".hive");
-  mkdirSync(snapshotDir, { recursive: true });
-  writeFileSync(resolve(snapshotDir, "installed-snapshot.json"), JSON.stringify(entries, null, 2));
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(resolve(stateDir, "installed-snapshot.json"), JSON.stringify(entries, null, 2));
 }
 
 function walkDir(dir: string, prefix: string, entries: SnapshotEntry[]): void {

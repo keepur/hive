@@ -33,5 +33,5 @@ export async function runUpdate(): Promise<void> {
     console.log(`Updated: ${fromVersion} → ${toVersion}.`);
   }
   console.log("Restarting Hive...");
-  await startDaemon(pkgRoot);
+  await startDaemon();
 }
