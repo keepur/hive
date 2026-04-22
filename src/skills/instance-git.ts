@@ -1,10 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { hiveStateDir, instanceGitDir } from "../paths.js";
+import { join, resolve } from "node:path";
 import { createLogger } from "../logging/logger.js";
 
 const log = createLogger("instance-git");
+
+/** Derive `.hive-state/` paths from a given hiveHome. */
+function statePaths(hiveHome: string): { stateDir: string; gitDir: string } {
+  const stateDir = resolve(hiveHome, ".hive-state");
+  return { stateDir, gitDir: resolve(stateDir, "git") };
+}
 
 /**
  * Initialize the instance-local git repo if not already present.
@@ -14,14 +19,15 @@ const log = createLogger("instance-git");
  * to avoid conflicts with any existing `.git` at hiveHome.
  */
 export function initInstanceGit(hiveHome: string): void {
-  if (existsSync(instanceGitDir)) return; // Already initialized
+  const { stateDir, gitDir } = statePaths(hiveHome);
+  if (existsSync(gitDir)) return; // Already initialized
 
-  mkdirSync(hiveStateDir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
 
   const git = (...args: string[]) =>
     execFileSync("git", [...args], {
       cwd: hiveHome,
-      env: { ...process.env, GIT_DIR: instanceGitDir, GIT_WORK_TREE: hiveHome },
+      env: { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: hiveHome },
       stdio: "pipe",
     });
 
@@ -37,16 +43,17 @@ export function initInstanceGit(hiveHome: string): void {
   git("checkout", "-b", "state");
   git("commit", "--allow-empty", "-m", "init: state branch");
 
-  log.info("Instance-local git initialized", { gitDir: instanceGitDir });
+  log.info("Instance-local git initialized", { gitDir });
 }
 
 /**
  * Helper to run git commands against the instance-local repo.
  */
 function gitCmd(hiveHome: string, ...args: string[]): string {
+  const { gitDir } = statePaths(hiveHome);
   return execFileSync("git", [...args], {
     cwd: hiveHome,
-    env: { ...process.env, GIT_DIR: instanceGitDir, GIT_WORK_TREE: hiveHome },
+    env: { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: hiveHome },
     stdio: "pipe",
     encoding: "utf-8",
   }).trim();
@@ -58,15 +65,16 @@ function gitCmd(hiveHome: string, ...args: string[]): string {
  * the live working tree's index.
  */
 export function commitToState(hiveHome: string, files: string[], message: string, authorName?: string): void {
-  if (!existsSync(instanceGitDir)) {
+  const { gitDir } = statePaths(hiveHome);
+  if (!existsSync(gitDir)) {
     log.warn("Instance git not initialized — skipping state commit");
     return;
   }
 
-  const tmpIndex = join(instanceGitDir, "state-index.tmp");
+  const tmpIndex = join(gitDir, "state-index.tmp");
   const env = {
     ...process.env,
-    GIT_DIR: instanceGitDir,
+    GIT_DIR: gitDir,
     GIT_WORK_TREE: hiveHome,
     GIT_INDEX_FILE: tmpIndex,
   };
@@ -145,12 +153,13 @@ export function commitToState(hiveHome: string, files: string[], message: string
  * the live working tree's index.
  */
 export function commitRemovalToState(hiveHome: string, files: string[], message: string): void {
-  if (!existsSync(instanceGitDir)) return;
+  const { gitDir } = statePaths(hiveHome);
+  if (!existsSync(gitDir)) return;
 
-  const tmpIndex = join(instanceGitDir, "state-index.tmp");
+  const tmpIndex = join(gitDir, "state-index.tmp");
   const env = {
     ...process.env,
-    GIT_DIR: instanceGitDir,
+    GIT_DIR: gitDir,
     GIT_WORK_TREE: hiveHome,
     GIT_INDEX_FILE: tmpIndex,
   };
