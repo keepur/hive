@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, writeFileSync, utimesSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, utimesSync, rmSync, existsSync, chmodSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import { RetentionSweeper, expandRule } from "./retention-sweeper.js";
@@ -131,5 +131,106 @@ describe("RetentionSweeper.sweep", () => {
     const sweeper = new RetentionSweeper(baseCfg({ paths: { data: { days: 7 } } }), { hiveHome: hive, report });
     const r = await sweeper.sweep();
     expect(r.candidates.map((c) => c.path)).toEqual([join(hive, "data", "old.csv")]);
+  });
+
+  it("collects errors when rmSync throws during enforcement", async () => {
+    // Make the parent directory read-only so rmSync cannot delete the file inside it.
+    mkdirSync(join(hive, "data"), { recursive: true });
+    touch(join(hive, "data", "old.csv"), 10);
+    chmodSync(join(hive, "data"), 0o555); // r-xr-xr-x — no write permission
+    try {
+      const sweeper = new RetentionSweeper(
+        baseCfg({ enabled: true, paths: { data: { days: 7 } } }),
+        { hiveHome: hive, report },
+      );
+      const r = await sweeper.sweep();
+      expect(r.deleted).toEqual([]);
+      expect(r.errors.length).toBe(1);
+      expect(r.errors[0].path).toBe(join(hive, "data", "old.csv"));
+    } finally {
+      // Restore write permission so afterEach cleanup can remove the temp dir.
+      chmodSync(join(hive, "data"), 0o755);
+    }
+  });
+
+  it("swallows report callback errors without failing the sweep", async () => {
+    touch(join(hive, "data", "old.csv"), 10);
+    const throwing = vi.fn().mockRejectedValue(new Error("slack down"));
+    const sweeper = new RetentionSweeper(
+      baseCfg({ paths: { data: { days: 7 } } }),
+      { hiveHome: hive, report: throwing },
+    );
+    const r = await sweeper.sweep();
+    expect(r.candidates.length).toBe(1);
+    expect(throwing).toHaveBeenCalledOnce();
+  });
+
+  it("honors .retention-days=0 override (keep forever) even when rule wants deletion", async () => {
+    mkdirSync(join(hive, "data"), { recursive: true });
+    writeFileSync(join(hive, "data", ".retention-days"), "0\n");
+    touch(join(hive, "data", "old.csv"), 30);
+    const sweeper = new RetentionSweeper(
+      baseCfg({ paths: { data: { days: 7 } } }),
+      { hiveHome: hive, report },
+    );
+    const r = await sweeper.sweep();
+    expect(r.candidates).toEqual([]);
+  });
+
+  it("rejects non-integer .retention-days override and falls back to rule default", async () => {
+    mkdirSync(join(hive, "data"), { recursive: true });
+    writeFileSync(join(hive, "data", ".retention-days"), "3.5");
+    touch(join(hive, "data", "old.csv"), 10); // 10 > 7, candidate under rule default
+    const sweeper = new RetentionSweeper(
+      baseCfg({ paths: { data: { days: 7 } } }),
+      { hiveHome: hive, report },
+    );
+    const r = await sweeper.sweep();
+    expect(r.candidates.map((c) => c.path)).toEqual([join(hive, "data", "old.csv")]);
+  });
+
+  it("rejects negative .retention-days override and falls back to rule default", async () => {
+    mkdirSync(join(hive, "data"), { recursive: true });
+    writeFileSync(join(hive, "data", ".retention-days"), "-5");
+    touch(join(hive, "data", "old.csv"), 10);
+    const sweeper = new RetentionSweeper(
+      baseCfg({ paths: { data: { days: 7 } } }),
+      { hiveHome: hive, report },
+    );
+    const r = await sweeper.sweep();
+    expect(r.candidates.map((c) => c.path)).toEqual([join(hive, "data", "old.csv")]);
+  });
+});
+
+describe("RetentionSweeper lifecycle", () => {
+  let hive: string;
+  let report: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    hive = makeHive();
+    report = vi.fn().mockResolvedValue(undefined);
+  });
+  afterEach(() => rmSync(hive, { recursive: true, force: true }));
+
+  it("start() fires sweep at configured interval; stop() halts firings", async () => {
+    vi.useFakeTimers();
+    try {
+      touch(join(hive, "data", "old.csv"), 10);
+      const sweeper = new RetentionSweeper(
+        baseCfg({ intervalMs: 1000, paths: { data: { days: 7 } } }),
+        { hiveHome: hive, report },
+      );
+      sweeper.start();
+      expect(report).not.toHaveBeenCalled(); // no sweep at start()
+      await vi.advanceTimersByTimeAsync(1500); // past one interval
+      expect(report).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(report).toHaveBeenCalledTimes(2);
+      sweeper.stop();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(report).toHaveBeenCalledTimes(2); // no further firings
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
