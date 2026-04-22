@@ -9,12 +9,12 @@ const home = process.env.HOME ?? "/tmp";
  * Priority:
  *   1. HIVE_HOME env var (explicit — always wins)
  *   2. ./hive.yaml in cwd (project-local / dev repo mode)
- *   3. ~/.hive/ (default for npm installs)
+ *   3. ~/hive/ (default for npm installs; v0.2.0 — was ~/.hive in v0.1.x)
  */
 export function resolveHiveHome(): string {
   if (process.env.HIVE_HOME) return resolve(process.env.HIVE_HOME);
   if (existsSync(resolve(process.cwd(), "hive.yaml"))) return process.cwd();
-  return resolve(home, ".hive");
+  return resolve(home, "hive");
 }
 
 /**
@@ -42,8 +42,30 @@ export const hiveHome = resolveHiveHome();
 /** Customer-space skills directory. */
 export const skillsDir = resolve(hiveHome, "skills");
 
-/** Instance-local metadata directory (.hive/). */
-export const hiveMetaDir = resolve(hiveHome, ".hive");
+/**
+ * Engine root inside the instance directory.
+ *
+ * Everything under here is wipe-and-replace on upgrade: `dist/`, `node_modules/`,
+ * `seeds/`, `service/`, `plugins/claude-code/`, `package.json`. Nothing agent-authored
+ * or operator-owned lives here.
+ */
+export const engineDir = resolve(hiveHome, ".hive");
+
+/**
+ * Instance-local engine state directory.
+ *
+ * Holds the instance-git working tree, installed-snapshot.json, previous-snapshot.json,
+ * and the upgrade-notice flag. Must survive `rm -rf .hive` upgrades — that's why it's
+ * a sibling of `.hive/`, not a child.
+ */
+export const hiveStateDir = resolve(hiveHome, ".hive-state");
+
+/**
+ * GIT_DIR location for the instance-local git repo.
+ *
+ * Callers in instance-git.ts use this as `GIT_DIR` and `hiveHome` as `GIT_WORK_TREE`.
+ */
+export const instanceGitDir = resolve(hiveStateDir, "git");
 
 /**
  * Core agent seeds directory (ships with the npm package).
