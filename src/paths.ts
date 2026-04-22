@@ -54,3 +54,27 @@ export const hiveMetaDir = resolve(hiveHome, ".hive");
  * Bundled: import.meta.dirname = <package>/pkg/ → resolve("..", "seeds") = <package>/seeds/
  */
 export const seedsDir = resolve(import.meta.dirname, "..", "seeds");
+
+/**
+ * Instance-local per-agent home root: `<hiveHome>/agents/`.
+ * The runner creates `<this>/<agentId>/` subdirs lazily on first use.
+ */
+export function agentsDir(home: string = hiveHome): string {
+  return resolve(home, "agents");
+}
+
+/**
+ * Default session cwd for an agent with no archetype-provided cwd.
+ * Business agents (Milo, River, Jessica, etc.) land here.
+ */
+export function agentScratchDir(agentId: string, home: string = hiveHome): string {
+  return resolve(agentsDir(home), agentId, "scratch");
+}
+
+/**
+ * Per-agent Playwright MCP home — holds the browser profile (`user-data/`)
+ * and CDP artifacts (snapshots, traces, screenshots) via `--output-dir`.
+ */
+export function agentPlaywrightDir(agentId: string, home: string = hiveHome): string {
+  return resolve(agentsDir(home), agentId, "playwright");
+}
