@@ -139,10 +139,10 @@ describe("RetentionSweeper.sweep", () => {
     touch(join(hive, "data", "old.csv"), 10);
     chmodSync(join(hive, "data"), 0o555); // r-xr-xr-x — no write permission
     try {
-      const sweeper = new RetentionSweeper(
-        baseCfg({ enabled: true, paths: { data: { days: 7 } } }),
-        { hiveHome: hive, report },
-      );
+      const sweeper = new RetentionSweeper(baseCfg({ enabled: true, paths: { data: { days: 7 } } }), {
+        hiveHome: hive,
+        report,
+      });
       const r = await sweeper.sweep();
       expect(r.deleted).toEqual([]);
       expect(r.errors.length).toBe(1);
@@ -156,10 +156,10 @@ describe("RetentionSweeper.sweep", () => {
   it("swallows report callback errors without failing the sweep", async () => {
     touch(join(hive, "data", "old.csv"), 10);
     const throwing = vi.fn().mockRejectedValue(new Error("slack down"));
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { data: { days: 7 } } }),
-      { hiveHome: hive, report: throwing },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { data: { days: 7 } } }), {
+      hiveHome: hive,
+      report: throwing,
+    });
     const r = await sweeper.sweep();
     expect(r.candidates.length).toBe(1);
     expect(throwing).toHaveBeenCalledOnce();
@@ -169,10 +169,7 @@ describe("RetentionSweeper.sweep", () => {
     mkdirSync(join(hive, "data"), { recursive: true });
     writeFileSync(join(hive, "data", ".retention-days"), "0\n");
     touch(join(hive, "data", "old.csv"), 30);
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { data: { days: 7 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { data: { days: 7 } } }), { hiveHome: hive, report });
     const r = await sweeper.sweep();
     expect(r.candidates).toEqual([]);
   });
@@ -181,10 +178,7 @@ describe("RetentionSweeper.sweep", () => {
     mkdirSync(join(hive, "data"), { recursive: true });
     writeFileSync(join(hive, "data", ".retention-days"), "3.5");
     touch(join(hive, "data", "old.csv"), 10); // 10 > 7, candidate under rule default
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { data: { days: 7 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { data: { days: 7 } } }), { hiveHome: hive, report });
     const r = await sweeper.sweep();
     expect(r.candidates.map((c) => c.path)).toEqual([join(hive, "data", "old.csv")]);
   });
@@ -193,10 +187,7 @@ describe("RetentionSweeper.sweep", () => {
     mkdirSync(join(hive, "data"), { recursive: true });
     writeFileSync(join(hive, "data", ".retention-days"), "-5");
     touch(join(hive, "data", "old.csv"), 10);
-    const sweeper = new RetentionSweeper(
-      baseCfg({ paths: { data: { days: 7 } } }),
-      { hiveHome: hive, report },
-    );
+    const sweeper = new RetentionSweeper(baseCfg({ paths: { data: { days: 7 } } }), { hiveHome: hive, report });
     const r = await sweeper.sweep();
     expect(r.candidates.map((c) => c.path)).toEqual([join(hive, "data", "old.csv")]);
   });
@@ -216,10 +207,10 @@ describe("RetentionSweeper lifecycle", () => {
     vi.useFakeTimers();
     try {
       touch(join(hive, "data", "old.csv"), 10);
-      const sweeper = new RetentionSweeper(
-        baseCfg({ intervalMs: 1000, paths: { data: { days: 7 } } }),
-        { hiveHome: hive, report },
-      );
+      const sweeper = new RetentionSweeper(baseCfg({ intervalMs: 1000, paths: { data: { days: 7 } } }), {
+        hiveHome: hive,
+        report,
+      });
       sweeper.start();
       expect(report).not.toHaveBeenCalled(); // no sweep at start()
       await vi.advanceTimersByTimeAsync(1500); // past one interval
