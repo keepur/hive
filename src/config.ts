@@ -69,6 +69,22 @@ export interface RegistryConfig {
   default?: boolean;
 }
 
+export interface RetentionPathConfig {
+  /** Number of days to keep files. `0` means keep forever. Negative values are rejected. */
+  days: number;
+}
+
+export interface RetentionConfig {
+  /** When false, sweeper logs + reports candidates but does not delete (ship as false). */
+  enabled: boolean;
+  /** Interval between sweeps. Defaults to 7 days. */
+  intervalMs: number;
+  /** Fallback retention for any path not in `paths`. */
+  defaultDays: number;
+  /** Per-path retention. Keys are glob-like strings relative to hiveHome (e.g. "agents/*\/scratch"). */
+  paths: Record<string, RetentionPathConfig>;
+}
+
 export interface SmsLine {
   id: string;
   label: string;
@@ -250,6 +266,36 @@ export const config = {
     retryMaxAttempts: parseInt(optional("SWEEPER_RETRY_MAX_ATTEMPTS", "3"), 10),
     retryBaseDelayMs: parseInt(optional("SWEEPER_RETRY_BASE_DELAY_MS", "30000"), 10),
   },
+  retention: (() => {
+    const yamlPaths = (hive.retention?.paths ?? {
+      data: 7,
+      "agents/*/scratch": 7,
+      "agents/*/feeds": 7,
+      "agents/*/playwright": 3,
+      "agents/*/reports": 0,
+      logs: 30,
+    }) as Record<string, number>;
+    const paths: Record<string, RetentionPathConfig> = {};
+    for (const [k, v] of Object.entries(yamlPaths)) {
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+        throw new Error(`Invalid retention.paths.${k}: must be a non-negative integer (got ${v})`);
+      }
+      paths[k] = { days: v };
+    }
+    const defaultDays = Number(hive.retention?.defaults?.days ?? 7);
+    if (!Number.isFinite(defaultDays) || defaultDays < 0) {
+      throw new Error(`Invalid retention.defaults.days: ${defaultDays}`);
+    }
+    return {
+      enabled: Boolean(hive.retention?.enabled ?? false),
+      intervalMs: parseInt(
+        optional("RETENTION_INTERVAL_MS", String(hive.retention?.intervalMs ?? 7 * 24 * 3600_000)),
+        10,
+      ),
+      defaultDays,
+      paths,
+    } satisfies RetentionConfig;
+  })(),
   memory: {
     hotBudgetTokens: parseInt(optional("MEMORY_HOT_BUDGET_TOKENS", String(hive.memory?.hotBudgetTokens ?? 3000)), 10),
     sweepIntervalHours: parseFloat(
