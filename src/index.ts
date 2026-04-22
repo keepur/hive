@@ -75,7 +75,6 @@ async function main(): Promise<void> {
   let scheduler: Scheduler;
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
   let fallbackAuditId: string | undefined;
-  let retentionSweeper: RetentionSweeper | undefined;
 
   const reload = async () => {
     // Guard: reload may fire via change stream before agentManager/scheduler are assigned
@@ -508,13 +507,13 @@ async function main(): Promise<void> {
   // Retention sweeper — deletes (or dry-runs) age-over files under agents/*, data/, logs/.
   // Ships in dry-run mode (enabled: false) until operator flips the flag after a week of
   // dry-run Slack reports prove the candidate list is sane. See KPR-51 design spec.
-  retentionSweeper = new RetentionSweeper(config.retention, {
+  const retentionSweeper = new RetentionSweeper(config.retention, {
     hiveHome,
     report: async (text) => {
       if (fallbackAuditId) {
-        await slack.postMessage(fallbackAuditId, text).catch((err) =>
-          log.warn("Retention report: Slack post failed", { error: String(err) }),
-        );
+        await slack
+          .postMessage(fallbackAuditId, text)
+          .catch((err) => log.warn("Retention report: Slack post failed", { error: String(err) }));
       } else {
         log.info("Retention report (no audit channel configured)", { text });
       }
@@ -530,7 +529,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
     sweeper.stop();
-    retentionSweeper?.stop();
+    retentionSweeper.stop();
     adminApi?.stop();
     registry.stopWatching();
     await smsAdapter.stop();
