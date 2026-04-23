@@ -210,7 +210,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
         return plist.includes(expectedEntry) || plist.includes(expectedMinified);
       },
       remedy:
-        "Live plist ProgramArguments does not reference <engineDir>/dist/index.js. Run `hive daemon start` to regenerate the plist.",
+        "Live plist ProgramArguments does not reference <engineDir>/dist/index.js. Run `hive start --daemon` to regenerate the plist.",
     },
   ];
 

@@ -168,10 +168,27 @@ preflight() {
     exit 0
   fi
 
-  # Confirm it's 0.1.x shape — must have either dist/ (old repo layout) or
-  # .hive/git/ (the instance-git internal state dir).
-  if [[ ! -f "$INSTANCE_DIR/dist/index.js" && ! -d "$INSTANCE_DIR/.hive/git" ]]; then
-    echo "ERROR: $INSTANCE_DIR doesn't look like 0.1.x (no dist/index.js or .hive/git/)." >&2
+  # Confirm it's a 0.1.x instance. Three valid shapes:
+  #   1. Repo-clone layout: dist/index.js present
+  #   2. Instance-git state: .hive/git/ present
+  #   3. Global-install layout: plist references a global npm path (not .hive/)
+  local is_01x=false
+  if [[ -f "$INSTANCE_DIR/dist/index.js" ]]; then
+    is_01x=true
+  elif [[ -d "$INSTANCE_DIR/.hive/git" ]]; then
+    is_01x=true
+  else
+    # Check if any plist in service/ points at a global npm install (0.1.x global pattern)
+    for plist in "$INSTANCE_DIR/service/"*.plist; do
+      [[ -f "$plist" ]] || continue
+      if grep -q 'node_modules/@keepur/hive/pkg/server.min.js' "$plist" 2>/dev/null; then
+        is_01x=true
+        break
+      fi
+    done
+  fi
+  if ! $is_01x; then
+    echo "ERROR: $INSTANCE_DIR doesn't look like 0.1.x (no dist/, .hive/git/, or global-install plist)." >&2
     echo "       Manual inspection required — refusing to proceed." >&2
     exit 1
   fi
@@ -250,19 +267,37 @@ preflight() {
 
   # Also check for lingering Playwright MCP children — see spec Runtime Failure Mode 6.
   # Skip in dry-run: we're not mutating the instance, so lingering children
-  # aren't dangerous, and a global pgrep picks up unrelated host processes
-  # (e.g. the operator's own editor-side Playwright MCP) in a dev harness.
-  if ! $DRY_RUN && pgrep -f playwright-mcp >/dev/null 2>&1; then
-    echo "WARNING: playwright-mcp child processes still running after service stop."
-    echo "         Waiting up to 5 seconds for them to exit..."
-    for _ in 1 2 3 4 5; do
-      sleep 1
-      pgrep -f playwright-mcp >/dev/null 2>&1 || break
-    done
-    if pgrep -f playwright-mcp >/dev/null 2>&1; then
-      echo "ERROR: playwright-mcp still running. Kill manually and retry:" >&2
-      echo "         pkill -f playwright-mcp" >&2
-      exit 1
+  # aren't dangerous. Only check processes whose cwd is under INSTANCE_DIR —
+  # a global pgrep picks up unrelated host processes (e.g. the operator's own
+  # editor-side Playwright MCP) that have nothing to do with this instance.
+  if ! $DRY_RUN; then
+    local instance_pids=""
+    while IFS= read -r pid; do
+      # lsof -a -d cwd: get the current working directory for this PID
+      local cwd
+      cwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | awk '/^n/{print substr($0,2)}')
+      if [[ "$cwd" == "$INSTANCE_DIR"* ]]; then
+        instance_pids="$instance_pids $pid"
+      fi
+    done < <(pgrep -f playwright-mcp 2>/dev/null || true)
+
+    if [[ -n "$instance_pids" ]]; then
+      echo "WARNING: playwright-mcp child processes from this instance still running (PIDs:$instance_pids)."
+      echo "         Waiting up to 5 seconds for them to exit..."
+      for _ in 1 2 3 4 5; do
+        sleep 1
+        local still_running=""
+        for pid in $instance_pids; do
+          kill -0 "$pid" 2>/dev/null && still_running="$still_running $pid"
+        done
+        instance_pids="$still_running"
+        [[ -z "$instance_pids" ]] && break
+      done
+      if [[ -n "$instance_pids" ]]; then
+        echo "ERROR: playwright-mcp from this instance still running (PIDs:$instance_pids). Kill and retry:" >&2
+        echo "         kill$instance_pids" >&2
+        exit 1
+      fi
     fi
   fi
 
@@ -711,7 +746,7 @@ step_regenerate_plists() {
 
   # 10b. Regenerate one plist per config file.
   # hive.yaml (primary) + any hive-<suffix>.yaml (e.g., hive-personal.yaml).
-  # hive daemon start reads HIVE_CONFIG, derives the label from that config's
+  # `hive start --daemon` reads HIVE_CONFIG, derives the label from that config's
   # instance.id, writes service/<label>.plist, creates the LaunchAgents
   # symlink, and launchctl-loads it (see src/cli/daemon.ts:84 startDaemon).
   local regenerated=0
@@ -719,9 +754,9 @@ step_regenerate_plists() {
     [[ -f "$yaml" ]] || continue
     local cfg
     cfg=$(basename "$yaml")
-    echo "  hive daemon start (HIVE_CONFIG=$cfg)"
-    if ! HIVE_HOME="$INSTANCE_DIR" HIVE_CONFIG="$cfg" hive daemon start; then
-      echo "ERROR: hive daemon start failed for $cfg." >&2
+    echo "  hive start --daemon (HIVE_CONFIG=$cfg)"
+    if ! HIVE_HOME="$INSTANCE_DIR" HIVE_CONFIG="$cfg" hive start --daemon; then
+      echo "ERROR: hive start --daemon failed for $cfg." >&2
       return 1
     fi
     regenerated=$((regenerated + 1))
