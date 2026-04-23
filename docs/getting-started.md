@@ -31,6 +31,12 @@ Homebrew may pop up a system dialog asking to install Xcode Command Line Tools. 
 npm i -g @keepur/hive && hive init
 ```
 
+## Where is my instance?
+
+Your Hive instance lives at `~/services/hive/<your-id>/` by default (pick `<your-id>` during `hive init`). Everything that persists across upgrades — your config, logs, agent data, skills, plugins — is at the instance root.
+
+The engine itself — the code Hive runs — lives in `<instance>/.hive/`. Think of `.hive/` as wipe-and-replace: `hive update` swaps it for a new version, `hive rollback` restores the previous one. Your data is never inside `.hive/`, so upgrades can't touch it.
+
 ## Running `hive init`
 
 The wizard walks you through several sections. Here's what to expect at each one:
