@@ -63,6 +63,9 @@ echo '{"name":"@keepur/hive","version":"0.2.0-dev"}' > "$BUILD_DIR/package.json"
 # (which would trip set -u on undefined ROLLBACK when sourced).
 sed -n '/^# --- Engine fetch\/swap\/rollback/,/^# --- Short-circuit:/{/^# --- Short-circuit:/!p;}' \
   "$SCRIPT_DIR/deploy.sh" > "$TESTROOT/helpers.sh"
+# Helper bodies reference $DRY_RUN (added so --dry-run skips the destructive
+# ops); set it false here so the helpers actually execute under set -u.
+DRY_RUN=false
 # shellcheck source=/dev/null
 source "$TESTROOT/helpers.sh"
 
@@ -134,5 +137,22 @@ if ! fetch_engine "$DEPLOY_DIR" "0.9.9-nonexistent" 2>&1 | grep -q "falling back
   exit 1
 fi
 [[ -f "$DEPLOY_DIR/.hive.next/pkg/server.min.js" ]] || { echo "FAIL: fallback did not populate pkg/server.min.js"; exit 1; }
+
+# --- Test 8: --dry-run skips destructive ops in helpers ---
+echo "test 8: dry-run helpers don't mutate disk"
+rm -rf "$DEPLOY_DIR"
+mkdir -p "$DEPLOY_DIR"
+DRY_RUN=true
+fetch_engine "$DEPLOY_DIR" "latest" >/dev/null
+[[ ! -d "$DEPLOY_DIR/.hive.next" ]] || { echo "FAIL: dry-run fetch_engine created .hive.next"; exit 1; }
+swap_engine "$DEPLOY_DIR" >/dev/null
+[[ ! -d "$DEPLOY_DIR/.hive" ]] || { echo "FAIL: dry-run swap_engine created .hive"; exit 1; }
+# rollback in dry-run with no .hive.prev should report failure but not touch disk
+if rollback_engine "$DEPLOY_DIR" >/dev/null 2>&1; then
+  echo "FAIL: dry-run rollback_engine should have returned 1 (no .hive.prev)"
+  exit 1
+fi
+[[ ! -d "$DEPLOY_DIR/.hive.broken" ]] || { echo "FAIL: dry-run rollback created .hive.broken"; exit 1; }
+DRY_RUN=false
 
 echo "all tests passed."

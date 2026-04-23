@@ -103,6 +103,10 @@ health_check() {
 
 kill_ports() {
   local ports_str="$1"
+  if $DRY_RUN; then
+    echo "[DRY RUN] kill_ports: would scan $ports_str"
+    return
+  fi
   for port in $ports_str; do
     local pids
     pids=$(lsof -i :"$port" -t 2>/dev/null || true)
@@ -153,6 +157,11 @@ fetch_engine() {
   local version
   version=$(_normalize_tag "$tag")
 
+  if $DRY_RUN; then
+    echo "[DRY RUN] fetch_engine: would populate $instance_dir/.hive.next/ from @keepur/hive@$version"
+    return 0
+  fi
+
   rm -rf "$instance_dir/.hive.next"
   mkdir -p "$instance_dir/.hive.next"
 
@@ -199,6 +208,10 @@ fetch_engine() {
 # exist is covered by the service being down.
 swap_engine() {
   local instance_dir="$1"
+  if $DRY_RUN; then
+    echo "[DRY RUN] swap_engine: would rotate $instance_dir/.hive{,.prev,.next}"
+    return 0
+  fi
   if [[ ! -d "$instance_dir/.hive.next" ]]; then
     echo "ERROR: swap_engine called but $instance_dir/.hive.next does not exist" >&2
     return 1
@@ -218,6 +231,14 @@ swap_engine() {
 # restores .hive.prev → .hive.
 rollback_engine() {
   local instance_dir="$1"
+  if $DRY_RUN; then
+    if [[ ! -d "$instance_dir/.hive.prev" ]]; then
+      echo "[DRY RUN] rollback_engine: would fail — no $instance_dir/.hive.prev"
+      return 1
+    fi
+    echo "[DRY RUN] rollback_engine: would swap $instance_dir/.hive ↔ .hive.prev (failed engine → .hive.broken)"
+    return 0
+  fi
   if [[ ! -d "$instance_dir/.hive.prev" ]]; then
     echo "ERROR: no previous engine at $instance_dir/.hive.prev — rollback unavailable" >&2
     return 1
@@ -269,6 +290,32 @@ if $ROLLBACK; then
     exit 1
   fi
 fi
+
+# --- Guard: shared instance_root with diverging pins ---
+# When multiple instances resolve to the same instance_root (today: dodi+personal
+# both share $DEPLOY_DIR until Phase 5 migrates them into per-instance dirs),
+# they share a single .hive/ — their ENGINE_TAG pins MUST agree. Otherwise
+# per-instance deploys silently clobber each other and deploy-check.sh
+# oscillates between versions on every poll. Compares the configured pins
+# (not the effective tag for this run) so even an explicit --tag override
+# can't sneak past a misconfigured pinning state. Fail fast before any work.
+declare -a _seen_roots=()
+declare -a _seen_pins=()
+for inst in "${INSTANCES[@]}"; do
+  IFS='|' read -r _id _config _label _logs _ports _engine_tag <<< "$inst"
+  _root=$(_instance_root "$_id")
+  _pin="${_engine_tag:-latest}"
+  for i in "${!_seen_roots[@]}"; do
+    if [[ "${_seen_roots[$i]}" == "$_root" && "${_seen_pins[$i]}" != "$_pin" ]]; then
+      echo "ERROR: instances share root '$_root' but pin different ENGINE_TAGs ('${_seen_pins[$i]}' vs '$_pin')." >&2
+      echo "       Set the same ENGINE_TAG for all instances under one root, or migrate them to per-instance dirs (Phase 5)." >&2
+      exit 2
+    fi
+  done
+  _seen_roots+=("$_root")
+  _seen_pins+=("$_pin")
+done
+unset _seen_roots _seen_pins _id _config _label _logs _ports _engine_tag _root _pin i
 
 # =============================================================================
 # Phase 1: Build (once, in $BUILD_DIR)
