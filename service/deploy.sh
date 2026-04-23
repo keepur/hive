@@ -202,6 +202,26 @@ fetch_engine() {
   fi
 }
 
+# install_engine_deps <instance_dir>
+# Runs `npm install --omit=dev` inside .hive.next/ so the bundle's runtime
+# externals (native modules, large SDKs, asset loaders — 14 of them) resolve
+# from .hive/pkg/. Node walks up to .hive/node_modules/ to find them.
+# Mirrors src/setup/populate-engine.ts so `hive init` and `hive update`
+# produce byte-identical .hive/ layouts.
+install_engine_deps() {
+  local instance_dir="$1"
+  if $DRY_RUN; then
+    echo "[DRY RUN] install_engine_deps: would npm install --omit=dev in $instance_dir/.hive.next/"
+    return 0
+  fi
+  if [[ ! -f "$instance_dir/.hive.next/package.json" ]]; then
+    echo "ERROR: install_engine_deps needs $instance_dir/.hive.next/package.json" >&2
+    return 1
+  fi
+  echo "  install_engine_deps: npm install --omit=dev in .hive.next/"
+  (cd "$instance_dir/.hive.next" && npm install --omit=dev --no-audit --no-fund --no-progress >&2)
+}
+
 # swap_engine <instance_dir>
 # Rotates: old .hive.prev → dropped; live .hive → .hive.prev; .hive.next → .hive.
 # Assumes the service is already stopped. The ~50ms window where .hive/ doesn't
@@ -392,6 +412,15 @@ for inst in "${INSTANCES[@]}"; do
   if ! fetch_engine "$instance_root" "$tag"; then
     notify "Deploy FAILED for \`$id\`: fetch_engine errored at tag \`$tag\`."
     FAILED_INSTANCES+=("$id")
+    run_cmd launchctl kickstart -k "gui/$(id -u)/$label" || true  # bring old engine back up
+    continue
+  fi
+
+  echo "  Installing engine deps..."
+  if ! install_engine_deps "$instance_root"; then
+    notify "Deploy FAILED for \`$id\`: install_engine_deps errored at tag \`$tag\`."
+    FAILED_INSTANCES+=("$id")
+    rm -rf "$instance_root/.hive.next"
     run_cmd launchctl kickstart -k "gui/$(id -u)/$label" || true  # bring old engine back up
     continue
   fi

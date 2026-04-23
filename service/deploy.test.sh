@@ -145,6 +145,7 @@ mkdir -p "$DEPLOY_DIR"
 DRY_RUN=true
 fetch_engine "$DEPLOY_DIR" "latest" >/dev/null
 [[ ! -d "$DEPLOY_DIR/.hive.next" ]] || { echo "FAIL: dry-run fetch_engine created .hive.next"; exit 1; }
+install_engine_deps "$DEPLOY_DIR" >/dev/null
 swap_engine "$DEPLOY_DIR" >/dev/null
 [[ ! -d "$DEPLOY_DIR/.hive" ]] || { echo "FAIL: dry-run swap_engine created .hive"; exit 1; }
 # rollback in dry-run with no .hive.prev should report failure but not touch disk
@@ -154,5 +155,46 @@ if rollback_engine "$DEPLOY_DIR" >/dev/null 2>&1; then
 fi
 [[ ! -d "$DEPLOY_DIR/.hive.broken" ]] || { echo "FAIL: dry-run rollback created .hive.broken"; exit 1; }
 DRY_RUN=false
+
+# --- Test 9: install_engine_deps runs npm install inside .hive.next ---
+echo "test 9: install_engine_deps runs npm install in .hive.next/"
+# Restore full shim so npm pack works
+cat > "$SHIM_DIR/npm" <<'NPMEOF'
+#!/usr/bin/env bash
+outdir="$PWD"
+case "$1" in
+  pack)
+    stage=$(mktemp -d)
+    mkdir -p "$stage/package/pkg" "$stage/package/seeds" "$stage/package/templates" "$stage/package/scripts"
+    echo "// fake server bundle" > "$stage/package/pkg/server.min.js"
+    echo '{"name":"@keepur/hive","version":"0.2.0"}' > "$stage/package/package.json"
+    tarball="keepur-hive-0.2.0.tgz"
+    (cd "$stage" && tar -czf "$outdir/$tarball" package)
+    rm -rf "$stage"
+    echo "$tarball"
+    ;;
+  view) echo "0.2.0" ;;
+  install)
+    # Record that npm install ran in the scratch dir so the test can verify it
+    touch "$PWD/.install-ran"
+    ;;
+  *) exit 0 ;;
+esac
+NPMEOF
+chmod +x "$SHIM_DIR/npm"
+rm -rf "$DEPLOY_DIR"
+mkdir -p "$DEPLOY_DIR"
+fetch_engine "$DEPLOY_DIR" "latest" >/dev/null
+install_engine_deps "$DEPLOY_DIR" >/dev/null
+[[ -f "$DEPLOY_DIR/.hive.next/.install-ran" ]] || { echo "FAIL: install_engine_deps didn't run npm install in .hive.next/"; exit 1; }
+
+# --- Test 10: install_engine_deps errors when package.json missing ---
+echo "test 10: install_engine_deps errors when .hive.next/package.json missing"
+rm -rf "$DEPLOY_DIR"
+mkdir -p "$DEPLOY_DIR/.hive.next"  # empty dir, no package.json
+if install_engine_deps "$DEPLOY_DIR" >/dev/null 2>&1; then
+  echo "FAIL: install_engine_deps should have errored without package.json"
+  exit 1
+fi
 
 echo "all tests passed."
