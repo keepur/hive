@@ -7,7 +7,7 @@ import { initInstanceGit, commitToState, commitRemovalToState } from "./instance
 
 /** Helper to run git commands against the test instance repo. */
 function git(hiveHome: string, ...args: string[]): string {
-  const gitDir = resolve(hiveHome, ".hive-state", "git");
+  const gitDir = resolve(hiveHome, ".hive", "git");
   return execFileSync("git", [...args], {
     cwd: hiveHome,
     env: { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: hiveHome },
@@ -27,10 +27,10 @@ describe("instance-git", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("initInstanceGit creates .hive-state/git with both branches", () => {
+  it("initInstanceGit creates .hive/git with both branches", () => {
     initInstanceGit(tmp);
 
-    const gitDir = resolve(tmp, ".hive-state", "git");
+    const gitDir = resolve(tmp, ".hive", "git");
     expect(existsSync(gitDir)).toBe(true);
 
     const branches = git(tmp, "branch", "--list");

@@ -1,6 +1,5 @@
 import { existsSync, watch } from "node:fs";
-import { resolve } from "node:path";
-import { skillsDir, hiveHome, hiveStateDir, engineDir } from "./paths.js";
+import { skillsDir, hiveHome, hiveMetaDir } from "./paths.js";
 import { MongoClient } from "mongodb";
 import { initInstanceGit } from "./skills/instance-git.js";
 import { verifyPackageIntegrity, checkAllowlistDrift } from "./skills/integrity.js";
@@ -26,7 +25,6 @@ import { CodeTaskManager } from "./code-task/code-task-manager.js";
 import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
-import { RetentionSweeper } from "./retention/retention-sweeper.js";
 import { setGeminiApiKey } from "./files/file-processor.js";
 import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
@@ -43,22 +41,10 @@ async function main(): Promise<void> {
   log.info("Hive starting up", { instance: config.instance.id, portBase: config.instance.portBase });
 
   // Boot-time integrity + upgrade checks
-  // Refuse to boot if both 0.1.x and 0.2.0 engine layouts exist side-by-side
-  // (catches botched manual upgrades where someone extracted a 0.2.0 tarball
-  // over a 0.1.x instance without removing the old dist/).
-  if (existsSync(resolve(hiveHome, "dist", "index.js")) && existsSync(resolve(engineDir, "dist", "index.js"))) {
-    log.error(
-      "Conflicting engine layouts detected — both <hiveHome>/dist/ and <hiveHome>/.hive/dist/ exist. " +
-        "Remove the old <hiveHome>/dist/ before starting 0.2.0.",
-      { hiveHome, engineDir },
-    );
-    process.exit(1);
-  }
-
-  verifyPackageIntegrity(hiveHome, hiveStateDir);
+  verifyPackageIntegrity(hiveHome, hiveMetaDir);
   checkAllowlistDrift(hiveHome);
   initInstanceGit(hiveHome);
-  checkUpgradeNotice(hiveStateDir, skillsDir);
+  checkUpgradeNotice(hiveMetaDir, skillsDir);
 
   // Initialize Gemini vision for image processing
   if (config.gemini.apiKey) {
@@ -87,7 +73,6 @@ async function main(): Promise<void> {
   // eslint-disable-next-line prefer-const
   let scheduler: Scheduler;
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-  let fallbackAuditId: string | undefined;
 
   const reload = async () => {
     // Guard: reload may fire via change stream before agentManager/scheduler are assigned
@@ -313,12 +298,12 @@ async function main(): Promise<void> {
       cursor = page.response_metadata?.next_cursor || undefined;
     } while (cursor);
     const fallbackName = config.slack.auditChannel;
-    fallbackAuditId = fallbackName ? channelIdByName.get(fallbackName) : undefined;
-    dispatcher.setAuditChannel(slackAdapter, channelIdByName, fallbackAuditId);
+    const fallbackId = fallbackName ? channelIdByName.get(fallbackName) : undefined;
+    dispatcher.setAuditChannel(slackAdapter, channelIdByName, fallbackId);
     log.info("Audit channel configured", {
       channels: channelIdByName.size,
       fallback: fallbackName || null,
-      fallbackResolved: Boolean(fallbackAuditId),
+      fallbackResolved: Boolean(fallbackId),
     });
   } catch (err) {
     log.warn("Failed to configure audit channel", { error: String(err) });
@@ -517,32 +502,10 @@ async function main(): Promise<void> {
   sweeper.start();
   log.info("Sweeper started", { intervalMs: config.sweeper.intervalMs });
 
-  // Retention sweeper — deletes (or dry-runs) age-over files under agents/*, data/, logs/.
-  // Ships in dry-run mode (enabled: false) until operator flips the flag after a week of
-  // dry-run Slack reports prove the candidate list is sane. See KPR-51 design spec.
-  const retentionSweeper = new RetentionSweeper(config.retention, {
-    hiveHome,
-    report: async (text) => {
-      if (fallbackAuditId) {
-        await slack
-          .postMessage(fallbackAuditId, text)
-          .catch((err) => log.warn("Retention report: Slack post failed", { error: String(err) }));
-      } else {
-        log.info("Retention report (no audit channel configured)", { text });
-      }
-    },
-  });
-  retentionSweeper.start();
-  log.info("Retention sweeper started", {
-    enabled: config.retention.enabled,
-    intervalMs: config.retention.intervalMs,
-  });
-
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
     sweeper.stop();
-    retentionSweeper.stop();
     adminApi?.stop();
     registry.stopWatching();
     await smsAdapter.stop();
