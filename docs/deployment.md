@@ -32,6 +32,7 @@ Each instance upgrades independently. `deploy-check.sh` polls `npm view` and tri
 
 - Omit the column to default to `latest` (autoupgrade on every publish).
 - Accepts `v0.2.0` or `0.2.0` — leading `v` is stripped before npm calls.
+- **Constraint until Phase 5:** instances that share a `DEPLOY_DIR` (today: `dodi` and `personal` share `~/services/hive`) share a single `.hive/` and MUST pin the same `ENGINE_TAG`. `deploy.sh` fails fast with `exit 2` if it sees diverging pins under one root. Once an instance is migrated to its own `<DEPLOY_DIR>/<id>/` dir, its pin can diverge freely.
 
 ## Operator commands
 
