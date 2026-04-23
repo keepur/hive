@@ -150,7 +150,7 @@ describe("installSkill", () => {
     installSkill(url, "committed", targetSkillsDir, targetHiveHome);
 
     // Check the state branch log
-    const gitDir = resolve(targetHiveHome, ".hive", "git");
+    const gitDir = resolve(targetHiveHome, ".hive-state", "git");
     const logOutput = execFileSync("git", ["log", "--oneline", "-1", "--format=%s"], {
       cwd: targetHiveHome,
       env: {

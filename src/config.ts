@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
-import { hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
+import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
 
 // Load .env from resolved hive home
 const dotenvPath = resolveDotenvPath(hiveHome);
@@ -21,14 +21,14 @@ function optional(key: string, fallback: string): string {
   return process.env[key] || fromKeychain(key) || fallback;
 }
 
-/** Auto-discover all plugin dirs under <hiveHome>/plugins/claude-code/, or use explicit list from hive.yaml */
+/** Auto-discover all plugin dirs under <engineDir>/plugins/claude-code/, or use explicit list from hive.yaml */
 function discoverPluginDirs(yamlDirs?: string[]): string[] {
   // Explicit list in hive.yaml takes precedence
   if (yamlDirs?.length) {
     return yamlDirs.map((d) => resolve(d.replace(/^~/, process.env.HOME ?? "/tmp")));
   }
-  // Auto-scan <hiveHome>/plugins/claude-code/*/
-  const parentDir = resolve(hiveHome, "plugins/claude-code");
+  // Auto-scan <engineDir>/plugins/claude-code/*/
+  const parentDir = resolve(engineDir, "plugins/claude-code");
   if (!existsSync(parentDir)) return [];
   return readdirSync(parentDir)
     .map((name) => resolve(parentDir, name))
@@ -67,6 +67,22 @@ export interface RegistryConfig {
   name: string;
   url: string;
   default?: boolean;
+}
+
+export interface RetentionPathConfig {
+  /** Number of days to keep files. `0` means keep forever. Negative values are rejected. */
+  days: number;
+}
+
+export interface RetentionConfig {
+  /** When false, sweeper logs + reports candidates but does not delete (ship as false). */
+  enabled: boolean;
+  /** Interval between sweeps. Defaults to 7 days. */
+  intervalMs: number;
+  /** Fallback retention for any path not in `paths`. */
+  defaultDays: number;
+  /** Per-path retention. Keys are glob-like strings relative to hiveHome (e.g. "agents/*\/scratch"). */
+  paths: Record<string, RetentionPathConfig>;
 }
 
 export interface SmsLine {
@@ -250,6 +266,42 @@ export const config = {
     retryMaxAttempts: parseInt(optional("SWEEPER_RETRY_MAX_ATTEMPTS", "3"), 10),
     retryBaseDelayMs: parseInt(optional("SWEEPER_RETRY_BASE_DELAY_MS", "30000"), 10),
   },
+  retention: (() => {
+    const yamlPaths = (hive.retention?.paths ?? {
+      data: 7,
+      "agents/*/scratch": 7,
+      "agents/*/feeds": 7,
+      "agents/*/playwright": 3,
+      "agents/*/reports": 0,
+      logs: 30,
+    }) as Record<string, number>;
+    const paths: Record<string, RetentionPathConfig> = {};
+    for (const [k, v] of Object.entries(yamlPaths)) {
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+        throw new Error(`Invalid retention.paths.${k}: must be a non-negative integer (got ${v})`);
+      }
+      paths[k] = { days: v };
+    }
+    const defaultDays = Number(hive.retention?.defaults?.days ?? 7);
+    if (!Number.isFinite(defaultDays) || defaultDays < 0) {
+      throw new Error(`Invalid retention.defaults.days: ${defaultDays}`);
+    }
+    const intervalMs = parseInt(
+      optional("RETENTION_INTERVAL_MS", String(hive.retention?.intervalMs ?? 7 * 24 * 3600_000)),
+      10,
+    );
+    // Guard against YAML like `intervalMs: weekly` (parseInt → NaN) — setInterval(fn, NaN)
+    // in Node clamps to 1ms and fires continuously, which would hammer the fs + Slack.
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      throw new Error(`Invalid retention.intervalMs: must be a positive integer (got ${intervalMs})`);
+    }
+    return {
+      enabled: Boolean(hive.retention?.enabled ?? false),
+      intervalMs,
+      defaultDays,
+      paths,
+    } satisfies RetentionConfig;
+  })(),
   memory: {
     hotBudgetTokens: parseInt(optional("MEMORY_HOT_BUDGET_TOKENS", String(hive.memory?.hotBudgetTokens ?? 3000)), 10),
     sweepIntervalHours: parseFloat(
