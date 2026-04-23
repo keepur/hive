@@ -28,8 +28,11 @@ export function relocateBetaPlugins(
     const src = resolve(srcDir, name);
     const dst = resolve(dstDir, name);
     if (existsSync(dst)) {
-      // Already relocated once, or a fresh-install overlap. Leave the
-      // hive-home copy as canonical; remove the engine-dir copy.
+      // Already relocated once (idempotent run), or a fresh-install overlap.
+      // Leave the hive-home copy as canonical. The stale engine-dir copy is
+      // left in place here — deploy.sh's swap_engine rotates .hive/ → .hive.prev/
+      // on the next successful update and drops it on the one after that, so
+      // there's no persistent leak.
       continue;
     }
     renameSync(src, dst);

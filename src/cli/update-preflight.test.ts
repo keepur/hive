@@ -49,6 +49,9 @@ describe("relocateBetaPlugins", () => {
     // Hive-home copy is untouched (canonical wins).
     const content = readFileSync(resolve(dst, "marker"), "utf-8");
     expect(content).toBe("hive-home-canonical");
+    // Engine-dir copy stays in place (not cleaned up here — deploy.sh's
+    // swap_engine handles it on the next update cycle).
+    expect(existsSync(resolve(src, "marker"))).toBe(true);
   });
 
   it("handles a missing engine plugins dir cleanly", () => {
