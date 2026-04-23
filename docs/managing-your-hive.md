@@ -31,7 +31,7 @@ The three currently published plugins:
 - `@keepur/hive-plugin-linear` — Linear issue tracking. <https://www.npmjs.com/package/@keepur/hive-plugin-linear>
 - `@keepur/hive-plugin-github` — GitHub Issues and PR tooling. <https://www.npmjs.com/package/@keepur/hive-plugin-github>
 
-Each plugin reads its credentials from `~/.hive/.env`. Required keys are documented in each plugin's npm README. (The Honeypot + Keychain credential model is on the roadmap; until it ships, treat `.env` as the credential store and protect it accordingly.)
+Each plugin reads its credentials from your instance's `.env` file (`~/services/hive/<your-instance>/.env`). Required keys are documented in each plugin's npm README. (The Honeypot + Keychain credential model is on the roadmap; until it ships, treat `.env` as the credential store and protect it accordingly.)
 
 ### Remove a plugin
 
@@ -85,7 +85,19 @@ For specific failure modes and remediation, see [troubleshooting.md](troubleshoo
 hive update
 ```
 
-Stops the service, updates the global `@keepur/hive` npm package, and restarts. Run when the CLI prompts you, or weekly as routine maintenance.
+Stops the service, fetches the new `@keepur/hive` engine tarball into `<instance>/.hive.next/`, atomically swaps it with `<instance>/.hive/`, and restarts. Auto-rolls-back from `<instance>/.hive.prev/` if the health check fails. Run when the CLI prompts you, or weekly as routine maintenance.
+
+To roll back the engine to the previously-installed version (without a full migration):
+
+```
+hive rollback
+```
+
+This restores `<instance>/.hive.prev/` over `<instance>/.hive/` and restarts. Available until the next `hive update` cycles the `.prev/` snapshot out.
+
+### Migrating from 0.1.x
+
+If you're still on 0.1.x, `hive update` is **not** the right command — the 0.1.x → 0.2.0 cutover is a one-shot layout migration, not a version bump. See [migrating-to-0.2.md](./migrating-to-0.2.md).
 
 ## Service control
 
@@ -95,16 +107,16 @@ Stops the service, updates the global `@keepur/hive` npm package, and restarts. 
 
 ## Configuration files
 
-Two files in `~/.hive/`. The CLI manages most of this; the fields below are the ones you may edit.
+Two files at your instance root (`~/services/hive/<your-instance>/`). The CLI manages most of this; the fields below are the ones you may edit. Both files survive `hive update` and `hive rollback` — only the engine in `<instance>/.hive/` gets swapped.
 
-### `~/.hive/hive.yaml`
+### `<instance>/hive.yaml`
 
 - `instance.id` — unique ID for this hive (used for DB name, tmp dirs, launchd label). Set once at `hive init`; changing it later is a migration, not an edit.
 - `agents.default` — agent ID that catches unrouted messages.
 - `plugins` — **do not hand-edit.** Managed by `hive plugin add` / `hive plugin remove`.
 - `skills.registries` — list of registries to pull skills from. The default `keepur/hive-skills` is added at init; add others with `hive registry`.
 
-### `~/.hive/.env`
+### `<instance>/.env`
 
 Core secrets:
 

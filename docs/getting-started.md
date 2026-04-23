@@ -15,6 +15,8 @@ The bootstrap script installs Homebrew and Node 22, then hands off to `hive init
 
 ## Install
 
+> **Already running 0.1.x?** Don't follow the install steps below — you need a one-shot migration instead. See [migrating-to-0.2.md](./migrating-to-0.2.md) for the walkthrough. The migration preserves your config, MongoDB data, logs, and agent files, and takes ~5 minutes per instance.
+
 ### Fresh Mac (no developer tools)
 
 Run:
@@ -30,6 +32,12 @@ Homebrew may pop up a system dialog asking to install Xcode Command Line Tools. 
 ```
 npm i -g @keepur/hive && hive init
 ```
+
+## Where is my instance?
+
+Your Hive instance lives at `~/services/hive/<your-id>/` by default (pick `<your-id>` during `hive init`). Everything that persists across upgrades — your config, logs, agent data, skills, plugins — is at the instance root.
+
+The engine itself — the code Hive runs — lives in `<instance>/.hive/`. Think of `.hive/` as wipe-and-replace: `hive update` swaps it for a new version, `hive rollback` restores the previous one. Your data is never inside `.hive/`, so upgrades can't touch it.
 
 ## Running `hive init`
 

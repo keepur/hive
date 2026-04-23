@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sync the three public docs + install/bootstrap.sh from this repo into
-# the public keepur/hive-docs checkout, then commit and push.
+# Sync the public docs + install scripts from this repo into the public
+# keepur/hive-docs checkout, then commit and push.
 #
 # Expects: $HIVE_DOCS_REPO (default ~/github/hive-docs) to be a clone of
 # https://github.com/keepur/hive-docs on the main branch with a clean worktree.
@@ -19,12 +19,15 @@ git -C "$DOCS_REPO" checkout -q main
 git -C "$DOCS_REPO" pull -q --ff-only
 
 mkdir -p "$DOCS_REPO/docs" "$DOCS_REPO/install"
-cp "$SRC_REPO/docs/getting-started.md"    "$DOCS_REPO/docs/"
-cp "$SRC_REPO/docs/managing-your-hive.md" "$DOCS_REPO/docs/"
-cp "$SRC_REPO/docs/troubleshooting.md"    "$DOCS_REPO/docs/"
-cp "$SRC_REPO/install/bootstrap.sh"       "$DOCS_REPO/install/"
-cp "$SRC_REPO/LICENSE"                    "$DOCS_REPO/LICENSE"
-chmod +x "$DOCS_REPO/install/bootstrap.sh"
+cp "$SRC_REPO/docs/getting-started.md"      "$DOCS_REPO/docs/"
+cp "$SRC_REPO/docs/managing-your-hive.md"   "$DOCS_REPO/docs/"
+cp "$SRC_REPO/docs/troubleshooting.md"      "$DOCS_REPO/docs/"
+cp "$SRC_REPO/docs/migrating-to-0.2.md"     "$DOCS_REPO/docs/"
+cp "$SRC_REPO/docs/release-notes-0.2.0.md"  "$DOCS_REPO/docs/"
+cp "$SRC_REPO/install/bootstrap.sh"         "$DOCS_REPO/install/"
+cp "$SRC_REPO/install/migrate-0.2.sh"       "$DOCS_REPO/install/"
+cp "$SRC_REPO/LICENSE"                      "$DOCS_REPO/LICENSE"
+chmod +x "$DOCS_REPO/install/bootstrap.sh" "$DOCS_REPO/install/migrate-0.2.sh"
 
 if git -C "$DOCS_REPO" diff --quiet; then
   echo "hive-docs already up to date."

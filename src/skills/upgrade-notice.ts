@@ -4,11 +4,11 @@ import { createLogger } from "../logging/logger.js";
 
 const log = createLogger("upgrade-notice");
 
-export function checkUpgradeNotice(hiveMetaDir: string, skillsDir: string): void {
-  const noticeFlag = resolve(hiveMetaDir, "upgrade-notice-emitted");
+export function checkUpgradeNotice(hiveStateDir: string, skillsDir: string): void {
+  const noticeFlag = resolve(hiveStateDir, "upgrade-notice-emitted");
   if (existsSync(noticeFlag)) return;
 
-  const prevSnapshotPath = resolve(hiveMetaDir, "previous-snapshot.json");
+  const prevSnapshotPath = resolve(hiveStateDir, "previous-snapshot.json");
   if (!existsSync(prevSnapshotPath)) return;
 
   try {
@@ -46,7 +46,7 @@ export function checkUpgradeNotice(hiveMetaDir: string, skillsDir: string): void
 
     log.info(notice);
 
-    mkdirSync(hiveMetaDir, { recursive: true });
+    mkdirSync(hiveStateDir, { recursive: true });
     writeFileSync(noticeFlag, new Date().toISOString());
   } catch (err) {
     log.warn("Failed to check upgrade notice", { error: String(err) });
