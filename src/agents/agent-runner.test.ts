@@ -7,15 +7,13 @@ import type { LoadedPlugin } from "../plugins/types.js";
 // vi.hoisted() runs before vi.mock factory, avoiding the TDZ error that
 // occurs when paths.ts (imported transitively) calls existsSync at module
 // load time before plain const-declared mocks are initialized.
-const { mockExistsSync, mockStatSync, mockMkdirSync } = vi.hoisted(() => ({
+const { mockExistsSync, mockStatSync } = vi.hoisted(() => ({
   mockExistsSync: vi.fn().mockReturnValue(true),
   mockStatSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
-  mockMkdirSync: vi.fn(),
 }));
 vi.mock("node:fs", () => ({
   existsSync: (...args: any[]) => mockExistsSync(...args),
   statSync: (...args: any[]) => mockStatSync(...args),
-  mkdirSync: (...args: any[]) => mockMkdirSync(...args),
 }));
 
 // ── SDK mock ────────────────────────────────────────────────────────
@@ -512,30 +510,6 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers).not.toHaveProperty("crm-search");
     expect(servers).not.toHaveProperty("product-search");
     expect(servers).not.toHaveProperty("ops-search");
-  });
-
-  it("scopes Playwright MCP output-dir and user-data-dir per agent", async () => {
-    const { config } = await import("../config.js");
-    const orig = config.browser.cdpEndpoint;
-    (config.browser as any).cdpEndpoint = "http://127.0.0.1:9222";
-    try {
-      runner = new AgentRunner(
-        makeAgentConfig({ id: "river", coreServers: ["browser"] }),
-        memoryManager as any,
-      );
-      await runner.send("hello");
-      const servers = getCapturedServers();
-      expect(servers).toHaveProperty("browser");
-      const args: string[] = servers.browser.args;
-      const outIdx = args.indexOf("--output-dir");
-      const udIdx = args.indexOf("--user-data-dir");
-      expect(outIdx).toBeGreaterThan(-1);
-      expect(udIdx).toBeGreaterThan(-1);
-      expect(args[outIdx + 1]).toMatch(/\/agents\/river\/playwright$/);
-      expect(args[udIdx + 1]).toMatch(/\/agents\/river\/playwright\/user-data$/);
-    } finally {
-      (config.browser as any).cdpEndpoint = orig;
-    }
   });
 });
 
@@ -1735,52 +1709,13 @@ describe("AgentRunner — archetype sessionOptions + cwd guard", () => {
     await expect(runner.send("hello")).rejects.toThrow(/not a directory/);
   });
 
-  it("falls back to per-agent scratch dir when no archetype is configured", async () => {
+  it("does not invoke statSync when no archetype is configured", async () => {
     mockStatSync.mockClear();
-    mockMkdirSync.mockClear();
-    const runner = makeRunner({ id: "milo" });
+    const runner = makeRunner({});
     await runner.send("hello");
-    // Default path: mkdir the scratch dir, no archetype stat.
     expect(mockStatSync.mock.calls.length).toBe(0);
-    expect(mockMkdirSync).toHaveBeenCalledWith(
-      expect.stringMatching(/\/agents\/milo\/scratch$/),
-      { recursive: true },
-    );
     const options = getCapturedOptions();
-    expect(options.cwd).toMatch(/\/agents\/milo\/scratch$/);
-  });
-
-  it("archetype-provided cwd still wins over default scratch dir", async () => {
-    mockMkdirSync.mockClear();
-    registerArchetype({
-      id: "overrides",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({ cwd: "/tmp/exists" }),
-    });
-    const runner = makeRunner({
-      id: "jasper",
-      archetype: "overrides",
-      archetypeConfig: {},
-    });
-    await runner.send("hello");
-    const options = getCapturedOptions();
-    expect(options.cwd).toBe("/tmp/exists");
-    // Archetype branch must not mkdir (operator-configured path must already exist).
-    const jasperScratchCalls = mockMkdirSync.mock.calls.filter((c) =>
-      /\/agents\/jasper\/scratch$/.test(String(c[0])),
-    );
-    expect(jasperScratchCalls.length).toBe(0);
-  });
-
-  it("propagates mkdir failure when scratch dir can't be created", async () => {
-    mockMkdirSync.mockImplementationOnce(() => {
-      throw new Error("EACCES");
-    });
-    const runner = makeRunner({ id: "river" });
-    await expect(runner.send("hello")).rejects.toThrow(/EACCES/);
+    expect(options.cwd).toBeUndefined();
   });
 });
 

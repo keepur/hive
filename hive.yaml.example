@@ -53,19 +53,3 @@ business:
 # resend:
 #   emailDomain: yourdomain.com
 #   businessName: Your Business
-
-# Retention policy — age-based sweep of agent scratch/feeds/playwright and pipeline data dirs.
-# Ships in dry-run mode by default: the sweeper reports what it would delete to the
-# Slack audit channel, but does not delete until `enabled: true`.
-# retention:
-#   enabled: false
-#   intervalMs: 604800000   # 7 days
-#   defaults:
-#     days: 7
-#   paths:
-#     data: 7
-#     "agents/*/scratch": 7
-#     "agents/*/feeds": 7
-#     "agents/*/playwright": 3
-#     "agents/*/reports": 0   # 0 = keep forever
-#     logs: 30

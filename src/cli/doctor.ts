@@ -1,5 +1,4 @@
 import { resolve } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
   type Check,
@@ -16,7 +15,7 @@ import {
   resolveServicePath,
   slackAuthOk,
 } from "./doctor-checks.js";
-import { engineDir, hiveHome } from "../paths.js";
+import { hiveHome } from "../paths.js";
 
 type HiveConfig = typeof import("../config.js").config;
 
@@ -136,7 +135,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       required: true,
       test: () => config !== null,
       remedy: configError
-        ? `config.ts threw: ${configError}. Set missing env vars in <HIVE_HOME>/.env and ensure hive.yaml exists.`
+        ? `config.ts threw: ${configError}. Set missing env vars in ~/.hive/.env and ensure hive.yaml exists.`
         : "Check hive.yaml at the hive home and run `hive init` if missing.",
     },
     ...requiredEnv.map<Check>((key) => ({
@@ -144,7 +143,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       group: "config",
       required: true,
       test: () => !!process.env[key],
-      remedy: `Set ${key} in <HIVE_HOME>/.env`,
+      remedy: `Set ${key} in ~/.hive/.env`,
     })),
     // ── Agents ───────────────────────────────────────────────────────────
     // All agent checks short-circuit to false when config failed to load —
@@ -193,24 +192,6 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       required: true,
       test: () => (config ? slackAuthOk(config.slack.botToken) : false),
       remedy: "Verify SLACK_BOT_TOKEN in .env and that the token still has the expected scopes.",
-    },
-    {
-      name: "live plist points at engine entry",
-      group: "services",
-      required: false,
-      test: async () => {
-        if (!config) return true; // Config group already reports the broken-config case
-        const label = `com.hive.${config.instance.id}.agent`;
-        const home = process.env.HOME ?? "";
-        const plistPath = resolve(home, "Library/LaunchAgents", `${label}.plist`);
-        if (!existsSync(plistPath)) return true; // No live plist = nothing to verify (not this check's job to create one)
-        const plist = readFileSync(plistPath, "utf-8");
-        const expectedEntry = resolve(engineDir, "dist", "index.js");
-        const expectedMinified = resolve(engineDir, "pkg", "server.min.js");
-        return plist.includes(expectedEntry) || plist.includes(expectedMinified);
-      },
-      remedy:
-        "Live plist ProgramArguments does not reference <engineDir>/dist/index.js. Run `hive daemon start` to regenerate the plist.",
     },
   ];
 

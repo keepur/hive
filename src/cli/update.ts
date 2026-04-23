@@ -1,57 +1,37 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { resolveHiveHome } from "../paths.js";
+import { stopDaemon, startDaemon } from "./daemon.js";
 
-function readInstalledVersion(engineDir: string): string {
+function readInstalledVersion(pkgRoot: string): string {
   try {
-    const pkg = JSON.parse(readFileSync(resolve(engineDir, "package.json"), "utf-8"));
+    const pkg = JSON.parse(readFileSync(resolve(pkgRoot, "package.json"), "utf-8"));
     return typeof pkg.version === "string" ? pkg.version : "unknown";
   } catch {
     return "unknown";
   }
 }
 
-export interface UpdateOptions {
-  tag?: string;
-  instance?: string;
-}
+export async function runUpdate(): Promise<void> {
+  const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf-8" }).trim();
+  const pkgRoot = resolve(npmRoot, "@keepur", "hive");
+  const fromVersion = readInstalledVersion(pkgRoot);
 
-/**
- * Shell out to deploy.sh for the actual fetch/swap/restart/health-check.
- * Keeps deploy.sh as the single implementation; this function is the typed
- * CLI surface for operators running `hive update`.
- */
-export async function runUpdate(opts: UpdateOptions = {}): Promise<void> {
-  const hiveHome = resolveHiveHome();
-  const engineDir = resolve(hiveHome, ".hive");
-  const deployScript = resolve(engineDir, "service", "deploy.sh");
-
-  if (!existsSync(deployScript)) {
-    console.error(`deploy.sh not found at ${deployScript}.`);
-    console.error("Either the engine isn't populated (.hive/ missing) or this is a dev install.");
-    process.exit(1);
-  }
-
-  const fromVersion = readInstalledVersion(engineDir);
-  const tag = opts.tag ?? "latest";
-
-  console.log(`Updating @keepur/hive (current: ${fromVersion}, target: ${tag})...`);
-
-  const args = ["--tag=" + tag];
-  if (opts.instance) args.push("--instance=" + opts.instance);
-
+  console.log("Stopping Hive...");
+  await stopDaemon();
+  console.log(`Updating @keepur/hive (current: ${fromVersion})...`);
   try {
-    execFileSync(deployScript, args, { stdio: "inherit" });
+    execFileSync("npm", ["update", "-g", "@keepur/hive"], { stdio: "inherit" });
   } catch {
-    console.error("Update failed. See deploy.sh output above.");
+    console.error("Update failed.");
     process.exit(1);
   }
-
-  const toVersion = readInstalledVersion(engineDir);
+  const toVersion = readInstalledVersion(pkgRoot);
   if (fromVersion === toVersion) {
-    console.log(`Already at latest matching tag: ${toVersion}.`);
+    console.log(`Already at latest version: ${toVersion}.`);
   } else {
     console.log(`Updated: ${fromVersion} → ${toVersion}.`);
   }
+  console.log("Restarting Hive...");
+  await startDaemon(pkgRoot);
 }
