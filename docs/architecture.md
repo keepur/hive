@@ -44,9 +44,37 @@ How the four repos work together to run Dodi's business.
 - **WebSocket Channel** (`src/channels/ws/`) — Backend for iOS shop app connections
 - **Model Router** — Per-turn Haiku classifier for dynamic model selection (Haiku vs Sonnet)
 
-**Runtime**: Node 24 on Mac Mini, `launchd` service (`com.hive.agent`), two clones:
-- Dev: `~/github/hive` (edit/commit/push)
-- Deploy: `~/services/hive` (compiled JS, `deploy.sh` pulls/builds/restarts)
+**Runtime**: Node 24 on Mac Mini, `launchd` service (`com.hive.<instance>.agent`).
+- Dev: `~/github/hive` (edit/commit/push; repo layout unchanged from 0.1.x — `dist/` + `node_modules/` at repo root)
+- Deploy: `~/services/hive/<instance>/` (instance dir; engine in `<instance>/.hive/`, upgraded via `hive update` → npm tarball fetch → `.hive/` swap; rollback via `hive rollback`)
+
+**Instance layout** (customer installs, post-0.2.x):
+
+```
+~/services/hive/<instance>/
+  .hive/                         # engine — wipe-and-replace on upgrade
+    pkg/ seeds/ templates/
+    service/                     # deploy.sh + instances.conf (engine-shipped)
+    scripts/honeypot
+    node_modules/                # prod deps (populated on fetch)
+    package.json
+    plugins/claude-code/         # built-in engine plugins
+  .hive.prev/                    # previous engine (rollback target; may be absent)
+  .env                           # instance config — survives upgrades
+  hive.yaml
+  beekeeper.yaml
+  .hive-generated.json           # seed-hash cache — survives upgrades
+  logs/                          # observability — survives upgrades
+  agents/<agent_id>/             # per-agent home — survives upgrades
+    scratch/ reports/ feeds/ playwright/
+    workshop/                    # software-engineer archetype only
+  workflow/                      # instance-authored flows
+  data/                          # pipeline dump ground — transient
+  skills/                        # instance-authored skills
+  plugins/                       # instance-authored plugins (from `hive plugin add`)
+```
+
+Engine files live under `.hive/` and are replaced atomically on upgrade. Everything at the instance root (config, agent data, logs, workflow, skills, instance plugins) survives upgrades.
 
 **Agent model tiers**: Opus (Mokie), Sonnet (River, Jessica, Jasper, Colt, Wyatt), Haiku (Rae, Chloe, Milo)
 
@@ -205,7 +233,7 @@ Permit filed in Bay Area city
 
 | Repo | Where It Runs | How It Deploys |
 |------|--------------|----------------|
-| **Hive** | Mac Mini (`launchd`) | `deploy.sh` in `~/services/hive` — git pull, npm install, build, restart |
+| **Hive** | Mac Mini (`launchd`) | `hive update [--tag=X]` shells to `<instance>/.hive/service/deploy.sh` — fetches npm tarball, swaps `.hive/` ↔ `.hive.prev/`, restarts. Rollback via `hive rollback`. |
 | **dodi_v2** | DigitalOcean | GitHub Actions CI on PR merge to `master`, manual deploy to `deploy/production` |
 | **iOS App** | User devices | Xcode → TestFlight |
 | **Marketing** | Mac Mini (crontab) | Nightly cron jobs at 1 AM (permits) and 3 AM (HubSpot) |
