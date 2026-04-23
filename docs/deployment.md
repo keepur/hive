@@ -12,6 +12,7 @@ One deploy run (`deploy.sh`) does:
 2. For each instance in `instances.conf`:
    - Stop the LaunchAgent.
    - Fetch the target tag's engine into `<instance>/.hive.next/` (primary: `npm pack @keepur/hive@<tag>`; fallback: rsync from `$BUILD_DIR/pkg/`).
+   - `npm install --omit=dev` inside `.hive.next/` so the bundle's runtime externals (14 packages: native modules, large SDKs, asset loaders) resolve from `.hive/node_modules/`.
    - Swap: old `.hive.prev/` dropped, live `.hive/` → `.hive.prev/`, new `.hive.next/` → `.hive/`.
    - Restart the LaunchAgent.
    - Health check (30s for `"Hive is running"` in the log).
