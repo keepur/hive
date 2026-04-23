@@ -13,13 +13,7 @@ import { resolve, dirname } from "node:path";
  * `files` field changes, update both here and deploy.sh's fetch_engine at
  * the same time.
  */
-export const PACKAGE_ENTRIES = [
-  "pkg",
-  "seeds",
-  "templates",
-  "scripts/honeypot",
-  "package.json",
-] as const;
+export const PACKAGE_ENTRIES = ["pkg", "seeds", "templates", "scripts/honeypot", "package.json"] as const;
 
 export interface PopulateEngineOptions {
   /**
@@ -47,11 +41,7 @@ export interface PopulateEngineOptions {
  * check is scoped to `hive.yaml`; this is defense-in-depth to avoid silently
  * clobbering a partially-populated engine dir.
  */
-export function populateEngine(
-  pkgRoot: string,
-  instanceDir: string,
-  opts: PopulateEngineOptions = {},
-): void {
+export function populateEngine(pkgRoot: string, instanceDir: string, opts: PopulateEngineOptions = {}): void {
   const engineDir = resolve(instanceDir, ".hive");
   if (existsSync(engineDir)) {
     throw new Error(
@@ -78,9 +68,8 @@ export function populateEngine(
   if (opts.skipInstall) return;
   if (!existsSync(resolve(engineDir, "package.json"))) return;
 
-  execFileSync(
-    "npm",
-    ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-progress"],
-    { cwd: engineDir, stdio: "inherit" },
-  );
+  execFileSync("npm", ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-progress"], {
+    cwd: engineDir,
+    stdio: "inherit",
+  });
 }

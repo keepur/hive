@@ -1,21 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import {
-  mkdirSync,
-  writeFileSync,
-  rmSync,
-  existsSync,
-  readFileSync,
-  statSync,
-} from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import { populateEngine, PACKAGE_ENTRIES } from "./populate-engine.js";
 
 function makeFakePkgRoot(): string {
-  const root = resolve(
-    tmpdir(),
-    `hive-populate-src-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-  );
+  const root = resolve(tmpdir(), `hive-populate-src-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(join(root, "pkg"), { recursive: true });
   writeFileSync(join(root, "pkg", "server.min.js"), "// server bundle");
   writeFileSync(join(root, "pkg", "cli.min.js"), "// cli bundle");
@@ -30,10 +20,7 @@ function makeFakePkgRoot(): string {
 }
 
 function makeInstanceDir(): string {
-  const dir = resolve(
-    tmpdir(),
-    `hive-populate-dst-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-  );
+  const dir = resolve(tmpdir(), `hive-populate-dst-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -75,18 +62,14 @@ describe("populateEngine", () => {
 
   it("package.json content round-trips", () => {
     populateEngine(pkgRoot, instanceDir, { skipInstall: true });
-    const pkg = JSON.parse(
-      readFileSync(resolve(instanceDir, ".hive", "package.json"), "utf-8"),
-    );
+    const pkg = JSON.parse(readFileSync(resolve(instanceDir, ".hive", "package.json"), "utf-8"));
     expect(pkg.name).toBe("@keepur/hive");
     expect(pkg.version).toBe("0.2.0");
   });
 
   it("throws if .hive/ is already populated", () => {
     populateEngine(pkgRoot, instanceDir, { skipInstall: true });
-    expect(() => populateEngine(pkgRoot, instanceDir, { skipInstall: true })).toThrow(
-      /Engine already populated/,
-    );
+    expect(() => populateEngine(pkgRoot, instanceDir, { skipInstall: true })).toThrow(/Engine already populated/);
   });
 
   it("silently skips missing entries (dev install without bundle)", () => {
@@ -109,13 +92,7 @@ describe("populateEngine", () => {
 
   it("PACKAGE_ENTRIES matches the tarball shape exactly", () => {
     // If this test fails, the deploy.sh fetch_engine rsync fallback also needs updating.
-    expect(PACKAGE_ENTRIES).toEqual([
-      "pkg",
-      "seeds",
-      "templates",
-      "scripts/honeypot",
-      "package.json",
-    ]);
+    expect(PACKAGE_ENTRIES).toEqual(["pkg", "seeds", "templates", "scripts/honeypot", "package.json"]);
   });
 
   it("runs npm install in .hive/ by default (no skipInstall)", () => {
