@@ -21,7 +21,8 @@
     "pkg/",
     "seeds/",
     "templates/",
-    "scripts/honeypot"
+    "scripts/honeypot",
+    "install/"
   ],
   "engines": {
     "node": ">=22.0.0"
