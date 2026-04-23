@@ -40,9 +40,9 @@ if [[ "$NODE_OK" -eq 0 ]]; then
   brew link --force --overwrite node@22
 fi
 
-# 4. Install hive globally
-log "Installing @keepur/hive..."
-npm i -g @keepur/hive
+# 4. Install hive globally (HIVE_VERSION pins a specific version; default: latest)
+log "Installing @keepur/hive@${HIVE_VERSION:-latest}..."
+npm i -g "@keepur/hive@${HIVE_VERSION:-latest}"
 
 # 5. Hand off to interactive setup (reopen stdin from TTY so the wizard can prompt)
 log "Launching 'hive init'..."
