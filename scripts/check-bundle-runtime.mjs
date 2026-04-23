@@ -10,8 +10,9 @@
  * Prereq: npm run bundle (pkg/ must exist)
  */
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, cpSync, rmSync, symlinkSync } from "node:fs";
 import { resolve } from "node:path";
+import { tmpdir } from "node:os";
 
 const PKG_DIR = "pkg";
 
@@ -86,6 +87,70 @@ try {
     // Expected: exits with error because no MongoDB/config — that's fine
     console.log("  ✓ server.min.js: loaded (exited on missing config — expected)");
   }
+}
+
+// Test 4: bundle runs from a relocated .hive/pkg/ path (post-Phase-4 layout)
+try {
+  const scratch = resolve(tmpdir(), `hive-bundle-check-${Date.now()}`);
+  const engine = resolve(scratch, ".hive");
+  try {
+    mkdirSync(engine, { recursive: true });
+    // Copy the built package's pkg/ + siblings into .hive/ to match the deployed
+    // shape. PKG_DIR is the relative root the other tests also use.
+    cpSync(PKG_DIR, resolve(engine, "pkg"), { recursive: true });
+    if (existsSync("seeds")) {
+      cpSync("seeds", resolve(engine, "seeds"), { recursive: true });
+    }
+    if (existsSync("templates")) {
+      cpSync("templates", resolve(engine, "templates"), { recursive: true });
+    }
+    if (existsSync("package.json")) {
+      cpSync("package.json", resolve(engine, "package.json"));
+    }
+
+    // Symlink the repo's node_modules into .hive/node_modules so the bundle's
+    // runtime externals resolve. In the real deployed shape, populateEngine /
+    // fetch_engine runs `npm install --omit=dev` inside .hive/ to produce this;
+    // for a runtime smoke test, the dev repo's node_modules is functionally
+    // equivalent and cheap. This test's job is to catch caller-relative path
+    // regressions inside the bundle — not to re-validate the install pipeline.
+    const repoNodeModules = resolve(process.cwd(), "node_modules");
+    if (existsSync(repoNodeModules)) {
+      symlinkSync(repoNodeModules, resolve(engine, "node_modules"), "dir");
+    }
+
+    // Loading test, parallel to Test 3: run server.min.js from the relocated path.
+    // We expect a non-zero exit (no config), but NOT a syntax error or missing
+    // module/package — the goal is "the bundle still resolves its sibling paths
+    // correctly from the new CWD," not "the server runs to steady state."
+    const serverPath = resolve(engine, "pkg", "server.min.js");
+    try {
+      execFileSync(process.execPath, [serverPath], {
+        encoding: "utf-8",
+        timeout: 10000,
+        env: { ...process.env, NODE_ENV: "test", HIVE_HOME: scratch },
+      });
+      console.log("  ✓ .hive/pkg/ layout: server.min.js loaded without crash");
+    } catch (err) {
+      const stderr = err.stderr ?? "";
+      if (
+        stderr.includes("SyntaxError") ||
+        stderr.includes("Cannot find module") ||
+        stderr.includes("Cannot find package") ||
+        stderr.includes("ERR_MODULE_NOT_FOUND")
+      ) {
+        console.error(`  ✗ .hive/pkg/ layout: bundle broken — ${stderr.slice(0, 200)}`);
+        failures++;
+      } else {
+        console.log("  ✓ .hive/pkg/ layout: server.min.js loaded (exited on missing config — expected)");
+      }
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+} catch (err) {
+  console.error(`  ✗ .hive/pkg/ layout: setup failed — ${err.message}`);
+  failures++;
 }
 
 if (failures > 0) {
