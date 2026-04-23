@@ -53,7 +53,7 @@ describe("populateEngine", () => {
   });
 
   it("creates .hive/ and copies each PACKAGE_ENTRIES member", () => {
-    populateEngine(pkgRoot, instanceDir);
+    populateEngine(pkgRoot, instanceDir, { skipInstall: true });
     const engine = resolve(instanceDir, ".hive");
     expect(existsSync(engine)).toBe(true);
     expect(existsSync(join(engine, "pkg", "server.min.js"))).toBe(true);
@@ -65,7 +65,7 @@ describe("populateEngine", () => {
   });
 
   it("places scripts/honeypot at .hive/scripts/honeypot (not flattened)", () => {
-    populateEngine(pkgRoot, instanceDir);
+    populateEngine(pkgRoot, instanceDir, { skipInstall: true });
     const dst = resolve(instanceDir, ".hive", "scripts", "honeypot");
     expect(existsSync(dst)).toBe(true);
     expect(readFileSync(dst, "utf-8")).toContain("honeypot");
@@ -74,7 +74,7 @@ describe("populateEngine", () => {
   });
 
   it("package.json content round-trips", () => {
-    populateEngine(pkgRoot, instanceDir);
+    populateEngine(pkgRoot, instanceDir, { skipInstall: true });
     const pkg = JSON.parse(
       readFileSync(resolve(instanceDir, ".hive", "package.json"), "utf-8"),
     );
@@ -83,15 +83,15 @@ describe("populateEngine", () => {
   });
 
   it("throws if .hive/ is already populated", () => {
-    populateEngine(pkgRoot, instanceDir);
-    expect(() => populateEngine(pkgRoot, instanceDir)).toThrow(
+    populateEngine(pkgRoot, instanceDir, { skipInstall: true });
+    expect(() => populateEngine(pkgRoot, instanceDir, { skipInstall: true })).toThrow(
       /Engine already populated/,
     );
   });
 
   it("silently skips missing entries (dev install without bundle)", () => {
     rmSync(join(pkgRoot, "pkg"), { recursive: true, force: true });
-    populateEngine(pkgRoot, instanceDir);
+    populateEngine(pkgRoot, instanceDir, { skipInstall: true });
     const engine = resolve(instanceDir, ".hive");
     expect(existsSync(join(engine, "pkg", "server.min.js"))).toBe(false);
     // Still copies what's available
@@ -100,7 +100,7 @@ describe("populateEngine", () => {
   });
 
   it("copies directories as directories (not as files)", () => {
-    populateEngine(pkgRoot, instanceDir);
+    populateEngine(pkgRoot, instanceDir, { skipInstall: true });
     const pkgDir = resolve(instanceDir, ".hive", "pkg");
     expect(statSync(pkgDir).isDirectory()).toBe(true);
     const seedsDir = resolve(instanceDir, ".hive", "seeds");
@@ -116,5 +116,13 @@ describe("populateEngine", () => {
       "scripts/honeypot",
       "package.json",
     ]);
+  });
+
+  it("runs npm install in .hive/ by default (no skipInstall)", () => {
+    // Fake package.json with no deps → npm install is a no-op but still
+    // produces a package-lock.json. Proves the install step ran.
+    populateEngine(pkgRoot, instanceDir);
+    const engine = resolve(instanceDir, ".hive");
+    expect(existsSync(join(engine, "package-lock.json"))).toBe(true);
   });
 });

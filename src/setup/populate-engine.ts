@@ -21,16 +21,37 @@ export const PACKAGE_ENTRIES = [
   "package.json",
 ] as const;
 
+export interface PopulateEngineOptions {
+  /**
+   * Skip the `npm install --omit=dev` step. Intended for unit tests that
+   * don't want the registry round-trip or for callers that will install
+   * deps themselves.
+   */
+  skipInstall?: boolean;
+}
+
 /**
- * Copies the running CLI's package contents into `<instance>/.hive/`.
+ * Copies the running CLI's package contents into `<instance>/.hive/` and
+ * installs runtime dependencies locally so the bundle's externals resolve.
  * Intended for the `hive init` wizard's bundled path only — non-bundled
  * dev installs have no `pkg/` to copy.
+ *
+ * The bundle keeps ~14 runtime externals (native modules, large SDKs with
+ * dynamic internals, libs with asset loading) because bundling them in is
+ * either impossible or breaks at runtime. Those externals must be resolvable
+ * from `.hive/pkg/`, so we `npm install --omit=dev` inside `.hive/` after the
+ * copy. Node's module resolution walks up from `.hive/pkg/server.min.js` to
+ * `.hive/node_modules/` and finds the deps.
  *
  * Throws if `.hive/` already exists: the wizard's upstream `existingInstall()`
  * check is scoped to `hive.yaml`; this is defense-in-depth to avoid silently
  * clobbering a partially-populated engine dir.
  */
-export function populateEngine(pkgRoot: string, instanceDir: string): void {
+export function populateEngine(
+  pkgRoot: string,
+  instanceDir: string,
+  opts: PopulateEngineOptions = {},
+): void {
   const engineDir = resolve(instanceDir, ".hive");
   if (existsSync(engineDir)) {
     throw new Error(
@@ -53,4 +74,13 @@ export function populateEngine(pkgRoot: string, instanceDir: string): void {
     if (isDir) mkdirSync(dst, { recursive: true });
     execFileSync("rsync", ["-a", srcArg, dstArg]);
   }
+
+  if (opts.skipInstall) return;
+  if (!existsSync(resolve(engineDir, "package.json"))) return;
+
+  execFileSync(
+    "npm",
+    ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-progress"],
+    { cwd: engineDir, stdio: "inherit" },
+  );
 }
