@@ -5,10 +5,7 @@ import { tmpdir } from "node:os";
 import { relocateBetaPlugins } from "./update-preflight.js";
 
 function makeDirs(): { hive: string; engine: string; cleanup: () => void } {
-  const hive = resolve(
-    tmpdir(),
-    `hive-update-preflight-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-  );
+  const hive = resolve(tmpdir(), `hive-update-preflight-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const engine = resolve(hive, ".hive");
   mkdirSync(engine, { recursive: true });
   return { hive, engine, cleanup: () => rmSync(hive, { recursive: true, force: true }) };
@@ -30,9 +27,7 @@ describe("relocateBetaPlugins", () => {
 
     const result = relocateBetaPlugins(hive, engine);
     expect(result.moved).toEqual(["@keepur"]);
-    expect(
-      existsSync(resolve(hive, "plugins", "node_modules", "@keepur", "example", "package.json")),
-    ).toBe(true);
+    expect(existsSync(resolve(hive, "plugins", "node_modules", "@keepur", "example", "package.json"))).toBe(true);
     expect(existsSync(resolve(engine, "plugins", "node_modules", "@keepur"))).toBe(false);
   });
 
