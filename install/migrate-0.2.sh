@@ -135,12 +135,14 @@ preflight() {
 
   # If any live plist is loaded right now, require the user to stop it first.
   local running=""
-  for plist in "${LIVE_PLISTS[@]:-}"; do
-    local label="${plist%.plist}"
-    if launchctl print "gui/$(id -u)/$label" &>/dev/null; then
-      running="$running $label"
-    fi
-  done
+  if (( ${#LIVE_PLISTS[@]} > 0 )); then
+    for plist in "${LIVE_PLISTS[@]}"; do
+      local label="${plist%.plist}"
+      if launchctl print "gui/$(id -u)/$label" &>/dev/null; then
+        running="$running $label"
+      fi
+    done
+  fi
   if [[ -n "$running" ]]; then
     echo "WARNING: the following LaunchAgents are currently loaded:"
     echo "  $running"
@@ -183,7 +185,10 @@ preflight() {
   fi
 
   # Also check for lingering Playwright MCP children — see spec Runtime Failure Mode 6.
-  if pgrep -f playwright-mcp >/dev/null 2>&1; then
+  # Skip in dry-run: we're not mutating the instance, so lingering children
+  # aren't dangerous, and a global pgrep picks up unrelated host processes
+  # (e.g. the operator's own editor-side Playwright MCP) in a dev harness.
+  if ! $DRY_RUN && pgrep -f playwright-mcp >/dev/null 2>&1; then
     echo "WARNING: playwright-mcp child processes still running after service stop."
     echo "         Waiting up to 5 seconds for them to exit..."
     for _ in 1 2 3 4 5; do
@@ -255,9 +260,11 @@ step_relocate_state() {
   if $DRY_RUN; then
     [[ -d "$INSTANCE_DIR/.hive/git" ]] && echo "  [DRY RUN] mv .hive/git .hive-state/git"
     for f in installed-snapshot.json previous-snapshot.json upgrade-notice-emitted; do
-      [[ -e "$INSTANCE_DIR/.hive/$f" ]] && echo "  [DRY RUN] mv .hive/$f .hive-state/$f"
+      if [[ -e "$INSTANCE_DIR/.hive/$f" ]]; then
+        echo "  [DRY RUN] mv .hive/$f .hive-state/$f"
+      fi
     done
-    return
+    return 0
   fi
   if [[ -d "$INSTANCE_DIR/.hive/git" ]]; then
     mv "$INSTANCE_DIR/.hive/git" "$INSTANCE_DIR/.hive-state/git"
@@ -683,16 +690,20 @@ auto_rollback() {
     fi
   done
 
-  for label in "${LABELS[@]:-}"; do
-    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-  done
+  if (( ${#LABELS[@]} > 0 )); then
+    for label in "${LABELS[@]}"; do
+      launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    done
+  fi
 
   rm -rf "$INSTANCE_DIR"
   mv "$INSTANCE_DIR.pre-0.2-bak" "$INSTANCE_DIR"
 
-  for label in "${LABELS[@]:-}"; do
-    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$label.plist"
-  done
+  if (( ${#LABELS[@]} > 0 )); then
+    for label in "${LABELS[@]}"; do
+      launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$label.plist"
+    done
+  fi
 
   notify "Migration to 0.2.0 FAILED and was rolled back for $INSTANCE_DIR. Instance(s) back on 0.1.x: ${LABELS[*]:-<none>}."
 }
