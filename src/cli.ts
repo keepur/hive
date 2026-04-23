@@ -79,6 +79,7 @@ Commands:
   status            Health check
   update            Update engine to latest (or --tag=<tag>) and restart
   rollback          Restore the previous engine (.hive.prev) and restart
+  migrate-0.2       Migrate a 0.1.x instance dir to the 0.2.0 layout
   doctor            Check prereqs, services, agent health
   plugin add <pkg>  Install a plugin package
   plugin list       List installed plugins
@@ -157,6 +158,17 @@ switch (command) {
   case "rollback": {
     const { runRollback } = await import("./cli/rollback.js");
     await runRollback({ instance: values.instance });
+    break;
+  }
+  case "migrate-0.2": {
+    const instanceDir = positionals[1];
+    if (!instanceDir) {
+      console.error("Usage: hive migrate-0.2 [--dry-run] <instance_dir>");
+      process.exit(2);
+    }
+    const dryRun = process.argv.includes("--dry-run");
+    const { runMigrate } = await import("./cli/migrate.js");
+    await runMigrate({ instanceDir, dryRun });
     break;
   }
   case "doctor": {

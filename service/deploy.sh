@@ -188,6 +188,7 @@ fetch_engine() {
     rsync -a --delete "$src/pkg/"       "$instance_dir/.hive.next/pkg/"
     rsync -a --delete "$src/seeds/"     "$instance_dir/.hive.next/seeds/"
     rsync -a --delete "$src/templates/" "$instance_dir/.hive.next/templates/"
+    rsync -a --delete "$src/install/"   "$instance_dir/.hive.next/install/"
     # scripts/honeypot is a single binary, not the whole scripts/ dir
     mkdir -p "$instance_dir/.hive.next/scripts"
     [[ -f "$src/scripts/honeypot" ]] && cp "$src/scripts/honeypot" "$instance_dir/.hive.next/scripts/honeypot"
