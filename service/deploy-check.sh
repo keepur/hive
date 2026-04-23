@@ -38,7 +38,14 @@ UPDATES_NEEDED=()
 for inst in "${INSTANCES[@]}"; do
   IFS='|' read -r id tag <<< "$inst"
   version="${tag#v}"
-  installed=$(jq -r .version < "$DEPLOY_DIR/.hive/package.json" 2>/dev/null || echo "unknown")
+  # Per-instance root: $DEPLOY_DIR/<id> if it exists (post-Phase-5 layout),
+  # else $DEPLOY_DIR (today's shared-dir primary layout).
+  if [[ -d "$DEPLOY_DIR/$id" ]]; then
+    instance_root="$DEPLOY_DIR/$id"
+  else
+    instance_root="$DEPLOY_DIR"
+  fi
+  installed=$(jq -r .version < "$instance_root/.hive/package.json" 2>/dev/null || echo "unknown")
   if [[ "$version" == "latest" ]]; then
     target=$(npm view @keepur/hive version 2>/dev/null || echo "unknown")
   else

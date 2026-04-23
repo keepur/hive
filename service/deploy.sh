@@ -127,10 +127,26 @@ _normalize_tag() {
   fi
 }
 
+# _instance_root <id>
+# Returns the instance root dir: $DEPLOY_DIR/<id> if that dir exists (post-Phase-5
+# per-instance layout), else $DEPLOY_DIR (today's primary-shared-dir layout).
+# Lets deploy.sh be per-instance-dir aware now so Phase 5's migration is a no-op
+# at the script level.
+_instance_root() {
+  local id="$1"
+  if [[ -d "$DEPLOY_DIR/$id" ]]; then
+    echo "$DEPLOY_DIR/$id"
+  else
+    echo "$DEPLOY_DIR"
+  fi
+}
+
 # fetch_engine <instance_dir> <tag>
 # Populates <instance_dir>/.hive.next/ with the tag's contents.
 # Primary path: npm pack @keepur/hive@<version> + tar -xzf --strip-components=1.
-# Fallback: rsync from $BUILD_DIR (developer-ergonomics path).
+# Fallback: rsync from $BUILD_DIR (developer-ergonomics path), only when npm pack
+# actually fails (not merely when the tag isn't in the registry — transient
+# registry errors should surface, not silently swap to rsync).
 fetch_engine() {
   local instance_dir="$1"
   local tag="$2"
@@ -140,27 +156,24 @@ fetch_engine() {
   rm -rf "$instance_dir/.hive.next"
   mkdir -p "$instance_dir/.hive.next"
 
-  if [[ "$version" == "latest" || -n "$(npm view "@keepur/hive@$version" version 2>/dev/null)" ]]; then
-    echo "  fetch_engine: npm pack @keepur/hive@$version"
-    local packdir
-    packdir=$(mktemp -d)
-    local tarball
-    # npm pack prints the tarball filename on the last line of stdout.
-    # Run from a temp dir so the tarball doesn't litter $PWD.
-    tarball=$(cd "$packdir" && npm pack "@keepur/hive@$version" 2>/dev/null | tail -n1)
-    if [[ -z "$tarball" || ! -f "$packdir/$tarball" ]]; then
-      rm -rf "$packdir" "$instance_dir/.hive.next"
-      echo "ERROR: npm pack @keepur/hive@$version produced no tarball" >&2
-      return 1
-    fi
+  local packdir
+  packdir=$(mktemp -d)
+  local tarball
+  # npm pack prints the tarball filename on the last line of stdout.
+  # Run from a temp dir so the tarball doesn't litter $PWD.
+  echo "  fetch_engine: npm pack @keepur/hive@$version"
+  tarball=$(cd "$packdir" && npm pack "@keepur/hive@$version" 2>/dev/null | tail -n1)
+
+  if [[ -n "$tarball" && -f "$packdir/$tarball" ]]; then
     tar -xzf "$packdir/$tarball" --strip-components=1 -C "$instance_dir/.hive.next/"
     rm -rf "$packdir"
   else
-    echo "  fetch_engine: npm view failed; falling back to rsync from $BUILD_DIR"
+    rm -rf "$packdir"
+    echo "  fetch_engine: npm pack failed; falling back to rsync from $BUILD_DIR" >&2
     local src="$BUILD_DIR"
     if [[ ! -f "$src/pkg/server.min.js" ]]; then
       rm -rf "$instance_dir/.hive.next"
-      echo "ERROR: fallback rsync needs $src/pkg/server.min.js — run 'npm run bundle' in $src" >&2
+      echo "ERROR: npm pack @keepur/hive@$version failed and fallback needs $src/pkg/server.min.js — run 'npm run bundle' in $src" >&2
       return 1
     fi
     rsync -a --delete "$src/pkg/"       "$instance_dir/.hive.next/pkg/"
@@ -238,15 +251,16 @@ if $ROLLBACK; then
     exit 2
   fi
   IFS='|' read -r id _config label logs_dir ports _tag <<< "$ROLLBACK_ROW"
-  echo "--- Rolling back $id ---"
+  instance_root=$(_instance_root "$id")
+  echo "--- Rolling back $id (root: $instance_root) ---"
   kill_ports "$ports"
-  if ! rollback_engine "$DEPLOY_DIR"; then
+  if ! rollback_engine "$instance_root"; then
     notify "Rollback FAILED for \`$id\`: no previous engine (.hive.prev missing)."
     exit 1
   fi
   run_cmd launchctl kickstart -k "gui/$(id -u)/$label"
-  if health_check "$DEPLOY_DIR/$logs_dir/hive.log"; then
-    rollback_version=$(jq -r .version < "$DEPLOY_DIR/.hive/package.json" 2>/dev/null || echo "unknown")
+  if health_check "$instance_root/$logs_dir/hive.log"; then
+    rollback_version=$(jq -r .version < "$instance_root/.hive/package.json" 2>/dev/null || echo "unknown")
     notify "Rollback succeeded for \`$id\` → \`$rollback_version\`."
     echo "Rollback complete."
     exit 0
@@ -315,19 +329,20 @@ for inst in "${INSTANCES[@]}"; do
 
   # --tag override > per-instance engine_tag > "latest"
   tag="${OVERRIDE_TAG:-${engine_tag:-latest}}"
+  instance_root=$(_instance_root "$id")
 
   echo ""
-  echo "--- Phase 2: Deploy instance '$id' @ $tag ---"
+  echo "--- Phase 2: Deploy instance '$id' @ $tag (root: $instance_root) ---"
   echo "  config=$config label=$label logs=$logs_dir ports=$ports"
 
-  mkdir -p "$DEPLOY_DIR/$logs_dir"
+  mkdir -p "$instance_root/$logs_dir"
 
   echo "  Stopping $label..."
   run_cmd launchctl kickstart -kp "gui/$(id -u)/$label" 2>/dev/null || true
   kill_ports "$ports"
 
   echo "  Fetching engine..."
-  if ! fetch_engine "$DEPLOY_DIR" "$tag"; then
+  if ! fetch_engine "$instance_root" "$tag"; then
     notify "Deploy FAILED for \`$id\`: fetch_engine errored at tag \`$tag\`."
     FAILED_INSTANCES+=("$id")
     run_cmd launchctl kickstart -k "gui/$(id -u)/$label" || true  # bring old engine back up
@@ -335,15 +350,15 @@ for inst in "${INSTANCES[@]}"; do
   fi
 
   echo "  Swapping engine..."
-  swap_engine "$DEPLOY_DIR"
+  swap_engine "$instance_root"
 
   echo "  Restarting $label..."
   run_cmd launchctl kickstart -k "gui/$(id -u)/$label"
 
   echo "  Checking health..."
-  if ! health_check "$DEPLOY_DIR/$logs_dir/hive.log"; then
+  if ! health_check "$instance_root/$logs_dir/hive.log"; then
     echo "  Health check FAILED for $id — rolling back"
-    if rollback_engine "$DEPLOY_DIR"; then
+    if rollback_engine "$instance_root"; then
       run_cmd launchctl kickstart -k "gui/$(id -u)/$label"
       notify "Deploy rolled back for \`$id\`: \`$tag\` failed health check, restored previous version."
     else
@@ -353,7 +368,7 @@ for inst in "${INSTANCES[@]}"; do
     continue
   fi
 
-  new_version=$(jq -r .version < "$DEPLOY_DIR/.hive/package.json" 2>/dev/null || echo "unknown")
+  new_version=$(jq -r .version < "$instance_root/.hive/package.json" 2>/dev/null || echo "unknown")
   echo "  Instance '$id' is healthy at version $new_version."
 done
 
