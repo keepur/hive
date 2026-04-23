@@ -1,6 +1,6 @@
 import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { getArchetype, type ArchetypeDefinition } from "../archetypes/registry.js";
 import { readFile } from "node:fs/promises";
@@ -9,7 +9,7 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
-import { hiveHome } from "../paths.js";
+import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
@@ -516,12 +516,23 @@ export class AgentRunner {
       };
     }
 
-    // Browser — Playwright MCP connected to user's Chrome via CDP
+    // Browser — Playwright MCP connected to user's Chrome via CDP.
+    // Per-agent `--output-dir` (snapshots/traces/screenshots) and
+    // `--user-data-dir` (profile) scope browser state to the agent's namespace
+    // and keep `.playwright-mcp/` out of HIVE_HOME. The SDK's McpStdioServerConfig
+    // has no cwd field, so CLI flags are the path — see KPR-51 design spec.
     if (config.browser.cdpEndpoint) {
+      const pwDir = agentPlaywrightDir(this.agentConfig.id, hiveHome);
+      mkdirSync(pwDir, { recursive: true });
       servers["browser"] = {
         type: "stdio",
         command: "npx",
-        args: ["@playwright/mcp@latest", "--cdp-endpoint", config.browser.cdpEndpoint],
+        args: [
+          "@playwright/mcp@latest",
+          "--cdp-endpoint", config.browser.cdpEndpoint,
+          "--output-dir", pwDir,
+          "--user-data-dir", resolve(pwDir, "user-data"),
+        ],
         env: {
           PATH: process.env.PATH ?? "",
           HOME: process.env.HOME ?? "",
@@ -638,6 +649,10 @@ export class AgentRunner {
         const entryJs = serverDef.entry.replace(/\.ts$/, ".js");
         const entryMin = serverDef.entry.replace(/\.ts$/, ".min.js");
         const devPath = resolve(DIST_DIR, `plugins/${plugin.name}/${entryJs}`);
+        // Instance-authored plugins live at <hiveHome>/plugins/, matching where
+        // `hive plugin add` installs them and where plugin-loader looks for them.
+        // Must stay outside <engineDir> so upgrades (which wipe .hive/) don't
+        // nuke customer plugins.
         const npmPath = resolve(hiveHome, "plugins", "node_modules", plugin.name, "dist", entryMin);
         const inTreePath = resolve(hiveHome, "plugins", plugin.name, "dist", entryMin);
         const compiledPath = [devPath, npmPath, inTreePath].find((p) => existsSync(p)) ?? devPath;
@@ -1116,20 +1131,33 @@ export class AgentRunner {
       }
     }
 
-    // Validate archetype cwd at session start — fail loud if workshop was deleted
-    // between agent load and session start (spec Runtime Failure Mode 1).
-    if (typeof archetypeExtra.cwd === "string") {
-      const cwd = archetypeExtra.cwd;
+    // Resolve the session cwd. Archetype-provided wins; otherwise every agent
+    // gets a per-agent scratch dir so Bash/Write with relative paths lands in
+    // the agent's namespace instead of HIVE_HOME. See KPR-51 design spec.
+    const cwdSource: "archetype" | "default" =
+      typeof archetypeExtra.cwd === "string" ? "archetype" : "default";
+    const effectiveCwd =
+      cwdSource === "archetype"
+        ? (archetypeExtra.cwd as string)
+        : agentScratchDir(this.agentConfig.id, hiveHome);
+
+    if (cwdSource === "default") {
+      // Lazy create — fail loud on mkdir errors (permissions, read-only fs).
+      mkdirSync(effectiveCwd, { recursive: true });
+    } else {
+      // Archetype path must already exist: Jasper's workshop is operator-configured
+      // and a missing dir there is a misconfig we want to surface at session start,
+      // not silently recreate.
       let st: ReturnType<typeof statSync>;
       try {
-        st = statSync(cwd);
+        st = statSync(effectiveCwd);
       } catch (err) {
-        const msg = `Archetype cwd unavailable at session start — refusing to run: ${cwd} (${String(err)})`;
+        const msg = `Archetype cwd unavailable at session start — refusing to run: ${effectiveCwd} (${String(err)})`;
         log.error(msg, { agent: this.agentConfig.id });
         throw new Error(msg);
       }
       if (!st.isDirectory()) {
-        const msg = `Archetype cwd is not a directory: ${cwd}`;
+        const msg = `Archetype cwd is not a directory: ${effectiveCwd}`;
         log.error(msg, { agent: this.agentConfig.id });
         throw new Error(msg);
       }
@@ -1150,7 +1178,7 @@ export class AgentRunner {
         // may return arbitrary SDK options, but we explicitly pick only the safe ones
         // so a rogue archetype can't override security invariants (permissionMode,
         // maxTurns, etc.) or runtime wiring (mcpServers, hooks, env, etc.).
-        ...(archetypeExtra.cwd ? { cwd: archetypeExtra.cwd } : {}),
+        cwd: effectiveCwd,
         // Default to SDK isolation mode (no user/project settings, no user-installed plugins).
         // Archetypes may opt in to specific sources (e.g. ["project"] for CLAUDE.md access).
         settingSources: archetypeExtra.settingSources ?? [],

@@ -105,12 +105,12 @@ Browser automation uses Playwright via CDP endpoint (`BROWSER_CDP_ENDPOINT` conf
 
 ## Dev vs Deploy
 
-- **Dev**: `~/github/hive` — edit, test, commit, push
-- **Deploy**: `~/services/hive` — separate clone, compiled JS, launchd points here
-- **Deploy script**: `~/services/hive/service/deploy.sh` — pulls, builds, syncs agents, restarts. Supports `--rollback`.
-- Editing source in dev does NOT affect the running service
-- Service restart: `launchctl kickstart -k "gui/$(id -u)/com.hive.agent"`
-- **CI runner**: `~/services/github-runner/` — self-hosted GitHub Actions runner, LaunchAgent (`com.github.actions-runner`)
+- **Dev**: `~/github/hive` — edit source, test, commit, push. Repo layout unchanged from 0.1.x.
+- **Deploy**: `~/services/hive/<instance>/` — instance dir. Engine lives in `<instance>/.hive/` (wipe-and-replace on upgrade). Instance config, agent data, logs at instance root (survive upgrades).
+- **Upgrade**: `hive update [--tag=X]` runs `deploy.sh`, which fetches the npm tarball and swaps `.hive/`. `hive rollback` restores `.hive.prev/`.
+- **Deploy script location**: `<instance>/.hive/service/deploy.sh` (engine-shipped, not in the repo root at runtime).
+- **CI runner**: self-hosted ARM64 runner on Mac Mini, unchanged.
+- **Restart**: `launchctl kickstart -k gui/$(id -u)/<label>` — still the primitive for picking up engine or config changes.
 
 ## Commands
 

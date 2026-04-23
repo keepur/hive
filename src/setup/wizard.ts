@@ -16,6 +16,7 @@ import { execFileSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
+import { populateEngine, ensureEngineDeps } from "./populate-engine.js";
 import { render as renderTemplate } from "./template-renderer.js";
 import { seedsDir } from "../paths.js";
 
@@ -451,7 +452,7 @@ export async function runWizard(targetDir: string, templatesDir: string, pkgRoot
     }
   }
 
-  // ── 9. Deploy ──────────────────────────────────────────────────────
+  // ── 9. Deploy (dev only) ───────────────────────────────────────────
   if (!isBundled) {
     section("Deploy");
 
@@ -478,6 +479,26 @@ export async function runWizard(targetDir: string, templatesDir: string, pkgRoot
     }
   }
 
+  // ── 9.5. Engine (bundled only) ─────────────────────────────────────
+  // For customer installs where the CLI was installed from npm, copy the
+  // package contents into <instance>/.hive/ so the service points at
+  // instance-local engine code. Dev installs (`npm run dev` from a git
+  // checkout) skip this — the engine runs from the checkout directly.
+  if (isBundled) {
+    section("Engine");
+    const engineDir = resolve(targetDir, ".hive");
+    if (existsSync(engineDir)) {
+      // Resume path: a prior run got this far. Finish the install step if
+      // it was interrupted (node_modules missing). ensureEngineDeps is a
+      // no-op when the tree is already complete.
+      ensureEngineDeps(engineDir);
+      console.log(`  ✓ Engine already populated at ${engineDir} (deps verified)`);
+    } else {
+      populateEngine(pkgRoot, targetDir);
+      console.log(`  ✓ Engine populated at ${engineDir}`);
+    }
+  }
+
   // ── 10. Service ───────────────────────────────────────────────────
   section("Service");
 
@@ -485,7 +506,7 @@ export async function runWizard(targetDir: string, templatesDir: string, pkgRoot
   if (installService) {
     try {
       const { startDaemon } = await import("../cli/daemon.js");
-      await startDaemon(pkgRoot);
+      await startDaemon();
     } catch (err) {
       console.log(`  ⚠ Service installation failed: ${err}`);
       console.log(`     You can start manually: hive start`);
