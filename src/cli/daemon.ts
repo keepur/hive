@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { hiveHome } from "../paths.js";
+import { engineDir, hiveHome } from "../paths.js";
 
 function getInstanceId(): string {
   const configPath = resolve(hiveHome, process.env.HIVE_CONFIG ?? "hive.yaml");
@@ -24,25 +24,17 @@ function getLaunchAgentLink(): string {
   return resolve(home, "Library", "LaunchAgents", `${getLabel()}.plist`);
 }
 
-export async function startDaemon(pkgRoot: string): Promise<void> {
-  const label = getLabel();
-  const plistPath = getPlistPath();
-  const linkPath = getLaunchAgentLink();
-  const serviceDir = resolve(hiveHome, "service");
-  const logsDir = resolve(hiveHome, "logs");
-
-  mkdirSync(serviceDir, { recursive: true });
-  mkdirSync(logsDir, { recursive: true });
-
-  const nodePath = execFileSync("which", ["node"], { encoding: "utf-8" }).trim();
-  const serverPath = existsSync(resolve(pkgRoot, "pkg", "server.min.js"))
-    ? resolve(pkgRoot, "pkg", "server.min.js")
-    : resolve(pkgRoot, "dist", "index.js");
-
-  const home = process.env.HOME ?? "/tmp";
-  const pathEnv = process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+export function buildPlist(opts: {
+  label: string;
+  nodePath: string;
+  serverPath: string;
+  hiveHome: string;
+  home: string;
+  pathEnv: string;
+  logsDir: string;
+}): string {
+  const { label, nodePath, serverPath, hiveHome, home, pathEnv, logsDir } = opts;
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -87,6 +79,27 @@ export async function startDaemon(pkgRoot: string): Promise<void> {
 </dict>
 </plist>
 `;
+}
+
+export async function startDaemon(): Promise<void> {
+  const label = getLabel();
+  const plistPath = getPlistPath();
+  const linkPath = getLaunchAgentLink();
+  const serviceDir = resolve(hiveHome, "service");
+  const logsDir = resolve(hiveHome, "logs");
+
+  mkdirSync(serviceDir, { recursive: true });
+  mkdirSync(logsDir, { recursive: true });
+
+  const nodePath = execFileSync("which", ["node"], { encoding: "utf-8" }).trim();
+  const serverPath = existsSync(resolve(engineDir, "pkg", "server.min.js"))
+    ? resolve(engineDir, "pkg", "server.min.js")
+    : resolve(engineDir, "dist", "index.js");
+
+  const home = process.env.HOME ?? "/tmp";
+  const pathEnv = process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+
+  const plist = buildPlist({ label, nodePath, serverPath, hiveHome, home, pathEnv, logsDir });
 
   writeFileSync(plistPath, plist);
   console.log(`Generated plist: ${plistPath}`);

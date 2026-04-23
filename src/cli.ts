@@ -51,6 +51,8 @@ const { positionals, values } = parseArgs({
     config: { type: "string" },
     version: { type: "boolean", short: "v", default: false },
     verbose: { type: "boolean", default: false },
+    tag: { type: "string" },
+    instance: { type: "string" },
   },
 });
 
@@ -75,7 +77,8 @@ Commands:
   start --daemon    Install + start as LaunchAgent
   stop              Stop LaunchAgent
   status            Health check
-  update            Stop → update package → restart
+  update            Update engine to latest (or --tag=<tag>) and restart
+  rollback          Restore the previous engine (.hive.prev) and restart
   doctor            Check prereqs, services, agent health
   plugin add <pkg>  Install a plugin package
   plugin list       List installed plugins
@@ -120,7 +123,7 @@ switch (command) {
     const hiveHome = ensureHiveInstallOrExit();
     if (values.daemon) {
       const { startDaemon } = await import("./cli/daemon.js");
-      await startDaemon(PKG_ROOT);
+      await startDaemon();
     } else {
       const { execFileSync } = await import("node:child_process");
       const serverPath = existsSync(resolve(PKG_ROOT, "pkg", "server.min.js"))
@@ -145,7 +148,15 @@ switch (command) {
   }
   case "update": {
     const { runUpdate } = await import("./cli/update.js");
-    await runUpdate();
+    await runUpdate({
+      tag: values.tag,
+      instance: values.instance,
+    });
+    break;
+  }
+  case "rollback": {
+    const { runRollback } = await import("./cli/rollback.js");
+    await runRollback({ instance: values.instance });
     break;
   }
   case "doctor": {

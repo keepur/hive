@@ -2,13 +2,13 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { hiveHome } from "../paths.js";
+import { engineDir } from "../paths.js";
 import { readConfig, writeConfig, configPath } from "./hive-config.js";
 import { restartHiveService } from "./hive-restart.js";
 import { HIVE_PLUGIN_API_VERSION } from "../plugins/api-version.js";
 import { isHiveApiCompatible } from "../plugins/plugin-loader.js";
 
-const pluginsDir = resolve(hiveHome, "plugins");
+const pluginsDir = resolve(engineDir, "plugins");
 
 /**
  * Resolve a plugin's version. `plugin.yaml` doesn't carry `version:` — the
