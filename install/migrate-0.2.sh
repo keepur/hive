@@ -409,8 +409,17 @@ step_wipe_engine() {
   echo "  ✓ engine files wiped (live plists preserved: ${LIVE_PLISTS[*]:-<none>})"
 }
 
-step_relocate_state
-step_wipe_engine
+# Steps 4-5 mutate the instance tree (mv/rm) after the snapshot exists — so
+# rollback IS possible. Wrap them so a mid-wipe or mid-relocate failure
+# triggers auto-rollback instead of leaving a half-rewritten instance that
+# the operator has to manually reason about.
+if ! step_relocate_state; then
+  rollback_or_die
+fi
+
+if ! step_wipe_engine; then
+  rollback_or_die
+fi
 
 # =============================================================================
 # Step 6 — Classify and relocate loose agent files
@@ -577,7 +586,7 @@ step_populate_engine() {
 
   # PACKAGE_ENTRIES — must match Phase 4's src/setup/populate-engine.ts exactly.
   # If you change this list, change it there too (and in deploy.sh fetch_engine).
-  local entries=(pkg seeds templates scripts/honeypot install package.json)
+  local entries=(pkg seeds templates scripts/honeypot install service package.json)
   for entry in "${entries[@]}"; do
     local src="$cli_root/$entry"
     if [[ ! -e "$src" ]]; then

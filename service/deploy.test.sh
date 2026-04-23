@@ -24,11 +24,13 @@ case "$1" in
     # $PWD at shim entry is the caller's chosen packdir (fetch_engine does `cd "$packdir"`).
     outdir="$PWD"
     stage=$(mktemp -d)
-    mkdir -p "$stage/package/pkg" "$stage/package/seeds" "$stage/package/templates" "$stage/package/scripts"
+    mkdir -p "$stage/package/pkg" "$stage/package/seeds" "$stage/package/templates" "$stage/package/scripts" "$stage/package/install" "$stage/package/service"
     echo "// fake server bundle" > "$stage/package/pkg/server.min.js"
     echo "// fake cli bundle" > "$stage/package/pkg/cli.min.js"
     echo "#!/usr/bin/env bash" > "$stage/package/scripts/honeypot"
     chmod +x "$stage/package/scripts/honeypot"
+    echo "#!/usr/bin/env bash" > "$stage/package/install/migrate-0.2.sh"
+    echo "#!/usr/bin/env bash" > "$stage/package/service/deploy.sh"
     # Version comes from @keepur/hive@<version> arg. `npm pack latest` should yield a real version.
     version="${2#*@keepur/hive@}"
     [[ "$version" == "@keepur/hive" || -z "$version" || "$version" == "latest" ]] && version="0.2.0"
@@ -52,8 +54,10 @@ export PATH="$SHIM_DIR:$PATH"
 export BUILD_DIR="$TESTROOT/build"  # fallback path
 export DEPLOY_DIR="$TESTROOT/deploy"
 
-mkdir -p "$BUILD_DIR/pkg" "$BUILD_DIR/seeds" "$BUILD_DIR/templates" "$BUILD_DIR/scripts"
+mkdir -p "$BUILD_DIR/pkg" "$BUILD_DIR/seeds" "$BUILD_DIR/templates" "$BUILD_DIR/scripts" "$BUILD_DIR/install" "$BUILD_DIR/service"
 echo "// fallback server" > "$BUILD_DIR/pkg/server.min.js"
+echo "#!/usr/bin/env bash" > "$BUILD_DIR/install/migrate-0.2.sh"
+echo "#!/usr/bin/env bash" > "$BUILD_DIR/service/deploy.sh"
 echo '{"name":"@keepur/hive","version":"0.2.0-dev"}' > "$BUILD_DIR/package.json"
 
 # Source the helpers from deploy.sh (extract the fetch/swap/rollback block).
@@ -137,6 +141,10 @@ if ! fetch_engine "$DEPLOY_DIR" "0.9.9-nonexistent" 2>&1 | grep -q "falling back
   exit 1
 fi
 [[ -f "$DEPLOY_DIR/.hive.next/pkg/server.min.js" ]] || { echo "FAIL: fallback did not populate pkg/server.min.js"; exit 1; }
+# service/deploy.sh must reach .hive.next/ — hive update/rollback both shell out
+# to it from .hive/service/, so a missing rsync here would brick both commands.
+[[ -f "$DEPLOY_DIR/.hive.next/service/deploy.sh" ]] || { echo "FAIL: fallback did not populate service/deploy.sh"; exit 1; }
+[[ -f "$DEPLOY_DIR/.hive.next/install/migrate-0.2.sh" ]] || { echo "FAIL: fallback did not populate install/migrate-0.2.sh"; exit 1; }
 
 # --- Test 8: --dry-run skips destructive ops in helpers ---
 echo "test 8: dry-run helpers don't mutate disk"

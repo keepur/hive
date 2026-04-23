@@ -189,6 +189,7 @@ fetch_engine() {
     rsync -a --delete "$src/seeds/"     "$instance_dir/.hive.next/seeds/"
     rsync -a --delete "$src/templates/" "$instance_dir/.hive.next/templates/"
     rsync -a --delete "$src/install/"   "$instance_dir/.hive.next/install/"
+    rsync -a --delete "$src/service/"   "$instance_dir/.hive.next/service/"
     # scripts/honeypot is a single binary, not the whole scripts/ dir
     mkdir -p "$instance_dir/.hive.next/scripts"
     [[ -f "$src/scripts/honeypot" ]] && cp "$src/scripts/honeypot" "$instance_dir/.hive.next/scripts/honeypot"
@@ -295,6 +296,11 @@ if $ROLLBACK; then
   IFS='|' read -r id _config label logs_dir ports _tag <<< "$ROLLBACK_ROW"
   instance_root=$(_instance_root "$id")
   echo "--- Rolling back $id (root: $instance_root) ---"
+  # Stop LaunchAgent BEFORE rotating .hive/. Without -kp, launchd auto-respawns
+  # mid-rollback and the restart picks up a partial state. Mirrors the deploy
+  # loop's stop sequence at the main branch.
+  echo "  Stopping $label..."
+  run_cmd launchctl kickstart -kp "gui/$(id -u)/$label" 2>/dev/null || true
   kill_ports "$ports"
   if ! rollback_engine "$instance_root"; then
     notify "Rollback FAILED for \`$id\`: no previous engine (.hive.prev missing)."
