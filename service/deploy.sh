@@ -342,10 +342,9 @@ unset _seen_roots _seen_pins _id _config _label _logs _ports _engine_tag _root _
 # Phase 1: Build (once, in $BUILD_DIR)
 # =============================================================================
 
-PREV_VERSION=$(jq -r .version < "$DEPLOY_DIR/.hive/package.json" 2>/dev/null || echo "unknown")
 echo ""
 echo "--- Phase 1: Build ---"
-echo "Current deployed version: $PREV_VERSION"
+# Per-instance current versions are reported in Phase 2 after each health check.
 
 echo "Pulling latest in build dir..."
 cd "$BUILD_DIR"

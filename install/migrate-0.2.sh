@@ -89,6 +89,70 @@ notify() {
     -d "$payload" > /dev/null || echo "  (Slack POST failed, continuing)"
 }
 
+# --- auto-rollback (defined early so every wrapped step can reach it) ---
+# Discovers labels via ~/Library/LaunchAgents symlink resolution (not from
+# hardcoded INSTANCE_ID-derived strings, because dodi's label is legacy
+# com.hive.agent, not com.hive.dodi.agent).
+auto_rollback() {
+  echo "==> AUTO-ROLLBACK"
+
+  # Defensive guard — rm -rf on $INSTANCE_DIR is catastrophic if empty. Line 59
+  # already resolves INSTANCE_DIR via `cd … && pwd` so this should never trip,
+  # but the cost is trivial and the blast radius of getting it wrong is the
+  # whole instance tree.
+  if [[ -z "$INSTANCE_DIR" || ! -d "$INSTANCE_DIR" ]]; then
+    echo "ERROR: auto_rollback refusing to run — INSTANCE_DIR unset or missing: '$INSTANCE_DIR'" >&2
+    return 1
+  fi
+  if [[ ! -d "$INSTANCE_DIR.pre-0.2-bak" ]]; then
+    echo "ERROR: auto_rollback cannot restore — $INSTANCE_DIR.pre-0.2-bak missing." >&2
+    return 1
+  fi
+
+  declare -a LABELS=()
+  for link in "$HOME/Library/LaunchAgents"/com.hive.*.plist; do
+    [[ -L "$link" ]] || continue
+    local abs
+    abs=$(realpath "$link" 2>/dev/null || true)
+    if [[ -n "$abs" && "$abs" == "$INSTANCE_DIR/service/"* ]]; then
+      LABELS+=("$(basename "$link" .plist)")
+    fi
+  done
+
+  if (( ${#LABELS[@]} > 0 )); then
+    for label in "${LABELS[@]}"; do
+      launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    done
+  fi
+
+  rm -rf "$INSTANCE_DIR"
+  mv "$INSTANCE_DIR.pre-0.2-bak" "$INSTANCE_DIR"
+
+  if (( ${#LABELS[@]} > 0 )); then
+    for label in "${LABELS[@]}"; do
+      launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$label.plist"
+    done
+  fi
+
+  notify "Migration to 0.2.0 FAILED and was rolled back for $INSTANCE_DIR. Instance(s) back on 0.1.x: ${LABELS[*]:-<none>}."
+}
+
+# rollback_or_die — standard post-failure cleanup. Tries auto_rollback; if the
+# rollback itself fails (snapshot missing, INSTANCE_DIR unset), escalates with
+# a distinct exit code (2) so incident response can distinguish "migration
+# failed but instance restored" (exit 1) from "migration failed AND rollback
+# failed — instance is in partial state" (exit 2). Always exits.
+rollback_or_die() {
+  if auto_rollback; then
+    exit 1
+  fi
+  echo "CRITICAL: auto_rollback failed — $INSTANCE_DIR is in a partial migration state." >&2
+  echo "         Snapshot may be available at: $INSTANCE_DIR.pre-0.2-bak" >&2
+  echo "         Manual recovery required before retrying." >&2
+  notify "MIGRATION CRITICAL: auto-rollback failed for $INSTANCE_DIR. Manual recovery required."
+  exit 2
+}
+
 # --- preflight ---
 preflight() {
   echo "==> Preflight: $INSTANCE_DIR"
@@ -506,7 +570,7 @@ step_populate_engine() {
   cli_bin=$(command -v hive)
   if [[ -z "$cli_bin" ]]; then
     echo "ERROR: hive CLI not found on PATH after npm install." >&2
-    exit 1
+    return 1
   fi
   local cli_root
   cli_root=$(dirname "$(realpath "$cli_bin")")/..
@@ -519,7 +583,7 @@ step_populate_engine() {
     if [[ ! -e "$src" ]]; then
       echo "ERROR: expected engine entry '$entry' missing from $cli_root." >&2
       echo "       Verify @keepur/hive@0.2.0 installed correctly: npm ls -g @keepur/hive" >&2
-      exit 1
+      return 1
     fi
     local dst="$INSTANCE_DIR/.hive/$entry"
     mkdir -p "$(dirname "$dst")"
@@ -534,7 +598,7 @@ step_populate_engine() {
   # Sanity check
   if [[ ! -f "$INSTANCE_DIR/.hive/pkg/server.min.js" ]]; then
     echo "ERROR: .hive/pkg/server.min.js missing after populate" >&2
-    exit 1
+    return 1
   fi
   echo "  ✓ .hive/ populated (version: $(jq -r .version "$INSTANCE_DIR/.hive/package.json"))"
 }
@@ -550,14 +614,24 @@ step_install_engine_deps() {
   echo "==> Step 7b: install engine runtime deps"
   if [[ ! -f "$INSTANCE_DIR/.hive/package.json" ]]; then
     echo "ERROR: install_engine_deps needs $INSTANCE_DIR/.hive/package.json" >&2
-    exit 1
+    return 1
   fi
   (cd "$INSTANCE_DIR/.hive" && npm install --omit=dev --no-audit --no-fund --no-progress)
   echo "  ✓ engine deps installed"
 }
 
-step_populate_engine
-step_install_engine_deps
+# Steps 7 and 7b are wrapped in auto_rollback for the same reason steps 8-11
+# are: a failure here (npm registry timeout, missing package entry, npm install
+# blowup) leaves .hive/ partially populated. Without rollback the retry guard
+# at line 102 would exit-0 on "already migrated" even though the engine is
+# broken. Returning 1 from the steps lets the caller trigger rollback.
+if ! step_populate_engine; then
+  rollback_or_die
+fi
+
+if ! step_install_engine_deps; then
+  rollback_or_die
+fi
 
 # =============================================================================
 # Step 8 — Rewrite hive.yaml paths
@@ -591,8 +665,18 @@ step_remove_git() {
   fi
 }
 
-step_rewrite_yaml
-step_remove_git
+# Wrap steps 8-9 in auto_rollback to match steps 10-11. Without this, a yq
+# failure mid-migration would leave the instance in a half-migrated state
+# (new .hive/ populated, yaml still pointing at legacy paths), and the retry
+# guard at the top of the script would exit-0 on "already migrated" instead
+# of completing the yaml rewrite.
+if ! step_rewrite_yaml; then
+  rollback_or_die
+fi
+
+if ! step_remove_git; then
+  rollback_or_die
+fi
 
 # =============================================================================
 # Step 10 — Regenerate live plist(s) + bootstrap
@@ -674,51 +758,16 @@ step_health_check() {
   return 1
 }
 
-# =============================================================================
-# Step 12 — Auto-rollback
-# =============================================================================
-# Discovers labels via ~/Library/LaunchAgents symlink resolution (not from
-# hardcoded INSTANCE_ID-derived strings, because dodi's label is legacy
-# com.hive.agent, not com.hive.dodi.agent).
-auto_rollback() {
-  echo "==> AUTO-ROLLBACK"
-
-  declare -a LABELS=()
-  for link in "$HOME/Library/LaunchAgents"/com.hive.*.plist; do
-    [[ -L "$link" ]] || continue
-    local abs
-    abs=$(realpath "$link" 2>/dev/null || true)
-    if [[ -n "$abs" && "$abs" == "$INSTANCE_DIR/service/"* ]]; then
-      LABELS+=("$(basename "$link" .plist)")
-    fi
-  done
-
-  if (( ${#LABELS[@]} > 0 )); then
-    for label in "${LABELS[@]}"; do
-      launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-    done
-  fi
-
-  rm -rf "$INSTANCE_DIR"
-  mv "$INSTANCE_DIR.pre-0.2-bak" "$INSTANCE_DIR"
-
-  if (( ${#LABELS[@]} > 0 )); then
-    for label in "${LABELS[@]}"; do
-      launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$label.plist"
-    done
-  fi
-
-  notify "Migration to 0.2.0 FAILED and was rolled back for $INSTANCE_DIR. Instance(s) back on 0.1.x: ${LABELS[*]:-<none>}."
-}
+# Step 12 — Auto-rollback is defined at the top of the script (near notify)
+# so all wrapped call sites can reach it. rollback_or_die() is the shared
+# post-failure escalation helper.
 
 if ! step_regenerate_plists; then
-  auto_rollback
-  exit 1
+  rollback_or_die
 fi
 
 if ! step_health_check; then
-  auto_rollback
-  exit 1
+  rollback_or_die
 fi
 
 notify "Migration succeeded: $INSTANCE_DIR → 0.2.0."
