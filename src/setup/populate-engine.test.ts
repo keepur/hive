@@ -15,6 +15,8 @@ function makeFakePkgRoot(): string {
   writeFileSync(join(root, "templates", "hive.yaml.example"), "instance: {}\n");
   mkdirSync(join(root, "scripts"), { recursive: true });
   writeFileSync(join(root, "scripts", "honeypot"), "#!/usr/bin/env bash\n# honeypot\necho x\n");
+  mkdirSync(join(root, "install"), { recursive: true });
+  writeFileSync(join(root, "install", "migrate-0.2.sh"), "#!/usr/bin/env bash\n# migrate\n");
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "@keepur/hive", version: "0.2.0" }));
   return root;
 }
@@ -48,6 +50,7 @@ describe("populateEngine", () => {
     expect(existsSync(join(engine, "seeds", "dodi.seed.ts"))).toBe(true);
     expect(existsSync(join(engine, "templates", "hive.yaml.example"))).toBe(true);
     expect(existsSync(join(engine, "scripts", "honeypot"))).toBe(true);
+    expect(existsSync(join(engine, "install", "migrate-0.2.sh"))).toBe(true);
     expect(existsSync(join(engine, "package.json"))).toBe(true);
   });
 
@@ -92,7 +95,7 @@ describe("populateEngine", () => {
 
   it("PACKAGE_ENTRIES matches the tarball shape exactly", () => {
     // If this test fails, the deploy.sh fetch_engine rsync fallback also needs updating.
-    expect(PACKAGE_ENTRIES).toEqual(["pkg", "seeds", "templates", "scripts/honeypot", "package.json"]);
+    expect(PACKAGE_ENTRIES).toEqual(["pkg", "seeds", "templates", "scripts/honeypot", "install", "package.json"]);
   });
 
   it("runs npm install in .hive/ by default (no skipInstall)", () => {

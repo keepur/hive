@@ -13,7 +13,7 @@ import { resolve, dirname } from "node:path";
  * `files` field changes, update both here and deploy.sh's fetch_engine at
  * the same time.
  */
-export const PACKAGE_ENTRIES = ["pkg", "seeds", "templates", "scripts/honeypot", "package.json"] as const;
+export const PACKAGE_ENTRIES = ["pkg", "seeds", "templates", "scripts/honeypot", "install", "package.json"] as const;
 
 export interface PopulateEngineOptions {
   /**

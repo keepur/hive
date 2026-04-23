@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { resolveHiveHome } from "../paths.js";
+import { relocateBetaPlugins } from "./update-preflight.js";
 
 function readInstalledVersion(engineDir: string): string {
   try {
@@ -37,6 +38,16 @@ export async function runUpdate(opts: UpdateOptions = {}): Promise<void> {
   const tag = opts.tag ?? "latest";
 
   console.log(`Updating @keepur/hive (current: ${fromVersion}, target: ${tag})...`);
+
+  // Beta pre-release safety net: relocate any plugins that 0.2.0-pre
+  // `hive plugin add` misrouted into <engineDir>/plugins/node_modules/.
+  // Must run before deploy.sh wipes .hive/. Idempotent.
+  const relocated = relocateBetaPlugins();
+  if (relocated.moved.length > 0) {
+    console.log(
+      `  ✓ Relocated ${relocated.moved.length} pre-release plugin(s) from .hive/ to plugins/: ${relocated.moved.join(", ")}`,
+    );
+  }
 
   const args = ["--tag=" + tag];
   if (opts.instance) args.push("--instance=" + opts.instance);

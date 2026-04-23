@@ -85,7 +85,19 @@ For specific failure modes and remediation, see [troubleshooting.md](troubleshoo
 hive update
 ```
 
-Stops the service, updates the global `@keepur/hive` npm package, and restarts. Run when the CLI prompts you, or weekly as routine maintenance.
+Stops the service, fetches the new `@keepur/hive` engine tarball into `<instance>/.hive.next/`, atomically swaps it with `<instance>/.hive/`, and restarts. Auto-rolls-back from `<instance>/.hive.prev/` if the health check fails. Run when the CLI prompts you, or weekly as routine maintenance.
+
+To roll back the engine to the previously-installed version (without a full migration):
+
+```
+hive rollback
+```
+
+This restores `<instance>/.hive.prev/` over `<instance>/.hive/` and restarts. Available until the next `hive update` cycles the `.prev/` snapshot out.
+
+### Migrating from 0.1.x
+
+If you're still on 0.1.x, `hive update` is **not** the right command — the 0.1.x → 0.2.0 cutover is a one-shot layout migration, not a version bump. See [migrating-to-0.2.md](./migrating-to-0.2.md).
 
 ## Service control
 

@@ -22,6 +22,10 @@ vi.mock("../paths.js", () => ({
   resolveHiveHome: () => "/tmp/test-hive",
 }));
 
+vi.mock("./update-preflight.js", () => ({
+  relocateBetaPlugins: () => ({ moved: [], skipped: true }),
+}));
+
 describe("runUpdate", () => {
   beforeEach(() => {
     mockExecFileSync.mockReset();
