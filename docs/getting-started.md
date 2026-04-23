@@ -15,6 +15,8 @@ The bootstrap script installs Homebrew and Node 22, then hands off to `hive init
 
 ## Install
 
+> **Already running 0.1.x?** Don't follow the install steps below — you need a one-shot migration instead. See [migrating-to-0.2.md](./migrating-to-0.2.md) for the walkthrough. The migration preserves your config, MongoDB data, logs, and agent files, and takes ~5 minutes per instance.
+
 ### Fresh Mac (no developer tools)
 
 Run:

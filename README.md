@@ -18,10 +18,23 @@ npm i -g @keepur/hive && hive init
 
 The bootstrap installs Homebrew and Node 22, then drops you into the `hive init` wizard which handles the rest (MongoDB, Ollama, Qdrant). Budget about 20 minutes end-to-end.
 
+## Upgrading from 0.1.x
+
+Hive 0.2.0 ships a new instance directory layout (engine in `<instance>/.hive/`; config, logs, agent data stay at the root). Existing 0.1.x installs need a one-shot migration:
+
+```
+curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/migrate-0.2.sh \
+  | bash -s -- ~/services/hive/<your-instance>
+```
+
+Dry-run first (`--dry-run` before the instance path) to preview the file classification. Full walkthrough: [Migrating to 0.2.0](https://github.com/keepur/hive-docs/blob/main/docs/migrating-to-0.2.md). Downtime is ~5 minutes per instance; the script auto-rolls-back on health-check failure.
+
 ## Documentation
 
 - [Getting started](https://github.com/keepur/hive-docs/blob/main/docs/getting-started.md) — install + first conversation
 - [Managing your hive](https://github.com/keepur/hive-docs/blob/main/docs/managing-your-hive.md) — plugins, skills, day-two ops
+- [Migrating to 0.2.0](https://github.com/keepur/hive-docs/blob/main/docs/migrating-to-0.2.md) — for existing 0.1.x installs
+- [Release notes — 0.2.0](https://github.com/keepur/hive-docs/blob/main/docs/release-notes-0.2.0.md) — what's new, what broke
 - [Troubleshooting](https://github.com/keepur/hive-docs/blob/main/docs/troubleshooting.md) — when things break
 
 ## What you get
