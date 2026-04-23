@@ -207,9 +207,6 @@ preflight() {
 
 preflight
 
-# --- Dry-run mode exits here, after the classifier in Task 5 ---
-# (Task 5 will add `run_dry_run_classifier` + `[[ $DRY_RUN == true ]] && exit 0`.)
-
 # =============================================================================
 # Step 2 — Snapshot for rollback
 # =============================================================================
@@ -327,9 +324,14 @@ step_wipe_engine() {
       local name
       name=$(basename "$f")
       local is_live=false
-      for live in "${LIVE_PLISTS[@]:-}"; do
-        [[ "$name" == "$live" ]] && is_live=true && break
-      done
+      # LIVE_PLISTS is always initialized by preflight() (declare -g -a LIVE_PLISTS=()),
+      # so direct expansion is safe. The ${#...} > 0 guard avoids iterating once with
+      # an empty string when the array is empty.
+      if (( ${#LIVE_PLISTS[@]} > 0 )); then
+        for live in "${LIVE_PLISTS[@]}"; do
+          [[ "$name" == "$live" ]] && is_live=true && break
+        done
+      fi
       if ! $is_live; then
         if $DRY_RUN; then
           echo "  [DRY RUN] rm -f service/$name"
@@ -487,16 +489,17 @@ fi
 step_populate_engine() {
   echo "==> Step 7: populate .hive/ with @keepur/hive@0.2.0"
 
-  # Install globally if not already on 0.2.0
+  # Install globally if not already on 0.2.x (any patch release — don't downgrade
+  # a customer who's on 0.2.1+ back to 0.2.0).
   local current=""
   if command -v hive >/dev/null 2>&1; then
     current=$(hive --version 2>/dev/null | awk '{print $NF}' | sed 's/^v//')
   fi
-  if [[ "$current" != "0.2.0" ]]; then
-    echo "  Installing @keepur/hive@0.2.0 globally..."
+  if [[ "$current" != 0.2.* ]]; then
+    echo "  Installing @keepur/hive@0.2.0 globally (current: ${current:-<none>})..."
     npm i -g "@keepur/hive@0.2.0"
   else
-    echo "  Global CLI already on 0.2.0."
+    echo "  Global CLI already on $current (≥0.2.0 — keeping it)."
   fi
 
   local cli_bin
@@ -510,7 +513,7 @@ step_populate_engine() {
 
   # PACKAGE_ENTRIES — must match Phase 4's src/setup/populate-engine.ts exactly.
   # If you change this list, change it there too (and in deploy.sh fetch_engine).
-  local entries=(pkg seeds templates scripts/honeypot package.json)
+  local entries=(pkg seeds templates scripts/honeypot install package.json)
   for entry in "${entries[@]}"; do
     local src="$cli_root/$entry"
     if [[ ! -e "$src" ]]; then
