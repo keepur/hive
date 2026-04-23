@@ -66,7 +66,19 @@ export function populateEngine(pkgRoot: string, instanceDir: string, opts: Popul
   }
 
   if (opts.skipInstall) return;
+  ensureEngineDeps(engineDir);
+}
+
+/**
+ * Runs `npm install --omit=dev` inside `engineDir` if `node_modules/` is
+ * missing. Idempotent — call it on wizard resume to finish an install that
+ * was interrupted after the copy step but before deps landed. No-op if
+ * `package.json` is absent (nothing to install against) or `node_modules/`
+ * already exists.
+ */
+export function ensureEngineDeps(engineDir: string): void {
   if (!existsSync(resolve(engineDir, "package.json"))) return;
+  if (existsSync(resolve(engineDir, "node_modules"))) return;
 
   execFileSync("npm", ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-progress"], {
     cwd: engineDir,

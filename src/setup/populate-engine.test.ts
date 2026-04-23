@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { populateEngine, PACKAGE_ENTRIES } from "./populate-engine.js";
+import { populateEngine, ensureEngineDeps, PACKAGE_ENTRIES } from "./populate-engine.js";
 
 function makeFakePkgRoot(): string {
   const root = resolve(tmpdir(), `hive-populate-src-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -101,5 +101,42 @@ describe("populateEngine", () => {
     populateEngine(pkgRoot, instanceDir);
     const engine = resolve(instanceDir, ".hive");
     expect(existsSync(join(engine, "package-lock.json"))).toBe(true);
+  });
+});
+
+describe("ensureEngineDeps", () => {
+  let engine: string;
+
+  beforeEach(() => {
+    engine = resolve(tmpdir(), `hive-ensure-deps-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(engine, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(engine, { recursive: true, force: true });
+  });
+
+  it("runs npm install when node_modules/ is missing (resume path)", () => {
+    writeFileSync(join(engine, "package.json"), JSON.stringify({ name: "@keepur/hive", version: "0.2.0" }));
+    ensureEngineDeps(engine);
+    expect(existsSync(join(engine, "package-lock.json"))).toBe(true);
+  });
+
+  it("is a no-op when node_modules/ already exists", () => {
+    writeFileSync(join(engine, "package.json"), JSON.stringify({ name: "@keepur/hive", version: "0.2.0" }));
+    mkdirSync(join(engine, "node_modules"), { recursive: true });
+    // Marker so we can tell if npm install ran and overwrote anything.
+    writeFileSync(join(engine, "node_modules", ".marker"), "present");
+    ensureEngineDeps(engine);
+    expect(readFileSync(join(engine, "node_modules", ".marker"), "utf-8")).toBe("present");
+    // npm install didn't run, so no package-lock.json was produced.
+    expect(existsSync(join(engine, "package-lock.json"))).toBe(false);
+  });
+
+  it("is a no-op when package.json is absent", () => {
+    // Empty engine dir — e.g., a prior init failed before the copy step.
+    ensureEngineDeps(engine);
+    expect(existsSync(join(engine, "package-lock.json"))).toBe(false);
+    expect(existsSync(join(engine, "node_modules"))).toBe(false);
   });
 });
