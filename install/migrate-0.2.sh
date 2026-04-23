@@ -211,7 +211,7 @@ preflight() {
     echo "WARNING: the following LaunchAgents are currently loaded:"
     echo "  $running"
     echo ""
-    read -p "Stop them now via launchctl bootout? [y/N] " reply
+    read -p "Stop them now via launchctl bootout? [y/N] " reply </dev/tty
     if [[ "$reply" =~ ^[Yy]$ ]]; then
       for label in $running; do
         launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
