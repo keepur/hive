@@ -2,13 +2,17 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { engineDir } from "../paths.js";
+import { hiveHome } from "../paths.js";
 import { readConfig, writeConfig, configPath } from "./hive-config.js";
 import { restartHiveService } from "./hive-restart.js";
 import { HIVE_PLUGIN_API_VERSION } from "../plugins/api-version.js";
 import { isHiveApiCompatible } from "../plugins/plugin-loader.js";
 
-const pluginsDir = resolve(engineDir, "plugins");
+// Instance-authored plugins live at <hiveHome>/plugins/, outside the engine dir
+// so they survive `hive update` / `hive rollback` wipes of <hiveHome>/.hive/.
+// Engine-shipped plugins (claude-code/) live at <engineDir>/plugins/ and are
+// populated by populateEngine / fetch_engine, not by this CLI.
+const pluginsDir = resolve(hiveHome, "plugins");
 
 /**
  * Resolve a plugin's version. `plugin.yaml` doesn't carry `version:` — the

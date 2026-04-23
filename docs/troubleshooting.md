@@ -52,7 +52,7 @@ Agents don't see Slack messages and Slack delivery fails.
 
 1. Go to <https://api.slack.com/apps> → your Hive app → **OAuth & Permissions** → reinstall to workspace.
 2. Copy the new **Bot User OAuth Token** (`xoxb-...`) and **App-Level Token** (`xapp-...`).
-3. Update `~/.hive/.env`:
+3. Update your instance's `.env` (at `~/services/hive/<your-instance>/.env`):
    ```
    SLACK_BOT_TOKEN=xoxb-...
    SLACK_APP_TOKEN=xapp-...
@@ -73,7 +73,7 @@ Agents don't see Slack messages and Slack delivery fails.
 **Fix:**
 
 1. Get a key at <https://console.anthropic.com/settings/keys>.
-2. Paste into `~/.hive/.env`:
+2. Paste into your instance's `.env` (at `~/services/hive/<your-instance>/.env`):
    ```
    ANTHROPIC_API_KEY=sk-ant-...
    ```
@@ -105,7 +105,7 @@ hive status
 If `hive start --daemon` itself fails or the LaunchAgent flips back to not-running, tail the log to find the underlying error:
 
 ```bash
-tail -f ~/.hive/logs/hive.log
+tail -f ~/services/hive/<your-instance>/logs/hive.log
 ```
 
 The most common cause is one of the failure modes above (MongoDB down, missing API key, bad config) — fix that, then `hive start --daemon` again.
@@ -177,5 +177,5 @@ hive doctor
 
 If `hive doctor` passes but something is still wrong — or a check fails in a way the sections above don't cover:
 
-- **Trust-gate cohort (you got an onboarding email from May):** text May at the cell number in that email. Include the full output of `hive doctor --verbose` and the last ~50 lines of `~/.hive/logs/hive.log`.
+- **Trust-gate cohort (you got an onboarding email from May):** text May at the cell number in that email. Include the full output of `hive doctor --verbose` and the last ~50 lines of `~/services/hive/<your-instance>/logs/hive.log`.
 - **Everyone else:** file an issue at <https://github.com/keepur/hive-docs/issues> with the same two artifacts attached.

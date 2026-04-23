@@ -13,7 +13,7 @@ Hive is the AI team I've been building for {{companyName}}-style operations. Out
 Two commands on a Mac to get started:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/bootstrap.sh | bash
 ```
 
 Or, if you already have Node 22:
@@ -22,7 +22,7 @@ Or, if you already have Node 22:
 npm i -g @keepur/hive && hive init
 ```
 
-Full walkthrough: https://github.com/keepur/hive/blob/main/docs/getting-started.md
+Full walkthrough: https://github.com/keepur/hive-docs/blob/main/docs/getting-started.md
 
 About 20 minutes start to first Slack reply. Text me at {{maysCell}} when you're stuck — happy to walk through it on the phone.
 

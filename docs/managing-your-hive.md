@@ -31,7 +31,7 @@ The three currently published plugins:
 - `@keepur/hive-plugin-linear` — Linear issue tracking. <https://www.npmjs.com/package/@keepur/hive-plugin-linear>
 - `@keepur/hive-plugin-github` — GitHub Issues and PR tooling. <https://www.npmjs.com/package/@keepur/hive-plugin-github>
 
-Each plugin reads its credentials from `~/.hive/.env`. Required keys are documented in each plugin's npm README. (The Honeypot + Keychain credential model is on the roadmap; until it ships, treat `.env` as the credential store and protect it accordingly.)
+Each plugin reads its credentials from your instance's `.env` file (`~/services/hive/<your-instance>/.env`). Required keys are documented in each plugin's npm README. (The Honeypot + Keychain credential model is on the roadmap; until it ships, treat `.env` as the credential store and protect it accordingly.)
 
 ### Remove a plugin
 
@@ -95,16 +95,16 @@ Stops the service, updates the global `@keepur/hive` npm package, and restarts. 
 
 ## Configuration files
 
-Two files in `~/.hive/`. The CLI manages most of this; the fields below are the ones you may edit.
+Two files at your instance root (`~/services/hive/<your-instance>/`). The CLI manages most of this; the fields below are the ones you may edit. Both files survive `hive update` and `hive rollback` — only the engine in `<instance>/.hive/` gets swapped.
 
-### `~/.hive/hive.yaml`
+### `<instance>/hive.yaml`
 
 - `instance.id` — unique ID for this hive (used for DB name, tmp dirs, launchd label). Set once at `hive init`; changing it later is a migration, not an edit.
 - `agents.default` — agent ID that catches unrouted messages.
 - `plugins` — **do not hand-edit.** Managed by `hive plugin add` / `hive plugin remove`.
 - `skills.registries` — list of registries to pull skills from. The default `keepur/hive-skills` is added at init; add others with `hive registry`.
 
-### `~/.hive/.env`
+### `<instance>/.env`
 
 Core secrets:
 
