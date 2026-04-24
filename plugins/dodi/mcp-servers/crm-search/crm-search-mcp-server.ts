@@ -35,14 +35,6 @@ async function ensureReady() {
   if (!backend) backend = await createSearchBackend({ requireAtlas: KB_BACKEND === "atlas" });
 }
 
-// Qdrant deal payloads store the pipeline as its resolved label (e.g. "Sales
-// Pipeline"), while Mongo rag_deals stores the raw ID ("default"). Resolve
-// through the pipelineMap so the Qdrant filter matches what the embedder wrote.
-// Falls back to the raw ID if the map isn't loaded.
-function dealPipelineValue(): string {
-  return backend.pipelineMap.get("default") ?? "default";
-}
-
 // ── Field Configuration ──────────────────────────────────────────────────────
 
 const CRM_FIELDS: FieldConfig = {
@@ -170,7 +162,7 @@ server.registerTool(
             col.name,
             queryEmbedding,
             col.name === "deals" ? limit * 3 : limit,
-            col.name === "deals" ? { pipeline: dealPipelineValue() } : undefined,
+            col.name === "deals" ? { pipeline: "default" } : undefined,
           ).catch((e) => {
             process.stderr.write(`crm-search: search failed on ${col.name}: ${e.message}\n`);
             return [] as any[];
@@ -296,7 +288,7 @@ server.registerTool(
           colName,
           sourceVector,
           limit + 1,
-          colName === "deals" ? { pipeline: dealPipelineValue() } : undefined,
+          colName === "deals" ? { pipeline: "default" } : undefined,
         );
 
         // Exclude the source record
@@ -568,7 +560,7 @@ async function crmStatsQdrant(metric: string): Promise<ToolResult> {
     let dealCount = 0;
     try {
       const dealResult = await backend.qdrant.count("deals", {
-        filter: { must: [{ key: "pipeline", match: { value: dealPipelineValue() } }] },
+        filter: { must: [{ key: "pipeline", match: { value: "default" } }] },
         exact: true,
       });
       dealCount = dealResult.count;
