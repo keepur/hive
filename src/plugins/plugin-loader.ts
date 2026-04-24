@@ -151,6 +151,54 @@ export function loadPlugins(
 }
 
 /**
+ * Re-check broken MCP server entries against the filesystem and drop any that
+ * now resolve. Mutates `plugin.brokenServers` in place. Intended for SIGUSR1
+ * recovery when plugin dist files land after startup (e.g., a race between
+ * the engine restart and whatever populates `<hiveHome>/plugins/<name>/dist/`).
+ *
+ * Active agent sessions keep their cached runner state; the next new session
+ * picks up the unmarked server naturally because agent-runner reads
+ * `plugin.brokenServers` at spawn time.
+ *
+ * Returns the names of rescued servers (per plugin) so callers can log a
+ * useful summary without re-walking the map.
+ */
+export function rescanPluginBrokenServers(
+  plugins: LoadedPlugin[],
+  rootDir: string,
+  resolveOpts?: { distDir?: string },
+): { rescued: Record<string, string[]>; stillBroken: Record<string, string[]> } {
+  const rescued: Record<string, string[]> = {};
+  const stillBroken: Record<string, string[]> = {};
+
+  for (const plugin of plugins) {
+    const brokenNames = Object.keys(plugin.brokenServers);
+    if (brokenNames.length === 0) continue;
+
+    for (const serverName of brokenNames) {
+      const serverDef = plugin.manifest.mcpServers[serverName];
+      if (!serverDef) {
+        // Server was removed from the manifest since startup — drop the stale entry.
+        delete plugin.brokenServers[serverName];
+        continue;
+      }
+      const resolved = resolvePluginServerPath(plugin.name, serverDef.entry, {
+        hiveHome: rootDir,
+        distDir: resolveOpts?.distDir,
+      });
+      if ("path" in resolved) {
+        delete plugin.brokenServers[serverName];
+        (rescued[plugin.name] ??= []).push(serverName);
+      } else {
+        (stillBroken[plugin.name] ??= []).push(serverName);
+      }
+    }
+  }
+
+  return { rescued, stillBroken };
+}
+
+/**
  * Minimal semver range check. Supports caret ranges ("^1.0.0") and exact
  * versions ("1.0.0"). Anything else is treated as accept-any with a warn.
  */
