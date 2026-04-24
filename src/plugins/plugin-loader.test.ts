@@ -25,6 +25,7 @@ describe("normalizeManifest", () => {
         "my-server": {
           entry: "mcp-servers/my-server/index.ts",
           env: ["API_KEY"],
+          "secret-env": ["SECRET_TOKEN"],
           "env-map": { SERVER_URL: "BASE_URL" },
           "agent-env": { MODE: "agentMode" },
         },
@@ -43,6 +44,7 @@ describe("normalizeManifest", () => {
       usage: undefined,
       notFor: undefined,
       env: ["API_KEY"],
+      secretEnv: ["SECRET_TOKEN"],
       envMap: { SERVER_URL: "BASE_URL" },
       agentEnv: { MODE: "agentMode" },
     });
@@ -99,9 +101,21 @@ describe("normalizeManifest", () => {
       usage: undefined,
       notFor: undefined,
       env: [],
+      secretEnv: [],
       envMap: {},
       agentEnv: {},
     });
+  });
+
+  it("round-trips secret-env (YAML) to secretEnv (TS)", () => {
+    const raw = {
+      "mcp-servers": {
+        s: { entry: "e.ts", "secret-env": ["A", "B", "C"] },
+      },
+    };
+    const result = normalizeManifest(raw);
+    expect(result.mcpServers.s.secretEnv).toEqual(["A", "B", "C"]);
+    expect(result.mcpServers.s.env).toEqual([]);
   });
 });
 

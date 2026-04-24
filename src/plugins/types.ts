@@ -5,7 +5,9 @@ export interface PluginMcpServer {
   usage?: string;
   /** Common misuse — "for X, use Y instead" */
   notFor?: string;
-  env?: string[]; // pass-through from base env (same name)
+  env?: string[]; // pass-through from base env (same name); no keychain fallback
+  /** Secret vars resolved via process.env first, macOS Keychain (honeypot) second. */
+  secretEnv?: string[];
   envMap?: Record<string, string>; // rename: SERVER_VAR -> BASE_VAR
   agentEnv?: Record<string, string>;
 }

@@ -7,6 +7,7 @@
  */
 
 import { config } from "../config.js";
+import { fromKeychain } from "../keychain/from-keychain.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { SERVER_CATALOG } from "./server-catalog.js";
 
@@ -76,12 +77,16 @@ export function buildInstanceCapabilities(plugins: LoadedPlugin[] = []): Instanc
     }
   }
 
-  // Plugin servers — generic check: configured iff every declared env var is non-empty
+  // Plugin servers — generic check: configured iff every declared env var resolves.
+  // `env` must come from process.env; `secretEnv` can fall through to Keychain.
+  const instanceId = config.instance?.id ?? "unknown";
   for (const plugin of plugins) {
     for (const [serverName, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
       const requiredEnv = serverDef.env ?? [];
-      const hasAll = requiredEnv.length === 0 || requiredEnv.every((envVar) => !!process.env[envVar]);
-      if (hasAll) {
+      const requiredSecrets = serverDef.secretEnv ?? [];
+      const envOk = requiredEnv.every((v) => !!process.env[v]);
+      const secretsOk = requiredSecrets.every((v) => !!process.env[v] || !!fromKeychain(instanceId, v));
+      if (envOk && secretsOk) {
         configured.push(serverName);
       } else {
         unconfigured.push(serverName);
