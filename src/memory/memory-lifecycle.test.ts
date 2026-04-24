@@ -12,20 +12,6 @@ vi.mock("../logging/logger.js", () => ({
   }),
 }));
 
-// ── SDK mock (used by summarizeCold) ────────────────────────────────
-vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
-  query: vi.fn().mockReturnValue({
-    close: vi.fn(),
-    [Symbol.asyncIterator]: async function* () {
-      yield {
-        type: "result",
-        subtype: "success",
-        result: "Summary text",
-      };
-    },
-  }),
-}));
-
 // ── Import after mocks ──────────────────────────────────────────────
 import { MemoryLifecycle } from "./memory-lifecycle.js";
 
@@ -74,6 +60,22 @@ function makeMockEmbedder() {
   };
 }
 
+function makeMockLlm(...texts: string[]) {
+  let i = 0;
+  return {
+    generateForTask: vi.fn().mockImplementation(async () => {
+      const text = texts[i] ?? texts[texts.length - 1] ?? "Summary text";
+      i++;
+      return {
+        text,
+        model: "test-model",
+        provider: "test-provider",
+        durationMs: 1,
+      };
+    }),
+  };
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 const defaultConfig: MemoryLifecycleConfig = {
   hotBudgetTokens: 3000,
@@ -108,7 +110,7 @@ function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
 
 // ── Scoring tests (moved from tests/memory/) ───────────────────────
 describe("MemoryLifecycle.computeScore", () => {
-  const lifecycle = new MemoryLifecycle(null as any, null as any, defaultConfig);
+  const lifecycle = new MemoryLifecycle(null as any, null as any, defaultConfig, makeMockLlm());
 
   const baseRecord = makeRecord({
     importance: "high",
@@ -163,7 +165,7 @@ describe("MemoryLifecycle.sweep", () => {
     vi.clearAllMocks();
     store = makeMockStore();
     embedder = makeMockEmbedder();
-    lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm());
   });
 
   it("returns zero counts when no agents exist", async () => {
@@ -262,7 +264,7 @@ describe("MemoryLifecycle Phase 6: hard-delete purged records", () => {
   });
 
   it("calls deletePurgedOlderThan with the correct 7-day cutoff", async () => {
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm());
     store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
     // Empty records — Phase 6 must still run even when agent has no active memories
     store.getAllNonPinned.mockResolvedValueOnce([]);
@@ -280,7 +282,7 @@ describe("MemoryLifecycle Phase 6: hard-delete purged records", () => {
   });
 
   it("calls embedder.remove for each hard-deleted record's qdrantPointId", async () => {
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm());
     const deletedRecord = makeRecord({ purged: true, purgedAt: new Date("2026-01-01"), qdrantPointId: "pt-purged-1" });
 
     store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
@@ -295,7 +297,7 @@ describe("MemoryLifecycle Phase 6: hard-delete purged records", () => {
   });
 
   it("does not call embedder.remove when no records are hard-deleted", async () => {
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm());
     store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
     store.getAllNonPinned.mockResolvedValueOnce([]);
     store.getColdTopics.mockResolvedValueOnce([]);
@@ -308,7 +310,7 @@ describe("MemoryLifecycle Phase 6: hard-delete purged records", () => {
   });
 
   it("continues sweep without throwing when phase 6 throws", async () => {
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm());
     store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
     store.getAllNonPinned.mockResolvedValueOnce([]);
     store.getColdTopics.mockResolvedValueOnce([]);
@@ -339,7 +341,7 @@ describe("MemoryLifecycle budget enforcement", () => {
       hotBudgetTokens: 60, // ~240 chars budget for non-pinned only
     };
 
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, config);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, config, makeMockLlm());
 
     store.getAgentIds.mockResolvedValueOnce(["agent-1"]);
 
@@ -396,13 +398,13 @@ describe("dream()", () => {
   });
 
   it("returns zeros when dreamConfig is not provided", async () => {
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm());
     const result = await lifecycle.dream();
     expect(result).toEqual({ merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] });
   });
 
   it("returns zeros when dreamConfig.enabled is false", async () => {
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, {
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm(), {
       enabled: false,
       idleThresholdMinutes: 30,
       cooldownMinutes: 60,
@@ -429,7 +431,7 @@ describe("dream()", () => {
       maxPromotionsPerRun: 10,
       maxBudgetUsd: 0.1,
     };
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm(), dreamCfg);
 
     // Mock getAgentIds returns two agents
     store.getAgentIds.mockResolvedValue(["agent-a", "agent-b"]);
@@ -456,7 +458,7 @@ describe("dream()", () => {
       maxPromotionsPerRun: 10,
       maxBudgetUsd: 0.1,
     };
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm(), dreamCfg);
 
     const rec1 = makeRecord({ agentId: "a1", qdrantPointId: "pt-1", importance: "high" });
     const rec2 = makeRecord({ agentId: "a1", qdrantPointId: "pt-2", importance: "medium" });
@@ -487,7 +489,6 @@ describe("dream()", () => {
 
   // ── Happy-path: detectContradictions ──────────────────────────────
   it("resolves contradiction with A_WINS and supersedes loser", async () => {
-    const { query: mockQuery } = await import("@anthropic-ai/claude-agent-sdk");
     const dreamCfg = {
       enabled: true,
       idleThresholdMinutes: 30,
@@ -499,7 +500,8 @@ describe("dream()", () => {
       maxPromotionsPerRun: 10,
       maxBudgetUsd: 0.1,
     };
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+    const llm = makeMockLlm("A_WINS");
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, llm, dreamCfg);
 
     const recA = makeRecord({ agentId: "a1", type: "fact", topic: "pricing" });
     const recB = makeRecord({ agentId: "a1", type: "fact", topic: "pricing" });
@@ -509,15 +511,6 @@ describe("dream()", () => {
     store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map([["pricing", [recA, recB]]]));
     store.getInteractionsByTopic.mockResolvedValue(new Map());
 
-    // SDK mock: first call is for merge (skipped, no duplicates), second for contradiction
-    // The global mock returns "Summary text" — override for this test
-    (mockQuery as ReturnType<typeof vi.fn>).mockReturnValueOnce({
-      close: vi.fn(),
-      [Symbol.asyncIterator]: async function* () {
-        yield { type: "result", subtype: "success", result: "A_WINS" };
-      },
-    });
-
     const result = await lifecycle.dream();
 
     expect(result.contradictions).toBe(1);
@@ -526,7 +519,6 @@ describe("dream()", () => {
 
   // ── Happy-path: detectContradictions — eliminated record skipped ──
   it("skips superseded records in later contradiction pairs", async () => {
-    const { query: mockQuery } = await import("@anthropic-ai/claude-agent-sdk");
     const dreamCfg = {
       enabled: true,
       idleThresholdMinutes: 30,
@@ -538,7 +530,8 @@ describe("dream()", () => {
       maxPromotionsPerRun: 10,
       maxBudgetUsd: 0.1,
     };
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+    const llm = makeMockLlm("A_WINS", "NO");
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, llm, dreamCfg);
 
     const recA = makeRecord({ agentId: "a1", type: "fact", topic: "t" });
     const recB = makeRecord({ agentId: "a1", type: "fact", topic: "t" });
@@ -549,21 +542,6 @@ describe("dream()", () => {
     store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map([["t", [recA, recB, recC]]]));
     store.getInteractionsByTopic.mockResolvedValue(new Map());
 
-    // Pair (A,B): B loses. Pair (A,C): no contradiction. Pair (B,C): should be SKIPPED.
-    (mockQuery as ReturnType<typeof vi.fn>)
-      .mockReturnValueOnce({
-        close: vi.fn(),
-        [Symbol.asyncIterator]: async function* () {
-          yield { type: "result", subtype: "success", result: "A_WINS" };
-        },
-      })
-      .mockReturnValueOnce({
-        close: vi.fn(),
-        [Symbol.asyncIterator]: async function* () {
-          yield { type: "result", subtype: "success", result: "NO" };
-        },
-      });
-
     const result = await lifecycle.dream();
 
     // Only 1 resolved (A beats B). B is eliminated so (B,C) never evaluated.
@@ -572,7 +550,7 @@ describe("dream()", () => {
     expect(store.markSuperseded).toHaveBeenCalledTimes(1);
     expect(store.markSuperseded).toHaveBeenCalledWith([recB._id!], recA._id!);
     // Only 2 LLM calls: (A,B) and (A,C). NOT (B,C).
-    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect(llm.generateForTask).toHaveBeenCalledTimes(2);
   });
 
   // ── Happy-path: promotePatterns ───────────────────────────────────
@@ -588,7 +566,7 @@ describe("dream()", () => {
       maxPromotionsPerRun: 10,
       maxBudgetUsd: 0.1,
     };
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm(), dreamCfg);
 
     const interactions = [
       makeRecord({ agentId: "a1", type: "interaction", topic: "greetings", sourceThread: "t1" }),
@@ -633,7 +611,14 @@ describe("dream()", () => {
       maxBudgetUsd: 0.1,
     };
     const getActiveAgentIds = vi.fn().mockResolvedValue(new Set(["active-agent"]));
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg, getActiveAgentIds);
+    const lifecycle = new MemoryLifecycle(
+      store as any,
+      embedder as any,
+      defaultConfig,
+      makeMockLlm(),
+      dreamCfg,
+      getActiveAgentIds,
+    );
 
     // Memory collection surfaces one active + one retired agent
     store.getAgentIds.mockResolvedValue(["active-agent", "retired-agent"]);
@@ -661,7 +646,7 @@ describe("dream()", () => {
       maxPromotionsPerRun: 10,
       maxBudgetUsd: 0.1,
     };
-    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, makeMockLlm(), dreamCfg);
 
     store.getAgentIds.mockResolvedValue(["a1", "a2"]);
     store.getByTiersForAgent.mockResolvedValue([]);

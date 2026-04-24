@@ -6,6 +6,7 @@ import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
 import { fromKeychain as fromKeychainRaw } from "./keychain/from-keychain.js";
 import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
+import type { LLMModelConfig, LLMProviderConfig, LLMRegistryConfig } from "./llm/types.js";
 
 // Load .env from resolved hive home
 const dotenvPath = resolveDotenvPath(hiveHome);
@@ -19,6 +20,10 @@ function required(key: string): string {
 
 function optional(key: string, fallback: string): string {
   return process.env[key] || fromKeychain(key) || fallback;
+}
+
+function envOptional(key: string, fallback: string): string {
+  return process.env[key] || fallback;
 }
 
 /** Auto-discover all plugin dirs under <engineDir>/plugins/claude-code/, or use explicit list from hive.yaml */
@@ -52,6 +57,11 @@ const fromKeychain = (key: string) => fromKeychainRaw(instanceId, key);
 
 const portBase = (hive.instance?.portBase as number) ?? 3100;
 const ports = (hive.instance?.ports as Record<string, number>) ?? {};
+
+const anthropicApiKey = optional("ANTHROPIC_API_KEY", "");
+const geminiApiKey = optional("GEMINI_API_KEY", "");
+const openaiApiKey = optional("OPENAI_API_KEY", "");
+const openaiCompatibleApiKey = optional("OPENAI_COMPATIBLE_API_KEY", "");
 
 export interface RegistryConfig {
   name: string;
@@ -88,6 +98,116 @@ export interface QuoLine {
   label: string;
 }
 
+function stringVal(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function providerConfig(
+  id: string,
+  fallback: LLMProviderConfig,
+  rawProviders: Record<string, unknown>,
+): LLMProviderConfig {
+  const raw = (rawProviders[id] ?? {}) as Partial<LLMProviderConfig>;
+  const apiKeyEnv = stringVal(raw.apiKeyEnv) ?? fallback.apiKeyEnv;
+  const apiKey =
+    stringVal(raw.apiKey) ??
+    (raw.apiKeyEnv && apiKeyEnv ? optional(apiKeyEnv, fallback.apiKey ?? "") : fallback.apiKey);
+  return {
+    ...fallback,
+    ...raw,
+    apiKeyEnv,
+    apiKey,
+    baseUrl: stringVal(raw.baseUrl) ?? fallback.baseUrl,
+  };
+}
+
+function buildLlmConfig(): LLMRegistryConfig {
+  const raw = (hive.llm ?? {}) as {
+    providers?: Record<string, unknown>;
+    models?: Record<string, LLMModelConfig>;
+    tasks?: Record<string, string>;
+  };
+  const rawProviders = raw.providers ?? {};
+
+  const providers: Record<string, LLMProviderConfig> = {
+    anthropic: providerConfig(
+      "anthropic",
+      { type: "anthropic", apiKeyEnv: "ANTHROPIC_API_KEY", apiKey: anthropicApiKey },
+      rawProviders,
+    ),
+    openai: providerConfig(
+      "openai",
+      { type: "openai", apiKeyEnv: "OPENAI_API_KEY", apiKey: openaiApiKey },
+      rawProviders,
+    ),
+    gemini: providerConfig(
+      "gemini",
+      { type: "gemini", apiKeyEnv: "GEMINI_API_KEY", apiKey: geminiApiKey },
+      rawProviders,
+    ),
+    "openai-compatible": providerConfig(
+      "openai-compatible",
+      {
+        type: "openai-compatible",
+        apiKeyEnv: "OPENAI_COMPATIBLE_API_KEY",
+        apiKey: openaiCompatibleApiKey,
+        baseUrl: envOptional("OPENAI_COMPATIBLE_BASE_URL", ""),
+      },
+      rawProviders,
+    ),
+  };
+
+  for (const [id, rawProvider] of Object.entries(rawProviders)) {
+    if (providers[id]) continue;
+    providers[id] = providerConfig(id, rawProvider as LLMProviderConfig, rawProviders);
+  }
+
+  const openAICompatibleModel = envOptional("OPENAI_COMPATIBLE_MODEL", "");
+  const defaultModels: Record<string, LLMModelConfig> = {
+    "anthropic-haiku": {
+      provider: "anthropic",
+      model: envOptional("MODEL_ROUTER_MODEL", "claude-haiku-4-5-20251001"),
+      capabilities: ["text", "json"],
+      maxOutputTokens: 1024,
+    },
+    "openai-fast": {
+      provider: "openai",
+      model: envOptional("OPENAI_MODEL", "gpt-4o-mini"),
+      capabilities: ["text", "json", "vision"],
+      maxOutputTokens: 1024,
+    },
+    "gemini-vision": {
+      provider: "gemini",
+      model: envOptional("GEMINI_VISION_MODEL", "gemini-2.5-flash"),
+      capabilities: ["text", "json", "vision"],
+      maxOutputTokens: 2048,
+    },
+    ...(openAICompatibleModel
+      ? {
+          "openai-compatible-fast": {
+            provider: "openai-compatible",
+            model: openAICompatibleModel,
+            capabilities: ["text", "json"] as const,
+            maxOutputTokens: 1024,
+          },
+        }
+      : {}),
+  };
+
+  const tasks = {
+    modelRouter: envOptional("MODEL_ROUTER_LLM", raw.tasks?.modelRouter ?? "anthropic-haiku"),
+    meetingClassifier: envOptional("MEETING_CLASSIFIER_LLM", raw.tasks?.meetingClassifier ?? "anthropic-haiku"),
+    memory: envOptional("MEMORY_LLM", raw.tasks?.memory ?? "anthropic-haiku"),
+    vision: envOptional("VISION_LLM", raw.tasks?.vision ?? "gemini-vision"),
+  };
+
+  return {
+    providers,
+    models: { ...defaultModels, ...(raw.models ?? {}) },
+    tasks,
+  };
+}
+
 export const config = {
   instance: { id: instanceId, portBase },
   business: {
@@ -105,7 +225,7 @@ export const config = {
     localMcpServer: Boolean(hive.slack?.localMcpServer ?? false),
   },
   anthropic: {
-    apiKey: optional("ANTHROPIC_API_KEY", ""),
+    apiKey: anthropicApiKey,
   },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),
@@ -177,10 +297,7 @@ export const config = {
   skillRegistries: (hive.skillRegistries as RegistryConfig[] | undefined) ?? [
     { name: "keepur-default", url: "https://github.com/keepur/hive-skills", default: true },
   ],
-  gemini: {
-    apiKey: optional("GEMINI_API_KEY", ""),
-    visionModel: optional("GEMINI_VISION_MODEL", "gemini-2.5-flash"),
-  },
+  llm: buildLlmConfig(),
   permits: {
     mongoUri: optional("PERMITS_MONGO_URI", "mongodb://localhost:27017/permits"),
   },
@@ -244,7 +361,6 @@ export const config = {
   },
   modelRouter: {
     enabled: optional("MODEL_ROUTER_ENABLED", "true") === "true",
-    model: optional("MODEL_ROUTER_MODEL", "claude-haiku-4-5-20251001"),
     timeoutMs: parseInt(optional("MODEL_ROUTER_TIMEOUT_MS", "8000"), 10),
   },
   sweeper: {
