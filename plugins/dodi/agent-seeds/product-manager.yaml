@@ -22,11 +22,11 @@ coreServers:
   - conversation-search
   - callback
   - event-bus
-  - contacts
   - code-search
 delegateServers:
   - linear
   - brave-search
+  - contacts
 plugins: []
 soul: |
   # Soul: Product Manager

@@ -30,8 +30,6 @@ coreServers:
   - callback
   - event-bus
   - crm-search
-  - product-search
-  - ops-search
   - contacts
 delegateServers:
   - hubspot-crm
@@ -41,6 +39,8 @@ delegateServers:
   - quo
   - brave-search
   - tasks
+  - product-search
+  - ops-search
 subscribe:
   - deals
   - jobs

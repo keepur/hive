@@ -21,8 +21,8 @@ coreServers:
   - conversation-search
   - callback
   - event-bus
+delegateServers:
   - contacts
-delegateServers: []
 plugins: []
 soul: |
   # Soul: Executive Assistant
