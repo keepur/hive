@@ -12,6 +12,7 @@ import { config } from "../config.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin } from "../plugins/types.js";
+import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
@@ -69,10 +70,37 @@ export interface RunResult {
  * Dev: <repo>/dist/agents/ → parent = <repo>/dist/
  * npm: <package>/pkg/ → server.min.js is in pkg/, dirname = pkg/
  * We detect mode by checking for pkg/mcp/ existence.
+ *
+ * Exported so plugin-loader can resolve dev-mode plugin paths against the
+ * same root without needing to rediscover it.
  */
-const DIST_DIR = existsSync(resolve(import.meta.dirname, "mcp"))
+export const DIST_DIR = existsSync(resolve(import.meta.dirname, "mcp"))
   ? import.meta.dirname
   : resolve(import.meta.dirname, "..");
+
+/**
+ * Engine's Node.js `node_modules` directory — found by walking up from
+ * DIST_DIR until a `node_modules/` sibling exists. Passed via `NODE_PATH`
+ * to plugin MCP servers so their imports (e.g. `@modelcontextprotocol/sdk`,
+ * `zod`) resolve against engine-bundled deps without each plugin needing
+ * its own `node_modules/`.
+ *
+ * Returns `null` if no `node_modules/` is reachable within a reasonable
+ * number of parent dirs — callers then skip the `NODE_PATH` injection.
+ */
+function findEngineNodeModules(startDir: string): string | null {
+  let dir = startDir;
+  for (let i = 0; i < 15; i++) {
+    const candidate = resolve(dir, "node_modules");
+    if (existsSync(candidate)) return candidate;
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+const ENGINE_NODE_MODULES = findEngineNodeModules(DIST_DIR);
 
 const MCP_BUNDLE_MAP: Record<string, string> = {
   "memory/memory-mcp-server.js": "memory.min.js",
@@ -640,23 +668,28 @@ export class AgentRunner {
           });
           continue;
         }
-        // Three-path resolution, first that exists wins:
-        // 1. Dev build from source (wins during active development)
-        // 2. npm-installed under node_modules/ (new — for hive plugin add)
-        // 3. In-tree fallback (legacy — plugins/dodi/ without node_modules)
-        // Preserve source directory structure in all three paths so two entries
-        // like mcp-servers/foo/index.ts and mcp-servers/bar/index.ts don't collide
-        // on the same basename.
-        const entryJs = serverDef.entry.replace(/\.ts$/, ".js");
-        const entryMin = serverDef.entry.replace(/\.ts$/, ".min.js");
-        const devPath = resolve(DIST_DIR, `plugins/${plugin.name}/${entryJs}`);
-        // Instance-authored plugins live at <hiveHome>/plugins/, matching where
-        // `hive plugin add` installs them and where plugin-loader looks for them.
-        // Must stay outside <engineDir> so upgrades (which wipe .hive/) don't
-        // nuke customer plugins.
-        const npmPath = resolve(hiveHome, "plugins", "node_modules", plugin.name, "dist", entryMin);
-        const inTreePath = resolve(hiveHome, "plugins", plugin.name, "dist", entryMin);
-        const compiledPath = [devPath, npmPath, inTreePath].find((p) => existsSync(p)) ?? devPath;
+        // Skip servers the loader already flagged as broken — spawning a
+        // missing file would produce a silent subprocess exit with no error
+        // surfaced to the agent. The loader's error log is the only place
+        // this should be reported.
+        if (plugin.brokenServers[name]) continue;
+
+        const resolved = resolvePluginServerPath(plugin.name, serverDef.entry, {
+          hiveHome,
+          distDir: DIST_DIR,
+        });
+        if ("reason" in resolved) {
+          // Should never hit this — loader already validated — but fail
+          // closed rather than spawn a missing file.
+          log.error("Plugin MCP server unresolvable at spawn time", {
+            plugin: plugin.name,
+            server: name,
+            reason: resolved.reason,
+            pathsChecked: resolved.pathsChecked,
+          });
+          continue;
+        }
+        const compiledPath = resolved.path;
 
         // Base env available to all plugin servers
         const pluginTaskKey = config.taskLedger.agentKeys[this.agentConfig.id] ?? config.taskLedger.apiKey;
@@ -669,6 +702,10 @@ export class AgentRunner {
           ...(pluginTaskKey ? { TASK_LEDGER_API_KEY: pluginTaskKey } : {}),
           PATH: process.env.PATH ?? "",
           HOME: process.env.HOME ?? "",
+          // Let plugin servers resolve common deps (@modelcontextprotocol/sdk,
+          // zod, etc.) against engine-bundled node_modules. Prepends engine's
+          // node_modules so a plugin's own deps (if any) still take precedence.
+          ...(ENGINE_NODE_MODULES ? { NODE_PATH: ENGINE_NODE_MODULES } : {}),
         };
 
         for (const envVar of serverDef.env ?? []) {

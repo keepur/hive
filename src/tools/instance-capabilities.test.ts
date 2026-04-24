@@ -28,11 +28,16 @@ import type { LoadedPlugin } from "../plugins/types.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
 
-function makePlugin(name: string, mcpServers: LoadedPlugin["manifest"]["mcpServers"]): LoadedPlugin {
+function makePlugin(
+  name: string,
+  mcpServers: LoadedPlugin["manifest"]["mcpServers"],
+  brokenServers: LoadedPlugin["brokenServers"] = {},
+): LoadedPlugin {
   return {
     name,
     dir: `/tmp/${name}`,
     manifest: { name, mcpServers, agentSeeds: [] },
+    brokenServers,
   };
 }
 
@@ -183,5 +188,58 @@ describe("buildInstanceCapabilities — plugin secretEnv", () => {
     const result = buildInstanceCapabilities([plugin]);
     expect(result.servers.configured).toContain("srv");
     delete process.env.__TEST_PUBLIC;
+  });
+});
+
+describe("buildInstanceCapabilities — broken plugin servers", () => {
+  beforeEach(() => {
+    mockFromKeychain.mockReset();
+    mockFromKeychain.mockReturnValue("");
+  });
+
+  it("surfaces broken servers with their reason, skipping cred checks", () => {
+    process.env.__TEST_PUBLIC = "p";
+    const plugin = makePlugin(
+      "p",
+      {
+        broken: { entry: "e.ts", env: ["__TEST_PUBLIC"] },
+      },
+      {
+        broken: {
+          reason: "no compiled entry found",
+          pathsChecked: ["/some/path/dist/e.min.js", "/some/path/dist/e.js"],
+        },
+      },
+    );
+    const result = buildInstanceCapabilities([plugin]);
+    expect(result.servers.broken).toEqual([{ name: "broken", reason: "no compiled entry found" }]);
+    // Even though __TEST_PUBLIC is set, broken wins — server never runs,
+    // creds are moot.
+    expect(result.servers.configured).not.toContain("broken");
+    expect(result.servers.unconfigured).not.toContain("broken");
+    delete process.env.__TEST_PUBLIC;
+  });
+
+  it("keeps working servers classified normally while broken ones are separated", () => {
+    process.env.__TEST_PUBLIC = "p";
+    const plugin = makePlugin(
+      "p",
+      {
+        working: { entry: "w.ts", env: ["__TEST_PUBLIC"] },
+        broken: { entry: "b.ts", env: ["__TEST_PUBLIC"] },
+      },
+      {
+        broken: { reason: "no compiled entry found", pathsChecked: [] },
+      },
+    );
+    const result = buildInstanceCapabilities([plugin]);
+    expect(result.servers.configured).toContain("working");
+    expect(result.servers.broken.map((s) => s.name)).toEqual(["broken"]);
+    delete process.env.__TEST_PUBLIC;
+  });
+
+  it("returns empty broken list when plugins have no broken servers", () => {
+    const result = buildInstanceCapabilities([]);
+    expect(result.servers.broken).toEqual([]);
   });
 });

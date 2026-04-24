@@ -1,7 +1,7 @@
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem } from "../types/work-item.js";
-import { AgentRunner, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
@@ -75,7 +75,7 @@ export class AgentManager {
     this.sessionStore = sessionStore;
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
-    this.plugins = loadPlugins(appConfig.plugins, hiveHome);
+    this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
   }
