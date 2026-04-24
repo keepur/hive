@@ -1,6 +1,6 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
+import { extractJsonObjectText, getLLMRegistry } from "../llm/index.js";
 
 const log = createLogger("model-router");
 
@@ -88,12 +88,10 @@ function parseRouterOutput(text: string): ModelTier | null {
     }
   } catch { /* fall through */ }
 
-  // Try finding JSON in text
-  const braceStart = text.indexOf("{");
-  const braceEnd = text.lastIndexOf("}");
-  if (braceStart !== -1 && braceEnd > braceStart) {
+  const jsonText = extractJsonObjectText(text);
+  if (jsonText) {
     try {
-      const parsed = JSON.parse(text.slice(braceStart, braceEnd + 1));
+      const parsed = JSON.parse(jsonText);
       if (parsed.tier && TIER_RANK[parsed.tier as ModelTier] !== undefined) {
         return parsed.tier as ModelTier;
       }
@@ -113,77 +111,32 @@ export async function routeModel(
   resourceTierOverrides?: ResourceTierOverrides,
 ): Promise<ModelRouterResult> {
   const ceilingTier = modelToTier(ceilingModel);
-  const routerModel = config.modelRouter.model;
 
   // If ceiling is already the cheapest tier, skip the call entirely
   if (ceilingTier === "haiku") {
     return { tier: "haiku", model: TIER_MODELS.haiku, costUsd: 0, durationMs: 0, resourceLimits: resolveResourceLimits("haiku", resourceTierOverrides) };
   }
 
-  let q: Query | null = null;
   let resultText = "";
   let costUsd = 0;
   let durationMs = 0;
 
-  const deadline = setTimeout(() => {
-    if (q) {
-      log.warn("Model router timed out", { timeoutMs: config.modelRouter.timeoutMs });
-      q.close();
-    }
-  }, config.modelRouter.timeoutMs);
-
   try {
-    q = query({
+    const result = await getLLMRegistry().generateForTask("modelRouter", {
       prompt: text,
-      options: {
-        model: routerModel,
-        systemPrompt: ROUTER_PROMPT,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        maxTurns: 1,
-        maxBudgetUsd: 0.01,
-        persistSession: false,
-        thinking: { type: "disabled" },
-        disallowedTools: ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "WebFetch", "WebSearch", "NotebookEdit"],
-        env: {
-          ...process.env,
-          ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
-          CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
-          CLAUDECODE: undefined as unknown as string,
-        },
-      },
+      systemPrompt: ROUTER_PROMPT,
+      responseFormat: "json",
+      maxOutputTokens: 64,
+      temperature: 0,
+      timeoutMs: config.modelRouter.timeoutMs,
     });
-
-    for await (const message of q) {
-      const msg = message as SDKMessage;
-
-      if (msg.type === "assistant") {
-        const content = (msg as any).message?.content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === "text") {
-              resultText = block.text;
-            }
-          }
-        }
-      }
-
-      if (msg.type === "result") {
-        const result = msg as SDKResultMessage;
-        costUsd = result.total_cost_usd;
-        durationMs = result.duration_ms;
-        if (result.subtype === "success" && result.result) {
-          resultText = result.result;
-        }
-      }
-    }
+    resultText = result.text;
+    costUsd = result.costUsd ?? 0;
+    durationMs = result.durationMs;
   } catch (err) {
     log.warn("Model router query failed, defaulting to sonnet", { error: String(err) });
     const fallbackTier = TIER_RANK[ceilingTier] >= TIER_RANK.sonnet ? "sonnet" : ceilingTier;
     return { tier: fallbackTier, model: TIER_MODELS[fallbackTier], costUsd: 0, durationMs: 0, resourceLimits: resolveResourceLimits(fallbackTier, resourceTierOverrides) };
-  } finally {
-    clearTimeout(deadline);
-    q = null;
   }
 
   const parsed = parseRouterOutput(resultText);

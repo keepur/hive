@@ -1,11 +1,6 @@
-import {
-  query,
-  type Query,
-  type SDKMessage,
-  type SDKResultMessage,
-} from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
+import { extractJsonObjectText, getLLMRegistry } from "../llm/index.js";
 
 const log = createLogger("meeting-classifier");
 
@@ -54,11 +49,9 @@ export function parseClassifierOutput(
   const direct = extract(text);
   if (direct) return direct;
 
-  // Try finding JSON in text
-  const braceStart = text.indexOf("{");
-  const braceEnd = text.lastIndexOf("}");
-  if (braceStart !== -1 && braceEnd > braceStart) {
-    const nested = extract(text.slice(braceStart, braceEnd + 1));
+  const jsonText = extractJsonObjectText(text);
+  if (jsonText) {
+    const nested = extract(jsonText);
     if (nested) return nested;
   }
 
@@ -99,82 +92,24 @@ export async function classifyMeetingMessage(
     return { respondAgentIds: [roster[0].agentId], costUsd: 0, durationMs: 0 };
   }
 
-  const routerModel = config.modelRouter.model;
-  let q: Query | null = null;
   let resultText = "";
   let costUsd = 0;
   let durationMs = 0;
 
-  const deadline = setTimeout(() => {
-    if (q) {
-      log.warn("Meeting classifier timed out", {
-        timeoutMs: config.modelRouter.timeoutMs,
-      });
-      q.close();
-    }
-  }, config.modelRouter.timeoutMs);
-
   try {
     const userPrompt = `${buildRosterContext(roster, recentMessages)}\n\nMessage:\n${messageText}`;
 
-    q = query({
+    const result = await getLLMRegistry().generateForTask("meetingClassifier", {
       prompt: userPrompt,
-      options: {
-        model: routerModel,
-        systemPrompt: CLASSIFIER_PROMPT,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        maxTurns: 1,
-        maxBudgetUsd: 0.01,
-        persistSession: false,
-        thinking: { type: "disabled" },
-        disallowedTools: [
-          "Bash",
-          "Read",
-          "Write",
-          "Edit",
-          "Glob",
-          "Grep",
-          "Agent",
-          "WebFetch",
-          "WebSearch",
-          "NotebookEdit",
-        ],
-        env: {
-          ...process.env,
-          ...(config.anthropic.apiKey
-            ? { ANTHROPIC_API_KEY: config.anthropic.apiKey }
-            : {}),
-          CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
-          CLAUDECODE: undefined as unknown as string,
-        },
-      },
+      systemPrompt: CLASSIFIER_PROMPT,
+      responseFormat: "json",
+      maxOutputTokens: 256,
+      temperature: 0,
+      timeoutMs: config.modelRouter.timeoutMs,
     });
-
-    for await (const message of q) {
-      const msg = message as SDKMessage;
-
-      if (msg.type === "assistant") {
-        // SDK SDKMessage union doesn't expose .message.content after type narrowing — runtime shape is correct
-        const content = (msg as any).message?.content; // eslint-disable-line @typescript-eslint/no-explicit-any
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === "text") {
-              resultText = block.text;
-            }
-          }
-        }
-      }
-
-      if (msg.type === "result") {
-        const result = msg as SDKResultMessage;
-        costUsd = result.total_cost_usd;
-        durationMs = result.duration_ms;
-        if (result.subtype === "success" && result.result) {
-          resultText = result.result;
-        }
-      }
-    }
+    resultText = result.text;
+    costUsd = result.costUsd ?? 0;
+    durationMs = result.durationMs;
   } catch (err) {
     log.warn("Meeting classifier query failed, selecting all roster members", {
       error: String(err),
@@ -184,9 +119,6 @@ export async function classifyMeetingMessage(
       costUsd: 0,
       durationMs: 0,
     };
-  } finally {
-    clearTimeout(deadline);
-    q = null;
   }
 
   const parsed = parseClassifierOutput(resultText, validIds);

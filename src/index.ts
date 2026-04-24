@@ -27,10 +27,11 @@ import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
 import { RetentionSweeper } from "./retention/retention-sweeper.js";
-import { setGeminiApiKey } from "./files/file-processor.js";
+import { setVisionLlmClient } from "./files/file-processor.js";
 import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
+import { getLLMRegistry } from "./llm/index.js";
 import { AdminApi } from "./admin/admin-api.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
@@ -60,11 +61,9 @@ async function main(): Promise<void> {
   initInstanceGit(hiveHome);
   checkUpgradeNotice(hiveStateDir, skillsDir);
 
-  // Initialize Gemini vision for image processing
-  if (config.gemini.apiKey) {
-    setGeminiApiKey(config.gemini.apiKey);
-    log.info("Gemini vision enabled", { model: config.gemini.visionModel });
-  }
+  // Wire the shared LLM registry for image description
+  const llmRegistry = getLLMRegistry();
+  setVisionLlmClient(llmRegistry);
 
   // Shared MongoDB client
   const mongoClient = new MongoClient(config.mongo.uri);
@@ -149,6 +148,7 @@ async function main(): Promise<void> {
       coldRetentionDays: config.memory.coldRetentionDays,
       purgeRetentionDays: config.memory.purgeRetentionDays,
     },
+    llmRegistry,
     config.autoDream,
     async () => new Set(registry!.listIds()),
   );

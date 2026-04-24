@@ -1,9 +1,9 @@
 import { ObjectId } from "mongodb";
-import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../logging/logger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { MemoryStore } from "./memory-store.js";
 import type { MemoryEmbedder } from "./memory-embedder.js";
+import type { GenerateTextRequest, GenerateTextResult } from "../llm/types.js";
 import type {
   MemoryRecord,
   MemoryLifecycleConfig,
@@ -16,14 +16,28 @@ import { IMPORTANCE_WEIGHTS, TYPE_WEIGHTS } from "./memory-types.js";
 
 const log = createLogger("memory-lifecycle");
 
+export interface MemoryLlmClient {
+  generateForTask(task: string, request: Omit<GenerateTextRequest, "model">): Promise<GenerateTextResult>;
+}
+
 export class MemoryLifecycle {
   constructor(
     private store: MemoryStore,
     private embedder: MemoryEmbedder,
     private config: MemoryLifecycleConfig,
+    private llm: MemoryLlmClient,
     private dreamConfig?: DreamConfig,
     private getActiveAgentIds?: () => Promise<Set<string>>,
   ) {}
+
+  private async generateMemoryText(prompt: string, maxOutputTokens = 1024): Promise<string> {
+    const result = await this.llm.generateForTask("memory", {
+      prompt,
+      maxOutputTokens,
+      temperature: 0,
+    });
+    return result.text.trim();
+  }
 
   /**
    * Filter memory-derived agent IDs (includes orphans from retired agents)
@@ -323,28 +337,7 @@ export class MemoryLifecycle {
         entries,
       ].join("\n");
 
-      const q = query({
-        prompt,
-        options: {
-          model: "claude-haiku-4-5-20251001",
-          permissionMode: "bypassPermissions",
-          allowDangerouslySkipPermissions: true,
-          maxTurns: 1,
-          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
-          persistSession: false,
-        },
-      });
-
-      let mergedText = "";
-      for await (const message of q) {
-        const msg = message as SDKMessage;
-        if (msg.type === "result") {
-          const result = msg as SDKResultMessage;
-          if (result.subtype === "success" && result.result) {
-            mergedText = result.result;
-          }
-        }
-      }
+      const mergedText = await this.generateMemoryText(prompt);
       if (!mergedText) continue;
 
       // Save merged record — inherit highest importance, keep topic and type from source
@@ -404,7 +397,7 @@ export class MemoryLifecycle {
     // a superseded record must not participate in later pair comparisons.
     const eliminated = new Set<string>();
 
-    for (const [topic, records] of byTopic) {
+    for (const [_topic, records] of byTopic) {
       if (pairsChecked >= cfg.maxContradictionPairsPerRun) break;
       if (records.length < 2) continue;
 
@@ -434,28 +427,7 @@ export class MemoryLifecycle {
             `- "UNCLEAR" if they contradict but you can't determine which is correct`,
           ].join("\n");
 
-          const q = query({
-            prompt,
-            options: {
-              model: "claude-haiku-4-5-20251001",
-              permissionMode: "bypassPermissions",
-              allowDangerouslySkipPermissions: true,
-              maxTurns: 1,
-              maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
-              persistSession: false,
-            },
-          });
-
-          let verdict = "";
-          for await (const message of q) {
-            const msg = message as SDKMessage;
-            if (msg.type === "result") {
-              const result = msg as SDKResultMessage;
-              if (result.subtype === "success" && result.result) {
-                verdict = result.result.trim().toUpperCase();
-              }
-            }
-          }
+          const verdict = (await this.generateMemoryText(prompt, 32)).trim().toUpperCase();
 
           pairsChecked++;
 
@@ -517,28 +489,7 @@ export class MemoryLifecycle {
         entries,
       ].join("\n");
 
-      const q = query({
-        prompt,
-        options: {
-          model: "claude-haiku-4-5-20251001",
-          permissionMode: "bypassPermissions",
-          allowDangerouslySkipPermissions: true,
-          maxTurns: 1,
-          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
-          persistSession: false,
-        },
-      });
-
-      let factText = "";
-      for await (const message of q) {
-        const msg = message as SDKMessage;
-        if (msg.type === "result") {
-          const result = msg as SDKResultMessage;
-          if (result.subtype === "success" && result.result) {
-            factText = result.result;
-          }
-        }
-      }
+      const factText = await this.generateMemoryText(prompt);
       if (!factText) continue;
 
       // Save as a hot-tier fact
@@ -592,29 +543,7 @@ export class MemoryLifecycle {
         entries,
       ].join("\n");
 
-      // Use Haiku for cheap summarization — SDK returns an async iterable
-      const q = query({
-        prompt,
-        options: {
-          model: "claude-haiku-4-5-20251001",
-          permissionMode: "bypassPermissions",
-          allowDangerouslySkipPermissions: true,
-          maxTurns: 1,
-          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
-          persistSession: false,
-        },
-      });
-
-      let summaryText = "";
-      for await (const message of q) {
-        const msg = message as SDKMessage;
-        if (msg.type === "result") {
-          const result = msg as SDKResultMessage;
-          if (result.subtype === "success" && result.result) {
-            summaryText = result.result;
-          }
-        }
-      }
+      const summaryText = await this.generateMemoryText(prompt);
       if (!summaryText) continue;
 
       // Save summary as a warm-tier record
