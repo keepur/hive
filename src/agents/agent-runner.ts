@@ -9,6 +9,7 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
+import { fromKeychain } from "../keychain/from-keychain.js";
 import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
@@ -672,6 +673,11 @@ export class AgentRunner {
 
         for (const envVar of serverDef.env ?? []) {
           if (process.env[envVar]) env[envVar] = process.env[envVar]!;
+        }
+
+        for (const envVar of serverDef.secretEnv ?? []) {
+          const value = process.env[envVar] || fromKeychain(config.instance.id, envVar);
+          if (value) env[envVar] = value;
         }
 
         // env-map: rename base env vars (e.g. DODI_OPS_API_URL -> TASK_LEDGER_API_URL)

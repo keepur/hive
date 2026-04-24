@@ -103,6 +103,8 @@ Browser automation uses Playwright via CDP endpoint (`BROWSER_CDP_ENDPOINT` conf
 - `catalog-mcp-server.ts` — read-only product catalog access
 - `permit-mcp-server.ts` — permit management
 
+**Manifest env vs. secret-env:** in `plugin.yaml`, list non-secret config (URLs without creds, flags, model names) under `env:` — pass-through from `process.env` only. List credentials (API keys, tokens, credentialed URIs) under `secret-env:` — resolved via `process.env` first, then macOS Keychain (Honeypot: `hive/<instanceId>/<KEY>`). Introspection and runtime injection agree: a `secret-env` var seeded only in Honeypot still works.
+
 ## Dev vs Deploy
 
 - **Dev**: `~/github/hive` — edit source, test, commit, push. Repo layout unchanged from 0.1.x.
