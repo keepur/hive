@@ -43,6 +43,9 @@ vi.mock("./agent-runner.js", () => ({
     abort: mockRunnerAbort,
     wasAborted: false,
   })),
+  // Re-exported from agent-runner for plugin-loader path resolution; the test
+  // manager doesn't use it, so a sentinel path is fine.
+  DIST_DIR: "/mock/dist",
 }));
 
 // Mock conversation index (hoisted because ConversationIndex is instantiated at module level)

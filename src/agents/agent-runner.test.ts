@@ -304,6 +304,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
@@ -317,6 +318,53 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers["custom-server"].env.MONGODB_URI).toBe(
       "mongodb://localhost:27017",
     );
+    // Engine node_modules injected so plugin imports (e.g. the MCP SDK)
+    // resolve without each plugin shipping its own copy.
+    expect(servers["custom-server"].env.NODE_PATH).toBeTruthy();
+    expect(servers["custom-server"].env.NODE_PATH).toContain("node_modules");
+  });
+
+  it("preserves any inherited NODE_PATH (prepends engine's, keeps caller's as fallback)", async () => {
+    const previousNodePath = process.env.NODE_PATH;
+    process.env.NODE_PATH = "/inherited/from/caller";
+    try {
+      const plugin: LoadedPlugin = {
+        name: "test-plugin",
+        dir: "/plugins/test-plugin",
+        manifest: {
+          name: "test-plugin",
+          description: "Test",
+          mcpServers: {
+            "custom-server": {
+              entry: "mcp-servers/custom/index.ts",
+              env: [],
+              envMap: {},
+              agentEnv: {},
+            },
+          },
+          agentSeeds: [],
+        },
+        brokenServers: {},
+      };
+
+      runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
+      await runner.send("hello");
+      const nodePath = getCapturedServers()["custom-server"].env.NODE_PATH;
+
+      // Engine's node_modules prepended; caller's value preserved as fallback.
+      expect(nodePath).toContain("node_modules");
+      expect(nodePath).toContain("/inherited/from/caller");
+      // Engine path comes first so it takes precedence.
+      expect(nodePath.indexOf("/inherited/from/caller")).toBeGreaterThan(
+        nodePath.indexOf("node_modules"),
+      );
+    } finally {
+      if (previousNodePath === undefined) {
+        delete process.env.NODE_PATH;
+      } else {
+        process.env.NODE_PATH = previousNodePath;
+      }
+    }
   });
 
   it("injects plugin secretEnv from process.env when present (no keychain lookup)", async () => {
@@ -340,6 +388,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["secret-server"] }), memoryManager as any, [plugin]);
@@ -374,6 +423,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["kc-server"] }), memoryManager as any, [plugin]);
@@ -405,6 +455,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["missing-server"] }), memoryManager as any, [plugin]);
@@ -433,6 +484,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["mapped-server"] }), memoryManager as any, [plugin]);
@@ -466,6 +518,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(
@@ -502,6 +555,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin]);
@@ -531,6 +585,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     // agent-a has a per-agent key "key-a" in the mock config
@@ -562,6 +617,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     // "unknown-agent" doesn't have a per-agent key
@@ -574,6 +630,42 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     const servers = getCapturedServers();
 
     expect(servers["keyed-server"].env.TASK_LEDGER_API_KEY).toBe("global-key");
+  });
+
+  it("skips plugin servers the loader flagged as broken", async () => {
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "broken-server": {
+            entry: "mcp-servers/broken/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {
+        "broken-server": {
+          reason: "no compiled entry found",
+          pathsChecked: ["/tmp/dist/broken.min.js", "/tmp/dist/broken.js"],
+        },
+      },
+    };
+
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["broken-server"] }),
+      memoryManager as any,
+      [plugin],
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers).not.toHaveProperty("broken-server");
   });
 
   it("excludes brave-search when API key is empty", async () => {
@@ -1071,6 +1163,7 @@ describe("AgentRunner server catalog prompt (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     const runner = new AgentRunner(

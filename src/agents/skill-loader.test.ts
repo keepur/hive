@@ -30,6 +30,7 @@ function makePlugin(name: string, dir: string): LoadedPlugin {
       mcpServers: {},
       agentSeeds: [],
     },
+    brokenServers: {},
   };
 }
 
