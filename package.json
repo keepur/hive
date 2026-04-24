@@ -1,6 +1,6 @@
 {
   "name": "@keepur/hive",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "hiveApi": "1.0.0",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
