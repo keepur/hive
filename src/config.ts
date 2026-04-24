@@ -374,6 +374,7 @@ export const config = {
       optional("AUTODREAM_MAX_PROMOTIONS", String(hive.autoDream?.maxPromotionsPerRun ?? 10)),
       10,
     ),
+    maxBudgetUsd: parseFloat(optional("AUTODREAM_MAX_BUDGET_USD", String(hive.autoDream?.maxBudgetUsd ?? 0.1))),
   },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),

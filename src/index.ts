@@ -149,6 +149,7 @@ async function main(): Promise<void> {
       purgeRetentionDays: config.memory.purgeRetentionDays,
     },
     config.autoDream,
+    async () => new Set(registry!.listIds()),
   );
   log.info("Structured memory lifecycle enabled");
 
