@@ -2,9 +2,9 @@ import dotenv from "dotenv";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
+import { fromKeychain as fromKeychainRaw } from "./keychain/from-keychain.js";
 import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
 
 // Load .env from resolved hive home
@@ -47,18 +47,8 @@ const home = process.env.HOME ?? "/tmp";
 // Instance identity — single source of truth for multi-instance derivation
 const instanceId = (hive.instance?.id as string) ?? "hive";
 
-/** Try to read a credential from macOS Keychain (honeypot-stored). */
-function fromKeychain(key: string): string {
-  if (process.platform !== "darwin") return "";
-  try {
-    return execFileSync("security", ["find-generic-password", "-s", `hive/${instanceId}/${key}`, "-w"], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-  } catch {
-    return "";
-  }
-}
+/** Closure over `instanceId` — lets `required()` / `optional()` stay unchanged. */
+const fromKeychain = (key: string) => fromKeychainRaw(instanceId, key);
 
 const portBase = (hive.instance?.portBase as number) ?? 3100;
 const ports = (hive.instance?.ports as Record<string, number>) ?? {};
