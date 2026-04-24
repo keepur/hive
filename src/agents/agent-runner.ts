@@ -1,6 +1,6 @@
 import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
-import { resolve, delimiter as pathDelimiter } from "node:path";
-import { existsSync, statSync, mkdirSync } from "node:fs";
+import { resolve } from "node:path";
+import { existsSync, statSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
 import { createRequire } from "node:module";
 import { getArchetype, type ArchetypeDefinition } from "../archetypes/registry.js";
 import { readFile } from "node:fs/promises";
@@ -80,19 +80,21 @@ export const DIST_DIR = existsSync(resolve(import.meta.dirname, "mcp"))
 
 /**
  * Engine's Node.js `node_modules` directory — found by walking up from
- * DIST_DIR until a `node_modules/` sibling exists. Passed via `NODE_PATH`
- * to plugin MCP servers so their imports (e.g. `@modelcontextprotocol/sdk`,
- * `zod`) resolve against engine-bundled deps without each plugin needing
- * its own `node_modules/`.
+ * DIST_DIR until a `node_modules/` sibling of a `package.json` exists.
  *
- * Returns `null` if no `node_modules/` is reachable within a reasonable
- * number of parent dirs — callers then skip the `NODE_PATH` injection.
+ * Used to symlink `<pluginDir>/node_modules` for in-tree plugins so their
+ * ESM imports (e.g. `@modelcontextprotocol/sdk`, `zod`) resolve against
+ * engine-bundled deps. We can't use `NODE_PATH` for this because Node's
+ * ESM loader ignores it — it's a legacy CommonJS-only feature.
+ *
+ * Returns `null` if no valid `node_modules/` is reachable. Callers then
+ * skip the symlink step and let plugin imports fail naturally at spawn
+ * (the broken-server surface will catch the missing entry).
  *
  * We only accept a `node_modules/` that sits next to a `package.json` —
- * otherwise a stray `~/github/node_modules/` or monorepo root
- * `node_modules/` could be picked up instead of the engine's. The engine
- * is always a published npm package, so its `node_modules/` is always
- * a sibling of its `package.json`.
+ * otherwise a stray `~/github/node_modules/` or monorepo root could be
+ * picked up instead of the engine's. The engine is always a published
+ * npm package, so this invariant always holds for its install root.
  */
 function findEngineNodeModules(startDir: string): string | null {
   let dir = startDir;
@@ -108,6 +110,41 @@ function findEngineNodeModules(startDir: string): string | null {
 }
 
 const ENGINE_NODE_MODULES = findEngineNodeModules(DIST_DIR);
+
+/**
+ * Ensure an in-tree plugin has a `node_modules/` symlink pointing at the
+ * engine's `node_modules/`. Required for Node's ESM loader, which walks
+ * up from each module file and ignores `NODE_PATH` entirely.
+ *
+ * Idempotent:
+ *   - If `<pluginDir>/node_modules` already exists (real dir or symlink),
+ *     do nothing — a plugin shipping its own deps wins.
+ *   - If the engine's `node_modules/` couldn't be located, do nothing —
+ *     plugin imports will fail naturally and show up in logs.
+ *
+ * This is only meaningful for in-tree plugins. npm-installed plugins
+ * (under `<hiveHome>/plugins/node_modules/<name>/`) already have their
+ * own `node_modules/` from the npm install step.
+ */
+export function ensurePluginNodeModulesLink(pluginDir: string): void {
+  if (!ENGINE_NODE_MODULES) return;
+  const link = resolve(pluginDir, "node_modules");
+  try {
+    // `lstatSync` so we see a dangling symlink as "present" and don't clobber it.
+    lstatSync(link);
+    return;
+  } catch {
+    // Not present — create it.
+  }
+  try {
+    symlinkSync(ENGINE_NODE_MODULES, link, "dir");
+    log.info("Linked plugin node_modules to engine deps", { pluginDir, target: ENGINE_NODE_MODULES });
+  } catch (err) {
+    // Race or permission issue — log and continue. A simultaneous spawn
+    // from another session may have already created the link.
+    log.warn("Failed to link plugin node_modules", { pluginDir, error: String(err) });
+  }
+}
 
 const MCP_BUNDLE_MAP: Record<string, string> = {
   "memory/memory-mcp-server.js": "memory.min.js",
@@ -698,6 +735,12 @@ export class AgentRunner {
         }
         const compiledPath = resolved.path;
 
+        // Ensure the plugin can resolve its deps via Node's standard ESM
+        // walker. Idempotent — real node_modules wins, existing symlink is
+        // preserved. npm-installed plugins already have their own deps so
+        // this is a no-op for them.
+        ensurePluginNodeModulesLink(plugin.dir);
+
         // Base env available to all plugin servers
         const pluginTaskKey = config.taskLedger.agentKeys[this.agentConfig.id] ?? config.taskLedger.apiKey;
         const env: Record<string, string> = {
@@ -709,19 +752,6 @@ export class AgentRunner {
           ...(pluginTaskKey ? { TASK_LEDGER_API_KEY: pluginTaskKey } : {}),
           PATH: process.env.PATH ?? "",
           HOME: process.env.HOME ?? "",
-          // Let plugin servers resolve common deps (@modelcontextprotocol/sdk,
-          // zod, etc.) against engine-bundled node_modules. Prepend the engine
-          // path so any inherited NODE_PATH entries (from a dev shell, a test
-          // harness, or another tool) still apply as a fallback.
-          ...(ENGINE_NODE_MODULES
-            ? {
-                NODE_PATH: [ENGINE_NODE_MODULES, process.env.NODE_PATH]
-                  .filter(Boolean)
-                  .join(pathDelimiter),
-              }
-            : process.env.NODE_PATH
-              ? { NODE_PATH: process.env.NODE_PATH }
-              : {}),
         };
 
         for (const envVar of serverDef.env ?? []) {
