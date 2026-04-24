@@ -23,8 +23,22 @@ export interface PluginManifest {
   registerCommands?: string;
 }
 
+/** A plugin MCP server whose entry couldn't be resolved to a runnable file. */
+export interface BrokenServer {
+  /** Human-readable explanation (e.g. "no compiled entry found"). */
+  reason: string;
+  /** Filesystem paths the resolver tried, in priority order. */
+  pathsChecked: string[];
+}
+
 export interface LoadedPlugin {
   name: string;
   dir: string;
   manifest: PluginManifest;
+  /**
+   * Servers whose compiled entry could not be resolved at load time.
+   * Keyed by server name. Callers (agent-runner, instance-capabilities) must
+   * skip these rather than spawning a missing file.
+   */
+  brokenServers: Record<string, BrokenServer>;
 }
