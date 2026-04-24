@@ -110,15 +110,26 @@ export class MemoryEmbedder {
     limit: number = 10,
   ): Promise<{ mongoId: string; score: number; pointId: string }[]> {
     await this.ensureCollection();
-    const results = await this.getClient().query(COLLECTION, {
-      query: { recommend: { positive: [pointId] } },
-      filter: {
-        must: [{ key: "agentId", match: { value: agentId } }],
-      },
-      limit,
-      with_payload: true,
-      score_threshold: threshold,
-    });
+    let results;
+    try {
+      results = await this.getClient().query(COLLECTION, {
+        query: { recommend: { positive: [pointId] } },
+        filter: {
+          must: [{ key: "agentId", match: { value: agentId } }],
+        },
+        limit,
+        with_payload: true,
+        score_threshold: threshold,
+      });
+    } catch (err) {
+      // Orphan Mongo record — its qdrantPointId doesn't exist in Qdrant.
+      // Treat as no-neighbors rather than aborting the caller's entire pass.
+      if (String(err).includes("Not Found") || String(err).includes("does not exists")) {
+        log.warn("findSimilar skipped orphan point", { pointId, agentId });
+        return [];
+      }
+      throw err;
+    }
 
     return results.points.map((r) => ({
       mongoId: r.payload?.mongoId as string,
