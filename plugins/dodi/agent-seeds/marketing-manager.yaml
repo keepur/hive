@@ -24,7 +24,6 @@ coreServers:
   - conversation-search
   - callback
   - event-bus
-  - contacts
   - crm-search
 delegateServers:
   - google
@@ -33,6 +32,7 @@ delegateServers:
   - brave-search
   - permits
   - tasks
+  - contacts
 plugins: []
 soul: |
   # Soul: Marketing Manager

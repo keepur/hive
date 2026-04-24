@@ -34,10 +34,8 @@ schedule:
     task: memory-review
 coreServers:
   - memory
-  - conversation-search
   - callback
   - event-bus
-  - contacts
   - code-search
   - code-task
   - keychain
@@ -45,6 +43,8 @@ coreServers:
 delegateServers:
   - linear
   - brave-search
+  - conversation-search
+  - contacts
 plugins:
   - dodi-dev
   - superpowers

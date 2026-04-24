@@ -31,12 +31,12 @@ coreServers:
   - conversation-search
   - callback
   - event-bus
-  - contacts
   - ops-search
 delegateServers:
   - dodi-ops
   - hubspot-crm
   - tasks
+  - contacts
 subscribe:
   - deals
   - cases
