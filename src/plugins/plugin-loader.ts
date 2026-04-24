@@ -109,6 +109,7 @@ export function normalizeManifest(raw: any): PluginManifest {
           usage: v.usage,
           notFor: v["not-for"],
           env: v.env ?? [],
+          secretEnv: v["secret-env"] ?? [],
           envMap: v["env-map"] ?? {},
           agentEnv: v["agent-env"] ?? {},
         },
