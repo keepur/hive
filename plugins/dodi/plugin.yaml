@@ -7,7 +7,7 @@ mcp-servers:
     description: "Search and manage CRM — deals, contacts, companies, notes, tasks, activities"
     usage: "Reading/writing individual CRM records by ID or specific criteria"
     not-for: "Broad topic searches across deals — use crm-search instead"
-    env: [HUBSPOT_API_KEY]
+    secret-env: [HUBSPOT_API_KEY]
   dodi-ops:
     entry: mcp-servers/dodi-ops/dodi-ops-mcp-server.ts
     description: "Production operations — jobs, cases, designs, cutlists, comments, attachments"
@@ -38,19 +38,22 @@ mcp-servers:
     description: "Semantic search across CRM deals by topic or keyword"
     usage: "Broad discovery queries across deals and contacts"
     not-for: "Reading/writing specific records — use hubspot-crm for targeted CRUD"
-    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY, KB_BACKEND]
+    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, KB_BACKEND]
+    secret-env: [MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
   product-search:
     entry: mcp-servers/product-search/product-search-mcp-server.ts
     description: "Semantic search across product catalog — find products by description or attributes"
     usage: "Finding products when you don't know the exact part ID"
     not-for: "Looking up specific parts by ID — use catalog instead"
-    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
+    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL]
+    secret-env: [MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
   ops-search:
     entry: mcp-servers/ops-search/ops-search-mcp-server.ts
     description: "Semantic search across operational data — find jobs, cases, designs by description"
     usage: "Broad discovery across ops data by topic or keyword"
     not-for: "Reading/writing specific records — use dodi-ops for targeted operations"
-    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL, MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
+    env: [OLLAMA_URL, QDRANT_URL, KB_EMBED_MODEL]
+    secret-env: [MONGODB_ATLAS_URI, MONGODB_STAGING_URI, VOYAGEAI_API_KEY]
 agent-seeds:
   - sdr
   - customer-success
