@@ -434,18 +434,18 @@ function buildDealPayload(
   doc: any,
   embeddingText: string,
   contactNames: string[],
-  stageMap: Map<string, { stageName: string; pipelineName: string }>,
 ): Record<string, any> {
   const props = doc.properties ?? {};
-  const stageInfo = stageMap.get(props.dealstage ?? "");
+  // Store raw IDs (dealstage, pipeline). Consumers resolve to labels at display
+  // time via pipelineMap/stageMap — same convention as Mongo rag_deals. See KPR-64.
   return {
     hubspotId: String(doc.id),
     objectType: "deal",
     embeddingText,
     dealname: props.dealname ?? "",
     amount: props.amount != null ? Number(props.amount) : null,
-    dealstage: stageInfo?.stageName ?? props.dealstage ?? "",
-    pipeline: stageInfo?.pipelineName ?? props.pipeline ?? "",
+    dealstage: props.dealstage ?? "",
+    pipeline: props.pipeline ?? "",
     closedate: props.closedate ?? "",
     contactNames,
     syncedAt: new Date().toISOString(),
@@ -484,7 +484,7 @@ function buildPayload(
     case "company":
       return buildCompanyPayload(doc, embeddingText);
     case "deal":
-      return buildDealPayload(doc, embeddingText, contactNamesList, ctx.stageMap);
+      return buildDealPayload(doc, embeddingText, contactNamesList);
     default:
       return buildActivityPayload(doc, objectType, embeddingText, contactNamesList);
   }

@@ -597,7 +597,7 @@ server.registerTool(
 
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
-  servers: { configured: [], unconfigured: [] },
+  servers: { configured: [], unconfigured: [], broken: [] },
 };
 
 let instanceCapabilities: InstanceCapabilities = FALLBACK_CAPABILITIES;
@@ -629,6 +629,10 @@ server.registerTool(
       for (const ch of a.passiveChannels ?? []) allChannels.add(ch);
     }
 
+    // Older engine versions may have shipped INSTANCE_CAPABILITIES without a
+    // `broken` field. Default to an empty list so legacy payloads don't crash.
+    const brokenServers = instanceCapabilities.servers.broken ?? [];
+
     const lines: string[] = [
       `Instance: ${instanceCapabilities.instanceId}`,
       `Agents: ${agents.length}`,
@@ -640,6 +644,9 @@ server.registerTool(
       ...(instanceCapabilities.servers.unconfigured.length > 0
         ? instanceCapabilities.servers.unconfigured.map((s: string) => `  ✗ ${s}`)
         : ["  (none — all servers configured)"]),
+      "",
+      "## Broken Servers (declared but not runnable)",
+      ...(brokenServers.length > 0 ? brokenServers.map((s) => `  ⚠ ${s.name} — ${s.reason}`) : ["  (none)"]),
       "",
       "## Active Channels",
       ...(allChannels.size > 0 ? [...allChannels].sort().map((ch) => `  #${ch}`) : ["  (no channels assigned)"]),

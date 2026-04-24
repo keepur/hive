@@ -2,12 +2,75 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { createLogger } from "../logging/logger.js";
-import type { LoadedPlugin, PluginManifest } from "./types.js";
+import type { BrokenServer, LoadedPlugin, PluginManifest } from "./types.js";
 import { HIVE_PLUGIN_API_VERSION } from "./api-version.js";
 
 const log = createLogger("plugin-loader");
 
-export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugin[] {
+/**
+ * Options for locating compiled plugin entries. Plugins can arrive through
+ * three channels; each has a different filesystem shape.
+ *
+ * Callers pass `distDir` so this module stays agnostic about where the engine
+ * bundle lives — agent-runner computes it from `import.meta.dirname` and hands
+ * it through.
+ */
+export interface PluginResolveOptions {
+  /** `<hiveHome>` — holds `plugins/<name>/` and `plugins/node_modules/<name>/`. */
+  hiveHome: string;
+  /** Engine DIST_DIR. When running from the dev repo, this holds `plugins/<name>/*.js`. */
+  distDir?: string;
+}
+
+/**
+ * Resolve a plugin MCP server's compiled entry. Returns the first existing
+ * path by priority, or a `BrokenServer` describing which paths were tried.
+ *
+ * Priority (first existing wins):
+ *   1. Dev build:      <distDir>/plugins/<name>/<entry>.js
+ *   2. npm bundled:    <hiveHome>/plugins/node_modules/<name>/dist/<entry>.min.js
+ *   3. npm unbundled:  <hiveHome>/plugins/node_modules/<name>/dist/<entry>.js
+ *   4. In-tree bundled: <hiveHome>/plugins/<name>/dist/<entry>.min.js
+ *   5. In-tree unbundled: <hiveHome>/plugins/<name>/dist/<entry>.js
+ *
+ * The `.js` fallbacks at (3) and (5) exist because a local `tsc` produces
+ * un-minified output. Without this, customers who build a plugin with plain
+ * `tsc` (the natural thing to do) would hit a silent spawn failure.
+ */
+export function resolvePluginServerPath(
+  pluginName: string,
+  serverEntry: string,
+  opts: PluginResolveOptions,
+): { path: string } | BrokenServer {
+  const entryJs = serverEntry.replace(/\.ts$/, ".js");
+  const entryMin = serverEntry.replace(/\.ts$/, ".min.js");
+
+  const candidates: string[] = [];
+  if (opts.distDir) {
+    candidates.push(resolve(opts.distDir, `plugins/${pluginName}/${entryJs}`));
+  }
+  candidates.push(
+    resolve(opts.hiveHome, "plugins", "node_modules", pluginName, "dist", entryMin),
+    resolve(opts.hiveHome, "plugins", "node_modules", pluginName, "dist", entryJs),
+    resolve(opts.hiveHome, "plugins", pluginName, "dist", entryMin),
+    resolve(opts.hiveHome, "plugins", pluginName, "dist", entryJs),
+  );
+
+  for (const path of candidates) {
+    if (existsSync(path)) return { path };
+  }
+
+  return {
+    reason: `no compiled entry found (expected one of .min.js or .js under dist/)`,
+    pathsChecked: candidates,
+  };
+}
+
+export function loadPlugins(
+  pluginNames: string[],
+  rootDir: string,
+  resolveOpts?: { distDir?: string },
+): LoadedPlugin[] {
   const plugins: LoadedPlugin[] = [];
 
   for (const name of pluginNames) {
@@ -46,13 +109,23 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
       }
     }
 
+    // Resolve each declared MCP server entry to its compiled artifact. Servers
+    // that don't resolve are tracked as `broken` so downstream consumers can
+    // surface the failure instead of spawning a missing file silently.
+    const brokenServers: Record<string, BrokenServer> = {};
     for (const [serverName, serverDef] of Object.entries(manifest.mcpServers)) {
-      const entryPath = join(pluginDir, serverDef.entry);
-      if (!existsSync(entryPath)) {
-        log.warn("Plugin MCP server entry not found", {
+      const resolved = resolvePluginServerPath(name, serverDef.entry, {
+        hiveHome: rootDir,
+        distDir: resolveOpts?.distDir,
+      });
+      if ("reason" in resolved) {
+        brokenServers[serverName] = resolved;
+        log.error("Plugin MCP server entry not resolvable", {
           plugin: name,
           server: serverName,
-          entry: entryPath,
+          entry: serverDef.entry,
+          reason: resolved.reason,
+          pathsChecked: resolved.pathsChecked,
         });
       }
     }
@@ -64,15 +137,65 @@ export function loadPlugins(pluginNames: string[], rootDir: string): LoadedPlugi
       }
     }
 
-    plugins.push({ name, dir: pluginDir, manifest });
+    plugins.push({ name, dir: pluginDir, manifest, brokenServers });
+    const brokenNames = Object.keys(brokenServers);
     log.info("Plugin loaded", {
       plugin: name,
       mcpServers: Object.keys(manifest.mcpServers),
       seeds: manifest.agentSeeds,
+      ...(brokenNames.length ? { brokenServers: brokenNames } : {}),
     });
   }
 
   return plugins;
+}
+
+/**
+ * Re-check broken MCP server entries against the filesystem and drop any that
+ * now resolve. Mutates `plugin.brokenServers` in place. Intended for SIGUSR1
+ * recovery when plugin dist files land after startup (e.g., a race between
+ * the engine restart and whatever populates `<hiveHome>/plugins/<name>/dist/`).
+ *
+ * Active agent sessions keep their cached runner state; the next new session
+ * picks up the unmarked server naturally because agent-runner reads
+ * `plugin.brokenServers` at spawn time.
+ *
+ * Returns the names of rescued servers (per plugin) so callers can log a
+ * useful summary without re-walking the map.
+ */
+export function rescanPluginBrokenServers(
+  plugins: LoadedPlugin[],
+  rootDir: string,
+  resolveOpts?: { distDir?: string },
+): { rescued: Record<string, string[]>; stillBroken: Record<string, string[]> } {
+  const rescued: Record<string, string[]> = {};
+  const stillBroken: Record<string, string[]> = {};
+
+  for (const plugin of plugins) {
+    const brokenNames = Object.keys(plugin.brokenServers);
+    if (brokenNames.length === 0) continue;
+
+    for (const serverName of brokenNames) {
+      const serverDef = plugin.manifest.mcpServers[serverName];
+      if (!serverDef) {
+        // Server was removed from the manifest since startup — drop the stale entry.
+        delete plugin.brokenServers[serverName];
+        continue;
+      }
+      const resolved = resolvePluginServerPath(plugin.name, serverDef.entry, {
+        hiveHome: rootDir,
+        distDir: resolveOpts?.distDir,
+      });
+      if ("path" in resolved) {
+        delete plugin.brokenServers[serverName];
+        (rescued[plugin.name] ??= []).push(serverName);
+      } else {
+        (stillBroken[plugin.name] ??= []).push(serverName);
+      }
+    }
+  }
+
+  return { rescued, stillBroken };
 }
 
 /**

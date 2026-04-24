@@ -22,7 +22,6 @@ schedule:
     task: memory-review
 coreServers:
   - memory
-  - conversation-search
   - callback
   - event-bus
   - keychain
@@ -31,6 +30,7 @@ delegateServers:
   - linear
   - brave-search
   - google
+  - conversation-search
 plugins: []
 soul: |
   # Soul: DevOps

@@ -7,15 +7,25 @@ import type { LoadedPlugin } from "../plugins/types.js";
 // vi.hoisted() runs before vi.mock factory, avoiding the TDZ error that
 // occurs when paths.ts (imported transitively) calls existsSync at module
 // load time before plain const-declared mocks are initialized.
-const { mockExistsSync, mockStatSync, mockMkdirSync } = vi.hoisted(() => ({
+const { mockExistsSync, mockStatSync, mockMkdirSync, mockSymlinkSync, mockLstatSync } = vi.hoisted(() => ({
   mockExistsSync: vi.fn().mockReturnValue(true),
   mockStatSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
   mockMkdirSync: vi.fn(),
+  mockSymlinkSync: vi.fn(),
+  // Default: lstat throws (link target not present) so ensurePluginNodeModulesLink
+  // will proceed to create a symlink.
+  mockLstatSync: vi.fn().mockImplementation(() => {
+    const err: NodeJS.ErrnoException = new Error("ENOENT");
+    err.code = "ENOENT";
+    throw err;
+  }),
 }));
 vi.mock("node:fs", () => ({
   existsSync: (...args: any[]) => mockExistsSync(...args),
   statSync: (...args: any[]) => mockStatSync(...args),
   mkdirSync: (...args: any[]) => mockMkdirSync(...args),
+  symlinkSync: (...args: any[]) => mockSymlinkSync(...args),
+  lstatSync: (...args: any[]) => mockLstatSync(...args),
 }));
 
 // ── SDK mock ────────────────────────────────────────────────────────
@@ -304,6 +314,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
@@ -317,6 +328,72 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers["custom-server"].env.MONGODB_URI).toBe(
       "mongodb://localhost:27017",
     );
+    // NODE_PATH is NOT set — Node's ESM resolver ignores it. Plugins get
+    // their deps via a node_modules symlink inside plugin.dir instead.
+    expect(servers["custom-server"].env.NODE_PATH).toBeUndefined();
+  });
+
+  it("symlinks plugin.dir/node_modules to engine deps before spawning a plugin server", async () => {
+    mockSymlinkSync.mockClear();
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "custom-server": {
+            entry: "mcp-servers/custom/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
+    await runner.send("hello");
+
+    // Symlink created at <plugin.dir>/node_modules, pointing at an absolute
+    // path that contains "node_modules" (the engine's).
+    const calls = mockSymlinkSync.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[0]).toContain("node_modules");
+    expect(lastCall[1]).toBe("/plugins/test-plugin/node_modules");
+    expect(lastCall[2]).toBe("dir");
+  });
+
+  it("skips symlink creation when plugin.dir/node_modules already exists", async () => {
+    mockSymlinkSync.mockClear();
+    // lstat returns a stat object → link already exists → no new symlink.
+    mockLstatSync.mockReturnValueOnce({ isSymbolicLink: () => true } as any);
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "custom-server": {
+            entry: "mcp-servers/custom/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
+    await runner.send("hello");
+
+    expect(mockSymlinkSync).not.toHaveBeenCalled();
   });
 
   it("injects plugin secretEnv from process.env when present (no keychain lookup)", async () => {
@@ -340,6 +417,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["secret-server"] }), memoryManager as any, [plugin]);
@@ -374,6 +452,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["kc-server"] }), memoryManager as any, [plugin]);
@@ -405,6 +484,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["missing-server"] }), memoryManager as any, [plugin]);
@@ -433,6 +513,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["mapped-server"] }), memoryManager as any, [plugin]);
@@ -466,6 +547,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(
@@ -502,6 +584,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin]);
@@ -531,6 +614,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     // agent-a has a per-agent key "key-a" in the mock config
@@ -562,6 +646,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     // "unknown-agent" doesn't have a per-agent key
@@ -574,6 +659,42 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     const servers = getCapturedServers();
 
     expect(servers["keyed-server"].env.TASK_LEDGER_API_KEY).toBe("global-key");
+  });
+
+  it("skips plugin servers the loader flagged as broken", async () => {
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "broken-server": {
+            entry: "mcp-servers/broken/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {
+        "broken-server": {
+          reason: "no compiled entry found",
+          pathsChecked: ["/tmp/dist/broken.min.js", "/tmp/dist/broken.js"],
+        },
+      },
+    };
+
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["broken-server"] }),
+      memoryManager as any,
+      [plugin],
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers).not.toHaveProperty("broken-server");
   });
 
   it("excludes brave-search when API key is empty", async () => {
@@ -1071,6 +1192,7 @@ describe("AgentRunner server catalog prompt (via send)", () => {
         },
         agentSeeds: [],
       },
+      brokenServers: {},
     };
 
     const runner = new AgentRunner(

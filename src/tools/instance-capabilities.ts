@@ -11,11 +11,26 @@ import { fromKeychain } from "../keychain/from-keychain.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { SERVER_CATALOG } from "./server-catalog.js";
 
+export interface BrokenServerCapability {
+  /** Server name as agents know it (e.g. "dodi-ops"). */
+  name: string;
+  /** Short reason — e.g. "no compiled entry found". Safe for agent prompts. */
+  reason: string;
+}
+
 export interface InstanceCapabilities {
   instanceId: string;
   servers: {
+    /** Server has credentials + a runnable entry. */
     configured: string[];
+    /** Server is present but missing credentials. */
     unconfigured: string[];
+    /**
+     * Server is declared but not runnable — compiled entry missing, manifest
+     * error, etc. Distinct from `unconfigured` so agents can tell "not set up"
+     * from "set up wrong." Plugin loader writes the cause; this is the surface.
+     */
+    broken: BrokenServerCapability[];
   };
 }
 
@@ -63,6 +78,7 @@ const INFRASTRUCTURE_SERVERS = new Set([
 export function buildInstanceCapabilities(plugins: LoadedPlugin[] = []): InstanceCapabilities {
   const configured: string[] = [];
   const unconfigured: string[] = [];
+  const broken: BrokenServerCapability[] = [];
 
   for (const serverName of Object.keys(SERVER_CATALOG)) {
     if (INFRASTRUCTURE_SERVERS.has(serverName)) {
@@ -77,11 +93,18 @@ export function buildInstanceCapabilities(plugins: LoadedPlugin[] = []): Instanc
     }
   }
 
-  // Plugin servers — generic check: configured iff every declared env var resolves.
-  // `env` must come from process.env; `secretEnv` can fall through to Keychain.
+  // Plugin servers — three-way classification:
+  //   - broken: loader couldn't resolve compiled entry (wins — no point checking creds)
+  //   - unconfigured: entry OK but required env/secrets missing
+  //   - configured: entry OK and creds resolve
   const instanceId = config.instance?.id ?? "unknown";
   for (const plugin of plugins) {
     for (const [serverName, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
+      const brokenInfo = plugin.brokenServers[serverName];
+      if (brokenInfo) {
+        broken.push({ name: serverName, reason: brokenInfo.reason });
+        continue;
+      }
       const requiredEnv = serverDef.env ?? [];
       const requiredSecrets = serverDef.secretEnv ?? [];
       const envOk = requiredEnv.every((v) => !!process.env[v]);
@@ -96,6 +119,6 @@ export function buildInstanceCapabilities(plugins: LoadedPlugin[] = []): Instanc
 
   return {
     instanceId: config.instance?.id ?? "unknown",
-    servers: { configured, unconfigured },
+    servers: { configured, unconfigured, broken },
   };
 }

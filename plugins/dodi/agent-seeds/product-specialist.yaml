@@ -33,10 +33,10 @@ coreServers:
   - conversation-search
   - callback
   - event-bus
-  - contacts
   - catalog
   - product-search
-delegateServers: []
+delegateServers:
+  - contacts
 plugins: []
 soul: |
   You are the Product Specialist.
