@@ -139,7 +139,7 @@ describe("buildInstanceCapabilities — plugin secretEnv", () => {
   it("marks plugin server configured when secretEnv resolves from process.env", () => {
     process.env.__TEST_SECRET = "s";
     const plugin = makePlugin("p", {
-      "srv": { entry: "e.ts", secretEnv: ["__TEST_SECRET"] },
+      srv: { entry: "e.ts", secretEnv: ["__TEST_SECRET"] },
     });
     const result = buildInstanceCapabilities([plugin]);
     expect(result.servers.configured).toContain("srv");
@@ -149,7 +149,7 @@ describe("buildInstanceCapabilities — plugin secretEnv", () => {
   it("marks plugin server configured when secretEnv resolves from Keychain", () => {
     mockFromKeychain.mockImplementation((_id, key) => (key === "__TEST_SECRET" ? "from-kc" : ""));
     const plugin = makePlugin("p", {
-      "srv": { entry: "e.ts", secretEnv: ["__TEST_SECRET"] },
+      srv: { entry: "e.ts", secretEnv: ["__TEST_SECRET"] },
     });
     const result = buildInstanceCapabilities([plugin]);
     expect(result.servers.configured).toContain("srv");
@@ -158,7 +158,7 @@ describe("buildInstanceCapabilities — plugin secretEnv", () => {
 
   it("marks plugin server unconfigured when secretEnv missing from both env and Keychain", () => {
     const plugin = makePlugin("p", {
-      "srv": { entry: "e.ts", secretEnv: ["__TEST_SECRET"] },
+      srv: { entry: "e.ts", secretEnv: ["__TEST_SECRET"] },
     });
     const result = buildInstanceCapabilities([plugin]);
     expect(result.servers.unconfigured).toContain("srv");
@@ -168,7 +168,7 @@ describe("buildInstanceCapabilities — plugin secretEnv", () => {
     // Keychain has the value, but it's declared under `env`, not `secretEnv`
     mockFromKeychain.mockReturnValue("from-kc");
     const plugin = makePlugin("p", {
-      "srv": { entry: "e.ts", env: ["__TEST_PUBLIC"] },
+      srv: { entry: "e.ts", env: ["__TEST_PUBLIC"] },
     });
     const result = buildInstanceCapabilities([plugin]);
     expect(result.servers.unconfigured).toContain("srv");
@@ -178,7 +178,7 @@ describe("buildInstanceCapabilities — plugin secretEnv", () => {
     process.env.__TEST_PUBLIC = "p";
     mockFromKeychain.mockReturnValue("from-kc");
     const plugin = makePlugin("p", {
-      "srv": { entry: "e.ts", env: ["__TEST_PUBLIC"], secretEnv: ["__TEST_SECRET"] },
+      srv: { entry: "e.ts", env: ["__TEST_PUBLIC"], secretEnv: ["__TEST_SECRET"] },
     });
     const result = buildInstanceCapabilities([plugin]);
     expect(result.servers.configured).toContain("srv");

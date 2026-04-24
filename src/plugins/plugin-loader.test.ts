@@ -110,7 +110,7 @@ describe("normalizeManifest", () => {
   it("round-trips secret-env (YAML) to secretEnv (TS)", () => {
     const raw = {
       "mcp-servers": {
-        "s": { entry: "e.ts", "secret-env": ["A", "B", "C"] },
+        s: { entry: "e.ts", "secret-env": ["A", "B", "C"] },
       },
     };
     const result = normalizeManifest(raw);
