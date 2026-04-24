@@ -7,15 +7,25 @@ import type { LoadedPlugin } from "../plugins/types.js";
 // vi.hoisted() runs before vi.mock factory, avoiding the TDZ error that
 // occurs when paths.ts (imported transitively) calls existsSync at module
 // load time before plain const-declared mocks are initialized.
-const { mockExistsSync, mockStatSync, mockMkdirSync } = vi.hoisted(() => ({
+const { mockExistsSync, mockStatSync, mockMkdirSync, mockSymlinkSync, mockLstatSync } = vi.hoisted(() => ({
   mockExistsSync: vi.fn().mockReturnValue(true),
   mockStatSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
   mockMkdirSync: vi.fn(),
+  mockSymlinkSync: vi.fn(),
+  // Default: lstat throws (link target not present) so ensurePluginNodeModulesLink
+  // will proceed to create a symlink.
+  mockLstatSync: vi.fn().mockImplementation(() => {
+    const err: NodeJS.ErrnoException = new Error("ENOENT");
+    err.code = "ENOENT";
+    throw err;
+  }),
 }));
 vi.mock("node:fs", () => ({
   existsSync: (...args: any[]) => mockExistsSync(...args),
   statSync: (...args: any[]) => mockStatSync(...args),
   mkdirSync: (...args: any[]) => mockMkdirSync(...args),
+  symlinkSync: (...args: any[]) => mockSymlinkSync(...args),
+  lstatSync: (...args: any[]) => mockLstatSync(...args),
 }));
 
 // ── SDK mock ────────────────────────────────────────────────────────
@@ -318,53 +328,72 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers["custom-server"].env.MONGODB_URI).toBe(
       "mongodb://localhost:27017",
     );
-    // Engine node_modules injected so plugin imports (e.g. the MCP SDK)
-    // resolve without each plugin shipping its own copy.
-    expect(servers["custom-server"].env.NODE_PATH).toBeTruthy();
-    expect(servers["custom-server"].env.NODE_PATH).toContain("node_modules");
+    // NODE_PATH is NOT set — Node's ESM resolver ignores it. Plugins get
+    // their deps via a node_modules symlink inside plugin.dir instead.
+    expect(servers["custom-server"].env.NODE_PATH).toBeUndefined();
   });
 
-  it("preserves any inherited NODE_PATH (prepends engine's, keeps caller's as fallback)", async () => {
-    const previousNodePath = process.env.NODE_PATH;
-    process.env.NODE_PATH = "/inherited/from/caller";
-    try {
-      const plugin: LoadedPlugin = {
+  it("symlinks plugin.dir/node_modules to engine deps before spawning a plugin server", async () => {
+    mockSymlinkSync.mockClear();
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
         name: "test-plugin",
-        dir: "/plugins/test-plugin",
-        manifest: {
-          name: "test-plugin",
-          description: "Test",
-          mcpServers: {
-            "custom-server": {
-              entry: "mcp-servers/custom/index.ts",
-              env: [],
-              envMap: {},
-              agentEnv: {},
-            },
+        description: "Test",
+        mcpServers: {
+          "custom-server": {
+            entry: "mcp-servers/custom/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
           },
-          agentSeeds: [],
         },
-        brokenServers: {},
-      };
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
 
-      runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
-      await runner.send("hello");
-      const nodePath = getCapturedServers()["custom-server"].env.NODE_PATH;
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
+    await runner.send("hello");
 
-      // Engine's node_modules prepended; caller's value preserved as fallback.
-      expect(nodePath).toContain("node_modules");
-      expect(nodePath).toContain("/inherited/from/caller");
-      // Engine path comes first so it takes precedence.
-      expect(nodePath.indexOf("/inherited/from/caller")).toBeGreaterThan(
-        nodePath.indexOf("node_modules"),
-      );
-    } finally {
-      if (previousNodePath === undefined) {
-        delete process.env.NODE_PATH;
-      } else {
-        process.env.NODE_PATH = previousNodePath;
-      }
-    }
+    // Symlink created at <plugin.dir>/node_modules, pointing at an absolute
+    // path that contains "node_modules" (the engine's).
+    const calls = mockSymlinkSync.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[0]).toContain("node_modules");
+    expect(lastCall[1]).toBe("/plugins/test-plugin/node_modules");
+    expect(lastCall[2]).toBe("dir");
+  });
+
+  it("skips symlink creation when plugin.dir/node_modules already exists", async () => {
+    mockSymlinkSync.mockClear();
+    // lstat returns a stat object → link already exists → no new symlink.
+    mockLstatSync.mockReturnValueOnce({ isSymbolicLink: () => true } as any);
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "custom-server": {
+            entry: "mcp-servers/custom/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["custom-server"] }), memoryManager as any, [plugin]);
+    await runner.send("hello");
+
+    expect(mockSymlinkSync).not.toHaveBeenCalled();
   });
 
   it("injects plugin secretEnv from process.env when present (no keychain lookup)", async () => {
