@@ -117,6 +117,7 @@ async function main(): Promise<void> {
     // Reload schedule overrides
     await scheduler.reloadSchedules();
     agentManager.reloadSkills();
+    agentManager.rescanPlugins();
   };
 
   registry = new AgentRegistry(agentDefsCollection as any, () => {

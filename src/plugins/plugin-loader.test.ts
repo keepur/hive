@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { loadPlugins, normalizeManifest, resolvePluginServerPath } from "./plugin-loader.js";
+import { loadPlugins, normalizeManifest, rescanPluginBrokenServers, resolvePluginServerPath } from "./plugin-loader.js";
+import type { BrokenServer, LoadedPlugin, PluginMcpServer } from "./types.js";
 import { existsSync, readFileSync } from "node:fs";
 
 vi.mock("node:fs", () => ({
@@ -442,5 +443,64 @@ mcp-servers:
 
     const result = loadPlugins(["p"], "/root");
     expect(result[0].brokenServers).toEqual({});
+  });
+});
+
+describe("rescanPluginBrokenServers", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makePlugin(brokenNames: string[]): LoadedPlugin {
+    const mcpServers: Record<string, PluginMcpServer> = {};
+    const brokenServers: Record<string, BrokenServer> = {};
+    for (const name of brokenNames) {
+      mcpServers[name] = { entry: `mcp-servers/${name}/index.ts` };
+      brokenServers[name] = { reason: "no compiled entry (startup)", pathsChecked: [] };
+    }
+    return {
+      name: "p",
+      dir: "/hive/plugins/p",
+      manifest: {
+        name: "p",
+        description: "",
+        mcpServers,
+        agentSeeds: [],
+      },
+      brokenServers,
+    };
+  }
+
+  it("drops entries that now resolve, keeps entries still missing", () => {
+    const plugin = makePlugin(["rescue-me", "still-broken"]);
+    vi.mocked(existsSync).mockImplementation((path) => String(path).endsWith("mcp-servers/rescue-me/index.js"));
+
+    const { rescued, stillBroken } = rescanPluginBrokenServers([plugin], "/hive");
+
+    expect(rescued).toEqual({ p: ["rescue-me"] });
+    expect(stillBroken).toEqual({ p: ["still-broken"] });
+    expect(plugin.brokenServers).toHaveProperty("still-broken");
+    expect(plugin.brokenServers).not.toHaveProperty("rescue-me");
+  });
+
+  it("returns empty maps when no plugins have broken servers", () => {
+    const plugin = makePlugin([]);
+    const { rescued, stillBroken } = rescanPluginBrokenServers([plugin], "/hive");
+    expect(rescued).toEqual({});
+    expect(stillBroken).toEqual({});
+  });
+
+  it("drops a broken entry whose server was removed from the manifest", () => {
+    const plugin = makePlugin(["still-registered"]);
+    // Simulate: the broken server was unregistered since startup.
+    plugin.brokenServers["phantom"] = { reason: "legacy", pathsChecked: [] };
+    vi.mocked(existsSync).mockReturnValue(false);
+
+    const { rescued, stillBroken } = rescanPluginBrokenServers([plugin], "/hive");
+
+    expect(plugin.brokenServers).not.toHaveProperty("phantom");
+    expect(plugin.brokenServers).toHaveProperty("still-registered");
+    expect(rescued).toEqual({});
+    expect(stillBroken).toEqual({ p: ["still-registered"] });
   });
 });
