@@ -14,6 +14,7 @@ import { createLogger } from "../logging/logger.js";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { join, extname } from "node:path";
 import { tmpdir } from "node:os";
+import type { GenerateTextRequest, GenerateTextResult } from "../llm/types.js";
 
 const log = createLogger("file-processor");
 const DOWNLOAD_DIR = join(tmpdir(), "hive-slack-files");
@@ -42,53 +43,45 @@ export interface ProcessedFile {
 
 export const IMAGE_TYPES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic"]);
 
-let geminiApiKey = "";
-const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
+const IMAGE_DESCRIPTION_PROMPT =
+  "Describe this image in detail. If it contains text, extract all of it. If it's a diagram, architecture drawing, or technical image, describe all labels, relationships, and structure. If it's a screenshot of messages or a conversation, transcribe everything. Be thorough.";
 
-/** Set the Gemini API key for image processing */
-export function setGeminiApiKey(key: string): void {
-  geminiApiKey = key;
+interface VisionLlmClient {
+  generateForTask(task: string, request: Omit<GenerateTextRequest, "model">): Promise<GenerateTextResult>;
 }
 
-export async function describeImageWithGemini(buffer: Buffer, mimetype: string): Promise<string | null> {
-  if (!geminiApiKey) return null;
+let visionLlmClient: VisionLlmClient | undefined;
+let visionTask = "vision";
+
+export function setVisionLlmClient(client: VisionLlmClient, task = "vision"): void {
+  visionLlmClient = client;
+  visionTask = task;
+}
+
+export function resetVisionLlmClientForTests(): void {
+  visionLlmClient = undefined;
+  visionTask = "vision";
+}
+
+export async function describeImage(buffer: Buffer, mimetype: string): Promise<string | null> {
+  if (!visionLlmClient) return null;
 
   try {
-    const base64 = buffer.toString("base64");
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { inline_data: { mime_type: mimetype, data: base64 } },
-                {
-                  text: "Describe this image in detail. If it contains text, extract all of it. If it's a diagram, architecture drawing, or technical image, describe all labels, relationships, and structure. If it's a screenshot of messages or a conversation, transcribe everything. Be thorough.",
-                },
-              ],
-            },
-          ],
-        }),
-      },
-    );
-
-    if (!res.ok) {
-      const err = await res.text();
-      log.warn("Gemini vision error", { status: res.status, error: err.slice(0, 200) });
-      return null;
-    }
-
-    const data = (await res.json()) as any;
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (text) {
-      log.info("Image described via Gemini", { model: GEMINI_MODEL, chars: text.length });
-    }
-    return text || null;
+    const result = await visionLlmClient.generateForTask(visionTask, {
+      prompt: IMAGE_DESCRIPTION_PROMPT,
+      images: [{ mimeType: mimetype, dataBase64: buffer.toString("base64") }],
+      maxOutputTokens: 2048,
+      temperature: 0,
+    });
+    if (!result.text) return null;
+    log.info("Image described", {
+      provider: result.provider,
+      model: result.model,
+      chars: result.text.length,
+    });
+    return result.text;
   } catch (e: any) {
-    log.warn("Gemini vision failed", { error: e.message });
+    log.warn("Image description failed", { error: e.message });
     return null;
   }
 }
@@ -224,7 +217,7 @@ export async function downloadAndProcess(file: SlackFile, botToken: string): Pro
 
     // Images — describe via Gemini vision, fall back to metadata only
     if (isImage) {
-      const description = await describeImageWithGemini(buffer, file.mimetype);
+      const description = await describeImage(buffer, file.mimetype);
       return {
         name: file.name,
         mimetype: file.mimetype,
@@ -256,7 +249,7 @@ export async function processImageBuffer(buffer: Buffer, filename: string, mimet
   const localPath = join(DOWNLOAD_DIR, `ws-${Date.now()}-${safeName}`);
   writeFileSync(localPath, buffer);
 
-  const description = await describeImageWithGemini(buffer, mimetype);
+  const description = await describeImage(buffer, mimetype);
   return {
     name: filename,
     mimetype,

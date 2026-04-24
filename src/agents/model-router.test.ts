@@ -1,4 +1,12 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+vi.mock("../config.js", () => ({
+  config: {
+    modelRouter: { timeoutMs: 8000 },
+    llm: { providers: {}, models: {}, tasks: {} },
+  },
+}));
+
 import { resolveResourceLimits, RESOURCE_TIER_DEFAULTS } from "./model-router.js";
 
 describe("resolveResourceLimits", () => {
