@@ -76,6 +76,7 @@ export interface DreamConfig {
   maxClustersPerRun: number;
   maxContradictionPairsPerRun: number;
   maxPromotionsPerRun: number;
+  maxBudgetUsd: number;
 }
 
 export interface DreamResult {

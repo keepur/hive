@@ -411,6 +411,7 @@ describe("dream()", () => {
       maxClustersPerRun: 20,
       maxContradictionPairsPerRun: 30,
       maxPromotionsPerRun: 10,
+      maxBudgetUsd: 0.1,
     });
     const result = await lifecycle.dream();
     expect(result).toEqual({ merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] });
@@ -426,6 +427,7 @@ describe("dream()", () => {
       maxClustersPerRun: 20,
       maxContradictionPairsPerRun: 30,
       maxPromotionsPerRun: 10,
+      maxBudgetUsd: 0.1,
     };
     const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
 
@@ -452,6 +454,7 @@ describe("dream()", () => {
       maxClustersPerRun: 20,
       maxContradictionPairsPerRun: 30,
       maxPromotionsPerRun: 10,
+      maxBudgetUsd: 0.1,
     };
     const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
 
@@ -494,6 +497,7 @@ describe("dream()", () => {
       maxClustersPerRun: 20,
       maxContradictionPairsPerRun: 30,
       maxPromotionsPerRun: 10,
+      maxBudgetUsd: 0.1,
     };
     const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
 
@@ -532,6 +536,7 @@ describe("dream()", () => {
       maxClustersPerRun: 20,
       maxContradictionPairsPerRun: 30,
       maxPromotionsPerRun: 10,
+      maxBudgetUsd: 0.1,
     };
     const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
 
@@ -581,6 +586,7 @@ describe("dream()", () => {
       maxClustersPerRun: 20,
       maxContradictionPairsPerRun: 30,
       maxPromotionsPerRun: 10,
+      maxBudgetUsd: 0.1,
     };
     const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
 
@@ -611,5 +617,60 @@ describe("dream()", () => {
       interactions.map((r) => r._id!),
       factId,
     );
+  });
+
+  // ── Retired-agent filter ──────────────────────────────────────────
+  it("skips retired agents when getActiveAgentIds is provided", async () => {
+    const dreamCfg = {
+      enabled: true,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+      maxBudgetUsd: 0.1,
+    };
+    const getActiveAgentIds = vi.fn().mockResolvedValue(new Set(["active-agent"]));
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg, getActiveAgentIds);
+
+    // Memory collection surfaces one active + one retired agent
+    store.getAgentIds.mockResolvedValue(["active-agent", "retired-agent"]);
+    store.getByTiersForAgent.mockResolvedValue([]);
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map());
+    store.getInteractionsByTopic.mockResolvedValue(new Map());
+
+    await lifecycle.dream();
+
+    // Only the active agent was iterated — retired-agent never fetched
+    expect(getActiveAgentIds).toHaveBeenCalledOnce();
+    expect(store.getByTiersForAgent).toHaveBeenCalledWith("active-agent", expect.any(Array));
+    expect(store.getByTiersForAgent).not.toHaveBeenCalledWith("retired-agent", expect.any(Array));
+  });
+
+  it("iterates all agents when getActiveAgentIds is NOT provided (backward compat)", async () => {
+    const dreamCfg = {
+      enabled: true,
+      idleThresholdMinutes: 30,
+      cooldownMinutes: 60,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+      maxBudgetUsd: 0.1,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+
+    store.getAgentIds.mockResolvedValue(["a1", "a2"]);
+    store.getByTiersForAgent.mockResolvedValue([]);
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map());
+    store.getInteractionsByTopic.mockResolvedValue(new Map());
+
+    await lifecycle.dream();
+
+    expect(store.getByTiersForAgent).toHaveBeenCalledWith("a1", expect.any(Array));
+    expect(store.getByTiersForAgent).toHaveBeenCalledWith("a2", expect.any(Array));
   });
 });

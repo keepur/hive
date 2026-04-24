@@ -22,7 +22,27 @@ export class MemoryLifecycle {
     private embedder: MemoryEmbedder,
     private config: MemoryLifecycleConfig,
     private dreamConfig?: DreamConfig,
+    private getActiveAgentIds?: () => Promise<Set<string>>,
   ) {}
+
+  /**
+   * Filter memory-derived agent IDs (includes orphans from retired agents)
+   * against the current active roster. If no roster provider is injected,
+   * returns the input unchanged — preserves backward compat and test setups.
+   */
+  private async filterActiveAgents(ids: string[]): Promise<string[]> {
+    if (!this.getActiveAgentIds) return ids;
+    const active = await this.getActiveAgentIds();
+    const filtered = ids.filter((id) => active.has(id));
+    const skippedCount = ids.length - filtered.length;
+    if (skippedCount > 0) {
+      log.debug("Skipped retired agents", {
+        skipped: skippedCount,
+        retiredIds: ids.filter((id) => !active.has(id)),
+      });
+    }
+    return filtered;
+  }
 
   /**
    * Compute retention score for a memory record.
@@ -64,7 +84,8 @@ export class MemoryLifecycle {
     const errors: string[] = [];
 
     try {
-      const agentIds = await this.store.getAgentIds();
+      const allIds = await this.store.getAgentIds();
+      const agentIds = await this.filterActiveAgents(allIds);
 
       for (const agentId of agentIds) {
         try {
@@ -219,7 +240,8 @@ export class MemoryLifecycle {
     const errors: string[] = [];
 
     try {
-      const agentIds = await this.store.getAgentIds();
+      const allIds = await this.store.getAgentIds();
+      const agentIds = await this.filterActiveAgents(allIds);
 
       for (const agentId of agentIds) {
         try {
@@ -308,7 +330,7 @@ export class MemoryLifecycle {
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           maxTurns: 1,
-          maxBudgetUsd: 0.02,
+          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
           persistSession: false,
         },
       });
@@ -419,7 +441,7 @@ export class MemoryLifecycle {
               permissionMode: "bypassPermissions",
               allowDangerouslySkipPermissions: true,
               maxTurns: 1,
-              maxBudgetUsd: 0.02,
+              maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
               persistSession: false,
             },
           });
@@ -502,7 +524,7 @@ export class MemoryLifecycle {
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           maxTurns: 1,
-          maxBudgetUsd: 0.02,
+          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
           persistSession: false,
         },
       });
@@ -578,7 +600,7 @@ export class MemoryLifecycle {
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           maxTurns: 1,
-          maxBudgetUsd: 0.02,
+          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
           persistSession: false,
         },
       });
