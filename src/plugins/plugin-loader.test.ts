@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { loadPlugins, normalizeManifest } from "./plugin-loader.js";
+import { loadPlugins, normalizeManifest, rescanPluginBrokenServers, resolvePluginServerPath } from "./plugin-loader.js";
+import type { BrokenServer, LoadedPlugin, PluginMcpServer } from "./types.js";
 import { existsSync, readFileSync } from "node:fs";
 
 vi.mock("node:fs", () => ({
@@ -297,5 +298,209 @@ describe("normalizeManifest hiveApi field", () => {
   it("leaves hiveApi undefined when absent", () => {
     const result = normalizeManifest({ name: "t" });
     expect(result.hiveApi).toBeUndefined();
+  });
+});
+
+describe("resolvePluginServerPath", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("prefers dev-build path when distDir is set and file exists", () => {
+    vi.mocked(existsSync).mockImplementation((path: any) => String(path).startsWith("/dist/plugins/foo/"));
+    const r = resolvePluginServerPath("foo", "mcp-servers/bar/index.ts", {
+      hiveHome: "/hive",
+      distDir: "/dist",
+    });
+    expect(r).toEqual({ path: "/dist/plugins/foo/mcp-servers/bar/index.js" });
+  });
+
+  it("falls back to npm .min.js when dev build missing", () => {
+    vi.mocked(existsSync).mockImplementation(
+      (path: any) => String(path) === "/hive/plugins/node_modules/foo/dist/mcp-servers/bar/index.min.js",
+    );
+    const r = resolvePluginServerPath("foo", "mcp-servers/bar/index.ts", {
+      hiveHome: "/hive",
+      distDir: "/dist",
+    });
+    expect(r).toEqual({
+      path: "/hive/plugins/node_modules/foo/dist/mcp-servers/bar/index.min.js",
+    });
+  });
+
+  it("falls back to npm .js when npm .min.js missing", () => {
+    vi.mocked(existsSync).mockImplementation(
+      (path: any) => String(path) === "/hive/plugins/node_modules/foo/dist/mcp-servers/bar/index.js",
+    );
+    const r = resolvePluginServerPath("foo", "mcp-servers/bar/index.ts", {
+      hiveHome: "/hive",
+      distDir: "/dist",
+    });
+    expect(r).toEqual({
+      path: "/hive/plugins/node_modules/foo/dist/mcp-servers/bar/index.js",
+    });
+  });
+
+  it("falls back to in-tree .min.js when npm paths missing", () => {
+    vi.mocked(existsSync).mockImplementation(
+      (path: any) => String(path) === "/hive/plugins/foo/dist/mcp-servers/bar/index.min.js",
+    );
+    const r = resolvePluginServerPath("foo", "mcp-servers/bar/index.ts", {
+      hiveHome: "/hive",
+    });
+    expect(r).toEqual({ path: "/hive/plugins/foo/dist/mcp-servers/bar/index.min.js" });
+  });
+
+  // This is tonight's dodi case: user dropped a plugin in, ran `tsc` once,
+  // got un-minified `.js` in `dist/`. Without this fallback the engine would
+  // silently fail to spawn.
+  it("falls back to in-tree .js — the tonight's-dodi case", () => {
+    vi.mocked(existsSync).mockImplementation(
+      (path: any) => String(path) === "/hive/plugins/foo/dist/mcp-servers/bar/index.js",
+    );
+    const r = resolvePluginServerPath("foo", "mcp-servers/bar/index.ts", {
+      hiveHome: "/hive",
+    });
+    expect(r).toEqual({ path: "/hive/plugins/foo/dist/mcp-servers/bar/index.js" });
+  });
+
+  it("returns broken with paths tried when nothing resolves", () => {
+    vi.mocked(existsSync).mockReturnValue(false);
+    const r = resolvePluginServerPath("foo", "mcp-servers/bar/index.ts", {
+      hiveHome: "/hive",
+      distDir: "/dist",
+    });
+    expect("reason" in r).toBe(true);
+    if ("reason" in r) {
+      expect(r.reason).toContain("no compiled entry");
+      expect(r.pathsChecked).toHaveLength(5);
+      expect(r.pathsChecked[0]).toContain("/dist/plugins/foo/");
+      expect(r.pathsChecked.some((p) => p.includes("node_modules"))).toBe(true);
+      expect(r.pathsChecked.some((p) => p.endsWith("index.min.js"))).toBe(true);
+      expect(r.pathsChecked.some((p) => p.endsWith("index.js"))).toBe(true);
+    }
+  });
+
+  it("skips dev path when distDir is not provided", () => {
+    vi.mocked(existsSync).mockReturnValue(false);
+    const r = resolvePluginServerPath("foo", "mcp-servers/bar/index.ts", {
+      hiveHome: "/hive",
+    });
+    expect("reason" in r).toBe(true);
+    if ("reason" in r) {
+      expect(r.pathsChecked).toHaveLength(4);
+      expect(r.pathsChecked.every((p) => !p.startsWith("/dist/"))).toBe(true);
+    }
+  });
+});
+
+describe("loadPlugins broken-server tracking", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("records servers with no resolvable entry in brokenServers", () => {
+    const manifestYaml = `
+name: p
+mcp-servers:
+  working:
+    entry: mcp-servers/working/index.ts
+  broken:
+    entry: mcp-servers/broken/index.ts
+`;
+    // Manifest found in-tree; only the `working` server has a compiled entry.
+    vi.mocked(existsSync).mockImplementation((path: any) => {
+      const p = String(path);
+      if (p.endsWith("plugins/p/plugin.yaml")) return true;
+      if (p.endsWith("mcp-servers/working/index.js")) return true;
+      if (p.endsWith("mcp-servers/working/index.min.js")) return true;
+      return false;
+    });
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["p"], "/root");
+    expect(result).toHaveLength(1);
+    expect(result[0].brokenServers).toHaveProperty("broken");
+    expect(result[0].brokenServers.broken.reason).toContain("no compiled entry");
+    expect(result[0].brokenServers.broken.pathsChecked.length).toBeGreaterThan(0);
+    expect(result[0].brokenServers).not.toHaveProperty("working");
+  });
+
+  it("leaves brokenServers empty when all entries resolve", () => {
+    const manifestYaml = `
+name: p
+mcp-servers:
+  a:
+    entry: mcp-servers/a/index.ts
+`;
+    vi.mocked(existsSync).mockImplementation((path: any) => {
+      const p = String(path);
+      if (p.endsWith("plugins/p/plugin.yaml")) return true;
+      if (p.endsWith("mcp-servers/a/index.min.js")) return true;
+      return false;
+    });
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["p"], "/root");
+    expect(result[0].brokenServers).toEqual({});
+  });
+});
+
+describe("rescanPluginBrokenServers", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makePlugin(brokenNames: string[]): LoadedPlugin {
+    const mcpServers: Record<string, PluginMcpServer> = {};
+    const brokenServers: Record<string, BrokenServer> = {};
+    for (const name of brokenNames) {
+      mcpServers[name] = { entry: `mcp-servers/${name}/index.ts` };
+      brokenServers[name] = { reason: "no compiled entry (startup)", pathsChecked: [] };
+    }
+    return {
+      name: "p",
+      dir: "/hive/plugins/p",
+      manifest: {
+        name: "p",
+        description: "",
+        mcpServers,
+        agentSeeds: [],
+      },
+      brokenServers,
+    };
+  }
+
+  it("drops entries that now resolve, keeps entries still missing", () => {
+    const plugin = makePlugin(["rescue-me", "still-broken"]);
+    vi.mocked(existsSync).mockImplementation((path) => String(path).endsWith("mcp-servers/rescue-me/index.js"));
+
+    const { rescued, stillBroken } = rescanPluginBrokenServers([plugin], "/hive");
+
+    expect(rescued).toEqual({ p: ["rescue-me"] });
+    expect(stillBroken).toEqual({ p: ["still-broken"] });
+    expect(plugin.brokenServers).toHaveProperty("still-broken");
+    expect(plugin.brokenServers).not.toHaveProperty("rescue-me");
+  });
+
+  it("returns empty maps when no plugins have broken servers", () => {
+    const plugin = makePlugin([]);
+    const { rescued, stillBroken } = rescanPluginBrokenServers([plugin], "/hive");
+    expect(rescued).toEqual({});
+    expect(stillBroken).toEqual({});
+  });
+
+  it("drops a broken entry whose server was removed from the manifest", () => {
+    const plugin = makePlugin(["still-registered"]);
+    // Simulate: the broken server was unregistered since startup.
+    plugin.brokenServers["phantom"] = { reason: "legacy", pathsChecked: [] };
+    vi.mocked(existsSync).mockReturnValue(false);
+
+    const { rescued, stillBroken } = rescanPluginBrokenServers([plugin], "/hive");
+
+    expect(plugin.brokenServers).not.toHaveProperty("phantom");
+    expect(plugin.brokenServers).toHaveProperty("still-registered");
+    expect(rescued).toEqual({});
+    expect(stillBroken).toEqual({ p: ["still-registered"] });
   });
 });

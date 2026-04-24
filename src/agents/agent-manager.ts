@@ -1,7 +1,7 @@
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem } from "../types/work-item.js";
-import { AgentRunner, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
@@ -9,7 +9,7 @@ import type { SweepResult } from "../sweeper/sweeper.js";
 import { formatFilesForPrompt } from "../files/file-processor.js";
 import { routeModel, type ResourceLimits } from "./model-router.js";
 import { config as appConfig } from "../config.js";
-import { loadPlugins } from "../plugins/plugin-loader.js";
+import { loadPlugins, rescanPluginBrokenServers } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { loadSkillIndex, type SkillIndex } from "./skill-loader.js";
 import { skillsDir, seedsDir, hiveHome } from "../paths.js";
@@ -75,7 +75,7 @@ export class AgentManager {
     this.sessionStore = sessionStore;
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
-    this.plugins = loadPlugins(appConfig.plugins, hiveHome);
+    this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
   }
@@ -100,6 +100,24 @@ export class AgentManager {
       this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
     } catch (err) {
       log.warn("Skill reload failed, retaining previous index", { error: String(err) });
+    }
+  }
+
+  /**
+   * Re-check plugins whose MCP server entries failed to resolve at startup.
+   * Called on SIGUSR1 — lets operators recover from a startup race (plugin
+   * dist files landing after the engine restart) without a full service
+   * restart. See KPR-62.
+   */
+  rescanPlugins(): void {
+    const { rescued, stillBroken } = rescanPluginBrokenServers(this.plugins, hiveHome, { distDir: DIST_DIR });
+    const rescuedCount = Object.values(rescued).reduce((n, list) => n + list.length, 0);
+    if (rescuedCount > 0) {
+      log.info("Plugin MCP servers rescued after rescan", { rescued });
+    }
+    const stillBrokenCount = Object.values(stillBroken).reduce((n, list) => n + list.length, 0);
+    if (stillBrokenCount > 0) {
+      log.warn("Plugin MCP servers still unresolvable after rescan", { stillBroken });
     }
   }
 
