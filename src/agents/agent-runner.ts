@@ -1,5 +1,5 @@
 import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
-import { resolve } from "node:path";
+import { resolve, delimiter as pathDelimiter } from "node:path";
 import { existsSync, statSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { getArchetype, type ArchetypeDefinition } from "../archetypes/registry.js";
@@ -87,12 +87,19 @@ export const DIST_DIR = existsSync(resolve(import.meta.dirname, "mcp"))
  *
  * Returns `null` if no `node_modules/` is reachable within a reasonable
  * number of parent dirs — callers then skip the `NODE_PATH` injection.
+ *
+ * We only accept a `node_modules/` that sits next to a `package.json` —
+ * otherwise a stray `~/github/node_modules/` or monorepo root
+ * `node_modules/` could be picked up instead of the engine's. The engine
+ * is always a published npm package, so its `node_modules/` is always
+ * a sibling of its `package.json`.
  */
 function findEngineNodeModules(startDir: string): string | null {
   let dir = startDir;
   for (let i = 0; i < 15; i++) {
     const candidate = resolve(dir, "node_modules");
-    if (existsSync(candidate)) return candidate;
+    const pkgJson = resolve(dir, "package.json");
+    if (existsSync(candidate) && existsSync(pkgJson)) return candidate;
     const parent = resolve(dir, "..");
     if (parent === dir) break;
     dir = parent;
@@ -703,9 +710,18 @@ export class AgentRunner {
           PATH: process.env.PATH ?? "",
           HOME: process.env.HOME ?? "",
           // Let plugin servers resolve common deps (@modelcontextprotocol/sdk,
-          // zod, etc.) against engine-bundled node_modules. Prepends engine's
-          // node_modules so a plugin's own deps (if any) still take precedence.
-          ...(ENGINE_NODE_MODULES ? { NODE_PATH: ENGINE_NODE_MODULES } : {}),
+          // zod, etc.) against engine-bundled node_modules. Prepend the engine
+          // path so any inherited NODE_PATH entries (from a dev shell, a test
+          // harness, or another tool) still apply as a fallback.
+          ...(ENGINE_NODE_MODULES
+            ? {
+                NODE_PATH: [ENGINE_NODE_MODULES, process.env.NODE_PATH]
+                  .filter(Boolean)
+                  .join(pathDelimiter),
+              }
+            : process.env.NODE_PATH
+              ? { NODE_PATH: process.env.NODE_PATH }
+              : {}),
         };
 
         for (const envVar of serverDef.env ?? []) {
