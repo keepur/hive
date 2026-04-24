@@ -293,7 +293,11 @@ if $ROLLBACK; then
     echo "ERROR: no instance '$FILTER_INSTANCE' in $INSTANCES_CONF" >&2
     exit 2
   fi
-  IFS='|' read -r id _config label logs_dir ports _tag <<< "$ROLLBACK_ROW"
+  IFS='|' read -r id _config _conf_label logs_dir ports _tag <<< "$ROLLBACK_ROW"
+  # Label is derived from instance id, not read from the conf (the conf's label
+  # column is historical — the installer builds labels as com.hive.<id>.agent
+  # per service/install.sh). See KPR-63.
+  label="com.hive.${id}.agent"
   instance_root=$(_instance_root "$id")
   echo "--- Rolling back $id (root: $instance_root) ---"
   # Stop LaunchAgent BEFORE rotating .hive/. Without -kp, launchd auto-respawns
@@ -391,7 +395,9 @@ fi
 FAILED_INSTANCES=()
 
 for inst in "${INSTANCES[@]}"; do
-  IFS='|' read -r id config label logs_dir ports engine_tag <<< "$inst"
+  IFS='|' read -r id config _conf_label logs_dir ports engine_tag <<< "$inst"
+  # Derive label from instance id — conf's label column is ignored (see KPR-63).
+  label="com.hive.${id}.agent"
 
   # --instance=<id> filter
   if [[ -n "$FILTER_INSTANCE" && "$FILTER_INSTANCE" != "$id" ]]; then
