@@ -55,6 +55,11 @@ vi.mock("../logging/logger.js", () => ({
   }),
 }));
 
+// ── Keychain mock ───────────────────────────────────────────────────
+vi.mock("../keychain/from-keychain.js", () => ({
+  fromKeychain: vi.fn(() => ""),
+}));
+
 // ── Config mock ─────────────────────────────────────────────────────
 vi.mock("../config.js", () => ({
   config: {
@@ -147,6 +152,9 @@ function getCapturedOptions(): Record<string, any> {
 // ── Import after mocks ──────────────────────────────────────────────
 import { AgentRunner } from "./agent-runner.js";
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
+import { fromKeychain } from "../keychain/from-keychain.js";
+
+const mockFromKeychain = vi.mocked(fromKeychain);
 
 function makeRunner(overrides: Partial<AgentConfig> = {}): AgentRunner {
   return new AgentRunner(makeAgentConfig(overrides), makeMockMemoryManager() as any);
@@ -309,6 +317,103 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers["custom-server"].env.MONGODB_URI).toBe(
       "mongodb://localhost:27017",
     );
+  });
+
+  it("injects plugin secretEnv from process.env when present (no keychain lookup)", async () => {
+    mockFromKeychain.mockReset();
+    mockFromKeychain.mockReturnValue("");
+    process.env.__TEST_SECRET_ENV = "from-env";
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "secret-server": {
+            entry: "mcp-servers/secret/index.ts",
+            env: [],
+            secretEnv: ["__TEST_SECRET_ENV"],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+    };
+
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["secret-server"] }), memoryManager as any, [plugin]);
+    try {
+      await runner.send("hello");
+      const servers = getCapturedServers();
+      expect(servers["secret-server"].env.__TEST_SECRET_ENV).toBe("from-env");
+      expect(mockFromKeychain).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.__TEST_SECRET_ENV;
+    }
+  });
+
+  it("falls back to Keychain for plugin secretEnv when process.env is empty", async () => {
+    mockFromKeychain.mockReset();
+    mockFromKeychain.mockImplementation((_id, key) => (key === "__TEST_SECRET_KC" ? "from-kc" : ""));
+    delete process.env.__TEST_SECRET_KC;
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "kc-server": {
+            entry: "mcp-servers/kc/index.ts",
+            env: [],
+            secretEnv: ["__TEST_SECRET_KC"],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+    };
+
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["kc-server"] }), memoryManager as any, [plugin]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers["kc-server"].env.__TEST_SECRET_KC).toBe("from-kc");
+    expect(mockFromKeychain).toHaveBeenCalledWith("hive", "__TEST_SECRET_KC");
+  });
+
+  it("omits plugin secretEnv key when neither env nor Keychain resolves", async () => {
+    mockFromKeychain.mockReset();
+    mockFromKeychain.mockReturnValue("");
+    delete process.env.__TEST_SECRET_MISSING;
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "missing-server": {
+            entry: "mcp-servers/missing/index.ts",
+            env: [],
+            secretEnv: ["__TEST_SECRET_MISSING"],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+    };
+
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["missing-server"] }), memoryManager as any, [plugin]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    // Subprocess still spawns (lenient failure mode per spec); var simply absent.
+    expect(servers).toHaveProperty("missing-server");
+    expect(servers["missing-server"].env.__TEST_SECRET_MISSING).toBeUndefined();
   });
 
   it("applies plugin envMap remapping", async () => {
