@@ -653,7 +653,14 @@ async function crmStatsAtlas(metric: string): Promise<ToolResult> {
             _id: "$properties.dealstage",
             count: { $sum: 1 },
             totalAmount: {
-              $sum: { $toDouble: { $ifNull: ["$properties.amount", "0"] } },
+              $sum: {
+                $convert: {
+                  input: "$properties.amount",
+                  to: "double",
+                  onError: 0,
+                  onNull: 0,
+                },
+              },
             },
           },
         },
