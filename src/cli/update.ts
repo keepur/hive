@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { parse as parseYaml } from "yaml";
-import { resolveHiveHome, resolveConfigFile } from "../paths.js";
+import { resolveHiveHome } from "../paths.js";
 import { relocateBetaPlugins } from "./update-preflight.js";
+import { deriveSingleInstanceEnv } from "./single-instance-env.js";
 
 function readInstalledVersion(engineDir: string): string {
   try {
@@ -17,54 +17,6 @@ function readInstalledVersion(engineDir: string): string {
 export interface UpdateOptions {
   tag?: string;
   instance?: string;
-}
-
-/**
- * Derive the per-instance facts deploy.sh needs in single-instance mode.
- *
- * Reads only what we need from hive.yaml — does NOT import ../config.ts because
- * config.ts pulls in dotenv + Mongo + keychain wiring at module load and would
- * throw on missing env in environments where `hive update` is the *first* thing
- * run after install. This keeps `hive update` startable on a half-configured box.
- */
-type SingleInstanceEnv = Record<string, string>;
-
-function deriveSingleInstanceEnv(hiveHome: string, tag: string): SingleInstanceEnv {
-  const configPath = resolveConfigFile(hiveHome);
-  const configFile = process.env.HIVE_CONFIG || "hive.yaml";
-
-  let yaml: Record<string, any> = {};
-  if (existsSync(configPath)) {
-    yaml = (parseYaml(readFileSync(configPath, "utf-8")) as Record<string, any>) ?? {};
-  }
-
-  const id = (yaml.instance?.id as string) ?? "hive";
-  const portBase = (yaml.instance?.portBase as number) ?? 3100;
-  const portOverrides = Object.values((yaml.instance?.ports as Record<string, number>) ?? {});
-
-  // Base port range covers every server config.ts derives from portBase
-  // (background..voice = +0..+6). Explicit overrides extend the kill-set so
-  // remapped ports also get cleared. Dedup to keep the arg compact.
-  const derived = Array.from({ length: 7 }, (_, i) => portBase + i);
-  const allPorts = Array.from(new Set([...derived, ...portOverrides])).sort((a, b) => a - b);
-
-  // Logs dir mirrors the resolveDotenvPath naming convention:
-  // hive-<suffix>.yaml → logs-<suffix>, hive.yaml → logs.
-  const suffix = configFile.match(/^hive-(.+)\.yaml$/)?.[1];
-  const logsDir = suffix ? `logs-${suffix}` : "logs";
-
-  const env: SingleInstanceEnv = {
-    HIVE_SINGLE_INSTANCE: "1",
-    HIVE_SINGLE_ID: id,
-    HIVE_SINGLE_CONFIG: configFile,
-    HIVE_SINGLE_LOGS: logsDir,
-    HIVE_SINGLE_PORTS: allPorts.join(" "),
-    HIVE_SINGLE_ROOT: hiveHome,
-  };
-  // Tag is also passed via --tag flag for deploy.sh's existing parsing path,
-  // but mirroring it as HIVE_SINGLE_TAG keeps the env contract self-contained.
-  if (tag) env.HIVE_SINGLE_TAG = tag;
-  return env;
 }
 
 /**
