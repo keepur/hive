@@ -4,6 +4,14 @@ import { resolveConfigFile } from "../paths.js";
 
 export type SingleInstanceEnv = Record<string, string>;
 
+type HiveYamlShape = {
+  instance?: {
+    id?: string;
+    portBase?: number;
+    ports?: Record<string, number>;
+  };
+};
+
 /**
  * Derive the per-instance facts deploy.sh needs in single-instance mode (KPR-70).
  *
@@ -22,14 +30,14 @@ export function deriveSingleInstanceEnv(hiveHome: string, tag?: string): SingleI
   const configPath = resolveConfigFile(hiveHome);
   const configFile = process.env.HIVE_CONFIG || "hive.yaml";
 
-  let yaml: Record<string, any> = {};
+  let yaml: HiveYamlShape = {};
   if (existsSync(configPath)) {
-    yaml = (parseYaml(readFileSync(configPath, "utf-8")) as Record<string, any>) ?? {};
+    yaml = (parseYaml(readFileSync(configPath, "utf-8")) as HiveYamlShape) ?? {};
   }
 
-  const id = (yaml.instance?.id as string) ?? "hive";
-  const portBase = (yaml.instance?.portBase as number) ?? 3100;
-  const portOverrides = Object.values((yaml.instance?.ports as Record<string, number>) ?? {});
+  const id = yaml.instance?.id ?? "hive";
+  const portBase = yaml.instance?.portBase ?? 3100;
+  const portOverrides = Object.values(yaml.instance?.ports ?? {});
 
   // Base port range covers every server config.ts derives from portBase
   // (background..voice = +0..+6). Explicit overrides extend the kill-set so
