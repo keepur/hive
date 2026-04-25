@@ -18,13 +18,19 @@ import { parse as parseYaml } from "yaml";
 
 const ROOT = resolve(import.meta.dirname, "..");
 
+type HiveYamlShape = {
+  instance?: {
+    id?: string;
+  };
+};
+
 // Load instance ID from hive.yaml
 const hiveConfigPath = resolve(ROOT, process.env.HIVE_CONFIG ?? "hive.yaml");
-let hiveConfig: Record<string, any> = {};
+let hiveConfig: HiveYamlShape = {};
 if (existsSync(hiveConfigPath)) {
-  hiveConfig = parseYaml(readFileSync(hiveConfigPath, "utf-8")) ?? {};
+  hiveConfig = (parseYaml(readFileSync(hiveConfigPath, "utf-8")) as HiveYamlShape) ?? {};
 }
-const instanceId = (hiveConfig.instance?.id as string) ?? "hive";
+const instanceId = hiveConfig.instance?.id ?? "hive";
 
 const home = process.env.HOME ?? "/tmp";
 const DEPLOY_DIR = process.env.HIVE_DEPLOY_DIR ?? resolve(home, "services", instanceId);
@@ -110,7 +116,7 @@ const rotatePlist = `<?xml version="1.0" encoding="UTF-8"?>
 
   <key>ProgramArguments</key>
   <array>
-    <string>${DEPLOY_DIR}/service/rotate-logs.sh</string>
+    <string>${DEPLOY_DIR}/.hive/service/rotate-logs.sh</string>
   </array>
 
   <key>EnvironmentVariables</key>
@@ -153,7 +159,7 @@ const deployCheckPlist = `<?xml version="1.0" encoding="UTF-8"?>
 
   <key>ProgramArguments</key>
   <array>
-    <string>${DEPLOY_DIR}/service/deploy-check.sh</string>
+    <string>${DEPLOY_DIR}/.hive/service/deploy-check.sh</string>
   </array>
 
   <key>EnvironmentVariables</key>
