@@ -6,6 +6,8 @@ Most AI tools give you a chatbot. Hive gives you a team. Each agent has a name, 
 
 It runs on a Mac you already own. One Anthropic key, one Slack workspace, one install command.
 
+> **Public beta.** Hive is in active beta. The product is solid for daily use, but the upgrade path isn't fully smooth yet — please read [Updating](#updating) before running `hive update`. We don't have a dedicated support team during beta; if you hit something weird, email [beta@keepur.io](mailto:beta@keepur.io) and a real human (one of us) will help directly.
+
 ## Install
 
 ```
@@ -28,6 +30,19 @@ curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/migra
 ```
 
 Dry-run first (`--dry-run` before the instance path) to preview the file classification. Full walkthrough: [Migrating to 0.2.0](https://github.com/keepur/hive-docs/blob/main/docs/migrating-to-0.2.md). Downtime is ~5 minutes per instance; the script auto-rolls-back on health-check failure.
+
+## Updating
+
+While we're in beta, the most reliable way to update is to refresh the global CLI **first**, then let it update the running engine:
+
+```
+npm i -g @keepur/hive@latest
+hive update
+```
+
+The order matters. `hive update` is driven by the globally-installed CLI, and an older CLI sometimes can't drive a newer engine layout. Refreshing the CLI first sidesteps that.
+
+If an update doesn't go cleanly, `hive doctor` will tell you what state the install is in, and `hive rollback` swaps back to the previous engine. When in doubt, email [beta@keepur.io](mailto:beta@keepur.io) — we'd rather hear from you early than have you wrestle with it alone.
 
 ## Documentation
 
@@ -59,7 +74,8 @@ hive start --daemon        # Start as background service
 hive stop                  # Stop the service
 hive status                # Service status
 hive doctor [--verbose]    # Health check (with fix hints)
-hive update                # Update to latest version
+hive update                # Update to latest version (see Updating section)
+hive rollback              # Roll back to previous engine
 hive plugin add <pkg>      # Install a plugin
 hive plugin list           # List installed plugins
 hive plugin remove <name>  # Remove a plugin
