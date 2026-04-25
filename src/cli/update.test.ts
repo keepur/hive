@@ -178,11 +178,7 @@ describe("runRollback", () => {
     });
     const { runRollback } = await import("./rollback.js");
     await runRollback();
-    const [, args, callOpts] = mockExecFileSync.mock.calls[0] as [
-      unknown,
-      string[],
-      { env: Record<string, string> },
-    ];
+    const [, args, callOpts] = mockExecFileSync.mock.calls[0] as [unknown, string[], { env: Record<string, string> }];
     expect(callOpts.env.HIVE_SINGLE_INSTANCE).toBe("1");
     expect(callOpts.env.HIVE_SINGLE_ID).toBe("catalyst");
     expect(callOpts.env.HIVE_SINGLE_LOGS).toBe("logs");
