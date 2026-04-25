@@ -506,7 +506,7 @@ export async function runWizard(targetDir: string, templatesDir: string, pkgRoot
   if (installService) {
     try {
       const { startDaemon } = await import("../cli/daemon.js");
-      await startDaemon();
+      await startDaemon(targetDir);
     } catch (err) {
       console.log(`  ⚠ Service installation failed: ${err}`);
       console.log(`     You can start manually: hive start`);
