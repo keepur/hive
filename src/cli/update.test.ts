@@ -20,6 +20,7 @@ vi.mock("node:fs", () => ({
 
 vi.mock("../paths.js", () => ({
   resolveHiveHome: () => "/tmp/test-hive",
+  resolveConfigFile: (home: string) => `${home}/hive.yaml`,
 }));
 
 vi.mock("./update-preflight.js", () => ({
@@ -60,6 +61,39 @@ describe("runUpdate", () => {
     const [, args] = mockExecFileSync.mock.calls[0];
     expect(args).toContain("--tag=0.2.1");
     expect(args).toContain("--instance=dodi");
+  });
+
+  it("passes single-instance env vars to deploy.sh (KPR-70)", async () => {
+    mockReadFileSync.mockImplementation((path: string) => {
+      if (path.includes(".hive/package.json")) return JSON.stringify({ version: "0.2.0" });
+      if (path.endsWith("hive.yaml")) {
+        return `instance:\n  id: catalyst\n  portBase: 3500\n`;
+      }
+      return "";
+    });
+    const { runUpdate } = await import("./update.js");
+    await runUpdate({ tag: "0.2.7" });
+    const callOpts = mockExecFileSync.mock.calls[0][2] as { env: Record<string, string> };
+    expect(callOpts.env.HIVE_SINGLE_INSTANCE).toBe("1");
+    expect(callOpts.env.HIVE_SINGLE_ID).toBe("catalyst");
+    expect(callOpts.env.HIVE_SINGLE_CONFIG).toBe("hive.yaml");
+    expect(callOpts.env.HIVE_SINGLE_LOGS).toBe("logs");
+    expect(callOpts.env.HIVE_SINGLE_ROOT).toBe("/tmp/test-hive");
+    expect(callOpts.env.HIVE_SINGLE_TAG).toBe("0.2.7");
+    // Default port range = portBase..portBase+6 = 3500..3506
+    expect(callOpts.env.HIVE_SINGLE_PORTS).toBe("3500 3501 3502 3503 3504 3505 3506");
+  });
+
+  it("defaults instance id to 'hive' when hive.yaml missing instance.id", async () => {
+    mockReadFileSync.mockImplementation((path: string) => {
+      if (path.includes(".hive/package.json")) return JSON.stringify({ version: "0.2.0" });
+      return "";
+    });
+    const { runUpdate } = await import("./update.js");
+    await runUpdate();
+    const callOpts = mockExecFileSync.mock.calls[0][2] as { env: Record<string, string> };
+    expect(callOpts.env.HIVE_SINGLE_ID).toBe("hive");
+    expect(callOpts.env.HIVE_SINGLE_PORTS).toBe("3100 3101 3102 3103 3104 3105 3106");
   });
 
   it("exits 1 when deploy.sh is missing", async () => {

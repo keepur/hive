@@ -9,7 +9,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/hive}"
-INSTANCES_CONF="$SCRIPT_DIR/instances.conf"
+INSTANCES_CONF="${HIVE_INSTANCES_CONF:-$SCRIPT_DIR/instances.conf}"
+
+# Single-instance mode (KPR-70): when invoked by `hive update` for a customer
+# install, the calling instance passes its own facts via env, and we skip the
+# build-from-source phase + the shipped instances.conf entirely. The instance
+# running the update is the only instance to update — no global registry read.
+SINGLE_INSTANCE_MODE=false
+if [[ "${HIVE_SINGLE_INSTANCE:-}" == "1" ]]; then
+  SINGLE_INSTANCE_MODE=true
+fi
 
 # --- Flags ---
 DRY_RUN=false
@@ -30,30 +39,48 @@ for arg in "$@"; do
   esac
 done
 
-# --- Notification config (from dodi's .env — the primary instance) ---
-# shellcheck source=/dev/null
-source "$DEPLOY_DIR/.env"
-: "${SLACK_BOT_TOKEN:?SLACK_BOT_TOKEN not set in .env}"
-: "${DEVOPS_CHANNEL_ID:?DEVOPS_CHANNEL_ID not set in .env}"
+# --- Notification config ---
+# Source $DEPLOY_DIR/.env if present so SLACK_BOT_TOKEN / DEVOPS_CHANNEL_ID
+# can populate from the dev convention. Customer installs have neither file
+# nor tokens — that's fine; notify() degrades to a silent no-op below.
+if [[ -f "$DEPLOY_DIR/.env" ]]; then
+  # shellcheck source=/dev/null
+  source "$DEPLOY_DIR/.env"
+fi
 
 # --- Load instances ---
 declare -a INSTANCES=()
-while IFS='|' read -r id config _agents_path label logs_dir ports engine_tag; do
-  [[ "$id" =~ ^[[:space:]]*# ]] && continue  # skip comments
-  [[ -z "$id" ]] && continue                  # skip blank lines
-  # Trim whitespace
-  id=$(echo "$id" | xargs)
-  config=$(echo "$config" | xargs)
-  label=$(echo "$label" | xargs)
-  logs_dir=$(echo "$logs_dir" | xargs)
-  ports=$(echo "$ports" | xargs)
-  engine_tag=$(echo "${engine_tag:-}" | xargs)
-  INSTANCES+=("$id|$config|$label|$logs_dir|$ports|$engine_tag")
-done < "$INSTANCES_CONF"
+if $SINGLE_INSTANCE_MODE; then
+  : "${HIVE_SINGLE_ID:?HIVE_SINGLE_ID required in single-instance mode}"
+  : "${HIVE_SINGLE_CONFIG:?HIVE_SINGLE_CONFIG required in single-instance mode}"
+  : "${HIVE_SINGLE_LOGS:?HIVE_SINGLE_LOGS required in single-instance mode}"
+  : "${HIVE_SINGLE_PORTS:?HIVE_SINGLE_PORTS required in single-instance mode}"
+  : "${HIVE_SINGLE_ROOT:?HIVE_SINGLE_ROOT required in single-instance mode}"
+  INSTANCES+=("$HIVE_SINGLE_ID|$HIVE_SINGLE_CONFIG|com.hive.${HIVE_SINGLE_ID}.agent|$HIVE_SINGLE_LOGS|$HIVE_SINGLE_PORTS|${HIVE_SINGLE_TAG:-}")
+else
+  if [[ ! -f "$INSTANCES_CONF" ]]; then
+    echo "ERROR: instances.conf not found at $INSTANCES_CONF"
+    echo "       For single-instance updates, set HIVE_SINGLE_INSTANCE=1 and the HIVE_SINGLE_* env vars."
+    echo "       For multi-instance dev, point HIVE_INSTANCES_CONF at a workspace-level conf."
+    exit 1
+  fi
+  while IFS='|' read -r id config _agents_path label logs_dir ports engine_tag; do
+    [[ "$id" =~ ^[[:space:]]*# ]] && continue  # skip comments
+    [[ -z "$id" ]] && continue                  # skip blank lines
+    # Trim whitespace
+    id=$(echo "$id" | xargs)
+    config=$(echo "$config" | xargs)
+    label=$(echo "$label" | xargs)
+    logs_dir=$(echo "$logs_dir" | xargs)
+    ports=$(echo "$ports" | xargs)
+    engine_tag=$(echo "${engine_tag:-}" | xargs)
+    INSTANCES+=("$id|$config|$label|$logs_dir|$ports|$engine_tag")
+  done < "$INSTANCES_CONF"
 
-if [[ ${#INSTANCES[@]} -eq 0 ]]; then
-  echo "ERROR: No instances found in $INSTANCES_CONF"
-  exit 1
+  if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+    echo "ERROR: No instances found in $INSTANCES_CONF"
+    exit 1
+  fi
 fi
 
 echo "=== Hive Deploy (${#INSTANCES[@]} instances) ==="
@@ -74,6 +101,11 @@ notify() {
   local message="$1"
   if $DRY_RUN; then
     echo "[DRY RUN] notify: $message"
+    return
+  fi
+  # Slack notification is opt-in. Customer installs without devops Slack
+  # tokens silently skip — never fail-closed on a missing notification config.
+  if [[ -z "${SLACK_BOT_TOKEN:-}" || -z "${DEVOPS_CHANNEL_ID:-}" ]]; then
     return
   fi
   local payload
@@ -132,12 +164,17 @@ _normalize_tag() {
 }
 
 # _instance_root <id>
-# Returns the instance root dir: $DEPLOY_DIR/<id> if that dir exists (post-Phase-5
-# per-instance layout), else $DEPLOY_DIR (today's primary-shared-dir layout).
-# Lets deploy.sh be per-instance-dir aware now so Phase 5's migration is a no-op
-# at the script level.
+# Returns the instance root dir. In single-instance mode (KPR-70) the caller
+# tells us via HIVE_SINGLE_ROOT — we don't probe DEPLOY_DIR. Otherwise:
+# $DEPLOY_DIR/<id> if that dir exists (post-Phase-5 per-instance layout), else
+# $DEPLOY_DIR (today's primary-shared-dir layout). Lets deploy.sh be
+# per-instance-dir aware now so Phase 5's migration is a no-op at the script level.
 _instance_root() {
   local id="$1"
+  if $SINGLE_INSTANCE_MODE; then
+    echo "$HIVE_SINGLE_ROOT"
+    return
+  fi
   if [[ -d "$DEPLOY_DIR/$id" ]]; then
     echo "$DEPLOY_DIR/$id"
   else
@@ -330,62 +367,76 @@ fi
 # oscillates between versions on every poll. Compares the configured pins
 # (not the effective tag for this run) so even an explicit --tag override
 # can't sneak past a misconfigured pinning state. Fail fast before any work.
-declare -a _seen_roots=()
-declare -a _seen_pins=()
-for inst in "${INSTANCES[@]}"; do
-  IFS='|' read -r _id _config _label _logs _ports _engine_tag <<< "$inst"
-  _root=$(_instance_root "$_id")
-  _pin="${_engine_tag:-latest}"
-  for i in "${!_seen_roots[@]}"; do
-    if [[ "${_seen_roots[$i]}" == "$_root" && "${_seen_pins[$i]}" != "$_pin" ]]; then
-      echo "ERROR: instances share root '$_root' but pin different ENGINE_TAGs ('${_seen_pins[$i]}' vs '$_pin')." >&2
-      echo "       Set the same ENGINE_TAG for all instances under one root, or migrate them to per-instance dirs (Phase 5)." >&2
-      exit 2
-    fi
+# Skipped in single-instance mode: one row can't conflict with itself.
+if ! $SINGLE_INSTANCE_MODE; then
+  declare -a _seen_roots=()
+  declare -a _seen_pins=()
+  for inst in "${INSTANCES[@]}"; do
+    IFS='|' read -r _id _config _label _logs _ports _engine_tag <<< "$inst"
+    _root=$(_instance_root "$_id")
+    _pin="${_engine_tag:-latest}"
+    for i in "${!_seen_roots[@]}"; do
+      if [[ "${_seen_roots[$i]}" == "$_root" && "${_seen_pins[$i]}" != "$_pin" ]]; then
+        echo "ERROR: instances share root '$_root' but pin different ENGINE_TAGs ('${_seen_pins[$i]}' vs '$_pin')." >&2
+        echo "       Set the same ENGINE_TAG for all instances under one root, or migrate them to per-instance dirs (Phase 5)." >&2
+        exit 2
+      fi
+    done
+    _seen_roots+=("$_root")
+    _seen_pins+=("$_pin")
   done
-  _seen_roots+=("$_root")
-  _seen_pins+=("$_pin")
-done
-unset _seen_roots _seen_pins _id _config _label _logs _ports _engine_tag _root _pin i
+  unset _seen_roots _seen_pins _id _config _label _logs _ports _engine_tag _root _pin i
+fi
 
 # =============================================================================
 # Phase 1: Build (once, in $BUILD_DIR)
 # =============================================================================
+# Skipped in single-instance mode (KPR-70): customer installs consume the
+# published @keepur/hive npm tarball via fetch_engine in Phase 2 — there is no
+# $BUILD_DIR, no `deploy` branch, nothing to rebuild from source.
 
-echo ""
-echo "--- Phase 1: Build ---"
-# Per-instance current versions are reported in Phase 2 after each health check.
+DEPLOY_SHA=""
+DEPLOY_MSG=""
 
-echo "Pulling latest in build dir..."
-cd "$BUILD_DIR"
-[[ "$(git branch --show-current)" == "deploy" ]] || { echo "ERROR: Build dir not on deploy branch"; exit 1; }
-run_cmd git pull --ff-only
+if $SINGLE_INSTANCE_MODE; then
+  echo ""
+  echo "--- Phase 1: Build (skipped in single-instance mode) ---"
+else
+  echo ""
+  echo "--- Phase 1: Build ---"
+  # Per-instance current versions are reported in Phase 2 after each health check.
 
-DEPLOY_SHA=$(git rev-parse --short HEAD)
-DEPLOY_MSG=$(git log -1 --pretty=%s)
+  echo "Pulling latest in build dir..."
+  cd "$BUILD_DIR"
+  [[ "$(git branch --show-current)" == "deploy" ]] || { echo "ERROR: Build dir not on deploy branch"; exit 1; }
+  run_cmd git pull --ff-only
 
-echo "Installing dependencies..."
-if ! run_cmd npm install; then
-  notify "Deploy aborted. \`npm install\` failed. Commit: \`$DEPLOY_SHA\`."
-  exit 1
-fi
+  DEPLOY_SHA=$(git rev-parse --short HEAD)
+  DEPLOY_MSG=$(git log -1 --pretty=%s)
 
-echo "Running checks..."
-if ! run_cmd npm run check; then
-  notify "Deploy aborted. \`npm run check\` failed. Commit: \`$DEPLOY_SHA\`."
-  exit 1
-fi
+  echo "Installing dependencies..."
+  if ! run_cmd npm install; then
+    notify "Deploy aborted. \`npm install\` failed. Commit: \`$DEPLOY_SHA\`."
+    exit 1
+  fi
 
-echo "Building..."
-if ! run_cmd npm run build; then
-  notify "Deploy aborted. Build failed. Commit: \`$DEPLOY_SHA\`."
-  exit 1
-fi
+  echo "Running checks..."
+  if ! run_cmd npm run check; then
+    notify "Deploy aborted. \`npm run check\` failed. Commit: \`$DEPLOY_SHA\`."
+    exit 1
+  fi
 
-echo "Bundling..."
-if ! run_cmd npm run bundle; then
-  notify "Deploy aborted. Bundle failed. Commit: \`$DEPLOY_SHA\`."
-  exit 1
+  echo "Building..."
+  if ! run_cmd npm run build; then
+    notify "Deploy aborted. Build failed. Commit: \`$DEPLOY_SHA\`."
+    exit 1
+  fi
+
+  echo "Bundling..."
+  if ! run_cmd npm run bundle; then
+    notify "Deploy aborted. Bundle failed. Commit: \`$DEPLOY_SHA\`."
+    exit 1
+  fi
 fi
 
 # =============================================================================
@@ -467,16 +518,22 @@ done
 echo ""
 echo "--- Phase 3: Report ---"
 
+# Build-commit clause appears only in multi-instance mode (Phase 1 ran).
+build_clause=""
+if [[ -n "$DEPLOY_SHA" ]]; then
+  build_clause=" Build commit \`$DEPLOY_SHA\`: $DEPLOY_MSG."
+fi
+
 if [[ ${#FAILED_INSTANCES[@]} -gt 0 ]]; then
   failed_list=$(printf ", %s" "${FAILED_INSTANCES[@]}")
   failed_list=${failed_list:2}
-  notify "Deploy partial. Build commit \`$DEPLOY_SHA\`: $DEPLOY_MSG. Failed instances: $failed_list."
+  notify "Deploy partial.${build_clause} Failed instances: $failed_list."
   echo "Deploy completed with failures: $failed_list"
   exit 1
 else
   # Count actual deploy targets (respecting --instance filter)
   deployed=${#INSTANCES[@]}
   [[ -n "$FILTER_INSTANCE" ]] && deployed=1
-  notify "Deploy succeeded ($deployed instance(s)). Build commit \`$DEPLOY_SHA\`: $DEPLOY_MSG."
+  notify "Deploy succeeded ($deployed instance(s)).${build_clause}"
   echo "Deploy complete. $deployed instance(s) running."
 fi

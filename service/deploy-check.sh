@@ -16,7 +16,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/hive}"
-INSTANCES_CONF="$SCRIPT_DIR/instances.conf"
+# HIVE_INSTANCES_CONF (KPR-70) lets multi-instance dev hosts point at a
+# workspace-level conf outside .hive/, so engine swaps don't wipe their
+# registry. The shipped $SCRIPT_DIR/instances.conf is empty by design.
+INSTANCES_CONF="${HIVE_INSTANCES_CONF:-$SCRIPT_DIR/instances.conf}"
 
 cd "$BUILD_DIR"
 [[ "$(git branch --show-current)" == "deploy" ]] || { echo "ERROR: Build dir not on deploy branch"; exit 1; }
@@ -25,6 +28,11 @@ echo "Checking for updates on deploy branch..."
 git fetch origin deploy --quiet
 
 # --- Load instances ---
+if [[ ! -f "$INSTANCES_CONF" ]]; then
+  echo "ERROR: instances.conf not found at $INSTANCES_CONF"
+  echo "       Set HIVE_INSTANCES_CONF to a workspace-level conf outside .hive/."
+  exit 1
+fi
 declare -a INSTANCES=()
 while IFS='|' read -r id config _agents _label logs_dir ports engine_tag; do
   [[ "$id" =~ ^[[:space:]]*# ]] && continue
@@ -33,6 +41,12 @@ while IFS='|' read -r id config _agents _label logs_dir ports engine_tag; do
   engine_tag=$(echo "${engine_tag:-}" | xargs)
   INSTANCES+=("$id|${engine_tag:-latest}")
 done < "$INSTANCES_CONF"
+
+if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+  echo "No instances registered in $INSTANCES_CONF — nothing to check."
+  echo "(The shipped service/instances.conf is empty by design; multi-instance dev hosts must use HIVE_INSTANCES_CONF.)"
+  exit 0
+fi
 
 UPDATES_NEEDED=()
 for inst in "${INSTANCES[@]}"; do
