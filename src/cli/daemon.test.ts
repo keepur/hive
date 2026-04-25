@@ -69,4 +69,17 @@ describe("daemon helpers (KPR-69)", () => {
     const home = process.env.HOME ?? "/tmp";
     expect(getLaunchAgentLink(tmp)).toBe(join(home, "Library", "LaunchAgents", "com.hive.catalyst.agent.plist"));
   });
+
+  it("getInstanceId honors HIVE_CONFIG to load an alternate config file", () => {
+    writeFileSync(join(tmp, "hive.yaml"), "instance:\n  id: default\n");
+    writeFileSync(join(tmp, "hive-personal.yaml"), "instance:\n  id: personal\n");
+    const prev = process.env.HIVE_CONFIG;
+    process.env.HIVE_CONFIG = "hive-personal.yaml";
+    try {
+      expect(getInstanceId(tmp)).toBe("personal");
+    } finally {
+      if (prev === undefined) delete process.env.HIVE_CONFIG;
+      else process.env.HIVE_CONFIG = prev;
+    }
+  });
 });
