@@ -127,7 +127,6 @@ export async function classifyMeetingMessage(
         maxTurns: 1,
         maxBudgetUsd: 0.01,
         persistSession: false,
-        thinking: { type: "disabled" },
         disallowedTools: [
           "Bash",
           "Read",

@@ -43,7 +43,7 @@ Beyond KAIROS: voice mode (push-to-talk), ULTRAPLAN (offloads to cloud Opus for 
 ### 5. Model Codenames
 
 - Capybara = Claude 4.6 (Sonnet class)
-- Fennec = Opus 4.6
+- Fennec = Opus 4.7
 - Numbat = unreleased, still testing
 - Internal notes: Capybara v8 has 29-30% false claims rate (regression from v4's 16.7%)
 
