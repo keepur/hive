@@ -287,7 +287,7 @@ describe("model router resource limits", () => {
   it("passes resource limits from router to runner.send()", async () => {
     const mockRoute = {
       tier: "opus" as const,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-7",
       costUsd: 0.001,
       durationMs: 50,
       resourceLimits: { timeoutMs: 600_000, maxTurns: 200, budgetUsd: 50 },
@@ -302,7 +302,7 @@ describe("model router resource limits", () => {
       undefined,
       undefined,
       expect.any(Object),
-      "claude-opus-4-6",
+      "claude-opus-4-7",
       mockRoute.resourceLimits,
     );
   });

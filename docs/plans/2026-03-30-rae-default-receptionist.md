@@ -152,7 +152,7 @@ In `agents-templates/chief-of-staff/agent.yaml.tpl`, make these changes:
 id: chief-of-staff
 name: "{{agent.name}}"
 icon: ":briefcase:"
-model: claude-opus-4-6
+model: claude-opus-4-7
 disabled: true
 channels:
   - agent-{{agent.name_lower}}

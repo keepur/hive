@@ -552,7 +552,7 @@ export const MCP_SERVERS = [
 export const MODELS = [
   { id: "claude-haiku-4-5", label: "Haiku", tier: "haiku" },
   { id: "claude-sonnet-4-5", label: "Sonnet", tier: "sonnet" },
-  { id: "claude-opus-4-6", label: "Opus", tier: "opus" },
+  { id: "claude-opus-4-7", label: "Opus", tier: "opus" },
 ];
 ```
 

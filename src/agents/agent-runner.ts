@@ -1262,7 +1262,6 @@ export class AgentRunner {
 
         maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
         maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
-        thinking: { type: "disabled" },
         // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
         // may return arbitrary SDK options, but we explicitly pick only the safe ones
         // so a rogue archetype can't override security invariants (permissionMode,
