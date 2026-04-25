@@ -2,26 +2,29 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { engineDir, hiveHome } from "../paths.js";
 
-function getInstanceId(): string {
+// `hiveHome` is passed explicitly into every helper here — see KPR-69. The
+// previous module-level import from ../paths.js froze hiveHome at import time
+// against process.cwd(), which broke any caller (wizard, future tools) that
+// dynamic-imported this module from a directory without a hive.yaml.
+export function getInstanceId(hiveHome: string): string {
   const configPath = resolve(hiveHome, process.env.HIVE_CONFIG ?? "hive.yaml");
   if (!existsSync(configPath)) return "hive";
   const config = parseYaml(readFileSync(configPath, "utf-8")) ?? {};
   return (config.instance?.id as string) ?? "hive";
 }
 
-function getLabel(): string {
-  return `com.hive.${getInstanceId()}.agent`;
+export function getLabel(hiveHome: string): string {
+  return `com.hive.${getInstanceId(hiveHome)}.agent`;
 }
 
-function getPlistPath(): string {
-  return resolve(hiveHome, "service", `${getLabel()}.plist`);
+export function getPlistPath(hiveHome: string): string {
+  return resolve(hiveHome, "service", `${getLabel(hiveHome)}.plist`);
 }
 
-function getLaunchAgentLink(): string {
+export function getLaunchAgentLink(hiveHome: string): string {
   const home = process.env.HOME ?? "/tmp";
-  return resolve(home, "Library", "LaunchAgents", `${getLabel()}.plist`);
+  return resolve(home, "Library", "LaunchAgents", `${getLabel(hiveHome)}.plist`);
 }
 
 export function buildPlist(opts: {
@@ -81,12 +84,13 @@ export function buildPlist(opts: {
 `;
 }
 
-export async function startDaemon(): Promise<void> {
-  const label = getLabel();
-  const plistPath = getPlistPath();
-  const linkPath = getLaunchAgentLink();
+export async function startDaemon(hiveHome: string): Promise<void> {
+  const label = getLabel(hiveHome);
+  const plistPath = getPlistPath(hiveHome);
+  const linkPath = getLaunchAgentLink(hiveHome);
   const serviceDir = resolve(hiveHome, "service");
   const logsDir = resolve(hiveHome, "logs");
+  const engineDir = resolve(hiveHome, ".hive");
 
   mkdirSync(serviceDir, { recursive: true });
   mkdirSync(logsDir, { recursive: true });
@@ -125,9 +129,9 @@ export async function startDaemon(): Promise<void> {
   }
 }
 
-export async function stopDaemon(): Promise<void> {
-  const linkPath = getLaunchAgentLink();
-  const label = getLabel();
+export async function stopDaemon(hiveHome: string): Promise<void> {
+  const linkPath = getLaunchAgentLink(hiveHome);
+  const label = getLabel(hiveHome);
 
   if (!existsSync(linkPath)) {
     console.log(`No LaunchAgent found for ${label}`);

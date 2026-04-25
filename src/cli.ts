@@ -124,7 +124,7 @@ switch (command) {
     const hiveHome = ensureHiveInstallOrExit();
     if (values.daemon) {
       const { startDaemon } = await import("./cli/daemon.js");
-      await startDaemon();
+      await startDaemon(hiveHome);
     } else {
       const { execFileSync } = await import("node:child_process");
       const serverPath = existsSync(resolve(PKG_ROOT, "pkg", "server.min.js"))
@@ -139,7 +139,7 @@ switch (command) {
   }
   case "stop": {
     const { stopDaemon } = await import("./cli/daemon.js");
-    await stopDaemon();
+    await stopDaemon(resolveHiveHome());
     break;
   }
   case "status": {
