@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { resolveHiveHome } from "../paths.js";
+import { deriveSingleInstanceEnv } from "./single-instance-env.js";
 
 function readEngineVersion(engineDir: string): string {
   try {
@@ -18,8 +19,9 @@ export interface RollbackOptions {
 
 /**
  * Shell out to deploy.sh --rollback to swap .hive ↔ .hive.prev.
- * --instance=<id> is required at the shell layer; we surface the instance
- * defaulting to HIVE_HOME's basename when not specified.
+ * --instance=<id> is required at the shell layer; defaults to the instance.id
+ * from hive.yaml (via HIVE_SINGLE_ID) so the arg matches the row deploy.sh
+ * sees in single-instance mode. An explicit opts.instance still wins.
  */
 export async function runRollback(opts: RollbackOptions = {}): Promise<void> {
   const hiveHome = resolveHiveHome();
@@ -36,14 +38,23 @@ export async function runRollback(opts: RollbackOptions = {}): Promise<void> {
     process.exit(1);
   }
 
+  // KPR-70: pass single-instance env so deploy.sh's --rollback short-circuit
+  // can locate the row without reading the (now-empty) shipped instances.conf.
+  // The --instance arg MUST agree with HIVE_SINGLE_ID — basename-derivation
+  // breaks when a custom install path doesn't match the configured instance.id.
+  const singleEnv = deriveSingleInstanceEnv(hiveHome);
+  const instance = opts.instance ?? singleEnv.HIVE_SINGLE_ID;
+
   const fromVersion = readEngineVersion(engineDir);
   const toVersion = readEngineVersion(prevDir);
-  const instance = opts.instance ?? hiveHome.split("/").filter(Boolean).pop() ?? "default";
 
   console.log(`Rolling back ${instance}: ${fromVersion} → ${toVersion}`);
 
   try {
-    execFileSync(deployScript, ["--rollback", `--instance=${instance}`], { stdio: "inherit" });
+    execFileSync(deployScript, ["--rollback", `--instance=${instance}`], {
+      stdio: "inherit",
+      env: { ...process.env, ...singleEnv },
+    });
   } catch {
     console.error("Rollback failed. See deploy.sh output above.");
     process.exit(1);

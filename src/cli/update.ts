@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { resolveHiveHome } from "../paths.js";
 import { relocateBetaPlugins } from "./update-preflight.js";
+import { deriveSingleInstanceEnv } from "./single-instance-env.js";
 
 function readInstalledVersion(engineDir: string): string {
   try {
@@ -52,8 +53,17 @@ export async function runUpdate(opts: UpdateOptions = {}): Promise<void> {
   const args = ["--tag=" + tag];
   if (opts.instance) args.push("--instance=" + opts.instance);
 
+  // KPR-70: always run deploy.sh in single-instance mode from `hive update`.
+  // The instance running the update is the only instance to update — we don't
+  // read the engine-shipped instances.conf (which historically carried our dev
+  // dodi/personal rows and broke every customer install).
+  const singleEnv = deriveSingleInstanceEnv(hiveHome, tag);
+
   try {
-    execFileSync(deployScript, args, { stdio: "inherit" });
+    execFileSync(deployScript, args, {
+      stdio: "inherit",
+      env: { ...process.env, ...singleEnv },
+    });
   } catch {
     console.error("Update failed. See deploy.sh output above.");
     process.exit(1);
