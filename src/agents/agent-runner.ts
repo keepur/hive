@@ -184,6 +184,8 @@ function mcpPath(devSubpath: string): string {
 
 export class AgentRunner {
   static registryRef?: import("./agent-registry.js").AgentRegistry;
+  static teamApiRef: import("../team-roster/team-api.js").TeamApi | null = null;
+  static teamMcpServerRef: import("@anthropic-ai/claude-agent-sdk").McpSdkServerConfigWithInstance | null = null;
 
   private agentConfig: AgentConfig;
   private memoryManager: MemoryManager;

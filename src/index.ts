@@ -127,6 +127,16 @@ async function main(): Promise<void> {
   await registry.load();
   log.info("Agent registry loaded", { agents: registry.listIds() });
 
+  // Team-roster module — built-in tools + system-prompt summary
+  const { initTeamRoster } = await import("./team-roster/index.js");
+  const teamRoster = await initTeamRoster({ db, registry });
+  log.info("Team roster initialized");
+
+  // Expose TeamApi + MCP server to AgentRunner via static refs (mirrors registryRef pattern)
+  const { AgentRunner: AgentRunnerEarly } = await import("./agents/agent-runner.js");
+  AgentRunnerEarly.teamApiRef = teamRoster.api;
+  AgentRunnerEarly.teamMcpServerRef = teamRoster.mcpServer;
+
   // Initialize core systems
   const memoryManager = new MemoryManager(config.mongo.uri, config.mongo.dbName);
   await memoryManager.init();
@@ -547,6 +557,7 @@ async function main(): Promise<void> {
     retentionSweeper.stop();
     adminApi?.stop();
     registry.stopWatching();
+    teamRoster.shutdown();
     await smsAdapter.stop();
     if (slackInternalApi) await slackInternalApi.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
