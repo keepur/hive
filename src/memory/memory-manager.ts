@@ -54,7 +54,7 @@ export class MemoryManager {
   }
 
   async list(relativePath: string): Promise<string[]> {
-    // List files under a directory prefix (e.g. "agents/chief-of-staff/")
+    // List files under a directory prefix (e.g. "agents/mokie/")
     const prefix = relativePath.endsWith("/") ? relativePath : relativePath + "/";
     const docs = await this.collection
       .find({ path: { $regex: `^${escapeRegex(prefix)}[^/]+$` } })
