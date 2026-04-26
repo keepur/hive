@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
 import { toAgentConfig, AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import type { Collection } from "mongodb";
@@ -363,5 +363,42 @@ describe("origin routing", () => {
     docs[0] = makeDefinition({ _id: "production-support", name: "Sige", catches: ["dodi-shop"] });
     await registry.load();
     expect(registry.findByOrigin("dodi-shop")?.id).toBe("production-support");
+  });
+});
+
+describe("AgentRegistry post-reload subscribers", () => {
+  it("onPostReload handlers fire after load() commits state", async () => {
+    const reg = new AgentRegistry(
+      makeFakeCollection([makeDefinition({ _id: "rae", name: "Rae" })]),
+    );
+    let observedIds: string[] = [];
+    reg.onPostReload(() => {
+      // listIds() observable inside the handler — state already committed
+      observedIds = reg.listIds();
+    });
+    await reg.load();
+    expect(observedIds).toEqual(["rae"]);
+  });
+
+  it("multiple handlers all fire", async () => {
+    const reg = new AgentRegistry(makeFakeCollection([]));
+    const a = vi.fn();
+    const b = vi.fn();
+    reg.onPostReload(a);
+    reg.onPostReload(b);
+    await reg.load();
+    expect(a).toHaveBeenCalledOnce();
+    expect(b).toHaveBeenCalledOnce();
+  });
+
+  it("a throwing handler does not prevent later handlers from firing", async () => {
+    const reg = new AgentRegistry(makeFakeCollection([]));
+    const second = vi.fn();
+    reg.onPostReload(() => {
+      throw new Error("boom");
+    });
+    reg.onPostReload(second);
+    await reg.load();
+    expect(second).toHaveBeenCalledOnce();
   });
 });
