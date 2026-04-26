@@ -21,6 +21,13 @@ interface PhoneEntry {
   label: string; // Primary, Mobile, Work, etc.
 }
 
+export type ContactCategory =
+  | "team-human"
+  | "customer"
+  | "vendor"
+  | "partner"
+  | "archived";
+
 interface ContactDoc {
   _id: ObjectId;
   name: string;
@@ -30,6 +37,8 @@ interface ContactDoc {
   phones: PhoneEntry[];
   company?: string;
   role?: string;
+  pronouns?: string;
+  category?: ContactCategory;
   tags: string[];
   notes?: string;
   source: string; // e.g. crm, sms, email, manual
@@ -67,6 +76,8 @@ function formatContact(c: ContactDoc): string {
   lines.push(`Name: ${c.name}`);
   if (c.company) lines.push(`Company: ${c.company}`);
   if (c.role) lines.push(`Role: ${c.role}`);
+  if (c.pronouns) lines.push(`Pronouns: ${c.pronouns}`);
+  if (c.category) lines.push(`Category: ${c.category}`);
   if (c.email) lines.push(`Email: ${c.email}`);
   if (c.phones.length) {
     lines.push(`Phone: ${c.phones.map((p) => `${p.label}: ${p.formatted}`).join(", ")}`);
@@ -196,9 +207,14 @@ server.registerTool(
       role: z.string().optional().describe("Job title or role"),
       tags: z.array(z.string()).optional().describe("Tags (e.g. homeowner, contractor, designer)"),
       notes: z.string().optional().describe("Free-text notes about this contact"),
+      pronouns: z.string().optional().describe("Pronouns (e.g. she/her, they/them)"),
+      category: z
+        .enum(["team-human", "customer", "vendor", "partner", "archived"])
+        .optional()
+        .describe("Contact category — set 'team-human' for current team members"),
     },
   },
-  async ({ firstName, lastName, email, phone, company, role, tags, notes }) => {
+  async ({ firstName, lastName, email, phone, company, role, tags, notes, pronouns, category }) => {
     try {
       await ensureConnected();
       const name = [firstName, lastName].filter(Boolean).join(" ") || email?.split("@")[0] || "Unknown";
@@ -218,6 +234,8 @@ server.registerTool(
         phones,
         company: company || undefined,
         role: role || undefined,
+        pronouns: pronouns || undefined,
+        category: category ?? undefined,
         tags: tags || [],
         notes: notes || undefined,
         source: "manual",
@@ -248,9 +266,14 @@ server.registerTool(
       role: z.string().optional().describe("Job title or role"),
       tags: z.array(z.string()).optional().describe("Tags to set (replaces existing)"),
       notes: z.string().optional().describe("Notes (replaces existing)"),
+      pronouns: z.string().optional().describe("Pronouns (replaces existing)"),
+      category: z
+        .enum(["team-human", "customer", "vendor", "partner", "archived"])
+        .optional()
+        .describe("Contact category"),
     },
   },
-  async ({ id, firstName, lastName, email, phone, company, role, tags, notes }) => {
+  async ({ id, firstName, lastName, email, phone, company, role, tags, notes, pronouns, category }) => {
     try {
       await ensureConnected();
       const updates: Record<string, any> = { updatedAt: new Date() };
@@ -261,6 +284,8 @@ server.registerTool(
       if (role !== undefined) updates.role = role;
       if (tags !== undefined) updates.tags = tags;
       if (notes !== undefined) updates.notes = notes;
+      if (pronouns !== undefined) updates.pronouns = pronouns;
+      if (category !== undefined) updates.category = category;
 
       if (firstName !== undefined || lastName !== undefined) {
         const existing = await contacts.findOne({ _id: new ObjectId(id) });
