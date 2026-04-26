@@ -135,7 +135,7 @@ async function main(): Promise<void> {
     }
 
     // Phase A3: embedded / structural fields that aren't simple equality.
-    const embeddedStats = await migrateEmbeddedReferences(db, dryRun);
+    const embeddedStats = await migrateEmbeddedReferences(client, db, dryRun);
     stats.push(...embeddedStats);
 
     console.log("\n=== MongoDB migration ===");
@@ -270,13 +270,13 @@ async function migrateNonIdField(
  * cover. Each handler returns a `MigrationStats` row so totals roll up
  * cleanly.
  */
-async function migrateEmbeddedReferences(db: Db, dryRun: boolean): Promise<MigrationStats[]> {
+async function migrateEmbeddedReferences(client: MongoClient, db: Db, dryRun: boolean): Promise<MigrationStats[]> {
   const out: MigrationStats[] = [];
   out.push(await migrateMemoryPaths(db, "memory", dryRun));
   out.push(await migrateMemoryPaths(db, "memory_versions", dryRun));
   out.push(await migrateTeamMessagesSenderId(db, dryRun));
-  out.push(await migrateTeamChannels(db, dryRun));
-  out.push(await migrateSessionIds(db, dryRun));
+  out.push(await migrateTeamChannels(client, db, dryRun));
+  out.push(await migrateSessionIds(client, db, dryRun));
   out.push(await migrateAgentDefinitionVersionsSnapshotId(db, dryRun));
   return out;
 }
@@ -319,7 +319,7 @@ async function migrateTeamMessagesSenderId(db: Db, dryRun: boolean): Promise<Mig
  * referenced anywhere on the doc, materialize a renamed copy under the new id
  * and remove the old.
  */
-async function migrateTeamChannels(db: Db, dryRun: boolean): Promise<MigrationStats> {
+async function migrateTeamChannels(client: MongoClient, db: Db, dryRun: boolean): Promise<MigrationStats> {
   const coll = db.collection("team_channels");
   let matched = 0;
   let modified = 0;
@@ -361,8 +361,7 @@ async function migrateTeamChannels(db: Db, dryRun: boolean): Promise<MigrationSt
           console.warn(`  ! team_channels: ${newDocId} already exists; skipping rename of ${oldDocId}`);
           continue;
         }
-        await coll.insertOne(replacement as never);
-        await coll.deleteOne({ _id: oldDocId as never });
+        await renameIdInTransaction(client, coll, oldDocId, replacement);
       } else {
         await coll.updateOne({ _id: oldDocId as never }, { $set: updateSet });
       }
@@ -381,7 +380,7 @@ async function migrateTeamChannels(db: Db, dryRun: boolean): Promise<MigrationSt
  * sessions._id is `<agentId>:<threadId>` and sessions.threadId can also embed
  * the agentId at the end (e.g., `team:dm:<userId>:<agentId>`). Rebuild both.
  */
-async function migrateSessionIds(db: Db, dryRun: boolean): Promise<MigrationStats> {
+async function migrateSessionIds(client: MongoClient, db: Db, dryRun: boolean): Promise<MigrationStats> {
   const coll = db.collection("sessions");
   let matched = 0;
   let modified = 0;
@@ -419,8 +418,7 @@ async function migrateSessionIds(db: Db, dryRun: boolean): Promise<MigrationStat
           console.warn(`  ! sessions: ${newDocId} already exists; skipping rename of ${oldDocId}`);
           continue;
         }
-        await coll.insertOne(replacement as never);
-        await coll.deleteOne({ _id: oldDocId as never });
+        await renameIdInTransaction(client, coll, oldDocId as string, replacement);
       } else if (newThreadId !== oldThreadId) {
         await coll.updateOne({ _id: oldDocId as never }, { $set: { threadId: newThreadId } });
       }
@@ -577,6 +575,13 @@ async function validate(db: Db, agentsDir: string): Promise<void> {
     if (sessCount > 0) {
       console.warn(`  ! straggler: sessions._id starts ${oldId}: → ${sessCount} docs`);
       stragglers += sessCount;
+    }
+    const sessTidCount = await db.collection("sessions").countDocuments({
+      threadId: { $regex: `:${escapeRegex(oldId)}$` },
+    } as Record<string, unknown>);
+    if (sessTidCount > 0) {
+      console.warn(`  ! straggler: sessions.threadId ends :${oldId} → ${sessTidCount} docs`);
+      stragglers += sessTidCount;
     }
     const advCount = await db.collection("agent_definition_versions").countDocuments({ "snapshot._id": oldId });
     if (advCount > 0) {
