@@ -244,6 +244,18 @@ export class AgentRunner {
       parts.push(constitution);
     }
 
+    // Team summary — concise live view of the team. Replaces the legacy
+    // shared/business-context.md table. Slotted post-constitution and pre
+    // tool-catalog so identity-context (constitution + team) groups together.
+    if (AgentRunner.teamApiRef) {
+      try {
+        const summary = await AgentRunner.teamApiRef.teamSummary();
+        if (summary) parts.push(summary);
+      } catch (err) {
+        log.error("teamSummary threw — omitting team block", { error: String(err) });
+      }
+    }
+
     // --- Semi-static (stable within a session, changes on restart) ---
 
     // Inject core server summaries so the agent knows what tools it has directly
@@ -814,6 +826,15 @@ export class AgentRunner {
       },
     };
 
+    // Team-roster MCP — in-process SDK server (createSdkMcpServer). Shares
+    // closure with engine TeamApi so tool calls and internal calls hit the
+    // same cache. Built once at module init in src/index.ts.
+    if (AgentRunner.teamMcpServerRef) {
+      servers["team-roster"] = AgentRunner.teamMcpServerRef;
+    } else {
+      log.warn("team-roster MCP server ref not set — agents will not have team_* tools");
+    }
+
     // Workflow MCP server — plan/task management
     if (config.workflow.enabled) {
       servers["workflow"] = {
@@ -874,6 +895,8 @@ export class AgentRunner {
     coreSet.add("schedule");
     // team is an implicit core server — available to all agents unconditionally
     coreSet.add("team");
+    // team-roster is an implicit core server — every agent gets the team API
+    coreSet.add("team-roster");
     // slack is an implicit core server — it's the default comms channel for every agent.
     // The server itself is only built when SLACK_MCP_TOKEN is configured (see buildAllServerConfigs),
     // so this is a no-op for Slack-less instances. Agents that should not post to Slack can be
@@ -936,7 +959,7 @@ export class AgentRunner {
 
   // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory
   private static readonly INFRASTRUCTURE_SERVERS = new Set([
-    "schedule", "structured-memory", "team",
+    "schedule", "structured-memory", "team", "team-roster",
   ]);
 
   // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)

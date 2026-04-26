@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { ContactsWatcher } from "./contacts-watcher.js";
 
+type Handler = (...args: unknown[]) => void;
+
 function fakeCol() {
-  const handlers: Record<string, Function> = {};
+  const handlers: Record<string, Handler> = {};
   const stream = {
-    on: vi.fn((event: string, cb: Function) => {
+    on: vi.fn((event: string, cb: Handler) => {
       handlers[event] = cb;
     }),
     close: vi.fn(async () => {}),
