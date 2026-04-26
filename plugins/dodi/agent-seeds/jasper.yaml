@@ -1,4 +1,4 @@
-_id: vp-engineering
+_id: jasper
 name: VP Engineering
 archetype: software-engineer
 title: VP Engineering
@@ -15,7 +15,7 @@ model: claude-haiku-4-5
 icon: ":wrench:"
 channels:
   - dev
-homeBase: agent-vp-engineering
+homeBase: agent-jasper
 passiveChannels:
   - devops
 keywords:

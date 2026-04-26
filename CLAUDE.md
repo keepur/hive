@@ -144,20 +144,20 @@ Admin MCP tools or the REST API manage agent CRUD. Plugin seeds (`plugins/<name>
 
 | Seed | Model | Role |
 |------|-------|------|
-| vp-engineering | Haiku | Code, builds, engineering backlog |
-| devops | Sonnet | Deploy, CI, monitoring |
-| product-manager | Haiku | Specs, user stories, backlog |
-| marketing-manager | Sonnet | Lead gen, content, market research |
-| customer-success | Sonnet | CRM, customer emails, follow-ups |
-| executive-assistant | Haiku | Receptionist, message routing |
-| product-specialist | Sonnet | Catalog, pricing, product knowledge |
-| production-support | Sonnet | Jobs, orders, manufacturing ops |
-| sdr | Haiku | Outbound outreach, lead qualification |
+| jasper | Haiku | Code, builds, engineering backlog |
+| colt | Sonnet | Deploy, CI, monitoring |
+| chloe | Haiku | Specs, user stories, backlog |
+| river | Sonnet | Lead gen, content, market research |
+| jessica | Sonnet | CRM, customer emails, follow-ups |
+| rae | Haiku | Receptionist, message routing |
+| wyatt | Sonnet | Catalog, pricing, product knowledge |
+| sige | Sonnet | Jobs, orders, manufacturing ops |
+| milo | Haiku | Outbound outreach, lead qualification |
 
 ## Conventions
 
 - **Logging**: `import { createLogger } from "./logging/logger.js"` → `const log = createLogger("module-name")`
-- **Agent IDs**: lowercase with hyphens (`chief-of-staff`, not `chief_of_staff`)
+- **Agent IDs**: lowercase, single-token name-based when possible (`mokie`, `jasper`); hyphens allowed (`chief-of-staff`) but never underscores (`chief_of_staff`)
 - **MCP servers**: stdio subprocesses of agent sessions — each gets env vars (AGENT_ID, CHANNEL_ID, etc.)
 - **Agent identity**: soul (personality) + systemPrompt (role) + memory (MongoDB) — all stored in `agent_definitions` collection
 - **WorkItem**: channel-agnostic message abstraction (text, source, sender, thread, metadata)

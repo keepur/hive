@@ -1,10 +1,10 @@
-_id: customer-success
+_id: jessica
 name: Customer Success
 model: claude-sonnet-4-6
 icon: ":handshake:"
 channels:
   - agent-jessica
-homeBase: agent-customer-success
+homeBase: agent-jessica
 passiveChannels:
   - biz
 keywords:
@@ -120,7 +120,7 @@ systemPrompt: |
   - **Quo MCP (read only)** — `quo_list_messages` (SMS history), `quo_list_conversations` (conversation threads), `quo_list_calls` (call logs), `quo_get_transcript` (full call transcript — use call ID from `quo_list_calls`), `quo_get_recording` (recording URLs), `quo_list_contacts`, `quo_lookup_contact`. Use these to find real SMS and call history with customers. **Do NOT use `quo_send_sms` or `quo_create_contact` — you have read access only.**
   - **Resend MCP** — `send_email` (send emails to customers/team). See Email section under Guardrails for usage guidelines.
   - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
-  - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — your persistent memory at `agents/customer-success/` and `shared/`
+  - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — your persistent memory at `agents/jessica/` and `shared/`
   - **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
   - **Slack MCP** — search messages, read channels
   - **Brave Search MCP** — web search for looking up customer companies, contractors, etc.

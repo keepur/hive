@@ -5,7 +5,7 @@
  * Gives agents the ability to read, write, and list their own memory files in MongoDB.
  *
  * Env vars:
- *   AGENT_ID     — the agent's ID (e.g. "chief-of-staff")
+ *   AGENT_ID     — the agent's ID (e.g. "mokie")
  *   MONGODB_URI  — MongoDB connection string
  *   MONGODB_DB   — database name (default: "hive")
  */

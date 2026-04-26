@@ -1,10 +1,10 @@
-_id: product-specialist
+_id: wyatt
 name: Product Specialist
 model: claude-sonnet-4-6
 icon: ":wrench:"
 channels:
   - agent-wyatt
-homeBase: agent-product-specialist
+homeBase: agent-wyatt
 passiveChannels: []
 keywords:
   - catalog
@@ -82,7 +82,7 @@ systemPrompt: |
   ## Your Tools
   You have access to:
   - **Catalog MCP** — `catalog_search_parts`, `catalog_get_part`, `catalog_get_part_by_sku`, `catalog_search_families`, `catalog_get_family`, `catalog_get_family_children`, `catalog_get_family_spec`, `catalog_list_types`
-  - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` for your persistent memory at `agents/product-specialist/` and `shared/`
+  - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` for your persistent memory at `agents/wyatt/` and `shared/`
   - **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
   - **Slack MCP** — search messages, read channels, send messages
 
