@@ -331,7 +331,7 @@ Two manual steps required before restart:
    ```
    Without this, all outbound agent email silently stops being BCC'd.
 
-2. **Migrate legacy `dodiOpsMode` on existing agent documents.** The field moved from a typed top-level field into `metadata.dodiOpsMode`. Existing Mongo docs still have the old shape; without migration, `production-support` silently loses its readonly mode on dodi-ops.
+2. **Migrate legacy `dodiOpsMode` on existing agent documents.** The field moved from a typed top-level field into `metadata.dodiOpsMode`. Existing Mongo docs still have the old shape; without migration, `sige` silently loses its readonly mode on dodi-ops.
    ```bash
    node scripts/migrate-agent-metadata.mjs
    ```
