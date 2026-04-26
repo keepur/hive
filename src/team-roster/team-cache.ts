@@ -6,7 +6,7 @@ import { createLogger } from "../logging/logger.js";
 const log = createLogger("team-roster:cache");
 const TTL_MS = 60_000;
 
-interface ContactRow {
+export interface ContactRow {
   _id: { toHexString(): string };
   name: string;
   firstName?: string;
@@ -44,7 +44,11 @@ export class TeamCache {
 
   async getHumans(): Promise<TeamMember[]> {
     if (this.isFresh(this.humans)) return this.humans.data!;
-    const rows = await this.contactsCol.find({ category: { $in: ["team-human", "archived"] } }).toArray();
+    // Only `team-human` — `archived` is shared with deduped customer rows
+    // from the migration script and isn't reliably "former team-human".
+    // includeArchived on the humans slice is a no-op; team membership is
+    // live data per spec, not history.
+    const rows = await this.contactsCol.find({ category: "team-human" }).toArray();
     const data: TeamMember[] = rows.map((c) => ({
       kind: "human",
       id: c._id.toHexString(),
@@ -52,8 +56,8 @@ export class TeamCache {
       email: c.email ?? undefined,
       role: c.role,
       pronouns: c.pronouns,
-      category: c.category === "archived" ? "archived" : "team-human",
-      active: c.category !== "archived",
+      category: "team-human",
+      active: true,
     }));
     this.humans = { data, populatedAt: Date.now() };
     return data;

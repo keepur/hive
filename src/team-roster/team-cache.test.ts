@@ -58,11 +58,11 @@ describe("TeamCache", () => {
     expect(col.find).toHaveBeenCalledTimes(2);
   });
 
-  it("filters humans by category in the Mongo query (only team-human and archived)", async () => {
+  it("filters humans by category in the Mongo query (team-human only — archived excluded since it's shared with deduped customer rows)", async () => {
     const col = fakeContactsCol([]);
     const cache = new TeamCache(col, fakeRegistry([]));
     await cache.getHumans();
-    expect(col.find).toHaveBeenCalledWith({ category: { $in: ["team-human", "archived"] } });
+    expect(col.find).toHaveBeenCalledWith({ category: "team-human" });
   });
 
   it("agents slice maps homeBase → slackChannel and disabled → archived", async () => {

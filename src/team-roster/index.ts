@@ -1,4 +1,6 @@
 import type { Db } from "mongodb";
+import type { ContactRow } from "./team-cache.js";
+import type { Collection } from "mongodb";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { TeamCache } from "./team-cache.js";
@@ -26,9 +28,12 @@ export interface TeamRosterHandle {
  *   - agent-registry onPostReload subscriber → invalidates agents slice
  */
 export async function initTeamRoster(deps: { db: Db; registry: AgentRegistry }): Promise<TeamRosterHandle> {
-  // Use the loosely-typed Collection here — TeamCache accepts the row shape via
-  // a structural ContactRow interface (subset of full ContactDoc).
-  const contactsCol = deps.db.collection("contacts") as any;
+  // TeamCache accepts the row shape via a structural ContactRow interface
+  // (subset of full ContactDoc). Cast at the boundary: ContactRow has a
+  // duck-typed `_id: { toHexString(): string }` that doesn't satisfy Mongo's
+  // ObjectId invariant, so we go through `unknown` rather than `any` —
+  // explicit escape hatch instead of leaking `any` further into the module.
+  const contactsCol = deps.db.collection("contacts") as unknown as Collection<ContactRow>;
   const cache = new TeamCache(contactsCol, deps.registry);
   const api = new TeamApi(cache);
   const mcpServer = buildTeamRosterMcpServer(api);
