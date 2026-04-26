@@ -21,12 +21,7 @@ interface PhoneEntry {
   label: string; // Primary, Mobile, Work, etc.
 }
 
-export type ContactCategory =
-  | "team-human"
-  | "customer"
-  | "vendor"
-  | "partner"
-  | "archived";
+export type ContactCategory = "team-human" | "customer" | "vendor" | "partner" | "archived";
 
 interface ContactDoc {
   _id: ObjectId;

@@ -16,7 +16,9 @@
   "include": [
     "scripts/agent-id-rename-map.ts",
     "scripts/migrate-agent-ids.ts",
-    "scripts/migrate-agent-ids.test.ts"
+    "scripts/migrate-agent-ids.test.ts",
+    "scripts/migrate-contacts-categories.ts",
+    "scripts/migrate-contacts-categories.test.ts"
   ],
   "exclude": ["node_modules"]
 }

@@ -11,29 +11,37 @@ function fakeCache(humans: TeamMember[], agents: TeamMember[], aliases: Record<s
 }
 
 const human = (over: Partial<TeamMember> = {}): TeamMember => ({
-  kind: "human", id: "h1", name: "May", email: "may@dodihome.com",
-  category: "team-human", active: true, ...over,
+  kind: "human",
+  id: "h1",
+  name: "May",
+  email: "may@dodihome.com",
+  category: "team-human",
+  active: true,
+  ...over,
 });
 const agent = (over: Partial<TeamMember> = {}): TeamMember => ({
-  kind: "agent", id: "mokie", agentId: "mokie", name: "Mokie",
-  category: "team-agent", active: true, ...over,
+  kind: "agent",
+  id: "mokie",
+  agentId: "mokie",
+  name: "Mokie",
+  category: "team-agent",
+  active: true,
+  ...over,
 });
 
 describe("TeamApi", () => {
   it("getTeam excludes archived by default", async () => {
-    const api = new TeamApi(fakeCache(
-      [human(), human({ id: "h2", name: "Konstantin", category: "archived", active: false })],
-      [],
-    ));
+    const api = new TeamApi(
+      fakeCache([human(), human({ id: "h2", name: "Konstantin", category: "archived", active: false })], []),
+    );
     const out = await api.getTeam();
     expect(out.map((m) => m.name)).toEqual(["May"]);
   });
 
   it("getTeam(includeArchived) returns archived too", async () => {
-    const api = new TeamApi(fakeCache(
-      [human(), human({ id: "h2", name: "Konstantin", category: "archived", active: false })],
-      [],
-    ));
+    const api = new TeamApi(
+      fakeCache([human(), human({ id: "h2", name: "Konstantin", category: "archived", active: false })], []),
+    );
     const out = await api.getTeam({ includeArchived: true });
     expect(out.length).toBe(2);
   });
@@ -63,10 +71,7 @@ describe("TeamApi", () => {
   });
 
   it("lookupHuman ignores non-team-human records (defensive)", async () => {
-    const api = new TeamApi(fakeCache(
-      [human({ category: "archived", active: false })],
-      [],
-    ));
+    const api = new TeamApi(fakeCache([human({ category: "archived", active: false })], []));
     expect(await api.lookupHuman({ name: "May" })).toBeNull();
   });
 
@@ -88,10 +93,12 @@ describe("TeamApi", () => {
   });
 
   it("teamSummary renders a markdown table with channel + pronouns", async () => {
-    const api = new TeamApi(fakeCache(
-      [human({ name: "May", role: "CEO", pronouns: "she/her" })],
-      [agent({ name: "Mokie", role: "Chief of Staff", slackChannel: "agent-mokie", pronouns: "she/her" })],
-    ));
+    const api = new TeamApi(
+      fakeCache(
+        [human({ name: "May", role: "CEO", pronouns: "she/her" })],
+        [agent({ name: "Mokie", role: "Chief of Staff", slackChannel: "agent-mokie", pronouns: "she/her" })],
+      ),
+    );
     const out = await api.teamSummary();
     expect(out).toContain("## Team Roster");
     expect(out).toContain("| Name | Role | Channel | Pronouns |");

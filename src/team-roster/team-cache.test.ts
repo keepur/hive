@@ -66,10 +66,13 @@ describe("TeamCache", () => {
   });
 
   it("agents slice maps homeBase → slackChannel and disabled → archived", async () => {
-    const cache = new TeamCache(fakeContactsCol([]), fakeRegistry([
-      mkAgentDef({ _id: "rae", name: "Rae", homeBase: "agent-rae", disabled: false }),
-      mkAgentDef({ _id: "mokie", name: "Mokie", homeBase: "agent-mokie", disabled: true }),
-    ]));
+    const cache = new TeamCache(
+      fakeContactsCol([]),
+      fakeRegistry([
+        mkAgentDef({ _id: "rae", name: "Rae", homeBase: "agent-rae", disabled: false }),
+        mkAgentDef({ _id: "mokie", name: "Mokie", homeBase: "agent-mokie", disabled: true }),
+      ]),
+    );
     const out = await cache.getAgents();
     const rae = out.find((m) => m.id === "rae")!;
     const mokie = out.find((m) => m.id === "mokie")!;

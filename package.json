@@ -41,6 +41,7 @@
     "setup:plugins": "npx tsx setup/sync-plugins.ts",
     "migrate:agents:legacy": "npx tsx setup/migrate-agents.ts",
     "migrate:agent-ids": "npx tsx scripts/migrate-agent-ids.ts",
+    "migrate:contacts-categories": "npx tsx scripts/migrate-contacts-categories.ts",
     "setup:plist": "npx tsx setup/generate-plist.ts",
     "update": "git pull && npm install && npm run build",
     "reindex": "npx tsx scripts/code-index.ts",

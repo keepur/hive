@@ -44,9 +44,7 @@ export class TeamCache {
 
   async getHumans(): Promise<TeamMember[]> {
     if (this.isFresh(this.humans)) return this.humans.data!;
-    const rows = await this.contactsCol
-      .find({ category: { $in: ["team-human", "archived"] } })
-      .toArray();
+    const rows = await this.contactsCol.find({ category: { $in: ["team-human", "archived"] } }).toArray();
     const data: TeamMember[] = rows.map((c) => ({
       kind: "human",
       id: c._id.toHexString(),
