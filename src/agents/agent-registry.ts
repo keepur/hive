@@ -19,11 +19,19 @@ export class AgentRegistry {
   private changeStream: ChangeStream | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastPollTime = new Date(0);
-  private onReload?: () => void;
+  /** Pre-reload trigger — fires when a mutation is detected, used to schedule a debounced reload. */
+  private onChangeDetected?: () => void;
+  /** Post-reload subscribers — fired after `load()` commits new state. Multi-subscriber. */
+  private postReloadHandlers: Array<() => void> = [];
 
-  constructor(agentDefs: Collection<AgentDefinition>, onReload?: () => void) {
+  constructor(agentDefs: Collection<AgentDefinition>, onChangeDetected?: () => void) {
     this.agentDefs = agentDefs;
-    this.onReload = onReload;
+    this.onChangeDetected = onChangeDetected;
+  }
+
+  /** Register a handler called after every successful `load()` (state already committed). */
+  onPostReload(handler: () => void): void {
+    this.postReloadHandlers.push(handler);
   }
 
   async load(): Promise<{ added: string[]; updated: string[]; removed: string[] }> {
@@ -109,6 +117,16 @@ export class AgentRegistry {
 
     this.lastPollTime = new Date();
     this.rebuildOriginIndex();
+
+    // Fire post-reload subscribers AFTER state commit. Errors in one handler
+    // must not prevent others from firing — log and continue.
+    for (const handler of this.postReloadHandlers) {
+      try {
+        handler();
+      } catch (err) {
+        log.error("onPostReload handler threw", { error: String(err) });
+      }
+    }
     return { added, updated, removed };
   }
 
@@ -117,7 +135,7 @@ export class AgentRegistry {
       this.changeStream = this.agentDefs.watch([], { fullDocument: "updateLookup" });
       this.changeStream.on("change", () => {
         log.info("Agent definition changed (change stream), triggering reload");
-        this.onReload?.();
+        this.onChangeDetected?.();
       });
       this.changeStream.on("error", (err) => {
         log.warn("Change stream error, falling back to polling", { error: String(err) });
@@ -139,7 +157,7 @@ export class AgentRegistry {
         });
         if (changed > 0) {
           log.info("Agent definitions changed (poll), triggering reload", { changed });
-          this.onReload?.();
+          this.onChangeDetected?.();
         }
       } catch (err) {
         log.error("Poll check failed", { error: String(err) });
