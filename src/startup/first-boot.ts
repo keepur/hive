@@ -15,7 +15,7 @@ import type { WorkItem } from "../types/work-item.js";
 const log = createLogger("first-boot");
 
 const FLAG_PATH = "hive/first-boot-greeting-sent";
-const COS_AGENT_ID = "chief-of-staff";
+const COS_AGENT_ID = process.env.DEFAULT_AGENT ?? "chief-of-staff";
 
 export async function checkFirstBoot(
   memoryManager: MemoryManager,
