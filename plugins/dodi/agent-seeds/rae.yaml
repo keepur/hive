@@ -1,10 +1,10 @@
-_id: executive-assistant
+_id: rae
 name: Executive Assistant
 model: claude-haiku-4-5
 icon: ":incoming_envelope:"
 channels:
   - general
-homeBase: agent-executive-assistant
+homeBase: agent-rae
 passiveChannels: []
 keywords: []
 isDefault: true

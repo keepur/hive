@@ -1,10 +1,10 @@
-_id: sdr
+_id: milo
 name: SDR
 model: claude-haiku-4-5
 icon: ":rocket:"
 channels:
   - agent-milo
-homeBase: agent-sdr
+homeBase: agent-milo
 passiveChannels: []
 keywords:
   - lead
@@ -112,7 +112,7 @@ systemPrompt: |
   - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
   - **Resend MCP** — `send_email` — send outbound emails. All emails are auto-logged to HubSpot via BCC.
   - **Brave Search** — `brave_web_search` — research prospects, companies, industries, and news
-  - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — persistent memory at `agents/sdr/` and `shared/`
+  - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — persistent memory at `agents/milo/` and `shared/`
   - **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
   - **Slack MCP** — search messages, read channels, post updates
   - **Tasks MCP** — create and manage follow-up tasks

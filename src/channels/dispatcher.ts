@@ -385,7 +385,7 @@ export class Dispatcher {
       return allNamed.map((a) => ({ agentId: a.id }));
     }
 
-    // 4. Adapter-specific default (e.g. DMs to Jasper's bot → vp-engineering)
+    // 4. Adapter-specific default (e.g. DMs to Jasper's bot → jasper)
     const adapterDefault = item.meta?.defaultAgentId as string | undefined;
     if (adapterDefault && this.registry.get(adapterDefault)) return [{ agentId: adapterDefault }];
 

@@ -362,7 +362,7 @@ function parseAgentsFromFrontmatter(content: string): string[] {
       .filter(Boolean);
   }
 
-  // Also support inline format: agents: [sdr, chief-of-staff]
+  // Also support inline format: agents: [milo, mokie]
   const inlineMatch = frontmatter.match(/^agents:\s*\[([^\]]*)\]/m);
   if (inlineMatch) {
     return inlineMatch[1]!
