@@ -1,4 +1,12 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+// model-router.ts imports ../config.js, which reads required env vars (e.g.
+// SLACK_APP_TOKEN) at module load. These tests only exercise pure helpers, so
+// stub config.js so the suite runs without any env wiring.
+vi.mock("../config.js", () => ({
+  config: {},
+}));
+
 import { resolveResourceLimits, RESOURCE_TIER_DEFAULTS } from "./model-router.js";
 
 describe("resolveResourceLimits", () => {
