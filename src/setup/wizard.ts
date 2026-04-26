@@ -24,6 +24,17 @@ import { seedsDir } from "../paths.js";
 let ENV_PATH = "";
 let HIVE_YAML_PATH = "";
 
+/**
+ * The "Chief of Staff" agent's ID for the current install. Defaults to the
+ * legacy `chief-of-staff` literal so fresh-install behaviour is unchanged;
+ * KPR-88 renamed deployed instances to name-based IDs (e.g. `mokie`) but the
+ * default seed still ships under `chief-of-staff` and existing fresh-install
+ * paths keep that name.
+ */
+function resolveCosAgentId(): string {
+  return process.env.DEFAULT_AGENT ?? "chief-of-staff";
+}
+
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
 function ask(question: string, defaultVal = ""): Promise<string> {
@@ -147,7 +158,8 @@ async function isAgentDone(): Promise<boolean> {
     const client = new MongoClient(process.env.MONGODB_URI ?? "mongodb://localhost:27017");
     await client.connect();
     const db = client.db(dbName);
-    const agent = await db.collection("agent_definitions").findOne({ _id: "chief-of-staff" as any });
+    const cosId = resolveCosAgentId();
+    const agent = await db.collection("agent_definitions").findOne({ _id: cosId as any });
     await client.close();
     return !!agent;
   } catch {
@@ -681,13 +693,15 @@ async function doAgent(hive: Record<string, any>): Promise<void> {
   const agentName = await ask("Name your Chief of Staff", "Chief");
   const channelName = await ask("Slack channel for your CoS", `agent-${agentName.toLowerCase()}`);
 
+  const cosId = resolveCosAgentId();
+
   // Store in hive.yaml for constitution rendering
   if (!hive.agents) hive.agents = {};
-  hive.agents["chief-of-staff"] = { name: agentName };
+  hive.agents[cosId] = { name: agentName };
   saveHiveYaml(hive);
 
   // Read seed YAML
-  const seedPath = resolve(seedsDir, "chief-of-staff", "agent.yaml");
+  const seedPath = resolve(seedsDir, cosId, "agent.yaml");
   if (!existsSync(seedPath)) {
     console.log(`  ⚠ Seed not found: ${seedPath}`);
     console.log("  You can seed the agent manually later.");
@@ -740,7 +754,8 @@ async function doAgent(hive: Record<string, any>): Promise<void> {
 async function doConstitution(hive: Record<string, any>) {
   section("Constitution — Chief of Staff Permissions");
 
-  const cosName = hive.agents?.["chief-of-staff"]?.name ?? "Chief of Staff";
+  const cosId = resolveCosAgentId();
+  const cosName = hive.agents?.[cosId]?.name ?? "Chief of Staff";
   const ownerName = hive.business?.owner?.name ?? "you";
   const hasOtherAgents = Object.keys(hive.agents ?? {}).length > 1;
 
