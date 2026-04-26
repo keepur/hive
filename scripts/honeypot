@@ -4,16 +4,21 @@ set -euo pipefail
 # honeypot — macOS Keychain credential wrapper for Hive
 #
 # Stores secrets scoped to the Hive instance under service prefix "hive/<id>/".
+# Also supports a cross-instance "beekeeper/<KEY>" namespace for Beekeeper-tier
+# secrets (e.g. pipelines that run outside any specific Hive instance).
 # The keychain MCP server (keychain-mcp-server.ts) reads these at runtime.
 # Coexists with .env — either source works, Keychain is preferred for new installs.
 #
 # Usage:
-#   honeypot set ANTHROPIC_API_KEY           # prompt for value (hidden input)
-#   honeypot set SLACK_BOT_TOKEN "xoxb-..."  # inline value
-#   honeypot get ANTHROPIC_API_KEY           # print value
-#   honeypot list                            # show stored keys (no values)
-#   honeypot rm ANTHROPIC_API_KEY            # delete
-#   honeypot doctor                          # check required keys are present
+#   honeypot set ANTHROPIC_API_KEY              # instance-scoped, prompts for value
+#   honeypot set SLACK_BOT_TOKEN "xoxb-..."     # instance-scoped, inline value
+#   honeypot set beekeeper/LINEAR_API_KEY       # beekeeper-tier (cross-instance)
+#   honeypot set hive/dodi/SOMETHING "v"        # fully-qualified, used as-is
+#   honeypot get ANTHROPIC_API_KEY              # print value
+#   honeypot get beekeeper/LINEAR_API_KEY       # beekeeper-tier
+#   honeypot list                               # show stored keys (no values)
+#   honeypot rm ANTHROPIC_API_KEY               # delete
+#   honeypot doctor                             # check required keys are present
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -47,6 +52,29 @@ resolve_instance_id() {
 INSTANCE_ID=$(resolve_instance_id)
 PREFIX="hive/${INSTANCE_ID}"
 
+# Resolve the keychain service name (-s) and account (-a) for a given key arg.
+# Sets globals: ACCOUNT_SERVICE, ACCOUNT_NAME
+#
+# Rules:
+#   beekeeper/<KEY>      → service="beekeeper/<KEY>", account="<KEY>"
+#   hive/<id>/<KEY>      → service="hive/<id>/<KEY>", account="<KEY>"
+#   <KEY>                → service="hive/<instance>/<KEY>", account="<KEY>"
+resolve_account() {
+  local key="$1"
+  if [[ "$key" == beekeeper/* ]]; then
+    ACCOUNT_SERVICE="$key"
+    ACCOUNT_NAME="${key#beekeeper/}"
+  elif [[ "$key" == hive/*/* ]]; then
+    ACCOUNT_SERVICE="$key"
+    # Strip "hive/<id>/" — the bit after the second slash is the bare key.
+    local rest="${key#hive/}"
+    ACCOUNT_NAME="${rest#*/}"
+  else
+    ACCOUNT_SERVICE="${PREFIX}/${key}"
+    ACCOUNT_NAME="$key"
+  fi
+}
+
 cmd="${1:-help}"
 shift || true
 
@@ -56,8 +84,10 @@ case "$cmd" in
     value="${2:-}"
     if [ -z "$key" ]; then
       echo "Usage: honeypot set <KEY> [value]"
+      echo "       honeypot set beekeeper/<KEY> [value]"
       exit 1
     fi
+    resolve_account "$key"
     if [ -z "$value" ]; then
       printf "Enter value for %s: " "$key"
       read -rs value
@@ -68,15 +98,15 @@ case "$cmd" in
       fi
     fi
     security add-generic-password \
-      -s "${PREFIX}/${key}" \
-      -a "$key" \
+      -s "$ACCOUNT_SERVICE" \
+      -a "$ACCOUNT_NAME" \
       -w "$value" \
       -U 2>/dev/null || \
     security add-generic-password \
-      -s "${PREFIX}/${key}" \
-      -a "$key" \
+      -s "$ACCOUNT_SERVICE" \
+      -a "$ACCOUNT_NAME" \
       -w "$value"
-    echo -e "${GREEN}+${NC} ${PREFIX}/${key}"
+    echo -e "${GREEN}+${NC} ${ACCOUNT_SERVICE}"
     ;;
 
   get)
@@ -85,11 +115,12 @@ case "$cmd" in
       echo "Usage: honeypot get <KEY>"
       exit 1
     fi
+    resolve_account "$key"
     security find-generic-password \
-      -s "${PREFIX}/${key}" \
-      -a "$key" \
+      -s "$ACCOUNT_SERVICE" \
+      -a "$ACCOUNT_NAME" \
       -w 2>/dev/null || {
-      echo -e "${RED}Not found:${NC} ${PREFIX}/${key}"
+      echo -e "${RED}Not found:${NC} ${ACCOUNT_SERVICE}"
       exit 1
     }
     ;;
@@ -100,27 +131,42 @@ case "$cmd" in
       echo "Usage: honeypot rm <KEY>"
       exit 1
     fi
+    resolve_account "$key"
     security delete-generic-password \
-      -s "${PREFIX}/${key}" \
-      -a "$key" &>/dev/null && \
-      echo -e "${GREEN}-${NC} ${PREFIX}/${key}" || {
-      echo -e "${RED}Not found:${NC} ${PREFIX}/${key}"
+      -s "$ACCOUNT_SERVICE" \
+      -a "$ACCOUNT_NAME" &>/dev/null && \
+      echo -e "${GREEN}-${NC} ${ACCOUNT_SERVICE}" || {
+      echo -e "${RED}Not found:${NC} ${ACCOUNT_SERVICE}"
       exit 1
     }
     ;;
 
   list|ls)
-    echo -e "${DIM}Secrets under ${PREFIX}/:${NC}"
-    echo ""
-    # Extract service names matching our prefix from keychain dump
-    entries=$(security dump-keychain 2>/dev/null | \
+    # Pull all matching service names from the keychain dump once.
+    all_entries=$(security dump-keychain 2>/dev/null | \
       grep "0x00000007" | \
       sed 's/.*<blob>="\([^"]*\)".*/\1/' | \
-      grep "^${PREFIX}/" | \
       sort -u || true)
-    if [ -n "$entries" ]; then
-      echo "$entries" | while IFS= read -r svc; do
+
+    instance_entries=$(echo "$all_entries" | grep "^${PREFIX}/" || true)
+    beekeeper_entries=$(echo "$all_entries" | grep "^beekeeper/" || true)
+
+    echo -e "${DIM}Secrets under ${PREFIX}/:${NC}"
+    echo ""
+    if [ -n "$instance_entries" ]; then
+      echo "$instance_entries" | while IFS= read -r svc; do
         echo "  ${svc#${PREFIX}/}"
+      done
+    else
+      echo "  (none)"
+    fi
+
+    echo ""
+    echo -e "${DIM}Secrets under beekeeper/ (cross-instance):${NC}"
+    echo ""
+    if [ -n "$beekeeper_entries" ]; then
+      echo "$beekeeper_entries" | while IFS= read -r svc; do
+        echo "  ${svc#beekeeper/}"
       done
     else
       echo "  (none)"
@@ -165,15 +211,19 @@ case "$cmd" in
 honeypot — macOS Keychain credential store for Hive
 
 Usage:
-  honeypot set <KEY> [value]    Store a credential (prompts if value omitted)
-  honeypot get <KEY>            Retrieve a credential
-  honeypot list                 Show stored keys (no values)
-  honeypot rm <KEY>             Delete a credential
-  honeypot doctor               Check required credentials are present
-  honeypot help                 This message
+  honeypot set <KEY> [value]            Store an instance-scoped credential
+  honeypot set beekeeper/<KEY> [value]  Store a cross-instance Beekeeper-tier secret
+  honeypot get <KEY>                    Retrieve a credential
+  honeypot list                         Show stored keys (no values)
+  honeypot rm <KEY>                     Delete a credential
+  honeypot doctor                       Check required credentials are present
+  honeypot help                         This message
 
-Credentials are stored in macOS Keychain under "hive/<instance-id>/<KEY>"
-and are readable by the Hive keychain MCP server at runtime.
+Credentials are stored in macOS Keychain under one of:
+  hive/<instance-id>/<KEY>   instance-scoped (default for bare KEY)
+  beekeeper/<KEY>            cross-instance Beekeeper-tier (e.g. pipeline-tick)
+
+Both namespaces are readable by the Hive keychain MCP server at runtime.
 
 HELP
     ;;
