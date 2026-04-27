@@ -228,7 +228,7 @@ function projectText(doc: any): string {
 }
 
 function designText(doc: any): string {
-  const parts = [`Design: ${doc.name || "Unknown"}`];
+  const parts = [`Design ${doc._id}: ${doc.name || "Unknown"}`];
   if (doc.state) parts.push(`Status: ${doc.state}`);
   // Extract useful metadata from spec, skip heavy geometry
   const spec = doc.spec;
