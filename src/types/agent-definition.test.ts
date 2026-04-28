@@ -75,8 +75,12 @@ describe("AGENT_DEFINITION_DEFAULTS", () => {
       "memory",
       "structured-memory",
       "keychain",
-      "event-bus",
       "contacts",
+      "event-bus",
+      "conversation-search",
+      "callback",
+      "schedule",
+      "slack",
     ]);
   });
 

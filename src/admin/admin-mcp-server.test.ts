@@ -253,7 +253,17 @@ describe("agent_create — schema promotion and archetype support", () => {
     });
     expect(res.isError).toBeFalsy();
     const doc = agentDocsStore.get("new-agent");
-    expect(doc.coreServers).toEqual(["memory", "structured-memory", "keychain", "contacts", "event-bus", "conversation-search", "callback", "schedule", "slack"]);
+    expect(doc.coreServers).toEqual([
+      "memory",
+      "structured-memory",
+      "keychain",
+      "contacts",
+      "event-bus",
+      "conversation-search",
+      "callback",
+      "schedule",
+      "slack",
+    ]);
     expect(doc.delegateServers).toEqual([]);
   });
 
