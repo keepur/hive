@@ -89,7 +89,21 @@ export async function syncOperatorSkills(
         continue;
       }
 
-      if (existing.origin?.["base-version"] === clone.headSha) {
+      if (!existing.origin?.["base-version"]) {
+        // Skill matches operator repo URL but lacks base-version (e.g., manually
+        // copied or partially corrupted frontmatter). Don't try to upgrade —
+        // upgradeSkill would throw with a confusing message. Surface as a clear
+        // error so the operator knows to reinstall.
+        result.errors.push({
+          skill: remoteName,
+          error:
+            "origin.source matches operator repo but base-version is missing. " +
+            "Reinstall with 'hive skill add' or remove and re-sync.",
+        });
+        continue;
+      }
+
+      if (existing.origin["base-version"] === clone.headSha) {
         result.upToDate.push(remoteName);
         continue;
       }

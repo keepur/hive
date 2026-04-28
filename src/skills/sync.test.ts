@@ -148,12 +148,7 @@ describe("syncOperatorSkills", () => {
     expect(result.orphaned).toEqual(["ghost"]);
     expect(result.pruned).toEqual(["ghost"]);
     expect(removeSkill).toHaveBeenCalledOnce();
-    expect(removeSkill).toHaveBeenCalledWith(
-      "ghost",
-      expect.stringContaining("skills"),
-      hiveHome,
-      { force: true },
-    );
+    expect(removeSkill).toHaveBeenCalledWith("ghost", expect.stringContaining("skills"), hiveHome, { force: true });
   });
 
   it("dry-run reports actions without performing them", async () => {
@@ -175,6 +170,22 @@ describe("syncOperatorSkills", () => {
 
     const result = await syncOperatorSkills(REPO, hiveHome);
     expect(result.orphaned).toEqual([]);
+  });
+
+  it("reports an error for skills with origin.source matching but missing base-version", async () => {
+    writeCustomerSkill("default", "alpha", {
+      type: "registry",
+      source: REPO,
+      // base-version intentionally omitted
+      modified: false,
+    });
+    vi.mocked(listSkillsInClone).mockReturnValue(["alpha"]);
+
+    const result = await syncOperatorSkills(REPO, hiveHome);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0].skill).toBe("alpha");
+    expect(result.errors[0].error).toMatch(/base-version is missing/);
+    expect(upgradeSkill).not.toHaveBeenCalled();
   });
 
   it("continues sync when a single skill fails", async () => {

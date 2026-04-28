@@ -92,6 +92,7 @@ Commands:
   skill list        List installed skills
   skill upgrade     Upgrade installed skills
   skill remove      Remove an installed skill
+  skill sync        Sync customer-space skills with operatorSkillsRepo
   skill search      Search for skills
   registry add      Add a skill registry
   registry list     List configured registries
