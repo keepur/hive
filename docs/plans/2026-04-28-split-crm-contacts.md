@@ -17,6 +17,7 @@
 | `src/migrations/002-split-crm-contacts.ts` | **Create** | One-time migration: copy `source=hubspot` records from `contacts` → `crm_contacts`, delete originals |
 | `src/migrations/run-migrations.ts` | **Modify** (line 4, 20) | Register migration002 |
 | `src/contacts/import-hubspot.ts` | **Modify** (line 75, collection ref) | Target `crm_contacts` for future imports |
+| `setup/templates/constitution-bootstrap.md.tpl` | **Modify** (append after line 121) | §1.24 tool convention: `contacts` = team roster, `crm_search` = customers |
 
 ---
 
@@ -271,6 +272,65 @@ The contacts MCP server reads from `"contacts"` — verify with a quick agent qu
 mongosh hive_dodi --quiet --eval "db.contacts.find({source: {$ne: 'hubspot'}}).toArray()"
 ```
 Expected: team roster only (May, Mokie, Corey, etc.)
+
+---
+
+## Task 4: Add tool-convention guidance to the shared constitution
+
+Agents that previously relied on `contacts_search` for customer lookups (Milo, Jessica, Sige, Mokie) need a permanent, single-source-of-truth directive. This goes into Section 1 of the constitution template — one update, all agents.
+
+**Files:**
+- Modify: `setup/templates/constitution-bootstrap.md.tpl` (after line 121 — current end of file)
+
+- [ ] **Step 1:** Append a new subsection to `setup/templates/constitution-bootstrap.md.tpl`
+
+The file currently ends after the Group Conversations section. Add after the final `---` separator:
+
+```markdown
+
+### Tool Conventions
+
+1.24. **`contacts` is the team roster, not a customer directory.** Use it to look up internal team members and manually-curated contacts. For HubSpot CRM contacts (customers, leads, prospects), use `crm_search`.
+```
+
+- [ ] **Step 2:** Re-render the constitution into MongoDB for both instances
+
+```bash
+# dodi instance (dev repo, targets hive_dodi via hive.yaml)
+cd ~/github/hive && npm run setup:constitution
+
+# keepur instance
+HIVE_CONFIG=~/services/hive/keepur/hive.yaml npm run setup:constitution
+```
+
+Expected output for each: `Constitution updated` (or similar — Section 2 is preserved, only Section 1 overwrites).
+
+- [ ] **Step 3:** Reload agents on both instances so they pick up the updated constitution
+
+```bash
+# dodi
+launchctl kill SIGUSR1 gui/$(id -u)/com.hive.dodi.agent
+
+# keepur
+launchctl kill SIGUSR1 gui/$(id -u)/com.hive.keepur.agent
+```
+
+- [ ] **Step 4:** Verify the constitution was updated in MongoDB
+
+```bash
+mongosh hive_dodi --quiet --eval "
+  const doc = db.memory.findOne({agentId: 'shared', key: 'constitution'});
+  print(doc?.value?.includes('Tool Conventions') ? 'FOUND' : 'MISSING');
+"
+```
+Expected: `FOUND`
+
+- [ ] **Step 5:** Commit
+
+```bash
+git add setup/templates/constitution-bootstrap.md.tpl
+git commit -m "feat(constitution): §1.24 contacts = team roster, crm_search = customers"
+```
 
 ---
 
