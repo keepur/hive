@@ -75,4 +75,31 @@ export async function runUpdate(opts: UpdateOptions = {}): Promise<void> {
   } else {
     console.log(`Updated: ${fromVersion} → ${toVersion}.`);
   }
+
+  // Post-upgrade skill sync (KPR-82) — opt-in via operatorSkillsRepo config.
+  // Failure here is non-fatal: engine upgrade succeeded; sync can be re-run manually.
+  try {
+    const { config } = await import("../config.js");
+    if (config.operatorSkillsRepo) {
+      console.log("");
+      console.log("Syncing skills from operator repo...");
+      const { syncOperatorSkills } = await import("../skills/sync.js");
+      const result = await syncOperatorSkills(config.operatorSkillsRepo.url, hiveHome);
+      if (result.installed.length || result.upgraded.length) {
+        console.log(
+          `  installed: ${result.installed.length}, upgraded: ${result.upgraded.length}, up-to-date: ${result.upToDate.length}`,
+        );
+      } else {
+        console.log("  all skills up to date");
+      }
+      if (result.errors.length) {
+        console.warn(
+          `  ${result.errors.length} skill(s) failed to sync — re-run 'hive skill sync' manually`,
+        );
+      }
+    }
+  } catch (err) {
+    console.warn(`Post-upgrade skill sync failed (non-fatal): ${err}`);
+    console.warn("Re-run manually with: hive skill sync");
+  }
 }
