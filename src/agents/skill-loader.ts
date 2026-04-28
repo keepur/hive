@@ -6,6 +6,7 @@ import { createLogger } from "../logging/logger.js";
 import { computeContentHash } from "../skills/content-hash.js";
 import { readSkillMd, writeSkillMd } from "../skills/frontmatter.js";
 import { commitToState } from "../skills/instance-git.js";
+import { agentSkillsDir } from "../paths.js";
 
 const log = createLogger("skill-loader");
 
@@ -22,18 +23,33 @@ export function getModifiedSkills(): Set<string> {
 type CollisionEntry = { source: string; path: string };
 
 /**
- * Scan seed-bundled skills, plugin-bundled skills, and customer-space skills,
- * build a map of agentId → SdkPluginConfig[] for that agent's workflows.
+ * Scan seed-bundled skills, plugin-bundled skills, agent-private skills (KPR-75),
+ * and customer-space skills, building a map of agentId → SdkPluginConfig[] for
+ * that agent's workflows.
  *
- * Precedence (high to low): customer > seeds > plugins.
- * Customer space always wins (shadow). Among non-customer sources, first
- * registered wins — seeds are scanned before plugins so they take priority.
- * Customer→customer collisions are errors — neither version loads.
+ * Precedence (high to low): customer > agent-private > seeds = plugins.
+ *
+ * Load-bearing pass-ordering invariant: seeds → plugins → agent-private → customer.
+ * Reordering breaks the customer-shadow-evicts-agent-private logic in scanWorkflowsFrom.
+ *
+ * Customer space always wins (shadow). Among non-customer sources, first registered
+ * wins — seeds are scanned before plugins so they take priority. Customer→customer
+ * collisions are errors. Agent-private skills are scoped per-agent, so two agents
+ * each having the same workflow name is NOT a collision.
+ *
+ * @param customerSkillsDir  e.g. <hiveHome>/skills
+ * @param plugins            loaded plugins (each may contain a skills/ dir)
+ * @param seedDirs           seed directories that may contain skills/
+ * @param agentIds           list of agent IDs to scan agents/<id>/skills/ for (KPR-75)
+ * @param hiveHomeOverride   testability — overrides the runtime hiveHome const for
+ *                           agentSkillsDir() resolution. Production callers omit this.
  */
 export function loadSkillIndex(
   customerSkillsDir: string,
   plugins?: LoadedPlugin[],
   seedDirs?: string[],
+  agentIds?: string[],
+  hiveHomeOverride?: string,
 ): SkillIndex {
   const index: SkillIndex = new Map();
   const universalPlugins: SdkPluginConfig[] = [];
@@ -52,6 +68,23 @@ export function loadSkillIndex(
     const pluginSkillsDir = join(plugin.dir, "skills");
     if (!existsSync(pluginSkillsDir)) continue;
     scanWorkflowsFrom(pluginSkillsDir, plugin.name, collisionMap, index, universalPlugins, false);
+  }
+
+  // Agent-private third (KPR-75) — agent-authored, agent-scoped by path.
+  // Path is source of truth — frontmatter `agents:` is forbidden (hard error).
+  // Local-filesystem-only — never commit, push, or sync these.
+  for (const agentId of agentIds ?? []) {
+    const dir = agentSkillsDir(agentId, hiveHomeOverride);
+    if (!existsSync(dir)) continue;
+    scanWorkflowsFrom(
+      dir,
+      `agent-private:${agentId}`,
+      collisionMap,
+      index,
+      universalPlugins,
+      false,
+      agentId, // implicitAgentScope
+    );
   }
 
   // Customer space last — wins all collisions
@@ -111,11 +144,24 @@ function removeWorkflowFromIndex(
 }
 
 /**
- * Scan one top-level skills directory (plugin or customer), register non-colliding
- * workflows into the index, and append to universalPlugins for hive-wide skills.
+ * Scan one top-level skills directory (plugin, customer, seed, or agent-private),
+ * register non-colliding workflows into the index, and append to universalPlugins
+ * for hive-wide skills.
  *
  * When winsCollisions is true (customer space), collisions with non-customer
  * sources shadow the existing entry. Customer→customer collisions are errors.
+ *
+ * When implicitAgentScope is set (agent-private skills, KPR-75):
+ *   - The collision key becomes per-agent (`<agentId>::<workflow>`), so two
+ *     agents each having the same workflow name is NOT a collision.
+ *   - Frontmatter `agents:` in agent-private skills is a hard error — the path
+ *     is the source of truth.
+ *   - Skills are bound to the implicit-scope agent only.
+ *
+ * When customer pass runs with no implicitAgentScope, after agent scope is
+ * known from frontmatter, also evict any per-agent-keyed entries in
+ * collisionMap+index for those agents — preserves operator authority over
+ * agent-private skills.
  */
 function scanWorkflowsFrom(
   rootDir: string,
@@ -124,6 +170,7 @@ function scanWorkflowsFrom(
   index: SkillIndex,
   universalPlugins: SdkPluginConfig[],
   winsCollisions: boolean,
+  implicitAgentScope?: string,
 ): void {
   let workflows: string[];
   try {
@@ -148,17 +195,20 @@ function scanWorkflowsFrom(
       continue;
     }
 
-    const existing = collisionMap.get(workflow);
+    // Per-agent collision key for agent-private skills; global for the rest.
+    const collisionKey = implicitAgentScope ? `${implicitAgentScope}::${workflow}` : workflow;
+
+    const existing = collisionMap.get(collisionKey);
     if (existing) {
       if (winsCollisions && existing.source !== "customer") {
-        // Customer shadows plugin — remove plugin's entries and replace
+        // Customer shadows plugin/seed — remove their entries and replace
         log.warn("Customer skill shadows plugin-bundled skill", {
           workflow,
           shadowed: existing,
           customer: { source, path: workflowPath },
         });
         removeWorkflowFromIndex(existing.path, index, universalPlugins);
-        collisionMap.set(workflow, { source, path: workflowPath });
+        collisionMap.set(collisionKey, { source, path: workflowPath });
       } else if (winsCollisions && existing.source === "customer") {
         // Customer→customer collision — error, load neither
         log.error("Customer skill collision — both skipped", {
@@ -168,10 +218,10 @@ function scanWorkflowsFrom(
         });
         // Remove the first customer version that was already loaded
         removeWorkflowFromIndex(existing.path, index, universalPlugins);
-        collisionMap.delete(workflow);
+        collisionMap.delete(collisionKey);
         continue;
       } else {
-        // Plugin→plugin collision — first wins
+        // Plugin→plugin or agent-private→agent-private (same agent) collision — first wins
         log.warn("Skill workflow collision — keeping first, skipping second", {
           workflow,
           kept: existing,
@@ -180,7 +230,7 @@ function scanWorkflowsFrom(
         continue;
       }
     } else {
-      collisionMap.set(workflow, { source, path: workflowPath });
+      collisionMap.set(collisionKey, { source, path: workflowPath });
     }
 
     const pluginConfig: SdkPluginConfig = { type: "local", path: workflowPath };
@@ -206,12 +256,47 @@ function scanWorkflowsFrom(
       const skillMd = join(skillsSubdir, skillDir, "SKILL.md");
       if (!existsSync(skillMd)) continue;
 
-      const agents = parseAgentsFromFrontmatter(readFileSync(skillMd, "utf-8"));
-      for (const agent of agents) {
-        if (agent === "all") {
-          hasAll = true;
-        } else {
-          agentIds.add(agent);
+      const declaredAgents = parseAgentsFromFrontmatter(readFileSync(skillMd, "utf-8"));
+
+      if (implicitAgentScope) {
+        // Path is the source of truth for agent-private skills. Frontmatter
+        // `agents:` is forbidden — surfaces a clear error rather than letting
+        // the file silently scope incorrectly.
+        if (declaredAgents.length > 0) {
+          throw new Error(
+            `Agent-private skill at ${skillMd} declares agents: in frontmatter. ` +
+              `For skills under agents/${implicitAgentScope}/skills/, the path is the source of truth — ` +
+              `remove the agents: field.`,
+          );
+        }
+        agentIds.add(implicitAgentScope);
+      } else {
+        for (const agent of declaredAgents) {
+          if (agent === "all") {
+            hasAll = true;
+          } else {
+            agentIds.add(agent);
+          }
+        }
+      }
+    }
+
+    // Customer-shadow eviction: when customer skill is loading and any agent
+    // it scopes to has an agent-private skill of the same workflow name, evict
+    // the agent-private version. Operator authority preserved.
+    if (winsCollisions && !implicitAgentScope) {
+      for (const agentId of agentIds) {
+        const perAgentKey = `${agentId}::${workflow}`;
+        const evicted = collisionMap.get(perAgentKey);
+        if (evicted) {
+          log.warn("Customer-space skill shadows agent-private skill", {
+            workflow,
+            agent: agentId,
+            shadowed: evicted.path,
+            winner: workflowPath,
+          });
+          removeWorkflowFromIndex(evicted.path, index, universalPlugins);
+          collisionMap.delete(perAgentKey);
         }
       }
     }
