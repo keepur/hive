@@ -92,6 +92,9 @@ Commands:
   registry add      Add a skill registry
   registry list     List configured registries
   registry remove   Remove a registry
+  credentials list           Show third-party API keys (Honeypot)
+  credentials add <KEY>      Set or rotate a credential
+  credentials remove <KEY>   Delete a credential
 
 Options:
   --config <path>   Path to hive.yaml
@@ -195,6 +198,14 @@ switch (command) {
     const args = positionals.slice(2);
     const { runRegistry } = await import("./cli/registry.js");
     await runRegistry(subcommand, ...args);
+    break;
+  }
+  case "credentials": {
+    const subcommand = positionals[1];
+    const args = positionals.slice(2);
+    const { runCredentialsCommand } = await import("./cli/credentials.js");
+    const code = await runCredentialsCommand(subcommand, args);
+    process.exit(code);
     break;
   }
   default:
