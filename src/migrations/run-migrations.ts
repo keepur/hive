@@ -1,6 +1,7 @@
 import type { Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import { migration001BackfillHomeBase } from "./001-backfill-home-base.js";
+import { migration002SplitCrmContacts } from "./002-split-crm-contacts.js";
 
 const log = createLogger("migrations");
 
@@ -15,7 +16,7 @@ interface MigrationRecord {
   notes?: string;
 }
 
-export const MIGRATIONS: Migration[] = [migration001BackfillHomeBase];
+export const MIGRATIONS: Migration[] = [migration001BackfillHomeBase, migration002SplitCrmContacts];
 
 export async function runMigrations(db: Db, registry: Migration[] = MIGRATIONS): Promise<void> {
   const coll = db.collection<MigrationRecord>("migrations");
