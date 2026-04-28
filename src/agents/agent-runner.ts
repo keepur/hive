@@ -941,12 +941,11 @@ export class AgentRunner {
    * config-gated.)
    */
   private static autoInjectedServerNames(): ReadonlySet<string> {
-    const set = new Set<string>([
-      "schedule",
-      "structured-memory",
-      "team",
-      "slack",
-    ]);
+    // structured-memory is paired with `memory` (filterCoreServers gates it on
+    // `memory` being in coreServers), so it's not unconditional. Agents with
+    // memory will have structured-memory in their post-filter coreServerNames
+    // and the toolkit will correctly classify it under Capability MCPs.
+    const set = new Set<string>(["schedule", "team", "slack"]);
     if (config.workflow.enabled) set.add("workflow");
     return set;
   }

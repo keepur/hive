@@ -2,18 +2,14 @@ import { describe, it, expect } from "vitest";
 import { buildToolkitSection } from "./toolkit-section.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 
-const AUTO_INJECTED = new Set([
-  "schedule",
-  "structured-memory",
-  "team",
-  "slack",
-]);
+const AUTO_INJECTED = new Set(["schedule", "team", "slack"]);
 
 function bareBonesInput(overrides: Partial<Parameters<typeof buildToolkitSection>[0]> = {}) {
-  // Bare-bones = engine auto-injects only. memory is NOT auto-injected today,
-  // so a true bare-bones agent omits it.
+  // Bare-bones = engine auto-injects only. structured-memory is conditionally
+  // paired with `memory` in filterCoreServers, NOT unconditionally injected,
+  // so a true bare-bones agent (no memory in coreServers) doesn't have it.
   return {
-    coreServerNames: ["schedule", "team", "slack", "structured-memory"],
+    coreServerNames: ["schedule", "team", "slack"],
     delegateServerNames: [],
     plugins: [],
     autoInjectedServers: AUTO_INJECTED,
@@ -35,11 +31,10 @@ describe("buildToolkitSection", () => {
   it("classifies auto-injected servers under 'Engine-provided'", () => {
     const out = buildToolkitSection(bareBonesInput());
     expect(out).toContain("### Engine-provided");
-    // schedule, team, slack, structured-memory are auto-injected
+    // schedule, team, slack are auto-injected
     expect(out).toMatch(/- schedule —/);
     expect(out).toMatch(/- team —/);
     expect(out).toMatch(/- slack —/);
-    expect(out).toMatch(/- structured-memory —/);
   });
 
   it("classifies non-auto-injected coreServers under 'Capability MCPs'", () => {
@@ -59,6 +54,23 @@ describe("buildToolkitSection", () => {
     const scheduleIdx = out.indexOf("- schedule —");
     expect(scheduleIdx).toBeGreaterThan(engineIdx);
     expect(scheduleIdx).toBeLessThan(capIdx);
+  });
+
+  it("classifies structured-memory under 'Capability MCPs' when paired with memory (KPR-87 review fix)", () => {
+    // structured-memory is conditionally paired with `memory` in
+    // filterCoreServers, NOT unconditionally injected. An agent with `memory`
+    // in coreServers gets structured-memory too — and the toolkit must show
+    // it under Capability MCPs (where memory lives), not Engine-provided.
+    const input = bareBonesInput({
+      coreServerNames: ["memory", "structured-memory", "schedule", "team", "slack"],
+    });
+    const out = buildToolkitSection(input);
+    const engineIdx = out.indexOf("### Engine-provided");
+    const capIdx = out.indexOf("### Capability MCPs");
+    const structuredMemIdx = out.indexOf("- structured-memory —");
+    expect(engineIdx).toBeGreaterThanOrEqual(0);
+    expect(capIdx).toBeGreaterThan(engineIdx);
+    expect(structuredMemIdx).toBeGreaterThan(capIdx);
   });
 
   it("emits 'Delegated' subsection when delegates present", () => {
