@@ -71,20 +71,32 @@ export function loadSkillIndex(
   }
 
   // Agent-private third (KPR-75) — agent-authored, agent-scoped by path.
-  // Path is source of truth — frontmatter `agents:` is forbidden (hard error).
+  // Path is source of truth — frontmatter `agents:` is forbidden.
   // Local-filesystem-only — never commit, push, or sync these.
+  //
+  // A bad SKILL.md from one agent must not prevent the hive from booting or
+  // disable other agents' skills. Catch per-agent so the rest of the index
+  // builds normally.
   for (const agentId of agentIds ?? []) {
     const dir = agentSkillsDir(agentId, hiveHomeOverride);
     if (!existsSync(dir)) continue;
-    scanWorkflowsFrom(
-      dir,
-      `agent-private:${agentId}`,
-      collisionMap,
-      index,
-      universalPlugins,
-      false,
-      agentId, // implicitAgentScope
-    );
+    try {
+      scanWorkflowsFrom(
+        dir,
+        `agent-private:${agentId}`,
+        collisionMap,
+        index,
+        universalPlugins,
+        false,
+        agentId, // implicitAgentScope
+      );
+    } catch (err) {
+      log.error("Agent-private skill rejected, skipping this agent's private skills", {
+        agentId,
+        dir,
+        error: String(err),
+      });
+    }
   }
 
   // Customer space last — wins all collisions
