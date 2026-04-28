@@ -130,6 +130,11 @@ npm run test           # Vitest
 npm run check          # All checks (typecheck + lint + format + test)
 npm run embed:hubspot  # Run HubSpot → Qdrant embed pipeline
 npm run embed:dodi     # Run dodi_v2 → Qdrant embed pipeline
+
+# Late-binding credentials (Honeypot, post-bootstrap)
+hive credentials list           # Show curated keys + which are set
+hive credentials add <KEY>      # Set or rotate one (uses curated registry)
+hive credentials remove <KEY>   # Delete one
 ```
 
 ## Agent Anatomy
