@@ -39,5 +39,9 @@ export const migration002SplitCrmContacts = {
       moved,
       skipped,
     });
+
+    if (skipped > 0) {
+      throw new Error(`Migration incomplete: ${skipped} record(s) failed to move — will retry on next boot`);
+    }
   },
 };
