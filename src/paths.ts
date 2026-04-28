@@ -110,3 +110,12 @@ export function agentReportsDir(agentId: string, home: string = hiveHome): strin
 export function agentFeedsDir(agentId: string, home: string = hiveHome): string {
   return resolve(agentsDir(home), agentId, "feeds");
 }
+
+/**
+ * Per-agent private skills directory — KPR-75 4th skill source.
+ * Agent-private, agent-authored, agent-scoped implicitly by path.
+ * Local-filesystem-only — no commit, no push, no sync.
+ */
+export function agentSkillsDir(agentId: string, home: string = hiveHome): string {
+  return resolve(agentsDir(home), agentId, "skills");
+}
