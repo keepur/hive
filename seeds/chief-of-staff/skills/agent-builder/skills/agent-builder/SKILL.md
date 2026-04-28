@@ -151,7 +151,22 @@ Example shape:
 }
 ```
 
-**Do NOT pass `coreServers`.** Phase 1's default (`memory`, `structured-memory`, `keychain`, `event-bus`, `contacts`) applies automatically. Override only if the owner's specifically approved tooling changes the baseline.
+**Do NOT pass `coreServers` unless the role needs additional servers beyond the universal baseline.** The engine default includes all 9 universal servers (memory, structured-memory, keychain, contacts, event-bus, conversation-search, callback, schedule, slack). Only pass `coreServers` to *add* role-specific servers on top — never to shrink the baseline.
+
+### 8b. VALIDATE — universal baseline
+
+After `agent_create` succeeds, verify the agent is correctly set up:
+
+1. Call `agent_get` with the new agent's `_id`
+2. Check `coreServers` includes all 9 universal servers: memory, structured-memory, keychain, contacts, event-bus, conversation-search, callback, schedule, slack
+3. If any are missing, call `config_add` with `field: "coreServers"` and the missing server names
+4. Verify `homeBase` is set (should be `agent-<id>`)
+5. Verify `soul` is non-empty
+6. Verify `systemPrompt` is non-empty
+
+If validation fails on soul or systemPrompt, something went wrong in the creation flow — don't silently proceed. Flag it to the owner.
+
+This step is belt-and-suspenders. The engine defaults should provide universal-9, but defaults can change. Always verify.
 
 ### 9. INTRODUCE — hand-off
 
