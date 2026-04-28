@@ -3,6 +3,7 @@ import { parseSkillSpec, resolveRegistry } from "../skills/registry-resolver.js"
 import { installSkill } from "../skills/install.js";
 import { upgradeSkill, findInstalledSkill } from "../skills/upgrade.js";
 import { removeSkill } from "../skills/remove.js";
+import { syncOperatorSkills, type SyncResult } from "../skills/sync.js";
 import { readSkillMd } from "../skills/frontmatter.js";
 import { hiveHome, skillsDir } from "../paths.js";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -104,9 +105,65 @@ export async function runSkill(subcommand?: string, ...args: string[]): Promise<
       break;
     }
 
+    case "sync": {
+      verifyGitAvailable();
+      const { config } = await import("../config.js");
+      if (!config.operatorSkillsRepo) {
+        console.error("No operatorSkillsRepo configured in hive.yaml. Set:");
+        console.error("");
+        console.error("  operatorSkillsRepo:");
+        console.error("    url: https://github.com/<operator>/<repo>");
+        console.error("");
+        process.exit(1);
+      }
+      const dryRun = process.argv.includes("--dry-run");
+      const prune = process.argv.includes("--prune");
+      const result = await syncOperatorSkills(
+        config.operatorSkillsRepo.url,
+        hiveHome,
+        { dryRun, prune },
+      );
+      printSyncSummary(result, { dryRun, prune });
+      if (result.errors.length > 0) process.exit(1);
+      break;
+    }
+
     default:
-      console.error("Usage: hive skill <add|list|upgrade|remove|search> [args]");
+      console.error(
+        "Usage: hive skill <add|list|upgrade|remove|search|sync> [args]\n" +
+          "\n" +
+          "  sync [--dry-run] [--prune]\n" +
+          "        Sync customer-space skills with the configured operatorSkillsRepo.\n" +
+          "        Installs missing, upgrades stale, leaves customer-modified alone.\n" +
+          "        --dry-run: report changes without applying.\n" +
+          "        --prune:   remove customer-space skills sourced from this repo\n" +
+          "                   but no longer present in it.",
+      );
       process.exit(1);
+  }
+}
+
+function printSyncSummary(
+  r: SyncResult,
+  opts: { dryRun: boolean; prune: boolean },
+): void {
+  const prefix = opts.dryRun ? "(dry-run) " : "";
+  console.log(`${prefix}Sync result @ ${r.headSha.slice(0, 8)}:`);
+  if (r.installed.length)
+    console.log(`  installed (${r.installed.length}): ${r.installed.join(", ")}`);
+  if (r.upgraded.length)
+    console.log(`  upgraded (${r.upgraded.length}): ${r.upgraded.join(", ")}`);
+  if (r.upToDate.length) console.log(`  up to date: ${r.upToDate.length}`);
+  if (r.modifiedSkipped.length)
+    console.log(`  customer-modified (skipped): ${r.modifiedSkipped.join(", ")}`);
+  if (r.orphaned.length) {
+    console.log(`  orphaned (${r.orphaned.length}): ${r.orphaned.join(", ")}`);
+    if (!opts.prune) console.log(`    re-run with --prune to remove orphans`);
+  }
+  if (r.pruned.length) console.log(`  pruned: ${r.pruned.join(", ")}`);
+  if (r.errors.length) {
+    console.log(`  errors (${r.errors.length}):`);
+    for (const e of r.errors) console.log(`    ${e.skill}: ${e.error}`);
   }
 }
 

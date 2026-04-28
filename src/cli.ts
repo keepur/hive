@@ -45,6 +45,10 @@ function ensureHiveInstallOrExit(): string {
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
+  // Subcommands declare their own flags by inspecting process.argv directly
+  // (see e.g. migrate-0.2's --dry-run handling). Strict mode would reject
+  // those before the subcommand runs.
+  strict: false,
   options: {
     help: { type: "boolean", short: "h", default: false },
     daemon: { type: "boolean", default: false },
@@ -103,7 +107,7 @@ Options:
 
 const PKG_ROOT = resolve(import.meta.dirname, "..");
 
-if (values.config) {
+if (typeof values.config === "string") {
   const configPath = resolve(values.config);
   if (existsSync(configPath)) {
     const stat = statSync(configPath);
@@ -150,14 +154,16 @@ switch (command) {
   case "update": {
     const { runUpdate } = await import("./cli/update.js");
     await runUpdate({
-      tag: values.tag,
-      instance: values.instance,
+      tag: typeof values.tag === "string" ? values.tag : undefined,
+      instance: typeof values.instance === "string" ? values.instance : undefined,
     });
     break;
   }
   case "rollback": {
     const { runRollback } = await import("./cli/rollback.js");
-    await runRollback({ instance: values.instance });
+    await runRollback({
+      instance: typeof values.instance === "string" ? values.instance : undefined,
+    });
     break;
   }
   case "migrate-0.2": {
