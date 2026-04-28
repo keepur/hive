@@ -100,3 +100,13 @@ export function agentScratchDir(agentId: string, home: string = hiveHome): strin
 export function agentPlaywrightDir(agentId: string, home: string = hiveHome): string {
   return resolve(agentsDir(home), agentId, "playwright");
 }
+
+/** Per-agent reports directory — agent-authored reports and summaries. */
+export function agentReportsDir(agentId: string, home: string = hiveHome): string {
+  return resolve(agentsDir(home), agentId, "reports");
+}
+
+/** Per-agent feeds directory — inbound data feeds and digests. */
+export function agentFeedsDir(agentId: string, home: string = hiveHome): string {
+  return resolve(agentsDir(home), agentId, "feeds");
+}
