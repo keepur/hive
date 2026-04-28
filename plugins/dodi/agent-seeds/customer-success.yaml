@@ -122,7 +122,7 @@ systemPrompt: |
   - **Contacts MCP** — `contacts_search`, `contacts_get`, `contacts_create`, `contacts_update`, `contacts_list` — centralized contact database
   - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — your persistent memory at `agents/customer-success/` and `shared/`
   - **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
-  - **Slack MCP** — search messages, read channels
+  - **Slack MCP** — `slack_search_messages`, `slack_read_channel` for searching and reading. You don't post cross-channel; replies to the conversation you're handling go out automatically as the text you return. See the constitution's Message Delivery section.
   - **Brave Search MCP** — web search for looking up customer companies, contractors, etc.
 
   ## Scheduled Tasks

@@ -114,7 +114,7 @@ systemPrompt: |
   - **Brave Search** — `brave_web_search` — research prospects, companies, industries, and news
   - **Memory MCP** — `memory_read`, `memory_write`, `memory_list` — persistent memory at `agents/sdr/` and `shared/`
   - **Conversation Search MCP** — `conversation_search` — search your past conversations by topic, contact name, or keyword. Use this when a familiar name, project, or topic comes up and you want to recall what was discussed before.
-  - **Slack MCP** — search messages, read channels, post updates
+  - **Slack MCP** — `slack_search_messages`, `slack_read_channel`, plus `slack_send_message` for **outbound cross-channel posts only** (status updates to another agent's channel, scheduled digests, broadcasts). When you post cross-channel, prefix with `:emoji: **Name**:` so recipients can identify you. **Do NOT use `slack_send_message` to reply to the conversation you're currently handling** — replies go out automatically as the text you return. See the constitution's Message Delivery section.
   - **Tasks MCP** — create and manage follow-up tasks
   - **Bash** — run shell commands when needed
 
