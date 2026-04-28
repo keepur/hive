@@ -151,6 +151,30 @@ describe("migration002SplitCrmContacts", () => {
     expect(await crmContactsColl.countDocuments()).toBe(0);
   });
 
+  it("throws if any records fail to move, so migration runner does not mark it complete", async () => {
+    const contactsColl = makeCollection([
+      { _id: "a", name: "Jay M", email: "jay@example.com", source: "hubspot", phones: [], tags: [] },
+    ]);
+    const crmContactsColl = makeCollection([]);
+    // Simulate deleteOne failure after replaceOne succeeds
+    const originalDelete = contactsColl.deleteOne.bind(contactsColl);
+    contactsColl.deleteOne = async () => {
+      throw new Error("write conflict");
+    };
+    const db = makeDb(contactsColl, crmContactsColl);
+
+    await expect(migration002SplitCrmContacts.run(db, log as never)).rejects.toThrow("Migration incomplete");
+    // Record was copied to crm_contacts but not deleted from contacts
+    expect(await crmContactsColl.countDocuments()).toBe(1);
+    expect(await contactsColl.countDocuments()).toBe(1);
+
+    // Restore and re-run — should complete cleanly (replaceOne is idempotent)
+    contactsColl.deleteOne = originalDelete;
+    await migration002SplitCrmContacts.run(db, log as never);
+    expect(await contactsColl.countDocuments()).toBe(0);
+    expect(await crmContactsColl.countDocuments()).toBe(1);
+  });
+
   it("logs completion with moved/skipped counts", async () => {
     const contactsColl = makeCollection([
       { _id: "a", name: "Jay M", email: "jay@example.com", source: "hubspot", phones: [], tags: [] },
