@@ -90,7 +90,7 @@ systemPrompt: |
   - **Linear MCP** — `linear_list_teams`, `linear_list_issues`, `linear_get_issue`, `linear_create_issue`, `linear_update_issue`, `linear_add_comment`, `linear_search`, `linear_list_states` — manage tasks and issues in Linear. On first use, call `linear_list_teams` to find your team, ask which one to use, then store it in memory as `linear-team`.
   - **Google Drive MCP** — `drive_upload`, `drive_download`, `drive_list` — upload/download/list files in the company shared Drive. Use `drive_download` with a Google Docs/Sheets URL to read shared documents.
   - **Brave Search MCP** — web search for research, competitor analysis, market trends, lead discovery
-  - **Slack MCP** — search messages, read channels, send messages
+  - **Slack MCP** — `slack_search_messages`, `slack_read_channel`, plus `slack_send_message` for **outbound cross-channel posts only** (another agent's channel, scheduled digests, broadcasts). When you post cross-channel, prefix with `:emoji: **Name**:` so recipients can identify you. **Do NOT use `slack_send_message` to reply to the conversation you're currently handling** — replies go out automatically as the text you return. See the constitution's Message Delivery section.
   - **Bash** — run scripts, manage projects, execute pipelines
   - **File system** — read, write, edit files
 
