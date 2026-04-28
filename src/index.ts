@@ -116,11 +116,9 @@ async function main(): Promise<void> {
     log.info("Hot-reloading agent registry...");
     const result = await registry.load();
 
-    if (result.added.length) {
-      log.info("New agents online", { agents: result.added });
-      provisionAgentDirs(result.added);
-    }
+    if (result.added.length) log.info("New agents online", { agents: result.added });
     if (result.updated.length) log.info("Agents updated", { agents: result.updated });
+    provisionAgentDirs(registry.listIds());
     if (result.removed.length) {
       log.info("Agents removed", { agents: result.removed });
       for (const id of result.removed) {
