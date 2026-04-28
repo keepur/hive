@@ -18,6 +18,7 @@ import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
 import { populateEngine, ensureEngineDeps } from "./populate-engine.js";
 import { render as renderTemplate } from "./template-renderer.js";
+import { runCredentialsStage, defaultSetSecret, defaultHasSecret } from "./credentials-wizard.js";
 import { seedsDir } from "../paths.js";
 
 // Resolved per-invocation inside runWizard().
@@ -376,6 +377,22 @@ export async function runWizard(targetDir: string, templatesDir: string, pkgRoot
   saveEnv(env);
   saveHiveYaml(hive);
   console.log("\n  ✓ Configuration saved (.env + hive.yaml)");
+
+  // ── 4.6 Third-party Credentials (Honeypot) ──────────────────────
+  section("Third-Party Credentials");
+
+  console.log("Hive can integrate with several third-party services (Linear, Brave Search,");
+  console.log("ClickUp, Resend, etc.). Provide API keys now to seed them into the macOS");
+  console.log("Keychain (Honeypot), or skip and add later via `hive credentials add <KEY>`.");
+
+  await runCredentialsStage({
+    ask: (q, def) => ask(q, def),
+    askSecret: (q) => ask(q),
+    confirm: (q, defaultYes) => confirm(q, defaultYes),
+    log: (m) => console.log(m),
+    setSecret: defaultSetSecret,
+    hasSecret: defaultHasSecret,
+  });
 
   // ── 4.5 Plugins ─────────────────────────────────────────────────
   section("Plugins");
