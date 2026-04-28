@@ -59,6 +59,11 @@ export interface RegistryConfig {
   default?: boolean;
 }
 
+export interface OperatorSkillsRepoConfig {
+  url: string;
+  branch: string;
+}
+
 export interface RetentionPathConfig {
   /** Number of days to keep files. `0` means keep forever. Negative values are rejected. */
   days: number;
@@ -177,6 +182,14 @@ export const config = {
   skillRegistries: (hive.skillRegistries as RegistryConfig[] | undefined) ?? [
     { name: "keepur-default", url: "https://github.com/keepur/hive-skills", default: true },
   ],
+  operatorSkillsRepo: hive.operatorSkillsRepo
+    ? ({
+        url: String((hive.operatorSkillsRepo as { url: unknown }).url),
+        branch: (hive.operatorSkillsRepo as { branch?: unknown }).branch
+          ? String((hive.operatorSkillsRepo as { branch: unknown }).branch)
+          : "main",
+      } as OperatorSkillsRepoConfig)
+    : null,
   gemini: {
     apiKey: optional("GEMINI_API_KEY", ""),
     visionModel: optional("GEMINI_VISION_MODEL", "gemini-2.5-flash"),

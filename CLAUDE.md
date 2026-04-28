@@ -179,6 +179,22 @@ Admin MCP tools or the REST API manage agent CRUD. Plugin seeds (`plugins/<name>
 - **Per-agent MCP whitelist**: `coreServers`/`delegateServers` arrays in agent definition — agents only get servers they need
 - **Log redaction**: No sensitive data in logs (no pairing codes, prompt previews, input previews, message text)
 
+## Skills distribution (KPR-82)
+
+Customer-space skills (`<hiveHome>/skills/`) are kept in sync across an operator's hive instances by pulling from a single git repo declared in `hive.yaml`:
+
+```yaml
+operatorSkillsRepo:
+  url: https://github.com/<operator>/<repo>
+  branch: main   # optional, default: main
+```
+
+The operator repo has the same shape as a skill registry — a flat `skills/<skill-name>/` layout. Run `hive skill sync` to install/upgrade all skills from the repo into customer space; `hive update` runs sync automatically after a successful engine upgrade.
+
+**Customer-modified skills are never overwritten.** If `origin.modified` is true on a local skill, sync skips it and reports the divergence.
+
+**Authoring flow (until publish-back ships):** author or edit a skill on any instance, then commit it to the operator repo manually. Other instances pick it up on next `hive skill sync` (or next `hive update`).
+
 ## Common Gotchas
 
 - After editing MCP server source: must `npm run build` AND restart Hive (compiled JS in `dist/`)
