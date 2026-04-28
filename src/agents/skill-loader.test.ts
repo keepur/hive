@@ -339,14 +339,20 @@ describe("agent-private skills (KPR-75)", () => {
     expect(getSkillsForAgent(index, "sam")[0]!.path).toContain("agents/sam");
   });
 
-  it("throws on an agent-private skill that declares agents: in frontmatter", () => {
+  it("rejects (skips) agent-private skill that declares agents: in frontmatter — does not crash loader", () => {
     const customer = join(tmp, "skills");
     mkdirSync(customer);
+    // Luna has a malformed private skill (declares agents: which is forbidden).
+    // Sam has a valid one. Loader must reject Luna's silently and still build
+    // Sam's so a single bad SKILL.md doesn't disable the rest of the hive.
     writeAgentSkillWithAgentsField(tmp, "luna", "blog-flow", "publish-blog-post", ["sam"]);
+    writeAgentSkill(tmp, "sam", "research", "lookup");
 
-    expect(() => loadSkillIndex(customer, [], [], ["luna"], tmp)).toThrow(
-      /path is the source of truth/,
-    );
+    const index = loadSkillIndex(customer, [], [], ["luna", "sam"], tmp);
+
+    expect(getSkillsForAgent(index, "luna")).toEqual([]);
+    expect(getSkillsForAgent(index, "sam")).toHaveLength(1);
+    expect(getSkillsForAgent(index, "sam")[0]!.path).toContain("agents/sam/skills/research");
   });
 
   it("customer-space skill shadows agent-private skill for the agents it scopes to", () => {
