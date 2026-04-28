@@ -106,14 +106,6 @@ export const CREDENTIAL_REGISTRY: CredentialEntry[] = [
     fields: [{ key: "RESEND_API_KEY", label: "Resend API Key" }],
   },
   {
-    server: "hubspot-crm",
-    title: "HubSpot CRM",
-    description: "HubSpot CRM read/write (private app token).",
-    helpUrl: "https://app.hubspot.com/ (Settings → Integrations → Private Apps)",
-    kind: "secret",
-    fields: [{ key: "HUBSPOT_API_KEY", label: "HubSpot Private App Token" }],
-  },
-  {
     server: "gemini",
     title: "Gemini (Image OCR)",
     description: "Google Gemini API for image OCR / vision (used by file ingestion).",

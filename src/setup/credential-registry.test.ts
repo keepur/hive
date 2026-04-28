@@ -11,7 +11,6 @@ import { SERVER_CATALOG } from "../tools/server-catalog.js";
 // legitimate registry entries. Keep this list small and explicit so a typo in
 // `server` doesn't slip through unnoticed.
 const NON_CATALOG_SERVERS = new Set([
-  "hubspot-crm", // dodi plugin
   "gemini", // file-ingestion vision, not its own MCP server
 ]);
 
@@ -27,7 +26,6 @@ describe("CREDENTIAL_REGISTRY", () => {
       "voice",
       "recall",
       "resend",
-      "hubspot-crm",
       "gemini",
       "google",
     ]) {
