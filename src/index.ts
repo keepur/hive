@@ -1,6 +1,14 @@
-import { existsSync, watch } from "node:fs";
+import { existsSync, mkdirSync, watch } from "node:fs";
 import { resolve } from "node:path";
-import { skillsDir, hiveHome, hiveStateDir, engineDir } from "./paths.js";
+import {
+  skillsDir,
+  hiveHome,
+  hiveStateDir,
+  engineDir,
+  agentScratchDir,
+  agentReportsDir,
+  agentFeedsDir,
+} from "./paths.js";
 import { MongoClient } from "mongodb";
 import { initInstanceGit } from "./skills/instance-git.js";
 import { verifyPackageIntegrity, checkAllowlistDrift } from "./skills/integrity.js";
@@ -38,6 +46,18 @@ import { checkFirstBoot } from "./startup/first-boot.js";
 import { SlackInternalApi } from "./slack/slack-internal-api.js";
 import { preflightBotScopes } from "./slack/slack-scope-preflight.js";
 const log = createLogger("index");
+
+function provisionAgentDirs(agentIds: string[]): void {
+  for (const agentId of agentIds) {
+    for (const dir of [agentScratchDir(agentId), agentReportsDir(agentId), agentFeedsDir(agentId)]) {
+      try {
+        mkdirSync(dir, { recursive: true });
+      } catch (err) {
+        log.warn("Failed to provision agent dir", { agentId, dir, err });
+      }
+    }
+  }
+}
 
 async function main(): Promise<void> {
   log.info("Hive starting up", { instance: config.instance.id, portBase: config.instance.portBase });
@@ -98,6 +118,7 @@ async function main(): Promise<void> {
 
     if (result.added.length) log.info("New agents online", { agents: result.added });
     if (result.updated.length) log.info("Agents updated", { agents: result.updated });
+    provisionAgentDirs(registry.listIds());
     if (result.removed.length) {
       log.info("Agents removed", { agents: result.removed });
       for (const id of result.removed) {
@@ -126,6 +147,7 @@ async function main(): Promise<void> {
   });
   await registry.load();
   log.info("Agent registry loaded", { agents: registry.listIds() });
+  provisionAgentDirs(registry.listIds());
 
   // Initialize core systems
   const memoryManager = new MemoryManager(config.mongo.uri, config.mongo.dbName);
