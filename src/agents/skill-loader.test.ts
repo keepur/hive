@@ -272,3 +272,132 @@ describe("loadSkillIndex", () => {
     expect(getSkillsForAgent(index, "agent-b")).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// KPR-75 — agent-private skills under agents/<id>/skills/
+// ---------------------------------------------------------------------------
+
+function writeAgentSkill(hiveHome: string, agentId: string, workflow: string, skill: string): void {
+  const dir = join(hiveHome, "agents", agentId, "skills", workflow, "skills", skill);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "SKILL.md"), `---\nname: ${skill}\ndescription: test\n---\n\n# ${skill}\n`);
+}
+
+function writeAgentSkillWithAgentsField(
+  hiveHome: string,
+  agentId: string,
+  workflow: string,
+  skill: string,
+  agents: string[],
+): void {
+  const dir = join(hiveHome, "agents", agentId, "skills", workflow, "skills", skill);
+  mkdirSync(dir, { recursive: true });
+  const agentsYaml = agents.map((a) => `  - ${a}`).join("\n");
+  writeFileSync(
+    join(dir, "SKILL.md"),
+    `---\nname: ${skill}\ndescription: test\nagents:\n${agentsYaml}\n---\n\n# ${skill}\n`,
+  );
+}
+
+describe("agent-private skills (KPR-75)", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "skill-loader-kpr75-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("loads skills from agents/<id>/skills/ scoped to that agent only", () => {
+    const customer = join(tmp, "skills");
+    mkdirSync(customer);
+    writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
+
+    // 5th arg `hiveHomeOverride` is required — paths.ts resolves hiveHome at
+    // module-load, so process.env.HIVE_HOME mutation has no effect.
+    const index = loadSkillIndex(customer, [], [], ["luna", "sam"], tmp);
+
+    expect(getSkillsForAgent(index, "luna").map((s) => s.path)).toContain(
+      join(tmp, "agents", "luna", "skills", "blog-flow"),
+    );
+    expect(getSkillsForAgent(index, "sam")).toEqual([]);
+  });
+
+  it("two agents with same skill name do NOT collide", () => {
+    const customer = join(tmp, "skills");
+    mkdirSync(customer);
+    writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
+    writeAgentSkill(tmp, "sam", "blog-flow", "publish-blog-post");
+
+    const index = loadSkillIndex(customer, [], [], ["luna", "sam"], tmp);
+
+    expect(getSkillsForAgent(index, "luna")).toHaveLength(1);
+    expect(getSkillsForAgent(index, "sam")).toHaveLength(1);
+    expect(getSkillsForAgent(index, "luna")[0]!.path).toContain("agents/luna");
+    expect(getSkillsForAgent(index, "sam")[0]!.path).toContain("agents/sam");
+  });
+
+  it("rejects (skips) agent-private skill that declares agents: in frontmatter — does not crash loader", () => {
+    const customer = join(tmp, "skills");
+    mkdirSync(customer);
+    // Luna has a malformed private skill (declares agents: which is forbidden).
+    // Sam has a valid one. Loader must reject Luna's silently and still build
+    // Sam's so a single bad SKILL.md doesn't disable the rest of the hive.
+    writeAgentSkillWithAgentsField(tmp, "luna", "blog-flow", "publish-blog-post", ["sam"]);
+    writeAgentSkill(tmp, "sam", "research", "lookup");
+
+    const index = loadSkillIndex(customer, [], [], ["luna", "sam"], tmp);
+
+    expect(getSkillsForAgent(index, "luna")).toEqual([]);
+    expect(getSkillsForAgent(index, "sam")).toHaveLength(1);
+    expect(getSkillsForAgent(index, "sam")[0]!.path).toContain("agents/sam/skills/research");
+  });
+
+  it("customer-space skill shadows agent-private skill for the agents it scopes to", () => {
+    const customer = join(tmp, "skills");
+    writeSkill(customer, "blog-flow", "publish-blog-post", ["luna"]);
+    writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
+
+    const index = loadSkillIndex(customer, [], [], ["luna"], tmp);
+
+    const lunaPaths = getSkillsForAgent(index, "luna").map((s) => s.path);
+    expect(lunaPaths).toEqual([join(customer, "blog-flow")]);
+  });
+
+  it("plugin skill scoped to a different agent does not block agent-private skill", () => {
+    const customer = join(tmp, "skills");
+    mkdirSync(customer);
+    const pluginDir = join(tmp, "plugin-a");
+    writeSkill(join(pluginDir, "skills"), "blog-flow", "publish-blog-post", ["sam"]);
+    writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
+
+    const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)], [], ["luna", "sam"], tmp);
+
+    expect(getSkillsForAgent(index, "luna")[0]!.path).toContain("agents/luna");
+    expect(getSkillsForAgent(index, "sam")[0]!.path).toContain("plugin-a");
+  });
+
+  it("missing agent dir is silently skipped", () => {
+    const customer = join(tmp, "skills");
+    mkdirSync(customer);
+    // No agents/ directory at all.
+
+    const index = loadSkillIndex(customer, [], [], ["luna", "sam"], tmp);
+
+    expect(index.size).toBe(0);
+  });
+
+  it("hot-reload picks up new agent-private skills", () => {
+    const customer = join(tmp, "skills");
+    mkdirSync(customer);
+
+    let index = loadSkillIndex(customer, [], [], ["luna"], tmp);
+    expect(getSkillsForAgent(index, "luna")).toEqual([]);
+
+    writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
+    index = loadSkillIndex(customer, [], [], ["luna"], tmp);
+    expect(getSkillsForAgent(index, "luna")).toHaveLength(1);
+  });
+});

@@ -77,7 +77,7 @@ export class AgentManager {
     this.prefetcher = prefetcher;
     this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
-    this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
+    this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
   }
 
   getPlugins(): LoadedPlugin[] {
@@ -97,7 +97,7 @@ export class AgentManager {
 
   reloadSkills(): void {
     try {
-      this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
+      this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
     } catch (err) {
       log.warn("Skill reload failed, retaining previous index", { error: String(err) });
     }
