@@ -93,9 +93,7 @@ export async function runUpdate(opts: UpdateOptions = {}): Promise<void> {
         console.log("  all skills up to date");
       }
       if (result.errors.length) {
-        console.warn(
-          `  ${result.errors.length} skill(s) failed to sync — re-run 'hive skill sync' manually`,
-        );
+        console.warn(`  ${result.errors.length} skill(s) failed to sync — re-run 'hive skill sync' manually`);
       }
     }
   } catch (err) {

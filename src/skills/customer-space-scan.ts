@@ -58,9 +58,6 @@ export function scanCustomerSpaceSkills(skillsRoot: string): InstalledSkill[] {
  * Filter installed skills by origin source URL.
  * Used by sync to find skills that came from a specific operator repo.
  */
-export function skillsFromSource(
-  installed: InstalledSkill[],
-  sourceUrl: string,
-): InstalledSkill[] {
+export function skillsFromSource(installed: InstalledSkill[], sourceUrl: string): InstalledSkill[] {
   return installed.filter((s) => s.origin?.source === sourceUrl);
 }

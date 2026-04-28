@@ -118,11 +118,7 @@ export async function runSkill(subcommand?: string, ...args: string[]): Promise<
       }
       const dryRun = process.argv.includes("--dry-run");
       const prune = process.argv.includes("--prune");
-      const result = await syncOperatorSkills(
-        config.operatorSkillsRepo.url,
-        hiveHome,
-        { dryRun, prune },
-      );
+      const result = await syncOperatorSkills(config.operatorSkillsRepo.url, hiveHome, { dryRun, prune });
       printSyncSummary(result, { dryRun, prune });
       if (result.errors.length > 0) process.exit(1);
       break;
@@ -143,19 +139,13 @@ export async function runSkill(subcommand?: string, ...args: string[]): Promise<
   }
 }
 
-function printSyncSummary(
-  r: SyncResult,
-  opts: { dryRun: boolean; prune: boolean },
-): void {
+function printSyncSummary(r: SyncResult, opts: { dryRun: boolean; prune: boolean }): void {
   const prefix = opts.dryRun ? "(dry-run) " : "";
   console.log(`${prefix}Sync result @ ${r.headSha.slice(0, 8)}:`);
-  if (r.installed.length)
-    console.log(`  installed (${r.installed.length}): ${r.installed.join(", ")}`);
-  if (r.upgraded.length)
-    console.log(`  upgraded (${r.upgraded.length}): ${r.upgraded.join(", ")}`);
+  if (r.installed.length) console.log(`  installed (${r.installed.length}): ${r.installed.join(", ")}`);
+  if (r.upgraded.length) console.log(`  upgraded (${r.upgraded.length}): ${r.upgraded.join(", ")}`);
   if (r.upToDate.length) console.log(`  up to date: ${r.upToDate.length}`);
-  if (r.modifiedSkipped.length)
-    console.log(`  customer-modified (skipped): ${r.modifiedSkipped.join(", ")}`);
+  if (r.modifiedSkipped.length) console.log(`  customer-modified (skipped): ${r.modifiedSkipped.join(", ")}`);
   if (r.orphaned.length) {
     console.log(`  orphaned (${r.orphaned.length}): ${r.orphaned.join(", ")}`);
     if (!opts.prune) console.log(`    re-run with --prune to remove orphans`);

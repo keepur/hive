@@ -60,16 +60,8 @@ origin:
   });
 
   it("skillsFromSource filters by origin URL", () => {
-    writeSkill(
-      "default",
-      "a",
-      "name: a\ndescription: test\norigin:\n  type: registry\n  source: https://op.git",
-    );
-    writeSkill(
-      "default",
-      "b",
-      "name: b\ndescription: test\norigin:\n  type: registry\n  source: https://other.git",
-    );
+    writeSkill("default", "a", "name: a\ndescription: test\norigin:\n  type: registry\n  source: https://op.git");
+    writeSkill("default", "b", "name: b\ndescription: test\norigin:\n  type: registry\n  source: https://other.git");
 
     const all = scanCustomerSpaceSkills(root);
     const filtered = skillsFromSource(all, "https://op.git");
