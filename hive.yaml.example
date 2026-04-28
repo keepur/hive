@@ -38,7 +38,7 @@ business:
 # Slack audit channel — receives app/SMS notifications
 # slack:
 #   auditChannel: jessica
-#   localMcpServer: false   # set true to use local bot-token Slack MCP instead of hosted MCP
+#   localMcpServer: true    # default: local bot-token Slack MCP (self-echo-safe). Set false to fall back to the hosted cloud MCP (user-OAuth identity — not recommended; see KPR-97).
 
 # slackInternal:
 #   # port auto-derived from instance portBase if omitted
