@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * Import HubSpot CSV contacts into hive.contacts MongoDB collection.
+ * Import HubSpot CSV contacts into hive.crm_contacts MongoDB collection.
  *
  * Usage:
  *   npx tsx src/contacts/import-hubspot.ts <csv-file> [--dry-run]
@@ -74,7 +74,7 @@ async function main() {
   const client = new MongoClient(uri);
   await client.connect();
   const db = client.db(dbName);
-  const contacts = db.collection("contacts");
+  const contacts = db.collection("crm_contacts");
 
   if (!dryRun) {
     // Create indexes (idempotent)
@@ -83,6 +83,8 @@ async function main() {
     await contacts.createIndex({ name: "text", email: "text", company: "text" });
     await contacts.createIndex({ tags: 1 });
     await contacts.createIndex({ updatedAt: 1 });
+    await contacts.createIndex({ source: 1 });
+    await contacts.createIndex({ sourceId: 1 }, { sparse: true });
   }
 
   const stats = { total: records.length, created: 0, updated: 0, skipped: 0, errors: 0 };
