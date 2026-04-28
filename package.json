@@ -40,6 +40,7 @@
     "setup:seeds": "npx tsx setup/setup-seeds.ts",
     "setup:plugins": "npx tsx setup/sync-plugins.ts",
     "migrate:agents:legacy": "npx tsx setup/migrate-agents.ts",
+    "migrate:split-crm-contacts": "npx tsx setup/migrate-split-crm-contacts.ts",
     "setup:plist": "npx tsx setup/generate-plist.ts",
     "update": "git pull && npm install && npm run build",
     "reindex": "npx tsx scripts/code-index.ts",
