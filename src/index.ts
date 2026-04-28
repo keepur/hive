@@ -1,6 +1,14 @@
 import { existsSync, mkdirSync, watch } from "node:fs";
 import { resolve } from "node:path";
-import { skillsDir, hiveHome, hiveStateDir, engineDir, agentScratchDir, agentReportsDir, agentFeedsDir } from "./paths.js";
+import {
+  skillsDir,
+  hiveHome,
+  hiveStateDir,
+  engineDir,
+  agentScratchDir,
+  agentReportsDir,
+  agentFeedsDir,
+} from "./paths.js";
 import { MongoClient } from "mongodb";
 import { initInstanceGit } from "./skills/instance-git.js";
 import { verifyPackageIntegrity, checkAllowlistDrift } from "./skills/integrity.js";
