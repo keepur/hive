@@ -14,8 +14,9 @@ import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
-import { SERVER_CATALOG, formatCatalogEntry, type ServerCatalogEntry } from "../tools/server-catalog.js";
+import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
+import { buildToolkitSection } from "./toolkit-section.js";
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 
@@ -244,25 +245,19 @@ export class AgentRunner {
 
     // --- Semi-static (stable within a session, changes on restart) ---
 
-    // Inject core server summaries so the agent knows what tools it has directly
-    // Exclude infrastructure servers that are always present and self-explanatory
-    const visibleCoreServers = coreServerNames.filter((s) => !AgentRunner.INFRASTRUCTURE_SERVERS.has(s));
-    if (visibleCoreServers.length > 0) {
-      const lines = visibleCoreServers.map((s) => formatCatalogEntry(s, this.getServerCatalogEntry(s)));
-      parts.push(
-        `## Your tools\n\nDirect tools available to you:\n${lines.join("\n")}`,
-      );
-    }
-
-    // Inject delegate namespace summaries so the agent knows what subagents are available
-    // Uses activeDelegates (actually constructed) rather than config (may include credential-gated servers)
-    const delegates = activeDelegates ?? [];
-    if (delegates.length > 0) {
-      const lines = delegates.map((s) => formatCatalogEntry(s, this.getServerCatalogEntry(s)));
-      parts.push(
-        `## Available via subagents\n\nYou have additional capabilities through delegation. If a task involves any of these domains, use the Agent tool — do NOT say you lack access:\n${lines.join("\n")}`,
-      );
-    }
+    // KPR-87: unified "Your toolkit" section listing SDK builtins, engine-auto-injected
+    // MCPs, capability MCPs (explicit core), and delegated capability MCPs. Replaces
+    // the prior split "Your tools" / "Available via subagents" blocks. The
+    // autoInjectedServers set MUST mirror the additions in filterCoreServers — keep
+    // both in sync (see comment there).
+    parts.push(
+      buildToolkitSection({
+        coreServerNames,
+        delegateServerNames: activeDelegates ?? [],
+        plugins: this.plugins,
+        autoInjectedServers: AgentRunner.autoInjectedServerNames(),
+      }),
+    );
 
     // --- Dynamic suffix (changes per turn → not cached) ---
 
@@ -868,6 +863,9 @@ export class AgentRunner {
     if (coreSet.has("memory")) {
       coreSet.add("structured-memory");
     }
+    // Auto-injected servers below MUST mirror AgentRunner.autoInjectedServerNames()
+    // so the toolkit section (KPR-87) classifies them under "engine-provided"
+    // instead of "capability MCPs". Keep both sites in sync.
     // schedule is an implicit core server — available to all agents unconditionally
     coreSet.add("schedule");
     // team is an implicit core server — available to all agents unconditionally
@@ -932,10 +930,25 @@ export class AgentRunner {
     return current == null ? "" : String(current);
   }
 
-  // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory
-  private static readonly INFRASTRUCTURE_SERVERS = new Set([
-    "schedule", "structured-memory", "team",
-  ]);
+  /**
+   * Returns the set of MCP server names the engine auto-injects into every
+   * agent's parent session, regardless of the agent definition. The toolkit
+   * section uses this set to classify "engine-provided" vs "capability MCPs"
+   * in the system prompt.
+   *
+   * MUST mirror the additions in {@link AgentRunner.filterCoreServers} —
+   * keep both sites in sync. (Computed dynamically because `workflow` is
+   * config-gated.)
+   */
+  private static autoInjectedServerNames(): ReadonlySet<string> {
+    // structured-memory is paired with `memory` (filterCoreServers gates it on
+    // `memory` being in coreServers), so it's not unconditional. Agents with
+    // memory will have structured-memory in their post-filter coreServerNames
+    // and the toolkit will correctly classify it under Capability MCPs.
+    const set = new Set<string>(["schedule", "team", "slack"]);
+    if (config.workflow.enabled) set.add("workflow");
+    return set;
+  }
 
   // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)
   private static CONTEXT_DEPENDENT_SERVERS = new Set([

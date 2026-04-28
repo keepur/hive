@@ -141,7 +141,7 @@ hive credentials remove <KEY>   # Delete one
 
 Agent definitions live in MongoDB (`agent_definitions` collection). Each agent is a single document containing all fields: config (model, channels, servers, schedule, budget), soul (personality/voice), systemPrompt (role/guardrails), and delegatePrompts.
 
-**System prompt assembly order**: date/time → soul → systemPrompt → constitution (shared/constitution.md) → agent memory
+**System prompt assembly order**: soul → systemPrompt → constitution (shared/constitution.md) → toolkit (KPR-87 — runtime tool inventory) → agent memory → date/time. Date/time goes last so the static prefix stays prompt-cache-friendly.
 
 Admin MCP tools or the REST API manage agent CRUD. Plugin seeds (`plugins/<name>/agent-seeds/`) provide initial agent definitions, imported via `npm run setup:seeds` (skips if agent already exists in DB). Version history is tracked in `agent_definition_versions`.
 

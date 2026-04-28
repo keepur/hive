@@ -954,9 +954,10 @@ describe("AgentRunner delegate subagents (via send)", () => {
     await runner.send("hello");
     const options = getCapturedOptions();
 
-    expect(options.systemPrompt).toContain("Available via subagents");
-    expect(options.systemPrompt).toContain("google:");
-    expect(options.systemPrompt).toContain("contacts:");
+    // KPR-87: delegate listing moved into the unified "Your toolkit" section.
+    expect(options.systemPrompt).toContain("### Delegated capability MCPs");
+    expect(options.systemPrompt).toMatch(/- google —/);
+    expect(options.systemPrompt).toMatch(/- contacts —/);
   });
 
   it("system prompt does NOT include delegate section when no delegateServers", async () => {
@@ -967,7 +968,7 @@ describe("AgentRunner delegate subagents (via send)", () => {
     await runner.send("hello");
     const options = getCapturedOptions();
 
-    expect(options.systemPrompt).not.toContain("Available via subagents");
+    expect(options.systemPrompt).not.toContain("### Delegated capability MCPs");
   });
 
   it("includes namespace description in delegate AgentDefinition", async () => {
@@ -1054,8 +1055,8 @@ describe("AgentRunner delegate subagents (via send)", () => {
   });
 });
 
-// ── Server catalog prompt tests ───────────────────────────────────
-describe("AgentRunner server catalog prompt (via send)", () => {
+// ── Toolkit section prompt tests (KPR-87) ─────────────────────────
+describe("AgentRunner toolkit section prompt (via send)", () => {
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;
 
   beforeEach(() => {
@@ -1064,7 +1065,7 @@ describe("AgentRunner server catalog prompt (via send)", () => {
     memoryManager = makeMockMemoryManager();
   });
 
-  it("injects core server catalog into system prompt as 'Your tools'", async () => {
+  it("injects 'Your toolkit' header with the four standard subsections (those that apply)", async () => {
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["memory", "contacts"],
@@ -1075,12 +1076,18 @@ describe("AgentRunner server catalog prompt (via send)", () => {
     await runner.send("hello");
     const options = getCapturedOptions();
 
-    expect(options.systemPrompt).toContain("## Your tools");
-    expect(options.systemPrompt).toContain("memory:");
-    expect(options.systemPrompt).toContain("contacts:");
+    expect(options.systemPrompt).toContain("## Your toolkit");
+    // SDK builtins always present
+    expect(options.systemPrompt).toContain("### Built-in (always available)");
+    // Engine-provided subsection appears (schedule/team/slack auto-injected)
+    expect(options.systemPrompt).toContain("### Engine-provided");
+    // Capability MCPs subsection appears (memory + contacts are explicit)
+    expect(options.systemPrompt).toContain("### Capability MCPs");
+    // No delegates configured → no Delegated subsection
+    expect(options.systemPrompt).not.toContain("### Delegated capability MCPs");
   });
 
-  it("includes usage hints in core tools section", async () => {
+  it("lists explicit core servers under 'Capability MCPs' with their blurbs", async () => {
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["memory", "contacts"],
@@ -1091,58 +1098,14 @@ describe("AgentRunner server catalog prompt (via send)", () => {
     await runner.send("hello");
     const options = getCapturedOptions();
 
-    expect(options.systemPrompt).toContain("Use for:");
+    expect(options.systemPrompt).toMatch(/- memory —/);
+    expect(options.systemPrompt).toMatch(/- contacts —/);
   });
 
-  it("includes notFor hints in core tools section", async () => {
-    const runner = new AgentRunner(
-      makeAgentConfig({
-        coreServers: ["contacts"],
-        delegateServers: [],
-      }),
-      memoryManager as any,
-    );
-    await runner.send("hello");
-    const options = getCapturedOptions();
-
-    // contacts has a notFor field
-    expect(options.systemPrompt).toContain("Not for:");
-  });
-
-  it("excludes infrastructure servers from 'Your tools' section", async () => {
-    const runner = new AgentRunner(
-      makeAgentConfig({
-        coreServers: ["memory", "schedule"],
-        delegateServers: [],
-      }),
-      memoryManager as any,
-    );
-    await runner.send("hello");
-    const options = getCapturedOptions();
-
-    // schedule is infrastructure — should not appear in "Your tools"
-    // memory should appear
-    expect(options.systemPrompt).toContain("memory:");
-    expect(options.systemPrompt).not.toMatch(/- schedule:/);
-  });
-
-  it("excludes structured-memory from 'Your tools' section", async () => {
-    const runner = new AgentRunner(
-      makeAgentConfig({
-        coreServers: ["memory"],
-        delegateServers: [],
-      }),
-      memoryManager as any,
-    );
-    await runner.send("hello");
-    const options = getCapturedOptions();
-
-    // structured-memory is auto-paired infrastructure
-    expect(options.systemPrompt).not.toMatch(/- structured-memory:/);
-  });
-
-  it("does not show 'Your tools' when only infrastructure servers present", async () => {
-    // Agent with only schedule (implicit) — no visible core servers
+  it("lists auto-injected servers under 'Engine-provided' even when not in coreServers", async () => {
+    // No explicit core servers — schedule/team still auto-inject (slack is also
+    // auto-injected, but the slack MCP server is only built when slack.mcpToken
+    // is configured; the test mock leaves it empty, so slack is absent here).
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: [],
@@ -1153,10 +1116,30 @@ describe("AgentRunner server catalog prompt (via send)", () => {
     await runner.send("hello");
     const options = getCapturedOptions();
 
-    expect(options.systemPrompt).not.toContain("## Your tools");
+    const engineIdx = options.systemPrompt.indexOf("### Engine-provided");
+    expect(engineIdx).toBeGreaterThan(-1);
+    expect(options.systemPrompt).toMatch(/- schedule —/);
+    expect(options.systemPrompt).toMatch(/- team —/);
   });
 
-  it("includes usage hints in delegate subagent summaries", async () => {
+  it("renders Engine-provided even when only auto-injected servers exist (no Capability MCPs)", async () => {
+    // Bare-bones agent — Engine-provided block must appear, Capability MCPs must not
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: [],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.systemPrompt).toContain("## Your toolkit");
+    expect(options.systemPrompt).toContain("### Engine-provided");
+    expect(options.systemPrompt).not.toContain("### Capability MCPs");
+  });
+
+  it("emits 'Delegated capability MCPs' subsection for delegates", async () => {
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["memory"],
@@ -1167,12 +1150,11 @@ describe("AgentRunner server catalog prompt (via send)", () => {
     await runner.send("hello");
     const options = getCapturedOptions();
 
-    expect(options.systemPrompt).toContain("Available via subagents");
-    expect(options.systemPrompt).toContain("google:");
-    expect(options.systemPrompt).toContain("Use for:");
+    expect(options.systemPrompt).toContain("### Delegated capability MCPs");
+    expect(options.systemPrompt).toMatch(/- google —/);
   });
 
-  it("falls back to plugin manifest description for unknown servers", async () => {
+  it("falls back to plugin manifest description for plugin servers", async () => {
     const plugin: LoadedPlugin = {
       name: "custom-plugin",
       dir: "/plugins/custom-plugin",
@@ -1206,9 +1188,31 @@ describe("AgentRunner server catalog prompt (via send)", () => {
     await runner.send("hello");
     const options = getCapturedOptions();
 
-    expect(options.systemPrompt).toContain("custom-tool: A custom tool for testing");
-    expect(options.systemPrompt).toContain("Use for: Testing things.");
-    expect(options.systemPrompt).toContain("Not for: Production use.");
+    expect(options.systemPrompt).toContain("- custom-tool — A custom tool for testing");
+  });
+
+  it("places toolkit section between constitution and date/time (assembly order)", async () => {
+    memoryManager.read.mockImplementation((path: string) => {
+      if (path === "shared/constitution.md") return Promise.resolve("CONSTITUTION_MARKER");
+      return Promise.resolve(null);
+    });
+
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: [],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    const constIdx = options.systemPrompt.indexOf("CONSTITUTION_MARKER");
+    const toolkitIdx = options.systemPrompt.indexOf("## Your toolkit");
+    const dateIdx = options.systemPrompt.indexOf("**Current date/time**");
+    expect(constIdx).toBeGreaterThan(-1);
+    expect(toolkitIdx).toBeGreaterThan(constIdx);
+    expect(dateIdx).toBeGreaterThan(toolkitIdx);
   });
 });
 
