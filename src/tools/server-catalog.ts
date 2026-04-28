@@ -5,6 +5,12 @@ export interface ServerCatalogEntry {
   usage?: string;
   /** Common misuse — "for X, use Y instead" */
   notFor?: string;
+  /**
+   * Optional shorter blurb used by the runtime "Your toolkit" section
+   * (KPR-87) where prompt budget is tight. Falls back to `description`
+   * when unset. Keep ≤ ~100 chars — one line, no marketing prose.
+   */
+  toolkitBlurb?: string;
 }
 
 /**
@@ -33,7 +39,13 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
   contacts: {
     description: "Contact lookups by name, email, or phone",
     usage: "Quick lookups of people in the contact directory",
-    notFor: "CRM deal/company data — use a CRM plugin's tools instead",
+    notFor: "Messaging another hive agent (use team) or CRM deal/company data (use a CRM plugin)",
+  },
+  team: {
+    description: "Direct agent-to-agent messaging — peer hive agents, not Slack DMs",
+    usage: "Sending a message or task to another agent in this hive",
+    notFor: "Looking up people in the contact directory — use contacts instead",
+    toolkitBlurb: "Direct messaging to peer hive agents (not Slack DMs)",
   },
   linear: {
     description: "Issue tracking and project management",
@@ -68,10 +80,17 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     description: "Read and write your personal agent memory",
     usage: "Storing and retrieving facts across conversations. Auto-managed — don't over-save",
   },
-  // structured-memory is auto-paired infrastructure (injected when memory is present) — not shown in prompt
+  // structured-memory is auto-paired infrastructure (injected when memory is present).
+  // KPR-87: surfaces in the "Your toolkit" section under engine-provided.
+  "structured-memory": {
+    description: "Semantic + temporal memory tiers — recall, save, pin, forget",
+    usage: "Use memory_recall to find prior facts; memory_save/_pin for durable notes",
+    toolkitBlurb: "Semantic + temporal memory tiers (recall, save, pin)",
+  },
   schedule: {
     description: "Self-service schedule management — view, add, update, remove your schedules",
     usage: "Managing your recurring or one-time scheduled tasks",
+    toolkitBlurb: "Manage your scheduled tasks (recurring or one-time)",
   },
   "event-bus": {
     description: "Publish events to the cross-agent event bus",
@@ -100,6 +119,7 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
   slack: {
     description: "Slack API — read channels, post messages, manage threads",
     usage: "Interacting with Slack channels and threads",
+    toolkitBlurb: "Slack channels, messages, and threads",
   },
   recall: {
     description: "Meeting bot — join calls, get transcripts",
