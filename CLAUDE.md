@@ -93,7 +93,7 @@ All in `src/` — each agent only gets servers listed in its `coreServers`/`dele
 - `code-task/code-task-mcp-server.ts` — delegate coding to Claude Code CLI sessions
 - `memory/structured-memory-mcp-server.ts` — tiered memory with semantic recall (auto-paired with memory server)
 
-Slack MCP defaults to the local-stdio implementation (`src/slack/slack-mcp-server.ts` — KPR-103). The official Slack HTTP MCP server (`https://mcp.slack.com/mcp`) remains opt-in via per-agent config.
+Slack MCP defaults to the official Slack HTTP MCP server (`https://mcp.slack.com/mcp`). The local-stdio implementation (`src/slack/slack-mcp-server.ts` — KPR-103) is opt-in via `slack.localMcpServer: true` in `hive.yaml`. Local stdio expects `chat:write.customize` on the bot token for identity-mode posts; if missing, the preflight warns (non-fatal) and posts silently fall back to plain bot identity.
 
 Browser automation uses Playwright via CDP endpoint (`BROWSER_CDP_ENDPOINT` config) — not a local stdio server.
 
