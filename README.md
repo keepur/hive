@@ -81,7 +81,15 @@ hive plugin list           # List installed plugins
 hive plugin remove <name>  # Remove a plugin
 hive skill add <name>      # Install a skill
 hive skill list            # List installed skills
+hive skill upgrade         # Upgrade installed skills
+hive skill search <query>  # Search registries for a skill
 hive skill remove <name>   # Remove a skill
+hive registry add          # Add a skill registry
+hive registry list         # List configured registries
+hive registry remove       # Remove a registry
+hive credentials list      # Show third-party API keys (curated)
+hive credentials add <KEY> # Set or rotate a credential (Keychain-backed)
+hive credentials remove <KEY>  # Delete a credential
 ```
 
 ## License

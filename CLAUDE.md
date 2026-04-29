@@ -93,7 +93,7 @@ All in `src/` — each agent only gets servers listed in its `coreServers`/`dele
 - `code-task/code-task-mcp-server.ts` — delegate coding to Claude Code CLI sessions
 - `memory/structured-memory-mcp-server.ts` — tiered memory with semantic recall (auto-paired with memory server)
 
-Slack MCP uses the official Slack HTTP MCP server (`https://mcp.slack.com/mcp`), not a local stdio server.
+Slack MCP defaults to the local-stdio implementation (`src/slack/slack-mcp-server.ts` — KPR-103). The official Slack HTTP MCP server (`https://mcp.slack.com/mcp`) remains opt-in via per-agent config.
 
 Browser automation uses Playwright via CDP endpoint (`BROWSER_CDP_ENDPOINT` config) — not a local stdio server.
 
@@ -135,6 +135,11 @@ npm run embed:dodi     # Run dodi_v2 → Qdrant embed pipeline
 hive credentials list           # Show curated keys + which are set
 hive credentials add <KEY>      # Set or rotate one (uses curated registry)
 hive credentials remove <KEY>   # Delete one
+
+# Skill registry management
+hive registry add               # Add a skill registry (Keepur, third-party, or local file)
+hive registry list              # List configured registries
+hive registry remove            # Remove a registry
 ```
 
 ## Agent Anatomy
@@ -143,7 +148,7 @@ Agent definitions live in MongoDB (`agent_definitions` collection). Each agent i
 
 **System prompt assembly order**: soul → systemPrompt → constitution (shared/constitution.md) → toolkit (KPR-87 — runtime tool inventory) → agent memory → date/time. Date/time goes last so the static prefix stays prompt-cache-friendly.
 
-Admin MCP tools or the REST API manage agent CRUD. Plugin seeds (`plugins/<name>/agent-seeds/`) provide initial agent definitions, imported via `npm run setup:seeds` (skips if agent already exists in DB). Version history is tracked in `agent_definition_versions`.
+Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline seed at `seeds/chief-of-staff/` (installed during `hive init`). Plugin seeds (`plugins/<name>/agent-seeds/`) provide additional agent definitions, imported via `npm run setup:seeds` (skips if agent already exists in DB). Version history is tracked in `agent_definition_versions`.
 
 **Plugin agent seeds** (dodi, 9 total):
 
@@ -175,7 +180,7 @@ Admin MCP tools or the REST API manage agent CRUD. Plugin seeds (`plugins/<name>
 **Posture: agents are employees, not hangout partners you met at an overnight party.** Everything that runs on a hive — plugins, skills, MCP servers, agent seeds — is assumed to have access to sensitive business operations and (under the Honeypot + Keychain model) the legitimate path to credentials. There is no "trusted enough to try, too harmless to worry about." If it runs, it's an employee, and employees come through curated channels.
 
 - **Curated distribution is the paved path.** Both plugins and skills are installed from registries (Keepur-hosted default, third-party registries configurable, local registry files supported). Raw git URL or raw file install exists only as a developer-mode escape hatch and is not how production hives get code. If you find yourself designing something where the user "just drops in a skill from a GitHub gist," stop — that's outside the framework. See `docs/specs/2026-04-14-plugin-architecture-design.md` for the full contract.
-- **Credentials are never in cloud-model-facing context.** Long-term home is the Honeypot + Keychain model (#139). MCP servers read credentials from Keychain at spawn via API; cloud-model agents have no Keychain read entitlement. Agents invoke *capabilities* (call a tool, get a result), they never hold secrets. Until Honeypot ships, credentials live in `.env` — do not add agent-visible paths that would let filesystem Read tools exfil `.env`.
+- **Credentials are never in cloud-model-facing context.** Honeypot is the live mechanism (KPR-73 — `hive credentials add/list/remove`, bootstrap collects third-party keys into Keychain). `secret-env` vars resolve from Keychain (`hive/<instanceId>/<KEY>`) at MCP server spawn, falling back to `process.env`. Cloud-model agents have no Keychain read entitlement; they invoke *capabilities*, never hold secrets. Do not add agent-visible paths that would let filesystem Read tools exfil `.env`.
 - **Plugins carry more risk than skills.** A plugin ships an MCP server, and the MCP server is the legitimate credential holder. A malicious plugin can exfil secrets directly. A malicious skill can cause business-operational harm but cannot reach credentials under the architectural model. Registry curation matters more for plugins than for skills — not less.
 - **No shell execution**: Use `execFileSync(binary, argsArray)`, never `execSync(shellString)`
 - **Agent permissions**: `bypassPermissions` mode — all SDK tools (Bash, Read, Write, Edit, etc.) and MCP tools available to all agents. Per-agent guardrails are enforced via system prompts, not tool blocking.
