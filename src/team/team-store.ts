@@ -1,6 +1,6 @@
 // src/team/team-store.ts
 
-import { MongoClient, type Db, type Collection, ObjectId } from "mongodb";
+import { type Db, type Collection, ObjectId } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import type { TeamChannel, TeamMessage } from "./types.js";
 import { dmChannelId } from "./types.js";
@@ -8,21 +8,12 @@ import { dmChannelId } from "./types.js";
 const log = createLogger("team-store");
 
 export class TeamStore {
-  private client: MongoClient;
-  private db!: Db;
   private channels!: Collection<TeamChannel>;
   private messages!: Collection<TeamMessage>;
 
-  constructor(
-    private uri: string,
-    private dbName: string,
-  ) {
-    this.client = new MongoClient(uri);
-  }
+  constructor(private db: Db) {}
 
-  async connect(): Promise<void> {
-    await this.client.connect();
-    this.db = this.client.db(this.dbName);
+  async init(): Promise<void> {
     this.channels = this.db.collection<TeamChannel>("team_channels");
     this.messages = this.db.collection<TeamMessage>("team_messages");
 
@@ -33,11 +24,7 @@ export class TeamStore {
     await this.messages.createIndex({ threadId: 1 });
     await this.messages.createIndex({ createdAt: -1 });
 
-    log.info("Team store connected", { db: this.dbName });
-  }
-
-  async close(): Promise<void> {
-    await this.client.close();
+    log.info("Team store connected", { db: this.db.databaseName });
   }
 
   // ── Channels ──────────────────────────────────────────────────
