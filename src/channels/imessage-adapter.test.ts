@@ -101,7 +101,8 @@ async function createAdapter(configOverrides: Record<string, unknown> = {}) {
   const { IMessageAdapter } = await import("./imessage-adapter.js");
   const config = makeConfig(configOverrides);
   const gateway = makeGateway();
-  const adapter = new IMessageAdapter(config as any, "mongodb://localhost", "hive", gateway as any, "test-instance");
+  const mockDb = { collection: mockCollection } as any;
+  const adapter = new IMessageAdapter(config as any, mockDb, gateway as any, "test-instance");
   return { adapter, gateway };
 }
 
@@ -277,7 +278,7 @@ describe("IMessageAdapter", () => {
   // -------------------------------------------------------------------------
 
   describe("stop", () => {
-    it("clears interval, closes db and mongo", async () => {
+    it("clears interval and closes the chat.db handle (shared mongo is owned by the host process)", async () => {
       const { adapter } = await createAdapter();
       const onWorkItem = vi.fn();
       await adapter.start(onWorkItem);
@@ -285,7 +286,6 @@ describe("IMessageAdapter", () => {
       await adapter.stop();
 
       expect(mockDbClose).toHaveBeenCalled();
-      expect(mockMongoClose).toHaveBeenCalled();
 
       // Advancing timers should not trigger any more polls
       mockGetNewMessages.mockClear();

@@ -17,7 +17,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { ObjectId } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import { MemoryStore } from "./memory-store.js";
 import { MemoryEmbedder } from "./memory-embedder.js";
 import type { MemoryType, MemoryImportance, MemoryTier, PurgeFilters } from "./memory-types.js";
@@ -33,7 +33,9 @@ if (!AGENT_ID) {
   process.exit(1);
 }
 
-const store = new MemoryStore(MONGODB_URI, MONGODB_DB);
+const mongoClient = new MongoClient(MONGODB_URI);
+await mongoClient.connect();
+const store = new MemoryStore(mongoClient.db(MONGODB_DB));
 await store.init();
 
 const embedder = new MemoryEmbedder(process.env.QDRANT_URL, process.env.OLLAMA_URL);
@@ -407,8 +409,12 @@ server.registerTool(
 );
 
 // Cleanup on exit
-process.on("SIGTERM", () => store.close());
-process.on("SIGINT", () => store.close());
+// Subprocess-local cleanup: close the MongoClient we own here.
+// (MemoryStore.close() is a no-op because the in-process hive shares the engine's
+// MongoClient — the subprocess case has its own client to close.)
+const cleanup = () => mongoClient.close().catch(() => {});
+process.on("SIGTERM", cleanup);
+process.on("SIGINT", cleanup);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

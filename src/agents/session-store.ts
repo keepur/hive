@@ -1,4 +1,4 @@
-import { MongoClient, type Collection, type Db } from "mongodb";
+import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 
 const log = createLogger("session-store");
@@ -21,30 +21,11 @@ interface SessionDoc {
 }
 
 export class SessionStore {
-  private client: MongoClient;
-  private db!: Db;
   private collection!: Collection<SessionDoc>;
-  private uri: string;
-  private dbName: string;
 
-  constructor(uri: string, dbName = "hive") {
-    this.uri = uri;
-    this.dbName = dbName;
-    this.client = new MongoClient(uri, {
-      // Keep the connection alive overnight
-      heartbeatFrequencyMS: 30_000,        // Ping server every 30s (default 10s is fine too)
-      serverSelectionTimeoutMS: 10_000,     // Wait up to 10s to find a server
-      socketTimeoutMS: 30_000,             // Kill stale sockets after 30s
-      maxIdleTimeMS: 300_000,              // Close idle connections after 5 min (driver recreates on demand)
-      retryWrites: true,                   // Auto-retry failed writes (transient errors)
-      retryReads: true,                    // Auto-retry failed reads
-    });
-  }
+  constructor(private db: Db) {}
 
-  async connect(dbName?: string): Promise<void> {
-    this.dbName = dbName ?? this.dbName;
-    await this.client.connect();
-    this.db = this.client.db(this.dbName);
+  async init(): Promise<void> {
     this.collection = this.db.collection<SessionDoc>("sessions");
 
     // TTL index: expire sessions after 7 days of inactivity
@@ -59,47 +40,19 @@ export class SessionStore {
   }
 
   /**
-   * Reconnect after a connection failure. Creates a fresh client.
-   */
-  private async reconnect(): Promise<void> {
-    log.warn("Reconnecting to MongoDB...");
-    try {
-      await this.client.close().catch(() => {}); // best-effort close old client
-    } catch {}
-    this.client = new MongoClient(this.uri, {
-      heartbeatFrequencyMS: 30_000,
-      serverSelectionTimeoutMS: 10_000,
-      socketTimeoutMS: 30_000,
-      maxIdleTimeMS: 300_000,
-      retryWrites: true,
-      retryReads: true,
-    });
-    await this.client.connect();
-    this.db = this.client.db(this.dbName);
-    this.collection = this.db.collection<SessionDoc>("sessions");
-    log.info("MongoDB reconnected");
-  }
-
-  /**
-   * Run a MongoDB operation with one retry on connection failure.
-   * If both attempts fail, returns the fallback value instead of throwing.
+   * Run a MongoDB operation with fail-soft fallback.
+   * The shared MongoClient handles transient reconnects via retryWrites/retryReads;
+   * this wrapper preserves the "return a fallback on persistent failure" semantics.
    */
   private async withRetry<T>(op: () => Promise<T>, fallback: T, label: string): Promise<T> {
     try {
       return await op();
     } catch (err: any) {
-      const msg = String(err?.message ?? err);
-      log.warn("MongoDB operation failed, retrying after reconnect", { label, error: msg });
-      try {
-        await this.reconnect();
-        return await op();
-      } catch (retryErr: any) {
-        log.error("MongoDB operation failed after retry, using fallback", {
-          label,
-          error: String(retryErr?.message ?? retryErr),
-        });
-        return fallback;
-      }
+      log.error("MongoDB operation failed, using fallback", {
+        label,
+        error: String(err?.message ?? err),
+      });
+      return fallback;
     }
   }
 
@@ -217,6 +170,6 @@ export class SessionStore {
   }
 
   async close(): Promise<void> {
-    await this.client.close();
+    // No-op: shared MongoClient is owned by the main hive process
   }
 }
