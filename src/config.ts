@@ -102,7 +102,7 @@ export const config = {
     botToken: required("SLACK_BOT_TOKEN"),
     mcpToken: optional("SLACK_MCP_TOKEN", ""),
     auditChannel: optional("SLACK_AUDIT_CHANNEL", hive.slack?.auditChannel ?? ""),
-    localMcpServer: Boolean(hive.slack?.localMcpServer ?? true),
+    localMcpServer: Boolean(hive.slack?.localMcpServer ?? false),
   },
   anthropic: {
     apiKey: optional("ANTHROPIC_API_KEY", ""),
