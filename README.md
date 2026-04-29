@@ -13,10 +13,6 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/keepur/keepur-co/main/assets/generated/product-hero-local-ai-ops.png" width="720" alt="Mac mini, monitor, and phone showing a local AI operations workspace" />
-</p>
-
-<p align="center">
   <a href="https://www.npmjs.com/package/@keepur/hive"><img src="https://img.shields.io/npm/v/@keepur/hive?label=npm&style=flat" alt="npm version" /></a>
   <a href="https://github.com/keepur/hive-docs/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Hive%20Preview-blue?style=flat" alt="License" /></a>
   <img src="https://img.shields.io/badge/status-public%20beta-orange?style=flat" alt="public beta" />
@@ -61,8 +57,6 @@ The bootstrap installs Homebrew and Node 22, then drops you into the `hive init`
 - **Your data, your machine — even from the AI.** API keys live in your Mac's keychain. The language model itself never sees them, your customer records, or your secrets — local services fetch credentials only at the moment of use, only by tools you control. No prompt-context exposure, no log retention, no *"we keep your data to improve the model."*
 - **Slack, where work already happens.** Agents show up in your existing channels and DMs. No new app to log in to. No new inbox to learn.
 - **Customer-facing things wait for you.** Outbound emails, deal commitments, anything that can't be undone — agents draft, then ask. Read-first, approve-first — by default, not by reminder.
-
-More on the trust model and how the pieces fit at **[keepur.co](https://keepur.co)**.
 
 ## Upgrading from 0.1.x
 
