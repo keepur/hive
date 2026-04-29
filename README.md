@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/keepur/keepur-co/main/assets/keepur-logo.svg" width="160" alt="Keepur" />
+  <img src="https://raw.githubusercontent.com/keepur/hive-docs/main/assets/keepur-logo.svg" width="160" alt="Keepur" />
 </p>
 
 <h1 align="center">Hive</h1>
