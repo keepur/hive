@@ -409,8 +409,12 @@ server.registerTool(
 );
 
 // Cleanup on exit
-process.on("SIGTERM", () => store.close());
-process.on("SIGINT", () => store.close());
+// Subprocess-local cleanup: close the MongoClient we own here.
+// (MemoryStore.close() is a no-op because the in-process hive shares the engine's
+// MongoClient — the subprocess case has its own client to close.)
+const cleanup = () => mongoClient.close().catch(() => {});
+process.on("SIGTERM", cleanup);
+process.on("SIGINT", cleanup);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
