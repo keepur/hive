@@ -1,24 +1,15 @@
-import { MongoClient, ObjectId, type Collection, type Db, type WithoutId } from "mongodb";
+import { ObjectId, type Collection, type Db, type WithoutId } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import type { MemoryRecord, MemoryRecordInput, MemoryImportance, MemoryTier, PurgeFilters } from "./memory-types.js";
 
 const log = createLogger("memory-store");
 
 export class MemoryStore {
-  private client: MongoClient;
-  private db!: Db;
   private collection!: Collection<MemoryRecord>;
 
-  constructor(
-    private mongoUri: string,
-    private dbName: string,
-  ) {
-    this.client = new MongoClient(mongoUri);
-  }
+  constructor(private db: Db) {}
 
   async init(): Promise<void> {
-    await this.client.connect();
-    this.db = this.client.db(this.dbName);
     this.collection = this.db.collection<MemoryRecord>("agent_memory");
 
     await this.collection.createIndex({ agentId: 1, tier: 1 });
@@ -26,7 +17,7 @@ export class MemoryStore {
     await this.collection.createIndex({ agentId: 1, updatedAt: 1 });
     await this.collection.createIndex({ agentId: 1, type: 1 });
     await this.collection.createIndex({ agentId: 1, purged: 1, purgedAt: 1 });
-    log.info("Memory store initialized", { db: this.dbName });
+    log.info("Memory store initialized", { db: this.db.databaseName });
   }
 
   /** Expose collection for advanced queries (e.g., knowledge extractor delete-before-save) */
@@ -306,6 +297,6 @@ export class MemoryStore {
   }
 
   async close(): Promise<void> {
-    await this.client.close();
+    // No-op: shared MongoClient is owned by the main hive process
   }
 }

@@ -98,7 +98,7 @@ describe("MemoryManager.getHotTierPrompt", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    manager = new MemoryManager("mongodb://localhost:27017", "hive-test");
+    manager = new MemoryManager(mockDb as any);
     await manager.init();
     mockStore = makeMockMemoryStore();
   });

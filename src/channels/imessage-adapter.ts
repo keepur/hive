@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
-import { MongoClient, type Collection, type Db } from "mongodb";
+import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
@@ -37,12 +37,10 @@ export class IMessageAdapter implements ChannelAdapter {
   readonly kind: ChannelKind = "imessage";
 
   private config: IMessageConfig;
-  private mongoUri: string;
-  private dbName: string;
+  private mongoDb: Db;
   private gateway: SlackGateway;
 
   private db?: IMessageDb;
-  private mongo?: MongoClient;
   private threadsCollection?: Collection<SlackThreadMapping>;
   private contactsCollection?: Collection<Contact>;
   private slackChannelId?: string;
@@ -53,21 +51,17 @@ export class IMessageAdapter implements ChannelAdapter {
   private lastColdPoll = 0;
   private stateFilePath: string;
 
-  constructor(config: IMessageConfig, mongoUri: string, dbName: string, gateway: SlackGateway, instanceId: string) {
+  constructor(config: IMessageConfig, mongoDb: Db, gateway: SlackGateway, instanceId: string) {
     this.config = config;
-    this.mongoUri = mongoUri;
-    this.dbName = dbName;
+    this.mongoDb = mongoDb;
     this.gateway = gateway;
     this.stateFilePath = resolve(`/tmp/${instanceId}-imessage-state.json`);
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
-    // Connect to MongoDB for thread mappings
-    this.mongo = new MongoClient(this.mongoUri);
-    await this.mongo.connect();
-    const db = this.mongo.db(this.dbName);
-    this.threadsCollection = db.collection<SlackThreadMapping>("imessage_threads");
-    this.contactsCollection = db.collection<Contact>("contacts");
+    // Mongo collections for thread mappings (shared client, no per-adapter pool)
+    this.threadsCollection = this.mongoDb.collection<SlackThreadMapping>("imessage_threads");
+    this.contactsCollection = this.mongoDb.collection<Contact>("contacts");
 
     // Resolve Slack channel ID
     try {
@@ -149,7 +143,6 @@ export class IMessageAdapter implements ChannelAdapter {
       this.interval = null;
     }
     this.db?.close();
-    await this.mongo?.close();
     log.info("iMessage adapter stopped");
   }
 

@@ -86,8 +86,18 @@ async function main(): Promise<void> {
     log.info("Gemini vision enabled", { model: config.gemini.visionModel });
   }
 
-  // Shared MongoDB client
-  const mongoClient = new MongoClient(config.mongo.uri);
+  // Shared MongoDB client — KPR-121: single pool for the whole hive process.
+  // All in-process Mongo consumers (MemoryManager, MemoryStore, SessionStore,
+  // Scheduler, TeamStore, IMessageAdapter, CodeIndexPrefetcher, etc.) receive
+  // `db` from this client instead of opening their own.
+  const mongoClient = new MongoClient(config.mongo.uri, {
+    heartbeatFrequencyMS: 30_000,
+    serverSelectionTimeoutMS: 10_000,
+    socketTimeoutMS: 30_000,
+    maxIdleTimeMS: 300_000,
+    retryWrites: true,
+    retryReads: true,
+  });
   await mongoClient.connect();
   const db = mongoClient.db(config.mongo.dbName);
 
@@ -150,11 +160,11 @@ async function main(): Promise<void> {
   provisionAgentDirs(registry.listIds());
 
   // Initialize core systems
-  const memoryManager = new MemoryManager(config.mongo.uri, config.mongo.dbName);
+  const memoryManager = new MemoryManager(db);
   await memoryManager.init();
 
   // Structured memory lifecycle — always enabled
-  const memoryStore = new MemoryStore(config.mongo.uri, config.mongo.dbName);
+  const memoryStore = new MemoryStore(db);
   await memoryStore.init();
   memoryManager.memoryStore = memoryStore;
   const memoryEmbedder = new MemoryEmbedder();
@@ -176,8 +186,8 @@ async function main(): Promise<void> {
   );
   log.info("Structured memory lifecycle enabled");
 
-  const sessionStore = new SessionStore(config.mongo.uri);
-  await sessionStore.connect(config.mongo.dbName);
+  const sessionStore = new SessionStore(db);
+  await sessionStore.init();
 
   // Activity logger — queryable audit trail for agent turns
   let activityLogger: ActivityLogger | undefined;
@@ -213,8 +223,7 @@ async function main(): Promise<void> {
     const { KnowledgeExtractor } = await import("./code-task/knowledge-extractor.js");
 
     prefetcher = new CodeIndexPrefetcher({
-      mongoUri: config.mongo.uri,
-      dbName: config.mongo.dbName,
+      db,
       qdrantUrl: process.env.QDRANT_URL ?? "http://localhost:6333",
       ollamaUrl: process.env.OLLAMA_URL ?? "http://localhost:11434",
       scoreThreshold: config.codeIndex.scoreThreshold,
@@ -377,13 +386,7 @@ async function main(): Promise<void> {
   // iMessage adapter — poll chat.db for inbound, AppleScript for outbound
   let iMessageAdapter: IMessageAdapter | undefined;
   if (config.imessage.enabled) {
-    iMessageAdapter = new IMessageAdapter(
-      config.imessage,
-      config.mongo.uri,
-      config.mongo.dbName,
-      slack,
-      config.instance.id,
-    );
+    iMessageAdapter = new IMessageAdapter(config.imessage, db, slack, config.instance.id);
     dispatcher.registerAdapter(iMessageAdapter);
     await iMessageAdapter.start((item) => {
       dispatcher.dispatch(item).catch((err) => {
@@ -402,8 +405,8 @@ async function main(): Promise<void> {
   const { TeamStore } = await import("./team/team-store.js");
   const { CommandRegistry } = await import("./team/command-registry.js");
 
-  const teamStore = new TeamStore(config.mongo.uri, config.mongo.dbName);
-  await teamStore.connect();
+  const teamStore = new TeamStore(db);
+  await teamStore.init();
 
   // Narrow resolver closure — keeps CommandRegistry decoupled from AgentRegistry.
   // Exact id wins; otherwise case-insensitive display name match.
@@ -483,7 +486,7 @@ async function main(): Promise<void> {
       log.error("Callback dispatch failed", { error: String(err) });
     });
   });
-  await scheduler.connectDb(config.mongo.uri, config.mongo.dbName);
+  await scheduler.connectDb(db);
   scheduler.start();
   log.info("Scheduler started");
 
@@ -575,7 +578,6 @@ async function main(): Promise<void> {
     beekeeperRegistration?.stop();
     if (wsAdapter) await wsAdapter.stop();
     voiceAdapter?.stop();
-    await teamStore.close();
     scheduler.stop();
     await bgTaskManager.stop();
     await codeTaskManager.stop();
