@@ -1,4 +1,4 @@
-import { MongoClient, type Collection, type Db } from "mongodb";
+import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import type { MemoryStore } from "./memory-store.js";
 
@@ -19,10 +19,6 @@ interface MemoryVersionDoc {
 }
 
 export class MemoryManager {
-  private mongoUri: string;
-  private dbName: string;
-  private client!: MongoClient;
-  private db!: Db;
   private collection!: Collection<MemoryDoc>;
   private versions!: Collection<MemoryVersionDoc>;
   private _memoryStore?: MemoryStore;
@@ -32,20 +28,14 @@ export class MemoryManager {
     this._memoryStore = store;
   }
 
-  constructor(mongoUri: string, dbName: string = "hive") {
-    this.mongoUri = mongoUri;
-    this.dbName = dbName;
-  }
+  constructor(private db: Db) {}
 
   async init(): Promise<void> {
-    this.client = new MongoClient(this.mongoUri);
-    await this.client.connect();
-    this.db = this.client.db(this.dbName);
     this.collection = this.db.collection<MemoryDoc>("memory");
     this.versions = this.db.collection<MemoryVersionDoc>("memory_versions");
     await this.collection.createIndex({ path: 1 }, { unique: true });
     await this.versions.createIndex({ path: 1, savedAt: -1 });
-    log.info("Memory manager connected to MongoDB", { db: this.dbName });
+    log.info("Memory manager connected to MongoDB", { db: this.db.databaseName });
   }
 
   async read(relativePath: string): Promise<string | null> {
@@ -151,7 +141,7 @@ export class MemoryManager {
   }
 
   async close(): Promise<void> {
-    await this.client?.close();
+    // No-op: shared MongoClient is owned by the main hive process
   }
 }
 

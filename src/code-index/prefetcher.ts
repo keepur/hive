@@ -1,11 +1,10 @@
 import { QdrantClient } from "@qdrant/js-client-rest";
-import { MongoClient } from "mongodb";
+import type { Db } from "mongodb";
 import { embedOllama } from "../search/embed-utils.js";
 import { CODE_INDEX_COLLECTION } from "./code-index-types.js";
 
 export interface PrefetcherOptions {
-  mongoUri: string;
-  dbName: string;
+  db: Db;
   qdrantUrl: string;
   ollamaUrl: string;
   scoreThreshold?: number;
@@ -13,7 +12,6 @@ export interface PrefetcherOptions {
 }
 
 export class CodeIndexPrefetcher {
-  private mongo!: MongoClient;
   private qdrant!: QdrantClient;
   private connected = false;
   private scoreThreshold: number;
@@ -26,8 +24,6 @@ export class CodeIndexPrefetcher {
 
   private async ensureConnected(): Promise<void> {
     if (this.connected) return;
-    this.mongo = new MongoClient(this.options.mongoUri);
-    await this.mongo.connect();
     this.qdrant = new QdrantClient({ url: this.options.qdrantUrl });
     this.connected = true;
   }
@@ -95,7 +91,7 @@ export class CodeIndexPrefetcher {
           // Fetch full content from MongoDB
           const mongoIds = relevant.map((r) => r.payload?.mongoId as string).filter(Boolean);
           if (mongoIds.length > 0) {
-            const memCollection = this.mongo.db(this.options.dbName).collection("agent_memory");
+            const memCollection = this.options.db.collection("agent_memory");
             const { ObjectId } = await import("mongodb");
             const records = await memCollection
               .find({ _id: { $in: mongoIds.map((id) => new ObjectId(id)) } })
@@ -158,7 +154,7 @@ export class CodeIndexPrefetcher {
     try {
       const paths = this.extractFilePaths(conversationText);
       if (paths.length > 0) {
-        const codeIndexCol = this.mongo.db(this.options.dbName).collection("code_index");
+        const codeIndexCol = this.options.db.collection("code_index");
         const records = await codeIndexCol
           .find({ filePath: { $in: paths } })
           .project({ repo: 1, filePath: 1, summary: 1, role: 1 })
@@ -217,7 +213,7 @@ export class CodeIndexPrefetcher {
           const mongoIds = codeMemories.map((r) => r.payload?.mongoId as string).filter(Boolean);
           if (mongoIds.length > 0) {
             const { ObjectId } = await import("mongodb");
-            const memCollection = this.mongo.db(this.options.dbName).collection("agent_memory");
+            const memCollection = this.options.db.collection("agent_memory");
             const records = await memCollection
               .find({ _id: { $in: mongoIds.map((id) => new ObjectId(id)) } })
               .toArray();
@@ -260,6 +256,6 @@ export class CodeIndexPrefetcher {
   }
 
   async close(): Promise<void> {
-    if (this.connected) await this.mongo.close();
+    // No-op: shared MongoClient is owned by the main hive process
   }
 }

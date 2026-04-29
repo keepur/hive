@@ -5,7 +5,7 @@ import type { MemoryManager } from "../memory/memory-manager.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
-import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
+import { type Collection, type Db, type ObjectId } from "mongodb";
 
 const log = createLogger("scheduler");
 
@@ -61,7 +61,6 @@ export class Scheduler {
   private healthReporter: HealthReporter;
   private registry: AgentRegistry;
   private cronJobs: CronJob[] = [];
-  private mongoClient: MongoClient | null = null;
   private db: Db | null = null;
   private callbackCollection: Collection<CallbackDoc> | null = null;
   private eventsCollection: Collection<AgentEventDoc> | null = null;
@@ -93,10 +92,8 @@ export class Scheduler {
     }
   }
 
-  async connectDb(uri: string, dbName: string): Promise<void> {
-    this.mongoClient = new MongoClient(uri);
-    await this.mongoClient.connect();
-    this.db = this.mongoClient.db(dbName);
+  async connectDb(db: Db): Promise<void> {
+    this.db = db;
     this.callbackCollection = this.db.collection<CallbackDoc>("agent_callbacks");
     this.eventsCollection = this.db.collection<AgentEventDoc>("agent_events");
     // Indexes
@@ -111,7 +108,7 @@ export class Scheduler {
     // Team pending requests indexes
     await this.db.collection("team_pending_requests").createIndex({ status: 1, createdAt: -1 });
     await this.db.collection("team_pending_requests").createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 });
-    log.info("Callback store connected", { db: dbName });
+    log.info("Callback store connected", { db: db.databaseName });
   }
 
   /** Reload cron jobs from agent configs. Called on hot-reload. */
@@ -200,7 +197,6 @@ export class Scheduler {
       clearInterval(this.teamTimer);
       this.teamTimer = null;
     }
-    this.mongoClient?.close().catch(() => {});
     log.info("Scheduler stopped");
   }
 

@@ -92,13 +92,13 @@ describe("MemoryStore", () => {
     mockToArray.mockResolvedValue([]);
     mockFind.mockReturnValue({ toArray: mockToArray, sort: mockSort });
     mockSort.mockReturnValue({ toArray: mockToArray });
-    store = new MemoryStore("mongodb://localhost:27017", "hive-test");
+    store = new MemoryStore(mockDb as any);
     await store.init();
   });
 
   describe("init", () => {
-    it("connects and creates indexes", async () => {
-      expect(mockClient.connect).toHaveBeenCalled();
+    it("creates indexes on the supplied Db", async () => {
+      expect(mockDb.collection).toHaveBeenCalledWith("agent_memory");
       expect(mockCreateIndex).toHaveBeenCalledTimes(5);
     });
   });
