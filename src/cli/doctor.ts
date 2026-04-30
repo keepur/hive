@@ -29,6 +29,41 @@ async function tryLoadConfig(): Promise<{ config: HiveConfig | null; error: stri
   }
 }
 
+/**
+ * Find the `required-env.json` shipped alongside the bundled doctor, or
+ * fall back to scanning `src/config.ts` source for dev / source-checkout
+ * runs where the JSON hasn't been built yet.
+ *
+ * Probe order matters — see the comment at the call site for layout
+ * details. Returns the empty list if nothing resolves; doctor reports it
+ * as a single failed check rather than throwing, so the rest of the
+ * checks still run.
+ */
+export function resolveRequiredEnvVars(hereDir: string): string[] {
+  const jsonCandidates = [
+    resolve(hereDir, "required-env.json"), // bundled: pkg/ alongside cli.min.js
+    resolve(hereDir, "..", "required-env.json"), // dist/ + pkg/ split layout
+  ];
+  for (const path of jsonCandidates) {
+    if (!existsSync(path)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf-8")) as { requiredEnv?: unknown };
+      if (Array.isArray(parsed.requiredEnv) && parsed.requiredEnv.every((k) => typeof k === "string")) {
+        return parsed.requiredEnv as string[];
+      }
+    } catch {
+      // Fall through to the next candidate / source scan.
+    }
+  }
+  // Source-checkout fallback. Walks two levels up from src/cli/ or
+  // dist/cli/. Returns [] if even the source isn't reachable.
+  const srcCandidate = resolve(hereDir, "..", "..", "src", "config.ts");
+  if (existsSync(srcCandidate)) {
+    return requiredEnvVarsFromConfig(srcCandidate);
+  }
+  return [];
+}
+
 const GROUP_TITLES: Record<CheckGroup, string> = {
   prereq: "Prereqs",
   config: "Config",
@@ -48,11 +83,16 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
   console.log(`  service path: ${servicePath ?? "(LaunchAgent plist not found)"}`);
   console.log("");
 
-  // Always read the source config.ts from the repo root. `src/` is preserved
-  // in both dev (tsx) and deploy (cloned repo with dist/ alongside src/) so
-  // `<dir>/../../src/config.ts` resolves correctly from both `src/cli/` and
-  // `dist/cli/`.
-  const requiredEnv = requiredEnvVarsFromConfig(resolve(import.meta.dirname, "../../src/config.ts"));
+  // Resolve the list of required env vars in this preference order:
+  //   1) `<here>/required-env.json` — emitted by build/bundle.ts and shipped
+  //      inside pkg/. This is the canonical path for npm-installed hives,
+  //      where src/ is NOT in package.json#files and the historical
+  //      "scan src/config.ts at runtime" approach ENOENTs.
+  //   2) `<here>/../required-env.json` — same JSON sitting next to a `dist/`
+  //      build (post-tsc, pre-bundle), in case future layouts split it.
+  //   3) Scan `<here>/../../src/config.ts` — the dev/source-checkout path
+  //      where pkg/ may not have been built yet but src/ is right there.
+  const requiredEnv = resolveRequiredEnvVars(import.meta.dirname);
 
   // Config must be loaded lazily — it throws on missing required env vars at
   // module eval time, which is exactly the fresh-box failure mode `hive doctor`

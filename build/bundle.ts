@@ -6,7 +6,7 @@
  * Output: pkg/ (publish-ready minified bundles)
  */
 import { build } from "esbuild";
-import { rmSync, mkdirSync, copyFileSync, existsSync } from "node:fs";
+import { rmSync, mkdirSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const PKG_DIR = "pkg";
@@ -104,5 +104,23 @@ for (const asset of setupAssets) {
   const dest = resolve(PKG_DIR, asset);
   if (existsSync(src)) copyFileSync(src, dest);
 }
+
+// Emit required-env.json for `hive doctor`. Pre-bundle the list of
+// `required("KEY")` calls in src/config.ts so doctor can read it from a
+// shipped artifact instead of trying to reach back into src/ at runtime
+// — src/ is not in package.json#files, so that path doesn't exist on
+// npm-installed hives. This is the canonical source-of-truth for which
+// env vars the config loader treats as required at startup.
+const configSrc = readFileSync(resolve("src/config.ts"), "utf-8");
+const requiredEnv = new Set<string>();
+for (const m of configSrc.matchAll(/\brequired\(\s*"([A-Z0-9_]+)"\s*\)/g)) {
+  requiredEnv.add(m[1]);
+}
+const requiredEnvList = [...requiredEnv].sort();
+writeFileSync(
+  resolve(PKG_DIR, "required-env.json"),
+  JSON.stringify({ requiredEnv: requiredEnvList }, null, 2) + "\n",
+);
+console.log(`  pkg/required-env.json (${requiredEnvList.length} keys: ${requiredEnvList.join(", ")})`);
 
 console.log("\n✓ Bundle complete → pkg/");
