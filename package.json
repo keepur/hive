@@ -2,15 +2,15 @@
   "name": "@keepur/hive",
   "version": "0.3.3",
   "hiveApi": "1.0.0",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "Apache-2.0",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/keepur/hive-docs.git"
+    "url": "git+https://github.com/keepur/hive.git"
   },
-  "homepage": "https://github.com/keepur/hive-docs#readme",
+  "homepage": "https://github.com/keepur/hive#readme",
   "bugs": {
-    "url": "https://github.com/keepur/hive-docs/issues",
+    "url": "https://github.com/keepur/hive/issues",
     "email": "beta@keepur.io"
   },
   "bin": {
@@ -29,8 +29,7 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "build": "tsc && tsc -p tsconfig.plugins.json",
-    "build:plugins": "tsc -p tsconfig.plugins.json",
+    "build": "tsc",
     "postversion": "git push --follow-tags",
     "start": "node dist/index.js",
     "dev": "npx tsx src/index.ts",
@@ -44,13 +43,11 @@
     "setup:plist": "npx tsx setup/generate-plist.ts",
     "update": "git pull && npm install && npm run build",
     "reindex": "npx tsx scripts/code-index.ts",
-    "embed:hubspot": "npx tsx scripts/hubspot-embed.ts",
-    "embed:dodi": "npx tsx scripts/dodi-embed.ts",
-    "lint": "eslint src/ plugins/ setup/",
-    "lint:fix": "eslint --fix src/ plugins/ setup/",
-    "format": "prettier --write \"src/**/*.ts\" \"plugins/**/*.ts\" \"setup/**/*.ts\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"plugins/**/*.ts\" \"setup/**/*.ts\"",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.plugins.json",
+    "lint": "eslint src/ setup/",
+    "lint:fix": "eslint --fix src/ setup/",
+    "format": "prettier --write \"src/**/*.ts\" \"setup/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"setup/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

@@ -178,4 +178,4 @@ hive doctor
 If `hive doctor` passes but something is still wrong — or a check fails in a way the sections above don't cover:
 
 - **Trust-gate cohort (you got an onboarding email from May):** text May at the cell number in that email. Include the full output of `hive doctor --verbose` and the last ~50 lines of `~/services/hive/<your-instance>/logs/hive.log`.
-- **Everyone else:** file an issue at <https://github.com/keepur/hive-docs/issues> with the same two artifacts attached.
+- **Everyone else:** file an issue at <https://github.com/keepur/hive/issues> with the same two artifacts attached.
