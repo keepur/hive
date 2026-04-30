@@ -1,0 +1,103 @@
+# Hive engine architecture
+
+What's inside the hive engine — the daemon you start with `hive start --daemon`. This is engine-side architecture; for operator-facing day-two docs see [managing-your-hive.md](managing-your-hive.md).
+
+## Process model
+
+```
+Slack / SMS / WebSocket / scheduler
+            ↓
+       Channel adapter
+            ↓
+       Dispatcher (routing, dedup, status)
+            ↓
+       Model router (Haiku / Sonnet classifier; respects per-agent ceiling)
+            ↓
+       Agent manager (concurrency, per-thread serialization)
+            ↓
+       Agent runner (spawns Claude session + MCP servers as subprocesses)
+            ↓
+       Response → channel adapter → delivery
+```
+
+A single hive process serves multiple agents and multiple channels. Each agent's work runs as a Claude Code session with a configured set of MCP server subprocesses scoped to it.
+
+## Key files (read these to understand the engine)
+
+- `src/index.ts` — entry point; wires every subsystem.
+- `src/config.ts` — loads env + `hive.yaml` into a typed config.
+- `src/agents/agent-runner.ts` — spawns Claude sessions, assembles the system prompt (soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers per agent.
+- `src/agents/agent-manager.ts` — concurrency limits, per-thread queues.
+- `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
+- `src/agents/model-router.ts` — Haiku/Sonnet classification.
+- `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue.
+- `src/channels/slack-adapter.ts` — Slack events → `WorkItem` → delivery.
+- `src/channels/sms-adapter.ts` — SMS via Quo/OpenPhone.
+- `src/slack/slack-gateway.ts` — Socket Mode listener, message filtering.
+
+## Storage
+
+- **MongoDB** — agent definitions, agent memory, per-agent sessions, callbacks, contacts, devices, model overrides. Collections include `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `memory`, `memory_versions`, `contacts`, `agent_callbacks`, `devices`, `model_overrides`.
+- **Qdrant** — vector storage for semantic recall (conversation search, code search, structured memory). Local Ollama (`bge-large`) generates embeddings.
+- **macOS Keychain (Honeypot)** — third-party API keys. Per-instance prefix `hive/<instance-id>/<KEY>`. The cloud language model never sees these — local MCP servers fetch credentials via Keychain at the moment of use.
+
+## MCP servers
+
+Each agent gets a subset of MCP servers — listed in its `coreServers` and `delegateServers` arrays. The engine ships a generic baseline:
+
+- `memory-mcp-server.ts` — read/write/list/history/rollback agent memory.
+- `memory/structured-memory-mcp-server.ts` — tiered semantic recall.
+- `keychain-mcp-server.ts` — macOS Keychain read-only.
+- `contacts-mcp-server.ts` — contact lookups.
+- `events/event-bus-mcp-server.ts` — cross-agent event bus.
+- `team/team-mcp-server.ts` — direct agent-to-agent messaging.
+- `schedule/schedule-mcp-server.ts` — cron-style scheduled tasks.
+- `callback/callback-mcp-server.ts` — delayed-response timers.
+- `slack/slack-mcp-server.ts` — Slack tooling.
+- `linear/linear-mcp-server.ts` — Linear issues.
+- `github/github-issues-mcp-server.ts` — GitHub Issues.
+- `clickup/clickup-mcp-server.ts` — ClickUp tasks.
+- `google/google-mcp-server.ts` — Gmail + Calendar + Drive (via `gog` CLI).
+- `quo/quo-mcp-server.ts` — SMS via Quo/OpenPhone.
+- `resend/resend-mcp-server.ts` — outbound email via Resend.
+- `recall/recall-mcp-server.ts` — meeting participation via Recall.ai.
+- `tasks/task-mcp-server.ts` — generic task store.
+- `background/background-task-mcp-server.ts` — spawn detached long-running commands.
+- `code-index/code-search-mcp-server.ts` — semantic code search over indexed files.
+- `code-task/code-task-mcp-server.ts` — delegate coding to Claude Code CLI sessions.
+- `search/conversation-search-mcp-server.ts` — semantic search over past conversations.
+- `admin/admin-mcp-server.ts` — agent CRUD + version history (admin-scoped).
+
+Plugins (e.g. CRM integrations, business-specific tools) are separately-published packages; install with `hive plugin add <pkg>`.
+
+## Channels
+
+- **Slack** — Socket Mode + Web API. Agents have their own bot identities; outbound posts use `chat:write.customize`.
+- **SMS** — Quo/OpenPhone webhook → adapter → dispatcher.
+- **WebSocket** — long-lived connection from clients. Hive registers as a `?channel=` capability on a sibling beekeeper gateway (loopback on `127.0.0.1:3200`); see [beekeeper's federation doc](https://github.com/keepur/beekeeper/blob/main/docs/federation.md).
+- **Scheduler** — `schedule-mcp-server` fires `WorkItem`s on cron expressions defined per agent.
+
+## System prompt assembly
+
+When an agent is invoked, the runner assembles its system prompt in this order, then calls the SDK:
+
+1. **Soul** — agent personality / voice / values.
+2. **systemPrompt** — agent's role + guardrails.
+3. **Constitution** — shared `constitution.md` for the instance.
+4. **Toolkit** — runtime-injected catalog of available MCP tools.
+5. **Agent memory** — hot-tier records (always loaded).
+6. **Date / time** — last so the static prefix stays prompt-cache-friendly.
+
+## Hot reload
+
+`SIGUSR1` reloads agent definitions from MongoDB without restarting the daemon. Used by admin tooling that mutates `agent_definitions` (the admin MCP server, beekeeper's tune-instance skill).
+
+## Security posture
+
+- **Keychain isolation** — cloud LLMs never see secrets. Keychain reads happen inside MCP servers, scoped by `hive/<instance>/<KEY>`.
+- **Per-agent MCP whitelist** — an agent only sees the servers in its `coreServers`/`delegateServers`. Tool selection is enforced by what's spawned, not by prompt instructions.
+- **Confirm-before-send for outbound** — by default, customer-facing tools (resend, slack outbound, sms) draft for human approval rather than send autonomously.
+- **No shell-string subprocess invocation** — all subprocess spawns pass argv as an array (`spawnSync(binary, [args])`), never as a shell string. Prevents command injection from interpolated input.
+- **Background task auth** — bearer token (`BG_TASK_AUTH_TOKEN`) on the background task HTTP API.
+
+For the broader trust model see [README.md#trust-posture](../README.md#trust-posture).
