@@ -27,7 +27,7 @@ See [Migrating to 0.2.0](./migrating-to-0.2.md) for the full walkthrough.
 TL;DR:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/migrate-0.2.sh \
+curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/migrate-0.2.sh \
   | bash -s -- ~/services/hive/<your-instance>
 ```
 
