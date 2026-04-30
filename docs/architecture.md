@@ -1,239 +1,103 @@
-# Dodi System Architecture
+# Hive engine architecture
 
-How the four repos work together to run Dodi's business.
+What's inside the hive engine — the daemon you start with `hive start --daemon`. This is engine-side architecture; for operator-facing day-two docs see [managing-your-hive.md](managing-your-hive.md).
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         DODI ECOSYSTEM                              │
-│                                                                     │
-│  ┌──────────┐    Slack     ┌──────────┐    REST/WS    ┌──────────┐ │
-│  │          │◄────────────►│          │──────────────►│          │ │
-│  │  HIVE    │   WebSocket  │  dodi_v2 │   MongoDB     │ iOS App  │ │
-│  │ (agents) │──────────────►│ (platform)│◄─────────────│(shop app)│ │
-│  │          │  task-ledger │          │               │          │ │
-│  └────┬─────┘  catalog API └─────┬────┘               └──────────┘ │
-│       │                          │                                  │
-│       │  permit data    ┌────────┴───────┐                         │
-│       │  CRM vectors    │   Marketing    │                         │
-│       │◄────────────────│  (pipelines)   │                         │
-│       │                 └────────────────┘                         │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Repo Overview
-
-| Repo | Path | What It Does | Tech Stack |
-|------|------|-------------|------------|
-| **Hive** | `~/github/hive` | Multi-agent orchestration — 9 AI agents that run the business via Slack | TypeScript, Claude Agent SDK, Slack Socket Mode, MCP servers |
-| **dodi_v2** | `~/dev/dodi_v2` | Kitchen cabinet design & fabrication platform — customer-facing + internal ops | Meteor 3, React, Babylon.js, MongoDB, TypeScript |
-| **dodi-shop-ios** | `~/github/dodi-shop-ios` | Native iOS chat for shop floor workers to talk to Hive agents | Swift, SwiftUI, SwiftData, WebSocket |
-| **marketing** | `~/github/marketing` | Automated lead generation — permit scraping, Reddit monitoring, HubSpot ETL | Node.js, Playwright, MongoDB, Claude API |
-
----
-
-## 1. Hive — Agent Orchestration
-
-**Purpose**: Run 9 AI agents (Mokie, Jasper, Rae, River, Jessica, Milo, Chloe, Colt, Wyatt) that coordinate business operations through Slack.
-
-**Key components**:
-- **Gateway** (`src/channels/slack/`) — Slack Socket Mode listener, routes messages to agents
-- **Agent Runner** (`src/agents/`) — Spawns Claude sessions with per-agent system prompts, MCP servers, and model config
-- **MCP Servers** (`src/*/`) — 15+ tool servers (memory, linear, slack, catalog, resend, contacts, hubspot, google, drive, permits, keychain, etc.)
-- **WebSocket Channel** (`src/channels/ws/`) — Backend for iOS shop app connections
-- **Model Router** — Per-turn Haiku classifier for dynamic model selection (Haiku vs Sonnet)
-
-**Runtime**: Node 24 on Mac Mini, `launchd` service (`com.hive.<instance>.agent`).
-- Dev: `~/github/hive` (edit/commit/push; repo layout unchanged from 0.1.x — `dist/` + `node_modules/` at repo root)
-- Deploy: `~/services/hive/<instance>/` (instance dir; engine in `<instance>/.hive/`, upgraded via `hive update` → npm tarball fetch → `.hive/` swap; rollback via `hive rollback`)
-
-**Instance layout** (customer installs, post-0.2.x):
+## Process model
 
 ```
-~/services/hive/<instance>/
-  .hive/                         # engine — wipe-and-replace on upgrade
-    pkg/ seeds/ templates/
-    service/                     # deploy.sh + instances.conf (engine-shipped)
-    scripts/honeypot
-    node_modules/                # prod deps (populated on fetch)
-    package.json
-    plugins/claude-code/         # built-in engine plugins
-  .hive.prev/                    # previous engine (rollback target; may be absent)
-  .env                           # instance config — survives upgrades
-  hive.yaml
-  beekeeper.yaml
-  .hive-generated.json           # seed-hash cache — survives upgrades
-  logs/                          # observability — survives upgrades
-  agents/<agent_id>/             # per-agent home — survives upgrades
-    scratch/ reports/ feeds/ playwright/
-    workshop/                    # software-engineer archetype only
-  workflow/                      # instance-authored flows
-  data/                          # pipeline dump ground — transient
-  skills/                        # instance-authored skills
-  plugins/                       # instance-authored plugins (from `hive plugin add`)
+Slack / SMS / WebSocket / scheduler
+            ↓
+       Channel adapter
+            ↓
+       Dispatcher (routing, dedup, status)
+            ↓
+       Model router (Haiku / Sonnet classifier; respects per-agent ceiling)
+            ↓
+       Agent manager (concurrency, per-thread serialization)
+            ↓
+       Agent runner (spawns Claude session + MCP servers as subprocesses)
+            ↓
+       Response → channel adapter → delivery
 ```
 
-Engine files live under `.hive/` and are replaced atomically on upgrade. Everything at the instance root (config, agent data, logs, workflow, skills, instance plugins) survives upgrades.
+A single hive process serves multiple agents and multiple channels. Each agent's work runs as a Claude Code session with a configured set of MCP server subprocesses scoped to it.
 
-**Agent model tiers**: Opus (Mokie), Sonnet (River, Jessica, Jasper, Colt, Wyatt), Haiku (Rae, Chloe, Milo)
+## Key files (read these to understand the engine)
 
----
+- `src/index.ts` — entry point; wires every subsystem.
+- `src/config.ts` — loads env + `hive.yaml` into a typed config.
+- `src/agents/agent-runner.ts` — spawns Claude sessions, assembles the system prompt (soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers per agent.
+- `src/agents/agent-manager.ts` — concurrency limits, per-thread queues.
+- `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
+- `src/agents/model-router.ts` — Haiku/Sonnet classification.
+- `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue.
+- `src/channels/slack-adapter.ts` — Slack events → `WorkItem` → delivery.
+- `src/channels/sms-adapter.ts` — SMS via Quo/OpenPhone.
+- `src/slack/slack-gateway.ts` — Socket Mode listener, message filtering.
 
-## 2. dodi_v2 — Product Platform
+## Storage
 
-**Purpose**: Design custom kitchen cabinets in 3D, generate quotes, manage production through CNC fabrication, track orders.
+- **MongoDB** — agent definitions, agent memory, per-agent sessions, callbacks, contacts, devices, model overrides. Collections include `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `memory`, `memory_versions`, `contacts`, `agent_callbacks`, `devices`, `model_overrides`.
+- **Qdrant** — vector storage for semantic recall (conversation search, code search, structured memory). Local Ollama (`bge-large`) generates embeddings.
+- **macOS Keychain (Honeypot)** — third-party API keys. Per-instance prefix `hive/<instance-id>/<KEY>`. The cloud language model never sees these — local MCP servers fetch credentials via Keychain at the moment of use.
 
-**Two apps sharing one MongoDB**:
-- **Ops App** (port 3002) — Main app for sales, design, production, purchasing. Four shells: internal desktop/mobile, customer desktop/mobile
-- **Sysadmin App** (port 3001) — Migrations, deploy checklists, API key management, Atlas Search admin
+## MCP servers
 
-**19 modules** organized as internal packages (`@dodihome/*`, `@dodi/*`):
-- **Core domain**: core (FSM, events), system (users, permissions, S3), designer (3D engine, BOM), catalog (parts, vendors)
-- **Business process**: project (quotes, sales), production (jobs, cutlists), operations (purchasing, receiving), tasks, workflow, communications
-- **AI**: LLM abstraction (Claude, GPT, Gemini, Grok), 40+ designer tools for AI-assisted cabinet design
-- **UI**: React components, 2D design editor, flow/BPMN editor
+Each agent gets a subset of MCP servers — listed in its `coreServers` and `delegateServers` arrays. The engine ships a generic baseline:
 
-**Deployment**: GitHub Actions CI on self-hosted DigitalOcean runner. Branch strategy: `master` (integration) → `deploy/production` (live).
+- `memory-mcp-server.ts` — read/write/list/history/rollback agent memory.
+- `memory/structured-memory-mcp-server.ts` — tiered semantic recall.
+- `keychain-mcp-server.ts` — macOS Keychain read-only.
+- `contacts-mcp-server.ts` — contact lookups.
+- `events/event-bus-mcp-server.ts` — cross-agent event bus.
+- `team/team-mcp-server.ts` — direct agent-to-agent messaging.
+- `schedule/schedule-mcp-server.ts` — cron-style scheduled tasks.
+- `callback/callback-mcp-server.ts` — delayed-response timers.
+- `slack/slack-mcp-server.ts` — Slack tooling.
+- `linear/linear-mcp-server.ts` — Linear issues.
+- `github/github-issues-mcp-server.ts` — GitHub Issues.
+- `clickup/clickup-mcp-server.ts` — ClickUp tasks.
+- `google/google-mcp-server.ts` — Gmail + Calendar + Drive (via `gog` CLI).
+- `quo/quo-mcp-server.ts` — SMS via Quo/OpenPhone.
+- `resend/resend-mcp-server.ts` — outbound email via Resend.
+- `recall/recall-mcp-server.ts` — meeting participation via Recall.ai.
+- `tasks/task-mcp-server.ts` — generic task store.
+- `background/background-task-mcp-server.ts` — spawn detached long-running commands.
+- `code-index/code-search-mcp-server.ts` — semantic code search over indexed files.
+- `code-task/code-task-mcp-server.ts` — delegate coding to Claude Code CLI sessions.
+- `search/conversation-search-mcp-server.ts` — semantic search over past conversations.
+- `admin/admin-mcp-server.ts` — agent CRUD + version history (admin-scoped).
 
-**Database**: MongoDB (local dev: `localhost:27017/master`, production: Atlas)
+Plugins (e.g. CRM integrations, business-specific tools) are separately-published packages; install with `hive plugin add <pkg>`.
 
----
+## Channels
 
-## 3. dodi-shop-ios — Shop Floor App
+- **Slack** — Socket Mode + Web API. Agents have their own bot identities; outbound posts use `chat:write.customize`.
+- **SMS** — Quo/OpenPhone webhook → adapter → dispatcher.
+- **WebSocket** — long-lived connection from clients. Hive registers as a `?channel=` capability on a sibling beekeeper gateway (loopback on `127.0.0.1:3200`); see [beekeeper's federation doc](https://github.com/keepur/beekeeper/blob/main/docs/federation.md).
+- **Scheduler** — `schedule-mcp-server` fires `WorkItem`s on cron expressions defined per agent.
 
-**Purpose**: Give warehouse/shop workers a native iOS chat interface to Hive agents without needing Slack.
+## System prompt assembly
 
-**Key features**:
-- Text, voice (multilingual STT/TTS — English, Chinese, Spanish), and photo input
-- Offline-first with SwiftData persistence and sync queue
-- Large touch targets for gloved hands, voice-first input for noisy environments
-- Thread management (create, rename, delete)
+When an agent is invoked, the runner assembles its system prompt in this order, then calls the SDK:
 
-**Connection**: WebSocket to Hive at `wss://shop.dodihome.com`
-- Pairing via 6-digit code → JWT auth stored in Keychain
-- Messages flow: iOS app → WebSocket → Hive gateway → agent → response back via WebSocket
-- Photos sent as base64 JPEG
+1. **Soul** — agent personality / voice / values.
+2. **systemPrompt** — agent's role + guardrails.
+3. **Constitution** — shared `constitution.md` for the instance.
+4. **Toolkit** — runtime-injected catalog of available MCP tools.
+5. **Agent memory** — hot-tier records (always loaded).
+6. **Date / time** — last so the static prefix stays prompt-cache-friendly.
 
-**No direct connection to dodi_v2** — all interaction goes through Hive agents.
+## Hot reload
 
----
+`SIGUSR1` reloads agent definitions from MongoDB without restarting the daemon. Used by admin tooling that mutates `agent_definitions` (the admin MCP server, beekeeper's tune-instance skill).
 
-## 4. Marketing — Lead Generation Pipelines
+## Security posture
 
-**Purpose**: Automated pipelines that find and qualify potential customers, then feed leads to agents.
+- **Keychain isolation** — cloud LLMs never see secrets. Keychain reads happen inside MCP servers, scoped by `hive/<instance>/<KEY>`.
+- **Per-agent MCP whitelist** — an agent only sees the servers in its `coreServers`/`delegateServers`. Tool selection is enforced by what's spawned, not by prompt instructions.
+- **Confirm-before-send for outbound** — by default, customer-facing tools (resend, slack outbound, sms) draft for human approval rather than send autonomously.
+- **No shell-string subprocess invocation** — all subprocess spawns pass argv as an array (`spawnSync(binary, [args])`), never as a shell string. Prevents command injection from interpolated input.
+- **Background task auth** — bearer token (`BG_TASK_AUTH_TOKEN`) on the background task HTTP API.
 
-**Three pipelines**:
-
-### Permit Monitor (`projects/permit-monitor/`)
-- Scrapes 28 Bay Area city permit databases (Accela, eTRAKiT, EnerGov, SODA, CKAN) via REST APIs + Playwright
-- Filters for kitchen/remodel projects, scores with Claude AI (1-10)
-- Enriches with BatchData skip-trace (owner name/phone/email from address) and SF assessor data
-- Delivers qualified leads to Slack via webhook
-- Runs nightly at 1 AM via crontab
-
-### Reddit Monitor (`projects/reddit-monitor/`)
-- Monitors relevant subreddits for keyword matches
-- Claude summarizes posts, generates daily digest to Slack
-
-### HubSpot Pipeline (`projects/hubspot-pipeline/`)
-- Extracts all HubSpot CRM data (contacts, deals, tasks, notes, calls, emails, meetings)
-- Stages in Atlas `staging_*` collections
-- Generates Voyage AI vector embeddings in `rag_*` collections
-- Makes CRM, design, and production data semantic-searchable by Hive agents via `knowledge-base` MCP server
-- Runs nightly at 3 AM via crontab
-
----
-
-## How They Connect
-
-### Hive ↔ dodi_v2
-
-| Connection | Direction | Mechanism |
-|-----------|-----------|-----------|
-| **Task Ledger** | Hive → dodi_v2 | REST API (`x-api-key` auth). Agents create/update tasks in dodi_v2's task system |
-| **Catalog** | Hive → dodi_v2 | REST API (`x-api-key` auth). Wyatt queries parts, families, pricing from dodi_v2's catalog module |
-| **Linear** | Both | Shared Linear workspace. Agents track dev work; dodi_v2 CI auto-creates issues on failure |
-
-No direct database sharing. All communication is via authenticated REST APIs.
-
-### Hive ↔ iOS App
-
-| Connection | Direction | Mechanism |
-|-----------|-----------|-----------|
-| **WebSocket** | Bidirectional | `wss://shop.dodihome.com`. Real-time chat between shop workers and agents |
-| **REST** | iOS → Hive | Pairing (`POST /pair`), device management (`GET/PUT /me`) |
-
-The iOS app is a thin client — all intelligence lives in Hive.
-
-### Hive ↔ Marketing
-
-| Connection | Direction | Mechanism |
-|-----------|-----------|-----------|
-| **Knowledge Base** | Marketing → Atlas → Hive | HubSpot pipeline writes vector embeddings to Atlas; Hive's `knowledge-base` MCP server queries them for CRM, design, and production data |
-| **Permits** | Marketing → MongoDB → Hive | Permit monitor writes to local MongoDB; Hive's `permits` MCP server reads them |
-| **Slack** | Marketing → Slack → Hive | Lead digests posted to Slack channels that agents monitor |
-
-Marketing pipelines are upstream data producers. They don't call Hive directly — data flows through shared databases and Slack.
-
-### dodi_v2 ↔ Marketing
-
-| Connection | Direction | Mechanism |
-|-----------|-----------|-----------|
-| **HubSpot Sync** | Marketing → dodi_v2 | `hubspot-sync.ts` can transform HubSpot data to dodi_v2 schemas (not yet in production) |
-| **Shared MongoDB Atlas** | Both | Same Atlas cluster, different databases (`master` for dodi_v2, `hubspot` for marketing) |
-
----
-
-## Data Flow: Lead to Customer
-
-```
-Permit filed in Bay Area city
-        │
-        ▼
-[Marketing: Permit Monitor]
-  scrape → filter → AI score → skip-trace → Slack digest
-        │
-        ▼
-[Hive: Agents read Slack]
-  Milo (SDR) or River (Marketing) pick up lead
-        │
-        ▼
-[Hive: Agent actions]
-  Look up in CRM (knowledge-base) → draft outreach (resend) → create deal (hubspot-crm)
-        │
-        ▼
-[dodi_v2: Design & Production]
-  Customer designs cabinets → quote → order → production → delivery
-        │
-        ▼
-[iOS App: Shop Floor]
-  Workers chat with Jessica (Customer Success) about production status
-```
-
----
-
-## Shared Infrastructure
-
-| Service | Used By | Purpose |
-|---------|---------|---------|
-| **MongoDB Atlas** | dodi_v2, marketing, hive (memory) | Primary database cluster |
-| **MongoDB Local** | marketing (permits) | Permit dedup and contractor data |
-| **Slack** | hive, marketing | Agent communication + lead delivery |
-| **Linear** | hive, dodi_v2 CI | Issue tracking |
-| **GitHub** | all repos | Source control, CI/CD |
-| **HubSpot** | marketing, hive (via MCP) | CRM |
-| **AWS S3** | dodi_v2 | File storage |
-| **Resend** | hive, dodi_v2 | Outbound email |
-| **Google Workspace** | hive (via MCP) | Drive, Gmail, Calendar |
-
----
-
-## Deployment Summary
-
-| Repo | Where It Runs | How It Deploys |
-|------|--------------|----------------|
-| **Hive** | Mac Mini (`launchd`) | `hive update [--tag=X]` shells to `<instance>/.hive/service/deploy.sh` — fetches npm tarball, swaps `.hive/` ↔ `.hive.prev/`, restarts. Rollback via `hive rollback`. |
-| **dodi_v2** | DigitalOcean | GitHub Actions CI on PR merge to `master`, manual deploy to `deploy/production` |
-| **iOS App** | User devices | Xcode → TestFlight |
-| **Marketing** | Mac Mini (crontab) | Nightly cron jobs at 1 AM (permits) and 3 AM (HubSpot) |
+For the broader trust model see [README.md#trust-posture](../README.md#trust-posture).
