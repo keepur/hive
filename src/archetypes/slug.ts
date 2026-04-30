@@ -1,12 +1,12 @@
 /**
  * Transform an absolute filesystem path into the Claude Code harness's
- * project-directory slug, e.g. /Users/mokie/dev/dodi_v2 → -Users-mokie-dev-dodi-v2.
+ * project-directory slug, e.g. /Users/alice/projects/my_app → -Users-alice-projects-my-app.
  *
- * Empirically derived from `ls ~/.claude/projects/` listings (Spike C):
- *   /Users/mokie                           → -Users-mokie
- *   /Users/mokie/dev/dodi_v2               → -Users-mokie-dev-dodi-v2
- *   /Users/mokie/github/hive-115           → -Users-mokie-github-hive-115
- *   /Users/mokie/services/hive             → -Users-mokie-services-hive
+ * Empirically derived from `ls ~/.claude/projects/` listings:
+ *   /Users/alice                           → -Users-alice
+ *   /Users/alice/projects/my_app           → -Users-alice-projects-my-app
+ *   /Users/alice/github/hive-115           → -Users-alice-github-hive-115
+ *   /Users/alice/services/hive             → -Users-alice-services-hive
  *
  * Rules:
  *  - Input must be an absolute path (leading "/"). Throws otherwise.

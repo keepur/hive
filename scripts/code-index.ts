@@ -26,19 +26,15 @@ const args = process.argv.slice(2);
 const repoFilter = args.includes("--repo") ? args[args.indexOf("--repo") + 1] : undefined;
 const forceFullReindex = args.includes("--full");
 
-// Default repo configs — can be overridden via hive.yaml but scripts run standalone
+// Default repo configs — can be overridden via hive.yaml but scripts run standalone.
+// Operators with private plugin repos (e.g. business-specific MCP servers) should
+// add them to their hive.yaml's codeIndex.repos rather than editing this file.
 const defaultRepos: Record<string, RepoConfig> = {
   hive: {
     path: "~/github/hive",
-    include: ["src/", "plugins/dodi/"],
+    include: ["src/"],
     extensions: [".ts"],
     exclude: ["*.test.ts", "*.spec.ts", "dist/"],
-  },
-  dodi_v2: {
-    path: "~/dev/dodi_v2",
-    include: ["src/modules/", "src/apps/", "src/services/"],
-    extensions: [".ts", ".tsx", ".js"],
-    exclude: ["*.test.", "*.spec.", "node_modules/", ".meteor/", "dist/", "build/"],
   },
 };
 
