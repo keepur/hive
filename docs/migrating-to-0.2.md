@@ -17,7 +17,7 @@ Existing 0.1.x installs need a one-shot migration to the new layout. This page w
 ## Run the migration
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/migrate-0.2.sh \
+curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/migrate-0.2.sh \
   | bash -s -- ~/services/hive/<your-instance>
 ```
 
@@ -37,7 +37,7 @@ Typical runtime: ~5 minutes per instance (most of that is disk I/O for the snaps
 ## Preview first (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keepur/hive-docs/main/install/migrate-0.2.sh \
+curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/migrate-0.2.sh \
   | bash -s -- --dry-run ~/services/hive/<your-instance>
 ```
 
