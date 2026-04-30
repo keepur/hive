@@ -21,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/keepur/hive/main/install/migrate-0.
   | bash -s -- ~/services/hive/<your-instance>
 ```
 
-Replace `<your-instance>` with the folder name (e.g., `dodi`, `keepur`). The script:
+Replace `<your-instance>` with your instance directory name. The script:
 
 1. Preflights your instance (checks for a valid 0.1.x layout, disk space, required CLIs).
 2. Takes a snapshot at `~/services/hive/<your-instance>.pre-0.2-bak` for rollback.
