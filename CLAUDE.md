@@ -2,9 +2,9 @@
 
 ## Development Process
 
-All repos under **[dodi-hq](https://github.com/dodi-hq)** use the same plugin-driven workflow via the `dodi-dev` plugin (`dodi-hq/dodi-skills`).
+> Hive is open source (Apache-2.0). External contributors should follow standard GitHub flow: fork, branch, PR. The workflow below is the maintainers' (Keepur Co.) internal flow using the [dodi-dev](https://github.com/dodi-hq/dodi-skills) plugin — useful context for AI sessions running this repo on a maintainer's machine, but not a requirement.
 
-### Workflow
+### Workflow (maintainers)
 
 | Step | Skill | What Happens |
 |------|-------|-------------|
@@ -23,24 +23,31 @@ All repos under **[dodi-hq](https://github.com/dodi-hq)** use the same plugin-dr
 
 ### Specs and Plans
 
-- Design specs: `docs/specs/YYYY-MM-DD-<topic>-design.md`
-- Implementation plans: `docs/plans/YYYY-MM-DD-<feature-name>.md`
-- Read relevant specs before modifying related code
+Historical design specs and implementation plans live in the **private** companion repo `keepur/hive-docs` under `internal/specs/` and `internal/plans/` — they were moved out of the public `keepur/hive` repo when it went open source so the public docs stay lean and OSS-shaped. New design work for sensitive/internal features should land there. Public-facing engine docs live in `keepur/hive/docs/`.
 
 ### PR & Merge
 
-- All changes go through PRs into `main`
-- `npm run check` must pass before submitting
-- **CI**: GitHub Actions runs `npm run check` on every PR and push to `main` (self-hosted ARM64 runner on Mac Mini)
-- Deploy: `/deploy` pushes `main` → `deploy` with pre-flight checks
+- All changes go through PRs into `main`. `main` is `enforce_admins: true` + `required_linear_history: true` — no direct pushes, no merge commits (squash or rebase only).
+- `npm run check` must pass before submitting.
+- **CI**: GitHub Actions runs `npm run check` on every PR and push to `main` (self-hosted ARM64 runner on Mac Mini).
+
+### Releases
+
+`main` is locked, so the `npm version` flow that auto-pushes a tag won't work. Use:
+
+1. `git checkout -b release/vX.Y.Z`
+2. `npm version --no-git-tag-version <patch|minor|major>`
+3. Stage + commit `package.json` + `package-lock.json`, push the branch, open a PR.
+4. After CI green and merge: `git checkout main && git pull --ff-only && git tag vX.Y.Z && git push origin vX.Y.Z`
+5. The tag push fires the publish workflow; it verifies `package.json` matches the tag, runs full CI, publishes `@keepur/hive` to npm.
 
 ## Project Overview
 
 - TypeScript, Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`), Slack Socket Mode + Web API
-- Runtime: Node 24 on Mac Mini, runs as launchd service (`com.hive.agent`)
-- Config: `hive.yaml` (instance config, gitignored) + `.env` (secrets, gitignored)
+- Runtime: Node 22+ on Mac (Apple Silicon recommended), runs as a per-instance launchd service (`com.hive.<instance-id>.agent`)
+- Config: `hive.yaml` (instance config, gitignored) + `.env` (secrets, gitignored), both per-instance under `~/services/hive/<id>/`
 - Agents: stored in MongoDB (`agent_definitions` collection), managed via admin MCP tools or REST API
-- Plugins: `plugins/<name>/` — business-specific MCP servers + agent seeds (e.g., `plugins/dodi/`)
+- Plugins: separately-published npm packages (`@keepur/hive-plugin-<name>`) installed via `hive plugin add`. Each plugin ships MCP servers + agent seeds for a specific business domain. Internal-only plugins (e.g. CRM integrations specific to one business) can live in private repos. The OSS engine repo carries no business-specific plugins.
 
 ## Architecture
 
@@ -79,7 +86,7 @@ All in `src/` — each agent only gets servers listed in its `coreServers`/`dele
 - `search/product-search-mcp-server.ts` — vector search over product catalog
 - `search/ops-search-mcp-server.ts` — vector search over ops data
 - `search/conversation-search-mcp-server.ts` — semantic search over past conversations
-- `tasks/task-mcp-server.ts` — dodi_v2 task CRUD
+- `tasks/task-mcp-server.ts` — generic task CRUD (used by agents to track work items)
 - `background/background-task-mcp-server.ts` — spawn detached long-running commands
 - `recall/recall-mcp-server.ts` — meeting participation via Recall.ai
 - `quo-mcp-server.ts` — SMS via Quo/OpenPhone
@@ -97,11 +104,9 @@ Slack MCP defaults to the official Slack HTTP MCP server (`https://mcp.slack.com
 
 Browser automation uses Playwright via CDP endpoint (`BROWSER_CDP_ENDPOINT` config) — not a local stdio server.
 
-### Plugin MCP Servers (`plugins/dodi/`)
-- `dodi-ops-mcp-server.ts` — dodi_v2 REST API (persons, projects, designs, jobs, cases, comments, attachments, cutlists)
-- `hubspot-crm-mcp-server.ts` — HubSpot CRM read/write
-- `catalog-mcp-server.ts` — read-only product catalog access
-- `permit-mcp-server.ts` — permit management
+### Plugins
+
+The OSS engine ships no business-specific plugins. Plugins are separately-published npm packages installed via `hive plugin add @keepur/hive-plugin-<name>`. Each plugin lives at `<instance>/plugins/<name>/` post-install and contains its own MCP servers + agent seeds + (optionally) operator skills.
 
 **Manifest env vs. secret-env:** in `plugin.yaml`, list non-secret config (URLs without creds, flags, model names) under `env:` — pass-through from `process.env` only. List credentials (API keys, tokens, credentialed URIs) under `secret-env:` — resolved via `process.env` first, then macOS Keychain (Honeypot: `hive/<instanceId>/<KEY>`). Introspection and runtime injection agree: a `secret-env` var seeded only in Honeypot still works.
 
@@ -128,8 +133,7 @@ npm run lint           # ESLint
 npm run format         # Prettier
 npm run test           # Vitest
 npm run check          # All checks (typecheck + lint + format + test)
-npm run embed:hubspot  # Run HubSpot → Qdrant embed pipeline
-npm run embed:dodi     # Run dodi_v2 → Qdrant embed pipeline
+npm run bundle         # Stage 2: esbuild → pkg/ (publish-ready); runs check:bundle gates
 
 # Late-binding credentials (Honeypot, post-bootstrap)
 hive credentials list           # Show curated keys + which are set
@@ -148,21 +152,7 @@ Agent definitions live in MongoDB (`agent_definitions` collection). Each agent i
 
 **System prompt assembly order**: soul → systemPrompt → constitution (shared/constitution.md) → toolkit (KPR-87 — runtime tool inventory) → agent memory → date/time. Date/time goes last so the static prefix stays prompt-cache-friendly.
 
-Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline seed at `seeds/chief-of-staff/` (installed during `hive init`). Plugin seeds (`plugins/<name>/agent-seeds/`) provide additional agent definitions, imported via `npm run setup:seeds` (skips if agent already exists in DB). Version history is tracked in `agent_definition_versions`.
-
-**Plugin agent seeds** (dodi, 9 total):
-
-| Seed | Model | Role |
-|------|-------|------|
-| vp-engineering | Haiku | Code, builds, engineering backlog |
-| devops | Sonnet | Deploy, CI, monitoring |
-| product-manager | Haiku | Specs, user stories, backlog |
-| marketing-manager | Sonnet | Lead gen, content, market research |
-| customer-success | Sonnet | CRM, customer emails, follow-ups |
-| executive-assistant | Haiku | Receptionist, message routing |
-| product-specialist | Sonnet | Catalog, pricing, product knowledge |
-| production-support | Sonnet | Jobs, orders, manufacturing ops |
-| sdr | Haiku | Outbound outreach, lead qualification |
+Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline seed at `seeds/chief-of-staff/` (installed during `hive init`). Plugins can ship additional agent seeds; `hive plugin add` runs the seed import (skips if an agent with the same id already exists in the DB). Version history is tracked in `agent_definition_versions`.
 
 ## Conventions
 
@@ -179,10 +169,10 @@ Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline
 
 **Posture: agents are employees, not hangout partners you met at an overnight party.** Everything that runs on a hive — plugins, skills, MCP servers, agent seeds — is assumed to have access to sensitive business operations and (under the Honeypot + Keychain model) the legitimate path to credentials. There is no "trusted enough to try, too harmless to worry about." If it runs, it's an employee, and employees come through curated channels.
 
-- **Curated distribution is the paved path.** Both plugins and skills are installed from registries (Keepur-hosted default, third-party registries configurable, local registry files supported). Raw git URL or raw file install exists only as a developer-mode escape hatch and is not how production hives get code. If you find yourself designing something where the user "just drops in a skill from a GitHub gist," stop — that's outside the framework. See `docs/specs/2026-04-14-plugin-architecture-design.md` for the full contract.
+- **Curated distribution is the paved path.** Both plugins and skills are installed from registries (Keepur-hosted default, third-party registries configurable, local registry files supported). Raw git URL or raw file install exists only as a developer-mode escape hatch and is not how production hives get code. If you find yourself designing something where the user "just drops in a skill from a GitHub gist," stop — that's outside the framework. The full plugin-architecture contract lives in `keepur/hive-docs/internal/specs/` (private companion repo).
 - **Credentials are never in cloud-model-facing context.** Honeypot is the live mechanism (KPR-73 — `hive credentials add/list/remove`, bootstrap collects third-party keys into Keychain). `secret-env` vars resolve from Keychain (`hive/<instanceId>/<KEY>`) at MCP server spawn, falling back to `process.env`. Cloud-model agents have no Keychain read entitlement; they invoke *capabilities*, never hold secrets. Do not add agent-visible paths that would let filesystem Read tools exfil `.env`.
 - **Plugins carry more risk than skills.** A plugin ships an MCP server, and the MCP server is the legitimate credential holder. A malicious plugin can exfil secrets directly. A malicious skill can cause business-operational harm but cannot reach credentials under the architectural model. Registry curation matters more for plugins than for skills — not less.
-- **No shell execution**: Use `execFileSync(binary, argsArray)`, never `execSync(shellString)`
+- **No shell-string subprocess invocation**: pass argv as an array (`execFileSync(binary, [args])` / `spawnSync(binary, [args])`), never as a shell string. Prevents command injection from interpolated input.
 - **Agent permissions**: `bypassPermissions` mode — all SDK tools (Bash, Read, Write, Edit, etc.) and MCP tools available to all agents. Per-agent guardrails are enforced via system prompts, not tool blocking.
 - **Background task API**: Bearer token auth on all endpoints (`BG_TASK_AUTH_TOKEN`)
 - **Webhook secrets**: Recall webhooks use secret path token (`RECALL_WEBHOOK_SECRET`). Fail-closed if missing.
@@ -191,7 +181,7 @@ Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline
 
 ## Common Gotchas
 
-- After editing MCP server source: must `npm run build` AND restart Hive (compiled JS in `dist/`)
+- After editing MCP server source: `npm run build` (tsc → `dist/`) for dev, or `npm run bundle` (esbuild → `pkg/`) for the publish-ready artifact. The runtime engine in `<instance>/.hive/` runs from `pkg/server.min.js`. Restart Hive (`launchctl kickstart -k gui/$(id -u)/com.hive.<id>.agent`) to pick up changes — or for agent-definition changes only, send `SIGUSR1` (no restart).
 - Agent definitions are DB-native — edit via admin MCP tools or REST API, changes take effect on next SIGUSR1 reload
 - `hive.yaml` and `.env` are gitignored — exist separately in dev and deploy dirs
 - Slack file downloads: auth header stripped on redirect — must follow redirects manually
