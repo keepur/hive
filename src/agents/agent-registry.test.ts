@@ -365,3 +365,67 @@ describe("origin routing", () => {
     expect(registry.findByOrigin("dodi-shop")?.id).toBe("production-support");
   });
 });
+
+describe("AgentRegistry onPostReload", () => {
+  beforeAll(async () => {
+    const registryModule = await import("./agent-registry.js");
+    AgentRegistry = registryModule.AgentRegistry;
+  });
+
+  it("fires after load() commits new state, in subscription order", async () => {
+    const calls: string[] = [];
+    const registry = new AgentRegistry(
+      makeFakeCollection([makeDefinition({ _id: "a-1", name: "A" })]),
+    );
+    registry.onPostReload(() => calls.push("a"));
+    registry.onPostReload(() => calls.push("b"));
+    await registry.load();
+    expect(calls).toEqual(["a", "b"]);
+  });
+
+  it("fires only after rebuildOriginIndex completes — handler sees the new state", async () => {
+    const docs = [makeDefinition({ _id: "agent-x", name: "X", catches: ["origin-x"] })];
+    const registry = new AgentRegistry(makeFakeCollection(docs));
+    let observed: string | undefined;
+    registry.onPostReload(() => {
+      observed = registry.findByOrigin("origin-x")?.id;
+    });
+    await registry.load();
+    expect(observed).toBe("agent-x");
+  });
+
+  it("returns an unsubscribe function", async () => {
+    const calls: string[] = [];
+    const registry = new AgentRegistry(makeFakeCollection([makeDefinition({ _id: "a-1", name: "A" })]));
+    const off = registry.onPostReload(() => calls.push("x"));
+    await registry.load();
+    expect(calls).toEqual(["x"]);
+    off();
+    await registry.load();
+    expect(calls).toEqual(["x"]); // not fired again
+  });
+
+  it("isolates handler errors — later subscribers still fire and load() does not throw", async () => {
+    const calls: string[] = [];
+    const registry = new AgentRegistry(makeFakeCollection([makeDefinition({ _id: "a-1", name: "A" })]));
+    registry.onPostReload(() => {
+      throw new Error("boom");
+    });
+    registry.onPostReload(() => calls.push("after-throw"));
+    await expect(registry.load()).resolves.not.toThrow();
+    expect(calls).toEqual(["after-throw"]);
+  });
+
+  it("fires on every reload", async () => {
+    const docs = [makeDefinition({ _id: "a-1", name: "A" })];
+    const registry = new AgentRegistry(makeFakeCollection(docs));
+    let count = 0;
+    registry.onPostReload(() => {
+      count++;
+    });
+    await registry.load();
+    await registry.load();
+    await registry.load();
+    expect(count).toBe(3);
+  });
+});
