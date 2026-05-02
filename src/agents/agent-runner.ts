@@ -19,6 +19,8 @@ import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
 import { buildToolkitSection } from "./toolkit-section.js";
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
+import type { TeamRoster } from "../team-roster/team-roster.js";
+import { createTeamRosterMcpServer } from "../team-roster/team-roster-mcp-server.js";
 
 const log = createLogger("agent-runner");
 
@@ -193,15 +195,21 @@ export class AgentRunner {
   private activeQuery: Query | null = null;
   private eventSubscribersJson: string;
   private prefetcher?: CodeIndexPrefetcher;
+  private teamRoster?: TeamRoster;
+  // Lazy-built once per AgentRunner — the in-process MCP server wraps the same
+  // teamRoster instance for every send(), so reuse is safe and avoids per-message
+  // allocation. (The shared cache is held by `teamRoster`, not the server wrapper.)
+  private teamRosterMcpServer?: ReturnType<typeof createTeamRosterMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
     this.skillIndex = skillIndex;
     this.eventSubscribersJson = eventSubscribersJson;
     this.prefetcher = prefetcher;
+    this.teamRoster = teamRoster;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
@@ -241,6 +249,21 @@ export class AgentRunner {
     const constitution = await this.memoryManager.read("shared/constitution.md");
     if (constitution) {
       parts.push(constitution);
+    }
+
+    // KPR-139: live team summary slotted right after the constitution and
+    // before the toolkit catalog. Replaces the static team table that used
+    // to live in shared/business-context.md.
+    if (this.teamRoster) {
+      try {
+        const teamSummary = await this.teamRoster.teamSummary();
+        if (teamSummary) parts.push(teamSummary);
+      } catch (err) {
+        log.warn("teamSummary failed; omitting from prompt", {
+          agent: this.agentConfig.id,
+          error: String(err),
+        });
+      }
     }
 
     // --- Semi-static (stable within a session, changes on restart) ---
@@ -870,6 +893,9 @@ export class AgentRunner {
     coreSet.add("schedule");
     // team is an implicit core server — available to all agents unconditionally
     coreSet.add("team");
+    // team-roster is an implicit core server — every agent gets the engine-native
+    // team API (in-process MCP) for team_list / team_lookup_human / team_lookup_agent.
+    coreSet.add("team-roster");
     // slack is an implicit core server — it's the default comms channel for every agent.
     // The server itself is only built when SLACK_MCP_TOKEN is configured (see buildAllServerConfigs),
     // so this is a no-op for Slack-less instances. Agents that should not post to Slack can be
@@ -945,7 +971,7 @@ export class AgentRunner {
     // `memory` being in coreServers), so it's not unconditional. Agents with
     // memory will have structured-memory in their post-filter coreServerNames
     // and the toolkit will correctly classify it under Capability MCPs.
-    const set = new Set<string>(["schedule", "team", "slack"]);
+    const set = new Set<string>(["schedule", "team", "team-roster", "slack"]);
     if (config.workflow.enabled) set.add("workflow");
     return set;
   }
@@ -1203,6 +1229,17 @@ export class AgentRunner {
 
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
+    // team-roster is the codebase's first in-process MCP server (createSdkMcpServer
+    // from the SDK). Unlike stdio entries, it isn't a process spawn — it's a
+    // long-lived object holding tool handlers that close over the shared
+    // teamRoster cache. Built once per AgentRunner and reused across send()
+    // invocations to avoid per-message allocation.
+    if (this.teamRoster) {
+      if (!this.teamRosterMcpServer) {
+        this.teamRosterMcpServer = createTeamRosterMcpServer(this.teamRoster);
+      }
+      mcpServers["team-roster"] = this.teamRosterMcpServer;
+    }
     const delegateAgents = this.buildDelegateAgents(allServerConfigs);
     const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(delegateAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];

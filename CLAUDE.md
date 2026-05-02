@@ -150,7 +150,7 @@ hive registry remove            # Remove a registry
 
 Agent definitions live in MongoDB (`agent_definitions` collection). Each agent is a single document containing all fields: config (model, channels, servers, schedule, budget), soul (personality/voice), systemPrompt (role/guardrails), and delegatePrompts.
 
-**System prompt assembly order**: soul → systemPrompt → constitution (shared/constitution.md) → toolkit (KPR-87 — runtime tool inventory) → agent memory → date/time. Date/time goes last so the static prefix stays prompt-cache-friendly.
+**System prompt assembly order**: soul → systemPrompt → constitution (shared/constitution.md) → team summary (KPR-139 — live roster from team-roster cache) → toolkit (KPR-87 — runtime tool inventory) → agent memory → date/time. Date/time goes last so the static prefix stays prompt-cache-friendly.
 
 Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline seed at `seeds/chief-of-staff/` (installed during `hive init`). Plugins can ship additional agent seeds; `hive plugin add` runs the seed import (skips if an agent with the same id already exists in the DB). Version history is tracked in `agent_definition_versions`.
 

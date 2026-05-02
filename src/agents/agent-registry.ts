@@ -19,11 +19,40 @@ export class AgentRegistry {
   private changeStream: ChangeStream | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastPollTime = new Date(0);
-  private onReload?: () => void;
+  private onChangeDetected?: () => void;
+  private postReloadHandlers: Array<() => void> = [];
 
-  constructor(agentDefs: Collection<AgentDefinition>, onReload?: () => void) {
+  constructor(agentDefs: Collection<AgentDefinition>, onChangeDetected?: () => void) {
     this.agentDefs = agentDefs;
-    this.onReload = onReload;
+    this.onChangeDetected = onChangeDetected;
+  }
+
+  /**
+   * Subscribe to post-reload events — fired after `load()` commits new state
+   * (i.e. after `this.agents` is updated and `rebuildOriginIndex()` runs).
+   * Multiple subscribers supported. Returns an unsubscribe function.
+   *
+   * **Handlers must be synchronous.** The signature is `() => void` and any
+   * returned Promise is discarded — `load()` will not await it. If you need
+   * async work post-reload, kick it off from the handler and let it run
+   * independently (or wire a different mechanism).
+   */
+  onPostReload(handler: () => void): () => void {
+    this.postReloadHandlers.push(handler);
+    return () => {
+      const i = this.postReloadHandlers.indexOf(handler);
+      if (i >= 0) this.postReloadHandlers.splice(i, 1);
+    };
+  }
+
+  private firePostReload(): void {
+    for (const h of this.postReloadHandlers) {
+      try {
+        h();
+      } catch (err) {
+        log.warn("onPostReload handler threw", { error: String(err) });
+      }
+    }
   }
 
   async load(): Promise<{ added: string[]; updated: string[]; removed: string[] }> {
@@ -109,6 +138,7 @@ export class AgentRegistry {
 
     this.lastPollTime = new Date();
     this.rebuildOriginIndex();
+    this.firePostReload();
     return { added, updated, removed };
   }
 
@@ -117,7 +147,7 @@ export class AgentRegistry {
       this.changeStream = this.agentDefs.watch([], { fullDocument: "updateLookup" });
       this.changeStream.on("change", () => {
         log.info("Agent definition changed (change stream), triggering reload");
-        this.onReload?.();
+        this.onChangeDetected?.();
       });
       this.changeStream.on("error", (err) => {
         log.warn("Change stream error, falling back to polling", { error: String(err) });
@@ -139,7 +169,7 @@ export class AgentRegistry {
         });
         if (changed > 0) {
           log.info("Agent definitions changed (poll), triggering reload", { changed });
-          this.onReload?.();
+          this.onChangeDetected?.();
         }
       } catch (err) {
         log.error("Poll check failed", { error: String(err) });

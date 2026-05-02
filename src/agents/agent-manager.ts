@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { ConversationIndex } from "../search/conversation-index.js";
 import type { ActivityLogger } from "../activity/activity-logger.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
+import type { TeamRoster } from "../team-roster/team-roster.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -64,17 +65,19 @@ export class AgentManager {
   private skillIndex: SkillIndex;
   private activityLogger?: ActivityLogger;
   private prefetcher?: CodeIndexPrefetcher;
+  private teamRoster?: TeamRoster;
   // Keyed by agentId → list of currently in-flight WorkItems (one per active thread).
   private activeWorkItems = new Map<string, WorkItem[]>();
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
 
-  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher) {
+  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
+    this.teamRoster = teamRoster;
     this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs);
@@ -92,7 +95,7 @@ export class AgentManager {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher);
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster);
   }
 
   reloadSkills(): void {

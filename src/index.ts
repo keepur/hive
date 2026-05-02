@@ -17,6 +17,9 @@ import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
+import { TeamCache } from "./team-roster/team-cache.js";
+import { TeamRoster } from "./team-roster/team-roster.js";
+import { ContactsWatcher } from "./team-roster/contacts-watcher.js";
 import { SlackGateway } from "./slack/slack-gateway.js";
 import { MemoryManager } from "./memory/memory-manager.js";
 import { Scheduler } from "./scheduler/scheduler.js";
@@ -159,6 +162,16 @@ async function main(): Promise<void> {
   log.info("Agent registry loaded", { agents: registry.listIds() });
   provisionAgentDirs(registry.listIds());
 
+  // KPR-139: engine-native team API. Single in-process cache shared between
+  // engine code (system-prompt assembly) and the agent-facing team-roster MCP
+  // server. Agents-slice invalidates via AgentRegistry.onPostReload; humans-
+  // slice invalidates via ContactsWatcher.
+  const teamCache = new TeamCache(db);
+  const teamRoster = new TeamRoster(teamCache);
+  registry.onPostReload(() => teamCache.invalidateAgents());
+  const contactsWatcher = new ContactsWatcher(db, teamCache);
+  await contactsWatcher.start();
+
   // Initialize core systems
   const memoryManager = new MemoryManager(db);
   await memoryManager.init();
@@ -240,7 +253,7 @@ async function main(): Promise<void> {
     });
   }
 
-  agentManager = new AgentManager(registry, memoryManager, sessionStore, activityLogger, prefetcher);
+  agentManager = new AgentManager(registry, memoryManager, sessionStore, activityLogger, prefetcher, teamRoster);
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
     registry,
@@ -572,6 +585,10 @@ async function main(): Promise<void> {
     retentionSweeper.stop();
     adminApi?.stop();
     registry.stopWatching();
+    // contactsWatcher kept alive until after agentManager.stopAll() so any
+    // in-flight buildSystemPrompt() that reaches teamSummary() doesn't race
+    // a closed Mongo client. (Stopping the watcher just halts invalidation;
+    // it doesn't tear down the cache.) See KPR-139.
     await smsAdapter.stop();
     if (slackInternalApi) await slackInternalApi.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
@@ -584,6 +601,7 @@ async function main(): Promise<void> {
     await prefetcher?.close();
     meetingMonitor?.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
+    contactsWatcher.stop();
     if (activityLogger) await activityLogger.stop();
     await sessionStore.close();
     await memoryStore.close();

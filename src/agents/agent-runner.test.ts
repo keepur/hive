@@ -53,6 +53,19 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
       },
     };
   },
+  // KPR-139: agent-runner imports createTeamRosterMcpServer which uses these.
+  // Required so any test passing a `teamRoster` to AgentRunner doesn't NPE on
+  // `createSdkMcpServer is undefined`.
+  createSdkMcpServer: vi.fn((opts: { name: string }) => ({
+    name: opts.name,
+    type: "sdk",
+    instance: {},
+  })),
+  tool: vi.fn((name: string, description: string, _schema: unknown, handler: any) => ({
+    name,
+    description,
+    handler,
+  })),
 }));
 
 // ── Logger mock ─────────────────────────────────────────────────────
@@ -166,8 +179,16 @@ import { fromKeychain } from "../keychain/from-keychain.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
 
-function makeRunner(overrides: Partial<AgentConfig> = {}): AgentRunner {
-  return new AgentRunner(makeAgentConfig(overrides), makeMockMemoryManager() as any);
+function makeRunner(overrides: Partial<AgentConfig> = {}, teamRoster?: any): AgentRunner {
+  return new AgentRunner(
+    makeAgentConfig(overrides),
+    makeMockMemoryManager() as any,
+    [],
+    new Map(),
+    "{}",
+    undefined,
+    teamRoster,
+  );
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -220,6 +241,45 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     // schedule + team are always included as implicit core servers (KPR-11)
     expect(Object.keys(servers)).toEqual(["team", "schedule"]);
+  });
+
+  it("KPR-139: team-roster appears in mcpServers when a TeamRoster is provided", async () => {
+    const teamRoster = {
+      teamSummary: async () => "## Team\n- Alice",
+    };
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers).toHaveProperty("team-roster");
+  });
+
+  it("KPR-139: team-roster is rendered under 'Engine-provided' in the toolkit section", async () => {
+    const teamRoster = {
+      teamSummary: async () => "## Team\n- Alice",
+    };
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+    const engineIdx = options.systemPrompt.indexOf("### Engine-provided");
+    const teamRosterIdx = options.systemPrompt.indexOf("- team-roster");
+    expect(engineIdx).toBeGreaterThan(-1);
+    expect(teamRosterIdx).toBeGreaterThan(engineIdx);
   });
 
   it("removes resend and quo when externalComms autonomy flag is false", async () => {
@@ -1813,6 +1873,33 @@ describe("buildSystemPrompt — archetype card", () => {
     expect(prompt).not.toContain("ARCH_CARD_MARKER");
     expect(prompt).toContain("SOUL_MARKER");
     expect(prompt).toContain("SYSPROMPT_MARKER");
+  });
+
+  it("KPR-139: injects team summary when teamRoster is provided", async () => {
+    const teamRoster = {
+      teamSummary: async () => "## Team\n- TEAM_SUMMARY_MARKER",
+    };
+    const runner = makeRunner({ soul: "SOUL", systemPrompt: "SYS" }, teamRoster);
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    expect(prompt).toContain("TEAM_SUMMARY_MARKER");
+  });
+
+  it("KPR-139: no team summary section when teamRoster is undefined", async () => {
+    const runner = makeRunner({ soul: "SOUL", systemPrompt: "SYS" });
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    expect(prompt).not.toContain("TEAM_SUMMARY_MARKER");
+  });
+
+  it("KPR-139: prompt assembly tolerates teamRoster.teamSummary throwing", async () => {
+    const teamRoster = {
+      teamSummary: async () => {
+        throw new Error("cache busted");
+      },
+    };
+    const runner = makeRunner({ soul: "SOUL", systemPrompt: "SYS_MARKER" }, teamRoster);
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    // Prompt still builds, no team summary, but other parts present
+    expect(prompt).toContain("SYS_MARKER");
   });
 
   it("buildHooks includes PreCompact by default", () => {
