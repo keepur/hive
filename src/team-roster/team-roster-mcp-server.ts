@@ -10,63 +10,63 @@ import type { TeamRoster } from "./team-roster.js";
  */
 export function buildTeamRosterTools(roster: TeamRoster) {
   return [
-      tool(
-        "team_list",
-        "List the team. Defaults: active humans + active agents, sorted by category then name. Set includeArchived=true to include archived members. Set includeAgents=false to filter to humans only.",
-        {
-          includeArchived: z.boolean().optional(),
-          includeAgents: z.boolean().optional(),
-        },
-        async (args) => {
-          const team = await roster.getTeam({
-            includeArchived: args.includeArchived,
-            includeAgents: args.includeAgents,
-          });
+    tool(
+      "team_list",
+      "List the team. Defaults: active humans + active agents, sorted by category then name. Set includeArchived=true to include archived members. Set includeAgents=false to filter to humans only.",
+      {
+        includeArchived: z.boolean().optional(),
+        includeAgents: z.boolean().optional(),
+      },
+      async (args) => {
+        const team = await roster.getTeam({
+          includeArchived: args.includeArchived,
+          includeAgents: args.includeAgents,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(team, null, 2) }],
+        };
+      },
+    ),
+    tool(
+      "team_lookup_human",
+      "Look up a team-human by name or email. Provide exactly one. Returns full contact card or null if no match. Match is case-insensitive exact (no fuzzy/partial).",
+      {
+        name: z.string().optional(),
+        email: z.string().optional(),
+      },
+      async (args) => {
+        if ((args.name ? 1 : 0) + (args.email ? 1 : 0) !== 1) {
           return {
-            content: [{ type: "text", text: JSON.stringify(team, null, 2) }],
+            isError: true,
+            content: [{ type: "text", text: "team_lookup_human: provide exactly one of name|email" }],
           };
-        },
-      ),
-      tool(
-        "team_lookup_human",
-        "Look up a team-human by name or email. Provide exactly one. Returns full contact card or null if no match. Match is case-insensitive exact (no fuzzy/partial).",
-        {
-          name: z.string().optional(),
-          email: z.string().optional(),
-        },
-        async (args) => {
-          if ((args.name ? 1 : 0) + (args.email ? 1 : 0) !== 1) {
-            return {
-              isError: true,
-              content: [{ type: "text", text: "team_lookup_human: provide exactly one of name|email" }],
-            };
-          }
-          const result = await roster.lookupHuman(args);
+        }
+        const result = await roster.lookupHuman(args);
+        return {
+          content: [{ type: "text", text: result ? JSON.stringify(result, null, 2) : "null" }],
+        };
+      },
+    ),
+    tool(
+      "team_lookup_agent",
+      "Look up a team-agent by agentId or name (aliases supported). Provide exactly one. agentId match is case-sensitive; name/alias match is case-insensitive. Returns full agent card or null if no match.",
+      {
+        agentId: z.string().optional(),
+        name: z.string().optional(),
+      },
+      async (args) => {
+        if ((args.agentId ? 1 : 0) + (args.name ? 1 : 0) !== 1) {
           return {
-            content: [{ type: "text", text: result ? JSON.stringify(result, null, 2) : "null" }],
+            isError: true,
+            content: [{ type: "text", text: "team_lookup_agent: provide exactly one of agentId|name" }],
           };
-        },
-      ),
-      tool(
-        "team_lookup_agent",
-        "Look up a team-agent by agentId or name (aliases supported). Provide exactly one. agentId match is case-sensitive; name/alias match is case-insensitive. Returns full agent card or null if no match.",
-        {
-          agentId: z.string().optional(),
-          name: z.string().optional(),
-        },
-        async (args) => {
-          if ((args.agentId ? 1 : 0) + (args.name ? 1 : 0) !== 1) {
-            return {
-              isError: true,
-              content: [{ type: "text", text: "team_lookup_agent: provide exactly one of agentId|name" }],
-            };
-          }
-          const result = await roster.lookupAgent(args);
-          return {
-            content: [{ type: "text", text: result ? JSON.stringify(result, null, 2) : "null" }],
-          };
-        },
-      ),
+        }
+        const result = await roster.lookupAgent(args);
+        return {
+          content: [{ type: "text", text: result ? JSON.stringify(result, null, 2) : "null" }],
+        };
+      },
+    ),
   ];
 }
 

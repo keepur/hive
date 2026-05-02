@@ -89,10 +89,7 @@ export class TeamCache {
     if (this.agents.data && Date.now() - this.agents.loadedAt < TTL_MS) {
       return this.agents.data;
     }
-    const docs = await this.db
-      .collection<AgentDefDoc>("agent_definitions")
-      .find({})
-      .toArray();
+    const docs = await this.db.collection<AgentDefDoc>("agent_definitions").find({}).toArray();
     const members: TeamMember[] = docs.map((d) => ({
       kind: "agent" as const,
       id: d._id,

@@ -21,7 +21,10 @@ export class ContactsWatcher {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastPollTime = new Date();
 
-  constructor(private db: Db, private cache: TeamCache) {}
+  constructor(
+    private db: Db,
+    private cache: TeamCache,
+  ) {}
 
   async start(): Promise<void> {
     try {
@@ -46,9 +49,7 @@ export class ContactsWatcher {
     if (this.pollTimer) return; // idempotent — error+catch can both call this
     this.pollTimer = setInterval(async () => {
       try {
-        const changed = await this.db
-          .collection("contacts")
-          .countDocuments({ updatedAt: { $gt: this.lastPollTime } });
+        const changed = await this.db.collection("contacts").countDocuments({ updatedAt: { $gt: this.lastPollTime } });
         if (changed > 0) {
           log.debug("contacts changed (poll), invalidating humans cache", { changed });
           this.cache.invalidateHumans();

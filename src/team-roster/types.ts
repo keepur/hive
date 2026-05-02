@@ -1,9 +1,4 @@
-export type ContactCategory =
-  | "team-human"
-  | "customer"
-  | "vendor"
-  | "partner"
-  | "archived";
+export type ContactCategory = "team-human" | "customer" | "vendor" | "partner" | "archived";
 
 export interface TeamMember {
   kind: "human" | "agent";
