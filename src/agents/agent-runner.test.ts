@@ -166,8 +166,16 @@ import { fromKeychain } from "../keychain/from-keychain.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
 
-function makeRunner(overrides: Partial<AgentConfig> = {}): AgentRunner {
-  return new AgentRunner(makeAgentConfig(overrides), makeMockMemoryManager() as any);
+function makeRunner(overrides: Partial<AgentConfig> = {}, teamRoster?: any): AgentRunner {
+  return new AgentRunner(
+    makeAgentConfig(overrides),
+    makeMockMemoryManager() as any,
+    [],
+    new Map(),
+    "{}",
+    undefined,
+    teamRoster,
+  );
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1813,6 +1821,33 @@ describe("buildSystemPrompt — archetype card", () => {
     expect(prompt).not.toContain("ARCH_CARD_MARKER");
     expect(prompt).toContain("SOUL_MARKER");
     expect(prompt).toContain("SYSPROMPT_MARKER");
+  });
+
+  it("KPR-139: injects team summary when teamRoster is provided", async () => {
+    const teamRoster = {
+      teamSummary: async () => "## Team\n- TEAM_SUMMARY_MARKER",
+    };
+    const runner = makeRunner({ soul: "SOUL", systemPrompt: "SYS" }, teamRoster);
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    expect(prompt).toContain("TEAM_SUMMARY_MARKER");
+  });
+
+  it("KPR-139: no team summary section when teamRoster is undefined", async () => {
+    const runner = makeRunner({ soul: "SOUL", systemPrompt: "SYS" });
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    expect(prompt).not.toContain("TEAM_SUMMARY_MARKER");
+  });
+
+  it("KPR-139: prompt assembly tolerates teamRoster.teamSummary throwing", async () => {
+    const teamRoster = {
+      teamSummary: async () => {
+        throw new Error("cache busted");
+      },
+    };
+    const runner = makeRunner({ soul: "SOUL", systemPrompt: "SYS_MARKER" }, teamRoster);
+    const prompt = await (runner as any).buildSystemPrompt([], []);
+    // Prompt still builds, no team summary, but other parts present
+    expect(prompt).toContain("SYS_MARKER");
   });
 
   it("buildHooks includes PreCompact by default", () => {
