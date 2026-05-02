@@ -585,7 +585,10 @@ async function main(): Promise<void> {
     retentionSweeper.stop();
     adminApi?.stop();
     registry.stopWatching();
-    contactsWatcher.stop();
+    // contactsWatcher kept alive until after agentManager.stopAll() so any
+    // in-flight buildSystemPrompt() that reaches teamSummary() doesn't race
+    // a closed Mongo client. (Stopping the watcher just halts invalidation;
+    // it doesn't tear down the cache.) See KPR-139.
     await smsAdapter.stop();
     if (slackInternalApi) await slackInternalApi.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
@@ -598,6 +601,7 @@ async function main(): Promise<void> {
     await prefetcher?.close();
     meetingMonitor?.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
+    contactsWatcher.stop();
     if (activityLogger) await activityLogger.stop();
     await sessionStore.close();
     await memoryStore.close();

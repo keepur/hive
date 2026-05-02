@@ -141,6 +141,12 @@ describe("TeamRoster.lookupAgent", () => {
     expect(await roster.lookupAgent({ name: "noone" })).toBeNull();
   });
 
+  it("does not match archived/disabled agents (symmetric with lookupHuman)", async () => {
+    const roster = new TeamRoster(makeCache([], [noraDisabled]));
+    expect(await roster.lookupAgent({ agentId: "nora" })).toBeNull();
+    expect(await roster.lookupAgent({ name: "Nora" })).toBeNull();
+  });
+
   it("throws when both args provided", async () => {
     const roster = new TeamRoster(makeCache([], [jasper]));
     await expect(roster.lookupAgent({ agentId: "x", name: "y" })).rejects.toThrow(/exactly one/);

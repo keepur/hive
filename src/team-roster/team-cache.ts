@@ -1,10 +1,15 @@
 import type { Db, ObjectId } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import type { TeamMember } from "./types.js";
+import type { ContactCategory, TeamMember } from "./types.js";
 
 const log = createLogger("team-cache");
 const TTL_MS = 60_000;
 
+// Local narrow projections of the canonical schemas. These exist deliberately:
+// the cache only needs the fields that participate in TeamMember mapping, and
+// keeping a narrow shape here avoids a wide import surface from contacts-mcp-
+// server.ts and agent-registry.ts. Add a field here only when TeamMember
+// actually uses it; cross-check with the canonical types if the schema evolves.
 interface AgentDefDoc {
   _id: string;
   name: string;
@@ -24,7 +29,7 @@ interface ContactDoc {
   email: string | null;
   role?: string;
   pronouns?: string;
-  category?: string;
+  category?: ContactCategory;
   updatedAt?: Date;
 }
 

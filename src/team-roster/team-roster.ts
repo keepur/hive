@@ -59,7 +59,10 @@ export class TeamRoster {
       throw new Error("lookupAgent: exactly one of agentId|name required");
     }
 
-    const agents = await this.cache.getAgents();
+    // Symmetric with lookupHuman: only return active agents. Archived/disabled
+    // agents stay queryable via team_list({ includeArchived: true }) but do not
+    // resolve through the lookup tool.
+    const agents = (await this.cache.getAgents()).filter((m) => m.category === "team-agent");
 
     if (haveId) {
       // agentId match is case-sensitive — these are stable identifiers.

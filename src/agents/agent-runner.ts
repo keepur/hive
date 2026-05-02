@@ -196,6 +196,10 @@ export class AgentRunner {
   private eventSubscribersJson: string;
   private prefetcher?: CodeIndexPrefetcher;
   private teamRoster?: TeamRoster;
+  // Lazy-built once per AgentRunner — the in-process MCP server wraps the same
+  // teamRoster instance for every send(), so reuse is safe and avoids per-message
+  // allocation. (The shared cache is held by `teamRoster`, not the server wrapper.)
+  private teamRosterMcpServer?: ReturnType<typeof createTeamRosterMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
@@ -1225,11 +1229,16 @@ export class AgentRunner {
 
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
-    // team-roster is in-process (the codebase's first createSdkMcpServer server).
-    // Inject the running instance directly into the mcpServers map so it shares
-    // the engine-side cache with internal callers.
+    // team-roster is the codebase's first in-process MCP server (createSdkMcpServer
+    // from the SDK). Unlike stdio entries, it isn't a process spawn — it's a
+    // long-lived object holding tool handlers that close over the shared
+    // teamRoster cache. Built once per AgentRunner and reused across send()
+    // invocations to avoid per-message allocation.
     if (this.teamRoster) {
-      mcpServers["team-roster"] = createTeamRosterMcpServer(this.teamRoster);
+      if (!this.teamRosterMcpServer) {
+        this.teamRosterMcpServer = createTeamRosterMcpServer(this.teamRoster);
+      }
+      mcpServers["team-roster"] = this.teamRosterMcpServer;
     }
     const delegateAgents = this.buildDelegateAgents(allServerConfigs);
     const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(delegateAgents));

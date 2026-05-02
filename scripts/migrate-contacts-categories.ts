@@ -22,9 +22,18 @@
 
 import { MongoClient, type ObjectId } from "mongodb";
 
-// Hardcoded team emails by instance — extend as new instances onboard.
-// (Per spec: precedence over the "source: hubspot" rule, so a HubSpot-synced
-// row whose email belongs to a team member is correctly recategorized.)
+// Hardcoded team emails — currently dodi-only. Other instances should either:
+//   (a) edit this list before running, or
+//   (b) skip this script entirely and use the contacts MCP (`contacts_create`)
+//       to seed team-humans manually with `category: "team-human"` set up-front.
+//
+// Per spec: this match takes precedence over the "source: hubspot" rule, so a
+// HubSpot-synced row whose email belongs to a team member is correctly
+// recategorized as team-human (not customer).
+//
+// If you run this on a non-dodi instance without editing this list, every
+// contact will be categorized as "customer" — see the warning emitted by the
+// dry-run summary when zero team-emails match.
 const TEAM_EMAILS_DODI = new Set(
   ["may", "mike", "corey", "angus", "aaron", "angela", "lauren", "zhitong"].map(
     (n) => `${n}@dodihome.com`,
@@ -103,11 +112,29 @@ async function main(): Promise<void> {
     toCategorize++;
   }
 
+  // Sanity check: count how many would be matched as team-human under the
+  // current TEAM_EMAILS_DODI list. If zero, warn loudly — almost certainly the
+  // operator is running this on a non-dodi instance without editing the list.
+  let teamMatches = 0;
+  for (const d of all) {
+    const email = (d.email ?? "").toLowerCase();
+    if (TEAM_EMAILS_DODI.has(email)) teamMatches++;
+  }
+
   console.log(`Plan against ${dbName}.contacts (total: ${all.length}):`);
   console.log(`  delete (test rows): ${testIds.length}`);
   console.log(`  archive (duplicate email): ${toArchiveIds.length}`);
   console.log(`  categorize (uncategorized): ${toCategorize}`);
   console.log(`  already categorized (skip): ${alreadyCategorized}`);
+  console.log(`  team-human matches (current TEAM_EMAILS_DODI): ${teamMatches}`);
+
+  if (teamMatches === 0 && all.length > 0) {
+    console.warn(
+      `\nWARNING: zero contacts match TEAM_EMAILS_DODI. If this isn't dodi, ` +
+        `edit the hardcoded list in this script before running with --apply, ` +
+        `or skip the script and seed team-humans via the contacts MCP.`,
+    );
+  }
 
   if (!apply) {
     console.log("\n(dry-run; pass --apply to commit)");
