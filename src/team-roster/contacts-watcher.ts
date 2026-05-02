@@ -35,6 +35,9 @@ export class ContactsWatcher {
       });
       this.changeStream.on("error", (err) => {
         log.warn("contacts change stream error, falling back to polling", { error: String(err) });
+        // Close the broken stream before nulling — leaving it open lets it
+        // continue emitting events on a GC'd reference.
+        this.changeStream?.close().catch(() => {});
         this.changeStream = null;
         this.startPolling();
       });
