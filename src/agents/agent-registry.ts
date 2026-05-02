@@ -31,6 +31,11 @@ export class AgentRegistry {
    * Subscribe to post-reload events — fired after `load()` commits new state
    * (i.e. after `this.agents` is updated and `rebuildOriginIndex()` runs).
    * Multiple subscribers supported. Returns an unsubscribe function.
+   *
+   * **Handlers must be synchronous.** The signature is `() => void` and any
+   * returned Promise is discarded — `load()` will not await it. If you need
+   * async work post-reload, kick it off from the handler and let it run
+   * independently (or wire a different mechanism).
    */
   onPostReload(handler: () => void): () => void {
     this.postReloadHandlers.push(handler);
