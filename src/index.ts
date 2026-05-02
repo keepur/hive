@@ -17,6 +17,9 @@ import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
+import { TeamCache } from "./team-roster/team-cache.js";
+import { TeamRoster } from "./team-roster/team-roster.js";
+import { ContactsWatcher } from "./team-roster/contacts-watcher.js";
 import { SlackGateway } from "./slack/slack-gateway.js";
 import { MemoryManager } from "./memory/memory-manager.js";
 import { Scheduler } from "./scheduler/scheduler.js";
@@ -159,6 +162,16 @@ async function main(): Promise<void> {
   log.info("Agent registry loaded", { agents: registry.listIds() });
   provisionAgentDirs(registry.listIds());
 
+  // KPR-139: engine-native team API. Single in-process cache shared between
+  // engine code (system-prompt assembly) and the agent-facing team-roster MCP
+  // server. Agents-slice invalidates via AgentRegistry.onPostReload; humans-
+  // slice invalidates via ContactsWatcher.
+  const teamCache = new TeamCache(db);
+  const teamRoster = new TeamRoster(teamCache);
+  registry.onPostReload(() => teamCache.invalidateAgents());
+  const contactsWatcher = new ContactsWatcher(db, teamCache);
+  await contactsWatcher.start();
+
   // Initialize core systems
   const memoryManager = new MemoryManager(db);
   await memoryManager.init();
@@ -240,7 +253,7 @@ async function main(): Promise<void> {
     });
   }
 
-  agentManager = new AgentManager(registry, memoryManager, sessionStore, activityLogger, prefetcher);
+  agentManager = new AgentManager(registry, memoryManager, sessionStore, activityLogger, prefetcher, teamRoster);
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
     registry,
@@ -572,6 +585,7 @@ async function main(): Promise<void> {
     retentionSweeper.stop();
     adminApi?.stop();
     registry.stopWatching();
+    contactsWatcher.stop();
     await smsAdapter.stop();
     if (slackInternalApi) await slackInternalApi.stop();
     if (iMessageAdapter) await iMessageAdapter.stop();
