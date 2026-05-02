@@ -21,6 +21,13 @@ interface PhoneEntry {
   label: string; // Primary, Mobile, Work, etc.
 }
 
+type ContactCategory =
+  | "team-human"   // current team member, curated via contacts MCP
+  | "customer"     // HubSpot-sourced; the bulk of the dataset historically
+  | "vendor"       // service providers, partners-by-payment
+  | "partner"      // strategic partners, non-payment relationships
+  | "archived";    // former team-human / stale customer / no-longer-active
+
 interface ContactDoc {
   _id: ObjectId;
   name: string;
@@ -30,10 +37,12 @@ interface ContactDoc {
   phones: PhoneEntry[];
   company?: string;
   role?: string;
+  pronouns?: string;
   tags: string[];
   notes?: string;
   source: string; // e.g. crm, sms, email, manual
   sourceId?: string;
+  category?: ContactCategory;
   createdAt: Date;
   updatedAt: Date;
 }
