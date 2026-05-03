@@ -7,6 +7,14 @@ export interface AgentDefinition {
   _id: string; // "rae", "jasper" — immutable after creation
   name: string;
   aliases?: string[]; // Short names / nicknames for name-based routing (e.g. ["Sam"] for "Samantha")
+  /**
+   * What this agent does — one or more concise role labels surfaced via
+   * team_lookup_agent and the team summary in system prompts. Required from
+   * KPR-141 onwards; legacy docs may have an empty array (engine soft-warns
+   * at load time). Examples: ["VP Engineering"], ["Production Support",
+   * "Bilingual liaison (Mandarin/English)"].
+   */
+  roles: string[];
   icon: string;
 
   // LLM
@@ -78,6 +86,7 @@ export const AGENT_DEFINITION_DEFAULTS = {
   budgetUsd: 10,
   maxTurns: 200,
   icon: "",
+  roles: [] as string[],
   keywords: [] as string[],
   passiveChannels: [] as string[],
   delegatePrompts: {} as Record<string, string>,
@@ -91,6 +100,7 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     id: doc._id,
     name: doc.name,
     aliases: doc.aliases ?? [],
+    roles: doc.roles ?? AGENT_DEFINITION_DEFAULTS.roles,
     model: doc.model,
     channels: doc.channels ?? [],
     homeBase: doc.homeBase,

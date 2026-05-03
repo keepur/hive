@@ -41,6 +41,7 @@
     "migrate:agents:legacy": "npx tsx setup/migrate-agents.ts",
     "migrate:split-crm-contacts": "npx tsx setup/migrate-split-crm-contacts.ts",
     "migrate:contacts-categories": "npx tsx scripts/migrate-contacts-categories.ts",
+    "migrate:agents:add-roles": "npx tsx scripts/migrate-agents-add-roles.ts",
     "setup:plist": "npx tsx setup/generate-plist.ts",
     "update": "git pull && npm install && npm run build",
     "reindex": "npx tsx scripts/code-index.ts",

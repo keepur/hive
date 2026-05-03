@@ -186,6 +186,7 @@ export class AdminApi {
       timeoutMs: body.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
       disabled: body.disabled ?? false,
       slackBot: body.slackBot,
+      roles: body.roles ?? [],
       createdAt: now,
       updatedAt: now,
       updatedBy: "admin-api",

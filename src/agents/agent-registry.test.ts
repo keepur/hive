@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
 import { toAgentConfig, AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import type { Collection } from "mongodb";
@@ -363,6 +363,101 @@ describe("origin routing", () => {
     docs[0] = makeDefinition({ _id: "production-support", name: "Sige", catches: ["dodi-shop"] });
     await registry.load();
     expect(registry.findByOrigin("dodi-shop")?.id).toBe("production-support");
+  });
+});
+
+describe("AgentRegistry roles[] warning on load", () => {
+  beforeAll(async () => {
+    const registryModule = await import("./agent-registry.js");
+    AgentRegistry = registryModule.AgentRegistry;
+  });
+
+  function captureWarnings(): { warnings: string[]; restore: () => void } {
+    const warnings: string[] = [];
+    const spy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((chunk: string | Uint8Array): boolean => {
+        const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+        if (text.includes(`"level":"warn"`)) warnings.push(text);
+        return true;
+      });
+    return {
+      warnings,
+      restore: () => spy.mockRestore(),
+    };
+  }
+
+  it("warns when an active agent has empty roles[]", async () => {
+    const { warnings, restore } = captureWarnings();
+    try {
+      const registry = new AgentRegistry(
+        makeFakeCollection([makeDefinition({ _id: "no-roles", name: "NoRoles", roles: [] })]),
+      );
+      await registry.load();
+      const matched = warnings.filter(
+        (w) => w.includes("Agent has no roles[]") && w.includes(`"id":"no-roles"`),
+      );
+      expect(matched.length).toBe(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("warns when an active agent has missing roles[]", async () => {
+    const { warnings, restore } = captureWarnings();
+    try {
+      const def = makeDefinition({ _id: "missing-roles", name: "MissingRoles" });
+      delete (def as Partial<AgentDefinition>).roles;
+      const registry = new AgentRegistry(makeFakeCollection([def]));
+      await registry.load();
+      const matched = warnings.filter(
+        (w) => w.includes("Agent has no roles[]") && w.includes(`"id":"missing-roles"`),
+      );
+      expect(matched.length).toBe(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not warn when roles[] is non-empty", async () => {
+    const { warnings, restore } = captureWarnings();
+    try {
+      const registry = new AgentRegistry(
+        makeFakeCollection([
+          makeDefinition({ _id: "has-roles", name: "HasRoles", roles: ["chief-of-staff"] }),
+        ]),
+      );
+      await registry.load();
+      const matched = warnings.filter(
+        (w) => w.includes("Agent has no roles[]") && w.includes(`"id":"has-roles"`),
+      );
+      expect(matched.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not warn for disabled agents with empty roles[]", async () => {
+    const { warnings, restore } = captureWarnings();
+    try {
+      const registry = new AgentRegistry(
+        makeFakeCollection([
+          makeDefinition({
+            _id: "disabled-no-roles",
+            name: "DisabledNoRoles",
+            roles: [],
+            disabled: true,
+          }),
+        ]),
+      );
+      await registry.load();
+      const matched = warnings.filter(
+        (w) => w.includes("Agent has no roles[]") && w.includes(`"id":"disabled-no-roles"`),
+      );
+      expect(matched.length).toBe(0);
+    } finally {
+      restore();
+    }
   });
 });
 

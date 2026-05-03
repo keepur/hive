@@ -76,6 +76,7 @@ async function main() {
         timeoutMs: raw.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
         disabled: raw.disabled ?? false,
         slackBot: raw.slackBot,
+        roles: raw.roles ?? AGENT_DEFINITION_DEFAULTS.roles,
         createdAt: now,
         updatedAt: now,
         updatedBy: `setup:seed:${pluginName}`,

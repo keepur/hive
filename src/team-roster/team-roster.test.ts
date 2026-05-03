@@ -17,7 +17,7 @@ const may: TeamMember = {
   id: "may-id",
   name: "May Huang",
   email: "may@dodihome.com",
-  role: "CEO",
+  roles: ["CEO"],
   pronouns: "she/her",
   category: "team-human",
   updatedAt: new Date("2026-04-01T00:00:00Z"),
@@ -178,5 +178,20 @@ describe("TeamRoster.teamSummary", () => {
     const summary = await roster.teamSummary();
     expect(summary).not.toContain("Konstantin");
     expect(summary).not.toContain("Nora");
+  });
+
+  it("joins multiple roles with ' / ' for agents", async () => {
+    const multiRoleAgent: TeamMember = {
+      kind: "agent",
+      id: "multi",
+      name: "Multi",
+      category: "team-agent",
+      agentId: "multi",
+      roles: ["A", "B"],
+      active: true,
+    };
+    const roster = new TeamRoster(makeCache([], [multiRoleAgent]));
+    const summary = await roster.teamSummary();
+    expect(summary).toContain("**Multi** — A / B");
   });
 });

@@ -13,7 +13,7 @@ const TTL_MS = 60_000;
 interface AgentDefDoc {
   _id: string;
   name: string;
-  role?: string;
+  roles?: string[];
   model?: string;
   homeBase?: string;
   channels?: string[];
@@ -81,7 +81,7 @@ export class TeamCache {
       id: d._id.toHexString(),
       name: d.name || `${d.firstName ?? ""} ${d.lastName ?? ""}`.trim(),
       email: d.email ?? undefined,
-      role: d.role,
+      roles: d.role ? [d.role] : [],
       pronouns: d.pronouns,
       category: (d.category === "archived" ? "archived" : "team-human") as TeamMember["category"],
       updatedAt: d.updatedAt,
@@ -99,7 +99,7 @@ export class TeamCache {
       kind: "agent" as const,
       id: d._id,
       name: d.name,
-      role: d.role,
+      roles: d.roles ?? [],
       category: d.disabled ? "archived" : "team-agent",
       agentId: d._id,
       slackChannel: d.homeBase ?? d.channels?.[0],
