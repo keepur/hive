@@ -99,11 +99,29 @@ Present the agent as a person, not a config:
 
 **ID collision check first.** Slugify the name (lowercase, hyphens) and call `agent_list` to ensure no collision. If taken, append a suffix or ask the owner for a variant. `_id` is immutable after creation.
 
+**Roles (required — KPR-141 schema enforcement).** The engine requires at least one role per agent; an empty `roles` array triggers a soft-warn at registry load. Ask:
+
+> *"What role or roles should [Name] carry on the team? These are short labels — things like `engineering-lead`, `customer-success`, `chief-of-staff`, `receptionist`. At least one is required."*
+
+If the owner gives none or an empty list, re-prompt once:
+
+> *"I need at least one role to register [Name] in the system. Even a broad one like `agent` works — what fits best?"*
+
+Lowercase-hyphenated is the convention but not enforced. Collect as an array.
+
+**Aliases (optional).** Ask once, can skip:
+
+> *"Any nicknames or alternate names people might use for [Name]? These let the team lookup find them by alias. Comma-separated, or skip if none."*
+
+Parse comma-separated input into an array. Empty input → omit the field (don't pass an empty array).
+
 Call `agent_create` with these top-level fields:
 
 - `_id` — slug (checked above)
 - `name` — display name
 - `model` — your choice (Haiku default; Sonnet for nuanced customer-facing or coordination work). Owner never sees this.
+- `roles` — array from above (required, ≥1 entry)
+- `aliases` — array from above (omit if owner skipped)
 - `homeBase` — `agent-<id>` (you will tell the owner to create this Slack channel in step 9)
 - `soul` — the draft from step 2
 - `systemPrompt` — concise role + guardrails; instance-specific flavor. For archetype agents, keep it short — the archetype card layers framing underneath.
@@ -114,6 +132,24 @@ Call `agent_create` with these top-level fields:
   - `schedule` — cron tasks if applicable
   - `archetypeConfig` — for SE: `{ workshop, workspaces: [] }`
   - **`autonomy: { externalComms: false }`** — ALWAYS pass this explicitly unless the owner approved outbound comms (email/SMS) in the conversation. The system default is `true`; you must opt out.
+
+Example shape:
+
+```json
+{
+  "_id": "jordan",
+  "name": "Jordan",
+  "model": "haiku",
+  "roles": ["receptionist"],
+  "aliases": ["the front desk"],
+  "homeBase": "agent-jordan",
+  "soul": "...",
+  "systemPrompt": "...",
+  "fields": {
+    "autonomy": { "externalComms": false }
+  }
+}
+```
 
 **Do NOT pass `coreServers`.** Phase 1's default (`memory`, `structured-memory`, `keychain`, `event-bus`, `contacts`) applies automatically. Override only if the owner's specifically approved tooling changes the baseline.
 
