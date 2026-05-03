@@ -1,5 +1,7 @@
 _id: chief-of-staff
 name: Chief
+roles:
+  - Chief of Staff
 model: opus
 icon: ":bee:"
 channels:
