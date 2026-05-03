@@ -137,12 +137,12 @@ Example shape:
 
 ```json
 {
-  "_id": "rae",
-  "name": "Rae",
+  "_id": "jordan",
+  "name": "Jordan",
   "model": "haiku",
   "roles": ["receptionist"],
   "aliases": ["the front desk"],
-  "homeBase": "agent-rae",
+  "homeBase": "agent-jordan",
   "soul": "...",
   "systemPrompt": "...",
   "fields": {
