@@ -88,14 +88,14 @@ export class TeamRoster {
     if (humans.length > 0) {
       lines.push("", "### Humans");
       for (const h of humans) {
-        const role = h.role ? ` — ${h.role}` : "";
+        const role = h.roles && h.roles.length > 0 ? ` — ${h.roles.join(" / ")}` : "";
         lines.push(`- **${h.name}**${role}`);
       }
     }
     if (agents.length > 0) {
       lines.push("", "### AI Agents");
       for (const a of agents) {
-        const role = a.role ? ` — ${a.role}` : "";
+        const role = a.roles && a.roles.length > 0 ? ` — ${a.roles.join(" / ")}` : "";
         const channel = a.slackChannel ? ` (\`#${a.slackChannel}\`)` : "";
         lines.push(`- **${a.name}**${channel}${role}`);
       }

@@ -5,7 +5,7 @@ export interface TeamMember {
   id: string;
   name: string;
   email?: string;
-  role?: string;
+  roles?: string[];
   pronouns?: string;
   category: "team-human" | "team-agent" | "archived";
   /** Used by lookupHuman's most-recently-updated tiebreak. Humans only. */

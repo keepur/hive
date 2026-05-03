@@ -62,7 +62,7 @@ describe("TeamCache", () => {
       id: id.toHexString(),
       name: "May Huang",
       email: "may@dodihome.com",
-      role: "CEO",
+      roles: ["CEO"],
       pronouns: "she/her",
       category: "team-human",
     });
@@ -136,6 +136,31 @@ describe("TeamCache", () => {
       slackChannel: "agent-nora",
       active: false,
     });
+  });
+
+  it("getAgents projects roles[] when present on the doc", async () => {
+    const agentDefs = makeFakeCollection([
+      {
+        _id: "jasper",
+        name: "Jasper",
+        roles: ["A", "B"],
+      },
+    ]);
+    const cache = new TeamCache(makeDb({ agentDefs }));
+    const [agent] = await cache.getAgents();
+    expect(agent.roles).toEqual(["A", "B"]);
+  });
+
+  it("getAgents projects empty roles[] when the doc has no roles field", async () => {
+    const agentDefs = makeFakeCollection([
+      {
+        _id: "jasper",
+        name: "Jasper",
+      },
+    ]);
+    const cache = new TeamCache(makeDb({ agentDefs }));
+    const [agent] = await cache.getAgents();
+    expect(agent.roles).toEqual([]);
   });
 
   it("caches humans within TTL — second call does not re-query", async () => {
