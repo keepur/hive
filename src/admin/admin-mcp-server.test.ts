@@ -400,10 +400,7 @@ describe("agent_create — schema promotion and archetype support", () => {
   });
 
   it("agent_get renders backfill hint when roles is empty", async () => {
-    agentDocsStore.set(
-      "no-roles",
-      makeBaseAgent({ _id: "no-roles", roles: [] }),
-    );
+    agentDocsStore.set("no-roles", makeBaseAgent({ _id: "no-roles", roles: [] }));
     const getHandler = registeredTools.get("agent_get")!;
     const res = await getHandler({ agent_id: "no-roles" });
     expect(res.isError).toBeFalsy();

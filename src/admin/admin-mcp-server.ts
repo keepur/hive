@@ -145,7 +145,7 @@ server.registerTool(
   {
     title: "Create Agent",
     description:
-      "Create a new agent definition. Required: _id, name, model, homeBase, roles. Roles is an array of concise role labels (e.g. [\"VP Engineering\"] or [\"Production Support\", \"Bilingual liaison\"]) — used by team_lookup_agent and the team summary in agent system prompts. Archetype is optional — pass it when the role is a discipline with shared infrastructure (see list_archetypes). Soul/systemPrompt shape the agent's voice and role; if omitted they default to empty strings. Additional tuning (channels, schedule, budget, autonomy, archetypeConfig, etc.) goes in `fields`.",
+      'Create a new agent definition. Required: _id, name, model, homeBase, roles. Roles is an array of concise role labels (e.g. ["VP Engineering"] or ["Production Support", "Bilingual liaison"]) — used by team_lookup_agent and the team summary in agent system prompts. Archetype is optional — pass it when the role is a discipline with shared infrastructure (see list_archetypes). Soul/systemPrompt shape the agent\'s voice and role; if omitted they default to empty strings. Additional tuning (channels, schedule, budget, autonomy, archetypeConfig, etc.) goes in `fields`.',
     inputSchema: {
       _id: z.string().describe("Agent ID (lowercase with hyphens, e.g. 'my-agent')"),
       name: z.string().describe("Display name for the agent"),
@@ -153,12 +153,12 @@ server.registerTool(
         .array(z.string())
         .min(1)
         .describe(
-          "What this agent does — one or more concise role labels (e.g. [\"VP Engineering\"], or [\"Production Support\", \"Bilingual liaison (Mandarin/English)\"]). Surfaced via team_lookup_agent and team summary in system prompts.",
+          'What this agent does — one or more concise role labels (e.g. ["VP Engineering"], or ["Production Support", "Bilingual liaison (Mandarin/English)"]). Surfaced via team_lookup_agent and team summary in system prompts.',
         ),
       aliases: z
         .array(z.string())
         .optional()
-        .describe("Optional short names / nicknames for name-based routing (e.g. [\"Sam\"] for \"Samantha\")."),
+        .describe('Optional short names / nicknames for name-based routing (e.g. ["Sam"] for "Samantha").'),
       model: z.string().describe("Model to use (e.g. 'claude-sonnet-4-6', 'claude-haiku-4-5')"),
       homeBase: z
         .string()
