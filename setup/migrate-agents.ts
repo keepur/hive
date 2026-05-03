@@ -16,6 +16,7 @@ import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
 import type { AgentDefinition } from "../src/types/agent-definition.js";
+import { AGENT_DEFINITION_DEFAULTS } from "../src/types/agent-definition.js";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const AGENTS_DIR = resolve(process.env.AGENTS_PATH ?? join(ROOT, "agents"));
@@ -124,6 +125,7 @@ async function main() {
       timeoutMs: (raw.timeoutMs as number) || 300_000,
       disabled: (raw.disabled as boolean) || false,
       slackBot: (raw.slackBot as string) || undefined,
+      roles: (raw.roles as string[]) ?? AGENT_DEFINITION_DEFAULTS.roles,
       createdAt: now,
       updatedAt: now,
       updatedBy: "migration",

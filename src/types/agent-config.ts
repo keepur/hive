@@ -10,6 +10,7 @@ export interface AgentConfig {
   id: string;
   name: string;
   aliases: string[];
+  roles: string[];
   model: string;
   channels: string[];
   homeBase?: string;
