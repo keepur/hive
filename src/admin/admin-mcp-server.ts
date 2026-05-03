@@ -211,6 +211,7 @@ server.registerTool(
       _id,
       name,
       aliases: f.aliases as string[] | undefined,
+      roles: (f.roles as string[]) ?? [], // KPR-141: stub for typecheck; Task 4 replaces with top-level destructured arg
       model,
       icon: (f.icon as string) ?? AGENT_DEFINITION_DEFAULTS.icon,
       channels: (f.channels as string[]) ?? [],
