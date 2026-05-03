@@ -29,7 +29,7 @@ export function buildTeamRosterTools(roster: TeamRoster) {
     ),
     tool(
       "team_lookup_human",
-      "Look up a team-human by name or email. Provide exactly one. Returns full contact card or null if no match. Match is case-insensitive exact (no fuzzy/partial).",
+      "Look up a team-human by name or email. USE THIS FOR ROUTINE TEAMMATE INFO — roles, email, pronouns. Provide exactly one of name|email. Returns full contact card or null if no match. Match is case-insensitive exact (no fuzzy/partial).",
       {
         name: z.string().optional(),
         email: z.string().optional(),
@@ -49,7 +49,7 @@ export function buildTeamRosterTools(roster: TeamRoster) {
     ),
     tool(
       "team_lookup_agent",
-      "Look up a team-agent by agentId or name (aliases supported). Provide exactly one. agentId match is case-sensitive; name/alias match is case-insensitive. Returns full agent card or null if no match.",
+      "Look up a team-agent by agentId or name (aliases supported). USE THIS FOR ROUTINE TEAMMATE INFO — roles, channel, model. Reserve `agent_get` (admin) for editing or version history. Provide exactly one of agentId|name. agentId match is case-sensitive; name/alias match is case-insensitive. Returns full agent card or null if no match.",
       {
         agentId: z.string().optional(),
         name: z.string().optional(),
