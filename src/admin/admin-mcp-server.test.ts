@@ -79,12 +79,15 @@ const agentVersionsStub = makeAgentVersionsStub();
 
 // Captured tool handlers: name → async handler fn
 const registeredTools: Map<string, (args: any) => Promise<any>> = new Map();
+// Captured tool schemas: name → { description, inputSchema (zod shape) }
+const registeredToolSchemas: Map<string, { description?: string; inputSchema?: Record<string, any> }> = new Map();
 
 // Mock the MCP SDK before any import
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
   McpServer: vi.fn().mockImplementation(() => ({
     registerTool: vi.fn((_name: string, _schema: any, handler: any) => {
       registeredTools.set(_name, handler);
+      registeredToolSchemas.set(_name, _schema);
     }),
     connect: vi.fn().mockResolvedValue(undefined),
   })),
@@ -160,7 +163,13 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
     const handler = registeredTools.get("agent_create")!;
     expect(handler).toBeDefined();
 
-    const result = await handler({ _id: "new-agent", name: "New Agent", model: "haiku", homeBase: undefined });
+    const result = await handler({
+      _id: "new-agent",
+      name: "New Agent",
+      model: "haiku",
+      homeBase: undefined,
+      roles: ["X"],
+    });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/homeBase/);
@@ -174,6 +183,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
       name: "New Agent",
       model: "haiku",
       homeBase: "",
+      roles: ["X"],
     });
 
     expect(result.isError).toBe(true);
@@ -188,6 +198,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
       name: "New Agent",
       model: "haiku",
       homeBase: "   ",
+      roles: ["X"],
     });
 
     expect(result.isError).toBe(true);
@@ -202,6 +213,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
       name: "Trimmed Agent",
       model: "haiku",
       homeBase: "  agent-foo  ",
+      roles: ["X"],
     });
 
     expect(result.isError).toBeFalsy();
@@ -215,7 +227,13 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
   it("rejects agent_create when fields is omitted entirely", async () => {
     const handler = registeredTools.get("agent_create")!;
 
-    const result = await handler({ _id: "new-agent", name: "New Agent", model: "haiku", homeBase: undefined });
+    const result = await handler({
+      _id: "new-agent",
+      name: "New Agent",
+      model: "haiku",
+      homeBase: undefined,
+      roles: ["X"],
+    });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/homeBase/);
@@ -230,6 +248,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
       name: "Dupe",
       model: "haiku",
       homeBase: "agent-existing",
+      roles: ["X"],
     });
 
     expect(result.isError).toBe(true);
@@ -250,6 +269,7 @@ describe("agent_create — schema promotion and archetype support", () => {
       name: "New",
       model: "claude-haiku-4-5",
       homeBase: "agent-new",
+      roles: ["Generic"],
     });
     expect(res.isError).toBeFalsy();
     const doc = agentDocsStore.get("new-agent");
@@ -264,6 +284,7 @@ describe("agent_create — schema promotion and archetype support", () => {
       name: "X",
       model: "claude-haiku-4-5",
       homeBase: "agent-x",
+      roles: ["Generic"],
       fields: { coreServers: ["admin"] },
     });
     expect(agentDocsStore.get("explicit-server-agent").coreServers).toEqual(["admin"]);
@@ -276,6 +297,7 @@ describe("agent_create — schema promotion and archetype support", () => {
       name: "Alex",
       model: "claude-sonnet-4-6",
       homeBase: "agent-alex",
+      roles: ["Engineering Lead"],
       archetype: "software-engineer",
       title: "Head of Product",
       fields: {
@@ -295,6 +317,7 @@ describe("agent_create — schema promotion and archetype support", () => {
       name: "Bad",
       model: "claude-haiku-4-5",
       homeBase: "agent-bad",
+      roles: ["Generic"],
       archetype: "bookkeeper",
     });
     expect(res.isError).toBe(true);
@@ -309,9 +332,82 @@ describe("agent_create — schema promotion and archetype support", () => {
       name: "No",
       model: "claude-haiku-4-5",
       homeBase: "",
+      roles: ["Generic"],
     });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("homeBase");
+  });
+
+  it("persists roles array as provided (multiple labels)", async () => {
+    const handler = registeredTools.get("agent_create");
+    const res = await handler!({
+      _id: "multi-role",
+      name: "Multi",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-multi",
+      roles: ["A", "B"],
+    });
+    expect(res.isError).toBeFalsy();
+    const doc = agentDocsStore.get("multi-role");
+    expect(doc.roles).toEqual(["A", "B"]);
+  });
+
+  it("persists optional aliases when provided as top-level arg", async () => {
+    const handler = registeredTools.get("agent_create");
+    const res = await handler!({
+      _id: "aliased",
+      name: "Samantha",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-aliased",
+      roles: ["Marketing Ops"],
+      aliases: ["Sam"],
+    });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("aliased").aliases).toEqual(["Sam"]);
+  });
+
+  it("rejects roles=[] at the schema layer (zod .min(1))", async () => {
+    // The mock harness bypasses schema validation when calling handlers directly,
+    // so we validate the registered zod schema independently.
+    const schema = registeredToolSchemas.get("agent_create");
+    expect(schema).toBeDefined();
+    expect(schema!.inputSchema).toBeDefined();
+    const { z } = await import("zod");
+    const obj = z.object(schema!.inputSchema as Record<string, any>);
+    const result = obj.safeParse({
+      _id: "x",
+      name: "X",
+      model: "haiku",
+      homeBase: "agent-x",
+      roles: [],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("agent_get renders Roles line for an agent with roles", async () => {
+    const createHandler = registeredTools.get("agent_create")!;
+    await createHandler({
+      _id: "rendered-agent",
+      name: "Rendered",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-rendered",
+      roles: ["A", "B"],
+    });
+    const getHandler = registeredTools.get("agent_get")!;
+    const res = await getHandler({ agent_id: "rendered-agent" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text as string).toMatch(/Roles: A \/ B/);
+  });
+
+  it("agent_get renders backfill hint when roles is empty", async () => {
+    agentDocsStore.set(
+      "no-roles",
+      makeBaseAgent({ _id: "no-roles", roles: [] }),
+    );
+    const getHandler = registeredTools.get("agent_get")!;
+    const res = await getHandler({ agent_id: "no-roles" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text as string).toMatch(/Roles: \(not set/);
   });
 });
 
@@ -397,6 +493,50 @@ describe("admin-mcp-server — agent_update homeBase passthrough", () => {
     const handler = registeredTools.get("agent_update");
     const res = await handler!({ agent_id: "empty-update" });
     expect(res.isError).toBe(true);
+  });
+
+  it("updates roles via top-level promotion", async () => {
+    agentDocsStore.set("rolly", {
+      _id: "rolly",
+      name: "Rolly",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-rolly",
+      roles: ["Old"],
+    });
+    const handler = registeredTools.get("agent_update");
+    const res = await handler!({ agent_id: "rolly", roles: ["New"] });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("rolly").roles).toEqual(["New"]);
+  });
+
+  it("preserves existing roles when agent_update is called without roles", async () => {
+    agentDocsStore.set("preserved", {
+      _id: "preserved",
+      name: "Preserved",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-preserved",
+      roles: ["Stable"],
+    });
+    const handler = registeredTools.get("agent_update");
+    const res = await handler!({ agent_id: "preserved", title: "New Title" });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("preserved").roles).toEqual(["Stable"]);
+    expect(agentDocsStore.get("preserved").title).toBe("New Title");
+  });
+
+  it("updates aliases via top-level promotion", async () => {
+    agentDocsStore.set("alias-target", {
+      _id: "alias-target",
+      name: "Samantha",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-sam",
+      roles: ["Marketing Ops"],
+      aliases: ["S"],
+    });
+    const handler = registeredTools.get("agent_update");
+    const res = await handler!({ agent_id: "alias-target", aliases: ["Sam"] });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("alias-target").aliases).toEqual(["Sam"]);
   });
 });
 

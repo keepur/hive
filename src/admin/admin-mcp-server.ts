@@ -91,7 +91,8 @@ server.registerTool(
   "agent_get",
   {
     title: "Get Agent Definition",
-    description: "Get the full definition for an agent, formatted for readability.",
+    description:
+      "Fetch full agent definition (admin). Use ONLY for editing or inspecting version history; for routine teammate info (roles, channel, model) prefer `team_lookup_agent`.",
     inputSchema: {
       agent_id: z.string().describe("The agent ID (e.g. 'rae', 'jasper')"),
     },
@@ -106,6 +107,10 @@ server.registerTool(
     }
 
     const lines: string[] = [`Agent: ${doc._id}`, `Name: ${doc.name}`, `Icon: ${doc.icon || "(none)"}`];
+    lines.push(`Aliases: [${(doc.aliases ?? []).join(", ")}]`);
+    lines.push(
+      `Roles: ${doc.roles && doc.roles.length > 0 ? doc.roles.join(" / ") : "(not set — backfill via agent_update)"}`,
+    );
     lines.push(`Model: ${doc.model}`);
     lines.push(`Channels: [${(doc.channels ?? []).join(", ")}]`);
     lines.push(`Passive Channels: [${(doc.passiveChannels ?? []).join(", ")}]`);
@@ -140,10 +145,20 @@ server.registerTool(
   {
     title: "Create Agent",
     description:
-      "Create a new agent definition. Required: _id, name, model, homeBase. Archetype is optional — pass it when the role is a discipline with shared infrastructure (see list_archetypes). Soul/systemPrompt shape the agent's voice and role; if omitted they default to empty strings. Additional tuning (channels, schedule, budget, autonomy, archetypeConfig, etc.) goes in `fields`.",
+      "Create a new agent definition. Required: _id, name, model, homeBase, roles. Roles is an array of concise role labels (e.g. [\"VP Engineering\"] or [\"Production Support\", \"Bilingual liaison\"]) — used by team_lookup_agent and the team summary in agent system prompts. Archetype is optional — pass it when the role is a discipline with shared infrastructure (see list_archetypes). Soul/systemPrompt shape the agent's voice and role; if omitted they default to empty strings. Additional tuning (channels, schedule, budget, autonomy, archetypeConfig, etc.) goes in `fields`.",
     inputSchema: {
       _id: z.string().describe("Agent ID (lowercase with hyphens, e.g. 'my-agent')"),
       name: z.string().describe("Display name for the agent"),
+      roles: z
+        .array(z.string())
+        .min(1)
+        .describe(
+          "What this agent does — one or more concise role labels (e.g. [\"VP Engineering\"], or [\"Production Support\", \"Bilingual liaison (Mandarin/English)\"]). Surfaced via team_lookup_agent and team summary in system prompts.",
+        ),
+      aliases: z
+        .array(z.string())
+        .optional()
+        .describe("Optional short names / nicknames for name-based routing (e.g. [\"Sam\"] for \"Samantha\")."),
       model: z.string().describe("Model to use (e.g. 'claude-sonnet-4-6', 'claude-haiku-4-5')"),
       homeBase: z
         .string()
@@ -176,7 +191,7 @@ server.registerTool(
         ),
     },
   },
-  async ({ _id, name, model, homeBase, soul, systemPrompt, archetype, title, fields }) => {
+  async ({ _id, name, roles, aliases, model, homeBase, soul, systemPrompt, archetype, title, fields }) => {
     const existing = await agentDefs.findOne({ _id: _id as any });
     if (existing) {
       return {
@@ -210,8 +225,8 @@ server.registerTool(
     const doc: AgentDefinition = {
       _id,
       name,
-      aliases: f.aliases as string[] | undefined,
-      roles: (f.roles as string[]) ?? [], // KPR-141: stub for typecheck; Task 4 replaces with top-level destructured arg
+      aliases: aliases ?? (f.aliases as string[] | undefined),
+      roles,
       model,
       icon: (f.icon as string) ?? AGENT_DEFINITION_DEFAULTS.icon,
       channels: (f.channels as string[]) ?? [],
@@ -284,13 +299,22 @@ server.registerTool(
           "Discipline id from list_archetypes. Pass null-style empty string to clear (note: fields.archetype: null also works via the fields bag).",
         ),
       title: z.string().optional().describe("Customer-facing title."),
+      roles: z
+        .array(z.string())
+        .min(1)
+        .optional()
+        .describe("Replace the agent's roles array. Pass the full new array, not a delta. Cannot be empty."),
+      aliases: z
+        .array(z.string())
+        .optional()
+        .describe("Replace the agent's aliases array (pass [] to clear). Optional."),
       fields: z
         .record(z.string(), z.any())
         .optional()
         .describe("Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.)"),
     },
   },
-  async ({ agent_id, homeBase, soul, systemPrompt, archetype, title, fields }) => {
+  async ({ agent_id, homeBase, soul, systemPrompt, archetype, title, roles, aliases, fields }) => {
     const existing = await agentDefs.findOne({ _id: agent_id as any });
     if (!existing) {
       return {
@@ -305,6 +329,8 @@ server.registerTool(
     if (systemPrompt !== undefined) merged.systemPrompt = systemPrompt;
     if (archetype !== undefined) merged.archetype = archetype;
     if (title !== undefined) merged.title = title;
+    if (roles !== undefined) merged.roles = roles;
+    if (aliases !== undefined) merged.aliases = aliases;
 
     if ("_id" in merged) {
       return {
