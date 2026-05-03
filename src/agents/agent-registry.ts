@@ -124,6 +124,16 @@ export class AgentRegistry {
 
       this.agents.set(agentConfig.id, agentConfig);
       log.info("Loaded agent", { id: agentConfig.id, name: agentConfig.name });
+
+      if (!doc.roles || doc.roles.length === 0) {
+        log.warn(
+          "Agent has no roles[] — set via admin agent_update or beekeeper tune-instance for proper team_lookup_agent payload",
+          {
+            id: agentConfig.id,
+            name: agentConfig.name,
+          },
+        );
+      }
     }
 
     this.disabledAgents = newDisabled;
