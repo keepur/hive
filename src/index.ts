@@ -253,7 +253,7 @@ async function main(): Promise<void> {
     });
   }
 
-  agentManager = new AgentManager(registry, memoryManager, sessionStore, activityLogger, prefetcher, teamRoster);
+  agentManager = new AgentManager(registry, memoryManager, sessionStore, db, activityLogger, prefetcher, teamRoster);
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
     registry,

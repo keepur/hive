@@ -6,6 +6,7 @@ import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
+import type { Db } from "mongodb";
 import { formatFilesForPrompt } from "../files/file-processor.js";
 import { routeModel, type ResourceLimits } from "./model-router.js";
 import { config as appConfig } from "../config.js";
@@ -66,15 +67,17 @@ export class AgentManager {
   private activityLogger?: ActivityLogger;
   private prefetcher?: CodeIndexPrefetcher;
   private teamRoster?: TeamRoster;
+  private db: Db;
   // Keyed by agentId → list of currently in-flight WorkItems (one per active thread).
   private activeWorkItems = new Map<string, WorkItem[]>();
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
 
-  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
+  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
+    this.db = db;
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
@@ -95,7 +98,7 @@ export class AgentManager {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster);
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db);
   }
 
   reloadSkills(): void {

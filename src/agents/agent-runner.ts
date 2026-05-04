@@ -21,6 +21,7 @@ import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import { createTeamRosterMcpServer } from "../team-roster/team-roster-mcp-server.js";
+import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
 
@@ -196,13 +197,16 @@ export class AgentRunner {
   private eventSubscribersJson: string;
   private prefetcher?: CodeIndexPrefetcher;
   private teamRoster?: TeamRoster;
+  // Optional in tests — runtime always passes the shared engine Db handle so
+  // in-process MCP servers can avoid opening their own MongoClient pools (KPR-122).
+  private db?: Db;
   // Lazy-built once per AgentRunner — the in-process MCP server wraps the same
   // teamRoster instance for every send(), so reuse is safe and avoids per-message
   // allocation. (The shared cache is held by `teamRoster`, not the server wrapper.)
   private teamRosterMcpServer?: ReturnType<typeof createTeamRosterMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
@@ -210,6 +214,7 @@ export class AgentRunner {
     this.eventSubscribersJson = eventSubscribersJson;
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
+    this.db = db;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
