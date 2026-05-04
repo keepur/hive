@@ -115,7 +115,13 @@ server.registerTool(
         ...(blocks !== undefined && { blocks }),
         ...(force_root !== undefined && { force_root }),
       });
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      // KPR-174: surface the posting identity so the agent can confirm
+      // which agent persona this post landed under. AGENT_ID is the
+      // agent-runner-injected hive agent id (e.g. "jessica") — distinct
+      // from any Slack workspace user mapping. Mirrors the convention
+      // gmail_send and quo_send_sms use.
+      const enriched = AGENT_ID ? { ...result, posted_as: AGENT_ID } : result;
+      return { content: [{ type: "text", text: JSON.stringify(enriched) }] };
     } catch (err) {
       return {
         content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
