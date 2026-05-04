@@ -1682,7 +1682,7 @@ describe("AgentRunner token tracking and compaction (via send)", () => {
       usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0 },
       modelUsage: {
         "claude-haiku-4-5": { contextWindow: 200000 },
-        "claude-sonnet-4-5": { contextWindow: 1000000 },
+        "claude-sonnet-4-6": { contextWindow: 1000000 },
       },
     }];
 
