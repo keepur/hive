@@ -26,6 +26,7 @@ import {
   createStructuredMemoryMcpServer,
   type StructuredMemoryTurnContext,
 } from "../memory/structured-memory-mcp-server.js";
+import { createEventBusMcpServer } from "../events/event-bus-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -214,6 +215,7 @@ export class AgentRunner {
   private memoryMcpServer?: ReturnType<typeof createMemoryMcpServer>;
   private structuredMemoryMcpServer?: ReturnType<typeof createStructuredMemoryMcpServer>;
   private structuredMemoryContextRef: { current: StructuredMemoryTurnContext } = { current: {} };
+  private eventBusMcpServer?: ReturnType<typeof createEventBusMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1322,6 +1324,19 @@ export class AgentRunner {
         });
       }
       mcpServers["memory"] = this.memoryMcpServer;
+    }
+
+    // KPR-122: event-bus MCP — in-process. Subscriber map is constructor-time
+    // stable on the runner so the cached server is safe to reuse across turns.
+    if (this.db && this.shouldEnableInProcessServer("event-bus")) {
+      if (!this.eventBusMcpServer) {
+        this.eventBusMcpServer = createEventBusMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          eventSubscribersJson: this.eventSubscribersJson,
+        });
+      }
+      mcpServers["event-bus"] = this.eventBusMcpServer;
     }
 
     // KPR-122: structured-memory MCP — in-process, paired with memory.
