@@ -27,6 +27,10 @@ import {
   type StructuredMemoryTurnContext,
 } from "../memory/structured-memory-mcp-server.js";
 import { createEventBusMcpServer } from "../events/event-bus-mcp-server.js";
+import {
+  createCallbackMcpServer,
+  type CallbackTurnContext,
+} from "../callback/callback-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -216,6 +220,8 @@ export class AgentRunner {
   private structuredMemoryMcpServer?: ReturnType<typeof createStructuredMemoryMcpServer>;
   private structuredMemoryContextRef: { current: StructuredMemoryTurnContext } = { current: {} };
   private eventBusMcpServer?: ReturnType<typeof createEventBusMcpServer>;
+  private callbackMcpServer?: ReturnType<typeof createCallbackMcpServer>;
+  private callbackContextRef: { current: CallbackTurnContext } = { current: {} };
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1337,6 +1343,29 @@ export class AgentRunner {
         });
       }
       mcpServers["event-bus"] = this.eventBusMcpServer;
+    }
+
+    // KPR-122: callback MCP — in-process. Per-turn source metadata flows
+    // through callbackContextRef.current, refreshed each turn so a callback
+    // scheduled mid-thread captures the right channel/thread.
+    if (this.db && this.shouldEnableInProcessServer("callback")) {
+      this.callbackContextRef.current = {
+        adapterId: context?.adapterId,
+        channelId: context?.channelId,
+        channelKind: context?.channelKind,
+        channelLabel: context?.channelLabel,
+        threadId: context?.threadId,
+        slackTs: context?.slackTs,
+        slackThreadTs: context?.slackThreadTs,
+      };
+      if (!this.callbackMcpServer) {
+        this.callbackMcpServer = createCallbackMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          context: this.callbackContextRef,
+        });
+      }
+      mcpServers["callback"] = this.callbackMcpServer;
     }
 
     // KPR-122: structured-memory MCP — in-process, paired with memory.
