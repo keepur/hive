@@ -94,6 +94,7 @@ await build({
     "mcp/workflow": "dist/workflow/workflow-mcp-server.js",
     "mcp/voice": "dist/voice/voice-mcp-server.js",
     "mcp/slack": "dist/slack/slack-mcp-server.js",
+    "mcp/skill-author": "dist/skill-author/skill-author-mcp-server.js",
   },
 });
 
