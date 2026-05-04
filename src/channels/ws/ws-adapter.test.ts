@@ -21,7 +21,7 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
     id: "test-agent",
     name: "Test Agent",
-    model: "claude-haiku-3-5",
+    model: "claude-haiku-4-5",
     channels: ["general"],
     passiveChannels: [],
     keywords: [],
@@ -84,7 +84,7 @@ describe("WsAdapter.buildAgentList()", () => {
       name: "Rae",
       icon: ":wave:",
       title: "Receptionist",
-      model: "claude-haiku-3-5",
+      model: "claude-haiku-4-5",
       channels: ["general", "support"],
     });
 
@@ -99,7 +99,7 @@ describe("WsAdapter.buildAgentList()", () => {
     expect(result[0].name).toBe("Rae");
     expect(result[0].icon).toBe(":wave:");
     expect(result[0].title).toBe("Receptionist");
-    expect(result[0].model).toBe("claude-haiku-3-5");
+    expect(result[0].model).toBe("claude-haiku-4-5");
     expect(result[0].channels).toEqual(["general", "support"]);
   });
 
