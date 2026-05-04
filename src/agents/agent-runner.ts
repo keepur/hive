@@ -35,6 +35,7 @@ import { createContactsMcpServer } from "../contacts/contacts-mcp-server.js";
 import { createScheduleMcpServer } from "../schedule/schedule-mcp-server.js";
 import { createTeamMcpServer } from "../team/team-mcp-server.js";
 import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
+import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -230,6 +231,7 @@ export class AgentRunner {
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
   private teamMcpServer?: ReturnType<typeof createTeamMcpServer>;
   private adminMcpServer?: ReturnType<typeof createAdminMcpServer>;
+  private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1394,6 +1396,15 @@ export class AgentRunner {
         });
       }
       mcpServers["admin"] = this.adminMcpServer;
+    }
+
+    // KPR-122: code-search MCP — in-process. Qdrant/Ollama URLs read from
+    // process.env at server-build time (same default values as the stdio path).
+    if (this.db && this.shouldEnableInProcessServer("code-search")) {
+      if (!this.codeSearchMcpServer) {
+        this.codeSearchMcpServer = createCodeSearchMcpServer({ db: this.db });
+      }
+      mcpServers["code-search"] = this.codeSearchMcpServer;
     }
 
     // KPR-122: callback MCP — in-process. Per-turn source metadata flows
