@@ -36,6 +36,7 @@ import { createScheduleMcpServer } from "../schedule/schedule-mcp-server.js";
 import { createTeamMcpServer } from "../team/team-mcp-server.js";
 import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
+import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -232,6 +233,7 @@ export class AgentRunner {
   private teamMcpServer?: ReturnType<typeof createTeamMcpServer>;
   private adminMcpServer?: ReturnType<typeof createAdminMcpServer>;
   private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
+  private workflowMcpServer?: ReturnType<typeof createWorkflowMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1405,6 +1407,20 @@ export class AgentRunner {
         this.codeSearchMcpServer = createCodeSearchMcpServer({ db: this.db });
       }
       mcpServers["code-search"] = this.codeSearchMcpServer;
+    }
+
+    // KPR-122: workflow MCP — in-process. Gated by config.workflow.enabled
+    // (mirrors `effectiveCoreServerSet` which only adds it when the feature
+    // flag is on).
+    if (this.db && config.workflow.enabled && this.shouldEnableInProcessServer("workflow")) {
+      if (!this.workflowMcpServer) {
+        this.workflowMcpServer = createWorkflowMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          eventSubscribersJson: this.eventSubscribersJson,
+        });
+      }
+      mcpServers["workflow"] = this.workflowMcpServer;
     }
 
     // KPR-122: callback MCP — in-process. Per-turn source metadata flows

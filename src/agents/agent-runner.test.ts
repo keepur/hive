@@ -2225,6 +2225,21 @@ describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
     expect(servers["admin"].type).toBe("sdk");
   });
 
+  it("workflow becomes an in-process SDK server when config.workflow.enabled is true", async () => {
+    const { config } = await import("../config.js");
+    const orig = config.workflow.enabled;
+    (config.workflow as any).enabled = true;
+    try {
+      const runner = makeRunnerWithDb(["workflow"]);
+      await runner.send("hello");
+      const servers = getCapturedServers();
+      expect(servers["workflow"]).toBeDefined();
+      expect(servers["workflow"].type).toBe("sdk");
+    } finally {
+      (config.workflow as any).enabled = orig;
+    }
+  });
+
   it("code-search becomes an in-process SDK server when codeAccess is on", async () => {
     const runner = new AgentRunner(
       makeAgentConfig({
