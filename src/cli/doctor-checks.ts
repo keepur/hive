@@ -156,6 +156,91 @@ export async function slackAuthOk(botToken: string): Promise<boolean> {
   }
 }
 
+// ── prompt cache observability (KPR-140) ───────────────────────────────
+
+export interface PromptCacheRow {
+  agentId: string;
+  turns: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  inputTokens: number;
+  ephemeral5mTokens: number;
+  ephemeral1hTokens: number;
+  hitRate: number | null;
+}
+
+/**
+ * Read-only doctor adapter for the agent_turn_telemetry collection. Uses a
+ * short-lived MongoClient like the other live checks in this file —
+ * `hive doctor` is a one-shot CLI, not the running engine. Mirrors the
+ * aggregator pipeline in `TurnTelemetryStore.hitRatesByAgent` rather than
+ * routing through the runtime store (which holds its own `Db` ref) — keeps
+ * the layering of `doctor-checks.ts` consistent with `mongoReachable` etc.
+ */
+export async function cacheHitRatesForDoctor(
+  uri: string,
+  dbName: string,
+  windowMs = 7 * 24 * 60 * 60 * 1000,
+): Promise<PromptCacheRow[]> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const since = new Date(Date.now() - windowMs);
+    const cursor = client
+      .db(dbName)
+      .collection("agent_turn_telemetry")
+      .aggregate<{
+        _id: string;
+        turns: number;
+        inputTokens: number;
+        cacheReadTokens: number;
+        cacheCreationTokens: number;
+        ephemeral5mTokens: number;
+        ephemeral1hTokens: number;
+      }>([
+        { $match: { createdAt: { $gte: since } } },
+        {
+          $group: {
+            _id: "$agentId",
+            turns: { $sum: 1 },
+            inputTokens: { $sum: "$inputTokens" },
+            cacheReadTokens: { $sum: "$cacheReadTokens" },
+            cacheCreationTokens: { $sum: "$cacheCreationTokens" },
+            ephemeral5mTokens: { $sum: { $ifNull: ["$ephemeral5mTokens", 0] } },
+            ephemeral1hTokens: { $sum: { $ifNull: ["$ephemeral1hTokens", 0] } },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]);
+    const rows: PromptCacheRow[] = [];
+    for await (const r of cursor) {
+      const denom = r.inputTokens + r.cacheReadTokens + r.cacheCreationTokens;
+      rows.push({
+        agentId: r._id,
+        turns: r.turns,
+        cacheReadTokens: r.cacheReadTokens,
+        cacheCreationTokens: r.cacheCreationTokens,
+        inputTokens: r.inputTokens,
+        ephemeral5mTokens: r.ephemeral5mTokens,
+        ephemeral1hTokens: r.ephemeral1hTokens,
+        hitRate: denom > 0 ? r.cacheReadTokens / denom : null,
+      });
+    }
+    return rows;
+  } catch {
+    return [];
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+/** Format a hit-rate value for display. Mirrors the "no data" branch in the aggregator. */
+export function formatHitRate(rate: number | null): string {
+  if (rate === null) return "no data";
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
 // ── resolved paths ─────────────────────────────────────────────────────
 
 /** Expand ~ in a path. */
