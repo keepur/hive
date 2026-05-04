@@ -10,7 +10,7 @@
 
 ## Loader contract (verified)
 
-> _Populated by Task 1. The contract here informs the doubled-slug nested write path adopted in the Decisions section below: future maintainers reading "why is the slug repeated?" should land on this paragraph first._
+Verified against `src/agents/skill-loader.ts` on `KPR-74-day1-oob`: `scanWorkflowsFrom` iterates `rootDir` for workflow dirs, then descends only into `<workflow>/skills/<skill>/SKILL.md`. A flat layout `<root>/<slug>/SKILL.md` (no inner `skills/`) is silently skipped via the `if (!existsSync(skillsSubdir)) continue` branch (skill-loader.ts:205). The per-agent pass calls `scanWorkflowsFrom(agentSkillsDir(agentId), ..., implicitAgentScope: agentId)` (skill-loader.ts:84-92), so agent-private skills follow the same nested-workflow contract as the other three sources. The KPR-75 test fixture `writeAgentSkill` (skill-loader.test.ts:280) builds `join(hiveHome, "agents", agentId, "skills", workflow, "skills", skill)`, confirming the doubled segment is the loader's intended on-disk shape, not an artifact. Conclusion: `author_skill` must write to `<HIVE_HOME>/agents/<id>/skills/<slug>/skills/<slug>/SKILL.md` (workflow dir and skill dir share the slug). The doubled slug is not a quirk; it is the loader's literal contract for every skill source. Spot-checked end-to-end in this worktree: nested layout loads, flat layout does not.
 
 ## Decisions
 
