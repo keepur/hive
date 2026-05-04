@@ -2102,6 +2102,74 @@ describe("AgentRunner — archetype sessionOptions + cwd guard", () => {
   });
 });
 
+// ── KPR-122: in-process MCP server wiring ──────────────────────────────
+//
+// Each ported server (per the plan) gets one assertion confirming that when
+// `db` is supplied to AgentRunner, the corresponding `mcpServers["<name>"]`
+// entry is replaced with an SDK MCP server instance (the mock in this file
+// returns objects with type:"sdk") rather than the stdio fallback. The cached
+// instance is exercised across turns by the team-roster precedent — same
+// shape applies here.
+describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  function makeFakeDb(): any {
+    return {
+      collection: vi.fn(() => ({
+        findOne: vi.fn().mockResolvedValue(null),
+        find: vi.fn(() => ({
+          toArray: vi.fn().mockResolvedValue([]),
+          sort: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockReturnThis(),
+          project: vi.fn().mockReturnThis(),
+          skip: vi.fn().mockReturnThis(),
+        })),
+        updateOne: vi.fn().mockResolvedValue({ matchedCount: 0 }),
+        insertOne: vi.fn().mockResolvedValue({ insertedId: "x" }),
+        deleteOne: vi.fn().mockResolvedValue({ deletedCount: 0 }),
+        countDocuments: vi.fn().mockResolvedValue(0),
+        createIndex: vi.fn().mockResolvedValue("ok"),
+      })),
+    };
+  }
+
+  function makeRunnerWithDb(coreServers: string[]): AgentRunner {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeDb(),
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("memory becomes an in-process SDK server when db is supplied", async () => {
+    const runner = makeRunnerWithDb(["memory"]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers.memory).toBeDefined();
+    expect(servers.memory.type).toBe("sdk");
+  });
+
+  it("memory in-process server is cached across send() invocations", async () => {
+    const runner = makeRunnerWithDb(["memory"]);
+    await runner.send("first");
+    const first = getCapturedServers().memory;
+    await runner.send("second");
+    const second = getCapturedServers().memory;
+    expect(first).toBe(second);
+  });
+});
+
 describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
   beforeEach(() => {
     vi.clearAllMocks();

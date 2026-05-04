@@ -21,6 +21,7 @@ import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import { createTeamRosterMcpServer } from "../team-roster/team-roster-mcp-server.js";
+import { createMemoryMcpServer } from "../memory/memory-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -204,6 +205,9 @@ export class AgentRunner {
   // teamRoster instance for every send(), so reuse is safe and avoids per-message
   // allocation. (The shared cache is held by `teamRoster`, not the server wrapper.)
   private teamRosterMcpServer?: ReturnType<typeof createTeamRosterMcpServer>;
+  // KPR-122: in-process Mongo-backed MCP servers, cached per-runner. Built lazily
+  // in send() so test harnesses that never call send() don't need a real Db.
+  private memoryMcpServer?: ReturnType<typeof createMemoryMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -328,6 +332,72 @@ export class AgentRunner {
 
 
   /**
+   * Compute the post-filter allowlist of core server names for this agent.
+   * Mirrors `filterCoreServers` exactly: starts from the agent's `coreServers`,
+   * adds auto-injected servers (schedule, team, team-roster, slack, optionally
+   * workflow), pairs `structured-memory` with `memory`, then applies autonomy
+   * gates. KPR-122 uses this to decide whether to wire an in-process MCP
+   * server without first having to materialize the stdio map for that server.
+   */
+  private effectiveCoreServerSet(): Set<string> {
+    const coreSet = new Set(this.agentConfig.coreServers);
+    if (coreSet.has("memory")) {
+      coreSet.add("structured-memory");
+    }
+    coreSet.add("schedule");
+    coreSet.add("team");
+    coreSet.add("team-roster");
+    coreSet.add("slack");
+    if (config.workflow.enabled) {
+      coreSet.add("workflow");
+    }
+    if (!this.agentConfig.autonomy.externalComms) {
+      coreSet.delete("resend");
+      coreSet.delete("quo");
+    }
+    if (!this.agentConfig.autonomy.codeTask) {
+      coreSet.delete("code-task");
+    }
+    if (!this.agentConfig.autonomy.codeAccess) {
+      coreSet.delete("code-search");
+    }
+    return coreSet;
+  }
+
+  private shouldEnableInProcessServer(name: string): boolean {
+    return this.effectiveCoreServerSet().has(name);
+  }
+
+  /**
+   * Resolve the memory scope list for this agent. "self" (Mongo) is always
+   * present; archetype-provided scopes are appended. KPR-122: extracted from
+   * `buildAllServerConfigs` so the in-process memory MCP factory can access
+   * the same list.
+   */
+  private resolveMemoryScopes(): ScopeDecl[] {
+    const memoryScopes: ScopeDecl[] = [{ id: "self", backing: "mongo" }];
+    const archetypeDef = this.getArchetypeDef();
+    if (archetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        const extra = archetypeDef.memoryScopes({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+        });
+        for (const s of extra) {
+          if (s.id !== "self") memoryScopes.push(s);
+        }
+      } catch (err) {
+        log.error("Archetype memoryScopes threw — using self-only", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
+    }
+    return memoryScopes;
+  }
+
+  /**
    * Build config for a single named MCP server.
    * Without a WorkItemContext, context-dependent servers (callback, background, recall, etc.)
    * will have empty channel/thread env vars — only use without context for non-context servers.
@@ -367,30 +437,15 @@ export class AgentRunner {
       }
     }
 
-    // Memory MCP server — gives the agent read/write access to its own memory.
-    // Archetypes may add additional filesystem-backed scopes (workshop, workspace, etc.)
-    // via memoryScopes(ctx). Self-mongo is always present as the first scope so the
-    // legacy behavior is preserved even if the archetype throws.
-    const memoryScopes: ScopeDecl[] = [{ id: "self", backing: "mongo" }];
-    const memoryArchetypeDef = this.getArchetypeDef();
-    if (memoryArchetypeDef && this.agentConfig.archetypeConfig) {
-      try {
-        const extra = memoryArchetypeDef.memoryScopes({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-        });
-        for (const s of extra) {
-          if (s.id !== "self") memoryScopes.push(s);
-        }
-      } catch (err) {
-        log.error("Archetype memoryScopes threw — using self-only", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-      }
-    }
-
+    // Memory MCP server — KPR-122: in-process at runtime (replaced in send()
+    // when `this.db` is present). The stdio entry below is retained so:
+    //  - `filterCoreServers` keeps `memory` in the post-filter map.
+    //  - The toolkit section sees `memory` in `coreServerNames`.
+    //  - The publish-ready bundle's stdio fallback path stays callable.
+    // Tests that don't pass a `db` exercise this stdio entry; production runs
+    // never spawn the subprocess because `send()` overwrites the slot with the
+    // in-process SDK server.
+    const memoryScopes: ScopeDecl[] = this.resolveMemoryScopes();
     servers["memory"] = {
       type: "stdio",
       command: "node",
@@ -1245,6 +1300,24 @@ export class AgentRunner {
       }
       mcpServers["team-roster"] = this.teamRosterMcpServer;
     }
+
+    // KPR-122: memory MCP — in-process. The stdio entry is gone from
+    // buildAllServerConfigs; we re-introduce the in-process server here when
+    // (a) the runner has a shared `db` (runtime path; tests without `db` skip)
+    // and (b) the agent's coreServers includes "memory". The cached SDK server
+    // is safe to reuse across turns: the resolved scope list depends only on
+    // constructor-time agent + archetype config.
+    if (this.db && this.shouldEnableInProcessServer("memory")) {
+      if (!this.memoryMcpServer) {
+        this.memoryMcpServer = createMemoryMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          memoryScopes: this.resolveMemoryScopes(),
+        });
+      }
+      mcpServers["memory"] = this.memoryMcpServer;
+    }
+
     const delegateAgents = this.buildDelegateAgents(allServerConfigs);
     const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(delegateAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
