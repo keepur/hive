@@ -26,6 +26,7 @@ import { Scheduler } from "./scheduler/scheduler.js";
 import { HealthReporter } from "./health/health-reporter.js";
 import { LinearClient } from "./linear/linear-client.js";
 import { SessionStore } from "./agents/session-store.js";
+import { TurnTelemetryStore } from "./agents/turn-telemetry.js";
 import { Dispatcher } from "./channels/dispatcher.js";
 import { SlackAdapter } from "./channels/slack-adapter.js";
 import { SmsAdapter } from "./channels/sms-adapter.js";
@@ -202,6 +203,9 @@ async function main(): Promise<void> {
   const sessionStore = new SessionStore(db);
   await sessionStore.init();
 
+  const turnTelemetryStore = new TurnTelemetryStore(db);
+  await turnTelemetryStore.init();
+
   // Activity logger — queryable audit trail for agent turns
   let activityLogger: ActivityLogger | undefined;
   if (config.activity.enabled) {
@@ -253,7 +257,7 @@ async function main(): Promise<void> {
     });
   }
 
-  agentManager = new AgentManager(registry, memoryManager, sessionStore, db, activityLogger, prefetcher, teamRoster);
+  agentManager = new AgentManager(registry, memoryManager, sessionStore, db, turnTelemetryStore, activityLogger, prefetcher, teamRoster);
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
     registry,

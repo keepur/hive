@@ -5,6 +5,7 @@ import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkIt
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
+import type { TurnTelemetryStore } from "./turn-telemetry.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { Db } from "mongodb";
 import { formatFilesForPrompt } from "../files/file-processor.js";
@@ -61,6 +62,7 @@ export class AgentManager {
   private registry: AgentRegistry;
   private memoryManager: MemoryManager;
   private sessionStore: SessionStore;
+  private turnTelemetryStore: TurnTelemetryStore;
   private plugins: LoadedPlugin[];
   private seedDirs: string[];
   private skillIndex: SkillIndex;
@@ -73,11 +75,15 @@ export class AgentManager {
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
 
-  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
+  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, turnTelemetryStore?: TurnTelemetryStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
     this.db = db;
+    // No-op fallback so the rest of the file can call `record` unconditionally.
+    // Tests that don't pass a store still exercise the call-shape path without
+    // needing a Mongo mock.
+    this.turnTelemetryStore = turnTelemetryStore ?? ({ record: async () => {} } as TurnTelemetryStore);
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
@@ -304,6 +310,26 @@ export class AgentManager {
             compactions: result.compactions,
             preCompactTokens: result.preCompactTokens,
           });
+          // Per-turn cache telemetry. Independent of sessionStore.set (which
+          // overwrites a per-thread snapshot — no history). The aggregator
+          // in `hive doctor` reads this collection.
+          this.turnTelemetryStore
+            .record({
+              agentId,
+              threadId,
+              sessionId: result.sessionId,
+              model: modelOverride ?? this.registry.get(agentId)?.model,
+              inputTokens: result.inputTokens,
+              outputTokens: result.outputTokens,
+              cacheReadTokens: result.cacheReadTokens,
+              cacheCreationTokens: result.cacheCreationTokens,
+              ephemeral5mTokens: result.ephemeral5mTokens,
+              ephemeral1hTokens: result.ephemeral1hTokens,
+            })
+            .catch(() => {
+              // Already logged inside the store via withRetry. Swallow here so a
+              // telemetry write failure cannot cascade into the turn pipeline.
+            });
         }
 
         const state = this.states.get(agentId)!;
