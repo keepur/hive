@@ -34,6 +34,7 @@ import {
 import { createContactsMcpServer } from "../contacts/contacts-mcp-server.js";
 import { createScheduleMcpServer } from "../schedule/schedule-mcp-server.js";
 import { createTeamMcpServer } from "../team/team-mcp-server.js";
+import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -228,6 +229,7 @@ export class AgentRunner {
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
   private teamMcpServer?: ReturnType<typeof createTeamMcpServer>;
+  private adminMcpServer?: ReturnType<typeof createAdminMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1379,6 +1381,19 @@ export class AgentRunner {
         });
       }
       mcpServers["team"] = this.teamMcpServer;
+    }
+
+    // KPR-122: admin MCP — in-process. instanceCapabilities is plugin-derived
+    // and constructor-stable on the runner.
+    if (this.db && this.shouldEnableInProcessServer("admin")) {
+      if (!this.adminMcpServer) {
+        this.adminMcpServer = createAdminMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
+        });
+      }
+      mcpServers["admin"] = this.adminMcpServer;
     }
 
     // KPR-122: callback MCP — in-process. Per-turn source metadata flows
