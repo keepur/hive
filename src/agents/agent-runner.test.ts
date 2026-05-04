@@ -228,7 +228,10 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
     // structured-memory is auto-paired with memory (always registered)
     // schedule + team are always included as implicit core servers (KPR-11)
-    expect(Object.keys(servers)).toEqual(["memory", "structured-memory", "keychain", "team", "schedule"]);
+    // skill-author is always included as an implicit core server (KPR-104)
+    expect(Object.keys(servers).sort()).toEqual(
+      ["memory", "structured-memory", "keychain", "team", "schedule", "skill-author"].sort(),
+    );
   });
 
   it("empty coreServers means only implicit servers", async () => {
@@ -240,7 +243,8 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     const servers = getCapturedServers();
 
     // schedule + team are always included as implicit core servers (KPR-11)
-    expect(Object.keys(servers)).toEqual(["team", "schedule"]);
+    // skill-author is always included as an implicit core server (KPR-104)
+    expect(Object.keys(servers).sort()).toEqual(["team", "schedule", "skill-author"].sort());
   });
 
   it("KPR-139: team-roster appears in mcpServers when a TeamRoster is provided", async () => {

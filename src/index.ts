@@ -5,6 +5,7 @@ import {
   hiveHome,
   hiveStateDir,
   engineDir,
+  agentsDir,
   agentScratchDir,
   agentReportsDir,
   agentFeedsDir,
@@ -334,6 +335,25 @@ async function main(): Promise<void> {
       reloadTimer = setTimeout(() => reload(), 500);
     });
     log.info("Skills hot-reload enabled", { watched: skillsDir });
+  }
+
+  // KPR-75: watch agents/ for SKILL.md changes (per-agent private skills).
+  // Filter by SKILL.md — agents write to scratch/, reports/, feeds/, playwright/
+  // constantly during normal operation; rebuilding the skill index on every
+  // scratch write would be a perf and log-noise nightmare. On platforms where
+  // `filename` may be null (Linux, some macOS event variants), fall back to
+  // debounced reload — the 500ms debounce coalesces the trigger.
+  const agentsRoot = agentsDir();
+  if (existsSync(agentsRoot)) {
+    watch(agentsRoot, { recursive: true }, (_event, filename) => {
+      const isSkillMd = typeof filename === "string" && filename.endsWith("SKILL.md");
+      const filenameMissing = filename === null || filename === undefined;
+      if (isSkillMd || filenameMissing) {
+        if (reloadTimer) clearTimeout(reloadTimer);
+        reloadTimer = setTimeout(() => reload(), 500);
+      }
+    });
+    log.info("Agent-private skills hot-reload enabled", { watched: agentsRoot });
   }
 
   // SIGUSR1: manual hot-reload trigger
