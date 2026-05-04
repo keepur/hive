@@ -147,7 +147,12 @@ server.registerTool(
         ...(cc ? ["--cc", cc] : []),
         ...(threadId ? ["--thread-id", threadId] : []),
       ]);
-      return { content: [{ type: "text", text: result || "Email sent." }] };
+      // KPR-174: surface the sending identity so the agent can confirm which
+      // mailbox (per-agent GOG_ACCOUNT) the message went out from. Mirrors
+      // the convention quo_send_sms uses ("Sent from <line> <number>").
+      const sentFrom = ACCOUNT ? `Sent from ${ACCOUNT}.` : "Email sent.";
+      const text = result ? `${sentFrom}\n\n${result}` : sentFrom;
+      return { content: [{ type: "text", text }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to send: ${e.message}` }], isError: true };
     }

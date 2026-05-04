@@ -47,6 +47,14 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     notFor: "Looking up people in the contact directory — use contacts instead",
     toolkitBlurb: "Direct messaging to peer hive agents (not Slack DMs)",
   },
+  // team-roster is engine-auto-injected (see AgentRunner.autoInjectedServerNames()).
+  // Without an entry here, the toolkit section renders "- team-roster — team-roster".
+  "team-roster": {
+    description: "Team directory lookups — list teammates, look up humans by name/email, look up agents by id/name",
+    usage: "Routine teammate info: roles, emails, channels, model. Reach for this before admin.",
+    notFor: "Editing agent definitions or version history — use admin instead",
+    toolkitBlurb: "Look up team humans + agents (roles, emails, channels)",
+  },
   linear: {
     description: "Issue tracking and project management",
     usage: "Creating, searching, and updating engineering issues",

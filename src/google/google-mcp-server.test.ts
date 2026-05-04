@@ -269,6 +269,44 @@ describe("google-mcp-server", () => {
     });
   });
 
+  describe("gmail_send", () => {
+    it("includes the sending identity (GOG_ACCOUNT) in the success response (KPR-174)", async () => {
+      await loadServer({
+        GOG_PATH: "/usr/local/bin/gog",
+        GOG_ACCOUNT: "jessica@dodihome.com",
+      });
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("send")) return "Message-ID: <abc@gmail.com>";
+        return "";
+      });
+      const result = await callTool("gmail_send", {
+        to: "customer@example.com",
+        subject: "Re: order",
+        body: "Thanks!",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain("Sent from jessica@dodihome.com");
+      // gog's own output should still be included for full traceability
+      expect(result.content[0].text).toContain("Message-ID:");
+    });
+
+    it("falls back to 'Email sent.' when GOG_ACCOUNT is unset", async () => {
+      await loadServer({ GOG_PATH: "/usr/local/bin/gog" });
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("send")) return "";
+        return "";
+      });
+      const result = await callTool("gmail_send", {
+        to: "customer@example.com",
+        subject: "Hi",
+        body: "Hello",
+      });
+      expect(result.content[0].text).toBe("Email sent.");
+    });
+  });
+
   describe("tool registration", () => {
     it("registers all expected tools", async () => {
       await loadServer({ GOG_PATH: "/usr/local/bin/gog" });
