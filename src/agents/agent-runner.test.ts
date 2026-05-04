@@ -1620,6 +1620,57 @@ describe("AgentRunner token tracking and compaction (via send)", () => {
     expect(result.preCompactTokens).toBeUndefined();
   });
 
+  it("extracts ephemeral 5m/1h breakdown when SDK surfaces cache_creation", async () => {
+    mockMessages = [{
+      type: "result",
+      subtype: "success",
+      result: "response",
+      total_cost_usd: 0.01,
+      duration_ms: 200,
+      session_id: "s1",
+      usage: {
+        input_tokens: 1500,
+        output_tokens: 300,
+        cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 200,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 150,
+          ephemeral_1h_input_tokens: 50,
+        },
+      },
+    }];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.ephemeral5mTokens).toBe(150);
+    expect(result.ephemeral1hTokens).toBe(50);
+  });
+
+  it("leaves ephemeral fields undefined when SDK does not surface cache_creation", async () => {
+    mockMessages = [{
+      type: "result",
+      subtype: "success",
+      result: "response",
+      total_cost_usd: 0.01,
+      duration_ms: 200,
+      session_id: "s1",
+      usage: {
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_input_tokens: 10,
+        cache_creation_input_tokens: 5,
+        // no cache_creation field
+      },
+    }];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.ephemeral5mTokens).toBeUndefined();
+    expect(result.ephemeral1hTokens).toBeUndefined();
+  });
+
   it("picks largest contextWindow when multiple models used", async () => {
     mockMessages = [{
       type: "result",

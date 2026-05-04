@@ -78,6 +78,8 @@ export interface RunResult {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  ephemeral5mTokens?: number; // From usage.cache_creation.ephemeral_5m_input_tokens; undefined if SDK omits it.
+  ephemeral1hTokens?: number; // From usage.cache_creation.ephemeral_1h_input_tokens; undefined if SDK omits it.
   contextWindow: number; // Model's max context size (e.g. 200000), NOT current utilization
   compactions: number;
   preCompactTokens?: number; // Token count before last compaction (from compact_metadata.pre_tokens)
@@ -1576,6 +1578,8 @@ export class AgentRunner {
     let outputTokens = 0;
     let cacheReadTokens = 0;
     let cacheCreationTokens = 0;
+    let ephemeral5mTokens: number | undefined;
+    let ephemeral1hTokens: number | undefined;
     let contextWindow = 0;
     let compactions = 0;
     let preCompactTokens: number | undefined;
@@ -1682,6 +1686,16 @@ export class AgentRunner {
             outputTokens = usage.output_tokens ?? 0;
             cacheReadTokens = usage.cache_read_input_tokens ?? 0;
             cacheCreationTokens = usage.cache_creation_input_tokens ?? 0;
+            // Cache-creation breakdown by TTL class. SDK type:
+            //   node_modules/@anthropic-ai/sdk/resources/beta/messages/messages.d.ts (BetaCacheCreation).
+            // Older SDK versions emit `cache_creation: null` — treat as "not surfaced," do not record zeros.
+            const cc = (usage as any).cache_creation;
+            if (cc && typeof cc === "object") {
+              ephemeral5mTokens =
+                typeof cc.ephemeral_5m_input_tokens === "number" ? cc.ephemeral_5m_input_tokens : undefined;
+              ephemeral1hTokens =
+                typeof cc.ephemeral_1h_input_tokens === "number" ? cc.ephemeral_1h_input_tokens : undefined;
+            }
           }
 
           // Extract context window from model usage
@@ -1766,6 +1780,8 @@ export class AgentRunner {
       outputTokens,
       cacheReadTokens,
       cacheCreationTokens,
+      ephemeral5mTokens,
+      ephemeral1hTokens,
       contextWindow,
       compactions,
       preCompactTokens,
@@ -1778,6 +1794,7 @@ export class AgentRunner {
       llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length,
       toolSummary: toolSummary || "none", streamed,
       inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+      ephemeral5mTokens, ephemeral1hTokens,
       contextWindow, compactions, preCompactTokens,
       error, aborted: this._aborted,
     };
