@@ -83,7 +83,7 @@ export class AgentManager {
     // No-op fallback so the rest of the file can call `record` unconditionally.
     // Tests that don't pass a store still exercise the call-shape path without
     // needing a Mongo mock.
-    this.turnTelemetryStore = turnTelemetryStore ?? ({ record: async () => {} } as TurnTelemetryStore);
+    this.turnTelemetryStore = turnTelemetryStore ?? ({ record: async () => {} } as unknown as TurnTelemetryStore);
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
