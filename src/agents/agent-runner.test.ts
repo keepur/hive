@@ -2192,6 +2192,14 @@ describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
     expect(servers["callback"]).toBeDefined();
     expect(servers["callback"].type).toBe("sdk");
   });
+
+  it("contacts becomes an in-process SDK server when in coreServers", async () => {
+    const runner = makeRunnerWithDb(["contacts"]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["contacts"]).toBeDefined();
+    expect(servers["contacts"].type).toBe("sdk");
+  });
 });
 
 describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {

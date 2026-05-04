@@ -31,6 +31,7 @@ import {
   createCallbackMcpServer,
   type CallbackTurnContext,
 } from "../callback/callback-mcp-server.js";
+import { createContactsMcpServer } from "../contacts/contacts-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -222,6 +223,7 @@ export class AgentRunner {
   private eventBusMcpServer?: ReturnType<typeof createEventBusMcpServer>;
   private callbackMcpServer?: ReturnType<typeof createCallbackMcpServer>;
   private callbackContextRef: { current: CallbackTurnContext } = { current: {} };
+  private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1343,6 +1345,14 @@ export class AgentRunner {
         });
       }
       mcpServers["event-bus"] = this.eventBusMcpServer;
+    }
+
+    // KPR-122: contacts MCP — in-process. No per-turn context.
+    if (this.db && this.shouldEnableInProcessServer("contacts")) {
+      if (!this.contactsMcpServer) {
+        this.contactsMcpServer = createContactsMcpServer({ db: this.db });
+      }
+      mcpServers["contacts"] = this.contactsMcpServer;
     }
 
     // KPR-122: callback MCP — in-process. Per-turn source metadata flows
