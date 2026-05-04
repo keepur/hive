@@ -39,7 +39,8 @@ export interface ToolkitSectionInput {
  * SDK builtin tools. The Claude Agent SDK does not expose a programmatic
  * manifest for these, so we maintain the list manually. Source:
  * @anthropic-ai/claude-agent-sdk — see SDK README and the `Options.allowedTools`
- * type.
+ * type, plus `sdk-tools.d.ts`'s `ToolInputSchemas` union for the canonical
+ * shipped set.
  *
  * Keep entries terse — total budget for the whole toolkit section is ≤ 1 KB
  * for a bare-bones agent.
@@ -50,6 +51,11 @@ const SDK_BUILTINS: ReadonlyArray<{ name: string; blurb: string }> = [
   { name: "Glob / Grep", blurb: "file/content search" },
   { name: "WebFetch / WebSearch", blurb: "web access" },
   { name: "NotebookEdit", blurb: "Jupyter notebook editing" },
+  // KPR-174: Task is the SDK's subagent-dispatch tool — agents with
+  // delegateServers must know it exists, otherwise the "Delegated capability
+  // MCPs" subsection is unreachable. TodoWrite is the multi-step task tracker.
+  { name: "Task", blurb: "delegate to a subagent (see Delegated capability MCPs below)" },
+  { name: "TodoWrite", blurb: "track multi-step tasks within this session" },
 ];
 
 /**

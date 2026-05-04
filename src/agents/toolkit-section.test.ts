@@ -30,6 +30,22 @@ describe("buildToolkitSection", () => {
     expect(out).toContain("Read / Write / Edit");
     expect(out).toContain("Glob / Grep");
     expect(out).toContain("WebFetch / WebSearch");
+    expect(out).toContain("NotebookEdit");
+  });
+
+  it("announces Task and TodoWrite under Built-in (KPR-174)", () => {
+    // Task = SDK subagent dispatch (load-bearing for the Delegated subsection).
+    // TodoWrite = multi-step task tracker. Both ship in the SDK preset and
+    // were missing from SDK_BUILTINS pre-KPR-174.
+    const out = buildToolkitSection(bareBonesInput());
+    const builtIdx = out.indexOf("### Built-in");
+    const engineIdx = out.indexOf("### Engine-provided");
+    const taskIdx = out.indexOf("- Task —");
+    const todoIdx = out.indexOf("- TodoWrite —");
+    expect(taskIdx).toBeGreaterThan(builtIdx);
+    expect(taskIdx).toBeLessThan(engineIdx);
+    expect(todoIdx).toBeGreaterThan(builtIdx);
+    expect(todoIdx).toBeLessThan(engineIdx);
   });
 
   it("classifies auto-injected servers under 'Engine-provided'", () => {
