@@ -22,6 +22,10 @@ import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import { createTeamRosterMcpServer } from "../team-roster/team-roster-mcp-server.js";
 import { createMemoryMcpServer } from "../memory/memory-mcp-server.js";
+import {
+  createStructuredMemoryMcpServer,
+  type StructuredMemoryTurnContext,
+} from "../memory/structured-memory-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -208,6 +212,8 @@ export class AgentRunner {
   // KPR-122: in-process Mongo-backed MCP servers, cached per-runner. Built lazily
   // in send() so test harnesses that never call send() don't need a real Db.
   private memoryMcpServer?: ReturnType<typeof createMemoryMcpServer>;
+  private structuredMemoryMcpServer?: ReturnType<typeof createStructuredMemoryMcpServer>;
+  private structuredMemoryContextRef: { current: StructuredMemoryTurnContext } = { current: {} };
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1316,6 +1322,26 @@ export class AgentRunner {
         });
       }
       mcpServers["memory"] = this.memoryMcpServer;
+    }
+
+    // KPR-122: structured-memory MCP — in-process, paired with memory.
+    // channel/thread come from the per-turn `context` (mutable ref so the
+    // cached SDK server sees the active values without rebuilding).
+    if (this.db && this.shouldEnableInProcessServer("structured-memory")) {
+      this.structuredMemoryContextRef.current = {
+        channelId: context?.channelId,
+        threadId: context?.threadId,
+      };
+      if (!this.structuredMemoryMcpServer) {
+        this.structuredMemoryMcpServer = createStructuredMemoryMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          context: this.structuredMemoryContextRef,
+          qdrantUrl: process.env.QDRANT_URL,
+          ollamaUrl: process.env.OLLAMA_URL,
+        });
+      }
+      mcpServers["structured-memory"] = this.structuredMemoryMcpServer;
     }
 
     const delegateAgents = this.buildDelegateAgents(allServerConfigs);
