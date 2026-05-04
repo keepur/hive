@@ -10,6 +10,20 @@ describe("SERVER_CATALOG", () => {
     }
   });
 
+  it("contains entries for every engine auto-injected server (KPR-174)", () => {
+    // Auto-injected servers (AgentRunner.autoInjectedServerNames) appear in
+    // every agent's "Your toolkit" section under Engine-provided. Without a
+    // catalog entry the toolkit line renders the server name as the blurb
+    // (resolveCatalogEntry fallback), which is poor discoverability.
+    // Keep this list aligned with autoInjectedServerNames(); workflow is
+    // config-gated and excluded here.
+    const autoInjected = ["schedule", "team", "team-roster", "slack"];
+    for (const name of autoInjected) {
+      expect(SERVER_CATALOG[name], `${name} missing from SERVER_CATALOG`).toBeDefined();
+      expect(SERVER_CATALOG[name].description).toBeTruthy();
+    }
+  });
+
   it("every entry has a non-empty description", () => {
     for (const [name, entry] of Object.entries(SERVER_CATALOG)) {
       expect(entry.description, `${name} missing description`).toBeTruthy();

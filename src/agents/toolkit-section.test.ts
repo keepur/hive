@@ -2,14 +2,18 @@ import { describe, it, expect } from "vitest";
 import { buildToolkitSection } from "./toolkit-section.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 
-const AUTO_INJECTED = new Set(["schedule", "team", "slack"]);
+// MUST mirror AgentRunner.autoInjectedServerNames() — keep in sync.
+// (KPR-174 audit caught the test fixture out-of-sync with runtime: team-roster
+// is auto-injected at runtime but the fixture omitted it, so a regression
+// classifying team-roster as a capability MCP would silently pass tests.)
+const AUTO_INJECTED = new Set(["schedule", "team", "team-roster", "slack"]);
 
 function bareBonesInput(overrides: Partial<Parameters<typeof buildToolkitSection>[0]> = {}) {
   // Bare-bones = engine auto-injects only. structured-memory is conditionally
   // paired with `memory` in filterCoreServers, NOT unconditionally injected,
   // so a true bare-bones agent (no memory in coreServers) doesn't have it.
   return {
-    coreServerNames: ["schedule", "team", "slack"],
+    coreServerNames: ["schedule", "team", "team-roster", "slack"],
     delegateServerNames: [],
     plugins: [],
     autoInjectedServers: AUTO_INJECTED,
@@ -31,10 +35,25 @@ describe("buildToolkitSection", () => {
   it("classifies auto-injected servers under 'Engine-provided'", () => {
     const out = buildToolkitSection(bareBonesInput());
     expect(out).toContain("### Engine-provided");
-    // schedule, team, slack are auto-injected
+    // schedule, team, team-roster, slack are auto-injected
     expect(out).toMatch(/- schedule —/);
     expect(out).toMatch(/- team —/);
+    expect(out).toMatch(/- team-roster —/);
     expect(out).toMatch(/- slack —/);
+  });
+
+  it("renders a real catalog blurb for team-roster, not the name fallback (KPR-174)", () => {
+    // team-roster is auto-injected; without a SERVER_CATALOG entry the line
+    // would render "- team-roster — team-roster" (resolveCatalogEntry's
+    // last-resort fallback). Audit caught this gap; assert the catalog
+    // entry stays in place.
+    const out = buildToolkitSection(bareBonesInput());
+    const teamRosterLine = out.split("\n").find((l) => l.startsWith("- team-roster —"));
+    expect(teamRosterLine).toBeDefined();
+    // Negative: not the fallback
+    expect(teamRosterLine).not.toBe("- team-roster — team-roster");
+    // Positive: blurb mentions teammates / lookup-shape language
+    expect(teamRosterLine!.toLowerCase()).toMatch(/team|roster|lookup|directory|humans|agents/);
   });
 
   it("classifies non-auto-injected coreServers under 'Capability MCPs'", () => {
