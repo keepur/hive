@@ -50,8 +50,7 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
   // team-roster is engine-auto-injected (see AgentRunner.autoInjectedServerNames()).
   // Without an entry here, the toolkit section renders "- team-roster — team-roster".
   "team-roster": {
-    description:
-      "Team directory lookups — list teammates, look up humans by name/email, look up agents by id/name",
+    description: "Team directory lookups — list teammates, look up humans by name/email, look up agents by id/name",
     usage: "Routine teammate info: roles, emails, channels, model. Reach for this before admin.",
     notFor: "Editing agent definitions or version history — use admin instead",
     toolkitBlurb: "Look up team humans + agents (roles, emails, channels)",
