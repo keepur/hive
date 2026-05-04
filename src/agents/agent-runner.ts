@@ -33,6 +33,7 @@ import {
 } from "../callback/callback-mcp-server.js";
 import { createContactsMcpServer } from "../contacts/contacts-mcp-server.js";
 import { createScheduleMcpServer } from "../schedule/schedule-mcp-server.js";
+import { createTeamMcpServer } from "../team/team-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -226,6 +227,7 @@ export class AgentRunner {
   private callbackContextRef: { current: CallbackTurnContext } = { current: {} };
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
+  private teamMcpServer?: ReturnType<typeof createTeamMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1363,6 +1365,20 @@ export class AgentRunner {
         this.scheduleMcpServer = createScheduleMcpServer({ db: this.db, agentId: this.agentConfig.id });
       }
       mcpServers["schedule"] = this.scheduleMcpServer;
+    }
+
+    // KPR-122: team MCP — in-process. `getAgentIds` reads the live registry on
+    // every call so a hot reload (SIGUSR1) is reflected without rebuilding the
+    // cached server.
+    if (this.db && this.shouldEnableInProcessServer("team")) {
+      if (!this.teamMcpServer) {
+        this.teamMcpServer = createTeamMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          getAgentIds: () => AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
+        });
+      }
+      mcpServers["team"] = this.teamMcpServer;
     }
 
     // KPR-122: callback MCP — in-process. Per-turn source metadata flows
