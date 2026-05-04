@@ -2102,6 +2102,165 @@ describe("AgentRunner — archetype sessionOptions + cwd guard", () => {
   });
 });
 
+// ── KPR-122: in-process MCP server wiring ──────────────────────────────
+//
+// Each ported server (per the plan) gets one assertion confirming that when
+// `db` is supplied to AgentRunner, the corresponding `mcpServers["<name>"]`
+// entry is replaced with an SDK MCP server instance (the mock in this file
+// returns objects with type:"sdk") rather than the stdio fallback. The cached
+// instance is exercised across turns by the team-roster precedent — same
+// shape applies here.
+describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  function makeFakeDb(): any {
+    return {
+      collection: vi.fn(() => ({
+        findOne: vi.fn().mockResolvedValue(null),
+        find: vi.fn(() => ({
+          toArray: vi.fn().mockResolvedValue([]),
+          sort: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockReturnThis(),
+          project: vi.fn().mockReturnThis(),
+          skip: vi.fn().mockReturnThis(),
+        })),
+        updateOne: vi.fn().mockResolvedValue({ matchedCount: 0 }),
+        insertOne: vi.fn().mockResolvedValue({ insertedId: "x" }),
+        deleteOne: vi.fn().mockResolvedValue({ deletedCount: 0 }),
+        countDocuments: vi.fn().mockResolvedValue(0),
+        createIndex: vi.fn().mockResolvedValue("ok"),
+      })),
+    };
+  }
+
+  function makeRunnerWithDb(coreServers: string[]): AgentRunner {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeDb(),
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("memory becomes an in-process SDK server when db is supplied", async () => {
+    const runner = makeRunnerWithDb(["memory"]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers.memory).toBeDefined();
+    expect(servers.memory.type).toBe("sdk");
+  });
+
+  it("memory in-process server is cached across send() invocations", async () => {
+    const runner = makeRunnerWithDb(["memory"]);
+    await runner.send("first");
+    const first = getCapturedServers().memory;
+    await runner.send("second");
+    const second = getCapturedServers().memory;
+    expect(first).toBe(second);
+  });
+
+  it("structured-memory becomes an in-process SDK server when memory is enabled", async () => {
+    const runner = makeRunnerWithDb(["memory"]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["structured-memory"]).toBeDefined();
+    expect(servers["structured-memory"].type).toBe("sdk");
+  });
+
+  it("event-bus becomes an in-process SDK server when in coreServers", async () => {
+    const runner = makeRunnerWithDb(["event-bus"]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["event-bus"]).toBeDefined();
+    expect(servers["event-bus"].type).toBe("sdk");
+  });
+
+  it("callback becomes an in-process SDK server when in coreServers", async () => {
+    const runner = makeRunnerWithDb(["callback"]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["callback"]).toBeDefined();
+    expect(servers["callback"].type).toBe("sdk");
+  });
+
+  it("contacts becomes an in-process SDK server when in coreServers", async () => {
+    const runner = makeRunnerWithDb(["contacts"]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["contacts"]).toBeDefined();
+    expect(servers["contacts"].type).toBe("sdk");
+  });
+
+  it("schedule becomes an in-process SDK server (auto-injected)", async () => {
+    const runner = makeRunnerWithDb([]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["schedule"]).toBeDefined();
+    expect(servers["schedule"].type).toBe("sdk");
+  });
+
+  it("team becomes an in-process SDK server (auto-injected)", async () => {
+    const runner = makeRunnerWithDb([]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["team"]).toBeDefined();
+    expect(servers["team"].type).toBe("sdk");
+  });
+
+  it("admin becomes an in-process SDK server when in coreServers", async () => {
+    const runner = makeRunnerWithDb(["admin"]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["admin"]).toBeDefined();
+    expect(servers["admin"].type).toBe("sdk");
+  });
+
+  it("workflow becomes an in-process SDK server when config.workflow.enabled is true", async () => {
+    const { config } = await import("../config.js");
+    const orig = config.workflow.enabled;
+    (config.workflow as any).enabled = true;
+    try {
+      const runner = makeRunnerWithDb(["workflow"]);
+      await runner.send("hello");
+      const servers = getCapturedServers();
+      expect(servers["workflow"]).toBeDefined();
+      expect(servers["workflow"].type).toBe("sdk");
+    } finally {
+      (config.workflow as any).enabled = orig;
+    }
+  });
+
+  it("code-search becomes an in-process SDK server when codeAccess is on", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["code-search"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: true },
+      }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeDb(),
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+    expect(servers["code-search"]).toBeDefined();
+    expect(servers["code-search"].type).toBe("sdk");
+  });
+});
+
 describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
   beforeEach(() => {
     vi.clearAllMocks();

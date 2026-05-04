@@ -74,12 +74,15 @@ Message (Slack/SMS/WebSocket/Scheduler)
 - `src/channels/sms-adapter.ts` — SMS message adapter via Quo/OpenPhone
 - `src/slack/slack-gateway.ts` — Socket Mode listener, message filtering
 
-### MCP Servers (stdio subprocesses per agent session)
+### MCP Servers (in-process by default; stdio for tier-3)
+
+**KPR-122**: engine-internal Mongo-backed MCPs are **in-process** SDK servers (`createSdkMcpServer`) — they share the engine's MongoClient pool, eliminating per-turn TIME_WAIT churn from stdio subprocess spawn/exit. Per-call context (`AGENT_ID` is constructor-stable; `CHANNEL_ID`/`THREAD_ID`/`WorkItemContext` metadata for context-sensitive servers) is threaded into tool handlers via a mutable `*ContextRef` the runner updates each turn before `query()`. **Crash isolation trade-off**: every in-process tool handler is wrapped in try/catch returning a structured error response, so a handler exception never crashes the hive — the SDK loop survives and the agent sees the error. If instability surfaces, individual MCPs can selectively revert to stdio. Stdio remains for tier-3 servers that require process boundaries (`code-task`, `background`, `keychain`) and tier-2 vendor-API stdio servers (`slack` local, `quo`, `resend`, `linear`, `github-issues`, `clickup`, `recall`, `google`, `voice`, `tasks`, `brave-search`, `browser`).
+
 All in `src/` — each agent only gets servers listed in its `coreServers`/`delegateServers` fields in the agent definition:
-- `memory-mcp-server.ts` — read/write/list/history/rollback agent memory (MongoDB)
+- `memory-mcp-server.ts` — read/write/list/history/rollback agent memory (MongoDB) [in-process]
 - `google/google-mcp-server.ts` — Gmail + Calendar + Drive via `gog` CLI
 - `keychain-mcp-server.ts` — macOS Keychain read-only
-- `contacts-mcp-server.ts` — contact lookups (MongoDB)
+- `contacts-mcp-server.ts` — contact lookups (MongoDB) [in-process]
 - `github/github-issues-mcp-server.ts` — GitHub Issues tracking via `gh` CLI
 - `linear/linear-mcp-server.ts` — Linear issue tracking
 - `search/crm-search-mcp-server.ts` — vector search over CRM data
@@ -91,14 +94,16 @@ All in `src/` — each agent only gets servers listed in its `coreServers`/`dele
 - `recall/recall-mcp-server.ts` — meeting participation via Recall.ai
 - `quo-mcp-server.ts` — SMS via Quo/OpenPhone
 - `resend/resend-mcp-server.ts` — outbound email via Resend
-- `callback-mcp-server.ts` — timer callbacks for delayed responses
-- `admin-mcp-server.ts` — agent CRUD + version history, model overrides
+- `callback-mcp-server.ts` — timer callbacks for delayed responses [in-process]
+- `admin-mcp-server.ts` — agent CRUD + version history, model overrides [in-process]
 - `clickup/clickup-mcp-server.ts` — ClickUp task management
-- `events/event-bus-mcp-server.ts` — cross-agent event bus (publish events, subscriber delivery)
-- `team/team-mcp-server.ts` — direct agent-to-agent messaging (feature flag: `team.enabled`)
-- `code-index/code-search-mcp-server.ts` — semantic code search over file index
+- `events/event-bus-mcp-server.ts` — cross-agent event bus (publish events, subscriber delivery) [in-process]
+- `team/team-mcp-server.ts` — direct agent-to-agent messaging (feature flag: `team.enabled`) [in-process]
+- `schedule/schedule-mcp-server.ts` — self-service schedule management (cron) [in-process]
+- `workflow/workflow-mcp-server.ts` — plan/task management (gated by `config.workflow.enabled`) [in-process]
+- `code-index/code-search-mcp-server.ts` — semantic code search over file index [in-process]
 - `code-task/code-task-mcp-server.ts` — delegate coding to Claude Code CLI sessions
-- `memory/structured-memory-mcp-server.ts` — tiered memory with semantic recall (auto-paired with memory server)
+- `memory/structured-memory-mcp-server.ts` — tiered memory with semantic recall (auto-paired with memory server) [in-process]
 
 Slack MCP defaults to the official Slack HTTP MCP server (`https://mcp.slack.com/mcp`). The local-stdio implementation (`src/slack/slack-mcp-server.ts` — KPR-103) is opt-in via `slack.localMcpServer: true` in `hive.yaml`. Local stdio expects `chat:write.customize` on the bot token for identity-mode posts; if missing, the preflight warns (non-fatal) and posts silently fall back to plain bot identity.
 
@@ -158,7 +163,7 @@ Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline
 
 - **Logging**: `import { createLogger } from "./logging/logger.js"` → `const log = createLogger("module-name")`
 - **Agent IDs**: lowercase with hyphens (`chief-of-staff`, not `chief_of_staff`)
-- **MCP servers**: stdio subprocesses of agent sessions — each gets env vars (AGENT_ID, CHANNEL_ID, etc.)
+- **MCP servers**: in-process SDK servers (`createSdkMcpServer`) for engine Mongo-backed servers — share the engine's MongoClient pool; per-turn context flows through mutable `*ContextRef` updated by `AgentRunner.send()`. Stdio subprocesses remain for tier-3 (`code-task`, `background`, `keychain`) and vendor-API integrations.
 - **Agent identity**: soul (personality) + systemPrompt (role) + memory (MongoDB) — all stored in `agent_definitions` collection
 - **WorkItem**: channel-agnostic message abstraction (text, source, sender, thread, metadata)
 - **Hot reload**: SIGUSR1 signal reloads agent definitions from MongoDB. No restart for agent config changes.

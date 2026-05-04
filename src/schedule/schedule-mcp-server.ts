@@ -1,24 +1,14 @@
-#!/usr/bin/env node
-
 /**
  * Schedule MCP Server — self-service schedule management for agents.
- * Each agent can only manage their own schedules.
- * Reads/writes agent_definitions.schedule directly (DB-native).
  *
- * Env vars:
- *   AGENT_ID                  — the calling agent's ID (scope lock)
- *   MONGODB_URI               — MongoDB connection string
- *   MONGODB_DB                — database name
+ * KPR-122 port: in-process via createSdkMcpServer. Tool handlers close over
+ * the shared engine Db. No per-turn context.
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { MongoClient } from "mongodb";
+import type { Db } from "mongodb";
 
-const AGENT_ID = process.env.AGENT_ID ?? "unknown";
-const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
-const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
 const MAX_SCHEDULES = 10;
 const MIN_INTERVAL_MINUTES = 15;
 
@@ -29,15 +19,10 @@ interface AgentDefDoc {
   scheduleLastReason?: string;
 }
 
-const client = new MongoClient(MONGODB_URI);
-await client.connect();
-const db = client.db(MONGODB_DB);
-const agentDefs = db.collection<AgentDefDoc>("agent_definitions");
-
-const server = new McpServer({
-  name: "hive-schedule",
-  version: "0.1.0",
-});
+export interface ScheduleToolDeps {
+  db: Db;
+  agentId: string;
+}
 
 /**
  * Validate that a cron expression doesn't resolve to faster than every N minutes.
@@ -49,7 +34,6 @@ export function validateMinInterval(cron: string): string | null {
 
   const minuteField = parts[0]!;
 
-  // Step values: */5 means every 5 minutes
   const stepMatch = minuteField.match(/^\*\/(\d+)$/);
   if (stepMatch) {
     const step = parseInt(stepMatch[1]!, 10);
@@ -58,7 +42,6 @@ export function validateMinInterval(cron: string): string | null {
     }
   }
 
-  // Comma-separated values: check if any two are closer than MIN_INTERVAL_MINUTES
   if (minuteField.includes(",")) {
     const vals = minuteField
       .split(",")
@@ -72,230 +55,263 @@ export function validateMinInterval(cron: string): string | null {
     }
   }
 
-  // Range: * with all wildcards means every minute
   if (minuteField === "*") {
     const allWild = parts.slice(1).every((p) => p === "*");
     if (allWild) return "This would run every minute. Minimum interval is every 15 minutes.";
   }
 
-  return null; // valid
+  return null;
 }
 
-// ── my_schedules ──────────────────────────────────────────────────────
+export function buildScheduleTools(deps: ScheduleToolDeps) {
+  const { db, agentId } = deps;
+  const agentDefs = db.collection<AgentDefDoc>("agent_definitions");
 
-server.registerTool(
-  "my_schedules",
-  {
-    title: "My Schedules",
-    description: "List your active schedules.",
-    inputSchema: {},
-  },
-  async () => {
-    const doc = await agentDefs.findOne({ _id: AGENT_ID });
-    const schedule: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
+  return [
+    tool("my_schedules", "List your active schedules.", {}, async () => {
+      try {
+        const doc = await agentDefs.findOne({ _id: agentId });
+        const schedule: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
-    const lines: string[] = [];
-    lines.push(`## Schedules for ${AGENT_ID}\n`);
+        const lines: string[] = [];
+        lines.push(`## Schedules for ${agentId}\n`);
 
-    if (schedule.length === 0) {
-      lines.push("No scheduled tasks configured.");
-    } else {
-      lines.push("### Active Schedules:");
-      for (const s of schedule) {
-        lines.push(`  ${s.cron} → ${s.task}`);
+        if (schedule.length === 0) {
+          lines.push("No scheduled tasks configured.");
+        } else {
+          lines.push("### Active Schedules:");
+          for (const s of schedule) {
+            lines.push(`  ${s.cron} → ${s.task}`);
+          }
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: "text", text: `my_schedules error: ${String(err)}` }] };
       }
-    }
-
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  },
-);
-
-// ── my_schedule_add ───────────────────────────────────────────────────
-
-server.registerTool(
-  "my_schedule_add",
-  {
-    title: "Add Schedule",
-    description:
+    }),
+    tool(
+      "my_schedule_add",
       "Add a new scheduled task. Must provide a cron expression and task name. Minimum interval: 15 minutes. Maximum: 10 schedules. Note: range patterns like 0-14 bypass the interval guard — use step syntax (*/15) for intervals.",
-    inputSchema: {
-      cron: z.string().describe("Cron expression (e.g. '0 9 * * 1-5' for weekdays at 9am)"),
-      task: z.string().describe("Task name (e.g. 'check-inbox', 'weekly-report')"),
-      reason: z.string().describe("Why you're adding this schedule (for audit trail)"),
-    },
-  },
-  async ({ cron, task, reason }) => {
-    const intervalError = validateMinInterval(cron);
-    if (intervalError) {
-      return { content: [{ type: "text", text: intervalError }], isError: true };
-    }
+      {
+        cron: z.string().describe("Cron expression (e.g. '0 9 * * 1-5' for weekdays at 9am)"),
+        task: z.string().describe("Task name (e.g. 'check-inbox', 'weekly-report')"),
+        reason: z.string().describe("Why you're adding this schedule (for audit trail)"),
+      },
+      async ({ cron, task, reason }) => {
+        try {
+          const intervalError = validateMinInterval(cron);
+          if (intervalError) {
+            return { isError: true, content: [{ type: "text", text: intervalError }] };
+          }
 
-    const doc = await agentDefs.findOne({ _id: AGENT_ID });
+          const doc = await agentDefs.findOne({ _id: agentId });
 
-    if (doc?.scheduleLocked) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Your schedule is locked by an admin. Contact the platform admin to unlock it.",
-          },
-        ],
-        isError: true,
-      };
-    }
+          if (doc?.scheduleLocked) {
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: "Your schedule is locked by an admin. Contact the platform admin to unlock it.",
+                },
+              ],
+            };
+          }
 
-    const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
+          const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
-    if (current.length >= MAX_SCHEDULES) {
-      return {
-        content: [{ type: "text", text: `Maximum ${MAX_SCHEDULES} schedules reached. Remove one first.` }],
-        isError: true,
-      };
-    }
+          if (current.length >= MAX_SCHEDULES) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `Maximum ${MAX_SCHEDULES} schedules reached. Remove one first.` }],
+            };
+          }
 
-    if (current.some((s) => s.task === task)) {
-      return {
-        content: [
-          { type: "text", text: `Schedule for task '${task}' already exists. Use my_schedule_update to change it.` },
-        ],
-        isError: true,
-      };
-    }
+          if (current.some((s) => s.task === task)) {
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: `Schedule for task '${task}' already exists. Use my_schedule_update to change it.`,
+                },
+              ],
+            };
+          }
 
-    const newSchedule = [...current, { cron, task }];
+          const newSchedule = [...current, { cron, task }];
 
-    await agentDefs.updateOne(
-      { _id: AGENT_ID },
-      { $set: { schedule: newSchedule, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
-    );
+          await agentDefs.updateOne(
+            { _id: agentId },
+            { $set: { schedule: newSchedule, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: agentId } },
+          );
 
-    // Change stream / polling picks up the write within 30s
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Added schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+              },
+            ],
+          };
+        } catch (err) {
+          return { isError: true, content: [{ type: "text", text: `my_schedule_add error: ${String(err)}` }] };
+        }
+      },
+    ),
+    tool(
+      "my_schedule_remove",
+      "Remove a scheduled task by task name.",
+      {
+        task: z.string().describe("The task name to remove"),
+        reason: z.string().describe("Why you're removing this schedule (for audit trail)"),
+      },
+      async ({ task, reason }) => {
+        try {
+          const doc = await agentDefs.findOne({ _id: agentId });
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Added schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.`,
-        },
-      ],
-    };
-  },
-);
+          if (doc?.scheduleLocked) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: "Your schedule is locked by an admin." }],
+            };
+          }
 
-// ── my_schedule_remove ────────────────────────────────────────────────
+          const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
 
-server.registerTool(
-  "my_schedule_remove",
-  {
-    title: "Remove Schedule",
-    description: "Remove a scheduled task by task name.",
-    inputSchema: {
-      task: z.string().describe("The task name to remove"),
-      reason: z.string().describe("Why you're removing this schedule (for audit trail)"),
-    },
-  },
-  async ({ task, reason }) => {
-    const doc = await agentDefs.findOne({ _id: AGENT_ID });
+          const idx = current.findIndex((s) => s.task === task);
+          if (idx === -1) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `No schedule found for task '${task}'.` }],
+            };
+          }
 
-    if (doc?.scheduleLocked) {
-      return {
-        content: [{ type: "text", text: "Your schedule is locked by an admin." }],
-        isError: true,
-      };
-    }
+          const newSchedule = current.filter((_, i) => i !== idx);
 
-    const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
+          await agentDefs.updateOne(
+            { _id: agentId },
+            { $set: { schedule: newSchedule, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: agentId } },
+          );
 
-    const idx = current.findIndex((s) => s.task === task);
-    if (idx === -1) {
-      return {
-        content: [{ type: "text", text: `No schedule found for task '${task}'.` }],
-        isError: true,
-      };
-    }
-
-    const newSchedule = current.filter((_, i) => i !== idx);
-
-    await agentDefs.updateOne(
-      { _id: AGENT_ID },
-      { $set: { schedule: newSchedule, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
-    );
-
-    // Change stream / polling picks up the write within 30s
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Removed schedule for task '${task}'.\nReason: ${reason}\nChange will take effect within 30 seconds.`,
-        },
-      ],
-    };
-  },
-);
-
-// ── my_schedule_update ────────────────────────────────────────────────
-
-server.registerTool(
-  "my_schedule_update",
-  {
-    title: "Update Schedule",
-    description:
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Removed schedule for task '${task}'.\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+              },
+            ],
+          };
+        } catch (err) {
+          return { isError: true, content: [{ type: "text", text: `my_schedule_remove error: ${String(err)}` }] };
+        }
+      },
+    ),
+    tool(
+      "my_schedule_update",
       "Update the cron expression for an existing scheduled task. Minimum interval: 15 minutes. Note: range patterns like 0-14 bypass the interval guard — use step syntax (*/15) for intervals.",
-    inputSchema: {
-      task: z.string().describe("The task name to update"),
-      cron: z.string().describe("New cron expression"),
-      reason: z.string().describe("Why you're changing this schedule (for audit trail)"),
-    },
-  },
-  async ({ task, cron, reason }) => {
-    const intervalError = validateMinInterval(cron);
-    if (intervalError) {
-      return { content: [{ type: "text", text: intervalError }], isError: true };
-    }
+      {
+        task: z.string().describe("The task name to update"),
+        cron: z.string().describe("New cron expression"),
+        reason: z.string().describe("Why you're changing this schedule (for audit trail)"),
+      },
+      async ({ task, cron, reason }) => {
+        try {
+          const intervalError = validateMinInterval(cron);
+          if (intervalError) {
+            return { isError: true, content: [{ type: "text", text: intervalError }] };
+          }
 
-    const doc = await agentDefs.findOne({ _id: AGENT_ID });
+          const doc = await agentDefs.findOne({ _id: agentId });
 
-    if (doc?.scheduleLocked) {
-      return {
-        content: [{ type: "text", text: "Your schedule is locked by an admin." }],
-        isError: true,
+          if (doc?.scheduleLocked) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: "Your schedule is locked by an admin." }],
+            };
+          }
+
+          const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
+
+          const idx = current.findIndex((s) => s.task === task);
+          if (idx === -1) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `No schedule found for task '${task}'.` }],
+            };
+          }
+
+          current[idx] = { cron, task };
+
+          await agentDefs.updateOne(
+            { _id: agentId },
+            { $set: { schedule: current, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: agentId } },
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Updated schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.`,
+              },
+            ],
+          };
+        } catch (err) {
+          return { isError: true, content: [{ type: "text", text: `my_schedule_update error: ${String(err)}` }] };
+        }
+      },
+    ),
+  ];
+}
+
+export function createScheduleMcpServer(deps: ScheduleToolDeps) {
+  return createSdkMcpServer({
+    name: "schedule",
+    version: "0.1.0",
+    tools: buildScheduleTools(deps),
+  });
+}
+
+// Stdio shim for the publish-ready bundle path.
+if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+  await (async () => {
+    const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+    const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
+    const { MongoClient } = await import("mongodb");
+
+    const AGENT_ID = process.env.AGENT_ID ?? "unknown";
+    const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
+    const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
+
+    const client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    const db = client.db(MONGODB_DB);
+
+    const tools = buildScheduleTools({ db, agentId: AGENT_ID });
+
+    const server = new McpServer({ name: "hive-schedule", version: "0.1.0" });
+    for (const t of tools) {
+      const def = t as unknown as {
+        name: string;
+        description: string;
+        inputSchema: Record<string, z.ZodTypeAny>;
+        handler: (args: Record<string, unknown>) => Promise<unknown>;
       };
+      server.registerTool(
+        def.name,
+        { title: def.name, description: def.description, inputSchema: def.inputSchema },
+        def.handler as never,
+      );
     }
 
-    const current: Array<{ cron: string; task: string }> = doc?.schedule ?? [];
-
-    const idx = current.findIndex((s) => s.task === task);
-    if (idx === -1) {
-      return {
-        content: [{ type: "text", text: `No schedule found for task '${task}'.` }],
-        isError: true,
-      };
-    }
-
-    current[idx] = { cron, task };
-
-    await agentDefs.updateOne(
-      { _id: AGENT_ID },
-      { $set: { schedule: current, scheduleLastReason: reason, updatedAt: new Date(), updatedBy: AGENT_ID } },
-    );
-
-    // Change stream / polling picks up the write within 30s
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Updated schedule: ${cron} → ${task}\nReason: ${reason}\nChange will take effect within 30 seconds.`,
-        },
-      ],
+    const cleanup = (): void => {
+      void client.close();
     };
-  },
-);
+    process.on("SIGTERM", cleanup);
+    process.on("SIGINT", cleanup);
 
-// Cleanup on exit
-process.on("SIGTERM", () => client.close());
-process.on("SIGINT", () => client.close());
-
-const transport = new StdioServerTransport();
-await server.connect(transport);
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  })();
+}

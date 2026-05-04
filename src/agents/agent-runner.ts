@@ -21,6 +21,23 @@ import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import { createTeamRosterMcpServer } from "../team-roster/team-roster-mcp-server.js";
+import { createMemoryMcpServer } from "../memory/memory-mcp-server.js";
+import {
+  createStructuredMemoryMcpServer,
+  type StructuredMemoryTurnContext,
+} from "../memory/structured-memory-mcp-server.js";
+import { createEventBusMcpServer } from "../events/event-bus-mcp-server.js";
+import {
+  createCallbackMcpServer,
+  type CallbackTurnContext,
+} from "../callback/callback-mcp-server.js";
+import { createContactsMcpServer } from "../contacts/contacts-mcp-server.js";
+import { createScheduleMcpServer } from "../schedule/schedule-mcp-server.js";
+import { createTeamMcpServer } from "../team/team-mcp-server.js";
+import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
+import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
+import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
+import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
 
@@ -196,13 +213,30 @@ export class AgentRunner {
   private eventSubscribersJson: string;
   private prefetcher?: CodeIndexPrefetcher;
   private teamRoster?: TeamRoster;
+  // Optional in tests — runtime always passes the shared engine Db handle so
+  // in-process MCP servers can avoid opening their own MongoClient pools (KPR-122).
+  private db?: Db;
   // Lazy-built once per AgentRunner — the in-process MCP server wraps the same
   // teamRoster instance for every send(), so reuse is safe and avoids per-message
   // allocation. (The shared cache is held by `teamRoster`, not the server wrapper.)
   private teamRosterMcpServer?: ReturnType<typeof createTeamRosterMcpServer>;
+  // KPR-122: in-process Mongo-backed MCP servers, cached per-runner. Built lazily
+  // in send() so test harnesses that never call send() don't need a real Db.
+  private memoryMcpServer?: ReturnType<typeof createMemoryMcpServer>;
+  private structuredMemoryMcpServer?: ReturnType<typeof createStructuredMemoryMcpServer>;
+  private structuredMemoryContextRef: { current: StructuredMemoryTurnContext } = { current: {} };
+  private eventBusMcpServer?: ReturnType<typeof createEventBusMcpServer>;
+  private callbackMcpServer?: ReturnType<typeof createCallbackMcpServer>;
+  private callbackContextRef: { current: CallbackTurnContext } = { current: {} };
+  private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
+  private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
+  private teamMcpServer?: ReturnType<typeof createTeamMcpServer>;
+  private adminMcpServer?: ReturnType<typeof createAdminMcpServer>;
+  private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
+  private workflowMcpServer?: ReturnType<typeof createWorkflowMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
@@ -210,6 +244,7 @@ export class AgentRunner {
     this.eventSubscribersJson = eventSubscribersJson;
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
+    this.db = db;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
@@ -323,6 +358,72 @@ export class AgentRunner {
 
 
   /**
+   * Compute the post-filter allowlist of core server names for this agent.
+   * Mirrors `filterCoreServers` exactly: starts from the agent's `coreServers`,
+   * adds auto-injected servers (schedule, team, team-roster, slack, optionally
+   * workflow), pairs `structured-memory` with `memory`, then applies autonomy
+   * gates. KPR-122 uses this to decide whether to wire an in-process MCP
+   * server without first having to materialize the stdio map for that server.
+   */
+  private effectiveCoreServerSet(): Set<string> {
+    const coreSet = new Set(this.agentConfig.coreServers);
+    if (coreSet.has("memory")) {
+      coreSet.add("structured-memory");
+    }
+    coreSet.add("schedule");
+    coreSet.add("team");
+    coreSet.add("team-roster");
+    coreSet.add("slack");
+    if (config.workflow.enabled) {
+      coreSet.add("workflow");
+    }
+    if (!this.agentConfig.autonomy.externalComms) {
+      coreSet.delete("resend");
+      coreSet.delete("quo");
+    }
+    if (!this.agentConfig.autonomy.codeTask) {
+      coreSet.delete("code-task");
+    }
+    if (!this.agentConfig.autonomy.codeAccess) {
+      coreSet.delete("code-search");
+    }
+    return coreSet;
+  }
+
+  private shouldEnableInProcessServer(name: string): boolean {
+    return this.effectiveCoreServerSet().has(name);
+  }
+
+  /**
+   * Resolve the memory scope list for this agent. "self" (Mongo) is always
+   * present; archetype-provided scopes are appended. KPR-122: extracted from
+   * `buildAllServerConfigs` so the in-process memory MCP factory can access
+   * the same list.
+   */
+  private resolveMemoryScopes(): ScopeDecl[] {
+    const memoryScopes: ScopeDecl[] = [{ id: "self", backing: "mongo" }];
+    const archetypeDef = this.getArchetypeDef();
+    if (archetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        const extra = archetypeDef.memoryScopes({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+        });
+        for (const s of extra) {
+          if (s.id !== "self") memoryScopes.push(s);
+        }
+      } catch (err) {
+        log.error("Archetype memoryScopes threw — using self-only", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
+    }
+    return memoryScopes;
+  }
+
+  /**
    * Build config for a single named MCP server.
    * Without a WorkItemContext, context-dependent servers (callback, background, recall, etc.)
    * will have empty channel/thread env vars — only use without context for non-context servers.
@@ -362,30 +463,15 @@ export class AgentRunner {
       }
     }
 
-    // Memory MCP server — gives the agent read/write access to its own memory.
-    // Archetypes may add additional filesystem-backed scopes (workshop, workspace, etc.)
-    // via memoryScopes(ctx). Self-mongo is always present as the first scope so the
-    // legacy behavior is preserved even if the archetype throws.
-    const memoryScopes: ScopeDecl[] = [{ id: "self", backing: "mongo" }];
-    const memoryArchetypeDef = this.getArchetypeDef();
-    if (memoryArchetypeDef && this.agentConfig.archetypeConfig) {
-      try {
-        const extra = memoryArchetypeDef.memoryScopes({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-        });
-        for (const s of extra) {
-          if (s.id !== "self") memoryScopes.push(s);
-        }
-      } catch (err) {
-        log.error("Archetype memoryScopes threw — using self-only", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-      }
-    }
-
+    // Memory MCP server — KPR-122: in-process at runtime (replaced in send()
+    // when `this.db` is present). The stdio entry below is retained so:
+    //  - `filterCoreServers` keeps `memory` in the post-filter map.
+    //  - The toolkit section sees `memory` in `coreServerNames`.
+    //  - The publish-ready bundle's stdio fallback path stays callable.
+    // Tests that don't pass a `db` exercise this stdio entry; production runs
+    // never spawn the subprocess because `send()` overwrites the slot with the
+    // in-process SDK server.
+    const memoryScopes: ScopeDecl[] = this.resolveMemoryScopes();
     servers["memory"] = {
       type: "stdio",
       command: "node",
@@ -1240,6 +1326,146 @@ export class AgentRunner {
       }
       mcpServers["team-roster"] = this.teamRosterMcpServer;
     }
+
+    // KPR-122: memory MCP — in-process. The stdio entry is gone from
+    // buildAllServerConfigs; we re-introduce the in-process server here when
+    // (a) the runner has a shared `db` (runtime path; tests without `db` skip)
+    // and (b) the agent's coreServers includes "memory". The cached SDK server
+    // is safe to reuse across turns: the resolved scope list depends only on
+    // constructor-time agent + archetype config.
+    if (this.db && this.shouldEnableInProcessServer("memory")) {
+      if (!this.memoryMcpServer) {
+        this.memoryMcpServer = createMemoryMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          memoryScopes: this.resolveMemoryScopes(),
+        });
+      }
+      mcpServers["memory"] = this.memoryMcpServer;
+    }
+
+    // KPR-122: event-bus MCP — in-process. Subscriber map is constructor-time
+    // stable on the runner so the cached server is safe to reuse across turns.
+    if (this.db && this.shouldEnableInProcessServer("event-bus")) {
+      if (!this.eventBusMcpServer) {
+        this.eventBusMcpServer = createEventBusMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          eventSubscribersJson: this.eventSubscribersJson,
+        });
+      }
+      mcpServers["event-bus"] = this.eventBusMcpServer;
+    }
+
+    // KPR-122: contacts MCP — in-process. No per-turn context.
+    if (this.db && this.shouldEnableInProcessServer("contacts")) {
+      if (!this.contactsMcpServer) {
+        this.contactsMcpServer = createContactsMcpServer({ db: this.db });
+      }
+      mcpServers["contacts"] = this.contactsMcpServer;
+    }
+
+    // KPR-122: schedule MCP — in-process. AgentId is constructor-stable.
+    if (this.db && this.shouldEnableInProcessServer("schedule")) {
+      if (!this.scheduleMcpServer) {
+        this.scheduleMcpServer = createScheduleMcpServer({ db: this.db, agentId: this.agentConfig.id });
+      }
+      mcpServers["schedule"] = this.scheduleMcpServer;
+    }
+
+    // KPR-122: team MCP — in-process. `getAgentIds` reads the live registry on
+    // every call so a hot reload (SIGUSR1) is reflected without rebuilding the
+    // cached server.
+    if (this.db && this.shouldEnableInProcessServer("team")) {
+      if (!this.teamMcpServer) {
+        this.teamMcpServer = createTeamMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          getAgentIds: () => AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
+        });
+      }
+      mcpServers["team"] = this.teamMcpServer;
+    }
+
+    // KPR-122: admin MCP — in-process. instanceCapabilities is plugin-derived
+    // and constructor-stable on the runner.
+    if (this.db && this.shouldEnableInProcessServer("admin")) {
+      if (!this.adminMcpServer) {
+        this.adminMcpServer = createAdminMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
+        });
+      }
+      mcpServers["admin"] = this.adminMcpServer;
+    }
+
+    // KPR-122: code-search MCP — in-process. Qdrant/Ollama URLs read from
+    // process.env at server-build time (same default values as the stdio path).
+    if (this.db && this.shouldEnableInProcessServer("code-search")) {
+      if (!this.codeSearchMcpServer) {
+        this.codeSearchMcpServer = createCodeSearchMcpServer({ db: this.db });
+      }
+      mcpServers["code-search"] = this.codeSearchMcpServer;
+    }
+
+    // KPR-122: workflow MCP — in-process. Gated by config.workflow.enabled
+    // (mirrors `effectiveCoreServerSet` which only adds it when the feature
+    // flag is on).
+    if (this.db && config.workflow.enabled && this.shouldEnableInProcessServer("workflow")) {
+      if (!this.workflowMcpServer) {
+        this.workflowMcpServer = createWorkflowMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          eventSubscribersJson: this.eventSubscribersJson,
+        });
+      }
+      mcpServers["workflow"] = this.workflowMcpServer;
+    }
+
+    // KPR-122: callback MCP — in-process. Per-turn source metadata flows
+    // through callbackContextRef.current, refreshed each turn so a callback
+    // scheduled mid-thread captures the right channel/thread.
+    if (this.db && this.shouldEnableInProcessServer("callback")) {
+      this.callbackContextRef.current = {
+        adapterId: context?.adapterId,
+        channelId: context?.channelId,
+        channelKind: context?.channelKind,
+        channelLabel: context?.channelLabel,
+        threadId: context?.threadId,
+        slackTs: context?.slackTs,
+        slackThreadTs: context?.slackThreadTs,
+      };
+      if (!this.callbackMcpServer) {
+        this.callbackMcpServer = createCallbackMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          context: this.callbackContextRef,
+        });
+      }
+      mcpServers["callback"] = this.callbackMcpServer;
+    }
+
+    // KPR-122: structured-memory MCP — in-process, paired with memory.
+    // channel/thread come from the per-turn `context` (mutable ref so the
+    // cached SDK server sees the active values without rebuilding).
+    if (this.db && this.shouldEnableInProcessServer("structured-memory")) {
+      this.structuredMemoryContextRef.current = {
+        channelId: context?.channelId,
+        threadId: context?.threadId,
+      };
+      if (!this.structuredMemoryMcpServer) {
+        this.structuredMemoryMcpServer = createStructuredMemoryMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          context: this.structuredMemoryContextRef,
+          qdrantUrl: process.env.QDRANT_URL,
+          ollamaUrl: process.env.OLLAMA_URL,
+        });
+      }
+      mcpServers["structured-memory"] = this.structuredMemoryMcpServer;
+    }
+
     const delegateAgents = this.buildDelegateAgents(allServerConfigs);
     const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(delegateAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
