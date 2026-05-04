@@ -32,6 +32,7 @@ import {
   type CallbackTurnContext,
 } from "../callback/callback-mcp-server.js";
 import { createContactsMcpServer } from "../contacts/contacts-mcp-server.js";
+import { createScheduleMcpServer } from "../schedule/schedule-mcp-server.js";
 import type { Db } from "mongodb";
 
 const log = createLogger("agent-runner");
@@ -224,6 +225,7 @@ export class AgentRunner {
   private callbackMcpServer?: ReturnType<typeof createCallbackMcpServer>;
   private callbackContextRef: { current: CallbackTurnContext } = { current: {} };
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
+  private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
 
   constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
@@ -1353,6 +1355,14 @@ export class AgentRunner {
         this.contactsMcpServer = createContactsMcpServer({ db: this.db });
       }
       mcpServers["contacts"] = this.contactsMcpServer;
+    }
+
+    // KPR-122: schedule MCP — in-process. AgentId is constructor-stable.
+    if (this.db && this.shouldEnableInProcessServer("schedule")) {
+      if (!this.scheduleMcpServer) {
+        this.scheduleMcpServer = createScheduleMcpServer({ db: this.db, agentId: this.agentConfig.id });
+      }
+      mcpServers["schedule"] = this.scheduleMcpServer;
     }
 
     // KPR-122: callback MCP — in-process. Per-turn source metadata flows
