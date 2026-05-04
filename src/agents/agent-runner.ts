@@ -171,6 +171,7 @@ const MCP_BUNDLE_MAP: Record<string, string> = {
   "schedule/schedule-mcp-server.js": "schedule.min.js",
   "admin/admin-mcp-server.js": "admin.min.js",
   "slack/slack-mcp-server.js": "slack.min.js",
+  "skill-author/skill-author-mcp-server.js": "skill-author.min.js",
 };
 
 function mcpPath(devSubpath: string): string {
@@ -862,6 +863,19 @@ export class AgentRunner {
       },
     };
 
+    // Skill-author MCP — always-on (KPR-104). Lets every agent author a private
+    // SKILL.md under <HIVE_HOME>/agents/<id>/skills/<slug>/. Slug regex is
+    // enforced inside the server so we never path.join unvalidated input.
+    servers["skill-author"] = {
+      type: "stdio",
+      command: "node",
+      args: [mcpPath("skill-author/skill-author-mcp-server.js")],
+      env: {
+        AGENT_ID: this.agentConfig.id,
+        HIVE_HOME: hiveHome,
+      },
+    };
+
     // Admin MCP server — model management, system controls
     servers["admin"] = {
       type: "stdio",
@@ -897,6 +911,9 @@ export class AgentRunner {
     coreSet.add("team");
     // team-roster is an implicit core server — every agent gets the team API
     coreSet.add("team-roster");
+    // skill-author is an implicit core server — every agent can author its own
+    // skills unconditionally (KPR-104). No permission flag; empowerment posture.
+    coreSet.add("skill-author");
     // slack is an implicit core server — it's the default comms channel for every agent.
     // The server itself is only built when SLACK_MCP_TOKEN is configured (see buildAllServerConfigs),
     // so this is a no-op for Slack-less instances. Agents that should not post to Slack can be
@@ -959,7 +976,7 @@ export class AgentRunner {
 
   // Infrastructure servers excluded from "Your tools" prompt section — always present, self-explanatory
   private static readonly INFRASTRUCTURE_SERVERS = new Set([
-    "schedule", "structured-memory", "team", "team-roster",
+    "schedule", "structured-memory", "team", "team-roster", "skill-author",
   ]);
 
   // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)
