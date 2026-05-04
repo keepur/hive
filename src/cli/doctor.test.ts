@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { resolveRequiredEnvVars } from "./doctor.js";
+import { renderPromptCacheSection, resolveRequiredEnvVars } from "./doctor.js";
 
 describe("resolveRequiredEnvVars", () => {
   let dir: string;
@@ -72,5 +72,77 @@ describe("resolveRequiredEnvVars", () => {
     writeFileSync(join(dir, "required-env.json"), JSON.stringify({ requiredEnv: "not-an-array" }));
 
     expect(resolveRequiredEnvVars(dir)).toEqual([]);
+  });
+});
+
+describe("renderPromptCacheSection", () => {
+  it("renders 'no telemetry yet' when the rows are empty", () => {
+    const lines: string[] = [];
+    renderPromptCacheSection([], (l) => lines.push(l));
+    expect(lines.join("\n")).toContain("Prompt cache (last 7 days)");
+    expect(lines.join("\n")).toContain("no telemetry yet");
+  });
+
+  it("renders one row per agent with hit rate, read, create, input, turns", () => {
+    const lines: string[] = [];
+    renderPromptCacheSection(
+      [
+        {
+          agentId: "chief-of-staff",
+          turns: 12,
+          cacheReadTokens: 8000,
+          cacheCreationTokens: 1000,
+          inputTokens: 1000,
+          ephemeral5mTokens: 800,
+          ephemeral1hTokens: 200,
+          hitRate: 0.8,
+        },
+      ],
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).toMatch(
+      /chief-of-staff: hit=80\.0% read=8000 create=1000 \(5m=800, 1h=200\) input=1000 turns=12/,
+    );
+  });
+
+  it("omits the ephemeral breakdown when both counters are zero", () => {
+    const lines: string[] = [];
+    renderPromptCacheSection(
+      [
+        {
+          agentId: "rae",
+          turns: 1,
+          cacheReadTokens: 50,
+          cacheCreationTokens: 50,
+          inputTokens: 100,
+          ephemeral5mTokens: 0,
+          ephemeral1hTokens: 0,
+          hitRate: 0.25,
+        },
+      ],
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).not.toContain("(5m=");
+    expect(lines.join("\n")).toContain("hit=25.0%");
+  });
+
+  it("renders 'no data' for a row with null hitRate", () => {
+    const lines: string[] = [];
+    renderPromptCacheSection(
+      [
+        {
+          agentId: "ghost",
+          turns: 1,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          inputTokens: 0,
+          ephemeral5mTokens: 0,
+          ephemeral1hTokens: 0,
+          hitRate: null,
+        },
+      ],
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).toContain("hit=no data");
   });
 });

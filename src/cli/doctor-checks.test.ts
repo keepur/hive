@@ -133,13 +133,14 @@ vi.mock("mongodb", () => {
   const ping = vi.fn();
   const estimatedDocumentCount = vi.fn();
   const findOne = vi.fn();
-  const collection = vi.fn(() => ({ estimatedDocumentCount, findOne }));
+  const aggregate = vi.fn();
+  const collection = vi.fn(() => ({ estimatedDocumentCount, findOne, aggregate }));
   const command = vi.fn((cmd: unknown) => ping(cmd));
   const db = vi.fn(() => ({ command, collection }));
   const connect = vi.fn();
   const close = vi.fn();
   const MongoClient = vi.fn(() => ({ connect, db, close }));
-  return { MongoClient, __mocks: { connect, close, ping, estimatedDocumentCount, findOne } };
+  return { MongoClient, __mocks: { connect, close, ping, estimatedDocumentCount, findOne, aggregate } };
 });
 
 import * as mongodb from "mongodb";
@@ -225,5 +226,59 @@ describe("slackAuthOk", () => {
       throw new Error("invalid_auth");
     });
     await expect(slackAuthOk("xoxb-x")).resolves.toBe(false);
+  });
+});
+
+// ── prompt cache observability (KPR-140) ────────────────────────────────
+
+import { cacheHitRatesForDoctor, formatHitRate } from "./doctor-checks.js";
+
+describe("formatHitRate", () => {
+  it("renders null as 'no data'", () => {
+    expect(formatHitRate(null)).toBe("no data");
+  });
+  it("renders a fraction as a percentage with one decimal", () => {
+    expect(formatHitRate(0.8123)).toBe("81.2%");
+    expect(formatHitRate(0)).toBe("0.0%");
+  });
+});
+
+describe("cacheHitRatesForDoctor", () => {
+  beforeEach(() => {
+    mongoMocks.connect.mockReset().mockResolvedValue(undefined);
+    mongoMocks.close.mockReset().mockResolvedValue(undefined);
+    mongoMocks.aggregate.mockReset();
+  });
+
+  it("returns [] when the collection has no rows", async () => {
+    mongoMocks.aggregate.mockReturnValue({
+      [Symbol.asyncIterator]: async function* () {},
+    });
+    await expect(cacheHitRatesForDoctor("mongodb://x", "hive_test")).resolves.toEqual([]);
+  });
+
+  it("computes hit rate from disjoint counters", async () => {
+    mongoMocks.aggregate.mockReturnValue({
+      [Symbol.asyncIterator]: async function* () {
+        yield {
+          _id: "agent-a",
+          turns: 3,
+          inputTokens: 100,
+          cacheReadTokens: 400,
+          cacheCreationTokens: 0,
+          ephemeral5mTokens: 0,
+          ephemeral1hTokens: 0,
+        };
+      },
+    });
+    const rows = await cacheHitRatesForDoctor("mongodb://x", "hive_test");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].hitRate).toBeCloseTo(0.8, 4);
+    expect(rows[0].turns).toBe(3);
+  });
+
+  it("returns [] when the connection throws", async () => {
+    mongoMocks.connect.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    await expect(cacheHitRatesForDoctor("mongodb://x", "hive_test")).resolves.toEqual([]);
   });
 });

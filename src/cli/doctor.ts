@@ -4,9 +4,12 @@ import { execFileSync } from "node:child_process";
 import {
   type Check,
   type CheckGroup,
+  type PromptCacheRow,
   brewServiceRunning,
+  cacheHitRatesForDoctor,
   commandExists,
   defaultAgentExists,
+  formatHitRate,
   hasAnyAgent,
   httpProbe,
   launchctlPrint,
@@ -62,6 +65,29 @@ export function resolveRequiredEnvVars(hereDir: string): string[] {
     return requiredEnvVarsFromConfig(srcCandidate);
   }
   return [];
+}
+
+/**
+ * Render the "Prompt cache" doctor section. Exported so the unit test
+ * doesn't need to invoke `runDoctor` (which runs every other doctor
+ * check and may exit non-zero on a CI environment without brew/Node22).
+ * Informational — does not affect exit code.
+ */
+export function renderPromptCacheSection(rows: PromptCacheRow[], emit: (line: string) => void = console.log): void {
+  emit("\nPrompt cache (last 7 days)");
+  if (rows.length === 0) {
+    emit("  ○ no telemetry yet — let the hive run for a window and re-check");
+    return;
+  }
+  for (const r of rows) {
+    const ephemeralBreakdown =
+      r.ephemeral5mTokens > 0 || r.ephemeral1hTokens > 0
+        ? ` (5m=${r.ephemeral5mTokens}, 1h=${r.ephemeral1hTokens})`
+        : "";
+    emit(
+      `  ${r.agentId}: hit=${formatHitRate(r.hitRate)} read=${r.cacheReadTokens} create=${r.cacheCreationTokens}${ephemeralBreakdown} input=${r.inputTokens} turns=${r.turns}`,
+    );
+  }
 }
 
 const GROUP_TITLES: Record<CheckGroup, string> = {
@@ -269,6 +295,16 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       console.log(`      → ${check.remedy}`);
     }
     if (!ok && check.required) allPassed = false;
+  }
+
+  // Prompt cache observability (KPR-140). Informational — does not
+  // contribute to allPassed; missing telemetry never fails the doctor.
+  if (config) {
+    const rows = await cacheHitRatesForDoctor(config.mongo.uri, config.mongo.dbName);
+    renderPromptCacheSection(rows);
+  } else {
+    console.log("\nPrompt cache (last 7 days)");
+    console.log("  ○ skipped: config not loaded");
   }
 
   if (!allPassed) {

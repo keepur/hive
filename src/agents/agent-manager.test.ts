@@ -152,6 +152,12 @@ function makeMockSessionStore() {
   };
 }
 
+function makeMockTurnTelemetryStore() {
+  return {
+    record: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function makeMockMemoryManager() {
   return {
     read: vi.fn().mockResolvedValue(null),
@@ -165,6 +171,7 @@ describe("AgentManager", () => {
   let registry: ReturnType<typeof makeMockRegistry>;
   let sessionStore: ReturnType<typeof makeMockSessionStore>;
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+  let turnTelemetryStore: ReturnType<typeof makeMockTurnTelemetryStore>;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -172,11 +179,18 @@ describe("AgentManager", () => {
     registry = makeMockRegistry();
     sessionStore = makeMockSessionStore();
     memoryManager = makeMockMemoryManager();
+    turnTelemetryStore = makeMockTurnTelemetryStore();
 
     // Default mock: runner.send resolves with a result
     mockRunnerSend.mockResolvedValue(makeRunResult());
 
-    manager = new AgentManager(registry as any, memoryManager as any, sessionStore as any);
+    manager = new AgentManager(
+      registry as any,
+      memoryManager as any,
+      sessionStore as any,
+      undefined as any,
+      turnTelemetryStore as any,
+    );
   });
 
   describe("sendMessage", () => {
@@ -258,6 +272,27 @@ describe("AgentManager", () => {
         compactions: 0,
         preCompactTokens: undefined,
       });
+    });
+
+    it("records per-turn cache telemetry after a successful turn", async () => {
+      const item = makeWorkItem();
+      await manager.sendMessage("agent-a", item);
+      // The promise is fire-and-forget — give it a microtask to settle.
+      await Promise.resolve();
+      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+      const arg = turnTelemetryStore.record.mock.calls[0][0];
+      expect(arg.agentId).toBe("agent-a");
+      expect(arg.cacheReadTokens).toBe(10);
+      expect(arg.cacheCreationTokens).toBe(5);
+      expect(arg.inputTokens).toBe(100);
+    });
+
+    it("does not record telemetry when the turn was aborted", async () => {
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ aborted: true }));
+      const item = makeWorkItem();
+      await manager.sendMessage("agent-a", item);
+      await Promise.resolve();
+      expect(turnTelemetryStore.record).not.toHaveBeenCalled();
     });
 
     it("increments error count on runner throw", async () => {
