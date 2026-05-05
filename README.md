@@ -45,6 +45,7 @@ If something breaks during install, ask the session — it has the source repo (
 - **Engine is Apache-2.0.** Read the source before you run it.
 - **Your data, your machine.** API keys live in your Mac's keychain. The language model never sees them, your customer records, or your secrets. No phone home.
 - **Customer-facing things wait for you.** Outbound emails, deal commitments — by default, drafts that need your approval.
+- **Visibility when you want it.** Run `hive doctor` for a snapshot of engine health (MongoDB connectivity, agent registry, prompt-cache telemetry).
 
 ## What we charge for
 
@@ -59,7 +60,6 @@ For deeper reading or when something breaks:
 - [Architecture](docs/architecture.md) — what's inside the engine.
 - [Managing your hive](docs/managing-your-hive.md) — plugins, skills, day-two ops.
 - [Troubleshooting](docs/troubleshooting.md) — when things break.
-- [Migrating to 0.2.0](docs/migrating-to-0.2.md) — for existing 0.1.x installs.
 
 ## License
 
