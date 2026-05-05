@@ -589,3 +589,93 @@ describe("agent_update — archetype clear semantics", () => {
     expect(doc.archetype).toBe("");
   });
 });
+
+describe("KPR-184 — delegateServers validation rejects in-process-ported servers", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+  });
+
+  const PORTED = [
+    "memory",
+    "structured-memory",
+    "event-bus",
+    "callback",
+    "contacts",
+    "schedule",
+    "team",
+    "admin",
+    "code-search",
+    "workflow",
+  ];
+
+  it.each(PORTED)("agent_create rejects delegateServers containing '%s'", async (server) => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "bad-delegate",
+      name: "Bad",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-bad",
+      roles: ["Generic"],
+      fields: { delegateServers: [server] },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("delegateServers");
+    expect(res.content[0].text).toContain(server);
+    // Reject is hard — agent must NOT be persisted.
+    expect(agentDocsStore.has("bad-delegate")).toBe(false);
+  });
+
+  it("agent_create rejects when delegateServers mixes valid and invalid entries", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "mixed-delegate",
+      name: "Mixed",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-mixed",
+      roles: ["Generic"],
+      fields: { delegateServers: ["google", "memory", "linear"] },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("memory");
+    expect(agentDocsStore.has("mixed-delegate")).toBe(false);
+  });
+
+  it("agent_create accepts delegateServers with only legitimate stdio servers", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "good-delegate",
+      name: "Good",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-good",
+      roles: ["Generic"],
+      fields: { delegateServers: ["google", "linear", "clickup"] },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("good-delegate")?.delegateServers).toEqual(["google", "linear", "clickup"]);
+  });
+
+  it("agent_update rejects delegateServers containing in-process-ported servers", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const handler = getHandler(makeTools(), "agent_update");
+    const res = await handler({
+      agent_id: "existing-agent",
+      fields: { delegateServers: ["event-bus"] },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("event-bus");
+    // Doc must be unchanged.
+    expect(agentDocsStore.get("existing-agent").delegateServers).toEqual([]);
+  });
+
+  it("agent_update accepts delegateServers update when entries are clean", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const handler = getHandler(makeTools(), "agent_update");
+    const res = await handler({
+      agent_id: "existing-agent",
+      fields: { delegateServers: ["google"] },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("existing-agent").delegateServers).toEqual(["google"]);
+  });
+});

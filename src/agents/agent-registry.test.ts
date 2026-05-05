@@ -524,3 +524,62 @@ describe("AgentRegistry onPostReload", () => {
     expect(count).toBe(3);
   });
 });
+
+describe("KPR-184 — AgentRegistry sanitizes in-process-ported servers from delegateServers", () => {
+  beforeAll(async () => {
+    const registryModule = await import("./agent-registry.js");
+    AgentRegistry = registryModule.AgentRegistry;
+  });
+
+  it("strips ported servers from delegateServers and keeps the rest", async () => {
+    const def = makeDefinition({
+      _id: "mixed-delegate",
+      delegateServers: ["memory", "google", "event-bus", "linear"],
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    await registry.load();
+
+    const loaded = registry.get("mixed-delegate");
+    expect(loaded).toBeDefined();
+    expect(loaded?.delegateServers).toEqual(["google", "linear"]);
+  });
+
+  it("strips all entries when every delegateServer is ported", async () => {
+    const def = makeDefinition({
+      _id: "all-ported",
+      delegateServers: ["memory", "structured-memory", "team"],
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    await registry.load();
+
+    expect(registry.get("all-ported")?.delegateServers).toEqual([]);
+  });
+
+  it("leaves clean delegateServers untouched", async () => {
+    const def = makeDefinition({
+      _id: "clean-delegate",
+      delegateServers: ["google", "linear", "clickup"],
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    await registry.load();
+
+    expect(registry.get("clean-delegate")?.delegateServers).toEqual([
+      "google",
+      "linear",
+      "clickup",
+    ]);
+  });
+
+  it("loads agent successfully even when sanitization removes entries", async () => {
+    const def = makeDefinition({
+      _id: "sanitized-agent",
+      delegateServers: ["memory"],
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const result = await registry.load();
+
+    // Agent still loads — sanitization is non-fatal.
+    expect(result.added).toContain("sanitized-agent");
+    expect(registry.get("sanitized-agent")).toBeDefined();
+  });
+});
