@@ -168,14 +168,19 @@ export function ensurePluginNodeModulesLink(pluginDir: string): void {
   }
 }
 
+// KPR-183: the 10 KPR-122-ported in-process servers (memory, structured-memory,
+// contacts, admin, callback, schedule, event-bus, team, code-search, workflow)
+// are not in this map. They have no per-server bundle — they only run
+// in-process via createSdkMcpServer wired in send(). The vestigial stdio
+// entries in buildAllServerConfigs are kept solely so filterCoreServers and
+// the toolkit listing keep treating them as "core servers"; production runs
+// never spawn the subprocess because send() overwrites the slot with the
+// in-process SDK server.
 const MCP_BUNDLE_MAP: Record<string, string> = {
-  "memory/memory-mcp-server.js": "memory.min.js",
-  "memory/structured-memory-mcp-server.js": "structured-memory.min.js",
   "keychain/keychain-mcp-server.js": "keychain.min.js",
   "google/google-mcp-server.js": "google.min.js",
   "quo/quo-mcp-server.js": "quo.min.js",
   "voice/voice-mcp-server.js": "voice.min.js",
-  "contacts/contacts-mcp-server.js": "contacts.min.js",
   "tasks/task-mcp-server.js": "task.min.js",
   "resend/resend-mcp-server.js": "resend.min.js",
   "linear/linear-mcp-server.js": "linear.min.js",
@@ -183,15 +188,8 @@ const MCP_BUNDLE_MAP: Record<string, string> = {
   "clickup/clickup-mcp-server.js": "clickup.min.js",
   "recall/recall-mcp-server.js": "recall.min.js",
   "background/background-task-mcp-server.js": "background-task.min.js",
-  "callback/callback-mcp-server.js": "callback.min.js",
   "code-task/code-task-mcp-server.js": "code-task.min.js",
   "search/conversation-search-mcp-server.js": "search-conversation.min.js",
-  "code-index/code-search-mcp-server.js": "code-search.min.js",
-  "events/event-bus-mcp-server.js": "event-bus.min.js",
-  "team/team-mcp-server.js": "team.min.js",
-  "workflow/workflow-mcp-server.js": "workflow.min.js",
-  "schedule/schedule-mcp-server.js": "schedule.min.js",
-  "admin/admin-mcp-server.js": "admin.min.js",
   "slack/slack-mcp-server.js": "slack.min.js",
   "skill-author/skill-author-mcp-server.js": "skill-author.min.js",
 };
@@ -467,13 +465,17 @@ export class AgentRunner {
     }
 
     // Memory MCP server — KPR-122: in-process at runtime (replaced in send()
-    // when `this.db` is present). The stdio entry below is retained so:
-    //  - `filterCoreServers` keeps `memory` in the post-filter map.
-    //  - The toolkit section sees `memory` in `coreServerNames`.
-    //  - The publish-ready bundle's stdio fallback path stays callable.
-    // Tests that don't pass a `db` exercise this stdio entry; production runs
-    // never spawn the subprocess because `send()` overwrites the slot with the
-    // in-process SDK server.
+    // when `this.db` is present). The stdio entry below is a placeholder kept
+    // for two reasons:
+    //  - `filterCoreServers` keeps `memory` in the post-filter map and the
+    //    toolkit section sees `memory` in `coreServerNames`.
+    //  - The SDK's AgentMcpServerSpec type for delegate subagents only accepts
+    //    process-transport configs (stdio/http/sse), not in-process refs.
+    // KPR-183: the stdio shim at the bottom of memory-mcp-server.ts was
+    // removed (it raced with pkg/server.min.js's entry-point check), so this
+    // stdio config no longer maps to a runnable subprocess — production runs
+    // never spawn it because send() overwrites the slot with the in-process
+    // SDK server. Delegate-mode for these ported servers is an open follow-up.
     const memoryScopes: ScopeDecl[] = this.resolveMemoryScopes();
     servers["memory"] = {
       type: "stdio",
@@ -1348,12 +1350,14 @@ export class AgentRunner {
       mcpServers["team-roster"] = this.teamRosterMcpServer;
     }
 
-    // KPR-122: memory MCP — in-process. The stdio entry is gone from
-    // buildAllServerConfigs; we re-introduce the in-process server here when
-    // (a) the runner has a shared `db` (runtime path; tests without `db` skip)
-    // and (b) the agent's coreServers includes "memory". The cached SDK server
-    // is safe to reuse across turns: the resolved scope list depends only on
-    // constructor-time agent + archetype config.
+    // KPR-122: memory MCP — in-process. The stdio entry in
+    // buildAllServerConfigs is a vestigial placeholder (KPR-183 removed the
+    // shim in memory-mcp-server.ts); we overwrite the slot here with the
+    // in-process SDK server when (a) the runner has a shared `db` (runtime
+    // path; tests without `db` skip) and (b) the agent's coreServers includes
+    // "memory". The cached SDK server is safe to reuse across turns: the
+    // resolved scope list depends only on constructor-time agent + archetype
+    // config.
     if (this.db && this.shouldEnableInProcessServer("memory")) {
       if (!this.memoryMcpServer) {
         this.memoryMcpServer = createMemoryMcpServer({

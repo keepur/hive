@@ -31,13 +31,18 @@ const required = [
   "scripts/honeypot",
 ];
 
-// All MCP servers must be present
+// All MCP servers must be present.
+// KPR-183: the 10 KPR-122-ported in-process servers (memory, structured-memory,
+// contacts, admin, callback, schedule, event-bus, team, code-search, workflow)
+// no longer ship per-server bundles — they only run in-process via
+// createSdkMcpServer. Their stdio shims were removed (they raced with
+// pkg/server.min.js's entry-point check), so per-server bundles for them
+// would be empty/no-op.
 const expectedMcp = [
-  "memory", "structured-memory", "contacts", "admin", "callback",
-  "schedule", "github-issues", "linear", "clickup", "google",
+  "github-issues", "linear", "clickup", "google",
   "keychain", "quo", "resend", "search-conversation",
-  "background-task", "recall", "task", "event-bus", "team",
-  "code-search", "code-task", "workflow", "voice", "slack",
+  "background-task", "recall", "task",
+  "code-task", "voice", "slack", "skill-author",
 ];
 for (const mcp of expectedMcp) {
   required.push(`pkg/mcp/${mcp}.min.js`);
