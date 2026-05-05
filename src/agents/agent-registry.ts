@@ -4,12 +4,34 @@ import type { AgentDefinition } from "../types/agent-definition.js";
 import { toAgentConfig } from "../types/agent-definition.js";
 import { config as appConfig } from "../config.js";
 import { getArchetype } from "../archetypes/registry.js";
+import { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
 import "../archetypes/index.js";
 import type { Collection, ChangeStream } from "mongodb";
 
 const log = createLogger("agent-registry");
 
 const POLL_INTERVAL_MS = 30_000;
+
+/**
+ * KPR-184: strip any KPR-122-ported in-process server names from
+ * `delegateServers`. The SDK's AgentDefinition.mcpServers type does not
+ * accept in-process configs, so a delegate referencing one of these falls
+ * back to a stdio path that no longer exists post-KPR-183. The admin tool
+ * rejects malformed inputs at create/update; this sanitizer guards
+ * pre-existing data on engine boot. Logs an error so the operator notices
+ * and can move the entry to coreServers (or remove it).
+ */
+function sanitizeDelegateServers(agentId: string, delegateServers: string[]): string[] {
+  const invalid = delegateServers.filter((s) => IN_PROCESS_PORTED_SERVERS.has(s));
+  if (invalid.length === 0) return delegateServers;
+  log.error("Invalid delegateServers — in-process-ported servers cannot be delegated. Stripping.", {
+    agent: agentId,
+    invalid,
+    remediation:
+      "Move these servers to coreServers (or remove) via admin_agent_update. Per KPR-122, they're in-process and the SDK's AgentDefinition type doesn't accept in-process configs.",
+  });
+  return delegateServers.filter((s) => !IN_PROCESS_PORTED_SERVERS.has(s));
+}
 
 export class AgentRegistry {
   private agents = new Map<string, AgentConfig>();
@@ -66,6 +88,10 @@ export class AgentRegistry {
 
     for (const doc of docs) {
       const agentConfig = toAgentConfig(doc, appConfig.autonomy);
+      // KPR-184: strip in-process-ported servers from delegateServers before
+      // any downstream consumer (subagent assembly, toolkit listing, etc.)
+      // sees the value. Logs an error if any are stripped.
+      agentConfig.delegateServers = sanitizeDelegateServers(agentConfig.id, agentConfig.delegateServers);
       currentIds.add(agentConfig.id);
 
       // Disabled check first — skip all validation for disabled agents.

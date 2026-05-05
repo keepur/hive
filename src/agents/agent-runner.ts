@@ -176,6 +176,12 @@ export function ensurePluginNodeModulesLink(pluginDir: string): void {
 // the toolkit listing keep treating them as "core servers"; production runs
 // never spawn the subprocess because send() overwrites the slot with the
 // in-process SDK server.
+//
+// KPR-184: these same 10 servers cannot appear in `delegateServers`. The
+// constant is defined in ./in-process-servers.ts (re-exported here for
+// historical callers) and consumed by the admin tool (strict reject at
+// create/update) and the agent registry (sanitize + log at load).
+export { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
 const MCP_BUNDLE_MAP: Record<string, string> = {
   "keychain/keychain-mcp-server.js": "keychain.min.js",
   "google/google-mcp-server.js": "google.min.js",

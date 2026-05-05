@@ -159,6 +159,8 @@ Agent definitions live in MongoDB (`agent_definitions` collection). Each agent i
 
 Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline seed at `seeds/chief-of-staff/` (installed during `hive init`). Plugins can ship additional agent seeds; `hive plugin add` runs the seed import (skips if an agent with the same id already exists in the DB). Version history is tracked in `agent_definition_versions`.
 
+**`delegateServers` constraint (KPR-184):** the 10 KPR-122-ported MCPs (`memory`, `structured-memory`, `event-bus`, `callback`, `contacts`, `schedule`, `team`, `admin`, `code-search`, `workflow`) cannot appear in `delegateServers`. They're in-process post-KPR-122 and the SDK's `AgentDefinition.mcpServers` type doesn't accept in-process configs. Use `coreServers` instead. The admin tool (`agent_create` / `agent_update`) rejects malformed inputs; the registry sanitizes pre-existing data at load time and logs an error so the operator can clean up via `admin_agent_update`. Constant lives at `src/agents/in-process-servers.ts`.
+
 ## Conventions
 
 - **Logging**: `import { createLogger } from "./logging/logger.js"` → `const log = createLogger("module-name")`

@@ -17,6 +17,25 @@ import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AutonomyFlags } from "../agents/autonomy.js";
 import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
 import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
+import { IN_PROCESS_PORTED_SERVERS } from "../agents/in-process-servers.js";
+
+/**
+ * KPR-184: returns an error message if `delegateServers` references any
+ * KPR-122-ported in-process server, or null if the list is clean (or
+ * undefined / empty). The 10 ported servers can't be delegated because the
+ * SDK's `AgentDefinition.mcpServers` type doesn't accept in-process configs.
+ */
+function checkDelegateServers(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  const invalid = value.filter((s): s is string => typeof s === "string" && IN_PROCESS_PORTED_SERVERS.has(s));
+  if (invalid.length === 0) return null;
+  return (
+    `delegateServers cannot include in-process-ported servers: ${invalid.join(", ")}. ` +
+    `These are core-only post-KPR-122 (the SDK's AgentDefinition type doesn't accept ` +
+    `in-process configs). Move to coreServers or remove. Ported servers: ` +
+    `${[...IN_PROCESS_PORTED_SERVERS].join(", ")}.`
+  );
+}
 
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
@@ -222,6 +241,12 @@ export function buildAdminTools(deps: AdminToolDeps) {
           }
 
           const f = fields ?? {};
+
+          // KPR-184: reject in-process-ported MCPs in delegateServers.
+          const delegateError = checkDelegateServers(f.delegateServers);
+          if (delegateError) {
+            return { isError: true, content: [{ type: "text", text: delegateError }] };
+          }
           const now = new Date();
           const doc: AgentDefinition = {
             _id,
@@ -338,6 +363,14 @@ export function buildAdminTools(deps: AdminToolDeps) {
               isError: true,
               content: [{ type: "text", text: `Unknown archetype: "${merged.archetype}". Known: ${known}.` }],
             };
+          }
+
+          // KPR-184: reject in-process-ported MCPs in delegateServers.
+          if ("delegateServers" in merged) {
+            const delegateError = checkDelegateServers(merged.delegateServers);
+            if (delegateError) {
+              return { isError: true, content: [{ type: "text", text: delegateError }] };
+            }
           }
 
           const changedFields = Object.keys(merged);
