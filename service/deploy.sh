@@ -336,18 +336,28 @@ if $ROLLBACK; then
   # per service/install.sh). See KPR-63.
   label="com.hive.${id}.agent"
   instance_root=$(_instance_root "$id")
+  plist_path="$instance_root/service/$label.plist"
   echo "--- Rolling back $id (root: $instance_root) ---"
-  # Stop LaunchAgent BEFORE rotating .hive/. Without -kp, launchd auto-respawns
-  # mid-rollback and the restart picks up a partial state. Mirrors the deploy
-  # loop's stop sequence at the main branch.
+  # Stop LaunchAgent BEFORE rotating .hive/. KPR-182: use bootout (true unload)
+  # rather than kickstart -kp — kickstart is fundamentally a *start* operation,
+  # and KeepAlive auto-respawns the service mid-rollback otherwise.
   echo "  Stopping $label..."
-  run_cmd launchctl kickstart -kp "gui/$(id -u)/$label" 2>/dev/null || true
-  kill_ports "$ports"
+  run_cmd launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  # Wait for ports to release (KeepAlive can't fire — service is unloaded).
+  if ! $DRY_RUN; then
+    for port in $ports; do
+      for _ in $(seq 1 10); do
+        if ! lsof -i :"$port" -t >/dev/null 2>&1; then break; fi
+        sleep 0.5
+      done
+    done
+  fi
+  kill_ports "$ports"  # defensive — catches anything bound elsewhere
   if ! rollback_engine "$instance_root"; then
     notify "Rollback FAILED for \`$id\`: no previous engine (.hive.prev missing)."
     exit 1
   fi
-  run_cmd launchctl kickstart -k "gui/$(id -u)/$label"
+  run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path"
   if health_check "$instance_root/$logs_dir/hive.log"; then
     rollback_version=$(jq -r .version < "$instance_root/.hive/package.json" 2>/dev/null || echo "unknown")
     notify "Rollback succeeded for \`$id\` → \`$rollback_version\`."
@@ -460,6 +470,7 @@ for inst in "${INSTANCES[@]}"; do
   # --tag override > per-instance engine_tag > "latest"
   tag="${OVERRIDE_TAG:-${engine_tag:-latest}}"
   instance_root=$(_instance_root "$id")
+  plist_path="$instance_root/service/$label.plist"
 
   echo ""
   echo "--- Phase 2: Deploy instance '$id' @ $tag (root: $instance_root) ---"
@@ -467,15 +478,26 @@ for inst in "${INSTANCES[@]}"; do
 
   mkdir -p "$instance_root/$logs_dir"
 
+  # KPR-182: bootout (true unload) so KeepAlive can't auto-respawn the old
+  # engine during fetch/install/swap. kickstart is a *start* operation — the
+  # `-k` flag merely kills-then-restarts, leaving the plist loaded.
   echo "  Stopping $label..."
-  run_cmd launchctl kickstart -kp "gui/$(id -u)/$label" 2>/dev/null || true
-  kill_ports "$ports"
+  run_cmd launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  if ! $DRY_RUN; then
+    for port in $ports; do
+      for _ in $(seq 1 10); do
+        if ! lsof -i :"$port" -t >/dev/null 2>&1; then break; fi
+        sleep 0.5
+      done
+    done
+  fi
+  kill_ports "$ports"  # defensive — catches anything bound elsewhere
 
   echo "  Fetching engine..."
   if ! fetch_engine "$instance_root" "$tag"; then
     notify "Deploy FAILED for \`$id\`: fetch_engine errored at tag \`$tag\`."
     FAILED_INSTANCES+=("$id")
-    run_cmd launchctl kickstart -k "gui/$(id -u)/$label" || true  # bring old engine back up
+    run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path" || true  # bring old engine back up
     continue
   fi
 
@@ -484,7 +506,7 @@ for inst in "${INSTANCES[@]}"; do
     notify "Deploy FAILED for \`$id\`: install_engine_deps errored at tag \`$tag\`."
     FAILED_INSTANCES+=("$id")
     rm -rf "$instance_root/.hive.next"
-    run_cmd launchctl kickstart -k "gui/$(id -u)/$label" || true  # bring old engine back up
+    run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path" || true  # bring old engine back up
     continue
   fi
 
@@ -492,13 +514,24 @@ for inst in "${INSTANCES[@]}"; do
   swap_engine "$instance_root"
 
   echo "  Restarting $label..."
-  run_cmd launchctl kickstart -k "gui/$(id -u)/$label"
+  run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path"
 
   echo "  Checking health..."
   if ! health_check "$instance_root/$logs_dir/hive.log"; then
     echo "  Health check FAILED for $id — rolling back"
+    # New engine bound the port and failed health check — bootout it before swap.
+    run_cmd launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    if ! $DRY_RUN; then
+      for port in $ports; do
+        for _ in $(seq 1 10); do
+          if ! lsof -i :"$port" -t >/dev/null 2>&1; then break; fi
+          sleep 0.5
+        done
+      done
+    fi
+    kill_ports "$ports"
     if rollback_engine "$instance_root"; then
-      run_cmd launchctl kickstart -k "gui/$(id -u)/$label"
+      run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path"
       notify "Deploy rolled back for \`$id\`: \`$tag\` failed health check, restored previous version."
     else
       notify "Deploy FAILED for \`$id\` and auto-rollback unavailable (.hive.prev missing). Manual intervention required."
