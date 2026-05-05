@@ -11,6 +11,15 @@ BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/hive}"
 INSTANCES_CONF="${HIVE_INSTANCES_CONF:-$SCRIPT_DIR/instances.conf}"
 
+# Health check tunables (KPR-185). Cold-start can transiently exceed a single
+# 30s window — DNS, Slack handshake, MongoDB warmup occasionally tip past the
+# original budget on otherwise-healthy boots. Three retries × 30s with 10s
+# waits between covers that without changing happy-path latency: a healthy
+# engine still resolves on the first attempt, typically well under 30s.
+HEALTH_CHECK_RETRIES=3
+HEALTH_CHECK_WINDOW=30
+HEALTH_CHECK_WAIT_BETWEEN=10
+
 # Single-instance mode (KPR-70): when invoked by `hive update` for a customer
 # install, the calling instance passes its own facts via env, and we skip the
 # build-from-source phase + the shipped instances.conf entirely. The instance
@@ -124,11 +133,18 @@ health_check() {
     echo "[DRY RUN] health_check: would check $log_file"
     return 0
   fi
-  for _ in $(seq 1 30); do
-    sleep 1
-    if tail -5 "$log_file" 2>/dev/null | grep -q '"Hive is running"'; then
-      return 0
+  for attempt in $(seq 1 "$HEALTH_CHECK_RETRIES"); do
+    if [[ "$attempt" -gt 1 ]]; then
+      echo "  Health check attempt $attempt/$HEALTH_CHECK_RETRIES (waiting ${HEALTH_CHECK_WAIT_BETWEEN}s before retry)..."
+      sleep "$HEALTH_CHECK_WAIT_BETWEEN"
     fi
+    for _ in $(seq 1 "$HEALTH_CHECK_WINDOW"); do
+      sleep 1
+      if tail -5 "$log_file" 2>/dev/null | grep -q '"Hive is running"'; then
+        return 0
+      fi
+    done
+    echo "  Health check attempt $attempt/$HEALTH_CHECK_RETRIES failed (no 'Hive is running' in last ${HEALTH_CHECK_WINDOW}s)."
   done
   return 1
 }
