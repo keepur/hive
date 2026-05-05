@@ -66,16 +66,16 @@ await build({
   },
 });
 
-// MCP servers — each is a separate entry point (spawned as subprocess)
+// MCP servers — each is a separate entry point (spawned as subprocess).
+// KPR-183: the 10 KPR-122-ported in-process servers (memory, structured-memory,
+// contacts, admin, callback, schedule, event-bus, team, code-search, workflow)
+// no longer ship per-server bundles — they only run in-process via
+// createSdkMcpServer wired in agent-runner.send(). Their stdio shims were
+// removed (they raced with pkg/server.min.js's entry-point check and crashed
+// the engine at boot).
 await build({
   ...shared,
   entryPoints: {
-    "mcp/memory": "dist/memory/memory-mcp-server.js",
-    "mcp/structured-memory": "dist/memory/structured-memory-mcp-server.js",
-    "mcp/contacts": "dist/contacts/contacts-mcp-server.js",
-    "mcp/admin": "dist/admin/admin-mcp-server.js",
-    "mcp/callback": "dist/callback/callback-mcp-server.js",
-    "mcp/schedule": "dist/schedule/schedule-mcp-server.js",
     "mcp/github-issues": "dist/github/github-issues-mcp-server.js",
     "mcp/linear": "dist/linear/linear-mcp-server.js",
     "mcp/clickup": "dist/clickup/clickup-mcp-server.js",
@@ -87,11 +87,7 @@ await build({
     "mcp/background-task": "dist/background/background-task-mcp-server.js",
     "mcp/recall": "dist/recall/recall-mcp-server.js",
     "mcp/task": "dist/tasks/task-mcp-server.js",
-    "mcp/event-bus": "dist/events/event-bus-mcp-server.js",
-    "mcp/team": "dist/team/team-mcp-server.js",
-    "mcp/code-search": "dist/code-index/code-search-mcp-server.js",
     "mcp/code-task": "dist/code-task/code-task-mcp-server.js",
-    "mcp/workflow": "dist/workflow/workflow-mcp-server.js",
     "mcp/voice": "dist/voice/voice-mcp-server.js",
     "mcp/slack": "dist/slack/slack-mcp-server.js",
     "mcp/skill-author": "dist/skill-author/skill-author-mcp-server.js",

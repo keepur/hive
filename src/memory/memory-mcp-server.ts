@@ -3,9 +3,10 @@
  * own MongoDB-backed memory plus optional filesystem-backed scopes.
  *
  * KPR-122 port: in-process via `createSdkMcpServer`. Tool handlers close over
- * the shared engine `Db` instead of opening a per-subprocess MongoClient. The
- * stdio shim at the bottom of this file is preserved for the bundled-server
- * fallback path used by the publish-ready artifact.
+ * the shared engine `Db` instead of opening a per-subprocess MongoClient.
+ * KPR-183: the stdio shim that lived at the bottom of this file was removed —
+ * it raced with the engine bundle's entry-point check (`pkg/server.min.js`)
+ * and crashed the engine at boot.
  */
 
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
@@ -356,67 +357,4 @@ export function createMemoryMcpServer(deps: MemoryToolDeps) {
     version: "0.2.0",
     tools: buildMemoryTools(deps),
   });
-}
-
-// ── Stdio shim ────────────────────────────────────────────────────────────
-// Preserved so the publish-ready bundle (`pkg/mcp/memory.min.js`) still emits
-// a runnable Node entry-point. When in-process wiring is the only consumer,
-// this branch is never entered.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
-  await (async () => {
-    const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
-    const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
-    const { MongoClient } = await import("mongodb");
-    const { parseScopesEnv } = await import("./memory-scope.js");
-
-    const AGENT_ID = process.env.AGENT_ID ?? "";
-    const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
-    const MONGODB_DB = process.env.MONGODB_DB ?? "hive";
-
-    if (!AGENT_ID) {
-      process.stderr.write("memory-mcp-server: AGENT_ID is required\n");
-      process.exit(1);
-    }
-
-    let memoryScopes: ScopeList = [];
-    try {
-      memoryScopes = parseScopesEnv(process.env.MEMORY_SCOPES_JSON);
-    } catch (err) {
-      process.stderr.write(
-        `memory-mcp-server: invalid MEMORY_SCOPES_JSON, falling back to self-only: ${String(err)}\n`,
-      );
-    }
-
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db(MONGODB_DB);
-
-    const tools = buildMemoryTools({ db, agentId: AGENT_ID, memoryScopes });
-
-    // Bridge buildMemoryTools (SDK-shape) → McpServer.registerTool.
-    const server = new McpServer({ name: "hive-memory", version: "0.2.0" });
-    for (const t of tools) {
-      const def = t as unknown as {
-        name: string;
-        description: string;
-        inputSchema: Record<string, z.ZodTypeAny>;
-        handler: (args: Record<string, unknown>) => Promise<unknown>;
-      };
-      server.registerTool(
-        def.name,
-        { title: def.name, description: def.description, inputSchema: def.inputSchema },
-        def.handler as never,
-      );
-    }
-
-    process.on("SIGTERM", () => {
-      void client.close();
-    });
-    process.on("SIGINT", () => {
-      void client.close();
-    });
-
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-  })();
 }
