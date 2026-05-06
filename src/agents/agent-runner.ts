@@ -1591,6 +1591,14 @@ export class AgentRunner {
           CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
           CLAUDECODE: undefined,
         },
+        // Pass --strict-mcp-config to the spawned claude CLI so it ignores all
+        // MCP sources except the engine-supplied `mcpServers` above (which the
+        // SDK feeds in via --mcp-config). Without this, user-level enabled
+        // plugins and claude.ai connectors (e.g. hosted Linear OAuth'd to a
+        // personal account) leak into agent sessions regardless of
+        // settingSources: []. Auth and session storage stay on the default
+        // ~/.claude/ — only MCP discovery is sandboxed.
+        extraArgs: { "strict-mcp-config": null },
       },
     });
 
