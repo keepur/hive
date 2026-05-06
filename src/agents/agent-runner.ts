@@ -10,7 +10,7 @@ import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
-import { hiveHome, agentScratchDir, agentPlaywrightDir, sdkConfigDir } from "../paths.js";
+import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
@@ -1559,10 +1559,6 @@ export class AgentRunner {
       }
     }
 
-    // Ensure the per-instance SDK CLI config dir exists so CLAUDE_CONFIG_DIR
-    // (set below in env) points at a real (and empty) directory.
-    mkdirSync(sdkConfigDir(hiveHome), { recursive: true });
-
     const q = query({
       prompt,
       options: {
@@ -1594,13 +1590,15 @@ export class AgentRunner {
           ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
           CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
           CLAUDECODE: undefined,
-          // Isolate the SDK-spawned claude CLI from the operator's ~/.claude/
-          // user config. Without this, user-level enabled plugins and claude.ai
-          // connectors (e.g. hosted Linear OAuth'd to a personal account) leak
-          // into agent sessions regardless of settingSources: []. Always set —
-          // the engine override wins over .env / process.env.
-          CLAUDE_CONFIG_DIR: sdkConfigDir(hiveHome),
         },
+        // Pass --strict-mcp-config to the spawned claude CLI so it ignores all
+        // MCP sources except the engine-supplied `mcpServers` above (which the
+        // SDK feeds in via --mcp-config). Without this, user-level enabled
+        // plugins and claude.ai connectors (e.g. hosted Linear OAuth'd to a
+        // personal account) leak into agent sessions regardless of
+        // settingSources: []. Auth and session storage stay on the default
+        // ~/.claude/ — only MCP discovery is sandboxed.
+        extraArgs: { "strict-mcp-config": null },
       },
     });
 
