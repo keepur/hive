@@ -43,6 +43,20 @@ export const hiveHome = resolveHiveHome();
 export const skillsDir = resolve(hiveHome, "skills");
 
 /**
+ * Per-instance config dir for the SDK-spawned `claude` CLI.
+ *
+ * The Claude Agent SDK invokes the `claude` CLI under the hood. Without a
+ * dedicated `CLAUDE_CONFIG_DIR`, that CLI reads `~/.claude/settings.json` and
+ * pulls in the operator's user-level enabled plugins and claude.ai connectors —
+ * leaking OAuth-bound MCP servers (e.g. hosted Linear) into agent sessions
+ * regardless of `settingSources: []`. Pointing the CLI at this empty per-
+ * instance dir gives the engine real isolation.
+ */
+export function sdkConfigDir(home: string = hiveHome): string {
+  return resolve(home, ".claude-sdk-config");
+}
+
+/**
  * Engine root inside the instance directory.
  *
  * Everything under here is wipe-and-replace on upgrade: `dist/`, `node_modules/`,

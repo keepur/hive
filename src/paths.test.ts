@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { resolve } from "node:path";
-import { engineDir, hiveHome, hiveStateDir, instanceGitDir } from "./paths.js";
+import { engineDir, hiveHome, hiveStateDir, instanceGitDir, sdkConfigDir } from "./paths.js";
 
 describe("paths", () => {
   it("engineDir resolves to <hiveHome>/.hive", () => {
@@ -13,5 +13,13 @@ describe("paths", () => {
 
   it("instanceGitDir is under hiveStateDir", () => {
     expect(instanceGitDir).toBe(resolve(hiveStateDir, "git"));
+  });
+
+  it("sdkConfigDir resolves to <hiveHome>/.claude-sdk-config", () => {
+    expect(sdkConfigDir()).toBe(resolve(hiveHome, ".claude-sdk-config"));
+  });
+
+  it("sdkConfigDir honors an explicit home arg", () => {
+    expect(sdkConfigDir("/tmp/fake-hive")).toBe(resolve("/tmp/fake-hive", ".claude-sdk-config"));
   });
 });
