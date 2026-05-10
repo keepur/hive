@@ -82,7 +82,7 @@ Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `age
 
 ### Direct messaging (Team MCP)
 
-1-to-1, fire-and-forget by default; optional `expectReply` blocks the caller until the recipient replies. The recipient processes the message in **their own session and time-axis** — it lands as a `WorkItem` on their inbox, not as a sub-agent of the sender. Use when handing off a task whose owner is someone else (e.g. Jessica hands a customer issue to Wyatt). Lives in `src/team/team-mcp-server.ts`. Gated by `team.enabled` in `hive.yaml`.
+1-to-1, fire-and-forget by default; optional `expectReply` blocks the caller until the recipient replies. The recipient processes the message in **their own session and time-axis** — it lands as a `WorkItem` on their inbox, not as a sub-agent of the sender. Use when handing off a task whose owner is someone else (e.g. Jessica hands a customer issue to Wyatt). Lives in `src/team/team-mcp-server.ts`. Auto-injected as a core server for every agent — operators don't wire it manually.
 
 ### Pub/sub events (Event Bus MCP)
 

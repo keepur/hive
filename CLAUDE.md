@@ -98,7 +98,7 @@ All in `src/` — each agent only gets servers listed in its `coreServers`/`dele
 - `admin-mcp-server.ts` — agent CRUD + version history, model overrides [in-process]
 - `clickup/clickup-mcp-server.ts` — ClickUp task management
 - `events/event-bus-mcp-server.ts` — cross-agent event bus (publish events, subscriber delivery) [in-process]
-- `team/team-mcp-server.ts` — direct agent-to-agent messaging (feature flag: `team.enabled`) [in-process]
+- `team/team-mcp-server.ts` — direct agent-to-agent messaging (auto-injected core server, no flag) [in-process]
 - `schedule/schedule-mcp-server.ts` — self-service schedule management (cron) [in-process]
 - `workflow/workflow-mcp-server.ts` — plan/task management (gated by `config.workflow.enabled`) [in-process]
 - `code-index/code-search-mcp-server.ts` — semantic code search over file index [in-process]
