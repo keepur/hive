@@ -22,11 +22,13 @@ Slack / SMS / WebSocket / scheduler
 
 A single hive process serves multiple agents and multiple channels. Each agent's work runs as a Claude Code session with a configured set of MCP server subprocesses scoped to it.
 
+Under the per-turn-spawn flags (`agentManager.perTurnSpawn.{sms,slack,ws,voice}` in `hive.yaml` — see [managing-your-hive.md](managing-your-hive.md)), the "agent runner" box above is recreated per inbound message rather than long-lived. A fresh `WorkItemContext` (channel id, thread id, source metadata) flows into MCP server handlers and hooks each spawn — no stale context survives across turns. The legacy long-lived path remains the default while the migration rolls out channel-by-channel.
+
 ## Key files (read these to understand the engine)
 
 - `src/index.ts` — entry point; wires every subsystem.
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
-- `src/agents/agent-runner.ts` — spawns Claude sessions, assembles the system prompt (soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers per agent.
+- `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn under per-turn-spawn flags); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
 - `src/agents/agent-manager.ts` — concurrency limits, per-thread queues.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
 - `src/agents/model-router.ts` — Haiku/Sonnet classification.
@@ -70,6 +72,22 @@ Each agent gets a subset of MCP servers — listed in its `coreServers` and `del
 
 Plugins (e.g. CRM integrations, business-specific tools) are separately-published packages; install with `hive plugin add <pkg>`.
 
+## Coordination primitives
+
+Hive supports three distinct cross-agent coordination patterns. They do not overlap; pick the one whose semantics match the use case.
+
+### In-session sub-agent
+
+Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `agents:` field, populated from `delegateServers` on the calling agent. The sub-agent is spawned for one focused task, returns its result, and is gone — it has no thread, no session, no inbox. Use when the calling agent needs a focused tool call done **right now** to finish the current turn (e.g. Jessica spawns a CRM-search specialist mid-turn). Built in `src/agents/agent-runner.ts:buildServerSubAgents`. The 6 context-dependent servers (`callback`, `background`, `code-task`, `recall`, `structured-memory`, `memory`) cannot be sub-agents — they need channel/thread context that doesn't exist in a sub-agent's spawn.
+
+### Direct messaging (Team MCP)
+
+1-to-1, fire-and-forget by default; optional `expectReply` blocks the caller until the recipient replies. The recipient processes the message in **their own session and time-axis** — it lands as a `WorkItem` on their inbox, not as a sub-agent of the sender. Use when handing off a task whose owner is someone else (e.g. Jessica hands a customer issue to Wyatt). Lives in `src/team/team-mcp-server.ts`. Gated by `team.enabled` in `hive.yaml`.
+
+### Pub/sub events (Event Bus MCP)
+
+1-to-many broadcast, subscriber-driven response. Publishers don't know or care who's listening; subscribers express interest by name and react via their own work items. Use when announcing something that may concern multiple agents (e.g. Mokie publishes "morning standup," any subscribed agent responds in their own session). Lives in `src/events/event-bus-mcp-server.ts`.
+
 ## Channels
 
 - **Slack** — Socket Mode + Web API. Agents have their own bot identities; outbound posts use `chat:write.customize`.
@@ -91,6 +109,8 @@ When an agent is invoked, the runner assembles its system prompt in this order, 
 ## Hot reload
 
 `SIGUSR1` reloads agent definitions from MongoDB without restarting the daemon. Used by admin tooling that mutates `agent_definitions` (the admin MCP server, beekeeper's tune-instance skill).
+
+Post-KPR-213, `SIGUSR1` is **no longer load-bearing for prefix freshness** — the assembled system-prompt prefix cache invalidates automatically on every write path that affects it (agent-def updates, memory writes, constitution edits, team-roster changes, skill changes). `SIGUSR1` still flushes the cache + reloads the registry, but it stays as an explicit operator escape hatch rather than a required step after edits. Cache stats are heartbeated to `db.telemetry` (`kind=prefix_cache_stats`) and surfaced via `hive doctor`.
 
 ## Security posture
 

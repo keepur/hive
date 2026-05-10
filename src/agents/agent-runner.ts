@@ -57,6 +57,42 @@ import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import type { Db } from "mongodb";
 
+/**
+ * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
+ *
+ * **Lifecycle (KPR-210 Phase A):**
+ *
+ * - **Legacy long-lived path**: one `AgentRunner` per agent per process,
+ *   reused across many turns. Per-turn `WorkItemContext` is threaded into
+ *   `send()` and through to in-process MCP handlers + hooks each call.
+ * - **Per-turn-spawn path** (gated by `agentManager.perTurnSpawn.<channel>`):
+ *   `AgentManager.spawnTurn` constructs a **fresh `AgentRunner` per turn**.
+ *   MCP servers, hook closures, and the mutable `*ContextRef` path are all
+ *   recreated per spawn — context isolation comes from the runner being
+ *   thrown away after the turn, not from a separate factory variant.
+ *
+ * **Per-spawn entry point**: {@link AgentRunner.send}. It assembles the SDK
+ * `query()` options — model, system prompt (cache-friendly prefix), MCP
+ * servers, hooks, `resume: sessionId` (when present), and per-archetype
+ * settings — and yields one inference cycle.
+ *
+ * **Hooks** ({@link AgentRunner.buildHooks}): rebuild on every `send()` call
+ * with the current `WorkItemContext`. No stale context survives across turns.
+ * The `PreCompact` matcher closes over the agent's `prefetcher` reference
+ * (constructed once at boot in `index.ts`, owned by `AgentManager`), so the
+ * closure captures fresh per spawn because the runner itself is fresh per
+ * spawn. `PreToolUse` matchers come from the archetype's `preToolUseHooks`
+ * factory — fail-closed if it throws (deny-all is installed rather than
+ * silently dropping enforcement).
+ *
+ * **Cross-agent coordination** is handled by three distinct primitives —
+ * see [docs/architecture.md](../../docs/architecture.md) "Coordination
+ * primitives" for the full story. The in-session sub-agent path (SDK
+ * `agents:` field, populated from `delegateServers`) is built here in
+ * {@link AgentRunner.buildServerSubAgents}; direct messaging lives in
+ * `src/team/team-mcp-server.ts`; pub/sub events live in
+ * `src/events/event-bus-mcp-server.ts`.
+ */
 const log = createLogger("agent-runner");
 
 /**

@@ -64,7 +64,7 @@ Message (Slack/SMS/WebSocket/Scheduler)
 ### Key Files
 - `src/index.ts` — entry point, wires all subsystems
 - `src/config.ts` — loads env + hive.yaml into typed config
-- `src/agents/agent-runner.ts` — spawns Claude sessions, assembles system prompts, configures MCP servers
+- `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn under per-turn-spawn flags); assembles system prompts, configures MCP servers, builds per-spawn hooks with current `WorkItemContext`
 - `src/agents/agent-manager.ts` — concurrency, thread queues, agent state
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB
 - `src/agents/session-store.ts` — manages agent session state in MongoDB
