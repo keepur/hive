@@ -553,6 +553,350 @@ git commit -m "refactor(voice): use Claude Agent SDK query() for OAuth path (KPR
 
 (`openai-translator.ts` is **not staged** — it's unchanged. If `voice-adapter.test.ts` was created in Step 3c, include it; if the auth-error tests were appended to `conversation-prompt.test.ts` instead, stage that file under Task 1's commit retroactively or amend Task 1's commit. Recommended path: create `voice-adapter.test.ts`.)
 
+> **Status (2026-05-09):** Tasks 1 + 2 completed and committed (`f79ee20`, `71e27d8`). The base SDK refactor is in. Local smoke confirmed OAuth path works (Claude responded), but measured **firstTokenMs p50 = 3371ms** across 6 streaming smokes — exceeds the spec's 1500ms gate. Spec was amended to add per-call SDK session resume; Task 2b below implements it.
+
+---
+
+### Task 2b: Per-call SDK session resume
+
+**Files:**
+- Modify: `src/channels/voice/voice-adapter.ts`
+- Modify: `src/channels/voice/conversation-prompt.ts` (add `extractLatestUserMessage`)
+- Modify: `src/channels/voice/conversation-prompt.test.ts` (tests for new helper)
+
+The base implementation in commit `71e27d8` calls `query()` per turn with the full transcript and never reuses sessions. This task adds session reuse: turn-1 of a Vapi call starts a fresh SDK session and captures the `sessionId`; turn-2+ resumes that session and only sends the latest user message. Resume failures fall back to a fresh turn-1 once.
+
+- [ ] **Step 1:** Add `extractLatestUserMessage` to `conversation-prompt.ts`.
+
+```typescript
+// src/channels/voice/conversation-prompt.ts (append below renderConversationPrompt)
+
+/**
+ * Pull the latest user message off Vapi's history. Used on turn-2+ when the
+ * SDK session is being resumed — the prior turns are already in the SDK's
+ * session memory, so we only send the new user input.
+ *
+ * Returns empty string if no user message is present (caller decides what to
+ * do; in practice voice-adapter falls back to turn-1 framing in that case).
+ */
+export function extractLatestUserMessage(messages: OpenAIChatRequest["messages"]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role === "user") {
+      return typeof m.content === "string" ? m.content : "";
+    }
+  }
+  return "";
+}
+```
+
+- [ ] **Step 2:** Append tests to `conversation-prompt.test.ts`.
+
+```typescript
+// at the bottom of src/channels/voice/conversation-prompt.test.ts
+import { extractLatestUserMessage } from "./conversation-prompt.js";
+
+describe("extractLatestUserMessage", () => {
+  it("returns the most recent user message", () => {
+    expect(
+      extractLatestUserMessage([
+        { role: "system", content: "x" },
+        { role: "user", content: "first" },
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "second" },
+      ]),
+    ).toBe("second");
+  });
+
+  it("returns empty string when no user message present", () => {
+    expect(extractLatestUserMessage([{ role: "system", content: "x" }])).toBe("");
+    expect(extractLatestUserMessage([])).toBe("");
+  });
+
+  it("ignores assistant and tool roles when scanning", () => {
+    expect(
+      extractLatestUserMessage([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "later" },
+        { role: "tool", content: "tool-output" } as any,
+      ]),
+    ).toBe("hi");
+  });
+});
+```
+
+- [ ] **Step 3:** Extend `CallSession` in `voice-adapter.ts` to track the SDK session ID.
+
+```typescript
+// existing
+interface CallSession {
+  callId: string;
+  agentId: string;
+  startedAt: Date;
+  // NEW
+  sdkSessionId?: string;
+}
+```
+
+- [ ] **Step 4:** Restructure `handleChatCompletion` to branch on whether a session is already tracked.
+
+The base implementation currently does:
+1. Look up / create `CallSession`.
+2. Build `systemPrompt`.
+3. `prompt = renderConversationPrompt(request.messages)`.
+4. `query({ prompt, options: { ... } })`.
+5. Consume stream.
+
+Rework as follows. The two paths share most code; factor the difference into `prompt` + `resume` only.
+
+```typescript
+import { renderConversationPrompt, extractLatestUserMessage } from "./conversation-prompt.js";
+
+// inside handleChatCompletion, after CallSession bookkeeping + buildVoiceSystemPrompt:
+
+const session = this.sessions.get(callId)!; // guaranteed present after bookkeeping
+
+const buildQuery = (resumeSessionId: string | undefined) => {
+  const turnPrompt = resumeSessionId
+    ? extractLatestUserMessage(request.messages)
+    : renderConversationPrompt(request.messages);
+
+  // If we tried to resume but the latest user message is empty (shouldn't
+  // happen mid-call, but defensive), fall back to full transcript framing.
+  const safePrompt =
+    resumeSessionId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
+  const effectiveResume = resumeSessionId && turnPrompt ? resumeSessionId : undefined;
+
+  return {
+    q: query({
+      prompt: safePrompt,
+      options: {
+        model: agentConfig.model,
+        systemPrompt,
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
+        maxTurns: 1,
+        settingSources: [],
+        includePartialMessages: request.stream !== false,
+        env: {
+          ...process.env,
+          ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
+          CLAUDE_AGENT_SDK_CLIENT_APP: "hive/voice",
+          CLAUDECODE: undefined,
+        },
+        extraArgs: { "strict-mcp-config": null },
+        ...(effectiveResume ? { resume: effectiveResume } : {}),
+      },
+    }),
+    isResumeAttempt: !!effectiveResume,
+  };
+};
+
+let { q, isResumeAttempt } = buildQuery(session.sdkSessionId);
+```
+
+- [ ] **Step 5:** Capture `sessionId` from `system/init` events.
+
+In both streaming and non-streaming branches, watch for `msg.type === "system" && msg.subtype === "init"` and write `session.sdkSessionId = msg.session_id`. This persists for use on the next turn of the same Vapi call.
+
+```typescript
+// inside the for-await / async-iterator consumption loop, alongside existing branches:
+if (msg.type === "system" && (msg as any).subtype === "init") {
+  const sid = (msg as any).session_id as string | undefined;
+  if (sid) session.sdkSessionId = sid;
+}
+```
+
+- [ ] **Step 6a:** Extract a `runTurn` helper that consumes one `query()` stream end-to-end.
+
+Move the iterator consumption (with its `system/init` capture, `firstTokenMs` timing, `text_delta` → SSE write, and `resultSubtype` capture) into a helper. The helper writes SSE chunks lazily — `res.writeHead(200, ...)` only fires when the **first `text_delta`** arrives. Errors before first text mean no bytes have been committed and we can retry cleanly.
+
+```typescript
+type TurnOutcome =
+  | { ok: true; firstTokenMs: number | undefined; resultSubtype?: string }
+  | { ok: false; reason: string; bytesSent: boolean };
+
+const runTurn = async (
+  q: ReturnType<typeof query>,
+  isStreaming: boolean,
+): Promise<TurnOutcome> => {
+  let firstTokenMs: number | undefined;
+  let resultSubtype: string | undefined;
+  let assistantText = "";
+  let headersSent = false;
+
+  try {
+    for await (const message of q) {
+      const msg = message as SDKMessage;
+
+      // Capture session id for next turn's resume.
+      if (msg.type === "system" && (msg as any).subtype === "init") {
+        const sid = (msg as any).session_id as string | undefined;
+        if (sid) session.sdkSessionId = sid;
+      }
+
+      // Streaming text path — write SSE chunks lazily.
+      if (isStreaming && msg.type === "stream_event") {
+        const event = (msg as any).event;
+        if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
+          if (!headersSent) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            });
+            headersSent = true;
+            firstTokenMs = Date.now() - startedAt;
+          }
+          res.write(formatSSETextChunk(completionId, event.delta.text ?? "", model));
+        }
+      }
+
+      // Non-streaming text path — collect assistant text from the canonical message.
+      if (!isStreaming && msg.type === "assistant") {
+        const content = (msg as any).message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block?.type === "text" && typeof block.text === "string") {
+              if (firstTokenMs === undefined) firstTokenMs = Date.now() - startedAt;
+              assistantText = block.text;
+            }
+          }
+        }
+      }
+
+      if (msg.type === "result") {
+        resultSubtype = (msg as any).subtype;
+        if (!isStreaming && resultSubtype === "success") {
+          assistantText = (msg as any).result || assistantText;
+        }
+      }
+    }
+  } catch (err) {
+    return { ok: false, reason: String(err), bytesSent: headersSent };
+  }
+
+  if (resultSubtype && resultSubtype !== "success") {
+    return { ok: false, reason: `result.subtype=${resultSubtype}`, bytesSent: headersSent };
+  }
+
+  // Streaming branch finalization — emit [DONE] and end.
+  if (isStreaming) {
+    if (!headersSent) {
+      // Resume succeeded but produced no text (degenerate but not impossible).
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      headersSent = true;
+    }
+    res.write(formatSSEDone(completionId, model));
+    res.end();
+    return { ok: true, firstTokenMs, resultSubtype };
+  }
+
+  // Non-streaming branch finalization — return the JSON body to caller.
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(formatNonStreamingResponse(completionId, assistantText, model)));
+  return { ok: true, firstTokenMs, resultSubtype };
+};
+```
+
+- [ ] **Step 6b:** Wire the resume + retry-once path.
+
+```typescript
+let { q, isResumeAttempt } = buildQuery(session.sdkSessionId);
+let outcome = await runTurn(q, request.stream !== false);
+
+const sdkSessionResumeAttempted = isResumeAttempt;
+
+if (!outcome.ok && isResumeAttempt && !outcome.bytesSent) {
+  // Resume failed before any bytes hit the wire — retry as turn-1 with full transcript.
+  log.warn("Voice session resume failed, retrying as turn-1", {
+    callId,
+    reason: outcome.reason,
+  });
+  session.sdkSessionId = undefined;
+  ({ q, isResumeAttempt } = buildQuery(undefined));
+  outcome = await runTurn(q, request.stream !== false);
+}
+
+if (!outcome.ok) {
+  // Either not a resume attempt, or retry also failed, or bytes already sent (mid-stream failure).
+  if (isAuthError(outcome.reason)) {
+    log.error("Voice query failed — OAuth credentials unavailable", {
+      callId, agentId, reason: outcome.reason,
+    });
+    if (!outcome.bytesSent) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Voice unavailable" }));
+    } else {
+      // Bytes already sent — best we can do is end the SSE stream with an error sentinel.
+      if (!res.writableEnded) {
+        res.write(formatSSEDone(completionId, model, "error"));
+        res.end();
+      }
+    }
+    return;
+  }
+
+  log.error("Voice query failed", { callId, agentId, reason: outcome.reason, bytesSent: outcome.bytesSent });
+  if (!outcome.bytesSent) {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Internal error" }));
+  } else {
+    if (!res.writableEnded) {
+      res.write(formatSSEDone(completionId, model, "error"));
+      res.end();
+    }
+  }
+  return;
+}
+```
+
+**Why "defer headers" instead of buffering**: the spec's latency gate (turn-2+ p50 < 1500 ms) is defined as time to first `text_delta`. If we buffered until `result` arrived and then flushed, the `firstTokenMs` measurement would be tied to buffer-flush time (effectively turn-completion time), making the 1500 ms gate either trivially fail or meaningless. Deferring headers preserves the metric's meaning and only adds brittleness on mid-stream failures — which can't be cleanly retried under either approach.
+
+**System-prompt drift caveat**: `buildVoiceSystemPrompt` is invoked every turn (current code), but the SDK's `resume` ignores the new `systemPrompt` option and keeps turn-1's. Memory updates and the date-time stamp drift across the call. **Accepted as-is** — voice calls are short (< 5 min typical), the staleness window is bounded, and this matches how `agent-runner.ts` handles cross-message continuity for Slack threads. Document with a one-line code comment in the resume branch.
+
+- [ ] **Step 7:** Add structured fields to the "Voice turn complete" log entry.
+
+Two distinct fields, NOT one:
+
+- `sdkSessionResumeAttempted` — `true` iff this turn started with `options.resume` set (regardless of whether it succeeded). Used by the metrics-bucketing script in Task 3 to classify a turn as "warm" vs "cold."
+- `sdkSessionResumed` — `true` iff this turn **successfully** ran on a resumed session (no retry). Used by the spec's "at least one turn-2+ in logs has `sdkSessionResumed: true`" acceptance test.
+
+```typescript
+log.info("Voice turn complete", {
+  callId,
+  agentId,
+  firstTokenMs: outcome.firstTokenMs,
+  totalMs: Date.now() - startedAt,
+  mode: request.stream === false ? "non-streaming" : "streaming",
+  resultSubtype: outcome.resultSubtype,
+  sdkSessionResumeAttempted, // captured BEFORE retry — preserves the original turn classification
+  sdkSessionResumed: sdkSessionResumeAttempted && outcome.ok && isResumeAttempt, // true iff resumed AND we didn't retry
+});
+```
+
+(After a retry, `isResumeAttempt` is reset to `false` by `buildQuery(undefined)`. That's why we capture `sdkSessionResumeAttempted` separately *before* retry — without it, fault-injected turns would silently bucket into turn-1 metrics and skew the dual-budget measurements.)
+
+- [ ] **Step 8:** Verify.
+
+```bash
+cd /Users/mokie/github/hive-KPR-207
+SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check
+```
+
+Expected: typecheck + lint + format clean, all tests pass (~1278 — adds 3 new `extractLatestUserMessage` tests).
+
+- [ ] **Step 9:** Commit.
+
+```bash
+git add src/channels/voice/voice-adapter.ts src/channels/voice/conversation-prompt.ts src/channels/voice/conversation-prompt.test.ts
+git commit -m "feat(voice): per-call SDK session resume for warm turn-2+ latency (KPR-207)"
+```
+
 ---
 
 ### Task 3: Bundle, deploy, smoke
@@ -609,38 +953,84 @@ Expected: `HTTP 200`, JSON body with a `choices[0].message.content` containing a
 
 If this returns 500 with `Could not resolve authentication method`, the operator's OAuth credentials aren't being inherited by the spawned `claude` CLI — investigate `~/.claude/.credentials.json` access from the launchd-spawned hive process before continuing.
 
-- [ ] **Step 5:** Real Vapi end-to-end (≥5 calls for latency p50 measurement).
+- [ ] **Step 5:** Real Vapi end-to-end — at least **5 multi-turn calls** (≥ 2 turns each) for the dual-budget measurement.
 
-Place at least 5 calls via the Vapi dashboard's "Talk" button on the Mokie assistant (web call), or phone `+1 (650) 729-6067` after assigning Mokie as inbound on that phone number in Vapi → Phone Numbers. Vary the user utterances so different prompts hit cache differently.
+Place ≥5 calls via the Vapi dashboard's "Talk" button on the Mokie assistant (web call), or phone `+1 (650) 729-6067` after assigning Mokie as inbound. Each call needs at least 2 user utterances so we get both a turn-1 and a turn-2+ measurement.
 
 Expected: live two-way conversation; Mokie greets the caller and responds in character. Check `~/services/hive/dodi/logs/hive.log` for `"Voice call session started"` and no `voice-adapter` errors.
 
-- [ ] **Step 6:** Latency p50 check — extract `firstTokenMs` from logs and compute p50.
+- [ ] **Step 6:** Latency check — split p50 by turn type using `sdkSessionResumed` to distinguish.
 
 ```bash
 grep '"Voice turn complete"' ~/services/hive/dodi/logs/hive.log \
-  | tail -20 \
+  | tail -50 \
   | python3 -c "
 import sys, json
-vals = []
+turn1, turn2plus = [], []
 for line in sys.stdin:
     try:
         d = json.loads(line)
-        if d.get('msg') == 'Voice turn complete' and 'firstTokenMs' in d:
-            vals.append(d['firstTokenMs'])
+        if d.get('msg') != 'Voice turn complete' or 'firstTokenMs' not in d:
+            continue
+        # Bucket by intent (resume attempted) not outcome (succeeded), so retries
+        # after fault-injected resume failures still count toward turn-2+ stats.
+        bucket = turn2plus if d.get('sdkSessionResumeAttempted') else turn1
+        bucket.append(d['firstTokenMs'])
     except: pass
-vals.sort()
-n = len(vals)
-print(f'samples: {n}')
-print(f'p50: {vals[n//2] if n else \"N/A\"} ms')
-print(f'p90: {vals[int(n*0.9)] if n else \"N/A\"} ms')
-print(f'all: {vals}')
+def p50(arr):
+    arr = sorted(arr)
+    return arr[len(arr)//2] if arr else None
+print(f'turn-1 samples={len(turn1)} p50={p50(turn1)} ms (gate < 4000)')
+print(f'turn-2+ samples={len(turn2plus)} p50={p50(turn2plus)} ms (gate < 1500)')
+print(f'turn-1 raw: {sorted(turn1)}')
+print(f'turn-2+ raw: {sorted(turn2plus)}')
 "
 ```
 
-Acceptance: p50 < 1500 ms across ≥5 samples. If exceeded, **stop** — do not declare KPR-207 done; treat as design blocker per the spec and revisit (likely SDK-session-resume).
+Acceptance:
+- Turn-1 p50 < 4000 ms (cold spawn — accepted, mitigated by Vapi's pre-canned `firstMessage`).
+- Turn-2+ p50 < 1500 ms (warm session — the user-perceptible gate).
 
-- [ ] **Step 7:** Verification gate — only proceed if Steps 5 + 6 pass.
+If either gate fails, **stop** — do not declare KPR-207 done. Surface as design blocker.
+
+- [ ] **Step 7:** Resume-fallback fault-injection test.
+
+The trick: corrupt the saved session **between** Vapi turns of a live call. Doing this by hand on a phone call is unreliable (turns are <2s apart). Use a one-shot watcher that fires on the first new session-dir creation, then renames it after a delay long enough for turn-1 to finish but before turn-2 begins.
+
+In a separate terminal **before** placing the call:
+
+```bash
+# Wait for a new session dir to appear, then rename it after 3s.
+# Run this once per fault-injection test.
+fswatch -1 -E -i '^[0-9a-f-]+$' ~/.claude/projects/ | while read f; do
+  echo "[fault] new session: $f — renaming in 3s"
+  sleep 3
+  mv "$f" "${f}.bak"
+  echo "[fault] renamed $f → ${f}.bak"
+  break
+done
+```
+
+Then place a multi-turn web call from the Vapi dashboard. Expected timeline:
+
+1. Call starts → turn-1 → SDK creates a session dir → fswatch fires.
+2. fswatch waits 3s (turn-1 completes, ~3.4s window).
+3. Renames the dir before turn-2 begins.
+4. Speak turn-2 → resume fails → adapter logs warn + retries as turn-1 → audio reply delivered.
+
+Verify:
+
+```bash
+grep "Voice session resume failed" ~/services/hive/dodi/logs/hive.log | tail -3
+```
+
+Expected: warn entry with `{ msg: "Voice session resume failed, retrying as turn-1", callId, reason }`; audio response heard by caller; call did not drop.
+
+If the timing window misses (turn-1 takes longer than 3s, or turn-2 starts before the rename), increase the `sleep` delay or run the test again. **Acceptance: at least one observed warn-log + successful retry across attempts.**
+
+Restore (optional — SDK will create new sessions on demand): `mv "${f}.bak" "$f"`.
+
+- [ ] **Step 8:** Verification gate — only proceed if Steps 5, 6, AND 7 all pass.
 
 ---
 
@@ -700,7 +1090,7 @@ curl -sS -X POST https://api.linear.app/graphql \
 
 - **Do NOT** modify `src/agents/agent-runner.ts`. We are mirroring its `query()` invocation pattern, not refactoring shared code.
 - **Do NOT** add MCP servers to the voice flow. Tools-on-call is a Phase-2 concern (spec) and explicitly out of scope here.
-- **Do NOT** add session-resume logic between Vapi turns. The spec accepts per-turn statelessness; adding session tracking is an optimization for a follow-up ticket.
+- Per-call SDK session resume is **in scope** as Task 2b — turn-1 starts a session, turn-2+ resumes it. Subprocess pooling across calls is out of scope (KPR-208).
 - The `extraArgs: { "strict-mcp-config": null }` line is critical — it sandboxes the spawned CLI from the operator's enabled plugins / connectors. Same rationale as KPR-201 in `agent-runner.ts:1601`.
 - `permissionMode: "bypassPermissions"` matches `agent-runner.ts:1567` — voice has no tools, so this is moot but keeps the surface aligned.
 - If the SDK CLI subprocess can't find OAuth credentials (Step 4 returns 500 with auth error), check that hive's process inherits the operator's HOME and that `~/.claude/.credentials.json` is readable. Do **not** paper over by setting `ANTHROPIC_API_KEY` — that defeats the whole ticket.
