@@ -854,8 +854,8 @@ describe("AgentRunner.buildServerConfig", () => {
   });
 });
 
-// ── Delegate subagents tests ─────────────────────────────────────
-describe("AgentRunner delegate subagents (via send)", () => {
+// ── Server sub-agents tests (KPR-221) ─────────────────────────────
+describe("AgentRunner server sub-agents (via send)", () => {
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;
 
   beforeEach(() => {
