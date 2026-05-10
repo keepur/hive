@@ -2033,6 +2033,32 @@ describe("buildSystemPrompt — archetype card", () => {
     expect(hooks.PreToolUse[0].matcher).toBeUndefined();
   });
 
+  it("KPR-222: buildHooks rebuilds with current WorkItemContext on every call (no stale context across spawns)", () => {
+    const captured: Array<unknown> = [];
+    registerArchetype({
+      id: "context-capturing",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: (args) => {
+        captured.push(args.workItemContext);
+        return [];
+      },
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "",
+      systemPrompt: "",
+      archetype: "context-capturing",
+      archetypeConfig: {},
+    });
+    const ctxA = { channelId: "ch-a", threadId: "thr-a", source: "test" } as any;
+    const ctxB = { channelId: "ch-b", threadId: "thr-b", source: "test" } as any;
+    (runner as any).buildHooks(ctxA);
+    (runner as any).buildHooks(ctxB);
+    expect(captured).toEqual([ctxA, ctxB]);
+  });
+
   it("omits card gracefully when archetype systemPromptCard throws", async () => {
     registerArchetype({
       id: "throws",
