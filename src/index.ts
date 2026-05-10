@@ -409,6 +409,28 @@ async function main(): Promise<void> {
   });
   log.info("Hot-reload enabled", { signal: "SIGUSR1" });
 
+  // KPR-213: heartbeat prefix-cache stats to Mongo so the out-of-process
+  // `hive doctor` CLI can render them. Doctor doesn't share memory with
+  // the engine. 30s cadence — same as agent-registry / contacts watchers.
+  const PREFIX_CACHE_HEARTBEAT_MS = 30_000;
+  const telemetryCollection = db.collection("telemetry");
+  const writeStats = async () => {
+    try {
+      const s = prefixCache.stats();
+      await telemetryCollection.updateOne(
+        { kind: "prefix_cache_stats" },
+        { $set: { ...s, updatedAt: new Date() } },
+        { upsert: true },
+      );
+    } catch (err) {
+      log.warn("prefix-cache stats heartbeat failed", { error: String(err) });
+    }
+  };
+  // Initial write at startup so doctor sees zeros instead of "no telemetry".
+  await writeStats();
+  const prefixCacheHeartbeat = setInterval(writeStats, PREFIX_CACHE_HEARTBEAT_MS);
+  prefixCacheHeartbeat.unref();
+
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);

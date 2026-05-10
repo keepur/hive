@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { renderPromptCacheSection, resolveRequiredEnvVars } from "./doctor.js";
+import { renderPrefixCacheSection, renderPromptCacheSection, resolveRequiredEnvVars } from "./doctor.js";
 
 describe("resolveRequiredEnvVars", () => {
   let dir: string;
@@ -144,5 +144,83 @@ describe("renderPromptCacheSection", () => {
       (l) => lines.push(l),
     );
     expect(lines.join("\n")).toContain("hit=no data");
+  });
+});
+
+describe("renderPrefixCacheSection", () => {
+  it("renders 'no heartbeat yet' when no row is available", () => {
+    const lines: string[] = [];
+    renderPrefixCacheSection(null, (l) => lines.push(l));
+    expect(lines.join("\n")).toContain("Prefix cache (live engine)");
+    expect(lines.join("\n")).toContain("no heartbeat yet");
+  });
+
+  it("renders the stats line with hit rate, entries, p99, oldest age, and heartbeat freshness", () => {
+    const lines: string[] = [];
+    renderPrefixCacheSection(
+      {
+        hits: 80,
+        misses: 20,
+        entryCount: 5,
+        lastBuildP99Ms: 42,
+        oldestEntryAgeMs: 3_500_000,
+        staleSeconds: 12,
+      },
+      (l) => lines.push(l),
+    );
+    const out = lines.join("\n");
+    expect(out).toContain("hit-rate=80.0%");
+    expect(out).toContain("entries=5");
+    expect(out).toContain("p99-build=42ms");
+    expect(out).toContain("oldest=3500s");
+    expect(out).toContain("heartbeat 12s ago");
+  });
+
+  it("warns when the heartbeat is stale (>120s)", () => {
+    const lines: string[] = [];
+    renderPrefixCacheSection(
+      {
+        hits: 0,
+        misses: 0,
+        entryCount: 0,
+        lastBuildP99Ms: 0,
+        oldestEntryAgeMs: 0,
+        staleSeconds: 300,
+      },
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).toMatch(/heartbeat is stale/);
+  });
+
+  it("warns when the oldest entry exceeds 24h (possible invalidation gap)", () => {
+    const lines: string[] = [];
+    renderPrefixCacheSection(
+      {
+        hits: 1,
+        misses: 0,
+        entryCount: 1,
+        lastBuildP99Ms: 0,
+        oldestEntryAgeMs: 25 * 60 * 60 * 1000,
+        staleSeconds: 5,
+      },
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).toMatch(/oldest entry > 24h/);
+  });
+
+  it("renders 'no data' hit-rate when no calls have happened yet", () => {
+    const lines: string[] = [];
+    renderPrefixCacheSection(
+      {
+        hits: 0,
+        misses: 0,
+        entryCount: 0,
+        lastBuildP99Ms: 0,
+        oldestEntryAgeMs: 0,
+        staleSeconds: 1,
+      },
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).toContain("hit-rate=no data");
   });
 });

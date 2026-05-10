@@ -241,6 +241,59 @@ export function formatHitRate(rate: number | null): string {
   return `${(rate * 100).toFixed(1)}%`;
 }
 
+/**
+ * KPR-213 prefix-cache stats snapshot. Engine heartbeats this once every 30s
+ * to `db.telemetry` (kind="prefix_cache_stats"); doctor reads it. `staleSeconds`
+ * is computed at read time so the operator can tell live-vs-stale at a glance.
+ */
+export interface PrefixCacheStatsRow {
+  hits: number;
+  misses: number;
+  entryCount: number;
+  lastBuildP99Ms: number;
+  oldestEntryAgeMs: number;
+  /** Seconds since the engine last wrote this doc; null if no doc found yet. */
+  staleSeconds: number | null;
+}
+
+/**
+ * Read-only doctor adapter for the `telemetry` collection's
+ * prefix_cache_stats heartbeat doc. Short-lived MongoClient mirrors the
+ * `cacheHitRatesForDoctor` pattern.
+ */
+export async function prefixCacheStatsForDoctor(uri: string, dbName: string): Promise<PrefixCacheStatsRow | null> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const doc = await client
+      .db(dbName)
+      .collection("telemetry")
+      .findOne<{
+        hits?: number;
+        misses?: number;
+        entryCount?: number;
+        lastBuildP99Ms?: number;
+        oldestEntryAgeMs?: number;
+        updatedAt?: Date;
+      }>({ kind: "prefix_cache_stats" });
+    if (!doc) return null;
+    const updatedAt = doc.updatedAt instanceof Date ? doc.updatedAt : null;
+    return {
+      hits: doc.hits ?? 0,
+      misses: doc.misses ?? 0,
+      entryCount: doc.entryCount ?? 0,
+      lastBuildP99Ms: doc.lastBuildP99Ms ?? 0,
+      oldestEntryAgeMs: doc.oldestEntryAgeMs ?? 0,
+      staleSeconds: updatedAt ? Math.round((Date.now() - updatedAt.getTime()) / 1000) : null,
+    };
+  } catch {
+    return null;
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 // ── resolved paths ─────────────────────────────────────────────────────
 
 /** Expand ~ in a path. */
