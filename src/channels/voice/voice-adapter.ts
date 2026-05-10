@@ -511,6 +511,7 @@ export class VoiceAdapter {
     };
 
     let outcome = await runOnce(ctx);
+    let outerRetryFired = false;
 
     // Outer retry — resume failed before any bytes hit the wire. Restart with
     // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
@@ -521,6 +522,7 @@ export class VoiceAdapter {
         callId,
         reason: outcome.reason,
       });
+      outerRetryFired = true;
       const fullPrompt = renderConversationPrompt(request.messages);
       const retryWorkItem: WorkItem = { ...workItem, text: fullPrompt };
       const retryCtx: TurnContext = {
@@ -586,6 +588,9 @@ export class VoiceAdapter {
     // without the outer-retry kicking in" — NOT `newSessionId === effectiveResume`,
     // because the SDK rotates session ids post-compaction, which would
     // systematically under-count successful resumes versus the baseline.
+    // The `!outerRetryFired` clause matches the legacy adapter's semantic
+    // exactly: when retry fires, the original resume failed, so this counts
+    // as a non-resumed turn even if the retry succeeded.
     log.info("Voice turn complete", {
       callId,
       agentId,
@@ -593,7 +598,7 @@ export class VoiceAdapter {
       totalMs: Date.now() - startedAt,
       mode: isStreaming ? "streaming" : "non-streaming",
       sdkSessionResumeAttempted: !!effectiveResume,
-      sdkSessionResumed: !!effectiveResume && outcome.ok,
+      sdkSessionResumed: !!effectiveResume && outcome.ok && !outerRetryFired,
       routedVia: "agentManager",
     });
   }
