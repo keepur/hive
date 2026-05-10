@@ -75,6 +75,14 @@ export interface TurnContext {
   threadId: string;
   workItem: WorkItem;
   channel: ChannelKind;
+  /**
+   * KPR-219: bypass `AgentRunner.buildSystemPrompt` entirely when set. Voice
+   * uses this to inject `buildVoiceSystemPrompt` output (omits tool summaries,
+   * adds call goal/context). Other channels leave it undefined and get the
+   * standard prefix builder. Forward-compatible — any future channel-specific
+   * prompt builder plugs in here without touching AgentRunner.
+   */
+  systemPromptOverride?: string;
 }
 
 export interface TurnUsage {
@@ -365,7 +373,15 @@ export class AgentManager {
       slackThreadTs: (ctx.workItem.meta?.slackThreadTs as string) ?? "",
     };
 
-    return runner.send(ctx.workItem.text, ctx.sessionId, onStream, bgContext);
+    return runner.send(
+      ctx.workItem.text,
+      ctx.sessionId,
+      onStream,
+      bgContext,
+      undefined,
+      undefined,
+      ctx.systemPromptOverride,
+    );
   }
 
   private finalizeSpawnResult(ctx: TurnContext, result: RunResult): TurnResult {

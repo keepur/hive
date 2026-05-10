@@ -1287,7 +1287,7 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits, systemPromptOverride?: string): Promise<RunResult> {
     const effectiveModel = modelOverride ?? this.agentConfig.model;
 
     log.info("Sending prompt to agent", {
@@ -1469,7 +1469,12 @@ export class AgentRunner {
     }
 
     const serverSubAgents = this.buildServerSubAgents(allServerConfigs);
-    const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(serverSubAgents));
+    // KPR-219: voice (and any future channel) can supply a fully-built system
+    // prompt that bypasses the standard prefix builder. Voice's prompt omits
+    // tool summaries + delegate descriptions (Vapi handles tools out-of-band).
+    // When undefined, fall through to the standard prefix path — zero behavior
+    // change for non-voice callers.
+    const systemPrompt = systemPromptOverride ?? await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(serverSubAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
 
     if (Object.keys(serverSubAgents).length > 0) {
