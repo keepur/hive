@@ -18,6 +18,23 @@ import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
 import { buildPrefix } from "./prefix-builder.js";
 import type { PrefixCache } from "./prefix-cache.js";
+
+/**
+ * KPR-213: translate a memory path → prefix-cache invalidation scope.
+ *  - `agents/<id>/...` → invalidate that agent only.
+ *  - `shared/...` (notably `shared/constitution.md`) and anything else →
+ *    invalidate all agents (shared content is in every prefix).
+ * Module-scoped so the structured-memory MCP factory and the FS-memory
+ * MCP factory can call into the same logic without duplicating.
+ */
+function invalidatePrefixCacheByPath(cache: PrefixCache, path: string, reason: string): void {
+  const m = path.match(/^agents\/([^/]+)\//);
+  if (m) {
+    cache.invalidateAgent(m[1], reason);
+    return;
+  }
+  cache.invalidateAll(reason);
+}
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
@@ -1297,6 +1314,12 @@ export class AgentRunner {
           db: this.db,
           agentId: this.agentConfig.id,
           memoryScopes: this.resolveMemoryScopes(),
+          // KPR-213: write-through prefix cache invalidation. Path-aware:
+          // agents/<id>/... only invalidates that agent; shared/* (e.g.
+          // shared/constitution.md) invalidates everyone.
+          onWrite: this.prefixCache
+            ? (path, reason) => invalidatePrefixCacheByPath(this.prefixCache!, path, reason)
+            : undefined,
         });
       }
       mcpServers["memory"] = this.memoryMcpServer;
@@ -1419,6 +1442,14 @@ export class AgentRunner {
           context: this.structuredMemoryContextRef,
           qdrantUrl: process.env.QDRANT_URL,
           ollamaUrl: process.env.OLLAMA_URL,
+          // KPR-213: structured-memory mutations affect the agent's hot-tier
+          // and therefore its prefix. Bulk paths pass null → invalidateAll.
+          onMutate: this.prefixCache
+            ? (mutAgentId, reason) => {
+                if (mutAgentId === null) this.prefixCache!.invalidateAll(reason);
+                else this.prefixCache!.invalidateAgent(mutAgentId, reason);
+              }
+            : undefined,
         });
       }
       mcpServers["structured-memory"] = this.structuredMemoryMcpServer;

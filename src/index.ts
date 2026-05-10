@@ -193,11 +193,27 @@ async function main(): Promise<void> {
   // Initialize core systems
   const memoryManager = new MemoryManager(db);
   await memoryManager.init();
+  // KPR-213: FS-style memory writes (constitution, agent memory.md) flow
+  // through MemoryManager.write — wire prefix invalidation here. Path-aware:
+  // shared/* invalidates all; agents/<id>/* invalidates that agent.
+  memoryManager.setOnWrite((path, reason) => {
+    const m = path.match(/^agents\/([^/]+)\//);
+    if (m) prefixCache.invalidateAgent(m[1], reason);
+    else prefixCache.invalidateAll(reason);
+  });
 
   // Structured memory lifecycle — always enabled
   const memoryStore = new MemoryStore(db);
   await memoryStore.init();
   memoryManager.memoryStore = memoryStore;
+  // KPR-213: structured-memory mutations from autoDream lifecycle and the
+  // knowledge-extractor go through this shared store instance (separate
+  // from the per-MCP stores — those wire onMutate themselves). Bulk-id
+  // paths pass `null` → invalidateAll.
+  memoryStore.setOnMutate((agentId, reason) => {
+    if (agentId === null) prefixCache.invalidateAll(reason);
+    else prefixCache.invalidateAgent(agentId, reason);
+  });
   const memoryEmbedder = new MemoryEmbedder();
   const memoryLifecycle = new MemoryLifecycle(
     memoryStore,
