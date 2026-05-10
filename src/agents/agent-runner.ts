@@ -1041,16 +1041,21 @@ export class AgentRunner {
   ]);
 
   /**
-   * Build AgentDefinition objects for delegate servers.
-   * Each delegate server becomes a named subagent with its own MCP connection.
+   * Build AgentDefinition objects for each MCP server listed in
+   * `delegateServers`. Each entry becomes a named tool-specialist sub-agent
+   * with its own MCP connection — these are not separate "delegate agents"
+   * (named coworkers) but per-MCP sub-agents the parent invokes via the
+   * SDK's `Agent` tool. The field name `delegateServers` is preserved on
+   * agent definitions, but the internal nomenclature uses "server sub-agents"
+   * for honesty (KPR-221).
    */
-  private buildDelegateAgents(allConfigs: Record<string, McpServerConfig>): Record<string, AgentDefinition> {
+  private buildServerSubAgents(allConfigs: Record<string, McpServerConfig>): Record<string, AgentDefinition> {
     const delegates = this.agentConfig.delegateServers;
     if (delegates.length === 0) return {};
 
     const agents: Record<string, AgentDefinition> = {};
 
-    // Autonomy gates for delegate servers — same rules as core servers
+    // Autonomy gates for server sub-agents — same rules as core servers
     const blockedDelegates = new Set<string>();
     if (!this.agentConfig.autonomy.externalComms) {
       blockedDelegates.add("resend");
@@ -1065,16 +1070,24 @@ export class AgentRunner {
 
     for (const serverName of delegates) {
       if (blockedDelegates.has(serverName)) {
-        log.debug("Autonomy gate — skipping delegate server", { server: serverName, agent: this.agentConfig.id });
+        log.debug("Autonomy gate — skipping server sub-agent", { server: serverName, agent: this.agentConfig.id });
         continue;
       }
 
-      // Warn if a context-dependent server is being delegated
+      // KPR-221: defense-in-depth. The agent registry and admin tool both
+      // hard-reject context-dependent servers in delegateServers at load +
+      // write time. If we somehow see one here it means a stale path snuck
+      // through — error and skip the offending server. Do NOT build a
+      // sub-agent for it; sub-agents spawn without channel/thread context
+      // and the server would silently malfunction. Previously this was a
+      // warn-and-proceed (which silently dropped the server downstream
+      // anyway via the missing-config branch). Now it's explicit.
       if (AgentRunner.CONTEXT_DEPENDENT_SERVERS.has(serverName)) {
-        log.warn("Context-dependent server in delegateServers — subagent won't have channel context", {
+        log.error("Context-dependent server in delegateServers — registry/admin guards bypassed; skipping", {
           agent: this.agentConfig.id,
           server: serverName,
         });
+        continue;
       }
 
       const serverConfig = allConfigs[serverName];
@@ -1455,14 +1468,14 @@ export class AgentRunner {
       mcpServers["structured-memory"] = this.structuredMemoryMcpServer;
     }
 
-    const delegateAgents = this.buildDelegateAgents(allServerConfigs);
-    const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(delegateAgents));
+    const serverSubAgents = this.buildServerSubAgents(allServerConfigs);
+    const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(serverSubAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
 
-    if (Object.keys(delegateAgents).length > 0) {
-      log.info("Delegate subagents configured", {
+    if (Object.keys(serverSubAgents).length > 0) {
+      log.info("Server sub-agents configured", {
         agent: this.agentConfig.id,
-        delegates: Object.keys(delegateAgents),
+        delegates: Object.keys(serverSubAgents),
       });
     }
 
@@ -1538,7 +1551,7 @@ export class AgentRunner {
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
-        ...(Object.keys(delegateAgents).length > 0 ? { agents: delegateAgents } : {}),
+        ...(Object.keys(serverSubAgents).length > 0 ? { agents: serverSubAgents } : {}),
         ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
         hooks: this.buildHooks(context),
         // Cast: AgentConfig stores string[] but SDK expects SdkBeta[] — intentional for forward compat
