@@ -17,6 +17,7 @@ import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
 import { buildPrefix } from "./prefix-builder.js";
+import type { PrefixCache } from "./prefix-cache.js";
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
@@ -242,8 +243,12 @@ export class AgentRunner {
   private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
   private workflowMcpServer?: ReturnType<typeof createWorkflowMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
+  // KPR-213: optional shared prefix cache. Production wires this in via
+  // index.ts; tests that don't pass one fall through to a direct buildPrefix
+  // call (no cache) so per-test isolation isn't a concern.
+  private prefixCache?: PrefixCache;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
@@ -252,14 +257,17 @@ export class AgentRunner {
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
     this.db = db;
+    this.prefixCache = prefixCache;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
-    // KPR-213: prefix assembly extracted into `buildPrefix` (pure function).
-    // The prefix is everything cacheable; datetime is appended here so the
-    // static prefix stays prompt-cache-friendly. Step 3 will swap the direct
-    // call for a write-through cache (`PrefixCache.getOrBuild`).
-    const prefix = await buildPrefix(this.agentConfig, {
+    // KPR-213: write-through prefix cache. coreServerNames + activeDelegates
+    // are stable per agent (derived from agent-def + autonomy gates, not from
+    // per-call inputs), so they're captured in the closure rather than baked
+    // into the cache key. If a future refactor causes them to vary per call,
+    // the audit invariant in §New module of the plan must be revisited and
+    // they must move into the cache key.
+    const buildContext = {
       coreServerNames,
       activeDelegateNames: activeDelegates ?? [],
       memoryManager: this.memoryManager,
@@ -269,7 +277,10 @@ export class AgentRunner {
       prefetcher: this.prefetcher,
       eventSubscribersJson: this.eventSubscribersJson,
       autoInjectedServers: AgentRunner.autoInjectedServerNames(),
-    });
+    };
+    const prefix = this.prefixCache
+      ? await this.prefixCache.getOrBuild(this.agentConfig.id, () => buildPrefix(this.agentConfig, buildContext))
+      : await buildPrefix(this.agentConfig, buildContext);
 
     // Date/time last — changes every minute, so placing it at the end
     // preserves the static prefix for prompt caching.
