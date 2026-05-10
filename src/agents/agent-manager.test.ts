@@ -982,4 +982,280 @@ describe("AgentManager", () => {
       expect(manager.getActiveWorkItems("agent-a")).toEqual([]);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // KPR-216: spawnTurn (per-turn-spawn API for SMS — Phase A under KPR-210)
+  // ---------------------------------------------------------------------------
+  describe("spawnTurn (KPR-216)", () => {
+    function smsCtx(overrides: Partial<{
+      agentId: string;
+      sessionId: string | undefined;
+      threadId: string;
+      channelId: string;
+      text: string;
+    }> = {}) {
+      const agentId = overrides.agentId ?? "agent-a";
+      const threadId = overrides.threadId ?? `sms:line-1:+15551234567`;
+      const channelId = overrides.channelId ?? "line-1";
+      const workItem = makeWorkItem({
+        text: overrides.text ?? "hello over sms",
+        threadId,
+        source: { kind: "sms" as const, id: channelId, label: "May (CEO)" },
+        sender: "+15551234567",
+      });
+      return {
+        agentId,
+        sessionId: overrides.sessionId,
+        channelId,
+        threadId,
+        workItem,
+        channel: "sms" as const,
+      };
+    }
+
+    it("returns a TurnResult with finalMessage, newSessionId, and usage on the happy path", async () => {
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({ text: "ack", sessionId: "session-sms-1", costUsd: 0.02, durationMs: 350 }),
+      );
+
+      const ctx = smsCtx();
+      const result = await manager.spawnTurn(ctx);
+
+      expect(result.finalMessage).toBe("ack");
+      expect(result.newSessionId).toBe("session-sms-1");
+      expect(result.errors).toEqual([]);
+      expect(result.usage.costUsd).toBe(0.02);
+      expect(result.usage.durationMs).toBe(350);
+      expect(result.usage.inputTokens).toBe(100);
+      expect(result.usage.outputTokens).toBe(50);
+
+      // Session-store updated under (agentId, threadId) — keyed on thread, NOT session.
+      expect(sessionStore.set).toHaveBeenCalledWith(
+        "agent-a",
+        ctx.threadId,
+        "session-sms-1",
+        expect.objectContaining({ inputTokens: 100, outputTokens: 50 }),
+      );
+
+      // Underlying runner.send called with the resume id (undefined on first turn) and
+      // the SMS WorkItem text + a per-spawn WorkItemContext.
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      const [prompt, sessionArg, , bgContext] = mockRunnerSend.mock.calls[0]!;
+      expect(prompt).toBe("hello over sms");
+      expect(sessionArg).toBeUndefined();
+      expect(bgContext).toMatchObject({
+        channelKind: "sms",
+        channelId: "line-1",
+        threadId: ctx.threadId,
+      });
+    });
+
+    it("forwards `resume` (sessionId) to runner.send when continuing a thread", async () => {
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "same-session" }));
+      await manager.spawnTurn(smsCtx({ sessionId: "same-session" }));
+      const [, sessionArg] = mockRunnerSend.mock.calls[0]!;
+      expect(sessionArg).toBe("same-session");
+    });
+
+    it("rejects when the agent is not in the registry", async () => {
+      await expect(manager.spawnTurn(smsCtx({ agentId: "no-such-agent" }))).rejects.toThrow(
+        /Unknown agent: no-such-agent/,
+      );
+      expect(mockRunnerSend).not.toHaveBeenCalled();
+    });
+
+    it("serializes concurrent spawns on the same (agentId, threadId)", async () => {
+      // Two spawns on the same thread should run strictly serially. Capture
+      // the start order via a sequence-of-events recorder.
+      const events: string[] = [];
+      const releasers: Array<() => void> = [];
+
+      mockRunnerSend.mockImplementation((prompt: string) => {
+        events.push(`start:${prompt}`);
+        return new Promise((resolve) => {
+          releasers.push(() => {
+            events.push(`finish:${prompt}`);
+            resolve(makeRunResult({ text: prompt, sessionId: `s-${prompt}` }));
+          });
+        });
+      });
+
+      const sharedThread = "sms:line-1:+15550000001";
+      const p1 = manager.spawnTurn(smsCtx({ threadId: sharedThread, text: "first" }));
+      const p2 = manager.spawnTurn(smsCtx({ threadId: sharedThread, text: "second" }));
+
+      // Yield to let p1 grab the lock and start. p2's busy-poll should keep it pending.
+      await new Promise((r) => setTimeout(r, 30));
+      expect(events).toEqual(["start:first"]);
+
+      // Release p1; p2 must now be allowed to start.
+      releasers[0]!();
+      await new Promise((r) => setTimeout(r, 60));
+      expect(events).toEqual(["start:first", "finish:first", "start:second"]);
+
+      releasers[1]!();
+      await Promise.all([p1, p2]);
+      expect(events[events.length - 1]).toBe("finish:second");
+    });
+
+    it("allows concurrent spawns on different threads of the same agent", async () => {
+      // Different threads on the same agent are NOT serialized by the per-thread lock.
+      // They are bounded only by the per-agent spawn budget (5 by default).
+      let inflight = 0;
+      let maxInflight = 0;
+      mockRunnerSend.mockImplementation(() => {
+        inflight++;
+        maxInflight = Math.max(maxInflight, inflight);
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            inflight--;
+            resolve(makeRunResult());
+          }, 30);
+        });
+      });
+
+      const spawns = [0, 1, 2].map((i) =>
+        manager.spawnTurn(smsCtx({ threadId: `sms:line-1:thread-${i}` })),
+      );
+      await Promise.all(spawns);
+
+      expect(maxInflight).toBeGreaterThanOrEqual(2);
+      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
+    });
+
+    it("rejects when per-agent spawn budget is exceeded (default 5)", async () => {
+      // Park 5 spawns on five distinct threads, then attempt a 6th — it must reject.
+      const releasers: Array<() => void> = [];
+      mockRunnerSend.mockImplementation(() => {
+        return new Promise((resolve) => {
+          releasers.push(() => resolve(makeRunResult()));
+        });
+      });
+
+      const inflight = [0, 1, 2, 3, 4].map((i) =>
+        manager.spawnTurn(smsCtx({ threadId: `sms:line-1:budget-${i}` })),
+      );
+      // Yield enough for all 5 to enter and bump the active count.
+      await new Promise((r) => setTimeout(r, 30));
+      expect(mockRunnerSend).toHaveBeenCalledTimes(5);
+
+      await expect(
+        manager.spawnTurn(smsCtx({ threadId: "sms:line-1:budget-overflow" })),
+      ).rejects.toThrow(/Spawn budget exceeded for agent-a/);
+
+      // Drain so the test cleans up.
+      releasers.forEach((r) => r());
+      await Promise.all(inflight);
+    });
+
+    it("releases lock + budget slot on error path so subsequent spawns work", async () => {
+      mockRunnerSend.mockRejectedValueOnce(new Error("synthetic SDK boom"));
+
+      await expect(manager.spawnTurn(smsCtx())).rejects.toThrow("synthetic SDK boom");
+
+      // The lock must be released — a second spawn on the same thread should proceed.
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered" }));
+      const result = await manager.spawnTurn(smsCtx());
+      expect(result.finalMessage).toBe("recovered");
+    });
+
+    it("returns errors[] populated when the SDK reports an error result (no throw)", async () => {
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({ text: "partial", error: "tool blew up", sessionId: "session-err-1" }),
+      );
+
+      const result = await manager.spawnTurn(smsCtx());
+
+      expect(result.errors).toEqual(["tool blew up"]);
+      expect(result.finalMessage).toBe("partial");
+
+      const state = manager.getState("agent-a");
+      expect(state!.errorCount).toBe(1);
+    });
+
+    it("retries once with sessionId stripped on auth-rebuild-resume sentinel", async () => {
+      // Mirrors voice-adapter.ts auth-error retry path. First attempt errors with the
+      // sentinel; second attempt (without resume) succeeds.
+      mockRunnerSend
+        .mockResolvedValueOnce(
+          makeRunResult({ error: "Could not resolve authentication method", sessionId: "" }),
+        )
+        .mockResolvedValueOnce(makeRunResult({ text: "ok after retry", sessionId: "session-retry" }));
+
+      const result = await manager.spawnTurn(smsCtx({ sessionId: "stale-session" }));
+
+      expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+      const [, firstSession] = mockRunnerSend.mock.calls[0]!;
+      const [, secondSession] = mockRunnerSend.mock.calls[1]!;
+      expect(firstSession).toBe("stale-session"); // first attempt resumed
+      expect(secondSession).toBeUndefined(); // retry stripped resume
+
+      expect(result.finalMessage).toBe("ok after retry");
+      expect(result.newSessionId).toBe("session-retry");
+    });
+
+    it("does NOT retry when the error is not an auth sentinel", async () => {
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({ error: "unrelated tool failure", sessionId: "session-x" }),
+      );
+
+      const result = await manager.spawnTurn(smsCtx({ sessionId: "current" }));
+
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      expect(result.errors).toEqual(["unrelated tool failure"]);
+    });
+
+    it("persists rotated sessionId across a 3-turn conversation (compaction sim — KPR-211/§R2)", async () => {
+      // Turn 1: first turn, no resume — SDK emits session-A.
+      // Turn 2: resumed against session-A but SDK rotates to session-B mid-turn (compaction).
+      // Turn 3: must resume against session-B, the rotated id.
+      mockRunnerSend
+        .mockResolvedValueOnce(makeRunResult({ text: "t1", sessionId: "session-A" }))
+        .mockResolvedValueOnce(makeRunResult({ text: "t2", sessionId: "session-B" })) // compaction rotated
+        .mockResolvedValueOnce(makeRunResult({ text: "t3", sessionId: "session-B" }));
+
+      const threadId = "sms:line-1:rotation";
+      const channelId = "line-1";
+
+      // Turn 1
+      const sess0 = await sessionStore.get("agent-a", threadId);
+      expect(sess0).toBeUndefined();
+      const turn1 = await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess0 }));
+      expect(turn1.newSessionId).toBe("session-A");
+      expect(await sessionStore.get("agent-a", threadId)).toBe("session-A");
+
+      // Turn 2 — adapter resumes against the stored id, SDK rotates inside.
+      const sess1 = await sessionStore.get("agent-a", threadId);
+      const turn2 = await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess1 }));
+      expect(turn2.newSessionId).toBe("session-B");
+      // Persistence side has rotated to the new id.
+      expect(await sessionStore.get("agent-a", threadId)).toBe("session-B");
+
+      // Turn 3 — adapter resumes against the rotated id.
+      const sess2 = await sessionStore.get("agent-a", threadId);
+      expect(sess2).toBe("session-B");
+      await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess2 }));
+
+      // The third runner.send call resumed against session-B, not the original session-A.
+      const [, thirdResume] = mockRunnerSend.mock.calls[2]!;
+      expect(thirdResume).toBe("session-B");
+
+      // sessionStore.set was called for each successful turn.
+      expect(sessionStore.set).toHaveBeenCalledTimes(3);
+    });
+
+    it("does NOT update session-store when the result is aborted", async () => {
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({ aborted: true, sessionId: "session-aborted" }),
+      );
+      await manager.spawnTurn(smsCtx());
+      expect(sessionStore.set).not.toHaveBeenCalled();
+    });
+
+    it("getSessionStore() exposes the underlying store for adapter use", () => {
+      // SmsAdapter.spawnTurnForWorkItem reads via this accessor — must return the
+      // same instance (read-only access; spawnTurn is the writer).
+      expect(manager.getSessionStore()).toBe(sessionStore);
+    });
+  });
 });
