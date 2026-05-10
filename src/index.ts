@@ -185,9 +185,7 @@ async function main(): Promise<void> {
     // simpler, correct choice.
     prefixCache.invalidateAll("agent-def-update");
   });
-  const contactsWatcher = new ContactsWatcher(db, teamCache, () =>
-    prefixCache.invalidateAll("team-roster-humans"),
-  );
+  const contactsWatcher = new ContactsWatcher(db, teamCache, () => prefixCache.invalidateAll("team-roster-humans"));
   await contactsWatcher.start();
 
   // Initialize core systems

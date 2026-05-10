@@ -80,7 +80,10 @@ export function resolveRequiredEnvVars(hereDir: string): string[] {
  * `telemetry.prefix_cache_stats` heartbeat (written every 30s).
  * Informational — does not affect exit code.
  */
-export function renderPrefixCacheSection(row: PrefixCacheStatsRow | null, emit: (line: string) => void = console.log): void {
+export function renderPrefixCacheSection(
+  row: PrefixCacheStatsRow | null,
+  emit: (line: string) => void = console.log,
+): void {
   emit("\nPrefix cache (live engine)");
   if (!row) {
     emit("  ○ no heartbeat yet — start the engine and re-check");

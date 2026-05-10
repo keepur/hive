@@ -266,17 +266,14 @@ export async function prefixCacheStatsForDoctor(uri: string, dbName: string): Pr
   const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
   try {
     await client.connect();
-    const doc = await client
-      .db(dbName)
-      .collection("telemetry")
-      .findOne<{
-        hits?: number;
-        misses?: number;
-        entryCount?: number;
-        lastBuildP99Ms?: number;
-        oldestEntryAgeMs?: number;
-        updatedAt?: Date;
-      }>({ kind: "prefix_cache_stats" });
+    const doc = await client.db(dbName).collection("telemetry").findOne<{
+      hits?: number;
+      misses?: number;
+      entryCount?: number;
+      lastBuildP99Ms?: number;
+      oldestEntryAgeMs?: number;
+      updatedAt?: Date;
+    }>({ kind: "prefix_cache_stats" });
     if (!doc) return null;
     const updatedAt = doc.updatedAt instanceof Date ? doc.updatedAt : null;
     return {
