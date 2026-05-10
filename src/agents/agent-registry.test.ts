@@ -583,3 +583,130 @@ describe("KPR-184 — AgentRegistry sanitizes in-process-ported servers from del
     expect(registry.get("sanitized-agent")).toBeDefined();
   });
 });
+
+describe("KPR-221 — AgentRegistry hard-rejects context-dependent servers in delegateServers", () => {
+  beforeAll(async () => {
+    const registryModule = await import("./agent-registry.js");
+    AgentRegistry = registryModule.AgentRegistry;
+  });
+
+  // Context-dependent servers that aren't also in IN_PROCESS_PORTED_SERVERS
+  // (which the KPR-184 sanitizer strips first). These are uniquely caught
+  // by KPR-221's hard-reject. The overlap cases (callback, memory,
+  // structured-memory) are stripped by KPR-184's sanitizer and don't reach
+  // the hard-reject path — covered by the separate "stripped" test.
+  const CONTEXT_DEPENDENT_NEW = ["background", "code-task", "recall"];
+
+  it.each(CONTEXT_DEPENDENT_NEW)("rejects agent with '%s' in delegateServers", async (server) => {
+    const def = makeDefinition({
+      _id: `bad-${server}-agent`,
+      delegateServers: [server],
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const result = await registry.load();
+
+    // Agent must NOT load — fail-closed.
+    expect(result.added).not.toContain(`bad-${server}-agent`);
+    expect(registry.get(`bad-${server}-agent`)).toBeUndefined();
+  });
+
+  it("rejects agent when context-dependent server is mixed with valid entries", async () => {
+    const def = makeDefinition({
+      _id: "mixed-context-agent",
+      delegateServers: ["google", "background", "linear"],
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const result = await registry.load();
+
+    expect(result.added).not.toContain("mixed-context-agent");
+    expect(registry.get("mixed-context-agent")).toBeUndefined();
+  });
+
+  it("evicts a previously-loaded agent if a new load contains a context-dependent server", async () => {
+    // First load: clean. Second load: same id but with a bad delegateServer.
+    const cleanDocs = [
+      makeDefinition({
+        _id: "agent-x",
+        delegateServers: ["google"],
+      }),
+    ];
+    const dirtyDocs = [
+      makeDefinition({
+        _id: "agent-x",
+        delegateServers: ["google", "recall"],
+      }),
+    ];
+
+    let activeDocs = cleanDocs;
+    const collection = {
+      find: () => ({ toArray: async () => activeDocs }),
+    } as unknown as Collection<AgentDefinition>;
+
+    const registry = new AgentRegistry(collection);
+    await registry.load();
+    expect(registry.get("agent-x")).toBeDefined();
+
+    activeDocs = dirtyDocs;
+    const result = await registry.load();
+    expect(result.removed).toContain("agent-x");
+    expect(registry.get("agent-x")).toBeUndefined();
+  });
+
+  it("does not abort the entire load when one agent has a bad delegateServer", async () => {
+    // Two agents — one bad, one clean. Clean must still load.
+    const docs = [
+      makeDefinition({ _id: "bad-agent", delegateServers: ["recall"] }),
+      makeDefinition({ _id: "clean-agent", delegateServers: ["google"] }),
+    ];
+    const registry = new AgentRegistry(makeFakeCollection(docs));
+    const result = await registry.load();
+
+    expect(registry.get("bad-agent")).toBeUndefined();
+    expect(registry.get("clean-agent")).toBeDefined();
+    expect(result.added).toContain("clean-agent");
+  });
+
+  it("memory, structured-memory, callback are stripped by KPR-184 sanitizer first (no hard-reject)", async () => {
+    // KPR-184's sanitizer strips IN_PROCESS_PORTED_SERVERS (which includes
+    // memory, structured-memory, and callback) before KPR-221 validation
+    // runs, so these load with empty delegateServers rather than getting
+    // evicted. The hard-reject path applies only to context-dependent
+    // servers that aren't also in-process (background, code-task, recall).
+    const def = makeDefinition({
+      _id: "in-process-stripped",
+      delegateServers: ["memory", "structured-memory", "callback"],
+    });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const result = await registry.load();
+
+    expect(result.added).toContain("in-process-stripped");
+    expect(registry.get("in-process-stripped")?.delegateServers).toEqual([]);
+  });
+});
+
+describe("KPR-221 — validateDelegateServersOrThrow", () => {
+  it("throws when a context-dependent server is present", async () => {
+    const mod = await import("./agent-registry.js");
+    expect(() => mod.validateDelegateServersOrThrow("a", ["callback"])).toThrow(/callback/);
+    expect(() => mod.validateDelegateServersOrThrow("a", ["google", "background"])).toThrow(/background/);
+  });
+
+  it("does not throw on a clean list", async () => {
+    const mod = await import("./agent-registry.js");
+    expect(() => mod.validateDelegateServersOrThrow("a", ["google", "linear"])).not.toThrow();
+    expect(() => mod.validateDelegateServersOrThrow("a", [])).not.toThrow();
+  });
+
+  it("error message names the offending server and the agent id", async () => {
+    const mod = await import("./agent-registry.js");
+    try {
+      mod.validateDelegateServersOrThrow("rae", ["recall", "code-task"]);
+      throw new Error("expected throw");
+    } catch (err) {
+      const msg = String(err);
+      expect(msg).toContain("rae");
+      expect(msg).toContain("recall");
+      expect(msg).toContain("code-task");
+    }
+  });
+});
