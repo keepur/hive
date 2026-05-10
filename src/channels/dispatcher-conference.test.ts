@@ -12,7 +12,9 @@ vi.mock("../logging/logger.js", () => ({
 }));
 
 vi.mock("../config.js", () => ({
-  config: {},
+  config: {
+    agentManager: { perTurnSpawn: { sms: false, slack: false, ws: false, voice: false } },
+  },
 }));
 
 vi.mock("../agents/meeting-classifier.js", () => ({

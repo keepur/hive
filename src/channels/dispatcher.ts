@@ -2,12 +2,7 @@ import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
-import type {
-  AgentManager,
-  TurnContext,
-  TurnResult,
-  SpawnTurnStreamCallback,
-} from "../agents/agent-manager.js";
+import type { AgentManager, TurnContext, TurnResult, SpawnTurnStreamCallback } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
@@ -401,9 +396,7 @@ export class Dispatcher {
         durationMs: result.usage.durationMs,
         error: result.errors[0],
       };
-      this.postAuditLog(workResult).catch((err) =>
-        log.warn("Audit post failed (voice)", { error: String(err) }),
-      );
+      this.postAuditLog(workResult).catch((err) => log.warn("Audit post failed (voice)", { error: String(err) }));
     }
 
     return result;

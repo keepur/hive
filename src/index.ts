@@ -600,7 +600,7 @@ async function main(): Promise<void> {
       registry,
       memoryManager,
       agentManager, // KPR-219: needed for the per-turn flag-on path
-      dispatcher,   // KPR-223: routes voice turns through the dispatcher (taskLedger + audit; dedup skipped)
+      dispatcher, // KPR-223: routes voice turns through the dispatcher (taskLedger + audit; dedup skipped)
     );
     await voiceAdapter.start();
     log.info("Voice adapter started", { port: config.voice.port });

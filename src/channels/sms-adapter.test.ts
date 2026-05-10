@@ -9,8 +9,7 @@ vi.mock("../logging/logger.js", () => ({
   }),
 }));
 
-import { SmsAdapter, type SmsAdapterPerTurnDeps } from "./sms-adapter.js";
-import type { AgentManager, TurnContext, TurnResult } from "../agents/agent-manager.js";
+import { SmsAdapter } from "./sms-adapter.js";
 import type { WorkItem, WorkResult } from "../types/work-item.js";
 
 // --- Test fixtures -----------------------------------------------------------
@@ -90,44 +89,6 @@ function wireQuoFetch(opts: { participant: string; msgId: string; text: string; 
   return { fetchStub, outboundCalls };
 }
 
-function makeAgentManagerStub(turnResult: Partial<TurnResult> = {}) {
-  const calls: Array<{ ctx: TurnContext }> = [];
-
-  const sessionStore = {
-    get: vi.fn().mockResolvedValue(undefined as string | undefined),
-    set: vi.fn().mockResolvedValue(undefined),
-  };
-
-  const spawnTurn = vi.fn(async (ctx: TurnContext) => {
-    calls.push({ ctx });
-    return {
-      finalMessage: "agent reply",
-      newSessionId: "session-1",
-      usage: {
-        inputTokens: 10,
-        outputTokens: 5,
-        cacheReadTokens: 0,
-        cacheCreationTokens: 0,
-        contextWindow: 200000,
-        costUsd: 0.001,
-        durationMs: 200,
-      },
-      errors: [],
-      ...turnResult,
-    } satisfies TurnResult;
-  });
-
-  const findAgentForThread = vi.fn().mockResolvedValue(undefined as string | undefined);
-
-  const stub: Pick<AgentManager, "spawnTurn" | "findAgentForThread" | "getSessionStore"> = {
-    spawnTurn: spawnTurn as unknown as AgentManager["spawnTurn"],
-    findAgentForThread: findAgentForThread as unknown as AgentManager["findAgentForThread"],
-    getSessionStore: () => sessionStore as any,
-  };
-
-  return { stub: stub as AgentManager, spawnTurn, findAgentForThread, sessionStore, calls };
-}
-
 const lineFixture = {
   id: "PN_LINE_1",
   label: "May (CEO)",
@@ -136,7 +97,7 @@ const lineFixture = {
 };
 
 // Helper: wait until a predicate is true, polling at short intervals.
-// Used because the per-turn-spawn path is fire-and-forget inside poll().
+// Used because poll() runs as fire-and-forget on adapter start.
 async function waitFor(pred: () => boolean, timeoutMs = 1000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -147,10 +108,12 @@ async function waitFor(pred: () => boolean, timeoutMs = 1000): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — KPR-223 simplified the adapter to a thin translator: poll Quo,
+// emit WorkItems via onWorkItem, deliver via Quo POST. Per-turn-spawn
+// branching now lives entirely inside the dispatcher.
 // ---------------------------------------------------------------------------
 
-describe("SmsAdapter (KPR-216)", () => {
+describe("SmsAdapter", () => {
   let stoppers: Array<() => Promise<void>> = [];
 
   beforeEach(() => {
@@ -164,12 +127,12 @@ describe("SmsAdapter (KPR-216)", () => {
     vi.useRealTimers();
   });
 
-  describe("legacy path (perTurn deps absent or perTurnSpawnEnabled=false)", () => {
-    it("falls back to onWorkItem callback when perTurn deps are not provided", async () => {
+  describe("poll() emits WorkItems via onWorkItem", () => {
+    it("emits a WorkItem for each incoming message", async () => {
       const { fetchStub } = wireQuoFetch({
         participant: "+15551112222",
-        msgId: "MSG_LEGACY_1",
-        text: "hi from legacy",
+        msgId: "MSG_1",
+        text: "hi",
         lineNumber: lineFixture.number,
       });
 
@@ -186,7 +149,7 @@ describe("SmsAdapter (KPR-216)", () => {
       const item = onWorkItem.mock.calls[0]![0] as WorkItem;
       expect(item.source.kind).toBe("sms");
       expect(item.source.id).toBe(lineFixture.id);
-      expect(item.text).toContain("hi from legacy");
+      expect(item.text).toContain("hi");
       expect(item.threadId).toBe(`sms:${lineFixture.id}:+15551112222`);
 
       // Conversations + messages both fetched; no POST yet (delivery is the dispatcher's job).
@@ -195,218 +158,28 @@ describe("SmsAdapter (KPR-216)", () => {
       expect(calls.some((u) => u.includes("/messages") && !u.includes("?"))).toBe(false);
     });
 
-    it("falls back to onWorkItem callback when perTurnSpawnEnabled is false", async () => {
+    it("uses slackChannel as the routing label when provided", async () => {
       wireQuoFetch({
-        participant: "+15551112223",
-        msgId: "MSG_LEGACY_2",
-        text: "still legacy",
-        lineNumber: lineFixture.number,
-      });
-
-      const { stub: agentManager, spawnTurn } = makeAgentManagerStub();
-      const perTurn: SmsAdapterPerTurnDeps = {
-        agentManager,
-        defaultAgentId: "default-agent",
-        perTurnSpawnEnabled: false,
-      };
-
-      const adapter = new SmsAdapter("quo-key-x", [lineFixture], perTurn);
-      stoppers.push(() => adapter.stop());
-
-      const onWorkItem = vi.fn();
-      await adapter.start(onWorkItem);
-
-      await waitFor(() => onWorkItem.mock.calls.length > 0);
-
-      expect(onWorkItem).toHaveBeenCalledTimes(1);
-      // spawnTurn must NOT be invoked when the flag is false.
-      expect(spawnTurn).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("per-turn path (perTurnSpawnEnabled=true)", () => {
-    it("calls agentManager.spawnTurn and delivers the resulting text via Quo POST /messages", async () => {
-      const { outboundCalls } = wireQuoFetch({
         participant: "+15553334444",
-        msgId: "MSG_PT_1",
-        text: "what's the status",
-        lineNumber: lineFixture.number,
-      });
-
-      const {
-        stub: agentManager,
-        spawnTurn,
-        sessionStore,
-        calls,
-      } = makeAgentManagerStub({
-        finalMessage: "All systems nominal.",
-      });
-
-      const adapter = new SmsAdapter("quo-key-y", [lineFixture], {
-        agentManager,
-        defaultAgentId: "default-agent",
-        perTurnSpawnEnabled: true,
-      });
-      stoppers.push(() => adapter.stop());
-
-      const onWorkItem = vi.fn();
-      await adapter.start(onWorkItem);
-
-      // Wait for the fire-and-forget per-turn spawn → Quo POST round trip.
-      await waitFor(() => outboundCalls.length > 0);
-
-      // Legacy callback must NOT fire when per-turn is on.
-      expect(onWorkItem).not.toHaveBeenCalled();
-
-      // spawnTurn invoked exactly once with the correct TurnContext.
-      expect(spawnTurn).toHaveBeenCalledTimes(1);
-      const ctx = calls[0]!.ctx;
-      expect(ctx.agentId).toBe("default-agent");
-      expect(ctx.channel).toBe("sms");
-      expect(ctx.channelId).toBe(lineFixture.id);
-      expect(ctx.threadId).toBe(`sms:${lineFixture.id}:+15553334444`);
-      expect(ctx.workItem.text).toContain("what's the status");
-      expect(ctx.sessionId).toBeUndefined();
-
-      // Delivery posted the agent's reply back to the original sender.
-      expect(outboundCalls).toHaveLength(1);
-      expect(outboundCalls[0]!.body).toMatchObject({
-        from: lineFixture.id,
-        to: ["+15553334444"],
-        content: "All systems nominal.",
-      });
-
-      expect(sessionStore.get).toHaveBeenCalledWith("default-agent", `sms:${lineFixture.id}:+15553334444`);
-    });
-
-    it("resolves a continued agent via findAgentForThread and prefers it over the default", async () => {
-      wireQuoFetch({
-        participant: "+15555556666",
-        msgId: "MSG_PT_2",
-        text: "follow up",
-        lineNumber: lineFixture.number,
-      });
-
-      const { stub: agentManager, spawnTurn, findAgentForThread, calls } = makeAgentManagerStub();
-      // Pretend this thread is already attached to a non-default agent.
-      findAgentForThread.mockResolvedValueOnce("rae");
-
-      const adapter = new SmsAdapter("quo-key-z", [lineFixture], {
-        agentManager,
-        defaultAgentId: "default-agent",
-        perTurnSpawnEnabled: true,
-      });
-      stoppers.push(() => adapter.stop());
-
-      await adapter.start(vi.fn());
-      await waitFor(() => spawnTurn.mock.calls.length > 0);
-
-      expect(findAgentForThread).toHaveBeenCalledWith(`sms:${lineFixture.id}:+15555556666`);
-      expect(calls[0]!.ctx.agentId).toBe("rae");
-    });
-
-    it("forwards stored sessionId so the SDK can resume on subsequent turns", async () => {
-      wireQuoFetch({
-        participant: "+15557778888",
-        msgId: "MSG_PT_3",
-        text: "still here",
-        lineNumber: lineFixture.number,
-      });
-
-      const { stub: agentManager, spawnTurn, sessionStore, calls } = makeAgentManagerStub();
-      sessionStore.get.mockResolvedValueOnce("session-resume-xyz");
-
-      const adapter = new SmsAdapter("quo-key-r", [lineFixture], {
-        agentManager,
-        defaultAgentId: "default-agent",
-        perTurnSpawnEnabled: true,
-      });
-      stoppers.push(() => adapter.stop());
-
-      await adapter.start(vi.fn());
-      await waitFor(() => spawnTurn.mock.calls.length > 0);
-
-      expect(calls[0]!.ctx.sessionId).toBe("session-resume-xyz");
-    });
-
-    it("skips delivery when spawnTurn returns an empty finalMessage (no Quo POST)", async () => {
-      const { outboundCalls } = wireQuoFetch({
-        participant: "+15559990000",
-        msgId: "MSG_PT_4",
+        msgId: "MSG_2",
         text: "ping",
         lineNumber: lineFixture.number,
       });
 
-      const { stub: agentManager } = makeAgentManagerStub({ finalMessage: "" });
-
-      const adapter = new SmsAdapter("quo-key-e", [lineFixture], {
-        agentManager,
-        defaultAgentId: "default-agent",
-        perTurnSpawnEnabled: true,
-      });
+      const adapter = new SmsAdapter("quo-key-y", [lineFixture]);
       stoppers.push(() => adapter.stop());
 
-      await adapter.start(vi.fn());
-      // Give the fire-and-forget enough time to settle.
-      await new Promise((r) => setTimeout(r, 80));
+      const onWorkItem = vi.fn();
+      await adapter.start(onWorkItem);
+      await waitFor(() => onWorkItem.mock.calls.length > 0);
 
-      expect(outboundCalls).toHaveLength(0);
+      const item = onWorkItem.mock.calls[0]![0] as WorkItem;
+      // routeLabel = slackChannel (lineFixture.slackChannel === "quo-may").
+      expect(item.source.label).toBe("quo-may");
     });
   });
 
-  describe("flag toggling between adapter instances", () => {
-    it("two adapters with opposite flag settings route the same input to different paths", async () => {
-      // Adapter A: perTurnSpawnEnabled=false → onWorkItem path
-      // Adapter B: perTurnSpawnEnabled=true  → spawnTurn path
-      const { stub: amA, spawnTurn: spawnA } = makeAgentManagerStub();
-      const { stub: amB, spawnTurn: spawnB } = makeAgentManagerStub();
-
-      // First adapter
-      const fetchA = wireQuoFetch({
-        participant: "+15551110001",
-        msgId: "MSG_TOG_A",
-        text: "to legacy",
-        lineNumber: lineFixture.number,
-      });
-      const adapterA = new SmsAdapter("k1", [lineFixture], {
-        agentManager: amA,
-        defaultAgentId: "default-agent",
-        perTurnSpawnEnabled: false,
-      });
-      stoppers.push(() => adapterA.stop());
-      const cbA = vi.fn();
-      await adapterA.start(cbA);
-      await waitFor(() => cbA.mock.calls.length > 0);
-      expect(spawnA).not.toHaveBeenCalled();
-      expect(cbA).toHaveBeenCalledTimes(1);
-
-      // Reset fetch for adapter B
-      vi.unstubAllGlobals();
-      const fetchB = wireQuoFetch({
-        participant: "+15551110002",
-        msgId: "MSG_TOG_B",
-        text: "to per-turn",
-        lineNumber: lineFixture.number,
-      });
-      const adapterB = new SmsAdapter("k2", [lineFixture], {
-        agentManager: amB,
-        defaultAgentId: "default-agent",
-        perTurnSpawnEnabled: true,
-      });
-      stoppers.push(() => adapterB.stop());
-      const cbB = vi.fn();
-      await adapterB.start(cbB);
-      await waitFor(() => spawnB.mock.calls.length > 0 || fetchB.outboundCalls.length > 0);
-
-      expect(cbB).not.toHaveBeenCalled();
-      expect(spawnB).toHaveBeenCalledTimes(1);
-
-      // Sanity: each fetch stub only saw its own call set.
-      expect(fetchA.fetchStub).toHaveBeenCalled();
-    });
-  });
-
-  describe("deliver() (Quo POST shape — independent of per-turn flag)", () => {
+  describe("deliver() (Quo POST shape)", () => {
     it("posts to /messages with from=phoneNumberId, to=[sender], content=text", async () => {
       const { outboundCalls } = wireQuoFetch({
         participant: "x",
@@ -466,8 +239,3 @@ describe("SmsAdapter (KPR-216)", () => {
     });
   });
 });
-
-// Note: integration test (round-trip Sms → real-ish AgentManager → stubbed
-// AgentRunner → Quo POST) lives in `sms-adapter.integration.test.ts` so its
-// module-level mocks for AgentManager's deps don't affect this file's
-// black-box adapter tests above.

@@ -33,10 +33,7 @@ export class SmsAdapter implements ChannelAdapter {
   private lines: SmsLine[];
   private interval: ReturnType<typeof setInterval> | null = null;
 
-  constructor(
-    apiKey: string,
-    lines: Array<{ id: string; label: string; number: string; slackChannel?: string }>,
-  ) {
+  constructor(apiKey: string, lines: Array<{ id: string; label: string; number: string; slackChannel?: string }>) {
     this.apiKey = apiKey;
     this.lines = lines.map((l) => ({
       id: l.id,

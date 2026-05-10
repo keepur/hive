@@ -93,7 +93,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
   return { spawnTurn, sessionStoreGet, sessionStoreSet, calls };
 }
 
-function makeVoiceAdapter(am?: AgentManagerStub) {
+function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: ReturnType<typeof vi.fn> }) {
   const registry: any = {
     get: vi.fn((id: string) =>
       id === "mokie" ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-5" } : undefined,
@@ -112,7 +112,7 @@ function makeVoiceAdapter(am?: AgentManagerStub) {
         }),
       }
     : undefined;
-  return new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager);
+  return new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager, dispatcher as any);
 }
 
 class MockServerResponse extends EventEmitter {
@@ -505,6 +505,39 @@ describe("VoiceAdapter — flag ON (spawnTurnViaAgentManager)", () => {
     expect(res.statusCode).toBe(503);
     const body = JSON.parse(res.written.join(""));
     expect(body.error).toBe("Voice unavailable");
+  });
+});
+
+describe("VoiceAdapter — dispatcher.routeVoiceTurn wiring (KPR-223)", () => {
+  beforeEach(() => {
+    configRef.current.agentManager.perTurnSpawn.voice = true;
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("routes through dispatcher.routeVoiceTurn when dispatcher is wired", async () => {
+    const am = makeAgentManager({ finalMessage: "via dispatcher" });
+    const routeVoiceTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      // Mirror the AgentManager mock so the runOnce path produces a TurnResult.
+      return am.spawnTurn(ctx, onStream);
+    });
+    const dispatcher = { routeVoiceTurn };
+    const adapter = makeVoiceAdapter(am, dispatcher);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    expect(routeVoiceTurn).toHaveBeenCalledTimes(1);
+    // Inner spawnTurn still ran (because the test's routeVoiceTurn delegates to it).
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+    // Voice-specific TurnContext shape preserved.
+    const ctx = routeVoiceTurn.mock.calls[0]![0]!;
+    expect(ctx.agentId).toBe("mokie");
+    expect(ctx.channel).toBe("voice");
+    expect(ctx.threadId).toBe("voice:call-abc-123");
   });
 });
 
