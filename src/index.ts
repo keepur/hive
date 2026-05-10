@@ -433,7 +433,10 @@ async function main(): Promise<void> {
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
-  const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack");
+  const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack", config.defaultAgent, undefined, {
+    agentManager,
+    perTurnSpawnEnabled: config.agentManager.perTurnSpawn.slack,
+  });
   dispatcher.registerAdapter(slackAdapter);
   dispatcher.setSlackAdapter(slackAdapter);
   await slackAdapter.start((item) => {
@@ -441,7 +444,7 @@ async function main(): Promise<void> {
       log.error("Slack dispatch failed", { error: String(err), source: item.source.label });
     });
   });
-  log.info("Slack adapter connected");
+  log.info("Slack adapter connected", { perTurnSpawn: config.agentManager.perTurnSpawn.slack });
 
   // Audit routing: every agent mirrors non-Slack conversations to their own
   // homeBase channel. The global slack.auditChannel (if set) is the fallback
