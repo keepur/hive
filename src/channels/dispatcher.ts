@@ -1,13 +1,20 @@
 import { createLogger } from "../logging/logger.js";
-import type { WorkItem, WorkResult } from "../types/work-item.js";
+import { config } from "../config.js";
+import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
-import type { AgentManager } from "../agents/agent-manager.js";
+import type {
+  AgentManager,
+  TurnContext,
+  TurnResult,
+  SpawnTurnStreamCallback,
+} from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
 import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
+import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
 
 const log = createLogger("dispatcher");
@@ -201,7 +208,9 @@ export class Dispatcher {
     // 4. Full agent processing
     await adapter?.onProcessingStart?.(item, agentId);
     try {
-      const runResult = await this.agentManager.sendMessage(agentId, item);
+      const runResult = this.getPerTurnFlag(item.source.kind)
+        ? await this.runPerTurnDispatch(agentId, item)
+        : await this.agentManager.sendMessage(agentId, item);
 
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
@@ -283,6 +292,121 @@ export class Dispatcher {
     for (const [id, ts] of this.recentMessageIds) {
       if (ts < cutoff) this.recentMessageIds.delete(id);
     }
+  }
+
+  /**
+   * KPR-223: per-channel per-turn-spawn flag detection. Maps WS adapter's
+   * ChannelKind `"app"` onto the config flag key `ws`. Voice is excluded —
+   * voice routes through {@link routeVoiceTurn}, not through the
+   * dispatch()/dispatchToAgent branch.
+   */
+  private getPerTurnFlag(kind: ChannelKind): boolean {
+    if (kind === "sms") return config.agentManager.perTurnSpawn.sms;
+    if (kind === "slack") return config.agentManager.perTurnSpawn.slack;
+    if (kind === "app") return config.agentManager.perTurnSpawn.ws;
+    return false; // voice, team, scheduler, imessage, internal — not routed through this branch
+  }
+
+  /**
+   * KPR-223: per-turn-spawn dispatch helper. When the per-channel flag is on
+   * the dispatcher calls this instead of `agentManager.sendMessage`. Spawns a
+   * fresh `query()` via {@link AgentManager.spawnTurn} with `options.resume =
+   * sessionId` and converts the resulting {@link TurnResult} into the
+   * {@link RunResult} shape that the rest of dispatch expects.
+   *
+   * The per-turn path's TurnUsage doesn't carry llmMs/toolMs/toolCalls/
+   * toolSummary/streamed/compactions, so those fields are zero/empty here.
+   * KPR-220 will revisit telemetry uniformity once the long-lived path
+   * retires.
+   */
+  private async runPerTurnDispatch(agentId: string, item: WorkItem): Promise<RunResult> {
+    const threadId = item.threadId ?? item.id;
+    const sessionId = await this.agentManager.getSessionStore().get(agentId, threadId);
+
+    const ctx: TurnContext = {
+      agentId,
+      sessionId,
+      channelId: item.source.id,
+      threadId,
+      workItem: item,
+      channel: item.source.kind,
+    };
+
+    const turn = await this.agentManager.spawnTurn(ctx);
+
+    return {
+      text: turn.finalMessage,
+      sessionId: turn.newSessionId,
+      costUsd: turn.usage.costUsd,
+      durationMs: turn.usage.durationMs,
+      inputTokens: turn.usage.inputTokens,
+      outputTokens: turn.usage.outputTokens,
+      cacheReadTokens: turn.usage.cacheReadTokens,
+      cacheCreationTokens: turn.usage.cacheCreationTokens,
+      contextWindow: turn.usage.contextWindow,
+      // Per-turn path doesn't surface these breakdowns; TurnUsage doesn't carry them.
+      // Telemetry rows for per-turn dispatch will show 0 for the *Ms/toolCalls fields.
+      // KPR-220 will revisit telemetry uniformity once long-lived path retires.
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: "",
+      streamed: false,
+      compactions: 0,
+      error: turn.errors[0],
+    };
+  }
+
+  /**
+   * KPR-223: voice per-turn routing. The voice adapter cannot emit through
+   * `onWorkItem` (synchronous HTTP request/response with Vapi requires
+   * writing the response in the same call), so the dispatcher exposes this
+   * direct entry point. Applies taskLedger + audit log; **skips dedup** —
+   * voice WorkItem.id is the Vapi callId, which is reused across many turns
+   * within a single call, and adding callId to the dedup map would silently
+   * drop turns 2+ inside the 60s TTL. Voice is implicitly serialized by
+   * Vapi (one POST per turn).
+   */
+  async routeVoiceTurn(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
+    // No dedup — Q4 invariant. See class comment above.
+    const tracked = this.taskLedger?.shouldTrack(ctx.workItem) ?? false;
+    if (tracked) {
+      this.taskLedger!.onDispatch(ctx.workItem, ctx.agentId).catch((err) =>
+        log.warn("Task ledger dispatch failed (voice)", { error: String(err) }),
+      );
+    }
+
+    const result = await this.agentManager.spawnTurn(ctx, onStream);
+
+    if (tracked) {
+      const workResult: WorkResult = {
+        text: result.finalMessage,
+        agentId: ctx.agentId,
+        workItem: ctx.workItem,
+        costUsd: result.usage.costUsd,
+        durationMs: result.usage.durationMs,
+        error: result.errors[0],
+      };
+      this.taskLedger!.onComplete(workResult).catch((err) =>
+        log.warn("Task ledger complete failed (voice)", { error: String(err) }),
+      );
+    }
+
+    if (this.auditAdapter && ctx.workItem.source.kind !== this.auditAdapter.kind) {
+      const workResult: WorkResult = {
+        text: result.finalMessage,
+        agentId: ctx.agentId,
+        workItem: ctx.workItem,
+        costUsd: result.usage.costUsd,
+        durationMs: result.usage.durationMs,
+        error: result.errors[0],
+      };
+      this.postAuditLog(workResult).catch((err) =>
+        log.warn("Audit post failed (voice)", { error: String(err) }),
+      );
+    }
+
+    return result;
   }
 
   private async resolveAgents(item: WorkItem): Promise<ResolvedAgent[]> {
@@ -506,7 +630,9 @@ export class Dispatcher {
     const adapter = this.adapters.get(effectiveItem.source.adapterId ?? effectiveItem.source.kind);
 
     try {
-      const runResult = await this.agentManager.sendMessage(agentId, effectiveItem);
+      const runResult = this.getPerTurnFlag(effectiveItem.source.kind)
+        ? await this.runPerTurnDispatch(agentId, effectiveItem)
+        : await this.agentManager.sendMessage(agentId, effectiveItem);
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
