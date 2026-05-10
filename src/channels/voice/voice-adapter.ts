@@ -13,6 +13,7 @@ import {
 import type { AgentRegistry } from "../../agents/agent-registry.js";
 import type { MemoryManager } from "../../memory/memory-manager.js";
 import type { AgentManager, SpawnTurnStreamCallback, TurnContext, TurnResult } from "../../agents/agent-manager.js";
+import type { Dispatcher } from "../../channels/dispatcher.js";
 import type { WorkItem } from "../../types/work-item.js";
 import { config } from "../../config.js";
 
@@ -52,6 +53,14 @@ export class VoiceAdapter {
      * is on, we fall through to the legacy path with a warning.
      */
     private agentManager?: AgentManager,
+    /**
+     * KPR-223: optional dispatcher reference. When wired, voice turns route
+     * through `dispatcher.routeVoiceTurn` (which applies taskLedger + audit
+     * log; dedup is intentionally skipped). Falls back to direct
+     * `agentManager.spawnTurn` when absent — preserves unit-test wiring
+     * that doesn't need the full dispatcher.
+     */
+    private dispatcher?: Dispatcher,
   ) {}
 
   async start(): Promise<void> {
@@ -500,7 +509,12 @@ export class VoiceAdapter {
       { ok: true; result: TurnResult; bytesSent: boolean } | { ok: false; reason: string; bytesSent: boolean }
     > => {
       try {
-        const result = await agentManager.spawnTurn(spawnCtx, onStream);
+        // KPR-223: route through dispatcher when wired (applies taskLedger +
+        // audit log; dedup intentionally skipped — see Dispatcher.routeVoiceTurn).
+        // Fall back to direct spawnTurn for unit-test wiring without dispatcher.
+        const result = this.dispatcher
+          ? await this.dispatcher.routeVoiceTurn(spawnCtx, onStream)
+          : await agentManager.spawnTurn(spawnCtx, onStream);
         if (result.errors.length > 0) {
           return { ok: false, reason: result.errors[0]!, bytesSent: headersSent };
         }
