@@ -6,8 +6,22 @@ const log = createLogger("memory-store");
 
 export class MemoryStore {
   private collection!: Collection<MemoryRecord>;
+  /**
+   * KPR-213 invalidation hook. Fired after any mutation that may affect an
+   * agent's hot-tier composition (save, update, delete, pin, unpin,
+   * setTier, supersede, purge, summary, flag-for-review). The callback is
+   * synchronous + best-effort; callers (e.g. PrefixCache.invalidateAgent)
+   * mutate in-memory state and don't await Mongo. Bulk-id paths that don't
+   * have an agentId in scope (markSuperseded, markSummarized, setTierBulk)
+   * fire `null` and the listener should treat that as "invalidate all".
+   */
+  private onMutate?: (agentId: string | null, reason: string) => void;
 
   constructor(private db: Db) {}
+
+  setOnMutate(cb: (agentId: string | null, reason: string) => void): void {
+    this.onMutate = cb;
+  }
 
   async init(): Promise<void> {
     this.collection = this.db.collection<MemoryRecord>("agent_memory");
@@ -52,6 +66,7 @@ export class MemoryStore {
     };
     const result = await this.collection.insertOne(record as WithoutId<MemoryRecord>);
     record._id = result.insertedId;
+    this.onMutate?.(agentId, "memory-save");
     return record;
   }
 
@@ -73,21 +88,28 @@ export class MemoryStore {
     if (qdrantPointId) updates.qdrantPointId = qdrantPointId;
 
     const result = await this.collection.findOneAndUpdate({ _id: id }, { $set: updates }, { returnDocument: "after" });
+    if (result) this.onMutate?.(result.agentId, "memory-update");
     return result;
   }
 
   async pin(id: ObjectId): Promise<boolean> {
+    const before = await this.collection.findOne({ _id: id }, { projection: { agentId: 1 } });
     const result = await this.collection.updateOne({ _id: id }, { $set: { pinned: true, tier: "hot" as MemoryTier } });
+    if (result.modifiedCount > 0 && before) this.onMutate?.(before.agentId, "memory-pin");
     return result.modifiedCount > 0;
   }
 
   async unpin(id: ObjectId): Promise<boolean> {
+    const before = await this.collection.findOne({ _id: id }, { projection: { agentId: 1 } });
     const result = await this.collection.updateOne({ _id: id }, { $set: { pinned: false } });
+    if (result.modifiedCount > 0 && before) this.onMutate?.(before.agentId, "memory-unpin");
     return result.modifiedCount > 0;
   }
 
   async delete(id: ObjectId): Promise<MemoryRecord | null> {
-    return this.collection.findOneAndDelete({ _id: id });
+    const result = await this.collection.findOneAndDelete({ _id: id });
+    if (result) this.onMutate?.(result.agentId, "memory-delete");
+    return result;
   }
 
   async touchAccess(ids: ObjectId[]): Promise<void> {
@@ -197,12 +219,18 @@ export class MemoryStore {
   async markSuperseded(ids: ObjectId[], supersededBy: ObjectId): Promise<void> {
     if (ids.length === 0) return;
     await this.collection.updateMany({ _id: { $in: ids } }, { $set: { supersededBy, tier: "cold" as MemoryTier } });
+    // KPR-213: bulk path — agentId not in scope, listener treats null as "invalidate all".
+    this.onMutate?.(null, "memory-superseded");
   }
 
   /** Flag records for human review (unresolvable contradictions) */
   async flagForReview(ids: ObjectId[]): Promise<void> {
     if (ids.length === 0) return;
     await this.collection.updateMany({ _id: { $in: ids } }, { $set: { needsReview: true } });
+    // KPR-213: review-flagged records no longer surface via getFactsAndDecisionsByTopic;
+    // hot-tier sort doesn't change but downstream consumers (autoDream) do.
+    // Fire null-agent invalidation as a precaution.
+    this.onMutate?.(null, "memory-flag-review");
   }
 
   async getAllForAgent(agentId: string): Promise<MemoryRecord[]> {
@@ -210,12 +238,17 @@ export class MemoryStore {
   }
 
   async setTier(id: ObjectId, tier: MemoryTier): Promise<void> {
+    const before = await this.collection.findOne({ _id: id }, { projection: { agentId: 1 } });
     await this.collection.updateOne({ _id: id }, { $set: { tier } });
+    if (before) this.onMutate?.(before.agentId, "memory-set-tier");
   }
 
   async setTierBulk(ids: ObjectId[], tier: MemoryTier): Promise<void> {
     if (ids.length === 0) return;
     await this.collection.updateMany({ _id: { $in: ids } }, { $set: { tier } });
+    // KPR-213: bulk path — fire null-agent (invalidate all). Tier moves can
+    // promote/demote records into/out of hot-tier and thus change the prefix.
+    this.onMutate?.(null, "memory-set-tier-bulk");
   }
 
   async getColdByTopic(agentId: string, topic: string): Promise<MemoryRecord[]> {
@@ -241,6 +274,9 @@ export class MemoryStore {
       { _id: { $in: ids } },
       { $set: { summarized: true, summaryGroup: summaryGroupId, summarizedAt: new Date() } },
     );
+    // KPR-213: summarized records are filtered out of getByTiersForAgent;
+    // bulk path so we invalidate all.
+    this.onMutate?.(null, "memory-summarized");
   }
 
   async deleteSummarizedOlderThan(agentId: string, before: Date): Promise<number> {
@@ -249,6 +285,7 @@ export class MemoryStore {
       summarized: true,
       summarizedAt: { $lt: before },
     });
+    if (result.deletedCount > 0) this.onMutate?.(agentId, "memory-delete-summarized");
     return result.deletedCount;
   }
 
@@ -279,6 +316,7 @@ export class MemoryStore {
     const result = await this.collection.updateMany(query, {
       $set: { purged: true, purgedAt: new Date() },
     });
+    if (result.modifiedCount > 0) this.onMutate?.(agentId, "memory-purge");
     return result.modifiedCount;
   }
 
@@ -289,6 +327,7 @@ export class MemoryStore {
 
     const ids = records.map((r) => r._id!);
     await this.collection.deleteMany({ _id: { $in: ids } });
+    this.onMutate?.(agentId, "memory-delete-purged");
     return records;
   }
 

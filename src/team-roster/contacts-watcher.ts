@@ -21,9 +21,16 @@ export class ContactsWatcher {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastPollTime = new Date();
 
+  /**
+   * @param onChange Optional second-stage callback fired after the team-cache
+   *   humans-slice invalidation. KPR-213 uses this to invalidate the prefix
+   *   cache (the team summary in every agent's prefix is a function of the
+   *   humans slice).
+   */
   constructor(
     private db: Db,
     private cache: TeamCache,
+    private onChange?: () => void,
   ) {}
 
   async start(): Promise<void> {
@@ -32,6 +39,7 @@ export class ContactsWatcher {
       this.changeStream.on("change", () => {
         log.debug("contacts changed (change stream), invalidating humans cache");
         this.cache.invalidateHumans();
+        this.onChange?.();
       });
       this.changeStream.on("error", (err) => {
         log.warn("contacts change stream error, falling back to polling", { error: String(err) });
@@ -56,6 +64,7 @@ export class ContactsWatcher {
         if (changed > 0) {
           log.debug("contacts changed (poll), invalidating humans cache", { changed });
           this.cache.invalidateHumans();
+          this.onChange?.();
           this.lastPollTime = new Date();
         }
       } catch (err) {

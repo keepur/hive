@@ -206,8 +206,9 @@ The operator repo has the same shape as a skill registry — a flat `skills/<ski
 
 - After editing MCP server source: `npm run build` (tsc → `dist/`) for dev, or `npm run bundle` (esbuild → `pkg/`) for the publish-ready artifact. The runtime engine in `<instance>/.hive/` runs from `pkg/server.min.js`. Restart Hive (`launchctl kickstart -k gui/$(id -u)/com.hive.<id>.agent`) to pick up changes — or for agent-definition changes only, send `SIGUSR1` (no restart).
 - Agent definitions are DB-native — edit via admin MCP tools or REST API, changes take effect on next SIGUSR1 reload
+- **Prefix cache (KPR-213):** assembled system-prompt prefixes are cached in-memory per agent and **invalidated automatically** on every write path that affects them — agent-def updates, memory writes (FS-style and structured-tier), constitution edits, team-roster changes, skill changes. SIGUSR1 still flushes the cache + reloads the registry, but it is **no longer load-bearing for prefix freshness** — it stays as an explicit operator escape hatch. Cache stats are heartbeated to `db.telemetry` (kind=`prefix_cache_stats`) every 30s and surfaced via `hive doctor`.
 - `hive.yaml` and `.env` are gitignored — exist separately in dev and deploy dirs
 - Slack file downloads: auth header stripped on redirect — must follow redirects manually
 - Thread deduplication: 60s window prevents double-processing
 - Agent concurrency default: 3 threads. Excess messages deferred and retried on sweep.
-- MongoDB collections: `memory`, `memory_versions`, `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `model_overrides`, `devices`, `agent_callbacks`, `contacts`
+- MongoDB collections: `memory`, `memory_versions`, `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `model_overrides`, `devices`, `agent_callbacks`, `contacts`, `telemetry` (prefix-cache stats heartbeat, KPR-213)

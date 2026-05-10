@@ -21,6 +21,7 @@ import { ConversationIndex } from "../search/conversation-index.js";
 import type { ActivityLogger } from "../activity/activity-logger.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
+import type { PrefixCache } from "./prefix-cache.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -69,13 +70,14 @@ export class AgentManager {
   private activityLogger?: ActivityLogger;
   private prefetcher?: CodeIndexPrefetcher;
   private teamRoster?: TeamRoster;
+  private prefixCache?: PrefixCache;
   private db: Db;
   // Keyed by agentId → list of currently in-flight WorkItems (one per active thread).
   private activeWorkItems = new Map<string, WorkItem[]>();
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
 
-  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, turnTelemetryStore?: TurnTelemetryStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster) {
+  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, turnTelemetryStore?: TurnTelemetryStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, prefixCache?: PrefixCache) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
@@ -87,9 +89,15 @@ export class AgentManager {
     this.activityLogger = activityLogger;
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
+    this.prefixCache = prefixCache;
     this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
+  }
+
+  /** KPR-213: expose the cache so out-of-band consumers (doctor heartbeat, etc.) can read stats. */
+  getPrefixCache(): PrefixCache | undefined {
+    return this.prefixCache;
   }
 
   getPlugins(): LoadedPlugin[] {
@@ -104,7 +112,7 @@ export class AgentManager {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db);
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache);
   }
 
   reloadSkills(): void {

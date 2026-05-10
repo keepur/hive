@@ -18,6 +18,7 @@ import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
+import { PrefixCache } from "./agents/prefix-cache.js";
 import { TeamCache } from "./team-roster/team-cache.js";
 import { TeamRoster } from "./team-roster/team-roster.js";
 import { ContactsWatcher } from "./team-roster/contacts-watcher.js";
@@ -170,18 +171,47 @@ async function main(): Promise<void> {
   // slice invalidates via ContactsWatcher.
   const teamCache = new TeamCache(db);
   const teamRoster = new TeamRoster(teamCache);
-  registry.onPostReload(() => teamCache.invalidateAgents());
-  const contactsWatcher = new ContactsWatcher(db, teamCache);
+  // KPR-213: write-through prefix cache. Singleton owned at the top level
+  // so every wiring point that mutates a prefix-affecting input can call
+  // invalidateAgent / invalidateAll synchronously. AgentRunner reads through
+  // it via AgentManager.
+  const prefixCache = new PrefixCache();
+  registry.onPostReload(() => {
+    teamCache.invalidateAgents();
+    // Agent-def updates are global from the prefix's perspective: the team
+    // summary may have changed (subsumes per-agent invalidation since the
+    // team summary appears in every agent's prefix), and the agent's own
+    // soul/systemPrompt/coreServers may have changed. invalidateAll is the
+    // simpler, correct choice.
+    prefixCache.invalidateAll("agent-def-update");
+  });
+  const contactsWatcher = new ContactsWatcher(db, teamCache, () => prefixCache.invalidateAll("team-roster-humans"));
   await contactsWatcher.start();
 
   // Initialize core systems
   const memoryManager = new MemoryManager(db);
   await memoryManager.init();
+  // KPR-213: FS-style memory writes (constitution, agent memory.md) flow
+  // through MemoryManager.write — wire prefix invalidation here. Path-aware:
+  // shared/* invalidates all; agents/<id>/* invalidates that agent.
+  memoryManager.setOnWrite((path, reason) => {
+    const m = path.match(/^agents\/([^/]+)\//);
+    if (m) prefixCache.invalidateAgent(m[1], reason);
+    else prefixCache.invalidateAll(reason);
+  });
 
   // Structured memory lifecycle — always enabled
   const memoryStore = new MemoryStore(db);
   await memoryStore.init();
   memoryManager.memoryStore = memoryStore;
+  // KPR-213: structured-memory mutations from autoDream lifecycle and the
+  // knowledge-extractor go through this shared store instance (separate
+  // from the per-MCP stores — those wire onMutate themselves). Bulk-id
+  // paths pass `null` → invalidateAll.
+  memoryStore.setOnMutate((agentId, reason) => {
+    if (agentId === null) prefixCache.invalidateAll(reason);
+    else prefixCache.invalidateAgent(agentId, reason);
+  });
   const memoryEmbedder = new MemoryEmbedder();
   const memoryLifecycle = new MemoryLifecycle(
     memoryStore,
@@ -267,6 +297,7 @@ async function main(): Promise<void> {
     activityLogger,
     prefetcher,
     teamRoster,
+    prefixCache,
   );
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
@@ -331,6 +362,11 @@ async function main(): Promise<void> {
   // Watch skills/ directory for changes — debounced to 500ms
   if (existsSync(skillsDir)) {
     watch(skillsDir, { recursive: true }, () => {
+      // KPR-213: skill registry changes don't currently affect the prefix
+      // (skills are wired as SDK plugins, not into the prompt). Invalidate
+      // anyway so the cache stays consistent with the runtime view in case
+      // the toolkit section ever starts reflecting the skill index.
+      prefixCache.invalidateAll("skill-change");
       if (reloadTimer) clearTimeout(reloadTimer);
       reloadTimer = setTimeout(() => reload(), 500);
     });
@@ -349,6 +385,10 @@ async function main(): Promise<void> {
       const isSkillMd = typeof filename === "string" && filename.endsWith("SKILL.md");
       const filenameMissing = filename === null || filename === undefined;
       if (isSkillMd || filenameMissing) {
+        // KPR-213: per-agent skills also feed the toolkit section in the
+        // future; invalidate prefix cache for safety. Same call site as the
+        // global skills watch above.
+        prefixCache.invalidateAll("agent-skill-change");
         if (reloadTimer) clearTimeout(reloadTimer);
         reloadTimer = setTimeout(() => reload(), 500);
       }
@@ -356,9 +396,38 @@ async function main(): Promise<void> {
     log.info("Agent-private skills hot-reload enabled", { watched: agentsRoot });
   }
 
-  // SIGUSR1: manual hot-reload trigger
-  process.on("SIGUSR1", () => reload());
+  // SIGUSR1: manual hot-reload trigger. KPR-213: also flush the prefix cache.
+  // Operators historically used SIGUSR1 to force-fresh prefixes; the cache
+  // now invalidates automatically on every write path, so SIGUSR1 is no
+  // longer load-bearing for prefix freshness — it stays as an explicit
+  // escape hatch.
+  process.on("SIGUSR1", () => {
+    prefixCache.invalidateAll("sigusr1");
+    reload();
+  });
   log.info("Hot-reload enabled", { signal: "SIGUSR1" });
+
+  // KPR-213: heartbeat prefix-cache stats to Mongo so the out-of-process
+  // `hive doctor` CLI can render them. Doctor doesn't share memory with
+  // the engine. 30s cadence — same as agent-registry / contacts watchers.
+  const PREFIX_CACHE_HEARTBEAT_MS = 30_000;
+  const telemetryCollection = db.collection("telemetry");
+  const writeStats = async () => {
+    try {
+      const s = prefixCache.stats();
+      await telemetryCollection.updateOne(
+        { kind: "prefix_cache_stats" },
+        { $set: { ...s, updatedAt: new Date() } },
+        { upsert: true },
+      );
+    } catch (err) {
+      log.warn("prefix-cache stats heartbeat failed", { error: String(err) });
+    }
+  };
+  // Initial write at startup so doctor sees zeros instead of "no telemetry".
+  await writeStats();
+  const prefixCacheHeartbeat = setInterval(writeStats, PREFIX_CACHE_HEARTBEAT_MS);
+  prefixCacheHeartbeat.unref();
 
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter

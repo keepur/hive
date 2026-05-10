@@ -16,7 +16,25 @@ import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildToolkitSection } from "./toolkit-section.js";
+import { buildPrefix } from "./prefix-builder.js";
+import type { PrefixCache } from "./prefix-cache.js";
+
+/**
+ * KPR-213: translate a memory path → prefix-cache invalidation scope.
+ *  - `agents/<id>/...` → invalidate that agent only.
+ *  - `shared/...` (notably `shared/constitution.md`) and anything else →
+ *    invalidate all agents (shared content is in every prefix).
+ * Module-scoped so the structured-memory MCP factory and the FS-memory
+ * MCP factory can call into the same logic without duplicating.
+ */
+function invalidatePrefixCacheByPath(cache: PrefixCache, path: string, reason: string): void {
+  const m = path.match(/^agents\/([^/]+)\//);
+  if (m) {
+    cache.invalidateAgent(m[1], reason);
+    return;
+  }
+  cache.invalidateAll(reason);
+}
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
@@ -242,8 +260,12 @@ export class AgentRunner {
   private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
   private workflowMcpServer?: ReturnType<typeof createWorkflowMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
+  // KPR-213: optional shared prefix cache. Production wires this in via
+  // index.ts; tests that don't pass one fall through to a direct buildPrefix
+  // call (no cache) so per-test isolation isn't a concern.
+  private prefixCache?: PrefixCache;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
@@ -252,114 +274,36 @@ export class AgentRunner {
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
     this.db = db;
+    this.prefixCache = prefixCache;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
-    // Prompt ordered for cache efficiency: static content first (cacheable prefix),
-    // dynamic content last (only invalidates suffix). API caches identical prefixes.
-    const parts: string[] = [];
-
-    // --- Static prefix (stable across turns → cacheable) ---
-
-    if (this.agentConfig.soul) {
-      parts.push(this.agentConfig.soul);
-    }
-
-    // Archetype card (static — cacheable prefix). Lives between soul and systemPrompt
-    // so the archetype defines the discipline and the agent's own systemPrompt reads
-    // as instance-specific flavor layered on top.
-    const archetypeDef = this.getArchetypeDef();
-    if (archetypeDef && this.agentConfig.archetypeConfig) {
-      try {
-        const card = archetypeDef.systemPromptCard({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-        });
-        if (card) parts.push(card);
-      } catch (err) {
-        log.error("Archetype systemPromptCard threw — omitting card", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-      }
-    }
-
-    parts.push(this.agentConfig.systemPrompt);
-
-    // Constitution is always loaded — non-negotiable team rules
-    const constitution = await this.memoryManager.read("shared/constitution.md");
-    if (constitution) {
-      parts.push(constitution);
-    }
-
-    // KPR-139: live team summary slotted right after the constitution and
-    // before the toolkit catalog. Replaces the static team table that used
-    // to live in shared/business-context.md.
-    if (this.teamRoster) {
-      try {
-        const teamSummary = await this.teamRoster.teamSummary();
-        if (teamSummary) parts.push(teamSummary);
-      } catch (err) {
-        log.warn("teamSummary failed; omitting from prompt", {
-          agent: this.agentConfig.id,
-          error: String(err),
-        });
-      }
-    }
-
-    // --- Semi-static (stable within a session, changes on restart) ---
-
-    // KPR-87: unified "Your toolkit" section listing SDK builtins, engine-auto-injected
-    // MCPs, capability MCPs (explicit core), and delegated capability MCPs. Replaces
-    // the prior split "Your tools" / "Available via subagents" blocks. The
-    // autoInjectedServers set MUST mirror the additions in filterCoreServers — keep
-    // both in sync (see comment there).
-    parts.push(
-      buildToolkitSection({
-        coreServerNames,
-        delegateServerNames: activeDelegates ?? [],
-        plugins: this.plugins,
-        autoInjectedServers: AgentRunner.autoInjectedServerNames(),
-      }),
-    );
-
-    // --- Dynamic suffix (changes per turn → not cached) ---
-
-    // Memory injection — prefer structured records, fall back to legacy blob
-    const hotTierPrompt = await this.memoryManager.getHotTierPrompt(
-      this.agentConfig.id,
-      config.memory.hotBudgetTokens,
-    );
-    if (hotTierPrompt) {
-      parts.push(hotTierPrompt);
-    } else {
-      // Legacy path — inject memory.md blob if structured records don't exist yet
-      const memoryDir = `agents/${this.agentConfig.id}`;
-      const memory = await this.memoryManager.read(`${memoryDir}/memory.md`);
-      if (memory) {
-        parts.push(`## Your Memory\n${memory}`);
-      }
-
-      // List available memory files so the agent knows what references it has
-      const memoryFiles = await this.memoryManager.list(memoryDir);
-      const mdFiles = memoryFiles.filter((f) => f.endsWith(".md") && f !== "memory.md");
-      if (mdFiles.length > 0) {
-        parts.push(
-          `## Available Memory Files\nYou have ${mdFiles.length} reference file(s) in your memory directory:\n` +
-          mdFiles.map((f) => `- ${memoryDir}/${f}`).join("\n") +
-          `\n\nRead relevant files via the memory MCP server (\`memory_read\`) before starting tasks that may relate to them.`,
-        );
-      }
-    }
+    // KPR-213: write-through prefix cache. coreServerNames + activeDelegates
+    // are stable per agent (derived from agent-def + autonomy gates, not from
+    // per-call inputs), so they're captured in the closure rather than baked
+    // into the cache key. If a future refactor causes them to vary per call,
+    // the audit invariant in §New module of the plan must be revisited and
+    // they must move into the cache key.
+    const buildContext = {
+      coreServerNames,
+      activeDelegateNames: activeDelegates ?? [],
+      memoryManager: this.memoryManager,
+      teamRoster: this.teamRoster,
+      plugins: this.plugins,
+      skillIndex: this.skillIndex,
+      prefetcher: this.prefetcher,
+      eventSubscribersJson: this.eventSubscribersJson,
+      autoInjectedServers: AgentRunner.autoInjectedServerNames(),
+    };
+    const prefix = this.prefixCache
+      ? await this.prefixCache.getOrBuild(this.agentConfig.id, () => buildPrefix(this.agentConfig, buildContext))
+      : await buildPrefix(this.agentConfig, buildContext);
 
     // Date/time last — changes every minute, so placing it at the end
-    // preserves the static prefix for prompt caching
+    // preserves the static prefix for prompt caching.
     const now = new Date();
     const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
-    parts.push(`**Current date/time**: ${pacific} (Pacific Time)`);
-
-    return parts.join("\n\n---\n\n");
+    return `${prefix}\n\n---\n\n**Current date/time**: ${pacific} (Pacific Time)`;
   }
 
 
@@ -1370,6 +1314,12 @@ export class AgentRunner {
           db: this.db,
           agentId: this.agentConfig.id,
           memoryScopes: this.resolveMemoryScopes(),
+          // KPR-213: write-through prefix cache invalidation. Path-aware:
+          // agents/<id>/... only invalidates that agent; shared/* (e.g.
+          // shared/constitution.md) invalidates everyone.
+          onWrite: this.prefixCache
+            ? (path, reason) => invalidatePrefixCacheByPath(this.prefixCache!, path, reason)
+            : undefined,
         });
       }
       mcpServers["memory"] = this.memoryMcpServer;
@@ -1492,6 +1442,14 @@ export class AgentRunner {
           context: this.structuredMemoryContextRef,
           qdrantUrl: process.env.QDRANT_URL,
           ollamaUrl: process.env.OLLAMA_URL,
+          // KPR-213: structured-memory mutations affect the agent's hot-tier
+          // and therefore its prefix. Bulk paths pass null → invalidateAll.
+          onMutate: this.prefixCache
+            ? (mutAgentId, reason) => {
+                if (mutAgentId === null) this.prefixCache!.invalidateAll(reason);
+                else this.prefixCache!.invalidateAgent(mutAgentId, reason);
+              }
+            : undefined,
         });
       }
       mcpServers["structured-memory"] = this.structuredMemoryMcpServer;
