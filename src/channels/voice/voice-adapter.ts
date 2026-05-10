@@ -82,7 +82,6 @@ export class VoiceAdapter {
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // Authenticate all requests — fail-closed
     if (!this.serverSecret) {
       log.error("Voice endpoint called but VAPI_SERVER_SECRET not configured — rejecting");
       res.writeHead(403, { "Content-Type": "application/json" });
@@ -90,57 +89,79 @@ export class VoiceAdapter {
       return;
     }
 
-    const providedSecret = (req.headers["x-vapi-secret"] as string) ?? (req.headers["server-secret"] as string) ?? "";
-    if (providedSecret !== this.serverSecret) {
-      log.warn("Voice request rejected — invalid server secret");
+    const authHeader = (req.headers["authorization"] as string) ?? "";
+    const bearerSecret = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7) : "";
+    const providedSecret =
+      (req.headers["x-vapi-secret"] as string) ?? (req.headers["server-secret"] as string) ?? bearerSecret ?? "";
+    const hasValidSecret = providedSecret === this.serverSecret;
+
+    // Custom LLM endpoint: Vapi sends `Authorization: Bearer no-credentials-provided`
+    // by default; their schema has no per-assistant API-key field. Auth this path by
+    // verifying the body's assistant.id maps to a configured agent — the UUID is
+    // the bearer token. Other paths still require the shared secret.
+    if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      const body = await readBody(req);
+      let request: OpenAIChatRequest;
+      try {
+        request = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+        return;
+      }
+
+      const agentId = this.resolveAgentId(request);
+      if (!agentId) {
+        log.warn("Voice request rejected — could not resolve agent from request body", {
+          assistantId: request.assistant?.id,
+          hasMetadata: !!request.assistant?.metadata,
+        });
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
+      const agentConfig = this.registry.get(agentId);
+      if (!agentConfig) {
+        log.warn("Voice request rejected — agent not in registry", { agentId });
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
+      return this.handleChatCompletion(req, res, request, agentId, agentConfig);
+    }
+
+    // All other paths require the shared secret.
+    if (!hasValidSecret) {
+      log.warn("Voice request rejected — invalid server secret", {
+        url: req.url,
+        method: req.method,
+        hasXVapi: !!req.headers["x-vapi-secret"],
+        hasAuthorization: !!authHeader,
+      });
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
     }
 
-    // Health check (behind auth)
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", activeCalls: this.sessions.size }));
       return;
     }
 
-    // Only accept POST /v1/chat/completions
-    if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Not found" }));
-      return;
-    }
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  }
 
-    // Parse request body
-    const body = await readBody(req);
-    let request: OpenAIChatRequest;
-    try {
-      request = JSON.parse(body);
-    } catch {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid JSON" }));
-      return;
-    }
-
-    // Resolve agent ID from Vapi metadata
-    const agentId = this.resolveAgentId(request);
-    if (!agentId) {
-      log.error("Could not resolve agent ID from Vapi request");
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Cannot determine agent identity" }));
-      return;
-    }
-
-    const agentConfig = this.registry.get(agentId);
-    if (!agentConfig) {
-      log.error("Agent not found", { agentId });
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Agent not found: ${agentId}` }));
-      return;
-    }
-
-    // Track session
+  private async handleChatCompletion(
+    _req: IncomingMessage,
+    res: ServerResponse,
+    request: OpenAIChatRequest,
+    agentId: string,
+    agentConfig: NonNullable<ReturnType<AgentRegistry["get"]>>,
+  ): Promise<void> {
     const callId = request.call?.id ?? randomUUID();
     if (!this.sessions.has(callId)) {
       this.sessions.set(callId, {
