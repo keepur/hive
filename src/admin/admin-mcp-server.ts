@@ -57,9 +57,7 @@ const CONTEXT_DEPENDENT_SERVERS = new Set<string>([
 
 function checkDelegateContextDependent(value: unknown): string | null {
   if (!Array.isArray(value)) return null;
-  const invalid = value.filter(
-    (s): s is string => typeof s === "string" && CONTEXT_DEPENDENT_SERVERS.has(s),
-  );
+  const invalid = value.filter((s): s is string => typeof s === "string" && CONTEXT_DEPENDENT_SERVERS.has(s));
   if (invalid.length === 0) return null;
   return (
     `delegateServers cannot include context-dependent servers: ${invalid.join(", ")}. ` +
