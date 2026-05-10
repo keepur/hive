@@ -115,6 +115,7 @@ Two files at your instance root (`~/services/hive/<your-instance>/`). The CLI ma
 - `agents.default` — agent ID that catches unrouted messages.
 - `plugins` — **do not hand-edit.** Managed by `hive plugin add` / `hive plugin remove`.
 - `skills.registries` — list of registries to pull skills from. The default `keepur/hive-skills` is added at init; add others with `hive registry`.
+- `agentManager.perTurnSpawn.{sms,slack,ws,voice}` — opt-in to the per-turn-spawn path on a channel. All default `false`; flip a channel to `true` once you've verified per-turn behavior on a dev thread for that channel. Per-turn spawn replaces the long-lived agent process with a fresh `query()` per inbound message (resuming the same SDK session id), which makes prompt-prefix changes take effect immediately and avoids long-lived process drift. The legacy long-lived path is still the default while the migration rolls out channel-by-channel.
 
 ### `<instance>/.env`
 

@@ -257,9 +257,13 @@ export const config = {
   agentManager: {
     perTurnSpawn: {
       sms: Boolean((hive.agentManager as { perTurnSpawn?: { sms?: unknown } } | undefined)?.perTurnSpawn?.sms ?? false),
-      slack: Boolean((hive.agentManager as { perTurnSpawn?: { slack?: unknown } } | undefined)?.perTurnSpawn?.slack ?? false),
+      slack: Boolean(
+        (hive.agentManager as { perTurnSpawn?: { slack?: unknown } } | undefined)?.perTurnSpawn?.slack ?? false,
+      ),
       ws: Boolean((hive.agentManager as { perTurnSpawn?: { ws?: unknown } } | undefined)?.perTurnSpawn?.ws ?? false),
-      voice: Boolean((hive.agentManager as { perTurnSpawn?: { voice?: unknown } } | undefined)?.perTurnSpawn?.voice ?? false),
+      voice: Boolean(
+        (hive.agentManager as { perTurnSpawn?: { voice?: unknown } } | undefined)?.perTurnSpawn?.voice ?? false,
+      ),
     },
   },
   autonomy: {

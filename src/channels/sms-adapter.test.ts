@@ -59,12 +59,7 @@ function makeJsonResponse(body: unknown, status = 200): Response {
  *
  * Returns a `outboundCalls` array so tests can assert on Quo delivery payloads.
  */
-function wireQuoFetch(opts: {
-  participant: string;
-  msgId: string;
-  text: string;
-  lineNumber: string;
-}) {
+function wireQuoFetch(opts: { participant: string; msgId: string; text: string; lineNumber: string }) {
   const outboundCalls: Array<{ url: string; body: any }> = [];
 
   const fetchStub = vi.fn(async (url: string, init?: RequestInit) => {
@@ -238,7 +233,12 @@ describe("SmsAdapter (KPR-216)", () => {
         lineNumber: lineFixture.number,
       });
 
-      const { stub: agentManager, spawnTurn, sessionStore, calls } = makeAgentManagerStub({
+      const {
+        stub: agentManager,
+        spawnTurn,
+        sessionStore,
+        calls,
+      } = makeAgentManagerStub({
         finalMessage: "All systems nominal.",
       });
 

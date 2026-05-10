@@ -145,11 +145,7 @@ async function waitFor(pred: () => boolean, timeoutMs = 1500): Promise<void> {
  * Wires fetch with a single inbound message. The first call to /messages with
  * `createdAfter` returns the message; outbound POSTs are recorded.
  */
-function wirePollFetch(opts: {
-  participant: string;
-  msgId: string;
-  text: string;
-}) {
+function wirePollFetch(opts: { participant: string; msgId: string; text: string }) {
   const outbound: Array<{ body: any }> = [];
   const fetchStub = vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url);
@@ -216,12 +212,7 @@ describe("SmsAdapter per-turn round-trip integration (KPR-216)", () => {
       list: vi.fn().mockResolvedValue([]),
     };
 
-    agentManager = new AgentManager(
-      registry as any,
-      memoryManager as any,
-      sessionStore,
-      undefined as any,
-    );
+    agentManager = new AgentManager(registry as any, memoryManager as any, sessionStore, undefined as any);
   });
 
   afterEach(() => {
@@ -277,9 +268,7 @@ describe("SmsAdapter per-turn round-trip integration (KPR-216)", () => {
     // Turn 1 emits session-A; turn 2 (resumed from A) rotates to session-B.
     mockRunnerSend
       .mockResolvedValueOnce(makeRunResultWith({ text: "ack-1", sessionId: "session-A" }))
-      .mockResolvedValueOnce(
-        makeRunResultWith({ text: "ack-2", sessionId: "session-B", compactions: 1 }),
-      );
+      .mockResolvedValueOnce(makeRunResultWith({ text: "ack-2", sessionId: "session-B", compactions: 1 }));
 
     const adapter = new SmsAdapter("integ-key", [lineFixture], {
       agentManager,
