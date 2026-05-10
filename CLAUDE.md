@@ -219,6 +219,21 @@ Where `<root>` is one of: a seed directory (e.g. `seeds/chief-of-staff/`), a plu
 
 **Migration:** `npx tsx scripts/flatten-skills.ts <root> [--dry]` lifts each `<root>/skills/<workflow>/skills/<skill>/SKILL.md` to `<root>/skills/<skill>/SKILL.md`. Idempotent. Engine seeds and in-repo plugins are already migrated; operator-skills repos (dodi, keepur) migrate under [KPR-215](https://linear.app/keepur/issue/KPR-215). The loader supports both layouts during the transition window, with a deprecation warning per source the first time legacy layout is detected.
 
+## Per-turn spawn migration (KPR-210 Phase A)
+
+Long-lived per-agent `query()` is being replaced channel-by-channel with per-turn `query()` + `options.resume = sessionId`. `AgentManager.spawnTurn(ctx, onStream?)` is the per-turn API; SMS is the first channel migrated (KPR-216). Each channel is opt-in via flag, default false:
+
+```yaml
+agentManager:
+  perTurnSpawn:
+    sms: false    # KPR-216 — operator opt-in after dev verification
+    slack: false  # KPR-217
+    ws: false     # KPR-218
+    voice: false  # KPR-219 (rope-back; voice already per-turn but bypasses AgentManager today)
+```
+
+When the flag is on, `AgentManager.spawnTurn` instantiates a fresh `AgentRunner` per turn, so MCP servers and the mutable `*ContextRef` path are recreated per spawn — context isolation comes from the runner being thrown away after the turn, not from a separate factory variant. The `buildStructuredMemoryMcpForTurn` / `buildCallbackMcpForTurn` factories are in place as scaffolding for KPR-220, when `AgentRunner` retires entirely. AgentManager simplification (rip out long-lived state) is also KPR-220 once all four channels migrate.
+
 ## Common Gotchas
 
 - After editing MCP server source: `npm run build` (tsc → `dist/`) for dev, or `npm run bundle` (esbuild → `pkg/`) for the publish-ready artifact. The runtime engine in `<instance>/.hive/` runs from `pkg/server.min.js`. Restart Hive (`launchctl kickstart -k gui/$(id -u)/com.hive.<id>.agent`) to pick up changes — or for agent-definition changes only, send `SIGUSR1` (no restart).

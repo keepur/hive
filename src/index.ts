@@ -487,7 +487,11 @@ async function main(): Promise<void> {
   }
 
   // SMS adapter — direct path, bypasses Slack
-  const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines);
+  const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines, {
+    agentManager,
+    defaultAgentId: config.defaultAgent,
+    perTurnSpawnEnabled: config.agentManager.perTurnSpawn.sms,
+  });
   dispatcher.registerAdapter(smsAdapter);
   if (config.quo.apiKey && config.sms.lines.length > 0) {
     await smsAdapter.start((item) => {
@@ -495,7 +499,10 @@ async function main(): Promise<void> {
         log.error("SMS dispatch failed", { error: String(err), source: item.source.label });
       });
     });
-    log.info("SMS adapter started", { lines: config.sms.lines.length });
+    log.info("SMS adapter started", {
+      lines: config.sms.lines.length,
+      perTurnSpawn: config.agentManager.perTurnSpawn.sms,
+    });
   }
 
   // iMessage adapter — poll chat.db for inbound, AppleScript for outbound

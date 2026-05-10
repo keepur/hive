@@ -185,3 +185,39 @@ export function createCallbackMcpServer(deps: CallbackToolDeps) {
     tools: buildCallbackTools(deps),
   });
 }
+
+/**
+ * KPR-216 scaffolding — NOT wired in. `AgentManager.spawnTurn` reuses
+ * `AgentRunner` per spawn, which keeps the existing `*ContextRef` path.
+ * Kept for KPR-220 when `AgentRunner` retires.
+ */
+export interface CallbackTurnDeps {
+  db: Db;
+  agentId: string;
+  adapterId?: string;
+  channelId?: string;
+  channelKind?: string;
+  channelLabel?: string;
+  threadId?: string;
+  slackTs?: string;
+  slackThreadTs?: string;
+}
+
+export function buildCallbackMcpForTurn(deps: CallbackTurnDeps) {
+  const contextRef: { current: CallbackTurnContext } = {
+    current: {
+      adapterId: deps.adapterId,
+      channelId: deps.channelId,
+      channelKind: deps.channelKind,
+      channelLabel: deps.channelLabel,
+      threadId: deps.threadId,
+      slackTs: deps.slackTs,
+      slackThreadTs: deps.slackThreadTs,
+    },
+  };
+  return createSdkMcpServer({
+    name: "callback",
+    version: "1.0.0",
+    tools: buildCallbackTools({ db: deps.db, agentId: deps.agentId, context: contextRef }),
+  });
+}

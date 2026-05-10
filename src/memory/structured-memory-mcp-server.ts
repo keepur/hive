@@ -421,3 +421,36 @@ export function createStructuredMemoryMcpServer(deps: StructuredMemoryToolDeps) 
     tools: buildStructuredMemoryTools(deps),
   });
 }
+
+/**
+ * KPR-216 scaffolding — NOT wired in. `AgentManager.spawnTurn` reuses
+ * `AgentRunner` per spawn, which keeps the existing `*ContextRef` path.
+ * Kept for KPR-220 when `AgentRunner` retires.
+ */
+export interface StructuredMemoryTurnDeps {
+  db: Db;
+  agentId: string;
+  channelId?: string;
+  threadId?: string;
+  qdrantUrl?: string;
+  ollamaUrl?: string;
+  onMutate?: (agentId: string | null, reason: string) => void;
+}
+
+export function buildStructuredMemoryMcpForTurn(deps: StructuredMemoryTurnDeps) {
+  const contextRef: { current: StructuredMemoryTurnContext } = {
+    current: { channelId: deps.channelId, threadId: deps.threadId },
+  };
+  return createSdkMcpServer({
+    name: "structured-memory",
+    version: "1.0.0",
+    tools: buildStructuredMemoryTools({
+      db: deps.db,
+      agentId: deps.agentId,
+      context: contextRef,
+      qdrantUrl: deps.qdrantUrl,
+      ollamaUrl: deps.ollamaUrl,
+      onMutate: deps.onMutate,
+    }),
+  });
+}
