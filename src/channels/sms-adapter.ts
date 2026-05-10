@@ -1,6 +1,7 @@
 import { createLogger } from "../logging/logger.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
+import type { AgentManager, TurnContext } from "../agents/agent-manager.js";
 
 const log = createLogger("sms-adapter");
 
@@ -25,6 +26,19 @@ interface QuoMessage {
   status?: string;
 }
 
+/**
+ * KPR-216: optional per-turn-spawn wiring. When `agentManager` and
+ * `defaultAgentId` are passed AND `perTurnSpawnEnabled` is true, polled
+ * SMS messages skip the dispatcher and go straight through
+ * `agentManager.spawnTurn(...)`. Otherwise the adapter falls back to the
+ * legacy `onWorkItem` → dispatcher path.
+ */
+export interface SmsAdapterPerTurnDeps {
+  agentManager: AgentManager;
+  defaultAgentId: string;
+  perTurnSpawnEnabled: boolean;
+}
+
 export class SmsAdapter implements ChannelAdapter {
   readonly id: string = "sms";
   readonly kind: ChannelKind = "sms";
@@ -32,8 +46,13 @@ export class SmsAdapter implements ChannelAdapter {
   private apiKey: string;
   private lines: SmsLine[];
   private interval: ReturnType<typeof setInterval> | null = null;
+  private perTurn?: SmsAdapterPerTurnDeps;
 
-  constructor(apiKey: string, lines: Array<{ id: string; label: string; number: string; slackChannel?: string }>) {
+  constructor(
+    apiKey: string,
+    lines: Array<{ id: string; label: string; number: string; slackChannel?: string }>,
+    perTurn?: SmsAdapterPerTurnDeps,
+  ) {
     this.apiKey = apiKey;
     this.lines = lines.map((l) => ({
       id: l.id,
@@ -42,6 +61,7 @@ export class SmsAdapter implements ChannelAdapter {
       routeLabel: l.slackChannel ?? l.label,
       lastSeen: new Date().toISOString(),
     }));
+    this.perTurn = perTurn;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
@@ -53,7 +73,10 @@ export class SmsAdapter implements ChannelAdapter {
     // Poll immediately, then every 30 seconds
     this.poll(onWorkItem);
     this.interval = setInterval(() => this.poll(onWorkItem), 30_000);
-    log.info("SMS adapter started", { lines: this.lines.map((l) => l.label) });
+    log.info("SMS adapter started", {
+      lines: this.lines.map((l) => l.label),
+      perTurnSpawn: this.perTurn?.perTurnSpawnEnabled ?? false,
+    });
   }
 
   async deliver(result: WorkResult): Promise<void> {
@@ -102,6 +125,59 @@ export class SmsAdapter implements ChannelAdapter {
   }
 
   // --- Private helpers ---
+
+  /**
+   * KPR-216: per-turn-spawn path. Resolves the agent (thread continuity →
+   * default), pulls the existing session id, spawns a single-turn query,
+   * and delivers the result via Quo. Bypasses dispatcher dedup/audit/retry
+   * by design — Phase A scope; KPR-220 will fold dispatcher concerns back
+   * in once all channels are per-turn.
+   */
+  private async spawnTurnForWorkItem(workItem: WorkItem): Promise<void> {
+    if (!this.perTurn) return;
+    const { agentManager, defaultAgentId } = this.perTurn;
+    const threadId = workItem.threadId ?? workItem.id;
+
+    const continuedAgentId = await agentManager.findAgentForThread(threadId);
+    const agentId = continuedAgentId ?? defaultAgentId;
+
+    const sessionId = await agentManager.getSessionStore().get(agentId, threadId);
+
+    const ctx: TurnContext = {
+      agentId,
+      sessionId,
+      channelId: workItem.source.id,
+      threadId,
+      workItem,
+      channel: workItem.source.kind,
+    };
+
+    const turn = await agentManager.spawnTurn(ctx);
+
+    if (turn.errors.length > 0) {
+      log.warn("SMS per-turn spawn returned errors", {
+        agentId,
+        threadId,
+        errors: turn.errors,
+      });
+    }
+
+    const text = turn.finalMessage?.trim();
+    if (!text) {
+      log.info("SMS per-turn spawn produced no text — skipping delivery", { agentId, threadId });
+      return;
+    }
+
+    const workResult: WorkResult = {
+      text,
+      agentId,
+      workItem,
+      costUsd: turn.usage.costUsd,
+      durationMs: turn.usage.durationMs,
+      error: turn.errors[0],
+    };
+    await this.deliver(workResult);
+  }
 
   private async quoApi(path: string, params: Record<string, string> = {}): Promise<any> {
     const url = new URL(`${QUO_BASE}${path}`);
@@ -171,7 +247,17 @@ export class SmsAdapter implements ChannelAdapter {
               textLength: msg.text.length,
             });
 
-            onWorkItem(workItem);
+            if (this.perTurn?.perTurnSpawnEnabled) {
+              this.spawnTurnForWorkItem(workItem).catch((err) => {
+                log.error("SMS per-turn spawn failed", {
+                  error: String(err),
+                  from: msg.from,
+                  line: line.label,
+                });
+              });
+            } else {
+              onWorkItem(workItem);
+            }
           }
         }
 

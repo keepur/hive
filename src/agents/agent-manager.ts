@@ -169,6 +169,15 @@ export class AgentManager {
     return this.prefixCache;
   }
 
+  /**
+   * KPR-216: per-turn-spawn channels need to resolve `sessionId` for
+   * `TurnContext`. Exposed read-only — adapters should not write directly;
+   * `spawnTurn` updates the store on completion.
+   */
+  getSessionStore(): SessionStore {
+    return this.sessionStore;
+  }
+
   getPlugins(): LoadedPlugin[] {
     return this.plugins;
   }
