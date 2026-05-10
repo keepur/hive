@@ -110,9 +110,7 @@ function postChatCompletion(
       (res) => {
         const chunks: string[] = [];
         res.on("data", (c) => chunks.push(c.toString("utf-8")));
-        res.on("end", () =>
-          resolve({ status: res.statusCode ?? 0, headers: res.headers, chunks }),
-        );
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, chunks }));
         res.on("error", reject);
       },
     );

@@ -96,9 +96,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
 function makeVoiceAdapter(am?: AgentManagerStub) {
   const registry: any = {
     get: vi.fn((id: string) =>
-      id === "mokie"
-        ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-5" }
-        : undefined,
+      id === "mokie" ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-5" } : undefined,
     ),
   };
   const memoryManager: any = {

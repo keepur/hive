@@ -12,12 +12,7 @@ import {
 } from "./openai-translator.js";
 import type { AgentRegistry } from "../../agents/agent-registry.js";
 import type { MemoryManager } from "../../memory/memory-manager.js";
-import type {
-  AgentManager,
-  SpawnTurnStreamCallback,
-  TurnContext,
-  TurnResult,
-} from "../../agents/agent-manager.js";
+import type { AgentManager, SpawnTurnStreamCallback, TurnContext, TurnResult } from "../../agents/agent-manager.js";
 import type { WorkItem } from "../../types/work-item.js";
 import { config } from "../../config.js";
 
@@ -453,8 +448,7 @@ export class VoiceAdapter {
     const turnPrompt = storedSessionId
       ? extractLatestUserMessage(request.messages)
       : renderConversationPrompt(request.messages);
-    const safePrompt =
-      storedSessionId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
+    const safePrompt = storedSessionId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
     const effectiveResume = storedSessionId && turnPrompt ? storedSessionId : undefined;
 
     // Synthesize a WorkItem. ChannelKind="voice" was added in Step 1 of this
@@ -503,8 +497,7 @@ export class VoiceAdapter {
     const runOnce = async (
       spawnCtx: TurnContext,
     ): Promise<
-      | { ok: true; result: TurnResult; bytesSent: boolean }
-      | { ok: false; reason: string; bytesSent: boolean }
+      { ok: true; result: TurnResult; bytesSent: boolean } | { ok: false; reason: string; bytesSent: boolean }
     > => {
       try {
         const result = await agentManager.spawnTurn(spawnCtx, onStream);
