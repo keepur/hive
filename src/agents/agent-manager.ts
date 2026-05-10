@@ -1,6 +1,6 @@
 import { createLogger } from "../logging/logger.js";
-import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
-import type { WorkItem } from "../types/work-item.js";
+import type { AgentState, AgentStatus } from "../types/agent-config.js";
+import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
@@ -54,6 +54,71 @@ interface QueuedMessage {
   reject: (error: Error) => void;
 }
 
+/**
+ * KPR-216: per-turn spawn API. AgentManager.spawnTurn replaces the
+ * long-lived AgentRunner.send() path for channels that opt in via
+ * `agentManager.perTurnSpawn.<channel>`. Each call spawns a fresh
+ * `query()` with `options.resume = ctx.sessionId`; in-process MCP servers
+ * are built fresh too so channel/thread context is captured at spawn time
+ * (no mutable contextRef across turns).
+ *
+ * Per-thread serialization (lock key `agentId:threadId`) shares the same
+ * `processing` set as the legacy path so concurrent SMS turns on the same
+ * thread queue serially even when both paths are simultaneously active
+ * (e.g. mid-flag-flip).
+ */
+export interface TurnContext {
+  agentId: string;
+  /** undefined on first turn; SDK may rotate post-compaction (KPR-211). */
+  sessionId: string | undefined;
+  channelId: string;
+  threadId: string;
+  workItem: WorkItem;
+  channel: ChannelKind;
+}
+
+export interface TurnUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  contextWindow: number;
+  costUsd: number;
+  durationMs: number;
+}
+
+export interface TurnResult {
+  finalMessage: string;
+  /** SDK may emit a new id post-compaction; always returned for session-store update. */
+  newSessionId: string;
+  usage: TurnUsage;
+  errors: string[];
+}
+
+/** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
+export type SpawnTurnStreamCallback = StreamCallback;
+
+/**
+ * Default per-agent in-flight spawn budget. Long-lived `maxConcurrent`
+ * defaults to 3 (per-thread); per-turn spawns count differently — same
+ * thread is still serialized, so the budget bounds parallel spawns across
+ * different threads. Plan §D3: "spawn budget calibration becomes a more
+ * open-ended dial." Tunable per-agent in a future ticket.
+ */
+const DEFAULT_PER_AGENT_SPAWN_BUDGET = 5;
+
+/**
+ * Voice-adapter sentinel: SDK auth-rebuild-resume errors are retried once
+ * with a rebuilt resume id. Mirrors voice-adapter.ts:isAuthError so
+ * KPR-219's voice rope-back can route through this same API without
+ * regressing.
+ */
+function isAuthRebuildResumeError(reason: string): boolean {
+  return /resolve authentication|credentials\.json|not authenticated|401 Unauthorized|ANTHROPIC_API_KEY|authToken/i.test(
+    reason,
+  );
+}
+
 export class AgentManager {
   private states = new Map<string, AgentState>();
   private queues = new Map<string, QueuedMessage[]>();
@@ -76,6 +141,10 @@ export class AgentManager {
   private activeWorkItems = new Map<string, WorkItem[]>();
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
+  // KPR-216: in-flight per-turn spawn count per agent. Bounded by
+  // DEFAULT_PER_AGENT_SPAWN_BUDGET; over-budget spawns reject immediately
+  // so the adapter can decide whether to drop, retry, or fall back.
+  private activeSpawnCount = new Map<string, number>();
 
   constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, turnTelemetryStore?: TurnTelemetryStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, prefixCache?: PrefixCache) {
     this.registry = registry;
@@ -198,6 +267,128 @@ export class AgentManager {
         this.retryDeferredThreads(agentId);
       });
     });
+  }
+
+  /**
+   * KPR-216: per-turn spawn API (Phase A). Spawns a fresh `query()` per
+   * turn with `options.resume = ctx.sessionId`. Replaces the long-lived
+   * AgentRunner.send() path for opt-in channels.
+   *
+   * Lock key reuses the existing `agentId:threadId` `processing` set so
+   * concurrent spawns on the same thread queue serially even when the
+   * legacy path is simultaneously active for a different thread on the
+   * same agent.
+   *
+   * Per-agent budget: bounded by DEFAULT_PER_AGENT_SPAWN_BUDGET. Over-budget
+   * calls reject so the adapter can react (drop / retry / log). No queue —
+   * the adapter or dispatcher owns retry policy.
+   *
+   * Resume-retry: if the SDK signals an auth-rebuild-resume sentinel
+   * (mirrors voice-adapter.ts:316-348 — KPR-219 ropes voice through this
+   * same API), retry once with sessionId stripped.
+   */
+  async spawnTurn(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
+    this.ensureState(ctx.agentId);
+
+    if (!this.registry.get(ctx.agentId)) {
+      throw new Error(`Unknown agent: ${ctx.agentId}`);
+    }
+
+    const budget = DEFAULT_PER_AGENT_SPAWN_BUDGET;
+    const active = this.activeSpawnCount.get(ctx.agentId) ?? 0;
+    if (active >= budget) {
+      throw new Error(`Spawn budget exceeded for ${ctx.agentId} (${active}/${budget})`);
+    }
+
+    const threadKey = `${ctx.agentId}:${ctx.threadId}`;
+    while (this.processing.has(threadKey)) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    this.processing.add(threadKey);
+    this.activeSpawnCount.set(ctx.agentId, active + 1);
+
+    if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
+
+    try {
+      const result = await this.runOneSpawnAttempt(ctx, onStream);
+
+      if (result.error && isAuthRebuildResumeError(result.error) && ctx.sessionId) {
+        log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
+          agentId: ctx.agentId,
+          threadId: ctx.threadId,
+          reason: result.error,
+        });
+        const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, onStream);
+        return this.finalizeSpawnResult(ctx, retry);
+      }
+
+      return this.finalizeSpawnResult(ctx, result);
+    } finally {
+      this.processing.delete(threadKey);
+      const next = (this.activeSpawnCount.get(ctx.agentId) ?? 1) - 1;
+      if (next <= 0) this.activeSpawnCount.delete(ctx.agentId);
+      else this.activeSpawnCount.set(ctx.agentId, next);
+    }
+  }
+
+  private async runOneSpawnAttempt(
+    ctx: TurnContext,
+    onStream?: SpawnTurnStreamCallback,
+  ): Promise<RunResult> {
+    // Fresh runner per spawn — its lazy-built in-process MCPs are therefore
+    // also fresh, with channel/thread ctx captured at construction. The
+    // long-lived path keeps reusing one runner per agent.
+    const runner = this.createRunner(ctx.agentId);
+
+    const bgContext: WorkItemContext = {
+      adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,
+      channelId: ctx.channelId,
+      channelKind: ctx.workItem.source.kind,
+      channelLabel: ctx.workItem.source.label,
+      threadId: ctx.threadId,
+      slackTs: (ctx.workItem.meta?.slackTs as string) ?? "",
+      slackThreadTs: (ctx.workItem.meta?.slackThreadTs as string) ?? "",
+    };
+
+    return runner.send(ctx.workItem.text, ctx.sessionId, onStream, bgContext);
+  }
+
+  private finalizeSpawnResult(ctx: TurnContext, result: RunResult): TurnResult {
+    const newSessionId = result.sessionId || ctx.sessionId || "";
+    if (result.sessionId && !result.aborted) {
+      // Persist post-spawn — captures session-id rotation post-compaction
+      // (KPR-211 verified this fires on resume).
+      this.sessionStore.set(ctx.agentId, ctx.threadId, result.sessionId, {
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheCreationTokens: result.cacheCreationTokens,
+        contextWindow: result.contextWindow,
+        compactions: result.compactions,
+        preCompactTokens: result.preCompactTokens,
+      });
+    }
+
+    const state = this.states.get(ctx.agentId)!;
+    state.messagesProcessed++;
+    state.lastActivity = new Date();
+    state.currentSessionId = result.sessionId;
+    if (result.error) state.errorCount++;
+
+    return {
+      finalMessage: result.text,
+      newSessionId,
+      usage: {
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheCreationTokens: result.cacheCreationTokens,
+        contextWindow: result.contextWindow,
+        costUsd: result.costUsd,
+        durationMs: result.durationMs,
+      },
+      errors: result.error ? [result.error] : [],
+    };
   }
 
   private async processThreadQueue(agentId: string, threadKey: string): Promise<void> {
