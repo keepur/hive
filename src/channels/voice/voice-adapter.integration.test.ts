@@ -49,6 +49,7 @@ vi.mock("../../config.js", () => ({
 
 import { VoiceAdapter } from "./voice-adapter.js";
 import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
+import type { Dispatcher } from "../dispatcher.js";
 
 interface CapturedSpawn {
   ctx: TurnContext;
@@ -60,6 +61,13 @@ function makeAdapter(opts: {
   spawn: (ctx: TurnContext, onStream?: (chunk: string) => void) => Promise<TurnResult>;
   /** What the session-store returns on get(agentId, threadId). */
   storedSessionId?: string;
+  /**
+   * KPR-223: optional dispatcher mock. When provided, the adapter is
+   * constructed with the 6-arg form so voice turns route through
+   * `dispatcher.routeVoiceTurn` instead of directly through
+   * `agentManager.spawnTurn`. Omit to keep the legacy fallback wiring.
+   */
+  dispatcher?: Dispatcher;
 }) {
   const captured: CapturedSpawn[] = [];
   const sessionStoreGet = vi.fn().mockResolvedValue(opts.storedSessionId);
@@ -84,7 +92,9 @@ function makeAdapter(opts: {
     getSessionStore: () => ({ get: sessionStoreGet, set: sessionStoreSet }),
   };
 
-  const adapter = new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager);
+  const adapter = opts.dispatcher
+    ? new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager, opts.dispatcher)
+    : new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager);
   return { adapter, captured, sessionStoreGet, sessionStoreSet, spawnTurn };
 }
 
@@ -246,5 +256,79 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     const joined = res.chunks.join("");
     expect(joined).toContain('"content":"Sure thing."');
     expect(joined).toContain("[DONE]");
+  });
+
+  it("routes through dispatcher.routeVoiceTurn end-to-end (KPR-223)", async () => {
+    // KPR-223: when the adapter is wired with a Dispatcher, voice turns must
+    // hit `dispatcher.routeVoiceTurn` (which threads taskLedger + audit log)
+    // instead of falling back to `agentManager.spawnTurn` directly. The mock
+    // dispatcher delegates to the same spawnTurn so the SSE byte round-trip
+    // still completes — proving the dispatcher path is fully wired without
+    // altering observable streaming behavior.
+
+    // Forward-ref box so the dispatcher closure can reach setup.spawnTurn —
+    // dispatcher is invoked only after the HTTP POST hits, well after
+    // makeAdapter returns and we populate the box.
+    const setupBox: { current: ReturnType<typeof makeAdapter> | undefined } = { current: undefined };
+    const routeVoiceTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      return await setupBox.current!.spawnTurn(ctx, onStream);
+    });
+    const dispatcher = { routeVoiceTurn } as unknown as Dispatcher;
+
+    const setup = makeAdapter({
+      spawn: async (_ctx, onStream) => {
+        onStream?.("via ");
+        onStream?.("dispatcher");
+        return {
+          finalMessage: "via dispatcher",
+          newSessionId: "dispatcher-session-id",
+          usage: {
+            inputTokens: 5,
+            outputTokens: 2,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            contextWindow: 200000,
+            costUsd: 0,
+            durationMs: 25,
+          },
+          errors: [],
+        };
+      },
+      dispatcher,
+    });
+    setupBox.current = setup;
+
+    const p = await startAdapter(setup);
+
+    const res = await postChatCompletion(p, {
+      model: "voice-mock",
+      stream: true,
+      messages: [
+        { role: "system", content: "you are mokie" },
+        { role: "user", content: "Test dispatcher routing" },
+      ],
+      assistant: { metadata: { hive_agent_id: "mokie" } },
+      call: { id: "call-int-3", metadata: { goal: "verify dispatcher" } },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toBe("text/event-stream");
+
+    // Dispatcher.routeVoiceTurn was called exactly once with the same
+    // TurnContext shape the agentManager.spawnTurn fallback would have seen.
+    expect(routeVoiceTurn).toHaveBeenCalledTimes(1);
+    const dispatchCtx = routeVoiceTurn.mock.calls[0]![0] as TurnContext;
+    expect(dispatchCtx.agentId).toBe("mokie");
+    expect(dispatchCtx.channel).toBe("voice");
+    expect(dispatchCtx.threadId).toBe("voice:call-int-3");
+
+    // SSE round-trip still completes through the dispatcher path.
+    const joined = res.chunks.join("");
+    expect(joined).toContain('"content":"via "');
+    expect(joined).toContain('"content":"dispatcher"');
+    expect(joined).toContain("[DONE]");
+
+    // Inner spawnTurn was reached via the dispatcher delegation.
+    expect(setup.spawnTurn).toHaveBeenCalledTimes(1);
   });
 });

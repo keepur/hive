@@ -433,10 +433,7 @@ async function main(): Promise<void> {
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
-  const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack", config.defaultAgent, undefined, {
-    agentManager,
-    perTurnSpawnEnabled: config.agentManager.perTurnSpawn.slack,
-  });
+  const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack", config.defaultAgent);
   dispatcher.registerAdapter(slackAdapter);
   dispatcher.setSlackAdapter(slackAdapter);
   await slackAdapter.start((item) => {
@@ -444,7 +441,7 @@ async function main(): Promise<void> {
       log.error("Slack dispatch failed", { error: String(err), source: item.source.label });
     });
   });
-  log.info("Slack adapter connected", { perTurnSpawn: config.agentManager.perTurnSpawn.slack });
+  log.info("Slack adapter connected");
 
   // Audit routing: every agent mirrors non-Slack conversations to their own
   // homeBase channel. The global slack.auditChannel (if set) is the fallback
@@ -489,12 +486,9 @@ async function main(): Promise<void> {
     log.info("Slack internal API started", { port: config.slackInternal.port });
   }
 
-  // SMS adapter — direct path, bypasses Slack
-  const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines, {
-    agentManager,
-    defaultAgentId: config.defaultAgent,
-    perTurnSpawnEnabled: config.agentManager.perTurnSpawn.sms,
-  });
+  // SMS adapter — direct path, bypasses Slack. Per-turn-spawn routing is
+  // handled inside the dispatcher (KPR-223); the adapter just emits WorkItems.
+  const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines);
   dispatcher.registerAdapter(smsAdapter);
   if (config.quo.apiKey && config.sms.lines.length > 0) {
     await smsAdapter.start((item) => {
@@ -502,10 +496,7 @@ async function main(): Promise<void> {
         log.error("SMS dispatch failed", { error: String(err), source: item.source.label });
       });
     });
-    log.info("SMS adapter started", {
-      lines: config.sms.lines.length,
-      perTurnSpawn: config.agentManager.perTurnSpawn.sms,
-    });
+    log.info("SMS adapter started", { lines: config.sms.lines.length });
   }
 
   // iMessage adapter — poll chat.db for inbound, AppleScript for outbound
@@ -566,12 +557,9 @@ async function main(): Promise<void> {
       commandRegistry,
       agentRegistry: registry,
       agentManager,
-      // KPR-218: adapter-level fallback for the per-turn resolver. Gating
-      // happens inside the adapter via `perTurn.perTurnSpawnEnabled`, so we
-      // wire these unconditionally — adapter falls back to the legacy
-      // `onWorkItem` → dispatcher path when the flag is false.
+      // Adapter-level fallback used by dispatcher meta routing (KPR-223 moved
+      // per-turn-spawn gating into the dispatcher itself).
       defaultAgentId: config.defaultAgent,
-      perTurn: { perTurnSpawnEnabled: config.agentManager.perTurnSpawn.ws },
     });
     dispatcher.registerAdapter(wsAdapter);
     await wsAdapter.start((item) => {
@@ -579,10 +567,7 @@ async function main(): Promise<void> {
         log.error("WS dispatch failed", { error: String(err), source: item.source.label });
       });
     });
-    log.info("WebSocket adapter started", {
-      port: config.ws.port,
-      perTurnSpawn: config.agentManager.perTurnSpawn.ws,
-    });
+    log.info("WebSocket adapter started", { port: config.ws.port });
   }
 
   // Beekeeper federation — advertise this Hive instance to sibling Beekeeper
@@ -615,6 +600,7 @@ async function main(): Promise<void> {
       registry,
       memoryManager,
       agentManager, // KPR-219: needed for the per-turn flag-on path
+      dispatcher, // KPR-223: routes voice turns through the dispatcher (taskLedger + audit; dedup skipped)
     );
     await voiceAdapter.start();
     log.info("Voice adapter started", { port: config.voice.port });

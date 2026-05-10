@@ -11,8 +11,16 @@ vi.mock("../logging/logger.js", () => ({
   }),
 }));
 
+// Per-turn-spawn flags are read from this object inside dispatcher.getPerTurnFlag.
+// Tests can mutate `mockConfig.agentManager.perTurnSpawn.<channel>` between
+// dispatches to flip the flag.
+const mockConfig: { agentManager: { perTurnSpawn: { sms: boolean; slack: boolean; ws: boolean; voice: boolean } } } = {
+  agentManager: { perTurnSpawn: { sms: false, slack: false, ws: false, voice: false } },
+};
 vi.mock("../config.js", () => ({
-  config: {},
+  get config() {
+    return mockConfig;
+  },
 }));
 
 // ---------------------------------------------------------------------------
@@ -150,6 +158,23 @@ function makeMockAgentManager() {
     }),
     findAgentForThread: vi.fn().mockResolvedValue(null),
     findAgentsForThread: vi.fn().mockResolvedValue([]),
+    spawnTurn: vi.fn().mockResolvedValue({
+      finalMessage: "turn response",
+      newSessionId: "s2",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0.01,
+        durationMs: 800,
+      },
+      errors: [],
+    }),
+    getSessionStore: vi.fn().mockReturnValue({
+      get: vi.fn().mockResolvedValue(undefined),
+    }),
   };
 }
 
@@ -644,6 +669,138 @@ describe("Multi-agent threads", () => {
 
     expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
     expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KPR-223: per-turn-spawn routing tests (dispatcher branches into spawnTurn
+// when the per-channel flag is on). Plus routeVoiceTurn behavior.
+// ---------------------------------------------------------------------------
+
+describe("Per-turn-spawn routing (KPR-223)", () => {
+  let dispatcher: Dispatcher;
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let agentManager: ReturnType<typeof makeMockAgentManager>;
+  let adapter: ReturnType<typeof makeMockAdapter>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workItemCounter = 0;
+    // Reset all per-channel flags between tests.
+    mockConfig.agentManager.perTurnSpawn.sms = false;
+    mockConfig.agentManager.perTurnSpawn.slack = false;
+    mockConfig.agentManager.perTurnSpawn.ws = false;
+    mockConfig.agentManager.perTurnSpawn.voice = false;
+
+    registry = makeMockRegistry();
+    agentManager = makeMockAgentManager();
+    const healthReporter = makeMockHealthReporter();
+    adapter = makeMockAdapter();
+
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
+    dispatcher.registerAdapter(adapter as any);
+  });
+
+  it("routes to spawnTurn when per-turn flag is on (sms)", async () => {
+    mockConfig.agentManager.perTurnSpawn.sms = true;
+    // SMS adapter mock — id="sms", kind="sms"
+    const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
+    dispatcher.registerAdapter(smsAdapter as any);
+
+    const item = makeWorkItem({
+      source: { kind: "sms", id: "PN_LINE_X", label: "quo-may", adapterId: "sms" },
+      threadId: "sms:PN_LINE_X:+15550001",
+      text: "hey Jasper, ping",
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    const ctx = agentManager.spawnTurn.mock.calls[0]![0];
+    expect(ctx.agentId).toBe("jasper");
+    expect(ctx.channel).toBe("sms");
+    expect(ctx.channelId).toBe("PN_LINE_X");
+    expect(ctx.threadId).toBe("sms:PN_LINE_X:+15550001");
+  });
+
+  it("uses sendMessage when per-turn flag is off (sms)", async () => {
+    mockConfig.agentManager.perTurnSpawn.sms = false;
+    const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
+    dispatcher.registerAdapter(smsAdapter as any);
+
+    const item = makeWorkItem({
+      source: { kind: "sms", id: "PN_LINE_Y", label: "quo-may", adapterId: "sms" },
+      text: "hey Jasper, ping",
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
+    expect(agentManager.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("fan-out path uses spawnTurn when flag on", async () => {
+    mockConfig.agentManager.perTurnSpawn.slack = true;
+
+    // Use "random" — not bound to any agent's channels so the dedicated-channel
+    // shortcut doesn't fire and resolveAgents falls into the name-mention branch.
+    const item = makeWorkItem({
+      source: { kind: "slack", id: "C-FANOUT", label: "random" },
+      text: "Jasper, and River, coordinate",
+    });
+    await dispatcher.dispatch(item);
+
+    // Fan-out path — both Jasper and River are spawned via spawnTurn.
+    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(2);
+    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    const calledAgents = agentManager.spawnTurn.mock.calls.map((c: any[]) => c[0].agentId);
+    expect(calledAgents).toContain("jasper");
+    expect(calledAgents).toContain("river");
+  });
+
+  it("routeVoiceTurn calls spawnTurn with correct ctx", async () => {
+    const ctx = {
+      agentId: "mokie",
+      sessionId: undefined,
+      channelId: "call-abc",
+      threadId: "voice:call-abc",
+      workItem: makeWorkItem({
+        id: "call-abc",
+        source: { kind: "voice", id: "call-abc", label: "voice:call-abc" },
+        threadId: "voice:call-abc",
+      }),
+      channel: "voice" as const,
+    };
+    const onStream = vi.fn();
+    await dispatcher.routeVoiceTurn(ctx as any, onStream);
+
+    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
+    const [passedCtx, passedOnStream] = agentManager.spawnTurn.mock.calls[0]!;
+    expect(passedCtx).toBe(ctx);
+    expect(passedOnStream).toBe(onStream);
+  });
+
+  it("routeVoiceTurn does NOT dedup on workItem.id", async () => {
+    // Q4 invariant: voice WorkItem.id is the Vapi callId, reused across many
+    // turns within a single call. Adding callId to the dispatcher dedup map
+    // would silently drop turns 2+ in the 60s TTL.
+    const ctx = {
+      agentId: "mokie",
+      sessionId: undefined,
+      channelId: "call-dedup-1",
+      threadId: "voice:call-dedup-1",
+      workItem: makeWorkItem({
+        id: "call-dedup-1",
+        source: { kind: "voice", id: "call-dedup-1", label: "voice:call-dedup-1" },
+        threadId: "voice:call-dedup-1",
+      }),
+      channel: "voice" as const,
+    };
+
+    await dispatcher.routeVoiceTurn(ctx as any);
+    await dispatcher.routeVoiceTurn(ctx as any);
+
+    // Both calls reach spawnTurn — no dedup-on-id swallows the second one.
+    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(2);
   });
 });
 

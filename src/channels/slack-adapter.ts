@@ -3,30 +3,11 @@ import type { ChannelAdapter } from "./channel-adapter.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
 import type { SlackGateway } from "../slack/slack-gateway.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
-import type { AgentManager, TurnContext } from "../agents/agent-manager.js";
-import { resolveAgentForSlackWorkItem } from "./slack-agent-resolver.js";
 import { formatError, formatResponse } from "../slack/response-formatter.js";
 import type { WebClient } from "@slack/web-api";
 import type { SweepResult } from "../sweeper/sweeper.js";
 
 const log = createLogger("slack-adapter");
-
-/**
- * KPR-217: optional per-turn-spawn wiring. When `perTurn` is provided AND
- * `perTurnSpawnEnabled` is true, inbound Slack messages skip the dispatcher
- * and route directly through `agentManager.spawnTurn(...)`. Otherwise the
- * adapter falls back to the legacy `onWorkItem` → dispatcher path.
- *
- * Bypasses dispatcher dedup/audit/retry/model-router/taskLedger and
- * dispatcher's full multi-agent + conference resolution. Agent routing under
- * the per-turn path uses {@link resolveAgentForSlackWorkItem} (single-agent
- * only). Flag stays OFF in production until KPR-223 decides whether
- * per-turn paths route through the dispatcher.
- */
-export interface SlackAdapterPerTurnDeps {
-  agentManager: AgentManager;
-  perTurnSpawnEnabled: boolean;
-}
 
 const DEFAULT_PROMPTS = [
   { title: "Daily briefing", message: "What's on my plate today?" },
@@ -51,7 +32,6 @@ export class SlackAdapter implements ChannelAdapter {
   private excludeChannels: Set<string>;
   private defaultAgentId?: string;
   private botLabel?: string;
-  private perTurn?: SlackAdapterPerTurnDeps;
   private threadContextMap = new Map<string, string>();
   private threadContextLastSeen = new Map<string, number>();
 
@@ -62,7 +42,6 @@ export class SlackAdapter implements ChannelAdapter {
     id: string = "slack",
     defaultAgentId?: string,
     botLabel?: string,
-    perTurn?: SlackAdapterPerTurnDeps,
   ) {
     this.id = id;
     this.gateway = gateway;
@@ -70,7 +49,6 @@ export class SlackAdapter implements ChannelAdapter {
     this.excludeChannels = new Set(excludeChannels);
     this.defaultAgentId = defaultAgentId;
     this.botLabel = botLabel;
-    this.perTurn = perTurn;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
@@ -119,20 +97,7 @@ export class SlackAdapter implements ChannelAdapter {
         files: msg.files,
       };
 
-      // KPR-217: per-turn-spawn branch. When the operator flag is on, route
-      // directly through AgentManager.spawnTurn (bypassing the dispatcher).
-      // Fire-and-forget — the gateway's onMessage handler doesn't await.
-      if (this.perTurn?.perTurnSpawnEnabled) {
-        this.spawnTurnForWorkItem(workItem).catch((err) => {
-          log.error("Slack per-turn spawn failed", {
-            error: String(err),
-            channel: workItem.source.label,
-            threadId: workItem.threadId,
-          });
-        });
-      } else {
-        onWorkItem(workItem);
-      }
+      onWorkItem(workItem);
     });
 
     // Handle assistant thread started (AI Apps split view)
@@ -218,92 +183,6 @@ export class SlackAdapter implements ChannelAdapter {
   async stop(): Promise<void> {
     await this.gateway.stop();
     log.info("Slack adapter stopped");
-  }
-
-  /**
-   * KPR-217: per-turn-spawn path. Resolves agent (thread continuity →
-   * channel binding → defaultAgentId), pulls existing session id, sets the
-   * "Thinking..." status, spawns one turn, clears the status in finally,
-   * delivers via gateway.postMessage.
-   *
-   * Bypasses dispatcher dedup/audit/retry/model-router/taskLedger and
-   * dispatcher's full multi-agent + conference resolution by design for
-   * Phase A — same caveat as SMS (KPR-216). Flag stays OFF in production
-   * until KPR-223 decides whether per-turn paths should route through the
-   * dispatcher.
-   *
-   * Note: `gateway.setThreadStatus` swallows its own errors (see
-   * SlackGateway), so the status calls are not wrapped here. If status
-   * setting fails the spawn still proceeds and a stale "Thinking..."
-   * indicator is the only user-visible degradation.
-   */
-  private async spawnTurnForWorkItem(workItem: WorkItem): Promise<void> {
-    if (!this.perTurn) return;
-    const { agentManager } = this.perTurn;
-
-    const agentId = await resolveAgentForSlackWorkItem(workItem, this.registry, agentManager, this.defaultAgentId);
-    if (!agentId) {
-      log.info("Slack per-turn: no agent resolved — dropping", {
-        channel: workItem.source.label,
-        threadId: workItem.threadId,
-      });
-      return;
-    }
-
-    const threadId = workItem.threadId ?? workItem.id;
-    const sessionId = await agentManager.getSessionStore().get(agentId, threadId);
-
-    const ctx: TurnContext = {
-      agentId,
-      sessionId,
-      channelId: workItem.source.id,
-      threadId,
-      workItem,
-      channel: "slack",
-    };
-
-    const slackTs = (workItem.meta?.slackThreadTs as string) ?? (workItem.meta?.slackTs as string);
-    const isIntegrationMsg = workItem.sender?.startsWith("B") || workItem.sender === "integration";
-    const showStatus = !isIntegrationMsg && !!slackTs;
-
-    if (showStatus) {
-      await this.gateway.setThreadStatus(workItem.source.id, slackTs, "Thinking...");
-    }
-
-    try {
-      const turn = await agentManager.spawnTurn(ctx);
-
-      if (turn.errors.length > 0) {
-        log.warn("Slack per-turn spawn returned errors", {
-          agentId,
-          threadId,
-          errors: turn.errors,
-        });
-      }
-
-      const text = turn.finalMessage?.trim();
-      if (!text) {
-        log.info("Slack per-turn spawn produced no text — skipping delivery", {
-          agentId,
-          threadId,
-        });
-        return;
-      }
-
-      const workResult: WorkResult = {
-        text,
-        agentId,
-        workItem,
-        costUsd: turn.usage.costUsd,
-        durationMs: turn.usage.durationMs,
-        error: turn.errors[0],
-      };
-      await this.deliver(workResult);
-    } finally {
-      if (showStatus) {
-        await this.gateway.setThreadStatus(workItem.source.id, slackTs, "");
-      }
-    }
   }
 
   /** Expose the Slack WebClient for external use (e.g. audit channel resolution) */
