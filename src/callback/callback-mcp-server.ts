@@ -185,3 +185,42 @@ export function createCallbackMcpServer(deps: CallbackToolDeps) {
     tools: buildCallbackTools(deps),
   });
 }
+
+/**
+ * KPR-216: per-turn factory variant. Captures source metadata at construction
+ * as plain values instead of via a mutable `*ContextRef`. Used by
+ * `AgentManager.spawnTurn` (per-turn-spawn channels) where the server's
+ * lifetime is the single turn — a callback scheduled mid-turn captures the
+ * spawn-time source, which matches what the long-lived path achieves by
+ * mutating the ref before each `query()`.
+ */
+export interface CallbackTurnDeps {
+  db: Db;
+  agentId: string;
+  adapterId?: string;
+  channelId?: string;
+  channelKind?: string;
+  channelLabel?: string;
+  threadId?: string;
+  slackTs?: string;
+  slackThreadTs?: string;
+}
+
+export function buildCallbackMcpForTurn(deps: CallbackTurnDeps) {
+  const contextRef: { current: CallbackTurnContext } = {
+    current: {
+      adapterId: deps.adapterId,
+      channelId: deps.channelId,
+      channelKind: deps.channelKind,
+      channelLabel: deps.channelLabel,
+      threadId: deps.threadId,
+      slackTs: deps.slackTs,
+      slackThreadTs: deps.slackThreadTs,
+    },
+  };
+  return createSdkMcpServer({
+    name: "callback",
+    version: "1.0.0",
+    tools: buildCallbackTools({ db: deps.db, agentId: deps.agentId, context: contextRef }),
+  });
+}

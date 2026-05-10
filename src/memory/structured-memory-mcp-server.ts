@@ -421,3 +421,41 @@ export function createStructuredMemoryMcpServer(deps: StructuredMemoryToolDeps) 
     tools: buildStructuredMemoryTools(deps),
   });
 }
+
+/**
+ * KPR-216: per-turn factory variant. Captures channel/thread at construction
+ * as plain values instead of via a mutable `*ContextRef`. Used by
+ * `AgentManager.spawnTurn` (per-turn-spawn channels) where the server's
+ * lifetime is the single turn — no need for the runner to mutate context
+ * between turns.
+ *
+ * The long-lived path (slack/ws/voice pre-rope-back) still uses
+ * `createStructuredMemoryMcpServer` with `StructuredMemoryToolDeps.context`.
+ */
+export interface StructuredMemoryTurnDeps {
+  db: Db;
+  agentId: string;
+  channelId?: string;
+  threadId?: string;
+  qdrantUrl?: string;
+  ollamaUrl?: string;
+  onMutate?: (agentId: string | null, reason: string) => void;
+}
+
+export function buildStructuredMemoryMcpForTurn(deps: StructuredMemoryTurnDeps) {
+  const contextRef: { current: StructuredMemoryTurnContext } = {
+    current: { channelId: deps.channelId, threadId: deps.threadId },
+  };
+  return createSdkMcpServer({
+    name: "structured-memory",
+    version: "1.0.0",
+    tools: buildStructuredMemoryTools({
+      db: deps.db,
+      agentId: deps.agentId,
+      context: contextRef,
+      qdrantUrl: deps.qdrantUrl,
+      ollamaUrl: deps.ollamaUrl,
+      onMutate: deps.onMutate,
+    }),
+  });
+}
