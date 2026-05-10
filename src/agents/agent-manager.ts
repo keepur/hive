@@ -145,6 +145,10 @@ export class AgentManager {
   // DEFAULT_PER_AGENT_SPAWN_BUDGET; over-budget spawns reject immediately
   // so the adapter can decide whether to drop, retry, or fall back.
   private activeSpawnCount = new Map<string, number>();
+  // KPR-216: per-turn spawn locks held in `processing` but with no entry in
+  // `activeRunners` (per-turn runners are local to spawnTurn). Sweep uses
+  // this to skip its "stuck flag" branch for legitimate in-flight spawns.
+  private activeSpawnKeys = new Set<string>();
 
   constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, turnTelemetryStore?: TurnTelemetryStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, prefixCache?: PrefixCache) {
     this.registry = registry;
@@ -314,6 +318,7 @@ export class AgentManager {
       await new Promise((r) => setTimeout(r, 25));
     }
     this.processing.add(threadKey);
+    this.activeSpawnKeys.add(threadKey);
     this.activeSpawnCount.set(ctx.agentId, active + 1);
 
     if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
@@ -334,6 +339,7 @@ export class AgentManager {
       return this.finalizeSpawnResult(ctx, result);
     } finally {
       this.processing.delete(threadKey);
+      this.activeSpawnKeys.delete(threadKey);
       const next = (this.activeSpawnCount.get(ctx.agentId) ?? 1) - 1;
       if (next <= 0) this.activeSpawnCount.delete(ctx.agentId);
       else this.activeSpawnCount.set(ctx.agentId, next);
@@ -803,6 +809,9 @@ export class AgentManager {
       const agentId = threadKey.split(":")[0];
       const runners = this.activeRunners.get(agentId);
       if (!runners || runners.size === 0) {
+        // KPR-216: per-turn spawns hold `processing` without populating
+        // `activeRunners` (their runner is local to spawnTurn). Skip.
+        if (this.activeSpawnKeys.has(threadKey)) continue;
         // No active runners but processing flag is set — stuck
         this.processing.delete(threadKey);
         const activeSet = this.activeThreads.get(agentId);

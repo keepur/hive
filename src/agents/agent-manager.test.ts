@@ -1257,5 +1257,56 @@ describe("AgentManager", () => {
       // same instance (read-only access; spawnTurn is the writer).
       expect(manager.getSessionStore()).toBe(sessionStore);
     });
+
+    it("sweep does not clear an in-flight per-turn spawn lock (regression)", async () => {
+      // Bug: sweep's stuck-flag detector keys on `activeRunners` being empty,
+      // which is the by-design state for per-turn spawns. Without the
+      // activeSpawnKeys guard, sweep would clear the legitimate lock and let
+      // a second concurrent spawnTurn race the first.
+      const events: string[] = [];
+      let release: (() => void) | undefined;
+      mockRunnerSend.mockImplementation((prompt: string) => {
+        events.push(`start:${prompt}`);
+        return new Promise((resolve) => {
+          release = () => {
+            events.push(`finish:${prompt}`);
+            resolve(makeRunResult({ text: prompt, sessionId: `s-${prompt}` }));
+          };
+        });
+      });
+
+      const sharedThread = "sms:line-1:+15559999999";
+      const p1 = manager.spawnTurn(smsCtx({ threadId: sharedThread, text: "first" }));
+
+      // Yield so the first spawn grabs the lock and starts.
+      await new Promise((r) => setTimeout(r, 30));
+      expect(events).toEqual(["start:first"]);
+
+      const processing = (manager as any).processing as Set<string>;
+      const threadKey = `agent-a:${sharedThread}`;
+      expect(processing.has(threadKey)).toBe(true);
+
+      // Sweep while the spawn is in-flight. Pre-fix this would delete the lock
+      // and log "Stuck processing flag cleared".
+      const result = manager.sweep();
+      expect(result.pruned).toBe(0);
+      expect(processing.has(threadKey)).toBe(true);
+
+      // A second concurrent spawn on the same thread must queue behind, not
+      // race the first.
+      const p2 = manager.spawnTurn(smsCtx({ threadId: sharedThread, text: "second" }));
+      await new Promise((r) => setTimeout(r, 30));
+      // Still only the first spawn has started — the second is busy-polling.
+      expect(events).toEqual(["start:first"]);
+
+      // Release the first; the second should now proceed.
+      release!();
+      await new Promise((r) => setTimeout(r, 60));
+      expect(events).toEqual(["start:first", "finish:first", "start:second"]);
+
+      // Drain.
+      release!();
+      await Promise.all([p1, p2]);
+    });
   });
 });
