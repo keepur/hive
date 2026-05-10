@@ -566,6 +566,12 @@ async function main(): Promise<void> {
       commandRegistry,
       agentRegistry: registry,
       agentManager,
+      // KPR-218: adapter-level fallback for the per-turn resolver. Gating
+      // happens inside the adapter via `perTurn.perTurnSpawnEnabled`, so we
+      // wire these unconditionally — adapter falls back to the legacy
+      // `onWorkItem` → dispatcher path when the flag is false.
+      defaultAgentId: config.defaultAgent,
+      perTurn: { perTurnSpawnEnabled: config.agentManager.perTurnSpawn.ws },
     });
     dispatcher.registerAdapter(wsAdapter);
     await wsAdapter.start((item) => {
@@ -573,7 +579,10 @@ async function main(): Promise<void> {
         log.error("WS dispatch failed", { error: String(err), source: item.source.label });
       });
     });
-    log.info("WebSocket adapter started", { port: config.ws.port });
+    log.info("WebSocket adapter started", {
+      port: config.ws.port,
+      perTurnSpawn: config.agentManager.perTurnSpawn.ws,
+    });
   }
 
   // Beekeeper federation — advertise this Hive instance to sibling Beekeeper
