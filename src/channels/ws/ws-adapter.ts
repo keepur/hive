@@ -22,7 +22,8 @@ import { processImageBuffer, processFileBuffer } from "../../files/file-processo
 import type { TeamStore } from "../../team/team-store.js";
 import type { CommandRegistry } from "../../team/command-registry.js";
 import type { AgentRegistry } from "../../agents/agent-registry.js";
-import type { AgentManager } from "../../agents/agent-manager.js";
+import type { AgentManager, TurnContext } from "../../agents/agent-manager.js";
+import { resolveAgentForWsWorkItem } from "./ws-agent-resolver.js";
 
 const log = createLogger("ws-adapter");
 
@@ -43,11 +44,36 @@ interface Device {
   origin?: string;
 }
 
+/**
+ * KPR-218: optional per-turn-spawn wiring. When `perTurn` is provided AND
+ * `perTurnSpawnEnabled` is true, inbound WS work items skip the dispatcher
+ * and route directly through `agentManager.spawnTurn(...)`. Otherwise the
+ * adapter falls back to the legacy `onWorkItem` → dispatcher path.
+ *
+ * Bypasses dispatcher dedup/audit/retry/model-router/taskLedger and the
+ * dispatcher's full multi-agent + conference resolution. Agent routing under
+ * the per-turn path uses {@link resolveAgentForWsWorkItem} (single-agent
+ * only). Flag stays OFF in production until KPR-223 decides whether per-turn
+ * paths route through the dispatcher.
+ *
+ * Note: unlike Slack's `SlackAdapterPerTurnDeps`, this interface does NOT
+ * carry `agentManager` — `agentManager` is already required at the top level
+ * of `WsAdapterDeps` (used by `buildAgentList`). Inside per-turn methods,
+ * reach `agentManager` via `this.agentManager`.
+ */
+export interface WsAdapterPerTurnDeps {
+  perTurnSpawnEnabled: boolean;
+}
+
 export interface WsAdapterDeps {
   teamStore: TeamStore;
   commandRegistry: CommandRegistry;
   agentRegistry: AgentRegistry;
   agentManager: AgentManager;
+  /** KPR-218: adapter-level fallback for the per-turn resolver. */
+  defaultAgentId?: string;
+  /** KPR-218: per-turn-spawn opt-in. Omit (or set perTurnSpawnEnabled=false) for legacy path. */
+  perTurn?: WsAdapterPerTurnDeps;
 }
 
 export class WsAdapter implements ChannelAdapter {
@@ -64,6 +90,8 @@ export class WsAdapter implements ChannelAdapter {
   private commandRegistry: CommandRegistry;
   private agentRegistry: AgentRegistry;
   private agentManager: AgentManager;
+  private defaultAgentId?: string;
+  private perTurn?: WsAdapterPerTurnDeps;
 
   constructor(port: number, deps: WsAdapterDeps) {
     this.port = port;
@@ -71,6 +99,20 @@ export class WsAdapter implements ChannelAdapter {
     this.commandRegistry = deps.commandRegistry;
     this.agentRegistry = deps.agentRegistry;
     this.agentManager = deps.agentManager;
+    this.defaultAgentId = deps.defaultAgentId;
+    this.perTurn = deps.perTurn;
+  }
+
+  /**
+   * KPR-218: actual port the HTTP/WS server is listening on. When
+   * constructed with `port: 0` (OS-assigned ephemeral) this returns the
+   * resolved port post-`start()`; otherwise it returns the constructor
+   * value. Tests use the ephemeral path to avoid collisions.
+   */
+  get listeningPort(): number {
+    const addr = this.server?.address();
+    if (addr && typeof addr === "object" && "port" in addr) return addr.port;
+    return this.port;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
@@ -262,7 +304,7 @@ export class WsAdapter implements ChannelAdapter {
               },
             };
 
-            this.onWorkItem(workItem);
+            this.routeWorkItem(workItem);
           }
 
           if (msg.type === "image") {
@@ -295,7 +337,7 @@ export class WsAdapter implements ChannelAdapter {
                 },
               };
 
-              this.onWorkItem(workItem);
+              this.routeWorkItem(workItem);
             } catch (imgErr) {
               log.error("Image processing failed", { deviceId, filename: msg.filename, error: String(imgErr) });
               this.send(ws, { type: "error", message: "Failed to process image" });
@@ -415,6 +457,134 @@ export class WsAdapter implements ChannelAdapter {
     return this.connections.size;
   }
 
+  // ── KPR-218: per-turn-spawn routing ───────────────────────────────
+
+  /**
+   * KPR-218: single branch point for inbound WorkItems. When the per-turn
+   * flag is on, work items go straight through `AgentManager.spawnTurn`
+   * (bypassing the dispatcher); otherwise they flow through `onWorkItem`
+   * like before.
+   *
+   * The five WorkItem-construction sites in WsAdapter all funnel through
+   * this method instead of calling `onWorkItem` directly, keeping the
+   * per-turn branch in one place.
+   */
+  private routeWorkItem(workItem: WorkItem): void {
+    if (this.perTurn?.perTurnSpawnEnabled) {
+      this.spawnTurnForWorkItem(workItem).catch((err) => {
+        log.error("WS per-turn spawn failed", {
+          error: String(err),
+          deviceId: workItem.meta?.deviceId,
+          threadId: workItem.threadId,
+          kind: workItem.source.kind,
+        });
+      });
+    } else {
+      this.onWorkItem(workItem);
+    }
+  }
+
+  /**
+   * KPR-218: per-turn-spawn path. Resolves agent via
+   * {@link resolveAgentForWsWorkItem}, loads sessionId, sends a best-effort
+   * `{type:"typing"}` indicator before the spawn (matches the legacy
+   * `onProcessingStart` behavior), spawns one turn, delivers via
+   * {@link deliver} (which inherits the existing `pendingMessages` buffer
+   * for disconnected devices).
+   *
+   * Bypasses dispatcher dedup/audit/retry/model-router/taskLedger by design
+   * for Phase A — same caveat as SMS (KPR-216) and Slack (KPR-217). Flag
+   * stays OFF in production until KPR-223 decides whether per-turn paths
+   * should route through the dispatcher.
+   *
+   * No status-clear in finally: WS clients clear the typing indicator
+   * implicitly when the message arrives, mirroring legacy
+   * `onProcessingEnd` which is a no-op. If the spawn throws without a
+   * subsequent message, the indicator stays on the client until the next
+   * message — acceptable for Phase A; a follow-up could send an explicit
+   * `{type: "error"}` on throw.
+   */
+  private async spawnTurnForWorkItem(workItem: WorkItem): Promise<void> {
+    if (!this.perTurn) return;
+    const threadId = workItem.threadId;
+    if (!threadId) {
+      log.warn("WS per-turn: WorkItem missing threadId — dropping", {
+        deviceId: workItem.meta?.deviceId,
+      });
+      return;
+    }
+
+    const agentId = await resolveAgentForWsWorkItem(
+      workItem,
+      this.agentRegistry,
+      this.agentManager,
+      this.defaultAgentId,
+    );
+    if (!agentId) {
+      log.info("WS per-turn: no agent resolved — dropping", {
+        deviceId: workItem.meta?.deviceId,
+        threadId,
+        kind: workItem.source.kind,
+      });
+      return;
+    }
+
+    const sessionId = await this.agentManager.getSessionStore().get(agentId, threadId);
+
+    // For app-kind, source.id === deviceId (ws-adapter.ts:251); for team-kind,
+    // source.id === channelId (line 491). Both flow into bgContext.channelId
+    // for in-process MCP handlers — this matches the existing dispatcher path's
+    // behavior for WS messages, so MCPs that key off channelId for app-kind
+    // already see the deviceId today. Not a regression; documented here so
+    // the asymmetry is visible.
+    const ctx: TurnContext = {
+      agentId,
+      sessionId,
+      channelId: workItem.source.id,
+      threadId,
+      workItem,
+      channel: workItem.source.kind, // "app" or "team"
+    };
+
+    // Best-effort typing indicator — mirrors legacy onProcessingStart.
+    const deviceId = workItem.meta?.deviceId as string | undefined;
+    if (deviceId) {
+      const ws = this.connections.get(deviceId);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        this.send(ws, { type: "typing", agentId });
+      }
+    }
+
+    const turn = await this.agentManager.spawnTurn(ctx);
+
+    if (turn.errors.length > 0) {
+      log.warn("WS per-turn spawn returned errors", {
+        agentId,
+        threadId,
+        errors: turn.errors,
+      });
+    }
+
+    const text = turn.finalMessage?.trim();
+    if (!text) {
+      log.info("WS per-turn spawn produced no text — skipping delivery", {
+        agentId,
+        threadId,
+      });
+      return;
+    }
+
+    const workResult: WorkResult = {
+      text,
+      agentId,
+      workItem,
+      costUsd: turn.usage.costUsd,
+      durationMs: turn.usage.durationMs,
+      error: turn.errors[0],
+    };
+    await this.deliver(workResult);
+  }
+
   // ── Team helpers ───────────────────────────────────────────────────
 
   /** Verify device is a member of the channel. Returns the channel on success, null on failure. */
@@ -503,7 +673,7 @@ export class WsAdapter implements ChannelAdapter {
       },
     };
 
-    this.onWorkItem(workItem);
+    this.routeWorkItem(workItem);
   }
 
   private async handleTeamImage(ws: WebSocket, msg: ClientTeamImage, device: Device, deviceId: string): Promise<void> {
@@ -560,7 +730,7 @@ export class WsAdapter implements ChannelAdapter {
         },
       };
 
-      this.onWorkItem(workItem);
+      this.routeWorkItem(workItem);
     } catch (imgErr) {
       log.error("Team image processing failed", {
         deviceId,
@@ -627,7 +797,7 @@ export class WsAdapter implements ChannelAdapter {
         },
       };
 
-      this.onWorkItem(workItem);
+      this.routeWorkItem(workItem);
     } catch (err) {
       log.error("Team file processing failed", {
         deviceId,
