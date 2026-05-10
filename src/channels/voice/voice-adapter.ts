@@ -1,11 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import Anthropic from "@anthropic-ai/sdk";
+import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../../logging/logger.js";
 import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
+import { renderConversationPrompt, extractLatestUserMessage } from "./conversation-prompt.js";
 import {
-  openaiToClaude,
-  openaiToolsToClaude,
   formatSSETextChunk,
   formatSSEDone,
   formatNonStreamingResponse,
@@ -17,17 +16,25 @@ import { config } from "../../config.js";
 
 const log = createLogger("voice-adapter");
 
+// Exported for unit tests.
+export function isAuthError(err: unknown): boolean {
+  const s = String(err);
+  return /resolve authentication|credentials\.json|not authenticated|401 Unauthorized|ANTHROPIC_API_KEY|authToken/i.test(
+    s,
+  );
+}
+
 interface CallSession {
   callId: string;
   agentId: string;
   startedAt: Date;
+  sdkSessionId?: string;
 }
 
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 export class VoiceAdapter {
   private httpServer: ReturnType<typeof createServer> | undefined;
-  private anthropic: Anthropic;
   private sessions = new Map<string, CallSession>();
   private sweepTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -36,9 +43,7 @@ export class VoiceAdapter {
     private serverSecret: string,
     private registry: AgentRegistry,
     private memoryManager: MemoryManager,
-  ) {
-    this.anthropic = new Anthropic();
-  }
+  ) {}
 
   async start(): Promise<void> {
     this.httpServer = createServer((req, res) => {
@@ -179,72 +184,199 @@ export class VoiceAdapter {
       context: callMeta?.context,
     });
 
-    // Translate OpenAI → Claude
-    const { system, messages } = openaiToClaude(request.messages, systemPrompt);
-    const tools = openaiToolsToClaude(request.tools);
+    const session = this.sessions.get(callId)!; // guaranteed present after bookkeeping
 
     const model = agentConfig.model;
-
     const completionId = `chatcmpl-${randomUUID()}`;
+    const startedAt = Date.now();
 
-    if (request.stream === false) {
-      // Non-streaming response
-      const response = await this.anthropic.messages.create({
-        model,
-        max_tokens: 1024,
-        system,
-        messages,
-        ...(tools ? { tools } : {}),
-      });
+    const buildQuery = (resumeSessionId: string | undefined) => {
+      const turnPrompt = resumeSessionId
+        ? extractLatestUserMessage(request.messages)
+        : renderConversationPrompt(request.messages);
 
-      const textBlocks = response.content.filter((b) => b.type === "text");
-      const text = textBlocks.map((b) => (b as Anthropic.TextBlock).text).join("");
+      // If we tried to resume but the latest user message is empty (shouldn't
+      // happen mid-call, but defensive), fall back to full transcript framing.
+      const safePrompt = resumeSessionId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
+      const effectiveResume = resumeSessionId && turnPrompt ? resumeSessionId : undefined;
 
+      return {
+        q: query({
+          prompt: safePrompt,
+          options: {
+            model: agentConfig.model,
+            systemPrompt,
+            permissionMode: "bypassPermissions",
+            allowDangerouslySkipPermissions: true,
+            maxTurns: 1,
+            settingSources: [],
+            includePartialMessages: request.stream !== false,
+            env: {
+              ...process.env,
+              ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
+              CLAUDE_AGENT_SDK_CLIENT_APP: "hive/voice",
+              CLAUDECODE: undefined,
+            },
+            extraArgs: { "strict-mcp-config": null },
+            ...(effectiveResume ? { resume: effectiveResume } : {}),
+          },
+        }),
+        isResumeAttempt: !!effectiveResume,
+      };
+    };
+
+    type TurnOutcome =
+      | { ok: true; firstTokenMs: number | undefined; resultSubtype?: string }
+      | { ok: false; reason: string; bytesSent: boolean };
+
+    const runTurn = async (q: ReturnType<typeof query>, isStreaming: boolean): Promise<TurnOutcome> => {
+      let firstTokenMs: number | undefined;
+      let resultSubtype: string | undefined;
+      let assistantText = "";
+      let headersSent = false;
+
+      try {
+        for await (const message of q) {
+          const msg = message as SDKMessage;
+
+          // Capture session id for next turn's resume.
+          if (msg.type === "system" && (msg as any).subtype === "init") {
+            const sid = (msg as any).session_id as string | undefined;
+            if (sid) session.sdkSessionId = sid;
+          }
+
+          // Streaming text path — write SSE chunks lazily.
+          if (isStreaming && msg.type === "stream_event") {
+            const event = (msg as any).event;
+            if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
+              if (!headersSent) {
+                res.writeHead(200, {
+                  "Content-Type": "text/event-stream",
+                  "Cache-Control": "no-cache",
+                  Connection: "keep-alive",
+                });
+                headersSent = true;
+                firstTokenMs = Date.now() - startedAt;
+              }
+              res.write(formatSSETextChunk(completionId, event.delta.text ?? "", model));
+            }
+          }
+
+          // Non-streaming text path — collect assistant text from the canonical message.
+          if (!isStreaming && msg.type === "assistant") {
+            const content = (msg as any).message?.content;
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (block?.type === "text" && typeof block.text === "string") {
+                  if (firstTokenMs === undefined) firstTokenMs = Date.now() - startedAt;
+                  assistantText = block.text;
+                }
+              }
+            }
+          }
+
+          if (msg.type === "result") {
+            resultSubtype = (msg as any).subtype;
+            if (!isStreaming && resultSubtype === "success") {
+              assistantText = (msg as any).result || assistantText;
+            }
+          }
+        }
+      } catch (err) {
+        return { ok: false, reason: String(err), bytesSent: headersSent };
+      }
+
+      if (resultSubtype && resultSubtype !== "success") {
+        return { ok: false, reason: `result.subtype=${resultSubtype}`, bytesSent: headersSent };
+      }
+
+      // Streaming branch finalization — emit [DONE] and end.
+      if (isStreaming) {
+        if (!headersSent) {
+          // Resume succeeded but produced no text (degenerate but not impossible).
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          headersSent = true;
+        }
+        res.write(formatSSEDone(completionId, model));
+        res.end();
+        return { ok: true, firstTokenMs, resultSubtype };
+      }
+
+      // Non-streaming branch finalization — return the JSON body to caller.
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(formatNonStreamingResponse(completionId, text, model)));
+      res.end(JSON.stringify(formatNonStreamingResponse(completionId, assistantText, model)));
+      return { ok: true, firstTokenMs, resultSubtype };
+    };
+
+    let { q, isResumeAttempt } = buildQuery(session.sdkSessionId);
+    let outcome = await runTurn(q, request.stream !== false);
+
+    const sdkSessionResumeAttempted = isResumeAttempt;
+
+    if (!outcome.ok && isResumeAttempt && !outcome.bytesSent) {
+      // Resume failed before any bytes hit the wire — retry as turn-1 with full transcript.
+      log.warn("Voice session resume failed, retrying as turn-1", {
+        callId,
+        reason: outcome.reason,
+      });
+      session.sdkSessionId = undefined;
+      ({ q, isResumeAttempt } = buildQuery(undefined));
+      outcome = await runTurn(q, request.stream !== false);
+    }
+
+    if (!outcome.ok) {
+      // Either not a resume attempt, or retry also failed, or bytes already sent (mid-stream failure).
+      if (isAuthError(outcome.reason)) {
+        log.error("Voice query failed — OAuth credentials unavailable", {
+          callId,
+          agentId,
+          reason: outcome.reason,
+        });
+        if (!outcome.bytesSent) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Voice unavailable" }));
+        } else {
+          // Bytes already sent — best we can do is end the SSE stream with an error sentinel.
+          if (!res.writableEnded) {
+            res.write(formatSSEDone(completionId, model, "error"));
+            res.end();
+          }
+        }
+        return;
+      }
+
+      log.error("Voice query failed", {
+        callId,
+        agentId,
+        reason: outcome.reason,
+        bytesSent: outcome.bytesSent,
+      });
+      if (!outcome.bytesSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal error" }));
+      } else {
+        if (!res.writableEnded) {
+          res.write(formatSSEDone(completionId, model, "error"));
+          res.end();
+        }
+      }
       return;
     }
 
-    // Streaming response (default — Vapi always sends stream: true)
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
+    log.info("Voice turn complete", {
+      callId,
+      agentId,
+      firstTokenMs: outcome.firstTokenMs,
+      totalMs: Date.now() - startedAt,
+      mode: request.stream === false ? "non-streaming" : "streaming",
+      resultSubtype: outcome.resultSubtype,
+      sdkSessionResumeAttempted, // captured BEFORE retry — preserves the original turn classification
+      sdkSessionResumed: sdkSessionResumeAttempted && outcome.ok && isResumeAttempt, // true iff resumed AND we didn't retry
     });
-
-    try {
-      const stream = this.anthropic.messages.stream({
-        model,
-        max_tokens: 1024,
-        system,
-        messages,
-        ...(tools ? { tools } : {}),
-      });
-
-      // PoC: text streaming only. Tool call streaming (tool_use blocks → OpenAI
-      // tool_calls format) is deferred to Phase 2 when live tool calling is wired.
-      for await (const event of stream) {
-        if (event.type === "content_block_delta") {
-          // SDK types content_block_delta.delta as a union — narrow to text_delta
-          const delta = event.delta as { type: string; text?: string };
-          if (delta.type === "text_delta") {
-            res.write(formatSSETextChunk(completionId, delta.text ?? "", model));
-          }
-        }
-      }
-
-      // Final done
-      if (!res.writableEnded) {
-        res.write(formatSSEDone(completionId, model));
-      }
-    } catch (err) {
-      log.error("Claude streaming error", { error: String(err), callId, agentId });
-      if (!res.writableEnded) {
-        res.write(formatSSEDone(completionId, model, "error"));
-      }
-    }
-
-    res.end();
   }
 
   /**
