@@ -12,6 +12,8 @@ import {
 } from "./openai-translator.js";
 import type { AgentRegistry } from "../../agents/agent-registry.js";
 import type { MemoryManager } from "../../memory/memory-manager.js";
+import type { AgentManager, SpawnTurnStreamCallback, TurnContext, TurnResult } from "../../agents/agent-manager.js";
+import type { WorkItem } from "../../types/work-item.js";
 import { config } from "../../config.js";
 
 const log = createLogger("voice-adapter");
@@ -43,6 +45,13 @@ export class VoiceAdapter {
     private serverSecret: string,
     private registry: AgentRegistry,
     private memoryManager: MemoryManager,
+    /**
+     * KPR-219: optional so legacy callers / unit tests that exercise just the
+     * inline direct-`query()` path don't need a manager. The flag-on
+     * spawnTurnViaAgentManager path requires it; if it's missing AND the flag
+     * is on, we fall through to the legacy path with a warning.
+     */
+    private agentManager?: AgentManager,
   ) {}
 
   async start(): Promise<void> {
@@ -175,6 +184,18 @@ export class VoiceAdapter {
         startedAt: new Date(),
       });
       log.info("Voice call session started", { callId, agentId });
+    }
+
+    // KPR-219: route through AgentManager.spawnTurn when the per-channel flag
+    // is on AND the manager dependency was wired. Voice is per-turn either way
+    // — the flag flips between direct `query()` and `spawnTurn` (per-thread
+    // lock + per-agent budget + session-store managed instead of the
+    // in-adapter Map).
+    if (config.agentManager.perTurnSpawn.voice && this.agentManager) {
+      return this.spawnTurnViaAgentManager(res, request, agentId, agentConfig, callId);
+    }
+    if (config.agentManager.perTurnSpawn.voice && !this.agentManager) {
+      log.warn("Voice perTurnSpawn flag on but agentManager not wired — falling back to direct query()");
     }
 
     // Build system prompt with call context
@@ -377,6 +398,235 @@ export class VoiceAdapter {
       sdkSessionResumeAttempted, // captured BEFORE retry — preserves the original turn classification
       sdkSessionResumed: sdkSessionResumeAttempted && outcome.ok && isResumeAttempt, // true iff resumed AND we didn't retry
     });
+  }
+
+  /**
+   * KPR-219: per-turn spawn through AgentManager. Replaces the inline `query()`
+   * spawn at lines 204-223 (the `buildQuery` builder + `runTurn` loop) when
+   * `agentManager.perTurnSpawn.voice` is true.
+   *
+   * Routes voice turns through the same per-thread lock + per-agent budget +
+   * session-store path as SMS/Slack/WS. Voice's existing outer
+   * retry-on-resume-fail logic stays around the spawnTurn call — it catches
+   * cases spawnTurn's inner auth-retry doesn't (stale session id without an
+   * auth-error pattern). The two retry layers compose intentionally; see plan
+   * Q4 / spec §D4a.
+   *
+   * Streaming: onStream relays each text-delta chunk to SSE. AgentRunner.send
+   * filters for `stream_event/content_block_delta/text_delta` upstream and
+   * invokes the callback with the extracted text string — voice does NOT see
+   * raw `SDKMessage` here. firstTokenMs captured on first non-empty chunk for
+   * telemetry parity with the KPR-207 baseline log shape.
+   */
+  private async spawnTurnViaAgentManager(
+    res: ServerResponse,
+    request: OpenAIChatRequest,
+    agentId: string,
+    agentConfig: NonNullable<ReturnType<AgentRegistry["get"]>>,
+    callId: string,
+  ): Promise<void> {
+    const agentManager = this.agentManager!;
+    const completionId = `chatcmpl-${randomUUID()}`;
+    const startedAt = Date.now();
+    const isStreaming = request.stream !== false;
+    const threadId = `voice:${callId}`;
+    const callMeta = request.call?.metadata as Record<string, string> | undefined;
+    const model = agentConfig.model;
+
+    // Voice-specific system prompt — omits tool summaries / delegate
+    // descriptions, adds call goal/context. AgentRunner consumes via
+    // TurnContext.systemPromptOverride.
+    const systemPrompt = await buildVoiceSystemPrompt(agentConfig, this.memoryManager, {
+      goal: callMeta?.goal,
+      context: callMeta?.context,
+    });
+
+    const sessionStore = agentManager.getSessionStore();
+    const storedSessionId = await sessionStore.get(agentId, threadId);
+
+    // Choose prompt based on resume-presence (mirrors current voice behavior).
+    const turnPrompt = storedSessionId
+      ? extractLatestUserMessage(request.messages)
+      : renderConversationPrompt(request.messages);
+    const safePrompt = storedSessionId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
+    const effectiveResume = storedSessionId && turnPrompt ? storedSessionId : undefined;
+
+    // Synthesize a WorkItem. ChannelKind="voice" was added in Step 1 of this
+    // ticket so this compiles.
+    const workItem: WorkItem = {
+      id: callId,
+      text: safePrompt,
+      source: { kind: "voice", id: callId, label: `voice:${callId}` },
+      sender: callId,
+      threadId,
+      timestamp: new Date(),
+      meta: { callId, ...(callMeta ?? {}) },
+    };
+
+    let firstTokenMs: number | undefined;
+    let headersSent = false;
+    const onStream: SpawnTurnStreamCallback | undefined = isStreaming
+      ? (chunk: string) => {
+          // chunk is the pre-extracted text-delta string (StreamCallback shape
+          // = `(chunk: string) => void`). Defensive empty-skip mirrors the
+          // legacy inline loop's behavior.
+          if (!chunk) return;
+          if (!headersSent) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            });
+            headersSent = true;
+            firstTokenMs = Date.now() - startedAt;
+          }
+          res.write(formatSSETextChunk(completionId, chunk, model));
+        }
+      : undefined;
+
+    const ctx: TurnContext = {
+      agentId,
+      sessionId: effectiveResume,
+      channelId: callId,
+      threadId,
+      workItem,
+      channel: "voice",
+      systemPromptOverride: systemPrompt,
+    };
+
+    const runOnce = async (
+      spawnCtx: TurnContext,
+    ): Promise<
+      { ok: true; result: TurnResult; bytesSent: boolean } | { ok: false; reason: string; bytesSent: boolean }
+    > => {
+      try {
+        const result = await agentManager.spawnTurn(spawnCtx, onStream);
+        if (result.errors.length > 0) {
+          return { ok: false, reason: result.errors[0]!, bytesSent: headersSent };
+        }
+        return { ok: true, result, bytesSent: headersSent };
+      } catch (err) {
+        return { ok: false, reason: String(err), bytesSent: headersSent };
+      }
+    };
+
+    let outcome = await runOnce(ctx);
+    let outerRetryFired = false;
+
+    // Outer retry — resume failed before any bytes hit the wire. Restart with
+    // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
+    // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
+    // cover (stale id without auth-error pattern, etc.).
+    if (!outcome.ok && effectiveResume && !outcome.bytesSent) {
+      log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
+        callId,
+        reason: outcome.reason,
+      });
+      outerRetryFired = true;
+      const fullPrompt = renderConversationPrompt(request.messages);
+      const retryWorkItem: WorkItem = { ...workItem, text: fullPrompt };
+      const retryCtx: TurnContext = {
+        ...ctx,
+        sessionId: undefined,
+        workItem: retryWorkItem,
+      };
+      outcome = await runOnce(retryCtx);
+    }
+
+    if (!outcome.ok) {
+      if (isAuthError(outcome.reason)) {
+        log.error("Voice spawnTurn failed — OAuth credentials unavailable", {
+          callId,
+          agentId,
+          reason: outcome.reason,
+        });
+        this.endWithError(res, 503, "Voice unavailable", outcome.bytesSent, completionId, model);
+        return;
+      }
+      if (outcome.reason.includes("Spawn budget exceeded")) {
+        log.error("Voice spawnTurn rejected — spawn budget exceeded", {
+          callId,
+          agentId,
+          reason: outcome.reason,
+        });
+        this.endWithError(res, 503, "Voice temporarily unavailable", outcome.bytesSent, completionId, model);
+        return;
+      }
+      log.error("Voice spawnTurn failed", {
+        callId,
+        agentId,
+        reason: outcome.reason,
+        bytesSent: outcome.bytesSent,
+      });
+      this.endWithError(res, 500, "Internal error", outcome.bytesSent, completionId, model);
+      return;
+    }
+
+    const result = outcome.result;
+
+    // Success — finalize the response shape.
+    if (isStreaming) {
+      if (!headersSent) {
+        // Resume produced no streamed text (degenerate: e.g. zero-content
+        // turn). Emit the standard SSE close anyway so Vapi ends cleanly.
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        headersSent = true;
+      }
+      res.write(formatSSEDone(completionId, model));
+      res.end();
+    } else {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(formatNonStreamingResponse(completionId, result.finalMessage, model)));
+    }
+
+    // Telemetry parity with KPR-207 baseline (voice-adapter.ts:370-379).
+    // sdkSessionResumed = "we attempted resume AND the spawn succeeded
+    // without the outer-retry kicking in" — NOT `newSessionId === effectiveResume`,
+    // because the SDK rotates session ids post-compaction, which would
+    // systematically under-count successful resumes versus the baseline.
+    // The `!outerRetryFired` clause matches the legacy adapter's semantic
+    // exactly: when retry fires, the original resume failed, so this counts
+    // as a non-resumed turn even if the retry succeeded.
+    log.info("Voice turn complete", {
+      callId,
+      agentId,
+      firstTokenMs,
+      totalMs: Date.now() - startedAt,
+      mode: isStreaming ? "streaming" : "non-streaming",
+      sdkSessionResumeAttempted: !!effectiveResume,
+      sdkSessionResumed: !!effectiveResume && outcome.ok && !outerRetryFired,
+      routedVia: "agentManager",
+    });
+  }
+
+  /**
+   * KPR-219: end the response with an error sentinel. Branches between
+   * `writeHead`+`end` for the no-bytes-sent case (clean HTTP error) and an
+   * SSE error close for the bytes-already-sent case (best we can do
+   * mid-stream). Net-new helper extracted to avoid duplicating the branch
+   * across the three error paths in `spawnTurnViaAgentManager`.
+   */
+  private endWithError(
+    res: ServerResponse,
+    status: number,
+    message: string,
+    bytesSent: boolean,
+    completionId: string,
+    model: string,
+  ): void {
+    if (!bytesSent) {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: message }));
+      return;
+    }
+    if (!res.writableEnded) {
+      res.write(formatSSEDone(completionId, model, "error"));
+      res.end();
+    }
   }
 
   /**

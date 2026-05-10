@@ -609,7 +609,13 @@ async function main(): Promise<void> {
   if (config.voice.enabled && config.voice.serverSecret) {
     const { VoiceAdapter } = await import("./channels/voice/voice-adapter.js");
 
-    voiceAdapter = new VoiceAdapter(config.voice.port, config.voice.serverSecret, registry, memoryManager);
+    voiceAdapter = new VoiceAdapter(
+      config.voice.port,
+      config.voice.serverSecret,
+      registry,
+      memoryManager,
+      agentManager, // KPR-219: needed for the per-turn flag-on path
+    );
     await voiceAdapter.start();
     log.info("Voice adapter started", { port: config.voice.port });
   }

@@ -229,7 +229,7 @@ agentManager:
     sms: false    # KPR-216 — operator opt-in after dev verification
     slack: false  # KPR-217 — operator opt-in after dev verification
     ws: false     # KPR-218 — operator opt-in after dev verification
-    voice: false  # KPR-219 (rope-back; voice already per-turn but bypasses AgentManager today)
+    voice: false  # KPR-219 — routes voice through AgentManager (already per-turn either way)
 ```
 
 When the flag is on, `AgentManager.spawnTurn` instantiates a fresh `AgentRunner` per turn, so MCP servers and the mutable `*ContextRef` path are recreated per spawn — context isolation comes from the runner being thrown away after the turn, not from a separate factory variant. The `buildStructuredMemoryMcpForTurn` / `buildCallbackMcpForTurn` factories are in place as scaffolding for KPR-220, when `AgentRunner` retires entirely. AgentManager simplification (rip out long-lived state) is also KPR-220 once all four channels migrate.
