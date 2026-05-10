@@ -16,7 +16,7 @@ import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildToolkitSection } from "./toolkit-section.js";
+import { buildPrefix } from "./prefix-builder.js";
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
@@ -255,111 +255,27 @@ export class AgentRunner {
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
-    // Prompt ordered for cache efficiency: static content first (cacheable prefix),
-    // dynamic content last (only invalidates suffix). API caches identical prefixes.
-    const parts: string[] = [];
-
-    // --- Static prefix (stable across turns → cacheable) ---
-
-    if (this.agentConfig.soul) {
-      parts.push(this.agentConfig.soul);
-    }
-
-    // Archetype card (static — cacheable prefix). Lives between soul and systemPrompt
-    // so the archetype defines the discipline and the agent's own systemPrompt reads
-    // as instance-specific flavor layered on top.
-    const archetypeDef = this.getArchetypeDef();
-    if (archetypeDef && this.agentConfig.archetypeConfig) {
-      try {
-        const card = archetypeDef.systemPromptCard({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-        });
-        if (card) parts.push(card);
-      } catch (err) {
-        log.error("Archetype systemPromptCard threw — omitting card", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-      }
-    }
-
-    parts.push(this.agentConfig.systemPrompt);
-
-    // Constitution is always loaded — non-negotiable team rules
-    const constitution = await this.memoryManager.read("shared/constitution.md");
-    if (constitution) {
-      parts.push(constitution);
-    }
-
-    // KPR-139: live team summary slotted right after the constitution and
-    // before the toolkit catalog. Replaces the static team table that used
-    // to live in shared/business-context.md.
-    if (this.teamRoster) {
-      try {
-        const teamSummary = await this.teamRoster.teamSummary();
-        if (teamSummary) parts.push(teamSummary);
-      } catch (err) {
-        log.warn("teamSummary failed; omitting from prompt", {
-          agent: this.agentConfig.id,
-          error: String(err),
-        });
-      }
-    }
-
-    // --- Semi-static (stable within a session, changes on restart) ---
-
-    // KPR-87: unified "Your toolkit" section listing SDK builtins, engine-auto-injected
-    // MCPs, capability MCPs (explicit core), and delegated capability MCPs. Replaces
-    // the prior split "Your tools" / "Available via subagents" blocks. The
-    // autoInjectedServers set MUST mirror the additions in filterCoreServers — keep
-    // both in sync (see comment there).
-    parts.push(
-      buildToolkitSection({
-        coreServerNames,
-        delegateServerNames: activeDelegates ?? [],
-        plugins: this.plugins,
-        autoInjectedServers: AgentRunner.autoInjectedServerNames(),
-      }),
-    );
-
-    // --- Dynamic suffix (changes per turn → not cached) ---
-
-    // Memory injection — prefer structured records, fall back to legacy blob
-    const hotTierPrompt = await this.memoryManager.getHotTierPrompt(
-      this.agentConfig.id,
-      config.memory.hotBudgetTokens,
-    );
-    if (hotTierPrompt) {
-      parts.push(hotTierPrompt);
-    } else {
-      // Legacy path — inject memory.md blob if structured records don't exist yet
-      const memoryDir = `agents/${this.agentConfig.id}`;
-      const memory = await this.memoryManager.read(`${memoryDir}/memory.md`);
-      if (memory) {
-        parts.push(`## Your Memory\n${memory}`);
-      }
-
-      // List available memory files so the agent knows what references it has
-      const memoryFiles = await this.memoryManager.list(memoryDir);
-      const mdFiles = memoryFiles.filter((f) => f.endsWith(".md") && f !== "memory.md");
-      if (mdFiles.length > 0) {
-        parts.push(
-          `## Available Memory Files\nYou have ${mdFiles.length} reference file(s) in your memory directory:\n` +
-          mdFiles.map((f) => `- ${memoryDir}/${f}`).join("\n") +
-          `\n\nRead relevant files via the memory MCP server (\`memory_read\`) before starting tasks that may relate to them.`,
-        );
-      }
-    }
+    // KPR-213: prefix assembly extracted into `buildPrefix` (pure function).
+    // The prefix is everything cacheable; datetime is appended here so the
+    // static prefix stays prompt-cache-friendly. Step 3 will swap the direct
+    // call for a write-through cache (`PrefixCache.getOrBuild`).
+    const prefix = await buildPrefix(this.agentConfig, {
+      coreServerNames,
+      activeDelegateNames: activeDelegates ?? [],
+      memoryManager: this.memoryManager,
+      teamRoster: this.teamRoster,
+      plugins: this.plugins,
+      skillIndex: this.skillIndex,
+      prefetcher: this.prefetcher,
+      eventSubscribersJson: this.eventSubscribersJson,
+      autoInjectedServers: AgentRunner.autoInjectedServerNames(),
+    });
 
     // Date/time last — changes every minute, so placing it at the end
-    // preserves the static prefix for prompt caching
+    // preserves the static prefix for prompt caching.
     const now = new Date();
     const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
-    parts.push(`**Current date/time**: ${pacific} (Pacific Time)`);
-
-    return parts.join("\n\n---\n\n");
+    return `${prefix}\n\n---\n\n**Current date/time**: ${pacific} (Pacific Time)`;
   }
 
 
