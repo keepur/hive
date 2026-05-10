@@ -232,7 +232,7 @@ agentManager:
     voice: false  # KPR-219 (rope-back; voice already per-turn but bypasses AgentManager today)
 ```
 
-When the flag is on, in-process MCPs that capture per-turn context (`structured-memory`, `callback`) use new factory variants (`buildStructuredMemoryMcpForTurn`, `buildCallbackMcpForTurn`) that bake channel/thread/source values at construction instead of reading them from a mutable `*ContextRef`. The other 8 in-process MCPs are already context-free. AgentManager simplification (rip out long-lived state) is KPR-220 once all four channels migrate.
+When the flag is on, `AgentManager.spawnTurn` instantiates a fresh `AgentRunner` per turn, so MCP servers and the mutable `*ContextRef` path are recreated per spawn — context isolation comes from the runner being thrown away after the turn, not from a separate factory variant. The `buildStructuredMemoryMcpForTurn` / `buildCallbackMcpForTurn` factories are in place as scaffolding for KPR-220, when `AgentRunner` retires entirely. AgentManager simplification (rip out long-lived state) is also KPR-220 once all four channels migrate.
 
 ## Common Gotchas
 

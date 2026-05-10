@@ -423,14 +423,9 @@ export function createStructuredMemoryMcpServer(deps: StructuredMemoryToolDeps) 
 }
 
 /**
- * KPR-216: per-turn factory variant. Captures channel/thread at construction
- * as plain values instead of via a mutable `*ContextRef`. Used by
- * `AgentManager.spawnTurn` (per-turn-spawn channels) where the server's
- * lifetime is the single turn — no need for the runner to mutate context
- * between turns.
- *
- * The long-lived path (slack/ws/voice pre-rope-back) still uses
- * `createStructuredMemoryMcpServer` with `StructuredMemoryToolDeps.context`.
+ * KPR-216 scaffolding — NOT wired in. `AgentManager.spawnTurn` reuses
+ * `AgentRunner` per spawn, which keeps the existing `*ContextRef` path.
+ * Kept for KPR-220 when `AgentRunner` retires.
  */
 export interface StructuredMemoryTurnDeps {
   db: Db;

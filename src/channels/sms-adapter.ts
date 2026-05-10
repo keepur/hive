@@ -129,9 +129,13 @@ export class SmsAdapter implements ChannelAdapter {
   /**
    * KPR-216: per-turn-spawn path. Resolves the agent (thread continuity →
    * default), pulls the existing session id, spawns a single-turn query,
-   * and delivers the result via Quo. Bypasses dispatcher dedup/audit/retry
-   * by design — Phase A scope; KPR-220 will fold dispatcher concerns back
-   * in once all channels are per-turn.
+   * and delivers the result via Quo.
+   *
+   * Bypasses dispatcher dedup/audit/retry/model-router/taskLedger by design
+   * for Phase A — the per-turn flag stays off in production until KPR-223
+   * decides whether to route per-turn spawns through the dispatcher (Option A)
+   * or accept the bypass and re-implement dispatcher concerns closer to the
+   * adapter (Option B).
    */
   private async spawnTurnForWorkItem(workItem: WorkItem): Promise<void> {
     if (!this.perTurn) return;

@@ -187,12 +187,9 @@ export function createCallbackMcpServer(deps: CallbackToolDeps) {
 }
 
 /**
- * KPR-216: per-turn factory variant. Captures source metadata at construction
- * as plain values instead of via a mutable `*ContextRef`. Used by
- * `AgentManager.spawnTurn` (per-turn-spawn channels) where the server's
- * lifetime is the single turn — a callback scheduled mid-turn captures the
- * spawn-time source, which matches what the long-lived path achieves by
- * mutating the ref before each `query()`.
+ * KPR-216 scaffolding — NOT wired in. `AgentManager.spawnTurn` reuses
+ * `AgentRunner` per spawn, which keeps the existing `*ContextRef` path.
+ * Kept for KPR-220 when `AgentRunner` retires.
  */
 export interface CallbackTurnDeps {
   db: Db;
