@@ -202,6 +202,23 @@ The operator repo has the same shape as a skill registry — a flat `skills/<ski
 
 **Authoring flow (until publish-back ships):** author or edit a skill on any instance, then commit it to the operator repo manually. Other instances pick it up on next `hive skill sync` (or next `hive update`).
 
+## Skills layout (KPR-214)
+
+Skills follow the SDK convention exactly — one directory level, no workflow grouping:
+
+```
+<root>/skills/<skill-name>/SKILL.md      ← canonical (KPR-214 onward)
+<root>/skills/<workflow>/skills/<skill-name>/SKILL.md   ← legacy, still loadable, deprecation warning
+```
+
+Where `<root>` is one of: a seed directory (e.g. `seeds/chief-of-staff/`), a plugin directory (`<instance>/plugins/<name>/`), the customer space (`<hiveHome>/`), or an agent-private space (`<hiveHome>/agents/<id>/`). The same flat shape applies to all four.
+
+**Why flat:** the SDK's plugin convention is `<plugin>/skills/<skill>/SKILL.md`. Hive's older double-`skills/` layout was an internal organizational sugar that diverged from SDK shape. Flat = a vanilla Claude Code skill drops into hive unchanged.
+
+**Per-skill `agents:` scoping** is preserved as an SDK-compatible extension. The loader reads frontmatter `agents: [milo, river]` (or `agents: [all]`) and projects each scoped flat skill into a synthetic plugin tree under `<hiveHome>/.skill-projections/` (a symlink to the real skill dir, rebuilt every load). The SDK only sees skills the agent is scoped to.
+
+**Migration:** `npx tsx scripts/flatten-skills.ts <root> [--dry]` lifts each `<root>/skills/<workflow>/skills/<skill>/SKILL.md` to `<root>/skills/<skill>/SKILL.md`. Idempotent. Engine seeds and in-repo plugins are already migrated; operator-skills repos (dodi, keepur) migrate under [KPR-215](https://linear.app/keepur/issue/KPR-215). The loader supports both layouts during the transition window, with a deprecation warning per source the first time legacy layout is detected.
+
 ## Common Gotchas
 
 - After editing MCP server source: `npm run build` (tsc → `dist/`) for dev, or `npm run bundle` (esbuild → `pkg/`) for the publish-ready artifact. The runtime engine in `<instance>/.hive/` runs from `pkg/server.min.js`. Restart Hive (`launchctl kickstart -k gui/$(id -u)/com.hive.<id>.agent`) to pick up changes — or for agent-definition changes only, send `SIGUSR1` (no restart).
