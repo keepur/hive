@@ -79,7 +79,9 @@ interface RegistryStubOpts {
 
 function makeRegistryStub(opts: RegistryStubOpts = {}): AgentRegistry {
   const byChannel = opts.channelAgents ?? {};
-  const byId: Record<string, { id: string; name?: string; disabled?: boolean; icon?: string }> = { ...(opts.agents ?? {}) };
+  const byId: Record<string, { id: string; name?: string; disabled?: boolean; icon?: string }> = {
+    ...(opts.agents ?? {}),
+  };
   // Hoist channel-defined agents into the id map so registry.get(id) works.
   for (const a of Object.values(byChannel)) byId[a.id] = byId[a.id] ?? a;
 
@@ -202,7 +204,12 @@ describe("SlackAdapter (KPR-217)", () => {
       const registry = makeRegistryStub({
         channelAgents: { general: { id: "rae", name: "Rae" } },
       });
-      const { stub: agentManager, spawnTurn, calls, sessionStore } = makeAgentManagerStub({
+      const {
+        stub: agentManager,
+        spawnTurn,
+        calls,
+        sessionStore,
+      } = makeAgentManagerStub({
         finalMessage: "All systems nominal.",
       });
       const adapter = new SlackAdapter(gw.gateway, registry, [], "slack", "rae", undefined, {

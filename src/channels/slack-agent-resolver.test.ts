@@ -51,7 +51,7 @@ describe("resolveAgentForSlackWorkItem (KPR-217)", () => {
   it("prefers thread-continuity agent when one exists in the registry", async () => {
     const reg = makeRegistry({
       byChannel: { general: { id: "channel-owner" } },
-      byId: { "rae": { id: "rae" } },
+      byId: { rae: { id: "rae" } },
     });
     const am = makeAgentManager("rae");
     const id = await resolveAgentForSlackWorkItem(makeItem(), reg, am, "default-agent");
@@ -91,21 +91,36 @@ describe("resolveAgentForSlackWorkItem (KPR-217)", () => {
       byId: { "default-agent": { id: "default-agent" } },
     });
     const am = makeAgentManager(undefined);
-    const id = await resolveAgentForSlackWorkItem(makeItem({ source: { kind: "slack", id: "C1", label: "untracked" } }), reg, am, "default-agent");
+    const id = await resolveAgentForSlackWorkItem(
+      makeItem({ source: { kind: "slack", id: "C1", label: "untracked" } }),
+      reg,
+      am,
+      "default-agent",
+    );
     expect(id).toBe("default-agent");
   });
 
   it("returns null when no continuation, no channel binding, and no default", async () => {
     const reg = makeRegistry();
     const am = makeAgentManager(undefined);
-    const id = await resolveAgentForSlackWorkItem(makeItem({ source: { kind: "slack", id: "C1", label: "untracked" } }), reg, am, undefined);
+    const id = await resolveAgentForSlackWorkItem(
+      makeItem({ source: { kind: "slack", id: "C1", label: "untracked" } }),
+      reg,
+      am,
+      undefined,
+    );
     expect(id).toBeNull();
   });
 
   it("returns null when default agent is unknown to the registry", async () => {
     const reg = makeRegistry();
     const am = makeAgentManager(undefined);
-    const id = await resolveAgentForSlackWorkItem(makeItem({ source: { kind: "slack", id: "C1", label: "untracked" } }), reg, am, "ghost-default");
+    const id = await resolveAgentForSlackWorkItem(
+      makeItem({ source: { kind: "slack", id: "C1", label: "untracked" } }),
+      reg,
+      am,
+      "ghost-default",
+    );
     expect(id).toBeNull();
   });
 
@@ -118,6 +133,6 @@ describe("resolveAgentForSlackWorkItem (KPR-217)", () => {
     delete item.threadId;
     const id = await resolveAgentForSlackWorkItem(item, reg, am, "default-agent");
     expect(id).toBe("channel-owner");
-    expect((am.findAgentForThread as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    expect(am.findAgentForThread as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
   });
 });
