@@ -68,6 +68,16 @@ removed morning-briefing
 
 Additional registries can be added with `hive registry`.
 
+## Cross-agent coordination
+
+When configuring an agent, three different fields wire three different cross-agent patterns. Pick the one whose semantics match what the agent actually needs:
+
+- **`delegateServers`** — in-session sub-agent. Synchronous, ephemeral, returns into the caller's turn. Use when the agent needs a focused tool call done right now to finish the current turn.
+- **Team MCP (auto-injected)** — direct messaging. 1-to-1, fire-and-forget by default; recipient handles the message in their own session and time-axis. Use when handing off a task whose owner is someone else. Available to every agent without configuration — the engine wires `team` as a core server unconditionally.
+- **`coreServers: ["event-bus"]`** — pub/sub broadcast. 1-to-many; subscribers express interest by event name and react via their own work items. Use when announcing something that may concern multiple agents.
+
+For the architectural distinctions and the engine-side wiring, see [architecture.md → Coordination primitives](architecture.md#coordination-primitives).
+
 ## Health checks
 
 `hive doctor` verifies prerequisites (Node version, MongoDB reachable, required CLIs on PATH), config files (`hive.yaml`, `.env` keys present), agent definitions (loadable from MongoDB), and service state (launchd job loaded, process running, port bindings).
