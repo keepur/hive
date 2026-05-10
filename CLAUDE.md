@@ -227,7 +227,7 @@ Long-lived per-agent `query()` is being replaced channel-by-channel with per-tur
 agentManager:
   perTurnSpawn:
     sms: false    # KPR-216 — operator opt-in after dev verification
-    slack: false  # KPR-217
+    slack: false  # KPR-217 — operator opt-in after dev verification
     ws: false     # KPR-218
     voice: false  # KPR-219 (rope-back; voice already per-turn but bypasses AgentManager today)
 ```
