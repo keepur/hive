@@ -505,7 +505,6 @@ export class WsAdapter implements ChannelAdapter {
    * `{type: "error"}` on throw.
    */
   private async spawnTurnForWorkItem(workItem: WorkItem): Promise<void> {
-    if (!this.perTurn) return;
     const threadId = workItem.threadId;
     if (!threadId) {
       log.warn("WS per-turn: WorkItem missing threadId — dropping", {
