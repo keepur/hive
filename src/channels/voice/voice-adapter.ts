@@ -1,11 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import Anthropic from "@anthropic-ai/sdk";
+import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../../logging/logger.js";
 import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
+import { renderConversationPrompt } from "./conversation-prompt.js";
 import {
-  openaiToClaude,
-  openaiToolsToClaude,
   formatSSETextChunk,
   formatSSEDone,
   formatNonStreamingResponse,
@@ -17,6 +16,14 @@ import { config } from "../../config.js";
 
 const log = createLogger("voice-adapter");
 
+// Exported for unit tests.
+export function isAuthError(err: unknown): boolean {
+  const s = String(err);
+  return /resolve authentication|credentials\.json|not authenticated|401 Unauthorized|ANTHROPIC_API_KEY|authToken/i.test(
+    s,
+  );
+}
+
 interface CallSession {
   callId: string;
   agentId: string;
@@ -27,7 +34,6 @@ const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 export class VoiceAdapter {
   private httpServer: ReturnType<typeof createServer> | undefined;
-  private anthropic: Anthropic;
   private sessions = new Map<string, CallSession>();
   private sweepTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -36,9 +42,7 @@ export class VoiceAdapter {
     private serverSecret: string,
     private registry: AgentRegistry,
     private memoryManager: MemoryManager,
-  ) {
-    this.anthropic = new Anthropic();
-  }
+  ) {}
 
   async start(): Promise<void> {
     this.httpServer = createServer((req, res) => {
@@ -179,71 +183,171 @@ export class VoiceAdapter {
       context: callMeta?.context,
     });
 
-    // Translate OpenAI → Claude
-    const { system, messages } = openaiToClaude(request.messages, systemPrompt);
-    const tools = openaiToolsToClaude(request.tools);
+    // Build the user-side prompt from the conversation transcript
+    const prompt = renderConversationPrompt(request.messages);
 
     const model = agentConfig.model;
-
     const completionId = `chatcmpl-${randomUUID()}`;
+    const startedAt = Date.now();
+    let firstTokenMs: number | undefined;
+
+    // One-shot SDK query — no MCP servers, no hooks, no session reuse.
+    // The SDK handles auth (ANTHROPIC_API_KEY env if set, else OAuth via the
+    // claude CLI's ~/.claude/.credentials.json). On operator instances with
+    // no API key configured, this falls through to the subscription path.
+    const q = query({
+      prompt,
+      options: {
+        model,
+        systemPrompt,
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
+        maxTurns: 1,
+        settingSources: [],
+        includePartialMessages: request.stream !== false,
+        env: {
+          ...process.env,
+          ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
+          CLAUDE_AGENT_SDK_CLIENT_APP: "hive/voice",
+          CLAUDECODE: undefined,
+        },
+        extraArgs: { "strict-mcp-config": null },
+      },
+    });
 
     if (request.stream === false) {
-      // Non-streaming response
-      const response = await this.anthropic.messages.create({
-        model,
-        max_tokens: 1024,
-        system,
-        messages,
-        ...(tools ? { tools } : {}),
+      // Non-streaming: collect full text from result message.
+      let text = "";
+      let resultSubtype: string | undefined;
+      try {
+        for await (const message of q) {
+          const msg = message as SDKMessage;
+          if (msg.type === "assistant") {
+            const content = (msg as any).message?.content;
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (block?.type === "text" && typeof block.text === "string") {
+                  if (firstTokenMs === undefined) firstTokenMs = Date.now() - startedAt;
+                  text = block.text;
+                }
+              }
+            }
+          } else if (msg.type === "result") {
+            resultSubtype = (msg as any).subtype;
+            if (resultSubtype === "success") {
+              text = (msg as any).result || text;
+            }
+          }
+        }
+      } catch (err) {
+        if (isAuthError(err)) {
+          log.error("Voice query failed — OAuth credentials unavailable", { error: String(err), callId, agentId });
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Voice unavailable" }));
+          return;
+        }
+        log.error("Voice query error (non-streaming)", { error: String(err), callId, agentId });
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal error" }));
+        return;
+      }
+
+      // Result subtype other than "success" → 500. Non-streaming is request/response
+      // so we have not yet committed any bytes; we can still surface a clean error.
+      if (resultSubtype && resultSubtype !== "success") {
+        log.error("Voice query result reported failure", { callId, agentId, resultSubtype });
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal error" }));
+        return;
+      }
+
+      log.info("Voice turn complete", {
+        callId,
+        agentId,
+        firstTokenMs,
+        totalMs: Date.now() - startedAt,
+        mode: "non-streaming",
       });
-
-      const textBlocks = response.content.filter((b) => b.type === "text");
-      const text = textBlocks.map((b) => (b as Anthropic.TextBlock).text).join("");
-
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(formatNonStreamingResponse(completionId, text, model)));
       return;
     }
 
-    // Streaming response (default — Vapi always sends stream: true)
+    // Streaming: peek the first SDK message to surface auth failures BEFORE
+    // committing to SSE headers (which would lock us into a 200 response).
+    const iter = q[Symbol.asyncIterator]();
+    let firstMessage: IteratorResult<SDKMessage>;
+    try {
+      firstMessage = (await iter.next()) as IteratorResult<SDKMessage>;
+    } catch (err) {
+      if (isAuthError(err)) {
+        log.error("Voice query failed — OAuth credentials unavailable", { error: String(err), callId, agentId });
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Voice unavailable" }));
+        return;
+      }
+      log.error("Voice query error (streaming/init)", { error: String(err), callId, agentId });
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal error" }));
+      return;
+    }
+
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
 
-    try {
-      const stream = this.anthropic.messages.stream({
-        model,
-        max_tokens: 1024,
-        system,
-        messages,
-        ...(tools ? { tools } : {}),
-      });
-
-      // PoC: text streaming only. Tool call streaming (tool_use blocks → OpenAI
-      // tool_calls format) is deferred to Phase 2 when live tool calling is wired.
-      for await (const event of stream) {
-        if (event.type === "content_block_delta") {
-          // SDK types content_block_delta.delta as a union — narrow to text_delta
-          const delta = event.delta as { type: string; text?: string };
-          if (delta.type === "text_delta") {
-            res.write(formatSSETextChunk(completionId, delta.text ?? "", model));
-          }
+    const handleStreamMessage = (msg: SDKMessage) => {
+      if (msg.type === "stream_event") {
+        const event = (msg as any).event;
+        if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
+          if (firstTokenMs === undefined) firstTokenMs = Date.now() - startedAt;
+          res.write(formatSSETextChunk(completionId, event.delta.text ?? "", model));
         }
       }
+    };
 
-      // Final done
+    let resultSubtype: string | undefined;
+    try {
+      const checkResult = (msg: SDKMessage) => {
+        if (msg.type === "result") resultSubtype = (msg as any).subtype;
+      };
+      if (!firstMessage.done) {
+        handleStreamMessage(firstMessage.value);
+        checkResult(firstMessage.value);
+      }
+      while (true) {
+        const next = await iter.next();
+        if (next.done) break;
+        const msg = next.value as SDKMessage;
+        handleStreamMessage(msg);
+        checkResult(msg);
+      }
       if (!res.writableEnded) {
+        // Non-success result is logged but not surfaced to Vapi mid-stream — caller
+        // already heard whatever audio was emitted; abruptly ending the stream
+        // would degrade more than it helps. Logging is enough to alert ops.
+        if (resultSubtype && resultSubtype !== "success") {
+          log.warn("Voice query result reported failure (post-stream)", { callId, agentId, resultSubtype });
+        }
         res.write(formatSSEDone(completionId, model));
       }
     } catch (err) {
-      log.error("Claude streaming error", { error: String(err), callId, agentId });
+      log.error("Voice query error (streaming)", { error: String(err), callId, agentId });
       if (!res.writableEnded) {
         res.write(formatSSEDone(completionId, model, "error"));
       }
     }
 
+    log.info("Voice turn complete", {
+      callId,
+      agentId,
+      firstTokenMs,
+      totalMs: Date.now() - startedAt,
+      mode: "streaming",
+      resultSubtype,
+    });
     res.end();
   }
 
