@@ -1074,12 +1074,20 @@ export class AgentRunner {
         continue;
       }
 
-      // Warn if a context-dependent server is being delegated
+      // KPR-221: defense-in-depth. The agent registry and admin tool both
+      // hard-reject context-dependent servers in delegateServers at load +
+      // write time. If we somehow see one here it means a stale path snuck
+      // through — error and skip the offending server. Do NOT build a
+      // sub-agent for it; sub-agents spawn without channel/thread context
+      // and the server would silently malfunction. Previously this was a
+      // warn-and-proceed (which silently dropped the server downstream
+      // anyway via the missing-config branch). Now it's explicit.
       if (AgentRunner.CONTEXT_DEPENDENT_SERVERS.has(serverName)) {
-        log.warn("Context-dependent server in delegateServers — subagent won't have channel context", {
+        log.error("Context-dependent server in delegateServers — registry/admin guards bypassed; skipping", {
           agent: this.agentConfig.id,
           server: serverName,
         });
+        continue;
       }
 
       const serverConfig = allConfigs[serverName];

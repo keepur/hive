@@ -975,6 +975,25 @@ describe("AgentRunner server sub-agents (via send)", () => {
     expect(options.agents).not.toHaveProperty("code-task");
   });
 
+  it("KPR-221: skips context-dependent servers if they slip through (defense-in-depth)", async () => {
+    // Bypass the registry/admin guards by constructing the AgentConfig
+    // directly with a context-dependent server. The runner must skip it
+    // (not build a sub-agent for it) — sub-agents spawn without channel
+    // context and the server would silently malfunction.
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "background"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents).toHaveProperty("google");
+    expect(options.agents).not.toHaveProperty("background");
+  });
+
   it("excludes code-search from delegates when codeAccess autonomy flag is false", async () => {
     const runner = new AgentRunner(
       makeAgentConfig({
