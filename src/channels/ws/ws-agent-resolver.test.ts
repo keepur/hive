@@ -238,36 +238,21 @@ describe("resolveAgentForWsWorkItem (KPR-218)", () => {
         byId: { "default-agent": { id: "default-agent" } },
       });
       const am = makeAgentManager(undefined);
-      const id = await resolveAgentForWsWorkItem(
-        makeAppItem({ meta: { deviceId: "dev1" } }),
-        reg,
-        am,
-        "default-agent",
-      );
+      const id = await resolveAgentForWsWorkItem(makeAppItem({ meta: { deviceId: "dev1" } }), reg, am, "default-agent");
       expect(id).toBe("default-agent");
     });
 
     it("returns null when constructor default is unknown to the registry", async () => {
       const reg = makeRegistry();
       const am = makeAgentManager(undefined);
-      const id = await resolveAgentForWsWorkItem(
-        makeAppItem({ meta: { deviceId: "dev1" } }),
-        reg,
-        am,
-        "ghost-default",
-      );
+      const id = await resolveAgentForWsWorkItem(makeAppItem({ meta: { deviceId: "dev1" } }), reg, am, "ghost-default");
       expect(id).toBeNull();
     });
 
     it("returns null when nothing matches and no default is provided", async () => {
       const reg = makeRegistry();
       const am = makeAgentManager(undefined);
-      const id = await resolveAgentForWsWorkItem(
-        makeAppItem({ meta: { deviceId: "dev1" } }),
-        reg,
-        am,
-        undefined,
-      );
+      const id = await resolveAgentForWsWorkItem(makeAppItem({ meta: { deviceId: "dev1" } }), reg, am, undefined);
       expect(id).toBeNull();
     });
   });

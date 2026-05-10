@@ -1292,7 +1292,15 @@ describe("WsAdapter per-turn path (KPR-218)", () => {
         return {
           finalMessage: "ok",
           newSessionId: "s1",
-          usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, contextWindow: 0, costUsd: 0, durationMs: 0 },
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            contextWindow: 0,
+            costUsd: 0,
+            durationMs: 0,
+          },
           errors: [],
         };
       });
@@ -1361,7 +1369,15 @@ describe("WsAdapter per-turn path (KPR-218)", () => {
         return {
           finalMessage: "delivered",
           newSessionId: "s1",
-          usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, contextWindow: 0, costUsd: 0, durationMs: 0 },
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            contextWindow: 0,
+            costUsd: 0,
+            durationMs: 0,
+          },
           errors: [],
         };
       });

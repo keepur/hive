@@ -228,7 +228,7 @@ agentManager:
   perTurnSpawn:
     sms: false    # KPR-216 — operator opt-in after dev verification
     slack: false  # KPR-217 — operator opt-in after dev verification
-    ws: false     # KPR-218
+    ws: false     # KPR-218 — operator opt-in after dev verification
     voice: false  # KPR-219 (rope-back; voice already per-turn but bypasses AgentManager today)
 ```
 
