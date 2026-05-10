@@ -773,3 +773,683 @@ describe("WsAdapter.handleCommand (KPR-11)", () => {
     expect(replies[0].text).toBe("Done.");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// KPR-218: per-turn-spawn path tests
+// ─────────────────────────────────────────────────────────────────────
+
+import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
+
+interface PerTurnAgentManagerStub {
+  spawnTurn: ReturnType<typeof vi.fn>;
+  findAgentForThread: ReturnType<typeof vi.fn>;
+  sessionStoreGet: ReturnType<typeof vi.fn>;
+  sessionStoreSet: ReturnType<typeof vi.fn>;
+  calls: Array<{ ctx: TurnContext }>;
+  getState: ReturnType<typeof vi.fn>;
+}
+
+function makePerTurnAgentManager(turnResult: Partial<TurnResult> = {}): PerTurnAgentManagerStub {
+  const calls: Array<{ ctx: TurnContext }> = [];
+  const sessionStoreGet = vi.fn().mockResolvedValue(undefined as string | undefined);
+  const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
+  const findAgentForThread = vi.fn().mockResolvedValue(undefined as string | undefined);
+  const getState = vi.fn().mockReturnValue(undefined);
+
+  const spawnTurn = vi.fn(async (ctx: TurnContext) => {
+    calls.push({ ctx });
+    return {
+      finalMessage: "agent reply",
+      newSessionId: "session-1",
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 200000,
+        costUsd: 0.001,
+        durationMs: 200,
+      },
+      errors: [],
+      ...turnResult,
+    } satisfies TurnResult;
+  });
+
+  return { spawnTurn, findAgentForThread, sessionStoreGet, sessionStoreSet, getState, calls };
+}
+
+function makePerTurnAdapterDeps(opts: {
+  agents?: Record<string, { id: string; name?: string; disabled?: boolean }>;
+  byOrigin?: Record<string, { id: string; disabled?: boolean }>;
+  channelMembers?: string[];
+  channelType?: "dm" | "channel";
+  channelName?: string;
+  am: PerTurnAgentManagerStub;
+}) {
+  const agents = opts.agents ?? {};
+  const byOrigin = opts.byOrigin ?? {};
+  const channelMembers = opts.channelMembers ?? ["dev1"];
+  const channelType = opts.channelType ?? "channel";
+  const channelName = opts.channelName ?? "general";
+
+  const teamStore = {
+    getChannel: vi.fn().mockResolvedValue({
+      _id: "c1",
+      type: channelType,
+      name: channelName,
+      members: channelMembers,
+    }),
+    listChannels: vi.fn().mockResolvedValue([]),
+    getHistory: vi.fn().mockResolvedValue({ messages: [], hasMore: false }),
+    saveMessage: vi.fn().mockResolvedValue(undefined),
+    getOrCreateDm: vi.fn(),
+    renameChannel: vi.fn(),
+    joinChannel: vi.fn(),
+    leaveChannel: vi.fn(),
+  } as any;
+  const commandRegistry = {
+    has: vi.fn().mockReturnValue(false),
+    list: vi.fn().mockReturnValue([]),
+    execute: vi.fn().mockResolvedValue({ found: false }),
+  } as any;
+  const agentRegistry = {
+    get: vi.fn((id: string) => agents[id]),
+    getAll: vi.fn(() => Object.values(agents)),
+    findByOrigin: vi.fn((slug: string) => byOrigin[slug]),
+  } as any;
+  const agentManager = {
+    spawnTurn: opts.am.spawnTurn as any,
+    findAgentForThread: opts.am.findAgentForThread as any,
+    getSessionStore: () =>
+      ({
+        get: opts.am.sessionStoreGet,
+        set: opts.am.sessionStoreSet,
+      }) as any,
+    getState: opts.am.getState as any,
+  } as any;
+  return { teamStore, commandRegistry, agentRegistry, agentManager };
+}
+
+async function emitConnection(adapter: WsAdapter, device: any) {
+  const wss = (adapter as any).wss;
+  const fakeWs = new EventEmitter() as any;
+  fakeWs.close = vi.fn();
+  fakeWs.send = vi.fn();
+  fakeWs.readyState = 1; // WebSocket.OPEN
+  wss.emit("connection", fakeWs, {} as any, device);
+  return fakeWs;
+}
+
+async function flush(maxMs = 200): Promise<void> {
+  // Drain microtasks + a couple of macrotasks so fire-and-forget chains
+  // (route → spawn → deliver) settle.
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, maxMs / 20));
+  }
+}
+
+async function waitFor(pred: () => boolean, timeoutMs = 1500): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+}
+
+describe("WsAdapter per-turn path (KPR-218)", () => {
+  let adapter: WsAdapter | undefined;
+
+  afterEach(async () => {
+    if (adapter) {
+      await adapter.stop();
+      adapter = undefined;
+    }
+    vi.clearAllMocks();
+  });
+
+  describe("legacy path (perTurn deps absent or perTurnSpawnEnabled=false)", () => {
+    it("falls back to onWorkItem when perTurn deps are not provided", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { rae: { id: "rae" } },
+        am,
+      });
+      adapter = new WsAdapter(0, deps);
+      const onWorkItem = vi.fn();
+      await adapter.start(onWorkItem);
+
+      const fakeWs = await emitConnection(adapter, {
+        _id: "dev1",
+        label: "Shop",
+        defaultAgentId: "",
+        origin: undefined,
+      });
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await flush();
+
+      expect(onWorkItem).toHaveBeenCalledTimes(1);
+      expect(am.spawnTurn).not.toHaveBeenCalled();
+    });
+
+    it("falls back to onWorkItem when perTurnSpawnEnabled=false", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { rae: { id: "rae" } },
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: false },
+      });
+      const onWorkItem = vi.fn();
+      await adapter.start(onWorkItem);
+
+      const fakeWs = await emitConnection(adapter, {
+        _id: "dev1",
+        label: "Shop",
+        defaultAgentId: "",
+      });
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await flush();
+
+      expect(onWorkItem).toHaveBeenCalledTimes(1);
+      expect(am.spawnTurn).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("per-turn path — direct text (entry site #1)", () => {
+    it("invokes spawnTurn with TurnContext shape: agentId, channelId=deviceId, threadId=app:deviceId, channel=app", async () => {
+      const am = makePerTurnAgentManager({ finalMessage: "yo" });
+      const deps = makePerTurnAdapterDeps({
+        agents: { rae: { id: "rae", name: "Rae" } },
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      const onWorkItem = vi.fn();
+      await adapter.start(onWorkItem);
+
+      const fakeWs = await emitConnection(adapter, {
+        _id: "dev1",
+        label: "Shop",
+        defaultAgentId: "",
+      });
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hello" })));
+
+      await waitFor(() => am.spawnTurn.mock.calls.length > 0);
+
+      expect(onWorkItem).not.toHaveBeenCalled();
+      const ctx = am.calls[0]!.ctx;
+      expect(ctx.agentId).toBe("rae");
+      expect(ctx.channel).toBe("app");
+      expect(ctx.channelId).toBe("dev1");
+      expect(ctx.threadId).toBe("app:dev1");
+      expect(ctx.sessionId).toBeUndefined();
+      expect(ctx.workItem.text).toBe("hello");
+      expect(am.sessionStoreGet).toHaveBeenCalledWith("rae", "app:dev1");
+    });
+
+    it("forwards stored sessionId so the SDK can resume on subsequent turns", async () => {
+      const am = makePerTurnAgentManager();
+      am.sessionStoreGet.mockResolvedValueOnce("session-resume-xyz");
+      const deps = makePerTurnAdapterDeps({
+        agents: { rae: { id: "rae" } },
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await waitFor(() => am.calls.length > 0);
+
+      expect(am.calls[0]!.ctx.sessionId).toBe("session-resume-xyz");
+    });
+  });
+
+  describe("per-turn path — direct image (entry site #2)", () => {
+    it("invokes spawnTurn for type:image with files populated", async () => {
+      const { processImageBuffer } = await import("../../files/file-processor.js");
+      (processImageBuffer as any).mockResolvedValue({
+        filename: "photo.jpg",
+        mimetype: "image/jpeg",
+        size: 4,
+        kind: "image",
+        content: "stub",
+      });
+
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { rae: { id: "rae" } },
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      fakeWs.emit(
+        "message",
+        Buffer.from(
+          JSON.stringify({
+            type: "image",
+            id: "img1",
+            filename: "photo.jpg",
+            data: Buffer.from("test").toString("base64"),
+          }),
+        ),
+      );
+      await waitFor(() => am.calls.length > 0);
+
+      const ctx = am.calls[0]!.ctx;
+      expect(ctx.workItem.text).toBe("[Photo: photo.jpg]");
+      expect(ctx.workItem.files).toBeDefined();
+      expect(ctx.workItem.files![0]!.filename).toBe("photo.jpg");
+      expect(ctx.channel).toBe("app");
+    });
+  });
+
+  describe("per-turn path — team text (entry site #3)", () => {
+    it("resolves DM peer via meta.targetAgentId", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { jessica: { id: "jessica" }, rae: { id: "rae" } },
+        channelType: "dm",
+        channelMembers: ["dev1", "jessica"],
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      fakeWs.emit(
+        "message",
+        Buffer.from(JSON.stringify({ type: "message", id: "m1", channelId: "c1", text: "hi DM" })),
+      );
+      await waitFor(() => am.calls.length > 0);
+
+      const ctx = am.calls[0]!.ctx;
+      expect(ctx.agentId).toBe("jessica");
+      expect(ctx.channel).toBe("team");
+      expect(ctx.channelId).toBe("c1");
+      expect(ctx.threadId).toBe("team:c1");
+    });
+
+    it("falls back to constructor defaultAgentId for non-DM team channels with no meta default", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { rae: { id: "rae" } },
+        channelType: "channel",
+        channelMembers: ["dev1"],
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      // device.defaultAgentId === "" (today's reality), so meta.defaultAgentId
+      // is "" (falsy) and resolution falls through to constructor default.
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      fakeWs.emit(
+        "message",
+        Buffer.from(JSON.stringify({ type: "message", id: "m1", channelId: "c1", text: "hello team" })),
+      );
+      await waitFor(() => am.calls.length > 0);
+
+      expect(am.calls[0]!.ctx.agentId).toBe("rae");
+    });
+  });
+
+  describe("per-turn path — team image (entry site #4)", () => {
+    it("invokes spawnTurn for team images with DM target resolution", async () => {
+      const { processImageBuffer } = await import("../../files/file-processor.js");
+      (processImageBuffer as any).mockResolvedValue({
+        filename: "team.jpg",
+        mimetype: "image/jpeg",
+        size: 4,
+        kind: "image",
+        content: "stub",
+      });
+
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { jessica: { id: "jessica" }, rae: { id: "rae" } },
+        channelType: "dm",
+        channelMembers: ["dev1", "jessica"],
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      fakeWs.emit(
+        "message",
+        Buffer.from(
+          JSON.stringify({
+            type: "image",
+            id: "img1",
+            channelId: "c1",
+            filename: "team.jpg",
+            data: Buffer.from("test").toString("base64"),
+          }),
+        ),
+      );
+      await waitFor(() => am.calls.length > 0);
+
+      const ctx = am.calls[0]!.ctx;
+      expect(ctx.agentId).toBe("jessica");
+      expect(ctx.workItem.text).toBe("[Photo: team.jpg]");
+      expect(ctx.workItem.files![0]!.filename).toBe("team.jpg");
+    });
+  });
+
+  describe("per-turn path — team file (entry site #5)", () => {
+    it("invokes spawnTurn for team files with DM target resolution", async () => {
+      const { processFileBuffer } = await import("../../files/file-processor.js");
+      (processFileBuffer as any).mockResolvedValue({
+        filename: "spec.pdf",
+        mimetype: "application/pdf",
+        size: 10,
+        kind: "doc",
+        content: "stub",
+      });
+
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { jessica: { id: "jessica" }, rae: { id: "rae" } },
+        channelType: "dm",
+        channelMembers: ["dev1", "jessica"],
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      fakeWs.emit(
+        "message",
+        Buffer.from(
+          JSON.stringify({
+            type: "file",
+            id: "f1",
+            channelId: "c1",
+            filename: "spec.pdf",
+            mimetype: "application/pdf",
+            data: Buffer.from("test").toString("base64"),
+          }),
+        ),
+      );
+      await waitFor(() => am.calls.length > 0);
+
+      const ctx = am.calls[0]!.ctx;
+      expect(ctx.agentId).toBe("jessica");
+      expect(ctx.workItem.text).toBe("[File: spec.pdf]");
+      expect(ctx.workItem.files![0]!.filename).toBe("spec.pdf");
+    });
+  });
+
+  describe("origin routing (app-kind, dispatcher parity)", () => {
+    it("routes via registry.findByOrigin when meta.origin is set", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { wyatt: { id: "wyatt" }, rae: { id: "rae" } },
+        byOrigin: { "dodi-shop": { id: "wyatt" } },
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, {
+        _id: "dev1",
+        label: "Shop",
+        defaultAgentId: "",
+        origin: "dodi-shop",
+      });
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await waitFor(() => am.calls.length > 0);
+
+      expect(am.calls[0]!.ctx.agentId).toBe("wyatt");
+      expect((deps.agentRegistry as any).findByOrigin).toHaveBeenCalledWith("dodi-shop");
+    });
+
+    it("drops on origin miss (does NOT fall back to constructor default)", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({
+        agents: { rae: { id: "rae" } },
+        byOrigin: {},
+        am,
+      });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, {
+        _id: "dev1",
+        label: "Shop",
+        defaultAgentId: "",
+        origin: "unknown-origin",
+      });
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await flush();
+
+      expect(am.spawnTurn).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("typing indicator", () => {
+    it("sends {type:'typing'} before spawnTurn when ws is open", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({ agents: { rae: { id: "rae" } }, am });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      // Order observation: capture send invocations through ws.send mock and
+      // assert "typing" arrives before the spawnTurn promise even resolves.
+      let typingSentBeforeSpawn = false;
+      am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext) => {
+        am.calls.push({ ctx });
+        // At this point, fakeWs.send should have already been called with typing.
+        const sent = (typingSpy.mock.calls as any[]).map((c) => JSON.parse(c[0]));
+        typingSentBeforeSpawn = sent.some((m) => m.type === "typing" && m.agentId === "rae");
+        return {
+          finalMessage: "ok",
+          newSessionId: "s1",
+          usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, contextWindow: 0, costUsd: 0, durationMs: 0 },
+          errors: [],
+        };
+      });
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      const typingSpy = fakeWs.send as ReturnType<typeof vi.fn>;
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await waitFor(() => am.calls.length > 0);
+
+      expect(typingSentBeforeSpawn).toBe(true);
+    });
+
+    it("skips typing send when device socket is missing", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({ agents: { rae: { id: "rae" } }, am });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      // Manually push a synthetic WorkItem (no real connection) into the
+      // per-turn path. The typing send must no-op (no connection in map),
+      // and spawnTurn must still run + deliver buffer.
+      const wi: any = {
+        id: "syn",
+        text: "hi",
+        source: { kind: "app", id: "ghost-dev", label: "app:ghost", adapterId: "ws" },
+        sender: "ghost-dev",
+        senderName: "ghost",
+        threadId: "app:ghost-dev",
+        timestamp: new Date(),
+        meta: { deviceId: "ghost-dev" },
+      };
+      await (adapter as any).spawnTurnForWorkItem(wi);
+
+      expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+      // Buffered into pendingMessages because no connection exists.
+      const pending = (adapter as any).pendingMessages as Map<string, any[]>;
+      expect(pending.get("ghost-dev")?.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("delivery + buffering", () => {
+    it("delivers final message via deliver(); buffers when ws disconnected mid-spawn", async () => {
+      const am = makePerTurnAgentManager({ finalMessage: "delivered" });
+      const deps = makePerTurnAdapterDeps({ agents: { rae: { id: "rae" } }, am });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+
+      // Disconnect mid-spawn: spawnTurn resolves only after we've removed
+      // the connection so deliver() sees a closed socket and buffers.
+      let resolveSpawn: (() => void) | undefined;
+      am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext) => {
+        am.calls.push({ ctx });
+        await new Promise<void>((r) => {
+          resolveSpawn = r;
+        });
+        return {
+          finalMessage: "delivered",
+          newSessionId: "s1",
+          usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, contextWindow: 0, costUsd: 0, durationMs: 0 },
+          errors: [],
+        };
+      });
+
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await waitFor(() => am.calls.length > 0);
+
+      // Simulate disconnect — remove connection from map and flip state.
+      (adapter as any).connections.delete("dev1");
+      fakeWs.readyState = 3; // CLOSED
+
+      resolveSpawn!();
+      await flush();
+
+      // Message landed in pendingMessages, not over the now-dead socket.
+      const pending = (adapter as any).pendingMessages as Map<string, any[]>;
+      const queued = pending.get("dev1") ?? [];
+      const deliveredMsg = queued.find((m) => m.type === "message" && m.text === "delivered");
+      expect(deliveredMsg).toBeDefined();
+      expect(deliveredMsg.agentId).toBe("rae");
+    });
+
+    it("skips delivery when finalMessage is empty", async () => {
+      const am = makePerTurnAgentManager({ finalMessage: "" });
+      const deps = makePerTurnAdapterDeps({ agents: { rae: { id: "rae" } }, am });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      const sendSpy = fakeWs.send as ReturnType<typeof vi.fn>;
+      sendSpy.mockClear();
+
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await waitFor(() => am.calls.length > 0);
+      await flush();
+
+      // Only typing was sent — no delivery message.
+      const sent = sendSpy.mock.calls.map((c) => JSON.parse(c[0]));
+      expect(sent.some((m) => m.type === "typing")).toBe(true);
+      expect(sent.some((m) => m.type === "message")).toBe(false);
+    });
+
+    it("delivers with WorkResult.error when spawnTurn returns errors[]", async () => {
+      const am = makePerTurnAgentManager({
+        finalMessage: "partial",
+        errors: ["something went wrong"],
+      });
+      const deps = makePerTurnAdapterDeps({ agents: { rae: { id: "rae" } }, am });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        defaultAgentId: "rae",
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      const sendSpy = fakeWs.send as ReturnType<typeof vi.fn>;
+      sendSpy.mockClear();
+
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await waitFor(() => sendSpy.mock.calls.some((c) => JSON.parse(c[0]).type === "message"));
+
+      const sent = sendSpy.mock.calls.map((c) => JSON.parse(c[0]));
+      const msg = sent.find((m) => m.type === "message")!;
+      expect(msg.text).toContain("something went wrong");
+    });
+  });
+
+  describe("no-resolution drop path", () => {
+    it("drops cleanly with no spawn when no agent resolves", async () => {
+      const am = makePerTurnAgentManager();
+      const deps = makePerTurnAdapterDeps({ agents: {}, am });
+      adapter = new WsAdapter(0, {
+        ...deps,
+        // No defaultAgentId — nothing to resolve to.
+        perTurn: { perTurnSpawnEnabled: true },
+      });
+      await adapter.start(vi.fn());
+
+      const fakeWs = await emitConnection(adapter, { _id: "dev1", label: "Shop", defaultAgentId: "" });
+      fakeWs.emit("message", Buffer.from(JSON.stringify({ type: "message", id: "m1", text: "hi" })));
+      await flush();
+
+      expect(am.spawnTurn).not.toHaveBeenCalled();
+    });
+  });
+});
