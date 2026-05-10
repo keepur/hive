@@ -44,3 +44,33 @@ describe("renderConversationPrompt", () => {
     expect(out).toContain("You: you have $42");
   });
 });
+
+import { extractLatestUserMessage } from "./conversation-prompt.js";
+
+describe("extractLatestUserMessage", () => {
+  it("returns the most recent user message", () => {
+    expect(
+      extractLatestUserMessage([
+        { role: "system", content: "x" },
+        { role: "user", content: "first" },
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "second" },
+      ]),
+    ).toBe("second");
+  });
+
+  it("returns empty string when no user message present", () => {
+    expect(extractLatestUserMessage([{ role: "system", content: "x" }])).toBe("");
+    expect(extractLatestUserMessage([])).toBe("");
+  });
+
+  it("ignores assistant and tool roles when scanning", () => {
+    expect(
+      extractLatestUserMessage([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "later" },
+        { role: "tool", content: "tool-output" } as any,
+      ]),
+    ).toBe("hi");
+  });
+});

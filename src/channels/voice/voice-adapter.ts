@@ -3,7 +3,7 @@ import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../../logging/logger.js";
 import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
-import { renderConversationPrompt } from "./conversation-prompt.js";
+import { renderConversationPrompt, extractLatestUserMessage } from "./conversation-prompt.js";
 import {
   formatSSETextChunk,
   formatSSEDone,
@@ -28,6 +28,7 @@ interface CallSession {
   callId: string;
   agentId: string;
   startedAt: Date;
+  sdkSessionId?: string;
 }
 
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -183,172 +184,199 @@ export class VoiceAdapter {
       context: callMeta?.context,
     });
 
-    // Build the user-side prompt from the conversation transcript
-    const prompt = renderConversationPrompt(request.messages);
+    const session = this.sessions.get(callId)!; // guaranteed present after bookkeeping
 
     const model = agentConfig.model;
     const completionId = `chatcmpl-${randomUUID()}`;
     const startedAt = Date.now();
-    let firstTokenMs: number | undefined;
 
-    // One-shot SDK query — no MCP servers, no hooks, no session reuse.
-    // The SDK handles auth (ANTHROPIC_API_KEY env if set, else OAuth via the
-    // claude CLI's ~/.claude/.credentials.json). On operator instances with
-    // no API key configured, this falls through to the subscription path.
-    const q = query({
-      prompt,
-      options: {
-        model,
-        systemPrompt,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        maxTurns: 1,
-        settingSources: [],
-        includePartialMessages: request.stream !== false,
-        env: {
-          ...process.env,
-          ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
-          CLAUDE_AGENT_SDK_CLIENT_APP: "hive/voice",
-          CLAUDECODE: undefined,
-        },
-        extraArgs: { "strict-mcp-config": null },
-      },
-    });
+    const buildQuery = (resumeSessionId: string | undefined) => {
+      const turnPrompt = resumeSessionId
+        ? extractLatestUserMessage(request.messages)
+        : renderConversationPrompt(request.messages);
 
-    if (request.stream === false) {
-      // Non-streaming: collect full text from result message.
-      let text = "";
+      // If we tried to resume but the latest user message is empty (shouldn't
+      // happen mid-call, but defensive), fall back to full transcript framing.
+      const safePrompt = resumeSessionId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
+      const effectiveResume = resumeSessionId && turnPrompt ? resumeSessionId : undefined;
+
+      return {
+        q: query({
+          prompt: safePrompt,
+          options: {
+            model: agentConfig.model,
+            systemPrompt,
+            permissionMode: "bypassPermissions",
+            allowDangerouslySkipPermissions: true,
+            maxTurns: 1,
+            settingSources: [],
+            includePartialMessages: request.stream !== false,
+            env: {
+              ...process.env,
+              ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
+              CLAUDE_AGENT_SDK_CLIENT_APP: "hive/voice",
+              CLAUDECODE: undefined,
+            },
+            extraArgs: { "strict-mcp-config": null },
+            ...(effectiveResume ? { resume: effectiveResume } : {}),
+          },
+        }),
+        isResumeAttempt: !!effectiveResume,
+      };
+    };
+
+    type TurnOutcome =
+      | { ok: true; firstTokenMs: number | undefined; resultSubtype?: string }
+      | { ok: false; reason: string; bytesSent: boolean };
+
+    const runTurn = async (q: ReturnType<typeof query>, isStreaming: boolean): Promise<TurnOutcome> => {
+      let firstTokenMs: number | undefined;
       let resultSubtype: string | undefined;
+      let assistantText = "";
+      let headersSent = false;
+
       try {
         for await (const message of q) {
           const msg = message as SDKMessage;
-          if (msg.type === "assistant") {
+
+          // Capture session id for next turn's resume.
+          if (msg.type === "system" && (msg as any).subtype === "init") {
+            const sid = (msg as any).session_id as string | undefined;
+            if (sid) session.sdkSessionId = sid;
+          }
+
+          // Streaming text path — write SSE chunks lazily.
+          if (isStreaming && msg.type === "stream_event") {
+            const event = (msg as any).event;
+            if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
+              if (!headersSent) {
+                res.writeHead(200, {
+                  "Content-Type": "text/event-stream",
+                  "Cache-Control": "no-cache",
+                  Connection: "keep-alive",
+                });
+                headersSent = true;
+                firstTokenMs = Date.now() - startedAt;
+              }
+              res.write(formatSSETextChunk(completionId, event.delta.text ?? "", model));
+            }
+          }
+
+          // Non-streaming text path — collect assistant text from the canonical message.
+          if (!isStreaming && msg.type === "assistant") {
             const content = (msg as any).message?.content;
             if (Array.isArray(content)) {
               for (const block of content) {
                 if (block?.type === "text" && typeof block.text === "string") {
                   if (firstTokenMs === undefined) firstTokenMs = Date.now() - startedAt;
-                  text = block.text;
+                  assistantText = block.text;
                 }
               }
             }
-          } else if (msg.type === "result") {
+          }
+
+          if (msg.type === "result") {
             resultSubtype = (msg as any).subtype;
-            if (resultSubtype === "success") {
-              text = (msg as any).result || text;
+            if (!isStreaming && resultSubtype === "success") {
+              assistantText = (msg as any).result || assistantText;
             }
           }
         }
       } catch (err) {
-        if (isAuthError(err)) {
-          log.error("Voice query failed — OAuth credentials unavailable", { error: String(err), callId, agentId });
-          res.writeHead(503, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Voice unavailable" }));
-          return;
-        }
-        log.error("Voice query error (non-streaming)", { error: String(err), callId, agentId });
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Internal error" }));
-        return;
+        return { ok: false, reason: String(err), bytesSent: headersSent };
       }
 
-      // Result subtype other than "success" → 500. Non-streaming is request/response
-      // so we have not yet committed any bytes; we can still surface a clean error.
       if (resultSubtype && resultSubtype !== "success") {
-        log.error("Voice query result reported failure", { callId, agentId, resultSubtype });
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Internal error" }));
-        return;
+        return { ok: false, reason: `result.subtype=${resultSubtype}`, bytesSent: headersSent };
       }
 
-      log.info("Voice turn complete", {
-        callId,
-        agentId,
-        firstTokenMs,
-        totalMs: Date.now() - startedAt,
-        mode: "non-streaming",
-      });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(formatNonStreamingResponse(completionId, text, model)));
-      return;
-    }
-
-    // Streaming: peek the first SDK message to surface auth failures BEFORE
-    // committing to SSE headers (which would lock us into a 200 response).
-    const iter = q[Symbol.asyncIterator]();
-    let firstMessage: IteratorResult<SDKMessage>;
-    try {
-      firstMessage = (await iter.next()) as IteratorResult<SDKMessage>;
-    } catch (err) {
-      if (isAuthError(err)) {
-        log.error("Voice query failed — OAuth credentials unavailable", { error: String(err), callId, agentId });
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Voice unavailable" }));
-        return;
-      }
-      log.error("Voice query error (streaming/init)", { error: String(err), callId, agentId });
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Internal error" }));
-      return;
-    }
-
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    });
-
-    const handleStreamMessage = (msg: SDKMessage) => {
-      if (msg.type === "stream_event") {
-        const event = (msg as any).event;
-        if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
-          if (firstTokenMs === undefined) firstTokenMs = Date.now() - startedAt;
-          res.write(formatSSETextChunk(completionId, event.delta.text ?? "", model));
-        }
-      }
-    };
-
-    let resultSubtype: string | undefined;
-    try {
-      const checkResult = (msg: SDKMessage) => {
-        if (msg.type === "result") resultSubtype = (msg as any).subtype;
-      };
-      if (!firstMessage.done) {
-        handleStreamMessage(firstMessage.value);
-        checkResult(firstMessage.value);
-      }
-      while (true) {
-        const next = await iter.next();
-        if (next.done) break;
-        const msg = next.value as SDKMessage;
-        handleStreamMessage(msg);
-        checkResult(msg);
-      }
-      if (!res.writableEnded) {
-        // Non-success result is logged but not surfaced to Vapi mid-stream — caller
-        // already heard whatever audio was emitted; abruptly ending the stream
-        // would degrade more than it helps. Logging is enough to alert ops.
-        if (resultSubtype && resultSubtype !== "success") {
-          log.warn("Voice query result reported failure (post-stream)", { callId, agentId, resultSubtype });
+      // Streaming branch finalization — emit [DONE] and end.
+      if (isStreaming) {
+        if (!headersSent) {
+          // Resume succeeded but produced no text (degenerate but not impossible).
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          headersSent = true;
         }
         res.write(formatSSEDone(completionId, model));
+        res.end();
+        return { ok: true, firstTokenMs, resultSubtype };
       }
-    } catch (err) {
-      log.error("Voice query error (streaming)", { error: String(err), callId, agentId });
-      if (!res.writableEnded) {
-        res.write(formatSSEDone(completionId, model, "error"));
+
+      // Non-streaming branch finalization — return the JSON body to caller.
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(formatNonStreamingResponse(completionId, assistantText, model)));
+      return { ok: true, firstTokenMs, resultSubtype };
+    };
+
+    let { q, isResumeAttempt } = buildQuery(session.sdkSessionId);
+    let outcome = await runTurn(q, request.stream !== false);
+
+    const sdkSessionResumeAttempted = isResumeAttempt;
+
+    if (!outcome.ok && isResumeAttempt && !outcome.bytesSent) {
+      // Resume failed before any bytes hit the wire — retry as turn-1 with full transcript.
+      log.warn("Voice session resume failed, retrying as turn-1", {
+        callId,
+        reason: outcome.reason,
+      });
+      session.sdkSessionId = undefined;
+      ({ q, isResumeAttempt } = buildQuery(undefined));
+      outcome = await runTurn(q, request.stream !== false);
+    }
+
+    if (!outcome.ok) {
+      // Either not a resume attempt, or retry also failed, or bytes already sent (mid-stream failure).
+      if (isAuthError(outcome.reason)) {
+        log.error("Voice query failed — OAuth credentials unavailable", {
+          callId,
+          agentId,
+          reason: outcome.reason,
+        });
+        if (!outcome.bytesSent) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Voice unavailable" }));
+        } else {
+          // Bytes already sent — best we can do is end the SSE stream with an error sentinel.
+          if (!res.writableEnded) {
+            res.write(formatSSEDone(completionId, model, "error"));
+            res.end();
+          }
+        }
+        return;
       }
+
+      log.error("Voice query failed", {
+        callId,
+        agentId,
+        reason: outcome.reason,
+        bytesSent: outcome.bytesSent,
+      });
+      if (!outcome.bytesSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal error" }));
+      } else {
+        if (!res.writableEnded) {
+          res.write(formatSSEDone(completionId, model, "error"));
+          res.end();
+        }
+      }
+      return;
     }
 
     log.info("Voice turn complete", {
       callId,
       agentId,
-      firstTokenMs,
+      firstTokenMs: outcome.firstTokenMs,
       totalMs: Date.now() - startedAt,
-      mode: "streaming",
-      resultSubtype,
+      mode: request.stream === false ? "non-streaming" : "streaming",
+      resultSubtype: outcome.resultSubtype,
+      sdkSessionResumeAttempted, // captured BEFORE retry — preserves the original turn classification
+      sdkSessionResumed: sdkSessionResumeAttempted && outcome.ok && isResumeAttempt, // true iff resumed AND we didn't retry
     });
-    res.end();
   }
 
   /**

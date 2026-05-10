@@ -37,3 +37,21 @@ export function renderConversationPrompt(messages: OpenAIChatRequest["messages"]
     "Respond to the caller's most recent message above. Keep it conversational and short — you are speaking, not writing.",
   ].join("\n");
 }
+
+/**
+ * Pull the latest user message off Vapi's history. Used on turn-2+ when the
+ * SDK session is being resumed — the prior turns are already in the SDK's
+ * session memory, so we only send the new user input.
+ *
+ * Returns empty string if no user message is present (caller decides what to
+ * do; in practice voice-adapter falls back to turn-1 framing in that case).
+ */
+export function extractLatestUserMessage(messages: OpenAIChatRequest["messages"]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role === "user") {
+      return typeof m.content === "string" ? m.content : "";
+    }
+  }
+  return "";
+}
