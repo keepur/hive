@@ -709,6 +709,24 @@ describe("agent-private skills (KPR-75)", () => {
     expect(link).toContain(join(customer, "publish-blog-post"));
   });
 
+  it("flat customer skill scoped to one agent shadows legacy agent-private skill of same name", () => {
+    // KPR-227 follow-up: the explicit-agent branch must also match by
+    // entry.skillName. A flat customer skill for luna has collision key
+    // `publish-blog-post`, but luna's legacy private skill is keyed by workflow
+    // (`luna::blog-flow`), so suffix/layout-key matching misses it.
+    writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
+
+    const customer = join(tmp, "skills");
+    writeFlatSkill(customer, "publish-blog-post", ["luna"]);
+
+    const index = loadSkillIndex(customer, [], [], ["luna"], tmp);
+
+    const luna = getSkillsForAgent(index, "luna");
+    expect(luna).toHaveLength(1);
+    const link = readlinkSync(join(luna[0]!.path, "skills", "publish-blog-post"));
+    expect(link).toContain(join(customer, "publish-blog-post"));
+  });
+
   it("F2 (KPR-225): customer skill with `agents: [all]` shadows agent-private skills of the same name", () => {
     // Pre-fix bug: when the customer skill scopes to `agents: [all]`, the
     // eviction loop iterated `agentIds` (which is empty in the hasAll case)
@@ -716,7 +734,7 @@ describe("agent-private skills (KPR-75)", () => {
     // agent-private and the universal customer entry.
     //
     // Post-fix: hasAll branch iterates collisionMap and evicts every
-    // `*::<skillName>` entry except the customer's own self-key.
+    // agent-private entry whose stored skillName matches the customer skill.
     const customer = join(tmp, "skills");
     writeFlatSkill(customer, "publish-blog-post", ["all"]);
     writeFlatAgentSkill(tmp, "luna", "publish-blog-post");
@@ -746,8 +764,8 @@ describe("agent-private skills (KPR-75)", () => {
     // `agents/luna/skills/blog-flow/skills/publish-blog-post` (collisionKey
     // `luna::blog-flow`), so luna saw both entries.
     //
-    // KPR-227 switches the hasAll filter to `entry.skillName === skillName`
-    // gated by `perAgentKey.includes("::")`, covering both layouts.
+    // KPR-227 switches the hasAll filter to agent-private source +
+    // `entry.skillName === skillName`, covering both layouts.
     writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
 
     const customer = join(tmp, "skills");

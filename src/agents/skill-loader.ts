@@ -552,9 +552,10 @@ function scanSkillsFrom(
     // agent-private version. Operator authority preserved.
     //
     // The agent-private collision-key uses the agent's layout key (workflow
-    // for legacy, skill name for flat). Cross-layout shadowing tries both
-    // forms so an operator who flattens customer skills while leaving agent
-    // private legacy still gets the correct precedence — and vice versa.
+    // for legacy, skill name for flat). Cross-layout shadowing therefore uses
+    // the stored `entry.skillName`, not the collision-key suffix, so an operator
+    // who flattens customer skills while leaving agent private legacy still gets
+    // the correct precedence — and vice versa.
     if (winsCollisions && !implicitAgentScope) {
       if (hasAll) {
         // KPR-225 F2: customer skill with `agents: [all]` shadows EVERY
@@ -571,14 +572,12 @@ function scanSkillsFrom(
         // and silently misses legacy private skills whose workflow name
         // differs from the skill name (e.g. `luna::blog-flow` for skill
         // `publish-blog-post`). Comparing `entry.skillName` covers both.
-        // The `includes("::")` guard mirrors the per-agent loop's invariant
-        // that only `<agentId>::*` keys are evictable — customer/seed/plugin
-        // entries use a bare `layoutKey` as collisionKey because
-        // implicitAgentScope is undefined for those scans, so they have no
-        // `::` and are naturally excluded (no self-evict possible).
+        // The source guard preserves the invariant that only agent-private
+        // entries are evictable — customer/seed/plugin entries are never
+        // removed by this operator-authority rule.
         const evictionKeys: string[] = [];
         for (const [perAgentKey, entry] of collisionMap.entries()) {
-          if (perAgentKey.includes("::") && entry.skillName === skillName) {
+          if (entry.source.startsWith("agent-private:") && entry.skillName === skillName) {
             evictionKeys.push(perAgentKey);
           }
         }
@@ -595,13 +594,17 @@ function scanSkillsFrom(
         }
       } else {
         for (const agentId of agentIds) {
-          const candidates = legacy
-            ? [`${agentId}::${legacyWorkflow}`, `${agentId}::${skillName}`]
-            : [`${agentId}::${skillName}`, `${agentId}::${skillName}`];
-          const seen = new Set<string>();
-          for (const perAgentKey of candidates) {
-            if (seen.has(perAgentKey)) continue;
-            seen.add(perAgentKey);
+          // Match the targeted agent's private entries by stored skillName,
+          // not by the customer's layout key. A flat customer skill scoped to
+          // one agent must still shadow legacy private keys like
+          // `luna::blog-flow` when `entry.skillName === "publish-blog-post"`.
+          const evictionKeys: string[] = [];
+          for (const [perAgentKey, entry] of collisionMap.entries()) {
+            if (entry.source === `agent-private:${agentId}` && entry.skillName === skillName) {
+              evictionKeys.push(perAgentKey);
+            }
+          }
+          for (const perAgentKey of evictionKeys) {
             const evicted = collisionMap.get(perAgentKey);
             if (evicted) {
               log.warn("Customer-space skill shadows agent-private skill", {
