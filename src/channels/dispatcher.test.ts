@@ -2,9 +2,13 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 
+// KPR-220 Phase 1: shared mock so tests can assert what dispatcher logs to
+// `info` (e.g., per-turn telemetry breakdown — llmMs/toolMs/toolCalls/etc).
+// vi.hoisted is required: vi.mock factories run before top-level statements.
+const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
-    info: vi.fn(),
+    info: mockLogInfo,
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
@@ -171,6 +175,12 @@ function makeMockAgentManager() {
         durationMs: 800,
       },
       errors: [],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
     }),
     getSessionStore: vi.fn().mockReturnValue({
       get: vi.fn().mockResolvedValue(undefined),
@@ -801,6 +811,61 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
 
     expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
     expect(agentManager.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("KPR-220 Phase 1: per-turn dispatch propagates non-zero llmMs/toolMs/toolCalls into the work-item-dispatched log", async () => {
+    mockConfig.agentManager.perTurnSpawn.sms = true;
+    const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
+    dispatcher.registerAdapter(smsAdapter as any);
+
+    // Override the default spawnTurn mock with a TurnResult carrying real
+    // execution metrics. Pre-Phase-1 the dispatcher zeroed these on the way
+    // out because TurnResult had no shape for them; post-Phase-1 they pass
+    // through into the RunResult that drives the `Work item dispatched` log.
+    agentManager.spawnTurn.mockResolvedValueOnce({
+      finalMessage: "ok",
+      newSessionId: "s-metrics",
+      usage: {
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 10,
+        cacheCreationTokens: 5,
+        contextWindow: 200000,
+        costUsd: 0.05,
+        durationMs: 1500,
+      },
+      errors: [],
+      llmMs: 999,
+      toolMs: 333,
+      toolCalls: 7,
+      toolSummary: "memory:1x",
+      streamed: true,
+      compactions: 1,
+      preCompactTokens: 12345,
+      ephemeral5mTokens: 42,
+      ephemeral1hTokens: 13,
+    });
+
+    mockLogInfo.mockClear();
+
+    const item = makeWorkItem({
+      source: { kind: "sms", id: "PN_LINE_M", label: "quo-may", adapterId: "sms" },
+      threadId: "sms:PN_LINE_M:+15550100",
+      text: "hey Jasper, telemetry probe",
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
+
+    const logCall = mockLogInfo.mock.calls.find(
+      ([msg]) => msg === "Work item dispatched",
+    );
+    expect(logCall).toBeDefined();
+    const fields = logCall![1] as Record<string, unknown>;
+    expect(fields.llmMs).toBe(999);
+    expect(fields.toolMs).toBe(333);
+    expect(fields.toolCalls).toBe(7);
+    expect(fields.toolSummary).toBe("memory:1x");
   });
 
   it("routeVoiceTurn does NOT dedup on workItem.id", async () => {

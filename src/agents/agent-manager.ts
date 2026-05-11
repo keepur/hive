@@ -101,6 +101,21 @@ export interface TurnResult {
   newSessionId: string;
   usage: TurnUsage;
   errors: string[];
+  // KPR-220 Phase 1: execution metrics carried through from RunResult so the
+  // dispatcher's RunResult conversion no longer has to zero them. The seven
+  // telemetry-shape fields below match agent-runner.ts:121-142 verbatim; the
+  // two ephemeral-token fields (5m / 1h cache lifetimes) are needed by
+  // Phase 9's convertTurnResult helper so no RunResult field is silently
+  // dropped during the dispatcher rewrite.
+  llmMs: number;
+  toolMs: number;
+  toolCalls: number;
+  toolSummary: string | null;
+  streamed: boolean;
+  compactions: number;
+  preCompactTokens?: number;
+  ephemeral5mTokens?: number;
+  ephemeral1hTokens?: number;
 }
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
@@ -600,6 +615,15 @@ export class AgentManager {
         durationMs: result.durationMs,
       },
       errors: result.error ? [result.error] : [],
+      llmMs: result.llmMs,
+      toolMs: result.toolMs,
+      toolCalls: result.toolCalls,
+      toolSummary: result.toolSummary || null,
+      streamed: result.streamed,
+      compactions: result.compactions,
+      preCompactTokens: result.preCompactTokens,
+      ephemeral5mTokens: result.ephemeral5mTokens,
+      ephemeral1hTokens: result.ephemeral1hTokens,
     };
   }
 

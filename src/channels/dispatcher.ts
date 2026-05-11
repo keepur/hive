@@ -316,10 +316,9 @@ export class Dispatcher {
    * sessionId` and converts the resulting {@link TurnResult} into the
    * {@link RunResult} shape that the rest of dispatch expects.
    *
-   * The per-turn path's TurnUsage doesn't carry llmMs/toolMs/toolCalls/
-   * toolSummary/streamed/compactions, so those fields are zero/empty here.
-   * KPR-220 will revisit telemetry uniformity once the long-lived path
-   * retires.
+   * KPR-220 Phase 1: TurnResult now carries the seven telemetry-shape fields
+   * plus the two ephemeral-token fields from RunResult, so the dispatcher no
+   * longer has to zero them — the conversion below is now lossless.
    */
   private async runPerTurnDispatch(agentId: string, item: WorkItem): Promise<RunResult> {
     const threadId = item.threadId ?? item.id;
@@ -346,15 +345,15 @@ export class Dispatcher {
       cacheReadTokens: turn.usage.cacheReadTokens,
       cacheCreationTokens: turn.usage.cacheCreationTokens,
       contextWindow: turn.usage.contextWindow,
-      // Per-turn path doesn't surface these breakdowns; TurnUsage doesn't carry them.
-      // Telemetry rows for per-turn dispatch will show 0 for the *Ms/toolCalls fields.
-      // KPR-220 will revisit telemetry uniformity once long-lived path retires.
-      llmMs: 0,
-      toolMs: 0,
-      toolCalls: 0,
-      toolSummary: "",
-      streamed: false,
-      compactions: 0,
+      llmMs: turn.llmMs,
+      toolMs: turn.toolMs,
+      toolCalls: turn.toolCalls,
+      toolSummary: turn.toolSummary ?? "",
+      streamed: turn.streamed,
+      compactions: turn.compactions,
+      preCompactTokens: turn.preCompactTokens,
+      ephemeral5mTokens: turn.ephemeral5mTokens,
+      ephemeral1hTokens: turn.ephemeral1hTokens,
       error: turn.errors[0],
     };
   }

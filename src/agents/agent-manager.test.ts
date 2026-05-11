@@ -1083,6 +1083,49 @@ describe("AgentManager", () => {
       expect(sessionArg).toBe("same-session");
     });
 
+    it("KPR-220 Phase 1: TurnResult carries all 9 execution-metric fields from RunResult", async () => {
+      // Pre-Phase-1: dispatcher.runPerTurnDispatch had to zero llmMs/toolMs/
+      // toolCalls/toolSummary/streamed/compactions because TurnResult did not
+      // surface them. ephemeral{5m,1h}Tokens + preCompactTokens were also
+      // dropped. Phase 1 expands TurnResult so finalizeSpawnResult can copy
+      // them straight from RunResult.
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({
+          text: "ack",
+          sessionId: "session-metrics",
+          llmMs: 1234,
+          toolMs: 567,
+          toolCalls: 4,
+          toolSummary: "memory:2x/0.3s,task:1x/0.4s",
+          streamed: true,
+          compactions: 2,
+          preCompactTokens: 18000,
+          ephemeral5mTokens: 9001,
+          ephemeral1hTokens: 7777,
+        }),
+      );
+
+      const result = await manager.spawnTurn(smsCtx());
+
+      expect(result.llmMs).toBe(1234);
+      expect(result.toolMs).toBe(567);
+      expect(result.toolCalls).toBe(4);
+      expect(result.toolSummary).toBe("memory:2x/0.3s,task:1x/0.4s");
+      expect(result.streamed).toBe(true);
+      expect(result.compactions).toBe(2);
+      expect(result.preCompactTokens).toBe(18000);
+      expect(result.ephemeral5mTokens).toBe(9001);
+      expect(result.ephemeral1hTokens).toBe(7777);
+    });
+
+    it("KPR-220 Phase 1: toolSummary defaults to null when RunResult.toolSummary is empty", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ toolSummary: "" }));
+      const result = await manager.spawnTurn(smsCtx());
+      expect(result.toolSummary).toBeNull();
+    });
+
     it("rejects when the agent is not in the registry", async () => {
       await expect(manager.spawnTurn(smsCtx({ agentId: "no-such-agent" }))).rejects.toThrow(
         /Unknown agent: no-such-agent/,
