@@ -1201,6 +1201,85 @@ describe("AgentManager", () => {
       expect(sessionArg).toBe("stored-session");
     });
 
+    it("KPR-220 Phase 4: spawnBudgetFor uses agent.spawnBudget when set", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Override agent-a with spawnBudget=7. Park 7 spawns; 8th must reject.
+      const cfg = registry._agents.get("agent-a")!;
+      cfg.spawnBudget = 7;
+
+      const releasers: Array<() => void> = [];
+      mockRunnerSend.mockImplementation(
+        () => new Promise((resolve) => {
+          releasers.push(() => resolve(makeRunResult()));
+        }),
+      );
+
+      const inflight = [0, 1, 2, 3, 4, 5, 6].map((i) =>
+        manager.spawnTurn(smsCtx({ threadId: `sms:line-1:phase4-budget-${i}` })),
+      );
+      await new Promise((r) => setTimeout(r, 30));
+      expect(mockRunnerSend).toHaveBeenCalledTimes(7);
+
+      await expect(
+        manager.spawnTurn(smsCtx({ threadId: "sms:line-1:phase4-overflow" })),
+      ).rejects.toThrow(/Spawn budget exceeded for agent-a \(7\/7\)/);
+
+      releasers.forEach((r) => r());
+      await Promise.all(inflight);
+    });
+
+    it("KPR-220 Phase 4: spawnBudgetFor falls back to maxConcurrent when spawnBudget unset", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const cfg = registry._agents.get("agent-a")!;
+      cfg.spawnBudget = undefined;
+      cfg.maxConcurrent = 2;
+
+      const releasers: Array<() => void> = [];
+      mockRunnerSend.mockImplementation(
+        () => new Promise((resolve) => {
+          releasers.push(() => resolve(makeRunResult()));
+        }),
+      );
+
+      const inflight = [0, 1].map((i) =>
+        manager.spawnTurn(smsCtx({ threadId: `sms:line-1:phase4-fallback-${i}` })),
+      );
+      await new Promise((r) => setTimeout(r, 30));
+
+      await expect(
+        manager.spawnTurn(smsCtx({ threadId: "sms:line-1:phase4-fallback-overflow" })),
+      ).rejects.toThrow(/Spawn budget exceeded for agent-a \(2\/2\)/);
+
+      releasers.forEach((r) => r());
+      await Promise.all(inflight);
+    });
+
+    it("KPR-220 Phase 4: spawnBudgetFor falls back to engine default (5) when both unset", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const cfg = registry._agents.get("agent-a")!;
+      cfg.spawnBudget = undefined;
+      cfg.maxConcurrent = undefined as unknown as number;
+
+      const releasers: Array<() => void> = [];
+      mockRunnerSend.mockImplementation(
+        () => new Promise((resolve) => {
+          releasers.push(() => resolve(makeRunResult()));
+        }),
+      );
+
+      const inflight = [0, 1, 2, 3, 4].map((i) =>
+        manager.spawnTurn(smsCtx({ threadId: `sms:line-1:phase4-default-${i}` })),
+      );
+      await new Promise((r) => setTimeout(r, 30));
+
+      await expect(
+        manager.spawnTurn(smsCtx({ threadId: "sms:line-1:phase4-default-overflow" })),
+      ).rejects.toThrow(/Spawn budget exceeded for agent-a \(5\/5\)/);
+
+      releasers.forEach((r) => r());
+      await Promise.all(inflight);
+    });
+
     it("KPR-220 Phase 3: runWorkItemTurn falls back to item.id as threadKey when threadId absent", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       mockRunnerSend.mockResolvedValueOnce(makeRunResult());
@@ -1303,6 +1382,7 @@ describe("AgentManager", () => {
     it("allows concurrent spawns on different threads of the same agent", async () => {
       // Different threads on the same agent are NOT serialized by the per-thread lock.
       // They are bounded only by the per-agent spawn budget (5 by default).
+      // Use agent-b — agent-a's maxConcurrent=2 now caps the spawn budget at 2.
       let inflight = 0;
       let maxInflight = 0;
       mockRunnerSend.mockImplementation(() => {
@@ -1317,7 +1397,7 @@ describe("AgentManager", () => {
       });
 
       const spawns = [0, 1, 2].map((i) =>
-        manager.spawnTurn(smsCtx({ threadId: `sms:line-1:thread-${i}` })),
+        manager.spawnTurn(smsCtx({ agentId: "agent-b", threadId: `sms:line-1:thread-${i}` })),
       );
       await Promise.all(spawns);
 
@@ -1326,7 +1406,9 @@ describe("AgentManager", () => {
     });
 
     it("rejects when per-agent spawn budget is exceeded (default 5)", async () => {
-      // Park 5 spawns on five distinct threads, then attempt a 6th — it must reject.
+      // KPR-220 Phase 4: agent-a has maxConcurrent=2 in the registry which
+      // resolves to spawnBudget=2 via the fallback chain. Use agent-b which
+      // has no override and therefore lands on the engine default of 5.
       const releasers: Array<() => void> = [];
       mockRunnerSend.mockImplementation(() => {
         return new Promise((resolve) => {
@@ -1335,15 +1417,15 @@ describe("AgentManager", () => {
       });
 
       const inflight = [0, 1, 2, 3, 4].map((i) =>
-        manager.spawnTurn(smsCtx({ threadId: `sms:line-1:budget-${i}` })),
+        manager.spawnTurn(smsCtx({ agentId: "agent-b", threadId: `sms:line-1:budget-${i}` })),
       );
       // Yield enough for all 5 to enter and bump the active count.
       await new Promise((r) => setTimeout(r, 30));
       expect(mockRunnerSend).toHaveBeenCalledTimes(5);
 
       await expect(
-        manager.spawnTurn(smsCtx({ threadId: "sms:line-1:budget-overflow" })),
-      ).rejects.toThrow(/Spawn budget exceeded for agent-a/);
+        manager.spawnTurn(smsCtx({ agentId: "agent-b", threadId: "sms:line-1:budget-overflow" })),
+      ).rejects.toThrow(/Spawn budget exceeded for agent-b \(5\/5\)/);
 
       // Drain so the test cleans up.
       releasers.forEach((r) => r());

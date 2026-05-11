@@ -509,11 +509,13 @@ export class AgentManager {
 
   /**
    * KPR-220 Phase 4: resolves the in-flight spawn budget for an agent.
-   * Phase 2 stub: always returns the engine default. Phase 4 wires the
-   * `spawnBudget` agent-definition field with maxConcurrent fallback.
+   * Fallback chain: agent.spawnBudget → agent.maxConcurrent (deprecated) →
+   * engine default (5). Returning the engine default for unknown agents
+   * keeps callers safe.
    */
-  private spawnBudgetFor(_agentId: string): number {
-    return DEFAULT_PER_AGENT_SPAWN_BUDGET;
+  private spawnBudgetFor(agentId: string): number {
+    const def = this.registry.get(agentId);
+    return def?.spawnBudget ?? def?.maxConcurrent ?? DEFAULT_PER_AGENT_SPAWN_BUDGET;
   }
 
   private async runOneSpawnAttempt(

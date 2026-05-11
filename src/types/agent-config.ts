@@ -26,7 +26,14 @@ export interface AgentConfig {
   coreServers: string[];
   delegateServers: string[];
   plugins?: string[]; // Claude Code plugin allowlist. Omit = no plugins
+  /** @deprecated KPR-220: use spawnBudget. Retained as fallback for legacy agent docs. */
   maxConcurrent?: number; // Max concurrent threads. Default 3
+  /**
+   * KPR-220: per-agent in-flight spawn budget (number of concurrent
+   * `query()` calls allowed across all threads of this agent). Falls back
+   * to `maxConcurrent` then to engine default (5) if unset.
+   */
+  spawnBudget?: number;
   timeoutMs?: number; // Response timeout in ms. Default 300000 (5 min)
   betas?: string[]; // SDK beta features. Note: "context-1m-2025-08-07" retires 2026-04-30
   metadata?: Record<string, unknown>; // plugin-managed bag — read via agent-env dotted paths

@@ -176,7 +176,17 @@ export function buildAdminTools(deps: AdminToolDeps) {
           if (doc.subscribe?.length) lines.push(`Subscribe: [${doc.subscribe.join(", ")}]`);
           lines.push(`Budget: $${doc.budgetUsd ?? AGENT_DEFINITION_DEFAULTS.budgetUsd}`);
           lines.push(`Max Turns: ${doc.maxTurns ?? AGENT_DEFINITION_DEFAULTS.maxTurns}`);
-          lines.push(`Max Concurrent: ${doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent}`);
+          // KPR-220 Phase 4: spawnBudget is the live field; maxConcurrent is
+          // retained as a deprecated fallback for legacy docs.
+          {
+            const resolved = doc.spawnBudget ?? doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent;
+            const source = doc.spawnBudget != null
+              ? "spawnBudget"
+              : doc.maxConcurrent != null
+              ? "maxConcurrent (deprecated)"
+              : "default";
+            lines.push(`Spawn Budget: ${resolved} (source: ${source})`);
+          }
           lines.push(`Timeout: ${doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs}ms`);
           lines.push(`Disabled: ${doc.disabled ?? false}`);
           if (doc.slackBot) lines.push(`Slack Bot: ${doc.slackBot}`);
@@ -312,6 +322,9 @@ export function buildAdminTools(deps: AdminToolDeps) {
             budgetUsd: (f.budgetUsd as number) ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
             maxTurns: (f.maxTurns as number) ?? AGENT_DEFINITION_DEFAULTS.maxTurns,
             maxConcurrent: (f.maxConcurrent as number) ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
+            // KPR-220 Phase 4: writes go to spawnBudget; maxConcurrent kept
+            // populated for backward compat so older readers don't see undefined.
+            spawnBudget: f.spawnBudget as number | undefined,
             timeoutMs: (f.timeoutMs as number) ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
             disabled: (f.disabled as boolean) ?? false,
             slackBot: f.slackBot as string | undefined,

@@ -57,7 +57,14 @@ export interface AgentDefinition {
   // Limits
   budgetUsd: number;
   maxTurns: number;
+  /** @deprecated KPR-220: use spawnBudget. Retained as fallback for legacy agent docs. */
   maxConcurrent: number;
+  /**
+   * KPR-220: per-agent in-flight spawn budget. Falls back to maxConcurrent,
+   * then to the engine default (5). Admin tools should write here; reads
+   * may consult both fields.
+   */
+  spawnBudget?: number;
   timeoutMs: number;
   resourceTiers?: ResourceTierOverrides;
 
@@ -127,6 +134,7 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     delegateServers: doc.delegateServers ?? [...AGENT_DEFINITION_DEFAULTS.delegateServers],
     plugins: doc.plugins,
     maxConcurrent: doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
+    spawnBudget: doc.spawnBudget,
     timeoutMs: doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
     betas: doc.betas,
     metadata: doc.metadata,

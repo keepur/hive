@@ -183,6 +183,9 @@ export class AdminApi {
       budgetUsd: body.budgetUsd ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
       maxTurns: body.maxTurns ?? AGENT_DEFINITION_DEFAULTS.maxTurns,
       maxConcurrent: body.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
+      // KPR-220 Phase 4: writes go to spawnBudget; maxConcurrent stays
+      // populated for backward compat.
+      spawnBudget: body.spawnBudget,
       timeoutMs: body.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
       disabled: body.disabled ?? false,
       slackBot: body.slackBot,
