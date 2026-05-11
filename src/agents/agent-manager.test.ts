@@ -1223,6 +1223,44 @@ describe("AgentManager", () => {
         .activeSpawnKeys.has(`${ctx1.agentId}:${sharedThread}`)).toBe(false);
     });
 
+    it("KPR-226: shaping throw does not leak per-thread lock or budget slot", async () => {
+      // Pre-fix bug: spawnTurn called prepareSpawn AFTER acquiring the lock + budget
+      // slot but BEFORE the try/finally that releases them. Any throw in shaping
+      // (e.g., formatFilesForPrompt on malformed file metadata) left `processing`,
+      // `activeSpawnKeys`, and `activeSpawnCount` stuck — next turn busy-waits
+      // forever; enough such failures permanently consume the per-agent budget.
+      //
+      // Post-fix: prepareSpawn is inside the try block, so the finally runs even
+      // on a shaping throw and the lock + budget slot are released.
+      const prepareSpawnSpy = vi
+        .spyOn(manager as unknown as { prepareSpawn: (ctx: unknown) => Promise<unknown> }, "prepareSpawn")
+        .mockRejectedValueOnce(new Error("synthetic shaping failure"));
+
+      const ctx = smsCtx();
+
+      // First spawn — shaping throws; the rejection propagates.
+      await expect(manager.spawnTurn(ctx)).rejects.toThrow("synthetic shaping failure");
+
+      // Lock + budget slot must be released after the throw.
+      const threadKey = `${ctx.agentId}:${ctx.threadId}`;
+      expect((manager as unknown as { processing: Set<string> })
+        .processing.has(threadKey)).toBe(false);
+      expect((manager as unknown as { activeSpawnKeys: Set<string> })
+        .activeSpawnKeys.has(threadKey)).toBe(false);
+      expect((manager as unknown as { activeSpawnCount: Map<string, number> })
+        .activeSpawnCount.get(ctx.agentId)).toBeUndefined();
+
+      // Restore the spy so the next spawn proceeds normally.
+      prepareSpawnSpy.mockRestore();
+
+      // Second spawn on same thread proceeds (no busy-wait, no lingering budget).
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered after shaping throw" }));
+      const result = await manager.spawnTurn(ctx);
+      expect(result.finalMessage).toBe("recovered after shaping throw");
+      expect(result.errors).toEqual([]);
+    });
+
     it("returns errors[] populated when the SDK reports an error result (no throw)", async () => {
       mockRunnerSend.mockResolvedValueOnce(
         makeRunResult({ text: "partial", error: "tool blew up", sessionId: "session-err-1" }),
