@@ -338,15 +338,18 @@ export class AgentManager {
     }
     this.activeSpawnCount.set(ctx.agentId, active + 1);
 
-    if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
-
-    // KPR-224: shape prompt + resolve model router once at the spawnTurn
-    // level so both the happy-path call and any auth-rebuild retry use the
-    // same shaped values, and recordSpawnObservability sees prompt /
-    // modelOverride in scope.
-    const shaping = await this.prepareSpawn(ctx);
-
     try {
+      if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
+
+      // KPR-224 + KPR-226: shape prompt + resolve model router once at the
+      // spawnTurn level so both the happy-path call and any auth-rebuild
+      // retry use the same shaped values, and recordSpawnObservability sees
+      // prompt / modelOverride in scope. Kept INSIDE the try/finally so any
+      // throw in shaping (e.g., formatFilesForPrompt on malformed file
+      // metadata) cannot leak the per-thread lock or budget slot — KPR-226
+      // regression prevention.
+      const shaping = await this.prepareSpawn(ctx);
+
       const result = await this.runOneSpawnAttempt(ctx, shaping, onStream);
 
       if (result.error && isAuthRebuildResumeError(result.error) && ctx.sessionId) {
