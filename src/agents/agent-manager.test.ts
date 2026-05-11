@@ -84,7 +84,7 @@ vi.mock("../search/conversation-index.js", () => ({
   })),
 }));
 
-import { AgentManager } from "./agent-manager.js";
+import { AgentManager, type TurnContext } from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
 import type { RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -1322,6 +1322,240 @@ describe("AgentManager", () => {
 
       release!();
       await inflight.catch(() => undefined);
+    });
+
+    it("KPR-220 Phase 6: reflection fires after debounce when thread quiescent + memory eligible", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Inject a tiny debounce so we don't have to wait 30s.
+      const fastManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 25 },
+      );
+
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "ack", sessionId: "s-A" }));
+      const sharedThread = "sms:line-1:reflect-eligible";
+
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+
+      const calledBefore = mockRunnerSend.mock.calls.length;
+      await new Promise((r) => setTimeout(r, 80));
+
+      expect(mockRunnerSend.mock.calls.length).toBeGreaterThan(calledBefore);
+      // The reflection turn was sent with the canonical reflection prompt.
+      const reflectionCall = mockRunnerSend.mock.calls
+        .slice(calledBefore)
+        .find(([prompt]) => typeof prompt === "string" && prompt.startsWith("[System — end of conversation reflection]"));
+      expect(reflectionCall).toBeDefined();
+    });
+
+    it("KPR-220 Phase 6: reflection skipped when no memory server in coreServers OR delegateServers", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const localRegistry = makeMockRegistry();
+      const cfg = localRegistry._agents.get("agent-a")!;
+      cfg.coreServers = ["keychain"]; // no memory / structured-memory anywhere
+      cfg.delegateServers = [];
+
+      const fastManager = new AgentManager(
+        localRegistry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 25 },
+      );
+
+      mockRunnerSend.mockResolvedValue(makeRunResult());
+      const sharedThread = "sms:line-1:no-memory";
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+
+      const calledBefore = mockRunnerSend.mock.calls.length;
+      await new Promise((r) => setTimeout(r, 80));
+      // No reflection fired — no extra runner.send.
+      expect(mockRunnerSend.mock.calls.length).toBe(calledBefore);
+    });
+
+    it("KPR-220 Phase 6: hasMemoryServer accepts memory in delegateServers (legacy doc shape)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const localRegistry = makeMockRegistry();
+      const cfg = localRegistry._agents.get("agent-a")!;
+      cfg.coreServers = ["keychain"];
+      cfg.delegateServers = ["memory"]; // legacy placement — KPR-184 forbids
+                                          // for new agents, runtime stays liberal
+
+      const fastManager = new AgentManager(
+        localRegistry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 25 },
+      );
+
+      mockRunnerSend.mockResolvedValue(makeRunResult());
+      const sharedThread = "sms:line-1:legacy-memory";
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+
+      const calledBefore = mockRunnerSend.mock.calls.length;
+      await new Promise((r) => setTimeout(r, 80));
+      expect(mockRunnerSend.mock.calls.length).toBeGreaterThan(calledBefore);
+    });
+
+    it("KPR-220 Phase 6: reflection skipped for system sender", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const fastManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 25 },
+      );
+
+      mockRunnerSend.mockResolvedValue(makeRunResult());
+      const sharedThread = "sms:line-1:system-sender";
+
+      // Build three system-sender WorkItems on the same thread.
+      for (let i = 0; i < 3; i++) {
+        const item = makeWorkItem({
+          text: "system note",
+          threadId: sharedThread,
+          source: { kind: "sms" as const, id: "line-1", label: "May (CEO)" },
+          sender: "system",
+        });
+        await fastManager.spawnTurn({
+          agentId: "agent-a",
+          sessionId: undefined,
+          channelId: "line-1",
+          threadId: sharedThread,
+          workItem: item,
+          channel: "sms",
+        });
+      }
+
+      const calledBefore = mockRunnerSend.mock.calls.length;
+      await new Promise((r) => setTimeout(r, 80));
+      expect(mockRunnerSend.mock.calls.length).toBe(calledBefore);
+    });
+
+    it("KPR-220 Phase 6: reflectionMinTurns <= 0 disables reflection scheduling", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const orig = (appConfig as any).memory.reflectionMinTurns;
+      (appConfig as any).memory.reflectionMinTurns = 0;
+      try {
+        const fastManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { reflectionDebounceMs: 25 },
+        );
+        mockRunnerSend.mockResolvedValue(makeRunResult());
+        const sharedThread = "sms:line-1:disabled";
+
+        await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+        await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+        await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+
+        const calledBefore = mockRunnerSend.mock.calls.length;
+        await new Promise((r) => setTimeout(r, 80));
+        expect(mockRunnerSend.mock.calls.length).toBe(calledBefore);
+        // No state was even tracked — disable path is short-circuited.
+        const states = (fastManager as unknown as { reflectionStates: Map<string, unknown> })
+          .reflectionStates;
+        expect(states.size).toBe(0);
+      } finally {
+        (appConfig as any).memory.reflectionMinTurns = orig;
+      }
+    });
+
+    it("KPR-220 Phase 6: stopAgent cancels pending reflection timer", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const fastManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 50 },
+      );
+
+      mockRunnerSend.mockResolvedValue(makeRunResult());
+      const sharedThread = "sms:line-1:cancel-stop";
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+
+      const calledBefore = mockRunnerSend.mock.calls.length;
+      fastManager.stopAgent("agent-a");
+      await new Promise((r) => setTimeout(r, 100));
+
+      // No reflection turn fired AND state map is empty after cancellation.
+      expect(mockRunnerSend.mock.calls.length).toBe(calledBefore);
+      const states = (fastManager as unknown as { reflectionStates: Map<string, unknown> })
+        .reflectionStates;
+      expect(states.size).toBe(0);
+    });
+
+    it("KPR-220 Phase 6: reflection turn (kind=reflection) does not reschedule reflection", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "reflected", sessionId: "s-r" }));
+
+      const reflectionCtx: TurnContext = {
+        agentId: "agent-a",
+        sessionId: undefined,
+        channelId: "line-1",
+        threadId: "sms:line-1:reflect-noop",
+        workItem: makeWorkItem({
+          text: "[System — end of conversation reflection]",
+          threadId: "sms:line-1:reflect-noop",
+          source: { kind: "sms" as const, id: "line-1", label: "line-1" },
+          sender: "system",
+        }),
+        channel: "sms",
+        kind: "reflection",
+      };
+
+      await manager.spawnTurn(reflectionCtx);
+
+      // Reflection turn ran, but no state was tracked (would-recurse guard).
+      const states = (manager as unknown as { reflectionStates: Map<string, unknown> })
+        .reflectionStates;
+      expect(states.size).toBe(0);
     });
 
     it("KPR-220 Phase 5: restartAgent re-enables spawns after stop", async () => {

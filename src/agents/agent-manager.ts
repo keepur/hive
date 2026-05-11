@@ -83,6 +83,11 @@ export interface TurnContext {
    * prompt builder plugs in here without touching AgentRunner.
    */
   systemPromptOverride?: string;
+  /**
+   * KPR-220 Phase 6: marks reflection turns so they don't recursively
+   * reschedule reflection. Other channel turns leave this undefined.
+   */
+  kind?: "reflection";
 }
 
 export interface TurnUsage {
@@ -171,6 +176,41 @@ export interface SpawnTicket {
   abort(): void;
 }
 
+/**
+ * KPR-220 Phase 6: per-(agentId,threadId) reflection coordinator state.
+ * The legacy queue-drain trigger is replaced by post-quiescence debounce —
+ * each non-reflection turn updates this state and (re)schedules a timer.
+ *
+ * State machine (B1 in spec):
+ * | Event                                | Action                                                                                                                       |
+ * |--------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
+ * | spawnTurn completes (non-reflection) | Increment pendingReflectionTurns; update lastTurnAt/lastSender/lastResultOk/lastChannelId/lastChannelKind; cancel existing timer; if eligible, schedule debounced timer |
+ * | spawnTurn completes (kind=reflection)| Do NOT increment; do NOT schedule; clear pendingReflectionTurns to 0                                                          |
+ * | Timer fires                          | Re-check eligibility; if eligible, run reflection; reset pendingReflectionTurns=0                                            |
+ * | Eligibility fails decisively         | Cancel timer; reset pendingReflectionTurns=0                                                                                 |
+ * | stopAgent / restartAgent / shutdown  | Cancel all timers; delete state                                                                                              |
+ */
+interface ReflectionState {
+  pendingReflectionTurns: number;
+  lastTurnAt: number;
+  lastSender: WorkItem["sender"];
+  lastResultOk: boolean;
+  lastChannelId: string;
+  lastChannelKind: WorkItem["source"]["kind"];
+  timer: NodeJS.Timeout | null;
+}
+
+const REFLECTION_PROMPT = [
+  "[System — end of conversation reflection]",
+  "This conversation is wrapping up. Review what was discussed:",
+  "- Were any new facts, decisions, or commitments made?",
+  "- Did anything contradict or update what you previously knew?",
+  "- Should any existing memories be updated or forgotten?",
+  "",
+  "If yes, use memory_save, memory_update, or memory_forget now.",
+  "If nothing worth saving, do nothing.",
+].join("\n");
+
 export class AgentManager {
   private states = new Map<string, AgentState>();
   private queues = new Map<string, QueuedMessage[]>();
@@ -208,8 +248,22 @@ export class AgentManager {
   // AgentStoppedError if the agent is in this set at any of three
   // checkpoints (pre-wait, mid-wait, post-lock).
   private stoppedAgents = new Set<string>();
+  // KPR-220 Phase 6: per-(agentId,threadId) reflection coordinator state.
+  private reflectionStates = new Map<string, ReflectionState>();
+  private reflectionDebounceMs: number;
 
-  constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, turnTelemetryStore?: TurnTelemetryStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, prefixCache?: PrefixCache) {
+  constructor(
+    registry: AgentRegistry,
+    memoryManager: MemoryManager,
+    sessionStore: SessionStore,
+    db: Db,
+    turnTelemetryStore?: TurnTelemetryStore,
+    activityLogger?: ActivityLogger,
+    prefetcher?: CodeIndexPrefetcher,
+    teamRoster?: TeamRoster,
+    prefixCache?: PrefixCache,
+    options?: { reflectionDebounceMs?: number },
+  ) {
     this.registry = registry;
     this.memoryManager = memoryManager;
     this.sessionStore = sessionStore;
@@ -222,6 +276,8 @@ export class AgentManager {
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
     this.prefixCache = prefixCache;
+    // KPR-220 Phase 6: 30s default; tests inject a small value for speed.
+    this.reflectionDebounceMs = options?.reflectionDebounceMs ?? 30_000;
     this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
@@ -402,6 +458,7 @@ export class AgentManager {
 
       const result = await this.runOneSpawnAttempt(ctx, shaping, ticket, onStream);
 
+      let turnResult: TurnResult;
       if (result.error && isAuthRebuildResumeError(result.error) && ctx.sessionId) {
         log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
           agentId: ctx.agentId,
@@ -409,13 +466,18 @@ export class AgentManager {
           reason: result.error,
         });
         const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, shaping, ticket, onStream);
-        const turnResult = this.finalizeSpawnResult(ctx, retry);
+        turnResult = this.finalizeSpawnResult(ctx, retry);
         this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, retry);
-        return turnResult;
+      } else {
+        turnResult = this.finalizeSpawnResult(ctx, result);
+        this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, result);
       }
 
-      const turnResult = this.finalizeSpawnResult(ctx, result);
-      this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, result);
+      // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
+      // turns themselves don't reschedule (kind="reflection" guard).
+      if (ctx.kind !== "reflection") {
+        this.scheduleReflectionIfEligible(ctx, turnResult);
+      }
       return turnResult;
     });
   }
@@ -516,6 +578,145 @@ export class AgentManager {
   private spawnBudgetFor(agentId: string): number {
     const def = this.registry.get(agentId);
     return def?.spawnBudget ?? def?.maxConcurrent ?? DEFAULT_PER_AGENT_SPAWN_BUDGET;
+  }
+
+  /**
+   * KPR-220 Phase 6: an agent is reflection-eligible if its definition lists
+   * `memory` or `structured-memory` in EITHER coreServers OR delegateServers.
+   * Matches the legacy queue-drain check at agent-manager.ts:750-752 so
+   * legacy agent docs that placed memory in delegateServers still get
+   * reflection scheduled. KPR-184 forbids that placement for new agents but
+   * the runtime is liberal here.
+   */
+  private hasMemoryServer(agentId: string): boolean {
+    const def = this.registry.get(agentId);
+    const all = [...(def?.coreServers ?? []), ...(def?.delegateServers ?? [])];
+    return all.includes("memory") || all.includes("structured-memory");
+  }
+
+  private reflectionKey(agentId: string, threadId: string): string {
+    return `${agentId}:${threadId}`;
+  }
+
+  /**
+   * KPR-220 Phase 6: post-spawnTurn hook. Updates the per-thread reflection
+   * state and (re)schedules the debounce timer if eligibility holds.
+   *
+   * Disabled when `appConfig.memory.reflectionMinTurns <= 0` (per plan-review
+   * SHOULD-FIX) — under post-quiescence semantics, treating zero as "fire
+   * every turn" would burn a reflection 30s after every active conversation
+   * turn. Legacy code shared the predicate but queue-drain semantics masked
+   * the consequence.
+   */
+  private scheduleReflectionIfEligible(ctx: TurnContext, turnResult: TurnResult): void {
+    const minTurns = appConfig.memory.reflectionMinTurns;
+    if (minTurns <= 0) return;
+
+    const key = this.reflectionKey(ctx.agentId, ctx.threadId);
+    const prior = this.reflectionStates.get(key);
+    if (prior?.timer) clearTimeout(prior.timer);
+
+    const ok = turnResult.errors.length === 0;
+    const state: ReflectionState = {
+      pendingReflectionTurns: (prior?.pendingReflectionTurns ?? 0) + 1,
+      lastTurnAt: Date.now(),
+      lastSender: ctx.workItem.sender,
+      lastResultOk: ok,
+      lastChannelId: ctx.workItem.source.id,
+      lastChannelKind: ctx.workItem.source.kind,
+      timer: null,
+    };
+    this.reflectionStates.set(key, state);
+
+    const eligible =
+      this.hasMemoryServer(ctx.agentId) &&
+      ok &&
+      state.pendingReflectionTurns >= minTurns &&
+      ctx.workItem.sender !== "system";
+    if (!eligible) return;
+
+    state.timer = setTimeout(() => {
+      this.runReflectionTurn(ctx.agentId, ctx.threadId).catch((err) =>
+        log.warn("Reflection failed, non-critical", { agentId: ctx.agentId, threadId: ctx.threadId, error: String(err) }),
+      );
+    }, this.reflectionDebounceMs);
+    // Don't keep the event loop alive solely for reflection; matches the
+    // long-lived path's pattern of treating reflection as best-effort.
+    state.timer.unref?.();
+  }
+
+  /**
+   * KPR-220 Phase 6: build a synthetic WorkItem from the captured channel
+   * context and route through spawnTurn with `kind: "reflection"`. Bypasses
+   * runWorkItemTurn because reflection's session lookup happened at the
+   * timer site (state was captured at the previous turn).
+   */
+  private async runReflectionTurn(agentId: string, threadId: string): Promise<void> {
+    const key = this.reflectionKey(agentId, threadId);
+    const state = this.reflectionStates.get(key);
+    if (!state) return;
+    state.timer = null;
+
+    // Re-check eligibility at fire time — registry/state may have changed
+    // during the debounce window.
+    if (this.stoppedAgents.has(agentId)) return;
+    if (!this.hasMemoryServer(agentId)) return;
+
+    const sessionId = await this.sessionStore.get(agentId, threadId);
+    const workItem: WorkItem = {
+      id: `reflection-${threadId}-${Date.now()}`,
+      text: REFLECTION_PROMPT,
+      threadId,
+      sender: "system",
+      source: { id: state.lastChannelId, kind: state.lastChannelKind, label: state.lastChannelId },
+      timestamp: new Date(),
+    };
+    const ctx: TurnContext = {
+      agentId,
+      sessionId,
+      channelId: state.lastChannelId,
+      threadId,
+      workItem,
+      channel: state.lastChannelKind,
+      kind: "reflection",
+    };
+
+    try {
+      const result = await this.spawnTurn(ctx);
+      log.info("Reflection completed", {
+        agentId,
+        threadId,
+        costUsd: result.usage.costUsd,
+        toolCalls: result.toolCalls,
+        toolSummary: result.toolSummary || undefined,
+      });
+    } catch (err) {
+      // Swallow non-critically; matches legacy processQueue at line 797.
+      log.warn("Reflection failed, non-critical", { agentId, threadId, error: String(err) });
+    } finally {
+      const after = this.reflectionStates.get(key);
+      if (after) {
+        after.pendingReflectionTurns = 0;
+        after.timer = null;
+      }
+    }
+  }
+
+  private cancelReflectionsFor(agentId: string): void {
+    const prefix = `${agentId}:`;
+    for (const [key, state] of this.reflectionStates) {
+      if (!key.startsWith(prefix)) continue;
+      if (state.timer) clearTimeout(state.timer);
+      this.reflectionStates.delete(key);
+    }
+  }
+
+  /** KPR-220 Phase 6: cancel all reflection timers (service shutdown). */
+  stopReflections(): void {
+    for (const state of this.reflectionStates.values()) {
+      if (state.timer) clearTimeout(state.timer);
+    }
+    this.reflectionStates.clear();
   }
 
   private async runOneSpawnAttempt(
@@ -1006,6 +1207,7 @@ export class AgentManager {
     // activeRunners (sendMessage path) and the new activeTickets (per-turn
     // path) and abort everything in flight.
     this.stoppedAgents.add(agentId);
+    this.cancelReflectionsFor(agentId);
     const runners = this.activeRunners.get(agentId);
     if (runners) {
       for (const runner of runners) {
