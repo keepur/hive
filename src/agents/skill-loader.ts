@@ -225,17 +225,14 @@ export function loadSkillIndex(
  * symlinks under it. Recursive remove is safe (no real content lives there).
  */
 function rebuildProjectionRoot(projectionRoot: string): void {
-  try {
-    if (existsSync(projectionRoot)) {
-      // Sanity check: don't blow away a real dir if some operator pointed
-      // HIVE_HOME at /. The projection root has a fixed name and is always a
-      // direct child of hiveHome — refuse to wipe anything else.
-      rmSync(projectionRoot, { recursive: true, force: true });
-    }
-    mkdirSync(projectionRoot, { recursive: true });
-  } catch (err) {
-    log.warn("Failed to rebuild projection root", { projectionRoot, error: String(err) });
+  // KPR-225 F3-bonus: fail-fast. Pre-fix swallowed errors and let
+  // `buildSkillProjection` later throw with a confusing "ENOENT" further
+  // down the call stack. Now bad config / EROFS surfaces immediately at
+  // load time at the actual root cause.
+  if (existsSync(projectionRoot)) {
+    rmSync(projectionRoot, { recursive: true, force: true });
   }
+  mkdirSync(projectionRoot, { recursive: true });
 }
 
 /**
@@ -559,24 +556,54 @@ function scanSkillsFrom(
     // forms so an operator who flattens customer skills while leaving agent
     // private legacy still gets the correct precedence — and vice versa.
     if (winsCollisions && !implicitAgentScope) {
-      for (const agentId of agentIds) {
-        const candidates = legacy
-          ? [`${agentId}::${legacyWorkflow}`, `${agentId}::${skillName}`]
-          : [`${agentId}::${skillName}`, `${agentId}::${skillName}`];
-        const seen = new Set<string>();
-        for (const perAgentKey of candidates) {
-          if (seen.has(perAgentKey)) continue;
-          seen.add(perAgentKey);
-          const evicted = collisionMap.get(perAgentKey);
-          if (evicted) {
-            log.warn("Customer-space skill shadows agent-private skill", {
-              skill: skillName,
-              agent: agentId,
-              shadowed: evicted.realPath,
-              winner: realSkillDir,
-            });
-            removeSkillFromIndex(evicted.pluginPath, index, universalPlugins);
-            collisionMap.delete(perAgentKey);
+      if (hasAll) {
+        // KPR-225 F2: customer skill with `agents: [all]` shadows EVERY
+        // agent-private skill of the same name. Pre-fix bug: the original
+        // loop only iterated `agentIds`, which is empty when hasAll=true,
+        // so no eviction happened and `getSkillsForAgent` returned both the
+        // agent-private and the universal customer skill simultaneously.
+        // Iterate collisionMap for keys ending in `::<skillName>`.
+        const evictionKeys: string[] = [];
+        for (const perAgentKey of collisionMap.keys()) {
+          // Skip the customer's own collision key (registered above as
+          // `customer::${skillName}` in the else branch). Without this guard
+          // we would evict our own freshly registered entry.
+          if (perAgentKey === `customer::${skillName}`) continue;
+          if (perAgentKey.endsWith(`::${skillName}`)) {
+            evictionKeys.push(perAgentKey);
+          }
+        }
+        for (const perAgentKey of evictionKeys) {
+          const evicted = collisionMap.get(perAgentKey)!;
+          log.warn("Customer-space [all] skill shadows agent-private skill", {
+            skill: skillName,
+            agentKey: perAgentKey,
+            shadowed: evicted.realPath,
+            winner: realSkillDir,
+          });
+          removeSkillFromIndex(evicted.pluginPath, index, universalPlugins);
+          collisionMap.delete(perAgentKey);
+        }
+      } else {
+        for (const agentId of agentIds) {
+          const candidates = legacy
+            ? [`${agentId}::${legacyWorkflow}`, `${agentId}::${skillName}`]
+            : [`${agentId}::${skillName}`, `${agentId}::${skillName}`];
+          const seen = new Set<string>();
+          for (const perAgentKey of candidates) {
+            if (seen.has(perAgentKey)) continue;
+            seen.add(perAgentKey);
+            const evicted = collisionMap.get(perAgentKey);
+            if (evicted) {
+              log.warn("Customer-space skill shadows agent-private skill", {
+                skill: skillName,
+                agent: agentId,
+                shadowed: evicted.realPath,
+                winner: realSkillDir,
+              });
+              removeSkillFromIndex(evicted.pluginPath, index, universalPlugins);
+              collisionMap.delete(perAgentKey);
+            }
           }
         }
       }
