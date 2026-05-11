@@ -683,4 +683,64 @@ describe("agent-private skills (KPR-75)", () => {
     const link = readlinkSync(join(luna[0]!.path, "skills", "publish-blog-post"));
     expect(link).toContain(join(customer, "publish-blog-post"));
   });
+
+  it("F2 (KPR-225): customer skill with `agents: [all]` shadows agent-private skills of the same name", () => {
+    // Pre-fix bug: when the customer skill scopes to `agents: [all]`, the
+    // eviction loop iterated `agentIds` (which is empty in the hasAll case)
+    // so no eviction fired. `getSkillsForAgent(luna)` returned BOTH the
+    // agent-private and the universal customer entry.
+    //
+    // Post-fix: hasAll branch iterates collisionMap and evicts every
+    // `*::<skillName>` entry except the customer's own self-key.
+    const customer = join(tmp, "skills");
+    writeFlatSkill(customer, "publish-blog-post", ["all"]);
+    writeFlatAgentSkill(tmp, "luna", "publish-blog-post");
+    writeFlatAgentSkill(tmp, "sam", "publish-blog-post");
+
+    const index = loadSkillIndex(customer, [], [], ["luna", "sam"], tmp);
+
+    // Both agents see exactly ONE entry — the customer (universal) one.
+    // Pre-fix: would be 2 for each agent (customer + their own private).
+    const luna = getSkillsForAgent(index, "luna");
+    expect(luna).toHaveLength(1);
+    const lunaLink = readlinkSync(join(luna[0]!.path, "skills", "publish-blog-post"));
+    expect(lunaLink).toContain(join(customer, "publish-blog-post"));
+
+    const sam = getSkillsForAgent(index, "sam");
+    expect(sam).toHaveLength(1);
+    const samLink = readlinkSync(join(sam[0]!.path, "skills", "publish-blog-post"));
+    expect(samLink).toContain(join(customer, "publish-blog-post"));
+  });
+});
+
+describe("rebuildProjectionRoot fail-fast (KPR-225 F3-bonus)", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "skill-loader-failfast-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("loadSkillIndex throws when projection root cannot be created (parent is a regular file)", () => {
+    // Pre-fix: rebuildProjectionRoot caught the error and log.warned, then
+    // buildSkillProjection later threw a confusing ENOENT downstream.
+    // Post-fix: throws immediately at load time at the actual root cause.
+    //
+    // Construct an unwritable hiveHome whose `.skill-projections` cannot be
+    // created: make hiveHome itself a path inside a regular file so mkdir
+    // can't even establish the parent. mkdirSync produces ENOTDIR.
+    const blocker = join(tmp, "blocker-file");
+    writeFileSync(blocker, "i am a file, not a dir");
+    const badHiveHome = join(blocker, "fake-hive-home");
+    const customer = join(badHiveHome, "skills");
+    // No need to write a real skill — rebuildProjectionRoot fires at load
+    // time before any skill scan runs.
+
+    expect(() => loadSkillIndex(customer, [], [], [], badHiveHome)).toThrow(
+      /ENOTDIR|EEXIST|EACCES|EROFS|ENOENT/,
+    );
+  });
 });
