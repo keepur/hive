@@ -1001,6 +1001,11 @@ export class AgentManager {
   }
 
   stopAgent(agentId: string): void {
+    // KPR-220 Phase 5: mark stopped first so any concurrent withSpawnTicket
+    // call sees it at the post-lock check. Then walk both the legacy
+    // activeRunners (sendMessage path) and the new activeTickets (per-turn
+    // path) and abort everything in flight.
+    this.stoppedAgents.add(agentId);
     const runners = this.activeRunners.get(agentId);
     if (runners) {
       for (const runner of runners) {
@@ -1010,6 +1015,13 @@ export class AgentManager {
     }
     this.activeRunners.delete(agentId);
     this.activeThreads.delete(agentId);
+    const tickets = this.activeTickets.get(agentId);
+    if (tickets) {
+      for (const ticket of tickets) {
+        ticket.abort();
+      }
+    }
+    this.activeTickets.delete(agentId);
     this.updateStatus(agentId, "stopped");
   }
 
@@ -1038,6 +1050,9 @@ export class AgentManager {
 
   restartAgent(agentId: string): void {
     this.stopAgent(agentId);
+    // KPR-220 Phase 5: re-enable acquisitions before clearing session state
+    // so any in-flight callers see "running" before retry.
+    this.stoppedAgents.delete(agentId);
     this.sessionStore.clearAgent(agentId);
     this.states.set(agentId, {
       id: agentId,

@@ -1297,6 +1297,48 @@ describe("AgentManager", () => {
       expect(sessionStore.get).toHaveBeenCalledWith("agent-a", item.id);
     });
 
+    it("KPR-220 Phase 5: stopAgent aborts in-flight tickets and prevents new spawns", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Park a spawn so there is an in-flight ticket to abort.
+      let release: (() => void) | undefined;
+      mockRunnerSend.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          release = () => resolve(makeRunResult({ aborted: true, text: "" }));
+        }),
+      );
+
+      const inflight = manager.spawnTurn(smsCtx({ threadId: "sms:line-1:stop-target" }));
+      await new Promise((r) => setTimeout(r, 30));
+
+      manager.stopAgent("agent-a");
+
+      // The runner attached its abort handle via ticket.attachAbort and was
+      // walked by stopAgent.
+      expect(mockRunnerAbort).toHaveBeenCalled();
+      // stoppedAgents now blocks further spawns on agent-a.
+      await expect(
+        manager.spawnTurn(smsCtx({ threadId: "sms:line-1:stop-blocked" })),
+      ).rejects.toThrow(/Agent agent-a is stopped/);
+
+      release!();
+      await inflight.catch(() => undefined);
+    });
+
+    it("KPR-220 Phase 5: restartAgent re-enables spawns after stop", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+
+      manager.stopAgent("agent-a");
+      await expect(manager.spawnTurn(smsCtx())).rejects.toThrow(/Agent agent-a is stopped/);
+      // Pre-wait stop check fired before any runner.send call.
+      expect(mockRunnerSend).not.toHaveBeenCalled();
+
+      manager.restartAgent("agent-a");
+      // Restart wipes session state — the next spawn fires fresh.
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "post-restart" }));
+      const result = await manager.spawnTurn(smsCtx());
+      expect(result.finalMessage).toBe("post-restart");
+    });
+
     it("KPR-220 Phase 2: withSpawnTicket post-lock stop check cleans up + throws AgentStoppedError", async () => {
       // The race we close: stopAgent flips `stoppedAgents` AFTER the wait loop
       // exits AND ticket.set runs but BEFORE fn(ticket) is called. Without the
