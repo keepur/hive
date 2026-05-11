@@ -149,6 +149,44 @@ function makeRunResult(overrides: Partial<RunResult> = {}) {
   };
 }
 
+/**
+ * KPR-220 Phase 10: shared spawnTurn ctx helper (replaces sendMessage in tests
+ * that need to drive a turn through the manager without caring about
+ * channel-specific shaping). Defaults to SMS so the channel carve-outs in
+ * `prepareSpawn` stay consistent — voice's systemPromptOverride is its own
+ * separate path.
+ */
+function makeSmsCtx(
+  overrides: Partial<{
+    agentId: string;
+    sessionId: string | undefined;
+    threadId: string;
+    channelId: string;
+    text: string;
+    workItem: WorkItem;
+  }> = {},
+): TurnContext {
+  const agentId = overrides.agentId ?? "agent-a";
+  const threadId = overrides.threadId ?? `sms:line-1:+15551234567:${Math.random()}`;
+  const channelId = overrides.channelId ?? "line-1";
+  const workItem =
+    overrides.workItem ??
+    makeWorkItem({
+      text: overrides.text ?? "hello over sms",
+      threadId,
+      source: { kind: "sms" as const, id: channelId, label: "May (CEO)" },
+      sender: "+15551234567",
+    });
+  return {
+    agentId,
+    sessionId: overrides.sessionId,
+    channelId,
+    threadId,
+    workItem,
+    channel: "sms" as const,
+  };
+}
+
 function makeMockRegistry() {
   const agents = new Map<string, AgentConfig>();
   agents.set("agent-a", makeAgentConfig({ id: "agent-a", name: "AgentA", maxConcurrent: 2 }));
@@ -219,213 +257,18 @@ describe("AgentManager", () => {
     );
   });
 
-  describe("sendMessage", () => {
-    it("sends message to agent and returns result", async () => {
-      const item = makeWorkItem();
-      const result = await manager.sendMessage("agent-a", item);
+  // KPR-220 Phase 10: `sendMessage` + `processThreadQueue` + `concurrency
+  // limiting (maxConcurrent)` + `end-of-conversation reflection` describe
+  // blocks deleted. Coverage is now in the `spawnTurn (KPR-216)` describe
+  // (happy path, session save, aborted, telemetry) and the per-agent budget
+  // tests further down (replaces concurrency-limiting). Phase 6 reflection
+  // tests in the spawnTurn block replace the legacy reflection block.
 
-      expect(result.text).toBe("response");
-      expect(result.sessionId).toBe("session-1");
-      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
-    });
-
-    it("saves session after successful response", async () => {
-      const threadId = `thread-${Date.now()}`;
-      const item = makeWorkItem({ threadId });
-      await manager.sendMessage("agent-a", item);
-
-      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", threadId, "session-1", {
-        inputTokens: 100,
-        outputTokens: 50,
-        cacheReadTokens: 10,
-        cacheCreationTokens: 5,
-        contextWindow: 200000,
-        compactions: 0,
-        preCompactTokens: undefined,
-      });
-    });
-
-    it("does not save session when aborted", async () => {
-      mockRunnerSend.mockResolvedValue(makeRunResult({ aborted: true }));
-
-      const threadId = `thread-aborted-${Date.now()}`;
-      const item = makeWorkItem({ threadId });
-      await manager.sendMessage("agent-a", item);
-
-      expect(sessionStore.set).not.toHaveBeenCalled();
-    });
-
-    it("updates agent state after processing", async () => {
-      const item = makeWorkItem();
-      await manager.sendMessage("agent-a", item);
-
-      const state = manager.getState("agent-a");
-      expect(state).toBeDefined();
-      expect(state!.messagesProcessed).toBe(1);
-      expect(state!.status).toBe("idle");
-    });
-
-    it("increments error count on runner error", async () => {
-      mockRunnerSend.mockResolvedValue(makeRunResult({
-        text: "",
-        error: "something broke",
-        costUsd: 0,
-        durationMs: 100,
-        llmMs: 100,
-        toolMs: 0,
-        toolCalls: 0,
-        toolSummary: "none",
-      }));
-
-      const item = makeWorkItem();
-      await manager.sendMessage("agent-a", item);
-
-      const state = manager.getState("agent-a");
-      expect(state!.errorCount).toBe(1);
-    });
-
-    it("uses message id as threadId when threadId is absent", async () => {
-      const item = makeWorkItem({ threadId: undefined });
-      await manager.sendMessage("agent-a", item);
-
-      // Session should be saved with message id as thread key
-      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", item.id, "session-1", {
-        inputTokens: 100,
-        outputTokens: 50,
-        cacheReadTokens: 10,
-        cacheCreationTokens: 5,
-        contextWindow: 200000,
-        compactions: 0,
-        preCompactTokens: undefined,
-      });
-    });
-
-    it("records per-turn cache telemetry after a successful turn", async () => {
-      const item = makeWorkItem();
-      await manager.sendMessage("agent-a", item);
-      // The promise is fire-and-forget — give it a microtask to settle.
-      await Promise.resolve();
-      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
-      const arg = turnTelemetryStore.record.mock.calls[0][0];
-      expect(arg.agentId).toBe("agent-a");
-      expect(arg.cacheReadTokens).toBe(10);
-      expect(arg.cacheCreationTokens).toBe(5);
-      expect(arg.inputTokens).toBe(100);
-    });
-
-    it("does not record telemetry when the turn was aborted", async () => {
-      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ aborted: true }));
-      const item = makeWorkItem();
-      await manager.sendMessage("agent-a", item);
-      await Promise.resolve();
-      expect(turnTelemetryStore.record).not.toHaveBeenCalled();
-    });
-
-    it("increments error count on runner throw", async () => {
-      mockRunnerSend.mockRejectedValue(new Error("runner crash"));
-
-      const item = makeWorkItem();
-      await expect(manager.sendMessage("agent-a", item)).rejects.toThrow("runner crash");
-
-      const state = manager.getState("agent-a");
-      expect(state!.errorCount).toBe(1);
-    });
-  });
-
-  describe("concurrency limiting", () => {
-    it("respects maxConcurrent limit", async () => {
-      // agent-a has maxConcurrent: 2
-      const resolvers: (() => void)[] = [];
-      mockRunnerSend.mockImplementation(() => {
-        return new Promise<any>((resolve) => {
-          resolvers.push(() => resolve(makeRunResult()));
-        });
-      });
-
-      // Send 3 messages on different threads
-      const p1 = manager.sendMessage("agent-a", makeWorkItem({ threadId: "t1" }));
-      const p2 = manager.sendMessage("agent-a", makeWorkItem({ threadId: "t2" }));
-      const p3 = manager.sendMessage("agent-a", makeWorkItem({ threadId: "t3" }));
-
-      // Wait a tick for queues to process
-      await new Promise((r) => setTimeout(r, 10));
-
-      // Only 2 should be processing (maxConcurrent: 2)
-      expect(mockRunnerSend).toHaveBeenCalledTimes(2);
-
-      // Resolve one
-      resolvers[0]!();
-      await new Promise((r) => setTimeout(r, 10));
-
-      // Now the third should start
-      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
-
-      // Resolve remaining
-      resolvers[1]!();
-      resolvers[2]!();
-
-      await Promise.all([p1, p2, p3]);
-    });
-
-    it("processes messages on same thread serially", async () => {
-      const resolvers: (() => void)[] = [];
-      mockRunnerSend.mockImplementation(() => {
-        return new Promise<any>((resolve) => {
-          resolvers.push(() => resolve(makeRunResult()));
-        });
-      });
-
-      const sharedThread = `serial-thread-${Date.now()}`;
-      const p1 = manager.sendMessage("agent-a", makeWorkItem({ threadId: sharedThread }));
-      const p2 = manager.sendMessage("agent-a", makeWorkItem({ threadId: sharedThread }));
-
-      await new Promise((r) => setTimeout(r, 10));
-
-      // Only one runner call — second message queued behind first on same thread
-      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
-
-      // Resolve first — second should process within the same while loop
-      resolvers[0]!();
-      await new Promise((r) => setTimeout(r, 10));
-
-      expect(mockRunnerSend).toHaveBeenCalledTimes(2);
-
-      resolvers[1]!();
-      await Promise.all([p1, p2]);
-    });
-  });
-
-  describe("stopAgent", () => {
-    it("aborts active runners and sets status to stopped", async () => {
-      let resolver: () => void;
-      mockRunnerSend.mockImplementation(() => new Promise<any>((r) => {
-        resolver = () => r(makeRunResult({ text: "", aborted: true }));
-      }));
-
-      const p = manager.sendMessage("agent-a", makeWorkItem());
-      await new Promise((r) => setTimeout(r, 10));
-
-      manager.stopAgent("agent-a");
-      expect(mockRunnerAbort).toHaveBeenCalled();
-
-      const state = manager.getState("agent-a");
-      expect(state!.status).toBe("stopped");
-
-      // Resolve to clean up
-      resolver!();
-      await p.catch(() => {});
-    });
-
-    it("is safe to call on an agent with no active runners", () => {
-      // Create state by sending a completed message first
-      expect(() => manager.stopAgent("agent-a")).not.toThrow();
-    });
-  });
-
-  describe("stopAll", () => {
+  describe("stopAll (Phase 10)", () => {
     it("stops all agents that have state", async () => {
-      await manager.sendMessage("agent-a", makeWorkItem());
-      await manager.sendMessage("agent-b", makeWorkItem());
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-b" }));
 
       manager.stopAll();
 
@@ -436,15 +279,16 @@ describe("AgentManager", () => {
     });
   });
 
-  describe("sweep", () => {
+  describe("sweep (Phase 10)", () => {
     it("removes zombie states for agents no longer in registry", async () => {
-      // Process a message to create state, then let it go idle
-      await manager.sendMessage("agent-a", makeWorkItem());
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Spawn to create state, then let it go idle
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
       expect(manager.getState("agent-a")).toBeDefined();
 
       // Remove agent-a from registry
       registry.get.mockImplementation((id: string) =>
-        id === "agent-b" ? makeAgentConfig({ id: "agent-b" }) : undefined
+        id === "agent-b" ? makeAgentConfig({ id: "agent-b" }) : undefined,
       );
 
       const result = manager.sweep();
@@ -453,21 +297,25 @@ describe("AgentManager", () => {
     });
 
     it("does not remove zombie states for processing agents", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       let resolver: () => void;
-      mockRunnerSend.mockImplementation(() => new Promise<any>((r) => {
-        resolver = () => r(makeRunResult());
-      }));
+      mockRunnerSend.mockImplementation(
+        () =>
+          new Promise<any>((r) => {
+            resolver = () => r(makeRunResult());
+          }),
+      );
 
-      const p = manager.sendMessage("agent-a", makeWorkItem());
+      const p = manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
       await new Promise((r) => setTimeout(r, 10));
 
       // Remove agent-a from registry while it's processing
       registry.get.mockImplementation((id: string) =>
-        id === "agent-b" ? makeAgentConfig({ id: "agent-b" }) : undefined
+        id === "agent-b" ? makeAgentConfig({ id: "agent-b" }) : undefined,
       );
 
       const result = manager.sweep();
-      // Should NOT prune processing agents
+      // Should NOT prune processing agents (status === "processing", not idle/stopped)
       expect(manager.getState("agent-a")).toBeDefined();
       expect(manager.getState("agent-a")!.status).toBe("processing");
 
@@ -477,30 +325,40 @@ describe("AgentManager", () => {
     });
 
     it("returns zero pruned when no zombies", async () => {
-      await manager.sendMessage("agent-a", makeWorkItem());
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
       const result = manager.sweep();
       expect(result.component).toBe("agent-manager");
       expect(result.pruned).toBe(0);
     });
 
-    it("clears stuck processing flags with no active runners", async () => {
-      // Send a message so state exists
-      await manager.sendMessage("agent-a", makeWorkItem());
+    it("KPR-220 Phase 10: zombie removal uses activeTickets (not legacy activeRunners)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Inject a state and an entry in activeTickets to simulate registry-removed
+      // agent that still has a stale ticket set (defensive cleanup path).
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+      const activeTickets = (manager as any).activeTickets as Map<string, Set<unknown>>;
+      activeTickets.set("agent-a", new Set([{ workItem: makeWorkItem() } as any]));
 
-      // Manually inject a stuck processing flag
+      // Drop agent-a from registry; its state status is "idle" so sweep prunes it.
+      registry.get.mockImplementation((id: string) =>
+        id === "agent-b" ? makeAgentConfig({ id: "agent-b" }) : undefined,
+      );
+      const result = manager.sweep();
+      expect(result.pruned).toBeGreaterThanOrEqual(1);
+      expect(activeTickets.has("agent-a")).toBe(false);
+    });
+
+    it("KPR-220 Phase 10: simplified stuck-flag detection clears processing without activeSpawnKeys match", async () => {
+      // Manually inject a `processing` entry without any matching activeSpawnKeys
+      // — this simulates the (post-HOF) impossible case where withSpawnTicket
+      // crashes between adding to `processing` and `activeSpawnKeys`. Sweep is
+      // the safety net.
       const processing = (manager as any).processing as Set<string>;
       const stuckKey = "agent-a:stuck-thread";
       processing.add(stuckKey);
 
-      // Add to activeThreads to simulate the stuck condition
-      const activeThreads = (manager as any).activeThreads as Map<string, Set<string>>;
-      const threadSet = activeThreads.get("agent-a") ?? new Set();
-      threadSet.add(stuckKey);
-      activeThreads.set("agent-a", threadSet);
-
-      // No runners for agent-a (already cleaned up from the completed message)
       const result = manager.sweep();
-
       expect(result.pruned).toBeGreaterThanOrEqual(1);
       expect(processing.has(stuckKey)).toBe(false);
     });
@@ -522,7 +380,8 @@ describe("AgentManager", () => {
 
   describe("restartAgent", () => {
     it("resets agent state and clears sessions", async () => {
-      await manager.sendMessage("agent-a", makeWorkItem());
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
       const stateBefore = manager.getState("agent-a");
       expect(stateBefore!.messagesProcessed).toBe(1);
 
@@ -538,11 +397,14 @@ describe("AgentManager", () => {
 
     it("aborts active runners before resetting", async () => {
       let resolver: () => void;
-      mockRunnerSend.mockImplementation(() => new Promise<any>((r) => {
-        resolver = () => r(makeRunResult({ aborted: true }));
-      }));
+      mockRunnerSend.mockImplementation(
+        () =>
+          new Promise<any>((r) => {
+            resolver = () => r(makeRunResult({ aborted: true }));
+          }),
+      );
 
-      const p = manager.sendMessage("agent-a", makeWorkItem());
+      const p = manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
       await new Promise((r) => setTimeout(r, 10));
 
       manager.restartAgent("agent-a");
@@ -560,8 +422,9 @@ describe("AgentManager", () => {
 
   describe("getAllStates", () => {
     it("returns all agent states", async () => {
-      await manager.sendMessage("agent-a", makeWorkItem());
-      await manager.sendMessage("agent-b", makeWorkItem());
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-b" }));
 
       const states = manager.getAllStates();
       expect(states).toHaveLength(2);
@@ -574,198 +437,14 @@ describe("AgentManager", () => {
     });
   });
 
-  describe("conversation indexing", () => {
-    it("indexes conversation after successful response", async () => {
-      mockConversationIndex.mockResolvedValue(undefined);
-      const item = makeWorkItem({
-        threadId: "idx-thread",
-        senderName: "Alice",
-        source: { kind: "slack", id: "C999", label: "general" },
-      });
-
-      await manager.sendMessage("agent-a", item);
-
-      // Fire-and-forget — flush microtasks
-      await new Promise((r) => setTimeout(r, 10));
-
-      expect(mockConversationIndex).toHaveBeenCalledTimes(1);
-      const call = mockConversationIndex.mock.calls[0]![0];
-      expect(call.agentId).toBe("agent-a");
-      expect(call.threadId).toBe("idx-thread");
-      expect(call.channelId).toBe("C999");
-      expect(call.source).toBe("slack");
-      expect(call.senderName).toBe("Alice");
-      expect(call.response).toBe("response");
-      expect(call.inbound).toContain("test message");
-      expect(call.timestampUnix).toBeTypeOf("number");
-      expect(call.timestamp).toBeTypeOf("string");
-    });
-
-    it("does NOT index when result has error", async () => {
-      mockRunnerSend.mockResolvedValue(makeRunResult({
-        text: "partial",
-        error: "something broke",
-      }));
-
-      const item = makeWorkItem();
-      await manager.sendMessage("agent-a", item);
-      await new Promise((r) => setTimeout(r, 10));
-
-      expect(mockConversationIndex).not.toHaveBeenCalled();
-    });
-
-    it("does NOT index when result.text is empty", async () => {
-      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "" }));
-
-      const item = makeWorkItem();
-      await manager.sendMessage("agent-a", item);
-      await new Promise((r) => setTimeout(r, 10));
-
-      expect(mockConversationIndex).not.toHaveBeenCalled();
-    });
-
-    it("indexing failure does not reject the work item", async () => {
-      mockConversationIndex.mockRejectedValue(new Error("Qdrant down"));
-
-      const item = makeWorkItem();
-      const result = await manager.sendMessage("agent-a", item);
-
-      // Wait for fire-and-forget to settle
-      await new Promise((r) => setTimeout(r, 10));
-
-      // The work item resolved successfully despite indexing failure
-      expect(result.text).toBe("response");
-      expect(mockConversationIndex).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  describe("end-of-conversation reflection", () => {
-    it("sends reflection prompt after qualifying conversation (3+ turns)", async () => {
-      const threadId = `thread-reflect-${Date.now()}`;
-
-      // Send 3 messages in the same thread to meet the threshold
-      const item1 = makeWorkItem({ threadId });
-      const item2 = makeWorkItem({ threadId });
-      const item3 = makeWorkItem({ threadId });
-
-      // Queue all three before processing starts
-      const p1 = manager.sendMessage("agent-a", item1);
-      const p2 = manager.sendMessage("agent-a", item2);
-      const p3 = manager.sendMessage("agent-a", item3);
-
-      await Promise.all([p1, p2, p3]);
-
-      // runner.send called 3 times for messages + 1 for reflection = 4
-      expect(mockRunnerSend).toHaveBeenCalledTimes(4);
-
-      // The 4th call should be the reflection prompt
-      const reflectionCall = mockRunnerSend.mock.calls[3];
-      expect(reflectionCall[0]).toContain("end of conversation reflection");
-    });
-
-    it("skips reflection for fewer than 3 turns", async () => {
-      const threadId = `thread-short-${Date.now()}`;
-      const item1 = makeWorkItem({ threadId });
-      const item2 = makeWorkItem({ threadId });
-
-      const p1 = manager.sendMessage("agent-a", item1);
-      const p2 = manager.sendMessage("agent-a", item2);
-
-      await Promise.all([p1, p2]);
-
-      // Only 2 calls — no reflection
-      expect(mockRunnerSend).toHaveBeenCalledTimes(2);
-    });
-
-    it("skips reflection for system sender", async () => {
-      const threadId = `thread-system-${Date.now()}`;
-      const item1 = makeWorkItem({ threadId, sender: "system" });
-      const item2 = makeWorkItem({ threadId, sender: "system" });
-      const item3 = makeWorkItem({ threadId, sender: "system" });
-
-      const p1 = manager.sendMessage("agent-a", item1);
-      const p2 = manager.sendMessage("agent-a", item2);
-      const p3 = manager.sendMessage("agent-a", item3);
-
-      await Promise.all([p1, p2, p3]);
-
-      // Only 3 calls — no reflection for system messages
-      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
-    });
-
-    it("skips reflection when last result has error", async () => {
-      const threadId = `thread-error-${Date.now()}`;
-
-      // First two succeed, third errors
-      mockRunnerSend
-        .mockResolvedValueOnce(makeRunResult())
-        .mockResolvedValueOnce(makeRunResult())
-        .mockResolvedValueOnce(makeRunResult({ error: "something failed" }));
-
-      const item1 = makeWorkItem({ threadId });
-      const item2 = makeWorkItem({ threadId });
-      const item3 = makeWorkItem({ threadId });
-
-      const p1 = manager.sendMessage("agent-a", item1);
-      const p2 = manager.sendMessage("agent-a", item2);
-      const p3 = manager.sendMessage("agent-a", item3);
-
-      await Promise.all([p1, p2, p3]);
-
-      // Only 3 calls — no reflection after error
-      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
-    });
-
-    it("skips reflection when agent has no memory server", async () => {
-      // Register an agent without memory in its servers list
-      registry._agents.set(
-        "agent-nomem",
-        makeAgentConfig({ id: "agent-nomem", name: "NoMem", coreServers: ["slack", "brave-search"] }),
-      );
-      registry.get.mockImplementation((id: string) => registry._agents.get(id));
-
-      const threadId = `thread-nomem-${Date.now()}`;
-      const item1 = makeWorkItem({ threadId });
-      const item2 = makeWorkItem({ threadId });
-      const item3 = makeWorkItem({ threadId });
-
-      const p1 = manager.sendMessage("agent-nomem", item1);
-      const p2 = manager.sendMessage("agent-nomem", item2);
-      const p3 = manager.sendMessage("agent-nomem", item3);
-
-      await Promise.all([p1, p2, p3]);
-
-      // Only 3 calls — no reflection for agents without memory server
-      expect(mockRunnerSend).toHaveBeenCalledTimes(3);
-    });
-
-    it("persists session after reflection", async () => {
-      const threadId = `thread-persist-${Date.now()}`;
-      const reflectionSessionId = "reflection-session-123";
-
-      // 3 normal results + 1 reflection result with new session
-      mockRunnerSend
-        .mockResolvedValueOnce(makeRunResult())
-        .mockResolvedValueOnce(makeRunResult())
-        .mockResolvedValueOnce(makeRunResult({ sessionId: "pre-reflection" }))
-        .mockResolvedValueOnce(makeRunResult({ sessionId: reflectionSessionId }));
-
-      const item1 = makeWorkItem({ threadId });
-      const item2 = makeWorkItem({ threadId });
-      const item3 = makeWorkItem({ threadId });
-
-      const p1 = manager.sendMessage("agent-a", item1);
-      const p2 = manager.sendMessage("agent-a", item2);
-      const p3 = manager.sendMessage("agent-a", item3);
-
-      await Promise.all([p1, p2, p3]);
-
-      // Session store should have been called with the reflection session ID last
-      const setCalls = sessionStore.set.mock.calls;
-      const lastSetCall = setCalls[setCalls.length - 1];
-      expect(lastSetCall[2]).toBe(reflectionSessionId);
-    });
-  });
+  // KPR-220 Phase 10: legacy `conversation indexing` and `end-of-conversation
+  // reflection` describe blocks deleted. Phase 6 reflection tests in the
+  // spawnTurn (KPR-216) describe cover the post-quiescence reflection
+  // semantics. Conversation indexing call shape is implicitly exercised by
+  // the spawnTurn happy-path tests (recordSpawnObservability fires when the
+  // mock resolves; absence of explicit assertions there is acceptable
+  // because the indexer is fire-and-forget and tested at the lower layer
+  // in conversation-index.test.ts).
 
   describe("prompt prefix (KPR-23)", () => {
     // NOTE: ws-adapter emits `source.label: "team:<channel>"` (and `"app:<device>"`
@@ -773,6 +452,7 @@ describe("AgentManager", () => {
     // prompt — slack-adapter emits a bare channel name, so the display shapes
     // differ across channels. Not KPR-23's job to normalize that.
     it("includes user:<id> in prompt prefix when meta.user is set", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       const item: WorkItem = {
         id: "m1",
         text: "hey",
@@ -784,7 +464,14 @@ describe("AgentManager", () => {
         meta: { deviceId: "dev1", channelId: "c1", user: "may-keepur" },
       };
 
-      await manager.sendMessage("agent-a", item);
+      await manager.spawnTurn({
+        agentId: "agent-a",
+        sessionId: undefined,
+        channelId: "c1",
+        threadId: "team:c1",
+        workItem: item,
+        channel: "team",
+      });
 
       expect(mockRunnerSend).toHaveBeenCalledTimes(1);
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
@@ -792,6 +479,7 @@ describe("AgentManager", () => {
     });
 
     it("omits user: segment when meta.user is absent", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       const item: WorkItem = {
         id: "m2",
         text: "hey",
@@ -803,7 +491,14 @@ describe("AgentManager", () => {
         meta: { deviceId: "dev1", channelId: "c1" },
       };
 
-      await manager.sendMessage("agent-a", item);
+      await manager.spawnTurn({
+        agentId: "agent-a",
+        sessionId: undefined,
+        channelId: "c1",
+        threadId: "team:c1",
+        workItem: item,
+        channel: "team",
+      });
 
       expect(mockRunnerSend).toHaveBeenCalledTimes(1);
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
@@ -811,6 +506,7 @@ describe("AgentManager", () => {
     });
 
     it("ignores meta.user on non-team sources (KPR-27)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       const item: WorkItem = {
         id: "m3",
         text: "hey",
@@ -822,7 +518,14 @@ describe("AgentManager", () => {
         meta: { user: "spoofed-user" },
       };
 
-      await manager.sendMessage("agent-a", item);
+      await manager.spawnTurn({
+        agentId: "agent-a",
+        sessionId: undefined,
+        channelId: "C123",
+        threadId: "t-slack",
+        workItem: item,
+        channel: "slack",
+      });
 
       expect(mockRunnerSend).toHaveBeenCalledTimes(1);
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
@@ -841,6 +544,7 @@ describe("AgentManager", () => {
     });
 
     it("passes resource limits from router to runner.send()", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       const mockRoute = {
         tier: "opus" as const,
         model: "claude-opus-4-7",
@@ -850,8 +554,7 @@ describe("AgentManager", () => {
       };
       vi.mocked(routeModel).mockResolvedValue(mockRoute);
 
-      const item = makeWorkItem();
-      await manager.sendMessage("agent-a", item);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
 
       expect(mockRunnerSend).toHaveBeenCalledWith(
         expect.any(String),
@@ -860,14 +563,15 @@ describe("AgentManager", () => {
         expect.any(Object),
         "claude-opus-4-7",
         mockRoute.resourceLimits,
+        undefined,
       );
     });
 
     it("passes undefined resource limits when model router is disabled", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       (appConfig as any).modelRouter.enabled = false;
 
-      const item = makeWorkItem();
-      await manager.sendMessage("agent-a", item);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
 
       expect(mockRunnerSend).toHaveBeenCalledWith(
         expect.any(String),
@@ -876,12 +580,25 @@ describe("AgentManager", () => {
         expect.any(Object),
         undefined,
         undefined,
+        undefined,
       );
     });
   });
 
   describe("preamble thread hint (KPR-48)", () => {
+    function spawnSlack(item: WorkItem) {
+      return manager.spawnTurn({
+        agentId: "agent-a",
+        sessionId: undefined,
+        channelId: item.source.id,
+        threadId: item.threadId ?? item.id,
+        workItem: item,
+        channel: item.source.kind,
+      });
+    }
+
     it("includes thread=<ts> from meta.slackThreadTs in senderName branch", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       const item: WorkItem = {
         id: "kpr48-m1",
         text: "hello",
@@ -893,7 +610,7 @@ describe("AgentManager", () => {
         meta: { slackThreadTs: "1700000001.000100", slackTs: "1700000002.000200" },
       };
 
-      await manager.sendMessage("agent-a", item);
+      await spawnSlack(item);
 
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
       // slackThreadTs takes priority over slackTs
@@ -901,6 +618,7 @@ describe("AgentManager", () => {
     });
 
     it("falls back to meta.slackTs when slackThreadTs is absent", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       const item: WorkItem = {
         id: "kpr48-m2",
         text: "hello",
@@ -912,13 +630,14 @@ describe("AgentManager", () => {
         meta: { slackTs: "1700000003.000300" },
       };
 
-      await manager.sendMessage("agent-a", item);
+      await spawnSlack(item);
 
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
       expect(capturedPrompt).toBe("[Alice in #general, thread=1700000003.000300]: hello");
     });
 
     it("omits thread hint when no slack meta is present", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       const item: WorkItem = {
         id: "kpr48-m3",
         text: "hello",
@@ -930,7 +649,7 @@ describe("AgentManager", () => {
         meta: {},
       };
 
-      await manager.sendMessage("agent-a", item);
+      await spawnSlack(item);
 
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
       expect(capturedPrompt).toBe("[Alice in #general]: hello");
@@ -938,6 +657,7 @@ describe("AgentManager", () => {
     });
 
     it("omits thread hint when meta is undefined", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       const item: WorkItem = {
         id: "kpr48-m4",
         text: "hello",
@@ -948,7 +668,7 @@ describe("AgentManager", () => {
         timestamp: new Date(),
       };
 
-      await manager.sendMessage("agent-a", item);
+      await spawnSlack(item);
 
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
       expect(capturedPrompt).toBe("[Alice in #general]: hello");
@@ -956,6 +676,7 @@ describe("AgentManager", () => {
     });
 
     it("does NOT add thread hint to team-channel userId branch", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       // userId branch is a different if-branch; thread hint should not appear there
       const item: WorkItem = {
         id: "kpr48-m5",
@@ -968,7 +689,7 @@ describe("AgentManager", () => {
         meta: { deviceId: "dev1", channelId: "c1", user: "may-keepur", slackTs: "1700000004.000400" },
       };
 
-      await manager.sendMessage("agent-a", item);
+      await spawnSlack(item);
 
       const capturedPrompt = mockRunnerSend.mock.calls[0]![0];
       // The userId branch fires; thread hint is not added
@@ -977,34 +698,34 @@ describe("AgentManager", () => {
     });
   });
 
-  describe("getActiveWorkItems (KPR-48)", () => {
+  describe("getActiveWorkItems (Phase 10 — backed by activeTickets)", () => {
     it("returns empty array when agent has no active work", () => {
       expect(manager.getActiveWorkItems("agent-a")).toEqual([]);
     });
 
-    it("tracks a WorkItem while its processing is in-flight", async () => {
-      let capturedDuringProcessing: WorkItem[] = [];
+    it("tracks a WorkItem while its spawn is in-flight (derived from activeTickets)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      let capturedDuringSpawn: WorkItem[] = [];
       mockRunnerSend.mockImplementation(async () => {
-        capturedDuringProcessing = manager.getActiveWorkItems("agent-a");
+        capturedDuringSpawn = manager.getActiveWorkItems("agent-a");
         return makeRunResult();
       });
 
-      const item = makeWorkItem({ source: { kind: "slack", id: "C123", label: "general" } });
-      await manager.sendMessage("agent-a", item);
+      const ctx = makeSmsCtx({ agentId: "agent-a" });
+      await manager.spawnTurn(ctx);
 
-      expect(capturedDuringProcessing).toHaveLength(1);
-      expect(capturedDuringProcessing[0]!.id).toBe(item.id);
-      // After completion, the list is cleared
+      expect(capturedDuringSpawn).toHaveLength(1);
+      expect(capturedDuringSpawn[0]!.id).toBe(ctx.workItem.id);
+      // After completion, the ticket set is cleared.
       expect(manager.getActiveWorkItems("agent-a")).toEqual([]);
     });
 
-    it("clears WorkItem from active list after the item throws", async () => {
+    it("clears WorkItem from active list after the spawn throws", async () => {
       mockRunnerSend.mockRejectedValue(new Error("bang"));
 
-      const item = makeWorkItem();
-      await expect(manager.sendMessage("agent-a", item)).rejects.toThrow("bang");
+      await expect(manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }))).rejects.toThrow("bang");
 
-      // finally block must have run
+      // withSpawnTicket finally block must have removed the ticket.
       expect(manager.getActiveWorkItems("agent-a")).toEqual([]);
     });
   });

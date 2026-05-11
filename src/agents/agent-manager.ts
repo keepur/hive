@@ -47,25 +47,15 @@ function discoverSeedDirs(rootSeedsDir: string): string[] {
   }
 }
 
-interface QueuedMessage {
-  message: WorkItem;
-  onStream?: StreamCallback;
-  resolve: (result: RunResult) => void;
-  reject: (error: Error) => void;
-}
-
 /**
- * KPR-216: per-turn spawn API. AgentManager.spawnTurn replaces the
- * long-lived AgentRunner.send() path for channels that opt in via
- * `agentManager.perTurnSpawn.<channel>`. Each call spawns a fresh
- * `query()` with `options.resume = ctx.sessionId`; in-process MCP servers
- * are built fresh too so channel/thread context is captured at spawn time
- * (no mutable contextRef across turns).
+ * KPR-216 + KPR-220: per-turn spawn API. AgentManager.spawnTurn is the only
+ * execution path post-KPR-220. Each call spawns a fresh `query()` with
+ * `options.resume = ctx.sessionId`; in-process MCP servers are built fresh
+ * too so channel/thread context is captured at spawn time (no mutable
+ * contextRef across turns).
  *
- * Per-thread serialization (lock key `agentId:threadId`) shares the same
- * `processing` set as the legacy path so concurrent SMS turns on the same
- * thread queue serially even when both paths are simultaneously active
- * (e.g. mid-flag-flip).
+ * Per-thread serialization (lock key `agentId:threadId`) is enforced by
+ * `withSpawnTicket` (Phase 2). Per-agent budget by `spawnBudgetFor`.
  */
 export interface TurnContext {
   agentId: string;
@@ -213,10 +203,9 @@ const REFLECTION_PROMPT = [
 
 export class AgentManager {
   private states = new Map<string, AgentState>();
-  private queues = new Map<string, QueuedMessage[]>();
+  // Per-thread serialization lock — `agentId:threadId`. Phase 10: queue/runner
+  // bookkeeping retired; this set is now co-extensive with `activeSpawnKeys`.
   private processing = new Set<string>();
-  private activeRunners = new Map<string, Set<AgentRunner>>();
-  private activeThreads = new Map<string, Set<string>>();
   private registry: AgentRegistry;
   private memoryManager: MemoryManager;
   private sessionStore: SessionStore;
@@ -229,20 +218,18 @@ export class AgentManager {
   private teamRoster?: TeamRoster;
   private prefixCache?: PrefixCache;
   private db: Db;
-  // Keyed by agentId → list of currently in-flight WorkItems (one per active thread).
-  private activeWorkItems = new Map<string, WorkItem[]>();
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
   // KPR-216: in-flight per-turn spawn count per agent. Bounded by
   // DEFAULT_PER_AGENT_SPAWN_BUDGET; over-budget spawns reject immediately
   // so the adapter can decide whether to drop, retry, or fall back.
   private activeSpawnCount = new Map<string, number>();
-  // KPR-216: per-turn spawn locks held in `processing` but with no entry in
-  // `activeRunners` (per-turn runners are local to spawnTurn). Sweep uses
-  // this to skip its "stuck flag" branch for legitimate in-flight spawns.
+  // KPR-216: per-turn spawn locks. After Phase 10 this is the canonical
+  // "in-flight" set — `processing` and `activeSpawnKeys` are co-extensive.
   private activeSpawnKeys = new Set<string>();
   // KPR-220 Phase 2: per-agent set of in-flight tickets. `stopAgent` walks
-  // this and calls `ticket.abort()` to interrupt running spawns.
+  // this and calls `ticket.abort()` to interrupt running spawns. Also
+  // backs `getActiveWorkItems(agentId)` (Phase 10).
   private activeTickets = new Map<string, Set<SpawnTicket>>();
   // KPR-220 Phase 2: agents marked stopped. `withSpawnTicket` rejects with
   // AgentStoppedError if the agent is in this set at any of three
@@ -301,8 +288,15 @@ export class AgentManager {
     return this.plugins;
   }
 
+  /**
+   * KPR-220 Phase 10: derived from `activeTickets` (the canonical in-flight
+   * registry post-Phase 10). Production caller `slack-internal-api.ts:143`
+   * uses this to resolve thread continuity for the Slack internal-post API.
+   */
   getActiveWorkItems(agentId: string): WorkItem[] {
-    return this.activeWorkItems.get(agentId) ?? [];
+    const tickets = this.activeTickets.get(agentId);
+    if (!tickets) return [];
+    return [...tickets].map((t) => t.workItem);
   }
 
   private createRunner(agentId: string): AgentRunner {
@@ -365,36 +359,6 @@ export class AgentManager {
         activeThreadCount: 0,
       });
     }
-  }
-
-  async sendMessage(agentId: string, message: WorkItem, onStream?: StreamCallback): Promise<RunResult> {
-    this.ensureState(agentId);
-    const threadId = message.threadId ?? message.id;
-    const threadKey = `${agentId}:${threadId}`;
-
-    return new Promise<RunResult>((resolve, reject) => {
-      const queue = this.queues.get(threadKey) ?? [];
-      queue.push({ message, onStream, resolve, reject });
-      this.queues.set(threadKey, queue);
-      this.processThreadQueue(agentId, threadKey).catch((err) => {
-        log.error("processThreadQueue failed unexpectedly", { agentId, threadKey, error: String(err) });
-        this.processing.delete(threadKey);
-        const activeSet = this.activeThreads.get(agentId);
-        if (activeSet) {
-          activeSet.delete(threadKey);
-          this.updateThreadCount(agentId);
-          if (activeSet.size === 0) this.updateStatus(agentId, "idle");
-        }
-        const queue = this.queues.get(threadKey);
-        if (queue) {
-          for (const pending of queue) {
-            pending.reject(err instanceof Error ? err : new Error(String(err)));
-          }
-          this.queues.delete(threadKey);
-        }
-        this.retryDeferredThreads(agentId);
-      });
-    });
   }
 
   /**
@@ -542,6 +506,8 @@ export class AgentManager {
     const ticketSet = this.activeTickets.get(ctx.agentId) ?? new Set<SpawnTicket>();
     ticketSet.add(ticket);
     this.activeTickets.set(ctx.agentId, ticketSet);
+    this.refreshActiveThreadCount(ctx.agentId);
+    this.updateStatus(ctx.agentId, "processing");
 
     // Post-lock stop check: closes the race where stopAgent fires between
     // lock acquisition and fn invocation.
@@ -553,6 +519,7 @@ export class AgentManager {
       const next = (this.activeSpawnCount.get(ctx.agentId) ?? 1) - 1;
       if (next <= 0) this.activeSpawnCount.delete(ctx.agentId);
       else this.activeSpawnCount.set(ctx.agentId, next);
+      this.refreshActiveThreadCount(ctx.agentId);
       throw new AgentStoppedError(ctx.agentId);
     }
 
@@ -566,6 +533,14 @@ export class AgentManager {
       const next = (this.activeSpawnCount.get(ctx.agentId) ?? 1) - 1;
       if (next <= 0) this.activeSpawnCount.delete(ctx.agentId);
       else this.activeSpawnCount.set(ctx.agentId, next);
+      this.refreshActiveThreadCount(ctx.agentId);
+      // Status returns to idle when the last in-flight ticket for this agent
+      // completes. Only flip when no tickets remain — otherwise an
+      // intermediate completion would prematurely mark "idle" while peers
+      // are still running.
+      if (!this.activeTickets.has(ctx.agentId) && !this.stoppedAgents.has(ctx.agentId)) {
+        this.updateStatus(ctx.agentId, "idle");
+      }
     }
   }
 
@@ -957,232 +932,20 @@ export class AgentManager {
     };
   }
 
-  private async processThreadQueue(agentId: string, threadKey: string): Promise<void> {
-    // Serialize within same thread
-    if (this.processing.has(threadKey)) return;
-
-    const queue = this.queues.get(threadKey);
-    if (!queue || queue.length === 0) return;
-
-    // Check concurrency limit
-    const config = this.registry.get(agentId);
-    const limit = config?.maxConcurrent ?? 3;
-    const activeSet = this.activeThreads.get(agentId) ?? new Set();
-    if (activeSet.size >= limit) {
-      log.debug("Agent at concurrency limit, deferring", { agentId, threadKey, active: activeSet.size, limit });
-      return;
-    }
-
-    this.processing.add(threadKey);
-    activeSet.add(threadKey);
-    this.activeThreads.set(agentId, activeSet);
-    this.updateStatus(agentId, "processing");
-    this.updateThreadCount(agentId);
-
-    const runner = this.createRunner(agentId);
-    const runners = this.activeRunners.get(agentId) ?? new Set();
-    runners.add(runner);
-    this.activeRunners.set(agentId, runners);
-
-    let turnCount = 0;
-    let lastItem: QueuedMessage | undefined;
-    let lastResult: RunResult | undefined;
-
-    while (queue.length > 0) {
-      const item = queue.shift()!;
-      // Track active WorkItem for the Slack internal API threading fallback.
-      const activeList = this.activeWorkItems.get(agentId) ?? [];
-      activeList.push(item.message);
-      this.activeWorkItems.set(agentId, activeList);
-      try {
-        const threadId = item.message.threadId ?? item.message.id;
-        const existingSession = await this.sessionStore.get(agentId, threadId);
-        if (!existingSession) this.recordSpawn(item.message.source.id);
-
-        const bgContext: WorkItemContext = {
-          adapterId: item.message.source.adapterId ?? item.message.source.kind,
-          channelId: item.message.source.id,
-          channelKind: item.message.source.kind,
-          channelLabel: item.message.source.label,
-          threadId,
-          slackTs: (item.message.meta?.slackTs as string) ?? "",
-          slackThreadTs: (item.message.meta?.slackThreadTs as string) ?? "",
-        };
-
-        // KPR-224: synthetic TurnContext routes the legacy path through the
-        // shared shaping + observability helpers. The carve-out for voice in
-        // prepareSpawn is defensive — voice currently flows via routeVoiceTurn,
-        // not processQueue, but threading channel: source.kind preserves the
-        // invariant if that ever changes.
-        const syntheticCtx: TurnContext = {
-          agentId,
-          sessionId: existingSession,
-          channelId: item.message.source.id,
-          threadId,
-          workItem: item.message,
-          channel: item.message.source.kind,
-        };
-        const { prompt, modelOverride, resourceLimits, routerCostUsd } =
-          await this.prepareSpawn(syntheticCtx);
-
-        const result = await runner.send(prompt, existingSession, item.onStream, bgContext, modelOverride, resourceLimits);
-        result.costUsd += routerCostUsd;
-
-        if (result.sessionId && !result.aborted) {
-          this.sessionStore.set(agentId, threadId, result.sessionId, {
-            inputTokens: result.inputTokens,
-            outputTokens: result.outputTokens,
-            cacheReadTokens: result.cacheReadTokens,
-            cacheCreationTokens: result.cacheCreationTokens,
-            contextWindow: result.contextWindow,
-            compactions: result.compactions,
-            preCompactTokens: result.preCompactTokens,
-          });
-        }
-
-        const state = this.states.get(agentId)!;
-        state.messagesProcessed++;
-        state.lastActivity = new Date();
-        state.currentSessionId = result.sessionId;
-
-        if (result.error) {
-          state.errorCount++;
-          // Don't set agent to error — other threads may be fine
-          // Clear stale session so next message starts fresh
-          if (existingSession) {
-            this.sessionStore.delete(agentId, threadId);
-          }
-        }
-
-        item.resolve(result);
-
-        turnCount++;
-        lastItem = item;
-        lastResult = result;
-
-        // KPR-224: telemetry + conversation index + activity audit via the
-        // shared helper. Replaces the inline blocks that previously lived
-        // here. Behavior preserved exactly — see prepareSpawn /
-        // recordSpawnObservability for the helper bodies.
-        this.recordSpawnObservability(syntheticCtx, prompt, modelOverride, result);
-      } catch (err) {
-        const state = this.states.get(agentId);
-        if (state) {
-          state.errorCount++;
-          state.lastActivity = new Date();
-        }
-        // Record failed turn in audit trail
-        this.activityLogger?.record({
-          agentId,
-          threadId: item.message.threadId ?? item.message.id,
-          timestamp: new Date(),
-          sender: item.message.sender,
-          senderName: item.message.senderName,
-          channel: item.message.source.label,
-          channelKind: item.message.source.kind,
-          model: config?.model ?? "unknown",
-          costUsd: 0,
-          durationMs: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          contextWindow: 0,
-          toolCalls: 0,
-          toolSummary: "none",
-          compactions: 0,
-          streamed: false,
-          error: String(err),
-        });
-        item.reject(err instanceof Error ? err : new Error(String(err)));
-      } finally {
-        const remaining = (this.activeWorkItems.get(agentId) ?? []).filter((w) => w.id !== item.message.id);
-        if (remaining.length === 0) this.activeWorkItems.delete(agentId);
-        else this.activeWorkItems.set(agentId, remaining);
-      }
-    }
-
-    // End-of-conversation reflection — prompt agent to save memories
-    const allServers = [...(config?.coreServers ?? []), ...(config?.delegateServers ?? [])];
-    const hasMemoryServer = allServers.includes("memory")
-      || allServers.includes("structured-memory");
-    if (
-      hasMemoryServer &&
-      lastResult &&
-      lastItem &&
-      !lastResult.error &&
-      !lastResult.aborted &&
-      turnCount >= appConfig.memory.reflectionMinTurns &&
-      lastItem.message.sender !== "system"
-    ) {
-      try {
-        const reflectionPrompt = [
-          "[System — end of conversation reflection]",
-          "This conversation is wrapping up. Review what was discussed:",
-          "- Were any new facts, decisions, or commitments made?",
-          "- Did anything contradict or update what you previously knew?",
-          "- Should any existing memories be updated or forgotten?",
-          "",
-          "If yes, use memory_save, memory_update, or memory_forget now.",
-          "If nothing worth saving, do nothing.",
-        ].join("\n");
-
-        const reflectionResult = await runner.send(reflectionPrompt, lastResult.sessionId);
-        log.info("Reflection completed", {
-          agentId,
-          threadKey,
-          turnCount,
-          costUsd: reflectionResult.costUsd,
-          toolCalls: reflectionResult.toolCalls,
-          toolSummary: reflectionResult.toolSummary || undefined,
-        });
-
-        // Persist session so next message picks up post-reflection state
-        if (reflectionResult.sessionId && !reflectionResult.aborted) {
-          const threadId = lastItem.message.threadId ?? lastItem.message.id;
-          this.sessionStore.set(agentId, threadId, reflectionResult.sessionId, {
-            inputTokens: reflectionResult.inputTokens,
-            outputTokens: reflectionResult.outputTokens,
-            cacheReadTokens: reflectionResult.cacheReadTokens,
-            cacheCreationTokens: reflectionResult.cacheCreationTokens,
-            contextWindow: reflectionResult.contextWindow,
-            compactions: reflectionResult.compactions,
-            preCompactTokens: reflectionResult.preCompactTokens,
-          });
-        }
-      } catch (err) {
-        log.warn("Reflection failed, non-critical", { agentId, threadKey, error: String(err) });
-      }
-    }
-
-    // Cleanup
-    runners.delete(runner);
-    this.processing.delete(threadKey);
-    activeSet.delete(threadKey);
-    this.queues.delete(threadKey);
-    this.updateThreadCount(agentId);
-
-    if (activeSet.size === 0) {
-      this.updateStatus(agentId, "idle");
-    }
-
-    // Pick up deferred threads that were waiting for a slot
-    this.retryDeferredThreads(agentId);
-  }
-
-  private updateThreadCount(agentId: string): void {
+  /**
+   * KPR-220 Phase 10: derive `state.activeThreadCount` from `activeSpawnKeys`
+   * filtered by `${agentId}:` prefix. Replaces the legacy `activeThreads`
+   * map. Called from spawnTurn paths via withSpawnTicket lifecycle.
+   */
+  private refreshActiveThreadCount(agentId: string): void {
     const state = this.states.get(agentId);
-    if (state) {
-      state.activeThreadCount = this.activeThreads.get(agentId)?.size ?? 0;
-    }
-  }
-
-  private retryDeferredThreads(agentId: string): void {
+    if (!state) return;
     const prefix = `${agentId}:`;
-    for (const [threadKey, queue] of this.queues) {
-      if (threadKey.startsWith(prefix) && queue.length > 0 && !this.processing.has(threadKey)) {
-        this.processThreadQueue(agentId, threadKey);
-        break; // One at a time to respect limit
-      }
+    let count = 0;
+    for (const key of this.activeSpawnKeys) {
+      if (key.startsWith(prefix)) count++;
     }
+    state.activeThreadCount = count;
   }
 
   private updateStatus(agentId: string, status: AgentStatus): void {
@@ -1202,21 +965,11 @@ export class AgentManager {
   }
 
   stopAgent(agentId: string): void {
-    // KPR-220 Phase 5: mark stopped first so any concurrent withSpawnTicket
-    // call sees it at the post-lock check. Then walk both the legacy
-    // activeRunners (sendMessage path) and the new activeTickets (per-turn
-    // path) and abort everything in flight.
+    // KPR-220 Phase 5/10: mark stopped first so any concurrent
+    // withSpawnTicket call sees it at the post-lock check. Then walk
+    // activeTickets and abort everything in flight.
     this.stoppedAgents.add(agentId);
     this.cancelReflectionsFor(agentId);
-    const runners = this.activeRunners.get(agentId);
-    if (runners) {
-      for (const runner of runners) {
-        runner.abort();
-      }
-      runners.clear();
-    }
-    this.activeRunners.delete(agentId);
-    this.activeThreads.delete(agentId);
     const tickets = this.activeTickets.get(agentId);
     if (tickets) {
       for (const ticket of tickets) {
@@ -1224,6 +977,7 @@ export class AgentManager {
       }
     }
     this.activeTickets.delete(agentId);
+    this.refreshActiveThreadCount(agentId);
     this.updateStatus(agentId, "stopped");
   }
 
@@ -1275,49 +1029,22 @@ export class AgentManager {
     for (const [agentId, state] of this.states) {
       if (!this.registry.get(agentId) && (state.status === "stopped" || state.status === "idle")) {
         this.states.delete(agentId);
-        this.activeRunners.delete(agentId);
-        this.activeThreads.delete(agentId);
+        this.activeTickets.delete(agentId);
         pruned++;
         log.info("Zombie agent state removed", { agentId });
       }
     }
 
-    // 2. Detect stuck processing flags
-    for (const threadKey of this.processing) {
-      const agentId = threadKey.split(":")[0];
-      const runners = this.activeRunners.get(agentId);
-      if (!runners || runners.size === 0) {
-        // KPR-216: per-turn spawns hold `processing` without populating
-        // `activeRunners` (their runner is local to spawnTurn). Skip.
-        if (this.activeSpawnKeys.has(threadKey)) continue;
-        // No active runners but processing flag is set — stuck
-        this.processing.delete(threadKey);
-        const activeSet = this.activeThreads.get(agentId);
-        if (activeSet) {
-          activeSet.delete(threadKey);
-          this.updateThreadCount(agentId);
-          if (activeSet.size === 0) this.updateStatus(agentId, "idle");
-        }
-        pruned++;
-        log.warn("Stuck processing flag cleared", { threadKey, agentId });
-
-        // Try to restart the queue for this thread
-        const queue = this.queues.get(threadKey);
-        if (queue && queue.length > 0) {
-          this.processThreadQueue(agentId, threadKey).catch((err) => {
-            log.error("Failed to restart stuck queue", { threadKey, error: String(err) });
-          });
-        }
-      }
-    }
-
-    // 3. Retry deferred threads for ALL agents with pending queues
-    const agentIds = new Set<string>();
-    for (const threadKey of this.queues.keys()) {
-      agentIds.add(threadKey.split(":")[0]);
-    }
-    for (const agentId of agentIds) {
-      this.retryDeferredThreads(agentId);
+    // 2. Detect stuck processing flags. Post-Phase-10, `processing` and
+    // `activeSpawnKeys` are co-extensive — a key in `processing` without a
+    // matching activeSpawnKey indicates `withSpawnTicket` crashed between
+    // adding the lock and the spawn-key (should not happen in the
+    // post-HOF world, but the guard rail stays for defensive cleanup).
+    for (const threadKey of [...this.processing]) {
+      if (this.activeSpawnKeys.has(threadKey)) continue;
+      this.processing.delete(threadKey);
+      pruned++;
+      log.warn("Stuck processing flag cleared", { threadKey });
     }
 
     return { component: "agent-manager", pruned, retried: 0, bytesFreed: 0, errors };
