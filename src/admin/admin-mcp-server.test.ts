@@ -378,15 +378,10 @@ describe("agent_create — schema promotion and archetype support", () => {
   });
 
   it("KPR-220 Phase 4: agent_get reports maxConcurrent fallback when spawnBudget unset", async () => {
-    agentDocsStore.set(
-      "legacy-agent",
-      makeBaseAgent({ _id: "legacy-agent", maxConcurrent: 4 }),
-    );
+    agentDocsStore.set("legacy-agent", makeBaseAgent({ _id: "legacy-agent", maxConcurrent: 4 }));
     const res = await getHandler(makeTools(), "agent_get")({ agent_id: "legacy-agent" });
     expect(res.isError).toBeFalsy();
-    expect(res.content[0].text as string).toMatch(
-      /Spawn Budget: 4 \(source: maxConcurrent \(deprecated\)\)/,
-    );
+    expect(res.content[0].text as string).toMatch(/Spawn Budget: 4 \(source: maxConcurrent \(deprecated\)\)/);
   });
 });
 

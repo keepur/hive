@@ -204,9 +204,10 @@ describe("VoiceAdapter — KPR-220 Phase 8 retirement", () => {
   });
 
   it("constructor throws when agentManager is not provided", () => {
-    expect(() =>
-      // Test wiring: pass undefined (typed-undefined coercion mirrors prod misconfig).
-      new VoiceAdapter(0, "shared-secret", {} as any, {} as any, undefined as unknown as any),
+    expect(
+      () =>
+        // Test wiring: pass undefined (typed-undefined coercion mirrors prod misconfig).
+        new VoiceAdapter(0, "shared-secret", {} as any, {} as any, undefined as unknown as any),
     ).toThrow(/AgentManager/);
   });
 
@@ -222,8 +223,7 @@ describe("VoiceAdapter — KPR-220 Phase 8 retirement", () => {
 });
 
 describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
-  beforeEach(() => {
-  });
+  beforeEach(() => {});
 
   afterEach(() => {
     vi.clearAllMocks();

@@ -858,9 +858,7 @@ describe("Per-turn dispatch (unconditional, KPR-220 Phase 9)", () => {
 
     expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
 
-    const logCall = mockLogInfo.mock.calls.find(
-      ([msg]) => msg === "Work item dispatched",
-    );
+    const logCall = mockLogInfo.mock.calls.find(([msg]) => msg === "Work item dispatched");
     expect(logCall).toBeDefined();
     const fields = logCall![1] as Record<string, unknown>;
     expect(fields.llmMs).toBe(999);

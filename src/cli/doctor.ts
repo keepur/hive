@@ -127,9 +127,7 @@ export function renderSpawnCoordinatorSection(
     if (r.staleSeconds !== null && r.staleSeconds > 120) flags.push("stale-heartbeat");
     const flagStr = flags.length > 0 ? ` [${flags.join(",")}]` : "";
     const lastSat =
-      r.lastSaturationAt === null
-        ? "never"
-        : `${Math.round((Date.now() - r.lastSaturationAt) / 1000)}s ago`;
+      r.lastSaturationAt === null ? "never" : `${Math.round((Date.now() - r.lastSaturationAt) / 1000)}s ago`;
     emit(
       `  ${r.agentId}: active=${r.activeSpawns} budget=${r.budget} (source=${r.budgetSource}) saturations=${r.saturationCount} (last ${lastSat})${flagStr} (heartbeat ${stale})`,
     );

@@ -180,11 +180,12 @@ export function buildAdminTools(deps: AdminToolDeps) {
           // retained as a deprecated fallback for legacy docs.
           {
             const resolved = doc.spawnBudget ?? doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent;
-            const source = doc.spawnBudget != null
-              ? "spawnBudget"
-              : doc.maxConcurrent != null
-              ? "maxConcurrent (deprecated)"
-              : "default";
+            const source =
+              doc.spawnBudget != null
+                ? "spawnBudget"
+                : doc.maxConcurrent != null
+                  ? "maxConcurrent (deprecated)"
+                  : "default";
             lines.push(`Spawn Budget: ${resolved} (source: ${source})`);
           }
           lines.push(`Timeout: ${doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs}ms`);

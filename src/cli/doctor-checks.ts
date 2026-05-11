@@ -316,10 +316,7 @@ export interface SpawnCoordinatorRow {
  * Mirrors `prefixCacheStatsForDoctor` — short-lived MongoClient + per-agent
  * documents. Returns an empty array if no docs exist yet.
  */
-export async function spawnCoordinatorStatsForDoctor(
-  uri: string,
-  dbName: string,
-): Promise<SpawnCoordinatorRow[]> {
+export async function spawnCoordinatorStatsForDoctor(uri: string, dbName: string): Promise<SpawnCoordinatorRow[]> {
   const { MongoClient } = await import("mongodb");
   const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
   try {
@@ -354,9 +351,7 @@ export async function spawnCoordinatorStatsForDoctor(
           lastSpawnAt: d.lastSpawnAt ?? null,
           lastError: d.lastError ?? null,
           stopped: d.stopped ?? false,
-          staleSeconds: updatedAt
-            ? Math.round((Date.now() - updatedAt.getTime()) / 1000)
-            : null,
+          staleSeconds: updatedAt ? Math.round((Date.now() - updatedAt.getTime()) / 1000) : null,
         };
       })
       .sort((a, b) => a.agentId.localeCompare(b.agentId));
