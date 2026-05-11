@@ -562,13 +562,14 @@ function scanSkillsFrom(
         // loop only iterated `agentIds`, which is empty when hasAll=true,
         // so no eviction happened and `getSkillsForAgent` returned both the
         // agent-private and the universal customer skill simultaneously.
-        // Iterate collisionMap for keys ending in `::<skillName>`.
+        //
+        // Match `*::<skillName>` — agent-private collision keys have the
+        // form `<agentId>::<skillName>` (line 457 above). The customer's
+        // own collision key is bare `<skillName>` (no `::` prefix, since
+        // implicitAgentScope is undefined for customer-space scans), so the
+        // endsWith filter naturally excludes it. No self-evict possible.
         const evictionKeys: string[] = [];
         for (const perAgentKey of collisionMap.keys()) {
-          // Skip the customer's own collision key (registered above as
-          // `customer::${skillName}` in the else branch). Without this guard
-          // we would evict our own freshly registered entry.
-          if (perAgentKey === `customer::${skillName}`) continue;
           if (perAgentKey.endsWith(`::${skillName}`)) {
             evictionKeys.push(perAgentKey);
           }
