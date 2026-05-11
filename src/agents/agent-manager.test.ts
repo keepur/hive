@@ -1309,4 +1309,197 @@ describe("AgentManager", () => {
       await Promise.all([p1, p2]);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // KPR-224: spawnTurn shaping (prepareSpawn + recordSpawnObservability)
+  // ---------------------------------------------------------------------------
+  describe("spawnTurn shaping (KPR-224)", () => {
+    beforeEach(() => {
+      // ConversationIndex.index is fire-and-forget; helper calls .catch() so
+      // the mock must return a Promise (default vi.fn() returns undefined).
+      mockConversationIndex.mockResolvedValue(undefined);
+    });
+
+    function makeCtx(workItem: WorkItem, channel: any = "slack", sessionId?: string) {
+      const threadId = workItem.threadId ?? workItem.id;
+      return {
+        agentId: "agent-a",
+        sessionId,
+        channelId: workItem.source.id,
+        threadId,
+        workItem,
+        channel: channel as any,
+      };
+    }
+
+    it("prepends sender identity for slack WorkItem", async () => {
+      const item = makeWorkItem({
+        text: "hello team",
+        source: { kind: "slack", id: "C-GEN", label: "general" },
+        sender: "U001",
+        senderName: "May",
+        meta: { slackTs: "1234" },
+      });
+
+      await manager.spawnTurn(makeCtx(item, "slack"));
+
+      const [prompt] = mockRunnerSend.mock.calls[0]!;
+      expect(prompt).toBe("[May in #general, thread=1234]: hello team");
+    });
+
+    it("prepends user identity for team channel WorkItem", async () => {
+      const item = makeWorkItem({
+        text: "ping",
+        source: { kind: "team", id: "team:foo", label: "team:foo", adapterId: "ws" },
+        sender: "device-1",
+        senderName: "device-1",
+        meta: { user: "may-keepur" },
+      });
+
+      await manager.spawnTurn(makeCtx(item, "team"));
+
+      const [prompt] = mockRunnerSend.mock.calls[0]!;
+      expect(prompt).toBe("[user:may-keepur via device-1 in #team:foo]: ping");
+    });
+
+    it("appends file attachments to prompt", async () => {
+      const { formatFilesForPrompt } = await import("../files/file-processor.js");
+      vi.mocked(formatFilesForPrompt).mockReturnValueOnce("\n\n[attachment summary]");
+
+      const item = makeWorkItem({
+        text: "look at this",
+        source: { kind: "slack", id: "C1", label: "general" },
+        files: [{ name: "doc.txt", url: "https://example.com/doc.txt" } as any],
+      });
+
+      await manager.spawnTurn(makeCtx(item, "slack"));
+
+      const [prompt] = mockRunnerSend.mock.calls[0]!;
+      expect(prompt.endsWith("[attachment summary]")).toBe(true);
+    });
+
+    it("calls model router and uses override + resourceLimits in runner.send", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        const mockRoute = {
+          tier: "haiku" as const,
+          model: "claude-haiku-4-5-routed",
+          costUsd: 0.001,
+          durationMs: 50,
+          resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
+        };
+        vi.mocked(routeModel).mockResolvedValueOnce(mockRoute);
+
+        const item = makeWorkItem({
+          text: "shape me",
+          source: { kind: "sms", id: "line-1", label: "May" },
+        });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(modelOverride).toBe("claude-haiku-4-5-routed");
+        expect(resourceLimits).toEqual(mockRoute.resourceLimits);
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+
+    it("adds router cost to TurnResult.usage.costUsd", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        const mockRoute = {
+          tier: "haiku" as const,
+          model: "claude-haiku-4-5-routed",
+          costUsd: 0.0042,
+          durationMs: 50,
+          resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
+        };
+        vi.mocked(routeModel).mockResolvedValueOnce(mockRoute);
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ costUsd: 0.05, sessionId: "s-cost" }));
+
+        const item = makeWorkItem({ text: "cost test", source: { kind: "sms", id: "line-1", label: "May" } });
+        const result = await manager.spawnTurn(makeCtx(item, "sms"));
+
+        // 0.05 (runner) + 0.0042 (router) = 0.0542
+        expect(result.usage.costUsd).toBeCloseTo(0.0542, 5);
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+
+    it("records telemetry, conversation index, and activity audit on success", async () => {
+      const activityLogger = { record: vi.fn() };
+      const localManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        activityLogger as any,
+      );
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({ text: "ack", sessionId: "session-obs", costUsd: 0.02, durationMs: 250 }),
+      );
+
+      const item = makeWorkItem({
+        text: "obs check",
+        source: { kind: "sms", id: "line-1", label: "May (CEO)" },
+        senderName: "May",
+      });
+      await localManager.spawnTurn(makeCtx(item, "sms"));
+      // Fire-and-forget telemetry/index — give a microtask to settle.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Telemetry — fired with shaped prompt's modelOverride (undefined when
+      // router disabled) and the runner's session/token counts.
+      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+      const telArg = turnTelemetryStore.record.mock.calls[0][0];
+      expect(telArg.agentId).toBe("agent-a");
+      expect(telArg.sessionId).toBe("session-obs");
+      expect(telArg.inputTokens).toBe(100);
+
+      // Conversation index — inbound is the shaped prompt, response is runner text.
+      expect(mockConversationIndex).toHaveBeenCalledTimes(1);
+      const idxArg = mockConversationIndex.mock.calls[0]![0];
+      expect(idxArg.agentId).toBe("agent-a");
+      expect(idxArg.inbound).toContain("obs check");
+      expect(idxArg.response).toBe("ack");
+
+      // Activity audit — full payload with cost/duration from RunResult.
+      expect(activityLogger.record).toHaveBeenCalledTimes(1);
+      const auditArg = activityLogger.record.mock.calls[0]![0];
+      expect(auditArg.agentId).toBe("agent-a");
+      expect(auditArg.costUsd).toBe(0.02);
+      expect(auditArg.durationMs).toBe(250);
+      expect(auditArg.channelKind).toBe("sms");
+    });
+
+    it("voice carve-out: passes raw text to runner.send and skips model router", async () => {
+      // KPR-219 design: voice has its own systemPromptOverride and explicitly
+      // bypasses sender prepending + model router. KPR-224's prepareSpawn must
+      // preserve this carve-out so future shaping edits cannot regress voice.
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        const item = makeWorkItem({
+          id: "call-1",
+          text: "raw voice text",
+          source: { kind: "voice", id: "call-1", label: "voice:call-1" },
+          threadId: "voice:call-1",
+          senderName: "Caller",
+        });
+        await manager.spawnTurn(makeCtx(item, "voice"));
+
+        // Raw text passed through — no `[Caller in #voice:call-1]:` prefix.
+        const [prompt] = mockRunnerSend.mock.calls[0]!;
+        expect(prompt).toBe("raw voice text");
+
+        // routeModel NOT invoked despite modelRouter.enabled=true.
+        expect(routeModel).not.toHaveBeenCalled();
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+  });
 });

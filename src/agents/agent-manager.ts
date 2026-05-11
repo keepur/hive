@@ -331,8 +331,14 @@ export class AgentManager {
 
     if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
 
+    // KPR-224: shape prompt + resolve model router once at the spawnTurn
+    // level so both the happy-path call and any auth-rebuild retry use the
+    // same shaped values, and recordSpawnObservability sees prompt /
+    // modelOverride in scope.
+    const shaping = await this.prepareSpawn(ctx);
+
     try {
-      const result = await this.runOneSpawnAttempt(ctx, onStream);
+      const result = await this.runOneSpawnAttempt(ctx, shaping, onStream);
 
       if (result.error && isAuthRebuildResumeError(result.error) && ctx.sessionId) {
         log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
@@ -340,11 +346,15 @@ export class AgentManager {
           threadId: ctx.threadId,
           reason: result.error,
         });
-        const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, onStream);
-        return this.finalizeSpawnResult(ctx, retry);
+        const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, shaping, onStream);
+        const turnResult = this.finalizeSpawnResult(ctx, retry);
+        this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, retry);
+        return turnResult;
       }
 
-      return this.finalizeSpawnResult(ctx, result);
+      const turnResult = this.finalizeSpawnResult(ctx, result);
+      this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, result);
+      return turnResult;
     } finally {
       this.processing.delete(threadKey);
       this.activeSpawnKeys.delete(threadKey);
@@ -356,6 +366,12 @@ export class AgentManager {
 
   private async runOneSpawnAttempt(
     ctx: TurnContext,
+    shaping: {
+      prompt: string;
+      modelOverride: string | undefined;
+      resourceLimits: ResourceLimits | undefined;
+      routerCostUsd: number;
+    },
     onStream?: SpawnTurnStreamCallback,
   ): Promise<RunResult> {
     // Fresh runner per spawn — its lazy-built in-process MCPs are therefore
@@ -373,15 +389,168 @@ export class AgentManager {
       slackThreadTs: (ctx.workItem.meta?.slackThreadTs as string) ?? "",
     };
 
-    return runner.send(
-      ctx.workItem.text,
+    const result = await runner.send(
+      shaping.prompt,
       ctx.sessionId,
       onStream,
       bgContext,
-      undefined,
-      undefined,
+      shaping.modelOverride,
+      shaping.resourceLimits,
       ctx.systemPromptOverride,
     );
+    // KPR-224: model router cost lives outside RunResult; add it here so
+    // finalizeSpawnResult and recordSpawnObservability see the full cost.
+    result.costUsd += shaping.routerCostUsd;
+    return result;
+  }
+
+  /**
+   * KPR-224: shared shaping helper for both `spawnTurn` (per-turn path) and
+   * `processQueue` (legacy path). Centralizes:
+   *  - sender identity prepending (`[user:X via Y in #Z]:` for team /
+   *    `[Y in #Z, thread=ts]:` for slack-with-sender)
+   *  - file-attachment text appending
+   *  - model router (modelOverride + resourceLimits + routerCostUsd)
+   *
+   * Voice carve-out: voice has its own `systemPromptOverride` injection
+   * (KPR-219) and explicitly bypasses sender prepending + model router.
+   * Returns raw text + no router for `ctx.channel === "voice"`.
+   */
+  private async prepareSpawn(ctx: TurnContext): Promise<{
+    prompt: string;
+    modelOverride: string | undefined;
+    resourceLimits: ResourceLimits | undefined;
+    routerCostUsd: number;
+  }> {
+    const item = ctx.workItem;
+
+    // Voice carve-out: KPR-219 supplies its own systemPromptOverride and
+    // explicitly bypasses prepending + model router. Pin via this branch so
+    // future prepareSpawn edits cannot accidentally re-shape voice prompts.
+    if (ctx.channel === "voice") {
+      return { prompt: item.text, modelOverride: undefined, resourceLimits: undefined, routerCostUsd: 0 };
+    }
+
+    const senderLabel = item.senderName ?? item.sender;
+    const userId =
+      item.source.kind === "team"
+        ? (item.meta?.user as string | undefined)
+        : undefined;
+
+    let prompt: string;
+    if (userId) {
+      prompt = `[user:${userId} via ${senderLabel} in #${item.source.label}]: ${item.text}`;
+    } else if (item.senderName) {
+      const slackThreadTs = item.meta?.slackThreadTs as string | undefined;
+      const slackTs = item.meta?.slackTs as string | undefined;
+      const threadTs = slackThreadTs ?? slackTs;
+      const threadHint = threadTs ? `, thread=${threadTs}` : "";
+      prompt = `[${senderLabel} in #${item.source.label}${threadHint}]: ${item.text}`;
+    } else {
+      prompt = item.text;
+    }
+
+    if (item.files?.length) {
+      prompt += formatFilesForPrompt(item.files);
+    }
+
+    let modelOverride: string | undefined;
+    let routerCostUsd = 0;
+    let resourceLimits: ResourceLimits | undefined;
+    if (appConfig.modelRouter.enabled && item.sender !== "system") {
+      try {
+        const agentConfig = this.registry.get(ctx.agentId);
+        if (agentConfig) {
+          const route = await routeModel(item.text, agentConfig.model, agentConfig.resourceTiers);
+          modelOverride = route.model !== agentConfig.model ? route.model : undefined;
+          routerCostUsd = route.costUsd;
+          resourceLimits = route.resourceLimits;
+        }
+      } catch (err) {
+        log.warn("Model router failed, using default", { agentId: ctx.agentId, error: String(err) });
+      }
+    }
+
+    return { prompt, modelOverride, resourceLimits, routerCostUsd };
+  }
+
+  /**
+   * KPR-224: shared post-spawn observability helper for both `spawnTurn` and
+   * `processQueue`. Records turn telemetry (per-turn cache window),
+   * conversation index (semantic recall), and activity audit. All three
+   * fail-soft — telemetry/index/audit failures cannot cascade into the turn
+   * pipeline (matches existing `processQueue` pattern).
+   */
+  private recordSpawnObservability(
+    ctx: TurnContext,
+    prompt: string,
+    modelOverride: string | undefined,
+    result: RunResult,
+  ): void {
+    const item = ctx.workItem;
+
+    // Per-turn telemetry — independent of sessionStore (no history in
+    // sessionStore.set). Aggregator in `hive doctor` reads this collection.
+    if (result.sessionId && !result.aborted) {
+      this.turnTelemetryStore
+        .record({
+          agentId: ctx.agentId,
+          threadId: ctx.threadId,
+          sessionId: result.sessionId,
+          model: modelOverride ?? this.registry.get(ctx.agentId)?.model,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          cacheReadTokens: result.cacheReadTokens,
+          cacheCreationTokens: result.cacheCreationTokens,
+          ephemeral5mTokens: result.ephemeral5mTokens,
+          ephemeral1hTokens: result.ephemeral1hTokens,
+        })
+        .catch(() => {
+          // Already logged inside the store via withRetry. Swallow here.
+        });
+    }
+
+    // Fire-and-forget: index conversation turn for semantic recall
+    if (result.text && !result.error) {
+      conversationIndex
+        .index({
+          agentId: ctx.agentId,
+          threadId: ctx.threadId,
+          channelId: item.source.id,
+          source: item.source.kind,
+          senderName: item.senderName ?? "unknown",
+          timestampUnix: Math.floor(Date.now() / 1000),
+          timestamp: new Date().toISOString(),
+          inbound: prompt,
+          response: result.text,
+        })
+        .catch((err) =>
+          log.warn("Conversation indexing failed", { agentId: ctx.agentId, error: String(err) }),
+        );
+    }
+
+    // Activity audit
+    this.activityLogger?.record({
+      agentId: ctx.agentId,
+      threadId: ctx.threadId,
+      timestamp: new Date(),
+      sender: item.sender,
+      senderName: item.senderName,
+      channel: item.source.label,
+      channelKind: item.source.kind,
+      model: modelOverride ?? this.registry.get(ctx.agentId)?.model ?? "unknown",
+      modelTier: undefined, // Model router tier not currently passed through
+      costUsd: result.costUsd,
+      durationMs: result.durationMs,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      contextWindow: result.contextWindow,
+      toolCalls: result.toolCalls,
+      toolSummary: result.toolSummary,
+      compactions: result.compactions,
+      streamed: result.streamed,
+      error: result.error,
+    });
   }
 
   private finalizeSpawnResult(ctx: TurnContext, result: RunResult): TurnResult {
@@ -469,63 +638,26 @@ export class AgentManager {
           channelId: item.message.source.id,
           channelKind: item.message.source.kind,
           channelLabel: item.message.source.label,
-          threadId: item.message.threadId ?? item.message.id,
+          threadId,
           slackTs: (item.message.meta?.slackTs as string) ?? "",
           slackThreadTs: (item.message.meta?.slackThreadTs as string) ?? "",
         };
 
-        // Prepend sender identity so the agent knows who they're talking to.
-        // For team channel (KPR-23): `meta.user` is the server-asserted
-        // identity forwarded by beekeeper after JWT verification. When set,
-        // surface it so agents treat it as "the user I'm talking with,"
-        // distinct from the cosmetic device label. Scoped to team-channel
-        // sources only (KPR-27) — no other adapter has authority to assert
-        // a user identity, and a stray `meta.user` from slack/sms/scheduler
-        // must not leak into the prompt.
-        const senderLabel = item.message.senderName ?? item.message.sender;
-        const userId =
-          item.message.source.kind === "team"
-            ? (item.message.meta?.user as string | undefined)
-            : undefined;
-        let prompt: string;
-        if (userId) {
-          prompt = `[user:${userId} via ${senderLabel} in #${item.message.source.label}]: ${item.message.text}`;
-        } else if (item.message.senderName) {
-          const slackThreadTs = item.message.meta?.slackThreadTs as string | undefined;
-          const slackTs = item.message.meta?.slackTs as string | undefined;
-          const threadTs = slackThreadTs ?? slackTs;
-          const threadHint = threadTs ? `, thread=${threadTs}` : "";
-          prompt = `[${senderLabel} in #${item.message.source.label}${threadHint}]: ${item.message.text}`;
-        } else {
-          prompt = item.message.text;
-        }
-
-        // Append file attachments to prompt
-        if (item.message.files?.length) {
-          prompt += formatFilesForPrompt(item.message.files);
-        }
-
-        // Model routing — classify complexity and pick the right model tier
-        let modelOverride: string | undefined;
-        let routerCostUsd = 0;
-        let resourceLimits: ResourceLimits | undefined;
-        if (appConfig.modelRouter.enabled && item.message.sender !== "system") {
-          try {
-            const agentConfig = this.registry.get(agentId);
-            if (agentConfig) {
-              const route = await routeModel(
-                item.message.text,
-                agentConfig.model,
-                agentConfig.resourceTiers,
-              );
-              modelOverride = route.model !== agentConfig.model ? route.model : undefined;
-              routerCostUsd = route.costUsd;
-              resourceLimits = route.resourceLimits;
-            }
-          } catch (err) {
-            log.warn("Model router failed, using default", { agentId, error: String(err) });
-          }
-        }
+        // KPR-224: synthetic TurnContext routes the legacy path through the
+        // shared shaping + observability helpers. The carve-out for voice in
+        // prepareSpawn is defensive — voice currently flows via routeVoiceTurn,
+        // not processQueue, but threading channel: source.kind preserves the
+        // invariant if that ever changes.
+        const syntheticCtx: TurnContext = {
+          agentId,
+          sessionId: existingSession,
+          channelId: item.message.source.id,
+          threadId,
+          workItem: item.message,
+          channel: item.message.source.kind,
+        };
+        const { prompt, modelOverride, resourceLimits, routerCostUsd } =
+          await this.prepareSpawn(syntheticCtx);
 
         const result = await runner.send(prompt, existingSession, item.onStream, bgContext, modelOverride, resourceLimits);
         result.costUsd += routerCostUsd;
@@ -540,26 +672,6 @@ export class AgentManager {
             compactions: result.compactions,
             preCompactTokens: result.preCompactTokens,
           });
-          // Per-turn cache telemetry. Independent of sessionStore.set (which
-          // overwrites a per-thread snapshot — no history). The aggregator
-          // in `hive doctor` reads this collection.
-          this.turnTelemetryStore
-            .record({
-              agentId,
-              threadId,
-              sessionId: result.sessionId,
-              model: modelOverride ?? this.registry.get(agentId)?.model,
-              inputTokens: result.inputTokens,
-              outputTokens: result.outputTokens,
-              cacheReadTokens: result.cacheReadTokens,
-              cacheCreationTokens: result.cacheCreationTokens,
-              ephemeral5mTokens: result.ephemeral5mTokens,
-              ephemeral1hTokens: result.ephemeral1hTokens,
-            })
-            .catch(() => {
-              // Already logged inside the store via withRetry. Swallow here so a
-              // telemetry write failure cannot cascade into the turn pipeline.
-            });
         }
 
         const state = this.states.get(agentId)!;
@@ -582,43 +694,11 @@ export class AgentManager {
         lastItem = item;
         lastResult = result;
 
-        // Fire-and-forget: index conversation turn for semantic recall
-        if (result.text && !result.error) {
-          conversationIndex.index({
-            agentId,
-            threadId,
-            channelId: item.message.source.id,
-            source: item.message.source.kind,
-            senderName: item.message.senderName ?? "unknown",
-            timestampUnix: Math.floor(Date.now() / 1000),
-            timestamp: new Date().toISOString(),
-            inbound: prompt,
-            response: result.text,
-          }).catch(err => log.warn("Conversation indexing failed", { agentId, error: String(err) }));
-        }
-
-        // Record activity for audit trail
-        this.activityLogger?.record({
-          agentId,
-          threadId,
-          timestamp: new Date(),
-          sender: item.message.sender,
-          senderName: item.message.senderName,
-          channel: item.message.source.label,
-          channelKind: item.message.source.kind,
-          model: modelOverride ?? config?.model ?? "unknown",
-          modelTier: undefined, // Model router tier not currently passed through
-          costUsd: result.costUsd,
-          durationMs: result.durationMs,
-          inputTokens: result.inputTokens,
-          outputTokens: result.outputTokens,
-          contextWindow: result.contextWindow,
-          toolCalls: result.toolCalls,
-          toolSummary: result.toolSummary,
-          compactions: result.compactions,
-          streamed: result.streamed,
-          error: result.error,
-        });
+        // KPR-224: telemetry + conversation index + activity audit via the
+        // shared helper. Replaces the inline blocks that previously lived
+        // here. Behavior preserved exactly — see prepareSpawn /
+        // recordSpawnObservability for the helper bodies.
+        this.recordSpawnObservability(syntheticCtx, prompt, modelOverride, result);
       } catch (err) {
         const state = this.states.get(agentId);
         if (state) {

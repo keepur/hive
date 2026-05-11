@@ -779,6 +779,30 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     expect(passedOnStream).toBe(onStream);
   });
 
+  it("routes WS team WorkItem (kind=team, adapterId=ws) through spawnTurn when perTurnSpawn.ws=true (KPR-224 F1)", async () => {
+    mockConfig.agentManager.perTurnSpawn.ws = true;
+    // WS adapter mock — id="ws", kind="app". Same physical adapter handles
+    // both kind:"app" device WorkItems and kind:"team" channel WorkItems
+    // (DMs / channels). Dispatcher resolves the adapter via adapterId.
+    const wsAdapter = { ...makeMockAdapter(), id: "ws", kind: "app" as const };
+    dispatcher.registerAdapter(wsAdapter as any);
+
+    const item = makeWorkItem({
+      // kind:"team" with adapterId:"ws" → same WS adapter, must follow ws flag.
+      source: { kind: "team", id: "team:dm:user-1", label: "team:dm:user-1", adapterId: "ws" },
+      threadId: "team:dm:user-1",
+      text: "hey Jasper, ping",
+      // targetAgentId short-circuits resolveAgents (the team-routing path
+      // requires a teamStore mock; for this F1 regression test we only care
+      // about the per-turn flag check, not team-channel resolution).
+      meta: { targetAgentId: "jasper" },
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("routeVoiceTurn does NOT dedup on workItem.id", async () => {
     // Q4 invariant: voice WorkItem.id is the Vapi callId, reused across many
     // turns within a single call. Adding callId to the dispatcher dedup map

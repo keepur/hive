@@ -1,6 +1,6 @@
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
-import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
+import type { WorkItem, WorkResult } from "../types/work-item.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
 import type { AgentManager, TurnContext, TurnResult, SpawnTurnStreamCallback } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
@@ -203,7 +203,7 @@ export class Dispatcher {
     // 4. Full agent processing
     await adapter?.onProcessingStart?.(item, agentId);
     try {
-      const runResult = this.getPerTurnFlag(item.source.kind)
+      const runResult = this.getPerTurnFlag(item)
         ? await this.runPerTurnDispatch(agentId, item)
         : await this.agentManager.sendMessage(agentId, item);
 
@@ -290,16 +290,23 @@ export class Dispatcher {
   }
 
   /**
-   * KPR-223: per-channel per-turn-spawn flag detection. Maps WS adapter's
-   * ChannelKind `"app"` onto the config flag key `ws`. Voice is excluded —
-   * voice routes through {@link routeVoiceTurn}, not through the
-   * dispatch()/dispatchToAgent branch.
+   * KPR-223 / KPR-224: per-channel per-turn-spawn flag detection. Maps WS
+   * adapter's ChannelKind `"app"` onto the config flag key `ws`. KPR-224
+   * extends the WS branch to also catch `kind: "team", adapterId: "ws"` —
+   * the same WS adapter emits team-channel WorkItems (DMs/channels) and
+   * those must follow the same per-turn flag as app-device WorkItems.
+   * Voice is excluded — voice routes through {@link routeVoiceTurn}, not
+   * through the dispatch()/dispatchToAgent branch.
    */
-  private getPerTurnFlag(kind: ChannelKind): boolean {
+  private getPerTurnFlag(item: WorkItem): boolean {
+    const { kind, adapterId } = item.source;
     if (kind === "sms") return config.agentManager.perTurnSpawn.sms;
     if (kind === "slack") return config.agentManager.perTurnSpawn.slack;
     if (kind === "app") return config.agentManager.perTurnSpawn.ws;
-    return false; // voice, team, scheduler, imessage, internal — not routed through this branch
+    // KPR-224: WS adapter also emits team WorkItems (DMs / channels).
+    // Same physical adapter, same flag.
+    if (kind === "team" && adapterId === "ws") return config.agentManager.perTurnSpawn.ws;
+    return false; // voice, scheduler, imessage, internal, non-WS team — not routed through this branch
   }
 
   /**
@@ -623,7 +630,7 @@ export class Dispatcher {
     const adapter = this.adapters.get(effectiveItem.source.adapterId ?? effectiveItem.source.kind);
 
     try {
-      const runResult = this.getPerTurnFlag(effectiveItem.source.kind)
+      const runResult = this.getPerTurnFlag(effectiveItem)
         ? await this.runPerTurnDispatch(agentId, effectiveItem)
         : await this.agentManager.sendMessage(agentId, effectiveItem);
       const trimmedText = runResult.text.trim();
