@@ -250,22 +250,6 @@ export const config = {
     serverSecret: optional("VAPI_SERVER_SECRET", ""),
     port: parseInt(optional("VOICE_PORT", String(ports.voice ?? portBase + 5)), 10),
   },
-  // KPR-216: per-channel rollout flag for per-turn `query()` spawn (KPR-210
-  // Phase A). All four channel keys land at once so KPR-217/218/219 don't
-  // each have to introduce config schema. Default false; operator flips per
-  // channel as each KPR ships and is verified.
-  agentManager: {
-    perTurnSpawn: {
-      sms: Boolean((hive.agentManager as { perTurnSpawn?: { sms?: unknown } } | undefined)?.perTurnSpawn?.sms ?? false),
-      slack: Boolean(
-        (hive.agentManager as { perTurnSpawn?: { slack?: unknown } } | undefined)?.perTurnSpawn?.slack ?? false,
-      ),
-      ws: Boolean((hive.agentManager as { perTurnSpawn?: { ws?: unknown } } | undefined)?.perTurnSpawn?.ws ?? false),
-      voice: Boolean(
-        (hive.agentManager as { perTurnSpawn?: { voice?: unknown } } | undefined)?.perTurnSpawn?.voice ?? false,
-      ),
-    },
-  },
   autonomy: {
     externalComms: (hive.autonomy?.externalComms ?? AUTONOMY_DEFAULTS.externalComms) as boolean,
     codeTask: (hive.autonomy?.codeTask ?? AUTONOMY_DEFAULTS.codeTask) as boolean,

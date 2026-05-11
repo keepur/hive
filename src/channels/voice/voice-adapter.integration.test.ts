@@ -36,7 +36,6 @@ vi.mock("../../agents/prompt-builder.js", () => ({
 
 const configRef = {
   current: {
-    agentManager: { perTurnSpawn: { voice: true, sms: false, slack: false, ws: false } },
     anthropic: { apiKey: "test-key" },
     voice: { assistants: {} as Record<string, string> },
   },
@@ -133,10 +132,6 @@ function postChatCompletion(
 describe("VoiceAdapter integration (KPR-219)", () => {
   let adapter: VoiceAdapter | undefined;
   let port: number = 0;
-
-  beforeEach(() => {
-    configRef.current.agentManager.perTurnSpawn.voice = true;
-  });
 
   afterEach(async () => {
     if (adapter) {

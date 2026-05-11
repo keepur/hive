@@ -197,17 +197,15 @@ export class VoiceAdapter {
       log.info("Voice call session started", { callId, agentId });
     }
 
-    // KPR-220 Phase 8: voice always routes through spawnTurnViaAgentManager;
-    // the inline direct-`query()` fallback has been retired. The legacy
-    // perTurnSpawn.voice flag is no longer consulted (Phase 9 removes the
-    // config key entirely).
+    // KPR-220 Phase 8/9: voice always routes through spawnTurnViaAgentManager;
+    // the inline direct-`query()` fallback and the legacy perTurnSpawn.voice
+    // flag have both been retired.
     return this.spawnTurnViaAgentManager(res, request, agentId, agentConfig, callId);
   }
 
   /**
    * KPR-219: per-turn spawn through AgentManager. Replaces the inline `query()`
-   * spawn at lines 204-223 (the `buildQuery` builder + `runTurn` loop) when
-   * `agentManager.perTurnSpawn.voice` is true.
+   * spawn at lines 204-223 (the `buildQuery` builder + `runTurn` loop).
    *
    * Routes voice turns through the same per-thread lock + per-agent budget +
    * session-store path as SMS/Slack/WS. Voice's existing outer

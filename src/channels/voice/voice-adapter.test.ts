@@ -38,12 +38,11 @@ vi.mock("../../agents/prompt-builder.js", () => ({
   }),
 }));
 
-// `config` is read for `agentManager.perTurnSpawn.voice` and
-// `voice.assistants` mapping. Default flag OFF so any test that doesn't opt
-// in keeps using the legacy path.
+// `config` is read for `voice.assistants` mapping. KPR-220 Phase 9 retired
+// the `agentManager.perTurnSpawn.voice` flag; voice always routes through
+// `AgentManager.spawnTurn`.
 const configRef: { current: any } = {
   current: {
-    agentManager: { perTurnSpawn: { voice: false, sms: false, slack: false, ws: false } },
     anthropic: { apiKey: "test-key" },
     voice: { assistants: {} as Record<string, string> },
   },
@@ -190,12 +189,10 @@ describe("isAuthError", () => {
 // KPR-219: per-turn-via-AgentManager path tests
 // ---------------------------------------------------------------------------
 
-// KPR-220 Phase 8: legacy direct-`query()` path retired. Voice now ALWAYS
-// routes through spawnTurnViaAgentManager regardless of the perTurnSpawn
-// flag (which Phase 9 deletes from config).
+// KPR-220 Phase 8/9: legacy direct-`query()` path and the per-channel flag
+// both retired. Voice now ALWAYS routes through spawnTurnViaAgentManager.
 describe("VoiceAdapter — KPR-220 Phase 8 retirement", () => {
   beforeEach(() => {
-    configRef.current.agentManager.perTurnSpawn.voice = false;
     sdkMessagesRef.current = [
       { type: "system", subtype: "init", session_id: "sdk-sid-1" },
       { type: "result", subtype: "success", result: "any-text" },
@@ -219,15 +216,13 @@ describe("VoiceAdapter — KPR-220 Phase 8 retirement", () => {
     const res = new MockServerResponse();
     const req = makeRequest({ stream: false });
     await callHandle(adapter, req, res);
-    // Even with the legacy flag off, spawnTurn fires — the direct-query
-    // fallback no longer exists.
+    // spawnTurn fires — the direct-query fallback no longer exists.
     expect(am.spawnTurn).toHaveBeenCalledTimes(1);
   });
 });
 
-describe("VoiceAdapter — flag ON (spawnTurnViaAgentManager)", () => {
+describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
   beforeEach(() => {
-    configRef.current.agentManager.perTurnSpawn.voice = true;
   });
 
   afterEach(() => {
@@ -519,10 +514,6 @@ describe("VoiceAdapter — flag ON (spawnTurnViaAgentManager)", () => {
 });
 
 describe("VoiceAdapter — dispatcher.routeVoiceTurn wiring (KPR-223)", () => {
-  beforeEach(() => {
-    configRef.current.agentManager.perTurnSpawn.voice = true;
-  });
-
   afterEach(() => {
     vi.clearAllMocks();
   });
@@ -551,11 +542,7 @@ describe("VoiceAdapter — dispatcher.routeVoiceTurn wiring (KPR-223)", () => {
   });
 });
 
-describe("VoiceAdapter.handleRequest agent resolution (flag-on)", () => {
-  beforeEach(() => {
-    configRef.current.agentManager.perTurnSpawn.voice = true;
-  });
-
+describe("VoiceAdapter.handleRequest agent resolution", () => {
   afterEach(() => {
     vi.clearAllMocks();
   });
