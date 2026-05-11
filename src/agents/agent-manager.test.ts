@@ -1,4 +1,30 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { vi } from "vitest";
+
+const { TEST_HIVE_HOME } = vi.hoisted(() => {
+  // KPR-225 F3: isolate HIVE_HOME so AgentManager's loadSkillIndex doesn't
+  // rebuild `~/hive/.skill-projections/` on the operator's real default path.
+  // vi.hoisted runs BEFORE imports — paths.ts then resolves hiveHome to this
+  // temp dir at module-load. Top-of-file `process.env.HIVE_HOME = ...` does
+  // NOT work because Vitest hoists ESM imports above top-level statements,
+  // so paths.ts evaluates first (per documented failure mode at
+  // skill-loader.test.ts:553-554). Use require inside the hoisted callback
+  // because vi.hoisted is sync and runs before ESM imports settle.
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const { mkdtempSync } = require("node:fs");
+  const { tmpdir } = require("node:os");
+  const { join } = require("node:path");
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  const dir = mkdtempSync(join(tmpdir(), "hive-agent-manager-test-"));
+  process.env.HIVE_HOME = dir;
+  return { TEST_HIVE_HOME: dir };
+});
+
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
+import { rmSync } from "node:fs";
+
+afterAll(() => {
+  rmSync(TEST_HIVE_HOME, { recursive: true, force: true });
+});
 
 // Mock logger
 vi.mock("../logging/logger.js", () => ({
@@ -1157,6 +1183,44 @@ describe("AgentManager", () => {
       mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered" }));
       const result = await manager.spawnTurn(smsCtx());
       expect(result.finalMessage).toBe("recovered");
+    });
+
+    it("F1 (KPR-225): budget tracking is atomic with per-thread lock — no leak on contention", async () => {
+      // Pre-fix bug: spawnTurn read activeSpawnCount BEFORE the per-thread lock,
+      // then wrote `active + 1` AFTER acquiring it. Two concurrent same-thread
+      // spawns both captured stale `active`, both passed the budget check, both
+      // queued on the lock, then both wrote `active + 1` based on stale state —
+      // leaking +1 per contention event.
+      //
+      // Post-fix: budget read+set is inside the critical section. After both
+      // spawns drain, activeSpawnCount must return to zero (entry deleted).
+      mockRunnerSend.mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve(makeRunResult()), 50)),
+      );
+
+      const sharedThread = "sms:line-1:f1-contention";
+      const ctx1 = smsCtx({ threadId: sharedThread, text: "first" });
+      const ctx2 = smsCtx({ threadId: sharedThread, text: "second" });
+
+      const [r1, r2] = await Promise.all([
+        manager.spawnTurn(ctx1),
+        manager.spawnTurn(ctx2),
+      ]);
+
+      // Both succeed (no spurious budget-exceeded thrown).
+      expect(r1.errors).toEqual([]);
+      expect(r2.errors).toEqual([]);
+
+      // Budget counter returns to zero (entry deleted in finally block).
+      // Pre-fix: would be 1 (or higher) due to the leak.
+      expect((manager as unknown as { activeSpawnCount: Map<string, number> })
+        .activeSpawnCount.get(ctx1.agentId)).toBeUndefined();
+
+      // Per-thread lock released.
+      expect((manager as unknown as { processing: Set<string> })
+        .processing.has(`${ctx1.agentId}:${sharedThread}`)).toBe(false);
+      expect((manager as unknown as { activeSpawnKeys: Set<string> })
+        .activeSpawnKeys.has(`${ctx1.agentId}:${sharedThread}`)).toBe(false);
     });
 
     it("returns errors[] populated when the SDK reports an error result (no throw)", async () => {

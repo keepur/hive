@@ -315,18 +315,27 @@ export class AgentManager {
       throw new Error(`Unknown agent: ${ctx.agentId}`);
     }
 
-    const budget = DEFAULT_PER_AGENT_SPAWN_BUDGET;
-    const active = this.activeSpawnCount.get(ctx.agentId) ?? 0;
-    if (active >= budget) {
-      throw new Error(`Spawn budget exceeded for ${ctx.agentId} (${active}/${budget})`);
-    }
-
+    // KPR-225 F1: per-thread lock acquired BEFORE budget read+set so the budget
+    // tracking is atomic with serialization. Pre-fix bug: contended same-thread
+    // calls captured stale `active` before waiting on the lock, then wrote
+    // `active + 1` post-lock — leaking +1 per contention event.
     const threadKey = `${ctx.agentId}:${ctx.threadId}`;
     while (this.processing.has(threadKey)) {
       await new Promise((r) => setTimeout(r, 25));
     }
     this.processing.add(threadKey);
     this.activeSpawnKeys.add(threadKey);
+
+    const active = this.activeSpawnCount.get(ctx.agentId) ?? 0;
+    if (active >= DEFAULT_PER_AGENT_SPAWN_BUDGET) {
+      // Lock-cleanup-on-throw: explicit because we're past processing.add but
+      // before the try/finally that handles the happy-path cleanup.
+      this.processing.delete(threadKey);
+      this.activeSpawnKeys.delete(threadKey);
+      throw new Error(
+        `Spawn budget exceeded for ${ctx.agentId} (${active}/${DEFAULT_PER_AGENT_SPAWN_BUDGET})`,
+      );
+    }
     this.activeSpawnCount.set(ctx.agentId, active + 1);
 
     if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
