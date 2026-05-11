@@ -331,8 +331,14 @@ export class AgentManager {
 
     if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
 
+    // KPR-224: shape prompt + resolve model router once at the spawnTurn
+    // level so both the happy-path call and any auth-rebuild retry use the
+    // same shaped values, and recordSpawnObservability sees prompt /
+    // modelOverride in scope.
+    const shaping = await this.prepareSpawn(ctx);
+
     try {
-      const result = await this.runOneSpawnAttempt(ctx, onStream);
+      const result = await this.runOneSpawnAttempt(ctx, shaping, onStream);
 
       if (result.error && isAuthRebuildResumeError(result.error) && ctx.sessionId) {
         log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
@@ -340,11 +346,15 @@ export class AgentManager {
           threadId: ctx.threadId,
           reason: result.error,
         });
-        const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, onStream);
-        return this.finalizeSpawnResult(ctx, retry);
+        const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, shaping, onStream);
+        const turnResult = this.finalizeSpawnResult(ctx, retry);
+        this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, retry);
+        return turnResult;
       }
 
-      return this.finalizeSpawnResult(ctx, result);
+      const turnResult = this.finalizeSpawnResult(ctx, result);
+      this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, result);
+      return turnResult;
     } finally {
       this.processing.delete(threadKey);
       this.activeSpawnKeys.delete(threadKey);
@@ -356,6 +366,12 @@ export class AgentManager {
 
   private async runOneSpawnAttempt(
     ctx: TurnContext,
+    shaping: {
+      prompt: string;
+      modelOverride: string | undefined;
+      resourceLimits: ResourceLimits | undefined;
+      routerCostUsd: number;
+    },
     onStream?: SpawnTurnStreamCallback,
   ): Promise<RunResult> {
     // Fresh runner per spawn — its lazy-built in-process MCPs are therefore
@@ -373,15 +389,19 @@ export class AgentManager {
       slackThreadTs: (ctx.workItem.meta?.slackThreadTs as string) ?? "",
     };
 
-    return runner.send(
-      ctx.workItem.text,
+    const result = await runner.send(
+      shaping.prompt,
       ctx.sessionId,
       onStream,
       bgContext,
-      undefined,
-      undefined,
+      shaping.modelOverride,
+      shaping.resourceLimits,
       ctx.systemPromptOverride,
     );
+    // KPR-224: model router cost lives outside RunResult; add it here so
+    // finalizeSpawnResult and recordSpawnObservability see the full cost.
+    result.costUsd += shaping.routerCostUsd;
+    return result;
   }
 
   /**
