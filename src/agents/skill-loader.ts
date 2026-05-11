@@ -563,14 +563,22 @@ function scanSkillsFrom(
         // so no eviction happened and `getSkillsForAgent` returned both the
         // agent-private and the universal customer skill simultaneously.
         //
-        // Match `*::<skillName>` — agent-private collision keys have the
-        // form `<agentId>::<skillName>` (line 457 above). The customer's
-        // own collision key is bare `<skillName>` (no `::` prefix, since
-        // implicitAgentScope is undefined for customer-space scans), so the
-        // endsWith filter naturally excludes it. No self-evict possible.
+        // KPR-227: match by `entry.skillName` rather than the bare suffix
+        // of `perAgentKey`. Agent-private collision keys are
+        // `<agentId>::<layoutKey>`, where `layoutKey === legacyWorkflow` for
+        // legacy nested layouts and `layoutKey === skillName` for flat ones.
+        // An `endsWith("::" + skillName)` filter only catches the flat case
+        // and silently misses legacy private skills whose workflow name
+        // differs from the skill name (e.g. `luna::blog-flow` for skill
+        // `publish-blog-post`). Comparing `entry.skillName` covers both.
+        // The `includes("::")` guard mirrors the per-agent loop's invariant
+        // that only `<agentId>::*` keys are evictable — customer/seed/plugin
+        // entries use a bare `layoutKey` as collisionKey because
+        // implicitAgentScope is undefined for those scans, so they have no
+        // `::` and are naturally excluded (no self-evict possible).
         const evictionKeys: string[] = [];
-        for (const perAgentKey of collisionMap.keys()) {
-          if (perAgentKey.endsWith(`::${skillName}`)) {
+        for (const [perAgentKey, entry] of collisionMap.entries()) {
+          if (perAgentKey.includes("::") && entry.skillName === skillName) {
             evictionKeys.push(perAgentKey);
           }
         }

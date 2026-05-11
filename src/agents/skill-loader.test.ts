@@ -736,6 +736,33 @@ describe("agent-private skills (KPR-75)", () => {
     const samLink = readlinkSync(join(sam[0]!.path, "skills", "publish-blog-post"));
     expect(samLink).toContain(join(customer, "publish-blog-post"));
   });
+
+  it("KPR-227 (F2 follow-up): customer skill with `agents: [all]` shadows LEGACY agent-private skills (keyed by workflow)", () => {
+    // KPR-225 F2 fix matched eviction keys by `endsWith("::${skillName}")`.
+    // That suffix only covers FLAT agent-private collisionKeys
+    // (`<agentId>::<skillName>`); it silently misses LEGACY keys whose
+    // layoutKey is the workflow, not the skill name. Result: an `agents:
+    // [all]` customer skill failed to shadow a luna-private legacy skill at
+    // `agents/luna/skills/blog-flow/skills/publish-blog-post` (collisionKey
+    // `luna::blog-flow`), so luna saw both entries.
+    //
+    // KPR-227 switches the hasAll filter to `entry.skillName === skillName`
+    // gated by `perAgentKey.includes("::")`, covering both layouts.
+    writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
+
+    const customer = join(tmp, "skills");
+    writeFlatSkill(customer, "publish-blog-post", ["all"]);
+
+    const index = loadSkillIndex(customer, [], [], ["luna"], tmp);
+
+    // Pre-fix: would be 2 (customer + legacy private). Post-fix: just the
+    // customer (universal) entry — legacy private was evicted via the
+    // entry.skillName match, NOT the bare endsWith suffix.
+    const luna = getSkillsForAgent(index, "luna");
+    expect(luna).toHaveLength(1);
+    const link = readlinkSync(join(luna[0]!.path, "skills", "publish-blog-post"));
+    expect(link).toContain(join(customer, "publish-blog-post"));
+  });
 });
 
 describe("rebuildProjectionRoot fail-fast (KPR-225 F3-bonus)", () => {
