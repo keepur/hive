@@ -311,29 +311,16 @@ export class Dispatcher {
 
   /**
    * KPR-223: per-turn-spawn dispatch helper. When the per-channel flag is on
-   * the dispatcher calls this instead of `agentManager.sendMessage`. Spawns a
-   * fresh `query()` via {@link AgentManager.spawnTurn} with `options.resume =
-   * sessionId` and converts the resulting {@link TurnResult} into the
-   * {@link RunResult} shape that the rest of dispatch expects.
+   * the dispatcher calls this instead of `agentManager.sendMessage`.
    *
-   * KPR-220 Phase 1: TurnResult now carries the seven telemetry-shape fields
-   * plus the two ephemeral-token fields from RunResult, so the dispatcher no
-   * longer has to zero them — the conversion below is now lossless.
+   * KPR-220 Phase 3: session lookup + TurnContext construction moved into
+   * `AgentManager.runWorkItemTurn` so the dispatcher no longer reaches into
+   * `agentManager.getSessionStore()` directly. The conversion below is the
+   * legacy TurnResult → RunResult mapping; Phase 9 extracts it into a named
+   * `convertTurnResult` helper when sendMessage retires.
    */
   private async runPerTurnDispatch(agentId: string, item: WorkItem): Promise<RunResult> {
-    const threadId = item.threadId ?? item.id;
-    const sessionId = await this.agentManager.getSessionStore().get(agentId, threadId);
-
-    const ctx: TurnContext = {
-      agentId,
-      sessionId,
-      channelId: item.source.id,
-      threadId,
-      workItem: item,
-      channel: item.source.kind,
-    };
-
-    const turn = await this.agentManager.spawnTurn(ctx);
+    const turn = await this.agentManager.runWorkItemTurn(agentId, item);
 
     return {
       text: turn.finalMessage,

@@ -182,6 +182,26 @@ function makeMockAgentManager() {
       streamed: false,
       compactions: 0,
     }),
+    runWorkItemTurn: vi.fn().mockResolvedValue({
+      finalMessage: "turn response",
+      newSessionId: "s2",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0.01,
+        durationMs: 800,
+      },
+      errors: [],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+    }),
     getSessionStore: vi.fn().mockReturnValue({
       get: vi.fn().mockResolvedValue(undefined),
     }),
@@ -711,7 +731,7 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     dispatcher.registerAdapter(adapter as any);
   });
 
-  it("routes to spawnTurn when per-turn flag is on (sms)", async () => {
+  it("routes to runWorkItemTurn when per-turn flag is on (sms)", async () => {
     mockConfig.agentManager.perTurnSpawn.sms = true;
     // SMS adapter mock — id="sms", kind="sms"
     const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
@@ -724,13 +744,16 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     });
     await dispatcher.dispatch(item);
 
-    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
+    // KPR-220 Phase 3: dispatcher's per-turn branch now delegates session
+    // lookup + ctx construction to AgentManager.runWorkItemTurn.
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
     expect(agentManager.sendMessage).not.toHaveBeenCalled();
-    const ctx = agentManager.spawnTurn.mock.calls[0]![0];
-    expect(ctx.agentId).toBe("jasper");
-    expect(ctx.channel).toBe("sms");
-    expect(ctx.channelId).toBe("PN_LINE_X");
-    expect(ctx.threadId).toBe("sms:PN_LINE_X:+15550001");
+    // getSessionStore() is no longer reached from the dispatcher's per-turn
+    // path — the wrapper does the resolve internally (B5 dedup).
+    expect(agentManager.getSessionStore).not.toHaveBeenCalled();
+    const [agentId, passedItem] = agentManager.runWorkItemTurn.mock.calls[0]!;
+    expect(agentId).toBe("jasper");
+    expect(passedItem).toBe(item);
   });
 
   it("uses sendMessage when per-turn flag is off (sms)", async () => {
@@ -745,10 +768,10 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     await dispatcher.dispatch(item);
 
     expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-    expect(agentManager.spawnTurn).not.toHaveBeenCalled();
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
   });
 
-  it("fan-out path uses spawnTurn when flag on", async () => {
+  it("fan-out path uses runWorkItemTurn when flag on", async () => {
     mockConfig.agentManager.perTurnSpawn.slack = true;
 
     // Use "random" — not bound to any agent's channels so the dedicated-channel
@@ -759,10 +782,10 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     });
     await dispatcher.dispatch(item);
 
-    // Fan-out path — both Jasper and River are spawned via spawnTurn.
-    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(2);
+    // KPR-220 Phase 3: Fan-out path also delegates to runWorkItemTurn.
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
     expect(agentManager.sendMessage).not.toHaveBeenCalled();
-    const calledAgents = agentManager.spawnTurn.mock.calls.map((c: any[]) => c[0].agentId);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
   });
@@ -789,7 +812,7 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     expect(passedOnStream).toBe(onStream);
   });
 
-  it("routes WS team WorkItem (kind=team, adapterId=ws) through spawnTurn when perTurnSpawn.ws=true (KPR-224 F1)", async () => {
+  it("routes WS team WorkItem (kind=team, adapterId=ws) through runWorkItemTurn when perTurnSpawn.ws=true (KPR-224 F1)", async () => {
     mockConfig.agentManager.perTurnSpawn.ws = true;
     // WS adapter mock — id="ws", kind="app". Same physical adapter handles
     // both kind:"app" device WorkItems and kind:"team" channel WorkItems
@@ -809,7 +832,7 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     });
     await dispatcher.dispatch(item);
 
-    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
     expect(agentManager.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -818,11 +841,12 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
     dispatcher.registerAdapter(smsAdapter as any);
 
-    // Override the default spawnTurn mock with a TurnResult carrying real
-    // execution metrics. Pre-Phase-1 the dispatcher zeroed these on the way
-    // out because TurnResult had no shape for them; post-Phase-1 they pass
-    // through into the RunResult that drives the `Work item dispatched` log.
-    agentManager.spawnTurn.mockResolvedValueOnce({
+    // Override runWorkItemTurn (Phase 3 changed the dispatcher call site)
+    // with a TurnResult carrying real execution metrics. Pre-Phase-1 the
+    // dispatcher zeroed these on the way out because TurnResult had no shape
+    // for them; post-Phase-1 they pass through into the RunResult that
+    // drives the `Work item dispatched` log.
+    agentManager.runWorkItemTurn.mockResolvedValueOnce({
       finalMessage: "ok",
       newSessionId: "s-metrics",
       usage: {
@@ -855,7 +879,7 @@ describe("Per-turn-spawn routing (KPR-223)", () => {
     });
     await dispatcher.dispatch(item);
 
-    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
 
     const logCall = mockLogInfo.mock.calls.find(
       ([msg]) => msg === "Work item dispatched",

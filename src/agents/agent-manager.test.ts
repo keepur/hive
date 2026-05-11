@@ -1179,6 +1179,45 @@ describe("AgentManager", () => {
       await p1.catch(() => undefined);
     });
 
+    it("KPR-220 Phase 3: runWorkItemTurn resolves session via store and delegates to spawnTurn", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Pre-seed a session so the wrapper's lookup hits.
+      sessionStore.set("agent-a", "sms:line-1:wrap", "stored-session", undefined as any);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "stored-session" }));
+
+      const item = makeWorkItem({
+        text: "wrapped",
+        threadId: "sms:line-1:wrap",
+        source: { kind: "sms" as const, id: "line-1", label: "May (CEO)" },
+        sender: "+15551112222",
+      });
+
+      const result = await manager.runWorkItemTurn("agent-a", item);
+
+      expect(result.finalMessage).toBe("response");
+      expect(sessionStore.get).toHaveBeenCalledWith("agent-a", "sms:line-1:wrap");
+      // Underlying runner.send was resumed against the stored sessionId.
+      const [, sessionArg] = mockRunnerSend.mock.calls[0]!;
+      expect(sessionArg).toBe("stored-session");
+    });
+
+    it("KPR-220 Phase 3: runWorkItemTurn falls back to item.id as threadKey when threadId absent", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult());
+
+      const item = makeWorkItem({
+        text: "no thread id",
+        // No threadId — wrapper must use item.id as the lookup key.
+        source: { kind: "sms" as const, id: "line-1", label: "May (CEO)" },
+        sender: "+15553334444",
+      });
+      delete (item as { threadId?: string }).threadId;
+
+      await manager.runWorkItemTurn("agent-a", item);
+
+      expect(sessionStore.get).toHaveBeenCalledWith("agent-a", item.id);
+    });
+
     it("KPR-220 Phase 2: withSpawnTicket post-lock stop check cleans up + throws AgentStoppedError", async () => {
       // The race we close: stopAgent flips `stoppedAgents` AFTER the wait loop
       // exits AND ticket.set runs but BEFORE fn(ticket) is called. Without the

@@ -342,6 +342,33 @@ export class AgentManager {
   }
 
   /**
+   * KPR-220 Phase 3: public per-turn entry point for channel adapters.
+   * Resolves session, builds TurnContext, and delegates to spawnTurn. The
+   * dispatcher's runPerTurnDispatch and (Phase 9) unconditional dispatch
+   * use this — keeps session lookup + ctx construction in one place so
+   * caller sites stay one-liner.
+   */
+  async runWorkItemTurn(
+    agentId: string,
+    item: WorkItem,
+    onStream?: SpawnTurnStreamCallback,
+  ): Promise<TurnResult> {
+    const threadId = item.threadId ?? item.id;
+    const sessionId = await this.sessionStore.get(agentId, threadId);
+
+    const ctx: TurnContext = {
+      agentId,
+      sessionId,
+      channelId: item.source.id,
+      threadId,
+      workItem: item,
+      channel: item.source.kind,
+    };
+
+    return this.spawnTurn(ctx, onStream);
+  }
+
+  /**
    * KPR-216: per-turn spawn API (Phase A). Spawns a fresh `query()` per
    * turn with `options.resume = ctx.sessionId`. Replaces the long-lived
    * AgentRunner.send() path for opt-in channels.
