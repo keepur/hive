@@ -190,12 +190,15 @@ describe("isAuthError", () => {
 // KPR-219: per-turn-via-AgentManager path tests
 // ---------------------------------------------------------------------------
 
-describe("VoiceAdapter — flag OFF (legacy path preserved)", () => {
+// KPR-220 Phase 8: legacy direct-`query()` path retired. Voice now ALWAYS
+// routes through spawnTurnViaAgentManager regardless of the perTurnSpawn
+// flag (which Phase 9 deletes from config).
+describe("VoiceAdapter — KPR-220 Phase 8 retirement", () => {
   beforeEach(() => {
     configRef.current.agentManager.perTurnSpawn.voice = false;
     sdkMessagesRef.current = [
       { type: "system", subtype: "init", session_id: "sdk-sid-1" },
-      { type: "result", subtype: "success", result: "legacy-text" },
+      { type: "result", subtype: "success", result: "any-text" },
     ];
   });
 
@@ -203,15 +206,22 @@ describe("VoiceAdapter — flag OFF (legacy path preserved)", () => {
     vi.clearAllMocks();
   });
 
-  it("does not call spawnTurn when flag is off, even if agentManager wired", async () => {
+  it("constructor throws when agentManager is not provided", () => {
+    expect(() =>
+      // Test wiring: pass undefined (typed-undefined coercion mirrors prod misconfig).
+      new VoiceAdapter(0, "shared-secret", {} as any, {} as any, undefined as unknown as any),
+    ).toThrow(/AgentManager/);
+  });
+
+  it("handleChatCompletion always routes through spawnTurnViaAgentManager (no flag check)", async () => {
     const am = makeAgentManager();
     const adapter = makeVoiceAdapter(am);
     const res = new MockServerResponse();
     const req = makeRequest({ stream: false });
     await callHandle(adapter, req, res);
-    expect(am.spawnTurn).not.toHaveBeenCalled();
-    // Legacy path emitted a non-streaming JSON response.
-    expect(res.statusCode).toBe(200);
+    // Even with the legacy flag off, spawnTurn fires — the direct-query
+    // fallback no longer exists.
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -1,5 +1,4 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../../logging/logger.js";
 import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
@@ -47,12 +46,11 @@ export class VoiceAdapter {
     private registry: AgentRegistry,
     private memoryManager: MemoryManager,
     /**
-     * KPR-219: optional so legacy callers / unit tests that exercise just the
-     * inline direct-`query()` path don't need a manager. The flag-on
-     * spawnTurnViaAgentManager path requires it; if it's missing AND the flag
-     * is on, we fall through to the legacy path with a warning.
+     * KPR-220 Phase 8: required. The inline direct-`query()` fallback path
+     * has retired; every voice turn now routes through
+     * spawnTurnViaAgentManager. Constructing without it throws.
      */
-    private agentManager?: AgentManager,
+    private agentManager: AgentManager,
     /**
      * KPR-223: optional dispatcher reference. When wired, voice turns route
      * through `dispatcher.routeVoiceTurn` (which applies taskLedger + audit
@@ -61,7 +59,11 @@ export class VoiceAdapter {
      * that doesn't need the full dispatcher.
      */
     private dispatcher?: Dispatcher,
-  ) {}
+  ) {
+    if (!agentManager) {
+      throw new Error("VoiceAdapter requires AgentManager (KPR-220 Phase 8 retired the direct-query fallback)");
+    }
+  }
 
   async start(): Promise<void> {
     this.httpServer = createServer((req, res) => {
@@ -195,218 +197,11 @@ export class VoiceAdapter {
       log.info("Voice call session started", { callId, agentId });
     }
 
-    // KPR-219: route through AgentManager.spawnTurn when the per-channel flag
-    // is on AND the manager dependency was wired. Voice is per-turn either way
-    // — the flag flips between direct `query()` and `spawnTurn` (per-thread
-    // lock + per-agent budget + session-store managed instead of the
-    // in-adapter Map).
-    if (config.agentManager.perTurnSpawn.voice && this.agentManager) {
-      return this.spawnTurnViaAgentManager(res, request, agentId, agentConfig, callId);
-    }
-    if (config.agentManager.perTurnSpawn.voice && !this.agentManager) {
-      log.warn("Voice perTurnSpawn flag on but agentManager not wired — falling back to direct query()");
-    }
-
-    // Build system prompt with call context
-    const callMeta = request.call?.metadata as Record<string, string> | undefined;
-    const systemPrompt = await buildVoiceSystemPrompt(agentConfig, this.memoryManager, {
-      goal: callMeta?.goal,
-      context: callMeta?.context,
-    });
-
-    const session = this.sessions.get(callId)!; // guaranteed present after bookkeeping
-
-    const model = agentConfig.model;
-    const completionId = `chatcmpl-${randomUUID()}`;
-    const startedAt = Date.now();
-
-    const buildQuery = (resumeSessionId: string | undefined) => {
-      const turnPrompt = resumeSessionId
-        ? extractLatestUserMessage(request.messages)
-        : renderConversationPrompt(request.messages);
-
-      // If we tried to resume but the latest user message is empty (shouldn't
-      // happen mid-call, but defensive), fall back to full transcript framing.
-      const safePrompt = resumeSessionId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
-      const effectiveResume = resumeSessionId && turnPrompt ? resumeSessionId : undefined;
-
-      return {
-        q: query({
-          prompt: safePrompt,
-          options: {
-            model: agentConfig.model,
-            systemPrompt,
-            permissionMode: "bypassPermissions",
-            allowDangerouslySkipPermissions: true,
-            maxTurns: 1,
-            settingSources: [],
-            includePartialMessages: request.stream !== false,
-            env: {
-              ...process.env,
-              ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
-              CLAUDE_AGENT_SDK_CLIENT_APP: "hive/voice",
-              CLAUDECODE: undefined,
-            },
-            extraArgs: { "strict-mcp-config": null },
-            ...(effectiveResume ? { resume: effectiveResume } : {}),
-          },
-        }),
-        isResumeAttempt: !!effectiveResume,
-      };
-    };
-
-    type TurnOutcome =
-      | { ok: true; firstTokenMs: number | undefined; resultSubtype?: string }
-      | { ok: false; reason: string; bytesSent: boolean };
-
-    const runTurn = async (q: ReturnType<typeof query>, isStreaming: boolean): Promise<TurnOutcome> => {
-      let firstTokenMs: number | undefined;
-      let resultSubtype: string | undefined;
-      let assistantText = "";
-      let headersSent = false;
-
-      try {
-        for await (const message of q) {
-          const msg = message as SDKMessage;
-
-          // Capture session id for next turn's resume.
-          if (msg.type === "system" && (msg as any).subtype === "init") {
-            const sid = (msg as any).session_id as string | undefined;
-            if (sid) session.sdkSessionId = sid;
-          }
-
-          // Streaming text path — write SSE chunks lazily.
-          if (isStreaming && msg.type === "stream_event") {
-            const event = (msg as any).event;
-            if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
-              if (!headersSent) {
-                res.writeHead(200, {
-                  "Content-Type": "text/event-stream",
-                  "Cache-Control": "no-cache",
-                  Connection: "keep-alive",
-                });
-                headersSent = true;
-                firstTokenMs = Date.now() - startedAt;
-              }
-              res.write(formatSSETextChunk(completionId, event.delta.text ?? "", model));
-            }
-          }
-
-          // Non-streaming text path — collect assistant text from the canonical message.
-          if (!isStreaming && msg.type === "assistant") {
-            const content = (msg as any).message?.content;
-            if (Array.isArray(content)) {
-              for (const block of content) {
-                if (block?.type === "text" && typeof block.text === "string") {
-                  if (firstTokenMs === undefined) firstTokenMs = Date.now() - startedAt;
-                  assistantText = block.text;
-                }
-              }
-            }
-          }
-
-          if (msg.type === "result") {
-            resultSubtype = (msg as any).subtype;
-            if (!isStreaming && resultSubtype === "success") {
-              assistantText = (msg as any).result || assistantText;
-            }
-          }
-        }
-      } catch (err) {
-        return { ok: false, reason: String(err), bytesSent: headersSent };
-      }
-
-      if (resultSubtype && resultSubtype !== "success") {
-        return { ok: false, reason: `result.subtype=${resultSubtype}`, bytesSent: headersSent };
-      }
-
-      // Streaming branch finalization — emit [DONE] and end.
-      if (isStreaming) {
-        if (!headersSent) {
-          // Resume succeeded but produced no text (degenerate but not impossible).
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
-          headersSent = true;
-        }
-        res.write(formatSSEDone(completionId, model));
-        res.end();
-        return { ok: true, firstTokenMs, resultSubtype };
-      }
-
-      // Non-streaming branch finalization — return the JSON body to caller.
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(formatNonStreamingResponse(completionId, assistantText, model)));
-      return { ok: true, firstTokenMs, resultSubtype };
-    };
-
-    let { q, isResumeAttempt } = buildQuery(session.sdkSessionId);
-    let outcome = await runTurn(q, request.stream !== false);
-
-    const sdkSessionResumeAttempted = isResumeAttempt;
-
-    if (!outcome.ok && isResumeAttempt && !outcome.bytesSent) {
-      // Resume failed before any bytes hit the wire — retry as turn-1 with full transcript.
-      log.warn("Voice session resume failed, retrying as turn-1", {
-        callId,
-        reason: outcome.reason,
-      });
-      session.sdkSessionId = undefined;
-      ({ q, isResumeAttempt } = buildQuery(undefined));
-      outcome = await runTurn(q, request.stream !== false);
-    }
-
-    if (!outcome.ok) {
-      // Either not a resume attempt, or retry also failed, or bytes already sent (mid-stream failure).
-      if (isAuthError(outcome.reason)) {
-        log.error("Voice query failed — OAuth credentials unavailable", {
-          callId,
-          agentId,
-          reason: outcome.reason,
-        });
-        if (!outcome.bytesSent) {
-          res.writeHead(503, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Voice unavailable" }));
-        } else {
-          // Bytes already sent — best we can do is end the SSE stream with an error sentinel.
-          if (!res.writableEnded) {
-            res.write(formatSSEDone(completionId, model, "error"));
-            res.end();
-          }
-        }
-        return;
-      }
-
-      log.error("Voice query failed", {
-        callId,
-        agentId,
-        reason: outcome.reason,
-        bytesSent: outcome.bytesSent,
-      });
-      if (!outcome.bytesSent) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Internal error" }));
-      } else {
-        if (!res.writableEnded) {
-          res.write(formatSSEDone(completionId, model, "error"));
-          res.end();
-        }
-      }
-      return;
-    }
-
-    log.info("Voice turn complete", {
-      callId,
-      agentId,
-      firstTokenMs: outcome.firstTokenMs,
-      totalMs: Date.now() - startedAt,
-      mode: request.stream === false ? "non-streaming" : "streaming",
-      resultSubtype: outcome.resultSubtype,
-      sdkSessionResumeAttempted, // captured BEFORE retry — preserves the original turn classification
-      sdkSessionResumed: sdkSessionResumeAttempted && outcome.ok && isResumeAttempt, // true iff resumed AND we didn't retry
-    });
+    // KPR-220 Phase 8: voice always routes through spawnTurnViaAgentManager;
+    // the inline direct-`query()` fallback has been retired. The legacy
+    // perTurnSpawn.voice flag is no longer consulted (Phase 9 removes the
+    // config key entirely).
+    return this.spawnTurnViaAgentManager(res, request, agentId, agentConfig, callId);
   }
 
   /**
