@@ -34,14 +34,20 @@ export class HealthReporter {
   generateReport(): HealthReport {
     const agents: HealthReport["agents"] = {};
 
+    // KPR-220 Phase 11: snapshot is the coordinator-shaped view (activeSpawns,
+    // budget, saturation, stopped). `getAllStates()` still carries persistent
+    // counters (messagesProcessed, errorCount, lastActivity) — both surfaces
+    // are stable, so we merge them here.
+    const snapshot = this.agentManager.getSnapshot();
     for (const state of this.agentManager.getAllStates()) {
+      const perAgent = snapshot.perAgent[state.id];
       agents[state.id] = {
         status: state.status,
         lastActivity: state.lastActivity.toISOString(),
         messagesProcessed: state.messagesProcessed,
         errorCount: state.errorCount,
         sessionId: state.currentSessionId,
-        activeThreads: state.activeThreadCount ?? 0,
+        activeThreads: perAgent?.activeSpawns ?? state.activeThreadCount ?? 0,
       };
     }
 

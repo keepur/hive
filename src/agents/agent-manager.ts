@@ -167,6 +167,39 @@ export interface SpawnTicket {
 }
 
 /**
+ * KPR-220 Phase 11 / spec S6: read-only snapshot of the spawn coordinator's
+ * per-agent state. Consumers (health-reporter, ws-adapter agent list, doctor
+ * heartbeat) project this into their UI shapes — no internal map access.
+ *
+ * `stopped` (spec S8) reflects `stoppedAgents.has(agentId)` so the doctor +
+ * dashboard surfaces stopped agents distinctly from "idle" ones.
+ */
+export interface CoordinatorSnapshotPerAgent {
+  /** Number of in-flight spawn tickets for this agent. */
+  activeSpawns: number;
+  /** Per-thread spawn keys currently in `processing` for this agent. */
+  activeThreadKeys: string[];
+  /** Resolved budget for this agent (agent.spawnBudget → maxConcurrent → engine default). */
+  budget: number;
+  /** Source of the budget — which fallback fired. */
+  budgetSource: "spawnBudget" | "maxConcurrent" | "default";
+  /** How many times withSpawnTicket has rejected this agent for budget over the lifetime of the process. */
+  saturationCount: number;
+  /** Unix epoch (ms) of the most recent saturation event, or null if never. */
+  lastSaturationAt: number | null;
+  /** Unix epoch (ms) of the most recent spawn start, or null if never. */
+  lastSpawnAt: number | null;
+  /** Most recent error-string surfaced by a spawn (truncated to 240 chars), or null. */
+  lastError: string | null;
+  /** Whether the agent is in `stoppedAgents` (spec S8). */
+  stopped: boolean;
+}
+
+export interface CoordinatorSnapshot {
+  perAgent: Record<string, CoordinatorSnapshotPerAgent>;
+}
+
+/**
  * KPR-220 Phase 6: per-(agentId,threadId) reflection coordinator state.
  * The legacy queue-drain trigger is replaced by post-quiescence debounce —
  * each non-reflection turn updates this state and (re)schedules a timer.
@@ -238,6 +271,13 @@ export class AgentManager {
   // KPR-220 Phase 6: per-(agentId,threadId) reflection coordinator state.
   private reflectionStates = new Map<string, ReflectionState>();
   private reflectionDebounceMs: number;
+  // KPR-220 Phase 11: per-agent saturation tracking. Incremented in
+  // `recordSaturation` from `withSpawnTicket`'s budget-exceeded throw path.
+  private saturationEvents = new Map<string, { count: number; lastAt: number }>();
+  // KPR-220 Phase 11: most-recent spawn-start timestamp per agent.
+  private lastSpawnAt = new Map<string, number>();
+  // KPR-220 Phase 11: most-recent spawn error per agent (truncated).
+  private lastSpawnError = new Map<string, string>();
 
   constructor(
     registry: AgentRegistry,
@@ -485,11 +525,13 @@ export class AgentManager {
     if (active >= budget) {
       this.processing.delete(threadKey);
       this.activeSpawnKeys.delete(threadKey);
+      this.recordSaturation(ctx.agentId, active, budget);
       throw new Error(
         `Spawn budget exceeded for ${ctx.agentId} (${active}/${budget})`,
       );
     }
     this.activeSpawnCount.set(ctx.agentId, active + 1);
+    this.lastSpawnAt.set(ctx.agentId, Date.now());
 
     let abortHandle: (() => void) | undefined;
     const ticket: SpawnTicket = {
@@ -553,6 +595,70 @@ export class AgentManager {
   private spawnBudgetFor(agentId: string): number {
     const def = this.registry.get(agentId);
     return def?.spawnBudget ?? def?.maxConcurrent ?? DEFAULT_PER_AGENT_SPAWN_BUDGET;
+  }
+
+  /**
+   * KPR-220 Phase 11: returns which fallback fired for an agent's budget.
+   * Mirrors `spawnBudgetFor`'s chain so the snapshot can surface the source
+   * (helpful when an operator wants to know whether to set `spawnBudget` on
+   * the agent definition vs. relying on legacy `maxConcurrent`).
+   */
+  private spawnBudgetSource(agentId: string): "spawnBudget" | "maxConcurrent" | "default" {
+    const def = this.registry.get(agentId);
+    if (def?.spawnBudget !== undefined) return "spawnBudget";
+    if (def?.maxConcurrent !== undefined) return "maxConcurrent";
+    return "default";
+  }
+
+  /**
+   * KPR-220 Phase 11: invoked by `withSpawnTicket` when the per-agent budget
+   * blocks a spawn. Increments saturation count + timestamp for the snapshot;
+   * also logs warn so the operator sees the saturation event live.
+   */
+  private recordSaturation(agentId: string, active: number, budget: number): void {
+    const prev = this.saturationEvents.get(agentId) ?? { count: 0, lastAt: 0 };
+    const next = { count: prev.count + 1, lastAt: Date.now() };
+    this.saturationEvents.set(agentId, next);
+    log.warn("Spawn budget saturated", { agentId, active, budget, saturationCount: next.count });
+  }
+
+  /**
+   * KPR-220 Phase 11 / spec S6: read-only snapshot of the spawn coordinator.
+   * Iterates the union of agents-with-state and agents-with-tickets so an
+   * agent that was spawned-then-stopped still appears in the snapshot until
+   * its zombie state is swept.
+   */
+  getSnapshot(): CoordinatorSnapshot {
+    const perAgent: Record<string, CoordinatorSnapshotPerAgent> = {};
+    const agentIds = new Set<string>([
+      ...this.states.keys(),
+      ...this.activeTickets.keys(),
+      ...this.saturationEvents.keys(),
+    ]);
+
+    for (const agentId of agentIds) {
+      const tickets = this.activeTickets.get(agentId);
+      const activeSpawns = tickets?.size ?? 0;
+      const prefix = `${agentId}:`;
+      const activeThreadKeys: string[] = [];
+      for (const key of this.activeSpawnKeys) {
+        if (key.startsWith(prefix)) activeThreadKeys.push(key);
+      }
+      const sat = this.saturationEvents.get(agentId);
+      perAgent[agentId] = {
+        activeSpawns,
+        activeThreadKeys,
+        budget: this.spawnBudgetFor(agentId),
+        budgetSource: this.spawnBudgetSource(agentId),
+        saturationCount: sat?.count ?? 0,
+        lastSaturationAt: sat?.lastAt ?? null,
+        lastSpawnAt: this.lastSpawnAt.get(agentId) ?? null,
+        lastError: this.lastSpawnError.get(agentId) ?? null,
+        stopped: this.stoppedAgents.has(agentId),
+      };
+    }
+
+    return { perAgent };
   }
 
   /**
@@ -905,7 +1011,12 @@ export class AgentManager {
     state.messagesProcessed++;
     state.lastActivity = new Date();
     state.currentSessionId = result.sessionId;
-    if (result.error) state.errorCount++;
+    if (result.error) {
+      state.errorCount++;
+      // KPR-220 Phase 11: surface the most-recent error in the snapshot
+      // (truncated to 240 chars to keep the heartbeat doc bounded).
+      this.lastSpawnError.set(ctx.agentId, result.error.slice(0, 240));
+    }
 
     return {
       finalMessage: result.text,

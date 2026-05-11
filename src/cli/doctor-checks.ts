@@ -291,6 +291,82 @@ export async function prefixCacheStatsForDoctor(uri: string, dbName: string): Pr
   }
 }
 
+/**
+ * KPR-220 Phase 11 / spec S6+S8: per-agent spawn-coordinator snapshot row,
+ * read from the `telemetry` collection where the engine heartbeats it every
+ * 30s under `kind: "spawn_coordinator_stats"`.
+ */
+export interface SpawnCoordinatorRow {
+  agentId: string;
+  activeSpawns: number;
+  budget: number;
+  budgetSource: "spawnBudget" | "maxConcurrent" | "default";
+  saturationCount: number;
+  lastSaturationAt: number | null;
+  lastSpawnAt: number | null;
+  lastError: string | null;
+  stopped: boolean;
+  /** Seconds since the engine last wrote this doc; null if no doc found yet. */
+  staleSeconds: number | null;
+}
+
+/**
+ * Read-only doctor adapter for the per-agent
+ * `kind="spawn_coordinator_stats"` heartbeat docs (KPR-220 Phase 11).
+ * Mirrors `prefixCacheStatsForDoctor` — short-lived MongoClient + per-agent
+ * documents. Returns an empty array if no docs exist yet.
+ */
+export async function spawnCoordinatorStatsForDoctor(
+  uri: string,
+  dbName: string,
+): Promise<SpawnCoordinatorRow[]> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const docs = await client
+      .db(dbName)
+      .collection("telemetry")
+      .find<{
+        agentId?: string;
+        activeSpawns?: number;
+        budget?: number;
+        budgetSource?: "spawnBudget" | "maxConcurrent" | "default";
+        saturationCount?: number;
+        lastSaturationAt?: number | null;
+        lastSpawnAt?: number | null;
+        lastError?: string | null;
+        stopped?: boolean;
+        updatedAt?: Date;
+      }>({ kind: "spawn_coordinator_stats" })
+      .toArray();
+    return docs
+      .filter((d) => typeof d.agentId === "string")
+      .map((d) => {
+        const updatedAt = d.updatedAt instanceof Date ? d.updatedAt : null;
+        return {
+          agentId: d.agentId as string,
+          activeSpawns: d.activeSpawns ?? 0,
+          budget: d.budget ?? 0,
+          budgetSource: d.budgetSource ?? "default",
+          saturationCount: d.saturationCount ?? 0,
+          lastSaturationAt: d.lastSaturationAt ?? null,
+          lastSpawnAt: d.lastSpawnAt ?? null,
+          lastError: d.lastError ?? null,
+          stopped: d.stopped ?? false,
+          staleSeconds: updatedAt
+            ? Math.round((Date.now() - updatedAt.getTime()) / 1000)
+            : null,
+        };
+      })
+      .sort((a, b) => a.agentId.localeCompare(b.agentId));
+  } catch {
+    return [];
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 // ── resolved paths ─────────────────────────────────────────────────────
 
 /** Expand ~ in a path. */

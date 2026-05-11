@@ -1859,4 +1859,119 @@ describe("AgentManager", () => {
       }
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // KPR-220 Phase 11: getSnapshot + saturation tracking
+  // ---------------------------------------------------------------------------
+  describe("getSnapshot (KPR-220 Phase 11)", () => {
+    it("returns empty perAgent map when no agents have state", () => {
+      const snapshot = manager.getSnapshot();
+      expect(snapshot).toEqual({ perAgent: {} });
+    });
+
+    it("returns activeSpawns, budget, budgetSource, lastSpawnAt for an agent after spawnTurn", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const before = Date.now();
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+      const after = Date.now();
+
+      const snapshot = manager.getSnapshot();
+      const perAgent = snapshot.perAgent["agent-a"];
+      expect(perAgent).toBeDefined();
+      expect(perAgent!.activeSpawns).toBe(0); // ticket released after spawn completes
+      expect(perAgent!.budget).toBe(2); // agent-a has maxConcurrent: 2 → fallback chain → 2
+      expect(perAgent!.budgetSource).toBe("maxConcurrent");
+      expect(perAgent!.saturationCount).toBe(0);
+      expect(perAgent!.lastSaturationAt).toBeNull();
+      expect(perAgent!.lastError).toBeNull();
+      expect(perAgent!.stopped).toBe(false);
+      expect(perAgent!.lastSpawnAt).toBeGreaterThanOrEqual(before);
+      expect(perAgent!.lastSpawnAt).toBeLessThanOrEqual(after);
+    });
+
+    it("reports activeSpawns > 0 mid-flight (snapshot taken inside spawn)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      let capturedActiveSpawns = -1;
+      mockRunnerSend.mockImplementation(async () => {
+        capturedActiveSpawns = manager.getSnapshot().perAgent["agent-a"]!.activeSpawns;
+        return makeRunResult();
+      });
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+      expect(capturedActiveSpawns).toBe(1);
+    });
+
+    it("KPR-220 Phase 11: recordSaturation increments saturationCount and lastSaturationAt on budget reject", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Park 2 spawns to fill the agent-a maxConcurrent=2 budget. Each parked
+      // spawn gets its own resolver so the cleanup can drain them both.
+      const resolvers: Array<() => void> = [];
+      mockRunnerSend.mockImplementation(
+        () =>
+          new Promise<any>((resolve) => {
+            resolvers.push(() => resolve(makeRunResult()));
+          }),
+      );
+
+      const p1 = manager.spawnTurn(makeSmsCtx({ agentId: "agent-a", threadId: "t-sat-1" }));
+      const p2 = manager.spawnTurn(makeSmsCtx({ agentId: "agent-a", threadId: "t-sat-2" }));
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Third spawn must hit the budget-exceeded path and increment saturation.
+      const before = Date.now();
+      await expect(
+        manager.spawnTurn(makeSmsCtx({ agentId: "agent-a", threadId: "t-sat-3" })),
+      ).rejects.toThrow(/Spawn budget exceeded/);
+      const after = Date.now();
+
+      const snapshot = manager.getSnapshot();
+      const perAgent = snapshot.perAgent["agent-a"]!;
+      expect(perAgent.saturationCount).toBe(1);
+      expect(perAgent.lastSaturationAt).toBeGreaterThanOrEqual(before);
+      expect(perAgent.lastSaturationAt).toBeLessThanOrEqual(after);
+
+      // Cleanup — release parked spawns.
+      for (const r of resolvers) r();
+      await Promise.all([p1, p2]).catch(() => {});
+    });
+
+    it("KPR-220 Phase 11 / spec S8: snapshot.stopped reflects stoppedAgents", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+      manager.stopAgent("agent-a");
+
+      const snapshot = manager.getSnapshot();
+      expect(snapshot.perAgent["agent-a"]!.stopped).toBe(true);
+
+      // restart clears the flag in the snapshot
+      manager.restartAgent("agent-a");
+      const after = manager.getSnapshot();
+      expect(after.perAgent["agent-a"]!.stopped).toBe(false);
+    });
+
+    it("KPR-220 Phase 11: snapshot.lastError carries truncated runner error string", async () => {
+      const longError = "a".repeat(300);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "partial", error: longError }));
+      mockConversationIndex.mockResolvedValue(undefined);
+
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+
+      const perAgent = manager.getSnapshot().perAgent["agent-a"]!;
+      expect(perAgent.lastError).not.toBeNull();
+      expect(perAgent.lastError!.length).toBe(240);
+      expect(perAgent.lastError!).toBe(longError.slice(0, 240));
+    });
+
+    it("budgetSource defaults to 'default' when neither spawnBudget nor maxConcurrent is set", async () => {
+      // agent-b has no maxConcurrent + no spawnBudget → falls through to engine default
+      const snapshot = manager.getSnapshot();
+      // No state yet for agent-b, so perAgent.agent-b is absent
+      expect(snapshot.perAgent["agent-b"]).toBeUndefined();
+
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-b" }));
+      const snap = manager.getSnapshot();
+      expect(snap.perAgent["agent-b"]!.budgetSource).toBe("default");
+      expect(snap.perAgent["agent-b"]!.budget).toBe(5);
+    });
+  });
 });

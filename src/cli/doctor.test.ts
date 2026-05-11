@@ -3,7 +3,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { renderPrefixCacheSection, renderPromptCacheSection, resolveRequiredEnvVars } from "./doctor.js";
+import {
+  renderPrefixCacheSection,
+  renderPromptCacheSection,
+  renderSpawnCoordinatorSection,
+  resolveRequiredEnvVars,
+} from "./doctor.js";
 
 describe("resolveRequiredEnvVars", () => {
   let dir: string;
@@ -222,5 +227,110 @@ describe("renderPrefixCacheSection", () => {
       (l) => lines.push(l),
     );
     expect(lines.join("\n")).toContain("hit-rate=no data");
+  });
+});
+
+describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
+  it("renders 'no heartbeat yet' when no rows are available", () => {
+    const lines: string[] = [];
+    renderSpawnCoordinatorSection([], (l) => lines.push(l));
+    const out = lines.join("\n");
+    expect(out).toContain("Spawn coordinator (live engine, per agent)");
+    expect(out).toContain("no heartbeat yet");
+  });
+
+  it("renders one line per agent with budget, source, saturation, and freshness", () => {
+    const lines: string[] = [];
+    renderSpawnCoordinatorSection(
+      [
+        {
+          agentId: "agent-a",
+          activeSpawns: 2,
+          budget: 5,
+          budgetSource: "spawnBudget",
+          saturationCount: 3,
+          lastSaturationAt: Date.now() - 10_000,
+          lastSpawnAt: Date.now() - 1_000,
+          lastError: null,
+          stopped: false,
+          staleSeconds: 5,
+        },
+      ],
+      (l) => lines.push(l),
+    );
+    const out = lines.join("\n");
+    expect(out).toContain("agent-a");
+    expect(out).toContain("active=2");
+    expect(out).toContain("budget=5");
+    expect(out).toContain("source=spawnBudget");
+    expect(out).toContain("saturations=3");
+    expect(out).toContain("heartbeat 5s ago");
+  });
+
+  it("flags stopped agents distinctly (spec S8)", () => {
+    const lines: string[] = [];
+    renderSpawnCoordinatorSection(
+      [
+        {
+          agentId: "agent-stop",
+          activeSpawns: 0,
+          budget: 5,
+          budgetSource: "default",
+          saturationCount: 0,
+          lastSaturationAt: null,
+          lastSpawnAt: null,
+          lastError: null,
+          stopped: true,
+          staleSeconds: 1,
+        },
+      ],
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).toContain("STOPPED");
+  });
+
+  it("flags stale heartbeat when >120s", () => {
+    const lines: string[] = [];
+    renderSpawnCoordinatorSection(
+      [
+        {
+          agentId: "agent-stale",
+          activeSpawns: 0,
+          budget: 5,
+          budgetSource: "default",
+          saturationCount: 0,
+          lastSaturationAt: null,
+          lastSpawnAt: null,
+          lastError: null,
+          stopped: false,
+          staleSeconds: 300,
+        },
+      ],
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).toContain("stale-heartbeat");
+  });
+
+  it("renders last error on a second line when present", () => {
+    const lines: string[] = [];
+    renderSpawnCoordinatorSection(
+      [
+        {
+          agentId: "agent-err",
+          activeSpawns: 0,
+          budget: 5,
+          budgetSource: "default",
+          saturationCount: 1,
+          lastSaturationAt: Date.now(),
+          lastSpawnAt: Date.now(),
+          lastError: "something broke",
+          stopped: false,
+          staleSeconds: 1,
+        },
+      ],
+      (l) => lines.push(l),
+    );
+    const out = lines.join("\n");
+    expect(out).toContain("last error: something broke");
   });
 });

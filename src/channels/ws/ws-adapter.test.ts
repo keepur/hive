@@ -71,7 +71,7 @@ describe("WsAdapter.buildAgentList()", () => {
   it("returns empty array when registry has no agents", () => {
     const adapter = makeAdapter(
       { getAll: vi.fn().mockReturnValue([]) },
-      { getState: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -90,7 +90,7 @@ describe("WsAdapter.buildAgentList()", () => {
 
     const adapter = makeAdapter(
       { getAll: vi.fn().mockReturnValue([agent]) },
-      { getState: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -113,7 +113,7 @@ describe("WsAdapter.buildAgentList()", () => {
 
     const adapter = makeAdapter(
       { getAll: vi.fn().mockReturnValue([agent]) },
-      { getState: vi.fn().mockReturnValue(state) },
+      { getState: vi.fn().mockReturnValue(state), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -127,7 +127,7 @@ describe("WsAdapter.buildAgentList()", () => {
 
     const adapter = makeAdapter(
       { getAll: vi.fn().mockReturnValue([agent]) },
-      { getState: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -144,7 +144,7 @@ describe("WsAdapter.buildAgentList()", () => {
 
     const adapter = makeAdapter(
       { getAll: vi.fn().mockReturnValue([agent]) },
-      { getState: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -161,7 +161,7 @@ describe("WsAdapter.buildAgentList()", () => {
 
     const adapter = makeAdapter(
       { getAll: vi.fn().mockReturnValue([agent]) },
-      { getState: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -176,7 +176,7 @@ describe("WsAdapter.buildAgentList()", () => {
 
     const adapter = makeAdapter(
       { getAll: vi.fn().mockReturnValue([agent]) },
-      { getState: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
     );
 
     const result = (adapter as any).buildAgentList();
@@ -218,7 +218,7 @@ describe("WsAdapter upgrade handler", () => {
     adapter = new WsAdapter(0, {
       ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
     await adapter.start(() => {});
     return adapter;
@@ -423,7 +423,7 @@ describe("WsAdapter upgrade handler", () => {
     adapter = new WsAdapter(0, {
       ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
     const captured: any[] = [];
     await adapter.start((item) => captured.push(item));
@@ -459,7 +459,7 @@ describe("WsAdapter upgrade handler", () => {
     adapter = new WsAdapter(0, {
       ...noopTeamDeps(),
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
     const captured: any[] = [];
     await adapter.start((item) => captured.push(item));
@@ -530,7 +530,7 @@ describe("WsAdapter team meta.user propagation (KPR-23)", () => {
     adapter = new WsAdapter(0, {
       ...teamDeps,
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
 
     const captured: any[] = [];
@@ -566,7 +566,7 @@ describe("WsAdapter team meta.user propagation (KPR-23)", () => {
     adapter = new WsAdapter(0, {
       ...teamDeps,
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
 
     const captured: any[] = [];
@@ -601,7 +601,7 @@ describe("WsAdapter team meta.user propagation (KPR-23)", () => {
     adapter = new WsAdapter(0, {
       ...teamDeps,
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
 
     const captured: any[] = [];
@@ -640,7 +640,7 @@ describe("WsAdapter team meta.user propagation (KPR-23)", () => {
     adapter = new WsAdapter(0, {
       ...teamDeps,
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
 
     const captured: any[] = [];
@@ -702,7 +702,7 @@ describe("WsAdapter.handleCommand (KPR-11)", () => {
         execute,
       } as any,
       agentRegistry: { getAll: vi.fn().mockReturnValue([]) } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     };
     const adapter = new WsAdapter(0, deps);
     return { adapter, deps, saveMessage, execute };
@@ -814,7 +814,7 @@ describe("WsAdapter buffering on disconnect (KPR-223 coverage migration)", () =>
         getAll: vi.fn().mockReturnValue([]),
         get: vi.fn().mockReturnValue({ name: "Rae" }),
       } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
     await adapter.start(() => {});
 
@@ -838,7 +838,7 @@ describe("WsAdapter buffering on disconnect (KPR-223 coverage migration)", () =>
         getAll: vi.fn().mockReturnValue([]),
         get: vi.fn().mockReturnValue({ name: "Rae" }),
       } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
     await adapter.start(() => {});
 
@@ -874,7 +874,7 @@ describe("WsAdapter buffering on disconnect (KPR-223 coverage migration)", () =>
         getAll: vi.fn().mockReturnValue([]),
         get: vi.fn().mockReturnValue({ name: "Rae" }),
       } as any,
-      agentManager: { getState: vi.fn().mockReturnValue(undefined) } as any,
+      agentManager: { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
     });
     await adapter.start(() => {});
 

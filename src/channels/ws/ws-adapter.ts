@@ -464,15 +464,21 @@ export class WsAdapter implements ChannelAdapter {
 
   /** Build the agent roster with runtime status for client consumption. */
   private buildAgentList(): AgentInfo[] {
+    // KPR-220 Phase 11: snapshot provides coordinator status (stopped flag,
+    // activeSpawns); persistent counters (messagesProcessed, lastActivity)
+    // still come from getState. Both surfaces are stable.
+    const snapshot = this.agentManager.getSnapshot();
     return this.agentRegistry.getAll().map((agent) => {
       const state = this.agentManager.getState(agent.id);
+      const perAgent = snapshot.perAgent[agent.id];
+      const status = perAgent?.stopped ? "stopped" : (state?.status ?? "idle");
       return {
         id: agent.id,
         name: agent.name,
         icon: agent.icon,
         title: agent.title ?? null,
         model: agent.model,
-        status: state?.status ?? "idle",
+        status,
         tools: [...new Set([...agent.coreServers, ...agent.delegateServers])].sort(),
         schedule: agent.schedule.map((s) => ({ cron: s.cron, task: s.task })),
         channels: agent.channels,
