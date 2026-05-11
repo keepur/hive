@@ -142,6 +142,35 @@ function isAuthRebuildResumeError(reason: string): boolean {
   );
 }
 
+/**
+ * KPR-220 Phase 2: thrown by `withSpawnTicket` when the agent is in
+ * `stoppedAgents` at any of three checkpoints (pre-wait, mid-wait,
+ * post-lock). Caller decides whether to swallow (reflection) or surface
+ * to the channel adapter (per-turn dispatch).
+ */
+export class AgentStoppedError extends Error {
+  constructor(public readonly agentId: string) {
+    super(`Agent ${agentId} is stopped`);
+    this.name = "AgentStoppedError";
+  }
+}
+
+/**
+ * KPR-220 Phase 2: handle returned by `withSpawnTicket` to the inner
+ * lambda. `attachAbort` wires an abort handle (provided by the lambda
+ * after constructing its AgentRunner); `abort()` invokes that handle —
+ * `stopAgent` walks all live tickets and calls this. Both are null-safe
+ * so the HOF's finally cleanup remains intact even when the runner
+ * constructor throws before `attachAbort` runs.
+ */
+export interface SpawnTicket {
+  readonly agentId: string;
+  readonly threadKey: string;
+  readonly workItem: WorkItem;
+  attachAbort(handle: () => void): void;
+  abort(): void;
+}
+
 export class AgentManager {
   private states = new Map<string, AgentState>();
   private queues = new Map<string, QueuedMessage[]>();
@@ -172,6 +201,13 @@ export class AgentManager {
   // `activeRunners` (per-turn runners are local to spawnTurn). Sweep uses
   // this to skip its "stuck flag" branch for legitimate in-flight spawns.
   private activeSpawnKeys = new Set<string>();
+  // KPR-220 Phase 2: per-agent set of in-flight tickets. `stopAgent` walks
+  // this and calls `ticket.abort()` to interrupt running spawns.
+  private activeTickets = new Map<string, Set<SpawnTicket>>();
+  // KPR-220 Phase 2: agents marked stopped. `withSpawnTicket` rejects with
+  // AgentStoppedError if the agent is in this set at any of three
+  // checkpoints (pre-wait, mid-wait, post-lock).
+  private stoppedAgents = new Set<string>();
 
   constructor(registry: AgentRegistry, memoryManager: MemoryManager, sessionStore: SessionStore, db: Db, turnTelemetryStore?: TurnTelemetryStore, activityLogger?: ActivityLogger, prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, prefixCache?: PrefixCache) {
     this.registry = registry;
@@ -310,14 +346,9 @@ export class AgentManager {
    * turn with `options.resume = ctx.sessionId`. Replaces the long-lived
    * AgentRunner.send() path for opt-in channels.
    *
-   * Lock key reuses the existing `agentId:threadId` `processing` set so
-   * concurrent spawns on the same thread queue serially even when the
-   * legacy path is simultaneously active for a different thread on the
-   * same agent.
-   *
-   * Per-agent budget: bounded by DEFAULT_PER_AGENT_SPAWN_BUDGET. Over-budget
-   * calls reject so the adapter can react (drop / retry / log). No queue —
-   * the adapter or dispatcher owns retry policy.
+   * KPR-220 Phase 2: lock + budget + ticket lifecycle are handled by
+   * `withSpawnTicket`. The lambda here owns shaping, runner construction
+   * (with abort wiring), the auth-rebuild retry, and observability.
    *
    * Resume-retry: if the SDK signals an auth-rebuild-resume sentinel
    * (mirrors voice-adapter.ts:316-348 — KPR-219 ropes voice through this
@@ -330,42 +361,19 @@ export class AgentManager {
       throw new Error(`Unknown agent: ${ctx.agentId}`);
     }
 
-    // KPR-225 F1: per-thread lock acquired BEFORE budget read+set so the budget
-    // tracking is atomic with serialization. Pre-fix bug: contended same-thread
-    // calls captured stale `active` before waiting on the lock, then wrote
-    // `active + 1` post-lock — leaking +1 per contention event.
-    const threadKey = `${ctx.agentId}:${ctx.threadId}`;
-    while (this.processing.has(threadKey)) {
-      await new Promise((r) => setTimeout(r, 25));
-    }
-    this.processing.add(threadKey);
-    this.activeSpawnKeys.add(threadKey);
-
-    const active = this.activeSpawnCount.get(ctx.agentId) ?? 0;
-    if (active >= DEFAULT_PER_AGENT_SPAWN_BUDGET) {
-      // Lock-cleanup-on-throw: explicit because we're past processing.add but
-      // before the try/finally that handles the happy-path cleanup.
-      this.processing.delete(threadKey);
-      this.activeSpawnKeys.delete(threadKey);
-      throw new Error(
-        `Spawn budget exceeded for ${ctx.agentId} (${active}/${DEFAULT_PER_AGENT_SPAWN_BUDGET})`,
-      );
-    }
-    this.activeSpawnCount.set(ctx.agentId, active + 1);
-
-    try {
+    return this.withSpawnTicket(ctx, async (ticket) => {
       if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
 
       // KPR-224 + KPR-226: shape prompt + resolve model router once at the
       // spawnTurn level so both the happy-path call and any auth-rebuild
       // retry use the same shaped values, and recordSpawnObservability sees
-      // prompt / modelOverride in scope. Kept INSIDE the try/finally so any
+      // prompt / modelOverride in scope. Kept INSIDE the HOF lambda so any
       // throw in shaping (e.g., formatFilesForPrompt on malformed file
       // metadata) cannot leak the per-thread lock or budget slot — KPR-226
       // regression prevention.
       const shaping = await this.prepareSpawn(ctx);
 
-      const result = await this.runOneSpawnAttempt(ctx, shaping, onStream);
+      const result = await this.runOneSpawnAttempt(ctx, shaping, ticket, onStream);
 
       if (result.error && isAuthRebuildResumeError(result.error) && ctx.sessionId) {
         log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
@@ -373,7 +381,7 @@ export class AgentManager {
           threadId: ctx.threadId,
           reason: result.error,
         });
-        const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, shaping, onStream);
+        const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, shaping, ticket, onStream);
         const turnResult = this.finalizeSpawnResult(ctx, retry);
         this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, retry);
         return turnResult;
@@ -382,13 +390,103 @@ export class AgentManager {
       const turnResult = this.finalizeSpawnResult(ctx, result);
       this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, result);
       return turnResult;
+    });
+  }
+
+  /**
+   * KPR-220 Phase 2: spawn coordinator HOF. Centralizes lock acquisition,
+   * budget enforcement, ticket lifecycle, and stop-checking around any
+   * per-turn execution. Called by spawnTurn (channel adapters) and
+   * runReflectionTurn (Phase 6).
+   *
+   * Three stop checkpoints (per plan-review BLOCKER fix):
+   *  1. Pre-wait: cheap reject before touching state.
+   *  2. Mid-wait: re-checked each 25ms cycle of the lock-wait loop.
+   *  3. Post-lock: closes the race where stopAgent fires AFTER processing.add
+   *     and ticket registration BUT BEFORE fn(ticket) starts running.
+   *
+   * KPR-225 F1 preserved: budget read+set happens INSIDE the per-thread
+   * critical section so contended same-thread spawns can't leak +1 per
+   * contention event.
+   */
+  private async withSpawnTicket<T>(
+    ctx: TurnContext,
+    fn: (ticket: SpawnTicket) => Promise<T>,
+  ): Promise<T> {
+    if (this.stoppedAgents.has(ctx.agentId)) {
+      throw new AgentStoppedError(ctx.agentId);
+    }
+
+    const threadKey = `${ctx.agentId}:${ctx.threadId}`;
+    while (this.processing.has(threadKey)) {
+      await new Promise((r) => setTimeout(r, 25));
+      if (this.stoppedAgents.has(ctx.agentId)) {
+        throw new AgentStoppedError(ctx.agentId);
+      }
+    }
+    this.processing.add(threadKey);
+    this.activeSpawnKeys.add(threadKey);
+
+    const active = this.activeSpawnCount.get(ctx.agentId) ?? 0;
+    const budget = this.spawnBudgetFor(ctx.agentId);
+    if (active >= budget) {
+      this.processing.delete(threadKey);
+      this.activeSpawnKeys.delete(threadKey);
+      throw new Error(
+        `Spawn budget exceeded for ${ctx.agentId} (${active}/${budget})`,
+      );
+    }
+    this.activeSpawnCount.set(ctx.agentId, active + 1);
+
+    let abortHandle: (() => void) | undefined;
+    const ticket: SpawnTicket = {
+      agentId: ctx.agentId,
+      threadKey,
+      workItem: ctx.workItem,
+      attachAbort: (handle) => {
+        abortHandle = handle;
+      },
+      abort: () => {
+        abortHandle?.();
+      },
+    };
+    const ticketSet = this.activeTickets.get(ctx.agentId) ?? new Set<SpawnTicket>();
+    ticketSet.add(ticket);
+    this.activeTickets.set(ctx.agentId, ticketSet);
+
+    // Post-lock stop check: closes the race where stopAgent fires between
+    // lock acquisition and fn invocation.
+    if (this.stoppedAgents.has(ctx.agentId)) {
+      ticketSet.delete(ticket);
+      if (ticketSet.size === 0) this.activeTickets.delete(ctx.agentId);
+      this.processing.delete(threadKey);
+      this.activeSpawnKeys.delete(threadKey);
+      const next = (this.activeSpawnCount.get(ctx.agentId) ?? 1) - 1;
+      if (next <= 0) this.activeSpawnCount.delete(ctx.agentId);
+      else this.activeSpawnCount.set(ctx.agentId, next);
+      throw new AgentStoppedError(ctx.agentId);
+    }
+
+    try {
+      return await fn(ticket);
     } finally {
+      ticketSet.delete(ticket);
+      if (ticketSet.size === 0) this.activeTickets.delete(ctx.agentId);
       this.processing.delete(threadKey);
       this.activeSpawnKeys.delete(threadKey);
       const next = (this.activeSpawnCount.get(ctx.agentId) ?? 1) - 1;
       if (next <= 0) this.activeSpawnCount.delete(ctx.agentId);
       else this.activeSpawnCount.set(ctx.agentId, next);
     }
+  }
+
+  /**
+   * KPR-220 Phase 4: resolves the in-flight spawn budget for an agent.
+   * Phase 2 stub: always returns the engine default. Phase 4 wires the
+   * `spawnBudget` agent-definition field with maxConcurrent fallback.
+   */
+  private spawnBudgetFor(_agentId: string): number {
+    return DEFAULT_PER_AGENT_SPAWN_BUDGET;
   }
 
   private async runOneSpawnAttempt(
@@ -399,12 +497,14 @@ export class AgentManager {
       resourceLimits: ResourceLimits | undefined;
       routerCostUsd: number;
     },
+    ticket: SpawnTicket,
     onStream?: SpawnTurnStreamCallback,
   ): Promise<RunResult> {
     // Fresh runner per spawn — its lazy-built in-process MCPs are therefore
     // also fresh, with channel/thread ctx captured at construction. The
     // long-lived path keeps reusing one runner per agent.
     const runner = this.createRunner(ctx.agentId);
+    ticket.attachAbort(() => runner.abort());
 
     const bgContext: WorkItemContext = {
       adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,

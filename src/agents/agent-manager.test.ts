@@ -1126,6 +1126,100 @@ describe("AgentManager", () => {
       expect(result.toolSummary).toBeNull();
     });
 
+    it("KPR-220 Phase 2: withSpawnTicket registers the ticket in activeTickets during fn, removes after", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      let snapshotDuringSend: number | undefined;
+      mockRunnerSend.mockImplementationOnce(async () => {
+        snapshotDuringSend = (manager as unknown as { activeTickets: Map<string, Set<unknown>> })
+          .activeTickets.get("agent-a")?.size;
+        return makeRunResult();
+      });
+
+      await manager.spawnTurn(smsCtx());
+
+      expect(snapshotDuringSend).toBe(1);
+      // After resolution, the ticket set is cleaned up (deleted when empty).
+      expect((manager as unknown as { activeTickets: Map<string, Set<unknown>> })
+        .activeTickets.get("agent-a")).toBeUndefined();
+    });
+
+    it("KPR-220 Phase 2: withSpawnTicket pre-wait stop check rejects with AgentStoppedError", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      (manager as unknown as { stoppedAgents: Set<string> }).stoppedAgents.add("agent-a");
+
+      await expect(manager.spawnTurn(smsCtx())).rejects.toThrow(/Agent agent-a is stopped/);
+      // Runner was never invoked — pre-wait check fired before any state mutation.
+      expect(mockRunnerSend).not.toHaveBeenCalled();
+    });
+
+    it("KPR-220 Phase 2: withSpawnTicket mid-wait stop check rejects an in-flight waiter", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Park spawn 1 holding the lock so spawn 2 enters the busy-poll loop.
+      let release: (() => void) | undefined;
+      mockRunnerSend.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          release = () => resolve(makeRunResult());
+        }),
+      );
+
+      const sharedThread = "sms:line-1:midwait";
+      const p1 = manager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      // Yield so spawn 1 grabs the lock.
+      await new Promise((r) => setTimeout(r, 30));
+
+      const p2 = manager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      // Yield once into spawn 2's wait loop, then mark agent stopped.
+      await new Promise((r) => setTimeout(r, 30));
+      (manager as unknown as { stoppedAgents: Set<string> }).stoppedAgents.add("agent-a");
+
+      await expect(p2).rejects.toThrow(/Agent agent-a is stopped/);
+
+      // Drain spawn 1 so the test cleans up (still holding the lock).
+      release!();
+      await p1.catch(() => undefined);
+    });
+
+    it("KPR-220 Phase 2: withSpawnTicket post-lock stop check cleans up + throws AgentStoppedError", async () => {
+      // The race we close: stopAgent flips `stoppedAgents` AFTER the wait loop
+      // exits AND ticket.set runs but BEFORE fn(ticket) is called. Without the
+      // post-lock check, the turn would slip through stop. Simulate the race
+      // by toggling `stoppedAgents` synchronously — wait loop is empty (no
+      // contention), so we land at the post-lock check immediately.
+      mockConversationIndex.mockResolvedValue(undefined);
+      const stoppedSet = (manager as unknown as { stoppedAgents: Set<string> }).stoppedAgents;
+      const processing = (manager as unknown as { processing: Set<string> }).processing;
+      const activeSpawnCount = (manager as unknown as { activeSpawnCount: Map<string, number> })
+        .activeSpawnCount;
+      const activeTickets = (manager as unknown as { activeTickets: Map<string, Set<unknown>> })
+        .activeTickets;
+
+      // Hook the processing.add so we can flip stoppedAgents AFTER it runs but
+      // BEFORE the post-lock check sees it. We flip via the next-tick from the
+      // wait loop's setTimeout(25ms) — but for an empty wait loop we need a
+      // different trick: use a Map.set spy on activeTickets to flip during
+      // ticket registration, which runs between processing.add and the
+      // post-lock check.
+      const origActiveTicketsSet = activeTickets.set.bind(activeTickets);
+      const setSpy = vi.spyOn(activeTickets, "set").mockImplementationOnce((key, value) => {
+        const out = origActiveTicketsSet(key, value);
+        stoppedSet.add("agent-a");
+        return out;
+      });
+
+      await expect(manager.spawnTurn(smsCtx())).rejects.toThrow(/Agent agent-a is stopped/);
+
+      // All state cleaned up — processing released, budget back to zero,
+      // ticket removed.
+      expect(processing.size).toBe(0);
+      expect(activeSpawnCount.get("agent-a")).toBeUndefined();
+      expect(activeTickets.get("agent-a")).toBeUndefined();
+      // Runner was never spawned — fn(ticket) was skipped.
+      expect(mockRunnerSend).not.toHaveBeenCalled();
+
+      setSpy.mockRestore();
+      stoppedSet.delete("agent-a");
+    });
+
     it("rejects when the agent is not in the registry", async () => {
       await expect(manager.spawnTurn(smsCtx({ agentId: "no-such-agent" }))).rejects.toThrow(
         /Unknown agent: no-such-agent/,
