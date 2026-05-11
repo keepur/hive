@@ -9,9 +9,11 @@ const { TEST_HIVE_HOME } = vi.hoisted(() => {
   // so paths.ts evaluates first (per documented failure mode at
   // skill-loader.test.ts:553-554). Use require inside the hoisted callback
   // because vi.hoisted is sync and runs before ESM imports settle.
+  /* eslint-disable @typescript-eslint/no-require-imports */
   const { mkdtempSync } = require("node:fs");
   const { tmpdir } = require("node:os");
   const { join } = require("node:path");
+  /* eslint-enable @typescript-eslint/no-require-imports */
   const dir = mkdtempSync(join(tmpdir(), "hive-agent-manager-test-"));
   process.env.HIVE_HOME = dir;
   return { TEST_HIVE_HOME: dir };

@@ -1,10 +1,35 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { vi } from "vitest";
+
+const { TEST_HIVE_HOME } = vi.hoisted(() => {
+  // KPR-225 F3: isolate HIVE_HOME so skill-loader tests that omit the
+  // 5th-arg `hiveHomeOverride` (legacy-shape tests in the first two
+  // describe blocks) don't write `.skill-projections/` into the operator's
+  // real `~/hive`. vi.hoisted runs BEFORE imports — paths.ts then resolves
+  // hiveHome to this temp dir at module-load. Top-of-file `process.env`
+  // mutation does NOT work because Vitest hoists ESM imports above
+  // top-level statements (see skill-loader.test.ts comment at the
+  // KPR-75 5th-arg test for the original documentation of this trap).
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const { mkdtempSync } = require("node:fs");
+  const { tmpdir: tmpdirFn } = require("node:os");
+  const { join: joinFn } = require("node:path");
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  const dir = mkdtempSync(joinFn(tmpdirFn(), "hive-skill-loader-test-"));
+  process.env.HIVE_HOME = dir;
+  return { TEST_HIVE_HOME: dir };
+});
+
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadSkillIndex, getSkillsForAgent, getModifiedSkills } from "./skill-loader.js";
 import { computeContentHash } from "../skills/content-hash.js";
 import type { LoadedPlugin } from "../plugins/types.js";
+
+afterAll(() => {
+  rmSync(TEST_HIVE_HOME, { recursive: true, force: true });
+});
 
 /**
  * Legacy double-`skills/` fixture: <root>/<workflow>/skills/<skill>/SKILL.md.
