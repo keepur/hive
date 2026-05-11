@@ -384,6 +384,155 @@ export class AgentManager {
     );
   }
 
+  /**
+   * KPR-224: shared shaping helper for both `spawnTurn` (per-turn path) and
+   * `processQueue` (legacy path). Centralizes:
+   *  - sender identity prepending (`[user:X via Y in #Z]:` for team /
+   *    `[Y in #Z, thread=ts]:` for slack-with-sender)
+   *  - file-attachment text appending
+   *  - model router (modelOverride + resourceLimits + routerCostUsd)
+   *
+   * Voice carve-out: voice has its own `systemPromptOverride` injection
+   * (KPR-219) and explicitly bypasses sender prepending + model router.
+   * Returns raw text + no router for `ctx.channel === "voice"`.
+   */
+  private async prepareSpawn(ctx: TurnContext): Promise<{
+    prompt: string;
+    modelOverride: string | undefined;
+    resourceLimits: ResourceLimits | undefined;
+    routerCostUsd: number;
+  }> {
+    const item = ctx.workItem;
+
+    // Voice carve-out: KPR-219 supplies its own systemPromptOverride and
+    // explicitly bypasses prepending + model router. Pin via this branch so
+    // future prepareSpawn edits cannot accidentally re-shape voice prompts.
+    if (ctx.channel === "voice") {
+      return { prompt: item.text, modelOverride: undefined, resourceLimits: undefined, routerCostUsd: 0 };
+    }
+
+    const senderLabel = item.senderName ?? item.sender;
+    const userId =
+      item.source.kind === "team"
+        ? (item.meta?.user as string | undefined)
+        : undefined;
+
+    let prompt: string;
+    if (userId) {
+      prompt = `[user:${userId} via ${senderLabel} in #${item.source.label}]: ${item.text}`;
+    } else if (item.senderName) {
+      const slackThreadTs = item.meta?.slackThreadTs as string | undefined;
+      const slackTs = item.meta?.slackTs as string | undefined;
+      const threadTs = slackThreadTs ?? slackTs;
+      const threadHint = threadTs ? `, thread=${threadTs}` : "";
+      prompt = `[${senderLabel} in #${item.source.label}${threadHint}]: ${item.text}`;
+    } else {
+      prompt = item.text;
+    }
+
+    if (item.files?.length) {
+      prompt += formatFilesForPrompt(item.files);
+    }
+
+    let modelOverride: string | undefined;
+    let routerCostUsd = 0;
+    let resourceLimits: ResourceLimits | undefined;
+    if (appConfig.modelRouter.enabled && item.sender !== "system") {
+      try {
+        const agentConfig = this.registry.get(ctx.agentId);
+        if (agentConfig) {
+          const route = await routeModel(item.text, agentConfig.model, agentConfig.resourceTiers);
+          modelOverride = route.model !== agentConfig.model ? route.model : undefined;
+          routerCostUsd = route.costUsd;
+          resourceLimits = route.resourceLimits;
+        }
+      } catch (err) {
+        log.warn("Model router failed, using default", { agentId: ctx.agentId, error: String(err) });
+      }
+    }
+
+    return { prompt, modelOverride, resourceLimits, routerCostUsd };
+  }
+
+  /**
+   * KPR-224: shared post-spawn observability helper for both `spawnTurn` and
+   * `processQueue`. Records turn telemetry (per-turn cache window),
+   * conversation index (semantic recall), and activity audit. All three
+   * fail-soft — telemetry/index/audit failures cannot cascade into the turn
+   * pipeline (matches existing `processQueue` pattern).
+   */
+  private recordSpawnObservability(
+    ctx: TurnContext,
+    prompt: string,
+    modelOverride: string | undefined,
+    result: RunResult,
+  ): void {
+    const item = ctx.workItem;
+
+    // Per-turn telemetry — independent of sessionStore (no history in
+    // sessionStore.set). Aggregator in `hive doctor` reads this collection.
+    if (result.sessionId && !result.aborted) {
+      this.turnTelemetryStore
+        .record({
+          agentId: ctx.agentId,
+          threadId: ctx.threadId,
+          sessionId: result.sessionId,
+          model: modelOverride ?? this.registry.get(ctx.agentId)?.model,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          cacheReadTokens: result.cacheReadTokens,
+          cacheCreationTokens: result.cacheCreationTokens,
+          ephemeral5mTokens: result.ephemeral5mTokens,
+          ephemeral1hTokens: result.ephemeral1hTokens,
+        })
+        .catch(() => {
+          // Already logged inside the store via withRetry. Swallow here.
+        });
+    }
+
+    // Fire-and-forget: index conversation turn for semantic recall
+    if (result.text && !result.error) {
+      conversationIndex
+        .index({
+          agentId: ctx.agentId,
+          threadId: ctx.threadId,
+          channelId: item.source.id,
+          source: item.source.kind,
+          senderName: item.senderName ?? "unknown",
+          timestampUnix: Math.floor(Date.now() / 1000),
+          timestamp: new Date().toISOString(),
+          inbound: prompt,
+          response: result.text,
+        })
+        .catch((err) =>
+          log.warn("Conversation indexing failed", { agentId: ctx.agentId, error: String(err) }),
+        );
+    }
+
+    // Activity audit
+    this.activityLogger?.record({
+      agentId: ctx.agentId,
+      threadId: ctx.threadId,
+      timestamp: new Date(),
+      sender: item.sender,
+      senderName: item.senderName,
+      channel: item.source.label,
+      channelKind: item.source.kind,
+      model: modelOverride ?? this.registry.get(ctx.agentId)?.model ?? "unknown",
+      modelTier: undefined, // Model router tier not currently passed through
+      costUsd: result.costUsd,
+      durationMs: result.durationMs,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      contextWindow: result.contextWindow,
+      toolCalls: result.toolCalls,
+      toolSummary: result.toolSummary,
+      compactions: result.compactions,
+      streamed: result.streamed,
+      error: result.error,
+    });
+  }
+
   private finalizeSpawnResult(ctx: TurnContext, result: RunResult): TurnResult {
     const newSessionId = result.sessionId || ctx.sessionId || "";
     if (result.sessionId && !result.aborted) {
