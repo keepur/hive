@@ -555,7 +555,13 @@ export class AgentManager {
     // lock acquisition and fn invocation.
     if (this.stoppedAgents.has(ctx.agentId)) {
       ticketSet.delete(ticket);
-      if (ticketSet.size === 0) this.activeTickets.delete(ctx.agentId);
+      // Identity-check before deleting the map entry: a concurrent
+      // stopAgent + restartAgent + new spawn could have replaced the
+      // map entry with a fresh Set holding the new turn's ticket. We
+      // must only clean up our own entry, not someone else's.
+      if (ticketSet.size === 0 && this.activeTickets.get(ctx.agentId) === ticketSet) {
+        this.activeTickets.delete(ctx.agentId);
+      }
       this.processing.delete(threadKey);
       this.activeSpawnKeys.delete(threadKey);
       const next = (this.activeSpawnCount.get(ctx.agentId) ?? 1) - 1;
@@ -569,7 +575,10 @@ export class AgentManager {
       return await fn(ticket);
     } finally {
       ticketSet.delete(ticket);
-      if (ticketSet.size === 0) this.activeTickets.delete(ctx.agentId);
+      // Identity-check (see post-lock cleanup above for rationale).
+      if (ticketSet.size === 0 && this.activeTickets.get(ctx.agentId) === ticketSet) {
+        this.activeTickets.delete(ctx.agentId);
+      }
       this.processing.delete(threadKey);
       this.activeSpawnKeys.delete(threadKey);
       const next = (this.activeSpawnCount.get(ctx.agentId) ?? 1) - 1;
@@ -1079,6 +1088,14 @@ export class AgentManager {
     // KPR-220 Phase 5/10: mark stopped first so any concurrent
     // withSpawnTicket call sees it at the post-lock check. Then walk
     // activeTickets and abort everything in flight.
+    //
+    // Phase 13 (post-review): do NOT delete activeTickets[agentId] here.
+    // Each in-flight ticket's withSpawnTicket finally cleans up its own
+    // entry. If we wipe the map here, a fast restartAgent + new spawn
+    // can register a fresh Set under the same key — and the old aborted
+    // turn's finally (firing later) would then erase the new Set. The
+    // finally's identity-check now also defends against any other
+    // future caller making the same mistake.
     this.stoppedAgents.add(agentId);
     this.cancelReflectionsFor(agentId);
     const tickets = this.activeTickets.get(agentId);
@@ -1087,7 +1104,6 @@ export class AgentManager {
         ticket.abort();
       }
     }
-    this.activeTickets.delete(agentId);
     this.refreshActiveThreadCount(agentId);
     this.updateStatus(agentId, "stopped");
   }

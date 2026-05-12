@@ -1045,6 +1045,63 @@ describe("AgentManager", () => {
       await inflight.catch(() => undefined);
     });
 
+    it("KPR-220 Phase 13: stopAgent + restartAgent + new spawn — old turn's finally does not wipe new ticket set", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Park the FIRST spawn so we control when its finally runs.
+      let releaseFirst: (() => void) | undefined;
+      mockRunnerSend.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseFirst = () => resolve(makeRunResult({ aborted: true, text: "" }));
+        }),
+      );
+
+      // SECOND spawn (post-restart) returns immediately when the runner is
+      // invoked — we want the ticket to remain in activeTickets until we
+      // explicitly release it, so we park this one too.
+      let releaseSecond: (() => void) | undefined;
+      mockRunnerSend.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseSecond = () => resolve(makeRunResult({ text: "ack-2", sessionId: "s-2" }));
+        }),
+      );
+
+      const turnA = manager.spawnTurn(smsCtx({ threadId: "sms:line-1:turnA" }));
+      await new Promise((r) => setTimeout(r, 30));
+
+      // Stop the agent — aborts turn A but turn A's finally has not yet run
+      // (the parked promise is still pending).
+      manager.stopAgent("agent-a");
+      manager.restartAgent("agent-a");
+
+      // Start turn B AFTER restart. Different thread so no per-thread lock
+      // contention with turn A's still-resolving lifecycle.
+      const turnB = manager.spawnTurn(smsCtx({ threadId: "sms:line-1:turnB" }));
+      await new Promise((r) => setTimeout(r, 30));
+
+      // Sanity: both turn A (aborting, finally not yet fired) and turn B
+      // (just started) are active. Under the Phase 13 fix, turn B joins
+      // turn A's still-registered set rather than creating a fresh one.
+      const activeBefore = manager.getActiveWorkItems("agent-a");
+      expect(activeBefore.length).toBe(2);
+
+      // Now release turn A — its finally runs and cleans up its own
+      // entry. WITHOUT the identity check + stopAgent-doesn't-delete fix,
+      // turn A's finally would wipe activeTickets["agent-a"] entirely,
+      // erasing turn B too (activeAfter.length === 0). Negative-verify:
+      // revert agent-manager.ts:572 to the unconditional
+      // `if (ticketSet.size === 0) this.activeTickets.delete(...)` AND
+      // restore `this.activeTickets.delete(agentId)` in stopAgent →
+      // this test fails (activeAfter.length === 0).
+      releaseFirst!();
+      await turnA.catch(() => undefined);
+
+      const activeAfter = manager.getActiveWorkItems("agent-a");
+      expect(activeAfter.length).toBe(1);
+
+      releaseSecond!();
+      await turnB.catch(() => undefined);
+    });
+
     it("KPR-220 Phase 6: reflection fires after debounce when thread quiescent + memory eligible", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       // Inject a tiny debounce so we don't have to wait 30s.
