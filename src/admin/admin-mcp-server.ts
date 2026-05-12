@@ -322,10 +322,14 @@ export function buildAdminTools(deps: AdminToolDeps) {
             subscribe: f.subscribe as string[] | undefined,
             budgetUsd: (f.budgetUsd as number) ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
             maxTurns: (f.maxTurns as number) ?? AGENT_DEFINITION_DEFAULTS.maxTurns,
-            maxConcurrent: (f.maxConcurrent as number) ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
-            // KPR-220 Phase 4: writes go to spawnBudget; maxConcurrent kept
-            // populated for backward compat so older readers don't see undefined.
-            spawnBudget: f.spawnBudget as number | undefined,
+            // KPR-220 Phase 13: writes canonicalize to spawnBudget. New docs
+            // do NOT carry maxConcurrent. Legacy caller supplying maxConcurrent
+            // (in fields bag) is translated. Reads use the spawnBudgetFor
+            // fallback chain to keep existing docs working unchanged.
+            spawnBudget:
+              (f.spawnBudget as number | undefined) ??
+              (f.maxConcurrent as number | undefined) ??
+              AGENT_DEFINITION_DEFAULTS.spawnBudget,
             timeoutMs: (f.timeoutMs as number) ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
             disabled: (f.disabled as boolean) ?? false,
             slackBot: f.slackBot as string | undefined,
@@ -426,6 +430,14 @@ export function buildAdminTools(deps: AdminToolDeps) {
               return { isError: true, content: [{ type: "text", text: contextError }] };
             }
           }
+
+          // KPR-220 Phase 13: canonicalize legacy maxConcurrent → spawnBudget
+          // before write. Existing docs keep their maxConcurrent until the
+          // next explicit update touches the field; reads use spawnBudgetFor.
+          if (merged.maxConcurrent !== undefined && merged.spawnBudget === undefined) {
+            merged.spawnBudget = merged.maxConcurrent;
+          }
+          delete merged.maxConcurrent;
 
           const changedFields = Object.keys(merged);
           if (changedFields.length === 0) {

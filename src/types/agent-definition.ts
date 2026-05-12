@@ -57,8 +57,9 @@ export interface AgentDefinition {
   // Limits
   budgetUsd: number;
   maxTurns: number;
-  /** @deprecated KPR-220: use spawnBudget. Retained as fallback for legacy agent docs. */
-  maxConcurrent: number;
+  /** @deprecated KPR-220: use spawnBudget. Retained as fallback for legacy agent docs.
+   * Optional post-Phase-13 — new creates write `spawnBudget` only. */
+  maxConcurrent?: number;
   /**
    * KPR-220: per-agent in-flight spawn budget. Falls back to maxConcurrent,
    * then to the engine default (5). Admin tools should write here; reads
@@ -88,7 +89,11 @@ export interface AgentDefinitionVersion {
 
 /** Defaults applied by toAgentConfig when fields are absent */
 export const AGENT_DEFINITION_DEFAULTS = {
+  /** @deprecated KPR-220: use spawnBudget. Retained for `toAgentConfig` runtime fallback. */
   maxConcurrent: 3,
+  /** KPR-220 Phase 13: canonical default for new agents. New creates write this; reads
+   * accept legacy `maxConcurrent` via the spawnBudgetFor fallback chain. */
+  spawnBudget: 5,
   timeoutMs: 300_000,
   budgetUsd: 10,
   maxTurns: 200,

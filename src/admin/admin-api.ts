@@ -182,10 +182,11 @@ export class AdminApi {
       subscribe: body.subscribe,
       budgetUsd: body.budgetUsd ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
       maxTurns: body.maxTurns ?? AGENT_DEFINITION_DEFAULTS.maxTurns,
-      maxConcurrent: body.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
-      // KPR-220 Phase 4: writes go to spawnBudget; maxConcurrent stays
-      // populated for backward compat.
-      spawnBudget: body.spawnBudget,
+      // KPR-220 Phase 13: writes canonicalize to spawnBudget. New docs do
+      // NOT carry maxConcurrent. If the caller supplies maxConcurrent (legacy
+      // API), translate to spawnBudget. Reads use the spawnBudgetFor fallback
+      // chain to keep existing docs working unchanged.
+      spawnBudget: body.spawnBudget ?? body.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.spawnBudget,
       timeoutMs: body.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
       disabled: body.disabled ?? false,
       slackBot: body.slackBot,
@@ -208,6 +209,14 @@ export class AdminApi {
     // Don't allow changing immutable fields
     delete body._id;
     delete body.createdAt;
+
+    // KPR-220 Phase 13: canonicalize legacy maxConcurrent → spawnBudget on
+    // writes. Existing docs keep their maxConcurrent untouched until the
+    // next explicit update; the spawnBudgetFor fallback chain handles reads.
+    if (body.maxConcurrent !== undefined && body.spawnBudget === undefined) {
+      body.spawnBudget = body.maxConcurrent;
+    }
+    delete body.maxConcurrent;
 
     const changedFields = Object.keys(body);
     await this.saveVersion(id, changedFields);
