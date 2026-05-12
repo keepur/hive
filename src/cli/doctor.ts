@@ -6,6 +6,7 @@ import {
   type CheckGroup,
   type PromptCacheRow,
   type PrefixCacheStatsRow,
+  type SpawnCoordinatorRow,
   brewServiceRunning,
   cacheHitRatesForDoctor,
   commandExists,
@@ -20,6 +21,7 @@ import {
   requiredEnvVarsFromConfig,
   resolveServicePath,
   slackAuthOk,
+  spawnCoordinatorStatsForDoctor,
 } from "./doctor-checks.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -100,6 +102,38 @@ export function renderPrefixCacheSection(
   }
   if (row.oldestEntryAgeMs > 24 * 60 * 60 * 1000) {
     emit("  ⚠ oldest entry > 24h — possible invalidation gap, file an issue if persistent");
+  }
+}
+
+/**
+ * KPR-220 Phase 11: render the spawn-coordinator section. Reads the
+ * per-agent heartbeat documents and prints one row per agent with budget,
+ * saturation, and stop flag. Uses the same staleness threshold (>120s) as
+ * the prefix-cache section.
+ */
+export function renderSpawnCoordinatorSection(
+  rows: SpawnCoordinatorRow[],
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nSpawn coordinator (live engine, per agent)");
+  if (rows.length === 0) {
+    emit("  ○ no heartbeat yet — start the engine and re-check");
+    return;
+  }
+  for (const r of rows) {
+    const stale = r.staleSeconds === null ? "?" : `${r.staleSeconds}s ago`;
+    const flags: string[] = [];
+    if (r.stopped) flags.push("STOPPED");
+    if (r.staleSeconds !== null && r.staleSeconds > 120) flags.push("stale-heartbeat");
+    const flagStr = flags.length > 0 ? ` [${flags.join(",")}]` : "";
+    const lastSat =
+      r.lastSaturationAt === null ? "never" : `${Math.round((Date.now() - r.lastSaturationAt) / 1000)}s ago`;
+    emit(
+      `  ${r.agentId}: active=${r.activeSpawns} budget=${r.budget} (source=${r.budgetSource}) saturations=${r.saturationCount} (last ${lastSat})${flagStr} (heartbeat ${stale})`,
+    );
+    if (r.lastError) {
+      emit(`    last error: ${r.lastError}`);
+    }
   }
 }
 
@@ -335,10 +369,15 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // KPR-213: prefix-cache stats from the engine heartbeat.
     const prefixStats = await prefixCacheStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderPrefixCacheSection(prefixStats);
+    // KPR-220 Phase 11: spawn-coordinator per-agent stats.
+    const coordinatorRows = await spawnCoordinatorStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+    renderSpawnCoordinatorSection(coordinatorRows);
   } else {
     console.log("\nPrompt cache (last 7 days)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nPrefix cache (live engine)");
+    console.log("  ○ skipped: config not loaded");
+    console.log("\nSpawn coordinator (live engine, per agent)");
     console.log("  ○ skipped: config not loaded");
   }
 

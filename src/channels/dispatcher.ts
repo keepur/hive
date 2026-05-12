@@ -1,5 +1,4 @@
 import { createLogger } from "../logging/logger.js";
-import { config } from "../config.js";
 import type { WorkItem, WorkResult } from "../types/work-item.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
 import type { AgentManager, TurnContext, TurnResult, SpawnTurnStreamCallback } from "../agents/agent-manager.js";
@@ -203,9 +202,7 @@ export class Dispatcher {
     // 4. Full agent processing
     await adapter?.onProcessingStart?.(item, agentId);
     try {
-      const runResult = this.getPerTurnFlag(item)
-        ? await this.runPerTurnDispatch(agentId, item)
-        : await this.agentManager.sendMessage(agentId, item);
+      const runResult = this.convertTurnResult(await this.agentManager.runWorkItemTurn(agentId, item));
 
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
@@ -290,52 +287,17 @@ export class Dispatcher {
   }
 
   /**
-   * KPR-223 / KPR-224: per-channel per-turn-spawn flag detection. Maps WS
-   * adapter's ChannelKind `"app"` onto the config flag key `ws`. KPR-224
-   * extends the WS branch to also catch `kind: "team", adapterId: "ws"` —
-   * the same WS adapter emits team-channel WorkItems (DMs/channels) and
-   * those must follow the same per-turn flag as app-device WorkItems.
-   * Voice is excluded — voice routes through {@link routeVoiceTurn}, not
-   * through the dispatch()/dispatchToAgent branch.
-   */
-  private getPerTurnFlag(item: WorkItem): boolean {
-    const { kind, adapterId } = item.source;
-    if (kind === "sms") return config.agentManager.perTurnSpawn.sms;
-    if (kind === "slack") return config.agentManager.perTurnSpawn.slack;
-    if (kind === "app") return config.agentManager.perTurnSpawn.ws;
-    // KPR-224: WS adapter also emits team WorkItems (DMs / channels).
-    // Same physical adapter, same flag.
-    if (kind === "team" && adapterId === "ws") return config.agentManager.perTurnSpawn.ws;
-    return false; // voice, scheduler, imessage, internal, non-WS team — not routed through this branch
-  }
-
-  /**
-   * KPR-223: per-turn-spawn dispatch helper. When the per-channel flag is on
-   * the dispatcher calls this instead of `agentManager.sendMessage`. Spawns a
-   * fresh `query()` via {@link AgentManager.spawnTurn} with `options.resume =
-   * sessionId` and converts the resulting {@link TurnResult} into the
-   * {@link RunResult} shape that the rest of dispatch expects.
+   * KPR-220 Phase 9: TurnResult → RunResult conversion. Per-turn is now the
+   * only execution path; the dispatcher unconditionally routes through
+   * `agentManager.runWorkItemTurn` and converts the `TurnResult` into the
+   * legacy `RunResult` shape that downstream delivery + audit code expects.
    *
-   * The per-turn path's TurnUsage doesn't carry llmMs/toolMs/toolCalls/
-   * toolSummary/streamed/compactions, so those fields are zero/empty here.
-   * KPR-220 will revisit telemetry uniformity once the long-lived path
-   * retires.
+   * Every field of `RunResult` MUST be mapped explicitly here. The extraction
+   * to a named private helper (vs. inline at call sites) is a plan-review
+   * constraint: an inline conversion could silently drop a field and still
+   * compile — the named helper makes the mapping auditable.
    */
-  private async runPerTurnDispatch(agentId: string, item: WorkItem): Promise<RunResult> {
-    const threadId = item.threadId ?? item.id;
-    const sessionId = await this.agentManager.getSessionStore().get(agentId, threadId);
-
-    const ctx: TurnContext = {
-      agentId,
-      sessionId,
-      channelId: item.source.id,
-      threadId,
-      workItem: item,
-      channel: item.source.kind,
-    };
-
-    const turn = await this.agentManager.spawnTurn(ctx);
-
+  private convertTurnResult(turn: TurnResult): RunResult {
     return {
       text: turn.finalMessage,
       sessionId: turn.newSessionId,
@@ -346,16 +308,21 @@ export class Dispatcher {
       cacheReadTokens: turn.usage.cacheReadTokens,
       cacheCreationTokens: turn.usage.cacheCreationTokens,
       contextWindow: turn.usage.contextWindow,
-      // Per-turn path doesn't surface these breakdowns; TurnUsage doesn't carry them.
-      // Telemetry rows for per-turn dispatch will show 0 for the *Ms/toolCalls fields.
-      // KPR-220 will revisit telemetry uniformity once long-lived path retires.
-      llmMs: 0,
-      toolMs: 0,
-      toolCalls: 0,
-      toolSummary: "",
-      streamed: false,
-      compactions: 0,
+      llmMs: turn.llmMs,
+      toolMs: turn.toolMs,
+      toolCalls: turn.toolCalls,
+      toolSummary: turn.toolSummary ?? "",
+      streamed: turn.streamed,
+      compactions: turn.compactions,
+      preCompactTokens: turn.preCompactTokens,
+      ephemeral5mTokens: turn.ephemeral5mTokens,
+      ephemeral1hTokens: turn.ephemeral1hTokens,
       error: turn.errors[0],
+      // Dispatcher's RunResult.aborted is never read downstream — grep-confirmed
+      // all `.aborted` references live inside agent-manager.ts. Hardcoding
+      // `false` is harmless because no caller distinguishes aborted from normal
+      // completion in RunResult.
+      aborted: false,
     };
   }
 
@@ -630,9 +597,7 @@ export class Dispatcher {
     const adapter = this.adapters.get(effectiveItem.source.adapterId ?? effectiveItem.source.kind);
 
     try {
-      const runResult = this.getPerTurnFlag(effectiveItem)
-        ? await this.runPerTurnDispatch(agentId, effectiveItem)
-        : await this.agentManager.sendMessage(agentId, effectiveItem);
+      const runResult = this.convertTurnResult(await this.agentManager.runWorkItemTurn(agentId, effectiveItem));
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 

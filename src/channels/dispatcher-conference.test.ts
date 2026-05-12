@@ -11,12 +11,6 @@ vi.mock("../logging/logger.js", () => ({
   }),
 }));
 
-vi.mock("../config.js", () => ({
-  config: {
-    agentManager: { perTurnSpawn: { sms: false, slack: false, ws: false, voice: false } },
-  },
-}));
-
 vi.mock("../agents/meeting-classifier.js", () => ({
   classifyMeetingMessage: vi.fn().mockResolvedValue({
     respondAgentIds: ["jasper"],
@@ -133,10 +127,25 @@ function makeMockRegistry() {
 
 function makeMockAgentManager() {
   return {
-    sendMessage: vi.fn().mockResolvedValue({
-      text: "Agent response",
-      costUsd: 0.01,
-      durationMs: 1000,
+    runWorkItemTurn: vi.fn().mockResolvedValue({
+      finalMessage: "Agent response",
+      newSessionId: "s2",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0.01,
+        durationMs: 1000,
+      },
+      errors: [],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
     }),
     findAgentForThread: vi.fn().mockResolvedValue(null),
     findAgentsForThread: vi.fn().mockResolvedValue([]),
@@ -202,8 +211,8 @@ describe("Conference channel routing", () => {
 
     // The classifier mock returns ["jasper"], so sendMessage should be called for jasper
     // with the conference-enriched item (context injected)
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith(
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith(
       "jasper",
       expect.objectContaining({
         source: item.source,
@@ -216,7 +225,7 @@ describe("Conference channel routing", () => {
       }),
     );
     // Verify the original text is included in the enriched text
-    const enrichedItem = agentManager.sendMessage.mock.calls[0][1];
+    const enrichedItem = agentManager.runWorkItemTurn.mock.calls[0][1];
     expect(enrichedItem.text).toContain("Jasper, what's the engineering status?");
     expect(enrichedItem.text).toContain("Meeting rules:");
   });
@@ -230,7 +239,7 @@ describe("Conference channel routing", () => {
 
     // Should route via normal channel mapping (general -> executive-assistant)
     // but text mentions Jasper so name routing wins
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("executive-assistant", item);
   });
 
   it("empty roster returns no agents", async () => {
@@ -243,7 +252,7 @@ describe("Conference channel routing", () => {
     await dispatcher.dispatch(item);
 
     // No names matched → empty roster → no agents dispatched
-    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
   });
 
   it("conference fan-out does not write to threadParticipants", async () => {
@@ -274,15 +283,15 @@ describe("Conference channel routing", () => {
     await dispatcher.dispatch(item);
 
     // Round-0 dispatches to jasper and river
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
-    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
 
     // Verify it does NOT use threadParticipants by dispatching a follow-up
     // in the same thread without new names — conference routing should re-evaluate
     // through the classifier with the persisted roster, not threadParticipants
-    agentManager.sendMessage.mockClear();
+    agentManager.runWorkItemTurn.mockClear();
     (classifyMeetingMessage as any).mockResolvedValueOnce({
       respondAgentIds: ["jasper"],
       costUsd: 0.001,
@@ -300,8 +309,8 @@ describe("Conference channel routing", () => {
     // Should go through conference path again (classifier decides), not threadParticipants
     // The roster was already built from the first message (jasper + river),
     // so the classifier is called with that roster, and returns just jasper
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-    const enrichedItem2 = agentManager.sendMessage.mock.calls[0][1];
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+    const enrichedItem2 = agentManager.runWorkItemTurn.mock.calls[0][1];
     expect(enrichedItem2.meta).toEqual(expect.objectContaining({ conferenceMode: true, conferenceRound: 0 }));
     expect(enrichedItem2.text).toContain("any updates on that?");
   });
@@ -337,7 +346,7 @@ describe("Conference channel routing", () => {
     const roster = callArgs[1];
     expect(roster.every((r: any) => r.agentId !== "chief-of-staff")).toBe(true);
 
-    const enrichedItem = agentManager.sendMessage.mock.calls[0][1];
+    const enrichedItem = agentManager.runWorkItemTurn.mock.calls[0][1];
     expect(enrichedItem.meta).toEqual(expect.objectContaining({ conferenceMode: true, conferenceRound: 0 }));
     expect(enrichedItem.text).toContain("Mokie, and Jasper, what do you think?");
   });

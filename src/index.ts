@@ -19,6 +19,7 @@ import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
 import { PrefixCache } from "./agents/prefix-cache.js";
+import { SpawnCoordinatorHeartbeat } from "./agents/spawn-coordinator-heartbeat.js";
 import { TeamCache } from "./team-roster/team-cache.js";
 import { TeamRoster } from "./team-roster/team-roster.js";
 import { ContactsWatcher } from "./team-roster/contacts-watcher.js";
@@ -429,6 +430,13 @@ async function main(): Promise<void> {
   const prefixCacheHeartbeat = setInterval(writeStats, PREFIX_CACHE_HEARTBEAT_MS);
   prefixCacheHeartbeat.unref();
 
+  // KPR-220 Phase 11: spawn-coordinator stats heartbeat. Cancels on service
+  // shutdown only (spec S8) — NOT on `stopAll()` — so the doctor still sees
+  // stopped agents in the snapshot.
+  const spawnCoordinatorHeartbeat = new SpawnCoordinatorHeartbeat(agentManager, telemetryCollection);
+  await spawnCoordinatorHeartbeat.writeOnce();
+  spawnCoordinatorHeartbeat.start();
+
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
@@ -713,6 +721,7 @@ async function main(): Promise<void> {
     await codeTaskManager.stop();
     await prefetcher?.close();
     meetingMonitor?.stop();
+    spawnCoordinatorHeartbeat.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
     contactsWatcher.stop();
     if (activityLogger) await activityLogger.stop();

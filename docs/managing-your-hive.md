@@ -125,7 +125,12 @@ Two files at your instance root (`~/services/hive/<your-instance>/`). The CLI ma
 - `agents.default` — agent ID that catches unrouted messages.
 - `plugins` — **do not hand-edit.** Managed by `hive plugin add` / `hive plugin remove`.
 - `skills.registries` — list of registries to pull skills from. The default `keepur/hive-skills` is added at init; add others with `hive registry`.
-- `agentManager.perTurnSpawn.{sms,slack,ws,voice}` — opt-in to the per-turn-spawn path on a channel. All default `false`; flip a channel to `true` once you've verified per-turn behavior on a dev thread for that channel. Per-turn spawn replaces the long-lived agent process with a fresh `query()` per inbound message (resuming the same SDK session id), which makes prompt-prefix changes take effect immediately and avoids long-lived process drift. The legacy long-lived path is still the default while the migration rolls out channel-by-channel.
+
+### Migration notes (KPR-220)
+
+- `agentManager.perTurnSpawn.{sms,slack,ws,voice}` keys are **removed**. Per-turn spawn is the only execution path now (it was opt-in during the channel-by-channel rollout; KPR-220 retired the opt-in). The YAML loader silently ignores any leftover `perTurnSpawn` keys you may have in `hive.yaml`, but they have no effect — drop them when convenient.
+- On an agent definition, `maxConcurrent` is **deprecated** in favor of `spawnBudget` (both control how many in-flight spawns the agent can have at once, across different threads). The engine reads `agent.spawnBudget` first, falls back to `agent.maxConcurrent`, then to the engine default (5). `hive doctor`'s "Spawn coordinator" section shows which fallback fired per agent so you can migrate definitions one at a time.
+- Reflection (end-of-conversation memory writes) trigger changed from queue-drain to post-quiescence debounce — reflection fires 30s after the most recent non-reflection turn on a thread. Setting `memory.reflectionMinTurns: 0` now disables reflection entirely. If you previously relied on `reflectionMinTurns: 0` as "off", behavior is unchanged; if you previously relied on it as "fire every turn", that semantics is gone (it was a footgun under the new debounce model).
 
 ### `<instance>/.env`
 

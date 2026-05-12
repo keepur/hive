@@ -80,7 +80,11 @@ describe("toAgentConfig", () => {
     delete (def as any).schedule;
 
     const config = toAgentConfig(def, {});
-    expect(config.maxConcurrent).toBe(AGENT_DEFINITION_DEFAULTS.maxConcurrent);
+    // KPR-220 Phase 17: maxConcurrent is no longer materialized to a default
+    // by toAgentConfig (it would make the spawnBudgetFor fallback chain's
+    // engine-default branch unreachable). The field passes through as
+    // undefined; spawnBudgetFor handles the absence directly.
+    expect(config.maxConcurrent).toBeUndefined();
     expect(config.timeoutMs).toBe(AGENT_DEFINITION_DEFAULTS.timeoutMs);
     expect(config.budgetUsd).toBe(AGENT_DEFINITION_DEFAULTS.budgetUsd);
     expect(config.maxTurns).toBe(AGENT_DEFINITION_DEFAULTS.maxTurns);

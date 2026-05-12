@@ -13,23 +13,30 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Model router (Haiku / Sonnet classifier; respects per-agent ceiling)
             ↓
-       Agent manager (concurrency, per-thread serialization)
+       Agent manager (spawn coordinator: per-thread lock + per-agent budget)
             ↓
-       Agent runner (spawns Claude session + MCP servers as subprocesses)
+       Agent runner (spawns Claude session + MCP servers as subprocesses, fresh per turn)
             ↓
        Response → channel adapter → delivery
 ```
 
-A single hive process serves multiple agents and multiple channels. Each agent's work runs as a Claude Code session with a configured set of MCP server subprocesses scoped to it.
+A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
 
-Under the per-turn-spawn flags (`agentManager.perTurnSpawn.{sms,slack,ws,voice}` in `hive.yaml` — see [managing-your-hive.md](managing-your-hive.md)), the "agent runner" box above is recreated per inbound message rather than long-lived. A fresh `WorkItemContext` (channel id, thread id, source metadata) flows into MCP server handlers and hooks each spawn — no stale context survives across turns. The legacy long-lived path remains the default while the migration rolls out channel-by-channel.
+The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, threadId)`, per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface used by `hive doctor`, the Slack health report, and the WebSocket agent roster.
+
+### Migration notes
+
+- The `agentManager.perTurnSpawn.{sms,slack,ws,voice}` config keys were removed in KPR-220. Per-turn spawn is the only execution path. The YAML loader silently ignores stale `perTurnSpawn` keys (KPR-225 F3 liberal-loader pattern), but they have no effect — drop them when convenient.
+- `maxConcurrent` on an agent definition is **deprecated** in favor of `spawnBudget`. The fallback chain is `agent.spawnBudget → agent.maxConcurrent → engine default (5)`. `hive doctor`'s "Spawn coordinator" section surfaces which fallback fired so operators can migrate agent-by-agent.
+- Reflection trigger changed from queue-drain ("conversation went idle because the queue is empty") to post-quiescence debounce: 30s after the most recent non-reflection turn on a `(agentId, threadId)` pair. `memory.reflectionMinTurns <= 0` now disables reflection entirely (legacy queue-drain semantics treated zero as "fire every turn", which was a footgun under the new debounce model).
 
 ## Key files (read these to understand the engine)
 
 - `src/index.ts` — entry point; wires every subsystem.
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
-- `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn under per-turn-spawn flags); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
-- `src/agents/agent-manager.ts` — concurrency limits, per-thread queues.
+- `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
+- `src/agents/agent-manager.ts` — spawn coordinator: lock, budget, ticket lifecycle, reflection scheduler, snapshot surface.
+- `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes the coordinator snapshot to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent for the doctor to read.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
 - `src/agents/model-router.ts` — Haiku/Sonnet classification.
 - `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue.
