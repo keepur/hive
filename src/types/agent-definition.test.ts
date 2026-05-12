@@ -89,6 +89,36 @@ describe("AGENT_DEFINITION_DEFAULTS", () => {
   });
 });
 
+describe("toAgentConfig — spawn budget passthrough (KPR-220 Phase 17)", () => {
+  it("does NOT materialize maxConcurrent when absent from the doc — passes undefined through", () => {
+    // KPR-220 Phase 17: pre-fix, toAgentConfig populated maxConcurrent with
+    // AGENT_DEFINITION_DEFAULTS.maxConcurrent (= 3) for legacy docs that
+    // had no explicit field. That made the spawnBudgetFor fallback's
+    // final `?? DEFAULT_PER_AGENT_SPAWN_BUDGET` branch (= 5) unreachable
+    // for those agents. Post-fix: maxConcurrent passes through as-is so
+    // the fallback chain correctly reaches the engine default of 5.
+    const def = makeDefinition();
+    const legacy = { ...def } as AgentDefinition & { maxConcurrent?: number };
+    delete (legacy as { maxConcurrent?: number }).maxConcurrent;
+    const cfg = toAgentConfig(legacy);
+    expect(cfg.maxConcurrent).toBeUndefined();
+  });
+
+  it("preserves explicit maxConcurrent value", () => {
+    const def = makeDefinition({ maxConcurrent: 7 });
+    const cfg = toAgentConfig(def);
+    expect(cfg.maxConcurrent).toBe(7);
+  });
+
+  it("passes spawnBudget through unchanged (set + unset)", () => {
+    const defWith = makeDefinition({ spawnBudget: 10 });
+    expect(toAgentConfig(defWith).spawnBudget).toBe(10);
+
+    const defWithout = makeDefinition();
+    expect(toAgentConfig(defWithout).spawnBudget).toBeUndefined();
+  });
+});
+
 describe("toAgentConfig — coreServers/delegateServers fallback", () => {
   it("falls back to the baseline when a definition is missing coreServers", () => {
     // Simulate a malformed/legacy definition that lacks coreServers (upstream callers

@@ -179,7 +179,11 @@ export function buildAdminTools(deps: AdminToolDeps) {
           // KPR-220 Phase 4: spawnBudget is the live field; maxConcurrent is
           // retained as a deprecated fallback for legacy docs.
           {
-            const resolved = doc.spawnBudget ?? doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent;
+            // KPR-220 Phase 17: fall back to AGENT_DEFINITION_DEFAULTS.spawnBudget
+            // (= 5, the spec'd engine default) when both fields are absent —
+            // matches the runtime behavior of spawnBudgetFor after the
+            // toAgentConfig fix (which no longer materializes maxConcurrent=3).
+            const resolved = doc.spawnBudget ?? doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.spawnBudget;
             const source =
               doc.spawnBudget != null
                 ? "spawnBudget"

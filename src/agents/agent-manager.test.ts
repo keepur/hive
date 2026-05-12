@@ -979,7 +979,11 @@ describe("AgentManager", () => {
       mockConversationIndex.mockResolvedValue(undefined);
       const cfg = registry._agents.get("agent-a")!;
       cfg.spawnBudget = undefined;
-      cfg.maxConcurrent = undefined as unknown as number;
+      // KPR-220 Phase 17: `maxConcurrent` is optional on `AgentConfig`; under
+      // the fixed `toAgentConfig`, it's no longer materialized to a default
+      // when absent in the underlying doc. The cast hack from pre-Phase-17
+      // is no longer needed.
+      cfg.maxConcurrent = undefined;
 
       const releasers: Array<() => void> = [];
       mockRunnerSend.mockImplementation(

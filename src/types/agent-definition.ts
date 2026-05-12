@@ -138,7 +138,16 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     coreServers: doc.coreServers ?? [...AGENT_DEFINITION_DEFAULTS.coreServers],
     delegateServers: doc.delegateServers ?? [...AGENT_DEFINITION_DEFAULTS.delegateServers],
     plugins: doc.plugins,
-    maxConcurrent: doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
+    // KPR-220 Phase 17: pass `maxConcurrent` through as-is (no default
+    // materialization). Materializing it here populated the field with
+    // AGENT_DEFINITION_DEFAULTS.maxConcurrent = 3 for legacy docs missing
+    // both fields, which made the `spawnBudgetFor` fallback's final branch
+    // (`?? DEFAULT_PER_AGENT_SPAWN_BUDGET` = 5) unreachable — legacy agents
+    // silently ran at budget=3 instead of the spec'd engine default of 5.
+    // `AgentConfig.maxConcurrent` is already optional; nothing reads it
+    // at runtime (the field is @deprecated; spawnBudgetFor consults it
+    // via the def via registry.get, not via cfg).
+    maxConcurrent: doc.maxConcurrent,
     spawnBudget: doc.spawnBudget,
     timeoutMs: doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
     betas: doc.betas,
