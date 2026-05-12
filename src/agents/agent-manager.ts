@@ -449,7 +449,24 @@ export class AgentManager {
     }
 
     return this.withSpawnTicket(ctx, async (ticket) => {
-      if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
+      // KPR-220 Phase 15: re-resolve sessionId post-lock for reflection
+      // turns. The reflection timer may have fired while a user turn was
+      // in flight on the same thread; that turn could have rotated the
+      // session post-compaction, so the sessionId captured at timer-fire
+      // time is potentially stale. Reading sessionStore HERE (after the
+      // per-thread lock is held) closes the race because no other turn
+      // can be writing to it. Non-reflection callers keep their original
+      // ctx.sessionId — they always resolve immediately before calling
+      // spawnTurn, so the window is microseconds and tolerated.
+      let effectiveCtx = ctx;
+      if (ctx.kind === "reflection") {
+        const freshSessionId = await this.sessionStore.get(ctx.agentId, ctx.threadId);
+        if (freshSessionId !== ctx.sessionId) {
+          effectiveCtx = { ...ctx, sessionId: freshSessionId };
+        }
+      }
+
+      if (!effectiveCtx.sessionId) this.recordSpawn(effectiveCtx.workItem.source.id);
 
       // KPR-224 + KPR-226: shape prompt + resolve model router once at the
       // spawnTurn level so both the happy-path call and any auth-rebuild
@@ -458,29 +475,29 @@ export class AgentManager {
       // throw in shaping (e.g., formatFilesForPrompt on malformed file
       // metadata) cannot leak the per-thread lock or budget slot — KPR-226
       // regression prevention.
-      const shaping = await this.prepareSpawn(ctx);
+      const shaping = await this.prepareSpawn(effectiveCtx);
 
-      const result = await this.runOneSpawnAttempt(ctx, shaping, ticket, onStream);
+      const result = await this.runOneSpawnAttempt(effectiveCtx, shaping, ticket, onStream);
 
       let turnResult: TurnResult;
-      if (result.error && isAuthRebuildResumeError(result.error) && ctx.sessionId) {
+      if (result.error && isAuthRebuildResumeError(result.error) && effectiveCtx.sessionId) {
         log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
-          agentId: ctx.agentId,
-          threadId: ctx.threadId,
+          agentId: effectiveCtx.agentId,
+          threadId: effectiveCtx.threadId,
           reason: result.error,
         });
-        const retry = await this.runOneSpawnAttempt({ ...ctx, sessionId: undefined }, shaping, ticket, onStream);
-        turnResult = this.finalizeSpawnResult(ctx, retry);
-        this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, retry);
+        const retry = await this.runOneSpawnAttempt({ ...effectiveCtx, sessionId: undefined }, shaping, ticket, onStream);
+        turnResult = this.finalizeSpawnResult(effectiveCtx, retry);
+        this.recordSpawnObservability(effectiveCtx, shaping.prompt, shaping.modelOverride, retry);
       } else {
-        turnResult = this.finalizeSpawnResult(ctx, result);
-        this.recordSpawnObservability(ctx, shaping.prompt, shaping.modelOverride, result);
+        turnResult = this.finalizeSpawnResult(effectiveCtx, result);
+        this.recordSpawnObservability(effectiveCtx, shaping.prompt, shaping.modelOverride, result);
       }
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
       // turns themselves don't reschedule (kind="reflection" guard).
-      if (ctx.kind !== "reflection") {
-        this.scheduleReflectionIfEligible(ctx, turnResult);
+      if (effectiveCtx.kind !== "reflection") {
+        this.scheduleReflectionIfEligible(effectiveCtx, turnResult);
       }
       return turnResult;
     });
@@ -550,6 +567,13 @@ export class AgentManager {
     this.activeTickets.set(ctx.agentId, ticketSet);
     this.refreshActiveThreadCount(ctx.agentId);
     this.updateStatus(ctx.agentId, "processing");
+
+    // KPR-220 Phase 15: cancel any pending reflection timer for this thread —
+    // a new user turn breaks the "30s quiescent" invariant. Skipped for
+    // reflection turns themselves (which would otherwise self-cancel).
+    if (ctx.kind !== "reflection") {
+      this.cancelReflectionTimer(ctx.agentId, ctx.threadId);
+    }
 
     // Post-lock stop check: closes the race where stopAgent fires between
     // lock acquisition and fn invocation.
@@ -639,7 +663,12 @@ export class AgentManager {
    */
   getSnapshot(): CoordinatorSnapshot {
     const perAgent: Record<string, CoordinatorSnapshotPerAgent> = {};
+    // KPR-220 Phase 16: include every registered agent — even ones that
+    // haven't handled traffic yet — so the heartbeat writes meaningful
+    // per-agent rows on a fresh engine. Without this, `hive doctor`
+    // reports "no heartbeat yet" until the first turn lands.
     const agentIds = new Set<string>([
+      ...this.registry.listIds(),
       ...this.states.keys(),
       ...this.activeTickets.keys(),
       ...this.saturationEvents.keys(),
@@ -752,6 +781,24 @@ export class AgentManager {
     if (this.stoppedAgents.has(agentId)) return;
     if (!this.hasMemoryServer(agentId)) return;
 
+    // KPR-220 Phase 15: quiescence pre-check. If the thread has an active
+    // spawn right now (a user turn that started within the debounce window
+    // but should have cancelled the timer in withSpawnTicket — if we got
+    // here anyway it means the timer fired in the microsecond window
+    // between turn-arrival and lock-acquisition), abort without rescheduling.
+    // The user turn's completion will reschedule via
+    // scheduleReflectionIfEligible. Without this, runReflectionTurn would
+    // queue behind the user turn and violate the "thread quiescent" invariant.
+    const threadKey = `${agentId}:${threadId}`;
+    if (this.processing.has(threadKey)) {
+      log.debug("Reflection skipped — thread not quiescent", { agentId, threadId });
+      return;
+    }
+
+    // Note: sessionId is resolved AGAIN inside spawnTurn AFTER the per-thread
+    // lock is acquired (see spawnTurn's effectiveCtx logic for ctx.kind ===
+    // "reflection"). The capture here is best-effort for any pre-lock logic
+    // that needs it; the post-lock re-resolve is the authoritative read.
     const sessionId = await this.sessionStore.get(agentId, threadId);
     const workItem: WorkItem = {
       id: `reflection-${threadId}-${Date.now()}`,
@@ -789,6 +836,23 @@ export class AgentManager {
         after.pendingReflectionTurns = 0;
         after.timer = null;
       }
+    }
+  }
+
+  /**
+   * KPR-220 Phase 15: cancel the pending reflection timer for a single
+   * (agentId, threadId) pair. Called from `withSpawnTicket` when a non-
+   * reflection turn starts on that thread, breaking the "30s quiescent"
+   * invariant. The reflection state itself (pendingReflectionTurns,
+   * lastSender, etc.) stays intact so the next eligible turn completion
+   * picks up where the timer left off.
+   */
+  private cancelReflectionTimer(agentId: string, threadId: string): void {
+    const key = this.reflectionKey(agentId, threadId);
+    const state = this.reflectionStates.get(key);
+    if (state?.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
     }
   }
 

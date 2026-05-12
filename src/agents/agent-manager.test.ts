@@ -1309,6 +1309,172 @@ describe("AgentManager", () => {
       expect(states.size).toBe(0);
     });
 
+    it("KPR-220 Phase 15: new turn START cancels pending reflection timer (not just turn completion)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const fastManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 200 },
+      );
+
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "ack" }));
+      const sharedThread = "sms:line-1:p15-cancel-on-start";
+      // 3 turns to satisfy reflectionMinTurns; debounce timer is scheduled.
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+
+      const key = `agent-a:${sharedThread}`;
+      const stateBefore = (fastManager as unknown as { reflectionStates: Map<string, { timer: unknown }> })
+        .reflectionStates.get(key);
+      expect(stateBefore?.timer).not.toBeNull(); // timer scheduled
+
+      // Park a NEW spawn — its withSpawnTicket should cancel the reflection
+      // timer when the lock is acquired, BEFORE the debounce window expires.
+      let release: (() => void) | undefined;
+      mockRunnerSend.mockImplementationOnce(
+        () => new Promise((resolve) => { release = () => resolve(makeRunResult({ text: "user" })); }),
+      );
+      const inflight = fastManager.spawnTurn(smsCtx({ threadId: sharedThread, text: "new user turn" }));
+      // Give withSpawnTicket time to acquire the lock + cancel the timer.
+      await new Promise((r) => setTimeout(r, 30));
+
+      const stateMid = (fastManager as unknown as { reflectionStates: Map<string, { timer: unknown }> })
+        .reflectionStates.get(key);
+      expect(stateMid?.timer).toBeNull(); // canceled by the new turn START
+
+      // Wait past the original debounce window — reflection MUST NOT fire,
+      // even though the timer was originally scheduled to fire in 200ms.
+      await new Promise((r) => setTimeout(r, 250));
+      const reflectionFired = mockRunnerSend.mock.calls.some(
+        ([prompt]) => typeof prompt === "string" && prompt.startsWith("[System — end of conversation reflection]"),
+      );
+      expect(reflectionFired).toBe(false);
+
+      release!();
+      await inflight;
+      // Clean up any leftover reflection timers so subsequent tests aren't
+      // polluted by mockRunnerSend calls from this manager's pending timers.
+      fastManager.stopAgent("agent-a");
+    });
+
+    it("KPR-220 Phase 15: runReflectionTurn skips when thread is non-quiescent (mid-spawn race)", async () => {
+      // Simulates the microsecond TOCTOU window between processing.has check
+      // in withSpawnTicket and the reflection timer firing: a user turn has
+      // acquired the per-thread lock right before the timer dispatches.
+      //
+      // Under the fix: runReflectionTurn returns early at the quiescence
+      // check; reflection NEVER fires even after the lock releases (the
+      // state.timer was cleared at entry, and the state.pendingReflectionTurns
+      // counter still satisfies eligibility — but the timer has to be
+      // rescheduled by the next user-turn completion, not by the aborted run).
+      //
+      // Under the bug (no quiescence check): runReflectionTurn proceeds to
+      // call spawnTurn → withSpawnTicket waits in the lock loop → as soon as
+      // processing.delete fires, the spawn acquires the lock and runs the
+      // reflection prompt. Detectable by sampling mockRunnerSend AFTER lock
+      // release.
+      mockConversationIndex.mockResolvedValue(undefined);
+      const fastManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 50 },
+      );
+
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "ack" }));
+      const sharedThread = "sms:line-1:p15-quiescence";
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+
+      const threadKey = `agent-a:${sharedThread}`;
+      const processing = (fastManager as unknown as { processing: Set<string> }).processing;
+      processing.add(threadKey);
+
+      const callsBefore = mockRunnerSend.mock.calls.length;
+      // Wait for debounce to fire — under fix, runReflectionTurn returns
+      // early; under bug, it queues behind the lock.
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Release the lock — under bug, the queued reflection now acquires it
+      // and runs; under fix, nothing happens because runReflectionTurn
+      // already returned.
+      processing.delete(threadKey);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const reflectionFired = mockRunnerSend.mock.calls
+        .slice(callsBefore)
+        .some(([prompt]) => typeof prompt === "string" && prompt.startsWith("[System — end of conversation reflection]"));
+      expect(reflectionFired).toBe(false);
+
+      fastManager.stopAgent("agent-a");
+    });
+
+    it("KPR-220 Phase 15: reflection turn re-resolves sessionId AFTER lock acquired", async () => {
+      // The race the fix closes: timer fires while a user turn is in flight
+      // on the same thread. The user turn's spawnTurn rotates sessionStore
+      // post-compaction. Pre-fix: reflection's sessionId is captured at
+      // timer fire (before lock wait) → stale. Post-fix: spawnTurn
+      // re-resolves sessionId from sessionStore inside withSpawnTicket
+      // when ctx.kind === "reflection".
+      mockConversationIndex.mockResolvedValue(undefined);
+      const fastManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 30 },
+      );
+
+      // First few calls: regular turns with sessionId rotation simulating
+      // post-compaction. sessionStore tracks the latest.
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "ack", sessionId: "s-original" }));
+      const sharedThread = "sms:line-1:p15-session-rotate";
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+      await fastManager.spawnTurn(smsCtx({ threadId: sharedThread }));
+
+      // sessionStore.get is invoked by spawnTurn before lock acquire for
+      // non-reflection turns. We tracked it via the mock; assert at least
+      // one reflection-flavor lookup happens AT reflection-fire-time and
+      // gets the up-to-date sessionId. The mock's sessionStore.get tracks
+      // calls — the reflection turn's sessionStore.get call (re-resolution
+      // inside the HOF) is the new behavior under Phase 15.
+      const sessionStoreGetCalls = (sessionStore.get as unknown as { mock: { calls: unknown[][] } }).mock.calls.length;
+
+      // Wait for reflection timer to fire.
+      await new Promise((r) => setTimeout(r, 90));
+
+      // After reflection, sessionStore.get was invoked at least twice more:
+      // once by runReflectionTurn (pre-lock best-effort, line 755), once by
+      // spawnTurn's re-resolve (post-lock, ctx.kind === "reflection"). The
+      // re-resolve happens INSIDE withSpawnTicket, post-Phase-15. Without
+      // the fix, only the pre-lock read happens.
+      const sessionStoreGetCallsAfter = (sessionStore.get as unknown as { mock: { calls: unknown[][] } }).mock.calls.length;
+      expect(sessionStoreGetCallsAfter - sessionStoreGetCalls).toBeGreaterThanOrEqual(2);
+
+      fastManager.stopAgent("agent-a");
+    });
+
     it("KPR-220 Phase 6: reflection turn (kind=reflection) does not reschedule reflection", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       mockRunnerSend.mockResolvedValue(makeRunResult({ text: "reflected", sessionId: "s-r" }));
@@ -1921,9 +2087,21 @@ describe("AgentManager", () => {
   // KPR-220 Phase 11: getSnapshot + saturation tracking
   // ---------------------------------------------------------------------------
   describe("getSnapshot (KPR-220 Phase 11)", () => {
-    it("returns empty perAgent map when no agents have state", () => {
+    it("KPR-220 Phase 16: includes every registered agent on a fresh engine (no traffic yet)", () => {
+      // Phase 16: snapshot includes registry.listIds() so the heartbeat
+      // writes meaningful rows on first poll even without traffic. Mock
+      // registry has agent-a and agent-b; both should appear with
+      // zero-valued fields.
       const snapshot = manager.getSnapshot();
-      expect(snapshot).toEqual({ perAgent: {} });
+      expect(Object.keys(snapshot.perAgent).sort()).toEqual(["agent-a", "agent-b"]);
+      const a = snapshot.perAgent["agent-a"]!;
+      expect(a.activeSpawns).toBe(0);
+      expect(a.activeThreadKeys).toEqual([]);
+      expect(a.saturationCount).toBe(0);
+      expect(a.lastSaturationAt).toBeNull();
+      expect(a.lastSpawnAt).toBeNull();
+      expect(a.lastError).toBeNull();
+      expect(a.stopped).toBe(false);
     });
 
     it("returns activeSpawns, budget, budgetSource, lastSpawnAt for an agent after spawnTurn", async () => {
@@ -2019,10 +2197,13 @@ describe("AgentManager", () => {
     });
 
     it("budgetSource defaults to 'default' when neither spawnBudget nor maxConcurrent is set", async () => {
-      // agent-b has no maxConcurrent + no spawnBudget → falls through to engine default
-      const snapshot = manager.getSnapshot();
-      // No state yet for agent-b, so perAgent.agent-b is absent
-      expect(snapshot.perAgent["agent-b"]).toBeUndefined();
+      // agent-b has no maxConcurrent + no spawnBudget → falls through to engine default.
+      // Post-Phase-16, agent-b is already present in the snapshot from the registry
+      // (zero-valued fields); the budget + source still resolve via spawnBudgetFor.
+      const preSnap = manager.getSnapshot();
+      expect(preSnap.perAgent["agent-b"]).toBeDefined();
+      expect(preSnap.perAgent["agent-b"]!.budgetSource).toBe("default");
+      expect(preSnap.perAgent["agent-b"]!.budget).toBe(5);
 
       mockConversationIndex.mockResolvedValue(undefined);
       await manager.spawnTurn(makeSmsCtx({ agentId: "agent-b" }));
