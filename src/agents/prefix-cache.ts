@@ -57,6 +57,15 @@ export class PrefixCache {
   private entries = new Map<string, PrefixCacheEntry>();
   private inflight = new Map<string, Promise<string>>();
 
+  // KPR-220 PR #266 review fix: invalidation generation counters. `getOrBuild`
+  // captures the (perAgent, global) generation at build start; on resolve, the
+  // result is only committed to `entries` if both are unchanged. Without this,
+  // an `invalidate*` that fires while a build is awaiting I/O is silently
+  // overwritten when the (stale) build result resolves — leaving the cache
+  // permanently stale until another invalidate fires.
+  private generations = new Map<string, number>();
+  private globalGeneration = 0;
+
   // Telemetry — incremented on every getOrBuild call.
   private hitCount = 0;
   private missCount = 0;
@@ -89,11 +98,34 @@ export class PrefixCache {
 
     this.missCount++;
     const buildStart = this.now();
+    // Capture the generation snapshot at build start. If an invalidate fires
+    // during the build, one of these counters will have advanced when the
+    // build resolves, and the result is dropped instead of committed. The
+    // caller still gets the freshly-built value (we return it); we just
+    // refuse to cache a known-stale prefix.
+    const genAtBuildStart = {
+      perAgent: this.generations.get(agentId) ?? 0,
+      global: this.globalGeneration,
+    };
     const promise = builder()
       .then((prefix) => {
         const builtAt = this.now();
         const buildDurationMs = builtAt - buildStart;
-        this.entries.set(agentId, { prefix, builtAt, buildDurationMs });
+        const perAgentNow = this.generations.get(agentId) ?? 0;
+        if (
+          perAgentNow === genAtBuildStart.perAgent &&
+          this.globalGeneration === genAtBuildStart.global
+        ) {
+          this.entries.set(agentId, { prefix, builtAt, buildDurationMs });
+        } else {
+          log.debug("prefix-cache build dropped — invalidation fired during build", {
+            agent: agentId,
+            perAgentAtStart: genAtBuildStart.perAgent,
+            perAgentNow,
+            globalAtStart: genAtBuildStart.global,
+            globalNow: this.globalGeneration,
+          });
+        }
         this.recordBuildDuration(buildDurationMs);
         return prefix;
       })
@@ -111,6 +143,10 @@ export class PrefixCache {
    * entry exists (no-op).
    */
   invalidateAgent(agentId: string, reason: string): void {
+    // Bump generation BEFORE deleting the entry. If a build for this agent is
+    // currently in flight, this bump ensures its resolution drops the result
+    // instead of committing it (see getOrBuild's generation check).
+    this.generations.set(agentId, (this.generations.get(agentId) ?? 0) + 1);
     const had = this.entries.delete(agentId);
     if (had) {
       log.debug("prefix-cache invalidated", { agent: agentId, reason });
@@ -122,6 +158,11 @@ export class PrefixCache {
    * (constitution edits, skill changes, team-roster changes, SIGUSR1).
    */
   invalidateAll(reason: string): void {
+    // Bump global generation regardless of whether entries is empty — an
+    // empty cache may still have in-flight builds that this invalidation
+    // should cancel. Without this, a global invalidate during a cold build
+    // would silently overwrite with the pre-invalidate prefix.
+    this.globalGeneration++;
     if (this.entries.size === 0) return;
     const count = this.entries.size;
     this.entries.clear();

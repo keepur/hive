@@ -670,6 +670,36 @@ describe("KPR-221 — AgentRegistry hard-rejects context-dependent servers in de
     expect(result.added).toContain("clean-agent");
   });
 
+  it("KPR-220 PR #266 fix: a DISABLED agent with a context-dependent delegateServer lands in disabledAgents, not evicted", async () => {
+    // Pre-fix: validateDelegateServersOrThrow ran AHEAD of the disabled
+    // short-circuit, so a disabled agent with `delegateServers: ["recall"]`
+    // got logged as a load failure and was omitted from disabledAgents.
+    // That broke the operator-facing "disable first, repair config later"
+    // invariant — disabled agents are offline docs, not live configs.
+    // Post-fix: the disabled check runs first; validation is skipped for
+    // disabled agents.
+    //
+    // Negative-verify: swap the order back (validateDelegateServersOrThrow
+    // before the disabled-check block) → this test fails because the agent
+    // is evicted/omitted instead of appearing in disabledAgents.
+    const docs = [
+      makeDefinition({
+        _id: "disabled-with-bad-delegate",
+        disabled: true,
+        delegateServers: ["recall"],
+      }),
+    ];
+    const registry = new AgentRegistry(makeFakeCollection(docs));
+    await registry.load();
+
+    // Disabled agents land in the disabled list (accessed via getDisabled()),
+    // not in the active map.
+    expect(registry.getDisabled()).toContainEqual(
+      expect.objectContaining({ id: "disabled-with-bad-delegate" }),
+    );
+    expect(registry.get("disabled-with-bad-delegate")).toBeUndefined();
+  });
+
   it("memory, structured-memory, callback are stripped by KPR-184 sanitizer first (no hard-reject)", async () => {
     // KPR-184's sanitizer strips IN_PROCESS_PORTED_SERVERS (which includes
     // memory, structured-memory, and callback) before KPR-221 validation

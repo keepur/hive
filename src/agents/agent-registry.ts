@@ -133,6 +133,26 @@ export class AgentRegistry {
       agentConfig.delegateServers = sanitizeDelegateServers(agentConfig.id, agentConfig.delegateServers);
       currentIds.add(agentConfig.id);
 
+      // Disabled check FIRST — skip all validation for disabled agents.
+      // Without this, a disabled agent with invalid archetypeConfig or with
+      // a context-dependent server in delegateServers (KPR-221) would fail
+      // validation and get evicted instead of being quietly skipped. The
+      // operator-facing contract is "disable first, repair config later" —
+      // a disabled agent definition is an offline doc, not a live config.
+      //
+      // KPR-220 PR #266 review fix: previously, validateDelegateServersOrThrow
+      // ran ahead of this block, causing disabled agents with bad
+      // delegateServers to be evicted instead of landing in disabledAgents.
+      if (agentConfig.disabled) {
+        newDisabled.push(agentConfig);
+        if (this.agents.has(agentConfig.id)) {
+          this.agents.delete(agentConfig.id);
+          removed.push(agentConfig.id);
+          log.info("Disabled agent removed from active map", { id: agentConfig.id });
+        }
+        continue;
+      }
+
       // KPR-221: hard-reject context-dependent servers in delegateServers.
       // These can't function as sub-agents (sub-agents spawn without channel/
       // thread env vars). Fail-closed: evict the offending agent and log the
@@ -150,19 +170,6 @@ export class AgentRegistry {
           log.warn("Evicted previously-loaded agent due to context-dependent server in delegateServers", {
             id: agentConfig.id,
           });
-        }
-        continue;
-      }
-
-      // Disabled check first — skip all validation for disabled agents.
-      // Without this, a disabled agent with invalid archetypeConfig would
-      // fail validation and get evicted instead of being quietly skipped.
-      if (agentConfig.disabled) {
-        newDisabled.push(agentConfig);
-        if (this.agents.has(agentConfig.id)) {
-          this.agents.delete(agentConfig.id);
-          removed.push(agentConfig.id);
-          log.info("Disabled agent removed from active map", { id: agentConfig.id });
         }
         continue;
       }

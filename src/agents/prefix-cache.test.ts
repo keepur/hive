@@ -164,7 +164,11 @@ describe("PrefixCache.stats", () => {
 });
 
 describe("PrefixCache concurrency edge cases", () => {
-  it("invalidate during in-flight build does not prevent the caller from getting the result", async () => {
+  it("invalidate during in-flight build still returns the result to the caller", async () => {
+    // The original caller awaiting the in-flight build still gets the
+    // freshly-built value — dropping it would break correctness for the
+    // in-flight request. What changes (post-KPR-220 PR #266 fix) is whether
+    // that result gets COMMITTED to the entries cache. See subsequent tests.
     const cache = new PrefixCache();
     let resolveBuild!: (value: string) => void;
     const builder = vi.fn(
@@ -179,12 +183,88 @@ describe("PrefixCache concurrency edge cases", () => {
     resolveBuild("PREFIX");
     const value = await p;
     expect(value).toBe("PREFIX");
+  });
 
-    // The build did insert the entry post-hoc; subsequent caller hits
-    // that entry. (This trades exact freshness for simplicity. Per spec,
-    // a follow-up invalidation event after the build window will catch
-    // any staleness.)
-    const v2 = await cache.getOrBuild("agent-1", builder);
-    expect(v2).toBe("PREFIX");
+  it("KPR-220 PR #266 fix: invalidateAgent during in-flight build does NOT commit the stale result", async () => {
+    // Pre-fix: when invalidateAgent fired during an in-flight build, the
+    // result still wrote to `entries` on resolve, leaving the cache
+    // permanently stale until another invalidation fired. Post-fix: a
+    // generation counter is bumped by invalidateAgent; the build commit
+    // checks the generation and drops the write if it changed.
+    const cache = new PrefixCache();
+    let resolveStale!: (value: string) => void;
+    const staleBuilder = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStale = resolve;
+        }),
+    );
+
+    const p = cache.getOrBuild("agent-1", staleBuilder);
+    cache.invalidateAgent("agent-1", "mid-flight-write");
+    resolveStale("STALE_PREFIX");
+    await p;
+
+    // Next caller must re-build (the stale result was NOT committed to entries).
+    // Negative-verify: remove the generation-check in getOrBuild → this test
+    // fails because freshBuilder is never invoked (stale result was committed).
+    const freshBuilder = vi.fn(async () => "FRESH_PREFIX");
+    const v2 = await cache.getOrBuild("agent-1", freshBuilder);
+    expect(v2).toBe("FRESH_PREFIX");
+    expect(freshBuilder).toHaveBeenCalledTimes(1);
+
+    // Stats: two misses total (the original cold miss + the post-invalidate miss).
+    expect(cache.stats().misses).toBe(2);
+    expect(cache.stats().hits).toBe(0);
+  });
+
+  it("KPR-220 PR #266 fix: invalidateAll during in-flight build does NOT commit stale result (cold cache)", async () => {
+    // The empty-cache early-return in invalidateAll() was a particularly
+    // sharp version of the bug: if entries was empty (cache cold), the
+    // method early-returned and didn't bump anything — so an in-flight
+    // cold build would commit pre-invalidate state. Post-fix: globalGeneration
+    // bumps BEFORE the early return.
+    const cache = new PrefixCache();
+    let resolveStale!: (value: string) => void;
+    const staleBuilder = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStale = resolve;
+        }),
+    );
+
+    // entries is empty (cold cache), but a build is in flight.
+    const p = cache.getOrBuild("agent-1", staleBuilder);
+    cache.invalidateAll("global-mid-flight");
+    resolveStale("STALE_PREFIX");
+    await p;
+
+    const freshBuilder = vi.fn(async () => "FRESH_PREFIX");
+    const v2 = await cache.getOrBuild("agent-1", freshBuilder);
+    expect(v2).toBe("FRESH_PREFIX");
+    expect(freshBuilder).toHaveBeenCalledTimes(1);
+  });
+
+  it("KPR-220 PR #266 fix: invalidateAgent on one agent does NOT drop unrelated agents' in-flight builds", async () => {
+    // Verifies the per-agent (not global-only) granularity of invalidateAgent.
+    // Agent A's build is in flight; invalidating agent B must NOT cause
+    // agent A's result to be dropped.
+    const cache = new PrefixCache();
+    let resolveA!: (value: string) => void;
+    const builderA = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveA = resolve;
+        }),
+    );
+
+    const pA = cache.getOrBuild("agent-a", builderA);
+    cache.invalidateAgent("agent-b", "unrelated"); // different agent
+    resolveA("A_PREFIX");
+    await pA;
+
+    // agent-a's prefix WAS committed (unrelated invalidate). Next call hits.
+    const v2 = await cache.getOrBuild("agent-a", async () => "should-not-run");
+    expect(v2).toBe("A_PREFIX");
   });
 });
