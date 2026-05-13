@@ -245,6 +245,108 @@ describe("PrefixCache concurrency edge cases", () => {
     expect(freshBuilder).toHaveBeenCalledTimes(1);
   });
 
+  it("KPR-220 PR #266 follow-up fix: post-invalidate caller does NOT join the stale in-flight build", async () => {
+    // The narrower race caught by external review on cebc9c5: the generation
+    // check prevents COMMITTING a stale result, but a new caller arriving
+    // AFTER the invalidation could still join the in-flight promise and
+    // receive the stale prefix. The turn that arrived post-invalidate then
+    // ran with pre-write prompt state.
+    //
+    // Post-fix: the inflight entry carries the generation it was started
+    // under; getOrBuild only joins if generations match, otherwise starts a
+    // fresh build.
+    const cache = new PrefixCache();
+    let resolveStale!: (value: string) => void;
+    const staleBuilder = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStale = resolve;
+        }),
+    );
+
+    // First caller starts the cold build.
+    const pStale = cache.getOrBuild("agent-1", staleBuilder);
+
+    // Invalidate fires while the build is in flight.
+    cache.invalidateAgent("agent-1", "mid-flight-write");
+
+    // Post-invalidate caller arrives. MUST start a fresh build, not join the
+    // stale in-flight one.
+    let resolveFresh!: (value: string) => void;
+    const freshBuilder = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveFresh = resolve;
+        }),
+    );
+    const pFresh = cache.getOrBuild("agent-1", freshBuilder);
+
+    // The fresh builder MUST have been invoked (negative-verify: without the
+    // inflight-generation check, getOrBuild returns the stale promise and
+    // freshBuilder is never called).
+    expect(freshBuilder).toHaveBeenCalledTimes(1);
+
+    resolveStale("STALE_PREFIX");
+    resolveFresh("FRESH_PREFIX");
+
+    // The two callers get distinct results.
+    expect(await pStale).toBe("STALE_PREFIX");
+    expect(await pFresh).toBe("FRESH_PREFIX");
+
+    // The committed entry is the fresh one (the stale build's commit was
+    // dropped by the generation check in .then()).
+    const v3 = await cache.getOrBuild("agent-1", async () => "should-not-run");
+    expect(v3).toBe("FRESH_PREFIX");
+  });
+
+  it("KPR-220 PR #266 follow-up fix: older inflight's .finally does NOT delete the newer inflight entry", async () => {
+    // Without the identity-check on .finally, the older (post-replaced)
+    // build's cleanup would delete `inflight[agentId]` even though that
+    // slot was replaced by a newer build. The newer build would then
+    // appear to "leak" — its .then() commits to entries successfully
+    // (correctness preserved at the cache layer), but the inflight entry
+    // is gone before its own .finally runs. The next concurrent caller
+    // arriving while the new build is still in flight would NOT find an
+    // inflight entry and would start ANOTHER fresh build (thundering herd
+    // re-emerges on cold post-invalidate cache).
+    const cache = new PrefixCache();
+    let resolveStale!: (value: string) => void;
+    cache.getOrBuild(
+      "agent-1",
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStale = resolve;
+        }),
+    );
+
+    cache.invalidateAgent("agent-1", "trigger-replacement");
+
+    let resolveFresh!: (value: string) => void;
+    const pFresh = cache.getOrBuild(
+      "agent-1",
+      () =>
+        new Promise<string>((resolve) => {
+          resolveFresh = resolve;
+        }),
+    );
+
+    // Resolve the OLDER build first. Its .finally should NOT delete the
+    // newer inflight entry (identity-check protects).
+    resolveStale("STALE");
+    await new Promise((r) => setTimeout(r, 0)); // let microtasks settle
+
+    // A third caller arrives while the FRESH build is still in flight.
+    // It must find the fresh inflight (NOT see it deleted by the stale
+    // build's cleanup) and join it — otherwise it'd start a 3rd build.
+    const thirdBuilder = vi.fn(async () => "third");
+    const pThird = cache.getOrBuild("agent-1", thirdBuilder);
+    expect(thirdBuilder).not.toHaveBeenCalled();
+
+    resolveFresh("FRESH");
+    expect(await pFresh).toBe("FRESH");
+    expect(await pThird).toBe("FRESH"); // joined the fresh build, did not start its own
+  });
+
   it("KPR-220 PR #266 fix: invalidateAgent on one agent does NOT drop unrelated agents' in-flight builds", async () => {
     // Verifies the per-agent (not global-only) granularity of invalidateAgent.
     // Agent A's build is in flight; invalidating agent B must NOT cause

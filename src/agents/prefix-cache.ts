@@ -53,9 +53,17 @@ export interface PrefixCacheStats {
 /** Rolling window size for p99 build-duration telemetry. */
 const P99_WINDOW = 200;
 
+interface InflightBuild {
+  promise: Promise<string>;
+  /** Generation snapshot at build start. A caller arriving later only joins
+   * this in-flight build if both counters still match — otherwise the build
+   * is operating on pre-invalidate state and a fresh build is started. */
+  generations: { perAgent: number; global: number };
+}
+
 export class PrefixCache {
   private entries = new Map<string, PrefixCacheEntry>();
-  private inflight = new Map<string, Promise<string>>();
+  private inflight = new Map<string, InflightBuild>();
 
   // KPR-220 PR #266 review fix: invalidation generation counters. `getOrBuild`
   // captures the (perAgent, global) generation at build start; on resolve, the
@@ -87,26 +95,35 @@ export class PrefixCache {
       return cached.prefix;
     }
 
-    // Miss path. Coalesce concurrent builds for the same agent.
+    const currentGen = {
+      perAgent: this.generations.get(agentId) ?? 0,
+      global: this.globalGeneration,
+    };
+
+    // Miss path. Coalesce concurrent builds for the same agent — but ONLY
+    // when the in-flight build was started under the SAME generation as
+    // current. If an invalidate fired between the in-flight build's start
+    // and this caller's arrival, the in-flight is operating on stale
+    // pre-invalidate state; this caller must NOT receive that result.
+    // Start a fresh build instead. The old in-flight still resolves and
+    // its result is dropped via the generation check in .then(); the
+    // identity-check on .finally below prevents the old build from
+    // deleting the new in-flight entry on cleanup.
     const inflight = this.inflight.get(agentId);
-    if (inflight) {
+    if (
+      inflight &&
+      inflight.generations.perAgent === currentGen.perAgent &&
+      inflight.generations.global === currentGen.global
+    ) {
       // Don't double-count misses for the joiners — they're the same
-      // logical miss as the original. Only the first caller increments
+      // logical miss as the original. Only the first caller incremented
       // the miss counter (handled below in the build branch).
-      return inflight;
+      return inflight.promise;
     }
 
     this.missCount++;
     const buildStart = this.now();
-    // Capture the generation snapshot at build start. If an invalidate fires
-    // during the build, one of these counters will have advanced when the
-    // build resolves, and the result is dropped instead of committed. The
-    // caller still gets the freshly-built value (we return it); we just
-    // refuse to cache a known-stale prefix.
-    const genAtBuildStart = {
-      perAgent: this.generations.get(agentId) ?? 0,
-      global: this.globalGeneration,
-    };
+    const genAtBuildStart = currentGen;
     const promise = builder()
       .then((prefix) => {
         const builtAt = this.now();
@@ -130,11 +147,18 @@ export class PrefixCache {
         return prefix;
       })
       .finally(() => {
-        // Drop the in-flight entry whether or not the build succeeded —
-        // a failed build should not block future retries.
-        this.inflight.delete(agentId);
+        // Identity-check via the chained promise: only delete if WE are
+        // still the registered in-flight entry. A newer build (started
+        // after an intervening invalidation) may have replaced this entry;
+        // that newer entry must NOT be deleted by this older build's
+        // cleanup. The chained-promise reference is captured by closure
+        // here; at run-time (after the chain resolves) the outer `const
+        // promise` is fully bound.
+        if (this.inflight.get(agentId)?.promise === promise) {
+          this.inflight.delete(agentId);
+        }
       });
-    this.inflight.set(agentId, promise);
+    this.inflight.set(agentId, { promise, generations: genAtBuildStart });
     return promise;
   }
 
