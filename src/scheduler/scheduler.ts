@@ -241,7 +241,7 @@ export class Scheduler {
         if (this.onDispatch) {
           this.onDispatch(workItem);
         } else {
-          this.agentManager.sendMessage(job.agentId, workItem).catch((err) => {
+          this.agentManager.runWorkItemTurn(job.agentId, workItem).catch((err) => {
             log.error("Scheduled task failed", { agentId: job.agentId, task: job.task, error: String(err) });
           });
         }
@@ -309,7 +309,7 @@ export class Scheduler {
         this.onDispatch(workItem);
       } else {
         // Fallback: direct to agent manager (no response routing)
-        this.agentManager.sendMessage(cb.agentId, workItem).catch((err) => {
+        this.agentManager.runWorkItemTurn(cb.agentId, workItem).catch((err) => {
           log.error("Callback dispatch failed", {
             agentId: cb.agentId,
             callbackId: cb._id.toString(),
@@ -399,7 +399,7 @@ export class Scheduler {
         if (this.onDispatch) {
           this.onDispatch(workItem);
         } else {
-          this.agentManager.sendMessage(delivery.agentId, workItem).catch((err) => {
+          this.agentManager.runWorkItemTurn(delivery.agentId, workItem).catch((err) => {
             log.error("Event dispatch failed", {
               agentId: delivery.agentId,
               eventType: event.type,
@@ -449,14 +449,16 @@ export class Scheduler {
             this.onDispatch(item);
           } else {
             this.agentManager
-              .sendMessage(req.targetAgentId as string, item)
+              .runWorkItemTurn(req.targetAgentId as string, item)
               .catch((err: unknown) =>
                 log.error("Fire-and-forget team message failed", { target: req.targetAgentId, error: String(err) }),
               );
           }
         } else if (req.type === "request_response") {
-          // For request/response, dispatch and capture the response
-          const result = await this.agentManager.sendMessage(req.targetAgentId as string, item);
+          // KPR-220 Phase 7: replace sendMessage (legacy long-lived path)
+          // with runWorkItemTurn (per-turn). Result type changes from
+          // RunResult to TurnResult — text becomes finalMessage.
+          const result = await this.agentManager.runWorkItemTurn(req.targetAgentId as string, item);
 
           // Save the response to team_messages
           await this.db.collection("team_messages").insertOne({
@@ -465,14 +467,14 @@ export class Scheduler {
             senderId: req.targetAgentId,
             senderType: "agent",
             senderName: req.targetAgentId,
-            text: result.text,
+            text: result.finalMessage,
             createdAt: new Date(),
           });
 
           // Signal the waiting send_message tool
           await this.db
             .collection("team_pending_requests")
-            .updateOne({ _id: req._id }, { $set: { status: "completed", response: result.text } });
+            .updateOne({ _id: req._id }, { $set: { status: "completed", response: result.finalMessage } });
         }
       } catch (err) {
         log.error("Team request dispatch failed", {

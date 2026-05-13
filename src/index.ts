@@ -18,6 +18,8 @@ import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
+import { PrefixCache } from "./agents/prefix-cache.js";
+import { SpawnCoordinatorHeartbeat } from "./agents/spawn-coordinator-heartbeat.js";
 import { TeamCache } from "./team-roster/team-cache.js";
 import { TeamRoster } from "./team-roster/team-roster.js";
 import { ContactsWatcher } from "./team-roster/contacts-watcher.js";
@@ -170,18 +172,47 @@ async function main(): Promise<void> {
   // slice invalidates via ContactsWatcher.
   const teamCache = new TeamCache(db);
   const teamRoster = new TeamRoster(teamCache);
-  registry.onPostReload(() => teamCache.invalidateAgents());
-  const contactsWatcher = new ContactsWatcher(db, teamCache);
+  // KPR-213: write-through prefix cache. Singleton owned at the top level
+  // so every wiring point that mutates a prefix-affecting input can call
+  // invalidateAgent / invalidateAll synchronously. AgentRunner reads through
+  // it via AgentManager.
+  const prefixCache = new PrefixCache();
+  registry.onPostReload(() => {
+    teamCache.invalidateAgents();
+    // Agent-def updates are global from the prefix's perspective: the team
+    // summary may have changed (subsumes per-agent invalidation since the
+    // team summary appears in every agent's prefix), and the agent's own
+    // soul/systemPrompt/coreServers may have changed. invalidateAll is the
+    // simpler, correct choice.
+    prefixCache.invalidateAll("agent-def-update");
+  });
+  const contactsWatcher = new ContactsWatcher(db, teamCache, () => prefixCache.invalidateAll("team-roster-humans"));
   await contactsWatcher.start();
 
   // Initialize core systems
   const memoryManager = new MemoryManager(db);
   await memoryManager.init();
+  // KPR-213: FS-style memory writes (constitution, agent memory.md) flow
+  // through MemoryManager.write — wire prefix invalidation here. Path-aware:
+  // shared/* invalidates all; agents/<id>/* invalidates that agent.
+  memoryManager.setOnWrite((path, reason) => {
+    const m = path.match(/^agents\/([^/]+)\//);
+    if (m) prefixCache.invalidateAgent(m[1], reason);
+    else prefixCache.invalidateAll(reason);
+  });
 
   // Structured memory lifecycle — always enabled
   const memoryStore = new MemoryStore(db);
   await memoryStore.init();
   memoryManager.memoryStore = memoryStore;
+  // KPR-213: structured-memory mutations from autoDream lifecycle and the
+  // knowledge-extractor go through this shared store instance (separate
+  // from the per-MCP stores — those wire onMutate themselves). Bulk-id
+  // paths pass `null` → invalidateAll.
+  memoryStore.setOnMutate((agentId, reason) => {
+    if (agentId === null) prefixCache.invalidateAll(reason);
+    else prefixCache.invalidateAgent(agentId, reason);
+  });
   const memoryEmbedder = new MemoryEmbedder();
   const memoryLifecycle = new MemoryLifecycle(
     memoryStore,
@@ -267,6 +298,7 @@ async function main(): Promise<void> {
     activityLogger,
     prefetcher,
     teamRoster,
+    prefixCache,
   );
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
@@ -331,6 +363,11 @@ async function main(): Promise<void> {
   // Watch skills/ directory for changes — debounced to 500ms
   if (existsSync(skillsDir)) {
     watch(skillsDir, { recursive: true }, () => {
+      // KPR-213: skill registry changes don't currently affect the prefix
+      // (skills are wired as SDK plugins, not into the prompt). Invalidate
+      // anyway so the cache stays consistent with the runtime view in case
+      // the toolkit section ever starts reflecting the skill index.
+      prefixCache.invalidateAll("skill-change");
       if (reloadTimer) clearTimeout(reloadTimer);
       reloadTimer = setTimeout(() => reload(), 500);
     });
@@ -349,6 +386,10 @@ async function main(): Promise<void> {
       const isSkillMd = typeof filename === "string" && filename.endsWith("SKILL.md");
       const filenameMissing = filename === null || filename === undefined;
       if (isSkillMd || filenameMissing) {
+        // KPR-213: per-agent skills also feed the toolkit section in the
+        // future; invalidate prefix cache for safety. Same call site as the
+        // global skills watch above.
+        prefixCache.invalidateAll("agent-skill-change");
         if (reloadTimer) clearTimeout(reloadTimer);
         reloadTimer = setTimeout(() => reload(), 500);
       }
@@ -356,15 +397,51 @@ async function main(): Promise<void> {
     log.info("Agent-private skills hot-reload enabled", { watched: agentsRoot });
   }
 
-  // SIGUSR1: manual hot-reload trigger
-  process.on("SIGUSR1", () => reload());
+  // SIGUSR1: manual hot-reload trigger. KPR-213: also flush the prefix cache.
+  // Operators historically used SIGUSR1 to force-fresh prefixes; the cache
+  // now invalidates automatically on every write path, so SIGUSR1 is no
+  // longer load-bearing for prefix freshness — it stays as an explicit
+  // escape hatch.
+  process.on("SIGUSR1", () => {
+    prefixCache.invalidateAll("sigusr1");
+    reload();
+  });
   log.info("Hot-reload enabled", { signal: "SIGUSR1" });
+
+  // KPR-213: heartbeat prefix-cache stats to Mongo so the out-of-process
+  // `hive doctor` CLI can render them. Doctor doesn't share memory with
+  // the engine. 30s cadence — same as agent-registry / contacts watchers.
+  const PREFIX_CACHE_HEARTBEAT_MS = 30_000;
+  const telemetryCollection = db.collection("telemetry");
+  const writeStats = async () => {
+    try {
+      const s = prefixCache.stats();
+      await telemetryCollection.updateOne(
+        { kind: "prefix_cache_stats" },
+        { $set: { ...s, updatedAt: new Date() } },
+        { upsert: true },
+      );
+    } catch (err) {
+      log.warn("prefix-cache stats heartbeat failed", { error: String(err) });
+    }
+  };
+  // Initial write at startup so doctor sees zeros instead of "no telemetry".
+  await writeStats();
+  const prefixCacheHeartbeat = setInterval(writeStats, PREFIX_CACHE_HEARTBEAT_MS);
+  prefixCacheHeartbeat.unref();
+
+  // KPR-220 Phase 11: spawn-coordinator stats heartbeat. Cancels on service
+  // shutdown only (spec S8) — NOT on `stopAll()` — so the doctor still sees
+  // stopped agents in the snapshot.
+  const spawnCoordinatorHeartbeat = new SpawnCoordinatorHeartbeat(agentManager, telemetryCollection);
+  await spawnCoordinatorHeartbeat.writeOnce();
+  spawnCoordinatorHeartbeat.start();
 
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
   const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
-  const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack");
+  const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack", config.defaultAgent);
   dispatcher.registerAdapter(slackAdapter);
   dispatcher.setSlackAdapter(slackAdapter);
   await slackAdapter.start((item) => {
@@ -417,7 +494,8 @@ async function main(): Promise<void> {
     log.info("Slack internal API started", { port: config.slackInternal.port });
   }
 
-  // SMS adapter — direct path, bypasses Slack
+  // SMS adapter — direct path, bypasses Slack. Per-turn-spawn routing is
+  // handled inside the dispatcher (KPR-223); the adapter just emits WorkItems.
   const smsAdapter = new SmsAdapter(config.quo.apiKey, config.sms.lines);
   dispatcher.registerAdapter(smsAdapter);
   if (config.quo.apiKey && config.sms.lines.length > 0) {
@@ -487,6 +565,9 @@ async function main(): Promise<void> {
       commandRegistry,
       agentRegistry: registry,
       agentManager,
+      // Adapter-level fallback used by dispatcher meta routing (KPR-223 moved
+      // per-turn-spawn gating into the dispatcher itself).
+      defaultAgentId: config.defaultAgent,
     });
     dispatcher.registerAdapter(wsAdapter);
     await wsAdapter.start((item) => {
@@ -521,7 +602,14 @@ async function main(): Promise<void> {
   if (config.voice.enabled && config.voice.serverSecret) {
     const { VoiceAdapter } = await import("./channels/voice/voice-adapter.js");
 
-    voiceAdapter = new VoiceAdapter(config.voice.port, config.voice.serverSecret, registry, memoryManager);
+    voiceAdapter = new VoiceAdapter(
+      config.voice.port,
+      config.voice.serverSecret,
+      registry,
+      memoryManager,
+      agentManager, // KPR-219: needed for the per-turn flag-on path
+      dispatcher, // KPR-223: routes voice turns through the dispatcher (taskLedger + audit; dedup skipped)
+    );
     await voiceAdapter.start();
     log.info("Voice adapter started", { port: config.voice.port });
   }
@@ -633,6 +721,7 @@ async function main(): Promise<void> {
     await codeTaskManager.stop();
     await prefetcher?.close();
     meetingMonitor?.stop();
+    spawnCoordinatorHeartbeat.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
     contactsWatcher.stop();
     if (activityLogger) await activityLogger.stop();

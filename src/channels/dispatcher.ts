@@ -1,13 +1,14 @@
 import { createLogger } from "../logging/logger.js";
 import type { WorkItem, WorkResult } from "../types/work-item.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
-import type { AgentManager } from "../agents/agent-manager.js";
+import type { AgentManager, TurnContext, TurnResult, SpawnTurnStreamCallback } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
 import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
+import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
 
 const log = createLogger("dispatcher");
@@ -201,7 +202,7 @@ export class Dispatcher {
     // 4. Full agent processing
     await adapter?.onProcessingStart?.(item, agentId);
     try {
-      const runResult = await this.agentManager.sendMessage(agentId, item);
+      const runResult = this.convertTurnResult(await this.agentManager.runWorkItemTurn(agentId, item));
 
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
@@ -283,6 +284,96 @@ export class Dispatcher {
     for (const [id, ts] of this.recentMessageIds) {
       if (ts < cutoff) this.recentMessageIds.delete(id);
     }
+  }
+
+  /**
+   * KPR-220 Phase 9: TurnResult → RunResult conversion. Per-turn is now the
+   * only execution path; the dispatcher unconditionally routes through
+   * `agentManager.runWorkItemTurn` and converts the `TurnResult` into the
+   * legacy `RunResult` shape that downstream delivery + audit code expects.
+   *
+   * Every field of `RunResult` MUST be mapped explicitly here. The extraction
+   * to a named private helper (vs. inline at call sites) is a plan-review
+   * constraint: an inline conversion could silently drop a field and still
+   * compile — the named helper makes the mapping auditable.
+   */
+  private convertTurnResult(turn: TurnResult): RunResult {
+    return {
+      text: turn.finalMessage,
+      sessionId: turn.newSessionId,
+      costUsd: turn.usage.costUsd,
+      durationMs: turn.usage.durationMs,
+      inputTokens: turn.usage.inputTokens,
+      outputTokens: turn.usage.outputTokens,
+      cacheReadTokens: turn.usage.cacheReadTokens,
+      cacheCreationTokens: turn.usage.cacheCreationTokens,
+      contextWindow: turn.usage.contextWindow,
+      llmMs: turn.llmMs,
+      toolMs: turn.toolMs,
+      toolCalls: turn.toolCalls,
+      toolSummary: turn.toolSummary ?? "",
+      streamed: turn.streamed,
+      compactions: turn.compactions,
+      preCompactTokens: turn.preCompactTokens,
+      ephemeral5mTokens: turn.ephemeral5mTokens,
+      ephemeral1hTokens: turn.ephemeral1hTokens,
+      error: turn.errors[0],
+      // Dispatcher's RunResult.aborted is never read downstream — grep-confirmed
+      // all `.aborted` references live inside agent-manager.ts. Hardcoding
+      // `false` is harmless because no caller distinguishes aborted from normal
+      // completion in RunResult.
+      aborted: false,
+    };
+  }
+
+  /**
+   * KPR-223: voice per-turn routing. The voice adapter cannot emit through
+   * `onWorkItem` (synchronous HTTP request/response with Vapi requires
+   * writing the response in the same call), so the dispatcher exposes this
+   * direct entry point. Applies taskLedger + audit log; **skips dedup** —
+   * voice WorkItem.id is the Vapi callId, which is reused across many turns
+   * within a single call, and adding callId to the dedup map would silently
+   * drop turns 2+ inside the 60s TTL. Voice is implicitly serialized by
+   * Vapi (one POST per turn).
+   */
+  async routeVoiceTurn(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
+    // No dedup — Q4 invariant. See class comment above.
+    const tracked = this.taskLedger?.shouldTrack(ctx.workItem) ?? false;
+    if (tracked) {
+      this.taskLedger!.onDispatch(ctx.workItem, ctx.agentId).catch((err) =>
+        log.warn("Task ledger dispatch failed (voice)", { error: String(err) }),
+      );
+    }
+
+    const result = await this.agentManager.spawnTurn(ctx, onStream);
+
+    if (tracked) {
+      const workResult: WorkResult = {
+        text: result.finalMessage,
+        agentId: ctx.agentId,
+        workItem: ctx.workItem,
+        costUsd: result.usage.costUsd,
+        durationMs: result.usage.durationMs,
+        error: result.errors[0],
+      };
+      this.taskLedger!.onComplete(workResult).catch((err) =>
+        log.warn("Task ledger complete failed (voice)", { error: String(err) }),
+      );
+    }
+
+    if (this.auditAdapter && ctx.workItem.source.kind !== this.auditAdapter.kind) {
+      const workResult: WorkResult = {
+        text: result.finalMessage,
+        agentId: ctx.agentId,
+        workItem: ctx.workItem,
+        costUsd: result.usage.costUsd,
+        durationMs: result.usage.durationMs,
+        error: result.errors[0],
+      };
+      this.postAuditLog(workResult).catch((err) => log.warn("Audit post failed (voice)", { error: String(err) }));
+    }
+
+    return result;
   }
 
   private async resolveAgents(item: WorkItem): Promise<ResolvedAgent[]> {
@@ -506,7 +597,7 @@ export class Dispatcher {
     const adapter = this.adapters.get(effectiveItem.source.adapterId ?? effectiveItem.source.kind);
 
     try {
-      const runResult = await this.agentManager.sendMessage(agentId, effectiveItem);
+      const runResult = this.convertTurnResult(await this.agentManager.runWorkItemTurn(agentId, effectiveItem));
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 

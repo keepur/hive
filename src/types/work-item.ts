@@ -7,7 +7,8 @@ export type ChannelKind =
   | "callback"
   | "internal"
   | "app"
-  | "team";
+  | "team"
+  | "voice";
 
 export interface ChannelRef {
   kind: ChannelKind;

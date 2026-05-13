@@ -53,7 +53,9 @@ export class SmsAdapter implements ChannelAdapter {
     // Poll immediately, then every 30 seconds
     this.poll(onWorkItem);
     this.interval = setInterval(() => this.poll(onWorkItem), 30_000);
-    log.info("SMS adapter started", { lines: this.lines.map((l) => l.label) });
+    log.info("SMS adapter started", {
+      lines: this.lines.map((l) => l.label),
+    });
   }
 
   async deliver(result: WorkResult): Promise<void> {
@@ -146,7 +148,7 @@ export class SmsAdapter implements ChannelAdapter {
           for (const msg of messages) {
             if (!msg.text) continue;
 
-            const smsText = `SMS from ${msg.from} \u2192 ${line.label}:\n${msg.text}`;
+            const smsText = `SMS from ${msg.from} → ${line.label}:\n${msg.text}`;
 
             const workItem: WorkItem = {
               id: msg.id,

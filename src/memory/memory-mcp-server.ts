@@ -23,6 +23,13 @@ export interface MemoryToolDeps {
    * in this list.
    */
   memoryScopes: ScopeList;
+  /**
+   * KPR-213: optional invalidation hook. Fired after any successful write
+   * to the agent's Mongo memory (memory_write, memory_rollback). The handler
+   * inspects the path and invalidates either a single agent or all agents
+   * (constitution edits affect every prefix).
+   */
+  onWrite?: (path: string, reason: string) => void;
 }
 
 function escapeRegex(str: string): string {
@@ -141,6 +148,9 @@ export function buildMemoryTools(deps: MemoryToolDeps) {
               { $set: { content, updatedAt: new Date(), updatedBy: agentId } },
               { upsert: true },
             );
+            // KPR-213: prefix cache invalidation. The MCP path bypasses
+            // MemoryManager.write, so fire the hook directly here.
+            deps.onWrite?.(path, "memory-mcp-write");
 
             return { content: [{ type: "text", text: `Written: ${path}` }] };
           }
@@ -339,6 +349,8 @@ export function buildMemoryTools(deps: MemoryToolDeps) {
             { $set: { content: target.content, updatedAt: new Date(), updatedBy: `${agentId}:rollback` } },
             { upsert: true },
           );
+          // KPR-213: prefix cache invalidation for the agent-tool rollback path.
+          deps.onWrite?.(path, "memory-mcp-rollback");
 
           const savedAt = target.savedAt as unknown;
           const date = savedAt instanceof Date ? savedAt.toISOString() : String(savedAt);

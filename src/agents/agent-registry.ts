@@ -13,6 +13,27 @@ const log = createLogger("agent-registry");
 const POLL_INTERVAL_MS = 30_000;
 
 /**
+ * KPR-221: context-dependent MCP servers that **cannot** appear in
+ * `delegateServers`. Sub-agents spawn without channel/thread env vars, so
+ * these servers — which embed `CHANNEL_ID`/`THREAD_ID`/`WorkItemContext`
+ * — would silently malfunction. Misconfigurations are bugs, not policy
+ * choices. Mirrored at `agent-runner.ts:CONTEXT_DEPENDENT_SERVERS` and
+ * the admin tool (`admin-mcp-server.ts:checkDelegateContextDependent`).
+ *
+ * Note `memory` and `structured-memory` overlap with `IN_PROCESS_PORTED_SERVERS`
+ * — they're rejected by either guard. `callback`, `background`, `code-task`,
+ * and `recall` are uniquely caught here.
+ */
+const CONTEXT_DEPENDENT_SERVERS = new Set<string>([
+  "callback",
+  "background",
+  "code-task",
+  "recall",
+  "structured-memory",
+  "memory",
+]);
+
+/**
  * KPR-184: strip any KPR-122-ported in-process server names from
  * `delegateServers`. The SDK's AgentDefinition.mcpServers type does not
  * accept in-process configs, so a delegate referencing one of these falls
@@ -31,6 +52,24 @@ function sanitizeDelegateServers(agentId: string, delegateServers: string[]): st
       "Move these servers to coreServers (or remove) via admin_agent_update. Per KPR-122, they're in-process and the SDK's AgentDefinition type doesn't accept in-process configs.",
   });
   return delegateServers.filter((s) => !IN_PROCESS_PORTED_SERVERS.has(s));
+}
+
+/**
+ * KPR-221: hard-reject context-dependent servers in `delegateServers`.
+ * Throws so the caller in `load()` can evict the offending agent and
+ * surface the error to the operator. The admin tool rejects these at
+ * write time; this guard catches stale data and (in test/dev) fixtures
+ * that bypass the admin path.
+ */
+export function validateDelegateServersOrThrow(agentId: string, delegateServers: readonly string[]): void {
+  const offending = delegateServers.filter((s) => CONTEXT_DEPENDENT_SERVERS.has(s));
+  if (offending.length === 0) return;
+  throw new Error(
+    `Agent '${agentId}' has context-dependent server(s) in delegateServers: ${offending.join(", ")}. ` +
+      `These servers embed channel/thread env vars and cannot work as sub-agents — sub-agents spawn ` +
+      `without that context. Move to coreServers or remove. Context-dependent: ` +
+      `${[...CONTEXT_DEPENDENT_SERVERS].join(", ")}.`,
+  );
 }
 
 export class AgentRegistry {
@@ -94,15 +133,43 @@ export class AgentRegistry {
       agentConfig.delegateServers = sanitizeDelegateServers(agentConfig.id, agentConfig.delegateServers);
       currentIds.add(agentConfig.id);
 
-      // Disabled check first — skip all validation for disabled agents.
-      // Without this, a disabled agent with invalid archetypeConfig would
-      // fail validation and get evicted instead of being quietly skipped.
+      // Disabled check FIRST — skip all validation for disabled agents.
+      // Without this, a disabled agent with invalid archetypeConfig or with
+      // a context-dependent server in delegateServers (KPR-221) would fail
+      // validation and get evicted instead of being quietly skipped. The
+      // operator-facing contract is "disable first, repair config later" —
+      // a disabled agent definition is an offline doc, not a live config.
+      //
+      // KPR-220 PR #266 review fix: previously, validateDelegateServersOrThrow
+      // ran ahead of this block, causing disabled agents with bad
+      // delegateServers to be evicted instead of landing in disabledAgents.
       if (agentConfig.disabled) {
         newDisabled.push(agentConfig);
         if (this.agents.has(agentConfig.id)) {
           this.agents.delete(agentConfig.id);
           removed.push(agentConfig.id);
           log.info("Disabled agent removed from active map", { id: agentConfig.id });
+        }
+        continue;
+      }
+
+      // KPR-221: hard-reject context-dependent servers in delegateServers.
+      // These can't function as sub-agents (sub-agents spawn without channel/
+      // thread env vars). Fail-closed: evict the offending agent and log the
+      // error. Operator remedies via admin_agent_update.
+      try {
+        validateDelegateServersOrThrow(agentConfig.id, agentConfig.delegateServers);
+      } catch (err) {
+        log.error("Context-dependent server in delegateServers — agent will not load", {
+          id: agentConfig.id,
+          error: String(err),
+        });
+        if (this.agents.has(agentConfig.id)) {
+          this.agents.delete(agentConfig.id);
+          removed.push(agentConfig.id);
+          log.warn("Evicted previously-loaded agent due to context-dependent server in delegateServers", {
+            id: agentConfig.id,
+          });
         }
         continue;
       }

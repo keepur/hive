@@ -48,6 +48,8 @@ export interface WsAdapterDeps {
   commandRegistry: CommandRegistry;
   agentRegistry: AgentRegistry;
   agentManager: AgentManager;
+  /** Adapter-level fallback used by dispatcher meta routing. */
+  defaultAgentId?: string;
 }
 
 export class WsAdapter implements ChannelAdapter {
@@ -64,6 +66,7 @@ export class WsAdapter implements ChannelAdapter {
   private commandRegistry: CommandRegistry;
   private agentRegistry: AgentRegistry;
   private agentManager: AgentManager;
+  private defaultAgentId?: string;
 
   constructor(port: number, deps: WsAdapterDeps) {
     this.port = port;
@@ -71,6 +74,19 @@ export class WsAdapter implements ChannelAdapter {
     this.commandRegistry = deps.commandRegistry;
     this.agentRegistry = deps.agentRegistry;
     this.agentManager = deps.agentManager;
+    this.defaultAgentId = deps.defaultAgentId;
+  }
+
+  /**
+   * KPR-218: actual port the HTTP/WS server is listening on. When
+   * constructed with `port: 0` (OS-assigned ephemeral) this returns the
+   * resolved port post-`start()`; otherwise it returns the constructor
+   * value. Tests use the ephemeral path to avoid collisions.
+   */
+  get listeningPort(): number {
+    const addr = this.server?.address();
+    if (addr && typeof addr === "object" && "port" in addr) return addr.port;
+    return this.port;
   }
 
   async start(onWorkItem: (item: WorkItem) => void): Promise<void> {
@@ -262,7 +278,7 @@ export class WsAdapter implements ChannelAdapter {
               },
             };
 
-            this.onWorkItem(workItem);
+            this.routeWorkItem(workItem);
           }
 
           if (msg.type === "image") {
@@ -295,7 +311,7 @@ export class WsAdapter implements ChannelAdapter {
                 },
               };
 
-              this.onWorkItem(workItem);
+              this.routeWorkItem(workItem);
             } catch (imgErr) {
               log.error("Image processing failed", { deviceId, filename: msg.filename, error: String(imgErr) });
               this.send(ws, { type: "error", message: "Failed to process image" });
@@ -415,6 +431,17 @@ export class WsAdapter implements ChannelAdapter {
     return this.connections.size;
   }
 
+  // ── KPR-223: WorkItem emit ────────────────────────────────────────
+
+  /**
+   * Single emit point for inbound WorkItems. All five WorkItem-construction
+   * sites in WsAdapter funnel through this method so the dispatcher remains
+   * the sole router (per-turn branching now lives inside the dispatcher).
+   */
+  private routeWorkItem(workItem: WorkItem): void {
+    this.onWorkItem(workItem);
+  }
+
   // ── Team helpers ───────────────────────────────────────────────────
 
   /** Verify device is a member of the channel. Returns the channel on success, null on failure. */
@@ -437,15 +464,21 @@ export class WsAdapter implements ChannelAdapter {
 
   /** Build the agent roster with runtime status for client consumption. */
   private buildAgentList(): AgentInfo[] {
+    // KPR-220 Phase 11: snapshot provides coordinator status (stopped flag,
+    // activeSpawns); persistent counters (messagesProcessed, lastActivity)
+    // still come from getState. Both surfaces are stable.
+    const snapshot = this.agentManager.getSnapshot();
     return this.agentRegistry.getAll().map((agent) => {
       const state = this.agentManager.getState(agent.id);
+      const perAgent = snapshot.perAgent[agent.id];
+      const status = perAgent?.stopped ? "stopped" : (state?.status ?? "idle");
       return {
         id: agent.id,
         name: agent.name,
         icon: agent.icon,
         title: agent.title ?? null,
         model: agent.model,
-        status: state?.status ?? "idle",
+        status,
         tools: [...new Set([...agent.coreServers, ...agent.delegateServers])].sort(),
         schedule: agent.schedule.map((s) => ({ cron: s.cron, task: s.task })),
         channels: agent.channels,
@@ -503,7 +536,7 @@ export class WsAdapter implements ChannelAdapter {
       },
     };
 
-    this.onWorkItem(workItem);
+    this.routeWorkItem(workItem);
   }
 
   private async handleTeamImage(ws: WebSocket, msg: ClientTeamImage, device: Device, deviceId: string): Promise<void> {
@@ -560,7 +593,7 @@ export class WsAdapter implements ChannelAdapter {
         },
       };
 
-      this.onWorkItem(workItem);
+      this.routeWorkItem(workItem);
     } catch (imgErr) {
       log.error("Team image processing failed", {
         deviceId,
@@ -627,7 +660,7 @@ export class WsAdapter implements ChannelAdapter {
         },
       };
 
-      this.onWorkItem(workItem);
+      this.routeWorkItem(workItem);
     } catch (err) {
       log.error("Team file processing failed", {
         deviceId,

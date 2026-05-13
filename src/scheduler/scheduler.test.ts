@@ -83,7 +83,29 @@ function makeRegistry(agents: AgentConfig[]) {
 
 function makeAgentManager() {
   return {
-    sendMessage: vi.fn().mockResolvedValue({ text: "ok" }),
+    // KPR-220 Phase 7: scheduler now calls runWorkItemTurn (TurnResult shape)
+    // instead of sendMessage (RunResult shape). The team request/response
+    // path consumes `finalMessage` rather than `text`.
+    runWorkItemTurn: vi.fn().mockResolvedValue({
+      finalMessage: "ok",
+      newSessionId: "s",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0,
+        durationMs: 0,
+      },
+      errors: [],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+    }),
   };
 }
 
@@ -209,6 +231,85 @@ describe("Scheduler.checkCronJobs — homeBase dispatch channel selection", () =
     injectJobAndFire(scheduler, { agentId: "agent-d", cron: ALWAYS, task: "report", lastRun: null });
 
     expect(dispatched).toHaveLength(0);
+  });
+
+  it("KPR-220 Phase 7: team request/response uses runWorkItemTurn and persists finalMessage", async () => {
+    const agentManager = makeAgentManager();
+    agentManager.runWorkItemTurn.mockResolvedValueOnce({
+      finalMessage: "team-response-text",
+      newSessionId: "s1",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0,
+        durationMs: 0,
+      },
+      errors: [],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+    });
+
+    const teamMessages: Array<Record<string, unknown>> = [];
+    const pendingDocs = [
+      {
+        _id: "req-1",
+        type: "request_response",
+        targetAgentId: "agent-target",
+        fromAgentId: "agent-from",
+        channelId: "channel-x",
+        threadId: "thr-1",
+        text: "ask",
+        status: "pending",
+      },
+    ];
+    const pendingUpdates: Array<Record<string, unknown>> = [];
+
+    const fakeDb = {
+      collection: (name: string) => {
+        if (name === "team_pending_requests") {
+          return {
+            find: () => ({ toArray: async () => pendingDocs }),
+            findOneAndUpdate: async (_filter: any, _update: any) => ({ value: pendingDocs[0] }),
+            updateOne: async (filter: any, update: any) => {
+              pendingUpdates.push({ filter, update });
+            },
+            createIndex: async () => undefined,
+          };
+        }
+        if (name === "team_messages") {
+          return {
+            insertOne: async (doc: Record<string, unknown>) => {
+              teamMessages.push(doc);
+            },
+            createIndex: async () => undefined,
+          };
+        }
+        return { createIndex: async () => undefined };
+      },
+    };
+
+    const scheduler = new Scheduler(
+      agentManager as any,
+      makeMemoryManager() as any,
+      makeHealthReporter() as any,
+      makeRegistry([]) as any,
+    );
+    (scheduler as any).db = fakeDb;
+    await (scheduler as any).fireTeamRequests();
+
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn.mock.calls[0]![0]).toBe("agent-target");
+    expect(teamMessages).toHaveLength(1);
+    expect(teamMessages[0]!.text).toBe("team-response-text");
+    expect(pendingUpdates).toHaveLength(1);
+    expect((pendingUpdates[0]!.update as any).$set.response).toBe("team-response-text");
   });
 
   it("does not double-dispatch a job that already ran this minute", () => {

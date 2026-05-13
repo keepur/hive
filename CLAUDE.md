@@ -56,7 +56,7 @@ Message (Slack/SMS/WebSocket/Scheduler)
   → Channel Adapter (slack, sms, ws)
   → Dispatcher (routing, dedup, status interception)
   → Model Router (Haiku/Sonnet classification, respects agent ceiling)
-  → Agent Manager (concurrency limits, per-thread serialization)
+  → Agent Manager (spawn coordinator: per-thread lock + per-agent budget)
   → Agent Runner (spawns Claude session + MCP servers)
   → Response → Channel Adapter → delivery
 ```
@@ -64,8 +64,9 @@ Message (Slack/SMS/WebSocket/Scheduler)
 ### Key Files
 - `src/index.ts` — entry point, wires all subsystems
 - `src/config.ts` — loads env + hive.yaml into typed config
-- `src/agents/agent-runner.ts` — spawns Claude sessions, assembles system prompts, configures MCP servers
-- `src/agents/agent-manager.ts` — concurrency, thread queues, agent state
+- `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles system prompts, configures MCP servers, builds per-spawn hooks with current `WorkItemContext`
+- `src/agents/agent-manager.ts` — spawn coordinator: per-thread lock + per-agent budget, ticket lifecycle, reflection scheduler, snapshot surface
+- `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes `getSnapshot()` to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB
 - `src/agents/session-store.ts` — manages agent session state in MongoDB
 - `src/agents/model-router.ts` — complexity classifier for model selection
@@ -98,7 +99,7 @@ All in `src/` — each agent only gets servers listed in its `coreServers`/`dele
 - `admin-mcp-server.ts` — agent CRUD + version history, model overrides [in-process]
 - `clickup/clickup-mcp-server.ts` — ClickUp task management
 - `events/event-bus-mcp-server.ts` — cross-agent event bus (publish events, subscriber delivery) [in-process]
-- `team/team-mcp-server.ts` — direct agent-to-agent messaging (feature flag: `team.enabled`) [in-process]
+- `team/team-mcp-server.ts` — direct agent-to-agent messaging (auto-injected core server, no flag) [in-process]
 - `schedule/schedule-mcp-server.ts` — self-service schedule management (cron) [in-process]
 - `workflow/workflow-mcp-server.ts` — plan/task management (gated by `config.workflow.enabled`) [in-process]
 - `code-index/code-search-mcp-server.ts` — semantic code search over file index [in-process]
@@ -202,12 +203,47 @@ The operator repo has the same shape as a skill registry — a flat `skills/<ski
 
 **Authoring flow (until publish-back ships):** author or edit a skill on any instance, then commit it to the operator repo manually. Other instances pick it up on next `hive skill sync` (or next `hive update`).
 
+## Skills layout (KPR-214)
+
+Skills follow the SDK convention exactly — one directory level, no workflow grouping:
+
+```
+<root>/skills/<skill-name>/SKILL.md      ← canonical (KPR-214 onward)
+<root>/skills/<workflow>/skills/<skill-name>/SKILL.md   ← legacy, still loadable, deprecation warning
+```
+
+Where `<root>` is one of: a seed directory (e.g. `seeds/chief-of-staff/`), a plugin directory (`<instance>/plugins/<name>/`), the customer space (`<hiveHome>/`), or an agent-private space (`<hiveHome>/agents/<id>/`). The same flat shape applies to all four.
+
+**Why flat:** the SDK's plugin convention is `<plugin>/skills/<skill>/SKILL.md`. Hive's older double-`skills/` layout was an internal organizational sugar that diverged from SDK shape. Flat = a vanilla Claude Code skill drops into hive unchanged.
+
+**Per-skill `agents:` scoping** is preserved as an SDK-compatible extension. The loader reads frontmatter `agents: [milo, river]` (or `agents: [all]`) and projects each scoped flat skill into a synthetic plugin tree under `<hiveHome>/.skill-projections/` (a symlink to the real skill dir, rebuilt every load). The SDK only sees skills the agent is scoped to.
+
+**Migration:** `npx tsx scripts/flatten-skills.ts <root> [--dry]` lifts each `<root>/skills/<workflow>/skills/<skill>/SKILL.md` to `<root>/skills/<skill>/SKILL.md`. Idempotent. Engine seeds and in-repo plugins are already migrated; operator-skills repos (dodi, keepur) migrate under [KPR-215](https://linear.app/keepur/issue/KPR-215). The loader supports both layouts during the transition window, with a deprecation warning per source the first time legacy layout is detected.
+
+## Spawn coordinator (KPR-220)
+
+Per-turn `query()` with `options.resume = sessionId` is the **only** execution path post-KPR-220. The long-lived per-agent `query()` loop (`AgentRunner.send()` driven by `AgentManager.sendMessage`) is gone; every channel (Slack, SMS, WS, voice, scheduler) routes through `AgentManager.runWorkItemTurn(agentId, item)` which builds a `TurnContext` and calls `spawnTurn(ctx)`. Voice keeps a direct `spawnTurn` call so it can pass its own `systemPromptOverride`.
+
+`AgentManager` is a thin spawn coordinator: per-thread lock (`agentId:threadId`), per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface. There is no longer any per-channel opt-in flag, no per-agent queue, no `AgentRunner` reuse.
+
+**Budget:** per-agent `spawnBudget` field on the agent definition; falls back to legacy `maxConcurrent`, then the engine default (5). `maxConcurrent` is **deprecated** for spawn-coordinator purposes — set `spawnBudget` on new agents. Source of the resolved budget is surfaced in `hive doctor` ("Spawn coordinator" section) as `source=spawnBudget|maxConcurrent|default`.
+
+**Reflection:** triggered by post-quiescence debounce (30s after the last non-reflection turn) instead of the legacy queue-drain trigger. `memory.reflectionMinTurns <= 0` disables reflection entirely (queue-drain semantics treated zero as "fire every turn" which was a bug under the new debounce model).
+
+**Observability:** `getSnapshot()` returns per-agent `{ activeSpawns, activeThreadKeys, budget, budgetSource, saturationCount, lastSaturationAt, lastSpawnAt, lastError, stopped }`. `SpawnCoordinatorHeartbeat` upserts per-agent docs to `db.telemetry` (`kind=spawn_coordinator_stats`) every 30s; the doctor reads them.
+
+**Migration notes:**
+- `agentManager.perTurnSpawn.{sms,slack,ws,voice}` config keys are removed. Hive.yaml loader silently ignores them (KPR-225 F3 liberal-loader pattern), but they have no effect.
+- `maxConcurrent` is deprecated in favor of `spawnBudget`. Existing agent definitions keep working via the fallback chain; `hive doctor` flags the fallback source so operators can migrate.
+- Reflection trigger changed from queue-drain to post-quiescence debounce; tuning lives on `memory.reflectionMinTurns` + the 30s debounce constant.
+
 ## Common Gotchas
 
 - After editing MCP server source: `npm run build` (tsc → `dist/`) for dev, or `npm run bundle` (esbuild → `pkg/`) for the publish-ready artifact. The runtime engine in `<instance>/.hive/` runs from `pkg/server.min.js`. Restart Hive (`launchctl kickstart -k gui/$(id -u)/com.hive.<id>.agent`) to pick up changes — or for agent-definition changes only, send `SIGUSR1` (no restart).
 - Agent definitions are DB-native — edit via admin MCP tools or REST API, changes take effect on next SIGUSR1 reload
+- **Prefix cache (KPR-213):** assembled system-prompt prefixes are cached in-memory per agent and **invalidated automatically** on every write path that affects them — agent-def updates, memory writes (FS-style and structured-tier), constitution edits, team-roster changes, skill changes. SIGUSR1 still flushes the cache + reloads the registry, but it is **no longer load-bearing for prefix freshness** — it stays as an explicit operator escape hatch. Cache stats are heartbeated to `db.telemetry` (kind=`prefix_cache_stats`) every 30s and surfaced via `hive doctor`.
 - `hive.yaml` and `.env` are gitignored — exist separately in dev and deploy dirs
 - Slack file downloads: auth header stripped on redirect — must follow redirects manually
 - Thread deduplication: 60s window prevents double-processing
-- Agent concurrency default: 3 threads. Excess messages deferred and retried on sweep.
-- MongoDB collections: `memory`, `memory_versions`, `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `model_overrides`, `devices`, `agent_callbacks`, `contacts`
+- Spawn budget default: 5 in-flight per agent (per-agent, not per-thread). Same-thread spawns serialize via the per-thread lock; budget bounds parallel spawns across different threads.
+- MongoDB collections: `memory`, `memory_versions`, `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `model_overrides`, `devices`, `agent_callbacks`, `contacts`, `telemetry` (prefix-cache stats heartbeat KPR-213; spawn-coordinator stats heartbeat KPR-220)

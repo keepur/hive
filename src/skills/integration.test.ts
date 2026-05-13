@@ -130,7 +130,9 @@ describe("skills integration: install → upgrade → remove", () => {
     expect(frontmatter.origin!.modified).toBe(false);
 
     // --- Step 4: Load skill index and verify agent assignment ---
-    const index = loadSkillIndex(targetSkillsDir);
+    // KPR-225 F3: pass targetHiveHome (5th arg) so loadSkillIndex projects
+    // under the test's temp dir, not the operator's real `~/hive`.
+    const index = loadSkillIndex(targetSkillsDir, [], [], [], targetHiveHome);
     const csSkills = getSkillsForAgent(index, "customer-success");
     expect(csSkills.length).toBeGreaterThan(0);
     expect(csSkills.some((s) => s.path.includes("customer-support"))).toBe(true);

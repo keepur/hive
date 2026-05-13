@@ -356,6 +356,33 @@ describe("agent_create — schema promotion and archetype support", () => {
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text as string).toMatch(/Roles: \(not set/);
   });
+
+  it("KPR-220 Phase 4: agent_create writes spawnBudget; agent_get shows the resolved value + source", async () => {
+    const tools = makeTools();
+    const create = getHandler(tools, "agent_create");
+    await create({
+      _id: "budget-agent",
+      name: "Budget",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-budget",
+      roles: ["X"],
+      fields: { spawnBudget: 8 },
+    });
+    const stored = agentDocsStore.get("budget-agent");
+    expect(stored.spawnBudget).toBe(8);
+
+    const get = getHandler(tools, "agent_get");
+    const res = await get({ agent_id: "budget-agent" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text as string).toMatch(/Spawn Budget: 8 \(source: spawnBudget\)/);
+  });
+
+  it("KPR-220 Phase 4: agent_get reports maxConcurrent fallback when spawnBudget unset", async () => {
+    agentDocsStore.set("legacy-agent", makeBaseAgent({ _id: "legacy-agent", maxConcurrent: 4 }));
+    const res = await getHandler(makeTools(), "agent_get")({ agent_id: "legacy-agent" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text as string).toMatch(/Spawn Budget: 4 \(source: maxConcurrent \(deprecated\)\)/);
+  });
 });
 
 describe("admin-mcp-server — agent_update homeBase passthrough", () => {
@@ -677,5 +704,80 @@ describe("KPR-184 — delegateServers validation rejects in-process-ported serve
     });
     expect(res.isError).toBeFalsy();
     expect(agentDocsStore.get("existing-agent").delegateServers).toEqual(["google"]);
+  });
+});
+
+describe("KPR-221 — delegateServers validation rejects context-dependent servers", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+  });
+
+  // The unique-to-KPR-221 set: context-dependent but not also in-process
+  // ported. Memory, structured-memory, and callback overlap with KPR-184
+  // and are caught there first; the other three are uniquely caught here.
+  const CONTEXT_DEPENDENT_NEW = ["background", "code-task", "recall"];
+
+  it.each(CONTEXT_DEPENDENT_NEW)("agent_create rejects delegateServers containing '%s'", async (server) => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "bad-context-delegate",
+      name: "Bad",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-bad",
+      roles: ["Generic"],
+      fields: { delegateServers: [server] },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("context-dependent");
+    expect(res.content[0].text).toContain(server);
+    expect(agentDocsStore.has("bad-context-delegate")).toBe(false);
+  });
+
+  it("agent_create rejects when delegateServers mixes valid and context-dependent entries", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "mixed-context-delegate",
+      name: "Mixed",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-mixed",
+      roles: ["Generic"],
+      fields: { delegateServers: ["google", "background", "linear"] },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("background");
+    expect(agentDocsStore.has("mixed-context-delegate")).toBe(false);
+  });
+
+  it("agent_update rejects delegateServers containing context-dependent servers", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const handler = getHandler(makeTools(), "agent_update");
+    const res = await handler({
+      agent_id: "existing-agent",
+      fields: { delegateServers: ["recall"] },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("recall");
+    expect(res.content[0].text).toContain("context-dependent");
+    // Doc must be unchanged.
+    expect(agentDocsStore.get("existing-agent").delegateServers).toEqual([]);
+  });
+
+  it("error message lists all context-dependent servers for operator awareness", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "doc-test",
+      name: "Doc",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-doc",
+      roles: ["Generic"],
+      fields: { delegateServers: ["background"] },
+    });
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    // The full set is enumerated so the operator can see what to avoid.
+    for (const s of ["callback", "background", "code-task", "recall", "structured-memory", "memory"]) {
+      expect(text).toContain(s);
+    }
   });
 });

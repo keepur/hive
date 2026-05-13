@@ -2,18 +2,22 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 
+// KPR-220 Phase 1: shared mock so tests can assert what dispatcher logs to
+// `info` (e.g., per-turn telemetry breakdown — llmMs/toolMs/toolCalls/etc).
+// vi.hoisted is required: vi.mock factories run before top-level statements.
+const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
-    info: vi.fn(),
+    info: mockLogInfo,
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
   }),
 }));
 
-vi.mock("../config.js", () => ({
-  config: {},
-}));
+// KPR-220 Phase 9: dispatcher no longer imports `config` — per-turn is
+// unconditional. The mock is retained as a no-op so any test that still
+// references it (or any indirect import path) gets a benign shape.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -143,13 +147,51 @@ function makeMockRegistry() {
 
 function makeMockAgentManager() {
   return {
-    sendMessage: vi.fn().mockResolvedValue({
-      text: "Agent response",
-      costUsd: 0.01,
-      durationMs: 1000,
-    }),
     findAgentForThread: vi.fn().mockResolvedValue(null),
     findAgentsForThread: vi.fn().mockResolvedValue([]),
+    spawnTurn: vi.fn().mockResolvedValue({
+      finalMessage: "turn response",
+      newSessionId: "s2",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0.01,
+        durationMs: 800,
+      },
+      errors: [],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+    }),
+    runWorkItemTurn: vi.fn().mockResolvedValue({
+      finalMessage: "turn response",
+      newSessionId: "s2",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0.01,
+        durationMs: 800,
+      },
+      errors: [],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+    }),
+    getSessionStore: vi.fn().mockReturnValue({
+      get: vi.fn().mockResolvedValue(undefined),
+    }),
   };
 }
 
@@ -258,7 +300,7 @@ describe("Dispatcher routing", () => {
       text: "need help with something",
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("executive-assistant", item);
   });
 
   it("routes to explicit targetAgentId", async () => {
@@ -266,7 +308,7 @@ describe("Dispatcher routing", () => {
       meta: { targetAgentId: "jasper" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("jasper", item);
   });
 
   it("passes resolved agentId to onProcessingStart and onProcessingEnd hooks", async () => {
@@ -287,25 +329,25 @@ describe("Dispatcher routing", () => {
       source: { kind: "slack", id: "C456", label: "agent-jasper" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("jasper", item);
   });
 
   it("routes by name mention", async () => {
     const item = makeWorkItem({ text: "hey River, can you help?" });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("river", item);
   });
 
   it("drops messages with no explicit routing match", async () => {
     const item = makeWorkItem({ text: "need help with marketing" });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
   });
 
   it("drops unaddressed messages instead of falling back to default", async () => {
     const item = makeWorkItem({ text: "random question" });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
   });
 
   it("drops messages in passive channels without mention", async () => {
@@ -314,7 +356,7 @@ describe("Dispatcher routing", () => {
       source: { kind: "slack", id: "C789", label: "biz" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
   });
 
   it("deduplicates messages with same ID", async () => {
@@ -324,7 +366,7 @@ describe("Dispatcher routing", () => {
     });
     await dispatcher.dispatch(item);
     await dispatcher.dispatch(item); // duplicate
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
   });
 
   it("maintains thread continuity", async () => {
@@ -335,7 +377,7 @@ describe("Dispatcher routing", () => {
       text: "hey River, help me",
     });
     await dispatcher.dispatch(item1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("river", item1);
 
     // Second message in same thread should stick with River
     const item2 = makeWorkItem({
@@ -344,26 +386,41 @@ describe("Dispatcher routing", () => {
       text: "follow up question",
     });
     await dispatcher.dispatch(item2);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item2);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("river", item2);
   });
 
   it("intercepts status queries and does not call agent", async () => {
     const item = makeWorkItem({ text: "status" });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
     expect(adapter.deliver).toHaveBeenCalledTimes(1);
   });
 
   it("suppresses non-response agent output", async () => {
-    agentManager.sendMessage.mockResolvedValueOnce({
-      text: "no response needed",
-      costUsd: 0.01,
-      durationMs: 500,
+    agentManager.runWorkItemTurn.mockResolvedValueOnce({
+      finalMessage: "no response needed",
+      newSessionId: "s-nr",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0.01,
+        durationMs: 500,
+      },
+      errors: [],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
     });
     const item = makeWorkItem({ text: "hey Jasper, check this" });
     await dispatcher.dispatch(item);
-    // sendMessage is called, but deliver should NOT be called (non-response suppressed)
-    expect(agentManager.sendMessage).toHaveBeenCalled();
+    // runWorkItemTurn is called, but deliver should NOT be called (non-response suppressed)
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalled();
     expect(adapter.deliver).not.toHaveBeenCalled();
   });
 
@@ -373,7 +430,7 @@ describe("Dispatcher routing", () => {
       source: { kind: "slack", id: "C789", label: "biz" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("jasper", item);
   });
 
   it("fans out to multiple agents when several are named", async () => {
@@ -382,8 +439,8 @@ describe("Dispatcher routing", () => {
     });
     await dispatcher.dispatch(item);
     // Both agents should be called
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
-    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
   });
@@ -396,7 +453,7 @@ describe("Dispatcher routing", () => {
       source: { kind: "slack", id: "D123ABC", label: "directmessage" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("executive-assistant", item);
   });
 
   it("does not fall back for non-DM channels with no match", async () => {
@@ -405,7 +462,7 @@ describe("Dispatcher routing", () => {
       source: { kind: "slack", id: "C999", label: "random" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
   });
 });
 
@@ -439,13 +496,13 @@ describe("Multi-agent threads", () => {
     });
     await dispatcher.dispatch(item);
 
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
-    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
 
     // Follow-up in same thread (no mentions) should still fan out to both
-    agentManager.sendMessage.mockClear();
+    agentManager.runWorkItemTurn.mockClear();
     const item2 = makeWorkItem({
       id: "multi-2",
       threadId: "thread-multi",
@@ -453,8 +510,8 @@ describe("Multi-agent threads", () => {
     });
     await dispatcher.dispatch(item2);
 
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
-    const followUpAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    const followUpAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
     expect(followUpAgents).toContain("jasper");
     expect(followUpAgents).toContain("river");
   });
@@ -467,10 +524,10 @@ describe("Multi-agent threads", () => {
       text: "hey River, help me",
     });
     await dispatcher.dispatch(item1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("river", item1);
 
     // Mention a second agent in the same thread
-    agentManager.sendMessage.mockClear();
+    agentManager.runWorkItemTurn.mockClear();
     const item2 = makeWorkItem({
       id: "trans-2",
       threadId: "thread-transition",
@@ -479,20 +536,20 @@ describe("Multi-agent threads", () => {
     await dispatcher.dispatch(item2);
 
     // Both River (original) and Jasper (new) should be called
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
-    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("river");
     expect(calledAgents).toContain("jasper");
 
     // Follow-up should continue to fan out
-    agentManager.sendMessage.mockClear();
+    agentManager.runWorkItemTurn.mockClear();
     const item3 = makeWorkItem({
       id: "trans-3",
       threadId: "thread-transition",
       text: "thoughts?",
     });
     await dispatcher.dispatch(item3);
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
   });
 
   it("does not transition when re-mentioning the same agent", async () => {
@@ -502,18 +559,18 @@ describe("Multi-agent threads", () => {
       text: "hey River, help me",
     });
     await dispatcher.dispatch(item1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("river", item1);
 
     // Re-mention River — should stay single-agent
-    agentManager.sendMessage.mockClear();
+    agentManager.runWorkItemTurn.mockClear();
     const item2 = makeWorkItem({
       id: "same-2",
       threadId: "thread-same",
       text: "River, one more thing",
     });
     await dispatcher.dispatch(item2);
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item2);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("river", item2);
   });
 
   it("adds new participants to existing multi-agent thread", async () => {
@@ -524,10 +581,10 @@ describe("Multi-agent threads", () => {
       text: "Jasper, and River, discuss this",
     });
     await dispatcher.dispatch(item1);
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
 
     // Now mention Rae — should add to participant set
-    agentManager.sendMessage.mockClear();
+    agentManager.runWorkItemTurn.mockClear();
     const item2 = makeWorkItem({
       id: "add-2",
       threadId: "thread-add",
@@ -535,8 +592,8 @@ describe("Multi-agent threads", () => {
     });
     await dispatcher.dispatch(item2);
 
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(3);
-    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(3);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
     expect(calledAgents).toContain("executive-assistant");
@@ -553,8 +610,8 @@ describe("Multi-agent threads", () => {
     });
     await dispatcher.dispatch(item);
 
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
-    const calledAgents = agentManager.sendMessage.mock.calls.map((c: any[]) => c[0]);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
     expect(calledAgents).toContain("jasper");
     expect(calledAgents).toContain("river");
   });
@@ -569,8 +626,8 @@ describe("Multi-agent threads", () => {
     });
     await dispatcher.dispatch(item);
 
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("river", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("river", item);
   });
 
   it("sweep cleans up expired multi-agent threads", async () => {
@@ -583,7 +640,7 @@ describe("Multi-agent threads", () => {
         text: "Jasper, and River, discuss",
       });
       await dispatcher.dispatch(item);
-      expect(agentManager.sendMessage).toHaveBeenCalledTimes(2);
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
 
       // Advance time past the TTL, then sweep
       vi.advanceTimersByTime(1000);
@@ -591,7 +648,7 @@ describe("Multi-agent threads", () => {
       expect(result.pruned).toBeGreaterThanOrEqual(1);
 
       // Next message in that thread should not fan out (affinity lost)
-      agentManager.sendMessage.mockClear();
+      agentManager.runWorkItemTurn.mockClear();
       agentManager.findAgentsForThread.mockResolvedValue([]);
       const item2 = makeWorkItem({
         id: "sweep-2",
@@ -600,7 +657,7 @@ describe("Multi-agent threads", () => {
       });
       await dispatcher.dispatch(item2);
       // Falls through — no match, message dropped (no default fallback)
-      expect(agentManager.sendMessage).not.toHaveBeenCalled();
+      expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -619,8 +676,8 @@ describe("Multi-agent threads", () => {
     await dispatcher.dispatch(item);
 
     // Should route to jasper only (channel owner), not fan out
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("jasper", item);
   });
 
   it("explicit targetAgentId overrides multi-agent thread", async () => {
@@ -633,7 +690,7 @@ describe("Multi-agent threads", () => {
     await dispatcher.dispatch(item1);
 
     // Callback with targetAgentId should only go to that agent
-    agentManager.sendMessage.mockClear();
+    agentManager.runWorkItemTurn.mockClear();
     const item2 = makeWorkItem({
       id: "target-2",
       threadId: "thread-target",
@@ -642,8 +699,196 @@ describe("Multi-agent threads", () => {
     });
     await dispatcher.dispatch(item2);
 
-    expect(agentManager.sendMessage).toHaveBeenCalledTimes(1);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item2);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("jasper", item2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KPR-223: per-turn-spawn routing tests (dispatcher branches into spawnTurn
+// when the per-channel flag is on). Plus routeVoiceTurn behavior.
+// ---------------------------------------------------------------------------
+
+// KPR-220 Phase 9: per-channel per-turn-spawn flags retired. Dispatcher
+// unconditionally routes through `runWorkItemTurn`. The voice path remains
+// distinct (dispatcher.routeVoiceTurn → AgentManager.spawnTurn) so voice can
+// pass its own systemPromptOverride.
+describe("Per-turn dispatch (unconditional, KPR-220 Phase 9)", () => {
+  let dispatcher: Dispatcher;
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let agentManager: ReturnType<typeof makeMockAgentManager>;
+  let adapter: ReturnType<typeof makeMockAdapter>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workItemCounter = 0;
+    registry = makeMockRegistry();
+    agentManager = makeMockAgentManager();
+    const healthReporter = makeMockHealthReporter();
+    adapter = makeMockAdapter();
+
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
+    dispatcher.registerAdapter(adapter as any);
+  });
+
+  it("dispatch: always routes through runWorkItemTurn across channel kinds (sms, slack, app)", async () => {
+    const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
+    const wsAdapter = { ...makeMockAdapter(), id: "ws", kind: "app" as const };
+    dispatcher.registerAdapter(smsAdapter as any);
+    dispatcher.registerAdapter(wsAdapter as any);
+
+    const smsItem = makeWorkItem({
+      source: { kind: "sms", id: "PN_X", label: "quo-may", adapterId: "sms" },
+      threadId: "sms:PN_X:+15550001",
+      text: "hey Jasper, ping",
+    });
+    const slackItem = makeWorkItem({
+      source: { kind: "slack", id: "C123", label: "agent-jasper" },
+      text: "ping",
+    });
+    const wsItem = makeWorkItem({
+      source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+      text: "hey Jasper, ping",
+      meta: { origin: "dodi-shop", deviceId: "dev1" },
+    });
+
+    await dispatcher.dispatch(smsItem);
+    await dispatcher.dispatch(slackItem);
+    await dispatcher.dispatch(wsItem);
+
+    // All three channel kinds delegate to runWorkItemTurn unconditionally — no
+    // flag check stays in the dispatcher.
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(3);
+  });
+
+  it("dispatcher: fan-out always uses runWorkItemTurn", async () => {
+    // Use "random" — not bound to any agent's channels so the dedicated-channel
+    // shortcut doesn't fire and resolveAgents falls into the name-mention branch.
+    const item = makeWorkItem({
+      source: { kind: "slack", id: "C-FANOUT", label: "random" },
+      text: "Jasper, and River, coordinate",
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
+    expect(calledAgents).toContain("jasper");
+    expect(calledAgents).toContain("river");
+  });
+
+  it("routeVoiceTurn calls spawnTurn (not runWorkItemTurn) — voice carve-out for systemPromptOverride", async () => {
+    const ctx = {
+      agentId: "mokie",
+      sessionId: undefined,
+      channelId: "call-abc",
+      threadId: "voice:call-abc",
+      workItem: makeWorkItem({
+        id: "call-abc",
+        source: { kind: "voice", id: "call-abc", label: "voice:call-abc" },
+        threadId: "voice:call-abc",
+      }),
+      channel: "voice" as const,
+    };
+    const onStream = vi.fn();
+    await dispatcher.routeVoiceTurn(ctx as any, onStream);
+
+    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(1);
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
+    const [passedCtx, passedOnStream] = agentManager.spawnTurn.mock.calls[0]!;
+    expect(passedCtx).toBe(ctx);
+    expect(passedOnStream).toBe(onStream);
+  });
+
+  it("routes WS team WorkItem (kind=team, adapterId=ws) through runWorkItemTurn", async () => {
+    const wsAdapter = { ...makeMockAdapter(), id: "ws", kind: "app" as const };
+    dispatcher.registerAdapter(wsAdapter as any);
+
+    const item = makeWorkItem({
+      source: { kind: "team", id: "team:dm:user-1", label: "team:dm:user-1", adapterId: "ws" },
+      threadId: "team:dm:user-1",
+      text: "hey Jasper, ping",
+      meta: { targetAgentId: "jasper" },
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("KPR-220 Phase 1: per-turn dispatch propagates non-zero llmMs/toolMs/toolCalls into the work-item-dispatched log", async () => {
+    const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
+    dispatcher.registerAdapter(smsAdapter as any);
+
+    // Override runWorkItemTurn (Phase 3 changed the dispatcher call site)
+    // with a TurnResult carrying real execution metrics. Pre-Phase-1 the
+    // dispatcher zeroed these on the way out because TurnResult had no shape
+    // for them; post-Phase-1 they pass through into the RunResult that
+    // drives the `Work item dispatched` log.
+    agentManager.runWorkItemTurn.mockResolvedValueOnce({
+      finalMessage: "ok",
+      newSessionId: "s-metrics",
+      usage: {
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 10,
+        cacheCreationTokens: 5,
+        contextWindow: 200000,
+        costUsd: 0.05,
+        durationMs: 1500,
+      },
+      errors: [],
+      llmMs: 999,
+      toolMs: 333,
+      toolCalls: 7,
+      toolSummary: "memory:1x",
+      streamed: true,
+      compactions: 1,
+      preCompactTokens: 12345,
+      ephemeral5mTokens: 42,
+      ephemeral1hTokens: 13,
+    });
+
+    mockLogInfo.mockClear();
+
+    const item = makeWorkItem({
+      source: { kind: "sms", id: "PN_LINE_M", label: "quo-may", adapterId: "sms" },
+      threadId: "sms:PN_LINE_M:+15550100",
+      text: "hey Jasper, telemetry probe",
+    });
+    await dispatcher.dispatch(item);
+
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+
+    const logCall = mockLogInfo.mock.calls.find(([msg]) => msg === "Work item dispatched");
+    expect(logCall).toBeDefined();
+    const fields = logCall![1] as Record<string, unknown>;
+    expect(fields.llmMs).toBe(999);
+    expect(fields.toolMs).toBe(333);
+    expect(fields.toolCalls).toBe(7);
+    expect(fields.toolSummary).toBe("memory:1x");
+  });
+
+  it("routeVoiceTurn does NOT dedup on workItem.id", async () => {
+    // Q4 invariant: voice WorkItem.id is the Vapi callId, reused across many
+    // turns within a single call. Adding callId to the dispatcher dedup map
+    // would silently drop turns 2+ in the 60s TTL.
+    const ctx = {
+      agentId: "mokie",
+      sessionId: undefined,
+      channelId: "call-dedup-1",
+      threadId: "voice:call-dedup-1",
+      workItem: makeWorkItem({
+        id: "call-dedup-1",
+        source: { kind: "voice", id: "call-dedup-1", label: "voice:call-dedup-1" },
+        threadId: "voice:call-dedup-1",
+      }),
+      channel: "voice" as const,
+    };
+
+    await dispatcher.routeVoiceTurn(ctx as any);
+    await dispatcher.routeVoiceTurn(ctx as any);
+
+    // Both calls reach spawnTurn — no dedup-on-id swallows the second one.
+    expect(agentManager.spawnTurn).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -671,7 +916,7 @@ describe("origin routing", () => {
       meta: { origin: "dodi-shop", deviceId: "dev1" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("production-support", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("production-support", item);
   });
 
   it("drops when origin is unknown", async () => {
@@ -681,7 +926,7 @@ describe("origin routing", () => {
       meta: { origin: "nonexistent", deviceId: "dev1" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).not.toHaveBeenCalled();
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
   });
 
   it("origin wins over name addressing", async () => {
@@ -691,7 +936,7 @@ describe("origin routing", () => {
       meta: { origin: "dodi-shop", deviceId: "dev1" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("production-support", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("production-support", item);
   });
 
   it("team-source WorkItem with meta.origin is routed by team logic, not origin", async () => {
@@ -719,7 +964,7 @@ describe("origin routing", () => {
     await dispatcher.dispatch(item);
 
     expect(teamStore.getChannel).toHaveBeenCalledWith("dm-1");
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("jasper", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("jasper", item);
     expect(findByOriginSpy).not.toHaveBeenCalled();
   });
 
@@ -730,7 +975,7 @@ describe("origin routing", () => {
       meta: { origin: "dodi-shop", targetAgentId: "executive-assistant", deviceId: "dev1" },
     });
     await dispatcher.dispatch(item);
-    expect(agentManager.sendMessage).toHaveBeenCalledWith("executive-assistant", item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("executive-assistant", item);
   });
 });
 

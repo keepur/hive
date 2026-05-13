@@ -28,6 +28,14 @@ export interface StructuredMemoryToolDeps {
   context: { current: StructuredMemoryTurnContext };
   qdrantUrl?: string;
   ollamaUrl?: string;
+  /**
+   * KPR-213: optional invalidation hook plumbed into MemoryStore.setOnMutate.
+   * Fired after any structured-memory mutation that may affect this agent's
+   * hot-tier composition (save, update, delete, pin, unpin, set-tier, purge,
+   * supersede, summarize, flag-for-review). Bulk-id paths fire `null` agent
+   * → caller invalidates all.
+   */
+  onMutate?: (agentId: string | null, reason: string) => void;
 }
 
 const VALID_TYPES = ["fact", "task", "interaction", "preference", "decision", "summary"] as const;
@@ -36,6 +44,11 @@ const VALID_IMPORTANCE = ["critical", "high", "medium", "low"] as const;
 export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
   const { db, agentId, context } = deps;
   const store = new MemoryStore(db);
+  // KPR-213: wire the prefix-cache invalidation hook into the MCP-owned store.
+  // The store is per-MCP (one per AgentRunner), so the agentId parameter
+  // forwarded by MemoryStore.setOnMutate is always this agent or `null`
+  // (bulk path) — both mapped at the listener.
+  if (deps.onMutate) store.setOnMutate(deps.onMutate);
   // Lazy init — schema/index creation happens on first use, not at module load,
   // so test harnesses without a real Mongo can still import the module.
   let initPromise: Promise<void> | null = null;
@@ -406,5 +419,38 @@ export function createStructuredMemoryMcpServer(deps: StructuredMemoryToolDeps) 
     name: "structured-memory",
     version: "1.0.0",
     tools: buildStructuredMemoryTools(deps),
+  });
+}
+
+/**
+ * KPR-216 scaffolding — NOT wired in. `AgentManager.spawnTurn` reuses
+ * `AgentRunner` per spawn, which keeps the existing `*ContextRef` path.
+ * Kept for KPR-220 when `AgentRunner` retires.
+ */
+export interface StructuredMemoryTurnDeps {
+  db: Db;
+  agentId: string;
+  channelId?: string;
+  threadId?: string;
+  qdrantUrl?: string;
+  ollamaUrl?: string;
+  onMutate?: (agentId: string | null, reason: string) => void;
+}
+
+export function buildStructuredMemoryMcpForTurn(deps: StructuredMemoryTurnDeps) {
+  const contextRef: { current: StructuredMemoryTurnContext } = {
+    current: { channelId: deps.channelId, threadId: deps.threadId },
+  };
+  return createSdkMcpServer({
+    name: "structured-memory",
+    version: "1.0.0",
+    tools: buildStructuredMemoryTools({
+      db: deps.db,
+      agentId: deps.agentId,
+      context: contextRef,
+      qdrantUrl: deps.qdrantUrl,
+      ollamaUrl: deps.ollamaUrl,
+      onMutate: deps.onMutate,
+    }),
   });
 }

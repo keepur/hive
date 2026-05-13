@@ -22,6 +22,17 @@ export class MemoryManager {
   private collection!: Collection<MemoryDoc>;
   private versions!: Collection<MemoryVersionDoc>;
   private _memoryStore?: MemoryStore;
+  /**
+   * KPR-213: invalidation hook for FS-style memory writes.
+   * - `path === "shared/constitution.md"` and any non-agent-scoped path → "all" (everyone's prefix).
+   * - `path` matching `agents/<id>/...` → single agent.
+   * The translation from path to scope happens at the listener (index.ts).
+   */
+  private onWrite?: (path: string, reason: string) => void;
+
+  setOnWrite(cb: (path: string, reason: string) => void): void {
+    this.onWrite = cb;
+  }
 
   /** Set the MemoryStore for structured memory operations (hot-tier injection). */
   set memoryStore(store: MemoryStore) {
@@ -130,6 +141,7 @@ export class MemoryManager {
       { $set: { content, updatedAt: new Date(), ...(updatedBy ? { updatedBy } : {}) } },
       { upsert: true },
     );
+    this.onWrite?.(relativePath, "memory-manager-write");
   }
 
   async commitAndPush(_message: string): Promise<void> {

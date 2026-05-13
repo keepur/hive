@@ -241,6 +241,127 @@ export function formatHitRate(rate: number | null): string {
   return `${(rate * 100).toFixed(1)}%`;
 }
 
+/**
+ * KPR-213 prefix-cache stats snapshot. Engine heartbeats this once every 30s
+ * to `db.telemetry` (kind="prefix_cache_stats"); doctor reads it. `staleSeconds`
+ * is computed at read time so the operator can tell live-vs-stale at a glance.
+ */
+export interface PrefixCacheStatsRow {
+  hits: number;
+  misses: number;
+  entryCount: number;
+  lastBuildP99Ms: number;
+  oldestEntryAgeMs: number;
+  /** Seconds since the engine last wrote this doc; null if no doc found yet. */
+  staleSeconds: number | null;
+}
+
+/**
+ * Read-only doctor adapter for the `telemetry` collection's
+ * prefix_cache_stats heartbeat doc. Short-lived MongoClient mirrors the
+ * `cacheHitRatesForDoctor` pattern.
+ */
+export async function prefixCacheStatsForDoctor(uri: string, dbName: string): Promise<PrefixCacheStatsRow | null> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const doc = await client.db(dbName).collection("telemetry").findOne<{
+      hits?: number;
+      misses?: number;
+      entryCount?: number;
+      lastBuildP99Ms?: number;
+      oldestEntryAgeMs?: number;
+      updatedAt?: Date;
+    }>({ kind: "prefix_cache_stats" });
+    if (!doc) return null;
+    const updatedAt = doc.updatedAt instanceof Date ? doc.updatedAt : null;
+    return {
+      hits: doc.hits ?? 0,
+      misses: doc.misses ?? 0,
+      entryCount: doc.entryCount ?? 0,
+      lastBuildP99Ms: doc.lastBuildP99Ms ?? 0,
+      oldestEntryAgeMs: doc.oldestEntryAgeMs ?? 0,
+      staleSeconds: updatedAt ? Math.round((Date.now() - updatedAt.getTime()) / 1000) : null,
+    };
+  } catch {
+    return null;
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+/**
+ * KPR-220 Phase 11 / spec S6+S8: per-agent spawn-coordinator snapshot row,
+ * read from the `telemetry` collection where the engine heartbeats it every
+ * 30s under `kind: "spawn_coordinator_stats"`.
+ */
+export interface SpawnCoordinatorRow {
+  agentId: string;
+  activeSpawns: number;
+  budget: number;
+  budgetSource: "spawnBudget" | "maxConcurrent" | "default";
+  saturationCount: number;
+  lastSaturationAt: number | null;
+  lastSpawnAt: number | null;
+  lastError: string | null;
+  stopped: boolean;
+  /** Seconds since the engine last wrote this doc; null if no doc found yet. */
+  staleSeconds: number | null;
+}
+
+/**
+ * Read-only doctor adapter for the per-agent
+ * `kind="spawn_coordinator_stats"` heartbeat docs (KPR-220 Phase 11).
+ * Mirrors `prefixCacheStatsForDoctor` — short-lived MongoClient + per-agent
+ * documents. Returns an empty array if no docs exist yet.
+ */
+export async function spawnCoordinatorStatsForDoctor(uri: string, dbName: string): Promise<SpawnCoordinatorRow[]> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const docs = await client
+      .db(dbName)
+      .collection("telemetry")
+      .find<{
+        agentId?: string;
+        activeSpawns?: number;
+        budget?: number;
+        budgetSource?: "spawnBudget" | "maxConcurrent" | "default";
+        saturationCount?: number;
+        lastSaturationAt?: number | null;
+        lastSpawnAt?: number | null;
+        lastError?: string | null;
+        stopped?: boolean;
+        updatedAt?: Date;
+      }>({ kind: "spawn_coordinator_stats" })
+      .toArray();
+    return docs
+      .filter((d) => typeof d.agentId === "string")
+      .map((d) => {
+        const updatedAt = d.updatedAt instanceof Date ? d.updatedAt : null;
+        return {
+          agentId: d.agentId as string,
+          activeSpawns: d.activeSpawns ?? 0,
+          budget: d.budget ?? 0,
+          budgetSource: d.budgetSource ?? "default",
+          saturationCount: d.saturationCount ?? 0,
+          lastSaturationAt: d.lastSaturationAt ?? null,
+          lastSpawnAt: d.lastSpawnAt ?? null,
+          lastError: d.lastError ?? null,
+          stopped: d.stopped ?? false,
+          staleSeconds: updatedAt ? Math.round((Date.now() - updatedAt.getTime()) / 1000) : null,
+        };
+      })
+      .sort((a, b) => a.agentId.localeCompare(b.agentId));
+  } catch {
+    return [];
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 // ── resolved paths ─────────────────────────────────────────────────────
 
 /** Expand ~ in a path. */

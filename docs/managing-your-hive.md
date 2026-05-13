@@ -68,6 +68,16 @@ removed morning-briefing
 
 Additional registries can be added with `hive registry`.
 
+## Cross-agent coordination
+
+When configuring an agent, three different fields wire three different cross-agent patterns. Pick the one whose semantics match what the agent actually needs:
+
+- **`delegateServers`** — in-session sub-agent. Synchronous, ephemeral, returns into the caller's turn. Use when the agent needs a focused tool call done right now to finish the current turn.
+- **Team MCP (auto-injected)** — direct messaging. 1-to-1, fire-and-forget by default; recipient handles the message in their own session and time-axis. Use when handing off a task whose owner is someone else. Available to every agent without configuration — the engine wires `team` as a core server unconditionally.
+- **`coreServers: ["event-bus"]`** — pub/sub broadcast. 1-to-many; subscribers express interest by event name and react via their own work items. Use when announcing something that may concern multiple agents.
+
+For the architectural distinctions and the engine-side wiring, see [architecture.md → Coordination primitives](architecture.md#coordination-primitives).
+
 ## Health checks
 
 `hive doctor` verifies prerequisites (Node version, MongoDB reachable, required CLIs on PATH), config files (`hive.yaml`, `.env` keys present), agent definitions (loadable from MongoDB), and service state (launchd job loaded, process running, port bindings).
@@ -115,6 +125,12 @@ Two files at your instance root (`~/services/hive/<your-instance>/`). The CLI ma
 - `agents.default` — agent ID that catches unrouted messages.
 - `plugins` — **do not hand-edit.** Managed by `hive plugin add` / `hive plugin remove`.
 - `skills.registries` — list of registries to pull skills from. The default `keepur/hive-skills` is added at init; add others with `hive registry`.
+
+### Migration notes (KPR-220)
+
+- `agentManager.perTurnSpawn.{sms,slack,ws,voice}` keys are **removed**. Per-turn spawn is the only execution path now (it was opt-in during the channel-by-channel rollout; KPR-220 retired the opt-in). The YAML loader silently ignores any leftover `perTurnSpawn` keys you may have in `hive.yaml`, but they have no effect — drop them when convenient.
+- On an agent definition, `maxConcurrent` is **deprecated** in favor of `spawnBudget` (both control how many in-flight spawns the agent can have at once, across different threads). The engine reads `agent.spawnBudget` first, falls back to `agent.maxConcurrent`, then to the engine default (5). `hive doctor`'s "Spawn coordinator" section shows which fallback fired per agent so you can migrate definitions one at a time.
+- Reflection (end-of-conversation memory writes) trigger changed from queue-drain to post-quiescence debounce — reflection fires 30s after the most recent non-reflection turn on a thread. Setting `memory.reflectionMinTurns: 0` now disables reflection entirely. If you previously relied on `reflectionMinTurns: 0` as "off", behavior is unchanged; if you previously relied on it as "fire every turn", that semantics is gone (it was a footgun under the new debounce model).
 
 ### `<instance>/.env`
 

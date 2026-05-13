@@ -16,7 +16,25 @@ import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildToolkitSection } from "./toolkit-section.js";
+import { buildPrefix } from "./prefix-builder.js";
+import type { PrefixCache } from "./prefix-cache.js";
+
+/**
+ * KPR-213: translate a memory path → prefix-cache invalidation scope.
+ *  - `agents/<id>/...` → invalidate that agent only.
+ *  - `shared/...` (notably `shared/constitution.md`) and anything else →
+ *    invalidate all agents (shared content is in every prefix).
+ * Module-scoped so the structured-memory MCP factory and the FS-memory
+ * MCP factory can call into the same logic without duplicating.
+ */
+function invalidatePrefixCacheByPath(cache: PrefixCache, path: string, reason: string): void {
+  const m = path.match(/^agents\/([^/]+)\//);
+  if (m) {
+    cache.invalidateAgent(m[1], reason);
+    return;
+  }
+  cache.invalidateAll(reason);
+}
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
@@ -39,6 +57,42 @@ import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import type { Db } from "mongodb";
 
+/**
+ * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
+ *
+ * **Lifecycle (KPR-210 Phase A):**
+ *
+ * - **Legacy long-lived path**: one `AgentRunner` per agent per process,
+ *   reused across many turns. Per-turn `WorkItemContext` is threaded into
+ *   `send()` and through to in-process MCP handlers + hooks each call.
+ * - **Per-turn-spawn path** (gated by `agentManager.perTurnSpawn.<channel>`):
+ *   `AgentManager.spawnTurn` constructs a **fresh `AgentRunner` per turn**.
+ *   MCP servers, hook closures, and the mutable `*ContextRef` path are all
+ *   recreated per spawn — context isolation comes from the runner being
+ *   thrown away after the turn, not from a separate factory variant.
+ *
+ * **Per-spawn entry point**: {@link AgentRunner.send}. It assembles the SDK
+ * `query()` options — model, system prompt (cache-friendly prefix), MCP
+ * servers, hooks, `resume: sessionId` (when present), and per-archetype
+ * settings — and yields one inference cycle.
+ *
+ * **Hooks** ({@link AgentRunner.buildHooks}): rebuild on every `send()` call
+ * with the current `WorkItemContext`. No stale context survives across turns.
+ * The `PreCompact` matcher closes over the agent's `prefetcher` reference
+ * (constructed once at boot in `index.ts`, owned by `AgentManager`), so the
+ * closure captures fresh per spawn because the runner itself is fresh per
+ * spawn. `PreToolUse` matchers come from the archetype's `preToolUseHooks`
+ * factory — fail-closed if it throws (deny-all is installed rather than
+ * silently dropping enforcement).
+ *
+ * **Cross-agent coordination** is handled by three distinct primitives —
+ * see [docs/architecture.md](../../docs/architecture.md) "Coordination
+ * primitives" for the full story. The in-session sub-agent path (SDK
+ * `agents:` field, populated from `delegateServers`) is built here in
+ * {@link AgentRunner.buildServerSubAgents}; direct messaging lives in
+ * `src/team/team-mcp-server.ts`; pub/sub events live in
+ * `src/events/event-bus-mcp-server.ts`.
+ */
 const log = createLogger("agent-runner");
 
 /**
@@ -242,8 +296,12 @@ export class AgentRunner {
   private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
   private workflowMcpServer?: ReturnType<typeof createWorkflowMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
+  // KPR-213: optional shared prefix cache. Production wires this in via
+  // index.ts; tests that don't pass one fall through to a direct buildPrefix
+  // call (no cache) so per-test isolation isn't a concern.
+  private prefixCache?: PrefixCache;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
@@ -252,114 +310,36 @@ export class AgentRunner {
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
     this.db = db;
+    this.prefixCache = prefixCache;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
-    // Prompt ordered for cache efficiency: static content first (cacheable prefix),
-    // dynamic content last (only invalidates suffix). API caches identical prefixes.
-    const parts: string[] = [];
-
-    // --- Static prefix (stable across turns → cacheable) ---
-
-    if (this.agentConfig.soul) {
-      parts.push(this.agentConfig.soul);
-    }
-
-    // Archetype card (static — cacheable prefix). Lives between soul and systemPrompt
-    // so the archetype defines the discipline and the agent's own systemPrompt reads
-    // as instance-specific flavor layered on top.
-    const archetypeDef = this.getArchetypeDef();
-    if (archetypeDef && this.agentConfig.archetypeConfig) {
-      try {
-        const card = archetypeDef.systemPromptCard({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-        });
-        if (card) parts.push(card);
-      } catch (err) {
-        log.error("Archetype systemPromptCard threw — omitting card", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-      }
-    }
-
-    parts.push(this.agentConfig.systemPrompt);
-
-    // Constitution is always loaded — non-negotiable team rules
-    const constitution = await this.memoryManager.read("shared/constitution.md");
-    if (constitution) {
-      parts.push(constitution);
-    }
-
-    // KPR-139: live team summary slotted right after the constitution and
-    // before the toolkit catalog. Replaces the static team table that used
-    // to live in shared/business-context.md.
-    if (this.teamRoster) {
-      try {
-        const teamSummary = await this.teamRoster.teamSummary();
-        if (teamSummary) parts.push(teamSummary);
-      } catch (err) {
-        log.warn("teamSummary failed; omitting from prompt", {
-          agent: this.agentConfig.id,
-          error: String(err),
-        });
-      }
-    }
-
-    // --- Semi-static (stable within a session, changes on restart) ---
-
-    // KPR-87: unified "Your toolkit" section listing SDK builtins, engine-auto-injected
-    // MCPs, capability MCPs (explicit core), and delegated capability MCPs. Replaces
-    // the prior split "Your tools" / "Available via subagents" blocks. The
-    // autoInjectedServers set MUST mirror the additions in filterCoreServers — keep
-    // both in sync (see comment there).
-    parts.push(
-      buildToolkitSection({
-        coreServerNames,
-        delegateServerNames: activeDelegates ?? [],
-        plugins: this.plugins,
-        autoInjectedServers: AgentRunner.autoInjectedServerNames(),
-      }),
-    );
-
-    // --- Dynamic suffix (changes per turn → not cached) ---
-
-    // Memory injection — prefer structured records, fall back to legacy blob
-    const hotTierPrompt = await this.memoryManager.getHotTierPrompt(
-      this.agentConfig.id,
-      config.memory.hotBudgetTokens,
-    );
-    if (hotTierPrompt) {
-      parts.push(hotTierPrompt);
-    } else {
-      // Legacy path — inject memory.md blob if structured records don't exist yet
-      const memoryDir = `agents/${this.agentConfig.id}`;
-      const memory = await this.memoryManager.read(`${memoryDir}/memory.md`);
-      if (memory) {
-        parts.push(`## Your Memory\n${memory}`);
-      }
-
-      // List available memory files so the agent knows what references it has
-      const memoryFiles = await this.memoryManager.list(memoryDir);
-      const mdFiles = memoryFiles.filter((f) => f.endsWith(".md") && f !== "memory.md");
-      if (mdFiles.length > 0) {
-        parts.push(
-          `## Available Memory Files\nYou have ${mdFiles.length} reference file(s) in your memory directory:\n` +
-          mdFiles.map((f) => `- ${memoryDir}/${f}`).join("\n") +
-          `\n\nRead relevant files via the memory MCP server (\`memory_read\`) before starting tasks that may relate to them.`,
-        );
-      }
-    }
+    // KPR-213: write-through prefix cache. coreServerNames + activeDelegates
+    // are stable per agent (derived from agent-def + autonomy gates, not from
+    // per-call inputs), so they're captured in the closure rather than baked
+    // into the cache key. If a future refactor causes them to vary per call,
+    // the audit invariant in §New module of the plan must be revisited and
+    // they must move into the cache key.
+    const buildContext = {
+      coreServerNames,
+      activeDelegateNames: activeDelegates ?? [],
+      memoryManager: this.memoryManager,
+      teamRoster: this.teamRoster,
+      plugins: this.plugins,
+      skillIndex: this.skillIndex,
+      prefetcher: this.prefetcher,
+      eventSubscribersJson: this.eventSubscribersJson,
+      autoInjectedServers: AgentRunner.autoInjectedServerNames(),
+    };
+    const prefix = this.prefixCache
+      ? await this.prefixCache.getOrBuild(this.agentConfig.id, () => buildPrefix(this.agentConfig, buildContext))
+      : await buildPrefix(this.agentConfig, buildContext);
 
     // Date/time last — changes every minute, so placing it at the end
-    // preserves the static prefix for prompt caching
+    // preserves the static prefix for prompt caching.
     const now = new Date();
     const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
-    parts.push(`**Current date/time**: ${pacific} (Pacific Time)`);
-
-    return parts.join("\n\n---\n\n");
+    return `${prefix}\n\n---\n\n**Current date/time**: ${pacific} (Pacific Time)`;
   }
 
 
@@ -1097,16 +1077,21 @@ export class AgentRunner {
   ]);
 
   /**
-   * Build AgentDefinition objects for delegate servers.
-   * Each delegate server becomes a named subagent with its own MCP connection.
+   * Build AgentDefinition objects for each MCP server listed in
+   * `delegateServers`. Each entry becomes a named tool-specialist sub-agent
+   * with its own MCP connection — these are not separate "delegate agents"
+   * (named coworkers) but per-MCP sub-agents the parent invokes via the
+   * SDK's `Agent` tool. The field name `delegateServers` is preserved on
+   * agent definitions, but the internal nomenclature uses "server sub-agents"
+   * for honesty (KPR-221).
    */
-  private buildDelegateAgents(allConfigs: Record<string, McpServerConfig>): Record<string, AgentDefinition> {
+  private buildServerSubAgents(allConfigs: Record<string, McpServerConfig>): Record<string, AgentDefinition> {
     const delegates = this.agentConfig.delegateServers;
     if (delegates.length === 0) return {};
 
     const agents: Record<string, AgentDefinition> = {};
 
-    // Autonomy gates for delegate servers — same rules as core servers
+    // Autonomy gates for server sub-agents — same rules as core servers
     const blockedDelegates = new Set<string>();
     if (!this.agentConfig.autonomy.externalComms) {
       blockedDelegates.add("resend");
@@ -1121,16 +1106,24 @@ export class AgentRunner {
 
     for (const serverName of delegates) {
       if (blockedDelegates.has(serverName)) {
-        log.debug("Autonomy gate — skipping delegate server", { server: serverName, agent: this.agentConfig.id });
+        log.debug("Autonomy gate — skipping server sub-agent", { server: serverName, agent: this.agentConfig.id });
         continue;
       }
 
-      // Warn if a context-dependent server is being delegated
+      // KPR-221: defense-in-depth. The agent registry and admin tool both
+      // hard-reject context-dependent servers in delegateServers at load +
+      // write time. If we somehow see one here it means a stale path snuck
+      // through — error and skip the offending server. Do NOT build a
+      // sub-agent for it; sub-agents spawn without channel/thread context
+      // and the server would silently malfunction. Previously this was a
+      // warn-and-proceed (which silently dropped the server downstream
+      // anyway via the missing-config branch). Now it's explicit.
       if (AgentRunner.CONTEXT_DEPENDENT_SERVERS.has(serverName)) {
-        log.warn("Context-dependent server in delegateServers — subagent won't have channel context", {
+        log.error("Context-dependent server in delegateServers — registry/admin guards bypassed; skipping", {
           agent: this.agentConfig.id,
           server: serverName,
         });
+        continue;
       }
 
       const serverConfig = allConfigs[serverName];
@@ -1330,7 +1323,7 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits, systemPromptOverride?: string): Promise<RunResult> {
     const effectiveModel = modelOverride ?? this.agentConfig.model;
 
     log.info("Sending prompt to agent", {
@@ -1370,6 +1363,12 @@ export class AgentRunner {
           db: this.db,
           agentId: this.agentConfig.id,
           memoryScopes: this.resolveMemoryScopes(),
+          // KPR-213: write-through prefix cache invalidation. Path-aware:
+          // agents/<id>/... only invalidates that agent; shared/* (e.g.
+          // shared/constitution.md) invalidates everyone.
+          onWrite: this.prefixCache
+            ? (path, reason) => invalidatePrefixCacheByPath(this.prefixCache!, path, reason)
+            : undefined,
         });
       }
       mcpServers["memory"] = this.memoryMcpServer;
@@ -1492,19 +1491,32 @@ export class AgentRunner {
           context: this.structuredMemoryContextRef,
           qdrantUrl: process.env.QDRANT_URL,
           ollamaUrl: process.env.OLLAMA_URL,
+          // KPR-213: structured-memory mutations affect the agent's hot-tier
+          // and therefore its prefix. Bulk paths pass null → invalidateAll.
+          onMutate: this.prefixCache
+            ? (mutAgentId, reason) => {
+                if (mutAgentId === null) this.prefixCache!.invalidateAll(reason);
+                else this.prefixCache!.invalidateAgent(mutAgentId, reason);
+              }
+            : undefined,
         });
       }
       mcpServers["structured-memory"] = this.structuredMemoryMcpServer;
     }
 
-    const delegateAgents = this.buildDelegateAgents(allServerConfigs);
-    const systemPrompt = await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(delegateAgents));
+    const serverSubAgents = this.buildServerSubAgents(allServerConfigs);
+    // KPR-219: voice (and any future channel) can supply a fully-built system
+    // prompt that bypasses the standard prefix builder. Voice's prompt omits
+    // tool summaries + delegate descriptions (Vapi handles tools out-of-band).
+    // When undefined, fall through to the standard prefix path — zero behavior
+    // change for non-voice callers.
+    const systemPrompt = systemPromptOverride ?? await this.buildSystemPrompt(Object.keys(mcpServers), Object.keys(serverSubAgents));
     const sdkPlugins = [...this.buildSdkPlugins(), ...this.buildNativeSkills()];
 
-    if (Object.keys(delegateAgents).length > 0) {
-      log.info("Delegate subagents configured", {
+    if (Object.keys(serverSubAgents).length > 0) {
+      log.info("Server sub-agents configured", {
         agent: this.agentConfig.id,
-        delegates: Object.keys(delegateAgents),
+        delegates: Object.keys(serverSubAgents),
       });
     }
 
@@ -1580,7 +1592,7 @@ export class AgentRunner {
         includePartialMessages: !!onStream,
         ...(sessionId ? { resume: sessionId } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
-        ...(Object.keys(delegateAgents).length > 0 ? { agents: delegateAgents } : {}),
+        ...(Object.keys(serverSubAgents).length > 0 ? { agents: serverSubAgents } : {}),
         ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
         hooks: this.buildHooks(context),
         // Cast: AgentConfig stores string[] but SDK expects SdkBeta[] — intentional for forward compat

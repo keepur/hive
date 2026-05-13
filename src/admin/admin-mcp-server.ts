@@ -37,6 +37,36 @@ function checkDelegateServers(value: unknown): string | null {
   );
 }
 
+/**
+ * KPR-221: returns an error message if `delegateServers` references any
+ * context-dependent MCP server, or null if the list is clean (or undefined
+ * / empty). Context-dependent servers embed channel/thread env vars and
+ * cannot work as sub-agents — sub-agents spawn without that context. The
+ * registry hard-rejects on load (defense in depth); the admin tool rejects
+ * at write time so operators see the error immediately, following the
+ * same precedent as KPR-184.
+ */
+const CONTEXT_DEPENDENT_SERVERS = new Set<string>([
+  "callback",
+  "background",
+  "code-task",
+  "recall",
+  "structured-memory",
+  "memory",
+]);
+
+function checkDelegateContextDependent(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  const invalid = value.filter((s): s is string => typeof s === "string" && CONTEXT_DEPENDENT_SERVERS.has(s));
+  if (invalid.length === 0) return null;
+  return (
+    `delegateServers cannot include context-dependent servers: ${invalid.join(", ")}. ` +
+    `These embed channel/thread env vars and won't work as sub-agents (sub-agents spawn ` +
+    `without that context). Move to coreServers or remove. Context-dependent: ` +
+    `${[...CONTEXT_DEPENDENT_SERVERS].join(", ")}.`
+  );
+}
+
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
   servers: { configured: [], unconfigured: [], broken: [] },
@@ -146,7 +176,22 @@ export function buildAdminTools(deps: AdminToolDeps) {
           if (doc.subscribe?.length) lines.push(`Subscribe: [${doc.subscribe.join(", ")}]`);
           lines.push(`Budget: $${doc.budgetUsd ?? AGENT_DEFINITION_DEFAULTS.budgetUsd}`);
           lines.push(`Max Turns: ${doc.maxTurns ?? AGENT_DEFINITION_DEFAULTS.maxTurns}`);
-          lines.push(`Max Concurrent: ${doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent}`);
+          // KPR-220 Phase 4: spawnBudget is the live field; maxConcurrent is
+          // retained as a deprecated fallback for legacy docs.
+          {
+            // KPR-220 Phase 17: fall back to AGENT_DEFINITION_DEFAULTS.spawnBudget
+            // (= 5, the spec'd engine default) when both fields are absent —
+            // matches the runtime behavior of spawnBudgetFor after the
+            // toAgentConfig fix (which no longer materializes maxConcurrent=3).
+            const resolved = doc.spawnBudget ?? doc.maxConcurrent ?? AGENT_DEFINITION_DEFAULTS.spawnBudget;
+            const source =
+              doc.spawnBudget != null
+                ? "spawnBudget"
+                : doc.maxConcurrent != null
+                  ? "maxConcurrent (deprecated)"
+                  : "default";
+            lines.push(`Spawn Budget: ${resolved} (source: ${source})`);
+          }
           lines.push(`Timeout: ${doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs}ms`);
           lines.push(`Disabled: ${doc.disabled ?? false}`);
           if (doc.slackBot) lines.push(`Slack Bot: ${doc.slackBot}`);
@@ -247,6 +292,11 @@ export function buildAdminTools(deps: AdminToolDeps) {
           if (delegateError) {
             return { isError: true, content: [{ type: "text", text: delegateError }] };
           }
+          // KPR-221: reject context-dependent servers in delegateServers.
+          const contextError = checkDelegateContextDependent(f.delegateServers);
+          if (contextError) {
+            return { isError: true, content: [{ type: "text", text: contextError }] };
+          }
           const now = new Date();
           const doc: AgentDefinition = {
             _id,
@@ -276,7 +326,14 @@ export function buildAdminTools(deps: AdminToolDeps) {
             subscribe: f.subscribe as string[] | undefined,
             budgetUsd: (f.budgetUsd as number) ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
             maxTurns: (f.maxTurns as number) ?? AGENT_DEFINITION_DEFAULTS.maxTurns,
-            maxConcurrent: (f.maxConcurrent as number) ?? AGENT_DEFINITION_DEFAULTS.maxConcurrent,
+            // KPR-220 Phase 13: writes canonicalize to spawnBudget. New docs
+            // do NOT carry maxConcurrent. Legacy caller supplying maxConcurrent
+            // (in fields bag) is translated. Reads use the spawnBudgetFor
+            // fallback chain to keep existing docs working unchanged.
+            spawnBudget:
+              (f.spawnBudget as number | undefined) ??
+              (f.maxConcurrent as number | undefined) ??
+              AGENT_DEFINITION_DEFAULTS.spawnBudget,
             timeoutMs: (f.timeoutMs as number) ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
             disabled: (f.disabled as boolean) ?? false,
             slackBot: f.slackBot as string | undefined,
@@ -371,7 +428,20 @@ export function buildAdminTools(deps: AdminToolDeps) {
             if (delegateError) {
               return { isError: true, content: [{ type: "text", text: delegateError }] };
             }
+            // KPR-221: reject context-dependent servers in delegateServers.
+            const contextError = checkDelegateContextDependent(merged.delegateServers);
+            if (contextError) {
+              return { isError: true, content: [{ type: "text", text: contextError }] };
+            }
           }
+
+          // KPR-220 Phase 13: canonicalize legacy maxConcurrent → spawnBudget
+          // before write. Existing docs keep their maxConcurrent until the
+          // next explicit update touches the field; reads use spawnBudgetFor.
+          if (merged.maxConcurrent !== undefined && merged.spawnBudget === undefined) {
+            merged.spawnBudget = merged.maxConcurrent;
+          }
+          delete merged.maxConcurrent;
 
           const changedFields = Object.keys(merged);
           if (changedFields.length === 0) {

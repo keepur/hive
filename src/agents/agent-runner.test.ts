@@ -854,8 +854,8 @@ describe("AgentRunner.buildServerConfig", () => {
   });
 });
 
-// ── Delegate subagents tests ─────────────────────────────────────
-describe("AgentRunner delegate subagents (via send)", () => {
+// ── Server sub-agents tests (KPR-221) ─────────────────────────────
+describe("AgentRunner server sub-agents (via send)", () => {
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;
 
   beforeEach(() => {
@@ -973,6 +973,25 @@ describe("AgentRunner delegate subagents (via send)", () => {
 
     expect(options.agents).toHaveProperty("google");
     expect(options.agents).not.toHaveProperty("code-task");
+  });
+
+  it("KPR-221: skips context-dependent servers if they slip through (defense-in-depth)", async () => {
+    // Bypass the registry/admin guards by constructing the AgentConfig
+    // directly with a context-dependent server. The runner must skip it
+    // (not build a sub-agent for it) — sub-agents spawn without channel
+    // context and the server would silently malfunction.
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory"],
+        delegateServers: ["google", "background"],
+      }),
+      memoryManager as any,
+    );
+    await runner.send("hello");
+    const options = getCapturedOptions();
+
+    expect(options.agents).toHaveProperty("google");
+    expect(options.agents).not.toHaveProperty("background");
   });
 
   it("excludes code-search from delegates when codeAccess autonomy flag is false", async () => {
@@ -2012,6 +2031,32 @@ describe("buildSystemPrompt — archetype card", () => {
     expect(hooks.PreToolUse).toHaveLength(1);
     // No matcher = matches all tools
     expect(hooks.PreToolUse[0].matcher).toBeUndefined();
+  });
+
+  it("KPR-222: buildHooks rebuilds with current WorkItemContext on every call (no stale context across spawns)", () => {
+    const captured: Array<unknown> = [];
+    registerArchetype({
+      id: "context-capturing",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: (args) => {
+        captured.push(args.workItemContext);
+        return [];
+      },
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeRunner({
+      soul: "",
+      systemPrompt: "",
+      archetype: "context-capturing",
+      archetypeConfig: {},
+    });
+    const ctxA = { channelId: "ch-a", threadId: "thr-a", source: "test" } as any;
+    const ctxB = { channelId: "ch-b", threadId: "thr-b", source: "test" } as any;
+    (runner as any).buildHooks(ctxA);
+    (runner as any).buildHooks(ctxB);
+    expect(captured).toEqual([ctxA, ctxB]);
   });
 
   it("omits card gracefully when archetype systemPromptCard throws", async () => {

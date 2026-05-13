@@ -5,6 +5,8 @@ import {
   type Check,
   type CheckGroup,
   type PromptCacheRow,
+  type PrefixCacheStatsRow,
+  type SpawnCoordinatorRow,
   brewServiceRunning,
   cacheHitRatesForDoctor,
   commandExists,
@@ -15,9 +17,11 @@ import {
   launchctlPrint,
   mongoReachable,
   pidAlive,
+  prefixCacheStatsForDoctor,
   requiredEnvVarsFromConfig,
   resolveServicePath,
   slackAuthOk,
+  spawnCoordinatorStatsForDoctor,
 } from "./doctor-checks.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -73,6 +77,66 @@ export function resolveRequiredEnvVars(hereDir: string): string[] {
  * check and may exit non-zero on a CI environment without brew/Node22).
  * Informational — does not affect exit code.
  */
+/**
+ * KPR-213: render the prefix-cache stats section. Reads the engine's
+ * `telemetry.prefix_cache_stats` heartbeat (written every 30s).
+ * Informational — does not affect exit code.
+ */
+export function renderPrefixCacheSection(
+  row: PrefixCacheStatsRow | null,
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nPrefix cache (live engine)");
+  if (!row) {
+    emit("  ○ no heartbeat yet — start the engine and re-check");
+    return;
+  }
+  const total = row.hits + row.misses;
+  const hitRate = total > 0 ? `${((row.hits / total) * 100).toFixed(1)}%` : "no data";
+  const stale = row.staleSeconds === null ? "?" : `${row.staleSeconds}s ago`;
+  emit(
+    `  hits=${row.hits} misses=${row.misses} hit-rate=${hitRate} entries=${row.entryCount} p99-build=${row.lastBuildP99Ms}ms oldest=${Math.round(row.oldestEntryAgeMs / 1000)}s (heartbeat ${stale})`,
+  );
+  if (row.staleSeconds !== null && row.staleSeconds > 120) {
+    emit("  ⚠ heartbeat is stale — engine may not be running, or stats writer is failing");
+  }
+  if (row.oldestEntryAgeMs > 24 * 60 * 60 * 1000) {
+    emit("  ⚠ oldest entry > 24h — possible invalidation gap, file an issue if persistent");
+  }
+}
+
+/**
+ * KPR-220 Phase 11: render the spawn-coordinator section. Reads the
+ * per-agent heartbeat documents and prints one row per agent with budget,
+ * saturation, and stop flag. Uses the same staleness threshold (>120s) as
+ * the prefix-cache section.
+ */
+export function renderSpawnCoordinatorSection(
+  rows: SpawnCoordinatorRow[],
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nSpawn coordinator (live engine, per agent)");
+  if (rows.length === 0) {
+    emit("  ○ no heartbeat yet — start the engine and re-check");
+    return;
+  }
+  for (const r of rows) {
+    const stale = r.staleSeconds === null ? "?" : `${r.staleSeconds}s ago`;
+    const flags: string[] = [];
+    if (r.stopped) flags.push("STOPPED");
+    if (r.staleSeconds !== null && r.staleSeconds > 120) flags.push("stale-heartbeat");
+    const flagStr = flags.length > 0 ? ` [${flags.join(",")}]` : "";
+    const lastSat =
+      r.lastSaturationAt === null ? "never" : `${Math.round((Date.now() - r.lastSaturationAt) / 1000)}s ago`;
+    emit(
+      `  ${r.agentId}: active=${r.activeSpawns} budget=${r.budget} (source=${r.budgetSource}) saturations=${r.saturationCount} (last ${lastSat})${flagStr} (heartbeat ${stale})`,
+    );
+    if (r.lastError) {
+      emit(`    last error: ${r.lastError}`);
+    }
+  }
+}
+
 export function renderPromptCacheSection(rows: PromptCacheRow[], emit: (line: string) => void = console.log): void {
   emit("\nPrompt cache (last 7 days)");
   if (rows.length === 0) {
@@ -302,8 +366,18 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
   if (config) {
     const rows = await cacheHitRatesForDoctor(config.mongo.uri, config.mongo.dbName);
     renderPromptCacheSection(rows);
+    // KPR-213: prefix-cache stats from the engine heartbeat.
+    const prefixStats = await prefixCacheStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+    renderPrefixCacheSection(prefixStats);
+    // KPR-220 Phase 11: spawn-coordinator per-agent stats.
+    const coordinatorRows = await spawnCoordinatorStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+    renderSpawnCoordinatorSection(coordinatorRows);
   } else {
     console.log("\nPrompt cache (last 7 days)");
+    console.log("  ○ skipped: config not loaded");
+    console.log("\nPrefix cache (live engine)");
+    console.log("  ○ skipped: config not loaded");
+    console.log("\nSpawn coordinator (live engine, per agent)");
     console.log("  ○ skipped: config not loaded");
   }
 

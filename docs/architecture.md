@@ -13,21 +13,30 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Model router (Haiku / Sonnet classifier; respects per-agent ceiling)
             ↓
-       Agent manager (concurrency, per-thread serialization)
+       Agent manager (spawn coordinator: per-thread lock + per-agent budget)
             ↓
-       Agent runner (spawns Claude session + MCP servers as subprocesses)
+       Agent runner (spawns Claude session + MCP servers as subprocesses, fresh per turn)
             ↓
        Response → channel adapter → delivery
 ```
 
-A single hive process serves multiple agents and multiple channels. Each agent's work runs as a Claude Code session with a configured set of MCP server subprocesses scoped to it.
+A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
+
+The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, threadId)`, per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface used by `hive doctor`, the Slack health report, and the WebSocket agent roster.
+
+### Migration notes
+
+- The `agentManager.perTurnSpawn.{sms,slack,ws,voice}` config keys were removed in KPR-220. Per-turn spawn is the only execution path. The YAML loader silently ignores stale `perTurnSpawn` keys (KPR-225 F3 liberal-loader pattern), but they have no effect — drop them when convenient.
+- `maxConcurrent` on an agent definition is **deprecated** in favor of `spawnBudget`. The fallback chain is `agent.spawnBudget → agent.maxConcurrent → engine default (5)`. `hive doctor`'s "Spawn coordinator" section surfaces which fallback fired so operators can migrate agent-by-agent.
+- Reflection trigger changed from queue-drain ("conversation went idle because the queue is empty") to post-quiescence debounce: 30s after the most recent non-reflection turn on a `(agentId, threadId)` pair. `memory.reflectionMinTurns <= 0` now disables reflection entirely (legacy queue-drain semantics treated zero as "fire every turn", which was a footgun under the new debounce model).
 
 ## Key files (read these to understand the engine)
 
 - `src/index.ts` — entry point; wires every subsystem.
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
-- `src/agents/agent-runner.ts` — spawns Claude sessions, assembles the system prompt (soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers per agent.
-- `src/agents/agent-manager.ts` — concurrency limits, per-thread queues.
+- `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
+- `src/agents/agent-manager.ts` — spawn coordinator: lock, budget, ticket lifecycle, reflection scheduler, snapshot surface.
+- `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes the coordinator snapshot to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent for the doctor to read.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
 - `src/agents/model-router.ts` — Haiku/Sonnet classification.
 - `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue.
@@ -70,6 +79,22 @@ Each agent gets a subset of MCP servers — listed in its `coreServers` and `del
 
 Plugins (e.g. CRM integrations, business-specific tools) are separately-published packages; install with `hive plugin add <pkg>`.
 
+## Coordination primitives
+
+Hive supports three distinct cross-agent coordination patterns. They do not overlap; pick the one whose semantics match the use case.
+
+### In-session sub-agent
+
+Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `agents:` field, populated from `delegateServers` on the calling agent. The sub-agent is spawned for one focused task, returns its result, and is gone — it has no thread, no session, no inbox. Use when the calling agent needs a focused tool call done **right now** to finish the current turn (e.g. Jessica spawns a CRM-search specialist mid-turn). Built in `src/agents/agent-runner.ts:buildServerSubAgents`. The 6 context-dependent servers (`callback`, `background`, `code-task`, `recall`, `structured-memory`, `memory`) cannot be sub-agents — they need channel/thread context that doesn't exist in a sub-agent's spawn.
+
+### Direct messaging (Team MCP)
+
+1-to-1, fire-and-forget by default; optional `expectReply` blocks the caller until the recipient replies. The recipient processes the message in **their own session and time-axis** — it lands as a `WorkItem` on their inbox, not as a sub-agent of the sender. Use when handing off a task whose owner is someone else (e.g. Jessica hands a customer issue to Wyatt). Lives in `src/team/team-mcp-server.ts`. Auto-injected as a core server for every agent — operators don't wire it manually.
+
+### Pub/sub events (Event Bus MCP)
+
+1-to-many broadcast, subscriber-driven response. Publishers don't know or care who's listening; subscribers express interest by name and react via their own work items. Use when announcing something that may concern multiple agents (e.g. Mokie publishes "morning standup," any subscribed agent responds in their own session). Lives in `src/events/event-bus-mcp-server.ts`.
+
 ## Channels
 
 - **Slack** — Socket Mode + Web API. Agents have their own bot identities; outbound posts use `chat:write.customize`.
@@ -91,6 +116,8 @@ When an agent is invoked, the runner assembles its system prompt in this order, 
 ## Hot reload
 
 `SIGUSR1` reloads agent definitions from MongoDB without restarting the daemon. Used by admin tooling that mutates `agent_definitions` (the admin MCP server, beekeeper's tune-instance skill).
+
+Post-KPR-213, `SIGUSR1` is **no longer load-bearing for prefix freshness** — the assembled system-prompt prefix cache invalidates automatically on every write path that affects it (agent-def updates, memory writes, constitution edits, team-roster changes, skill changes). `SIGUSR1` still flushes the cache + reloads the registry, but it stays as an explicit operator escape hatch rather than a required step after edits. Cache stats are heartbeated to `db.telemetry` (`kind=prefix_cache_stats`) and surfaced via `hive doctor`.
 
 ## Security posture
 

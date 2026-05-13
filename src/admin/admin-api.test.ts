@@ -234,11 +234,44 @@ describe("AdminApi", () => {
       const body = await res.json();
       expect(body._id).toBe("new-agent");
       expect(body.model).toBe("haiku");
-      expect(body.maxConcurrent).toBe(3);
+      // KPR-220 Phase 13: new creates canonicalize to spawnBudget (default 5),
+      // maxConcurrent is no longer written.
+      expect(body.spawnBudget).toBe(5);
+      expect(body.maxConcurrent).toBeUndefined();
       expect(body.budgetUsd).toBe(10);
       expect(body.disabled).toBe(false);
       expect(body.channels).toEqual([]);
       expect(onReload).toHaveBeenCalled();
+    });
+
+    it("KPR-220 Phase 13: creates agent with caller-supplied maxConcurrent — translates to spawnBudget", async () => {
+      const res = await fetch(`${baseUrl}/admin/agents`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ _id: "legacy-caller", name: "Legacy", model: "haiku", maxConcurrent: 7 }),
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.spawnBudget).toBe(7);
+      expect(body.maxConcurrent).toBeUndefined();
+    });
+
+    it("KPR-220 Phase 13: creates agent with spawnBudget supplied — preferred over maxConcurrent", async () => {
+      const res = await fetch(`${baseUrl}/admin/agents`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          _id: "both-supplied",
+          name: "Both",
+          model: "haiku",
+          spawnBudget: 10,
+          maxConcurrent: 7,
+        }),
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.spawnBudget).toBe(10);
+      expect(body.maxConcurrent).toBeUndefined();
     });
 
     it("stores the created agent in the collection", async () => {
@@ -298,6 +331,30 @@ describe("AdminApi", () => {
         body: JSON.stringify({ model: "opus" }),
       });
       expect(onReload).toHaveBeenCalled();
+    });
+
+    it("KPR-220 Phase 13: PATCH translates maxConcurrent → spawnBudget; maxConcurrent dropped from write", async () => {
+      agentDefs._docs.set("legacy-update", makeAgent({ _id: "legacy-update" }));
+      await fetch(`${baseUrl}/admin/agents/legacy-update`, {
+        method: "PATCH",
+        headers: authHeaders(),
+        body: JSON.stringify({ maxConcurrent: 8 }),
+      });
+      const updateCall = agentDefs.updateOne.mock.calls[0][1];
+      expect(updateCall.$set.spawnBudget).toBe(8);
+      expect(updateCall.$set.maxConcurrent).toBeUndefined();
+    });
+
+    it("KPR-220 Phase 13: PATCH with both maxConcurrent + spawnBudget — prefers spawnBudget, drops maxConcurrent", async () => {
+      agentDefs._docs.set("both-update", makeAgent({ _id: "both-update" }));
+      await fetch(`${baseUrl}/admin/agents/both-update`, {
+        method: "PATCH",
+        headers: authHeaders(),
+        body: JSON.stringify({ spawnBudget: 12, maxConcurrent: 8 }),
+      });
+      const updateCall = agentDefs.updateOne.mock.calls[0][1];
+      expect(updateCall.$set.spawnBudget).toBe(12);
+      expect(updateCall.$set.maxConcurrent).toBeUndefined();
     });
   });
 
