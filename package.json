@@ -1,8 +1,8 @@
 {
   "name": "@keepur/hive",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "hiveApi": "1.0.0",
-  "license": "Apache-2.0",
+  "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "repository": {
     "type": "git",
@@ -23,7 +23,10 @@
     "templates/",
     "scripts/honeypot",
     "install/",
-    "service/"
+    "service/",
+    "LICENSE",
+    "LICENSE-APACHE-2.0.txt",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=22.0.0"
