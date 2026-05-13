@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@keepur/hive"><img src="https://img.shields.io/npm/v/@keepur/hive?label=npm&style=flat" alt="npm version" /></a>
-  <a href="https://github.com/keepur/hive/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat" alt="License" /></a>
+  <a href="https://github.com/keepur/hive/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue?style=flat" alt="License" /></a>
   <img src="https://img.shields.io/badge/status-public%20beta-orange?style=flat" alt="public beta" />
 </p>
 
@@ -42,7 +42,7 @@ If something breaks during install, ask the session — it has the source repo (
 
 ## Trust posture
 
-- **Engine is Apache-2.0.** Read the source before you run it.
+- **Source-available.** Engine is licensed under FSL-1.1-ALv2 — read the source before you run it; use it freely for your business; build derivatives. The only restriction is offering a competing product. Each version converts to Apache-2.0 two years after release.
 - **Your data, your machine.** API keys live in your Mac's keychain. The language model never sees them, your customer records, or your secrets. No phone home.
 - **Customer-facing things wait for you.** Outbound emails, deal commitments — by default, drafts that need your approval.
 - **Visibility when you want it.** Run `hive doctor` for a snapshot of engine health (MongoDB connectivity, agent registry, prompt-cache telemetry).
@@ -63,6 +63,10 @@ For deeper reading or when something breaks:
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Functional Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2). See [LICENSE](LICENSE).
 
-For commercial support, certified plugin bundles, or curation engagements, email [beta@keepur.io](mailto:beta@keepur.io).
+Use it for your business, internally or for your customers — that's a Permitted Purpose. The license restricts only Competing Use: building a product or service that substitutes for Hive itself. Each version converts to Apache-2.0 two years after release.
+
+Earlier versions (0.1.0 – 0.6.0) were released under Apache-2.0 and remain available under that license; see [NOTICE](NOTICE) for history.
+
+For commercial licensing outside the Permitted Purpose, support, certified plugin bundles, or curation engagements, email [beta@keepur.io](mailto:beta@keepur.io).

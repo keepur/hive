@@ -2,7 +2,7 @@
 
 ## Development Process
 
-> Hive is open source (Apache-2.0). External contributors should follow standard GitHub flow: fork, branch, PR. The workflow below is the maintainers' (Keepur Co.) internal flow using the [dodi-dev](https://github.com/dodi-hq/dodi-skills) plugin — useful context for AI sessions running this repo on a maintainer's machine, but not a requirement.
+> Hive is source-available under FSL-1.1-ALv2 (Functional Source License, Apache-2.0 Future License — each version converts to Apache-2.0 two years after release). External contributors should follow standard GitHub flow: fork, branch, PR. The workflow below is the maintainers' (Keepur Co.) internal flow using the [dodi-dev](https://github.com/dodi-hq/dodi-skills) plugin — useful context for AI sessions running this repo on a maintainer's machine, but not a requirement.
 
 ### Workflow (maintainers)
 

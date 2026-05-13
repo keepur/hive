@@ -1,0 +1,24 @@
+Hive
+Copyright 2026 Keepur Co.
+
+This product includes software developed by Keepur Co.
+
+LICENSE HISTORY
+---------------
+
+Versions 0.1.0 through 0.6.0 of @keepur/hive were released under the
+Apache License, Version 2.0. Those versions remain available under that
+license. The Apache-2.0 text is preserved in LICENSE-APACHE-2.0.txt for
+reference.
+
+Versions 0.7.0 and later are released under the Functional Source License,
+Version 1.1, with Apache License 2.0 as the Future License (FSL-1.1-ALv2).
+See LICENSE for terms. Each such version converts to Apache License 2.0
+on the second anniversary of its publication date.
+
+THIRD-PARTY SOFTWARE
+--------------------
+
+This software depends on third-party packages distributed under their own
+licenses. See package.json for the dependency list and individual package
+LICENSE files in node_modules/ for terms.
