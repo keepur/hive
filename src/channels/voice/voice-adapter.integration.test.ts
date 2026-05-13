@@ -79,7 +79,7 @@ function makeAdapter(opts: {
 
   const registry: any = {
     get: vi.fn((id: string) =>
-      id === "mokie" ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-5" } : undefined,
+      id === "mokie" ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-6" } : undefined,
     ),
   };
   const memoryManager: any = {
