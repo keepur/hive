@@ -131,12 +131,24 @@ export async function hasAnyAgent(uri: string, dbName: string): Promise<boolean>
   }
 }
 
-export async function defaultAgentExists(uri: string, dbName: string, defaultAgent: string): Promise<boolean> {
+/** True when at least one agent has `isDefault: true`.
+ *
+ * KPR-229: replaces the prior per-id check (which required setting
+ * `DEFAULT_AGENT` per-instance, otherwise fell back to the literal
+ * "chief-of-staff" — failing as `✗` on every non-default instance like
+ * keepur/hermi or dodi/mokie). The `isDefault` flag is the
+ * agent-definition mechanism for "this is the instance's default
+ * agent"; checking it directly removes the per-instance config
+ * dependency. The prior query also had a latent field-name bug
+ * (looked up by `{ id: ... }` while the docs use `_id`), which this
+ * fix obviates entirely.
+ */
+export async function defaultAgentExists(uri: string, dbName: string): Promise<boolean> {
   const { MongoClient } = await import("mongodb");
   const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
   try {
     await client.connect();
-    const doc = await client.db(dbName).collection("agent_definitions").findOne({ id: defaultAgent });
+    const doc = await client.db(dbName).collection("agent_definitions").findOne({ isDefault: true });
     return doc !== null;
   } catch {
     return false;

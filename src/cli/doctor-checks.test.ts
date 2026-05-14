@@ -182,13 +182,19 @@ describe("hasAnyAgent / defaultAgentExists", () => {
     mongoMocks.estimatedDocumentCount.mockResolvedValue(0);
     await expect(hasAnyAgent("mongodb://x", "hive_test")).resolves.toBe(false);
   });
-  it("defaultAgentExists true when doc found", async () => {
-    mongoMocks.findOne.mockResolvedValue({ id: "chief-of-staff" });
-    await expect(defaultAgentExists("mongodb://x", "hive_test", "chief-of-staff")).resolves.toBe(true);
+  it("KPR-229: defaultAgentExists true when an agent has isDefault: true", async () => {
+    // Post-fix: query looks for `{ isDefault: true }` (any matching doc),
+    // not a specific `id`. Returns true if any agent is flagged.
+    mongoMocks.findOne.mockResolvedValue({ _id: "hermi", isDefault: true });
+    await expect(defaultAgentExists("mongodb://x", "hive_test")).resolves.toBe(true);
+    // The query filter is `{ isDefault: true }` — pin it so a future
+    // refactor can't silently revert to the per-id lookup that hid the
+    // problem.
+    expect(mongoMocks.findOne).toHaveBeenLastCalledWith({ isDefault: true });
   });
-  it("defaultAgentExists false when doc missing", async () => {
+  it("KPR-229: defaultAgentExists false when no agent has isDefault: true", async () => {
     mongoMocks.findOne.mockResolvedValue(null);
-    await expect(defaultAgentExists("mongodb://x", "hive_test", "ghost")).resolves.toBe(false);
+    await expect(defaultAgentExists("mongodb://x", "hive_test")).resolves.toBe(false);
   });
 });
 
