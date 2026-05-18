@@ -896,6 +896,48 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 });
 
 // ── buildServerConfig tests ──────────────────────────────────────
+describe("AgentRunner.buildHttpServerConfig", () => {
+  it("defaults header to x-api-key and uses the raw key for api-key auth", () => {
+    const result = AgentRunner.buildHttpServerConfig(
+      {
+        transport: "http",
+        url: "https://x/mcp",
+        auth: { type: "api-key", keySource: "agentApiKey" },
+      },
+      "my-key",
+    );
+    expect(result).toEqual({
+      type: "http",
+      url: "https://x/mcp",
+      headers: { "x-api-key": "my-key" },
+    });
+  });
+
+  it("defaults header to Authorization and prefixes 'Bearer ' for bearer auth", () => {
+    const result = AgentRunner.buildHttpServerConfig(
+      {
+        transport: "http",
+        url: "https://x/mcp",
+        auth: { type: "bearer", keySource: "agentApiKey" },
+      },
+      "my-key",
+    );
+    expect(result.headers).toEqual({ Authorization: "Bearer my-key" });
+  });
+
+  it("respects an explicit header override but still applies the Bearer prefix on bearer auth", () => {
+    const result = AgentRunner.buildHttpServerConfig(
+      {
+        transport: "http",
+        url: "https://x/mcp",
+        auth: { type: "bearer", header: "X-Custom", keySource: "agentApiKey" },
+      },
+      "my-key",
+    );
+    expect(result.headers).toEqual({ "X-Custom": "Bearer my-key" });
+  });
+});
+
 describe("AgentRunner.buildServerConfig", () => {
   let runner: AgentRunner;
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;

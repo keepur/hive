@@ -201,6 +201,20 @@ describe("normalizeManifest", () => {
       ).toThrow(/auth.type must be/);
     });
 
+    it("rejects empty-string auth.header (would emit a malformed HTTP header at the wire)", () => {
+      expect(() =>
+        normalizeManifest({
+          "mcp-servers": {
+            bad: {
+              transport: "http",
+              url: "https://x/mcp",
+              auth: { type: "api-key", header: "", keySource: "agentApiKey" },
+            },
+          },
+        }),
+      ).toThrow(/auth.header must be a non-empty string/);
+    });
+
     it("rejects unknown keySource", () => {
       expect(() =>
         normalizeManifest({

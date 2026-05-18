@@ -277,6 +277,11 @@ function normalizeServerEntry(serverName: string, v: any): PluginMcpServer {
         `plugin MCP server '${serverName}': auth.keySource must be 'agentApiKey' (got ${JSON.stringify(keySource)})`,
       );
     }
+    if (rawAuth.header !== undefined && (typeof rawAuth.header !== "string" || rawAuth.header.length === 0)) {
+      throw new Error(
+        `plugin MCP server '${serverName}': auth.header must be a non-empty string when set (got ${JSON.stringify(rawAuth.header)})`,
+      );
+    }
     return {
       ...base,
       transport: "http",

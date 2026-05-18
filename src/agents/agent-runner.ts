@@ -816,7 +816,11 @@ export class AgentRunner {
 
         // HTTP transport: no subprocess, no env wiring, just a per-agent key in
         // a request header. Key resolves from the same per-agent registry that
-        // stdio plugins read via TASK_LEDGER_API_KEY.
+        // stdio plugins read via TASK_LEDGER_API_KEY. Skip-on-empty is
+        // intentional (asymmetric with stdio, which would inject the empty
+        // env var) — sending "Bearer " or an empty x-api-key produces a 401
+        // with no useful signal at the wire, so failing closed at spawn time
+        // is the kinder behavior.
         if (isHttpServer(serverDef)) {
           const agentKey = config.taskLedger.agentKeys[this.agentConfig.id] ?? config.taskLedger.apiKey;
           if (!agentKey) {
