@@ -15,12 +15,16 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Agent manager (spawn coordinator: per-thread lock + per-agent budget)
             ↓
+       Provider adapter (Claude production implementation; OpenAI/Gemini pilots are direct-call only)
+            ↓
+       Tool transport inventory → future provider-specific tool bridge
+            ↓
        Agent runner (spawns Claude session + MCP servers as subprocesses, fresh per turn)
             ↓
        Response → channel adapter → delivery
 ```
 
-A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
+A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. `AgentManager` hands a one-turn request to a provider adapter; production selection is still Claude-only, delegating to the existing `AgentRunner`/Claude Agent SDK path. KPR-232 adds a provider-neutral tool transport inventory for compatibility planning. KPR-233 adds a tool-free OpenAI Agents SDK pilot adapter, and KPR-234 adds a tool-free Gemini ADK pilot adapter. Both can be instantiated directly by pilot code, but Slack/SMS/WebSocket/voice turns do not select them. Claude still receives the direct SDK MCP wiring. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
 
 The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, threadId)`, per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface used by `hive doctor`, the Slack health report, and the WebSocket agent roster.
 
@@ -36,6 +40,7 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
 - `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
 - `src/agents/agent-manager.ts` — spawn coordinator: lock, budget, ticket lifecycle, reflection scheduler, snapshot surface.
+- `src/agents/provider-adapters/` — one-turn provider boundary and tool transport classification. Runtime channel traffic remains Claude-only: `ClaudeAgentAdapter` delegates to `AgentRunner`; no config or schema provider selection exists yet. `OpenAIAgentsAdapter` is a direct-call, tool-free pilot that uses the OpenAI Agents SDK and relies on the SDK's standard `OPENAI_API_KEY` environment/configuration path when making real calls. `GeminiAdkAdapter` is a direct-call, tool-free pilot that uses Google ADK's in-memory ephemeral runner path and relies on ADK/Google GenAI standard environment configuration for real calls.
 - `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes the coordinator snapshot to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent for the doctor to read.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
 - `src/agents/model-router.ts` — Haiku/Sonnet classification.
@@ -79,13 +84,27 @@ Each agent gets a subset of MCP servers — listed in its `coreServers` and `del
 
 Plugins (e.g. CRM integrations, business-specific tools) are separately-published packages; install with `hive plugin add <pkg>`.
 
+### Provider tool transport compatibility
+
+KPR-232 adds `AgentRunner.buildToolTransportInventory()` as a read-only inventory of the tool transports visible to a turn. The inventory describes Claude SDK built-ins, parent-session MCP servers, in-process SDK MCP servers, `team-roster`, and delegated sub-agent tools without exporting the Claude SDK `McpServerConfig` shape as the public boundary.
+
+The compatibility path is:
+
+```
+Provider adapter → tool transport inventory → provider-specific tool bridge
+```
+
+This is a compatibility layer only. Claude continues to use direct Claude Agent SDK `mcpServers`, in-process SDK MCP servers, SDK built-ins, hooks, plugins/native skills, and `agents:` sub-agent wiring. Non-Claude adapters must not consume the Claude-shaped `mcpServers` object directly. The KPR-233 OpenAI pilot and KPR-234 Gemini pilot intentionally attach no tools: they ignore Claude-only built-ins/sub-agents and reject any inventory entry that would require a provider bridge. OpenAI/Gemini tool bridging, provider selection, and memory/session policy are deferred.
+
+The future bridge belongs inside Hive, not inside each provider adapter. It should keep Honeypot/Keychain resolution local, preserve `WorkItemContext` for context-dependent servers, and expose only selected tools through provider-supported MCP or native function surfaces. SDK plugins/native skills, hooks, prompt assembly, settings sources, and SDK `extraArgs` are out of this inventory and remain Claude runtime behavior unless a later spec gives another provider an equivalent implementation.
+
 ## Coordination primitives
 
 Hive supports three distinct cross-agent coordination patterns. They do not overlap; pick the one whose semantics match the use case.
 
 ### In-session sub-agent
 
-Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `agents:` field, populated from `delegateServers` on the calling agent. The sub-agent is spawned for one focused task, returns its result, and is gone — it has no thread, no session, no inbox. Use when the calling agent needs a focused tool call done **right now** to finish the current turn (e.g. Jessica spawns a CRM-search specialist mid-turn). Built in `src/agents/agent-runner.ts:buildServerSubAgents`. The 6 context-dependent servers (`callback`, `background`, `code-task`, `recall`, `structured-memory`, `memory`) cannot be sub-agents — they need channel/thread context that doesn't exist in a sub-agent's spawn.
+Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `agents:` field, populated from `delegateServers` on the calling agent. The sub-agent is spawned for one focused task, returns its result, and is gone — it has no thread, no session, no inbox. Use when the calling agent needs a focused tool call done **right now** to finish the current turn (e.g. Jessica spawns a CRM-search specialist mid-turn). Built in `src/agents/agent-runner.ts:buildServerSubAgents`. Context-dependent servers (`callback`, `background`, `code-task`, `recall`, `structured-memory`) cannot be sub-agents because they need channel/thread context that does not exist in a sub-agent spawn. `memory` is also delegate-unsafe, but for a different reason: it is Hive-runtime-backed rather than turn-context-dependent.
 
 ### Direct messaging (Team MCP)
 

@@ -22,6 +22,8 @@ import type { ActivityLogger } from "../activity/activity-logger.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import type { PrefixCache } from "./prefix-cache.js";
+import { ClaudeAgentAdapter } from "./provider-adapters/claude-agent-adapter.js";
+import type { AgentProviderAdapter } from "./provider-adapters/types.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -153,7 +155,7 @@ export class AgentStoppedError extends Error {
 /**
  * KPR-220 Phase 2: handle returned by `withSpawnTicket` to the inner
  * lambda. `attachAbort` wires an abort handle (provided by the lambda
- * after constructing its AgentRunner); `abort()` invokes that handle —
+ * after constructing its provider adapter); `abort()` invokes that handle —
  * `stopAgent` walks all live tickets and calls this. Both are null-safe
  * so the HOF's finally cleanup remains intact even when the runner
  * constructor throws before `attachAbort` runs.
@@ -339,11 +341,12 @@ export class AgentManager {
     return [...tickets].map((t) => t.workItem);
   }
 
-  private createRunner(agentId: string): AgentRunner {
+  private createProviderAdapter(agentId: string): AgentProviderAdapter {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache);
+    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache);
+    return new ClaudeAgentAdapter(runner);
   }
 
   reloadSkills(): void {
@@ -884,11 +887,11 @@ export class AgentManager {
     ticket: SpawnTicket,
     onStream?: SpawnTurnStreamCallback,
   ): Promise<RunResult> {
-    // Fresh runner per spawn — its lazy-built in-process MCPs are therefore
+    // Fresh provider adapter per spawn — its lazy-built in-process MCPs are therefore
     // also fresh, with channel/thread ctx captured at construction. The
     // long-lived path keeps reusing one runner per agent.
-    const runner = this.createRunner(ctx.agentId);
-    ticket.attachAbort(() => runner.abort());
+    const adapter = this.createProviderAdapter(ctx.agentId);
+    ticket.attachAbort(() => adapter.abort());
 
     const bgContext: WorkItemContext = {
       adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,
@@ -900,15 +903,15 @@ export class AgentManager {
       slackThreadTs: (ctx.workItem.meta?.slackThreadTs as string) ?? "",
     };
 
-    const result = await runner.send(
-      shaping.prompt,
-      ctx.sessionId,
+    const result = await adapter.runTurn({
+      prompt: shaping.prompt,
+      sessionId: ctx.sessionId,
       onStream,
-      bgContext,
-      shaping.modelOverride,
-      shaping.resourceLimits,
-      ctx.systemPromptOverride,
-    );
+      workItemContext: bgContext,
+      modelOverride: shaping.modelOverride,
+      resourceLimits: shaping.resourceLimits,
+      systemPromptOverride: ctx.systemPromptOverride,
+    });
     // KPR-224: model router cost lives outside RunResult; add it here so
     // finalizeSpawnResult and recordSpawnObservability see the full cost.
     result.costUsd += shaping.routerCostUsd;
