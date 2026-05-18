@@ -17,12 +17,14 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Provider adapter (Claude implementation; no provider selection yet)
             ↓
+       Tool transport inventory → future provider-specific tool bridge
+            ↓
        Agent runner (spawns Claude session + MCP servers as subprocesses, fresh per turn)
             ↓
        Response → channel adapter → delivery
 ```
 
-A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. `AgentManager` hands a one-turn request to a provider adapter; in B0 the only adapter is the Claude implementation, which delegates to the existing `AgentRunner`/Claude Agent SDK path. This is a no-behavior-change extraction: provider selection is not available yet, and OpenAI/Gemini runtime implementations are deferred to later provider tickets. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
+A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. `AgentManager` hands a one-turn request to a provider adapter; in B0 the only adapter is the Claude implementation, which delegates to the existing `AgentRunner`/Claude Agent SDK path. KPR-232 adds a provider-neutral tool transport inventory for compatibility planning, but it does not add provider selection or OpenAI/Gemini runtime support. Claude still receives the direct SDK MCP wiring. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
 
 The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, threadId)`, per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface used by `hive doctor`, the Slack health report, and the WebSocket agent roster.
 
@@ -38,7 +40,7 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
 - `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
 - `src/agents/agent-manager.ts` — spawn coordinator: lock, budget, ticket lifecycle, reflection scheduler, snapshot surface.
-- `src/agents/provider-adapters/` — one-turn provider boundary. Currently Claude-only: `ClaudeAgentAdapter` delegates to `AgentRunner`; no config or schema provider selection exists yet.
+- `src/agents/provider-adapters/` — one-turn provider boundary and tool transport classification. Currently Claude-only at runtime: `ClaudeAgentAdapter` delegates to `AgentRunner`; no config or schema provider selection exists yet.
 - `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes the coordinator snapshot to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent for the doctor to read.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
 - `src/agents/model-router.ts` — Haiku/Sonnet classification.
@@ -81,6 +83,20 @@ Each agent gets a subset of MCP servers — listed in its `coreServers` and `del
 - `admin/admin-mcp-server.ts` — agent CRUD + version history (admin-scoped).
 
 Plugins (e.g. CRM integrations, business-specific tools) are separately-published packages; install with `hive plugin add <pkg>`.
+
+### Provider tool transport compatibility
+
+KPR-232 adds `AgentRunner.buildToolTransportInventory()` as a read-only inventory of the tool transports visible to a turn. The inventory describes Claude SDK built-ins, parent-session MCP servers, in-process SDK MCP servers, `team-roster`, and delegated sub-agent tools without exporting the Claude SDK `McpServerConfig` shape as the public boundary.
+
+The compatibility path is:
+
+```
+Provider adapter → tool transport inventory → provider-specific tool bridge
+```
+
+This is a compatibility layer only. Claude continues to use direct Claude Agent SDK `mcpServers`, in-process SDK MCP servers, SDK built-ins, hooks, plugins/native skills, and `agents:` sub-agent wiring. Non-Claude adapters must not consume the Claude-shaped `mcpServers` object directly; future OpenAI/Gemini pilots should consume the inventory and opt into explicitly classified bridge candidates or provider-native tools.
+
+The future bridge belongs inside Hive, not inside each provider adapter. It should keep Honeypot/Keychain resolution local, preserve `WorkItemContext` for context-dependent servers, and expose only selected tools through provider-supported MCP or native function surfaces. SDK plugins/native skills, hooks, prompt assembly, settings sources, and SDK `extraArgs` are out of this inventory and remain Claude runtime behavior unless a later spec gives another provider an equivalent implementation.
 
 ## Coordination primitives
 
