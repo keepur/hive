@@ -15,12 +15,14 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Agent manager (spawn coordinator: per-thread lock + per-agent budget)
             ↓
+       Provider adapter (Claude implementation; no provider selection yet)
+            ↓
        Agent runner (spawns Claude session + MCP servers as subprocesses, fresh per turn)
             ↓
        Response → channel adapter → delivery
 ```
 
-A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
+A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. `AgentManager` hands a one-turn request to a provider adapter; in B0 the only adapter is the Claude implementation, which delegates to the existing `AgentRunner`/Claude Agent SDK path. This is a no-behavior-change extraction: provider selection is not available yet, and OpenAI/Gemini runtime implementations are deferred to later provider tickets. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
 
 The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, threadId)`, per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface used by `hive doctor`, the Slack health report, and the WebSocket agent roster.
 
@@ -36,6 +38,7 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
 - `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
 - `src/agents/agent-manager.ts` — spawn coordinator: lock, budget, ticket lifecycle, reflection scheduler, snapshot surface.
+- `src/agents/provider-adapters/` — one-turn provider boundary. Currently Claude-only: `ClaudeAgentAdapter` delegates to `AgentRunner`; no config or schema provider selection exists yet.
 - `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes the coordinator snapshot to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent for the doctor to read.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
 - `src/agents/model-router.ts` — Haiku/Sonnet classification.
