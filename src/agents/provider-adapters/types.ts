@@ -1,7 +1,7 @@
 import type { ResourceLimits } from "../model-router.js";
 import type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner.js";
 
-export type AgentProviderId = "claude";
+export type AgentProviderId = "claude" | "openai";
 
 export interface AgentProviderTurnRequest {
   prompt: string;
