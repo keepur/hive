@@ -397,6 +397,72 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers["custom-server"].env.NODE_PATH).toBeUndefined();
   });
 
+  it("KPR-236: emits an http MCP config for transport:http plugin servers with api-key auth", async () => {
+    const plugin: LoadedPlugin = {
+      name: "remote-plugin",
+      dir: "/plugins/remote-plugin",
+      manifest: {
+        name: "remote-plugin",
+        description: "",
+        mcpServers: {
+          purchasing: {
+            transport: "http",
+            url: "https://app.example.com/mcp/purchasing",
+            auth: { type: "api-key", keySource: "agentApiKey" },
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["purchasing"] }), memoryManager as any, [plugin]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    // Default `test-agent` is not in taskLedger.agentKeys, so the global key wins.
+    expect(servers.purchasing).toEqual({
+      type: "http",
+      url: "https://app.example.com/mcp/purchasing",
+      headers: { "x-api-key": "global-key" },
+    });
+  });
+
+  it("KPR-236: bearer auth prefixes the value with 'Bearer ' and defaults to the Authorization header", async () => {
+    const plugin: LoadedPlugin = {
+      name: "remote-plugin",
+      dir: "/plugins/remote-plugin",
+      manifest: {
+        name: "remote-plugin",
+        description: "",
+        mcpServers: {
+          remote: {
+            transport: "http",
+            url: "https://example.com/mcp",
+            auth: { type: "bearer", keySource: "agentApiKey" },
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+
+    runner = new AgentRunner(
+      makeAgentConfig({ id: "agent-a", coreServers: ["remote"] }),
+      memoryManager as any,
+      [plugin],
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    // agent-a has a per-agent key in taskLedger.agentKeys → that wins over global-key.
+    expect(servers.remote).toEqual({
+      type: "http",
+      url: "https://example.com/mcp",
+      headers: { Authorization: "Bearer key-a" },
+    });
+  });
+
   it("symlinks plugin.dir/node_modules to engine deps before spawning a plugin server", async () => {
     mockSymlinkSync.mockClear();
     const plugin: LoadedPlugin = {

@@ -98,12 +98,21 @@ export function buildInstanceCapabilities(plugins: LoadedPlugin[] = []): Instanc
   //   - broken: loader couldn't resolve compiled entry (wins — no point checking creds)
   //   - unconfigured: entry OK but required env/secrets missing
   //   - configured: entry OK and creds resolve
+  //
+  // HTTP-transport servers have no instance-level env/secret check. Their
+  // per-agent key resolves at runtime per agent, so at instance scope they
+  // are always classified as `configured` if the manifest is valid (which
+  // the loader has already enforced — bad http manifests never land here).
   const instanceId = config.instance?.id ?? "unknown";
   for (const plugin of plugins) {
     for (const [serverName, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
       const brokenInfo = plugin.brokenServers[serverName];
       if (brokenInfo) {
         broken.push({ name: serverName, reason: brokenInfo.reason });
+        continue;
+      }
+      if (serverDef.transport === "http") {
+        configured.push(serverName);
         continue;
       }
       const requiredEnv = serverDef.env ?? [];

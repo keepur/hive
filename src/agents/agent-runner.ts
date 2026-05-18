@@ -11,7 +11,8 @@ import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config } from "../config.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
-import type { LoadedPlugin } from "../plugins/types.js";
+import type { LoadedPlugin, HttpPluginMcpServer } from "../plugins/types.js";
+import { isHttpServer } from "../plugins/types.js";
 import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
@@ -813,6 +814,23 @@ export class AgentRunner {
         // this should be reported.
         if (plugin.brokenServers[name]) continue;
 
+        // HTTP transport: no subprocess, no env wiring, just a per-agent key in
+        // a request header. Key resolves from the same per-agent registry that
+        // stdio plugins read via TASK_LEDGER_API_KEY.
+        if (isHttpServer(serverDef)) {
+          const agentKey = config.taskLedger.agentKeys[this.agentConfig.id] ?? config.taskLedger.apiKey;
+          if (!agentKey) {
+            log.warn("HTTP plugin server has no per-agent key, skipping", {
+              plugin: plugin.name,
+              server: name,
+              agent: this.agentConfig.id,
+            });
+            continue;
+          }
+          servers[name] = AgentRunner.buildHttpServerConfig(serverDef, agentKey);
+          continue;
+        }
+
         const resolved = resolvePluginServerPath(plugin.name, serverDef.entry, {
           hiveHome,
           distDir: DIST_DIR,
@@ -1047,6 +1065,26 @@ export class AgentRunner {
       current = (current as Record<string, unknown>)[part];
     }
     return current == null ? "" : String(current);
+  }
+
+  /**
+   * Build the SDK `type: "http"` MCP server config for a plugin HTTP server.
+   * Defaults headers per auth type: `x-api-key` for `api-key`, `Authorization:
+   * Bearer <key>` for `bearer`. An explicit `header:` overrides the default
+   * name (but `bearer` still keeps the `Bearer ` prefix on the value).
+   */
+  static buildHttpServerConfig(
+    serverDef: HttpPluginMcpServer,
+    agentKey: string,
+  ): { type: "http"; url: string; headers: Record<string, string> } {
+    const isBearer = serverDef.auth.type === "bearer";
+    const headerName = serverDef.auth.header ?? (isBearer ? "Authorization" : "x-api-key");
+    const headerValue = isBearer ? `Bearer ${agentKey}` : agentKey;
+    return {
+      type: "http",
+      url: serverDef.url,
+      headers: { [headerName]: headerValue },
+    };
   }
 
   /**
