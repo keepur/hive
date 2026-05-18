@@ -40,6 +40,7 @@ describe("normalizeManifest", () => {
     expect(result.description).toBe("A test plugin");
     expect(result.agentSeeds).toEqual(["agent-a", "agent-b"]);
     expect(result.mcpServers["my-server"]).toEqual({
+      transport: "stdio",
       entry: "mcp-servers/my-server/index.ts",
       description: undefined,
       usage: undefined,
@@ -97,6 +98,7 @@ describe("normalizeManifest", () => {
     };
     const result = normalizeManifest(raw);
     expect(result.mcpServers.simple).toEqual({
+      transport: "stdio",
       entry: "index.ts",
       description: undefined,
       usage: undefined,
@@ -115,8 +117,123 @@ describe("normalizeManifest", () => {
       },
     };
     const result = normalizeManifest(raw);
-    expect(result.mcpServers.s.secretEnv).toEqual(["A", "B", "C"]);
-    expect(result.mcpServers.s.env).toEqual([]);
+    const server = result.mcpServers.s;
+    if (server.transport === "http") throw new Error("expected stdio");
+    expect(server.secretEnv).toEqual(["A", "B", "C"]);
+    expect(server.env).toEqual([]);
+  });
+
+  describe("transport: http", () => {
+    it("normalizes an http server with api-key auth", () => {
+      const raw = {
+        name: "remote-plugin",
+        "mcp-servers": {
+          purchasing: {
+            transport: "http",
+            url: "https://app.example.com/mcp/purchasing",
+            description: "Remote purchasing",
+            auth: { type: "api-key", "key-source": "agentApiKey" },
+          },
+        },
+      };
+      const result = normalizeManifest(raw);
+      expect(result.mcpServers.purchasing).toEqual({
+        transport: "http",
+        url: "https://app.example.com/mcp/purchasing",
+        description: "Remote purchasing",
+        usage: undefined,
+        notFor: undefined,
+        auth: { type: "api-key", header: undefined, keySource: "agentApiKey" },
+      });
+    });
+
+    it("normalizes an http server with bearer auth and a custom header", () => {
+      const raw = {
+        "mcp-servers": {
+          remote: {
+            transport: "http",
+            url: "https://example.com/mcp",
+            auth: { type: "bearer", header: "X-Auth", keySource: "agentApiKey" },
+          },
+        },
+      };
+      const result = normalizeManifest(raw);
+      const server = result.mcpServers.remote;
+      if (server.transport !== "http") throw new Error("expected http");
+      expect(server.auth).toEqual({ type: "bearer", header: "X-Auth", keySource: "agentApiKey" });
+    });
+
+    it("accepts kebab-case key-source from YAML and camelCase keySource interchangeably", () => {
+      const camelRaw = {
+        "mcp-servers": {
+          r: { transport: "http", url: "https://x/mcp", auth: { type: "api-key", keySource: "agentApiKey" } },
+        },
+      };
+      const result = normalizeManifest(camelRaw);
+      const server = result.mcpServers.r;
+      if (server.transport !== "http") throw new Error("expected http");
+      expect(server.auth.keySource).toBe("agentApiKey");
+    });
+
+    it("rejects http server missing url", () => {
+      expect(() =>
+        normalizeManifest({
+          "mcp-servers": { bad: { transport: "http", auth: { type: "api-key", keySource: "agentApiKey" } } },
+        }),
+      ).toThrow(/requires a 'url'/);
+    });
+
+    it("rejects http server missing auth block", () => {
+      expect(() =>
+        normalizeManifest({
+          "mcp-servers": { bad: { transport: "http", url: "https://x/mcp" } },
+        }),
+      ).toThrow(/requires an 'auth' block/);
+    });
+
+    it("rejects unknown auth.type", () => {
+      expect(() =>
+        normalizeManifest({
+          "mcp-servers": {
+            bad: { transport: "http", url: "https://x/mcp", auth: { type: "oauth2", keySource: "agentApiKey" } },
+          },
+        }),
+      ).toThrow(/auth.type must be/);
+    });
+
+    it("rejects empty-string auth.header (would emit a malformed HTTP header at the wire)", () => {
+      expect(() =>
+        normalizeManifest({
+          "mcp-servers": {
+            bad: {
+              transport: "http",
+              url: "https://x/mcp",
+              auth: { type: "api-key", header: "", keySource: "agentApiKey" },
+            },
+          },
+        }),
+      ).toThrow(/auth.header must be a non-empty string/);
+    });
+
+    it("rejects unknown keySource", () => {
+      expect(() =>
+        normalizeManifest({
+          "mcp-servers": {
+            bad: { transport: "http", url: "https://x/mcp", auth: { type: "api-key", keySource: "env:OTHER" } },
+          },
+        }),
+      ).toThrow(/auth.keySource must be/);
+    });
+
+    it("rejects unknown transport value", () => {
+      expect(() => normalizeManifest({ "mcp-servers": { bad: { transport: "websocket", entry: "x.ts" } } })).toThrow(
+        /unknown transport/,
+      );
+    });
+
+    it("rejects stdio server missing entry", () => {
+      expect(() => normalizeManifest({ "mcp-servers": { bad: {} } })).toThrow(/requires an 'entry'/);
+    });
   });
 });
 
@@ -281,6 +398,48 @@ agents-templates:
     const result = loadPlugins(["@keepur/hive-plugin-foo"], "/root");
     expect(result).toHaveLength(1);
     expect(result[0].dir).toContain("@keepur");
+  });
+
+  it("loads a plugin with an http-transport server without touching the entry resolver", () => {
+    const manifestYaml = `
+name: remote
+mcp-servers:
+  purchasing:
+    transport: http
+    url: https://app.example.com/mcp/purchasing
+    auth:
+      type: api-key
+      key-source: agentApiKey
+`;
+    // existsSync returns true for the manifest path; nothing else needs to exist
+    // — the loader must not even ask the filesystem about a compiled entry.
+    vi.mocked(existsSync).mockImplementation((path: any) => String(path).endsWith("plugin.yaml"));
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["remote"], "/root");
+    expect(result).toHaveLength(1);
+    const server = result[0].manifest.mcpServers.purchasing;
+    if (server.transport !== "http") throw new Error("expected http");
+    expect(server.url).toBe("https://app.example.com/mcp/purchasing");
+    expect(server.auth.type).toBe("api-key");
+    expect(result[0].brokenServers).toEqual({});
+  });
+
+  it("skips a plugin whose manifest is invalid (e.g. http server missing url)", () => {
+    const manifestYaml = `
+name: broken
+mcp-servers:
+  bad:
+    transport: http
+    auth:
+      type: api-key
+      key-source: agentApiKey
+`;
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(manifestYaml);
+
+    const result = loadPlugins(["broken"], "/root");
+    expect(result).toEqual([]);
   });
 });
 
@@ -502,5 +661,21 @@ describe("rescanPluginBrokenServers", () => {
     expect(plugin.brokenServers).toHaveProperty("still-registered");
     expect(rescued).toEqual({});
     expect(stillBroken).toEqual({ p: ["still-registered"] });
+  });
+
+  it("drops a broken entry whose transport flipped to http", () => {
+    const plugin = makePlugin(["was-stdio"]);
+    plugin.manifest.mcpServers["was-stdio"] = {
+      transport: "http",
+      url: "https://x/mcp",
+      auth: { type: "api-key", keySource: "agentApiKey" },
+    };
+    vi.mocked(existsSync).mockReturnValue(false);
+
+    const { rescued, stillBroken } = rescanPluginBrokenServers([plugin], "/hive");
+
+    expect(plugin.brokenServers).not.toHaveProperty("was-stdio");
+    expect(rescued).toEqual({});
+    expect(stillBroken).toEqual({});
   });
 });
