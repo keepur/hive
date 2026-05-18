@@ -70,6 +70,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.63",
     "@anthropic-ai/sdk": "^0.82.0",
+    "@google/adk": "^1.1.0",
     "@linear/sdk": "^76.0.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@openai/agents": "^0.11.4",

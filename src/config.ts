@@ -196,6 +196,7 @@ export const config = {
   gemini: {
     apiKey: optional("GEMINI_API_KEY", ""),
     visionModel: optional("GEMINI_VISION_MODEL", "gemini-2.5-flash"),
+    agentModel: optional("GEMINI_AGENT_MODEL", ""),
   },
   permits: {
     mongoUri: optional("PERMITS_MONGO_URI", "mongodb://localhost:27017/permits"),
