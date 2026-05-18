@@ -112,6 +112,9 @@ export const config = {
   anthropic: {
     apiKey: optional("ANTHROPIC_API_KEY", ""),
   },
+  openai: {
+    agentModel: optional("OPENAI_AGENT_MODEL", ""),
+  },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),
     teamId: optional("LINEAR_TEAM_ID", ""),
