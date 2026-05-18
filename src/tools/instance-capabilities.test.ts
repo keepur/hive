@@ -191,6 +191,71 @@ describe("buildInstanceCapabilities — plugin secretEnv", () => {
   });
 });
 
+describe("buildInstanceCapabilities — http-transport plugin servers", () => {
+  // The test mock for config has no taskLedger.apiKey and no agentKeys, so
+  // the default behavior is `unconfigured` — matching agent-runner's
+  // skip-on-no-key behavior. Tests with keys mutate config in-place.
+
+  beforeEach(() => {
+    mockFromKeychain.mockReset();
+    mockFromKeychain.mockReturnValue("");
+  });
+
+  it("marks http server unconfigured when no global apiKey and no per-agent keys", async () => {
+    // Default mock has neither — verify against that baseline.
+    const { config } = await import("../config.js");
+    expect(config.taskLedger.apiKey).toBeUndefined();
+    expect(config.taskLedger.agentKeys).toBeUndefined();
+
+    const plugin = makePlugin("p", {
+      remote: {
+        transport: "http",
+        url: "https://x/mcp",
+        auth: { type: "api-key", keySource: "agentApiKey" },
+      },
+    });
+    const result = buildInstanceCapabilities([plugin]);
+    expect(result.servers.unconfigured).toContain("remote");
+    expect(result.servers.configured).not.toContain("remote");
+  });
+
+  it("marks http server configured when a global apiKey is set", async () => {
+    const { config } = await import("../config.js");
+    (config.taskLedger as any).apiKey = "global-key";
+    try {
+      const plugin = makePlugin("p", {
+        remote: {
+          transport: "http",
+          url: "https://x/mcp",
+          auth: { type: "api-key", keySource: "agentApiKey" },
+        },
+      });
+      const result = buildInstanceCapabilities([plugin]);
+      expect(result.servers.configured).toContain("remote");
+    } finally {
+      delete (config.taskLedger as any).apiKey;
+    }
+  });
+
+  it("marks http server configured when at least one per-agent key is set", async () => {
+    const { config } = await import("../config.js");
+    (config.taskLedger as any).agentKeys = { nora: "key-nora" };
+    try {
+      const plugin = makePlugin("p", {
+        remote: {
+          transport: "http",
+          url: "https://x/mcp",
+          auth: { type: "api-key", keySource: "agentApiKey" },
+        },
+      });
+      const result = buildInstanceCapabilities([plugin]);
+      expect(result.servers.configured).toContain("remote");
+    } finally {
+      delete (config.taskLedger as any).agentKeys;
+    }
+  });
+});
+
 describe("buildInstanceCapabilities — broken plugin servers", () => {
   beforeEach(() => {
     mockFromKeychain.mockReset();

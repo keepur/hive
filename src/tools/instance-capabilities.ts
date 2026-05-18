@@ -99,11 +99,16 @@ export function buildInstanceCapabilities(plugins: LoadedPlugin[] = []): Instanc
   //   - unconfigured: entry OK but required env/secrets missing
   //   - configured: entry OK and creds resolve
   //
-  // HTTP-transport servers have no instance-level env/secret check. Their
-  // per-agent key resolves at runtime per agent, so at instance scope they
-  // are always classified as `configured` if the manifest is valid (which
-  // the loader has already enforced — bad http manifests never land here).
+  // HTTP-transport servers have no env/secret-env. Their per-agent key
+  // resolves at runtime via `config.taskLedger.agentKeys[agentId] ??
+  // config.taskLedger.apiKey`. At instance scope we can't know which agent
+  // will be queried, but we CAN tell whether ANY key resolution would
+  // succeed — if there's no global apiKey and no per-agent keys at all,
+  // every spawn will skip the server (see agent-runner skip-on-no-key),
+  // which means it must classify as `unconfigured` here. Otherwise the
+  // toolkit section would lie to agents about what's reachable.
   const instanceId = config.instance?.id ?? "unknown";
+  const httpAuthAvailable = !!config.taskLedger?.apiKey || Object.keys(config.taskLedger?.agentKeys ?? {}).length > 0;
   for (const plugin of plugins) {
     for (const [serverName, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
       const brokenInfo = plugin.brokenServers[serverName];
@@ -112,7 +117,8 @@ export function buildInstanceCapabilities(plugins: LoadedPlugin[] = []): Instanc
         continue;
       }
       if (serverDef.transport === "http") {
-        configured.push(serverName);
+        if (httpAuthAvailable) configured.push(serverName);
+        else unconfigured.push(serverName);
         continue;
       }
       const requiredEnv = serverDef.env ?? [];
