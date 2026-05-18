@@ -104,7 +104,7 @@ Hive supports three distinct cross-agent coordination patterns. They do not over
 
 ### In-session sub-agent
 
-Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `agents:` field, populated from `delegateServers` on the calling agent. The sub-agent is spawned for one focused task, returns its result, and is gone — it has no thread, no session, no inbox. Use when the calling agent needs a focused tool call done **right now** to finish the current turn (e.g. Jessica spawns a CRM-search specialist mid-turn). Built in `src/agents/agent-runner.ts:buildServerSubAgents`. The 6 context-dependent servers (`callback`, `background`, `code-task`, `recall`, `structured-memory`, `memory`) cannot be sub-agents — they need channel/thread context that doesn't exist in a sub-agent's spawn.
+Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `agents:` field, populated from `delegateServers` on the calling agent. The sub-agent is spawned for one focused task, returns its result, and is gone — it has no thread, no session, no inbox. Use when the calling agent needs a focused tool call done **right now** to finish the current turn (e.g. Jessica spawns a CRM-search specialist mid-turn). Built in `src/agents/agent-runner.ts:buildServerSubAgents`. Context-dependent servers (`callback`, `background`, `code-task`, `recall`, `structured-memory`) cannot be sub-agents because they need channel/thread context that does not exist in a sub-agent spawn. `memory` is also delegate-unsafe, but for a different reason: it is Hive-runtime-backed rather than turn-context-dependent.
 
 ### Direct messaging (Team MCP)
 
