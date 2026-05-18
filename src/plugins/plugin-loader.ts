@@ -2,7 +2,8 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { createLogger } from "../logging/logger.js";
-import type { BrokenServer, LoadedPlugin, PluginManifest } from "./types.js";
+import type { BrokenServer, LoadedPlugin, PluginManifest, PluginMcpServer } from "./types.js";
+import { isHttpServer } from "./types.js";
 import { HIVE_PLUGIN_API_VERSION } from "./api-version.js";
 
 const log = createLogger("plugin-loader");
@@ -95,7 +96,17 @@ export function loadPlugins(
 
     const manifestPath = join(pluginDir, "plugin.yaml");
     const raw = parseYaml(readFileSync(manifestPath, "utf-8"));
-    const manifest = normalizeManifest(raw);
+    let manifest: PluginManifest;
+    try {
+      manifest = normalizeManifest(raw);
+    } catch (err) {
+      log.error("Plugin manifest invalid, skipping", {
+        plugin: name,
+        manifestPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
 
     if (manifest.hiveApi) {
       const compatible = isHiveApiCompatible(manifest.hiveApi, HIVE_PLUGIN_API_VERSION);
@@ -109,11 +120,13 @@ export function loadPlugins(
       }
     }
 
-    // Resolve each declared MCP server entry to its compiled artifact. Servers
-    // that don't resolve are tracked as `broken` so downstream consumers can
-    // surface the failure instead of spawning a missing file silently.
+    // Resolve each declared stdio MCP server entry to its compiled artifact.
+    // Servers that don't resolve are tracked as `broken` so downstream consumers
+    // can surface the failure instead of spawning a missing file silently.
+    // HTTP servers have no compiled entry to resolve.
     const brokenServers: Record<string, BrokenServer> = {};
     for (const [serverName, serverDef] of Object.entries(manifest.mcpServers)) {
+      if (isHttpServer(serverDef)) continue;
       const resolved = resolvePluginServerPath(name, serverDef.entry, {
         hiveHome: rootDir,
         distDir: resolveOpts?.distDir,
@@ -182,6 +195,11 @@ export function rescanPluginBrokenServers(
         delete plugin.brokenServers[serverName];
         continue;
       }
+      if (isHttpServer(serverDef)) {
+        // Transport flipped to http since startup — no entry to rescan; drop the stale broken record.
+        delete plugin.brokenServers[serverName];
+        continue;
+      }
       const resolved = resolvePluginServerPath(plugin.name, serverDef.entry, {
         hiveHome: rootDir,
         distDir: resolveOpts?.distDir,
@@ -224,22 +242,72 @@ export function normalizeManifest(raw: any): PluginManifest {
     description: raw.description ?? "",
     hiveApi: raw.hiveApi ?? raw["hive-api"] ?? undefined,
     mcpServers: Object.fromEntries(
-      Object.entries(raw["mcp-servers"] ?? {}).map(([k, v]: [string, any]) => [
-        k,
-        {
-          entry: v.entry,
-          description: v.description,
-          usage: v.usage,
-          notFor: v["not-for"],
-          env: v.env ?? [],
-          secretEnv: v["secret-env"] ?? [],
-          envMap: v["env-map"] ?? {},
-          agentEnv: v["agent-env"] ?? {},
-        },
-      ]),
+      Object.entries(raw["mcp-servers"] ?? {}).map(([k, v]: [string, any]) => [k, normalizeServerEntry(k, v)]),
     ),
     agentSeeds: raw["agent-seeds"] ?? raw["agents-templates"] ?? [],
     registerCommands: raw["register-commands"] ?? undefined,
+  };
+}
+
+function normalizeServerEntry(serverName: string, v: any): PluginMcpServer {
+  const transport = v.transport ?? "stdio";
+  const base = {
+    description: v.description,
+    usage: v.usage,
+    notFor: v["not-for"],
+  };
+
+  if (transport === "http") {
+    if (!v.url || typeof v.url !== "string") {
+      throw new Error(`plugin MCP server '${serverName}': transport: http requires a 'url' string`);
+    }
+    const rawAuth = v.auth;
+    if (!rawAuth || typeof rawAuth !== "object") {
+      throw new Error(`plugin MCP server '${serverName}': transport: http requires an 'auth' block`);
+    }
+    const authType = rawAuth.type;
+    if (authType !== "api-key" && authType !== "bearer") {
+      throw new Error(
+        `plugin MCP server '${serverName}': auth.type must be 'api-key' or 'bearer' (got ${JSON.stringify(authType)})`,
+      );
+    }
+    const keySource = rawAuth["key-source"] ?? rawAuth.keySource;
+    if (keySource !== "agentApiKey") {
+      throw new Error(
+        `plugin MCP server '${serverName}': auth.keySource must be 'agentApiKey' (got ${JSON.stringify(keySource)})`,
+      );
+    }
+    if (rawAuth.header !== undefined && (typeof rawAuth.header !== "string" || rawAuth.header.length === 0)) {
+      throw new Error(
+        `plugin MCP server '${serverName}': auth.header must be a non-empty string when set (got ${JSON.stringify(rawAuth.header)})`,
+      );
+    }
+    return {
+      ...base,
+      transport: "http",
+      url: v.url,
+      auth: {
+        type: authType,
+        header: typeof rawAuth.header === "string" ? rawAuth.header : undefined,
+        keySource: "agentApiKey",
+      },
+    };
+  }
+
+  if (transport !== "stdio") {
+    throw new Error(`plugin MCP server '${serverName}': unknown transport ${JSON.stringify(transport)}`);
+  }
+  if (!v.entry || typeof v.entry !== "string") {
+    throw new Error(`plugin MCP server '${serverName}': stdio transport requires an 'entry' string`);
+  }
+  return {
+    ...base,
+    transport: "stdio",
+    entry: v.entry,
+    env: v.env ?? [],
+    secretEnv: v["secret-env"] ?? [],
+    envMap: v["env-map"] ?? {},
+    agentEnv: v["agent-env"] ?? {},
   };
 }
 
