@@ -191,6 +191,12 @@ function makeRunner(overrides: Partial<AgentConfig> = {}, teamRoster?: any): Age
   );
 }
 
+function inventoryByName(runner: AgentRunner, name: string) {
+  const descriptor = runner.buildToolTransportInventory().find((entry) => entry.name === name);
+  expect(descriptor).toBeDefined();
+  return descriptor!;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 describe("AgentRunner.buildMcpServers (via send)", () => {
   let runner: AgentRunner;
@@ -851,6 +857,295 @@ describe("AgentRunner.buildServerConfig", () => {
     runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
     const serverConfig = runner.buildServerConfig("nonexistent");
     expect(serverConfig).toBeUndefined();
+  });
+});
+
+// ── Tool transport inventory tests (KPR-232) ─────────────────────
+describe("AgentRunner.buildToolTransportInventory", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("classifies stdio core servers as non-Claude MCP bridge candidates", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["keychain"] }),
+      memoryManager as any,
+    );
+
+    const keychain = inventoryByName(runner, "keychain");
+    expect(keychain).toMatchObject({
+      transport: "stdio",
+      source: "core",
+      requiresTurnContext: false,
+      requiresHiveRuntime: false,
+      inProcess: false,
+    });
+    expect(keychain.compatibility).toEqual({
+      claude: "direct",
+      openai: "mcp-bridge-candidate",
+      gemini: "mcp-bridge-candidate",
+    });
+  });
+
+  it("classifies hosted Slack HTTP MCP as a bridge candidate when configured", async () => {
+    const { config } = await import("../config.js");
+    const origToken = config.slack.mcpToken;
+    const origLocal = (config.slack as any).localMcpServer;
+    (config.slack as any).mcpToken = "xoxp-test";
+    (config.slack as any).localMcpServer = false;
+    try {
+      const runner = new AgentRunner(
+        makeAgentConfig({ coreServers: [] }),
+        memoryManager as any,
+      );
+
+      const slack = inventoryByName(runner, "slack");
+      expect(slack.transport).toBe("http");
+      expect(slack.source).toBe("engine");
+      expect(slack.compatibility.openai).toBe("mcp-bridge-candidate");
+      expect(slack.compatibility.gemini).toBe("mcp-bridge-candidate");
+    } finally {
+      (config.slack as any).mcpToken = origToken;
+      (config.slack as any).localMcpServer = origLocal;
+    }
+  });
+
+  it("classifies plugin stdio servers as plugin bridge candidates", () => {
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "custom-server": {
+            entry: "mcp-servers/custom/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["custom-server"] }),
+      memoryManager as any,
+      [plugin],
+    );
+
+    const custom = inventoryByName(runner, "custom-server");
+    expect(custom).toMatchObject({
+      transport: "stdio",
+      source: "plugin",
+      requiresTurnContext: false,
+      requiresHiveRuntime: false,
+    });
+    expect(custom.compatibility.openai).toBe("mcp-bridge-candidate");
+  });
+
+  it("excludes broken plugin servers from available inventory", () => {
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          "broken-server": {
+            entry: "mcp-servers/broken/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {
+        "broken-server": {
+          reason: "no compiled entry found",
+          pathsChecked: ["/tmp/dist/broken.min.js"],
+        },
+      },
+    };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["broken-server"] }),
+      memoryManager as any,
+      [plugin],
+    );
+
+    expect(runner.buildToolTransportInventory().map((entry) => entry.name)).not.toContain("broken-server");
+  });
+
+  it("classifies in-process memory as Hive-runtime-backed but not turn-context-dependent", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      {} as any,
+    );
+
+    const memory = inventoryByName(runner, "memory");
+    expect(memory).toMatchObject({
+      transport: "sdk-in-process",
+      source: "core",
+      requiresTurnContext: false,
+      requiresHiveRuntime: true,
+      inProcess: true,
+    });
+    expect(memory.compatibility.openai).toBe("requires-hive-bridge");
+    expect(memory.compatibility.gemini).toBe("requires-hive-bridge");
+  });
+
+  it("classifies auto-injected in-process schedule as requiring a Hive bridge", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      {} as any,
+    );
+
+    const schedule = inventoryByName(runner, "schedule");
+    expect(schedule).toMatchObject({
+      transport: "sdk-in-process",
+      source: "engine",
+      requiresTurnContext: false,
+      requiresHiveRuntime: true,
+      inProcess: true,
+    });
+    expect(schedule.compatibility.openai).toBe("requires-hive-bridge");
+  });
+
+  it("classifies context-dependent servers as requiring a Hive bridge", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["background"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+
+    const background = inventoryByName(runner, "background");
+    expect(background.requiresTurnContext).toBe(true);
+    expect(background.requiresHiveRuntime).toBe(false);
+    expect(background.compatibility.openai).toBe("requires-hive-bridge");
+    expect(background.compatibility.gemini).toBe("requires-hive-bridge");
+  });
+
+  it("includes team-roster when a TeamRoster is present", () => {
+    const teamRoster = {
+      teamSummary: async () => "## Team\n- Alice",
+    };
+    const runner = makeRunner({ coreServers: [] }, teamRoster);
+
+    const teamRosterDescriptor = inventoryByName(runner, "team-roster");
+    expect(teamRosterDescriptor).toMatchObject({
+      transport: "sdk-in-process",
+      source: "engine",
+      requiresTurnContext: false,
+      requiresHiveRuntime: true,
+      inProcess: true,
+    });
+    expect(teamRosterDescriptor.compatibility.openai).toBe("requires-hive-bridge");
+  });
+
+  it("classifies delegate servers as Claude sub-agents and Claude-only for non-Claude providers", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: [],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+    );
+
+    const google = inventoryByName(runner, "google");
+    expect(google).toMatchObject({
+      transport: "claude-subagent",
+      source: "delegate",
+      requiresTurnContext: false,
+      requiresHiveRuntime: false,
+    });
+    expect(google.compatibility).toEqual({
+      claude: "direct",
+      openai: "claude-only",
+      gemini: "claude-only",
+    });
+  });
+
+  it("includes representative Claude SDK built-ins as Claude-only descriptors", () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+
+    const bash = inventoryByName(runner, "Bash");
+    const task = inventoryByName(runner, "Task");
+    for (const descriptor of [bash, task]) {
+      expect(descriptor).toMatchObject({
+        transport: "claude-builtin",
+        source: "sdk-builtin",
+        requiresTurnContext: false,
+        requiresHiveRuntime: false,
+        inProcess: false,
+      });
+      expect(descriptor.compatibility).toEqual({
+        claude: "direct",
+        openai: "claude-only",
+        gemini: "claude-only",
+      });
+    }
+  });
+
+  it("matches runtime-exposed mcpServers and agents in a golden send comparison", async () => {
+    const teamRoster = {
+      teamSummary: async () => "## Team\n- Alice",
+    };
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["memory", "keychain"],
+        delegateServers: ["google"],
+      }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+    );
+
+    const inventoryNames = new Set(runner.buildToolTransportInventory().map((entry) => entry.name));
+    await runner.send("hello");
+    const runtimeServerNames = Object.keys(getCapturedServers());
+    const runtimeAgentNames = Object.keys(getCapturedOptions().agents ?? {});
+
+    for (const name of [...runtimeServerNames, ...runtimeAgentNames]) {
+      expect(inventoryNames).toContain(name);
+    }
+  });
+
+  it("applies autonomy gates consistently to inventory", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({
+        coreServers: ["code-task", "code-search"],
+        delegateServers: ["code-task", "code-search"],
+        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      }),
+      memoryManager as any,
+    );
+
+    const names = runner.buildToolTransportInventory().map((entry) => entry.name);
+    expect(names).not.toContain("code-task");
+    expect(names).not.toContain("code-search");
   });
 });
 
