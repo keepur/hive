@@ -1,16 +1,31 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { Agent, run } from "@openai/agents";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Agent, OpenAIProvider, Runner, run } from "@openai/agents";
 import { OpenAIAgentsAdapter, coerceFinalOutput } from "./openai-agents-adapter.js";
 import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+
+const { runnerRunMock } = vi.hoisted(() => ({
+  runnerRunMock: vi.fn(),
+}));
 
 vi.mock("@openai/agents", () => ({
   Agent: vi.fn(function Agent(options: unknown) {
     return { options };
   }),
+  OpenAIProvider: vi.fn(function OpenAIProvider(options: unknown) {
+    return { options };
+  }),
+  Runner: vi.fn(function Runner(options: unknown) {
+    return { options, run: runnerRunMock };
+  }),
   run: vi.fn(),
 }));
 
 const AgentMock = vi.mocked(Agent);
+const OpenAIProviderMock = vi.mocked(OpenAIProvider);
+const RunnerMock = vi.mocked(Runner);
 const runMock = vi.mocked(run);
 
 function makeAdapter(overrides: Partial<ConstructorParameters<typeof OpenAIAgentsAdapter>[0]> = {}) {
@@ -18,6 +33,7 @@ function makeAdapter(overrides: Partial<ConstructorParameters<typeof OpenAIAgent
     name: "Pilot",
     instructions: "Be useful.",
     model: "gpt-5.4-mini",
+    preferOAuth: false,
     ...overrides,
   });
 }
@@ -51,6 +67,7 @@ function makeSdkResult(overrides: Record<string, unknown> = {}) {
 describe("OpenAIAgentsAdapter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.OPENAI_API_KEY;
   });
 
   it("exposes the OpenAI provider id", () => {
@@ -186,6 +203,36 @@ describe("OpenAIAgentsAdapter", () => {
     });
   });
 
+  it("prefers Codex OAuth and falls back to API-key auth on OpenAI auth failures", async () => {
+    process.env.OPENAI_API_KEY = "sk-fallback";
+    const dir = mkdtempSync(join(tmpdir(), "hive-codex-auth-"));
+    const authPath = join(dir, "auth.json");
+    writeFileSync(authPath, JSON.stringify({ tokens: { access_token: makeJwt({ exp: 60 * 60 }) } }));
+    runnerRunMock
+      .mockRejectedValueOnce(Object.assign(new Error("Missing scopes: api.responses.write"), { status: 401 }))
+      .mockResolvedValueOnce(makeSdkResult({ finalOutput: "used fallback", lastResponseId: "resp-fallback" }));
+
+    try {
+      const result = await makeAdapter({ preferOAuth: true, codexAuthPath: authPath }).runTurn({ prompt: "hello" });
+
+      expect(result).toMatchObject({
+        text: "used fallback",
+        sessionId: "resp-fallback",
+        aborted: false,
+      });
+      expect(runMock).not.toHaveBeenCalled();
+      expect(RunnerMock).toHaveBeenCalledTimes(2);
+      expect(OpenAIProviderMock).toHaveBeenCalledTimes(2);
+
+      const firstClient = (OpenAIProviderMock.mock.calls[0][0] as any).openAIClient;
+      const secondClient = (OpenAIProviderMock.mock.calls[1][0] as any).openAIClient;
+      expect(typeof firstClient._options.apiKey).toBe("function");
+      expect(secondClient._options.apiKey).toBe("sk-fallback");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("coerces finalOutput values", async () => {
     runMock
       .mockResolvedValueOnce(makeSdkResult({ finalOutput: undefined, lastResponseId: undefined }) as never)
@@ -225,3 +272,15 @@ describe("OpenAIAgentsAdapter", () => {
     expect(runMock).toHaveBeenCalledTimes(1);
   });
 });
+
+function makeJwt(payload: Record<string, unknown>): string {
+  const now = Math.floor(Date.now() / 1000);
+  const encoded = Buffer.from(
+    JSON.stringify({
+      aud: ["https://api.openai.com/v1"],
+      ...payload,
+      exp: now + Number(payload.exp ?? 60 * 60),
+    }),
+  ).toString("base64url");
+  return `header.${encoded}.signature`;
+}

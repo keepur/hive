@@ -1,13 +1,19 @@
-import { Agent, run } from "@openai/agents";
+import { Agent, OpenAIProvider, Runner, run } from "@openai/agents";
+import OpenAI from "openai";
 import type { RunResult } from "../agent-runner.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
 import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+import { createCodexOpenAITokenProvider, envValue, isProviderAuthError } from "./oauth-credentials.js";
 
 export interface OpenAIAgentsAdapterOptions {
   name: string;
   instructions: string;
   model?: string;
   toolInventory?: HiveToolTransportDescriptor[];
+  apiKey?: string;
+  preferOAuth?: boolean;
+  codexAuthPath?: string;
+  codexRefreshCommand?: string;
 }
 
 interface OpenAIResultLike {
@@ -18,6 +24,11 @@ interface OpenAIResultLike {
 interface OpenAIStreamResultLike extends OpenAIResultLike {
   completed: Promise<void>;
   toTextStream(options: { compatibleWithNodeStreams: true }): AsyncIterable<unknown>;
+}
+
+interface OpenAIAuthAttempt {
+  source: "codex-oauth" | "api-key";
+  client: OpenAI;
 }
 
 export class OpenAIAgentsAdapter implements AgentProviderAdapter {
@@ -53,7 +64,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
       };
 
       if (streamed) {
-        const result = await run(agent, request.prompt, {
+        const result = await this.runWithAuthFallback(agent, request.prompt, {
           ...runOptions,
           stream: true,
         });
@@ -68,7 +79,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
         });
       }
 
-      const result = await run(agent, request.prompt, {
+      const result = await this.runWithAuthFallback(agent, request.prompt, {
         ...runOptions,
         stream: false,
       });
@@ -121,6 +132,71 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     if (unsupported) {
       throw new Error(`OpenAI tool bridge is not implemented in KPR-233: ${unsupported.name}`);
     }
+  }
+
+  private async runWithAuthFallback(
+    agent: Agent,
+    prompt: string,
+    options: { stream: true; maxTurns?: number; signal: AbortSignal; previousResponseId?: string },
+  ): Promise<OpenAIStreamResultLike>;
+  private async runWithAuthFallback(
+    agent: Agent,
+    prompt: string,
+    options: { stream: false; maxTurns?: number; signal: AbortSignal; previousResponseId?: string },
+  ): Promise<OpenAIResultLike>;
+  private async runWithAuthFallback(
+    agent: Agent,
+    prompt: string,
+    options:
+      | { stream: true; maxTurns?: number; signal: AbortSignal; previousResponseId?: string }
+      | { stream: false; maxTurns?: number; signal: AbortSignal; previousResponseId?: string },
+  ): Promise<OpenAIResultLike | OpenAIStreamResultLike> {
+    const attempts = this.buildAuthAttempts();
+    if (attempts.length === 0) {
+      return run(agent, prompt, options as never) as Promise<OpenAIResultLike | OpenAIStreamResultLike>;
+    }
+
+    let lastError: unknown;
+    for (const [index, attempt] of attempts.entries()) {
+      try {
+        const runner = new Runner({
+          modelProvider: new OpenAIProvider({ openAIClient: attempt.client as never }),
+        });
+        return (await runner.run(agent, prompt, options as never)) as OpenAIResultLike | OpenAIStreamResultLike;
+      } catch (error) {
+        lastError = error;
+        if (index === attempts.length - 1 || !isProviderAuthError(error)) throw error;
+      }
+    }
+
+    throw lastError;
+  }
+
+  private buildAuthAttempts(): OpenAIAuthAttempt[] {
+    const attempts: OpenAIAuthAttempt[] = [];
+
+    if (this.options.preferOAuth !== false) {
+      const tokenProvider = createCodexOpenAITokenProvider({
+        authPath: this.options.codexAuthPath,
+        refreshCommand: this.options.codexRefreshCommand,
+      });
+      if (tokenProvider) {
+        attempts.push({
+          source: "codex-oauth",
+          client: new OpenAI({ apiKey: tokenProvider }),
+        });
+      }
+    }
+
+    const apiKey = this.options.apiKey ?? envValue("OPENAI_API_KEY");
+    if (apiKey) {
+      attempts.push({
+        source: "api-key",
+        client: new OpenAI({ apiKey }),
+      });
+    }
+
+    return attempts;
   }
 
   private async consumeTextStream(result: OpenAIStreamResultLike, onStream?: (chunk: string) => void): Promise<string> {

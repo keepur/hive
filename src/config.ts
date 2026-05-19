@@ -115,6 +115,9 @@ export const config = {
   openai: {
     agentModel: optional("OPENAI_AGENT_MODEL", ""),
   },
+  codex: {
+    agentModel: optional("CODEX_AGENT_MODEL", "gpt-5.4-mini"),
+  },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),
     teamId: optional("LINEAR_TEAM_ID", ""),

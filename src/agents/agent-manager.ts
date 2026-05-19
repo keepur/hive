@@ -23,6 +23,12 @@ import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import type { PrefixCache } from "./prefix-cache.js";
 import { ClaudeAgentAdapter } from "./provider-adapters/claude-agent-adapter.js";
+import {
+  CodexSubscriptionAdapter,
+  type CodexReasoningEffort,
+} from "./provider-adapters/codex-subscription-adapter.js";
+import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
+import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
 import type { AgentProviderAdapter } from "./provider-adapters/types.js";
 
 const log = createLogger("agent-manager");
@@ -126,6 +132,48 @@ export type SpawnTurnStreamCallback = StreamCallback;
  * open-ended dial." Tunable per-agent in a future ticket.
  */
 const DEFAULT_PER_AGENT_SPAWN_BUDGET = 5;
+
+type ProviderModelRoute =
+  | { provider: "claude"; model: string }
+  | { provider: "openai"; model: string; reasoningEffort?: CodexReasoningEffort }
+  | { provider: "gemini"; model: string }
+  | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort };
+
+const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
+
+function resolveProviderModel(model: string): ProviderModelRoute {
+  const normalized = model.trim();
+  const slash = normalized.indexOf("/");
+  if (slash <= 0) return { provider: "claude", model: normalized };
+
+  const provider = normalized.slice(0, slash).toLowerCase();
+  const { model: providerModel, reasoningEffort } = splitProviderModel(normalized.slice(slash + 1));
+  if (provider === "codex" || provider === "openai-codex") {
+    return { provider: "codex", model: providerModel, reasoningEffort };
+  }
+  if (provider === "openai") {
+    return { provider: "openai", model: providerModel, reasoningEffort };
+  }
+  if (provider === "gemini" || provider === "google-gemini") {
+    return { provider: "gemini", model: providerModel };
+  }
+
+  return { provider: "claude", model: normalized };
+}
+
+function splitProviderModel(providerModel: string): { model: string; reasoningEffort?: CodexReasoningEffort } {
+  const colon = providerModel.lastIndexOf(":");
+  if (colon <= 0 || colon === providerModel.length - 1) return { model: providerModel };
+
+  const suffix = providerModel.slice(colon + 1);
+  if (!REASONING_EFFORTS.has(suffix as CodexReasoningEffort)) return { model: providerModel };
+  return { model: providerModel.slice(0, colon), reasoningEffort: suffix as CodexReasoningEffort };
+}
+
+function buildPilotInstructions(name: string, soul: string, systemPrompt: string): string {
+  const sections = [soul.trim(), systemPrompt.trim()].filter(Boolean);
+  return sections.length ? sections.join("\n\n") : `You are ${name}.`;
+}
 
 /**
  * Voice-adapter sentinel: SDK auth-rebuild-resume errors are retried once
@@ -346,7 +394,39 @@ export class AgentManager {
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
     const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache);
-    return new ClaudeAgentAdapter(runner);
+    const route = resolveProviderModel(config.model);
+    if (route.provider === "claude") {
+      return new ClaudeAgentAdapter(runner);
+    }
+
+    const instructions = buildPilotInstructions(config.name, config.soul, config.systemPrompt);
+    const toolInventory: [] = [];
+
+    if (route.provider === "codex") {
+      return new CodexSubscriptionAdapter({
+        name: config.name,
+        instructions,
+        model: route.model || appConfig.codex.agentModel,
+        reasoningEffort: route.reasoningEffort,
+        toolInventory,
+      });
+    }
+
+    if (route.provider === "openai") {
+      return new OpenAIAgentsAdapter({
+        name: config.name,
+        instructions,
+        model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
+        toolInventory,
+      });
+    }
+
+    return new GeminiAdkAdapter({
+      name: config.name,
+      instructions,
+      model: route.model || appConfig.gemini.agentModel || "gemini-2.5-flash",
+      toolInventory,
+    });
   }
 
   reloadSkills(): void {

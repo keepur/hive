@@ -1,16 +1,19 @@
 import {
   EventType,
+  Gemini,
   InMemoryRunner,
   LlmAgent,
   isFinalResponse,
   stringifyContent,
   toStructuredEvents,
 } from "@google/adk";
+import type { BaseLlm } from "@google/adk";
 import type { Event, StructuredEvent } from "@google/adk";
 import { randomUUID } from "node:crypto";
 import type { RunResult } from "../agent-runner.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
 import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+import { envValue, isProviderAuthError, resolveGoogleVertexOAuthConfig } from "./oauth-credentials.js";
 
 export interface GeminiAdkAdapterOptions {
   name: string;
@@ -19,11 +22,21 @@ export interface GeminiAdkAdapterOptions {
   toolInventory?: HiveToolTransportDescriptor[];
   appName?: string;
   userId?: string;
+  apiKey?: string;
+  preferOAuth?: boolean;
+  googleApplicationCredentialsPath?: string;
+  vertexProject?: string;
+  vertexLocation?: string;
 }
 
 interface GeminiRunAccumulator {
   text: string;
   error?: string;
+}
+
+interface GeminiAuthAttempt {
+  source: "google-oauth" | "api-key";
+  model: string | BaseLlm | undefined;
 }
 
 export class GeminiAdkAdapter implements AgentProviderAdapter {
@@ -43,59 +56,7 @@ export class GeminiAdkAdapter implements AgentProviderAdapter {
     const sessionId = request.sessionId ?? `gemini-pilot-${randomUUID()}`;
 
     try {
-      const agent = new LlmAgent({
-        name: sanitizeAgentName(this.options.name),
-        instruction: request.systemPromptOverride ?? this.options.instructions,
-        model: this.options.model,
-        tools: [],
-      });
-      const runner = new InMemoryRunner({
-        agent,
-        appName: this.options.appName ?? "hive-gemini-pilot",
-      });
-
-      const events = runner.runEphemeral({
-        userId: this.options.userId ?? "hive-gemini-pilot-user",
-        newMessage: {
-          role: "user",
-          parts: [{ text: request.prompt }],
-        },
-        runConfig: {
-          maxLlmCalls: request.resourceLimits?.maxTurns,
-        },
-      });
-
-      const accumulated = await this.consumeEvents(events, request.onStream);
-      const durationMs = Date.now() - startedAt;
-
-      if (this.aborted) {
-        return this.buildResult({
-          text: "",
-          sessionId,
-          durationMs,
-          streamed,
-          aborted: true,
-        });
-      }
-
-      if (accumulated.error) {
-        return this.buildResult({
-          text: accumulated.text,
-          sessionId,
-          durationMs,
-          streamed,
-          aborted: false,
-          error: accumulated.error,
-        });
-      }
-
-      return this.buildResult({
-        text: accumulated.text,
-        sessionId,
-        durationMs,
-        streamed,
-        aborted: false,
-      });
+      return await this.runWithAuthFallback(request, sessionId, streamed, startedAt);
     } catch (error) {
       const durationMs = Date.now() - startedAt;
       if (this.aborted) {
@@ -132,6 +93,130 @@ export class GeminiAdkAdapter implements AgentProviderAdapter {
     if (unsupported) {
       throw new Error(`Gemini ADK tool bridge is not implemented in KPR-234: ${unsupported.name}`);
     }
+  }
+
+  private async runWithAuthFallback(
+    request: AgentProviderTurnRequest,
+    sessionId: string,
+    streamed: boolean,
+    startedAt: number,
+  ): Promise<RunResult> {
+    const attempts = this.buildAuthAttempts();
+    const effectiveAttempts = attempts.length ? attempts : [{ source: "api-key" as const, model: this.options.model }];
+
+    for (const [index, attempt] of effectiveAttempts.entries()) {
+      try {
+        const result = await this.runWithModel(request, sessionId, streamed, startedAt, attempt.model);
+        if (result.error && index < effectiveAttempts.length - 1 && isProviderAuthError(result.error)) {
+          continue;
+        }
+        return result;
+      } catch (error) {
+        if (index === effectiveAttempts.length - 1 || !isProviderAuthError(error)) throw error;
+      }
+    }
+
+    return this.runWithModel(request, sessionId, streamed, startedAt, this.options.model);
+  }
+
+  private async runWithModel(
+    request: AgentProviderTurnRequest,
+    sessionId: string,
+    streamed: boolean,
+    startedAt: number,
+    model: string | BaseLlm | undefined,
+  ): Promise<RunResult> {
+    const agent = new LlmAgent({
+      name: sanitizeAgentName(this.options.name),
+      instruction: request.systemPromptOverride ?? this.options.instructions,
+      model,
+      tools: [],
+    });
+    const runner = new InMemoryRunner({
+      agent,
+      appName: this.options.appName ?? "hive-gemini-pilot",
+    });
+
+    const events = runner.runEphemeral({
+      userId: this.options.userId ?? "hive-gemini-pilot-user",
+      newMessage: {
+        role: "user",
+        parts: [{ text: request.prompt }],
+      },
+      runConfig: {
+        maxLlmCalls: request.resourceLimits?.maxTurns,
+      },
+    });
+
+    const accumulated = await this.consumeEvents(events, request.onStream);
+    const durationMs = Date.now() - startedAt;
+
+    if (this.aborted) {
+      return this.buildResult({
+        text: "",
+        sessionId,
+        durationMs,
+        streamed,
+        aborted: true,
+      });
+    }
+
+    if (accumulated.error) {
+      return this.buildResult({
+        text: accumulated.text,
+        sessionId,
+        durationMs,
+        streamed,
+        aborted: false,
+        error: accumulated.error,
+      });
+    }
+
+    return this.buildResult({
+      text: accumulated.text,
+      sessionId,
+      durationMs,
+      streamed,
+      aborted: false,
+    });
+  }
+
+  private buildAuthAttempts(): GeminiAuthAttempt[] {
+    const attempts: GeminiAuthAttempt[] = [];
+    const modelName = this.options.model;
+
+    if (this.options.preferOAuth !== false) {
+      const vertex = resolveGoogleVertexOAuthConfig({
+        credentialsPath: this.options.googleApplicationCredentialsPath,
+        project: this.options.vertexProject,
+        location: this.options.vertexLocation,
+      });
+      if (vertex) {
+        attempts.push({
+          source: "google-oauth",
+          model: new Gemini({
+            model: modelName,
+            vertexai: true,
+            project: vertex.project,
+            location: vertex.location,
+          }),
+        });
+      }
+    }
+
+    const apiKey =
+      this.options.apiKey ||
+      envValue("GOOGLE_GENAI_API_KEY") ||
+      envValue("GEMINI_API_KEY") ||
+      envValue("GOOGLE_API_KEY");
+    if (apiKey) {
+      attempts.push({
+        source: "api-key",
+        model: new Gemini({ model: modelName, apiKey }),
+      });
+    }
+
+    return attempts;
   }
 
   private async consumeEvents(

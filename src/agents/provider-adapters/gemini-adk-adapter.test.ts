@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { EventType, InMemoryRunner, LlmAgent, isFinalResponse, toStructuredEvents } from "@google/adk";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { EventType, Gemini, InMemoryRunner, LlmAgent, isFinalResponse, toStructuredEvents } from "@google/adk";
 import { GeminiAdkAdapter, coerceGeminiOutput, extractTextChunks } from "./gemini-adk-adapter.js";
 import type { HiveToolTransportDescriptor } from "./tool-transport.js";
 
@@ -14,6 +17,9 @@ vi.mock("@google/adk", async () => {
     LlmAgent: vi.fn(function LlmAgent(options: unknown) {
       return { options };
     }),
+    Gemini: vi.fn(function Gemini(options: unknown) {
+      return { options };
+    }),
     InMemoryRunner: vi.fn(function InMemoryRunner(options: unknown) {
       return { options, runEphemeral: runEphemeralMock };
     }),
@@ -23,6 +29,7 @@ vi.mock("@google/adk", async () => {
   };
 });
 
+const GeminiMock = vi.mocked(Gemini);
 const LlmAgentMock = vi.mocked(LlmAgent);
 const InMemoryRunnerMock = vi.mocked(InMemoryRunner);
 const isFinalResponseMock = vi.mocked(isFinalResponse);
@@ -199,6 +206,44 @@ describe("GeminiAdkAdapter", () => {
       aborted: false,
       error: "quota exceeded",
     });
+  });
+
+  it("prefers Google OAuth via Vertex and falls back to Gemini API-key auth on auth failures", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hive-google-adc-"));
+    const credentialsPath = join(dir, "application_default_credentials.json");
+    writeFileSync(credentialsPath, JSON.stringify({ type: "authorized_user", quota_project_id: "pilot-project" }));
+    runEphemeralMock
+      .mockImplementationOnce(() => {
+        throw Object.assign(new Error("Unauthorized"), { status: 401 });
+      })
+      .mockReturnValueOnce(events({ finalText: "used gemini key" }));
+    isFinalResponseMock.mockReturnValue(true);
+
+    try {
+      const result = await makeAdapter({
+        googleApplicationCredentialsPath: credentialsPath,
+        vertexLocation: "us-central1",
+        apiKey: "gemini-fallback",
+      }).runTurn({ prompt: "hello" });
+
+      expect(result).toMatchObject({
+        text: "used gemini key",
+        aborted: false,
+      });
+      expect(GeminiMock).toHaveBeenNthCalledWith(1, {
+        model: "gemini-flash-latest",
+        vertexai: true,
+        project: "pilot-project",
+        location: "us-central1",
+      });
+      expect(GeminiMock).toHaveBeenNthCalledWith(2, {
+        model: "gemini-flash-latest",
+        apiKey: "gemini-fallback",
+      });
+      expect(LlmAgentMock).toHaveBeenCalledTimes(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("extracts text from structured, final, and raw ADK events", () => {
