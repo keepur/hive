@@ -227,7 +227,8 @@ export class Sweeper {
       // (b) Idle trigger: all agents idle for threshold duration
       let allIdle = false;
       if (cooldownElapsed && !justSwept) {
-        const thresholdMs = dreamCfg.idleThresholdMinutes * 60 * 1000;
+        const thresholdMinutes = dreamCfg.quietPeriodMinutes ?? dreamCfg.idleThresholdMinutes ?? 120;
+        const thresholdMs = thresholdMinutes * 60 * 1000;
         const states = this.targets.agentManager.getAllStates();
         allIdle =
           states.length > 0 && states.every((s) => s.status === "idle" && now - s.lastActivity.getTime() > thresholdMs);
