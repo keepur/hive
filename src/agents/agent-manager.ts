@@ -22,6 +22,14 @@ import type { ActivityLogger } from "../activity/activity-logger.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import type { PrefixCache } from "./prefix-cache.js";
+import { ClaudeAgentAdapter } from "./provider-adapters/claude-agent-adapter.js";
+import {
+  CodexSubscriptionAdapter,
+  type CodexReasoningEffort,
+} from "./provider-adapters/codex-subscription-adapter.js";
+import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
+import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
+import type { AgentProviderAdapter } from "./provider-adapters/types.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -125,6 +133,48 @@ export type SpawnTurnStreamCallback = StreamCallback;
  */
 const DEFAULT_PER_AGENT_SPAWN_BUDGET = 5;
 
+type ProviderModelRoute =
+  | { provider: "claude"; model: string }
+  | { provider: "openai"; model: string; reasoningEffort?: CodexReasoningEffort }
+  | { provider: "gemini"; model: string }
+  | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort };
+
+const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
+
+function resolveProviderModel(model: string): ProviderModelRoute {
+  const normalized = model.trim();
+  const slash = normalized.indexOf("/");
+  if (slash <= 0) return { provider: "claude", model: normalized };
+
+  const provider = normalized.slice(0, slash).toLowerCase();
+  const { model: providerModel, reasoningEffort } = splitProviderModel(normalized.slice(slash + 1));
+  if (provider === "codex" || provider === "openai-codex") {
+    return { provider: "codex", model: providerModel, reasoningEffort };
+  }
+  if (provider === "openai") {
+    return { provider: "openai", model: providerModel, reasoningEffort };
+  }
+  if (provider === "gemini" || provider === "google-gemini") {
+    return { provider: "gemini", model: providerModel };
+  }
+
+  return { provider: "claude", model: normalized };
+}
+
+function splitProviderModel(providerModel: string): { model: string; reasoningEffort?: CodexReasoningEffort } {
+  const colon = providerModel.lastIndexOf(":");
+  if (colon <= 0 || colon === providerModel.length - 1) return { model: providerModel };
+
+  const suffix = providerModel.slice(colon + 1);
+  if (!REASONING_EFFORTS.has(suffix as CodexReasoningEffort)) return { model: providerModel };
+  return { model: providerModel.slice(0, colon), reasoningEffort: suffix as CodexReasoningEffort };
+}
+
+function buildPilotInstructions(name: string, soul: string, systemPrompt: string): string {
+  const sections = [soul.trim(), systemPrompt.trim()].filter(Boolean);
+  return sections.length ? sections.join("\n\n") : `You are ${name}.`;
+}
+
 /**
  * Voice-adapter sentinel: SDK auth-rebuild-resume errors are retried once
  * with a rebuilt resume id. Mirrors voice-adapter.ts:isAuthError so
@@ -153,7 +203,7 @@ export class AgentStoppedError extends Error {
 /**
  * KPR-220 Phase 2: handle returned by `withSpawnTicket` to the inner
  * lambda. `attachAbort` wires an abort handle (provided by the lambda
- * after constructing its AgentRunner); `abort()` invokes that handle —
+ * after constructing its provider adapter); `abort()` invokes that handle —
  * `stopAgent` walks all live tickets and calls this. Both are null-safe
  * so the HOF's finally cleanup remains intact even when the runner
  * constructor throws before `attachAbort` runs.
@@ -339,11 +389,44 @@ export class AgentManager {
     return [...tickets].map((t) => t.workItem);
   }
 
-  private createRunner(agentId: string): AgentRunner {
+  private createProviderAdapter(agentId: string): AgentProviderAdapter {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache);
+    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache);
+    const route = resolveProviderModel(config.model);
+    if (route.provider === "claude") {
+      return new ClaudeAgentAdapter(runner);
+    }
+
+    const instructions = buildPilotInstructions(config.name, config.soul, config.systemPrompt);
+    const toolInventory: [] = [];
+
+    if (route.provider === "codex") {
+      return new CodexSubscriptionAdapter({
+        name: config.name,
+        instructions,
+        model: route.model || appConfig.codex.agentModel,
+        reasoningEffort: route.reasoningEffort,
+        toolInventory,
+      });
+    }
+
+    if (route.provider === "openai") {
+      return new OpenAIAgentsAdapter({
+        name: config.name,
+        instructions,
+        model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
+        toolInventory,
+      });
+    }
+
+    return new GeminiAdkAdapter({
+      name: config.name,
+      instructions,
+      model: route.model || appConfig.gemini.agentModel || "gemini-2.5-flash",
+      toolInventory,
+    });
   }
 
   reloadSkills(): void {
@@ -884,11 +967,11 @@ export class AgentManager {
     ticket: SpawnTicket,
     onStream?: SpawnTurnStreamCallback,
   ): Promise<RunResult> {
-    // Fresh runner per spawn — its lazy-built in-process MCPs are therefore
+    // Fresh provider adapter per spawn — its lazy-built in-process MCPs are therefore
     // also fresh, with channel/thread ctx captured at construction. The
     // long-lived path keeps reusing one runner per agent.
-    const runner = this.createRunner(ctx.agentId);
-    ticket.attachAbort(() => runner.abort());
+    const adapter = this.createProviderAdapter(ctx.agentId);
+    ticket.attachAbort(() => adapter.abort());
 
     const bgContext: WorkItemContext = {
       adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,
@@ -900,15 +983,15 @@ export class AgentManager {
       slackThreadTs: (ctx.workItem.meta?.slackThreadTs as string) ?? "",
     };
 
-    const result = await runner.send(
-      shaping.prompt,
-      ctx.sessionId,
+    const result = await adapter.runTurn({
+      prompt: shaping.prompt,
+      sessionId: ctx.sessionId,
       onStream,
-      bgContext,
-      shaping.modelOverride,
-      shaping.resourceLimits,
-      ctx.systemPromptOverride,
-    );
+      workItemContext: bgContext,
+      modelOverride: shaping.modelOverride,
+      resourceLimits: shaping.resourceLimits,
+      systemPromptOverride: ctx.systemPromptOverride,
+    });
     // KPR-224: model router cost lives outside RunResult; add it here so
     // finalizeSpawnResult and recordSpawnObservability see the full cost.
     result.costUsd += shaping.routerCostUsd;

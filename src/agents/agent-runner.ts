@@ -19,6 +19,18 @@ import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
 import { buildPrefix } from "./prefix-builder.js";
 import type { PrefixCache } from "./prefix-cache.js";
+import {
+  CLAUDE_SDK_BUILTIN_TOOL_NAMES,
+  classifyToolTransport,
+  type HiveToolTransportDescriptor,
+  type HiveToolTransportKind,
+  type HiveToolTransportSource,
+} from "./provider-adapters/tool-transport.js";
+import {
+  DELEGATE_UNSAFE_SERVERS as DELEGATE_UNSAFE_SERVER_NAMES,
+  TURN_CONTEXT_DEPENDENT_SERVERS,
+} from "./server-traits.js";
+import { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
 
 /**
  * KPR-213: translate a memory path → prefix-cache invalidation scope.
@@ -236,7 +248,7 @@ export function ensurePluginNodeModulesLink(pluginDir: string): void {
 // constant is defined in ./in-process-servers.ts (re-exported here for
 // historical callers) and consumed by the admin tool (strict reject at
 // create/update) and the agent registry (sanitize + log at load).
-export { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
+export { IN_PROCESS_PORTED_SERVERS };
 const MCP_BUNDLE_MAP: Record<string, string> = {
   "keychain/keychain-mcp-server.js": "keychain.min.js",
   "google/google-mcp-server.js": "google.min.js",
@@ -1113,10 +1125,105 @@ export class AgentRunner {
     return set;
   }
 
-  // Context-dependent servers that must NOT be delegated (they embed channel/thread env vars)
-  private static CONTEXT_DEPENDENT_SERVERS = new Set([
-    "callback", "background", "code-task", "recall", "structured-memory", "memory",
-  ]);
+  // Delegate-unsafe servers must NOT be delegated. This preserves the existing
+  // validation set while keeping turn-context dependency narrower for inventory.
+  private static DELEGATE_UNSAFE_SERVERS = DELEGATE_UNSAFE_SERVER_NAMES;
+
+  private pluginServerNames(): Set<string> {
+    const names = new Set<string>();
+    for (const plugin of this.plugins) {
+      for (const name of Object.keys(plugin.manifest.mcpServers)) {
+        if (!plugin.brokenServers[name]) names.add(name);
+      }
+    }
+    return names;
+  }
+
+  private activeDelegateNames(allConfigs: Record<string, McpServerConfig>): string[] {
+    const delegates = this.agentConfig.delegateServers;
+    if (delegates.length === 0) return [];
+
+    const blockedDelegates = new Set<string>();
+    if (!this.agentConfig.autonomy.externalComms) {
+      blockedDelegates.add("resend");
+      blockedDelegates.add("quo");
+    }
+    if (!this.agentConfig.autonomy.codeTask) {
+      blockedDelegates.add("code-task");
+    }
+    if (!this.agentConfig.autonomy.codeAccess) {
+      blockedDelegates.add("code-search");
+    }
+
+    const active: string[] = [];
+    for (const serverName of delegates) {
+      if (blockedDelegates.has(serverName)) continue;
+      if (AgentRunner.DELEGATE_UNSAFE_SERVERS.has(serverName)) continue;
+      if (!allConfigs[serverName]) continue;
+      active.push(serverName);
+    }
+    return active;
+  }
+
+  private static transportKindForServerConfig(serverConfig: McpServerConfig): HiveToolTransportKind {
+    if (serverConfig.type === "http" || serverConfig.type === "sse") return serverConfig.type;
+    return "stdio";
+  }
+
+  buildToolTransportInventory(context?: WorkItemContext): HiveToolTransportDescriptor[] {
+    const allServerConfigs = this.buildAllServerConfigs(context);
+    const mcpServers = this.filterCoreServers(allServerConfigs);
+    const autoInjectedServers = AgentRunner.autoInjectedServerNames();
+    const pluginServerNames = this.pluginServerNames();
+    const inventory: HiveToolTransportDescriptor[] = [];
+
+    for (const [name, serverConfig] of Object.entries(mcpServers)) {
+      const inProcess = !!this.db && IN_PROCESS_PORTED_SERVERS.has(name) && this.shouldEnableInProcessServer(name);
+      const source: HiveToolTransportSource = autoInjectedServers.has(name)
+        ? "engine"
+        : pluginServerNames.has(name)
+          ? "plugin"
+          : "core";
+
+      inventory.push(classifyToolTransport({
+        name,
+        transport: inProcess ? "sdk-in-process" : AgentRunner.transportKindForServerConfig(serverConfig),
+        source,
+        requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has(name),
+        requiresHiveRuntime: inProcess,
+        inProcess,
+      }));
+    }
+
+    if (this.teamRoster) {
+      inventory.push(classifyToolTransport({
+        name: "team-roster",
+        transport: "sdk-in-process",
+        source: "engine",
+        requiresTurnContext: false,
+        requiresHiveRuntime: true,
+        inProcess: true,
+      }));
+    }
+
+    for (const name of this.activeDelegateNames(allServerConfigs)) {
+      inventory.push(classifyToolTransport({
+        name,
+        transport: "claude-subagent",
+        source: "delegate",
+      }));
+    }
+
+    for (const name of CLAUDE_SDK_BUILTIN_TOOL_NAMES) {
+      inventory.push(classifyToolTransport({
+        name,
+        transport: "claude-builtin",
+        source: "sdk-builtin",
+      }));
+    }
+
+    return inventory;
+  }
 
   /**
    * Build AgentDefinition objects for each MCP server listed in
@@ -1160,7 +1267,7 @@ export class AgentRunner {
       // and the server would silently malfunction. Previously this was a
       // warn-and-proceed (which silently dropped the server downstream
       // anyway via the missing-config branch). Now it's explicit.
-      if (AgentRunner.CONTEXT_DEPENDENT_SERVERS.has(serverName)) {
+      if (AgentRunner.DELEGATE_UNSAFE_SERVERS.has(serverName)) {
         log.error("Context-dependent server in delegateServers — registry/admin guards bypassed; skipping", {
           agent: this.agentConfig.id,
           server: serverName,

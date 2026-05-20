@@ -40,6 +40,9 @@ vi.mock("../logging/logger.js", () => ({
 vi.mock("../config.js", () => ({
   config: {
     plugins: [],
+    openai: { agentModel: "" },
+    codex: { agentModel: "gpt-5.4-mini" },
+    gemini: { agentModel: "" },
     modelRouter: { enabled: false },
     memory: { reflectionMinTurns: 3 },
   },
@@ -63,15 +66,63 @@ vi.mock("../files/file-processor.js", () => ({
 // Mock AgentRunner - need to capture instances
 const mockRunnerSend = vi.fn();
 const mockRunnerAbort = vi.fn();
+const mockRunnerToolInventory = vi.fn().mockReturnValue([]);
 vi.mock("./agent-runner.js", () => ({
   AgentRunner: vi.fn().mockImplementation(() => ({
     send: mockRunnerSend,
     abort: mockRunnerAbort,
     wasAborted: false,
+    buildToolTransportInventory: mockRunnerToolInventory,
   })),
   // Re-exported from agent-runner for plugin-loader path resolution; the test
   // manager doesn't use it, so a sentinel path is fine.
   DIST_DIR: "/mock/dist",
+}));
+
+const { mockCodexConstructor, mockCodexRunTurn, mockOpenAIConstructor, mockOpenAIRunTurn, mockGeminiConstructor, mockGeminiRunTurn } =
+  vi.hoisted(() => ({
+    mockCodexConstructor: vi.fn(),
+    mockCodexRunTurn: vi.fn(),
+    mockOpenAIConstructor: vi.fn(),
+    mockOpenAIRunTurn: vi.fn(),
+    mockGeminiConstructor: vi.fn(),
+    mockGeminiRunTurn: vi.fn(),
+  }));
+
+vi.mock("./provider-adapters/codex-subscription-adapter.js", () => ({
+  CodexSubscriptionAdapter: vi.fn().mockImplementation((options) => {
+    mockCodexConstructor(options);
+    return {
+      provider: "codex",
+      runTurn: mockCodexRunTurn,
+      abort: vi.fn(),
+      wasAborted: false,
+    };
+  }),
+}));
+
+vi.mock("./provider-adapters/openai-agents-adapter.js", () => ({
+  OpenAIAgentsAdapter: vi.fn().mockImplementation((options) => {
+    mockOpenAIConstructor(options);
+    return {
+      provider: "openai",
+      runTurn: mockOpenAIRunTurn,
+      abort: vi.fn(),
+      wasAborted: false,
+    };
+  }),
+}));
+
+vi.mock("./provider-adapters/gemini-adk-adapter.js", () => ({
+  GeminiAdkAdapter: vi.fn().mockImplementation((options) => {
+    mockGeminiConstructor(options);
+    return {
+      provider: "gemini",
+      runTurn: mockGeminiRunTurn,
+      abort: vi.fn(),
+      wasAborted: false,
+    };
+  }),
 }));
 
 // Mock conversation index (hoisted because ConversationIndex is instantiated at module level)
@@ -247,6 +298,10 @@ describe("AgentManager", () => {
 
     // Default mock: runner.send resolves with a result
     mockRunnerSend.mockResolvedValue(makeRunResult());
+    mockRunnerToolInventory.mockReturnValue([]);
+    mockCodexRunTurn.mockResolvedValue(makeRunResult({ text: "codex response", sessionId: "codex-session" }));
+    mockOpenAIRunTurn.mockResolvedValue(makeRunResult({ text: "openai response", sessionId: "openai-session" }));
+    mockGeminiRunTurn.mockResolvedValue(makeRunResult({ text: "gemini response", sessionId: "gemini-session" }));
 
     manager = new AgentManager(
       registry as any,
@@ -2010,6 +2065,70 @@ describe("AgentManager", () => {
       } finally {
         (appConfig as any).modelRouter.enabled = false;
       }
+    });
+
+    it("routes codex-prefixed agents to the Codex subscription adapter", async () => {
+      registry._agents.set(
+        "codex-pilot",
+        makeAgentConfig({
+          id: "codex-pilot",
+          name: "Codex Pilot",
+          model: "codex/gpt-5.5:medium",
+          coreServers: [],
+          soul: "pilot soul",
+          systemPrompt: "pilot system",
+        }),
+      );
+
+      const item = makeWorkItem({ text: "hello codex", source: { kind: "sms", id: "line-1", label: "May" } });
+      const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+      expect(mockRunnerSend).not.toHaveBeenCalled();
+      expect(mockCodexConstructor).toHaveBeenCalledWith({
+        name: "Codex Pilot",
+        instructions: "pilot soul\n\npilot system",
+        model: "gpt-5.5",
+        reasoningEffort: "medium",
+        toolInventory: [],
+      });
+      expect(mockCodexRunTurn).toHaveBeenCalledWith(expect.objectContaining({
+        prompt: "hello codex",
+        sessionId: undefined,
+        modelOverride: undefined,
+      }));
+      expect(result.finalMessage).toBe("codex response");
+      expect(result.newSessionId).toBe("codex-session");
+    });
+
+    it.each([
+      ["openai/gpt-5.4-mini", mockOpenAIConstructor, mockOpenAIRunTurn, "openai response", "openai-session"],
+      ["gemini/gemini-2.5-flash", mockGeminiConstructor, mockGeminiRunTurn, "gemini response", "gemini-session"],
+      ["openai-codex/gpt-5.4", mockCodexConstructor, mockCodexRunTurn, "codex response", "codex-session"],
+    ] as const)("routes %s through the matching pilot adapter", async (model, constructorMock, runTurnMock, text, sessionId) => {
+      const agentId = `pilot-${model.replace(/[^a-z0-9]+/gi, "-")}`;
+      registry._agents.set(
+        agentId,
+        makeAgentConfig({
+          id: agentId,
+          name: "Pilot",
+          model,
+          coreServers: [],
+          soul: "",
+          systemPrompt: "pilot system",
+        }),
+      );
+
+      const item = makeWorkItem({ text: "ping", source: { kind: "sms", id: "line-1", label: "May" } });
+      const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId });
+
+      expect(mockRunnerSend).not.toHaveBeenCalled();
+      expect(constructorMock).toHaveBeenCalledWith(expect.objectContaining({
+        name: "Pilot",
+        instructions: "pilot system",
+      }));
+      expect(runTurnMock).toHaveBeenCalledWith(expect.objectContaining({ prompt: "ping" }));
+      expect(result.finalMessage).toBe(text);
+      expect(result.newSessionId).toBe(sessionId);
     });
 
     it("records telemetry, conversation index, and activity audit on success", async () => {
