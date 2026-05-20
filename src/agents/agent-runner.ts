@@ -345,7 +345,7 @@ export class AgentRunner {
   /**
    * Compute the post-filter allowlist of core server names for this agent.
    * Mirrors `filterCoreServers` exactly: starts from the agent's `coreServers`,
-   * adds auto-injected servers (schedule, team, team-roster, slack, optionally
+   * adds auto-injected servers (schedule, team, team-roster, optionally
    * workflow), pairs `structured-memory` with `memory`, then applies autonomy
    * gates. KPR-122 uses this to decide whether to wire an in-process MCP
    * server without first having to materialize the stdio map for that server.
@@ -358,7 +358,6 @@ export class AgentRunner {
     coreSet.add("schedule");
     coreSet.add("team");
     coreSet.add("team-roster");
-    coreSet.add("slack");
     if (config.workflow.enabled) {
       coreSet.add("workflow");
     }
@@ -1008,11 +1007,6 @@ export class AgentRunner {
     // skill-author is an implicit core server — every agent can author its own
     // skills unconditionally (KPR-104). No permission flag; empowerment posture.
     coreSet.add("skill-author");
-    // slack is an implicit core server — it's the default comms channel for every agent.
-    // The server itself is only built when SLACK_MCP_TOKEN is configured (see buildAllServerConfigs),
-    // so this is a no-op for Slack-less instances. Agents that should not post to Slack can be
-    // gated via an autonomy flag rather than by omitting the server.
-    coreSet.add("slack");
     // workflow is an implicit core server when workflow layer is enabled
     if (config.workflow.enabled) {
       coreSet.add("workflow");
@@ -1105,7 +1099,7 @@ export class AgentRunner {
     // and the toolkit will correctly classify it under Capability MCPs.
     // skill-author is unconditional (KPR-104) — every agent can author its own
     // private skills.
-    const set = new Set<string>(["schedule", "team", "team-roster", "slack", "skill-author"]);
+    const set = new Set<string>(["schedule", "team", "team-roster", "skill-author"]);
     if (config.workflow.enabled) set.add("workflow");
     return set;
   }

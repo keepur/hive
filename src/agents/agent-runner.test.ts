@@ -999,7 +999,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     });
   });
 
-  it("classifies hosted Slack HTTP MCP as a bridge candidate when configured", async () => {
+  it("classifies hosted Slack HTTP MCP as a bridge candidate when explicitly configured", async () => {
     const { config } = await import("../config.js");
     const origToken = config.slack.mcpToken;
     const origLocal = (config.slack as any).localMcpServer;
@@ -1007,13 +1007,13 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     (config.slack as any).localMcpServer = false;
     try {
       const runner = new AgentRunner(
-        makeAgentConfig({ coreServers: [] }),
+        makeAgentConfig({ coreServers: ["slack"] }),
         memoryManager as any,
       );
 
       const slack = inventoryByName(runner, "slack");
       expect(slack.transport).toBe("http");
-      expect(slack.source).toBe("engine");
+      expect(slack.source).toBe("core");
       expect(slack.compatibility.openai).toBe("mcp-bridge-candidate");
       expect(slack.compatibility.gemini).toBe("mcp-bridge-candidate");
     } finally {
@@ -1565,7 +1565,7 @@ describe("AgentRunner toolkit section prompt (via send)", () => {
     expect(options.systemPrompt).toContain("## Your toolkit");
     // SDK builtins always present
     expect(options.systemPrompt).toContain("### Built-in (always available)");
-    // Engine-provided subsection appears (schedule/team/slack auto-injected)
+    // Engine-provided subsection appears (schedule/team auto-injected)
     expect(options.systemPrompt).toContain("### Engine-provided");
     // Capability MCPs subsection appears (memory + contacts are explicit)
     expect(options.systemPrompt).toContain("### Capability MCPs");
@@ -1589,9 +1589,7 @@ describe("AgentRunner toolkit section prompt (via send)", () => {
   });
 
   it("lists auto-injected servers under 'Engine-provided' even when not in coreServers", async () => {
-    // No explicit core servers — schedule/team still auto-inject (slack is also
-    // auto-injected, but the slack MCP server is only built when slack.mcpToken
-    // is configured; the test mock leaves it empty, so slack is absent here).
+    // No explicit core servers — schedule/team still auto-inject.
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: [],
