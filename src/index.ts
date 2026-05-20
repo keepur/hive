@@ -19,6 +19,7 @@ import { createLogger } from "./logging/logger.js";
 import { AgentRegistry } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
 import { PrefixCache } from "./agents/prefix-cache.js";
+import { invalidatePrefixCacheByMemoryPath } from "./agents/prefix-invalidation.js";
 import { SpawnCoordinatorHeartbeat } from "./agents/spawn-coordinator-heartbeat.js";
 import { TeamCache } from "./team-roster/team-cache.js";
 import { TeamRoster } from "./team-roster/team-roster.js";
@@ -193,12 +194,11 @@ async function main(): Promise<void> {
   const memoryManager = new MemoryManager(db);
   await memoryManager.init();
   // KPR-213: FS-style memory writes (constitution, agent memory.md) flow
-  // through MemoryManager.write — wire prefix invalidation here. Path-aware:
-  // shared/* invalidates all; agents/<id>/* invalidates that agent.
+  // through MemoryManager.write — wire prompt-prefix invalidation here.
+  // Path-aware: shared/* invalidates all; agents/<id>/* invalidates that agent;
+  // status/* is operational telemetry and does not affect prompts.
   memoryManager.setOnWrite((path, reason) => {
-    const m = path.match(/^agents\/([^/]+)\//);
-    if (m) prefixCache.invalidateAgent(m[1], reason);
-    else prefixCache.invalidateAll(reason);
+    invalidatePrefixCacheByMemoryPath(prefixCache, path, reason);
   });
 
   // Structured memory lifecycle — always enabled

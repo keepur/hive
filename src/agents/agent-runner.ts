@@ -19,23 +19,8 @@ import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
 import { buildPrefix } from "./prefix-builder.js";
 import type { PrefixCache } from "./prefix-cache.js";
+import { invalidatePrefixCacheByMemoryPath } from "./prefix-invalidation.js";
 
-/**
- * KPR-213: translate a memory path → prefix-cache invalidation scope.
- *  - `agents/<id>/...` → invalidate that agent only.
- *  - `shared/...` (notably `shared/constitution.md`) and anything else →
- *    invalidate all agents (shared content is in every prefix).
- * Module-scoped so the structured-memory MCP factory and the FS-memory
- * MCP factory can call into the same logic without duplicating.
- */
-function invalidatePrefixCacheByPath(cache: PrefixCache, path: string, reason: string): void {
-  const m = path.match(/^agents\/([^/]+)\//);
-  if (m) {
-    cache.invalidateAgent(m[1], reason);
-    return;
-  }
-  cache.invalidateAll(reason);
-}
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
@@ -1406,10 +1391,10 @@ export class AgentRunner {
           agentId: this.agentConfig.id,
           memoryScopes: this.resolveMemoryScopes(),
           // KPR-213: write-through prefix cache invalidation. Path-aware:
-          // agents/<id>/... only invalidates that agent; shared/* (e.g.
-          // shared/constitution.md) invalidates everyone.
+          // agents/<id>/... invalidates that agent; shared/* invalidates
+          // everyone; status/* is operational telemetry and does not affect prompts.
           onWrite: this.prefixCache
-            ? (path, reason) => invalidatePrefixCacheByPath(this.prefixCache!, path, reason)
+            ? (path, reason) => invalidatePrefixCacheByMemoryPath(this.prefixCache!, path, reason)
             : undefined,
         });
       }

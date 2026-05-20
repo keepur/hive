@@ -24,8 +24,9 @@ export class MemoryManager {
   private _memoryStore?: MemoryStore;
   /**
    * KPR-213: invalidation hook for FS-style memory writes.
-   * - `path === "shared/constitution.md"` and any non-agent-scoped path → "all" (everyone's prefix).
-   * - `path` matching `agents/<id>/...` → single agent.
+   * - `shared/*` and legacy unknown paths → "all" (everyone's prefix).
+   * - `agents/<id>/...` → single agent.
+   * - `status/*` → no prefix invalidation (operational telemetry, not prompt input).
    * The translation from path to scope happens at the listener (index.ts).
    */
   private onWrite?: (path: string, reason: string) => void;
