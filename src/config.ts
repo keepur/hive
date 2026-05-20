@@ -366,13 +366,20 @@ export const config = {
     retentionDays: parseInt(optional("ACTIVITY_RETENTION_DAYS", String(hive.activity?.retentionDays ?? 90)), 10),
   },
   autoDream: {
-    enabled: (hive.autoDream?.enabled ?? true) as boolean,
-    idleThresholdMinutes: parseInt(
-      optional("AUTODREAM_IDLE_THRESHOLD_MINUTES", String(hive.autoDream?.idleThresholdMinutes ?? 30)),
+    enabled: (hive.autoDream?.enabled ?? false) as boolean,
+    quietPeriodMinutes: parseInt(
+      optional(
+        "AUTODREAM_QUIET_PERIOD_MINUTES",
+        String(hive.autoDream?.quietPeriodMinutes ?? hive.autoDream?.idleThresholdMinutes ?? 120),
+      ),
       10,
     ),
     cooldownMinutes: parseInt(
-      optional("AUTODREAM_COOLDOWN_MINUTES", String(hive.autoDream?.cooldownMinutes ?? 60)),
+      optional("AUTODREAM_COOLDOWN_MINUTES", String(hive.autoDream?.cooldownMinutes ?? 1440)),
+      10,
+    ),
+    minNewMemories: parseInt(
+      optional("AUTODREAM_MIN_NEW_MEMORIES", String(hive.autoDream?.minNewMemories ?? 10)),
       10,
     ),
     similarityThreshold: parseFloat(
@@ -391,10 +398,21 @@ export const config = {
       10,
     ),
     maxPromotionsPerRun: parseInt(
-      optional("AUTODREAM_MAX_PROMOTIONS", String(hive.autoDream?.maxPromotionsPerRun ?? 10)),
+      optional("AUTODREAM_MAX_PROMOTIONS", String(hive.autoDream?.maxPromotionsPerRun ?? 2)),
       10,
     ),
-    maxBudgetUsd: parseFloat(optional("AUTODREAM_MAX_BUDGET_USD", String(hive.autoDream?.maxBudgetUsd ?? 0.1))),
+    maxRunBudgetUsd: parseFloat(
+      optional(
+        "AUTODREAM_MAX_RUN_BUDGET_USD",
+        String(hive.autoDream?.maxRunBudgetUsd ?? hive.autoDream?.maxBudgetUsd ?? 0.05),
+      ),
+    ),
+    maxCallBudgetUsd: parseFloat(
+      optional(
+        "AUTODREAM_MAX_CALL_BUDGET_USD",
+        String(hive.autoDream?.maxCallBudgetUsd ?? hive.autoDream?.maxBudgetUsd ?? 0.01),
+      ),
+    ),
   },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),

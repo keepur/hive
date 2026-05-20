@@ -69,14 +69,24 @@ export interface MemoryLifecycleConfig {
 
 export interface DreamConfig {
   enabled: boolean;
-  idleThresholdMinutes: number;
+  /** Preferred name for the required idle window before autoDream can run. */
+  quietPeriodMinutes?: number;
+  /** Legacy name kept for config compatibility; use quietPeriodMinutes instead. */
+  idleThresholdMinutes?: number;
   cooldownMinutes: number;
+  /** Minimum changed memory records since an agent's last successful autoDream. */
+  minNewMemories?: number;
   similarityThreshold: number;
   patternMinCount: number;
   maxClustersPerRun: number;
   maxContradictionPairsPerRun: number;
   maxPromotionsPerRun: number;
-  maxBudgetUsd: number;
+  /** Total budget for one autoDream invocation across all agents/calls. */
+  maxRunBudgetUsd?: number;
+  /** Per-SDK-call safety cap inside the run-level budget. */
+  maxCallBudgetUsd?: number;
+  /** Legacy per-call budget field; use maxRunBudgetUsd + maxCallBudgetUsd instead. */
+  maxBudgetUsd?: number;
 }
 
 export interface DreamResult {
@@ -85,6 +95,10 @@ export interface DreamResult {
   promoted: number;
   flaggedForReview: number;
   errors: string[];
+  skippedAgents?: number;
+  spentUsd?: number;
+  budgetUsd?: number;
+  llmCalls?: number;
 }
 
 export const IMPORTANCE_WEIGHTS: Record<MemoryImportance, number> = {

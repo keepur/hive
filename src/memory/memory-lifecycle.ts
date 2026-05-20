@@ -16,6 +16,33 @@ import { IMPORTANCE_WEIGHTS, TYPE_WEIGHTS } from "./memory-types.js";
 
 const log = createLogger("memory-lifecycle");
 
+class AutoDreamBudget {
+  spentUsd = 0;
+  llmCalls = 0;
+
+  constructor(
+    readonly maxRunUsd: number,
+    readonly maxCallUsd: number,
+  ) {}
+
+  remainingUsd(): number {
+    return Math.max(0, this.maxRunUsd - this.spentUsd);
+  }
+
+  canSpend(): boolean {
+    return this.remainingUsd() > 0.001;
+  }
+
+  callBudgetUsd(): number {
+    return Math.min(this.maxCallUsd, this.remainingUsd());
+  }
+
+  record(costUsd: number): void {
+    this.spentUsd += costUsd;
+    this.llmCalls++;
+  }
+}
+
 export class MemoryLifecycle {
   constructor(
     private store: MemoryStore,
@@ -42,6 +69,48 @@ export class MemoryLifecycle {
       });
     }
     return filtered;
+  }
+
+  private autoDreamRunBudget(): number {
+    return this.dreamConfig?.maxRunBudgetUsd ?? this.dreamConfig?.maxBudgetUsd ?? 0.05;
+  }
+
+  private autoDreamCallBudget(): number {
+    return this.dreamConfig?.maxCallBudgetUsd ?? this.dreamConfig?.maxBudgetUsd ?? 0.01;
+  }
+
+  private autoDreamMinNewMemories(): number {
+    return this.dreamConfig?.minNewMemories ?? 10;
+  }
+
+  private async runDreamQuery(prompt: string, budget: AutoDreamBudget): Promise<string> {
+    if (!budget.canSpend()) throw new Error("autoDream run budget exhausted");
+
+    const q = query({
+      prompt,
+      options: {
+        model: "claude-haiku-4-5-20251001",
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
+        maxTurns: 1,
+        maxBudgetUsd: budget.callBudgetUsd(),
+        persistSession: false,
+      },
+    });
+
+    let text = "";
+    for await (const message of q) {
+      const msg = message as SDKMessage;
+      if (msg.type === "result") {
+        const result = msg as SDKResultMessage;
+        budget.record(result.total_cost_usd ?? 0);
+        if (result.subtype === "success" && result.result) {
+          text = result.result;
+        }
+      }
+    }
+
+    return text;
   }
 
   /**
@@ -237,7 +306,9 @@ export class MemoryLifecycle {
     let contradictions = 0;
     let promoted = 0;
     let flaggedForReview = 0;
+    let skippedAgents = 0;
     const errors: string[] = [];
+    const budget = new AutoDreamBudget(this.autoDreamRunBudget(), this.autoDreamCallBudget());
 
     try {
       const allIds = await this.store.getAgentIds();
@@ -245,18 +316,42 @@ export class MemoryLifecycle {
 
       for (const agentId of agentIds) {
         try {
-          const r1 = await this.mergeDuplicates(agentId);
+          const state = await this.store.getAutoDreamState(agentId);
+          const changedMemoryCount = await this.store.countAutoDreamCandidates(agentId, state?.lastDreamAt);
+          if (changedMemoryCount < this.autoDreamMinNewMemories()) {
+            skippedAgents++;
+            log.debug("autoDream skipped agent — insufficient new memory", {
+              agentId,
+              changedMemoryCount,
+              minNewMemories: this.autoDreamMinNewMemories(),
+            });
+            continue;
+          }
+
+          const agentStartSpent = budget.spentUsd;
+          const agentStartCalls = budget.llmCalls;
+          const r1 = await this.mergeDuplicates(agentId, budget);
           merged += r1.merged;
 
-          const r2 = await this.detectContradictions(agentId);
+          const r2 = await this.detectContradictions(agentId, budget);
           contradictions += r2.resolved;
           flaggedForReview += r2.flagged;
 
-          const r3 = await this.promotePatterns(agentId);
+          const r3 = await this.promotePatterns(agentId, budget);
           promoted += r3.promoted;
+
+          await this.store.markAutoDreamRun(
+            agentId,
+            new Date(),
+            changedMemoryCount,
+            budget.spentUsd - agentStartSpent,
+            budget.llmCalls - agentStartCalls,
+          );
         } catch (err) {
           errors.push(`${agentId}: ${err}`);
           log.error("autoDream failed for agent", { agentId, error: String(err) });
+          if (String(err).includes("autoDream run budget exhausted")) break;
+          if (String(err).includes("hit your limit")) break;
         }
       }
     } catch (err) {
@@ -271,11 +366,25 @@ export class MemoryLifecycle {
         contradictions,
         promoted,
         flaggedForReview,
+        skippedAgents,
+        spentUsd: budget.spentUsd,
+        budgetUsd: budget.maxRunUsd,
+        llmCalls: budget.llmCalls,
         errors: errors.length,
       });
     }
 
-    return { merged, contradictions, promoted, flaggedForReview, errors };
+    return {
+      merged,
+      contradictions,
+      promoted,
+      flaggedForReview,
+      errors,
+      skippedAgents,
+      spentUsd: budget.spentUsd,
+      budgetUsd: budget.maxRunUsd,
+      llmCalls: budget.llmCalls,
+    };
   }
 
   /**
@@ -283,7 +392,7 @@ export class MemoryLifecycle {
    * Uses Qdrant recommend API to find similar records (cosine > threshold),
    * then Haiku to merge each cluster into a single consolidated record.
    */
-  private async mergeDuplicates(agentId: string): Promise<{ merged: number }> {
+  private async mergeDuplicates(agentId: string, budget: AutoDreamBudget): Promise<{ merged: number }> {
     const cfg = this.dreamConfig!;
     const records = await this.store.getByTiersForAgent(agentId, ["hot", "warm"]);
     if (records.length < 2) return { merged: 0 };
@@ -323,28 +432,7 @@ export class MemoryLifecycle {
         entries,
       ].join("\n");
 
-      const q = query({
-        prompt,
-        options: {
-          model: "claude-haiku-4-5-20251001",
-          permissionMode: "bypassPermissions",
-          allowDangerouslySkipPermissions: true,
-          maxTurns: 1,
-          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
-          persistSession: false,
-        },
-      });
-
-      let mergedText = "";
-      for await (const message of q) {
-        const msg = message as SDKMessage;
-        if (msg.type === "result") {
-          const result = msg as SDKResultMessage;
-          if (result.subtype === "success" && result.result) {
-            mergedText = result.result;
-          }
-        }
-      }
+      const mergedText = await this.runDreamQuery(prompt, budget);
       if (!mergedText) continue;
 
       // Save merged record — inherit highest importance, keep topic and type from source
@@ -394,7 +482,7 @@ export class MemoryLifecycle {
    * Detect contradicting fact/decision records within the same topic.
    * Haiku evaluates each pair. Loser is superseded by winner (newer wins tie).
    */
-  private async detectContradictions(agentId: string): Promise<{ resolved: number; flagged: number }> {
+  private async detectContradictions(agentId: string, budget: AutoDreamBudget): Promise<{ resolved: number; flagged: number }> {
     const cfg = this.dreamConfig!;
     const byTopic = await this.store.getFactsAndDecisionsByTopic(agentId);
     let resolved = 0;
@@ -434,28 +522,7 @@ export class MemoryLifecycle {
             `- "UNCLEAR" if they contradict but you can't determine which is correct`,
           ].join("\n");
 
-          const q = query({
-            prompt,
-            options: {
-              model: "claude-haiku-4-5-20251001",
-              permissionMode: "bypassPermissions",
-              allowDangerouslySkipPermissions: true,
-              maxTurns: 1,
-              maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
-              persistSession: false,
-            },
-          });
-
-          let verdict = "";
-          for await (const message of q) {
-            const msg = message as SDKMessage;
-            if (msg.type === "result") {
-              const result = msg as SDKResultMessage;
-              if (result.subtype === "success" && result.result) {
-                verdict = result.result.trim().toUpperCase();
-              }
-            }
-          }
+          const verdict = (await this.runDreamQuery(prompt, budget)).trim().toUpperCase();
 
           pairsChecked++;
 
@@ -491,7 +558,7 @@ export class MemoryLifecycle {
    * If 3+ interactions on the same topic come from different conversations,
    * generate a fact summary and promote to hot tier.
    */
-  private async promotePatterns(agentId: string): Promise<{ promoted: number }> {
+  private async promotePatterns(agentId: string, budget: AutoDreamBudget): Promise<{ promoted: number }> {
     const cfg = this.dreamConfig!;
     const byTopic = await this.store.getInteractionsByTopic(agentId);
     let promoted = 0;
@@ -517,28 +584,7 @@ export class MemoryLifecycle {
         entries,
       ].join("\n");
 
-      const q = query({
-        prompt,
-        options: {
-          model: "claude-haiku-4-5-20251001",
-          permissionMode: "bypassPermissions",
-          allowDangerouslySkipPermissions: true,
-          maxTurns: 1,
-          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
-          persistSession: false,
-        },
-      });
-
-      let factText = "";
-      for await (const message of q) {
-        const msg = message as SDKMessage;
-        if (msg.type === "result") {
-          const result = msg as SDKResultMessage;
-          if (result.subtype === "success" && result.result) {
-            factText = result.result;
-          }
-        }
-      }
+      const factText = await this.runDreamQuery(prompt, budget);
       if (!factText) continue;
 
       // Save as a hot-tier fact
@@ -600,7 +646,7 @@ export class MemoryLifecycle {
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           maxTurns: 1,
-          maxBudgetUsd: this.dreamConfig?.maxBudgetUsd ?? 0.1,
+          maxBudgetUsd: this.autoDreamCallBudget(),
           persistSession: false,
         },
       });
