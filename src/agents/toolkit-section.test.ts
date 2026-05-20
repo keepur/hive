@@ -6,14 +6,14 @@ import type { LoadedPlugin } from "../plugins/types.js";
 // (KPR-174 audit caught the test fixture out-of-sync with runtime: team-roster
 // is auto-injected at runtime but the fixture omitted it, so a regression
 // classifying team-roster as a capability MCP would silently pass tests.)
-const AUTO_INJECTED = new Set(["schedule", "team", "team-roster", "slack"]);
+const AUTO_INJECTED = new Set(["schedule", "team", "team-roster", "skill-author"]);
 
 function bareBonesInput(overrides: Partial<Parameters<typeof buildToolkitSection>[0]> = {}) {
   // Bare-bones = engine auto-injects only. structured-memory is conditionally
   // paired with `memory` in filterCoreServers, NOT unconditionally injected,
   // so a true bare-bones agent (no memory in coreServers) doesn't have it.
   return {
-    coreServerNames: ["schedule", "team", "team-roster", "slack"],
+    coreServerNames: ["schedule", "team", "team-roster", "skill-author"],
     delegateServerNames: [],
     plugins: [],
     autoInjectedServers: AUTO_INJECTED,
@@ -51,11 +51,11 @@ describe("buildToolkitSection", () => {
   it("classifies auto-injected servers under 'Engine-provided'", () => {
     const out = buildToolkitSection(bareBonesInput());
     expect(out).toContain("### Engine-provided");
-    // schedule, team, team-roster, slack are auto-injected
+    // schedule, team, team-roster, skill-author are auto-injected
     expect(out).toMatch(/- schedule —/);
     expect(out).toMatch(/- team —/);
     expect(out).toMatch(/- team-roster —/);
-    expect(out).toMatch(/- slack —/);
+    expect(out).toMatch(/- skill-author —/);
   });
 
   it("renders a real catalog blurb for team-roster, not the name fallback (KPR-174)", () => {
@@ -255,10 +255,11 @@ describe("buildToolkitSection", () => {
     expect(withBrowser).toMatch(/- browser —/);
   });
 
-  it("agent that explicitly authored team or slack still classifies them as engine-provided", () => {
+  it("agent that explicitly authored team still classifies it as engine-provided, while slack stays a capability", () => {
     // Even if agent-author put "team" in coreServers explicitly, the auto-inject
     // set drives the classification — team must show under Engine-provided, not
-    // capability MCPs.
+    // capability MCPs. Slack is no longer auto-injected, so an explicit Slack
+    // core server should stay under Capability MCPs.
     const out = buildToolkitSection({
       coreServerNames: ["team", "slack", "memory"],
       delegateServerNames: [],
@@ -272,8 +273,7 @@ describe("buildToolkitSection", () => {
     const memoryIdx = out.indexOf("- memory —");
     expect(teamIdx).toBeGreaterThan(engineIdx);
     expect(teamIdx).toBeLessThan(capIdx);
-    expect(slackIdx).toBeGreaterThan(engineIdx);
-    expect(slackIdx).toBeLessThan(capIdx);
+    expect(slackIdx).toBeGreaterThan(capIdx);
     // memory is not auto-injected — appears under Capability MCPs
     expect(memoryIdx).toBeGreaterThan(capIdx);
   });
