@@ -1,8 +1,19 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { resolve, join } from "node:path";
+import { dirname, resolve, join } from "node:path";
 import { existsSync, readFileSync, statSync, readdirSync } from "node:fs";
-import { resolveHiveHome } from "./paths.js";
+
+function resolveCliHiveHome(): string {
+  if (process.env.HIVE_HOME) return resolve(process.env.HIVE_HOME);
+  let dir = resolve(process.cwd());
+  while (true) {
+    if (existsSync(resolve(dir, "hive.yaml"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return resolve(process.env.HOME ?? "/tmp", "hive");
+}
 
 /**
  * Guard `hive start` against running with no configured instance. Without a real
@@ -10,7 +21,7 @@ import { resolveHiveHome } from "./paths.js";
  * crash on port collision — so bail out with an actionable message.
  */
 function ensureHiveInstallOrExit(): string {
-  const home = resolveHiveHome();
+  const home = resolveCliHiveHome();
   if (existsSync(join(home, "hive.yaml"))) return home;
 
   const lines: string[] = [
@@ -62,6 +73,32 @@ const { positionals, values } = parseArgs({
 
 const command = positionals[0];
 
+function stringOption(name: "config" | "tag" | "instance", parsed: string | undefined): string | undefined {
+  if (typeof parsed === "string") return parsed;
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === `--${name}`) {
+      const next = args[i + 1];
+      return next && !next.startsWith("--") ? next : undefined;
+    }
+    if (arg?.startsWith(`--${name}=`)) {
+      return arg.slice(name.length + 3);
+    }
+  }
+  return undefined;
+}
+
+function booleanOption(name: "verbose", parsed: boolean | undefined): boolean {
+  if (parsed) return true;
+  return process.argv.slice(2).includes(`--${name}`);
+}
+
+const configValue = stringOption("config", typeof values.config === "string" ? values.config : undefined);
+const tagValue = stringOption("tag", typeof values.tag === "string" ? values.tag : undefined);
+const instanceValue = stringOption("instance", typeof values.instance === "string" ? values.instance : undefined);
+const verboseValue = booleanOption("verbose", typeof values.verbose === "boolean" ? values.verbose : undefined);
+
 if (values.version) {
   const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, "..", "package.json"), "utf-8"));
   console.log(`hive v${pkg.version}`);
@@ -111,8 +148,8 @@ Options:
 
 const PKG_ROOT = resolve(import.meta.dirname, "..");
 
-if (typeof values.config === "string") {
-  const configPath = resolve(values.config);
+if (typeof configValue === "string") {
+  const configPath = resolve(configValue);
   if (existsSync(configPath)) {
     const stat = statSync(configPath);
     process.env.HIVE_HOME = stat.isDirectory() ? configPath : resolve(configPath, "..");
@@ -120,6 +157,12 @@ if (typeof values.config === "string") {
     console.error(`Config not found: ${configPath}`);
     process.exit(1);
   }
+}
+
+function resolveInstanceHome(instanceId: string): string | null {
+  const userHome = process.env.HOME ?? "/tmp";
+  const candidate = resolve(userHome, "services", "hive", instanceId);
+  return existsSync(join(candidate, "hive.yaml")) ? candidate : null;
 }
 
 switch (command) {
@@ -147,7 +190,7 @@ switch (command) {
   }
   case "stop": {
     const { stopDaemon } = await import("./cli/daemon.js");
-    await stopDaemon(resolveHiveHome());
+    await stopDaemon(resolveCliHiveHome());
     break;
   }
   case "status": {
@@ -158,15 +201,15 @@ switch (command) {
   case "update": {
     const { runUpdate } = await import("./cli/update.js");
     await runUpdate({
-      tag: typeof values.tag === "string" ? values.tag : undefined,
-      instance: typeof values.instance === "string" ? values.instance : undefined,
+      tag: tagValue,
+      instance: instanceValue,
     });
     break;
   }
   case "rollback": {
     const { runRollback } = await import("./cli/rollback.js");
     await runRollback({
-      instance: typeof values.instance === "string" ? values.instance : undefined,
+      instance: instanceValue,
     });
     break;
   }
@@ -182,8 +225,14 @@ switch (command) {
     break;
   }
   case "doctor": {
+    if (!process.env.HIVE_HOME && typeof instanceValue === "string") {
+      const instanceHome = resolveInstanceHome(instanceValue);
+      if (instanceHome) {
+        process.env.HIVE_HOME = instanceHome;
+      }
+    }
     const { runDoctor } = await import("./cli/doctor.js");
-    await runDoctor({ verbose: !!values.verbose });
+    await runDoctor({ verbose: verboseValue });
     break;
   }
   case "plugin": {
