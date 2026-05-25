@@ -482,7 +482,10 @@ export class MemoryLifecycle {
    * Detect contradicting fact/decision records within the same topic.
    * Haiku evaluates each pair. Loser is superseded by winner (newer wins tie).
    */
-  private async detectContradictions(agentId: string, budget: AutoDreamBudget): Promise<{ resolved: number; flagged: number }> {
+  private async detectContradictions(
+    agentId: string,
+    budget: AutoDreamBudget,
+  ): Promise<{ resolved: number; flagged: number }> {
     const cfg = this.dreamConfig!;
     const byTopic = await this.store.getFactsAndDecisionsByTopic(agentId);
     let resolved = 0;

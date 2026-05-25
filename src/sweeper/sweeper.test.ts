@@ -41,7 +41,15 @@ function makeConfig(): SweeperConfig {
   };
 }
 
-function makeTargets(dream: () => Promise<{ merged: number; contradictions: number; promoted: number; flaggedForReview: number; errors: string[] }>): SweeperTargets {
+function makeTargets(
+  dream: () => Promise<{
+    merged: number;
+    contradictions: number;
+    promoted: number;
+    flaggedForReview: number;
+    errors: string[];
+  }>,
+): SweeperTargets {
   const idleSince = new Date(Date.now() - 31 * 60 * 1000);
   return {
     dispatcher: { sweep: vi.fn(() => emptyResult("dispatcher")) } as any,
@@ -64,7 +72,13 @@ describe("Sweeper autoDream", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-05-20T18:00:00Z"));
 
-    const dreamRun = deferred<{ merged: number; contradictions: number; promoted: number; flaggedForReview: number; errors: string[] }>();
+    const dreamRun = deferred<{
+      merged: number;
+      contradictions: number;
+      promoted: number;
+      flaggedForReview: number;
+      errors: string[];
+    }>();
     const targets = makeTargets(() => dreamRun.promise);
     const sweeper = new Sweeper(makeConfig(), targets);
 

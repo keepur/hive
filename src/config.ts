@@ -378,10 +378,7 @@ export const config = {
       optional("AUTODREAM_COOLDOWN_MINUTES", String(hive.autoDream?.cooldownMinutes ?? 1440)),
       10,
     ),
-    minNewMemories: parseInt(
-      optional("AUTODREAM_MIN_NEW_MEMORIES", String(hive.autoDream?.minNewMemories ?? 10)),
-      10,
-    ),
+    minNewMemories: parseInt(optional("AUTODREAM_MIN_NEW_MEMORIES", String(hive.autoDream?.minNewMemories ?? 10)), 10),
     similarityThreshold: parseFloat(
       optional("AUTODREAM_SIMILARITY_THRESHOLD", String(hive.autoDream?.similarityThreshold ?? 0.85)),
     ),
