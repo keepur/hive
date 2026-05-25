@@ -20,7 +20,15 @@ const { TEST_HIVE_HOME } = vi.hoisted(() => {
 });
 
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readlinkSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  existsSync,
+  readlinkSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadSkillIndex, getSkillsForAgent, getModifiedSkills } from "./skill-loader.js";
@@ -145,6 +153,25 @@ describe("loadSkillIndex", () => {
     );
     expect(readlinkSync(join(milo[0]!.path, "helpers"))).toContain(helperDir);
     expect(readlinkSync(join(river[0]!.path, "helpers"))).toContain(helperDir);
+  });
+
+  it("does not fail legacy skill loading when a workflow sibling cannot be mirrored", () => {
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "ai-analyst", "market-scan", ["milo"]);
+    symlinkSync(
+      join(tmp, "missing-helper-target"),
+      join(customer, "ai-analyst", "broken-helper"),
+    );
+
+    const index = loadSkillIndex(customer, [], [], [], tmp);
+
+    const milo = getSkillsForAgent(index, "milo");
+    expect(milo).toHaveLength(1);
+    expectProjectedSkill(
+      milo[0]!,
+      "market-scan",
+      join(customer, "ai-analyst", "skills", "market-scan"),
+    );
   });
 
   it("loads plugin-bundled skills alongside customer", () => {
