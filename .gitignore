@@ -47,3 +47,5 @@ mokie-*.png
 .playwright-mcp/
 test-results/
 .mcp.json
+.claude/worktrees/
+.hive-state/
