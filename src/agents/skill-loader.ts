@@ -33,10 +33,10 @@ export function getModifiedSkills(): Set<string> {
 type CollisionEntry = {
   source: string;
   /**
-   * Path used as the de-dup key — the *real* skill directory on disk
-   * (the one a customer-modification check would re-hash). For flat-layout
-   * skills this is `<root>/skills/<skill>/`; for old-layout it's the
-   * workflow grouping dir.
+   * Path used for customer-modification checks — the *real* skill directory
+   * on disk (the one we re-hash). For flat-layout skills this is
+   * `<root>/skills/<skill>/`; for legacy layout this is the inner
+   * `<root>/<workflow>/skills/<skill>/` directory.
    */
   realPath: string;
   /** Plugin-config path actually fed to the SDK. May be a projection. */
@@ -248,6 +248,7 @@ function buildSkillProjection(
   sourceTag: string,
   skillName: string,
   realSkillDir: string,
+  legacyWorkflowDir?: string,
 ): string {
   const key = projectionKey(sourceTag, realSkillDir, skillName);
   const pluginDir = join(projectionRoot, key);
@@ -280,7 +281,41 @@ function buildSkillProjection(
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
   }
+  if (legacyWorkflowDir) {
+    mirrorLegacyWorkflowSiblings(pluginDir, legacyWorkflowDir);
+  }
   return pluginDir;
+}
+
+/**
+ * Legacy workflow layouts often carry shared assets beside `skills/`, e.g.
+ * `<workflow>/helpers/` or `<workflow>/templates/`. Per-skill projections keep
+ * sibling skills isolated, but mirror non-skill workflow siblings into the
+ * projected plugin root so references such as `../../helpers/foo.md` still
+ * resolve from `<projection>/skills/<skill>/SKILL.md`.
+ */
+function mirrorLegacyWorkflowSiblings(pluginDir: string, legacyWorkflowDir: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(legacyWorkflowDir);
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (entry === "skills") continue;
+    const sourcePath = join(legacyWorkflowDir, entry);
+    const linkPath = join(pluginDir, entry);
+    if (existsSync(linkPath)) continue;
+
+    try {
+      const sourceStat = statSync(sourcePath);
+      const resolved = realpathSync(sourcePath);
+      symlinkSync(resolved, linkPath, sourceStat.isDirectory() ? "dir" : "file");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
 }
 
 /**
@@ -447,27 +482,24 @@ function scanSkillsFrom(
   for (const found of iterateSkillsRoot(rootDir, source)) {
     const { skillName, realSkillDir, legacy, legacyWorkflow } = found;
 
-    // Collision key: legacy entries collide on workflow grouping (preserves
-    // the pre-KPR-214 invariant that a "workflow" is a single shadow unit);
-    // flat entries collide on skill name (each skill is its own unit).
-    // Customer-shadow eviction needs to find legacy skills regardless of which
-    // layout the customer uses, so the cross-layout flattened key is also
-    // tracked separately when needed (see customer-shadow eviction below).
-    const layoutKey = legacy ? legacyWorkflow! : skillName;
-    const collisionKey = implicitAgentScope ? `${implicitAgentScope}::${layoutKey}` : layoutKey;
+    // Collision key: every yielded SKILL.md collides by skill name, regardless
+    // of whether the source is flat or legacy double-`skills/`. Legacy
+    // workflows can contain many independently-scoped skills; keying them by
+    // parent workflow silently collapsed siblings under the same workflow.
+    const collisionKey = implicitAgentScope ? `${implicitAgentScope}::${skillName}` : skillName;
 
-    // Determine the SDK plugin path. Flat skills get a synthetic projection
-    // (so the SDK sees the layout it expects). Legacy skills already have the
-    // expected layout — point the SDK at the workflow dir directly.
-    let pluginPath: string;
-    if (legacy) {
-      // legacyWorkflow is non-null for legacy entries; the workflow dir is
-      // realSkillDir's parent's parent.
-      const workflowDir = join(rootDir, legacyWorkflow!);
-      pluginPath = workflowDir;
-    } else {
-      pluginPath = buildSkillProjection(projectionRoot, source, skillName, realSkillDir);
-    }
+    // Determine the SDK plugin path. Both flat and legacy skills get a
+    // synthetic per-skill projection so the SDK sees exactly one
+    // `<plugin>/skills/<skill>/SKILL.md`. Legacy projections also mirror
+    // workflow-level sibling assets so old relative references keep working.
+    const legacyWorkflowDir = legacy ? join(rootDir, legacyWorkflow!) : undefined;
+    const pluginPath = buildSkillProjection(
+      projectionRoot,
+      source,
+      skillName,
+      realSkillDir,
+      legacyWorkflowDir,
+    );
 
     const existing = collisionMap.get(collisionKey);
     if (existing) {
@@ -551,11 +583,9 @@ function scanSkillsFrom(
     // it scopes to has an agent-private skill of the same name, evict the
     // agent-private version. Operator authority preserved.
     //
-    // The agent-private collision-key uses the agent's layout key (workflow
-    // for legacy, skill name for flat). Cross-layout shadowing therefore uses
-    // the stored `entry.skillName`, not the collision-key suffix, so an operator
-    // who flattens customer skills while leaving agent private legacy still gets
-    // the correct precedence — and vice versa.
+    // Cross-layout shadowing uses the stored `entry.skillName`, so an operator
+    // who flattens customer skills while leaving agent-private skills legacy
+    // still gets the correct precedence — and vice versa.
     if (winsCollisions && !implicitAgentScope) {
       if (hasAll) {
         // KPR-225 F2: customer skill with `agents: [all]` shadows EVERY
@@ -564,14 +594,9 @@ function scanSkillsFrom(
         // so no eviction happened and `getSkillsForAgent` returned both the
         // agent-private and the universal customer skill simultaneously.
         //
-        // KPR-227: match by `entry.skillName` rather than the bare suffix
-        // of `perAgentKey`. Agent-private collision keys are
-        // `<agentId>::<layoutKey>`, where `layoutKey === legacyWorkflow` for
-        // legacy nested layouts and `layoutKey === skillName` for flat ones.
-        // An `endsWith("::" + skillName)` filter only catches the flat case
-        // and silently misses legacy private skills whose workflow name
-        // differs from the skill name (e.g. `luna::blog-flow` for skill
-        // `publish-blog-post`). Comparing `entry.skillName` covers both.
+        // KPR-227: match by `entry.skillName` rather than depending on the
+        // collision-key suffix. Comparing the stored skill name covers both
+        // flat and legacy private layouts.
         // The source guard preserves the invariant that only agent-private
         // entries are evictable — customer/seed/plugin entries are never
         // removed by this operator-authority rule.

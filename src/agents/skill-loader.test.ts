@@ -79,6 +79,24 @@ function makePlugin(name: string, dir: string): LoadedPlugin {
   };
 }
 
+function expectProjectedSkill(
+  plugin: { path: string },
+  skill: string,
+  target: string,
+): void {
+  expect(plugin.path).toContain(".skill-projections");
+  const linkPath = join(plugin.path, "skills", skill);
+  expect(existsSync(linkPath)).toBe(true);
+  expect(readlinkSync(linkPath)).toContain(target);
+}
+
+function findProjectedSkill(
+  plugins: { path: string }[],
+  skill: string,
+): { path: string } | undefined {
+  return plugins.find((plugin) => existsSync(join(plugin.path, "skills", skill)));
+}
+
 describe("loadSkillIndex", () => {
   let tmp: string;
 
@@ -100,6 +118,35 @@ describe("loadSkillIndex", () => {
     expect(getSkillsForAgent(index, "other")).toHaveLength(0);
   });
 
+  it("loads multiple legacy skills under the same workflow without collisions", () => {
+    const customer = join(tmp, "customer-skills");
+    writeSkill(customer, "ai-analyst", "market-scan", ["milo"]);
+    writeSkill(customer, "ai-analyst", "metrics-review", ["river"]);
+    const helperDir = join(customer, "ai-analyst", "helpers");
+    mkdirSync(helperDir, { recursive: true });
+    writeFileSync(join(helperDir, "shared.md"), "shared workflow helper\n");
+
+    const index = loadSkillIndex(customer, [], [], [], tmp);
+
+    const milo = getSkillsForAgent(index, "milo");
+    const river = getSkillsForAgent(index, "river");
+    expect(milo).toHaveLength(1);
+    expect(river).toHaveLength(1);
+    expect(milo[0]!.path).not.toBe(river[0]!.path);
+    expectProjectedSkill(
+      milo[0]!,
+      "market-scan",
+      join(customer, "ai-analyst", "skills", "market-scan"),
+    );
+    expectProjectedSkill(
+      river[0]!,
+      "metrics-review",
+      join(customer, "ai-analyst", "skills", "metrics-review"),
+    );
+    expect(readlinkSync(join(milo[0]!.path, "helpers"))).toContain(helperDir);
+    expect(readlinkSync(join(river[0]!.path, "helpers"))).toContain(helperDir);
+  });
+
   it("loads plugin-bundled skills alongside customer", () => {
     const customer = join(tmp, "customer-skills");
     writeSkill(customer, "alpha", "customer-skill", ["milo"]);
@@ -111,37 +158,45 @@ describe("loadSkillIndex", () => {
 
     const miloSkills = getSkillsForAgent(index, "milo");
     expect(miloSkills).toHaveLength(2);
-    expect(miloSkills.map((s) => s.path).sort()).toEqual(
-      [join(customer, "alpha"), join(pluginDir, "skills", "beta")].sort(),
+    expectProjectedSkill(
+      findProjectedSkill(miloSkills, "customer-skill")!,
+      "customer-skill",
+      join(customer, "alpha", "skills", "customer-skill"),
+    );
+    expectProjectedSkill(
+      findProjectedSkill(miloSkills, "plugin-skill")!,
+      "plugin-skill",
+      join(pluginDir, "skills", "beta", "skills", "plugin-skill"),
     );
   });
 
   it("customer skill shadows plugin-bundled skill", () => {
     const customer = join(tmp, "customer-skills");
-    writeSkill(customer, "shared", "customer-version", ["milo"]);
+    writeSkill(customer, "customer-flow", "shared", ["milo"]);
 
     const pluginDir = join(tmp, "plugin-a");
-    writeSkill(join(pluginDir, "skills"), "shared", "plugin-version", ["milo"]);
+    writeSkill(join(pluginDir, "skills"), "plugin-flow", "shared", ["milo"]);
 
     const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
 
-    const paths = getSkillsForAgent(index, "milo").map((s) => s.path);
-    expect(paths).toEqual([join(customer, "shared")]);
+    const milo = getSkillsForAgent(index, "milo");
+    expect(milo).toHaveLength(1);
+    expectProjectedSkill(milo[0]!, "shared", join(customer, "customer-flow", "skills", "shared"));
   });
 
   it("customer skill shadows plugin universal skill", () => {
     const customer = join(tmp, "customer-skills");
-    writeSkill(customer, "shared", "customer-all", ["all"]);
+    writeSkill(customer, "customer-flow", "shared", ["all"]);
 
     const pluginDir = join(tmp, "plugin-a");
-    writeSkill(join(pluginDir, "skills"), "shared", "plugin-all", ["all"]);
+    writeSkill(join(pluginDir, "skills"), "plugin-flow", "shared", ["all"]);
 
     const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)]);
 
     // Customer version should win — only one universal skill
     const universal = getSkillsForAgent(index, "brand-new");
     expect(universal).toHaveLength(1);
-    expect(universal[0]!.path).toBe(join(customer, "shared"));
+    expectProjectedSkill(universal[0]!, "shared", join(customer, "customer-flow", "skills", "shared"));
   });
 
   it("first-loaded plugin wins collision vs later plugin", () => {
@@ -149,18 +204,19 @@ describe("loadSkillIndex", () => {
     mkdirSync(customer, { recursive: true });
 
     const pluginA = join(tmp, "plugin-a");
-    writeSkill(join(pluginA, "skills"), "shared", "a-version", ["milo"]);
+    writeSkill(join(pluginA, "skills"), "a-flow", "shared", ["milo"]);
 
     const pluginB = join(tmp, "plugin-b");
-    writeSkill(join(pluginB, "skills"), "shared", "b-version", ["milo"]);
+    writeSkill(join(pluginB, "skills"), "b-flow", "shared", ["milo"]);
 
     const index = loadSkillIndex(customer, [
       makePlugin("plugin-a", pluginA),
       makePlugin("plugin-b", pluginB),
     ]);
 
-    const paths = getSkillsForAgent(index, "milo").map((s) => s.path);
-    expect(paths).toEqual([join(pluginA, "skills", "shared")]);
+    const milo = getSkillsForAgent(index, "milo");
+    expect(milo).toHaveLength(1);
+    expectProjectedSkill(milo[0]!, "shared", join(pluginA, "skills", "a-flow", "skills", "shared"));
   });
 
   it("ignores plugins with no skills/ subdir", () => {
@@ -256,38 +312,42 @@ describe("loadSkillIndex", () => {
     const index = loadSkillIndex(customer, [], [seedDir]);
 
     expect(getSkillsForAgent(index, "chief-of-staff")).toHaveLength(1);
-    expect(getSkillsForAgent(index, "chief-of-staff")[0]!.path).toBe(
-      join(seedDir, "skills", "onboarding"),
+    expectProjectedSkill(
+      getSkillsForAgent(index, "chief-of-staff")[0]!,
+      "onboarding-skill",
+      join(seedDir, "skills", "onboarding", "skills", "onboarding-skill"),
     );
   });
 
-  it("seed skill wins over plugin skill (same workflow name)", () => {
+  it("seed skill wins over plugin skill (same skill name)", () => {
     const customer = join(tmp, "customer-skills");
     mkdirSync(customer, { recursive: true });
 
     const seedDir = join(tmp, "chief-of-staff");
-    writeSkill(join(seedDir, "skills"), "onboarding", "seed-version", ["chief-of-staff"]);
+    writeSkill(join(seedDir, "skills"), "seed-flow", "onboarding", ["chief-of-staff"]);
 
     const pluginDir = join(tmp, "plugin-a");
-    writeSkill(join(pluginDir, "skills"), "onboarding", "plugin-version", ["chief-of-staff"]);
+    writeSkill(join(pluginDir, "skills"), "plugin-flow", "onboarding", ["chief-of-staff"]);
 
     const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)], [seedDir]);
 
-    const paths = getSkillsForAgent(index, "chief-of-staff").map((s) => s.path);
-    expect(paths).toEqual([join(seedDir, "skills", "onboarding")]);
+    const cos = getSkillsForAgent(index, "chief-of-staff");
+    expect(cos).toHaveLength(1);
+    expectProjectedSkill(cos[0]!, "onboarding", join(seedDir, "skills", "seed-flow", "skills", "onboarding"));
   });
 
   it("customer skill shadows seed-bundled skill", () => {
     const customer = join(tmp, "customer-skills");
-    writeSkill(customer, "onboarding", "customer-version", ["chief-of-staff"]);
+    writeSkill(customer, "customer-flow", "onboarding", ["chief-of-staff"]);
 
     const seedDir = join(tmp, "chief-of-staff");
-    writeSkill(join(seedDir, "skills"), "onboarding", "seed-version", ["chief-of-staff"]);
+    writeSkill(join(seedDir, "skills"), "seed-flow", "onboarding", ["chief-of-staff"]);
 
     const index = loadSkillIndex(customer, [], [seedDir]);
 
-    const paths = getSkillsForAgent(index, "chief-of-staff").map((s) => s.path);
-    expect(paths).toEqual([join(customer, "onboarding")]);
+    const cos = getSkillsForAgent(index, "chief-of-staff");
+    expect(cos).toHaveLength(1);
+    expectProjectedSkill(cos[0]!, "onboarding", join(customer, "customer-flow", "skills", "onboarding"));
   });
 
   it("ignores seed dirs with no skills/ subdirectory", () => {
@@ -579,8 +639,12 @@ describe("agent-private skills (KPR-75)", () => {
     // module-load, so process.env.HIVE_HOME mutation has no effect.
     const index = loadSkillIndex(customer, [], [], ["luna", "sam"], tmp);
 
-    expect(getSkillsForAgent(index, "luna").map((s) => s.path)).toContain(
-      join(tmp, "agents", "luna", "skills", "blog-flow"),
+    const luna = getSkillsForAgent(index, "luna");
+    expect(luna).toHaveLength(1);
+    expectProjectedSkill(
+      luna[0]!,
+      "publish-blog-post",
+      join(tmp, "agents", "luna", "skills", "blog-flow", "skills", "publish-blog-post"),
     );
     expect(getSkillsForAgent(index, "sam")).toEqual([]);
   });
@@ -595,8 +659,16 @@ describe("agent-private skills (KPR-75)", () => {
 
     expect(getSkillsForAgent(index, "luna")).toHaveLength(1);
     expect(getSkillsForAgent(index, "sam")).toHaveLength(1);
-    expect(getSkillsForAgent(index, "luna")[0]!.path).toContain("agents/luna");
-    expect(getSkillsForAgent(index, "sam")[0]!.path).toContain("agents/sam");
+    expectProjectedSkill(
+      getSkillsForAgent(index, "luna")[0]!,
+      "publish-blog-post",
+      join(tmp, "agents", "luna", "skills", "blog-flow", "skills", "publish-blog-post"),
+    );
+    expectProjectedSkill(
+      getSkillsForAgent(index, "sam")[0]!,
+      "publish-blog-post",
+      join(tmp, "agents", "sam", "skills", "blog-flow", "skills", "publish-blog-post"),
+    );
   });
 
   it("rejects (skips) agent-private skill that declares agents: in frontmatter — does not crash loader", () => {
@@ -612,7 +684,11 @@ describe("agent-private skills (KPR-75)", () => {
 
     expect(getSkillsForAgent(index, "luna")).toEqual([]);
     expect(getSkillsForAgent(index, "sam")).toHaveLength(1);
-    expect(getSkillsForAgent(index, "sam")[0]!.path).toContain("agents/sam/skills/research");
+    expectProjectedSkill(
+      getSkillsForAgent(index, "sam")[0]!,
+      "lookup",
+      join(tmp, "agents", "sam", "skills", "research", "skills", "lookup"),
+    );
   });
 
   it("customer-space skill shadows agent-private skill for the agents it scopes to", () => {
@@ -622,8 +698,13 @@ describe("agent-private skills (KPR-75)", () => {
 
     const index = loadSkillIndex(customer, [], [], ["luna"], tmp);
 
-    const lunaPaths = getSkillsForAgent(index, "luna").map((s) => s.path);
-    expect(lunaPaths).toEqual([join(customer, "blog-flow")]);
+    const luna = getSkillsForAgent(index, "luna");
+    expect(luna).toHaveLength(1);
+    expectProjectedSkill(
+      luna[0]!,
+      "publish-blog-post",
+      join(customer, "blog-flow", "skills", "publish-blog-post"),
+    );
   });
 
   it("plugin skill scoped to a different agent does not block agent-private skill", () => {
@@ -635,8 +716,16 @@ describe("agent-private skills (KPR-75)", () => {
 
     const index = loadSkillIndex(customer, [makePlugin("plugin-a", pluginDir)], [], ["luna", "sam"], tmp);
 
-    expect(getSkillsForAgent(index, "luna")[0]!.path).toContain("agents/luna");
-    expect(getSkillsForAgent(index, "sam")[0]!.path).toContain("plugin-a");
+    expectProjectedSkill(
+      getSkillsForAgent(index, "luna")[0]!,
+      "publish-blog-post",
+      join(tmp, "agents", "luna", "skills", "blog-flow", "skills", "publish-blog-post"),
+    );
+    expectProjectedSkill(
+      getSkillsForAgent(index, "sam")[0]!,
+      "publish-blog-post",
+      join(pluginDir, "skills", "blog-flow", "skills", "publish-blog-post"),
+    );
   });
 
   it("missing agent dir is silently skipped", () => {
@@ -710,10 +799,9 @@ describe("agent-private skills (KPR-75)", () => {
   });
 
   it("flat customer skill scoped to one agent shadows legacy agent-private skill of same name", () => {
-    // KPR-227 follow-up: the explicit-agent branch must also match by
-    // entry.skillName. A flat customer skill for luna has collision key
-    // `publish-blog-post`, but luna's legacy private skill is keyed by workflow
-    // (`luna::blog-flow`), so suffix/layout-key matching misses it.
+    // KPR-227 follow-up: the explicit-agent branch must match by
+    // entry.skillName so customer/operator authority works across flat and
+    // legacy agent-private layouts.
     writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
 
     const customer = join(tmp, "skills");
@@ -755,15 +843,7 @@ describe("agent-private skills (KPR-75)", () => {
     expect(samLink).toContain(join(customer, "publish-blog-post"));
   });
 
-  it("KPR-227 (F2 follow-up): customer skill with `agents: [all]` shadows LEGACY agent-private skills (keyed by workflow)", () => {
-    // KPR-225 F2 fix matched eviction keys by `endsWith("::${skillName}")`.
-    // That suffix only covers FLAT agent-private collisionKeys
-    // (`<agentId>::<skillName>`); it silently misses LEGACY keys whose
-    // layoutKey is the workflow, not the skill name. Result: an `agents:
-    // [all]` customer skill failed to shadow a luna-private legacy skill at
-    // `agents/luna/skills/blog-flow/skills/publish-blog-post` (collisionKey
-    // `luna::blog-flow`), so luna saw both entries.
-    //
+  it("KPR-227 (F2 follow-up): customer skill with `agents: [all]` shadows LEGACY agent-private skills", () => {
     // KPR-227 switches the hasAll filter to agent-private source +
     // `entry.skillName === skillName`, covering both layouts.
     writeAgentSkill(tmp, "luna", "blog-flow", "publish-blog-post");
@@ -774,8 +854,7 @@ describe("agent-private skills (KPR-75)", () => {
     const index = loadSkillIndex(customer, [], [], ["luna"], tmp);
 
     // Pre-fix: would be 2 (customer + legacy private). Post-fix: just the
-    // customer (universal) entry — legacy private was evicted via the
-    // entry.skillName match, NOT the bare endsWith suffix.
+    // customer (universal) entry.
     const luna = getSkillsForAgent(index, "luna");
     expect(luna).toHaveLength(1);
     const link = readlinkSync(join(luna[0]!.path, "skills", "publish-blog-post"));
