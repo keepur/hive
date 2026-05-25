@@ -83,6 +83,9 @@ describe("author_skill -> skill-loader integration", () => {
 
 describe("filterCoreServers always-on injection", () => {
   it("retains skill-author for an agent whose coreServers does not list it", async () => {
+    process.env.SLACK_APP_TOKEN ??= "xapp-test";
+    process.env.SLACK_BOT_TOKEN ??= "xoxb-test";
+
     const { AgentRunner } = await import("./agent-runner.js");
 
     // Build a minimal-but-valid AgentConfig. Field set must match what
