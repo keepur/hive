@@ -4,8 +4,19 @@ import type { MemoryRecord, MemoryRecordInput, MemoryImportance, MemoryTier, Pur
 
 const log = createLogger("memory-store");
 
+export interface AutoDreamAgentState {
+  _id: string;
+  agentId: string;
+  lastDreamAt: Date;
+  changedMemoryCount: number;
+  spentUsd: number;
+  llmCalls: number;
+  updatedAt: Date;
+}
+
 export class MemoryStore {
   private collection!: Collection<MemoryRecord>;
+  private autoDreamStateCollection!: Collection<AutoDreamAgentState>;
   /**
    * KPR-213 invalidation hook. Fired after any mutation that may affect an
    * agent's hot-tier composition (save, update, delete, pin, unpin,
@@ -25,12 +36,14 @@ export class MemoryStore {
 
   async init(): Promise<void> {
     this.collection = this.db.collection<MemoryRecord>("agent_memory");
+    this.autoDreamStateCollection = this.db.collection<AutoDreamAgentState>("agent_memory_autodream_state");
 
     await this.collection.createIndex({ agentId: 1, tier: 1 });
     await this.collection.createIndex({ agentId: 1, topic: 1 });
     await this.collection.createIndex({ agentId: 1, updatedAt: 1 });
     await this.collection.createIndex({ agentId: 1, type: 1 });
     await this.collection.createIndex({ agentId: 1, purged: 1, purgedAt: 1 });
+    await this.autoDreamStateCollection.createIndex({ agentId: 1 }, { unique: true });
     log.info("Memory store initialized", { db: this.db.databaseName });
   }
 
@@ -333,6 +346,44 @@ export class MemoryStore {
 
   async getAgentIds(): Promise<string[]> {
     return this.collection.distinct("agentId");
+  }
+
+  async getAutoDreamState(agentId: string): Promise<AutoDreamAgentState | null> {
+    return this.autoDreamStateCollection.findOne({ _id: agentId });
+  }
+
+  async countAutoDreamCandidates(agentId: string, since?: Date): Promise<number> {
+    const query: Record<string, unknown> = {
+      agentId,
+      purged: { $ne: true },
+      supersededBy: { $exists: false },
+      type: { $ne: "summary" },
+    };
+    if (since) query.updatedAt = { $gt: since };
+    return this.collection.countDocuments(query);
+  }
+
+  async markAutoDreamRun(
+    agentId: string,
+    at: Date,
+    changedMemoryCount: number,
+    spentUsd: number,
+    llmCalls: number,
+  ): Promise<void> {
+    await this.autoDreamStateCollection.updateOne(
+      { _id: agentId },
+      {
+        $set: {
+          agentId,
+          lastDreamAt: at,
+          changedMemoryCount,
+          spentUsd,
+          llmCalls,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true },
+    );
   }
 
   async close(): Promise<void> {

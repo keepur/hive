@@ -60,6 +60,9 @@ function makeMockStore() {
     getInteractionsByTopic: vi.fn().mockResolvedValue(new Map()),
     markSuperseded: vi.fn().mockResolvedValue(undefined),
     flagForReview: vi.fn().mockResolvedValue(undefined),
+    getAutoDreamState: vi.fn().mockResolvedValue(null),
+    countAutoDreamCandidates: vi.fn().mockResolvedValue(10),
+    markAutoDreamRun: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -415,6 +418,82 @@ describe("dream()", () => {
     });
     const result = await lifecycle.dream();
     expect(result).toEqual({ merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] });
+  });
+
+  it("skips agents without enough changed memories since their last autoDream", async () => {
+    const dreamCfg = {
+      enabled: true,
+      quietPeriodMinutes: 120,
+      cooldownMinutes: 60,
+      minNewMemories: 10,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+      maxRunBudgetUsd: 0.05,
+      maxCallBudgetUsd: 0.01,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+
+    store.getAgentIds.mockResolvedValue(["quiet-agent"]);
+    store.getAutoDreamState.mockResolvedValue({ lastDreamAt: new Date("2026-05-20T10:00:00Z") });
+    store.countAutoDreamCandidates.mockResolvedValue(3);
+
+    const result = await lifecycle.dream();
+
+    expect(result.skippedAgents).toBe(1);
+    expect(store.getByTiersForAgent).not.toHaveBeenCalled();
+    expect(store.markAutoDreamRun).not.toHaveBeenCalled();
+  });
+
+  it("applies maxRunBudgetUsd across multiple autoDream SDK calls", async () => {
+    const { query: mockQuery } = await import("@anthropic-ai/claude-agent-sdk");
+    const dreamCfg = {
+      enabled: true,
+      quietPeriodMinutes: 120,
+      cooldownMinutes: 60,
+      minNewMemories: 1,
+      similarityThreshold: 0.85,
+      patternMinCount: 3,
+      maxClustersPerRun: 20,
+      maxContradictionPairsPerRun: 30,
+      maxPromotionsPerRun: 10,
+      maxRunBudgetUsd: 0.015,
+      maxCallBudgetUsd: 0.01,
+    };
+    const lifecycle = new MemoryLifecycle(store as any, embedder as any, defaultConfig, dreamCfg);
+    const recA = makeRecord({ agentId: "a1", type: "fact", topic: "t" });
+    const recB = makeRecord({ agentId: "a1", type: "fact", topic: "t" });
+    const recC = makeRecord({ agentId: "a1", type: "fact", topic: "t" });
+
+    store.getAgentIds.mockResolvedValue(["a1"]);
+    store.countAutoDreamCandidates.mockResolvedValue(3);
+    store.getByTiersForAgent.mockResolvedValue([]);
+    store.getFactsAndDecisionsByTopic.mockResolvedValue(new Map([["t", [recA, recB, recC]]]));
+    store.getInteractionsByTopic.mockResolvedValue(new Map());
+    (mockQuery as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({
+        close: vi.fn(),
+        [Symbol.asyncIterator]: async function* () {
+          yield { type: "result", subtype: "success", result: "NO", total_cost_usd: 0.01 };
+        },
+      })
+      .mockReturnValueOnce({
+        close: vi.fn(),
+        [Symbol.asyncIterator]: async function* () {
+          yield { type: "result", subtype: "success", result: "NO", total_cost_usd: 0.005 };
+        },
+      });
+
+    const result = await lifecycle.dream();
+
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect((mockQuery as ReturnType<typeof vi.fn>).mock.calls[0][0].options.maxBudgetUsd).toBe(0.01);
+    expect((mockQuery as ReturnType<typeof vi.fn>).mock.calls[1][0].options.maxBudgetUsd).toBeCloseTo(0.005, 5);
+    expect(result.errors[0]).toContain("autoDream run budget exhausted");
+    expect(result.spentUsd).toBe(0.015);
+    expect(result.llmCalls).toBe(2);
   });
 
   it("catches per-agent errors without stopping other agents", async () => {
