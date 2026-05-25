@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, existsSync, readlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadSkillIndex, getSkillsForAgent } from "./skill-loader.js";
@@ -57,9 +57,12 @@ describe("author_skill -> skill-loader integration", () => {
     // session spawn.
     const idx = loadSkillIndex(join(home, "skills"), [], [], [id], home);
     const forAgent = getSkillsForAgent(idx, id);
-    // The plugin path is the workflow dir (the outer <slug>), per scanWorkflowsFrom.
-    const expectedWorkflowPath = join(home, "agents", id, "skills", skillName);
-    expect(forAgent.some((p) => p.path === expectedWorkflowPath)).toBe(true);
+    const projected = forAgent.find((p) => existsSync(join(p.path, "skills", skillName)));
+    expect(projected).toBeDefined();
+    expect(projected!.path).toContain(".skill-projections");
+    expect(readlinkSync(join(projected!.path, "skills", skillName))).toContain(
+      join(home, "agents", id, "skills", skillName, "skills", skillName),
+    );
   });
 
   it("two agents authoring the same slug do not collide — each gets its own", () => {
@@ -76,8 +79,14 @@ describe("author_skill -> skill-loader integration", () => {
     const idx = loadSkillIndex(join(home, "skills"), [], [], ["river", "milo"], home);
     const river = getSkillsForAgent(idx, "river").map((p) => p.path);
     const milo = getSkillsForAgent(idx, "milo").map((p) => p.path);
-    expect(river).toContain(join(home, "agents", "river", "skills", skillName));
-    expect(milo).toContain(join(home, "agents", "milo", "skills", skillName));
+    expect(river).toHaveLength(1);
+    expect(milo).toHaveLength(1);
+    expect(readlinkSync(join(river[0]!, "skills", skillName))).toContain(
+      join(home, "agents", "river", "skills", skillName, "skills", skillName),
+    );
+    expect(readlinkSync(join(milo[0]!, "skills", skillName))).toContain(
+      join(home, "agents", "milo", "skills", skillName, "skills", skillName),
+    );
   });
 });
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installSkill } from "./install.js";
@@ -135,7 +135,10 @@ describe("skills integration: install → upgrade → remove", () => {
     const index = loadSkillIndex(targetSkillsDir, [], [], [], targetHiveHome);
     const csSkills = getSkillsForAgent(index, "customer-success");
     expect(csSkills.length).toBeGreaterThan(0);
-    expect(csSkills.some((s) => s.path.includes("customer-support"))).toBe(true);
+    const projected = csSkills.find((s) => existsSync(join(s.path, "skills", "greet-customer")));
+    expect(projected).toBeDefined();
+    expect(projected!.path).toContain(".skill-projections");
+    expect(readlinkSync(join(projected!.path, "skills", "greet-customer"))).toContain(expectedPath);
 
     // Agent not in the list should not get this skill (it's not "all")
     const otherSkills = getSkillsForAgent(index, "sdr");
