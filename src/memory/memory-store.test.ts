@@ -99,7 +99,9 @@ describe("MemoryStore", () => {
   describe("init", () => {
     it("creates indexes on the supplied Db", async () => {
       expect(mockDb.collection).toHaveBeenCalledWith("agent_memory");
-      expect(mockCreateIndex).toHaveBeenCalledTimes(5);
+      expect(mockDb.collection).toHaveBeenCalledWith("agent_memory_autodream_state");
+      expect(mockCreateIndex).toHaveBeenCalledTimes(6);
+      expect(mockCreateIndex).toHaveBeenCalledWith({ agentId: 1 }, { unique: true });
     });
   });
 
