@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 const home = process.env.HOME ?? "/tmp";
 
@@ -8,12 +8,18 @@ const home = process.env.HOME ?? "/tmp";
  *
  * Priority:
  *   1. HIVE_HOME env var (explicit — always wins)
- *   2. ./hive.yaml in cwd (project-local / dev repo mode)
+ *   2. nearest hive.yaml at cwd or an ancestor directory
  *   3. ~/hive/ (default for npm installs; v0.2.0 — was ~/.hive in v0.1.x)
  */
 export function resolveHiveHome(): string {
   if (process.env.HIVE_HOME) return resolve(process.env.HIVE_HOME);
-  if (existsSync(resolve(process.cwd(), "hive.yaml"))) return process.cwd();
+  let dir = resolve(process.cwd());
+  while (true) {
+    if (existsSync(resolve(dir, "hive.yaml"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
   return resolve(home, "hive");
 }
 

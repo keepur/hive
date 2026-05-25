@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { resolve } from "node:path";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 describe("resolveHiveHome", () => {
   beforeEach(() => {
@@ -9,6 +11,7 @@ describe("resolveHiveHome", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+    vi.doUnmock("node:fs");
   });
 
   it("uses HIVE_HOME env var when set", async () => {
@@ -24,6 +27,25 @@ describe("resolveHiveHome", () => {
     }));
     const { resolveHiveHome } = await import("../paths.js");
     expect(resolveHiveHome()).toBe(process.cwd());
+  });
+
+  it("walks up from cwd to the nearest parent hive.yaml", async () => {
+    vi.stubEnv("HIVE_HOME", "");
+    vi.doUnmock("node:fs");
+    const root = mkdtempSync(join(tmpdir(), "hive-home-"));
+    const nested = join(root, ".hive", "pkg");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(root, "hive.yaml"), "instance:\n  id: catalyst\n");
+
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(nested);
+      const { resolveHiveHome } = await import("../paths.js");
+      expect(resolveHiveHome()).toBe(realpathSync(root));
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("falls back to ~/hive/", async () => {
