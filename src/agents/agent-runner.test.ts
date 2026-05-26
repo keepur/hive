@@ -89,7 +89,7 @@ vi.mock("../config.js", () => ({
     instance: { id: "hive", portBase: 3100 },
     slack: { mcpToken: "" },
     mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
-    google: { account: "", accounts: {}, sharedFolder: "test-folder" },
+    google: { accounts: { "test-agent": ["test@example.com"] }, sharedFolder: "test-folder" },
     quo: { apiKey: "", phoneNumberId: "", lines: [] },
     taskLedger: {
       apiUrl: "http://localhost:3000",

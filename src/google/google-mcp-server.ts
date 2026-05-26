@@ -7,9 +7,10 @@
  * Requires `gog` CLI to be installed and authenticated.
  *
  * Env vars:
- *   GOG_ACCOUNT — Google account email (optional, uses gog default if unset)
- *   GOG_CLIENT  — OAuth client name (optional, uses gog default if unset)
- *   GOG_PATH    — path to gog binary (optional, auto-detected if unset)
+ *   GOG_ACCOUNTS — CSV of Google account emails (KPR-242). First entry is the implicit default.
+ *                  When more than one is listed, every tool surfaces an `account` enum parameter.
+ *   GOG_CLIENT   — OAuth client name (optional, uses gog default if unset)
+ *   GOG_PATH     — path to gog binary (optional, auto-detected if unset)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -19,7 +20,12 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 
-const ACCOUNT = process.env.GOG_ACCOUNT ?? "";
+const ACCOUNTS = (process.env.GOG_ACCOUNTS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const DEFAULT_ACCOUNT = ACCOUNTS[0] ?? "";
+const MULTI = ACCOUNTS.length > 1;
 const CLIENT = process.env.GOG_CLIENT ?? "";
 const GOG =
   process.env.GOG_PATH ??
@@ -31,10 +37,35 @@ const GOG =
     }
   })();
 
-function gog(args: string[]): string {
+/**
+ * KPR-242: when MULTI is true, every tool's input schema gets this `account`
+ * enum spread in. When false (the common single-account case), the spread is
+ * `{}` and the registered tool schema is byte-identical to pre-KPR-242 —
+ * critical for keeping the toolkit prefix prompt cache warm for Rae/Milo/Sige.
+ *
+ * The static type carries `account` as an optional Zod schema so spreading
+ * `...accountField` into each tool's `inputSchema` propagates `account?:` into
+ * the SDK's schema-derived handler argument type, letting handlers destructure
+ * `{ ..., account }` whether MULTI is true or false. At runtime the key is
+ * present only when MULTI is true, so the registered tool schema stays
+ * byte-identical for single-account agents.
+ */
+type AccountField = { account?: z.ZodOptional<z.ZodEnum<Record<string, string>>> };
+const accountField: AccountField = MULTI
+  ? {
+      account: z
+        .enum(ACCOUNTS as [string, ...string[]])
+        .optional()
+        .describe(
+          `Which Google account to use. Defaults to ${DEFAULT_ACCOUNT}. Available: ${ACCOUNTS.join(", ")}`,
+        ) as z.ZodOptional<z.ZodEnum<Record<string, string>>>,
+    }
+  : {};
+
+function gog(account: string, args: string[]): string {
   const fullArgs = [
     ...args,
-    ...(ACCOUNT ? ["-a", ACCOUNT] : []),
+    ...(account ? ["-a", account] : []),
     ...(CLIENT ? ["--client", CLIENT] : []),
     "--json",
     "--results-only",
@@ -43,10 +74,10 @@ function gog(args: string[]): string {
   return execFileSync(GOG, fullArgs, { encoding: "utf-8", timeout: 30_000 }).trim();
 }
 
-function gogPlain(args: string[]): string {
+function gogPlain(account: string, args: string[]): string {
   const fullArgs = [
     ...args,
-    ...(ACCOUNT ? ["-a", ACCOUNT] : []),
+    ...(account ? ["-a", account] : []),
     ...(CLIENT ? ["--client", CLIENT] : []),
     "--plain",
     "--no-input",
@@ -70,11 +101,13 @@ server.registerTool(
     inputSchema: {
       query: z.string().describe("Gmail search query"),
       max: z.number().optional().default(10).describe("Max results (default 10)"),
+      ...accountField,
     },
   },
-  async ({ query, max }) => {
+  async ({ query, max, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
-      const result = gog(["gmail", "search", query, `--max=${max}`]);
+      const result = gog(acc, ["gmail", "search", query, `--max=${max}`]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Search failed: ${e.message}` }], isError: true };
@@ -89,11 +122,13 @@ server.registerTool(
     description: "Read a specific email message by its message ID. Returns full message content.",
     inputSchema: {
       messageId: z.string().describe("Gmail message ID"),
+      ...accountField,
     },
   },
-  async ({ messageId }) => {
+  async ({ messageId, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
-      const result = gog(["gmail", "get", messageId]);
+      const result = gog(acc, ["gmail", "get", messageId]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to read message: ${e.message}` }], isError: true };
@@ -108,11 +143,13 @@ server.registerTool(
     description: "Read an entire email thread by thread ID. Returns all messages in the conversation.",
     inputSchema: {
       threadId: z.string().describe("Gmail thread ID"),
+      ...accountField,
     },
   },
-  async ({ threadId }) => {
+  async ({ threadId, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
-      const result = gog(["gmail", "thread", "get", threadId]);
+      const result = gog(acc, ["gmail", "thread", "get", threadId]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to read thread: ${e.message}` }], isError: true };
@@ -131,11 +168,13 @@ server.registerTool(
       body: z.string().describe("Email body (plain text)"),
       cc: z.string().optional().describe("CC recipients (comma-separated)"),
       threadId: z.string().optional().describe("Thread ID to reply within"),
+      ...accountField,
     },
   },
-  async ({ to, subject, body, cc, threadId }) => {
+  async ({ to, subject, body, cc, threadId, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
-      const result = gogPlain([
+      const result = gogPlain(acc, [
         "send",
         "--to",
         to,
@@ -147,10 +186,10 @@ server.registerTool(
         ...(cc ? ["--cc", cc] : []),
         ...(threadId ? ["--thread-id", threadId] : []),
       ]);
-      // KPR-174: surface the sending identity so the agent can confirm which
-      // mailbox (per-agent GOG_ACCOUNT) the message went out from. Mirrors
-      // the convention quo_send_sms uses ("Sent from <line> <number>").
-      const sentFrom = ACCOUNT ? `Sent from ${ACCOUNT}.` : "Email sent.";
+      // KPR-174 + KPR-242: surface the sending identity so the agent (and the
+      // operator) can confirm which mailbox actually sent the message — now
+      // reflecting the per-call account choice instead of a spawn-time const.
+      const sentFrom = acc ? `Sent from ${acc}.` : "Email sent.";
       const text = result ? `${sentFrom}\n\n${result}` : sentFrom;
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
@@ -166,11 +205,15 @@ server.registerTool(
   {
     title: "List Calendars",
     description: "List all available Google calendars.",
-    inputSchema: {},
+    inputSchema: {
+      ...accountField,
+    },
   },
-  async () => {
+  async (args: { account?: string } = {}) => {
+    const { account } = args;
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
-      const result = gog(["cal", "calendars"]);
+      const result = gog(acc, ["cal", "calendars"]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to list calendars: ${e.message}` }], isError: true };
@@ -191,9 +234,11 @@ server.registerTool(
       days: z.number().optional().describe("Show events for next N days"),
       max: z.number().optional().default(20).describe("Max results (default 20)"),
       calendarId: z.string().optional().describe("Calendar ID (default: primary)"),
+      ...accountField,
     },
   },
-  async ({ from, to, today, days, max, calendarId }) => {
+  async ({ from, to, today, days, max, calendarId, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
       const args: string[] = ["cal", "events"];
       if (calendarId) args.push(calendarId);
@@ -205,7 +250,7 @@ server.registerTool(
             : [...(from ? ["--from", from] : []), ...(to ? ["--to", to] : [])]),
       );
       args.push(`--max=${max}`);
-      const result = gog(args);
+      const result = gog(acc, args);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to list events: ${e.message}` }], isError: true };
@@ -222,11 +267,13 @@ server.registerTool(
       query: z.string().describe("Search query"),
       from: z.string().optional().describe("Start time"),
       to: z.string().optional().describe("End time"),
+      ...accountField,
     },
   },
-  async ({ query, from, to }) => {
+  async ({ query, from, to, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
-      const result = gog(["cal", "search", query, ...(from ? ["--from", from] : []), ...(to ? ["--to", to] : [])]);
+      const result = gog(acc, ["cal", "search", query, ...(from ? ["--from", from] : []), ...(to ? ["--to", to] : [])]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `No events found or search failed: ${e.message}` }], isError: true };
@@ -247,11 +294,13 @@ server.registerTool(
       location: z.string().optional().describe("Event location"),
       attendees: z.string().optional().describe("Attendee emails (comma-separated)"),
       calendarId: z.string().optional().default("primary").describe("Calendar ID (default: primary)"),
+      ...accountField,
     },
   },
-  async ({ summary, from, to, description, location, attendees, calendarId }) => {
+  async ({ summary, from, to, description, location, attendees, calendarId, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
-      const result = gogPlain([
+      const result = gogPlain(acc, [
         "cal",
         "create",
         calendarId,
@@ -282,11 +331,13 @@ server.registerTool(
       from: z.string().describe("Start time"),
       to: z.string().describe("End time"),
       calendarIds: z.string().optional().default("primary").describe("Calendar IDs (comma-separated)"),
+      ...accountField,
     },
   },
-  async ({ from, to, calendarIds }) => {
+  async ({ from, to, calendarIds, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     try {
-      const result = gog(["cal", "freebusy", calendarIds, "--from", from, "--to", to]);
+      const result = gog(acc, ["cal", "freebusy", calendarIds, "--from", from, "--to", to]);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Failed to check free/busy: ${e.message}` }], isError: true };
@@ -312,9 +363,11 @@ server.registerTool(
     inputSchema: {
       file_path: z.string().describe("Absolute path to the local file to upload"),
       name: z.string().optional().describe("Override the filename in Drive (defaults to local filename)"),
+      ...accountField,
     },
   },
-  async ({ file_path, name }) => {
+  async ({ file_path, name, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     if (!SHARED_FOLDER) {
       return {
         content: [{ type: "text", text: "Drive shared folder not configured (DRIVE_SHARED_FOLDER)." }],
@@ -329,7 +382,7 @@ server.registerTool(
     const fileName = name || basename(file_path);
 
     try {
-      const result = gog(["drive", "upload", file_path, "--parent", SHARED_FOLDER, "--name", fileName]);
+      const result = gog(acc, ["drive", "upload", file_path, "--parent", SHARED_FOLDER, "--name", fileName]);
       const data = JSON.parse(result);
 
       const summary = [
@@ -357,9 +410,11 @@ server.registerTool(
       file_id: z.string().optional().describe("Google Drive file ID"),
       url: z.string().optional().describe("Google Drive URL (file ID will be extracted)"),
       format: z.string().optional().describe("Export format (e.g. txt, csv, pdf). Only for Google-native files."),
+      ...accountField,
     },
   },
-  async ({ file_id, url, format }) => {
+  async ({ file_id, url, format, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     let id = file_id;
 
     if (!id && url) {
@@ -375,7 +430,7 @@ server.registerTool(
       const outPath = join(DOWNLOAD_DIR, id + (format ? `.${format}` : ""));
       const args = ["drive", "download", id, "--out", outPath];
       if (format) args.push("--format", format);
-      gogPlain(args);
+      gogPlain(acc, args);
 
       // Return inline content for text-readable files
       const textExtensions = new Set([".txt", ".csv", ".md", ".json", ".xml", ".html", ".tsv"]);
@@ -408,9 +463,11 @@ server.registerTool(
     inputSchema: {
       query: z.string().optional().describe("Search query to filter files (e.g. 'permits' or 'name contains report')"),
       limit: z.number().optional().default(20).describe("Max results (default 20)"),
+      ...accountField,
     },
   },
-  async ({ query, limit }) => {
+  async ({ query, limit, account }) => {
+    const acc = account ?? DEFAULT_ACCOUNT;
     if (!SHARED_FOLDER) {
       return { content: [{ type: "text", text: "Drive shared folder not configured." }], isError: true };
     }
@@ -419,7 +476,7 @@ server.registerTool(
       const args = ["drive", "ls", "--parent", SHARED_FOLDER];
       if (query) args.push("--query", query);
       args.push(`--max=${limit ?? 20}`);
-      const result = gog(args);
+      const result = gog(acc, args);
 
       // Format as human-readable text
       try {

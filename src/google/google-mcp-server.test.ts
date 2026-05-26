@@ -16,11 +16,11 @@ vi.mock("node:fs", () => ({
 
 // Mock MCP SDK — capture registered tools
 type ToolHandler = (...args: any[]) => any;
-const registeredTools = new Map<string, { handler: ToolHandler }>();
+const registeredTools = new Map<string, { handler: ToolHandler; inputSchema: Record<string, unknown> }>();
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
   McpServer: vi.fn().mockImplementation(() => ({
-    registerTool: vi.fn((name: string, _opts: any, handler: ToolHandler) => {
-      registeredTools.set(name, { handler });
+    registerTool: vi.fn((name: string, opts: { inputSchema?: Record<string, unknown> }, handler: ToolHandler) => {
+      registeredTools.set(name, { handler, inputSchema: opts.inputSchema ?? {} });
     }),
     connect: vi.fn(),
   })),
@@ -270,10 +270,10 @@ describe("google-mcp-server", () => {
   });
 
   describe("gmail_send", () => {
-    it("includes the sending identity (GOG_ACCOUNT) in the success response (KPR-174)", async () => {
+    it("includes the sending identity in the success response (KPR-174 + KPR-242)", async () => {
       await loadServer({
         GOG_PATH: "/usr/local/bin/gog",
-        GOG_ACCOUNT: "jessica@dodihome.com",
+        GOG_ACCOUNTS: "jessica@dodihome.com",
       });
       mockExecFileSync.mockImplementation((cmd: any, args: any) => {
         if (cmd === "which") return "/usr/local/bin/gog\n";
@@ -287,11 +287,10 @@ describe("google-mcp-server", () => {
       });
       expect(result.isError).toBeUndefined();
       expect(result.content[0].text).toContain("Sent from jessica@dodihome.com");
-      // gog's own output should still be included for full traceability
       expect(result.content[0].text).toContain("Message-ID:");
     });
 
-    it("falls back to 'Email sent.' when GOG_ACCOUNT is unset", async () => {
+    it("falls back to 'Email sent.' when GOG_ACCOUNTS is unset", async () => {
       await loadServer({ GOG_PATH: "/usr/local/bin/gog" });
       mockExecFileSync.mockImplementation((cmd: any, args: any) => {
         if (cmd === "which") return "/usr/local/bin/gog\n";
@@ -327,6 +326,122 @@ describe("google-mcp-server", () => {
       for (const name of expected) {
         expect(registeredTools.has(name), `expected tool "${name}" to be registered`).toBe(true);
       }
+    });
+  });
+
+  describe("KPR-242 multi-account", () => {
+    it("single-account: no `account` field appears in any tool's input schema", async () => {
+      await loadServer({
+        GOG_PATH: "/usr/local/bin/gog",
+        GOG_ACCOUNTS: "rae@dodihome.com",
+      });
+      for (const [name, t] of registeredTools.entries()) {
+        expect(t.inputSchema, `tool "${name}" should not surface \`account\``).not.toHaveProperty("account");
+      }
+    });
+
+    it("multi-account: every tool's input schema includes an `account` enum field", async () => {
+      await loadServer({
+        GOG_PATH: "/usr/local/bin/gog",
+        GOG_ACCOUNTS: "may@dodihome.com,may.huang@gmail.com,may@keepur.io",
+      });
+      for (const [name, t] of registeredTools.entries()) {
+        expect(t.inputSchema, `tool "${name}" should surface \`account\``).toHaveProperty("account");
+      }
+    });
+
+    it("multi-account: omitting `account` routes to the first account (default)", async () => {
+      await loadServer({
+        GOG_PATH: "/usr/local/bin/gog",
+        GOG_ACCOUNTS: "may@dodihome.com,may.huang@gmail.com,may@keepur.io",
+      });
+      let capturedArgs: string[] = [];
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("search")) {
+          capturedArgs = args;
+          return "[]";
+        }
+        return "";
+      });
+      await callTool("gmail_search", { query: "is:unread", max: 5 });
+      const aIdx = capturedArgs.indexOf("-a");
+      expect(aIdx).toBeGreaterThan(-1);
+      expect(capturedArgs[aIdx + 1]).toBe("may@dodihome.com");
+    });
+
+    it("multi-account: explicit `account` overrides the default", async () => {
+      await loadServer({
+        GOG_PATH: "/usr/local/bin/gog",
+        GOG_ACCOUNTS: "may@dodihome.com,may.huang@gmail.com,may@keepur.io",
+      });
+      let capturedArgs: string[] = [];
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("search")) {
+          capturedArgs = args;
+          return "[]";
+        }
+        return "";
+      });
+      await callTool("gmail_search", { query: "is:unread", max: 5, account: "may@keepur.io" });
+      const aIdx = capturedArgs.indexOf("-a");
+      expect(aIdx).toBeGreaterThan(-1);
+      expect(capturedArgs[aIdx + 1]).toBe("may@keepur.io");
+    });
+
+    it("multi-account: `gmail_send` identity line reflects the resolved per-call account", async () => {
+      await loadServer({
+        GOG_PATH: "/usr/local/bin/gog",
+        GOG_ACCOUNTS: "may@dodihome.com,may.huang@gmail.com,may@keepur.io",
+      });
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("send")) return "";
+        return "";
+      });
+      const result = await callTool("gmail_send", {
+        to: "x@y.com",
+        subject: "Hi",
+        body: "Hello",
+        account: "may.huang@gmail.com",
+      });
+      expect(result.content[0].text).toBe("Sent from may.huang@gmail.com.");
+    });
+
+    it("single-account: argv carries `-a <only-account>` even without an explicit param", async () => {
+      await loadServer({
+        GOG_PATH: "/usr/local/bin/gog",
+        GOG_ACCOUNTS: "rae@dodihome.com",
+      });
+      let capturedArgs: string[] = [];
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("search")) {
+          capturedArgs = args;
+          return "[]";
+        }
+        return "";
+      });
+      await callTool("gmail_search", { query: "is:unread", max: 5 });
+      const aIdx = capturedArgs.indexOf("-a");
+      expect(aIdx).toBeGreaterThan(-1);
+      expect(capturedArgs[aIdx + 1]).toBe("rae@dodihome.com");
+    });
+
+    it("no accounts: argv carries no `-a` flag (preserves legacy gog-default behavior)", async () => {
+      await loadServer({ GOG_PATH: "/usr/local/bin/gog", GOG_ACCOUNTS: "" });
+      let capturedArgs: string[] = [];
+      mockExecFileSync.mockImplementation((cmd: any, args: any) => {
+        if (cmd === "which") return "/usr/local/bin/gog\n";
+        if (args?.includes("search")) {
+          capturedArgs = args;
+          return "[]";
+        }
+        return "";
+      });
+      await callTool("gmail_search", { query: "is:unread", max: 5 });
+      expect(capturedArgs).not.toContain("-a");
     });
   });
 });
