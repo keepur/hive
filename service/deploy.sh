@@ -127,10 +127,32 @@ notify() {
     > /dev/null
 }
 
+# log_size_before <log_file>
+# Byte size of the log right now, or 0 if it doesn't exist. Captured
+# immediately before `launchctl bootstrap` so health_check can scan only
+# bytes written by the new boot and ignore any stale "Hive is running"
+# from a prior run.
+log_size_before() {
+  local log_file="$1"
+  if [[ -f "$log_file" ]]; then
+    wc -c < "$log_file" | awk '{print $1}'
+  else
+    echo 0
+  fi
+}
+
+# health_check <log_file> [start_offset]
+# KPR-240: anchor the marker scan to the boot we just kicked off.
+# Reads bytes after $start_offset and succeeds iff "Hive is running"
+# appears after "Hive starting up" in that window. Avoids the tail -5
+# race on busy boots (12 agents + scheduler + memory lifecycle can push
+# the marker out of the last 5 lines within 1s) and refuses to match a
+# stale marker from a previous run.
 health_check() {
   local log_file="$1"
+  local start_offset="${2:-0}"
   if $DRY_RUN; then
-    echo "[DRY RUN] health_check: would check $log_file"
+    echo "[DRY RUN] health_check: would check $log_file (offset $start_offset)"
     return 0
   fi
   for attempt in $(seq 1 "$HEALTH_CHECK_RETRIES"); do
@@ -140,13 +162,27 @@ health_check() {
     fi
     for _ in $(seq 1 "$HEALTH_CHECK_WINDOW"); do
       sleep 1
-      if tail -5 "$log_file" 2>/dev/null | grep -q '"Hive is running"'; then
+      if _scan_new_boot "$log_file" "$start_offset"; then
         return 0
       fi
     done
     echo "  Health check attempt $attempt/$HEALTH_CHECK_RETRIES failed (no 'Hive is running' in last ${HEALTH_CHECK_WINDOW}s)."
   done
   return 1
+}
+
+# _scan_new_boot <log_file> <start_offset>
+# True iff the bytes after $start_offset contain "Hive is running"
+# preceded by "Hive starting up". tail -c +N is 1-indexed: start at byte N.
+_scan_new_boot() {
+  local log_file="$1"
+  local start_offset="$2"
+  [[ -f "$log_file" ]] || return 1
+  tail -c "+$((start_offset + 1))" "$log_file" 2>/dev/null | awk '
+    /"Hive starting up"/ { started = 1; next }
+    started && /"Hive is running"/ { found = 1; exit }
+    END { if (found) exit 0; else exit 1 }
+  '
 }
 
 kill_ports() {
@@ -373,8 +409,10 @@ if $ROLLBACK; then
     notify "Rollback FAILED for \`$id\`: no previous engine (.hive.prev missing)."
     exit 1
   fi
+  health_log="$instance_root/$logs_dir/hive.log"
+  health_offset=$(log_size_before "$health_log")
   run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path"
-  if health_check "$instance_root/$logs_dir/hive.log"; then
+  if health_check "$health_log" "$health_offset"; then
     rollback_version=$(jq -r .version < "$instance_root/.hive/package.json" 2>/dev/null || echo "unknown")
     notify "Rollback succeeded for \`$id\` → \`$rollback_version\`."
     echo "Rollback complete."
@@ -529,11 +567,13 @@ for inst in "${INSTANCES[@]}"; do
   echo "  Swapping engine..."
   swap_engine "$instance_root"
 
+  health_log="$instance_root/$logs_dir/hive.log"
+  health_offset=$(log_size_before "$health_log")
   echo "  Restarting $label..."
   run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path"
 
   echo "  Checking health..."
-  if ! health_check "$instance_root/$logs_dir/hive.log"; then
+  if ! health_check "$health_log" "$health_offset"; then
     echo "  Health check FAILED for $id — rolling back"
     # New engine bound the port and failed health check — bootout it before swap.
     run_cmd launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
