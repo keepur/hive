@@ -865,3 +865,29 @@ describe("MemoryLifecycle sweep relocation (KPR-241)", () => {
     expect(store.getColdByTopicPaged).not.toHaveBeenCalled();
   });
 });
+
+describe("MemoryLifecycle.runConsolidationForAgent (KPR-241)", () => {
+  it("returns drained=true when summarizeColdPhase reports drained", async () => {
+    const { lifecycle } = makeLifecycle();
+    (lifecycle as any).summarizeColdPhase = vi.fn().mockResolvedValue({ summarized: 5, drained: true });
+    (lifecycle as any).mergeDuplicates = vi.fn().mockResolvedValue({ merged: 0 });
+    (lifecycle as any).detectContradictions = vi.fn().mockResolvedValue({ resolved: 0, flagged: 0 });
+    (lifecycle as any).promotePatterns = vi.fn().mockResolvedValue({ promoted: 0 });
+    const result = await lifecycle.runConsolidationForAgent("a1", { maxPages: 50 });
+    expect(result.drained).toBe(true);
+    expect(result.summarized).toBe(5);
+  });
+
+  it("respects maxPages cap when not yet drained", async () => {
+    const { lifecycle } = makeLifecycle();
+    const summarizeStub = vi.fn().mockResolvedValue({ summarized: 5, drained: false });
+    (lifecycle as any).summarizeColdPhase = summarizeStub;
+    (lifecycle as any).mergeDuplicates = vi.fn().mockResolvedValue({ merged: 0 });
+    (lifecycle as any).detectContradictions = vi.fn().mockResolvedValue({ resolved: 0, flagged: 0 });
+    (lifecycle as any).promotePatterns = vi.fn().mockResolvedValue({ promoted: 0 });
+    const result = await lifecycle.runConsolidationForAgent("a1", { maxPages: 3 });
+    expect(summarizeStub).toHaveBeenCalledTimes(3);
+    expect(result.pagesProcessed).toBe(3);
+    expect(result.drained).toBe(false);
+  });
+});

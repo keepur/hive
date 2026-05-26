@@ -299,6 +299,8 @@ async function main(): Promise<void> {
     prefetcher,
     teamRoster,
     prefixCache,
+    undefined,
+    memoryLifecycle,
   );
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(

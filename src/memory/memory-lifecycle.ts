@@ -407,6 +407,84 @@ export class MemoryLifecycle {
   }
 
   /**
+   * KPR-241: operator-callable bounded consolidation run for a single agent.
+   * Loops summarizeColdPhase until the topic backlog is drained, the page
+   * cap is hit, or the budget is exhausted. Then runs the other three
+   * phases (each has its own per-run caps). Returns structured progress.
+   */
+  async runConsolidationForAgent(
+    agentId: string,
+    options: { maxPages: number; maxBudgetUsdOverride?: number },
+  ): Promise<{
+    summarized: number;
+    merged: number;
+    contradictions: number;
+    promoted: number;
+    pagesProcessed: number;
+    drained: boolean;
+    spentUsd: number;
+    errors: string[];
+  }> {
+    if (!this.dreamConfig) {
+      return {
+        summarized: 0, merged: 0, contradictions: 0, promoted: 0,
+        pagesProcessed: 0, drained: true, spentUsd: 0,
+        errors: ["autoDream not configured"],
+      };
+    }
+    const errors: string[] = [];
+    const budget = new AutoDreamBudget(
+      options.maxBudgetUsdOverride ?? this.autoDreamRunBudget(),
+      this.autoDreamCallBudget(),
+    );
+    let summarized = 0, merged = 0, contradictions = 0, promoted = 0, pagesProcessed = 0;
+    let drained = false;
+    const runAt = new Date();
+    try {
+      for (let i = 0; i < options.maxPages && budget.canSpend(); i++) {
+        const state = await this.store.getAutoDreamState(agentId);
+        const r0 = await this.summarizeColdPhase(agentId, budget, state);
+        summarized += r0.summarized;
+        pagesProcessed++;
+        if (r0.drained) { drained = true; break; }
+        if (r0.summarized === 0) {
+          drained = true;
+          break;
+        }
+      }
+      if (budget.canSpend()) {
+        const r1 = await this.mergeDuplicates(agentId, budget);
+        merged += r1.merged;
+      }
+      if (budget.canSpend()) {
+        const r2 = await this.detectContradictions(agentId, budget);
+        contradictions += r2.resolved;
+      }
+      if (budget.canSpend()) {
+        const r3 = await this.promotePatterns(agentId, budget);
+        promoted += r3.promoted;
+      }
+    } catch (err) {
+      errors.push(String(err));
+    } finally {
+      try {
+        await this.store.markAutoDreamRun(agentId, {
+          at: runAt,
+          spentUsd: budget.spentUsd,
+          llmCalls: budget.llmCalls,
+          lastAttemptAt: runAt,
+          lastError: errors.length > 0 ? errors[0] : null,
+          ...(errors.length === 0 ? { lastSuccessAt: runAt } : {}),
+          ...(drained ? { phase: "idle" as const, topic: null, cursor: null } : {}),
+        });
+      } catch (markErr) {
+        log.warn("runConsolidationForAgent markAutoDreamRun failed", { agentId, error: String(markErr) });
+      }
+    }
+    return { summarized, merged, contradictions, promoted, pagesProcessed, drained, spentUsd: budget.spentUsd, errors };
+  }
+
+  /**
    * Find and merge duplicate memories within an agent's hot+warm tiers.
    * Uses Qdrant recommend API to find similar records (cosine > threshold),
    * then Haiku to merge each cluster into a single consolidated record.
