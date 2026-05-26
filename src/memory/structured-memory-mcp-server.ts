@@ -18,6 +18,22 @@ export interface StructuredMemoryTurnContext {
   threadId?: string;
 }
 
+/**
+ * KPR-241: write-time guard thresholds. Defaults are conservative; operators
+ * can tune via hive.yaml memory.writeGuards.*.
+ */
+export interface StructuredMemoryGuardConfig {
+  burst: { enabled: boolean; windowMinutes: number; similarityThreshold: number; topK: number };
+  oversize: { enabled: boolean; maxChars: number };
+  rawDump: { enabled: boolean; jsonTokenThreshold: number; monolithCharThreshold: number };
+}
+
+const GUARD_DEFAULTS: StructuredMemoryGuardConfig = {
+  burst: { enabled: true, windowMinutes: 1440, similarityThreshold: 0.92, topK: 5 },
+  oversize: { enabled: true, maxChars: 6000 },
+  rawDump: { enabled: true, jsonTokenThreshold: 300, monolithCharThreshold: 2000 },
+};
+
 export interface StructuredMemoryToolDeps {
   db: Db;
   agentId: string;
@@ -36,6 +52,8 @@ export interface StructuredMemoryToolDeps {
    * → caller invalidates all.
    */
   onMutate?: (agentId: string | null, reason: string) => void;
+  /** KPR-241: optional write-guard config; defaults to GUARD_DEFAULTS. */
+  guardConfig?: StructuredMemoryGuardConfig;
 }
 
 const VALID_TYPES = ["fact", "task", "interaction", "preference", "decision", "summary"] as const;
@@ -68,14 +86,96 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
         type: z.enum(VALID_TYPES).describe("Memory type: fact, task, interaction, preference, or decision"),
         topic: z.string().describe('Freeform topic tag, e.g. "customer:jones", "project:kitchen-reno"'),
         importance: z.enum(VALID_IMPORTANCE).describe("Importance level: critical, high, medium, or low"),
+        sourceRef: z
+          .string()
+          .optional()
+          .describe(
+            "Pointer to system of record (Linear URL, GitHub link, Slack permalink, CRM record). URL form preferred. Add this when the memory references a fact that lives somewhere authoritative.",
+          ),
       },
-      async ({ content, type, topic, importance }) => {
+      async ({ content, type, topic, importance, sourceRef }) => {
         try {
           await ensureInit();
+          const guard = deps.guardConfig ?? GUARD_DEFAULTS;
+
+          // Oversize guard
+          if (guard.oversize.enabled && content.length > guard.oversize.maxChars) {
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `memory_save error: content too long (${content.length} chars; limit ${guard.oversize.maxChars}). ` +
+                    `Memory should be a digest, not a paste. Break into smaller records with a shared topic, ` +
+                    `or save a digest + sourceRef pointing to the full source.`,
+                },
+              ],
+            };
+          }
+
+          // Raw-fact-dump heuristic
+          if (guard.rawDump.enabled && !sourceRef) {
+            const isJsonLike = /^[{\[]/.test(content.trim());
+            const tokenEst = Math.ceil(content.length / 4);
+            const tableLines = (content.match(/^\s*\|.*\|.*$/gm) ?? []).length;
+            const isMonolith = !content.includes("\n") && content.length > guard.rawDump.monolithCharThreshold;
+            const isJsonDump = isJsonLike && tokenEst > guard.rawDump.jsonTokenThreshold;
+            const isTableDump = tableLines > 3;
+            if (isJsonDump || isTableDump || isMonolith) {
+              return {
+                isError: true,
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      `memory_save error: content looks like a raw dump from an external system. ` +
+                      `Memory should hold a digest plus a sourceRef pointing to the original ` +
+                      `(Linear URL, GitHub link, Slack permalink, CRM record).`,
+                  },
+                ],
+              };
+            }
+          }
+
+          // Burst guard — Qdrant-dependent, fail open on outage.
+          if (guard.burst.enabled) {
+            try {
+              const recentSimilar = await embedder.search(content, agentId, {
+                topic,
+                limit: guard.burst.topK,
+              });
+              const cutoff = Date.now() - guard.burst.windowMinutes * 60_000;
+              for (const sr of recentSimilar) {
+                if (sr.score < guard.burst.similarityThreshold) continue;
+                const existing = await store.getById(new ObjectId(sr.mongoId));
+                if (!existing) continue;
+                if (existing.createdAt.getTime() < cutoff) continue;
+                if (existing.topic !== topic) continue;
+                return {
+                  isError: true,
+                  content: [
+                    {
+                      type: "text",
+                      text:
+                        `memory_save error: too similar to existing record [${existing._id}] in topic "${topic}" ` +
+                        `(similarity ${sr.score.toFixed(2)}). Use memory_update on the existing record, ` +
+                        `or add a sourceRef to distinguish if these are different sources.`,
+                    },
+                  ],
+                };
+              }
+            } catch (err) {
+              // KPR-241: fail open — Qdrant outage skips burst check only, save proceeds.
+              process.stderr.write(`memory_save burst-guard skipped: ${String(err)}\n`);
+            }
+          }
+
+          // All guards passed (or skipped on outage). Save.
           const pointId = crypto.randomUUID();
           const record = await store.save(
             agentId,
-            { content, type: type as MemoryType, topic, importance: importance as MemoryImportance },
+            { content, type: type as MemoryType, topic, importance: importance as MemoryImportance, sourceRef },
             pointId,
             context.current.channelId,
             context.current.threadId,
@@ -125,20 +225,28 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
       async ({ query, type, topic, tier, importance, limit }) => {
         try {
           await ensureInit();
-          const searchResults = await embedder.search(query, agentId, {
-            type: type as MemoryType,
-            topic,
-            tier: tier as MemoryTier,
-            importance: importance as MemoryImportance,
-            limit,
-          });
+          // KPR-241: must_not filter to hide cold from default recall.
+          const extraMustNot = tier === undefined ? [{ key: "tier", match: { value: "cold" } }] : [];
+          const searchResults = await embedder.search(
+            query,
+            agentId,
+            {
+              type: type as MemoryType,
+              topic,
+              tier: tier as MemoryTier,
+              importance: importance as MemoryImportance,
+              limit,
+            },
+            extraMustNot,
+          );
 
           if (searchResults.length === 0) {
             return { content: [{ type: "text", text: "No matching memories found." }] };
           }
 
           const ids = searchResults.map((r) => new ObjectId(r.mongoId));
-          const allRecords = await store.getByIds(ids);
+          // KPR-241: hide summarized originals from normal recall.
+          const allRecords = await store.getByIds(ids, { excludeSummarized: true });
           const recordMap = new Map(allRecords.map((r) => [r._id!.toString(), r]));
 
           const records: string[] = [];
@@ -155,6 +263,9 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
 
           await store.touchAccess(ids);
 
+          if (records.length === 0) {
+            return { content: [{ type: "text", text: "No matching memories found." }] };
+          }
           return { content: [{ type: "text", text: records.join("\n\n---\n\n") }] };
         } catch (err) {
           return { isError: true, content: [{ type: "text", text: `memory_recall error: ${String(err)}` }] };

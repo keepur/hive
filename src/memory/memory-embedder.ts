@@ -97,7 +97,12 @@ export class MemoryEmbedder implements MemoryVectorIndex {
     });
   }
 
-  async search(query: string, agentId: string, filters?: MemoryRecallFilters): Promise<EmbedSearchResult[]> {
+  async search(
+    query: string,
+    agentId: string,
+    filters?: MemoryRecallFilters,
+    extraMustNot: Array<{ key: string; match: { value: string } }> = [],
+  ): Promise<EmbedSearchResult[]> {
     await this.ensureCollection();
     const queryVector = await this.embed(query);
     const limit = filters?.limit ?? 10;
@@ -108,11 +113,14 @@ export class MemoryEmbedder implements MemoryVectorIndex {
     if (filters?.tier) must.push({ key: "tier", match: { value: filters.tier } });
     if (filters?.importance) must.push({ key: "importance", match: { value: filters.importance } });
 
+    const searchFilter: any = { must };
+    if (extraMustNot.length > 0) searchFilter.must_not = extraMustNot;
+
     const results = await this.getClient().search(COLLECTION, {
       vector: queryVector,
       limit,
       with_payload: true,
-      filter: { must },
+      filter: searchFilter,
     });
 
     return results.map((r) => ({

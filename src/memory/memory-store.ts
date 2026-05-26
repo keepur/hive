@@ -182,9 +182,14 @@ export class MemoryStore {
     }));
   }
 
-  async getByIds(ids: ObjectId[]): Promise<MemoryRecord[]> {
+  async getByIds(
+    ids: ObjectId[],
+    options: { excludeSummarized?: boolean } = {},
+  ): Promise<MemoryRecord[]> {
     if (ids.length === 0) return [];
-    return this.collection.find({ _id: { $in: ids }, purged: { $ne: true } }).toArray();
+    const filter: Record<string, unknown> = { _id: { $in: ids }, purged: { $ne: true } };
+    if (options.excludeSummarized) filter.summarized = { $ne: true };
+    return this.collection.find(filter).toArray();
   }
 
   async countNonHot(agentId: string): Promise<number> {
