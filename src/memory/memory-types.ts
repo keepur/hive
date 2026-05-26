@@ -106,6 +106,10 @@ export interface DreamConfig {
   maxCallBudgetUsd?: number;
   /** Legacy per-call budget field; use maxRunBudgetUsd + maxCallBudgetUsd instead. */
   maxBudgetUsd?: number;
+  // KPR-241 additions
+  coldSummaryPageSize?: number;            // default 20
+  coldSummaryPromptTokenBudget?: number;   // default 8000
+  summaryOfSummariesThreshold?: number;    // default 5
 }
 
 export interface DreamResult {
@@ -118,6 +122,7 @@ export interface DreamResult {
   spentUsd?: number;
   budgetUsd?: number;
   llmCalls?: number;
+  summarized?: number; // KPR-241
 }
 
 export const IMPORTANCE_WEIGHTS: Record<MemoryImportance, number> = {
