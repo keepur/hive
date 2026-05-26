@@ -30,7 +30,14 @@ describe("MemoryLifecycleHeartbeat", () => {
     const store = makeStore({
       agentIds: ["a1", "a2"],
       counts: {
-        a1: { hot: 2, warm: 5, cold: 10, summarized: 1, needsReview: 0, oldestCold: [{ createdAt: new Date("2026-04-01") }] },
+        a1: {
+          hot: 2,
+          warm: 5,
+          cold: 10,
+          summarized: 1,
+          needsReview: 0,
+          oldestCold: [{ createdAt: new Date("2026-04-01") }],
+        },
         a2: { hot: 0, warm: 0, cold: 0, summarized: 0, needsReview: 0, oldestCold: [] },
       },
     });

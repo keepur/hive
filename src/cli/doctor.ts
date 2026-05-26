@@ -149,25 +149,22 @@ export function renderMemoryLifecycleSection(
   for (const row of rows) {
     const cons = row.consolidation;
     const staleFlag = row.staleSeconds !== null && row.staleSeconds > 300 ? " ⚠ heartbeat stale" : "";
-    const spendFlag = cons.cumulativeSpentUsd30d > spendWarnUsd
-      ? ` ⚠ spend $${cons.cumulativeSpentUsd30d.toFixed(2)}/30d`
-      : "";
+    const spendFlag =
+      cons.cumulativeSpentUsd30d > spendWarnUsd ? ` ⚠ spend $${cons.cumulativeSpentUsd30d.toFixed(2)}/30d` : "";
     const errFlag = cons.lastError ? ` ⚠ lastError: ${cons.lastError.slice(0, 60)}` : "";
     const oldest = row.oldestColdAgeDays !== null ? ` (oldest ${row.oldestColdAgeDays}d)` : "";
     emit(
       `  ${row.agentId}: hot=${row.counts.hot} warm=${row.counts.warm} cold=${row.counts.cold}${oldest}, ` +
-      `summarized-not-purged=${row.summarizedNotPurged}, needsReview=${row.needsReview}${staleFlag}${spendFlag}${errFlag}`,
+        `summarized-not-purged=${row.summarizedNotPurged}, needsReview=${row.needsReview}${staleFlag}${spendFlag}${errFlag}`,
     );
     if (cons.phase !== "idle") {
-      const cursorStr = cons.cursor?.createdAt
-        ? new Date(cons.cursor.createdAt).toISOString().slice(0, 10)
-        : "—";
+      const cursorStr = cons.cursor?.createdAt ? new Date(cons.cursor.createdAt).toISOString().slice(0, 10) : "—";
       emit(`        phase=${cons.phase} topic="${cons.topic ?? ""}" cursor=${cursorStr}`);
     }
     if (cons.lastSuccessAt) {
       emit(
         `        last success ${cons.lastSuccessAt.toISOString()} | ` +
-        `last attempt ${cons.lastAttemptAt?.toISOString() ?? "—"}`,
+          `last attempt ${cons.lastAttemptAt?.toISOString() ?? "—"}`,
       );
     }
   }

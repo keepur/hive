@@ -116,7 +116,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
 
           // Raw-fact-dump heuristic
           if (guard.rawDump.enabled && !sourceRef) {
-            const isJsonLike = /^[{\[]/.test(content.trim());
+            const isJsonLike = /^[{[]/.test(content.trim());
             const tokenEst = Math.ceil(content.length / 4);
             const tableLines = (content.match(/^\s*\|.*\|.*$/gm) ?? []).length;
             const isMonolith = !content.includes("\n") && content.length > guard.rawDump.monolithCharThreshold;

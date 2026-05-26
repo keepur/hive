@@ -427,8 +427,13 @@ export class MemoryLifecycle {
   }> {
     if (!this.dreamConfig) {
       return {
-        summarized: 0, merged: 0, contradictions: 0, promoted: 0,
-        pagesProcessed: 0, drained: true, spentUsd: 0,
+        summarized: 0,
+        merged: 0,
+        contradictions: 0,
+        promoted: 0,
+        pagesProcessed: 0,
+        drained: true,
+        spentUsd: 0,
         errors: ["autoDream not configured"],
       };
     }
@@ -437,7 +442,11 @@ export class MemoryLifecycle {
       options.maxBudgetUsdOverride ?? this.autoDreamRunBudget(),
       this.autoDreamCallBudget(),
     );
-    let summarized = 0, merged = 0, contradictions = 0, promoted = 0, pagesProcessed = 0;
+    let summarized = 0,
+      merged = 0,
+      contradictions = 0,
+      promoted = 0,
+      pagesProcessed = 0;
     let drained = false;
     const runAt = new Date();
     try {
@@ -446,7 +455,10 @@ export class MemoryLifecycle {
         const r0 = await this.summarizeColdPhase(agentId, budget, state);
         summarized += r0.summarized;
         pagesProcessed++;
-        if (r0.drained) { drained = true; break; }
+        if (r0.drained) {
+          drained = true;
+          break;
+        }
         if (r0.summarized === 0) {
           drained = true;
           break;
@@ -533,7 +545,10 @@ export class MemoryLifecycle {
       const cap = this.dreamConfig?.coldSummaryPromptTokenBudget ?? 8000;
       if (promptTokens > cap) {
         log.warn("autoDream: skipping prompt exceeding token budget", {
-          agentId, phase: "mergeDuplicates", promptTokens, cap,
+          agentId,
+          phase: "mergeDuplicates",
+          promptTokens,
+          cap,
         });
         continue;
       }
@@ -635,7 +650,10 @@ export class MemoryLifecycle {
           const cap = this.dreamConfig?.coldSummaryPromptTokenBudget ?? 8000;
           if (promptTokens > cap) {
             log.warn("autoDream: skipping prompt exceeding token budget", {
-              agentId, phase: "detectContradictions", promptTokens, cap,
+              agentId,
+              phase: "detectContradictions",
+              promptTokens,
+              cap,
             });
             continue;
           }
@@ -706,7 +724,10 @@ export class MemoryLifecycle {
       const cap = this.dreamConfig?.coldSummaryPromptTokenBudget ?? 8000;
       if (promptTokens > cap) {
         log.warn("autoDream: skipping prompt exceeding token budget", {
-          agentId, phase: "promotePatterns", promptTokens, cap,
+          agentId,
+          phase: "promotePatterns",
+          promptTokens,
+          cap,
         });
         continue;
       }
@@ -773,8 +794,8 @@ export class MemoryLifecycle {
     topics.sort(); // deterministic order
 
     // Resume from checkpoint if state matches phase=summarizeCold.
-    const resumeTopic = state?.phase === "summarizeCold" ? state.topic ?? null : null;
-    const resumeCursor = state?.phase === "summarizeCold" ? state.cursor ?? null : null;
+    const resumeTopic = state?.phase === "summarizeCold" ? (state.topic ?? null) : null;
+    const resumeCursor = state?.phase === "summarizeCold" ? (state.cursor ?? null) : null;
     const startIdx = resumeTopic ? Math.max(0, topics.indexOf(resumeTopic)) : 0;
 
     for (let i = startIdx; i < topics.length; i++) {
@@ -792,7 +813,9 @@ export class MemoryLifecycle {
         if (this.estimateTokens(r.content) > promptTokenBudget) {
           await this.store.flagForReview([r._id!]);
           log.warn("autoDream: cold record flagged needsReview (oversized)", {
-            agentId, topic, recordId: r._id!.toString(),
+            agentId,
+            topic,
+            recordId: r._id!.toString(),
           });
           continue;
         }
@@ -843,7 +866,10 @@ export class MemoryLifecycle {
       });
 
       // Mark originals summarized.
-      await this.store.markSummarized(usable.map((r) => r._id!), summaryRecord._id!);
+      await this.store.markSummarized(
+        usable.map((r) => r._id!),
+        summaryRecord._id!,
+      );
 
       // Advance checkpoint.
       const last = usable[usable.length - 1];

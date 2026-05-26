@@ -382,29 +382,49 @@ export const config = {
       burst: {
         enabled: (hive.memory?.writeGuards?.burst?.enabled ?? true) as boolean,
         windowMinutes: parseInt(
-          optional("MEMORY_WRITE_GUARD_BURST_WINDOW_MINUTES",
-            String(hive.memory?.writeGuards?.burst?.windowMinutes ?? 1440)), 10),
+          optional(
+            "MEMORY_WRITE_GUARD_BURST_WINDOW_MINUTES",
+            String(hive.memory?.writeGuards?.burst?.windowMinutes ?? 1440),
+          ),
+          10,
+        ),
         similarityThreshold: parseFloat(
-          optional("MEMORY_WRITE_GUARD_BURST_SIMILARITY",
-            String(hive.memory?.writeGuards?.burst?.similarityThreshold ?? 0.92))),
+          optional(
+            "MEMORY_WRITE_GUARD_BURST_SIMILARITY",
+            String(hive.memory?.writeGuards?.burst?.similarityThreshold ?? 0.92),
+          ),
+        ),
         topK: parseInt(
-          optional("MEMORY_WRITE_GUARD_BURST_TOPK",
-            String(hive.memory?.writeGuards?.burst?.topK ?? 5)), 10),
+          optional("MEMORY_WRITE_GUARD_BURST_TOPK", String(hive.memory?.writeGuards?.burst?.topK ?? 5)),
+          10,
+        ),
       },
       oversize: {
         enabled: (hive.memory?.writeGuards?.oversize?.enabled ?? true) as boolean,
         maxChars: parseInt(
-          optional("MEMORY_WRITE_GUARD_OVERSIZE_MAX_CHARS",
-            String(hive.memory?.writeGuards?.oversize?.maxChars ?? 6000)), 10),
+          optional(
+            "MEMORY_WRITE_GUARD_OVERSIZE_MAX_CHARS",
+            String(hive.memory?.writeGuards?.oversize?.maxChars ?? 6000),
+          ),
+          10,
+        ),
       },
       rawDump: {
         enabled: (hive.memory?.writeGuards?.rawDump?.enabled ?? true) as boolean,
         jsonTokenThreshold: parseInt(
-          optional("MEMORY_WRITE_GUARD_RAWDUMP_JSON_TOKENS",
-            String(hive.memory?.writeGuards?.rawDump?.jsonTokenThreshold ?? 300)), 10),
+          optional(
+            "MEMORY_WRITE_GUARD_RAWDUMP_JSON_TOKENS",
+            String(hive.memory?.writeGuards?.rawDump?.jsonTokenThreshold ?? 300),
+          ),
+          10,
+        ),
         monolithCharThreshold: parseInt(
-          optional("MEMORY_WRITE_GUARD_RAWDUMP_MONOLITH_CHARS",
-            String(hive.memory?.writeGuards?.rawDump?.monolithCharThreshold ?? 2000)), 10),
+          optional(
+            "MEMORY_WRITE_GUARD_RAWDUMP_MONOLITH_CHARS",
+            String(hive.memory?.writeGuards?.rawDump?.monolithCharThreshold ?? 2000),
+          ),
+          10,
+        ),
       },
     },
   },
@@ -480,14 +500,20 @@ export const config = {
       ),
     ),
     coldSummaryPageSize: parseInt(
-      optional("AUTODREAM_COLD_SUMMARY_PAGE_SIZE",
-        String(hive.autoDream?.coldSummaryPageSize ?? 20)), 10),
+      optional("AUTODREAM_COLD_SUMMARY_PAGE_SIZE", String(hive.autoDream?.coldSummaryPageSize ?? 20)),
+      10,
+    ),
     coldSummaryPromptTokenBudget: parseInt(
-      optional("AUTODREAM_COLD_SUMMARY_PROMPT_TOKEN_BUDGET",
-        String(hive.autoDream?.coldSummaryPromptTokenBudget ?? 8000)), 10),
+      optional(
+        "AUTODREAM_COLD_SUMMARY_PROMPT_TOKEN_BUDGET",
+        String(hive.autoDream?.coldSummaryPromptTokenBudget ?? 8000),
+      ),
+      10,
+    ),
     summaryOfSummariesThreshold: parseInt(
-      optional("AUTODREAM_SUMMARY_OF_SUMMARIES_THRESHOLD",
-        String(hive.autoDream?.summaryOfSummariesThreshold ?? 5)), 10),
+      optional("AUTODREAM_SUMMARY_OF_SUMMARIES_THRESHOLD", String(hive.autoDream?.summaryOfSummariesThreshold ?? 5)),
+      10,
+    ),
   },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),

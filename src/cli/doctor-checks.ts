@@ -433,9 +433,10 @@ export async function memoryLifecycleStatsForDoctor(uri: string, dbName: string)
       const cons = doc.consolidation;
       const cursor = cons?.cursor
         ? {
-            createdAt: cons.cursor.createdAt instanceof Date
-              ? cons.cursor.createdAt
-              : new Date(cons.cursor.createdAt as unknown as string),
+            createdAt:
+              cons.cursor.createdAt instanceof Date
+                ? cons.cursor.createdAt
+                : new Date(cons.cursor.createdAt as unknown as string),
             // BSON ObjectId or string — normalize to string for the doctor surface.
             lastId: String((cons.cursor as { lastId: unknown }).lastId ?? ""),
           }

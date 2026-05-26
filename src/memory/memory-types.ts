@@ -107,9 +107,9 @@ export interface DreamConfig {
   /** Legacy per-call budget field; use maxRunBudgetUsd + maxCallBudgetUsd instead. */
   maxBudgetUsd?: number;
   // KPR-241 additions
-  coldSummaryPageSize?: number;            // default 20
-  coldSummaryPromptTokenBudget?: number;   // default 8000
-  summaryOfSummariesThreshold?: number;    // default 5
+  coldSummaryPageSize?: number; // default 20
+  coldSummaryPromptTokenBudget?: number; // default 8000
+  summaryOfSummariesThreshold?: number; // default 5
 }
 
 export interface DreamResult {

@@ -64,15 +64,18 @@ export class MemoryLifecycleHeartbeat {
         memoryCollection.countDocuments({ agentId, tier: "cold", purged: { $ne: true } }),
         memoryCollection.countDocuments({ agentId, summarized: true, purged: { $ne: true } }),
         memoryCollection.countDocuments({ agentId, needsReview: true, purged: { $ne: true } }),
-        memoryCollection.find({ agentId, tier: "cold", purged: { $ne: true } })
-          .sort({ createdAt: 1 }).limit(1).project({ createdAt: 1 }).toArray(),
+        memoryCollection
+          .find({ agentId, tier: "cold", purged: { $ne: true } })
+          .sort({ createdAt: 1 })
+          .limit(1)
+          .project({ createdAt: 1 })
+          .toArray(),
         this.store.getAutoDreamState(agentId),
       ]);
 
-      const oldestColdAgeDays =
-        oldestCold[0]?.createdAt
-          ? Math.floor((updatedAt.getTime() - oldestCold[0].createdAt.getTime()) / (1000 * 60 * 60 * 24))
-          : null;
+      const oldestColdAgeDays = oldestCold[0]?.createdAt
+        ? Math.floor((updatedAt.getTime() - oldestCold[0].createdAt.getTime()) / (1000 * 60 * 60 * 24))
+        : null;
 
       // Derive spend metrics from spendHistory rolling window.
       const history: AutoDreamSpendSample[] = state?.spendHistory ?? [];
@@ -114,9 +117,7 @@ export class MemoryLifecycleHeartbeat {
   start(): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      this.writeOnce().catch((err) =>
-        log.warn("memory-lifecycle heartbeat tick failed", { error: String(err) }),
-      );
+      this.writeOnce().catch((err) => log.warn("memory-lifecycle heartbeat tick failed", { error: String(err) }));
     }, this.intervalMs);
     this.timer.unref?.();
   }

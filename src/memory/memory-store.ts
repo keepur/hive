@@ -48,7 +48,10 @@ export class MemoryStore {
   /** KPR-241: optional vector-index for Qdrant tier sync on transitions. */
   private vectorIndex?: MemoryVectorIndex;
 
-  constructor(private db: Db, vectorIndex?: MemoryVectorIndex) {
+  constructor(
+    private db: Db,
+    vectorIndex?: MemoryVectorIndex,
+  ) {
     this.vectorIndex = vectorIndex;
   }
 
@@ -182,10 +185,7 @@ export class MemoryStore {
     }));
   }
 
-  async getByIds(
-    ids: ObjectId[],
-    options: { excludeSummarized?: boolean } = {},
-  ): Promise<MemoryRecord[]> {
+  async getByIds(ids: ObjectId[], options: { excludeSummarized?: boolean } = {}): Promise<MemoryRecord[]> {
     if (ids.length === 0) return [];
     const filter: Record<string, unknown> = { _id: { $in: ids }, purged: { $ne: true } };
     if (options.excludeSummarized) filter.summarized = { $ne: true };
@@ -279,10 +279,7 @@ export class MemoryStore {
   }
 
   async setTier(id: ObjectId, tier: MemoryTier): Promise<void> {
-    const before = await this.collection.findOne(
-      { _id: id },
-      { projection: { agentId: 1, qdrantPointId: 1 } },
-    );
+    const before = await this.collection.findOne({ _id: id }, { projection: { agentId: 1, qdrantPointId: 1 } });
     await this.collection.updateOne({ _id: id }, { $set: { tier } });
     if (before) {
       this.onMutate?.(before.agentId, "memory-set-tier");

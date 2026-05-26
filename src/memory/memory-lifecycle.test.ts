@@ -88,17 +88,28 @@ function makeLifecycle(dreamOverrides: Partial<DreamConfig> = {}) {
   const store = makeMockStore();
   const embedder = makeMockEmbedder();
   const config: MemoryLifecycleConfig = {
-    hotBudgetTokens: 3000, sweepIntervalHours: 6,
-    hotThreshold: 0.6, warmThreshold: 0.3, recencyHalfLifeDays: 7,
+    hotBudgetTokens: 3000,
+    sweepIntervalHours: 6,
+    hotThreshold: 0.6,
+    warmThreshold: 0.3,
+    recencyHalfLifeDays: 7,
     coldSummaryMinRecords: 1,
-    coldRetentionDays: 90, purgeRetentionDays: 7,
+    coldRetentionDays: 90,
+    purgeRetentionDays: 7,
   };
   const dreamConfig: DreamConfig = {
     enabled: true,
-    cooldownMinutes: 0, similarityThreshold: 0.85, patternMinCount: 3,
-    maxClustersPerRun: 20, maxContradictionPairsPerRun: 30, maxPromotionsPerRun: 2,
-    maxRunBudgetUsd: 1.0, maxCallBudgetUsd: 0.1, minNewMemories: 0,
-    coldSummaryPageSize: 20, coldSummaryPromptTokenBudget: 8000,
+    cooldownMinutes: 0,
+    similarityThreshold: 0.85,
+    patternMinCount: 3,
+    maxClustersPerRun: 20,
+    maxContradictionPairsPerRun: 30,
+    maxPromotionsPerRun: 2,
+    maxRunBudgetUsd: 1.0,
+    maxCallBudgetUsd: 0.1,
+    minNewMemories: 0,
+    coldSummaryPageSize: 20,
+    coldSummaryPromptTokenBudget: 8000,
     ...dreamOverrides,
   };
   const lifecycle = new MemoryLifecycle(store as any, embedder as any, config, dreamConfig);
@@ -799,9 +810,7 @@ describe("MemoryLifecycle.summarizeColdPhase (KPR-241)", () => {
     (store.getAgentIds as any).mockResolvedValue(["a1"]);
     (store.getColdTopics as any).mockResolvedValue(["topic-a"]);
     const recs = [0, 1, 2, 3, 4].map((i) => makeColdRecord(i, "topic-a"));
-    (store.getColdByTopicPaged as any)
-      .mockResolvedValueOnce(recs)
-      .mockResolvedValueOnce([]);
+    (store.getColdByTopicPaged as any).mockResolvedValueOnce(recs).mockResolvedValueOnce([]);
     await lifecycle.dream();
     const pagedCalls = (store.getColdByTopicPaged as any).mock.calls;
     expect(pagedCalls[0][3]).toBe(5);
@@ -823,15 +832,14 @@ describe("MemoryLifecycle.summarizeColdPhase (KPR-241)", () => {
 
   it("flags oversized records needsReview and continues with remaining records", async () => {
     const { lifecycle, store } = makeLifecycle({
-      coldSummaryPageSize: 10, coldSummaryPromptTokenBudget: 100,
+      coldSummaryPageSize: 10,
+      coldSummaryPromptTokenBudget: 100,
     });
     (store.getAgentIds as any).mockResolvedValue(["a1"]);
     (store.getColdTopics as any).mockResolvedValue(["topic-a"]);
     const huge = makeColdRecord(0, "topic-a", "x".repeat(5000));
     const normals = [1, 2, 3, 4].map((i) => makeColdRecord(i, "topic-a", "ok"));
-    (store.getColdByTopicPaged as any)
-      .mockResolvedValueOnce([huge, ...normals])
-      .mockResolvedValueOnce([]);
+    (store.getColdByTopicPaged as any).mockResolvedValueOnce([huge, ...normals]).mockResolvedValueOnce([]);
     await lifecycle.dream();
     expect(store.flagForReview).toHaveBeenCalledWith([huge._id]);
     expect(store.markSummarized).toHaveBeenCalled();
@@ -844,9 +852,7 @@ describe("MemoryLifecycle.summarizeColdPhase (KPR-241)", () => {
     (store.getAgentIds as any).mockResolvedValue(["a1"]);
     (store.getColdTopics as any).mockResolvedValue(["topic-a"]);
     const page = [makeColdRecord(0, "topic-a"), makeColdRecord(1, "topic-a"), makeColdRecord(2, "topic-a")];
-    (store.getColdByTopicPaged as any)
-      .mockResolvedValueOnce(page)
-      .mockResolvedValueOnce([]);
+    (store.getColdByTopicPaged as any).mockResolvedValueOnce(page).mockResolvedValueOnce([]);
     await lifecycle.dream();
     const cursorCall = (store.markAutoDreamRun as any).mock.calls.find((c: any) => c[1].phase === "summarizeCold");
     expect(cursorCall).toBeDefined();

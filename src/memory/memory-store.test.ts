@@ -18,7 +18,9 @@ const mockToArray = vi.fn().mockResolvedValue([]);
 const mockLimit = vi.fn().mockReturnValue({ toArray: mockToArray });
 const mockProject = vi.fn().mockReturnValue({ toArray: mockToArray });
 const mockSort = vi.fn().mockReturnValue({ toArray: mockToArray, limit: mockLimit, project: mockProject });
-const mockFind = vi.fn().mockReturnValue({ toArray: mockToArray, sort: mockSort, project: mockProject, limit: mockLimit });
+const mockFind = vi
+  .fn()
+  .mockReturnValue({ toArray: mockToArray, sort: mockSort, project: mockProject, limit: mockLimit });
 const mockFindOne = vi.fn().mockResolvedValue(null);
 const mockInsertOne = vi.fn().mockResolvedValue({ insertedId: new ObjectId() });
 const mockUpdateOne = vi.fn().mockResolvedValue({ modifiedCount: 1 });
@@ -530,7 +532,10 @@ describe("MemoryStore.markAutoDreamRun options-object (KPR-241)", () => {
     const updateCall = mockUpdateOne.mock.calls[0];
     expect(updateCall[0]).toEqual({ _id: "a1" });
     expect(updateCall[1].$set).toMatchObject({
-      phase: "summarizeCold", topic: "t", cursor, lastError: "boom",
+      phase: "summarizeCold",
+      topic: "t",
+      cursor,
+      lastError: "boom",
     });
     expect(updateCall[2]).toMatchObject({ upsert: true });
   });

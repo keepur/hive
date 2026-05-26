@@ -53,7 +53,13 @@ describe("MemoryEmbedder.upsert truncation (KPR-241)", () => {
     (embedder as any).embed = vi.fn().mockResolvedValue([0.1, 0.2]);
     (embedder as any).collectionReady = true;
     await embedder.upsert("p1", "short content", {
-      agentId: "a", mongoId: "m", type: "fact", topic: "t", tier: "hot", importance: "medium", createdAt: 1,
+      agentId: "a",
+      mongoId: "m",
+      type: "fact",
+      topic: "t",
+      tier: "hot",
+      importance: "medium",
+      createdAt: 1,
     });
     const upsertCall = upsertSpy.mock.calls[0][1];
     expect(upsertCall.points[0].payload.truncated).toBeUndefined();
@@ -68,7 +74,13 @@ describe("MemoryEmbedder.upsert truncation (KPR-241)", () => {
     (embedder as any).collectionReady = true;
     const longContent = "x".repeat(7000);
     await embedder.upsert("p1", longContent, {
-      agentId: "a", mongoId: "m", type: "fact", topic: "t", tier: "hot", importance: "medium", createdAt: 1,
+      agentId: "a",
+      mongoId: "m",
+      type: "fact",
+      topic: "t",
+      tier: "hot",
+      importance: "medium",
+      createdAt: 1,
     });
     expect(embedSpy.mock.calls[0][0].length).toBeLessThanOrEqual(6100);
     expect(upsertSpy.mock.calls[0][1].points[0].payload.truncated).toBe(true);

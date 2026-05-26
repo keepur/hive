@@ -802,7 +802,10 @@ export function buildAdminTools(deps: AdminToolDeps) {
       {
         agentId: z.string().describe("Agent to consolidate"),
         maxPages: z.number().optional().describe("Cap on pages processed this run across all phases (default 50)"),
-        maxBudgetUsdOverride: z.number().optional().describe("Per-run USD budget cap (defaults to config.autoDream.maxRunBudgetUsd)"),
+        maxBudgetUsdOverride: z
+          .number()
+          .optional()
+          .describe("Per-run USD budget cap (defaults to config.autoDream.maxRunBudgetUsd)"),
       },
       async ({ agentId: targetAgentId, maxPages, maxBudgetUsdOverride }) => {
         if (!deps.memoryLifecycle) {

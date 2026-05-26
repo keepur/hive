@@ -445,11 +445,9 @@ async function main(): Promise<void> {
   // KPR-241: memory-lifecycle stats heartbeat. Same cadence + pattern as
   // SpawnCoordinatorHeartbeat. `telemetryCollection` is the existing local
   // ref; do not re-call db.collection("telemetry").
-  const memoryLifecycleHeartbeat = new MemoryLifecycleHeartbeat(
-    memoryStore,
-    telemetryCollection,
-    { getActiveAgentIds: async () => new Set(registry!.listIds()) },
-  );
+  const memoryLifecycleHeartbeat = new MemoryLifecycleHeartbeat(memoryStore, telemetryCollection, {
+    getActiveAgentIds: async () => new Set(registry!.listIds()),
+  });
   await memoryLifecycleHeartbeat.writeOnce();
   memoryLifecycleHeartbeat.start();
 
