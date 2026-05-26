@@ -42,7 +42,7 @@ export interface InstanceCapabilities {
  * like memory, slack, callback, background, etc.).
  */
 const SERVER_CREDENTIAL_CHECKS: Record<string, () => boolean> = {
-  google: () => Object.keys(config.google?.accounts ?? {}).length > 0 || !!config.google?.account,
+  google: () => Object.keys(config.google?.accounts ?? {}).length > 0,
   resend: () => !!config.resend?.apiKey,
   "brave-search": () => !!config.brave?.apiKey,
   linear: () => !!config.linear?.apiKey,

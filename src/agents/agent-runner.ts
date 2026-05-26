@@ -499,22 +499,26 @@ export class AgentRunner {
       },
     };
 
-    // Google MCP server — Gmail + Calendar via gog CLI
-    // Per-agent account from google.accounts map, falls back to global google.account
-    const gogAccount = config.google.accounts[this.agentConfig.id] || config.google.account;
-    const gogClient = config.google.client;
-    servers["google"] = {
-      type: "stdio",
-      command: "node",
-      args: [mcpPath("google/google-mcp-server.js")],
-      env: {
-        ...(gogAccount ? { GOG_ACCOUNT: gogAccount } : {}),
-        ...(gogClient ? { GOG_CLIENT: gogClient } : {}),
-        DRIVE_SHARED_FOLDER: config.google.sharedFolder,
-        INSTANCE_ID: config.instance.id,
-        PATH: process.env.PATH ?? "",
-      },
-    };
+    // Google MCP server — Gmail + Calendar + Drive via gog CLI.
+    // KPR-242: per-agent account list; if no entry, Google MCP isn't wired up for this agent.
+    // First account in the list is the implicit default; the MCP surfaces `account` as a tool
+    // parameter only when the list has 2+ entries (avoids prompt-cache churn for single-account agents).
+    const gogAccounts = config.google.accounts[this.agentConfig.id] ?? [];
+    if (gogAccounts.length > 0) {
+      const gogClient = config.google.client;
+      servers["google"] = {
+        type: "stdio",
+        command: "node",
+        args: [mcpPath("google/google-mcp-server.js")],
+        env: {
+          GOG_ACCOUNTS: gogAccounts.join(","),
+          ...(gogClient ? { GOG_CLIENT: gogClient } : {}),
+          DRIVE_SHARED_FOLDER: config.google.sharedFolder,
+          INSTANCE_ID: config.instance.id,
+          PATH: process.env.PATH ?? "",
+        },
+      };
+    }
 
     // Quo MCP server — SMS, calls, contacts via Quo (OpenPhone) API
     if (config.quo.apiKey) {

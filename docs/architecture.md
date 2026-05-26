@@ -15,7 +15,7 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Agent manager (spawn coordinator: per-thread lock + per-agent budget)
             ↓
-       Provider adapter (Claude production implementation; OpenAI/Gemini pilots are direct-call only)
+       Provider adapter (selected from the agent's model string)
             ↓
        Tool transport inventory → future provider-specific tool bridge
             ↓
@@ -24,7 +24,7 @@ Slack / SMS / WebSocket / scheduler
        Response → channel adapter → delivery
 ```
 
-A single hive process serves multiple agents and multiple channels. Each agent's work runs as a fresh Claude Code session per inbound work item, with a configured set of MCP server subprocesses scoped to it. `AgentManager` hands a one-turn request to a provider adapter; production selection is still Claude-only, delegating to the existing `AgentRunner`/Claude Agent SDK path. KPR-232 adds a provider-neutral tool transport inventory for compatibility planning. KPR-233 adds a tool-free OpenAI Agents SDK pilot adapter, and KPR-234 adds a tool-free Gemini ADK pilot adapter. Both can be instantiated directly by pilot code, but Slack/SMS/WebSocket/voice turns do not select them. Claude still receives the direct SDK MCP wiring. A new `AgentRunner` instance is constructed per spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
+A single hive process serves multiple agents and multiple channel adapters. Inbound work from Slack, SMS, WebSocket, scheduler, voice, or other sources is normalized into a `WorkItem`, then routed to an agent. Provider/model selection is derived from that selected agent's `model` string: unprefixed models use Claude, while provider-prefixed models such as `codex/...`, `openai/...`, or `gemini/...` select the matching adapter. Claude still receives the direct SDK MCP wiring; non-Claude adapters remain tool-free until the provider tool bridge lands. A new `AgentRunner` instance is constructed per Claude spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
 
 The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, threadId)`, per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface used by `hive doctor`, the Slack health report, and the WebSocket agent roster.
 
@@ -40,7 +40,7 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
 - `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
 - `src/agents/agent-manager.ts` — spawn coordinator: lock, budget, ticket lifecycle, reflection scheduler, snapshot surface.
-- `src/agents/provider-adapters/` — one-turn provider boundary and tool transport classification. Runtime channel traffic remains Claude-only: `ClaudeAgentAdapter` delegates to `AgentRunner`; no config or schema provider selection exists yet. `OpenAIAgentsAdapter` is a direct-call, tool-free pilot that uses the OpenAI Agents SDK and relies on the SDK's standard `OPENAI_API_KEY` environment/configuration path when making real calls. `GeminiAdkAdapter` is a direct-call, tool-free pilot that uses Google ADK's in-memory ephemeral runner path and relies on ADK/Google GenAI standard environment configuration for real calls.
+- `src/agents/provider-adapters/` — one-turn provider boundary and tool transport classification. `AgentManager` selects the adapter from the selected agent's `model` string: Claude by default, or provider-prefixed `codex/...`, `openai/...`, and `gemini/...` models for the non-Claude adapters. `ClaudeAgentAdapter` delegates to `AgentRunner`; `OpenAIAgentsAdapter`, `GeminiAdkAdapter`, and `CodexSubscriptionAdapter` are tool-free provider paths until the tool bridge lands.
 - `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes the coordinator snapshot to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent for the doctor to read.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
 - `src/agents/model-router.ts` — Haiku/Sonnet classification.

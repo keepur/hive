@@ -21,6 +21,42 @@ function optional(key: string, fallback: string): string {
   return process.env[key] || fromKeychain(key) || fallback;
 }
 
+/**
+ * Normalize `hive.google.accounts` to `Record<string, string[]>`.
+ * Accepts string (single account) or string[] (multi-account) per agent.
+ * Filters out falsy/empty values; preserves declaration order (first = default).
+ * Explicitly rejects array inputs — YAML maps can't produce arrays at this
+ * position, but the typed input is `unknown` so guard against stringly-keyed
+ * garbage if a future caller hands us `[]` or `[["agent", "email"]]`.
+ */
+export function normalizeGoogleAccounts(raw: unknown): Record<string, string[]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, string[]> = {};
+  for (const [agentId, val] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof val === "string" && val.trim()) {
+      out[agentId] = [val.trim()];
+    } else if (Array.isArray(val)) {
+      const list = val.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
+      if (list.length > 0) out[agentId] = list;
+    }
+  }
+  return out;
+}
+
+/**
+ * KPR-242: warn once at config load if hive.yaml still carries the deprecated
+ * `google.account` field. Exported so unit tests can exercise it directly.
+ */
+export function warnIfLegacyGoogleAccount(rawHive: Record<string, unknown> | undefined): void {
+  const g = rawHive?.google;
+  if (g && typeof g === "object" && "account" in g) {
+    console.warn(
+      "[config] `google.account` is deprecated and unused; " +
+        "use `google.accounts.<agentId>` (string for single account, string[] for multi-account) to grant Google access per agent.",
+    );
+  }
+}
+
 /** Auto-discover all plugin dirs under <engineDir>/plugins/claude-code/, or use explicit list from hive.yaml */
 function discoverPluginDirs(yamlDirs?: string[]): string[] {
   // Explicit list in hive.yaml takes precedence
@@ -41,6 +77,8 @@ let hive: Record<string, any> = {};
 if (existsSync(hiveConfigPath)) {
   hive = parseYaml(readFileSync(hiveConfigPath, "utf-8")) ?? {};
 }
+
+warnIfLegacyGoogleAccount(hive);
 
 const home = process.env.HOME ?? "/tmp";
 
@@ -148,9 +186,8 @@ export const config = {
   },
   defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
   google: {
-    account: optional("GOOGLE_ACCOUNT", hive.google?.account ?? ""),
     client: optional("GOG_CLIENT", hive.google?.client ?? ""),
-    accounts: (hive.google?.accounts ?? {}) as Record<string, string>,
+    accounts: normalizeGoogleAccounts(hive.google?.accounts),
     sharedFolder: optional(
       "DRIVE_SHARED_FOLDER",
       hive.google?.sharedFolder ?? hive.googleWorkspace?.sharedFolder ?? "",

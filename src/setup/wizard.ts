@@ -85,7 +85,8 @@ function saveEnv(env: Record<string, string>) {
     { header: "# Slack", keys: ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_MCP_TOKEN"] },
     { header: "# Anthropic", keys: ["ANTHROPIC_API_KEY"] },
     { header: "# SMS (Quo/OpenPhone)", keys: ["QUO_API_KEY", "QUO_PHONE_NUMBER_ID"] },
-    { header: "# Google", keys: ["GOOGLE_ACCOUNT"] },
+    // KPR-242: Google account assignment now lives in hive.yaml under `google.accounts.<agent>`.
+    // No env keys to write here, but the Google setup block (below) still runs gog auth verification.
     { header: "# Project Management", keys: ["LINEAR_API_KEY", "CLICKUP_API_TOKEN"] },
     { header: "# External Communications", keys: ["EXTERNAL_COMMS_ENABLED"] },
   ];
@@ -339,18 +340,23 @@ export async function runWizard(targetDir: string, templatesDir: string, pkgRoot
         }
       }
 
-      // Set primary account
-      env.GOOGLE_ACCOUNT = await ask("Primary Google account for Hive", env.GOOGLE_ACCOUNT || "");
-
-      // Verify it works
-      if (env.GOOGLE_ACCOUNT) {
+      // KPR-242: Google access is per-agent via hive.yaml `google.accounts.<agent-id>`.
+      // The wizard verifies gog auth for one account but does not persist it to .env.
+      const verifyAccount = await ask(
+        "Primary Google account to verify gog auth (you'll wire per-agent assignments in hive.yaml later)",
+        "",
+      );
+      if (verifyAccount) {
         try {
           execFileSync(
             "gog",
-            ["gmail", "search", "is:unread", "-a", env.GOOGLE_ACCOUNT, "--json", "--results-only", "--no-input"],
+            ["gmail", "search", "is:unread", "-a", verifyAccount, "--json", "--results-only", "--no-input"],
             { encoding: "utf-8", timeout: 15_000 },
           );
-          console.log(`  ✓ Gmail access verified for ${env.GOOGLE_ACCOUNT}`);
+          console.log(`  ✓ Gmail access verified for ${verifyAccount}`);
+          console.log(
+            `  → Next: add this account to hive.yaml under \`google.accounts.<agent-id>\` for any agent that should reach it.`,
+          );
         } catch {
           console.log(`  ⚠ Could not verify Gmail access — check authentication later`);
         }

@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("../config.js", () => ({
   config: {
     instance: { id: "test-instance" },
-    google: { accounts: { "user@example.com": "token" }, account: "" },
+    google: { accounts: { mokie: ["mokie@example.com"] } },
     resend: { apiKey: "rk_test" },
     brave: { apiKey: "" },
     linear: { apiKey: "lin_test" },

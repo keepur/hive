@@ -122,8 +122,9 @@ export const CREDENTIAL_REGISTRY: CredentialEntry[] = [
     fields: [],
     oauthInstructions:
       "Google access uses OAuth, not an API key. After setup, run `gog auth add <your-account@gmail.com>` " +
-      "to authenticate one or more accounts, then set `GOOGLE_ACCOUNT` (or `google.accounts.<agent-id>` " +
-      "in hive.yaml) so agents know which mailbox to use.",
+      "to authenticate one or more accounts, then assign them in hive.yaml under " +
+      "`google.accounts.<agent-id>` — a string for a single account, a list for multi-account agents " +
+      "(first entry is the default).",
   },
 ];
 
