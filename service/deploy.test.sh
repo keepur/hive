@@ -65,11 +65,15 @@ echo '{"name":"@keepur/hive","version":"0.2.0-dev"}' > "$BUILD_DIR/package.json"
 # function bodies via sed and source them in isolation. The inner `/!p` drops
 # the closing delimiter line so we don't capture the `if $ROLLBACK; then` line
 # (which would trip set -u on undefined ROLLBACK when sourced).
-sed -n '/^# --- Engine fetch\/swap\/rollback/,/^# --- Short-circuit:/{/^# --- Short-circuit:/!p;}' \
+sed -n '/^# --- Helpers ---/,/^# --- Short-circuit:/{/^# --- Short-circuit:/!p;}' \
   "$SCRIPT_DIR/deploy.sh" > "$TESTROOT/helpers.sh"
 # Helper bodies reference $DRY_RUN (added so --dry-run skips the destructive
 # ops); set it false here so the helpers actually execute under set -u.
 DRY_RUN=false
+# Keep health_check's retry/window/wait small so the new tests don't burn 90s.
+HEALTH_CHECK_RETRIES=1
+HEALTH_CHECK_WINDOW=2
+HEALTH_CHECK_WAIT_BETWEEN=0
 # shellcheck source=/dev/null
 source "$TESTROOT/helpers.sh"
 
@@ -202,6 +206,90 @@ rm -rf "$DEPLOY_DIR"
 mkdir -p "$DEPLOY_DIR/.hive.next"  # empty dir, no package.json
 if install_engine_deps "$DEPLOY_DIR" >/dev/null 2>&1; then
   echo "FAIL: install_engine_deps should have errored without package.json"
+  exit 1
+fi
+
+# --- Health-check tests (KPR-240) ---
+# Anchor the marker scan to a captured byte offset so a busy boot logging
+# many lines after "Hive is running" can't be falsely flagged failed, and
+# so a stale marker from a previous run can't be falsely flagged healthy.
+LOG_DIR=$(mktemp -d -t hive-health-test.XXXXXX)
+trap 'rm -rf "$TESTROOT" "$LOG_DIR"' EXIT
+
+# --- Test 11: busy boot logs many lines after marker, still passes ---
+echo "test 11: busy boot passes despite marker scrolling out of tail -5"
+LOG_FILE="$LOG_DIR/hive-busy.log"
+: > "$LOG_FILE"
+OFFSET=$(log_size_before "$LOG_FILE")
+# Simulate the new boot: starting marker, running marker, then a flood of
+# log lines (12 agents + scheduler + memory lifecycle) that pushes the
+# marker far out of `tail -5`.
+{
+  echo '{"ts":"2026-05-25T00:00:00Z","level":"info","component":"hive","msg":"Hive starting up","instance":"test"}'
+  echo '{"ts":"2026-05-25T00:00:00Z","level":"info","component":"hive","msg":"Hive is running"}'
+  for i in $(seq 1 50); do
+    echo '{"ts":"2026-05-25T00:00:00Z","level":"info","component":"agent","msg":"agent-'"$i"' ready"}'
+  done
+} >> "$LOG_FILE"
+if ! health_check "$LOG_FILE" "$OFFSET" >/dev/null; then
+  echo "FAIL: healthy boot with flood after marker should pass"
+  exit 1
+fi
+# Sanity: with the legacy tail -5 strategy this would have failed.
+if tail -5 "$LOG_FILE" | grep -q '"Hive is running"'; then
+  echo "FAIL: tail -5 unexpectedly still contains the marker — test setup wrong"
+  exit 1
+fi
+
+# --- Test 12: genuine boot failure (never reaches marker) fails ---
+echo "test 12: genuine boot failure fails health_check"
+LOG_FILE="$LOG_DIR/hive-fail.log"
+: > "$LOG_FILE"
+OFFSET=$(log_size_before "$LOG_FILE")
+{
+  echo '{"ts":"2026-05-25T00:00:00Z","level":"info","component":"hive","msg":"Hive starting up","instance":"test"}'
+  echo '{"ts":"2026-05-25T00:00:00Z","level":"error","component":"hive","msg":"Mongo unreachable, exiting"}'
+} >> "$LOG_FILE"
+if health_check "$LOG_FILE" "$OFFSET" >/dev/null 2>&1; then
+  echo "FAIL: boot that never reached 'Hive is running' should fail"
+  exit 1
+fi
+
+# --- Test 13: stale "Hive is running" before offset is ignored ---
+echo "test 13: stale marker from previous boot is not matched"
+LOG_FILE="$LOG_DIR/hive-stale.log"
+: > "$LOG_FILE"
+# Previous boot: full happy-path markers land in the file.
+{
+  echo '{"ts":"2026-05-24T00:00:00Z","level":"info","component":"hive","msg":"Hive starting up","instance":"test"}'
+  echo '{"ts":"2026-05-24T00:00:00Z","level":"info","component":"hive","msg":"Hive is running"}'
+} >> "$LOG_FILE"
+# Capture offset AFTER the prior boot's markers — mimics the deploy.sh
+# call site that snapshots wc -c right before launchctl bootstrap.
+OFFSET=$(log_size_before "$LOG_FILE")
+# New boot crashes before "Hive is running". The stale marker is still
+# physically in the log, but past start_offset there is no marker.
+{
+  echo '{"ts":"2026-05-25T00:00:00Z","level":"info","component":"hive","msg":"Hive starting up","instance":"test"}'
+  echo '{"ts":"2026-05-25T00:00:00Z","level":"error","component":"hive","msg":"crashed"}'
+} >> "$LOG_FILE"
+if health_check "$LOG_FILE" "$OFFSET" >/dev/null 2>&1; then
+  echo "FAIL: stale marker from previous boot should not satisfy health_check"
+  exit 1
+fi
+
+# --- Test 14: log file absent at start (fresh install), then created ---
+echo "test 14: missing log at offset capture, populated by boot, passes"
+LOG_FILE="$LOG_DIR/hive-fresh.log"
+# No file yet — offset is 0 by contract.
+OFFSET=$(log_size_before "$LOG_FILE")
+[[ "$OFFSET" == "0" ]] || { echo "FAIL: log_size_before should return 0 for missing file (got '$OFFSET')"; exit 1; }
+{
+  echo '{"ts":"2026-05-25T00:00:00Z","level":"info","component":"hive","msg":"Hive starting up","instance":"test"}'
+  echo '{"ts":"2026-05-25T00:00:00Z","level":"info","component":"hive","msg":"Hive is running"}'
+} > "$LOG_FILE"
+if ! health_check "$LOG_FILE" "$OFFSET" >/dev/null; then
+  echo "FAIL: fresh-install boot should pass health_check"
   exit 1
 fi
 
