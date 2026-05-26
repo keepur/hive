@@ -47,6 +47,7 @@ import { setGeminiApiKey } from "./files/file-processor.js";
 import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
+import { MemoryLifecycleHeartbeat } from "./memory/memory-lifecycle-heartbeat.js";
 import { AdminApi } from "./admin/admin-api.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
@@ -202,7 +203,10 @@ async function main(): Promise<void> {
   });
 
   // Structured memory lifecycle — always enabled
-  const memoryStore = new MemoryStore(db);
+  // KPR-241: embedder constructed before store so it can be injected as the
+  // MemoryVectorIndex implementation for tier-sync on setTier/setTierBulk.
+  const memoryEmbedder = new MemoryEmbedder();
+  const memoryStore = new MemoryStore(db, memoryEmbedder);
   await memoryStore.init();
   memoryManager.memoryStore = memoryStore;
   // KPR-213: structured-memory mutations from autoDream lifecycle and the
@@ -213,7 +217,6 @@ async function main(): Promise<void> {
     if (agentId === null) prefixCache.invalidateAll(reason);
     else prefixCache.invalidateAgent(agentId, reason);
   });
-  const memoryEmbedder = new MemoryEmbedder();
   const memoryLifecycle = new MemoryLifecycle(
     memoryStore,
     memoryEmbedder,
@@ -438,6 +441,17 @@ async function main(): Promise<void> {
   const spawnCoordinatorHeartbeat = new SpawnCoordinatorHeartbeat(agentManager, telemetryCollection);
   await spawnCoordinatorHeartbeat.writeOnce();
   spawnCoordinatorHeartbeat.start();
+
+  // KPR-241: memory-lifecycle stats heartbeat. Same cadence + pattern as
+  // SpawnCoordinatorHeartbeat. `telemetryCollection` is the existing local
+  // ref; do not re-call db.collection("telemetry").
+  const memoryLifecycleHeartbeat = new MemoryLifecycleHeartbeat(
+    memoryStore,
+    telemetryCollection,
+    { getActiveAgentIds: async () => new Set(registry!.listIds()) },
+  );
+  await memoryLifecycleHeartbeat.writeOnce();
+  memoryLifecycleHeartbeat.start();
 
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
@@ -724,6 +738,7 @@ async function main(): Promise<void> {
     await prefetcher?.close();
     meetingMonitor?.stop();
     spawnCoordinatorHeartbeat.stop();
+    memoryLifecycleHeartbeat.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
     contactsWatcher.stop();
     if (activityLogger) await activityLogger.stop();
