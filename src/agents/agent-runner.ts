@@ -53,6 +53,7 @@ import { createTeamMcpServer } from "../team/team-mcp-server.js";
 import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
+import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
 
 /**
@@ -291,6 +292,7 @@ export class AgentRunner {
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
   private teamMcpServer?: ReturnType<typeof createTeamMcpServer>;
   private adminMcpServer?: ReturnType<typeof createAdminMcpServer>;
+  private memoryLifecycle?: MemoryLifecycle;
   private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
   private workflowMcpServer?: ReturnType<typeof createWorkflowMcpServer>;
   private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
@@ -299,7 +301,7 @@ export class AgentRunner {
   // call (no cache) so per-test isolation isn't a concern.
   private prefixCache?: PrefixCache;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache, memoryLifecycle?: MemoryLifecycle) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
@@ -309,6 +311,7 @@ export class AgentRunner {
     this.teamRoster = teamRoster;
     this.db = db;
     this.prefixCache = prefixCache;
+    this.memoryLifecycle = memoryLifecycle;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
@@ -1557,6 +1560,7 @@ export class AgentRunner {
           db: this.db,
           agentId: this.agentConfig.id,
           instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
+          memoryLifecycle: this.memoryLifecycle,
         });
       }
       mcpServers["admin"] = this.adminMcpServer;

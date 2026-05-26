@@ -4,6 +4,23 @@ export type MemoryType = "fact" | "task" | "interaction" | "preference" | "decis
 export type MemoryImportance = "critical" | "high" | "medium" | "low";
 export type MemoryTier = "hot" | "warm" | "cold";
 
+export type ConsolidationPhase =
+  | "idle"
+  | "summarizeCold"
+  | "mergeDuplicates"
+  | "detectContradictions"
+  | "promotePatterns";
+
+export interface ConsolidationCursor {
+  createdAt: Date;
+  lastId: ObjectId;
+}
+
+export interface AutoDreamSpendSample {
+  at: Date;
+  spentUsd: number;
+}
+
 export interface MemoryRecord {
   _id?: ObjectId;
   agentId: string;
@@ -27,6 +44,7 @@ export interface MemoryRecord {
   purged?: boolean;
   purgedAt?: Date;
   needsReview?: boolean; // Contradiction detection couldn't resolve automatically
+  sourceRef?: string; // Freeform pointer to system of record. URL form preferred.
 }
 
 export interface MemoryRecordInput {
@@ -34,6 +52,7 @@ export interface MemoryRecordInput {
   type: MemoryType;
   topic: string;
   importance: MemoryImportance;
+  sourceRef?: string;
 }
 
 export interface MemoryRecallFilters {
@@ -87,6 +106,9 @@ export interface DreamConfig {
   maxCallBudgetUsd?: number;
   /** Legacy per-call budget field; use maxRunBudgetUsd + maxCallBudgetUsd instead. */
   maxBudgetUsd?: number;
+  // KPR-241 additions
+  coldSummaryPageSize?: number; // default 20
+  coldSummaryPromptTokenBudget?: number; // default 8000
 }
 
 export interface DreamResult {
@@ -99,6 +121,7 @@ export interface DreamResult {
   spentUsd?: number;
   budgetUsd?: number;
   llmCalls?: number;
+  summarized?: number; // KPR-241
 }
 
 export const IMPORTANCE_WEIGHTS: Record<MemoryImportance, number> = {

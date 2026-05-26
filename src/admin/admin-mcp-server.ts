@@ -75,6 +75,8 @@ const FALLBACK_CAPABILITIES: InstanceCapabilities = {
 export interface AdminToolDeps {
   db: Db;
   agentId: string;
+  /** KPR-241: shared memory lifecycle instance for the consolidation tool. */
+  memoryLifecycle?: import("../memory/memory-lifecycle.js").MemoryLifecycle;
   /**
    * JSON-encoded `InstanceCapabilities`. Constructor-stable on AgentRunner —
    * derived from `buildInstanceCapabilities(plugins)` once per runner.
@@ -790,6 +792,53 @@ export function buildAdminTools(deps: AdminToolDeps) {
         } catch {
           return {
             content: [{ type: "text", text: JSON.stringify({ exists: false, isDirectory: false, resolved }) }],
+          };
+        }
+      },
+    ),
+    tool(
+      "memory_lifecycle_run_consolidation",
+      "Run a bounded memory-lifecycle consolidation pass for one agent. Use to drain a large cold backlog faster than normal sweep cadence. Each invocation processes at most `maxPages` pages across all phases, bounded by the configured run budget. Returns structured progress info.",
+      {
+        agentId: z.string().describe("Agent to consolidate"),
+        maxPages: z.number().optional().describe("Cap on pages processed this run across all phases (default 50)"),
+        maxBudgetUsdOverride: z
+          .number()
+          .optional()
+          .describe("Per-run USD budget cap (defaults to config.autoDream.maxRunBudgetUsd)"),
+      },
+      async ({ agentId: targetAgentId, maxPages, maxBudgetUsdOverride }) => {
+        if (!deps.memoryLifecycle) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: "memory_lifecycle_run_consolidation: lifecycle not injected" }],
+          };
+        }
+        try {
+          const result = await deps.memoryLifecycle.runConsolidationForAgent(targetAgentId, {
+            maxPages: maxPages ?? 50,
+            maxBudgetUsdOverride,
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `memory_lifecycle_run_consolidation [${targetAgentId}]\n` +
+                  `  summarized: ${result.summarized}\n` +
+                  `  merged: ${result.merged}\n` +
+                  `  contradictions: ${result.contradictions}\n` +
+                  `  patternsPromoted: ${result.promoted}\n` +
+                  `  pagesProcessed: ${result.pagesProcessed}\n` +
+                  `  spentUsd: ${result.spentUsd?.toFixed(4) ?? "0"}\n` +
+                  `  errors: ${result.errors.length}`,
+              },
+            ],
+          };
+        } catch (err) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `memory_lifecycle_run_consolidation error: ${String(err)}` }],
           };
         }
       },

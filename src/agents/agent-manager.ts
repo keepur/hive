@@ -22,6 +22,7 @@ import type { ActivityLogger } from "../activity/activity-logger.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import type { PrefixCache } from "./prefix-cache.js";
+import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import { ClaudeAgentAdapter } from "./provider-adapters/claude-agent-adapter.js";
 import {
   CodexSubscriptionAdapter,
@@ -301,6 +302,7 @@ export class AgentManager {
   private teamRoster?: TeamRoster;
   private prefixCache?: PrefixCache;
   private db: Db;
+  private memoryLifecycle?: MemoryLifecycle;
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
   // KPR-216: in-flight per-turn spawn count per agent. Bounded by
@@ -340,6 +342,7 @@ export class AgentManager {
     teamRoster?: TeamRoster,
     prefixCache?: PrefixCache,
     options?: { reflectionDebounceMs?: number },
+    memoryLifecycle?: MemoryLifecycle,
   ) {
     this.registry = registry;
     this.memoryManager = memoryManager;
@@ -353,6 +356,7 @@ export class AgentManager {
     this.prefetcher = prefetcher;
     this.teamRoster = teamRoster;
     this.prefixCache = prefixCache;
+    this.memoryLifecycle = memoryLifecycle;
     // KPR-220 Phase 6: 30s default; tests inject a small value for speed.
     this.reflectionDebounceMs = options?.reflectionDebounceMs ?? 30_000;
     this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
@@ -393,7 +397,7 @@ export class AgentManager {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache);
+    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle);
     const route = resolveProviderModel(config.model);
     if (route.provider === "claude") {
       return new ClaudeAgentAdapter(runner);

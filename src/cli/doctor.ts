@@ -7,6 +7,7 @@ import {
   type PromptCacheRow,
   type PrefixCacheStatsRow,
   type SpawnCoordinatorRow,
+  type MemoryLifecycleRow,
   brewServiceRunning,
   cacheHitRatesForDoctor,
   commandExists,
@@ -22,6 +23,7 @@ import {
   resolveServicePath,
   slackAuthOk,
   spawnCoordinatorStatsForDoctor,
+  memoryLifecycleStatsForDoctor,
 } from "./doctor-checks.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -133,6 +135,37 @@ export function renderSpawnCoordinatorSection(
     );
     if (r.lastError) {
       emit(`    last error: ${r.lastError}`);
+    }
+  }
+}
+
+export function renderMemoryLifecycleSection(
+  rows: MemoryLifecycleRow[],
+  emit: (line: string) => void = console.log,
+  spendWarnUsd = 5,
+): void {
+  if (rows.length === 0) return;
+  emit("\nMemory lifecycle (per agent):");
+  for (const row of rows) {
+    const cons = row.consolidation;
+    const staleFlag = row.staleSeconds !== null && row.staleSeconds > 300 ? " ⚠ heartbeat stale" : "";
+    const spendFlag =
+      cons.cumulativeSpentUsd30d > spendWarnUsd ? ` ⚠ spend $${cons.cumulativeSpentUsd30d.toFixed(2)}/30d` : "";
+    const errFlag = cons.lastError ? ` ⚠ lastError: ${cons.lastError.slice(0, 60)}` : "";
+    const oldest = row.oldestColdAgeDays !== null ? ` (oldest ${row.oldestColdAgeDays}d)` : "";
+    emit(
+      `  ${row.agentId}: hot=${row.counts.hot} warm=${row.counts.warm} cold=${row.counts.cold}${oldest}, ` +
+        `summarized-not-purged=${row.summarizedNotPurged}, needsReview=${row.needsReview}${staleFlag}${spendFlag}${errFlag}`,
+    );
+    if (cons.phase !== "idle") {
+      const cursorStr = cons.cursor?.createdAt ? new Date(cons.cursor.createdAt).toISOString().slice(0, 10) : "—";
+      emit(`        phase=${cons.phase} topic="${cons.topic ?? ""}" cursor=${cursorStr}`);
+    }
+    if (cons.lastSuccessAt) {
+      emit(
+        `        last success ${cons.lastSuccessAt.toISOString()} | ` +
+          `last attempt ${cons.lastAttemptAt?.toISOString() ?? "—"}`,
+      );
     }
   }
 }
@@ -392,6 +425,9 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // KPR-220 Phase 11: spawn-coordinator per-agent stats.
     const coordinatorRows = await spawnCoordinatorStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderSpawnCoordinatorSection(coordinatorRows);
+    // KPR-241: memory lifecycle per-agent stats.
+    const memoryRows = await memoryLifecycleStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+    renderMemoryLifecycleSection(memoryRows, console.log, config.memory.spendWarnThresholdUsd ?? 5);
   } else {
     console.log("\nPrompt cache (last 7 days)");
     console.log("  ○ skipped: config not loaded");
@@ -399,6 +435,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     console.log("  ○ skipped: config not loaded");
     console.log("\nSpawn coordinator (live engine, per agent)");
     console.log("  ○ skipped: config not loaded");
+    console.log("\nMemory lifecycle: skipped (config not loaded)");
   }
 
   if (!allPassed) {

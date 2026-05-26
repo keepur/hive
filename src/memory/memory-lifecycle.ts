@@ -2,7 +2,7 @@ import { ObjectId } from "mongodb";
 import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../logging/logger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
-import type { MemoryStore } from "./memory-store.js";
+import type { MemoryStore, AutoDreamAgentState } from "./memory-store.js";
 import type { MemoryEmbedder } from "./memory-embedder.js";
 import type {
   MemoryRecord,
@@ -11,6 +11,7 @@ import type {
   DreamConfig,
   DreamResult,
   MemoryImportance,
+  ConsolidationCursor,
 } from "./memory-types.js";
 import { IMPORTANCE_WEIGHTS, TYPE_WEIGHTS } from "./memory-types.js";
 
@@ -203,7 +204,6 @@ export class MemoryLifecycle {
 
     // 1. Score all non-pinned records
     const records = await this.store.getAllNonPinned(agentId);
-    let summarizedCount = 0;
     let cleanedCount = 0;
 
     if (records.length > 0) {
@@ -257,21 +257,14 @@ export class MemoryLifecycle {
         await this.store.setTierBulk(toOverflow, "warm");
         demoted += toOverflow.length;
       }
-
-      // 4. Summarize cold batches
-      try {
-        summarizedCount = await this.summarizeCold(agentId);
-      } catch (err) {
-        log.warn("Cold summarization failed", { agentId, error: String(err) });
-      }
     }
 
-    // 5. Clean up old summarized records
+    // 4. Clean up old summarized records
     // Runs unconditionally — agents with no active memories still have old summaries to clean.
     const retentionDate = new Date(Date.now() - this.config.coldRetentionDays * 24 * 60 * 60 * 1000);
     cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
 
-    // 6. Hard-delete purged records older than retention period
+    // 5. Hard-delete purged records older than retention period
     // Runs unconditionally — agents that purged all memories still need cleanup.
     const purgeCutoff = new Date(Date.now() - this.config.purgeRetentionDays * 24 * 60 * 60 * 1000);
     let purgedCount = 0;
@@ -289,7 +282,7 @@ export class MemoryLifecycle {
       log.warn("Purge hard-delete phase failed", { agentId, error: String(err) });
     }
 
-    return { promoted, demoted, summarized: summarizedCount, cleaned: cleanedCount, purged: purgedCount };
+    return { promoted, demoted, summarized: 0, cleaned: cleanedCount, purged: purgedCount };
   }
 
   /**
@@ -307,6 +300,7 @@ export class MemoryLifecycle {
     let promoted = 0;
     let flaggedForReview = 0;
     let skippedAgents = 0;
+    let summarized = 0;
     const errors: string[] = [];
     const budget = new AutoDreamBudget(this.autoDreamRunBudget(), this.autoDreamCallBudget());
 
@@ -330,23 +324,46 @@ export class MemoryLifecycle {
 
           const agentStartSpent = budget.spentUsd;
           const agentStartCalls = budget.llmCalls;
-          const r1 = await this.mergeDuplicates(agentId, budget);
-          merged += r1.merged;
+          const runAt = new Date();
+          let runError: string | null = null;
 
-          const r2 = await this.detectContradictions(agentId, budget);
-          contradictions += r2.resolved;
-          flaggedForReview += r2.flagged;
+          let summarizeColdDrained = true;
+          try {
+            // Phase 1: summarizeCold (KPR-241 — moved here from sweepAgent)
+            const r0 = await this.summarizeColdPhase(agentId, budget, state);
+            summarized += r0.summarized;
+            summarizeColdDrained = r0.drained;
 
-          const r3 = await this.promotePatterns(agentId, budget);
-          promoted += r3.promoted;
-
-          await this.store.markAutoDreamRun(
-            agentId,
-            new Date(),
-            changedMemoryCount,
-            budget.spentUsd - agentStartSpent,
-            budget.llmCalls - agentStartCalls,
-          );
+            // Phase 2-4 (existing)
+            const r1 = await this.mergeDuplicates(agentId, budget);
+            merged += r1.merged;
+            const r2 = await this.detectContradictions(agentId, budget);
+            contradictions += r2.resolved;
+            flaggedForReview += r2.flagged;
+            const r3 = await this.promotePatterns(agentId, budget);
+            promoted += r3.promoted;
+          } catch (err) {
+            runError = String(err);
+            throw err;
+          } finally {
+            // Only reset phase/topic/cursor when summarizeCold fully drained;
+            // otherwise preserve checkpoint so next run resumes.
+            const resetCheckpoint = runError === null && summarizeColdDrained;
+            try {
+              await this.store.markAutoDreamRun(agentId, {
+                at: runAt,
+                changedMemoryCount,
+                spentUsd: budget.spentUsd - agentStartSpent,
+                llmCalls: budget.llmCalls - agentStartCalls,
+                lastAttemptAt: runAt,
+                lastError: runError,
+                ...(runError === null ? { lastSuccessAt: runAt } : {}),
+                ...(resetCheckpoint ? { phase: "idle" as const, topic: null, cursor: null } : {}),
+              });
+            } catch (markErr) {
+              log.warn("autoDream markAutoDreamRun failed", { agentId, error: String(markErr) });
+            }
+          }
         } catch (err) {
           errors.push(`${agentId}: ${err}`);
           log.error("autoDream failed for agent", { agentId, error: String(err) });
@@ -358,7 +375,7 @@ export class MemoryLifecycle {
       errors.push(`global: ${err}`);
     }
 
-    const totalActions = merged + contradictions + promoted + flaggedForReview;
+    const totalActions = merged + contradictions + promoted + flaggedForReview + summarized;
     if (totalActions > 0) {
       log.info("autoDream complete", {
         durationMs: Date.now() - start,
@@ -366,6 +383,7 @@ export class MemoryLifecycle {
         contradictions,
         promoted,
         flaggedForReview,
+        summarized,
         skippedAgents,
         spentUsd: budget.spentUsd,
         budgetUsd: budget.maxRunUsd,
@@ -379,12 +397,103 @@ export class MemoryLifecycle {
       contradictions,
       promoted,
       flaggedForReview,
+      summarized,
       errors,
       skippedAgents,
       spentUsd: budget.spentUsd,
       budgetUsd: budget.maxRunUsd,
       llmCalls: budget.llmCalls,
     };
+  }
+
+  /**
+   * KPR-241: operator-callable bounded consolidation run for a single agent.
+   * Loops summarizeColdPhase until the topic backlog is drained, the page
+   * cap is hit, or the budget is exhausted. Then runs the other three
+   * phases (each has its own per-run caps). Returns structured progress.
+   */
+  async runConsolidationForAgent(
+    agentId: string,
+    options: { maxPages: number; maxBudgetUsdOverride?: number },
+  ): Promise<{
+    summarized: number;
+    merged: number;
+    contradictions: number;
+    promoted: number;
+    pagesProcessed: number;
+    drained: boolean;
+    spentUsd: number;
+    errors: string[];
+  }> {
+    if (!this.dreamConfig) {
+      return {
+        summarized: 0,
+        merged: 0,
+        contradictions: 0,
+        promoted: 0,
+        pagesProcessed: 0,
+        drained: true,
+        spentUsd: 0,
+        errors: ["autoDream not configured"],
+      };
+    }
+    const errors: string[] = [];
+    const budget = new AutoDreamBudget(
+      options.maxBudgetUsdOverride ?? this.autoDreamRunBudget(),
+      this.autoDreamCallBudget(),
+    );
+    let summarized = 0,
+      merged = 0,
+      contradictions = 0,
+      promoted = 0,
+      pagesProcessed = 0;
+    let drained = false;
+    const runAt = new Date();
+    try {
+      for (let i = 0; i < options.maxPages && budget.canSpend(); i++) {
+        const state = await this.store.getAutoDreamState(agentId);
+        const r0 = await this.summarizeColdPhase(agentId, budget, state);
+        summarized += r0.summarized;
+        pagesProcessed++;
+        if (r0.drained) {
+          drained = true;
+          break;
+        }
+        if (r0.summarized === 0) {
+          drained = true;
+          break;
+        }
+      }
+      if (budget.canSpend()) {
+        const r1 = await this.mergeDuplicates(agentId, budget);
+        merged += r1.merged;
+      }
+      if (budget.canSpend()) {
+        const r2 = await this.detectContradictions(agentId, budget);
+        contradictions += r2.resolved;
+      }
+      if (budget.canSpend()) {
+        const r3 = await this.promotePatterns(agentId, budget);
+        promoted += r3.promoted;
+      }
+    } catch (err) {
+      errors.push(String(err));
+    } finally {
+      try {
+        await this.store.markAutoDreamRun(agentId, {
+          at: runAt,
+          spentUsd: budget.spentUsd,
+          llmCalls: budget.llmCalls,
+          lastAttemptAt: runAt,
+          lastError: errors.length > 0 ? errors[0] : null,
+          ...(errors.length === 0 ? { lastSuccessAt: runAt } : {}),
+          ...(drained ? { phase: "idle" as const, topic: null, cursor: null } : {}),
+        });
+      } catch (markErr) {
+        log.warn("runConsolidationForAgent markAutoDreamRun failed", { agentId, error: String(markErr) });
+      }
+    }
+    return { summarized, merged, contradictions, promoted, pagesProcessed, drained, spentUsd: budget.spentUsd, errors };
   }
 
   /**
@@ -431,6 +540,18 @@ export class MemoryLifecycle {
         "",
         entries,
       ].join("\n");
+
+      const promptTokens = this.estimateTokens(prompt);
+      const cap = this.dreamConfig?.coldSummaryPromptTokenBudget ?? 8000;
+      if (promptTokens > cap) {
+        log.warn("autoDream: skipping prompt exceeding token budget", {
+          agentId,
+          phase: "mergeDuplicates",
+          promptTokens,
+          cap,
+        });
+        continue;
+      }
 
       const mergedText = await this.runDreamQuery(prompt, budget);
       if (!mergedText) continue;
@@ -525,6 +646,18 @@ export class MemoryLifecycle {
             `- "UNCLEAR" if they contradict but you can't determine which is correct`,
           ].join("\n");
 
+          const promptTokens = this.estimateTokens(prompt);
+          const cap = this.dreamConfig?.coldSummaryPromptTokenBudget ?? 8000;
+          if (promptTokens > cap) {
+            log.warn("autoDream: skipping prompt exceeding token budget", {
+              agentId,
+              phase: "detectContradictions",
+              promptTokens,
+              cap,
+            });
+            continue;
+          }
+
           const verdict = (await this.runDreamQuery(prompt, budget)).trim().toUpperCase();
 
           pairsChecked++;
@@ -587,6 +720,18 @@ export class MemoryLifecycle {
         entries,
       ].join("\n");
 
+      const promptTokens = this.estimateTokens(prompt);
+      const cap = this.dreamConfig?.coldSummaryPromptTokenBudget ?? 8000;
+      if (promptTokens > cap) {
+        log.warn("autoDream: skipping prompt exceeding token budget", {
+          agentId,
+          phase: "promotePatterns",
+          promptTokens,
+          cap,
+        });
+        continue;
+      }
+
       const factText = await this.runDreamQuery(prompt, budget);
       if (!factText) continue;
 
@@ -623,16 +768,78 @@ export class MemoryLifecycle {
     return { promoted };
   }
 
-  private async summarizeCold(agentId: string): Promise<number> {
-    const topics = await this.store.getColdTopics(agentId);
+  /**
+   * KPR-241: paged + checkpointed cold-summary consolidation as an
+   * autoDream phase. Drains backlog across multiple sweep cycles; each
+   * call processes at most `coldSummaryPageSize` records per topic.
+   *
+   * Returns `drained: true` only when every topic was processed to
+   * completion within this call. If budget exhausted mid-traversal or a
+   * topic still has cold records that didn't fit in the page, returns
+   * `drained: false` so the outer `dream()` block does NOT reset
+   * phase/topic/cursor — those are needed to resume next run.
+   */
+  private async summarizeColdPhase(
+    agentId: string,
+    budget: AutoDreamBudget,
+    state: AutoDreamAgentState | null,
+  ): Promise<{ summarized: number; drained: boolean }> {
+    const cfg = this.dreamConfig!;
+    const pageSize = cfg.coldSummaryPageSize ?? 20;
+    const promptTokenBudget = cfg.coldSummaryPromptTokenBudget ?? 8000;
     let summarized = 0;
 
-    for (const topic of topics) {
-      const coldRecords = await this.store.getColdByTopic(agentId, topic);
-      if (coldRecords.length < this.config.coldSummaryMinRecords) continue;
+    const topics = await this.store.getColdTopics(agentId);
+    if (topics.length === 0) return { summarized: 0, drained: true };
+    topics.sort(); // deterministic order
 
-      const entries = coldRecords.map((r) => `- [${r.type}/${r.importance}] ${r.content}`).join("\n");
+    // Resume from checkpoint if state matches phase=summarizeCold.
+    // If the checkpointed topic no longer exists in the current topic set
+    // (e.g. operator purged it externally), indexOf returns -1 — discard
+    // the stale cursor so we don't apply it to the wrong topic.
+    const resumeTopic = state?.phase === "summarizeCold" ? (state.topic ?? null) : null;
+    const resumeIdx = resumeTopic ? topics.indexOf(resumeTopic) : -1;
+    const resumeCursor = state?.phase === "summarizeCold" && resumeIdx >= 0 ? (state.cursor ?? null) : null;
+    const startIdx = resumeIdx >= 0 ? resumeIdx : 0;
 
+    for (let i = startIdx; i < topics.length; i++) {
+      const topic = topics[i];
+      const cursor: ConsolidationCursor | null = i === startIdx ? resumeCursor : null;
+
+      // Inner pagination loop — at most one page per dream() invocation per topic.
+      const page = await this.store.getColdByTopicPaged(agentId, topic, cursor, pageSize);
+      if (page.length < this.config.coldSummaryMinRecords) continue;
+
+      // Oversized single-record handling — filter before page-shrinking so
+      // one huge record doesn't cause the shrink loop to discard normal records.
+      const afterOversizeFilter: typeof page = [];
+      for (const r of page) {
+        if (this.estimateTokens(r.content) > promptTokenBudget) {
+          await this.store.flagForReview([r._id!]);
+          log.warn("autoDream: cold record flagged needsReview (oversized)", {
+            agentId,
+            topic,
+            recordId: r._id!.toString(),
+          });
+          continue;
+        }
+        afterOversizeFilter.push(r);
+      }
+      if (afterOversizeFilter.length < this.config.coldSummaryMinRecords) continue;
+
+      // Token-budget defense: shrink page if estimated prompt exceeds budget.
+      let pageEntries = afterOversizeFilter;
+      let estTokens = this.estimateTokens(pageEntries.map((r) => r.content).join("\n"));
+      while (estTokens > promptTokenBudget && pageEntries.length > this.config.coldSummaryMinRecords) {
+        pageEntries = pageEntries.slice(0, Math.floor(pageEntries.length / 2));
+        estTokens = this.estimateTokens(pageEntries.map((r) => r.content).join("\n"));
+      }
+
+      const usable = pageEntries;
+      if (usable.length < this.config.coldSummaryMinRecords) continue;
+
+      // Build prompt and call Haiku.
+      const entries = usable.map((r) => `- [${r.type}/${r.importance}] ${r.content}`).join("\n");
       const prompt = [
         `Summarize the following memory entries for agent ${agentId} about topic "${topic}".`,
         "Preserve key facts, decisions, and outcomes. Discard routine interactions.",
@@ -641,43 +848,17 @@ export class MemoryLifecycle {
         entries,
       ].join("\n");
 
-      // Use Haiku for cheap summarization — SDK returns an async iterable
-      const q = query({
-        prompt,
-        options: {
-          model: "claude-haiku-4-5-20251001",
-          permissionMode: "bypassPermissions",
-          allowDangerouslySkipPermissions: true,
-          maxTurns: 1,
-          maxBudgetUsd: this.autoDreamCallBudget(),
-          persistSession: false,
-        },
-      });
-
-      let summaryText = "";
-      for await (const message of q) {
-        const msg = message as SDKMessage;
-        if (msg.type === "result") {
-          const result = msg as SDKResultMessage;
-          if (result.subtype === "success" && result.result) {
-            summaryText = result.result;
-          }
-        }
-      }
+      const summaryText = await this.runDreamQuery(prompt, budget);
       if (!summaryText) continue;
 
-      // Save summary as a warm-tier record
+      // Save summary as warm `type: "summary"` record, embed.
       const pointId = crypto.randomUUID();
       const summaryRecord = await this.store.save(
         agentId,
         { content: summaryText, type: "summary", topic, importance: "medium" },
         pointId,
       );
-
-      // Set to warm (summaries start warm, can be promoted to hot by access)
       await this.store.setTier(summaryRecord._id!, "warm");
-
-      // Embed the summary
       await this.embedder.upsert(pointId, summaryText, {
         agentId,
         mongoId: summaryRecord._id!.toString(),
@@ -688,15 +869,38 @@ export class MemoryLifecycle {
         createdAt: Math.floor(Date.now() / 1000),
       });
 
-      // Mark originals as summarized
+      // Mark originals summarized.
       await this.store.markSummarized(
-        coldRecords.map((r) => r._id!),
+        usable.map((r) => r._id!),
         summaryRecord._id!,
       );
 
-      summarized += coldRecords.length;
+      // Advance checkpoint.
+      const last = usable[usable.length - 1];
+      await this.store.markAutoDreamRun(agentId, {
+        at: new Date(),
+        phase: "summarizeCold",
+        topic,
+        cursor: { createdAt: last.createdAt, lastId: last._id! },
+      });
+
+      summarized += usable.length;
+
+      if (!budget.canSpend()) {
+        return { summarized, drained: false };
+      }
     }
 
-    return summarized;
+    // Reached end of topics. Check whether anything is left across all topics.
+    const remainingTopics = await this.store.getColdTopics(agentId);
+    let drained = true;
+    for (const t of remainingTopics) {
+      const probe = await this.store.getColdByTopicPaged(agentId, t, null, this.config.coldSummaryMinRecords);
+      if (probe.length >= this.config.coldSummaryMinRecords) {
+        drained = false;
+        break;
+      }
+    }
+    return { summarized, drained };
   }
 }

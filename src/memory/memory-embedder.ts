@@ -1,11 +1,20 @@
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { createLogger } from "../logging/logger.js";
 import { embedOllama } from "../search/embed-utils.js";
-import type { MemoryRecallFilters } from "./memory-types.js";
+import type { MemoryRecallFilters, MemoryTier } from "./memory-types.js";
+import type { MemoryVectorIndex } from "./memory-vector-index.js";
 
 const log = createLogger("memory-embedder");
 
 const COLLECTION = "agent_memory";
+
+/**
+ * KPR-241: Ollama embed-context cap. The Catalyst diagnostic ("Ollama embed
+ * 400: the input length exceeds the context length") motivates a hard cap
+ * applied at the embedder boundary. 6000 chars ≈ 1500 tokens leaves headroom
+ * vs typical 2048-token Ollama defaults. Configurable via env.
+ */
+const EMBED_MAX_CHARS = parseInt(process.env.MEMORY_EMBED_MAX_CHARS ?? "6000", 10);
 
 interface QdrantPayload {
   [key: string]: unknown;
@@ -16,6 +25,7 @@ interface QdrantPayload {
   tier: string;
   importance: string;
   createdAt: number;
+  truncated?: boolean;
 }
 
 export interface EmbedSearchResult {
@@ -23,7 +33,7 @@ export interface EmbedSearchResult {
   score: number;
 }
 
-export class MemoryEmbedder {
+export class MemoryEmbedder implements MemoryVectorIndex {
   private qdrant: QdrantClient | null = null;
   private collectionReady = false;
 
@@ -41,6 +51,17 @@ export class MemoryEmbedder {
 
   private async embed(text: string): Promise<number[]> {
     return embedOllama(this.ollamaUrl, text);
+  }
+
+  /**
+   * KPR-241: truncate content to the embed-context limit. Returns the
+   * possibly-truncated content and a flag for the payload. Truncating at
+   * the embedder boundary keeps the Mongo record intact while preventing
+   * Ollama 400s from leaving orphan Mongo records.
+   */
+  private truncateForEmbed(content: string): { content: string; truncated: boolean } {
+    if (content.length <= EMBED_MAX_CHARS) return { content, truncated: false };
+    return { content: content.slice(0, EMBED_MAX_CHARS) + "\n…[truncated]", truncated: true };
   }
 
   async ensureCollection(): Promise<void> {
@@ -61,9 +82,11 @@ export class MemoryEmbedder {
 
   async upsert(pointId: string, content: string, payload: QdrantPayload): Promise<void> {
     await this.ensureCollection();
-    const vector = await this.embed(content);
+    const { content: embedContent, truncated } = this.truncateForEmbed(content);
+    const vector = await this.embed(embedContent);
+    const finalPayload: QdrantPayload = truncated ? { ...payload, truncated: true } : payload;
     await this.getClient().upsert(COLLECTION, {
-      points: [{ id: pointId, vector, payload }],
+      points: [{ id: pointId, vector, payload: finalPayload }],
     });
   }
 
@@ -74,7 +97,12 @@ export class MemoryEmbedder {
     });
   }
 
-  async search(query: string, agentId: string, filters?: MemoryRecallFilters): Promise<EmbedSearchResult[]> {
+  async search(
+    query: string,
+    agentId: string,
+    filters?: MemoryRecallFilters,
+    extraMustNot: Array<{ key: string; match: { value: string } }> = [],
+  ): Promise<EmbedSearchResult[]> {
     await this.ensureCollection();
     const queryVector = await this.embed(query);
     const limit = filters?.limit ?? 10;
@@ -85,11 +113,14 @@ export class MemoryEmbedder {
     if (filters?.tier) must.push({ key: "tier", match: { value: filters.tier } });
     if (filters?.importance) must.push({ key: "importance", match: { value: filters.importance } });
 
+    const searchFilter: any = { must };
+    if (extraMustNot.length > 0) searchFilter.must_not = extraMustNot;
+
     const results = await this.getClient().search(COLLECTION, {
       vector: queryVector,
       limit,
       with_payload: true,
-      filter: { must },
+      filter: searchFilter,
     });
 
     return results.map((r) => ({
@@ -136,5 +167,23 @@ export class MemoryEmbedder {
       score: r.score ?? 0,
       pointId: typeof r.id === "string" ? r.id : String(r.id),
     }));
+  }
+
+  /**
+   * KPR-241: sync the `tier` field on zero or more existing Qdrant points
+   * without re-embedding. Best-effort: errors are logged + swallowed; Mongo
+   * is the source of truth and the doctor surfaces sampled drift.
+   */
+  async setTierPayload(pointIds: string[], tier: MemoryTier): Promise<void> {
+    if (pointIds.length === 0) return;
+    try {
+      await this.ensureCollection();
+      await this.getClient().setPayload(COLLECTION, {
+        payload: { tier },
+        points: pointIds,
+      });
+    } catch (err) {
+      log.warn("setTierPayload failed", { count: pointIds.length, tier, error: String(err) });
+    }
   }
 }

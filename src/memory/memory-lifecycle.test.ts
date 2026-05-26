@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ObjectId } from "mongodb";
-import type { MemoryRecord, MemoryLifecycleConfig } from "./memory-types.js";
+import type { MemoryRecord, MemoryLifecycleConfig, DreamConfig } from "./memory-types.js";
 
 // ── Logger mock ─────────────────────────────────────────────────────
 vi.mock("../logging/logger.js", () => ({
@@ -38,7 +38,7 @@ function makeMockStore() {
     setTier: vi.fn().mockResolvedValue(undefined),
     setTierBulk: vi.fn().mockResolvedValue(undefined),
     getColdTopics: vi.fn().mockResolvedValue([]),
-    getColdByTopic: vi.fn().mockResolvedValue([]),
+    getColdByTopicPaged: vi.fn().mockResolvedValue([]),
     markSummarized: vi.fn().mockResolvedValue(undefined),
     deleteSummarizedOlderThan: vi.fn().mockResolvedValue(0),
     deletePurgedOlderThan: vi.fn().mockResolvedValue([]),
@@ -52,7 +52,6 @@ function makeMockStore() {
     touchAccess: vi.fn(),
     getByIds: vi.fn(),
     getAllForAgent: vi.fn(),
-    getAgentIds2: vi.fn(),
     init: vi.fn(),
     close: vi.fn(),
     getByTiersForAgent: vi.fn().mockResolvedValue([]),
@@ -63,7 +62,58 @@ function makeMockStore() {
     getAutoDreamState: vi.fn().mockResolvedValue(null),
     countAutoDreamCandidates: vi.fn().mockResolvedValue(10),
     markAutoDreamRun: vi.fn().mockResolvedValue(undefined),
+    getCollection: vi.fn(),
   };
+}
+
+function makeColdRecord(idx: number, topic: string, content: string = `cold-${idx}`): any {
+  return {
+    _id: new ObjectId(),
+    content,
+    type: "interaction",
+    topic,
+    importance: "medium",
+    tier: "cold",
+    createdAt: new Date(2026, 0, 1, 0, 0, idx),
+    updatedAt: new Date(2026, 0, 1, 0, 0, idx),
+    lastAccessedAt: new Date(2026, 0, 1, 0, 0, idx),
+    accessCount: 0,
+    pinned: false,
+    summarized: false,
+    qdrantPointId: `point-${idx}`,
+  };
+}
+
+function makeLifecycle(dreamOverrides: Partial<DreamConfig> = {}) {
+  const store = makeMockStore();
+  const embedder = makeMockEmbedder();
+  const config: MemoryLifecycleConfig = {
+    hotBudgetTokens: 3000,
+    sweepIntervalHours: 6,
+    hotThreshold: 0.6,
+    warmThreshold: 0.3,
+    recencyHalfLifeDays: 7,
+    coldSummaryMinRecords: 1,
+    coldRetentionDays: 90,
+    purgeRetentionDays: 7,
+  };
+  const dreamConfig: DreamConfig = {
+    enabled: true,
+    cooldownMinutes: 0,
+    similarityThreshold: 0.85,
+    patternMinCount: 3,
+    maxClustersPerRun: 20,
+    maxContradictionPairsPerRun: 30,
+    maxPromotionsPerRun: 2,
+    maxRunBudgetUsd: 1.0,
+    maxCallBudgetUsd: 0.1,
+    minNewMemories: 0,
+    coldSummaryPageSize: 20,
+    coldSummaryPromptTokenBudget: 8000,
+    ...dreamOverrides,
+  };
+  const lifecycle = new MemoryLifecycle(store as any, embedder as any, config, dreamConfig);
+  return { lifecycle, store, embedder };
 }
 
 // ── Mock MemoryEmbedder ─────────────────────────────────────────────
@@ -751,5 +801,99 @@ describe("dream()", () => {
 
     expect(store.getByTiersForAgent).toHaveBeenCalledWith("a1", expect.any(Array));
     expect(store.getByTiersForAgent).toHaveBeenCalledWith("a2", expect.any(Array));
+  });
+});
+
+describe("MemoryLifecycle.summarizeColdPhase (KPR-241)", () => {
+  it("calls getColdByTopicPaged with pageSize limit and returns drained=true when no records left", async () => {
+    const { lifecycle, store } = makeLifecycle({ coldSummaryPageSize: 5 });
+    (store.getAgentIds as any).mockResolvedValue(["a1"]);
+    (store.getColdTopics as any).mockResolvedValue(["topic-a"]);
+    const recs = [0, 1, 2, 3, 4].map((i) => makeColdRecord(i, "topic-a"));
+    (store.getColdByTopicPaged as any).mockResolvedValueOnce(recs).mockResolvedValueOnce([]);
+    await lifecycle.dream();
+    const pagedCalls = (store.getColdByTopicPaged as any).mock.calls;
+    expect(pagedCalls[0][3]).toBe(5);
+  });
+
+  it("returns drained=false when a probe finds remaining cold records", async () => {
+    const { lifecycle, store } = makeLifecycle({ coldSummaryPageSize: 2 });
+    (store.getAgentIds as any).mockResolvedValue(["a1"]);
+    (store.getColdTopics as any).mockResolvedValue(["topic-a"]);
+    const page1 = [makeColdRecord(0, "topic-a"), makeColdRecord(1, "topic-a")];
+    (store.getColdByTopicPaged as any)
+      .mockResolvedValueOnce(page1)
+      .mockResolvedValueOnce([makeColdRecord(2, "topic-a")]);
+    await lifecycle.dream();
+    const calls = (store.markAutoDreamRun as any).mock.calls;
+    const lastCallOpts = calls[calls.length - 1][1];
+    expect(lastCallOpts.phase).not.toBe("idle");
+  });
+
+  it("flags oversized records needsReview and continues with remaining records", async () => {
+    const { lifecycle, store } = makeLifecycle({
+      coldSummaryPageSize: 10,
+      coldSummaryPromptTokenBudget: 100,
+    });
+    (store.getAgentIds as any).mockResolvedValue(["a1"]);
+    (store.getColdTopics as any).mockResolvedValue(["topic-a"]);
+    const huge = makeColdRecord(0, "topic-a", "x".repeat(5000));
+    const normals = [1, 2, 3, 4].map((i) => makeColdRecord(i, "topic-a", "ok"));
+    (store.getColdByTopicPaged as any).mockResolvedValueOnce([huge, ...normals]).mockResolvedValueOnce([]);
+    await lifecycle.dream();
+    expect(store.flagForReview).toHaveBeenCalledWith([huge._id]);
+    expect(store.markSummarized).toHaveBeenCalled();
+    const summarizedIds = (store.markSummarized as any).mock.calls[0][0];
+    expect(summarizedIds).toEqual(normals.map((r) => r._id));
+  });
+
+  it("advances compound cursor to {lastRecord.createdAt, lastRecord._id}", async () => {
+    const { lifecycle, store } = makeLifecycle({ coldSummaryPageSize: 3 });
+    (store.getAgentIds as any).mockResolvedValue(["a1"]);
+    (store.getColdTopics as any).mockResolvedValue(["topic-a"]);
+    const page = [makeColdRecord(0, "topic-a"), makeColdRecord(1, "topic-a"), makeColdRecord(2, "topic-a")];
+    (store.getColdByTopicPaged as any).mockResolvedValueOnce(page).mockResolvedValueOnce([]);
+    await lifecycle.dream();
+    const cursorCall = (store.markAutoDreamRun as any).mock.calls.find((c: any) => c[1].phase === "summarizeCold");
+    expect(cursorCall).toBeDefined();
+    expect(cursorCall[1].cursor).toEqual({
+      createdAt: page[2].createdAt,
+      lastId: page[2]._id,
+    });
+  });
+});
+
+describe("MemoryLifecycle sweep relocation (KPR-241)", () => {
+  it("sweepAgent no longer calls summarizeCold path", async () => {
+    const { lifecycle, store } = makeLifecycle();
+    (store.getAgentIds as any).mockResolvedValue(["a1"]);
+    await lifecycle.sweep();
+    expect(store.getColdByTopicPaged).not.toHaveBeenCalled();
+  });
+});
+
+describe("MemoryLifecycle.runConsolidationForAgent (KPR-241)", () => {
+  it("returns drained=true when summarizeColdPhase reports drained", async () => {
+    const { lifecycle } = makeLifecycle();
+    (lifecycle as any).summarizeColdPhase = vi.fn().mockResolvedValue({ summarized: 5, drained: true });
+    (lifecycle as any).mergeDuplicates = vi.fn().mockResolvedValue({ merged: 0 });
+    (lifecycle as any).detectContradictions = vi.fn().mockResolvedValue({ resolved: 0, flagged: 0 });
+    (lifecycle as any).promotePatterns = vi.fn().mockResolvedValue({ promoted: 0 });
+    const result = await lifecycle.runConsolidationForAgent("a1", { maxPages: 50 });
+    expect(result.drained).toBe(true);
+    expect(result.summarized).toBe(5);
+  });
+
+  it("respects maxPages cap when not yet drained", async () => {
+    const { lifecycle } = makeLifecycle();
+    const summarizeStub = vi.fn().mockResolvedValue({ summarized: 5, drained: false });
+    (lifecycle as any).summarizeColdPhase = summarizeStub;
+    (lifecycle as any).mergeDuplicates = vi.fn().mockResolvedValue({ merged: 0 });
+    (lifecycle as any).detectContradictions = vi.fn().mockResolvedValue({ resolved: 0, flagged: 0 });
+    (lifecycle as any).promotePatterns = vi.fn().mockResolvedValue({ promoted: 0 });
+    const result = await lifecycle.runConsolidationForAgent("a1", { maxPages: 3 });
+    expect(summarizeStub).toHaveBeenCalledTimes(3);
+    expect(result.pagesProcessed).toBe(3);
+    expect(result.drained).toBe(false);
   });
 });

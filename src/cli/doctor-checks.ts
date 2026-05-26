@@ -374,6 +374,101 @@ export async function spawnCoordinatorStatsForDoctor(uri: string, dbName: string
   }
 }
 
+/**
+ * KPR-241: per-agent memory lifecycle snapshot row from `telemetry`
+ * (kind=memory_lifecycle_stats heartbeat).
+ *
+ * Note: `cursor.lastId` is read as the BSON ObjectId's `.toString()` form
+ * (24-char hex) because the doctor runs out-of-process from the engine and
+ * surfaces the value to humans. Mongo's driver round-trips it as either an
+ * ObjectId or a string depending on serialization path — we accept either
+ * shape on read and normalize to string.
+ */
+export interface MemoryLifecycleRow {
+  agentId: string;
+  counts: { hot: number; warm: number; cold: number };
+  summarizedNotPurged: number;
+  needsReview: number;
+  oldestColdAgeDays: number | null;
+  consolidation: {
+    phase: string;
+    topic: string | null;
+    cursor: { createdAt: Date; lastId: string } | null;
+    lastAttemptAt: Date | null;
+    lastSuccessAt: Date | null;
+    lastError: string | null;
+    lastRunSpentUsd: number | null;
+    cumulativeSpentUsd30d: number;
+  };
+  /** Seconds since the engine last wrote this doc; null if no doc found. */
+  staleSeconds: number | null;
+}
+
+/**
+ * Read-only doctor adapter for the per-agent
+ * `kind="memory_lifecycle_stats"` heartbeat docs. Mirrors
+ * `spawnCoordinatorStatsForDoctor`.
+ */
+export async function memoryLifecycleStatsForDoctor(uri: string, dbName: string): Promise<MemoryLifecycleRow[]> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const docs = await client
+      .db(dbName)
+      .collection("telemetry")
+      .find<{
+        agentId?: string;
+        counts?: { hot: number; warm: number; cold: number };
+        summarizedNotPurged?: number;
+        needsReview?: number;
+        oldestColdAgeDays?: number | null;
+        consolidation?: MemoryLifecycleRow["consolidation"];
+        updatedAt?: Date;
+      }>({ kind: "memory_lifecycle_stats" })
+      .sort({ agentId: 1 })
+      .toArray();
+    const now = Date.now();
+    return docs.map((doc) => {
+      const cons = doc.consolidation;
+      const cursor = cons?.cursor
+        ? {
+            createdAt:
+              cons.cursor.createdAt instanceof Date
+                ? cons.cursor.createdAt
+                : new Date(cons.cursor.createdAt as unknown as string),
+            // BSON ObjectId or string — normalize to string for the doctor surface.
+            lastId: String((cons.cursor as { lastId: unknown }).lastId ?? ""),
+          }
+        : null;
+      return {
+        agentId: doc.agentId ?? "<unknown>",
+        counts: doc.counts ?? { hot: 0, warm: 0, cold: 0 },
+        summarizedNotPurged: doc.summarizedNotPurged ?? 0,
+        needsReview: doc.needsReview ?? 0,
+        oldestColdAgeDays: doc.oldestColdAgeDays ?? null,
+        consolidation: cons
+          ? { ...cons, cursor }
+          : {
+              phase: "idle",
+              topic: null,
+              cursor: null,
+              lastAttemptAt: null,
+              lastSuccessAt: null,
+              lastError: null,
+              lastRunSpentUsd: null,
+              cumulativeSpentUsd30d: 0,
+            },
+        staleSeconds: doc.updatedAt instanceof Date ? Math.round((now - doc.updatedAt.getTime()) / 1000) : null,
+      };
+    });
+  } catch {
+    return [];
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 // ── resolved paths ─────────────────────────────────────────────────────
 
 /** Expand ~ in a path. */
