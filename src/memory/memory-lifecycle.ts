@@ -794,9 +794,13 @@ export class MemoryLifecycle {
     topics.sort(); // deterministic order
 
     // Resume from checkpoint if state matches phase=summarizeCold.
+    // If the checkpointed topic no longer exists in the current topic set
+    // (e.g. operator purged it externally), indexOf returns -1 — discard
+    // the stale cursor so we don't apply it to the wrong topic.
     const resumeTopic = state?.phase === "summarizeCold" ? (state.topic ?? null) : null;
-    const resumeCursor = state?.phase === "summarizeCold" ? (state.cursor ?? null) : null;
-    const startIdx = resumeTopic ? Math.max(0, topics.indexOf(resumeTopic)) : 0;
+    const resumeIdx = resumeTopic ? topics.indexOf(resumeTopic) : -1;
+    const resumeCursor = state?.phase === "summarizeCold" && resumeIdx >= 0 ? (state.cursor ?? null) : null;
+    const startIdx = resumeIdx >= 0 ? resumeIdx : 0;
 
     for (let i = startIdx; i < topics.length; i++) {
       const topic = topics[i];

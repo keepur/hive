@@ -510,10 +510,6 @@ export const config = {
       ),
       10,
     ),
-    summaryOfSummariesThreshold: parseInt(
-      optional("AUTODREAM_SUMMARY_OF_SUMMARIES_THRESHOLD", String(hive.autoDream?.summaryOfSummariesThreshold ?? 5)),
-      10,
-    ),
   },
   browser: {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),
