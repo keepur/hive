@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ObjectId } from "mongodb";
 import type { MemoryRecord } from "./memory-types.js";
+import type { MemoryVectorIndex } from "./memory-vector-index.js";
 
 // ── Logger mock ─────────────────────────────────────────────────────
 vi.mock("../logging/logger.js", () => ({
@@ -14,8 +15,10 @@ vi.mock("../logging/logger.js", () => ({
 
 // ── MongoDB mock ────────────────────────────────────────────────────
 const mockToArray = vi.fn().mockResolvedValue([]);
-const mockSort = vi.fn().mockReturnValue({ toArray: mockToArray });
-const mockFind = vi.fn().mockReturnValue({ toArray: mockToArray, sort: mockSort });
+const mockLimit = vi.fn().mockReturnValue({ toArray: mockToArray });
+const mockProject = vi.fn().mockReturnValue({ toArray: mockToArray });
+const mockSort = vi.fn().mockReturnValue({ toArray: mockToArray, limit: mockLimit, project: mockProject });
+const mockFind = vi.fn().mockReturnValue({ toArray: mockToArray, sort: mockSort, project: mockProject, limit: mockLimit });
 const mockFindOne = vi.fn().mockResolvedValue(null);
 const mockInsertOne = vi.fn().mockResolvedValue({ insertedId: new ObjectId() });
 const mockUpdateOne = vi.fn().mockResolvedValue({ modifiedCount: 1 });
@@ -90,8 +93,10 @@ describe("MemoryStore", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     mockToArray.mockResolvedValue([]);
-    mockFind.mockReturnValue({ toArray: mockToArray, sort: mockSort });
-    mockSort.mockReturnValue({ toArray: mockToArray });
+    mockProject.mockReturnValue({ toArray: mockToArray });
+    mockLimit.mockReturnValue({ toArray: mockToArray });
+    mockSort.mockReturnValue({ toArray: mockToArray, limit: mockLimit, project: mockProject });
+    mockFind.mockReturnValue({ toArray: mockToArray, sort: mockSort, project: mockProject, limit: mockLimit });
     store = new MemoryStore(mockDb as any);
     await store.init();
   });
@@ -419,5 +424,131 @@ describe("MemoryStore", () => {
       const results = await store.getHotTierWithStats("test-agent");
       expect(results).toHaveLength(0);
     });
+  });
+});
+
+describe("MemoryStore vectorIndex injection (KPR-241)", () => {
+  let store: MemoryStore;
+  let setTierPayloadSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mockProject.mockReturnValue({ toArray: mockToArray });
+    mockLimit.mockReturnValue({ toArray: mockToArray });
+    mockSort.mockReturnValue({ toArray: mockToArray, limit: mockLimit, project: mockProject });
+    mockFind.mockReturnValue({ toArray: mockToArray, sort: mockSort, project: mockProject, limit: mockLimit });
+    setTierPayloadSpy = vi.fn().mockResolvedValue(undefined);
+    const vectorIndex: MemoryVectorIndex = { setTierPayload: setTierPayloadSpy };
+    store = new MemoryStore(mockDb as any, vectorIndex);
+    await store.init();
+  });
+
+  it("calls vectorIndex.setTierPayload on setTier when qdrantPointId is present", async () => {
+    mockFindOne.mockResolvedValueOnce({ agentId: "a1", qdrantPointId: "point-1" });
+    await store.setTier(new ObjectId(), "cold");
+    expect(setTierPayloadSpy).toHaveBeenCalledWith(["point-1"], "cold");
+  });
+
+  it("setTier no-ops vectorIndex when findOne returns null", async () => {
+    mockFindOne.mockResolvedValueOnce(null);
+    await store.setTier(new ObjectId(), "cold");
+    expect(setTierPayloadSpy).not.toHaveBeenCalled();
+  });
+
+  it("setTierBulk projects qdrantPointId and forwards all IDs", async () => {
+    mockToArray.mockResolvedValueOnce([{ qdrantPointId: "p1" }, { qdrantPointId: "p2" }]);
+    await store.setTierBulk([new ObjectId(), new ObjectId()], "warm");
+    expect(setTierPayloadSpy).toHaveBeenCalledWith(expect.arrayContaining(["p1", "p2"]), "warm");
+  });
+
+  it("no-ops vectorIndex completely when not injected", async () => {
+    const noIndexStore = new MemoryStore(mockDb as any);
+    await noIndexStore.init();
+    mockFindOne.mockResolvedValueOnce({ agentId: "a1", qdrantPointId: "p1" });
+    await expect(noIndexStore.setTier(new ObjectId(), "cold")).resolves.toBeUndefined();
+    expect(setTierPayloadSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("MemoryStore.getColdByTopicPaged (KPR-241)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockProject.mockReturnValue({ toArray: mockToArray });
+    mockLimit.mockReturnValue({ toArray: mockToArray });
+    mockSort.mockReturnValue({ toArray: mockToArray, limit: mockLimit, project: mockProject });
+    mockFind.mockReturnValue({ toArray: mockToArray, sort: mockSort, project: mockProject, limit: mockLimit });
+  });
+
+  it("builds filter without $or when cursor is null", async () => {
+    const store = new MemoryStore(mockDb as any);
+    await store.init();
+    mockToArray.mockResolvedValueOnce([]);
+    await store.getColdByTopicPaged("a1", "t", null, 20);
+    const filterArg = mockFind.mock.calls[0][0];
+    expect(filterArg).toMatchObject({ agentId: "a1", tier: "cold", topic: "t", summarized: false });
+    expect(filterArg.$or).toBeUndefined();
+  });
+
+  it("builds compound $or filter when cursor is set", async () => {
+    const store = new MemoryStore(mockDb as any);
+    await store.init();
+    const cursorDate = new Date("2026-01-01");
+    const cursorId = new ObjectId();
+    mockToArray.mockResolvedValueOnce([]);
+    await store.getColdByTopicPaged("a1", "t", { createdAt: cursorDate, lastId: cursorId }, 20);
+    const filterArg = mockFind.mock.calls[0][0];
+    expect(filterArg.$or).toEqual([
+      { createdAt: { $gt: cursorDate } },
+      { createdAt: cursorDate, _id: { $gt: cursorId } },
+    ]);
+  });
+
+  it("sorts by { createdAt: 1, _id: 1 } and applies limit", async () => {
+    const store = new MemoryStore(mockDb as any);
+    await store.init();
+    mockToArray.mockResolvedValueOnce([]);
+    await store.getColdByTopicPaged("a1", "t", null, 7);
+    expect(mockSort).toHaveBeenCalledWith({ createdAt: 1, _id: 1 });
+    expect(mockLimit).toHaveBeenCalledWith(7);
+  });
+});
+
+describe("MemoryStore.markAutoDreamRun options-object (KPR-241)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("persists phase/topic/cursor/lastError via $set", async () => {
+    const store = new MemoryStore(mockDb as any);
+    await store.init();
+    const cursor = { createdAt: new Date("2026-01-01"), lastId: new ObjectId() };
+    await store.markAutoDreamRun("a1", {
+      at: new Date(),
+      phase: "summarizeCold",
+      topic: "t",
+      cursor,
+      lastError: "boom",
+    });
+    const updateCall = mockUpdateOne.mock.calls[0];
+    expect(updateCall[0]).toEqual({ _id: "a1" });
+    expect(updateCall[1].$set).toMatchObject({
+      phase: "summarizeCold", topic: "t", cursor, lastError: "boom",
+    });
+    expect(updateCall[2]).toMatchObject({ upsert: true });
+  });
+
+  it("appends to spendHistory with $push + $slice -60 when spentUsd > 0", async () => {
+    const store = new MemoryStore(mockDb as any);
+    await store.init();
+    await store.markAutoDreamRun("a1", { at: new Date("2026-01-01"), spentUsd: 0.01 });
+    const updateCall = mockUpdateOne.mock.calls[0];
+    expect(updateCall[1].$push).toEqual({
+      spendHistory: { $each: [{ at: new Date("2026-01-01"), spentUsd: 0.01 }], $slice: -60 },
+    });
+  });
+
+  it("does not push to spendHistory when spentUsd is 0 or omitted", async () => {
+    const store = new MemoryStore(mockDb as any);
+    await store.init();
+    await store.markAutoDreamRun("a1", { at: new Date(), phase: "idle" });
+    expect(mockUpdateOne.mock.calls[0][1].$push).toBeUndefined();
   });
 });

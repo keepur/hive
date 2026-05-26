@@ -1,6 +1,16 @@
 import { ObjectId, type Collection, type Db, type WithoutId } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import type { MemoryRecord, MemoryRecordInput, MemoryImportance, MemoryTier, PurgeFilters } from "./memory-types.js";
+import type {
+  MemoryRecord,
+  MemoryRecordInput,
+  MemoryImportance,
+  MemoryTier,
+  PurgeFilters,
+  ConsolidationPhase,
+  ConsolidationCursor,
+  AutoDreamSpendSample,
+} from "./memory-types.js";
+import type { MemoryVectorIndex } from "./memory-vector-index.js";
 
 const log = createLogger("memory-store");
 
@@ -12,6 +22,14 @@ export interface AutoDreamAgentState {
   spentUsd: number;
   llmCalls: number;
   updatedAt: Date;
+  // KPR-241 additions
+  phase?: ConsolidationPhase;
+  topic?: string | null;
+  cursor?: ConsolidationCursor | null;
+  lastError?: string | null;
+  lastAttemptAt?: Date;
+  lastSuccessAt?: Date;
+  spendHistory?: AutoDreamSpendSample[];
 }
 
 export class MemoryStore {
@@ -27,8 +45,12 @@ export class MemoryStore {
    * fire `null` and the listener should treat that as "invalidate all".
    */
   private onMutate?: (agentId: string | null, reason: string) => void;
+  /** KPR-241: optional vector-index for Qdrant tier sync on transitions. */
+  private vectorIndex?: MemoryVectorIndex;
 
-  constructor(private db: Db) {}
+  constructor(private db: Db, vectorIndex?: MemoryVectorIndex) {
+    this.vectorIndex = vectorIndex;
+  }
 
   setOnMutate(cb: (agentId: string | null, reason: string) => void): void {
     this.onMutate = cb;
@@ -76,6 +98,7 @@ export class MemoryStore {
       pinned: false,
       summarized: false,
       qdrantPointId,
+      ...(input.sourceRef ? { sourceRef: input.sourceRef } : {}),
     };
     const result = await this.collection.insertOne(record as WithoutId<MemoryRecord>);
     record._id = result.insertedId;
@@ -251,24 +274,62 @@ export class MemoryStore {
   }
 
   async setTier(id: ObjectId, tier: MemoryTier): Promise<void> {
-    const before = await this.collection.findOne({ _id: id }, { projection: { agentId: 1 } });
+    const before = await this.collection.findOne(
+      { _id: id },
+      { projection: { agentId: 1, qdrantPointId: 1 } },
+    );
     await this.collection.updateOne({ _id: id }, { $set: { tier } });
-    if (before) this.onMutate?.(before.agentId, "memory-set-tier");
+    if (before) {
+      this.onMutate?.(before.agentId, "memory-set-tier");
+      if (before.qdrantPointId && this.vectorIndex) {
+        await this.vectorIndex.setTierPayload([before.qdrantPointId], tier);
+      }
+    }
   }
 
   async setTierBulk(ids: ObjectId[], tier: MemoryTier): Promise<void> {
     if (ids.length === 0) return;
+    const records = await this.collection
+      .find({ _id: { $in: ids } })
+      .project<{ qdrantPointId: string }>({ qdrantPointId: 1 })
+      .toArray();
     await this.collection.updateMany({ _id: { $in: ids } }, { $set: { tier } });
+    if (this.vectorIndex) {
+      const pointIds = records.map((r) => r.qdrantPointId).filter(Boolean);
+      await this.vectorIndex.setTierPayload(pointIds, tier);
+    }
     // KPR-213: bulk path — fire null-agent (invalidate all). Tier moves can
     // promote/demote records into/out of hot-tier and thus change the prefix.
     this.onMutate?.(null, "memory-set-tier-bulk");
   }
 
-  async getColdByTopic(agentId: string, topic: string): Promise<MemoryRecord[]> {
-    return this.collection
-      .find({ agentId, tier: "cold", topic, summarized: false, purged: { $ne: true } })
-      .sort({ createdAt: 1 })
-      .toArray();
+  /**
+   * KPR-241: paged cold-by-topic lookup with compound cursor. Returns up to
+   * `limit` non-summarized cold records for the topic, sorted by
+   * `{ createdAt: 1, _id: 1 }`. When cursor is null, returns the oldest
+   * records; when set, applies the compound `$or` predicate so same-instant
+   * siblings (records sharing createdAt to the millisecond) are not skipped.
+   */
+  async getColdByTopicPaged(
+    agentId: string,
+    topic: string,
+    cursor: ConsolidationCursor | null,
+    limit: number,
+  ): Promise<MemoryRecord[]> {
+    const filter: Record<string, unknown> = {
+      agentId,
+      tier: "cold",
+      topic,
+      summarized: false,
+      purged: { $ne: true },
+    };
+    if (cursor) {
+      filter.$or = [
+        { createdAt: { $gt: cursor.createdAt } },
+        { createdAt: cursor.createdAt, _id: { $gt: cursor.lastId } },
+      ];
+    }
+    return this.collection.find(filter).sort({ createdAt: 1, _id: 1 }).limit(limit).toArray();
   }
 
   async getColdTopics(agentId: string): Promise<string[]> {
@@ -363,27 +424,51 @@ export class MemoryStore {
     return this.collection.countDocuments(query);
   }
 
+  /**
+   * KPR-241: options-object signature so phase/topic/cursor/error fields can
+   * be updated independently of the spend fields. Appends to spendHistory
+   * (capped at 60 entries) whenever `at` and `spentUsd` are both provided.
+   */
   async markAutoDreamRun(
     agentId: string,
-    at: Date,
-    changedMemoryCount: number,
-    spentUsd: number,
-    llmCalls: number,
+    update: {
+      at: Date;
+      changedMemoryCount?: number;
+      spentUsd?: number;
+      llmCalls?: number;
+      phase?: ConsolidationPhase;
+      topic?: string | null;
+      cursor?: ConsolidationCursor | null;
+      lastError?: string | null;
+      lastAttemptAt?: Date;
+      lastSuccessAt?: Date;
+    },
   ): Promise<void> {
-    await this.autoDreamStateCollection.updateOne(
-      { _id: agentId },
-      {
-        $set: {
-          agentId,
-          lastDreamAt: at,
-          changedMemoryCount,
-          spentUsd,
-          llmCalls,
-          updatedAt: new Date(),
+    const setFields: Record<string, unknown> = {
+      agentId,
+      lastDreamAt: update.at,
+      updatedAt: new Date(),
+    };
+    if (update.changedMemoryCount !== undefined) setFields.changedMemoryCount = update.changedMemoryCount;
+    if (update.spentUsd !== undefined) setFields.spentUsd = update.spentUsd;
+    if (update.llmCalls !== undefined) setFields.llmCalls = update.llmCalls;
+    if (update.phase !== undefined) setFields.phase = update.phase;
+    if (update.topic !== undefined) setFields.topic = update.topic;
+    if (update.cursor !== undefined) setFields.cursor = update.cursor;
+    if (update.lastError !== undefined) setFields.lastError = update.lastError;
+    if (update.lastAttemptAt !== undefined) setFields.lastAttemptAt = update.lastAttemptAt;
+    if (update.lastSuccessAt !== undefined) setFields.lastSuccessAt = update.lastSuccessAt;
+
+    const ops: Record<string, unknown> = { $set: setFields };
+    if (update.spentUsd !== undefined && update.spentUsd > 0) {
+      ops.$push = {
+        spendHistory: {
+          $each: [{ at: update.at, spentUsd: update.spentUsd }],
+          $slice: -60, // keep most recent 60 samples
         },
-      },
-      { upsert: true },
-    );
+      };
+    }
+    await this.autoDreamStateCollection.updateOne({ _id: agentId }, ops, { upsert: true });
   }
 
   async close(): Promise<void> {

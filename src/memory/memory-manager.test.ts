@@ -60,7 +60,7 @@ function makeMockMemoryStore() {
     getAllForAgent: vi.fn(),
     setTier: vi.fn(),
     setTierBulk: vi.fn(),
-    getColdByTopic: vi.fn(),
+    getColdByTopicPaged: vi.fn().mockResolvedValue([]),
     getColdTopics: vi.fn(),
     markSummarized: vi.fn(),
     deleteSummarizedOlderThan: vi.fn(),

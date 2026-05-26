@@ -340,13 +340,12 @@ export class MemoryLifecycle {
           const r3 = await this.promotePatterns(agentId, budget);
           promoted += r3.promoted;
 
-          await this.store.markAutoDreamRun(
-            agentId,
-            new Date(),
+          await this.store.markAutoDreamRun(agentId, {
+            at: new Date(),
             changedMemoryCount,
-            budget.spentUsd - agentStartSpent,
-            budget.llmCalls - agentStartCalls,
-          );
+            spentUsd: budget.spentUsd - agentStartSpent,
+            llmCalls: budget.llmCalls - agentStartCalls,
+          });
         } catch (err) {
           errors.push(`${agentId}: ${err}`);
           log.error("autoDream failed for agent", { agentId, error: String(err) });
@@ -628,7 +627,7 @@ export class MemoryLifecycle {
     let summarized = 0;
 
     for (const topic of topics) {
-      const coldRecords = await this.store.getColdByTopic(agentId, topic);
+      const coldRecords = await this.store.getColdByTopicPaged(agentId, topic, null, 10_000);
       if (coldRecords.length < this.config.coldSummaryMinRecords) continue;
 
       const entries = coldRecords.map((r) => `- [${r.type}/${r.importance}] ${r.content}`).join("\n");
