@@ -313,7 +313,12 @@ function mirrorLegacyWorkflowSiblings(pluginDir: string, legacyWorkflowDir: stri
       const resolved = realpathSync(sourcePath);
       symlinkSync(resolved, linkPath, sourceStat.isDirectory() ? "dir" : "file");
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") continue;
+      log.warn("Failed to mirror legacy workflow sibling into skill projection", {
+        legacyWorkflowDir,
+        entry,
+        error: String(err),
+      });
     }
   }
 }
