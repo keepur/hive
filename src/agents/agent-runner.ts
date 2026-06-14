@@ -507,7 +507,7 @@ export class AgentRunner {
     // First account in the list is the implicit default; the MCP surfaces `account` as a tool
     // parameter only when the list has 2+ entries (avoids prompt-cache churn for single-account agents).
     const gogAccounts = config.google.accounts[this.agentConfig.id] ?? [];
-    if (gogAccounts.length > 0) {
+    if (gogAccounts.length > 0 && !this.hasExternalGooglePlugin()) {
       const gogClient = config.google.client;
       servers["google"] = {
         type: "stdio",
@@ -805,6 +805,16 @@ export class AgentRunner {
     // ── Plugin MCP Servers ──────────────────────────────────────────
     for (const plugin of this.plugins) {
       for (const [name, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
+        const isGooglePlugin = AgentRunner.isGooglePluginServer(plugin, name);
+        if (isGooglePlugin && gogAccounts.length === 0) {
+          log.debug("Google plugin has no accounts for agent, skipping", {
+            plugin: plugin.name,
+            server: name,
+            agent: this.agentConfig.id,
+          });
+          continue;
+        }
+
         if (servers[name]) {
           log.warn("Plugin server name conflicts with core server, skipping", {
             plugin: plugin.name, server: name,
@@ -890,6 +900,10 @@ export class AgentRunner {
 
         for (const [envVar, fieldPath] of Object.entries(serverDef.agentEnv ?? {})) {
           env[envVar] = AgentRunner.resolveAgentEnvPath(this.agentConfig, fieldPath);
+        }
+
+        if (isGooglePlugin) {
+          Object.assign(env, this.googlePluginEnv(gogAccounts));
         }
 
         servers[name] = {
@@ -1123,6 +1137,26 @@ export class AgentRunner {
       }
     }
     return names;
+  }
+
+  private hasExternalGooglePlugin(): boolean {
+    return this.plugins.some((plugin) => AgentRunner.isGooglePluginServer(plugin, "google") && !plugin.brokenServers.google);
+  }
+
+  private static isGooglePluginServer(plugin: LoadedPlugin, serverName: string): boolean {
+    return serverName === "google" && plugin.name === "@keepur/hive-plugin-google";
+  }
+
+  private googlePluginEnv(gogAccounts: string[]): Record<string, string> {
+    const env: Record<string, string> = {
+      GOG_ACCOUNTS: gogAccounts.join(","),
+      DRIVE_SHARED_FOLDER: config.google.sharedFolder,
+      INSTANCE_ID: config.instance.id,
+    };
+    if (config.google.client) {
+      env.GOG_CLIENT = config.google.client;
+    }
+    return env;
   }
 
   private activeDelegateNames(allConfigs: Record<string, McpServerConfig>): string[] {
