@@ -89,7 +89,7 @@ vi.mock("../config.js", () => ({
     instance: { id: "hive", portBase: 3100 },
     slack: { mcpToken: "" },
     mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
-    google: { accounts: { "test-agent": ["test@example.com"] }, sharedFolder: "test-folder" },
+    google: { client: "test-client", accounts: { "test-agent": ["test@example.com"] }, sharedFolder: "test-folder" },
     quo: { apiKey: "", phoneNumberId: "", lines: [] },
     taskLedger: {
       apiUrl: "http://localhost:3000",
@@ -189,6 +189,27 @@ function makeRunner(overrides: Partial<AgentConfig> = {}, teamRoster?: any): Age
     undefined,
     teamRoster,
   );
+}
+
+function makeGooglePlugin(): LoadedPlugin {
+  return {
+    name: "@keepur/hive-plugin-google",
+    dir: "/plugins/node_modules/@keepur/hive-plugin-google",
+    manifest: {
+      name: "@keepur/hive-plugin-google",
+      description: "Google Workspace tools",
+      mcpServers: {
+        google: {
+          entry: "mcp-servers/google/index.ts",
+          env: ["GOG_ACCOUNTS"],
+          envMap: {},
+          agentEnv: {},
+        },
+      },
+      agentSeeds: [],
+    },
+    brokenServers: {},
+  };
 }
 
 function inventoryByName(runner: AgentRunner, name: string) {
@@ -401,6 +422,53 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     // NODE_PATH is NOT set — Node's ESM resolver ignores it. Plugins get
     // their deps via a node_modules symlink inside plugin.dir instead.
     expect(servers["custom-server"].env.NODE_PATH).toBeUndefined();
+  });
+
+  it("uses the built-in Google MCP server when the external Google plugin is not installed", async () => {
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["google"] }), memoryManager as any);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers.google.args[0]).toMatch(/google[/-]google-mcp-server\.js$|mcp\/google\.min\.js$/);
+    expect(servers.google.args[0]).not.toContain("/plugins/");
+    expect(servers.google.env.GOG_ACCOUNTS).toBe("test@example.com");
+    expect(servers.google.env.GOG_CLIENT).toBe("test-client");
+  });
+
+  it("lets @keepur/hive-plugin-google replace the built-in Google MCP server", async () => {
+    process.env.GOG_ACCOUNTS = "wrong-global@example.com";
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["google"] }),
+      memoryManager as any,
+      [makeGooglePlugin()],
+    );
+
+    try {
+      await runner.send("hello");
+      const servers = getCapturedServers();
+
+      expect(servers.google.args[0]).toContain("@keepur/hive-plugin-google");
+      expect(servers.google.args[0]).toMatch(/mcp-servers[/\\]google[/\\]index(?:\.min)?\.js$/);
+      expect(servers.google.args[0]).not.toMatch(/google[/-]google-mcp-server\.js$|mcp\/google\.min\.js$/);
+      expect(servers.google.env.GOG_ACCOUNTS).toBe("test@example.com");
+      expect(servers.google.env.GOG_CLIENT).toBe("test-client");
+      expect(servers.google.env.DRIVE_SHARED_FOLDER).toBe("test-folder");
+      expect(servers.google.env.INSTANCE_ID).toBe("hive");
+    } finally {
+      delete process.env.GOG_ACCOUNTS;
+    }
+  });
+
+  it("does not expose the Google plugin to agents without configured Google accounts", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ id: "no-google-agent", coreServers: ["google"] }),
+      memoryManager as any,
+      [makeGooglePlugin()],
+    );
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    expect(servers).not.toHaveProperty("google");
   });
 
   it("KPR-236: emits an http MCP config for transport:http plugin servers with api-key auth", async () => {
