@@ -453,12 +453,17 @@ export function startBeekeeperRegistration(opts: BeekeeperRegistrationOptions): 
 
   const register = async (): Promise<void> => {
     try {
-      const res = await fetch(url, {
+      // The global `RequestInit` resolves to the DOM lib variant in this
+      // project (a transitive dep pulls in lib.dom), which lacks undici's
+      // `dispatcher` field. Pass it via a typed intersection rather than
+      // weakening to `any` — the runtime fetch is undici's and honors it.
+      const init: RequestInit & { dispatcher: Dispatcher } = {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
         dispatcher,
-      });
+      };
+      const res = await fetch(url, init);
       if (res.ok) {
         log.debug("Registered with beekeeper", { beekeeperPort, wsPort });
       } else {
@@ -482,9 +487,9 @@ export function startBeekeeperRegistration(opts: BeekeeperRegistrationOptions): 
 }
 ```
 
-> No cast is needed: this repo has no DOM lib in `tsconfig.json`, so global `fetch`/`RequestInit` resolve via `@types/node` → `undici-types`, whose `RequestInit` already declares `dispatcher?: Dispatcher`. Pass `dispatcher` inline as shown. Also: **preserve the existing file-level docstring (current lines 1–11)** — only the imports, the options interface, and the `register()`/defaults are being changed, not the top-of-file comment block.
+> **Typed intersection required (corrected during implementation).** Although `tsconfig.json` sets no DOM lib, a transitive dependency pulls `lib.dom.d.ts` into the global type graph, so `@types/node`'s conditional resolves the global `RequestInit` to the **DOM** variant — which has no `dispatcher`. Passing `dispatcher` inline therefore fails `tsc` with TS2769. Use the `RequestInit & { dispatcher: Dispatcher }` intersection shown above (no `any`; repo convention). Note the asymmetry: this only bites **typechecked source files** — `*.test.ts` is excluded from `tsc`, so test code can pass `dispatcher` inline at runtime (esbuild strips types). Also: **preserve the existing file-level docstring (current lines 1–11)** — only the imports, the options interface, and the `register()`/defaults are being changed, not the top-of-file comment block.
 
-- [ ] **Step 2:** Add a connection-reuse test to `src/beekeeper-client.test.ts`. Add inside the existing `describe("startBeekeeperRegistration", ...)` block; import `createKeepAliveAgent` + `Agent` at the top.
+- [ ] **Step 2:** Add a connection-reuse test to `src/beekeeper-client.test.ts`. Add inside the existing `describe("startBeekeeperRegistration", ...)` block; import `createKeepAliveAgent` at the top.
 
 ```typescript
 // add to imports at top of the file:
