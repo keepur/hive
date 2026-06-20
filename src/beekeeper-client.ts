@@ -14,6 +14,16 @@ import { createLogger } from "./logging/logger.js";
 
 const log = createLogger("beekeeper-client");
 
+/**
+ * Default re-registration interval (ms).
+ *
+ * INVARIANT: the shared keep-alive dispatcher's idle timeout
+ * (`KEEPALIVE_TIMEOUT_MS` in src/http/loopback-dispatcher.ts) MUST exceed this,
+ * or the pooled socket closes between ticks and we churn a new connection every
+ * poll — KPR-252. Asserted in loopback-dispatcher.test.ts.
+ */
+export const DEFAULT_REGISTRATION_INTERVAL_MS = 30_000;
+
 export interface BeekeeperRegistrationOptions {
   beekeeperPort: number;
   wsPort: number;
