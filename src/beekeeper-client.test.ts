@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { startBeekeeperRegistration } from "./beekeeper-client.js";
+import { createKeepAliveAgent } from "./http/loopback-dispatcher.js";
 
 vi.mock("./logging/logger.js", () => ({
   createLogger: () => ({
@@ -93,5 +94,42 @@ describe("startBeekeeperRegistration", () => {
 
     // If we got here without an unhandled rejection, we're good.
     expect(typeof stopHandle.stop).toBe("function");
+  });
+
+  it("reuses a single TCP connection across registration ticks", async () => {
+    let connections = 0;
+    const agent = createKeepAliveAgent();
+    server = createServer((req, res) => {
+      if (req.method === "POST" && req.url === "/internal/register-capability") {
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    server.on("connection", () => {
+      connections += 1;
+    });
+    const port = await listen(server);
+
+    stopHandle = startBeekeeperRegistration({
+      beekeeperPort: port,
+      wsPort: 4321,
+      intervalMs: 20,
+      dispatcher: agent,
+    });
+
+    // Wait until several ticks have fired (well past 3 × 20ms).
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    stopHandle.stop();
+    stopHandle = undefined;
+    await agent.close();
+
+    // All ticks rode one pooled connection, not one socket per tick.
+    expect(connections).toBe(1);
   });
 });

@@ -20,6 +20,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { installKeepAliveDispatcher } from "../http/loopback-dispatcher.js";
+
+// KPR-252: reuse loopback connections to the background-task manager across the
+// session instead of a fresh socket per tool call. Silent install — must not
+// write to stdout (JSON-RPC stream).
+installKeepAliveDispatcher();
 
 const API = process.env.BG_TASK_API ?? "http://127.0.0.1:3100";
 const AGENT_ID = process.env.BG_AGENT_ID ?? "";

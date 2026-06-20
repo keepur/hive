@@ -11,16 +11,30 @@
  */
 
 import { createLogger } from "./logging/logger.js";
+import { getLoopbackDispatcher } from "./http/loopback-dispatcher.js";
+import type { Dispatcher } from "undici";
 
 const log = createLogger("beekeeper-client");
+
+/**
+ * Default re-registration interval (ms).
+ *
+ * INVARIANT: the shared keep-alive dispatcher's idle timeout
+ * (`KEEPALIVE_TIMEOUT_MS` in src/http/loopback-dispatcher.ts) MUST exceed this,
+ * or the pooled socket closes between ticks and we churn a new connection every
+ * poll — KPR-252. Asserted in loopback-dispatcher.test.ts.
+ */
+export const DEFAULT_REGISTRATION_INTERVAL_MS = 30_000;
 
 export interface BeekeeperRegistrationOptions {
   beekeeperPort: number;
   wsPort: number;
   /** Capability name to register with beekeeper. Defaults to "hive". */
   capabilityName?: string;
-  /** Test-only override. Defaults to 30_000. */
+  /** Test-only override. Defaults to DEFAULT_REGISTRATION_INTERVAL_MS. */
   intervalMs?: number;
+  /** Test-only override. Defaults to the shared keep-alive loopback dispatcher. */
+  dispatcher?: Dispatcher;
 }
 
 export interface BeekeeperRegistrationHandle {
@@ -29,7 +43,8 @@ export interface BeekeeperRegistrationHandle {
 
 export function startBeekeeperRegistration(opts: BeekeeperRegistrationOptions): BeekeeperRegistrationHandle {
   const { beekeeperPort, wsPort } = opts;
-  const intervalMs = opts.intervalMs ?? 30_000;
+  const intervalMs = opts.intervalMs ?? DEFAULT_REGISTRATION_INTERVAL_MS;
+  const dispatcher = opts.dispatcher ?? getLoopbackDispatcher();
 
   const url = `http://127.0.0.1:${beekeeperPort}/internal/register-capability`;
   const payload = {
@@ -41,11 +56,17 @@ export function startBeekeeperRegistration(opts: BeekeeperRegistrationOptions): 
 
   const register = async (): Promise<void> => {
     try {
-      const res = await fetch(url, {
+      // The global `RequestInit` resolves to the DOM lib variant in this
+      // project (a transitive dep pulls in lib.dom), which lacks undici's
+      // `dispatcher` field. Pass it via a typed intersection rather than
+      // weakening to `any` — the runtime fetch is undici's and honors it.
+      const init: RequestInit & { dispatcher: Dispatcher } = {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
-      });
+        dispatcher,
+      };
+      const res = await fetch(url, init);
       if (res.ok) {
         log.debug("Registered with beekeeper", { beekeeperPort, wsPort });
       } else {

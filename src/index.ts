@@ -54,6 +54,7 @@ import { runMigrations } from "./migrations/run-migrations.js";
 import { checkFirstBoot } from "./startup/first-boot.js";
 import { SlackInternalApi } from "./slack/slack-internal-api.js";
 import { preflightBotScopes } from "./slack/slack-scope-preflight.js";
+import { installKeepAliveDispatcher } from "./http/loopback-dispatcher.js";
 const log = createLogger("index");
 
 function provisionAgentDirs(agentIds: string[]): void {
@@ -69,6 +70,11 @@ function provisionAgentDirs(agentIds: string[]): void {
 }
 
 async function main(): Promise<void> {
+  // KPR-252: pool all outbound HTTP (loopback control plane + external) behind a
+  // single keep-alive dispatcher before any fetch() runs, so the registration
+  // loop and task-ledger clients reuse connections instead of exhausting the
+  // IPv4 ephemeral port range. Must run before startBeekeeperRegistration().
+  installKeepAliveDispatcher();
   log.info("Hive starting up", { instance: config.instance.id, portBase: config.instance.portBase });
 
   // Boot-time integrity + upgrade checks
