@@ -50,8 +50,10 @@ describe("loopback-dispatcher", () => {
     agent = createKeepAliveAgent();
 
     for (let i = 0; i < 5; i++) {
-      // `dispatcher` is a documented field on RequestInit (via @types/node →
-      // undici-types) in this repo — no cast needed.
+      // Test files are excluded from tsc (see tsconfig), so `dispatcher` can be
+      // passed inline at runtime here. Typechecked source resolves the global
+      // RequestInit to the DOM variant (no `dispatcher`) and needs a typed
+      // intersection — see src/beekeeper-client.ts.
       const res = await fetch(`http://127.0.0.1:${port}/`, { dispatcher: agent });
       await res.text();
       // Yield one macrotask tick so undici recycles the just-used socket back
