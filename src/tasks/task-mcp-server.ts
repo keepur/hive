@@ -13,6 +13,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { installKeepAliveDispatcher } from "../http/loopback-dispatcher.js";
 
 const API_URL = process.env.TASK_LEDGER_API_URL ?? "http://localhost:3002";
 const API_KEY = process.env.TASK_LEDGER_API_KEY ?? "";
@@ -21,6 +22,11 @@ if (!API_KEY) {
   process.stderr.write("task-mcp-server: TASK_LEDGER_API_KEY is required\n");
   process.exit(1);
 }
+
+// KPR-252: reuse loopback connections to the task ledger across the
+// session instead of a fresh socket per tool call. Silent install — must not
+// write to stdout (JSON-RPC stream).
+installKeepAliveDispatcher();
 
 async function api(method: string, path: string, body?: object): Promise<any> {
   const res = await fetch(`${API_URL}/api/v1${path}`, {
