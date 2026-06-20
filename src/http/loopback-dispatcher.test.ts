@@ -2,11 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Agent } from "undici";
-import {
-  KEEPALIVE_TIMEOUT_MS,
-  createKeepAliveAgent,
-  installKeepAliveDispatcher,
-} from "./loopback-dispatcher.js";
+import { KEEPALIVE_TIMEOUT_MS, createKeepAliveAgent, installKeepAliveDispatcher } from "./loopback-dispatcher.js";
 import { DEFAULT_REGISTRATION_INTERVAL_MS } from "../beekeeper-client.js";
 
 async function listen(server: Server): Promise<number> {
