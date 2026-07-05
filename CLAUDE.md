@@ -246,4 +246,5 @@ Per-turn `query()` with `options.resume = sessionId` is the **only** execution p
 - Slack file downloads: auth header stripped on redirect — must follow redirects manually
 - Thread deduplication: 60s window prevents double-processing
 - Spawn budget default: 5 in-flight per agent (per-agent, not per-thread). Same-thread spawns serialize via the per-thread lock; budget bounds parallel spawns across different threads.
-- MongoDB collections: `memory`, `memory_versions`, `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `model_overrides`, `devices`, `agent_callbacks`, `contacts`, `telemetry` (prefix-cache stats heartbeat KPR-213; spawn-coordinator stats heartbeat KPR-220)
+- MongoDB collections: `memory`, `memory_versions`, `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `model_overrides`, `devices`, `agent_callbacks`, `contacts`, `instance_identity` (identity sentinel, KPR-294), `telemetry` (prefix-cache stats heartbeat KPR-213; spawn-coordinator stats heartbeat KPR-220; db-identity stats heartbeat `db_identity_stats` KPR-294)
+- `HIVE_DB_SENTINEL_RESTAMP=1` re-stamps the DB identity sentinel for one boot (adopting another instance's DB); remove after use — it is honored every boot it is set

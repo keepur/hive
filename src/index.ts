@@ -11,6 +11,8 @@ import {
   agentFeedsDir,
 } from "./paths.js";
 import { MongoClient } from "mongodb";
+import { ensureIdentitySentinelAtBoot, DbIdentityMonitor } from "./db/identity-sentinel.js";
+import { WriteGuard, guardDb } from "./db/write-guard.js";
 import { initInstanceGit } from "./skills/instance-git.js";
 import { verifyPackageIntegrity, checkAllowlistDrift } from "./skills/integrity.js";
 import { checkUpgradeNotice } from "./skills/upgrade-notice.js";
@@ -114,7 +116,44 @@ async function main(): Promise<void> {
     retryReads: true,
   });
   await mongoClient.connect();
-  const db = mongoClient.db(config.mongo.dbName);
+  const rawDb = mongoClient.db(config.mongo.dbName);
+
+  // KPR-294: verify DB identity BEFORE any write (createIndex/migrations below).
+  const bootResult = await ensureIdentitySentinelAtBoot(rawDb, {
+    instanceId: config.instance.id,
+    dbName: config.mongo.dbName,
+    restamp: process.env.HIVE_DB_SENTINEL_RESTAMP === "1",
+  });
+  if (bootResult.outcome === "mismatch") {
+    log.error("DB IDENTITY MISMATCH at boot — refusing to start", {
+      critical: true,
+      expected: { instanceId: config.instance.id, dbName: config.mongo.dbName },
+      observed: bootResult.observed,
+      hint: "If adopting this DB intentionally, set HIVE_DB_SENTINEL_RESTAMP=1 for one boot. Manual alternative: mongosh <db> --eval 'db.instance_identity.replaceOne({_id:\"identity_sentinel\"}, {...}, {upsert:true})'",
+    });
+    process.exit(1);
+  }
+  if (bootResult.outcome === "restamped") {
+    log.warn("identity sentinel RE-STAMPED via HIVE_DB_SENTINEL_RESTAMP", {
+      previous: bootResult.previous,
+      current: { instanceId: config.instance.id, dbName: config.mongo.dbName },
+      action: "remove HIVE_DB_SENTINEL_RESTAMP from the environment now",
+    });
+  }
+  if (bootResult.outcome === "stamped") {
+    log.info("identity sentinel stamped (first boot)");
+  }
+
+  const writeGuard = new WriteGuard({ instanceId: config.instance.id, dbName: config.mongo.dbName });
+  const db = guardDb(rawDb, writeGuard); // downstream `db` consumers unchanged
+
+  const rawTelemetryCollection = rawDb.collection("telemetry"); // guard-immune (spec ⚠11)
+  const dbIdentityMonitor = new DbIdentityMonitor(mongoClient, rawDb, writeGuard, rawTelemetryCollection, {
+    instanceId: config.instance.id,
+    dbName: config.mongo.dbName,
+  });
+  await dbIdentityMonitor.writeOnce(); // initial telemetry so doctor never sees "no telemetry yet"
+  dbIdentityMonitor.start(); // started NOW, not in the heartbeat block — reconnects during startup must be caught
 
   // Agent definitions collection
   const agentDefsCollection = db.collection("agent_definitions");
@@ -743,6 +782,7 @@ async function main(): Promise<void> {
     meetingMonitor?.stop();
     spawnCoordinatorHeartbeat.stop();
     memoryLifecycleHeartbeat.stop();
+    dbIdentityMonitor.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
     contactsWatcher.stop();
     if (activityLogger) await activityLogger.stop();
