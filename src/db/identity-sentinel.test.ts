@@ -1,13 +1,33 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import type { Db } from "mongodb";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import type { Db, Collection } from "mongodb";
+import { MongoServerSelectionError } from "mongodb";
 import {
   SENTINEL_COLLECTION,
   SENTINEL_ID,
   SENTINEL_SCHEMA_VERSION,
   ensureIdentitySentinelAtBoot,
   verifySentinel,
+  DbIdentityMonitor,
   type IdentitySentinelDoc,
+  type MonitoredMongoClient,
 } from "./identity-sentinel.js";
+import { WriteGuard } from "./write-guard.js";
+
+// `identity-sentinel.ts` calls `createLogger("identity-sentinel")` exactly
+// once at module load, so the mock must return the SAME logger object every
+// time (not a fresh one per call) for tests to observe calls against it.
+// `vi.hoisted` is required because `vi.mock` factories are hoisted above
+// top-level const declarations.
+const mockLog = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+vi.mock("../logging/logger.js", () => ({
+  createLogger: () => mockLog,
+}));
 
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -333,5 +353,499 @@ describe("verifySentinel", () => {
       schemaVersionNewer: true,
       observed: { instanceId: EXPECTED.instanceId, dbName: EXPECTED.dbName, sentinelId: "future-uuid" },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 3 — DbIdentityMonitor
+// ---------------------------------------------------------------------------
+
+describe("DbIdentityMonitor", () => {
+  const MONITOR_EXPECTED = { instanceId: "hive", dbName: "hive_hive" };
+
+  function makeFakeClient(): MonitoredMongoClient & EventEmitter {
+    return new EventEmitter() as unknown as MonitoredMongoClient & EventEmitter;
+  }
+
+  function makeSentinelCollection() {
+    return { findOne: vi.fn() };
+  }
+
+  function makeTelemetryCollection() {
+    return { updateOne: vi.fn().mockResolvedValue({ acknowledged: true }) };
+  }
+
+  function makeRawDb(sentinelCollection: ReturnType<typeof makeSentinelCollection>) {
+    return {
+      collection: vi.fn(() => sentinelCollection),
+    } as unknown as Db;
+  }
+
+  function matchingDoc(overrides: Partial<IdentitySentinelDoc> = {}): IdentitySentinelDoc {
+    return {
+      _id: "identity_sentinel",
+      schemaVersion: 1,
+      instanceId: MONITOR_EXPECTED.instanceId,
+      dbName: MONITOR_EXPECTED.dbName,
+      sentinelId: "matching-uuid",
+      stampedAt: new Date(),
+      stampedBy: { engineVersion: "0.9.2", hostname: "host", pid: 1 },
+      ...overrides,
+    };
+  }
+
+  function foreignDoc(): IdentitySentinelDoc {
+    return matchingDoc({ instanceId: "impostor", dbName: "hive_impostor", sentinelId: "impostor-uuid" });
+  }
+
+  function serverDescription(type: string, processId?: string) {
+    return { type, topologyVersion: processId === undefined ? null : { processId } };
+  }
+
+  /** Builds a monitor wired to fresh fakes; returns everything a test needs. */
+  function setup(opts?: { intervalMs?: number; retryDelayMs?: number }) {
+    const client = makeFakeClient();
+    const sentinelCollection = makeSentinelCollection();
+    const rawDb = makeRawDb(sentinelCollection);
+    const telemetryCollection = makeTelemetryCollection();
+    const guard = new WriteGuard(MONITOR_EXPECTED);
+    const monitor = new DbIdentityMonitor(client, rawDb, guard, telemetryCollection as unknown as Collection, {
+      instanceId: MONITOR_EXPECTED.instanceId,
+      dbName: MONITOR_EXPECTED.dbName,
+      intervalMs: opts?.intervalMs ?? DbIdentityMonitor.INTERVAL_MS,
+      retryDelayMs: opts?.retryDelayMs ?? DbIdentityMonitor.RETRY_DELAY_MS,
+    });
+    return { client, sentinelCollection, telemetryCollection, guard, monitor };
+  }
+
+  async function flush(times = 10): Promise<void> {
+    for (let i = 0; i < times; i++) {
+      await Promise.resolve();
+    }
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockLog.debug.mockClear();
+    mockLog.info.mockClear();
+    mockLog.warn.mockClear();
+    mockLog.error.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // --- Scenario 1: serverDescriptionChanged trigger semantics ---
+  it("serverDescriptionChanged: changed processId triggers verify; same processId does not; first-seen seeds silently", async () => {
+    const { client, sentinelCollection, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+    monitor.start();
+
+    // First observation of this address: seeds silently, no verify.
+    client.emit("serverDescriptionChanged", {
+      address: "localhost:27017",
+      previousDescription: serverDescription("Unknown"),
+      newDescription: serverDescription("RSPrimary", "proc-1"),
+    });
+    await flush();
+    expect(sentinelCollection.findOne).not.toHaveBeenCalled();
+
+    // Same processId again: no trigger.
+    client.emit("serverDescriptionChanged", {
+      address: "localhost:27017",
+      previousDescription: serverDescription("RSPrimary", "proc-1"),
+      newDescription: serverDescription("RSPrimary", "proc-1"),
+    });
+    await flush();
+    expect(sentinelCollection.findOne).not.toHaveBeenCalled();
+
+    // Changed processId: triggers.
+    client.emit("serverDescriptionChanged", {
+      address: "localhost:27017",
+      previousDescription: serverDescription("RSPrimary", "proc-1"),
+      newDescription: serverDescription("RSPrimary", "proc-2"),
+    });
+    await flush();
+    expect(sentinelCollection.findOne).toHaveBeenCalledTimes(1);
+
+    monitor.stop();
+  });
+
+  it("serverDescriptionChanged: skips when newDescription.type is Unknown", async () => {
+    const { client, sentinelCollection, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+    monitor.start();
+
+    client.emit("serverDescriptionChanged", {
+      address: "localhost:27017",
+      previousDescription: serverDescription("RSPrimary", "proc-1"),
+      newDescription: serverDescription("Unknown"),
+    });
+    await flush();
+    expect(sentinelCollection.findOne).not.toHaveBeenCalled();
+
+    monitor.stop();
+  });
+
+  // --- Scenario 2: topologyDescriptionChanged + connectionPoolCleared triggers ---
+  it("topologyDescriptionChanged: Unknown -> known transition triggers verify", async () => {
+    const { client, sentinelCollection, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+    monitor.start();
+
+    const previousServers = new Map([["localhost:27017", serverDescription("Unknown")]]);
+    const newServers = new Map([["localhost:27017", serverDescription("RSPrimary", "proc-1")]]);
+
+    client.emit("topologyDescriptionChanged", {
+      previousDescription: { servers: previousServers },
+      newDescription: { servers: newServers },
+    });
+    await flush();
+    expect(sentinelCollection.findOne).toHaveBeenCalledTimes(1);
+
+    monitor.stop();
+  });
+
+  it("topologyDescriptionChanged: known -> known does not trigger", async () => {
+    const { client, sentinelCollection, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+    monitor.start();
+
+    const previousServers = new Map([["localhost:27017", serverDescription("RSPrimary", "proc-1")]]);
+    const newServers = new Map([["localhost:27017", serverDescription("RSPrimary", "proc-1")]]);
+
+    client.emit("topologyDescriptionChanged", {
+      previousDescription: { servers: previousServers },
+      newDescription: { servers: newServers },
+    });
+    await flush();
+    expect(sentinelCollection.findOne).not.toHaveBeenCalled();
+
+    monitor.stop();
+  });
+
+  it("connectionPoolCleared: always triggers verify", async () => {
+    const { client, sentinelCollection, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+    monitor.start();
+
+    client.emit("connectionPoolCleared", {});
+    await flush();
+    expect(sentinelCollection.findOne).toHaveBeenCalledTimes(1);
+
+    monitor.stop();
+  });
+
+  // --- Scenario 3: single-flight dirty-flag dedup ---
+  it("single-flight: burst of 5 triggers while in flight -> exactly one follow-up run", async () => {
+    const { client, sentinelCollection, monitor } = setup();
+    let releaseFirst!: () => void;
+    const gate = new Promise<IdentitySentinelDoc>((resolve) => {
+      releaseFirst = () => resolve(matchingDoc());
+    });
+    sentinelCollection.findOne.mockReturnValueOnce(gate).mockResolvedValue(matchingDoc());
+    monitor.start();
+
+    // First trigger starts the in-flight verification (gated on `gate`).
+    client.emit("connectionPoolCleared", {});
+    await flush();
+    expect(sentinelCollection.findOne).toHaveBeenCalledTimes(1);
+
+    // 5 more triggers while in flight — all should collapse into the dirty flag.
+    for (let i = 0; i < 5; i++) {
+      client.emit("connectionPoolCleared", {});
+    }
+    await flush();
+    // Still just the one in-flight call — the burst hasn't run yet.
+    expect(sentinelCollection.findOne).toHaveBeenCalledTimes(1);
+
+    // Release the gate; in-flight settles, dirty flag fires exactly one follow-up.
+    releaseFirst();
+    await flush(15);
+    expect(sentinelCollection.findOne).toHaveBeenCalledTimes(2);
+
+    monitor.stop();
+  });
+
+  // --- Scenario 4: runtime absent doc -> mismatch (the incident-shaped regression test) ---
+  it("runtime absent doc -> mismatch, guard engaged, telemetry + critical log", async () => {
+    const { client, sentinelCollection, telemetryCollection, guard, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValueOnce(null);
+    monitor.start();
+
+    client.emit("connectionPoolCleared", {});
+    await flush(15);
+
+    expect(guard.engaged).toBe(true);
+
+    const upsertCall = telemetryCollection.updateOne.mock.calls.at(-1);
+    expect(upsertCall[0]).toEqual({ kind: "db_identity_stats" });
+    expect(upsertCall[1].$set.state).toBe("mismatch");
+    expect(upsertCall[1].$set.writesRefused).toBe(true);
+
+    expect(mockLog.error).toHaveBeenCalledWith(
+      "DB IDENTITY MISMATCH — refusing writes",
+      expect.objectContaining({ critical: true }),
+    );
+
+    monitor.stop();
+  });
+
+  // --- Scenario 5: mismatch -> matching read -> auto-recovery ---
+  it("mismatch -> later matching read -> guard disengaged, recovery logged, telemetry verified", async () => {
+    const { client, sentinelCollection, telemetryCollection, guard, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValueOnce(null);
+    monitor.start();
+
+    client.emit("connectionPoolCleared", {});
+    await flush(15);
+    expect(guard.engaged).toBe(true);
+
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+    await vi.advanceTimersByTimeAsync(DbIdentityMonitor.INTERVAL_MS);
+    await flush(15);
+
+    expect(guard.engaged).toBe(false);
+    expect(mockLog.info).toHaveBeenCalledWith("identity re-verified — write refusal lifted", expect.anything());
+    const upsertCall = telemetryCollection.updateOne.mock.calls.at(-1);
+    expect(upsertCall[1].$set.state).toBe("verified");
+
+    monitor.stop();
+  });
+
+  // --- Scenario 6: 3x generic error -> cant_verify; later success recovers ---
+  it("findOne rejects 3x with generic Error -> cant_verify, guard engaged; later success recovers", async () => {
+    const { client, sentinelCollection, guard, monitor } = setup({ retryDelayMs: 5_000 });
+    sentinelCollection.findOne
+      .mockRejectedValueOnce(new Error("boom-1"))
+      .mockRejectedValueOnce(new Error("boom-2"))
+      .mockRejectedValueOnce(new Error("boom-3"));
+    monitor.start();
+
+    client.emit("connectionPoolCleared", {});
+    await flush();
+    // 2 retry delays between the 3 attempts.
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush(15);
+
+    expect(sentinelCollection.findOne).toHaveBeenCalledTimes(3);
+    expect(guard.engaged).toBe(true);
+
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+    await vi.advanceTimersByTimeAsync(DbIdentityMonitor.INTERVAL_MS);
+    await flush(15);
+    expect(guard.engaged).toBe(false);
+
+    monitor.stop();
+  });
+
+  // --- Scenario 7: 3x MongoServerSelectionError -> state unchanged, guard NOT engaged ---
+  it("findOne rejects 3x with MongoServerSelectionError -> state unchanged, guard not engaged, lastVerifyError recorded", async () => {
+    const { client, sentinelCollection, telemetryCollection, guard, monitor } = setup({ retryDelayMs: 5_000 });
+
+    function makeSelectionError(msg: string) {
+      const err = Object.create(MongoServerSelectionError.prototype) as MongoServerSelectionError;
+      (err as { message: string }).message = msg;
+      return err;
+    }
+
+    sentinelCollection.findOne
+      .mockRejectedValueOnce(makeSelectionError("unreachable-1"))
+      .mockRejectedValueOnce(makeSelectionError("unreachable-2"))
+      .mockRejectedValueOnce(makeSelectionError("unreachable-3"));
+    monitor.start();
+
+    client.emit("connectionPoolCleared", {});
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush(15);
+
+    expect(sentinelCollection.findOne).toHaveBeenCalledTimes(3);
+    // State started "verified" (constructor seed) and must remain unchanged.
+    expect(guard.engaged).toBe(false);
+
+    const upsertCall = telemetryCollection.updateOne.mock.calls.at(-1);
+    expect(upsertCall[1].$set.state).toBe("verified");
+    expect(upsertCall[1].$set.lastVerifyError).toContain("unreachable-3");
+
+    monitor.stop();
+  });
+
+  // --- Scenario 8: throwing listener/tick never escapes ---
+  it("throwing listener/tick: synchronous findOne throw does not produce an unhandled rejection; monitor stays responsive", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const { client, sentinelCollection, monitor } = setup({ retryDelayMs: 5_000 });
+      // Throws synchronously on every call within this run's retry loop
+      // (all 3 attempts) — the retry/grace path must absorb this without
+      // ever surfacing as an unhandled rejection.
+      sentinelCollection.findOne.mockImplementation(() => {
+        throw new Error("synchronous boom");
+      });
+      monitor.start();
+
+      client.emit("connectionPoolCleared", {});
+      await flush();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flush();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flush(15);
+
+      expect(unhandled).not.toHaveBeenCalled();
+      expect(sentinelCollection.findOne).toHaveBeenCalledTimes(3);
+
+      // Monitor should still be responsive to a subsequent trigger.
+      sentinelCollection.findOne.mockReset();
+      sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+      client.emit("connectionPoolCleared", {});
+      await flush(15);
+      expect(sentinelCollection.findOne).toHaveBeenCalledTimes(1);
+
+      monitor.stop();
+    } finally {
+      process.removeListener("unhandledRejection", unhandled);
+    }
+  });
+
+  // --- Scenario 9: engaged-to-engaged cross-transitions ---
+  it("cross-transitions: mismatch -> cant_verify -> mismatch -> stays mismatch under selection errors", async () => {
+    const { client, sentinelCollection, guard, monitor } = setup({ retryDelayMs: 5_000 });
+
+    // 1) mismatch (absent doc).
+    sentinelCollection.findOne.mockResolvedValueOnce(null);
+    monitor.start();
+    client.emit("connectionPoolCleared", {});
+    await flush(15);
+    expect(guard.engaged).toBe(true);
+
+    // 2) mismatch -> cant_verify (3x generic error).
+    sentinelCollection.findOne
+      .mockRejectedValueOnce(new Error("e1"))
+      .mockRejectedValueOnce(new Error("e2"))
+      .mockRejectedValueOnce(new Error("e3"));
+    await vi.advanceTimersByTimeAsync(DbIdentityMonitor.INTERVAL_MS);
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush(15);
+    expect(guard.engaged).toBe(true);
+
+    // 3) cant_verify -> mismatch (read succeeds with foreign doc).
+    sentinelCollection.findOne.mockResolvedValue(foreignDoc());
+    await vi.advanceTimersByTimeAsync(DbIdentityMonitor.INTERVAL_MS);
+    await flush(15);
+    expect(guard.engaged).toBe(true);
+
+    // 4) mismatch -> 3x MongoServerSelectionError -> stays mismatch (state unchanged).
+    function makeSelectionError(msg: string) {
+      const err = Object.create(MongoServerSelectionError.prototype) as MongoServerSelectionError;
+      (err as { message: string }).message = msg;
+      return err;
+    }
+    sentinelCollection.findOne
+      .mockRejectedValueOnce(makeSelectionError("s1"))
+      .mockRejectedValueOnce(makeSelectionError("s2"))
+      .mockRejectedValueOnce(makeSelectionError("s3"));
+    await vi.advanceTimersByTimeAsync(DbIdentityMonitor.INTERVAL_MS);
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush(15);
+
+    // Still refusing (state stayed "mismatch"), and guard remains engaged throughout.
+    expect(guard.engaged).toBe(true);
+    expect(guard.reason).not.toBeNull();
+
+    monitor.stop();
+  });
+
+  // --- Scenario 10 (plan lists two "9"s — schemaVersion tolerance) ---
+  it("schemaVersion 2 matching doc -> stays verified, log.warn called", async () => {
+    const { client, sentinelCollection, guard, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc({ schemaVersion: 2 }));
+    monitor.start();
+
+    client.emit("connectionPoolCleared", {});
+    await flush(15);
+
+    expect(guard.engaged).toBe(false);
+    expect(mockLog.warn).toHaveBeenCalledWith(
+      "identity sentinel schemaVersion is newer than this engine expects",
+      expect.anything(),
+    );
+
+    monitor.stop();
+  });
+
+  // --- Scenario 11: telemetry doc shape snapshot ---
+  it("telemetry doc shape: full key set and kind/filter of the upsert", async () => {
+    const { telemetryCollection, monitor } = setup();
+
+    await monitor.writeOnce();
+
+    expect(telemetryCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [filter, update, options] = telemetryCollection.updateOne.mock.calls[0];
+    expect(filter).toEqual({ kind: "db_identity_stats" });
+    expect(options).toEqual({ upsert: true });
+
+    const setDoc = update.$set;
+    expect(Object.keys(setDoc).sort()).toEqual(
+      [
+        "kind",
+        "state",
+        "expectedInstanceId",
+        "expectedDbName",
+        "sentinelPresent",
+        "observedInstanceId",
+        "observedDbName",
+        "observedSentinelId",
+        "writesRefused",
+        "refusedWriteCount",
+        "verifyCount",
+        "mismatchCount",
+        "lastVerifiedAt",
+        "lastMismatchAt",
+        "lastVerifyError",
+        "lastTriggerReason",
+        "updatedAt",
+      ].sort(),
+    );
+    expect(setDoc.kind).toBe("db_identity_stats");
+    expect(setDoc.updatedAt).toBeInstanceOf(Date);
+  });
+
+  // --- Scenario 12: stop() clears interval and removes listeners ---
+  it("stop() clears the interval and removes listeners; emit after stop() causes no verify", async () => {
+    const { client, sentinelCollection, monitor } = setup();
+    sentinelCollection.findOne.mockResolvedValue(matchingDoc());
+    monitor.start();
+    monitor.stop();
+
+    client.emit("connectionPoolCleared", {});
+    client.emit("serverDescriptionChanged", {
+      address: "localhost:27017",
+      previousDescription: serverDescription("Unknown"),
+      newDescription: serverDescription("RSPrimary", "proc-1"),
+    });
+    client.emit("topologyDescriptionChanged", {
+      previousDescription: { servers: new Map([["localhost:27017", serverDescription("Unknown")]]) },
+      newDescription: { servers: new Map([["localhost:27017", serverDescription("RSPrimary", "proc-1")]]) },
+    });
+    await flush(15);
+    await vi.advanceTimersByTimeAsync(DbIdentityMonitor.INTERVAL_MS * 2);
+    await flush(15);
+
+    expect(sentinelCollection.findOne).not.toHaveBeenCalled();
+    expect(client.listenerCount("connectionPoolCleared")).toBe(0);
+    expect(client.listenerCount("serverDescriptionChanged")).toBe(0);
+    expect(client.listenerCount("topologyDescriptionChanged")).toBe(0);
   });
 });
