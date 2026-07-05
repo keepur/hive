@@ -614,6 +614,58 @@ describe("DbIdentityMonitor", () => {
     monitor.stop();
   });
 
+  // --- Scenario 5b: mismatch against impostor A, then a DIFFERENT impostor B
+  // -> re-logs a second critical line (KPR-294 code-review fix: observedChanged
+  // must be computed from the PRE-mutation observed identity, not compared
+  // against itself post-mutation). ---
+  it("mismatch against impostor A, then impostor B (different foreign identity) -> re-logs a second critical error", async () => {
+    const { client, sentinelCollection, guard, monitor } = setup();
+
+    // 1) First mismatch: impostor A.
+    sentinelCollection.findOne.mockResolvedValueOnce(foreignDoc());
+    monitor.start();
+    client.emit("connectionPoolCleared", {});
+    await flush(15);
+
+    expect(guard.engaged).toBe(true);
+    expect(mockLog.error).toHaveBeenCalledTimes(1);
+    expect(mockLog.error).toHaveBeenNthCalledWith(
+      1,
+      "DB IDENTITY MISMATCH — refusing writes",
+      expect.objectContaining({
+        critical: true,
+        observed: { instanceId: "impostor", dbName: "hive_impostor" },
+      }),
+    );
+
+    // 2) Still a mismatch, but a DIFFERENT foreign identity: impostor B.
+    const impostorB = matchingDoc({
+      instanceId: "impostor-b",
+      dbName: "hive_impostor_b",
+      sentinelId: "impostor-b-uuid",
+    });
+    sentinelCollection.findOne.mockResolvedValue(impostorB);
+    await vi.advanceTimersByTimeAsync(DbIdentityMonitor.INTERVAL_MS);
+    await flush(15);
+
+    // State stayed "mismatch" both times, but the observed identity changed
+    // -> a second critical log line must fire (previously dead code: this
+    // assertion would fail before the fix, since observedChanged was always
+    // computed as false).
+    expect(guard.engaged).toBe(true);
+    expect(mockLog.error).toHaveBeenCalledTimes(2);
+    expect(mockLog.error).toHaveBeenNthCalledWith(
+      2,
+      "DB IDENTITY MISMATCH — refusing writes",
+      expect.objectContaining({
+        critical: true,
+        observed: { instanceId: "impostor-b", dbName: "hive_impostor_b" },
+      }),
+    );
+
+    monitor.stop();
+  });
+
   // --- Scenario 6: 3x generic error -> cant_verify; later success recovers ---
   it("findOne rejects 3x with generic Error -> cant_verify, guard engaged; later success recovers", async () => {
     const { client, sentinelCollection, guard, monitor } = setup({ retryDelayMs: 5_000 });

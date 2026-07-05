@@ -486,11 +486,14 @@ export class DbIdentityMonitor {
 
         // Server selectable but the sentinel read keeps failing — fail
         // closed: this is the "reachable but unverifiable" suspect state.
+        // `this.observedInstanceId`/`this.observedDbName` are untouched on
+        // this path, so the observed identity is definitionally unchanged.
         await this.transitionTo("cant_verify", reason, {
           sentinelPresent: this.sentinelPresent,
           observedInstanceId: this.observedInstanceId,
           observedDbName: this.observedDbName,
           observedSentinelId: this.observedSentinelId,
+          observedChanged: false,
         });
         return;
       }
@@ -498,6 +501,11 @@ export class DbIdentityMonitor {
   }
 
   private async applyResult(result: SentinelVerifyResult, reason: string): Promise<void> {
+    // Capture the PREVIOUS observed identity before any mutation below, so
+    // `observedChanged` reflects an actual before/after comparison instead
+    // of comparing the post-mutation value against itself.
+    const prevObserved = { instanceId: this.observedInstanceId, dbName: this.observedDbName };
+
     if (result.state === "verified") {
       this.lastVerifiedAt = new Date();
       this.sentinelPresent = true;
@@ -513,11 +521,14 @@ export class DbIdentityMonitor {
         });
       }
 
+      const observedChanged =
+        result.observed.instanceId !== prevObserved.instanceId || result.observed.dbName !== prevObserved.dbName;
       await this.transitionTo("verified", reason, {
         sentinelPresent: true,
         observedInstanceId: result.observed.instanceId,
         observedDbName: result.observed.dbName,
         observedSentinelId: result.observed.sentinelId,
+        observedChanged,
       });
       return;
     }
@@ -529,11 +540,14 @@ export class DbIdentityMonitor {
     this.observedDbName = result.observed?.dbName ?? null;
     this.observedSentinelId = result.observed?.sentinelId ?? null;
 
+    const observedChanged =
+      this.observedInstanceId !== prevObserved.instanceId || this.observedDbName !== prevObserved.dbName;
     await this.transitionTo("mismatch", reason, {
       sentinelPresent: result.sentinelPresent,
       observedInstanceId: this.observedInstanceId,
       observedDbName: this.observedDbName,
       observedSentinelId: this.observedSentinelId,
+      observedChanged,
     });
   }
 
@@ -549,11 +563,18 @@ export class DbIdentityMonitor {
       observedInstanceId: string | null;
       observedDbName: string | null;
       observedSentinelId: string | null;
+      /**
+       * Precomputed by the caller (`applyResult`/`verifyOnce`) BEFORE
+       * `this.observed*` was mutated to the new values — comparing against
+       * `this.observed*` here would always be false, since by the time
+       * `transitionTo` runs the fields already hold the new (observed)
+       * values (KPR-294 code-review fix).
+       */
+      observedChanged: boolean;
     },
   ): Promise<void> {
     const previous = this.state;
-    const observedChanged =
-      observed.observedInstanceId !== this.observedInstanceId || observed.observedDbName !== this.observedDbName;
+    const observedChanged = observed.observedChanged;
     this.state = next;
 
     if (next === "verified") {
