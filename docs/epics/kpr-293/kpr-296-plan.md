@@ -290,8 +290,12 @@ export async function datastoreIdentityForDoctor(
       const status = await admin.command({ serverStatus: 1 });
       server.host = typeof status.host === "string" ? status.host : null;
       server.version = typeof status.version === "string" ? status.version : null;
-      // BSON int64 may surface as Long depending on driver serialization; coerce.
-      server.pid = status.pid != null ? Number(status.pid) : null;
+      // BSON int64 may surface as a bson.Long depending on driver serialization
+      // (promoteLongs defaults to true, but don't assume the caller's client
+      // config) — a genuine Long has no valueOf, so plain Number(...) can
+      // yield NaN. Route through toString() first, which every plausible
+      // shape (number, bson.Long, numeric string) supports correctly.
+      server.pid = status.pid != null ? Number(status.pid.toString()) : null;
       server.uptimeSeconds = typeof status.uptime === "number" ? Math.round(status.uptime) : null;
     } catch (err) {
       notes.push(`serverStatus failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -797,7 +801,7 @@ Comment out the three `failed = true;` assignments in `renderDatastoreIdentitySe
 7. **F3 freshness gate:** fail only when `staleSeconds !== null && staleSeconds <= 120`. Stale-or-missing heartbeat with a non-verified last state is W6 (warn), not F3 — a dead engine's last gasp must not fail the doctor a week later. Conversely `staleSeconds: null` on an existing doc is treated as stale (warn), never fresh.
 8. **W5 gating:** requires both counts non-null AND `degraded: false` (F2 already owns the degraded case). W4 requires `docCount > 0` so the edge-15 shape (`docCount: 0`) routes to W5 only.
 9. **`report.uri` is pre-redacted in the adapter** — the renderer never sees raw credentials, so no render-path change can leak them.
-10. **serverStatus `pid` may arrive as a BSON Long** depending on driver serialization — coerce with `Number(...)`, don't `typeof === "number"`-gate it to null.
+10. **serverStatus `pid` may arrive as a BSON Long** depending on driver serialization — coerce via `Number(status.pid.toString())` (Task 1's code does this), never bare `Number(...)` on the raw value (a genuine `Long` has no `valueOf`, so plain `Number()` can yield `NaN`), and don't `typeof === "number"`-gate it to null.
 11. **Section placement and fold:** render as the first statement of the existing `if (config)` block; fold `failed` into `allPassed` right there. It precedes the `process.exit(1)` block by construction — do not move the section after the informational renders or into a separate `if`.
 12. **`--verbose` untouched:** remediation lines print unconditionally inline (newer-section ⚠ style). Do not thread `verbose` into the render signature.
 13. **esbuild bundle** must stay green (`npm run bundle`); no `import.meta.url` entry-guard patterns (repo lesson, KPR-183).
