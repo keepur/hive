@@ -51,7 +51,7 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 
 ## Storage
 
-- **MongoDB** — agent definitions, agent memory, per-agent sessions, callbacks, contacts, devices, model overrides. Collections include `agent_definitions`, `agent_definition_versions`, `agent_sessions`, `memory`, `memory_versions`, `contacts`, `agent_callbacks`, `devices`, `model_overrides`.
+- **MongoDB** — agent definitions, agent memory (FS-style + structured tiers), per-thread sessions, callbacks, contacts, team/workflow state, identity sentinel, telemetry. Collections include `agent_definitions`, `agent_definition_versions`, `sessions`, `memory`, `memory_versions`, `agent_memory`, `contacts`, `agent_callbacks`, `instance_identity`, `telemetry` (non-exhaustive — see CLAUDE.md for the full list).
 - **Qdrant** — vector storage for semantic recall (conversation search, code search, structured memory). Local Ollama (`bge-large`) generates embeddings.
 - **macOS Keychain (Honeypot)** — third-party API keys. Per-instance prefix `hive/<instance-id>/<KEY>`. The cloud language model never sees these — local MCP servers fetch credentials via Keychain at the moment of use.
 
