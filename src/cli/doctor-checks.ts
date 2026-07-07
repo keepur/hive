@@ -469,6 +469,338 @@ export async function memoryLifecycleStatsForDoctor(uri: string, dbName: string)
   }
 }
 
+// ── datastore identity (KPR-296) ────────────────────────────────────────
+
+/**
+ * Sentinel Contract identifiers (KPR-294 R2) and telemetry kinds, duplicated
+ * as literals: `src/db/identity-sentinel.ts` statically imports the mongodb
+ * driver + engine logger, and this module's convention is to never pull the
+ * driver at module load (unit tests mock nothing). Drift against the
+ * producer's exported constants is pinned by a test in doctor-checks.test.ts.
+ */
+export const DOCTOR_SENTINEL_COLLECTION = "instance_identity";
+export const DOCTOR_SENTINEL_ID = "identity_sentinel";
+export const DOCTOR_SENTINEL_SCHEMA_VERSION = 1;
+export const DOCTOR_DB_IDENTITY_STATS_KIND = "db_identity_stats";
+export const DOCTOR_ROSTER_STATS_KIND = "agent_roster_stats";
+
+/** KPR-296 spec §Report shape — verbatim. */
+export interface DatastoreIdentityReport {
+  // Connection target (from config; credentials redacted before display)
+  uri: string; // userinfo stripped: mongodb://<credentials>@host
+  dbName: string;
+  instanceId: string;
+
+  // Server fingerprint — each null when the command failed; note carries why
+  server: {
+    host: string | null; // serverStatus.host (self-reported host:port)
+    version: string | null; // serverStatus.version
+    pid: number | null; // serverStatus.pid
+    uptimeSeconds: number | null;
+    dbPath: string | null; // getCmdLineOpts.parsed.storage.dbPath
+    note: string | null; // e.g. "serverStatus unauthorized — expected under authed Mongo (KPR-297)"
+  };
+
+  // Doctor's own sentinel read (Sentinel Contract, KPR-294 R2)
+  sentinel:
+    | {
+        state: "verified";
+        observed: { instanceId: string; dbName: string; sentinelId: string | null };
+        schemaVersionNewer: boolean;
+        stampedAt: Date | null; // advisory display only, never verified (R2)
+        stampedBy: string | null;
+      }
+    | {
+        state: "mismatch";
+        observed: { instanceId: string; dbName: string; sentinelId: string | null };
+        schemaVersionNewer: boolean;
+      }
+    | { state: "absent" }
+    | { state: "error"; message: string };
+
+  // Live count — exact countDocuments({}), not estimated (it is a compare-target)
+  agentDefinitionsCount: number | null;
+
+  // Engine's identity monitor view (db_identity_stats — heartbeat kind)
+  identityStats: {
+    state: "verified" | "mismatch" | "cant_verify" | string; // tolerate unknown future states as non-verified
+    writesRefused: boolean;
+    refusedWriteCount: number;
+    lastVerifiedAt: Date | null;
+    lastMismatchAt: Date | null;
+    observedInstanceId: string | null;
+    observedDbName: string | null;
+    staleSeconds: number | null; // from updatedAt — heartbeat cadence, staleness IS meaningful here
+  } | null; // null = no doc yet (engine never booted post-KPR-294)
+
+  // Roster guard view (agent_roster_stats — EVENT-DRIVEN kind)
+  rosterStats: {
+    docCount: number | null;
+    activeCount: number | null;
+    disabledCount: number | null;
+    lastGoodAt: Date | null;
+    lastGoodSource: "boot" | "reload" | null;
+    degraded: boolean;
+    degradedSince: Date | null;
+    blockedReloadCount: number;
+    lastBlockedAt: Date | null;
+    updatedAt: Date | null; // displayed as a timestamp only — NEVER a staleness warning (canon E3)
+  } | null; // null = no doc yet (engine never booted post-KPR-295)
+}
+
+/** Strip userinfo from a Mongo URI for display (log-redaction convention, CLAUDE.md Security). */
+export function redactMongoUri(uri: string): string {
+  // Userinfo cannot contain an unencoded `/`, so `[^@/]+@` never crosses
+  // into the host/path and a credential-less URI passes through unchanged.
+  return uri.replace(/^(mongodb(?:\+srv)?:\/\/)[^@/]+@/, "$1<credentials>@");
+}
+
+/** Temp-directory roots — a dbPath under any of these is the Jul-4 impostor signature (spec W3). */
+const TEMP_DB_PATH_ROOTS = ["/tmp", "/private/tmp", "/var/folders"];
+
+export function isTempDbPath(dbPath: string): boolean {
+  return TEMP_DB_PATH_ROOTS.some((root) => dbPath === root || dbPath.startsWith(`${root}/`));
+}
+
+/** Compact uptime for the fingerprint line: 266520 → "3d2h", 3700 → "1h1m", 90 → "1m". */
+export function formatUptime(totalSeconds: number): string {
+  const d = Math.floor(totalSeconds / 86_400);
+  const h = Math.floor((totalSeconds % 86_400) / 3_600);
+  const m = Math.floor((totalSeconds % 3_600) / 60);
+  if (d > 0) return `${d}d${h}h`;
+  if (h > 0) return `${h}h${m}m`;
+  return `${m}m`;
+}
+
+/** Loose read shapes — the doctor reads defensively; it never assumes the producer's TS types (E2). */
+interface SentinelDocLike {
+  instanceId?: unknown;
+  dbName?: unknown;
+  sentinelId?: unknown;
+  schemaVersion?: unknown;
+  stampedAt?: unknown;
+  stampedBy?: unknown;
+}
+
+/**
+ * Pure sentinel-doc → report mapping. Match = `instanceId` AND `dbName`
+ * equality ONLY (Sentinel Contract, R2) — never `sentinelId`, `stampedAt`,
+ * `stampedBy`, or wall clock. `schemaVersion > 1` is tolerated (W2 warn at
+ * render time; frozen fields still trusted). The `error` variant is
+ * assigned by the adapter's catch, not here.
+ */
+export function mapSentinelDoc(
+  doc: SentinelDocLike | null,
+  expected: { instanceId: string; dbName: string },
+): DatastoreIdentityReport["sentinel"] {
+  if (!doc) return { state: "absent" };
+  const observed = {
+    instanceId: typeof doc.instanceId === "string" ? doc.instanceId : "<invalid>",
+    dbName: typeof doc.dbName === "string" ? doc.dbName : "<invalid>",
+    sentinelId: typeof doc.sentinelId === "string" ? doc.sentinelId : null,
+  };
+  const schemaVersionNewer =
+    typeof doc.schemaVersion === "number" && doc.schemaVersion > DOCTOR_SENTINEL_SCHEMA_VERSION;
+  if (observed.instanceId === expected.instanceId && observed.dbName === expected.dbName) {
+    const stampedBy = doc.stampedBy as { engineVersion?: unknown; hostname?: unknown } | null | undefined;
+    return {
+      state: "verified",
+      observed,
+      schemaVersionNewer,
+      stampedAt: doc.stampedAt instanceof Date ? doc.stampedAt : null,
+      stampedBy:
+        stampedBy && (typeof stampedBy.engineVersion === "string" || typeof stampedBy.hostname === "string")
+          ? `${String(stampedBy.engineVersion ?? "?")}@${String(stampedBy.hostname ?? "?")}`
+          : null,
+    };
+  }
+  return { state: "mismatch", observed, schemaVersionNewer };
+}
+
+interface IdentityStatsDocLike {
+  state?: unknown;
+  writesRefused?: unknown;
+  refusedWriteCount?: unknown;
+  lastVerifiedAt?: unknown;
+  lastMismatchAt?: unknown;
+  observedInstanceId?: unknown;
+  observedDbName?: unknown;
+  updatedAt?: unknown;
+}
+
+/** Pure db_identity_stats-doc → report mapping. Unknown/missing `state` maps to "unknown" — the renderer treats any non-"verified" as F3 when fresh (fail-closed, spec edge #12). */
+export function mapIdentityStatsDoc(
+  doc: IdentityStatsDocLike | null,
+  now = Date.now(),
+): DatastoreIdentityReport["identityStats"] {
+  if (!doc) return null;
+  const updatedAt = doc.updatedAt instanceof Date ? doc.updatedAt : null;
+  return {
+    state: typeof doc.state === "string" ? doc.state : "unknown",
+    writesRefused: doc.writesRefused === true,
+    refusedWriteCount: typeof doc.refusedWriteCount === "number" ? doc.refusedWriteCount : 0,
+    lastVerifiedAt: doc.lastVerifiedAt instanceof Date ? doc.lastVerifiedAt : null,
+    lastMismatchAt: doc.lastMismatchAt instanceof Date ? doc.lastMismatchAt : null,
+    observedInstanceId: typeof doc.observedInstanceId === "string" ? doc.observedInstanceId : null,
+    observedDbName: typeof doc.observedDbName === "string" ? doc.observedDbName : null,
+    staleSeconds: updatedAt ? Math.round((now - updatedAt.getTime()) / 1000) : null,
+  };
+}
+
+interface RosterStatsDocLike {
+  docCount?: unknown;
+  activeCount?: unknown;
+  disabledCount?: unknown;
+  lastGoodAt?: unknown;
+  lastGoodSource?: unknown;
+  degraded?: unknown;
+  degradedSince?: unknown;
+  blockedReloadCount?: unknown;
+  lastBlockedAt?: unknown;
+  updatedAt?: unknown;
+}
+
+/** Pure agent_roster_stats-doc → report mapping. Frozen fields per E2; `disabledCount`/`degradedSince`/`blockedReloadCount`/`lastBlockedAt` are merged-but-stable (spec §Report shape note) — a partial/pre-KPR-295 doc still maps without throwing. */
+export function mapRosterStatsDoc(doc: RosterStatsDocLike | null): DatastoreIdentityReport["rosterStats"] {
+  if (!doc) return null;
+  const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
+  const date = (v: unknown): Date | null => (v instanceof Date ? v : null);
+  return {
+    docCount: num(doc.docCount),
+    activeCount: num(doc.activeCount),
+    disabledCount: num(doc.disabledCount),
+    lastGoodAt: date(doc.lastGoodAt),
+    lastGoodSource: doc.lastGoodSource === "boot" || doc.lastGoodSource === "reload" ? doc.lastGoodSource : null,
+    degraded: doc.degraded === true,
+    degradedSince: date(doc.degradedSince),
+    blockedReloadCount: typeof doc.blockedReloadCount === "number" ? doc.blockedReloadCount : 0,
+    lastBlockedAt: date(doc.lastBlockedAt),
+    updatedAt: date(doc.updatedAt),
+  };
+}
+
+/**
+ * KPR-296 read adapter. Returns `null` only when the server is unreachable
+ * (the Agents-group `mongoReachable` check already fails and explains that
+ * case — the section renders "○ unreachable" and does not double-fail).
+ *
+ * ⚠ Delegated (spec §Design, settled): ONE shared client for all sub-reads,
+ * unlike the sibling one-client-per-check pattern — the report's value
+ * depends on every read observing the SAME server; split clients could
+ * straddle a server flap and produce an incoherent report. Each sub-read is
+ * individually try/caught so one failing command (e.g. unauthorized
+ * `serverStatus` post-KPR-297) yields a partial report, not a dead section.
+ *
+ * STRICTLY READ-ONLY — both producer contracts mandate "doctor MUST NOT
+ * write" (R2 / E2). No insert/update/replace/delete/drop of any kind.
+ */
+export async function datastoreIdentityForDoctor(
+  uri: string,
+  dbName: string,
+  instanceId: string,
+): Promise<DatastoreIdentityReport | null> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    await client.db(dbName).command({ ping: 1 });
+  } catch {
+    await client.close().catch(() => {});
+    return null;
+  }
+
+  try {
+    const db = client.db(dbName);
+    const admin = db.admin();
+
+    // Server fingerprint — best-effort, never fails the report (I4/KPR-297 forward-compat).
+    const server: DatastoreIdentityReport["server"] = {
+      host: null,
+      version: null,
+      pid: null,
+      uptimeSeconds: null,
+      dbPath: null,
+      note: null,
+    };
+    const notes: string[] = [];
+    try {
+      const status = await admin.command({ serverStatus: 1 });
+      server.host = typeof status.host === "string" ? status.host : null;
+      server.version = typeof status.version === "string" ? status.version : null;
+      // BSON int64 may surface as a bson.Long depending on driver serialization
+      // (promoteLongs defaults to true, but don't assume the caller's client
+      // config) — a genuine Long has no valueOf, so plain Number(...) can
+      // yield NaN. Route through toString() first, which every plausible
+      // shape (number, bson.Long, numeric string) supports correctly.
+      server.pid = status.pid != null ? Number(status.pid.toString()) : null;
+      server.uptimeSeconds = typeof status.uptime === "number" ? Math.round(status.uptime) : null;
+    } catch (err) {
+      notes.push(`serverStatus failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      const opts = await admin.command({ getCmdLineOpts: 1 });
+      const dbPath = (opts as { parsed?: { storage?: { dbPath?: unknown } } }).parsed?.storage?.dbPath;
+      server.dbPath = typeof dbPath === "string" ? dbPath : null; // absent under bare defaults → renderer prints "(default)", skips W3
+    } catch (err) {
+      notes.push(`getCmdLineOpts failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    server.note = notes.length > 0 ? notes.join("; ") : null;
+
+    // Doctor's OWN sentinel read (out-of-process, R4 leaves CLIs ungated by design).
+    let sentinel: DatastoreIdentityReport["sentinel"];
+    try {
+      const doc = await db
+        .collection<{ _id: string } & SentinelDocLike>(DOCTOR_SENTINEL_COLLECTION)
+        .findOne({ _id: DOCTOR_SENTINEL_ID });
+      sentinel = mapSentinelDoc(doc, { instanceId, dbName });
+    } catch (err) {
+      sentinel = { state: "error", message: err instanceof Error ? err.message : String(err) };
+    }
+
+    // Live roster count — exact countDocuments (compare-target for W5),
+    // NOT estimatedDocumentCount.
+    let agentDefinitionsCount: number | null = null;
+    try {
+      agentDefinitionsCount = await db.collection("agent_definitions").countDocuments({});
+    } catch {
+      agentDefinitionsCount = null;
+    }
+
+    // Engine telemetry views — absent doc and failed read both map to null
+    // (renders I2); the report shape carries no error slot for these.
+    let identityStats: DatastoreIdentityReport["identityStats"] = null;
+    try {
+      identityStats = mapIdentityStatsDoc(
+        await db.collection<IdentityStatsDocLike>("telemetry").findOne({ kind: DOCTOR_DB_IDENTITY_STATS_KIND }),
+      );
+    } catch {
+      /* stays null */
+    }
+
+    let rosterStats: DatastoreIdentityReport["rosterStats"] = null;
+    try {
+      rosterStats = mapRosterStatsDoc(
+        await db.collection<RosterStatsDocLike>("telemetry").findOne({ kind: DOCTOR_ROSTER_STATS_KIND }),
+      );
+    } catch {
+      /* stays null */
+    }
+
+    return {
+      uri: redactMongoUri(uri),
+      dbName,
+      instanceId,
+      server,
+      sentinel,
+      agentDefinitionsCount,
+      identityStats,
+      rosterStats,
+    };
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 // ── resolved paths ─────────────────────────────────────────────────────
 
 /** Expand ~ in a path. */

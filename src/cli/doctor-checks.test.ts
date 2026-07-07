@@ -288,3 +288,287 @@ describe("cacheHitRatesForDoctor", () => {
     await expect(cacheHitRatesForDoctor("mongodb://x", "hive_test")).resolves.toEqual([]);
   });
 });
+
+// ── datastore identity (KPR-296) ─────────────────────────────────────────
+
+import {
+  DOCTOR_DB_IDENTITY_STATS_KIND,
+  DOCTOR_SENTINEL_COLLECTION,
+  DOCTOR_SENTINEL_ID,
+  DOCTOR_SENTINEL_SCHEMA_VERSION,
+  formatUptime,
+  isTempDbPath,
+  mapIdentityStatsDoc,
+  mapRosterStatsDoc,
+  mapSentinelDoc,
+  redactMongoUri,
+} from "./doctor-checks.js";
+// Producer constants — imported in TESTS only (the source module must not
+// import identity-sentinel.ts; see the literal-duplication comment there).
+import {
+  SENTINEL_COLLECTION,
+  SENTINEL_ID,
+  SENTINEL_SCHEMA_VERSION,
+  DbIdentityMonitor,
+} from "../db/identity-sentinel.js";
+
+describe("KPR-296 contract drift pins", () => {
+  it("doctor's duplicated sentinel identifiers match the producer's exported constants", () => {
+    expect(DOCTOR_SENTINEL_COLLECTION).toBe(SENTINEL_COLLECTION);
+    expect(DOCTOR_SENTINEL_ID).toBe(SENTINEL_ID);
+    expect(DOCTOR_SENTINEL_SCHEMA_VERSION).toBe(SENTINEL_SCHEMA_VERSION);
+    expect(DOCTOR_DB_IDENTITY_STATS_KIND).toBe(DbIdentityMonitor.TELEMETRY_KIND);
+  });
+  // agent_roster_stats has no exported producer constant — it's a literal
+  // inside the writeRosterStats closure in index.ts; pinned by the Task 3
+  // grep acceptance instead.
+});
+
+describe("redactMongoUri", () => {
+  it("redacts userinfo on a plain mongodb:// URI", () => {
+    expect(redactMongoUri("mongodb://user:pass@localhost:27017/x")).toBe("mongodb://<credentials>@localhost:27017/x");
+  });
+  it("redacts userinfo on a mongodb+srv:// URI", () => {
+    expect(redactMongoUri("mongodb+srv://u:p@cluster.example.com")).toBe(
+      "mongodb+srv://<credentials>@cluster.example.com",
+    );
+  });
+  it("leaves a credential-less URI unchanged", () => {
+    expect(redactMongoUri("mongodb://localhost:27017")).toBe("mongodb://localhost:27017");
+  });
+  it("leaves a URI with '@' only after the first '/' unchanged (no userinfo)", () => {
+    expect(redactMongoUri("mongodb://localhost:27017/db?replicaSet=rs@0")).toBe(
+      "mongodb://localhost:27017/db?replicaSet=rs@0",
+    );
+  });
+});
+
+describe("isTempDbPath", () => {
+  it("true for /tmp and subpaths", () => {
+    expect(isTempDbPath("/tmp")).toBe(true);
+    expect(isTempDbPath("/tmp/xyz")).toBe(true);
+  });
+  it("true for /private/tmp subpaths", () => {
+    expect(isTempDbPath("/private/tmp/mongo-impostor")).toBe(true);
+  });
+  it("true for /var/folders subpaths", () => {
+    expect(isTempDbPath("/var/folders/ab/cd")).toBe(true);
+  });
+  it("false for unrelated or look-alike paths", () => {
+    expect(isTempDbPath("/opt/homebrew/var/mongodb")).toBe(false);
+    expect(isTempDbPath("/tmpfoo")).toBe(false);
+    expect(isTempDbPath("/data/tmp")).toBe(false);
+  });
+});
+
+describe("formatUptime", () => {
+  it("formats days+hours", () => {
+    expect(formatUptime(266_520)).toBe("3d2h");
+  });
+  it("formats hours+minutes", () => {
+    expect(formatUptime(3_700)).toBe("1h1m");
+  });
+  it("formats minutes only", () => {
+    expect(formatUptime(90)).toBe("1m");
+  });
+});
+
+describe("mapSentinelDoc", () => {
+  const expected = { instanceId: "dodi", dbName: "hive_dodi" };
+
+  it("null doc -> absent", () => {
+    expect(mapSentinelDoc(null, expected)).toEqual({ state: "absent" });
+  });
+
+  it("exact match -> verified, with stampedBy formatting and stampedAt passthrough", () => {
+    const stampedAt = new Date("2026-07-01T00:00:00Z");
+    const result = mapSentinelDoc(
+      {
+        instanceId: "dodi",
+        dbName: "hive_dodi",
+        sentinelId: "abc-123",
+        schemaVersion: 1,
+        stampedAt,
+        stampedBy: { engineVersion: "0.9.2", hostname: "mokiemon" },
+      },
+      expected,
+    );
+    expect(result).toEqual({
+      state: "verified",
+      observed: { instanceId: "dodi", dbName: "hive_dodi", sentinelId: "abc-123" },
+      schemaVersionNewer: false,
+      stampedAt,
+      stampedBy: "0.9.2@mokiemon",
+    });
+  });
+
+  it("instanceId differs (dbName equal) -> mismatch", () => {
+    const result = mapSentinelDoc({ instanceId: "keepur", dbName: "hive_dodi" }, expected);
+    expect(result.state).toBe("mismatch");
+  });
+
+  it("dbName differs (instanceId equal) -> mismatch (inverse direction)", () => {
+    const result = mapSentinelDoc({ instanceId: "dodi", dbName: "hive_keepur" }, expected);
+    expect(result.state).toBe("mismatch");
+  });
+
+  it("match ignores sentinelId/stampedAt/stampedBy/wall clock — still verified", () => {
+    const result = mapSentinelDoc(
+      {
+        instanceId: "dodi",
+        dbName: "hive_dodi",
+        sentinelId: "foreign-sentinel-id",
+        stampedAt: new Date("2000-01-01T00:00:00Z"),
+        stampedBy: { engineVersion: "0.0.1", hostname: "someone-elses-box" },
+      },
+      expected,
+    );
+    expect(result.state).toBe("verified");
+  });
+
+  it("schemaVersion newer + matching identity -> verified with schemaVersionNewer true", () => {
+    const result = mapSentinelDoc({ instanceId: "dodi", dbName: "hive_dodi", schemaVersion: 2 }, expected);
+    expect(result).toMatchObject({ state: "verified", schemaVersionNewer: true });
+  });
+
+  it("schemaVersion newer + mismatch -> mismatch with schemaVersionNewer true", () => {
+    const result = mapSentinelDoc({ instanceId: "keepur", dbName: "hive_dodi", schemaVersion: 2 }, expected);
+    expect(result).toMatchObject({ state: "mismatch", schemaVersionNewer: true });
+  });
+
+  it("malformed doc (missing instanceId) -> mismatch with observed.instanceId '<invalid>', no throw", () => {
+    expect(() => mapSentinelDoc({ dbName: "hive_dodi" }, expected)).not.toThrow();
+    const result = mapSentinelDoc({ dbName: "hive_dodi" }, expected);
+    expect(result).toMatchObject({ state: "mismatch", observed: { instanceId: "<invalid>" } });
+  });
+});
+
+describe("mapIdentityStatsDoc", () => {
+  const now = new Date("2026-07-06T00:00:00Z").getTime();
+
+  it("null -> null", () => {
+    expect(mapIdentityStatsDoc(null, now)).toBeNull();
+  });
+
+  it("full doc maps all fields + staleSeconds from pinned now", () => {
+    const updatedAt = new Date(now - 45_000);
+    const lastVerifiedAt = new Date(now - 10_000);
+    const lastMismatchAt = new Date(now - 500_000);
+    const result = mapIdentityStatsDoc(
+      {
+        state: "verified",
+        writesRefused: false,
+        refusedWriteCount: 3,
+        lastVerifiedAt,
+        lastMismatchAt,
+        observedInstanceId: "dodi",
+        observedDbName: "hive_dodi",
+        updatedAt,
+      },
+      now,
+    );
+    expect(result).toEqual({
+      state: "verified",
+      writesRefused: false,
+      refusedWriteCount: 3,
+      lastVerifiedAt,
+      lastMismatchAt,
+      observedInstanceId: "dodi",
+      observedDbName: "hive_dodi",
+      staleSeconds: 45,
+    });
+  });
+
+  it("missing state -> 'unknown'", () => {
+    const result = mapIdentityStatsDoc({}, now);
+    expect(result?.state).toBe("unknown");
+  });
+
+  it("missing counters -> defaults", () => {
+    const result = mapIdentityStatsDoc({}, now);
+    expect(result).toMatchObject({
+      writesRefused: false,
+      refusedWriteCount: 0,
+      lastVerifiedAt: null,
+      lastMismatchAt: null,
+      observedInstanceId: null,
+      observedDbName: null,
+    });
+  });
+
+  it("non-Date updatedAt -> staleSeconds null", () => {
+    const result = mapIdentityStatsDoc({ updatedAt: "2026-07-06T00:00:00Z" }, now);
+    expect(result?.staleSeconds).toBeNull();
+  });
+
+  it("unknown state string passes through verbatim", () => {
+    const result = mapIdentityStatsDoc({ state: "some_future_state" }, now);
+    expect(result?.state).toBe("some_future_state");
+  });
+});
+
+describe("mapRosterStatsDoc", () => {
+  it("null -> null", () => {
+    expect(mapRosterStatsDoc(null)).toBeNull();
+  });
+
+  it("full doc round-trips", () => {
+    const lastGoodAt = new Date("2026-07-05T00:00:00Z");
+    const degradedSince = new Date("2026-07-04T00:00:00Z");
+    const lastBlockedAt = new Date("2026-07-03T00:00:00Z");
+    const updatedAt = new Date("2026-07-06T00:00:00Z");
+    const result = mapRosterStatsDoc({
+      docCount: 12,
+      activeCount: 10,
+      disabledCount: 2,
+      lastGoodAt,
+      lastGoodSource: "reload",
+      degraded: true,
+      degradedSince,
+      blockedReloadCount: 4,
+      lastBlockedAt,
+      updatedAt,
+    });
+    expect(result).toEqual({
+      docCount: 12,
+      activeCount: 10,
+      disabledCount: 2,
+      lastGoodAt,
+      lastGoodSource: "reload",
+      degraded: true,
+      degradedSince,
+      blockedReloadCount: 4,
+      lastBlockedAt,
+      updatedAt,
+    });
+  });
+
+  it("partial doc (only frozen E2 fields) -> nulls/defaults, no throw", () => {
+    expect(() =>
+      mapRosterStatsDoc({
+        docCount: 5,
+        activeCount: 5,
+        lastGoodAt: new Date("2026-07-05T00:00:00Z"),
+        lastGoodSource: "boot",
+      }),
+    ).not.toThrow();
+    const result = mapRosterStatsDoc({
+      docCount: 5,
+      activeCount: 5,
+      lastGoodAt: new Date("2026-07-05T00:00:00Z"),
+      lastGoodSource: "boot",
+    });
+    expect(result).toMatchObject({
+      disabledCount: null,
+      degradedSince: null,
+      blockedReloadCount: 0,
+      lastBlockedAt: null,
+      degraded: false,
+    });
+  });
+
+  it("degraded missing -> false", () => {
+    const result = mapRosterStatsDoc({ docCount: 1 });
+    expect(result?.degraded).toBe(false);
+  });
+});
