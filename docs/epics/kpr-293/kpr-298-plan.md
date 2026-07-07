@@ -134,7 +134,7 @@ In `docs/troubleshooting.md`:
 > Adapted from the KPR-296 implementation plan's E2E drill (`docs/epics/kpr-293/kpr-296-plan.md`, Testing Contract → E2E). Exercises F1, the temp-path warn, and W1 without touching the real DB:
 >
 > 1. **Happy path:** on a healthy instance with the engine running: `hive doctor; echo $?` → the Datastore identity section shows the server fingerprint and `✓` sentinel / `✓` engine monitor / `✓` roster lines; exit `0`.
-> 2. **F1 + temp-path (impostor-shaped):** start a scratch mongod on a spare port with a throwaway data dir: `mongod --dbpath "$(mktemp -d)" --port 27099 &`. Stamp a *foreign* sentinel + one dummy agent def:
+> 2. **F1 + temp-path (impostor-shaped):** start a scratch mongod on a spare port with a throwaway data dir: `mongod --dbpath "$(mktemp -d)" --port 27099 &`. Stamp a *foreign* sentinel + one dummy agent def (`<dbName>` below must be your instance's **configured** DB name — `hive_<instance-id>` by default, or `MONGODB_DB` if set — otherwise the doctor sees an absent sentinel, not a MISMATCH):
 >
 >    ```
 >    mongosh --port 27099 <dbName> --eval 'db.instance_identity.insertOne({_id:"identity_sentinel",schemaVersion:1,instanceId:"other",dbName:"hive_other",sentinelId:"drill",stampedAt:new Date(),stampedBy:{engineVersion:"drill",hostname:"drill",pid:1}}); db.agent_definitions.insertOne({_id:"dummy",isDefault:true})'
