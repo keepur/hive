@@ -60,9 +60,9 @@ Expected: exit 0 (typecheck + lint + format + tests all green) before any edit.
   - Reason: every new behavior is pure in-process logic over injectable collaborators — time via `now: () => number`, failures via `TurnClassification`/`RunResult` literals, Mongo via the existing mock factories, the SDK via the existing `mockQuery` harness. **No live-provider tests** (spec testing outline) and no network anywhere.
   - Minimum assertions:
     - Classifier: one assertion per fault kind per pattern table; **each of the six `isAuthRebuildResumeError` sentinel alternates individually classifies `auth`** (`resolve authentication`, `credentials.json`, `not authenticated`, `401 Unauthorized`, `ANTHROPIC_API_KEY`, `authToken`); `timedOut+aborted` → `timeout` (precedence over `aborted`); `aborted` alone → neutral; no error → success; unknown string → `non-provider`; SDK subtypes `error_max_turns`/`error_during_execution` → `non-provider`; `classifyThrown` default; `HARD_FAULT_KINDS` excludes exactly `non-provider`.
-    - State machine (injected clock): closed→open at 3 consecutive hard faults; success resets streak; non-provider fault resets streak; aborted leaves streak unchanged; p95 trip (minSamples gate, threshold breach, `reason: "p95-breach"`, `lastFaultMessage: null`); window cleared on close; open-state `acquire` throws with correct `provider/openedAt/retryAfterMs/reason/lastFaultMessage`; lazy half-open at `openedAt + cooldown` (that acquire is the probe, `isProbe: true`); **half-open concurrent acquire throws with `retryAfterMs === 0`** (contract reconciliation pin); probe success → closed + full reset (streak, window, backoff); probe hard fault → open with doubled cooldown, capped at `openMaxMs`; probe aborted → open, exponent unchanged; probe non-provider fault → closed; per-provider isolation (claude open, gemini grants); shadow mode (acquire never throws, transitions still tracked, `fastFailCount` stays 0); stale-probe reconciliation; `record` idempotent per permit; **late permit** (acquired closed, recorded while open) never transitions state; `tripCount` counts closed→open only.
+    - State machine (injected clock): closed→open at 3 consecutive hard faults; success resets streak; non-provider fault resets streak; aborted leaves streak unchanged; p95 trip (minSamples gate, threshold breach, `reason: "p95-breach"`, `lastFaultMessage: null`); window **and stale `lastFaultKind`/`lastFaultMessage`/`lastFaultAt`** cleared on close (a later p95 trip after a prior, already-recovered fault still pins `lastFaultMessage: null`); open-state `acquire` throws with correct `provider/openedAt/retryAfterMs/reason/lastFaultMessage`; lazy half-open at `openedAt + cooldown` (that acquire is the probe, `isProbe: true`); **half-open concurrent acquire throws with `retryAfterMs === 0`** (contract reconciliation pin); probe success → closed + full reset (streak, window seeded with the probe's own sample, backoff); probe hard fault → open with doubled cooldown, capped at `openMaxMs`; probe aborted → open, exponent unchanged; probe non-provider fault → closed; per-provider isolation (claude open, gemini grants); shadow mode (acquire never throws, transitions still tracked, `fastFailCount` stays 0); stale-probe reconciliation; `record` idempotent per permit; **late permit** (acquired closed, recorded while open) never transitions state; `tripCount` counts closed→open only.
     - Runner: deadline fire → `timedOut: true` + `aborted: true`; operator abort → `aborted: true`, `timedOut` unset; **operator-abort-then-late-deadline** (abort nulls `activeQuery`, deadline fires after) → `timedOut` unset — the assertion the `if (this.activeQuery)` guard exists for.
-    - Wrap point: 3 hard-fault turns trip the breaker and the 4th `spawnTurn` rejects with `ProviderCircuitOpenError` **without invoking the adapter** (`mockRunnerSend` call count unchanged); coordinator snapshot clean after fast-fail (`activeSpawns === 0`, thread lock free — next call rejects with `ProviderCircuitOpenError`, not budget/lock errors); record-once under auth-rebuild retry (only the retry's result feeds the breaker); thrown adapter error classified via `classifyThrown` and rethrown; probe-success recovery end-to-end through `spawnTurn` with an injected-clock registry.
+    - Wrap point: 3 hard-fault turns trip the breaker and the 4th `spawnTurn` rejects with `ProviderCircuitOpenError` **without invoking the adapter** (`mockRunnerSend` call count unchanged) **or the router** (`routeModel` not called — rejection lands before `prepareSpawn`/router); coordinator snapshot clean after fast-fail (`activeSpawns === 0`, thread lock free — next call rejects with `ProviderCircuitOpenError`, not budget/lock errors); record-once under auth-rebuild retry (only the retry's result feeds the breaker); thrown adapter error classified via `classifyThrown` and rethrown; probe-success recovery end-to-end through `spawnTurn` with an injected-clock registry.
     - Heartbeat: per-provider upsert on `{ kind: "circuit_breaker_stats", provider }`, `$set` carries snapshot + `updatedAt: Date`, `upsert: true`; write failure swallowed with `log.warn`; empty snapshot → zero ops; interval tick + `stop()`.
     - Doctor: renderer variants (empty rows, closed, open with reason/next-probe/last-fault line, half-open, `[shadow]`, `stale-heartbeat` >120s); loader maps missing fields to defaults, filters docs without `provider`, returns `[]` on connection error; **section renders via `emit` only and returns `void`** (cannot alter exit code — D4).
     - Config: absent section → all defaults; partial section → per-key `??`; garbage types → defaults; `p95MinSamples` clamped to `p95WindowSize`.
@@ -490,6 +490,10 @@ const FAULT_MESSAGE_MAX = 240;
  * probe permit never recorded (caller lost between acquire and record —
  * structurally prevented at the wrap point, belt-and-braces here) is
  * reconciled as inconclusive on the next acquire.
+ *
+ * Agents with a custom `timeoutMs` > 300s can hit premature stale-probe
+ * reconciliation here — bounded and safe: a late probe success still
+ * records as telemetry-only, and the next post-cooldown turn re-probes.
  */
 const PROBE_STALE_MS = 360_000;
 
@@ -650,7 +654,7 @@ export class ProviderCircuitBreaker {
     if (this.probe === p) {
       this.probe = null;
       this.probeStartedAt = null;
-      this.settleProbe(classification, now);
+      this.settleProbe(classification, now, llmMs);
       return;
     }
 
@@ -793,6 +797,12 @@ export class ProviderCircuitBreaker {
     // recovered provider.
     this.window = [];
     this.windowCursor = 0;
+    // Clear stale fault telemetry too — otherwise a later pure p95 trip
+    // would carry a fault message from an unrelated, already-recovered
+    // incident (contract: lastFaultMessage is null for pure p95 trips).
+    this.lastFaultKind = null;
+    this.lastFaultMessage = null;
+    this.lastFaultAt = null;
     this.fastFailLoggedSinceOpen = false;
     log.info("Provider circuit CLOSED — provider recovered", {
       provider: this.provider,
@@ -801,7 +811,7 @@ export class ProviderCircuitBreaker {
     });
   }
 
-  private settleProbe(classification: TurnClassification, now: number): void {
+  private settleProbe(classification: TurnClassification, now: number, llmMs: number): void {
     if (
       classification.outcome === "success" ||
       (classification.outcome === "fault" && !HARD_FAULT_KINDS.has(classification.kind))
@@ -809,6 +819,12 @@ export class ProviderCircuitBreaker {
       // A turn that reached the provider and failed on something else still
       // proves the provider is reachable — closes.
       this.close(now);
+      if (classification.outcome === "success") {
+        // Seed the fresh window with the probe's own successful latency —
+        // discarding a genuine successful turn would blind the p95 window's
+        // warm-up right after recovery (plan-review round-1 decision).
+        this.pushSample(llmMs);
+      }
       return;
     }
     if (classification.outcome === "aborted") {
@@ -1050,6 +1066,25 @@ describe("ProviderCircuitBreaker — p95 trip", () => {
     expect(snap.state).toBe("closed");
     expect(snap.sampleCount).toBe(1); // only the probe's own sample
     expect(snap.p95Ms).toBeNull();
+  });
+
+  it("close() clears stale fault telemetry — a later p95 trip pins lastFaultMessage null", () => {
+    const { registry, turn, advance } = makeRegistry({
+      p95WindowSize: 5,
+      p95MinSamples: 3,
+      p95ThresholdMs: 1_000,
+    });
+    turn(hardFault());
+    turn(hardFault());
+    turn(hardFault()); // opens; lastFaultMessage set to the hard-fault text
+    advance(15_000);
+    turn(success(), 50); // probe succeeds → closed; lastFault* must be cleared
+    turn(success(), 2_000);
+    turn(success(), 2_000); // 3rd sample — p95 breach, pure latency trip
+    const snap = registry.stateFor("claude")!;
+    expect(snap.state).toBe("open");
+    expect(snap.reason).toBe("p95-breach");
+    expect(snap.lastFaultMessage).toBeNull(); // not the stale hard-fault message
   });
 });
 
@@ -1652,98 +1687,104 @@ and initialize it in the constructor body (next to the other assignments):
 
 Semantics preserved from the old branch structure: the retry fires under the identical condition; `finalizeSpawnResult` + `recordSpawnObservability` receive whichever result was final (previously `retry` in one arm, `result` in the other — now the single `finalResult`).
 
-- [ ] **Step 5.4:** Extend `src/agents/agent-manager.test.ts` with a new top-level-in-`AgentManager` describe (uses the existing `smsCtx`/`makeRunResult`/`mockRunnerSend` helpers; place it after the `spawnTurn (KPR-216)` describe). Also add to the imports:
+- [ ] **Step 5.4:** Extend `src/agents/agent-manager.test.ts` with a new describe nested *inside* the existing `spawnTurn (KPR-216)` describe (it closes at line ~1950 — insert this new describe as the last child, just before that closing `});`). Nesting is required, not stylistic: `smsCtx` is a `function` declared inside `spawnTurn (KPR-216)` (test file line 792), not hoisted to module scope — a sibling describe placed after the block would not have it in scope. `makeRunResult`/`mockRunnerSend` are already module-level and available either way. Also add to the imports:
 
 ```typescript
 import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./provider-circuit-breaker.js";
 ```
 
 ```typescript
-  describe("provider circuit breaker at the wrap point (KPR-306)", () => {
-    // agent-a's model is a bare id in these fixtures → provider "claude".
-    const CONNECT_FAIL = "TypeError: fetch failed: connect ECONNREFUSED 127.0.0.1:443";
+    // Nested inside `spawnTurn (KPR-216)` (not a sibling) so `smsCtx` stays in
+    // scope — it's a local `function` declared at the top of that describe,
+    // not module-level. `routeModel` is already imported/mocked module-wide
+    // (see the existing `import { routeModel } from "./model-router.js"`).
+    describe("provider circuit breaker at the wrap point (KPR-306)", () => {
+      // agent-a's model is a bare id in these fixtures → provider "claude".
+      const CONNECT_FAIL = "TypeError: fetch failed: connect ECONNREFUSED 127.0.0.1:443";
 
-    async function tripBreaker(threadPrefix = "trip") {
-      for (let i = 0; i < 3; i++) {
-        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: CONNECT_FAIL }));
-        await manager.spawnTurn(smsCtx({ threadId: `sms:line-1:${threadPrefix}-${i}` }));
+      async function tripBreaker(threadPrefix = "trip") {
+        for (let i = 0; i < 3; i++) {
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: CONNECT_FAIL }));
+          await manager.spawnTurn(smsCtx({ threadId: `sms:line-1:${threadPrefix}-${i}` }));
+        }
       }
-    }
 
-    it("three consecutive hard faults open the breaker; the next spawnTurn fast-fails before the adapter", async () => {
-      await tripBreaker();
-      expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
+      it("three consecutive hard faults open the breaker; the next spawnTurn fast-fails before the adapter", async () => {
+        await tripBreaker();
+        expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
 
-      const callsBefore = mockRunnerSend.mock.calls.length;
-      await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:fast-fail" }))).rejects.toBeInstanceOf(
-        ProviderCircuitOpenError,
-      );
-      // Adapter never invoked for the fast-failed turn (pre-prepareSpawn throw).
-      expect(mockRunnerSend.mock.calls.length).toBe(callsBefore);
+        const callsBefore = mockRunnerSend.mock.calls.length;
+        await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:fast-fail" }))).rejects.toBeInstanceOf(
+          ProviderCircuitOpenError,
+        );
+        // Adapter never invoked for the fast-failed turn (pre-prepareSpawn throw).
+        expect(mockRunnerSend.mock.calls.length).toBe(callsBefore);
+        // Rejection lands before the router too (pre-prepareSpawn/router property, pinned directly).
+        expect(routeModel).not.toHaveBeenCalled();
+      });
+
+      it("fast-fail releases the ticket cleanly: no active spawns, no lock leak, repeatable", async () => {
+        await tripBreaker();
+        const threadId = "sms:line-1:cleanliness";
+        await expect(manager.spawnTurn(smsCtx({ threadId }))).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+
+        const perAgent = manager.getSnapshot().perAgent["agent-a"];
+        expect(perAgent?.activeSpawns ?? 0).toBe(0);
+        expect(perAgent?.activeThreadKeys ?? []).toEqual([]);
+
+        // Same thread again: rejects with the breaker error — NOT a budget or
+        // lock error — proving the finally released everything.
+        await expect(manager.spawnTurn(smsCtx({ threadId }))).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+      });
+
+      it("record-once under auth-rebuild retry: only the retry's outcome feeds the breaker", async () => {
+        // First attempt: auth sentinel (with a resumable session) → retried.
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
+        // Retry: success.
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered", sessionId: "s2" }));
+        await manager.spawnTurn(smsCtx({ sessionId: "s1", threadId: "sms:line-1:auth-retry" }));
+
+        const snap = manager.circuitBreakers.stateFor("claude")!;
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0); // retry success recorded, first attempt never counted
+      });
+
+      it("auth-rebuild retry that also fails records exactly one auth fault", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
+        await manager.spawnTurn(smsCtx({ sessionId: "s1", threadId: "sms:line-1:auth-fail" }));
+        expect(manager.circuitBreakers.stateFor("claude")!.consecutiveHardFaults).toBe(1);
+      });
+
+      it("a thrown adapter error is classified and rethrown", async () => {
+        mockRunnerSend.mockRejectedValueOnce(new Error("fetch failed"));
+        await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:thrown" }))).rejects.toThrow("fetch failed");
+        expect(manager.circuitBreakers.stateFor("claude")!.consecutiveHardFaults).toBe(1);
+      });
+
+      it("non-provider errors (tool failures) never trip", async () => {
+        for (let i = 0; i < 5; i++) {
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "tool handler exploded: boom" }));
+          await manager.spawnTurn(smsCtx({ threadId: `sms:line-1:np-${i}` }));
+        }
+        expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
+      });
+
+      it("probe recovery end-to-end: post-cooldown turn is admitted and closes the breaker", async () => {
+        // Swap in a registry with an injected clock (readonly is compile-time only).
+        let t = 0;
+        (manager as unknown as { circuitBreakers: ProviderCircuitBreakerRegistry }).circuitBreakers =
+          new ProviderCircuitBreakerRegistry(undefined, () => t);
+        await tripBreaker("probe");
+        expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
+
+        t += 15_000; // past cooldown — next real turn becomes the probe
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "back", sessionId: "s-probe" }));
+        const result = await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:probe-turn" }));
+        expect(result.finalMessage).toBe("back");
+        expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
+      });
     });
-
-    it("fast-fail releases the ticket cleanly: no active spawns, no lock leak, repeatable", async () => {
-      await tripBreaker();
-      const threadId = "sms:line-1:cleanliness";
-      await expect(manager.spawnTurn(smsCtx({ threadId }))).rejects.toBeInstanceOf(ProviderCircuitOpenError);
-
-      const perAgent = manager.getSnapshot().perAgent["agent-a"];
-      expect(perAgent?.activeSpawns ?? 0).toBe(0);
-      expect(perAgent?.activeThreadKeys ?? []).toEqual([]);
-
-      // Same thread again: rejects with the breaker error — NOT a budget or
-      // lock error — proving the finally released everything.
-      await expect(manager.spawnTurn(smsCtx({ threadId }))).rejects.toBeInstanceOf(ProviderCircuitOpenError);
-    });
-
-    it("record-once under auth-rebuild retry: only the retry's outcome feeds the breaker", async () => {
-      // First attempt: auth sentinel (with a resumable session) → retried.
-      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
-      // Retry: success.
-      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered", sessionId: "s2" }));
-      await manager.spawnTurn(smsCtx({ sessionId: "s1", threadId: "sms:line-1:auth-retry" }));
-
-      const snap = manager.circuitBreakers.stateFor("claude")!;
-      expect(snap.state).toBe("closed");
-      expect(snap.consecutiveHardFaults).toBe(0); // retry success recorded, first attempt never counted
-    });
-
-    it("auth-rebuild retry that also fails records exactly one auth fault", async () => {
-      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
-      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
-      await manager.spawnTurn(smsCtx({ sessionId: "s1", threadId: "sms:line-1:auth-fail" }));
-      expect(manager.circuitBreakers.stateFor("claude")!.consecutiveHardFaults).toBe(1);
-    });
-
-    it("a thrown adapter error is classified and rethrown", async () => {
-      mockRunnerSend.mockRejectedValueOnce(new Error("fetch failed"));
-      await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:thrown" }))).rejects.toThrow("fetch failed");
-      expect(manager.circuitBreakers.stateFor("claude")!.consecutiveHardFaults).toBe(1);
-    });
-
-    it("non-provider errors (tool failures) never trip", async () => {
-      for (let i = 0; i < 5; i++) {
-        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "tool handler exploded: boom" }));
-        await manager.spawnTurn(smsCtx({ threadId: `sms:line-1:np-${i}` }));
-      }
-      expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
-    });
-
-    it("probe recovery end-to-end: post-cooldown turn is admitted and closes the breaker", async () => {
-      // Swap in a registry with an injected clock (readonly is compile-time only).
-      let t = 0;
-      (manager as unknown as { circuitBreakers: ProviderCircuitBreakerRegistry }).circuitBreakers =
-        new ProviderCircuitBreakerRegistry(undefined, () => t);
-      await tripBreaker("probe");
-      expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
-
-      t += 15_000; // past cooldown — next real turn becomes the probe
-      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "back", sessionId: "s-probe" }));
-      const result = await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:probe-turn" }));
-      expect(result.finalMessage).toBe("back");
-      expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
-    });
-  });
 ```
 
 Note: existing suites already resolve `mockRunnerSend` with error strings like `"boom"` or auth sentinels 1–2 times per test — all either non-provider (streak reset) or below the threshold of 3, and every test gets a fresh manager from `beforeEach`, so no existing test can trip the breaker. If a HEAD-drifted test does, fix the test's fixture (distinct manager or non-provider error string), not the breaker.
