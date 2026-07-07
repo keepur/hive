@@ -8,13 +8,17 @@ import {
   type PrefixCacheStatsRow,
   type SpawnCoordinatorRow,
   type MemoryLifecycleRow,
+  type DatastoreIdentityReport,
   brewServiceRunning,
   cacheHitRatesForDoctor,
   commandExists,
+  datastoreIdentityForDoctor,
   defaultAgentExists,
   formatHitRate,
+  formatUptime,
   hasAnyAgent,
   httpProbe,
+  isTempDbPath,
   launchctlPrint,
   mongoReachable,
   pidAlive,
@@ -168,6 +172,184 @@ export function renderMemoryLifecycleSection(
       );
     }
   }
+}
+
+/**
+ * KPR-296: render the "Datastore identity" section — the doctor's answer to
+ * "is the mongod behind config.mongo.uri actually this instance's database?"
+ * (Jul-4 impostor incident; audit §9). Pure + emit-collector-testable.
+ *
+ * DELIBERATE departure from the informational-section precedent: returns a
+ * hard-failure verdict that `runDoctor` folds into `allPassed` — F1 (sentinel
+ * present-but-mismatched), F2 (roster guard degraded), F3 (engine identity
+ * monitor fresh + non-verified) flip the doctor's exit code. This delivers
+ * the diagnostics `DbIdentityMismatchError` already promises
+ * ("Run `hive doctor` for identity diagnostics", src/db/write-guard.ts:19).
+ *
+ * Remediation hints print inline on failing lines unconditionally (the
+ * ⚠-inline style of the newer sections, not the --verbose remedy style).
+ */
+export function renderDatastoreIdentitySection(
+  report: DatastoreIdentityReport | null,
+  emit: (line: string) => void = console.log,
+): { failed: boolean } {
+  emit("\nDatastore identity");
+  if (!report) {
+    // I5 — mongoReachable (Agents group) already failed and counted once.
+    emit('  ○ unreachable — see "MongoDB reachable" above');
+    return { failed: false };
+  }
+
+  let failed = false;
+  const iso = (d: Date | null): string => (d ? d.toISOString() : "?");
+
+  // ── server fingerprint (best-effort, never fails the doctor) ──
+  const s = report.server;
+  const haveFingerprint = s.host !== null || s.version !== null || s.pid !== null || s.dbPath !== null;
+  if (haveFingerprint) {
+    const up = s.uptimeSeconds === null ? "?" : formatUptime(s.uptimeSeconds);
+    emit(`  server: ${s.host ?? "?"} — mongod ${s.version ?? "?"}, pid ${s.pid ?? "?"}, up ${up}`);
+    emit(`    dbPath: ${s.dbPath ?? "(default)"}`);
+  }
+  if (s.note) {
+    // I4 — e.g. unauthorized under a KPR-297-authed mongod.
+    emit(`  ○ server fingerprint unavailable — ${s.note}`);
+  }
+  if (s.dbPath !== null && isTempDbPath(s.dbPath)) {
+    // W3 — the exact incident signature (impostor ran --dbpath /tmp/...).
+    emit(`  ⚠ connected mongod dbPath is a TEMP directory (${s.dbPath}) — this is the Jul-4 impostor signature`);
+    emit(`      → verify you are talking to the production mongod (brew services list; lsof -i :27017)`);
+  }
+
+  emit(`  target: ${report.uri} db=${report.dbName} instance=${report.instanceId}`);
+
+  // ── doctor's own sentinel read (Sentinel Contract, R2) ──
+  const sen = report.sentinel;
+  if (sen.state === "verified") {
+    const stamp =
+      sen.stampedAt || sen.stampedBy
+        ? `, stamped ${sen.stampedAt ? sen.stampedAt.toISOString().slice(0, 10) : "?"} by ${sen.stampedBy ?? "?"}`
+        : "";
+    emit(`  ✓ identity sentinel matches (instanceId=${report.instanceId}, dbName=${report.dbName}${stamp})`);
+  } else if (sen.state === "mismatch") {
+    // F1 — hard fail.
+    failed = true;
+    emit(
+      `  ✗ identity sentinel MISMATCH — expected ${report.instanceId}/${report.dbName}, ` +
+        `observed ${sen.observed.instanceId}/${sen.observed.dbName} (sentinelId=${sen.observed.sentinelId ?? "<none>"})`,
+    );
+    emit(
+      `      → wrong DB or wrong instance config. To intentionally adopt this DB: ` +
+        `set HIVE_DB_SENTINEL_RESTAMP=1 for one engine boot (remove after).`,
+    );
+  } else if (sen.state === "absent") {
+    if (report.agentDefinitionsCount === null) {
+      emit(`  ⚠ identity sentinel absent and agent count unavailable — cannot confirm pre-first-boot; re-run doctor`);
+    } else if (report.agentDefinitionsCount > 0) {
+      // W1 — warn, not fail (⚠ delegated, settled): the legitimate 0.9.2→next
+      // upgrade window must not hard-fail every not-yet-rebooted instance.
+      emit(`  ⚠ identity sentinel absent but DB has hive data (${report.agentDefinitionsCount} agent defs)`);
+      emit(
+        `      → pre-KPR-294 engine, or the engine hasn't booted since upgrade — start it to stamp. ` +
+          `If it HAS booted: you may be looking at a different DB than the engine.`,
+      );
+    } else {
+      // I1 — pre-first-boot.
+      emit(`  ○ identity sentinel absent, DB empty — pre-first-boot (not an error)`);
+    }
+  } else {
+    // Edge #5 — read flap: warn, not fail (can't distinguish flap from incident in one shot).
+    emit(`  ⚠ sentinel read failed: ${sen.message}`);
+  }
+  if ((sen.state === "verified" || sen.state === "mismatch") && sen.schemaVersionNewer) {
+    // W2 — R2 forward-compat clause.
+    emit(`  ⚠ sentinel schemaVersion is newer than this doctor knows — frozen fields still authoritative`);
+  }
+
+  // ── engine identity monitor (db_identity_stats — HEARTBEAT cadence) ──
+  const ids = report.identityStats;
+  if (ids === null) {
+    // I2 — cross-referenced with the sentinel result when it is also absent.
+    emit(
+      `  ○ no db_identity_stats telemetry yet — engine hasn't booted on this engine version` +
+        (sen.state === "absent" ? "; cross-check the sentinel result above" : ""),
+    );
+  } else {
+    const fresh = ids.staleSeconds !== null && ids.staleSeconds <= 120;
+    if (!fresh) {
+      // W6 — same 120s threshold as the prefix-cache/spawn-coordinator sections.
+      emit(
+        `  ⚠ db_identity_stats heartbeat is stale (${ids.staleSeconds ?? "?"}s) — engine may not be running (last state: ${ids.state})`,
+      );
+    } else if (ids.state === "verified") {
+      emit(
+        `  ✓ engine identity monitor: verified (heartbeat ${ids.staleSeconds}s ago, writes refused=${ids.writesRefused})`,
+      );
+    } else {
+      // F3 — fresh non-verified, incl. unknown future states (fail-closed, edge #12).
+      // ⚠ delegated (settled): keyed on `state`, not `writesRefused` — they agree
+      // by construction (transitionTo engages/disengages atomically with state),
+      // and `state` also covers cant_verify.
+      failed = true;
+      emit(
+        `  ✗ engine identity monitor: ${ids.state} — writes refused=${ids.writesRefused}, refused=${ids.refusedWriteCount}, ` +
+          `observed ${ids.observedInstanceId ?? "<absent>"}/${ids.observedDbName ?? "<absent>"}`,
+      );
+      emit(
+        `      → the running engine is refusing DB writes; see db_identity_stats and engine logs (critical marker).`,
+      );
+    }
+  }
+
+  // ── roster guard (agent_roster_stats — EVENT-DRIVEN kind; canon E3:
+  // updatedAt is NOT liveness — no staleness warning here, ever) ──
+  const rs = report.rosterStats;
+  if (rs === null) {
+    emit(`  ○ no agent_roster_stats telemetry yet — engine hasn't booted on this engine version`);
+  } else if (rs.degraded) {
+    // F2 — hard fail.
+    failed = true;
+    emit(
+      `  ✗ roster guard DEGRADED since ${iso(rs.degradedSince)} — engine holding last-good roster ` +
+        `(${rs.docCount ?? "?"} docs @ ${iso(rs.lastGoodAt)}) but DB reload read empty (${rs.blockedReloadCount} blocked)`,
+    );
+    emit(
+      `      → restore the real DB; the engine auto-recovers within ~30s. ` +
+        `If the engine was restarted mid-episode, SIGUSR1 after restore.`,
+    );
+  } else {
+    const { docCount, activeCount, disabledCount } = rs;
+    // Canon E6 discriminators (edge #14): all-disabled is recorded operator
+    // state (I3); 0-active-not-all-disabled is validation-evicted-all (W4).
+    const allDisabled = docCount !== null && docCount > 0 && activeCount === 0 && disabledCount === docCount;
+    const evictedAll = docCount !== null && docCount > 0 && activeCount === 0 && !allDisabled;
+    // Edge #15 (⚠ delegated, settled: any delta, not only →0). Both non-null, not degraded.
+    const diverged =
+      report.agentDefinitionsCount !== null && docCount !== null && report.agentDefinitionsCount !== docCount;
+
+    if (evictedAll) {
+      emit(
+        `  ⚠ roster: ${docCount} docs but 0 active and not all disabled — validation evicted every agent (engine/data version skew?)`,
+      );
+    } else if (allDisabled) {
+      emit(`  ○ all ${docCount} agents disabled (recorded operator state)`);
+    }
+    if (diverged) {
+      emit(
+        `  ⚠ roster divergence: DB has ${report.agentDefinitionsCount} agent defs, engine last committed ${docCount} (@ ${iso(rs.lastGoodAt)})`,
+      );
+      emit(
+        `      → if the engine restarted during a DB outage it may be running an empty/stale roster — send SIGUSR1 to reload.`,
+      );
+    } else if (!evictedAll && !allDisabled) {
+      emit(
+        `  ✓ roster: ${report.agentDefinitionsCount ?? "?"} docs live = ${docCount ?? "?"} at last good load ` +
+          `(active=${activeCount ?? "?"}, disabled=${disabledCount ?? "?"}, source=${rs.lastGoodSource ?? "?"} @ ${iso(rs.lastGoodAt)})`,
+      );
+    }
+  }
+
+  return { failed };
 }
 
 export function renderPromptCacheSection(rows: PromptCacheRow[], emit: (line: string) => void = console.log): void {
@@ -417,6 +599,15 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
   // Prompt cache observability (KPR-140). Informational — does not
   // contribute to allPassed; missing telemetry never fails the doctor.
   if (config) {
+    // KPR-296: datastore identity — rendered FIRST among the post-check
+    // sections (identity outranks cache stats; failure text sits near the
+    // check groups) and the ONLY post-check section that can fail the
+    // doctor: F1 sentinel mismatch / F2 roster degraded / F3 fresh
+    // non-verified engine monitor flip the exit code.
+    const identityReport = await datastoreIdentityForDoctor(config.mongo.uri, config.mongo.dbName, config.instance.id);
+    const { failed: identityFailed } = renderDatastoreIdentitySection(identityReport, console.log);
+    if (identityFailed) allPassed = false;
+
     const rows = await cacheHitRatesForDoctor(config.mongo.uri, config.mongo.dbName);
     renderPromptCacheSection(rows);
     // KPR-213: prefix-cache stats from the engine heartbeat.
@@ -429,6 +620,8 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     const memoryRows = await memoryLifecycleStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderMemoryLifecycleSection(memoryRows, console.log, config.memory.spendWarnThresholdUsd ?? 5);
   } else {
+    console.log("\nDatastore identity");
+    console.log("  ○ skipped: config not loaded");
     console.log("\nPrompt cache (last 7 days)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nPrefix cache (live engine)");
