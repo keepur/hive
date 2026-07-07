@@ -23,7 +23,7 @@
 
 ### Specs and Plans
 
-Design specs and implementation plans live in two places. Sensitive/internal design work lands in the **private** companion repo `keepur/hive-docs` under `internal/specs/` and `internal/plans/`. Non-sensitive, engine-shaped specs and plans may live in the public repo — under `docs/specs/`, `docs/plans/`, and `docs/epics/<epic>/` (the epic-workflow convention: each epic directory carries its children's specs and plans). Public-facing engine docs live in `keepur/hive/docs/`.
+Design specs and implementation plans live in the **private** companion repo `keepur/hive-docs` under `internal/specs/` and `internal/plans/`. The public repo keeps only the **epic-workflow** specs and plans — under `docs/epics/<epic>/`, where each epic directory carries its children's specs and plans — plus public-facing engine docs under `keepur/hive/docs/`. (Standalone design specs and plans that previously lived under `docs/specs/` and `docs/plans/` were relocated to `keepur/hive-docs/internal/`; those public directories are no longer the home for design artifacts.)
 
 ### PR & Merge
 
@@ -236,6 +236,17 @@ Per-turn `query()` with `options.resume = sessionId` is the **only** execution p
 - `agentManager.perTurnSpawn.{sms,slack,ws,voice}` config keys are removed. Hive.yaml loader silently ignores them (KPR-225 F3 liberal-loader pattern), but they have no effect.
 - `maxConcurrent` is deprecated in favor of `spawnBudget`. Existing agent definitions keep working via the fallback chain; `hive doctor` flags the fallback source so operators can migrate.
 - Reflection trigger changed from queue-drain to post-quiescence debounce; tuning lives on `memory.reflectionMinTurns` + the 30s debounce constant.
+
+## Provider adapters
+
+Agents can run on providers other than Claude. The agent's `model` field selects the provider via `resolveProviderModel` (`src/agents/agent-manager.ts`): a bare model id (no `/`) routes to **Claude** (the default); a `<provider>/<model>[:<reasoningEffort>]` prefix routes elsewhere — `openai`, `gemini`/`google-gemini`, or `codex`/`openai-codex`. Unknown prefixes fall back to Claude. The optional `:effort` suffix (`minimal`|`none`|`low`|`medium`|`high`|`xhigh`) applies to codex/openai.
+
+`AgentManager.createProviderAdapter()` builds the adapter per spawn:
+
+- **`ClaudeAgentAdapter`** — the default, full-featured path: wraps `AgentRunner`, so it gets the whole hive runtime (MCP tools, skills, memory, hooks).
+- **`CodexSubscriptionAdapter` / `OpenAIAgentsAdapter` / `GeminiAdkAdapter`** — **pilot** adapters (`src/agents/provider-adapters/`, KPR-231–234). Built from `buildPilotInstructions` (soul + systemPrompt) with an **empty tool inventory** — they run the model against the agent's persona but do **not** yet receive hive's MCP tools. Models default from `config.{codex,openai,gemini}.agentModel`; credentials resolve via `oauth-credentials.ts` (e.g. Codex subscription auth).
+
+All adapters implement the `AgentProviderAdapter` contract (`provider`, `runTurn()`, `abort()`, `wasAborted` — `src/agents/provider-adapters/types.ts`). `tool-transport.ts` classifies each hive tool's transport and cross-provider compatibility (`direct` | `mcp-bridge-candidate` | `requires-hive-bridge` | `claude-only` | `unsupported`) — the boundary governing which tools a non-Claude adapter can eventually carry. Design specs live in `keepur/hive-docs/internal/specs/` (KPR-231–234).
 
 ## Common Gotchas
 
