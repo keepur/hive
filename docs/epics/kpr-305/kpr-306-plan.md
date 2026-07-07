@@ -62,7 +62,7 @@ Expected: exit 0 (typecheck + lint + format + tests all green) before any edit.
     - Classifier: one assertion per fault kind per pattern table; **each of the six `isAuthRebuildResumeError` sentinel alternates individually classifies `auth`** (`resolve authentication`, `credentials.json`, `not authenticated`, `401 Unauthorized`, `ANTHROPIC_API_KEY`, `authToken`); `timedOut+aborted` → `timeout` (precedence over `aborted`); `aborted` alone → neutral; no error → success; unknown string → `non-provider`; SDK subtypes `error_max_turns`/`error_during_execution` → `non-provider`; `classifyThrown` default; `HARD_FAULT_KINDS` excludes exactly `non-provider`.
     - State machine (injected clock): closed→open at 3 consecutive hard faults; success resets streak; non-provider fault resets streak; aborted leaves streak unchanged; p95 trip (minSamples gate, threshold breach, `reason: "p95-breach"`, `lastFaultMessage: null`); window **and stale `lastFaultKind`/`lastFaultMessage`/`lastFaultAt`** cleared on close (a later p95 trip after a prior, already-recovered fault still pins `lastFaultMessage: null`); open-state `acquire` throws with correct `provider/openedAt/retryAfterMs/reason/lastFaultMessage`; lazy half-open at `openedAt + cooldown` (that acquire is the probe, `isProbe: true`); **half-open concurrent acquire throws with `retryAfterMs === 0`** (contract reconciliation pin); probe success → closed + full reset (streak, window seeded with the probe's own sample, backoff); probe hard fault → open with doubled cooldown, capped at `openMaxMs`; probe aborted → open, exponent unchanged; probe non-provider fault → closed; per-provider isolation (claude open, gemini grants); shadow mode (acquire never throws, transitions still tracked, `fastFailCount` stays 0); stale-probe reconciliation; `record` idempotent per permit; **late permit** (acquired closed, recorded while open) never transitions state; `tripCount` counts closed→open only.
     - Runner: deadline fire → `timedOut: true` + `aborted: true`; operator abort → `aborted: true`, `timedOut` unset; **operator-abort-then-late-deadline** (abort nulls `activeQuery`, deadline fires after) → `timedOut` unset — the assertion the `if (this.activeQuery)` guard exists for.
-    - Wrap point: 3 hard-fault turns trip the breaker and the 4th `spawnTurn` rejects with `ProviderCircuitOpenError` **without invoking the adapter** (`mockRunnerSend` call count unchanged) **or the router** (`routeModel` not called — rejection lands before `prepareSpawn`/router); coordinator snapshot clean after fast-fail (`activeSpawns === 0`, thread lock free — next call rejects with `ProviderCircuitOpenError`, not budget/lock errors); record-once under auth-rebuild retry (only the retry's result feeds the breaker); thrown adapter error classified via `classifyThrown` and rethrown; probe-success recovery end-to-end through `spawnTurn` with an injected-clock registry.
+    - Wrap point: 3 hard-fault turns trip the breaker and the 4th `spawnTurn` rejects with `ProviderCircuitOpenError` **without invoking the adapter** (`mockRunnerSend` call count unchanged) **or the router** (with `modelRouter.enabled` turned on for this test — the module-mocked config defaults it off — `routeModel`'s call count is unchanged across the fast-fail turn, i.e. the rejection lands before `prepareSpawn`/router on that turn); coordinator snapshot clean after fast-fail (`activeSpawns === 0`, thread lock free — next call rejects with `ProviderCircuitOpenError`, not budget/lock errors); record-once under auth-rebuild retry (only the retry's result feeds the breaker); thrown adapter error classified via `classifyThrown` and rethrown; probe-success recovery end-to-end through `spawnTurn` with an injected-clock registry.
     - Heartbeat: per-provider upsert on `{ kind: "circuit_breaker_stats", provider }`, `$set` carries snapshot + `updatedAt: Date`, `upsert: true`; write failure swallowed with `log.warn`; empty snapshot → zero ops; interval tick + `stop()`.
     - Doctor: renderer variants (empty rows, closed, open with reason/next-probe/last-fault line, half-open, `[shadow]`, `stale-heartbeat` >120s); loader maps missing fields to defaults, filters docs without `provider`, returns `[]` on connection error; **section renders via `emit` only and returns `void`** (cannot alter exit code — D4).
     - Config: absent section → all defaults; partial section → per-key `??`; garbage types → defaults; `p95MinSamples` clamped to `p95WindowSize`.
@@ -1710,17 +1710,45 @@ import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./prov
       }
 
       it("three consecutive hard faults open the breaker; the next spawnTurn fast-fails before the adapter", async () => {
-        await tripBreaker();
-        expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
+        // Router must be enabled for this assertion to mean anything — with
+        // the module-mocked config's default `modelRouter.enabled: false`
+        // (test file line 46), `routeModel` is never called regardless of
+        // where the circuit-breaker rejection lands, making a bare
+        // `not.toHaveBeenCalled()` vacuous. Enable it here with try/finally
+        // restore, mirroring the voice carve-out precedent (test file
+        // ~2186-2205).
+        (appConfig as any).modelRouter.enabled = true;
+        try {
+          // Pattern per test file :610 — resolve routeModel so tripBreaker's
+          // setup turns (which now also invoke the router) don't hang.
+          vi.mocked(routeModel).mockResolvedValue({
+            tier: "sonnet",
+            model: "claude-sonnet-4-7",
+            costUsd: 0,
+            durationMs: 0,
+            resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
+          });
 
-        const callsBefore = mockRunnerSend.mock.calls.length;
-        await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:fast-fail" }))).rejects.toBeInstanceOf(
-          ProviderCircuitOpenError,
-        );
-        // Adapter never invoked for the fast-failed turn (pre-prepareSpawn throw).
-        expect(mockRunnerSend.mock.calls.length).toBe(callsBefore);
-        // Rejection lands before the router too (pre-prepareSpawn/router property, pinned directly).
-        expect(routeModel).not.toHaveBeenCalled();
+          await tripBreaker();
+          expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
+
+          const callsBefore = mockRunnerSend.mock.calls.length;
+          const routerCallsBefore = vi.mocked(routeModel).mock.calls.length;
+          await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:fast-fail" }))).rejects.toBeInstanceOf(
+            ProviderCircuitOpenError,
+          );
+          // Adapter never invoked for the fast-failed turn (pre-prepareSpawn throw).
+          expect(mockRunnerSend.mock.calls.length).toBe(callsBefore);
+          // Router also never invoked for the fast-failed turn specifically:
+          // pin the *call-count delta* across just this turn (routeModel was
+          // already called `routerCallsBefore` times by tripBreaker's setup
+          // turns, since the router is enabled here) — mirroring the
+          // `mockRunnerSend` count-delta assertion immediately above, not an
+          // absolute "never called" claim.
+          expect(vi.mocked(routeModel).mock.calls.length).toBe(routerCallsBefore);
+        } finally {
+          (appConfig as any).modelRouter.enabled = false;
+        }
       });
 
       it("fast-fail releases the ticket cleanly: no active spawns, no lock leak, repeatable", async () => {
