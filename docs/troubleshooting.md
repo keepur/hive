@@ -176,7 +176,7 @@ hive doctor
 
 ### 8. Datastore identity failures (`hive doctor` exits 1)
 
-The **Datastore identity** section (KPR-296) answers "is the mongod behind `config.mongo.uri` actually this instance's database?" It is the first and only doctor section that can **fail the doctor (exit 1)**. Three conditions fail; everything else warns or informs. Entries below are indexed by the failing line.
+The **Datastore identity** section (KPR-296) answers "is the mongod behind `config.mongo.uri` actually this instance's database?" It is the first and only *post-check* doctor section that can **fail the doctor (exit 1)** — the required prerequisite/config/agent/service checks above it already exit 1 on failure (see §§1–4); among the post-check telemetry sections, this is the only one that does. Three conditions fail; everything else warns or informs. Entries below are indexed by the failing line.
 
 #### `✗ identity sentinel MISMATCH — expected <id>/<db>, observed <other>/<other-db>` (F1)
 
