@@ -2,6 +2,7 @@
 
 **Status:** DRAFT — decision-ready, awaiting human ruling on the D3 option pick (§4)
 **Epic:** KPR-305 · **Baseline:** `keepur/hive` @ `08ca29e` (branch `kpr-305`) · sibling survey: `~/github/beekeeper` local checkout (read-only)
+**Re-confirm note:** this baseline is pinned under the maturity-first program's snapshot discipline, not a live-HEAD guarantee — the write-plan/implement lane must re-verify the §2 evidence table against HEAD before coding, since main may have moved since this draft.
 **Ticket text:** "WS channel reachable on-LAN without cloudflared (static host or discovery config); outage-mode routing prefers the LAN channel for floor-critical agents. Today shop.dodihome.com rides the tunnel and dies with the WAN."
 
 ---
@@ -58,6 +59,8 @@ The iOS app reaches hive's WS channel only through cloudflared → beekeeper (pu
 
 ## 4. D3 — Architecture options (the blocking decision)
 
+*Process note: epic KPR-305's decision register carries no prior ruling on device-identity ownership or LAN exposure — this is a new question, not a revisit. The operator's D3 ruling on this spec becomes first canon on it.*
+
 ### Option (a) — hive-side LAN listener with self-contained auth
 
 Hive grows a second WS listener bound to the LAN interface, plus everything the loopback-trust model currently outsources:
@@ -104,7 +107,7 @@ Build §5 (floor-critical designation + dispatcher preference behind the KPR-306
 
 New optional boolean on the agent definition: **`floorCritical`** (default `false`).
 
-- `src/types/agent-definition.ts` — add `floorCritical: boolean` to the interface; `fromDoc` parses `doc.floorCritical ?? false` (liberal-loader pattern, same as existing optional fields around `:127`).
+- The defaulting site is **`toAgentConfig`** (`src/types/agent-definition.ts:120`, verified), not a `fromDoc` parser — no such function exists in this codebase. Add `floorCritical: boolean` to **both** the `AgentDefinition` doc type (`src/types/agent-definition.ts:6`) and the projected `AgentConfig` the dispatcher reads via the registry (`src/types/agent-config.ts:9`), and thread `doc.floorCritical ?? false` through `toAgentConfig` (liberal-loader pattern, same as existing optional fields there).
 - Admin MCP `agent_create` / `agent_update` accept and persist it (plain boolean, no cross-field constraints — nothing like the KPR-184 `delegateServers` rules applies).
 - Surfaced in the WS `agent_list` payload (`ws-adapter.ts:buildAgentList`) so the app can badge floor-critical agents. *(Nice-to-have; drop if it bloats the PR.)*
 
@@ -118,13 +121,13 @@ At the two delivery sites (`dispatcher.ts:200` and `:597`), before resolving the
 if (outage-mode is active
     && agent.floorCritical
     && wsAdapter is registered
-    && wsAdapter.connectionCount > 0
     && item.source.kind is "slack" or "scheduler")   // never divert app/team/sms-sourced replies
   → deliver via the ws adapter (broadcast, §5.4) instead of the source adapter
+  → §5.4's deliverBroadcast is the authoritative connectionCount check (0 → fall through); no redundant connectionCount > 0 pre-check here
   → on broadcast failure, fall through to the normal source-adapter path (existing retry queue semantics unchanged)
 ```
 
-Source-keyed replies for app/team-originated items are untouched — they already route correctly. SMS is deliberately excluded from diversion: an SMS user is not on the shop floor.
+Source-keyed replies for app/team-originated items are untouched — they already route correctly. SMS is deliberately excluded from diversion: an SMS user is not on the shop floor. The `"scheduler"` leg is **defensive**: `ChannelKind` includes `"scheduler"` (`src/types/work-item.ts:1-11`), but nothing produces it today — the scheduler synthesizes `source: { kind: "slack", ... }` (`scheduler.ts:233`) — so this branch is currently unreachable in practice and tests target it knowingly, not because a live producer exists.
 
 ### 5.3 Breaker dependency seam (KPR-306)
 
@@ -163,7 +166,7 @@ None required in `hive.yaml` for the slice. The per-agent `floorCritical` flag i
 ### 5.7 Testing contract
 
 - `agent-definition` parse: `floorCritical` absent/true/false/garbage → boolean, default false.
-- Dispatcher matrix (unit, fake adapters): breaker open/closed × floorCritical true/false × ws connections 0/n × source kind slack/scheduler/app — diversion fires only on the one correct cell per rule; app-sourced replies never divert; zero-connection broadcast falls through to source adapter.
+- Dispatcher matrix (unit, fake adapters): breaker open/closed × floorCritical true/false × ws connections 0/n × source kind slack/scheduler/app — diversion fires only on the one correct cell per rule; app-sourced replies never divert; zero-connection broadcast falls through to source adapter. The `scheduler` source-kind cell is a defensive test (§5.2) — no live code path produces it today, but the branch is exercised knowingly since the type union allows it.
 - `WsAdapter.deliverBroadcast`: n open connections all receive the frame; closed sockets skipped; returns accurate count; does **not** touch `pendingMessages`.
 - Admin MCP: `agent_update` round-trips `floorCritical`.
 
@@ -183,6 +186,7 @@ Owner: the iOS app repo (outside `keepur/hive` and `keepur/beekeeper`). The app 
 - **Hive's trust boundary is unchanged** under option (b): ws-adapter stays loopback-bound; only beekeeper faces the LAN, which is already its job description.
 - ⚠ **Cleartext on LAN (W2 accepted risk, needs operator sign-off):** plain `ws://` means message frames and the query-string JWT are readable/replayable by anyone on the shop network. Mitigations now: shop Wi-Fi is WPA2/3 (link-layer encryption from clients to AP), device revocation via beekeeper. Upgrade path: B-4 — beekeeper optional TLS with an mkcert/self-signed cert pinned in the app; tracked as a beekeeper follow-up ticket, not W2.
 - The tunnel path remains preferred when healthy (app-side ordering, §6.2), so cleartext exposure is limited to actual outage windows plus any manual LAN use.
+- ⚠ **Scope correction:** LAN reachability under option (b) exposes beekeeper's **entire public HTTP surface**, not just the WS upgrade path — the D3 sign-off is blessing all of it, not a narrower "WS on LAN" slice. Notably: `POST /pair` (public, no auth — a 6-digit pairing-code exchange for a JWT) has **no rate limiting in the handler** (beekeeper/src/index.ts:144-190; verified — no throttle/attempt-counter in `index.ts` or `device-registry.ts`), so LAN brute-force of an outstanding pairing code is feasible for the window it's valid. The Bearer-gated admin endpoints are fine as-is — auth uses `timingSafeEqual` (beekeeper/src/index.ts:90-94), not string comparison. The B-1 operator sign-off (§4, option b) must bless this **full** surface — pairing endpoint included — as a deliberate acceptance, not just the WS path.
 
 ## 8. Scope summary
 
