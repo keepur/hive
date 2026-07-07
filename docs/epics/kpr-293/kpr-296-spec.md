@@ -112,6 +112,8 @@ export interface DatastoreIdentityReport {
 
 Nullable telemetry fields mirror the wire contracts' TS-nullable-but-never-null-when-written semantics (E2): the adapter reads defensively with `??` defaults like the sibling adapters, but the doctor does not assume never-null — a pre-KPR-295 doc shape or partial doc still renders.
 
+Note: `disabledCount`, `degradedSince`, `blockedReloadCount`, `lastBlockedAt`, and `lastRecoveryAt` are present in the merged roster-stats doc but are not part of E2's *frozen* field list (only `kind`/`docCount`/`activeCount`/`lastGoodAt`/`lastGoodSource`/`degraded`/`updatedAt` are frozen) — this section reads them as merged-but-stable fields, not frozen contract fields. A future producer change to these specific fields is not bound by E2 and would need this section's defensive-read posture (already in place) to keep degrading gracefully.
+
 ### Verdict table
 
 | # | Condition | Icon / effect | Line + remediation |
@@ -181,7 +183,7 @@ The `allPassed` fold must happen before the existing `if (!allPassed) … proces
 
 | # | Scenario | Doctor behavior |
 |---|---|---|
-| 1 | **The incident** (engine running, driver flapped to impostor): doctor connects to the same impostor | Sentinel absent + DB empty reads as I1 on its own — but the engine's raw-handle telemetry lands on the impostor (KPR-294 "honest caveat"), so `db_identity_stats` shows `state: mismatch` fresh → **F3 fails**. `dbPath` under `/tmp` → W3. Roster stats doc (also impostor-written while degraded) shows `degraded: true` → **F2 fails**. Three independent signals; any one suffices. |
+| 1 | **The incident** (engine running, driver flapped to impostor): doctor connects to the same impostor | Sentinel absent + DB empty reads as I1 on its own — but the engine's raw-handle telemetry lands on the impostor (KPR-294 "honest caveat"), so `db_identity_stats` shows `state: mismatch` fresh → **F3 fails**. `dbPath` under `/tmp` → W3. Roster stats doc (also impostor-written while degraded) shows `degraded: true` → **F2 fails** — *if* a reload fired during the episode (`writeRosterStats` only runs at boot and on reload outcomes; on an empty impostor with no matching poll trigger, the roster stats doc may not exist yet, reading as I2 rather than F2). Up to three signals; F3 and W3 are the ones guaranteed present. |
 | 2 | **Restart-into-impostor** (boot-absent → engine stamps the impostor, R3's deliberate trade-off) | Sentinel reads *verified* (stamped with correct identity). Remaining discriminators: W3 temp-dbPath warn, the Agents-group "at least one agent exists" ✗, and W5 divergence if a stale roster-stats doc survived. Documented honestly: the sentinel alone cannot catch this case — by design (R3); the section's other signals compose to cover it. |
 | 3 | Doctor and engine see **different servers** (port stolen between engine boot and doctor run) | Doctor's own sentinel read is authoritative for what *the doctor* sees; the engine's `identityStats` describes what *the engine* sees. Both render; a disagreement (doctor verified + engine mismatch fresh) still fails via F3 — correct, since the running engine is refusing writes. |
 | 4 | KPR-297 lands auth; doctor's URI lacks privileges for `serverStatus`/`getCmdLineOpts` | I4 — fingerprint "unavailable," note names the auth cause, no failure. Sentinel/telemetry reads use normal collection reads on the instance DB and keep working under the engine's own credentials in the URI. |
