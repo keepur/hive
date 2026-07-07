@@ -80,7 +80,7 @@ For the architectural distinctions and the engine-side wiring, see [architecture
 
 ## Health checks
 
-`hive doctor` verifies prerequisites (Node version, MongoDB reachable, required CLIs on PATH), config files (`hive.yaml`, `.env` keys present), agent definitions (loadable from MongoDB), and service state (launchd job loaded, process running, port bindings).
+`hive doctor` verifies prerequisites (Node version, MongoDB reachable, required CLIs on PATH), config files (`hive.yaml`, `.env` keys present), agent definitions (loadable from MongoDB), and service state (launchd job loaded, process running, port bindings). It also prints a **Datastore identity** section (KPR-296): the connected mongod's server fingerprint (host, pid, uptime, version, dbPath), an independent verification of the DB identity sentinel, the engine's identity-monitor and roster-guard telemetry, and a live-vs-last-good roster count. Hard identity failures — sentinel mismatch, roster guard degraded, engine refusing writes — make the doctor **exit 1**, so CI or cron wrappers around `hive doctor` will see identity incidents as failures. Every other check remains informational.
 
 ```
 hive doctor              # pass/fail per check

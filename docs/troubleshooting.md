@@ -13,7 +13,8 @@ Run `hive doctor --verbose` first — it diagnoses 90% of problems.
 5. [Port conflict on init](#5-port-conflict-on-init)
 6. [Plugin install fails `hiveApi` compat check](#6-plugin-install-fails-hiveapi-compat-check)
 7. [`gog` CLI not on PATH after Google plugin install](#7-gog-cli-not-on-path-after-google-plugin-install)
-8. [Where to get help](#8-where-to-get-help)
+8. [Datastore identity failures (`hive doctor` exits 1)](#8-datastore-identity-failures-hive-doctor-exits-1)
+9. [Where to get help](#9-where-to-get-help)
 
 ---
 
@@ -173,7 +174,71 @@ hive doctor
 
 ---
 
-### 8. Where to get help
+### 8. Datastore identity failures (`hive doctor` exits 1)
+
+The **Datastore identity** section (KPR-296) answers "is the mongod behind `config.mongo.uri` actually this instance's database?" It is the first and only doctor section that can **fail the doctor (exit 1)**. Three conditions fail; everything else warns or informs. Entries below are indexed by the failing line.
+
+#### `✗ identity sentinel MISMATCH — expected <id>/<db>, observed <other>/<other-db>` (F1)
+
+**Symptom:** exit code 1; the section's server fingerprint (host, pid, uptime, `dbPath`) may show a mongod you don't recognize.
+
+**Meaning:** the DB the doctor connected to carries another instance's identity sentinel — you're pointed at the wrong DB, the wrong mongod is answering on the configured port (the Jul-4 impostor scenario), or you intentionally adopted another instance's data.
+
+**Fix:** first verify *which* mongod answered using the fingerprint printed at the top of the section — cross-check with `brew services list` and `lsof -i :27017`. If the wrong mongod is answering, stop it and restore the right one; if the DB itself is wrong, restore the right DB. If the adoption is intentional (e.g. bringing another instance's backup under this instance id), set `HIVE_DB_SENTINEL_RESTAMP=1` for exactly one engine boot, then remove it — it re-stamps every boot it is set.
+
+#### `✗ roster guard DEGRADED since <ts> — engine holding last-good roster` (F2)
+
+**Symptom:** exit code 1; agents still respond (the engine is serving its last-good roster).
+
+**Meaning:** an agent-definitions reload read **zero** documents after this process had previously loaded a non-empty roster (KPR-295 empty-roster guard). The engine blocked the wipe as a full no-op and is retrying every 30s. Usual causes: DB wiped, restored empty, or an impostor mongod answering.
+
+**Fix:** restore or verify the DB (check the fingerprint/sentinel lines in the same section). Once agent definitions reappear the guard **auto-recovers within ~30s** — no restart, no operator ack. If the engine was restarted mid-episode and came up on an empty DB, send `SIGUSR1` after the restore to reload. If you genuinely mean to run with an empty roster: restart the engine — there is no bypass knob; a fresh process has no non-empty baseline and commits the empty set.
+
+#### `✗ engine identity monitor: <state> — writes refused=…` (F3)
+
+**Symptom:** exit code 1; the `db_identity_stats` heartbeat is fresh (≤120s) but reports a non-verified state (unknown states fail closed).
+
+**Meaning:** the *running engine* has detected an identity problem and **is refusing DB writes right now** — this is the live counterpart of F1; the doctor is relaying the engine's own alarm.
+
+**Fix:** read the engine logs (look for the `critical: true` marker) to see what the identity monitor observed, then resolve as F1 — verify the mongod, restore the right DB, or `HIVE_DB_SENTINEL_RESTAMP=1` if adoption is intentional. Writes resume automatically once the monitor re-verifies.
+
+#### `⚠ identity sentinel absent but DB has hive data (<n> agent defs)` (W1 — warn, not fail)
+
+**Meaning:** the DB has data but no sentinel — expected exactly once per pre-KPR-294 instance: the engine hasn't booted since the upgrade, and it stamps the sentinel on next boot. If the engine *has* booted since upgrading, you may be looking at a different DB than the engine is.
+
+**Fix:** start (or restart) the engine, re-run `hive doctor`, confirm the line flips to `✓ identity sentinel matches`.
+
+#### `⚠ connected mongod dbPath is a TEMP directory` (warn)
+
+**Meaning:** the answering mongod's `dbPath` is under `/tmp` or `/var/folders` — the exact Jul-4 impostor signature (a scratch mongod squatting on the production port).
+
+**Fix:** verify what's listening (`brew services list; lsof -i :27017`), kill the squatter, confirm the real mongod is bound, re-run the doctor.
+
+Remaining warn tier, one line each:
+
+- `⚠ roster: <n> docs but 0 active and not all disabled` — validation evicted every agent (engine/data version skew); check engine logs from the last reload.
+- `⚠ roster divergence: DB has <n> agent defs, engine last committed <m>` — live count ≠ last committed roster (e.g. the engine restarted during a DB outage); send `SIGUSR1` after restore to reload.
+
+#### Operator drill (safe — touches only a throwaway mongod)
+
+Adapted from the KPR-296 implementation plan's E2E drill (`docs/epics/kpr-293/kpr-296-plan.md`, Testing Contract → E2E). Exercises F1, the temp-path warn, and W1 without touching the real DB:
+
+1. **Happy path:** on a healthy instance with the engine running: `hive doctor; echo $?` → the Datastore identity section shows the server fingerprint and `✓` sentinel / `✓` engine monitor / `✓` roster lines; exit `0`.
+2. **F1 + temp-path (impostor-shaped):** start a scratch mongod on a spare port with a throwaway data dir: `mongod --dbpath "$(mktemp -d)" --port 27099 &`. Stamp a *foreign* sentinel + one dummy agent def (`<dbName>` below must be your instance's **configured** DB name — `hive_<instance-id>` by default, or `MONGODB_DB` if set — otherwise the doctor sees an absent sentinel, not a MISMATCH):
+
+   ```
+   mongosh --port 27099 <dbName> --eval 'db.instance_identity.insertOne({_id:"identity_sentinel",schemaVersion:1,instanceId:"other",dbName:"hive_other",sentinelId:"drill",stampedAt:new Date(),stampedBy:{engineVersion:"drill",hostname:"drill",pid:1}}); db.agent_definitions.insertOne({_id:"dummy",isDefault:true})'
+   ```
+
+   Then from the instance dir: `MONGODB_URI=mongodb://localhost:27099 hive doctor; echo $?` → expect `✗ identity sentinel MISMATCH — expected …, observed other/hive_other` with the RESTAMP remediation, the `⚠ … TEMP directory …` warning (`mktemp` lands under `/var/folders` on macOS), exit `1`.
+3. **W1 (upgrade window):** on the scratch mongod: `db.instance_identity.deleteOne({_id:"identity_sentinel"})`, re-run the doctor → expect `⚠ identity sentinel absent but DB has hive data (1 agent defs)`; the identity section itself does **not** fail (other sections may still fail on the scratch DB — read the section, not just `$?`).
+4. **Teardown:** kill the scratch mongod; re-run step 1 against the real instance to confirm it is untouched (the drill wrote only to the throwaway `--dbpath`; the doctor itself writes nothing).
+
+Drill safety properties preserved per spec Edge #3: scratch mongod on a spare port, throwaway `--dbpath`, teardown step confirming the real DB untouched — no step touches a live instance's DB.
+
+---
+
+### 9. Where to get help
 
 If `hive doctor` passes but something is still wrong — or a check fails in a way the sections above don't cover:
 
