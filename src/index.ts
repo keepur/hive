@@ -18,7 +18,7 @@ import { verifyPackageIntegrity, checkAllowlistDrift } from "./skills/integrity.
 import { checkUpgradeNotice } from "./skills/upgrade-notice.js";
 import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
-import { AgentRegistry } from "./agents/agent-registry.js";
+import { AgentRegistry, buildRosterStatsDoc } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
 import { PrefixCache } from "./agents/prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./agents/prefix-invalidation.js";
@@ -173,12 +173,31 @@ async function main(): Promise<void> {
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
   let fallbackAuditId: string | undefined;
 
+  // KPR-295 — writes the roster-stats contract doc on every load outcome
+  // (including blocked) via the guard-immune raw collection. Must use
+  // `rawTelemetryCollection`, never the guarded `telemetryCollection` below —
+  // guarded writes are refused in exactly the scenario this guard fires (a
+  // suspect DB).
+  const writeRosterStats = async () => {
+    try {
+      await rawTelemetryCollection.updateOne(
+        { kind: "agent_roster_stats" },
+        { $set: { ...buildRosterStatsDoc(registry.getRosterGuardState()), updatedAt: new Date() } },
+        { upsert: true },
+      );
+    } catch (err) {
+      log.warn("roster stats write failed", { error: String(err) });
+    }
+  };
+
   const reload = async () => {
     // Guard: reload may fire via change stream before agentManager/scheduler are assigned
     if (!agentManager || !scheduler) return;
 
     log.info("Hot-reloading agent registry...");
     const result = await registry.load();
+    await writeRosterStats(); // every outcome, incl. blocked
+    if (result.blocked) return; // roster kept; skip stops/schedules/skills/plugins
 
     if (result.added.length) log.info("New agents online", { agents: result.added });
     if (result.updated.length) log.info("Agents updated", { agents: result.updated });
@@ -205,11 +224,19 @@ async function main(): Promise<void> {
     agentManager.rescanPlugins();
   };
 
+  // KPR-295 — fire-and-forget call sites must not be able to produce an
+  // unhandled rejection. `String(err)` coercion only — the catch handler
+  // itself must not be able to throw.
+  const safeReload = () => {
+    reload().catch((err) => log.error("hot-reload failed — roster unchanged", { error: String(err) }));
+  };
+
   registry = new AgentRegistry(agentDefsCollection as any, () => {
     if (reloadTimer) clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(() => reload(), 500);
+    reloadTimer = setTimeout(safeReload, 500);
   });
   await registry.load();
+  await writeRosterStats();
   log.info("Agent registry loaded", { agents: registry.listIds() });
   provisionAgentDirs(registry.listIds());
 
@@ -419,7 +446,7 @@ async function main(): Promise<void> {
       // the toolkit section ever starts reflecting the skill index.
       prefixCache.invalidateAll("skill-change");
       if (reloadTimer) clearTimeout(reloadTimer);
-      reloadTimer = setTimeout(() => reload(), 500);
+      reloadTimer = setTimeout(safeReload, 500);
     });
     log.info("Skills hot-reload enabled", { watched: skillsDir });
   }
@@ -441,7 +468,7 @@ async function main(): Promise<void> {
         // global skills watch above.
         prefixCache.invalidateAll("agent-skill-change");
         if (reloadTimer) clearTimeout(reloadTimer);
-        reloadTimer = setTimeout(() => reload(), 500);
+        reloadTimer = setTimeout(safeReload, 500);
       }
     });
     log.info("Agent-private skills hot-reload enabled", { watched: agentsRoot });
@@ -454,7 +481,7 @@ async function main(): Promise<void> {
   // escape hatch.
   process.on("SIGUSR1", () => {
     prefixCache.invalidateAll("sigusr1");
-    reload();
+    safeReload();
   });
   log.info("Hot-reload enabled", { signal: "SIGUSR1" });
 
@@ -694,7 +721,7 @@ async function main(): Promise<void> {
       config.adminApi.token,
       agentDefsCollection as any,
       db.collection("agent_definition_versions") as any,
-      () => reload(),
+      safeReload,
     );
     await adminApi.start();
     log.info("Admin API started", { port: config.adminApi.port });
