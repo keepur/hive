@@ -50,7 +50,7 @@ This plan was written against branch `mature/KPR-308` @ `7b9adbb` and will be im
   - Reason: all new behavior is pure in-process logic over injectable collaborators — the codebase's established pattern (fake adapters/registries in `dispatcher.test.ts`, fake Mongo collections in `admin-mcp-server.test.ts`, injected fake sockets in `ws-adapter.test.ts`).
   - Minimum assertions:
     - `toAgentConfig`: `floorCritical` absent → `false`; `true` → `true`; `false` → `false`; garbage (`"yes"`, `1`) → `false` (spec §5.7).
-    - Dispatcher matrix (spec §5.7): breaker open/closed × floorCritical true/false × ws connections 0/n × source kind slack/scheduler/app — diversion fires **only** when breaker open ∧ floorCritical ∧ source ∈ {slack, scheduler} ∧ broadcast count > 0; app-sourced replies never divert; sms never diverts; zero-connection broadcast falls through to source adapter; broadcast exception falls through to source adapter; ws adapter unregistered falls through. The `scheduler` source-kind cell is **defensive** — no live producer exists today (C6/C7); the test exercises the type-union branch knowingly.
+    - Dispatcher matrix (spec §5.7): breaker open/closed × floorCritical true/false × ws connections 0/n × source kind slack/scheduler/app × result error present/absent — diversion fires **only** when the result carries no error ∧ breaker open ∧ floorCritical ∧ source ∈ {slack, scheduler} ∧ broadcast count > 0; app-sourced replies never divert; sms never diverts; zero-connection broadcast falls through to source adapter; broadcast exception falls through to source adapter; ws adapter unregistered falls through; a result carrying an error never diverts even when every other condition holds (review advisory — error-carrying results always deliver via the source adapter, no error frames on the floor broadcast). The `scheduler` source-kind cell is **defensive** — no live producer exists today (C6/C7); the test exercises the type-union branch knowingly. The matrix also exercises the fan-out delivery site (`dispatchToAgent`, site 2) directly with one test, in addition to the `dispatch()` (site 1) coverage above — closing both delivery-site seams.
     - `deliverBroadcast`: n open connections all receive the standard `message` frame (agentId + resolved agentName + replyTo); non-OPEN sockets skipped and not counted; returns accurate count; `pendingMessages` untouched (no offline buffering); agentName falls back to id when agent missing from registry.
     - Admin MCP: `agent_create` persists `floorCritical: true` from fields bag and `false` when absent; `agent_update` round-trips `floorCritical` and coerces garbage to strict boolean at the write boundary.
     - Seam: a real `WsAdapter` instance satisfies `isBroadcastCapable`; a plain mock adapter without the method does not.
@@ -82,6 +82,7 @@ This plan was written against branch `mature/KPR-308` @ `7b9adbb` and will be im
 - Admin MCP `spawnBudget`/`maxConcurrent` canonicalization and KPR-184/KPR-221 delegateServers validation (adjacent code in both handlers).
 - `toAgentConfig` existing field projection (no other field's default may change).
 - Note: routing both fan-out delivery sites through the shared helper adds a `log.warn` to the fan-out failure path that previously enqueued silently — intentional, benign.
+- Note: partial-broadcast double-delivery — one device receiving the frame before a later connection's `send()` throws mid-loop — is fail-safe by design (a duplicate delivered during an outage beats one lost) and the `readyState === OPEN` gate makes the scenario near-impossible in practice.
 
 ### Commands
 
@@ -520,18 +521,21 @@ export type OutageStateProvider = () => boolean;
   /**
    * KPR-308 §5.2: outage-mode delivery preference. Applied at both agent-
    * response delivery sites before the source adapter is used. Diverts to a
-   * WS broadcast only when ALL hold: outage mode active; the handling agent
-   * is floorCritical; the item is slack- or scheduler-sourced (app/team/sms
-   * replies already route correctly and must never divert); the ws adapter is
-   * registered and broadcast-capable; and at least one device is connected
-   * (deliverBroadcast's returned count is the authoritative check — no
-   * redundant connectionCount pre-check). Any failure or zero-count falls
-   * through to the normal source-adapter path.
+   * WS broadcast only when ALL hold: the result carries no error; outage mode
+   * active; the handling agent is floorCritical; the item is slack- or
+   * scheduler-sourced (app/team/sms replies already route correctly and must
+   * never divert); the ws adapter is registered and broadcast-capable; and at
+   * least one device is connected (deliverBroadcast's returned count is the
+   * authoritative check — no redundant connectionCount pre-check). Any
+   * failure or zero-count falls through to the normal source-adapter path.
    *
    * The "scheduler" leg is defensive: ChannelKind includes it, but nothing
    * produces it today — the scheduler synthesizes kind:"slack" sources.
    */
   private async tryOutageDiversion(result: WorkResult): Promise<boolean> {
+    // Review advisory: error-carrying results always deliver via the source
+    // adapter — no error frames on the floor broadcast.
+    if (result.error) return false;
     if (!this.outageStateProvider()) return false;
     const sourceKind = result.workItem.source.kind;
     if (sourceKind !== "slack" && sourceKind !== "scheduler") return false;
@@ -763,6 +767,45 @@ describe("outage-mode delivery preference (KPR-308)", () => {
     await dispatcher.dispatch(makeSchedulerSynthItem());
     expect(retryQueue.enqueue).toHaveBeenCalledTimes(1);
   });
+
+  it("never diverts a result carrying an error, even when every other condition holds (review advisory)", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    agentManager.runWorkItemTurn.mockResolvedValueOnce({
+      finalMessage: "partial output before the failure",
+      newSessionId: "s2",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0.01,
+        durationMs: 800,
+      },
+      errors: ["tool call failed"],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+    });
+    await dispatcher.dispatch(makeSchedulerSynthItem());
+    expect(wsAdapter.deliverBroadcast).not.toHaveBeenCalled();
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+    expect(slackAdapter.deliver.mock.calls[0][0].error).toBe("tool call failed");
+  });
+
+  it("fan-out path (dispatchToAgent, site 2): floor-critical agent's reply diverts to broadcast, the other delivers normally", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    const item = makeWorkItem({ text: "Floory, and Jasper, coordinate on this" });
+    await dispatcher.dispatch(item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    expect(wsAdapter.deliverBroadcast).toHaveBeenCalledTimes(1);
+    expect(wsAdapter.deliverBroadcast.mock.calls[0][0].agentId).toBe("floor-agent");
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+    expect(slackAdapter.deliver.mock.calls[0][0].agentId).toBe("jasper");
+  });
 });
 
 describe("BroadcastCapableAdapter seam contract (KPR-308)", () => {
@@ -784,7 +827,7 @@ describe("BroadcastCapableAdapter seam contract (KPR-308)", () => {
 - [ ] **Step 4.8:** Verify
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/dispatcher.test.ts`
-Expected: all tests pass, including 10 new outage-preference tests and the seam-contract test. Pre-existing dispatcher tests unchanged and green (dormancy invariant).
+Expected: all tests pass, including 12 new outage-preference tests (10 dispatch()-path matrix cases + the error-guard case + the dispatchToAgent fan-out case) and the seam-contract test. Pre-existing dispatcher tests unchanged and green (dormancy invariant).
 
 - [ ] **Step 4.9:** Commit
 
