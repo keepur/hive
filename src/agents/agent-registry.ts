@@ -72,6 +72,61 @@ export function validateDelegateServersOrThrow(agentId: string, delegateServers:
   );
 }
 
+/**
+ * KPR-295 — roster guard state shape, returned by `getRosterGuardState()`.
+ * Kept as a standalone interface so `buildRosterStatsDoc` can map it without
+ * importing anything Mongo-specific into this file.
+ */
+export interface RosterGuardState {
+  degraded: boolean;
+  degradedSince: Date | null;
+  blockedReloadCount: number;
+  lastBlockedAt: Date | null;
+  lastRecoveryAt: Date | null;
+  lastGood: {
+    docCount: number;
+    activeCount: number;
+    disabledCount: number;
+    at: Date;
+    source: "boot" | "reload";
+  } | null;
+}
+
+/**
+ * KPR-295 — pure mapping from `getRosterGuardState()` output to the telemetry
+ * doc shape (`db.telemetry`, consumed by `hive doctor` / KPR-296). No `kind`,
+ * no `updatedAt` — the caller (`writeRosterStats` in `index.ts`) owns the
+ * envelope. This telemetry kind is event-driven — written on every reload
+ * outcome, not on a heartbeat cadence (unlike `prefix_cache_stats` /
+ * `spawn_coordinator_stats`, which are heartbeat-cadence). No mongodb
+ * imports here by design.
+ */
+export function buildRosterStatsDoc(state: RosterGuardState): {
+  docCount: number | null;
+  activeCount: number | null;
+  disabledCount: number | null;
+  lastGoodAt: Date | null;
+  lastGoodSource: "boot" | "reload" | null;
+  degraded: boolean;
+  degradedSince: Date | null;
+  blockedReloadCount: number;
+  lastBlockedAt: Date | null;
+  lastRecoveryAt: Date | null;
+} {
+  return {
+    docCount: state.lastGood?.docCount ?? null,
+    activeCount: state.lastGood?.activeCount ?? null,
+    disabledCount: state.lastGood?.disabledCount ?? null,
+    lastGoodAt: state.lastGood?.at ?? null,
+    lastGoodSource: state.lastGood?.source ?? null,
+    degraded: state.degraded,
+    degradedSince: state.degradedSince,
+    blockedReloadCount: state.blockedReloadCount,
+    lastBlockedAt: state.lastBlockedAt,
+    lastRecoveryAt: state.lastRecoveryAt,
+  };
+}
+
 export class AgentRegistry {
   private agents = new Map<string, AgentConfig>();
   private originToAgent = new Map<string, string>();
@@ -82,6 +137,33 @@ export class AgentRegistry {
   private lastPollTime = new Date(0);
   private onChangeDetected?: () => void;
   private postReloadHandlers: Array<() => void> = [];
+
+  // KPR-295 — empty-roster reload guard state. `hadNonEmptyLoad` arms the
+  // guard: it's false only before the first non-empty commit, so a genuinely
+  // empty fresh install can still boot/reload without tripping the guard.
+  private hadNonEmptyLoad = false;
+  private hasLoadedOnce = false;
+  private rosterGuard: {
+    degraded: boolean;
+    degradedSince: Date | null;
+    blockedReloadCount: number;
+    lastBlockedAt: Date | null;
+    lastRecoveryAt: Date | null;
+  } = {
+    degraded: false,
+    degradedSince: null,
+    blockedReloadCount: 0,
+    lastBlockedAt: null,
+    lastRecoveryAt: null,
+  };
+  private lastGood: {
+    docCount: number;
+    activeCount: number;
+    disabledCount: number;
+    at: Date;
+    source: "boot" | "reload";
+  } | null = null;
+  private degradedRetryTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(agentDefs: Collection<AgentDefinition>, onChangeDetected?: () => void) {
     this.agentDefs = agentDefs;
@@ -116,8 +198,17 @@ export class AgentRegistry {
     }
   }
 
-  async load(): Promise<{ added: string[]; updated: string[]; removed: string[] }> {
+  async load(): Promise<{ added: string[]; updated: string[]; removed: string[]; blocked?: boolean }> {
+    // INVARIANT (KPR-295): load() must keep exactly one await before the
+    // synchronous commit below; the guard's correctness (and the diff's
+    // atomicity) depends on it. Do not introduce another await between the
+    // `find().toArray()` resolving and the map mutations further down.
     const docs = await this.agentDefs.find().toArray();
+
+    if (docs.length === 0 && this.hadNonEmptyLoad) {
+      return this.blockEmptyReload();
+    }
+
     const previousIds = new Set(this.agents.keys());
     const currentIds = new Set<string>();
     const added: string[] = [];
@@ -241,8 +332,128 @@ export class AgentRegistry {
 
     this.lastPollTime = new Date();
     this.rebuildOriginIndex();
+
+    // KPR-295 — commit-path bookkeeping. Runs on every commit (including a
+    // genuinely empty fresh-install load), before firePostReload().
+    this.hadNonEmptyLoad ||= docs.length > 0;
+    const now = new Date();
+    this.lastGood = {
+      docCount: docs.length,
+      activeCount: this.agents.size,
+      disabledCount: newDisabled.length,
+      at: now,
+      source: this.hasLoadedOnce ? "reload" : "boot",
+    };
+    this.hasLoadedOnce = true;
+
+    if (this.rosterGuard.degraded) {
+      this.rosterGuard.degraded = false;
+      this.rosterGuard.degradedSince = null;
+      this.rosterGuard.lastRecoveryAt = now;
+      if (this.degradedRetryTimer) {
+        clearInterval(this.degradedRetryTimer);
+        this.degradedRetryTimer = null;
+      }
+      log.info("roster reload recovered — last-good roster replaced", {
+        agents: docs.length,
+        blockedReloadCount: this.rosterGuard.blockedReloadCount,
+      });
+    }
+
     this.firePostReload();
     return { added, updated, removed };
+  }
+
+  /**
+   * KPR-295 — an empty `find().toArray()` result after a previous non-empty
+   * commit is treated as a suspect read (impostor/wiped DB), not a genuine
+   * roster shrink-to-zero. Keeps serving the last-good in-memory roster
+   * untouched: no map mutation, no `lastPollTime` touch, no post-reload fire.
+   * Entire body is try/wrapped so this can never throw and break `load()`'s
+   * fail-open contract (spec: throwing logger inside here must not prevent
+   * `load()` from resolving `{ blocked: true }`).
+   */
+  private blockEmptyReload(): { added: string[]; updated: string[]; removed: string[]; blocked: true } {
+    try {
+      const now = new Date();
+      const wasDegraded = this.rosterGuard.degraded;
+      this.rosterGuard.degraded = true;
+      this.rosterGuard.degradedSince ??= now;
+      this.rosterGuard.blockedReloadCount++;
+      this.rosterGuard.lastBlockedAt = now;
+
+      // Start the retry timer BEFORE any logging. If the logger throws
+      // synchronously on the first blocked load, the catch below must not
+      // be able to swallow it before the timer starts — otherwise
+      // auto-recovery is dead until some external trigger fires (which may
+      // never happen: the poll predicate can't fire on an empty collection
+      // and the change stream is typically down in this scenario). The
+      // timer-start itself is safe/never-throwing (try-wrapped tick body).
+      if (!this.degradedRetryTimer) {
+        this.degradedRetryTimer = setInterval(() => {
+          try {
+            this.onChangeDetected?.();
+          } catch (err) {
+            log.warn("degraded-retry tick failed", { error: String(err) });
+          }
+        }, POLL_INTERVAL_MS);
+        this.degradedRetryTimer.unref?.();
+      }
+
+      try {
+        if (!wasDegraded) {
+          log.error("EMPTY ROSTER READ — keeping last-good roster", {
+            critical: true,
+            lastGoodDocCount: this.lastGood?.docCount ?? null,
+            lastGoodAt: this.lastGood?.at ?? null,
+            hint:
+              "DB may be an impostor or wiped — see hive doctor / db_identity_stats. If you intentionally deleted all agents, restart the engine to apply.",
+          });
+        } else {
+          log.info("roster reload still blocked — empty read repeated", {
+            blockedReloadCount: this.rosterGuard.blockedReloadCount,
+          });
+        }
+      } catch (logErr) {
+        log.warn("blockEmptyReload logging failed", { error: String(logErr) });
+      }
+    } catch (err) {
+      // Fail-open: never let a logging/timer failure here prevent load()
+      // from resolving with blocked: true and the roster left untouched.
+      try {
+        log.warn("blockEmptyReload encountered an internal error", { error: String(err) });
+      } catch {
+        // Even the warn call is inside the same try — swallow silently as
+        // the last resort.
+      }
+    }
+
+    return { added: [], updated: [], removed: [], blocked: true };
+  }
+
+  /**
+   * KPR-295 — public snapshot of the roster guard state, consumed by
+   * `writeRosterStats` (in `index.ts`, event-driven — feeds `hive doctor` /
+   * KPR-296 via the telemetry doc) and tests. Returns copies, not live
+   * references, so callers can't mutate internal state.
+   */
+  getRosterGuardState(): RosterGuardState {
+    return {
+      degraded: this.rosterGuard.degraded,
+      degradedSince: this.rosterGuard.degradedSince ? new Date(this.rosterGuard.degradedSince) : null,
+      blockedReloadCount: this.rosterGuard.blockedReloadCount,
+      lastBlockedAt: this.rosterGuard.lastBlockedAt ? new Date(this.rosterGuard.lastBlockedAt) : null,
+      lastRecoveryAt: this.rosterGuard.lastRecoveryAt ? new Date(this.rosterGuard.lastRecoveryAt) : null,
+      lastGood: this.lastGood
+        ? {
+            docCount: this.lastGood.docCount,
+            activeCount: this.lastGood.activeCount,
+            disabledCount: this.lastGood.disabledCount,
+            at: new Date(this.lastGood.at),
+            source: this.lastGood.source,
+          }
+        : null,
+    };
   }
 
   async startWatching(): Promise<void> {
@@ -308,6 +519,10 @@ export class AgentRegistry {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
+    }
+    if (this.degradedRetryTimer) {
+      clearInterval(this.degradedRetryTimer);
+      this.degradedRetryTimer = null;
     }
   }
 

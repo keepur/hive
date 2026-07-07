@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { toAgentConfig, AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import type { Collection } from "mongodb";
@@ -715,6 +715,409 @@ describe("KPR-221 — AgentRegistry hard-rejects context-dependent servers in de
 
     expect(result.added).toContain("in-process-stripped");
     expect(registry.get("in-process-stripped")?.delegateServers).toEqual([]);
+  });
+});
+
+describe("KPR-295 — empty-roster reload guard", () => {
+  let RosterAgentRegistry: AgentRegistryModule["AgentRegistry"];
+  let buildRosterStatsDoc: AgentRegistryModule["buildRosterStatsDoc"];
+
+  beforeAll(async () => {
+    const registryModule = await import("./agent-registry.js");
+    RosterAgentRegistry = registryModule.AgentRegistry;
+    buildRosterStatsDoc = registryModule.buildRosterStatsDoc;
+  });
+
+  /** Mutable-docs fake collection — same closure pattern as makeFakeCollection above. */
+  function makeMutableCollection(initialDocs: AgentDefinition[]): {
+    collection: Collection<AgentDefinition>;
+    setDocs: (docs: AgentDefinition[]) => void;
+  } {
+    let docs = initialDocs;
+    const collection = {
+      find: () => ({ toArray: async () => docs }),
+    } as unknown as Collection<AgentDefinition>;
+    return { collection, setDocs: (next) => (docs = next) };
+  }
+
+  /** Captures stdout+stderr writes, since log.error emits to stderr (logger.ts) and info/warn to stdout. */
+  function captureLogs(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const capture = (chunk: string | Uint8Array): boolean => {
+      const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+      lines.push(text);
+      return true;
+    };
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(capture);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(capture);
+    return {
+      lines,
+      restore: () => {
+        stdoutSpy.mockRestore();
+        stderrSpy.mockRestore();
+      },
+    };
+  }
+
+  function countMatching(lines: string[], substrings: string[]): number {
+    return lines.filter((l) => substrings.every((s) => l.includes(s))).length;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("1. boot-shaped first load with 0 docs commits (blocked falsy); a second empty load also commits", async () => {
+    const { collection } = makeMutableCollection([]);
+    const registry = new RosterAgentRegistry(collection);
+
+    const first = await registry.load();
+    expect(first.blocked).toBeFalsy();
+    expect(registry.getRosterGuardState().degraded).toBe(false);
+
+    const second = await registry.load();
+    expect(second.blocked).toBeFalsy();
+    expect(registry.getRosterGuardState().degraded).toBe(false);
+  });
+
+  it("1b. fresh-install arming arc: empty boot -> non-empty (arms) -> empty -> third load is blocked", async () => {
+    const { collection, setDocs } = makeMutableCollection([]);
+    const registry = new RosterAgentRegistry(collection);
+
+    const boot = await registry.load();
+    expect(boot.blocked).toBeFalsy();
+
+    setDocs([makeDefinition({ _id: "agent-1" })]);
+    const armed = await registry.load();
+    expect(armed.blocked).toBeFalsy();
+    expect(registry.get("agent-1")).toBeDefined();
+
+    setDocs([]);
+    const emptyAfterArm = await registry.load();
+    // Per spec: hadNonEmptyLoad is now true, so THIS load should already be
+    // treated as suspect. Pin exact semantics: the load right after the
+    // non-empty commit goes empty is the one that trips blocked.
+    expect(emptyAfterArm.blocked).toBe(true);
+
+    setDocs([]);
+    const third = await registry.load();
+    expect(third.blocked).toBe(true);
+  });
+
+  it("2. incident shape: non-empty -> empty triggers blocked, roster/state unchanged, post-reload not fired again", async () => {
+    const def1 = makeDefinition({ _id: "agent-a", catches: ["origin-a"] });
+    const { collection, setDocs } = makeMutableCollection([def1]);
+    const registry = new RosterAgentRegistry(collection);
+
+    let postReloadCount = 0;
+    registry.onPostReload(() => postReloadCount++);
+
+    await registry.load();
+    expect(postReloadCount).toBe(1);
+
+    const beforeGet = registry.get("agent-a");
+    const beforeAll_ = registry.getAll();
+    const beforeDisabled = registry.getDisabled();
+    const beforeOrigin = registry.findByOrigin("origin-a");
+
+    setDocs([]);
+    const { lines, restore } = captureLogs();
+    let result: Awaited<ReturnType<typeof registry.load>>;
+    try {
+      result = await registry.load();
+    } finally {
+      restore();
+    }
+
+    expect(result.blocked).toBe(true);
+    expect(result.removed).toEqual([]);
+    expect(registry.get("agent-a")).toEqual(beforeGet);
+    expect(registry.getAll()).toEqual(beforeAll_);
+    expect(registry.getDisabled()).toEqual(beforeDisabled);
+    expect(registry.findByOrigin("origin-a")).toEqual(beforeOrigin);
+    expect(postReloadCount).toBe(1); // not fired again
+
+    const errorLines = lines.filter((l) => l.includes(`"level":"error"`) && l.includes(`"critical":true`));
+    expect(errorLines.length).toBe(1);
+  });
+
+  it("3. blocked -> blocked again: second emits log.info not log.error; blockedReloadCount reaches 2", async () => {
+    const { collection, setDocs } = makeMutableCollection([makeDefinition({ _id: "agent-a" })]);
+    const registry = new RosterAgentRegistry(collection);
+    await registry.load();
+
+    setDocs([]);
+    const { lines: firstLines, restore: restore1 } = captureLogs();
+    await registry.load();
+    restore1();
+    expect(countMatching(firstLines, [`"level":"error"`, "EMPTY ROSTER READ"])).toBe(1);
+
+    const { lines: secondLines, restore: restore2 } = captureLogs();
+    const second = await registry.load();
+    restore2();
+
+    expect(countMatching(secondLines, [`"level":"error"`, "EMPTY ROSTER READ"])).toBe(0);
+    expect(countMatching(secondLines, [`"level":"info"`, "blockedReloadCount"])).toBe(1);
+    expect(second.blocked).toBe(true);
+    expect(registry.getRosterGuardState().blockedReloadCount).toBe(2);
+  });
+
+  it("4. recovery: non-empty -> empty (blocked) -> non-empty commits, guard clears, retry timer stops", async () => {
+    vi.useFakeTimers();
+    const { collection, setDocs } = makeMutableCollection([makeDefinition({ _id: "agent-a" })]);
+    let onChangeCalls = 0;
+    const registry = new RosterAgentRegistry(collection, () => {
+      onChangeCalls++;
+    });
+
+    await registry.load();
+
+    setDocs([]);
+    await registry.load();
+    expect(registry.getRosterGuardState().degraded).toBe(true);
+
+    setDocs([makeDefinition({ _id: "agent-b", name: "AgentB" })]);
+    const { lines, restore } = captureLogs();
+    const recovered = await registry.load();
+    restore();
+
+    expect(recovered.blocked).toBeFalsy();
+    expect(registry.get("agent-b")).toBeDefined();
+    const state = registry.getRosterGuardState();
+    expect(state.degraded).toBe(false);
+    expect(state.lastRecoveryAt).not.toBeNull();
+    expect(countMatching(lines, [`"level":"info"`, "recovered"])).toBe(1);
+
+    // Retry timer must be cleared — advancing past 30s must not trigger
+    // another onChangeDetected call from the (now-dead) degraded timer.
+    const callsBeforeAdvance = onChangeCalls;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(onChangeCalls).toBe(callsBeforeAdvance);
+  });
+
+  it("5. shrinkage 5 -> 2 commits silently; all-disabled commits silently with correct lastGood", async () => {
+    const docs5 = Array.from({ length: 5 }, (_, i) => makeDefinition({ _id: `agent-${i}` }));
+    const { collection, setDocs } = makeMutableCollection(docs5);
+    const registry = new RosterAgentRegistry(collection);
+    await registry.load();
+
+    const docs2 = [makeDefinition({ _id: "agent-0" }), makeDefinition({ _id: "agent-1" })];
+    setDocs(docs2);
+    const { lines, restore } = captureLogs();
+    const shrink = await registry.load();
+    restore();
+
+    expect(shrink.blocked).toBeFalsy();
+    expect(countMatching(lines, [`"level":"error"`])).toBe(0);
+    expect(registry.getRosterGuardState().degraded).toBe(false);
+
+    // All-disabled: docs > 0, 0 active.
+    const allDisabled = [
+      makeDefinition({ _id: "agent-x", disabled: true }),
+      makeDefinition({ _id: "agent-y", disabled: true }),
+    ];
+    setDocs(allDisabled);
+    const { lines: lines2, restore: restore2 } = captureLogs();
+    const disabledResult = await registry.load();
+    restore2();
+
+    expect(disabledResult.blocked).toBeFalsy();
+    expect(countMatching(lines2, [`"level":"error"`])).toBe(0);
+    const state = registry.getRosterGuardState();
+    expect(state.degraded).toBe(false);
+    expect(state.lastGood?.activeCount).toBe(0);
+    expect(state.lastGood?.disabledCount).toBe(2);
+  });
+
+  it("5b. validation-evicts-all stays unguarded", async () => {
+    const validDocs = [
+      makeDefinition({
+        _id: "arch-agent-1",
+        archetype: "kpr295-test-arch",
+        archetypeConfig: { workshop: "/tmp/a" },
+      }),
+      makeDefinition({
+        _id: "arch-agent-2",
+        archetype: "kpr295-test-arch",
+        archetypeConfig: { workshop: "/tmp/b" },
+      }),
+    ];
+
+    const archetypes = await import("../archetypes/registry.js");
+    archetypes.registerArchetype({
+      id: "kpr295-test-arch",
+      validateConfig: (c: unknown) => {
+        const cfg = (c ?? {}) as { workshop?: string };
+        if (typeof cfg.workshop !== "string") throw new Error("missing workshop");
+        return cfg;
+      },
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [],
+      sessionOptions: () => ({}),
+    });
+
+    const { collection, setDocs } = makeMutableCollection(validDocs);
+    const registry = new RosterAgentRegistry(collection);
+    await registry.load();
+    expect(registry.get("arch-agent-1")).toBeDefined();
+    expect(registry.get("arch-agent-2")).toBeDefined();
+
+    // All docs now fail archetype validation — docs.length is still > 0, so
+    // this must NOT be treated as an empty-roster read.
+    const invalidDocs = [
+      makeDefinition({ _id: "arch-agent-1", archetype: "kpr295-test-arch", archetypeConfig: {} }),
+      makeDefinition({ _id: "arch-agent-2", archetype: "kpr295-test-arch", archetypeConfig: {} }),
+    ];
+    setDocs(invalidDocs);
+    const { lines, restore } = captureLogs();
+    const result = await registry.load();
+    restore();
+
+    expect(result.blocked).toBeFalsy();
+    expect(countMatching(lines, [`"critical":true`])).toBe(0);
+    expect(result.removed).toContain("arch-agent-1");
+    expect(result.removed).toContain("arch-agent-2");
+
+    const state = registry.getRosterGuardState();
+    expect(state.lastGood?.docCount).toBe(2);
+    expect(state.lastGood?.activeCount).toBe(0);
+    expect(state.degraded).toBe(false);
+  });
+
+  it("6. retry timer: blocked load starts a 30s interval; second blocked load doesn't double-start; stopWatching clears it", async () => {
+    vi.useFakeTimers();
+    const { collection, setDocs } = makeMutableCollection([makeDefinition({ _id: "agent-a" })]);
+    let onChangeCalls = 0;
+    const registry = new RosterAgentRegistry(collection, () => {
+      onChangeCalls++;
+    });
+    await registry.load();
+
+    setDocs([]);
+    await registry.load(); // first blocked load — starts the timer
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(onChangeCalls).toBe(1);
+
+    await registry.load(); // second blocked load — must not double-start
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(onChangeCalls).toBe(2); // exactly one more call, not two
+
+    registry.stopWatching();
+    const callsAfterStop = onChangeCalls;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(onChangeCalls).toBe(callsAfterStop);
+  });
+
+  it("7. retry tick with a throwing onChangeDetected logs a warn, no throw escapes", async () => {
+    vi.useFakeTimers();
+    const { collection, setDocs } = makeMutableCollection([makeDefinition({ _id: "agent-a" })]);
+    const registry = new RosterAgentRegistry(collection, () => {
+      throw new Error("onChangeDetected boom");
+    });
+    await registry.load();
+
+    setDocs([]);
+    await registry.load();
+
+    const { lines, restore } = captureLogs();
+    let threw = false;
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+    } catch {
+      threw = true;
+    } finally {
+      restore();
+    }
+
+    expect(threw).toBe(false);
+    expect(countMatching(lines, [`"level":"warn"`, "degraded-retry tick failed"])).toBe(1);
+  });
+
+  it("8. throwing logger inside the blocked path -> load() still resolves blocked: true, roster untouched (fail-open)", async () => {
+    const def = makeDefinition({ _id: "agent-a" });
+    const { collection, setDocs } = makeMutableCollection([def]);
+    const registry = new RosterAgentRegistry(collection);
+    await registry.load();
+    const beforeGet = registry.get("agent-a");
+
+    setDocs([]);
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => {
+      throw new Error("stderr write boom");
+    });
+    let result: Awaited<ReturnType<typeof registry.load>>;
+    try {
+      result = await registry.load();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(result.blocked).toBe(true);
+    expect(registry.get("agent-a")).toEqual(beforeGet);
+  });
+
+  it("9. getRosterGuardState() snapshot + lastGood.source across boot/reload transitions", async () => {
+    const { collection, setDocs } = makeMutableCollection([]);
+    const registry = new RosterAgentRegistry(collection);
+
+    await registry.load();
+    expect(registry.getRosterGuardState().lastGood?.source).toBe("boot");
+
+    setDocs([makeDefinition({ _id: "agent-a" })]);
+    await registry.load();
+    expect(registry.getRosterGuardState().lastGood?.source).toBe("reload");
+  });
+
+  it("9b. getRosterGuardState() returns copies, not live references", async () => {
+    const { collection } = makeMutableCollection([makeDefinition({ _id: "agent-a" })]);
+    const registry = new RosterAgentRegistry(collection);
+    await registry.load();
+
+    const state1 = registry.getRosterGuardState();
+    state1.blockedReloadCount = 999;
+    if (state1.lastGood) state1.lastGood.docCount = 999;
+
+    const state2 = registry.getRosterGuardState();
+    expect(state2.blockedReloadCount).not.toBe(999);
+    expect(state2.lastGood?.docCount).not.toBe(999);
+  });
+
+  it("10. buildRosterStatsDoc: exact key-set snapshot + value mapping from a populated guard state", async () => {
+    const { collection, setDocs } = makeMutableCollection([makeDefinition({ _id: "agent-a" })]);
+    const registry = new RosterAgentRegistry(collection);
+    await registry.load();
+
+    setDocs([]);
+    await registry.load(); // arms degraded
+
+    const state = registry.getRosterGuardState();
+    const doc = buildRosterStatsDoc(state);
+
+    expect(Object.keys(doc).sort()).toEqual(
+      [
+        "docCount",
+        "activeCount",
+        "disabledCount",
+        "lastGoodAt",
+        "lastGoodSource",
+        "degraded",
+        "degradedSince",
+        "blockedReloadCount",
+        "lastBlockedAt",
+        "lastRecoveryAt",
+      ].sort(),
+    );
+    expect(doc.docCount).toBe(state.lastGood?.docCount ?? null);
+    expect(doc.activeCount).toBe(state.lastGood?.activeCount ?? null);
+    expect(doc.disabledCount).toBe(state.lastGood?.disabledCount ?? null);
+    expect(doc.lastGoodAt).toBe(state.lastGood?.at ?? null);
+    expect(doc.lastGoodSource).toBe(state.lastGood?.source ?? null);
+    expect(doc.degraded).toBe(true);
+    expect(doc.degradedSince).toEqual(state.degradedSince);
+    expect(doc.blockedReloadCount).toBe(1);
+    expect(doc.lastBlockedAt).toEqual(state.lastBlockedAt);
+    expect(doc.lastRecoveryAt).toBeNull();
   });
 });
 
