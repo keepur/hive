@@ -97,7 +97,7 @@ export const HARD_FAULT_KINDS: ReadonlySet<ProviderFaultKind>;      // all kinds
 
 Classification order (first match wins):
 
-1. `timedOut === true` → `fault: timeout` (even though `aborted` is also true — the deadline path sets both).
+1. `timedOut === true && aborted === true` → `fault: timeout` (the deadline path sets both flags; requiring both here is belt-and-suspenders on top of the runner-side guard in the next section, which is the primary fix).
 2. `aborted === true` (without `timedOut`) → `aborted` (neutral: not success, not fault; probes treat it as inconclusive).
 3. No `error` → `success`.
 4. `error` matched against a pattern table (case-insensitive regex, exact patterns are an implementation detail but must cover at least):
@@ -105,14 +105,14 @@ Classification order (first match wins):
    - `rate-limit`: `\b429\b | rate.?limit | too many requests`
    - `auth`: `\b401\b | \b403\b | authentication | unauthorized | invalid.?api.?key | OAuth session is not available`
    - `server-error`: `\b5\d\d\b | overloaded | internal server error | service unavailable | bad gateway | upstream`
-   - Explicit `non-provider` short-circuits (checked before the tables above where ambiguous): SDK result subtypes `error_max_turns`, `error_during_execution` (set at `agent-runner.ts:1930-1937`), and the auth-rebuild-resume sentinel patterns (`agent-manager.ts:185-189`) — the latter never reach the breaker anyway (see recording rules) but the classifier stays consistent standalone.
+   - Explicit `non-provider` short-circuit (checked before the tables above where ambiguous): SDK result subtypes `error_max_turns`, `error_during_execution` (set at `agent-runner.ts:1930-1937`). The auth-rebuild-resume sentinel patterns (`agent-manager.ts:185-189`, e.g. "401 Unauthorized", "not authenticated", "ANTHROPIC_API_KEY", "authToken") are **not** short-circuited to `non-provider` — they overlap the `auth` fault row above and classify as `auth` faults like any other match. Record-once (not the classifier) is what keeps the locally-recoverable first attempt out of the breaker: the auth-retry only fires when `effectiveCtx.sessionId` exists (`agent-manager.ts:570`), so a fresh-thread first attempt with no prior session records directly (there is no retry to prefer), and the retry's own result always records. A persistent auth outage therefore classifies `auth` and counts toward the trip streak on every recorded attempt — consistent with the Failure Modes "Auth-rebuild-resume" paragraph below.
 5. Default → `fault: non-provider`. **Fail-safe bias: an unrecognized error string must never trip the breaker.** False negatives (missed provider fault) delay a trip by one turn; false positives (tool failure tripping the breaker) take a healthy provider offline — the asymmetry dictates the default.
 
 `classifyThrown` runs `String(err)` through the same table (default `non-provider`) — it covers the rare throw path out of `adapter.runTurn` (e.g. codex missing-OAuth throw pre-`RunResult`).
 
 ### Runner change: distinguish timeout from operator abort
 
-In `AgentRunner.send()`: a local `let timedOut = false;` set inside the existing deadline callback (`agent-runner.ts:1812-1818`) before `this.abort()`, and a new optional field on the returned object / `RunResult` interface (`agent-runner.ts:120-141`):
+In `AgentRunner.send()`: a local `let timedOut = false;` set inside the existing deadline callback (`agent-runner.ts:1812-1818`), but **only when the abort actually cancels an active query** — mirror `abort()`'s own guard (`agent-runner.ts:2028-2035`: it no-ops when `this.activeQuery` is `null`). Concretely: `if (this.activeQuery) { timedOut = true; } this.abort();` (or check `activeQuery` before calling `abort()`). Without this guard, a deadline firing in the narrow window between the final result message and the `finally` block's `clearTimeout(deadline)` (`agent-runner.ts:1961-1962`) would find `activeQuery` already `null`, call a no-op `abort()`, yet still flip `timedOut = true` on an otherwise-successful result — a false-positive timeout fault. New optional field on the returned object / `RunResult` interface (`agent-runner.ts:120-141`):
 
 ```ts
 export interface RunResult {
@@ -151,11 +151,11 @@ interface ProviderCircuitBreakerRegistry {
 }
 ```
 
-`TurnPermit` is an opaque handle carrying `{ provider, isProbe }`. Requiring `record(permit, …)` (not `record(provider, …)`) makes probe bookkeeping airtight: the half-open breaker hands out exactly one probe permit; a permit that is never recorded (caller crashed between acquire and record — impossible given the `try/finally` shape below, but belt-and-braces) is reconciled by a staleness check on the next `acquire` (probe permit older than the effective turn deadline + 60s is considered inconclusive).
+`TurnPermit` is an opaque handle carrying `{ provider, isProbe }`. Requiring `record(permit, …)` (not `record(provider, …)`) makes probe bookkeeping airtight: the half-open breaker hands out exactly one probe permit; a permit that is never recorded (caller crashed between acquire and record — impossible given the `try/finally` shape below, but belt-and-braces) is reconciled by a staleness check on the next `acquire` (probe permit older than the effective turn deadline + 60s is considered inconclusive). Records from non-probe permits that complete after a trip (turn acquired while closed, finishing while the breaker is now open or half-open) still feed counters/telemetry but never drive a state transition — only the designated half-open probe's outcome transitions state.
 
 **Trip rules (closed state):**
 
-- *Hard:* `consecutiveHardFaults >= consecutiveFaultThreshold` (default **3**) → open. Counted per `HARD_FAULT_KINDS`; `success` resets the counter; `non-provider` faults and `aborted` leave it unchanged (they neither confirm nor deny provider health). Under an outage with live traffic, connect-fails complete in milliseconds → three inbound turns trip the breaker in **single-digit seconds** (the ticket's bar). A quiet instance trips slower — acceptable, since fast-fail only matters when traffic exists.
+- *Hard:* `consecutiveHardFaults >= consecutiveFaultThreshold` (default **3**) → open. Counted per `HARD_FAULT_KINDS`; `success` resets the counter; `aborted` leaves it unchanged (inconclusive — the turn never reached a provider-attributable outcome). A `non-provider` fault **resets** the counter too: it proves the turn traversed the provider path and got a response (the same reachability logic the half-open rule uses below — a turn that reached the provider and failed on something else confirms the provider is up). Under an outage with live traffic, connect-fails complete in milliseconds → three inbound turns trip the breaker in **single-digit seconds** (the ticket's bar). A quiet instance trips slower — acceptable, since fast-fail only matters when traffic exists.
 - *Soft (p95):* ring buffer of the last `p95WindowSize` (default **50**) `llmMs` samples from **successful turns only** (failed turns contribute via the fault path; `llmMs` rather than `durationMs` so tool-heavy turns don't false-trip — pilot adapters report `llmMs == durationMs`, consistent). Evaluated after each insertion; requires `sampleCount >= p95MinSamples` (default **20**); p95 computed by sorting a copy of the window (50 elements — cost is noise). `p95 > p95ThresholdMs` (default **240_000**, i.e. 80% of the 300s default turn deadline ⚠) → open with `reason: "p95-breach"`. The window is cleared on every close transition so pre-outage latencies can't instantly re-trip a recovered provider.
 
 **Open state:** `cooldownMs = min(openBaseMs * 2^backoffExponent, openMaxMs)` (defaults **15_000** base, **60_000** cap). `acquire` during cooldown throws `ProviderCircuitOpenError`. First `acquire` at/after `openedAt + cooldownMs` transitions to half-open and returns a probe permit — lazy transition, no timer.
@@ -285,13 +285,14 @@ Flags: `[OPEN]` / `[HALF-OPEN]` / `[shadow]` (when `enabled=false`) / `stale-hea
 - **Unknown error strings** → `non-provider` → never trip (fail-safe bias, rationale in classifier section).
 - **Operator abort / agent stop mid-turn** → `aborted` → breaker-neutral; mid-probe → inconclusive → re-open without backoff escalation.
 - **Timeout vs abort ambiguity** → resolved by the new `timedOut` flag; without the flag a stop-agent sweep during load could have tripped the breaker falsely.
-- **Auth-rebuild-resume** → first attempt never recorded (record-once-per-spawnTurn); a *persistent* auth failure surfaces on the retry result as `auth` and trips — correct, since a dead OAuth session is a provider-path outage for that provider.
+- **Auth-rebuild-resume** → sentinel-matching errors classify as `auth` faults like any other auth string (no `non-provider` short-circuit); record-once-per-spawnTurn means the retry attempt's result is what's recorded when a retry happens (`effectiveCtx.sessionId` present), and a fresh-thread first attempt with no session records directly. Either way, a *persistent* auth failure surfaces as `auth` on the recorded attempt and trips — correct, since a dead OAuth session is a provider-path outage for that provider.
 - **Low traffic** → slow trip (needs 3 turns) and slow probe (needs 1 turn). Acceptable: fast-fail protects nothing when nothing is arriving.
 - **Mixed workloads on one provider** → one agent's broken MCP tool produces `non-provider` faults only; cannot starve other agents (the false-positive asymmetry the taxonomy exists to prevent).
 - **Probe permit leak** (acquire without record) → structurally prevented by try/catch/finally at the wrap point; reconciled by staleness fallback in the breaker regardless.
 - **Shadow mode** (`enabled: false`) → full observability, zero behavioral change; doctor row flagged `[shadow]`.
 - **Engine restart mid-outage** → breaker resets to closed; re-trips within seconds under traffic. Telemetry rows persist (stale) until the new process's `writeOnce()` overwrites them — `updatedAt` staleness in doctor covers the gap.
 - **Registry hot-reload (SIGUSR1) / agent model changes** → breakers key on provider, not agent; an agent switching `claude` → `gemini/...` simply starts acquiring from a different breaker on its next turn.
+- **Intermittent faults (~50% failure rate) never trip either rule** — interleaved successes reset `consecutiveHardFaults` before it reaches threshold, and the p95 window only samples successful turns, so a provider failing roughly every other turn produces neither a consecutive-fault streak nor a latency-window breach. This profile is explicitly **out of detection scope** — a simplicity trade-off of consecutive-count detection, accepted at spec time.
 
 ## Integration Points (exact files/functions, re-confirm at HEAD)
 
@@ -312,9 +313,9 @@ Flags: `[OPEN]` / `[HALF-OPEN]` / `[shadow]` (when `enabled=false`) / `stale-hea
 
 Vitest, colocated `*.test.ts` (repo convention — precedents exist at every touch point). Time is faked via the injected `now: () => number` (no `vi.useFakeTimers` needed for the state machine); failures are faked as `TurnClassification` inputs / `RunResult` literals — no network anywhere.
 
-- `error-classification.test.ts` — pattern table: each fault kind, timeout-flag precedence over aborted, aborted-neutral, unknown-string → non-provider, SDK subtypes → non-provider, auth-rebuild patterns → non-provider, `classifyThrown` default.
+- `error-classification.test.ts` — pattern table: each fault kind, timeout-flag precedence over aborted, aborted-neutral, unknown-string → non-provider, SDK subtypes → non-provider, auth-rebuild patterns → `auth` (no short-circuit), `classifyThrown` default.
 - `provider-circuit-breaker.test.ts` — the state machine with injected clock:
-  - closed→open on 3 consecutive hard faults; success resets counter; non-provider/aborted don't touch it.
+  - closed→open on 3 consecutive hard faults; success resets counter; non-provider also resets counter (reachability logic); aborted leaves it unchanged.
   - p95 trip: window fill, minSamples gate, threshold breach, window cleared on close.
   - open: `acquire` throws with correct `provider/openedAt/retryAfterMs/reason`; lazy half-open transition at `openedAt + cooldown`.
   - half-open: single probe permit, concurrent acquire rejected; probe success → closed + resets; hard-fault probe → open with doubled cooldown, capped at `openMaxMs`; aborted probe → open, exponent unchanged; non-provider probe outcome → closed.
@@ -323,7 +324,7 @@ Vitest, colocated `*.test.ts` (repo convention — precedents exist at every tou
   - stale-probe reconciliation.
 - `circuit-breaker-heartbeat.test.ts` — mirror `spawn-coordinator-heartbeat.test.ts`: per-provider upsert keys, `updatedAt`, write-failure swallow, `writeOnce`.
 - `agent-manager.test.ts` (extend) — wrap-point integration with a stubbed adapter: open breaker → spawnTurn rejects with `ProviderCircuitOpenError` **before** `prepareSpawn`/router runs; ticket fully released after fast-fail (activeSpawnCount/processing/activeTickets clean — the existing snapshot surface makes this assertable); record-once under the auth-rebuild retry; thrown-adapter-error classified and rethrown.
-- `agent-runner.test.ts` (extend) — deadline fire sets `timedOut: true` + `aborted: true`; operator abort sets `aborted` only.
+- `agent-runner.test.ts` (extend) — deadline fire sets `timedOut: true` + `aborted: true`; operator abort sets `aborted` only; deadline firing after `activeQuery` is already cleared (result-then-deadline race) leaves `timedOut` unset.
 - `doctor.test.ts` / `doctor-checks.test.ts` (extend) — renderer snapshot rows (closed/open/shadow/stale variants), empty-rows message, loader field defaults; assert section presence does not alter exit code.
 - `config.test.ts` (extend) — absent section → defaults; partial section → per-key `??`.
 
@@ -333,7 +334,7 @@ Gate: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm r
 
 - ⚠ **Defaults**: threshold 3, openBase 15s, openMax 60s, window 50, minSamples 20, p95 threshold 240s (80% of the 300s default deadline). All operator-tunable via hive.yaml; chosen for the 30-minute-outage profile (trip ≤ seconds under traffic, probe ≥ every 60s).
 - ⚠ **`enabled: false` = shadow mode** (observe + telemetry, never fast-fail) rather than fully-off; default `enabled: true` (fast-fail live from first deploy).
-- ⚠ **Auth faults trip the breaker** — an expired/broken credential path is treated as a provider-path outage (stops per-turn hammering); revisit if operators find auth trips more confusing than helpful.
+- ⚠ **Auth faults trip the breaker, unconditionally** — an expired/broken credential path is treated as a provider-path outage (stops per-turn hammering); no `non-provider` short-circuit for the auth-rebuild sentinel (classifier section) — revisit if operators find auth trips more confusing than helpful.
 - ⚠ **Keying by provider, not model** — one Anthropic outage takes all Claude tiers together; no evidence yet of per-model partial outages worth the state fan-out.
 - ⚠ **`llmMs` (not `durationMs`) as the p95 sample** — excludes tool time so tool-heavy agents don't false-trip; pilot adapters report `llmMs == durationMs`.
 - ⚠ **Successful-turns-only latency window** — failed/aborted turns excluded from p95 (they're handled by the fault path; including a 300s timeout sample would double-count the same signal).
