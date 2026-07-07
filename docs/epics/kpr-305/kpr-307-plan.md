@@ -22,7 +22,7 @@ This plan is written ahead of implementation against `mature/KPR-307` @ `2afca8d
 
 | # | KPR-306 deliverable (frozen contract) | Re-check command | Expect |
 |---|---|---|---|
-| D1 | `ProviderCircuitOpenError` exported with `provider/openedAt/retryAfterMs/reason/lastFaultMessage` | `grep -n "export class ProviderCircuitOpenError" src/agents/provider-circuit-breaker.ts` | class present, fields per contract |
+| D1 | `ProviderCircuitOpenError` exported with `provider/openedAt/retryAfterMs/reason/lastFaultMessage` | `grep -n "export class ProviderCircuitOpenError" src/agents/provider-circuit-breaker.ts` then read its constructor | class present, fields per contract; **also confirm the constructor arity/shape at HEAD** — KPR-306 freezes the FIELDS, not the constructor signature. Task 5/8 fixtures assume a positional 5-arg `new ProviderCircuitOpenError(provider, openedAt, retryAfterMs, reason, lastFaultMessage)`; adapt those fixtures if the ctor differs |
 | D2 | `CircuitBreakerSnapshot` with `state` and `enabled` fields; `stateFor(provider)` on the registry | `grep -n "stateFor\|enabled" src/agents/provider-circuit-breaker.ts \| head` | both present |
 | D3 | `AgentManager` exposes `readonly circuitBreakers` | `grep -n "circuitBreakers" src/agents/agent-manager.ts` | public readonly field |
 | D4 | `classifyTurnResult` + `HARD_FAULT_KINDS` exported | `grep -n "export function classifyTurnResult\|export const HARD_FAULT_KINDS" src/agents/provider-adapters/error-classification.ts` | both exported |
@@ -53,7 +53,7 @@ This plan is written ahead of implementation against `mature/KPR-307` @ `2afca8d
 | C18 | Voice outer retry fires when `!outcome.ok && effectiveResume && !outcome.bytesSent` | `voice-adapter.ts:327-341` | `grep -n "retrying as turn-1" src/channels/voice/voice-adapter.ts` |
 | C19 | Scheduler id formats: `sched:` (`scheduler.ts:231`), `callback:<oid>` (`:289`), `event:<id>:<agentId>` (`:381`), `team-<oid>` (`:428`) — the §5-3a prefix table depends on these | `src/scheduler/scheduler.ts` | `grep -n '"sched:\|"callback:\|\`event:\|\`team-\|id: \`' src/scheduler/scheduler.ts \| head` |
 | C20 | Callback-poller precedent: atomic mark-fired via `updateOne({_id, status:"pending"}, {$set:{status:"fired"}})` | `scheduler.ts:265-269` | `grep -n "already picked up" src/scheduler/scheduler.ts` |
-| C21 | Delivery retry queue is in-memory, delivery-only — **untouched by this ticket** | `src/sweeper/retry-queue.ts` | `git diff --stat` at the end must show no change to this file |
+| C21 | Delivery retry queue is in-memory, delivery-only — **untouched by this ticket** | `src/sweeper/retry-queue.ts` | `git diff --stat $(git merge-base HEAD kpr-305)..HEAD -- src/sweeper/retry-queue.ts` at the end must show no change (base is the child branch point, not `main` — see Task 10 Step 10.3) |
 | C22 | `index.ts`: guarded `db` (`guardDb(rawDb, ...)`), dispatcher construction, `dispatcher.setRetryQueue(retryQueue)`, shutdown block with `scheduler.stop()` | `src/index.ts:148, 381, 735, 789-822` | `grep -n "setRetryQueue\|guardDb\|const shutdown" src/index.ts` |
 | C23 | Doctor: `spawnCoordinatorStatsForDoctor` short-lived-client pattern (`serverSelectionTimeoutMS: 2000`, empty/null on error); `runDoctor` post-check section wiring + skipped-else block; only Datastore identity can flip exit code | `src/cli/doctor-checks.ts:331-375`, `src/cli/doctor.ts:600-640` | `grep -n "serverSelectionTimeoutMS: 2000" src/cli/doctor-checks.ts \| head -3`; `grep -n "skipped: config not loaded" src/cli/doctor.ts` |
 | C24 | Config liberal-loader precedent (`imessage` block, all-optional `??`); KPR-306 adds `resolveCircuitBreakerConfig` — mirror its placement for `resolveOutageQueueConfig` | `src/config.ts:209-215` | `grep -n "resolveCircuitBreakerConfig\|imessage:" src/config.ts` |
@@ -65,7 +65,7 @@ This plan is written ahead of implementation against `mature/KPR-307` @ `2afca8d
 - [ ] **Step 0.3:** Grep for sibling-wave seams: `grep -rn "outage_queue\|outageReplay\|OutageQueueStore\|outagePolicy" src/`. Expect empty (KPR-308 has no shared code with this ticket by design). If KPR-308 landed something that collides, stop and reconcile with the epic driver.
 - [ ] **Step 0.4:** Establish a green baseline on the untouched branch:
 
-Run: `cd /Users/mayandmikemacmini/github/hive-mature-KPR-307 && SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check`
+Run (in the repo root at HEAD — the implement lane runs in a fresh child worktree, not the spec-lane path above): `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check`
 Expected: exit 0 (typecheck + lint + format + tests all green) before any edit.
 
 ---
@@ -80,7 +80,7 @@ Expected: exit 0 (typecheck + lint + format + tests all green) before any edit.
   - Minimum assertions (one per spec §11 row — the five r2/r3-added rows are marked ★):
     - **Store:** enqueue idempotency pinned to the composite `(itemId, agentId)` unique key — double-enqueue same agent is a no-op; a fan-out produces N independent docs for one `itemId`, not collapsed to one; claim ordering oldest-`enqueuedAt`-first; atomic claim (two sequential claims never return the same doc); `release` semantics (`pending` non-terminal, `done`/`expired` terminal with `doneAt`); `recordFailedAttempt` attempts+1 → `pending` below cap, terminal `failed` at cap; `expireOlderThan` marks + returns only over-age pending docs; boot-recovery of stale `replaying` reverts only over-age docs.
     - **Notices/tracker:** `policyFor` covers every §5-3a row (`sched:`→skip, `callback:`/`event:`/`team-`→silent, slack/sms/imessage/app/team-DM→notify); episode lifecycle: first fast-fail notices once → repeat turns silent → clear → next outage notices again; repeated fast-fails during one episode never re-notice (the probe-cycle `openedAt`-churn guarantee — the tracker never reads `openedAt` at all); per-sender key for SMS (`threadId ?? sender`); `firstForThread` is a synchronous test-and-set (two immediate calls, no await between: exactly one `true`); template constants + `replayWrap` notify/silent variants pinned.
-    - **Dispatcher:** instanceof path queues + delivers plain-text notice with `error` UNSET on the delivered `WorkResult` (the SMS-skip regression guard); post-turn open-state path (errored TurnResult + open snapshot + `HARD_FAULT_KINDS` classification → outage path; `non-provider` classification while open → legacy error path; closed snapshot → legacy; shadow `enabled:false` open snapshot → legacy); ★ **timeout gate** — `timedOut === true && aborted === true` with the breaker open → outage path even when `errors` is empty; `timedOut === true` with the breaker closed → legacy path, unqueued; skip for `sched:`; silent-queue for `callback:`/`event:`/`team-` (no notice delivered); overflow variant at `maxDepth` (not queued); ★ **release-before-depth** — a replayed fast-fail while the queue is at `maxDepth` resolves its existing doc via `store.release(..., "pending")` and does NOT take the overflow branch; `outageReplay` re-entrancy (no dup enqueue, no second notice) + dedup bypass lets the same id redispatch while a non-replay duplicate id is still dropped; ★ **legacy thrown branch** — a replay item that throws a non-outage error (e.g. "Spawn budget exceeded") with the breaker closed releases the doc back to `pending`, attempts unchanged, then continues today's error delivery; disabled pinned-agent replay resolves to `expired`; ★ **deleted/unresolvable pinned-agent replay** resolves to `expired` with NO fall-through resolution (`runWorkItemTurn` never called); episode cleared on success only when `stateFor(provider)?.state !== "open"` at that moment; fan-out double fast-fail on one thread → two enqueues (one per agentId — composite-key evidence), exactly one notice; `failed` terminal transition delivers a plain-text terminal notice on notify policy, none on silent.
+    - **Dispatcher:** instanceof path queues + delivers plain-text notice with `error` UNSET on the delivered `WorkResult` (the SMS-skip regression guard); post-turn open-state path (errored TurnResult + open snapshot + `HARD_FAULT_KINDS` classification → outage path; `non-provider` classification while open → legacy error path; closed snapshot → legacy; shadow `enabled:false` open snapshot → legacy); ★ **timeout gate** — `timedOut === true && aborted === true` with the breaker open → outage path even when `errors` is empty; `timedOut === true` with the breaker closed → legacy path, unqueued; skip for `sched:`; silent-queue for `callback:`/`event:`/`team-` (no notice delivered); overflow variant at `maxDepth` (not queued; one overflow notice per thread per episode, not per overflowed message); ★ **release-before-depth** — a replayed fast-fail while the queue is at `maxDepth` resolves its existing doc via `store.release(..., "pending")` and does NOT take the overflow branch; `outageReplay` re-entrancy (no dup enqueue, no second notice) + dedup bypass lets the same id redispatch while a non-replay duplicate id is still dropped; ★ **legacy thrown branch** — a replay item that throws a non-outage error (e.g. "Spawn budget exceeded") with the breaker closed releases the doc back to `pending`, attempts unchanged, then continues today's error delivery; disabled pinned-agent replay resolves to `expired`; ★ **deleted/unresolvable pinned-agent replay** resolves to `expired` with NO fall-through resolution (`runWorkItemTurn` never called); episode cleared on success only when `stateFor(provider)?.state !== "open"` at that moment; fan-out double fast-fail on one thread → two enqueues (one per agentId — composite-key evidence), exactly one notice; `failed` terminal transition delivers a plain-text terminal notice on notify policy, none on silent.
     - **Processor:** drain continues through `done`/`expired`/`failed` and ★ **stops on re-read `status === "pending"`** (dispatcher-authored outcomes; `dispatch()` returns void — the poller re-reads, never infers); redispatch keeps the **original** item id (no synthetic per-attempt id) with `meta.outageReplay` + pinned `targetAgentId` and the §5-2d wrapped text; expiry → one batched per-thread notice with the correct count, silent docs excluded; a `dispatch()` throw releases the doc back to `pending` and stops the drain; a doc left in `replaying` after dispatch (no release path fired) is defensively reverted; tick re-entrancy guard.
     - **Agent-manager:** `providerFor` maps bare model → `"claude"`, `gemini/...` → `"gemini"`, unknown agent → `null`; `spawnTurn`'s `TurnResult` carries `timedOut`/`aborted` propagated from `RunResult`.
     - **Voice:** `ProviderCircuitOpenError` from `spawnTurn`/`routeVoiceTurn` → HTTP 200 completion carrying the spoken outage sentence (non-streaming JSON body; streaming SSE text chunk + done), NOT a generic 500; the outer resume-retry does not fire for circuit-open fast-fails.
@@ -1239,6 +1239,10 @@ export interface OutageHandlingDeps {
       // (with a plain-text notice on notify policy). The raw error result is
       // never delivered for a replay item: SMS/iMessage would swallow it and
       // Slack would spam one per attempt.
+      // Deliberate: this also fires with the breaker still OPEN when the
+      // result classifies as `non-provider` (maybeHandlePostTurnOutage above
+      // only handles HARD_FAULT_KINDS) — a tool error is outage-independent,
+      // so it counts as a real attempt regardless of breaker state.
       if (this.outage && item.meta?.outageReplay && runResult.error) {
         await this.resolveReplayRealFailure(item, agentId, adapter, runResult.error);
         return;
@@ -1424,7 +1428,16 @@ The existing `isNonResponse`/deliver block between the guards and the success ho
           agentId,
           provider,
         });
-        if (policy === "notify") {
+        // Advisory 3 (plan review round 1): one overflow notice per thread
+        // per episode, not one per overflowed message — a chatty outage with
+        // a full queue would otherwise cost one SMS per dropped message.
+        // Reuses the episode tracker's synchronous test-and-set with a
+        // suffixed adapter key so this dedup key never collides with the
+        // queued-turn notice's own key on the same thread/episode.
+        if (
+          policy === "notify" &&
+          outage.episodes.firstForThread(provider, `${adapterKeyFor(item)}:overflow`, threadKeyFor(item))
+        ) {
           await this.deliverOutageNotice(item, agentId, adapter, overflowNoticeFor(item.source.kind));
         }
         return true;
@@ -1732,15 +1745,20 @@ describe("outage interception (KPR-307)", () => {
     expect(adapter.deliver).not.toHaveBeenCalled();
   });
 
-  it("overflow at maxDepth: NOT queued, overflow notice delivered (notify policy)", async () => {
+  it("overflow at maxDepth: NOT queued, one overflow notice per thread per episode (notify policy)", async () => {
     store.pendingCount.mockResolvedValue(500);
-    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    agentManager.runWorkItemTurn.mockRejectedValue(makeCircuitOpenError());
 
     await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
     expect(store.enqueue).not.toHaveBeenCalled();
     expect(adapter.deliver).toHaveBeenCalledTimes(1);
     expect(adapter.deliver.mock.calls[0][0].text).toBe(OUTAGE_OVERFLOW_NOTICE_DEFAULT);
     expect(adapter.deliver.mock.calls[0][0].error).toBeUndefined();
+
+    // Advisory 3: a second overflowed message on the SAME thread during the
+    // same episode must NOT re-notice — dedup is per-thread, not per-message.
+    await dispatcher.dispatch(slackItem({ id: "m2", threadId: "t1" }));
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
   });
 
   it("★ release-before-depth: replayed fast-fail at maxDepth resolves its doc, never the overflow branch", async () => {
@@ -2647,7 +2665,8 @@ git commit -m "KPR-307: informational outage-queue doctor section (direct collec
 
 - [ ] **Step 10.3:** Full gate + zero-diff assertions
 
-Run: `git diff --stat main...HEAD -- src/sweeper/retry-queue.ts src/scheduler/scheduler.ts src/agents/provider-circuit-breaker.ts src/agents/provider-adapters/error-classification.ts`
+Run: `git diff --stat $(git merge-base HEAD kpr-305)..HEAD -- src/sweeper/retry-queue.ts src/scheduler/scheduler.ts src/agents/provider-circuit-breaker.ts src/agents/provider-adapters/error-classification.ts`
+(Base is the child branch point, not `main` — KPR-306 lands on the epic branch `kpr-305` before this ticket, and the epic only merges to `main` at the end, so `main...HEAD` would falsely show the breaker/error-classification files as wholly added.)
 Expected: empty (untouched-by-design files).
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check`
