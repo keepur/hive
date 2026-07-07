@@ -599,6 +599,15 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
   // Prompt cache observability (KPR-140). Informational — does not
   // contribute to allPassed; missing telemetry never fails the doctor.
   if (config) {
+    // KPR-296: datastore identity — rendered FIRST among the post-check
+    // sections (identity outranks cache stats; failure text sits near the
+    // check groups) and the ONLY post-check section that can fail the
+    // doctor: F1 sentinel mismatch / F2 roster degraded / F3 fresh
+    // non-verified engine monitor flip the exit code.
+    const identityReport = await datastoreIdentityForDoctor(config.mongo.uri, config.mongo.dbName, config.instance.id);
+    const { failed: identityFailed } = renderDatastoreIdentitySection(identityReport, console.log);
+    if (identityFailed) allPassed = false;
+
     const rows = await cacheHitRatesForDoctor(config.mongo.uri, config.mongo.dbName);
     renderPromptCacheSection(rows);
     // KPR-213: prefix-cache stats from the engine heartbeat.
@@ -611,6 +620,8 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     const memoryRows = await memoryLifecycleStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderMemoryLifecycleSection(memoryRows, console.log, config.memory.spendWarnThresholdUsd ?? 5);
   } else {
+    console.log("\nDatastore identity");
+    console.log("  ○ skipped: config not loaded");
     console.log("\nPrompt cache (last 7 days)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nPrefix cache (live engine)");
