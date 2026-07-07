@@ -92,9 +92,9 @@ Add a short block (suggested home: a new bullet in Common Gotchas, adjacent to t
 
 **(b) docs/managing-your-hive.md:83** — extend the doctor description sentence to add the Datastore identity section: connected-server fingerprint (host/pid/uptime/version/dbPath), independent sentinel verification, engine identity-monitor + roster-guard telemetry, live-vs-last-good roster count — and note that hard identity failures exit 1 (CI/cron wrappers around `hive doctor` will see identity incidents as failures).
 
-**(c) docs/troubleshooting.md** — new section(s) following the file's established symptom/meaning/what-to-do format, indexed by failing check name, covering: F1 (mismatch → verify which mongod answered via the fingerprint; restore the right DB, or `HIVE_DB_SENTINEL_RESTAMP=1` if adoption is intentional), F2 (roster degraded → restore/verify DB, SIGUSR1, guard auto-recovers), F3 (engine monitor non-verified → read engine logs, writes are being refused), W1 (absent sentinel + data → expected once per pre-KPR-294 upgrade; engine stamps on next boot), and the temp-dbPath warn. Include the **4-step manual operator drill** adapted from `docs/epics/kpr-293/kpr-296-plan.md` §E2E (happy path → scratch-mongod impostor F1+temp-path → W1 upgrade window → teardown/verify-untouched), with a link back to the plan for provenance.
+**(c) docs/troubleshooting.md** — new section(s) following the file's established symptom/meaning/what-to-do format, indexed by failing check name, covering: F1 (mismatch → verify which mongod answered via the fingerprint; restore the right DB, or `HIVE_DB_SENTINEL_RESTAMP=1` if adoption is intentional), F2 (roster degraded → restore/verify DB, SIGUSR1, guard auto-recovers), F3 (engine monitor non-verified → read engine logs, writes are being refused), W1 (absent sentinel + data → expected once per pre-KPR-294 upgrade; engine stamps on next boot), and the temp-dbPath warn. One line each for the remaining warn tier: the validation-evicted-all discriminator warn (docCount > 0, 0 active, not all disabled → engine/data version skew) and the roster-divergence warn (live count ≠ last committed → SIGUSR1 after restore). Include the **4-step manual operator drill** adapted from `docs/epics/kpr-293/kpr-296-plan.md` §E2E (happy path → scratch-mongod impostor F1+temp-path → W1 upgrade window → teardown/verify-untouched), with a link back to the plan for provenance.
 
-**Evidence:** canon D1–D6 (KPR-296 register entry, 5e837a3); propagation comment on KPR-298 (2026-07-07T02:42); render implementation `src/cli/doctor.ts:178-310`; drill at `docs/epics/kpr-293/kpr-296-plan.md:761-770`.
+**Evidence:** canon D1–D6 (KPR-296 register entry, 5e837a3); propagation comment on KPR-298 (2026-07-07T02:42); render implementation `src/cli/doctor.ts:~177-352` (F2 fail assignment at :311, function returns at :352); drill at `docs/epics/kpr-293/kpr-296-plan.md:761-770`.
 
 ### C5 — CLAUDE.md "Specs and Plans" paragraph — align with observable layout
 
@@ -132,7 +132,7 @@ Add a short block (suggested home: a new bullet in Common Gotchas, adjacent to t
 
 Docs-only — no unit tests. Acceptance is grep-verifiable:
 
-- `grep -rn "agent_sessions\|model_overrides\|devices" CLAUDE.md docs/architecture.md` → hits only inside the legacy-collections bullet (C1) and epic docs under `docs/epics/`.
+- `grep -n "agent_sessions\|model_overrides\|devices" CLAUDE.md docs/architecture.md` → hits only inside the legacy-collections bullet (C1). (Epic docs under `docs/epics/` are deliberately outside this grep's file list — they are historical artifacts, not maintained reference docs.)
 - `grep -n "agent_memory" CLAUDE.md docs/architecture.md` → present in both.
 - `grep -n "Datastore identity" CLAUDE.md docs/managing-your-hive.md docs/troubleshooting.md` → present in all three.
 - `grep -n "KPR-297" CLAUDE.md docs/troubleshooting.md docs/managing-your-hive.md docs/architecture.md` → no hits in any new text.
