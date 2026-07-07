@@ -432,9 +432,10 @@ export class AgentRegistry {
   }
 
   /**
-   * KPR-295 — public snapshot of the roster guard state, for `hive doctor`
-   * (KPR-296, out of scope here) and the telemetry heartbeat. Returns copies,
-   * not live references, so callers can't mutate internal state.
+   * KPR-295 — public snapshot of the roster guard state, consumed by
+   * `writeRosterStats` (in `index.ts`, event-driven — feeds `hive doctor` /
+   * KPR-296 via the telemetry doc) and tests. Returns copies, not live
+   * references, so callers can't mutate internal state.
    */
   getRosterGuardState(): RosterGuardState {
     return {
