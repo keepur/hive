@@ -11,12 +11,14 @@ import {
   agentFeedsDir,
 } from "./paths.js";
 import { MongoClient } from "mongodb";
+import { ensureIdentitySentinelAtBoot, DbIdentityMonitor } from "./db/identity-sentinel.js";
+import { WriteGuard, guardDb } from "./db/write-guard.js";
 import { initInstanceGit } from "./skills/instance-git.js";
 import { verifyPackageIntegrity, checkAllowlistDrift } from "./skills/integrity.js";
 import { checkUpgradeNotice } from "./skills/upgrade-notice.js";
 import { config } from "./config.js";
 import { createLogger } from "./logging/logger.js";
-import { AgentRegistry } from "./agents/agent-registry.js";
+import { AgentRegistry, buildRosterStatsDoc } from "./agents/agent-registry.js";
 import { AgentManager } from "./agents/agent-manager.js";
 import { PrefixCache } from "./agents/prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./agents/prefix-invalidation.js";
@@ -114,7 +116,44 @@ async function main(): Promise<void> {
     retryReads: true,
   });
   await mongoClient.connect();
-  const db = mongoClient.db(config.mongo.dbName);
+  const rawDb = mongoClient.db(config.mongo.dbName);
+
+  // KPR-294: verify DB identity BEFORE any write (createIndex/migrations below).
+  const bootResult = await ensureIdentitySentinelAtBoot(rawDb, {
+    instanceId: config.instance.id,
+    dbName: config.mongo.dbName,
+    restamp: process.env.HIVE_DB_SENTINEL_RESTAMP === "1",
+  });
+  if (bootResult.outcome === "mismatch") {
+    log.error("DB IDENTITY MISMATCH at boot — refusing to start", {
+      critical: true,
+      expected: { instanceId: config.instance.id, dbName: config.mongo.dbName },
+      observed: bootResult.observed,
+      hint: "If adopting this DB intentionally, set HIVE_DB_SENTINEL_RESTAMP=1 for one boot. Manual alternative: mongosh <db> --eval 'db.instance_identity.replaceOne({_id:\"identity_sentinel\"}, {...}, {upsert:true})'",
+    });
+    process.exit(1);
+  }
+  if (bootResult.outcome === "restamped") {
+    log.warn("identity sentinel RE-STAMPED via HIVE_DB_SENTINEL_RESTAMP", {
+      previous: bootResult.previous,
+      current: { instanceId: config.instance.id, dbName: config.mongo.dbName },
+      action: "remove HIVE_DB_SENTINEL_RESTAMP from the environment now",
+    });
+  }
+  if (bootResult.outcome === "stamped") {
+    log.info("identity sentinel stamped (first boot)");
+  }
+
+  const writeGuard = new WriteGuard({ instanceId: config.instance.id, dbName: config.mongo.dbName });
+  const db = guardDb(rawDb, writeGuard); // downstream `db` consumers unchanged
+
+  const rawTelemetryCollection = rawDb.collection("telemetry"); // guard-immune (spec ⚠11)
+  const dbIdentityMonitor = new DbIdentityMonitor(mongoClient, rawDb, writeGuard, rawTelemetryCollection, {
+    instanceId: config.instance.id,
+    dbName: config.mongo.dbName,
+  });
+  await dbIdentityMonitor.writeOnce(); // initial telemetry so doctor never sees "no telemetry yet"
+  dbIdentityMonitor.start(); // started NOW, not in the heartbeat block — reconnects during startup must be caught
 
   // Agent definitions collection
   const agentDefsCollection = db.collection("agent_definitions");
@@ -134,12 +173,31 @@ async function main(): Promise<void> {
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
   let fallbackAuditId: string | undefined;
 
+  // KPR-295 — writes the roster-stats contract doc on every load outcome
+  // (including blocked) via the guard-immune raw collection. Must use
+  // `rawTelemetryCollection`, never the guarded `telemetryCollection` below —
+  // guarded writes are refused in exactly the scenario this guard fires (a
+  // suspect DB).
+  const writeRosterStats = async () => {
+    try {
+      await rawTelemetryCollection.updateOne(
+        { kind: "agent_roster_stats" },
+        { $set: { ...buildRosterStatsDoc(registry.getRosterGuardState()), updatedAt: new Date() } },
+        { upsert: true },
+      );
+    } catch (err) {
+      log.warn("roster stats write failed", { error: String(err) });
+    }
+  };
+
   const reload = async () => {
     // Guard: reload may fire via change stream before agentManager/scheduler are assigned
     if (!agentManager || !scheduler) return;
 
     log.info("Hot-reloading agent registry...");
     const result = await registry.load();
+    await writeRosterStats(); // every outcome, incl. blocked
+    if (result.blocked) return; // roster kept; skip stops/schedules/skills/plugins
 
     if (result.added.length) log.info("New agents online", { agents: result.added });
     if (result.updated.length) log.info("Agents updated", { agents: result.updated });
@@ -166,11 +224,19 @@ async function main(): Promise<void> {
     agentManager.rescanPlugins();
   };
 
+  // KPR-295 — fire-and-forget call sites must not be able to produce an
+  // unhandled rejection. `String(err)` coercion only — the catch handler
+  // itself must not be able to throw.
+  const safeReload = () => {
+    reload().catch((err) => log.error("hot-reload failed — roster unchanged", { error: String(err) }));
+  };
+
   registry = new AgentRegistry(agentDefsCollection as any, () => {
     if (reloadTimer) clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(() => reload(), 500);
+    reloadTimer = setTimeout(safeReload, 500);
   });
   await registry.load();
+  await writeRosterStats();
   log.info("Agent registry loaded", { agents: registry.listIds() });
   provisionAgentDirs(registry.listIds());
 
@@ -380,7 +446,7 @@ async function main(): Promise<void> {
       // the toolkit section ever starts reflecting the skill index.
       prefixCache.invalidateAll("skill-change");
       if (reloadTimer) clearTimeout(reloadTimer);
-      reloadTimer = setTimeout(() => reload(), 500);
+      reloadTimer = setTimeout(safeReload, 500);
     });
     log.info("Skills hot-reload enabled", { watched: skillsDir });
   }
@@ -402,7 +468,7 @@ async function main(): Promise<void> {
         // global skills watch above.
         prefixCache.invalidateAll("agent-skill-change");
         if (reloadTimer) clearTimeout(reloadTimer);
-        reloadTimer = setTimeout(() => reload(), 500);
+        reloadTimer = setTimeout(safeReload, 500);
       }
     });
     log.info("Agent-private skills hot-reload enabled", { watched: agentsRoot });
@@ -415,7 +481,7 @@ async function main(): Promise<void> {
   // escape hatch.
   process.on("SIGUSR1", () => {
     prefixCache.invalidateAll("sigusr1");
-    reload();
+    safeReload();
   });
   log.info("Hot-reload enabled", { signal: "SIGUSR1" });
 
@@ -655,7 +721,7 @@ async function main(): Promise<void> {
       config.adminApi.token,
       agentDefsCollection as any,
       db.collection("agent_definition_versions") as any,
-      () => reload(),
+      safeReload,
     );
     await adminApi.start();
     log.info("Admin API started", { port: config.adminApi.port });
@@ -743,6 +809,7 @@ async function main(): Promise<void> {
     meetingMonitor?.stop();
     spawnCoordinatorHeartbeat.stop();
     memoryLifecycleHeartbeat.stop();
+    dbIdentityMonitor.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer
     contactsWatcher.stop();
     if (activityLogger) await activityLogger.stop();

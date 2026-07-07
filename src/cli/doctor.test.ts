@@ -4,11 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  renderDatastoreIdentitySection,
   renderPrefixCacheSection,
   renderPromptCacheSection,
   renderSpawnCoordinatorSection,
   resolveRequiredEnvVars,
 } from "./doctor.js";
+import type { DatastoreIdentityReport } from "./doctor-checks.js";
 
 describe("resolveRequiredEnvVars", () => {
   let dir: string;
@@ -332,5 +334,530 @@ describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
     );
     const out = lines.join("\n");
     expect(out).toContain("last error: something broke");
+  });
+});
+
+describe("renderDatastoreIdentitySection (KPR-296)", () => {
+  function makeIdentityReport(overrides: Partial<DatastoreIdentityReport> = {}): DatastoreIdentityReport {
+    return {
+      uri: "mongodb://localhost:27017",
+      dbName: "hive_test",
+      instanceId: "test",
+      server: {
+        host: "localhost:27017",
+        version: "8.0.11",
+        pid: 4242,
+        uptimeSeconds: 266_520,
+        dbPath: "/opt/homebrew/var/mongodb",
+        note: null,
+      },
+      sentinel: {
+        state: "verified",
+        observed: { instanceId: "test", dbName: "hive_test", sentinelId: "abc-123" },
+        schemaVersionNewer: false,
+        stampedAt: new Date("2026-07-05T00:00:00Z"),
+        stampedBy: "0.9.2@mokiemon",
+      },
+      agentDefinitionsCount: 11,
+      identityStats: {
+        state: "verified",
+        writesRefused: false,
+        refusedWriteCount: 0,
+        lastVerifiedAt: new Date(),
+        lastMismatchAt: null,
+        observedInstanceId: "test",
+        observedDbName: "hive_test",
+        staleSeconds: 12,
+      },
+      rosterStats: {
+        docCount: 11,
+        activeCount: 10,
+        disabledCount: 1,
+        lastGoodAt: new Date("2026-07-06T04:11:00Z"),
+        lastGoodSource: "reload",
+        degraded: false,
+        degradedSince: null,
+        blockedReloadCount: 0,
+        lastBlockedAt: null,
+        updatedAt: new Date("2026-07-06T04:11:00Z"),
+      },
+      ...overrides,
+    };
+  }
+
+  function render(report: DatastoreIdentityReport | null): { out: string; failed: boolean } {
+    const lines: string[] = [];
+    const { failed } = renderDatastoreIdentitySection(report, (l) => lines.push(l));
+    return { out: lines.join("\n"), failed };
+  }
+
+  it("1. happy path: all-green factory renders success, no warnings/failures", () => {
+    const { out, failed } = render(makeIdentityReport());
+    expect(failed).toBe(false);
+    expect(out).toContain("Datastore identity");
+    expect(out).toContain("server:");
+    expect(out).toContain("dbPath:");
+    expect(out).toContain("target:");
+    const checkmarks = out.match(/✓/g) ?? [];
+    expect(checkmarks.length).toBe(3);
+    expect(out).not.toContain("✗");
+    expect(out).not.toContain("⚠");
+  });
+
+  it("2. I5: null report renders unreachable, does not throw", () => {
+    expect(() => render(null)).not.toThrow();
+    const { out, failed } = render(null);
+    expect(failed).toBe(false);
+    expect(out).toContain('unreachable — see "MongoDB reachable" above');
+  });
+
+  it("3. F1: sentinel mismatch hard-fails with remediation", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        sentinel: {
+          state: "mismatch",
+          observed: { instanceId: "other", dbName: "hive_other", sentinelId: "zzz" },
+          schemaVersionNewer: false,
+        },
+      }),
+    );
+    expect(failed).toBe(true);
+    expect(out).toMatch(/✗ identity sentinel MISMATCH — expected test\/hive_test, observed other\/hive_other/);
+    expect(out).toContain("HIVE_DB_SENTINEL_RESTAMP=1");
+  });
+
+  it("4. F2: roster guard degraded hard-fails with remediation", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        rosterStats: {
+          docCount: 11,
+          activeCount: 10,
+          disabledCount: 1,
+          lastGoodAt: new Date("2026-07-06T04:11:00Z"),
+          lastGoodSource: "reload",
+          degraded: true,
+          degradedSince: new Date("2026-07-06T04:10:00Z"),
+          blockedReloadCount: 4,
+          lastBlockedAt: new Date("2026-07-06T04:12:00Z"),
+          updatedAt: new Date("2026-07-06T04:12:00Z"),
+        },
+      }),
+    );
+    expect(failed).toBe(true);
+    expect(out).toMatch(/✗ roster guard DEGRADED/);
+    expect(out).toContain("SIGUSR1 after restore");
+  });
+
+  it("5. F3 (mismatch): fresh non-verified identity monitor hard-fails", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        identityStats: {
+          state: "mismatch",
+          writesRefused: true,
+          refusedWriteCount: 7,
+          lastVerifiedAt: null,
+          lastMismatchAt: new Date(),
+          observedInstanceId: "other",
+          observedDbName: "hive_other",
+          staleSeconds: 10,
+        },
+      }),
+    );
+    expect(failed).toBe(true);
+    expect(out).toContain("engine identity monitor: mismatch");
+    expect(out).toContain("refused=7");
+  });
+
+  it("6. F3 (cant_verify): hard-fails", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        identityStats: {
+          state: "cant_verify",
+          writesRefused: true,
+          refusedWriteCount: 2,
+          lastVerifiedAt: null,
+          lastMismatchAt: null,
+          observedInstanceId: null,
+          observedDbName: null,
+          staleSeconds: 10,
+        },
+      }),
+    );
+    expect(failed).toBe(true);
+    expect(out).toContain("engine identity monitor: cant_verify");
+  });
+
+  it("7. F3 (unknown future state, edge #12): fail-closed", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        identityStats: {
+          state: "quarantined",
+          writesRefused: false,
+          refusedWriteCount: 0,
+          lastVerifiedAt: null,
+          lastMismatchAt: null,
+          observedInstanceId: "test",
+          observedDbName: "hive_test",
+          staleSeconds: 5,
+        },
+      }),
+    );
+    expect(failed).toBe(true);
+    expect(out).toContain("engine identity monitor: quarantined");
+  });
+
+  it("8. F3 requires freshness: stale non-verified warns instead of failing", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        identityStats: {
+          state: "mismatch",
+          writesRefused: true,
+          refusedWriteCount: 3,
+          lastVerifiedAt: null,
+          lastMismatchAt: new Date(),
+          observedInstanceId: "other",
+          observedDbName: "hive_other",
+          staleSeconds: 300,
+        },
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("heartbeat is stale (300s)");
+    expect(out).toContain("last state: mismatch");
+  });
+
+  it("9. W6 on verified-but-stale: warns, does not fail", () => {
+    const staleVerified = render(
+      makeIdentityReport({
+        identityStats: {
+          state: "verified",
+          writesRefused: false,
+          refusedWriteCount: 0,
+          lastVerifiedAt: new Date(),
+          lastMismatchAt: null,
+          observedInstanceId: "test",
+          observedDbName: "hive_test",
+          staleSeconds: 300,
+        },
+      }),
+    );
+    expect(staleVerified.failed).toBe(false);
+    expect(staleVerified.out).toContain("heartbeat is stale (300s)");
+
+    const nullStale = render(
+      makeIdentityReport({
+        identityStats: {
+          state: "verified",
+          writesRefused: false,
+          refusedWriteCount: 0,
+          lastVerifiedAt: new Date(),
+          lastMismatchAt: null,
+          observedInstanceId: "test",
+          observedDbName: "hive_test",
+          staleSeconds: null,
+        },
+      }),
+    );
+    expect(nullStale.failed).toBe(false);
+    expect(nullStale.out).toContain("heartbeat is stale");
+  });
+
+  it("10. W1: sentinel absent with existing hive data warns, does not fail", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        sentinel: { state: "absent" },
+        agentDefinitionsCount: 11,
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("sentinel absent but DB has hive data (11 agent defs)");
+    expect(out).toContain("HAS booted");
+  });
+
+  it("11. I1: sentinel absent with empty DB is pre-first-boot info, no warn", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        sentinel: { state: "absent" },
+        agentDefinitionsCount: 0,
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("○ identity sentinel absent, DB empty");
+    // No sentinel-related warning line should be present.
+    expect(out).not.toMatch(/⚠ identity sentinel/);
+  });
+
+  it("12. sentinel absent + null agent count warns cannot-confirm", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        sentinel: { state: "absent" },
+        agentDefinitionsCount: null,
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("cannot confirm pre-first-boot");
+  });
+
+  it("13. W2: verified with newer schemaVersion warns; also alongside F1 mismatch", () => {
+    const verifiedNewer = render(
+      makeIdentityReport({
+        sentinel: {
+          state: "verified",
+          observed: { instanceId: "test", dbName: "hive_test", sentinelId: "abc-123" },
+          schemaVersionNewer: true,
+          stampedAt: null,
+          stampedBy: null,
+        },
+      }),
+    );
+    expect(verifiedNewer.failed).toBe(false);
+    expect(verifiedNewer.out).toContain("schemaVersion is newer");
+
+    const mismatchNewer = render(
+      makeIdentityReport({
+        sentinel: {
+          state: "mismatch",
+          observed: { instanceId: "other", dbName: "hive_other", sentinelId: "zzz" },
+          schemaVersionNewer: true,
+        },
+      }),
+    );
+    expect(mismatchNewer.failed).toBe(true);
+    expect(mismatchNewer.out).toContain("schemaVersion is newer");
+  });
+
+  it("14. W3: temp dbPath warns with impostor signature; alias, null, and non-temp paths behave", () => {
+    const tmp = render(
+      makeIdentityReport({
+        server: {
+          host: "localhost:27017",
+          version: "8.0.11",
+          pid: 1,
+          uptimeSeconds: 10,
+          dbPath: "/tmp/mongo-8DqT",
+          note: null,
+        },
+      }),
+    );
+    expect(tmp.out).toContain("TEMP directory");
+    expect(tmp.out).toContain("Jul-4 impostor signature");
+
+    const privateTmpAlias = render(
+      makeIdentityReport({
+        server: {
+          host: "localhost:27017",
+          version: "8.0.11",
+          pid: 1,
+          uptimeSeconds: 10,
+          dbPath: "/private/tmp/x",
+          note: null,
+        },
+      }),
+    );
+    expect(privateTmpAlias.out).toContain("TEMP directory");
+
+    const nullPath = render(
+      makeIdentityReport({
+        server: {
+          host: "localhost:27017",
+          version: "8.0.11",
+          pid: 1,
+          uptimeSeconds: 10,
+          dbPath: null,
+          note: null,
+        },
+      }),
+    );
+    expect(nullPath.out).toContain("(default)");
+    expect(nullPath.out).not.toContain("TEMP directory");
+
+    const happy = render(makeIdentityReport());
+    expect(happy.out).not.toContain("TEMP directory");
+  });
+
+  it("15. I4: server all-null with note omits server line, no failure", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        server: {
+          host: null,
+          version: null,
+          pid: null,
+          uptimeSeconds: null,
+          dbPath: null,
+          note: "serverStatus failed: not authorized",
+        },
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("○ server fingerprint unavailable — serverStatus failed: not authorized");
+    expect(out).not.toContain("server:");
+  });
+
+  it("16. W4 (edge #14): validation evicted every agent warns, does not fail", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        agentDefinitionsCount: 5,
+        rosterStats: {
+          docCount: 5,
+          activeCount: 0,
+          disabledCount: 2,
+          lastGoodAt: new Date("2026-07-06T04:11:00Z"),
+          lastGoodSource: "reload",
+          degraded: false,
+          degradedSince: null,
+          blockedReloadCount: 0,
+          lastBlockedAt: null,
+          updatedAt: new Date("2026-07-06T04:11:00Z"),
+        },
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("validation evicted every agent");
+  });
+
+  it("17. I3: all-disabled is recorded operator state, no W4 warn", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        agentDefinitionsCount: 5,
+        rosterStats: {
+          docCount: 5,
+          activeCount: 0,
+          disabledCount: 5,
+          lastGoodAt: new Date("2026-07-06T04:11:00Z"),
+          lastGoodSource: "reload",
+          degraded: false,
+          degradedSince: null,
+          blockedReloadCount: 0,
+          lastBlockedAt: null,
+          updatedAt: new Date("2026-07-06T04:11:00Z"),
+        },
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("○ all 5 agents disabled (recorded operator state)");
+    expect(out).not.toContain("validation evicted every agent");
+  });
+
+  it("18. W5: any delta between live count and last-good roster warns divergence", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        agentDefinitionsCount: 11,
+        rosterStats: {
+          docCount: 8,
+          activeCount: 8,
+          disabledCount: 0,
+          lastGoodAt: new Date("2026-07-06T04:11:00Z"),
+          lastGoodSource: "reload",
+          degraded: false,
+          degradedSince: null,
+          blockedReloadCount: 0,
+          lastBlockedAt: null,
+          updatedAt: new Date("2026-07-06T04:11:00Z"),
+        },
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("roster divergence: DB has 11 agent defs, engine last committed 8");
+    expect(out).toContain("SIGUSR1");
+  });
+
+  it("19. W5 (edge #15 shape): all-zero roster with live agents still warns divergence, not W4", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        agentDefinitionsCount: 11,
+        rosterStats: {
+          docCount: 0,
+          activeCount: 0,
+          disabledCount: 0,
+          lastGoodAt: null,
+          lastGoodSource: null,
+          degraded: false,
+          degradedSince: null,
+          blockedReloadCount: 0,
+          lastBlockedAt: null,
+          updatedAt: null,
+        },
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("roster divergence: DB has 11 agent defs, engine last committed 0");
+    expect(out).not.toContain("validation evicted every agent");
+  });
+
+  it("20. E3 pin: ancient roster updatedAt never produces a staleness warning", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        rosterStats: {
+          docCount: 11,
+          activeCount: 10,
+          disabledCount: 1,
+          lastGoodAt: new Date("2026-07-06T04:11:00Z"),
+          lastGoodSource: "reload",
+          degraded: false,
+          degradedSince: null,
+          blockedReloadCount: 0,
+          lastBlockedAt: null,
+          updatedAt: new Date("2026-05-01T00:00:00Z"),
+        },
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).not.toContain("⚠");
+  });
+
+  it("21. I2: missing telemetry docs render info lines, cross-check hint when sentinel also absent", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        sentinel: { state: "absent" },
+        agentDefinitionsCount: 0,
+        identityStats: null,
+        rosterStats: null,
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("○ no db_identity_stats telemetry yet");
+    expect(out).toContain("○ no agent_roster_stats telemetry yet");
+    expect(out).toContain("cross-check the sentinel result above");
+  });
+
+  it("22. sentinel read error (edge #5) warns, does not fail", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        sentinel: { state: "error", message: "boom" },
+      }),
+    );
+    expect(failed).toBe(false);
+    expect(out).toContain("⚠ sentinel read failed: boom");
+  });
+
+  it("23. composite incident shape (spec edge #1): caught even when sentinel sees only absent+empty", () => {
+    const { out, failed } = render(
+      makeIdentityReport({
+        sentinel: { state: "absent" },
+        agentDefinitionsCount: 0,
+        server: {
+          host: "localhost:27017",
+          version: "8.0.11",
+          pid: 1,
+          uptimeSeconds: 10,
+          dbPath: "/tmp/x",
+          note: null,
+        },
+        identityStats: {
+          state: "mismatch",
+          writesRefused: true,
+          refusedWriteCount: 3,
+          lastVerifiedAt: null,
+          lastMismatchAt: new Date(),
+          observedInstanceId: "impostor",
+          observedDbName: "impostor_db",
+          staleSeconds: 5,
+        },
+      }),
+    );
+    expect(failed).toBe(true);
+    expect(out).toContain("TEMP directory");
+    expect(out).toContain("○ identity sentinel absent, DB empty");
+    expect(out).toContain("engine identity monitor: mismatch");
   });
 });
