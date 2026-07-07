@@ -23,7 +23,7 @@
 
 ### Specs and Plans
 
-Design specs and implementation plans live in two places. Sensitive/internal design work lands in the **private** companion repo `keepur/hive-docs` under `internal/specs/` and `internal/plans/`. Non-sensitive, engine-shaped specs and plans may live in the public repo — under `docs/specs/`, `docs/plans/`, and `docs/epics/<epic>/` (the epic-workflow convention: each epic directory carries its children's specs and plans). Public-facing engine docs live in `keepur/hive/docs/`. Note: the KPR-231–234 specs under `docs/specs/` describe provider-adapter work that lives on the `epic/kpr-230-phase-b-provider-adapters` branch and is not yet merged — don't expect a matching adapter layer in `src/`.
+Design specs and implementation plans live in two places. Sensitive/internal design work lands in the **private** companion repo `keepur/hive-docs` under `internal/specs/` and `internal/plans/`. Non-sensitive, engine-shaped specs and plans may live in the public repo — under `docs/specs/`, `docs/plans/`, and `docs/epics/<epic>/` (the epic-workflow convention: each epic directory carries its children's specs and plans). Public-facing engine docs live in `keepur/hive/docs/`.
 
 ### PR & Merge
 
