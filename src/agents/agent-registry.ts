@@ -95,8 +95,11 @@ export interface RosterGuardState {
 /**
  * KPR-295 — pure mapping from `getRosterGuardState()` output to the telemetry
  * doc shape (`db.telemetry`, consumed by `hive doctor` / KPR-296). No `kind`,
- * no `updatedAt` — the caller (heartbeat wiring, out of scope for this task)
- * owns the envelope. No mongodb imports here by design.
+ * no `updatedAt` — the caller (`writeRosterStats` in `index.ts`) owns the
+ * envelope. This telemetry kind is event-driven — written on every reload
+ * outcome, not on a heartbeat cadence (unlike `prefix_cache_stats` /
+ * `spawn_coordinator_stats`, which are heartbeat-cadence). No mongodb
+ * imports here by design.
  */
 export function buildRosterStatsDoc(state: RosterGuardState): {
   docCount: number | null;
@@ -379,20 +382,13 @@ export class AgentRegistry {
       this.rosterGuard.blockedReloadCount++;
       this.rosterGuard.lastBlockedAt = now;
 
-      if (!wasDegraded) {
-        log.error("EMPTY ROSTER READ — keeping last-good roster", {
-          critical: true,
-          lastGoodDocCount: this.lastGood?.docCount ?? null,
-          lastGoodAt: this.lastGood?.at ?? null,
-          hint:
-            "DB may be an impostor or wiped — see hive doctor / db_identity_stats. If you intentionally deleted all agents, restart the engine to apply.",
-        });
-      } else {
-        log.info("roster reload still blocked — empty read repeated", {
-          blockedReloadCount: this.rosterGuard.blockedReloadCount,
-        });
-      }
-
+      // Start the retry timer BEFORE any logging. If the logger throws
+      // synchronously on the first blocked load, the catch below must not
+      // be able to swallow it before the timer starts — otherwise
+      // auto-recovery is dead until some external trigger fires (which may
+      // never happen: the poll predicate can't fire on an empty collection
+      // and the change stream is typically down in this scenario). The
+      // timer-start itself is safe/never-throwing (try-wrapped tick body).
       if (!this.degradedRetryTimer) {
         this.degradedRetryTimer = setInterval(() => {
           try {
@@ -402,6 +398,24 @@ export class AgentRegistry {
           }
         }, POLL_INTERVAL_MS);
         this.degradedRetryTimer.unref?.();
+      }
+
+      try {
+        if (!wasDegraded) {
+          log.error("EMPTY ROSTER READ — keeping last-good roster", {
+            critical: true,
+            lastGoodDocCount: this.lastGood?.docCount ?? null,
+            lastGoodAt: this.lastGood?.at ?? null,
+            hint:
+              "DB may be an impostor or wiped — see hive doctor / db_identity_stats. If you intentionally deleted all agents, restart the engine to apply.",
+          });
+        } else {
+          log.info("roster reload still blocked — empty read repeated", {
+            blockedReloadCount: this.rosterGuard.blockedReloadCount,
+          });
+        }
+      } catch (logErr) {
+        log.warn("blockEmptyReload logging failed", { error: String(logErr) });
       }
     } catch (err) {
       // Fail-open: never let a logging/timer failure here prevent load()
