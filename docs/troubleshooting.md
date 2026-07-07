@@ -214,7 +214,7 @@ The **Datastore identity** section (KPR-296) answers "is the mongod behind `conf
 
 **Fix:** verify what's listening (`brew services list; lsof -i :27017`), kill the squatter, confirm the real mongod is bound, re-run the doctor.
 
-Remaining warn tier, one line each:
+Other warn-tier lines include:
 
 - `⚠ roster: <n> docs but 0 active and not all disabled` — validation evicted every agent (engine/data version skew); check engine logs from the last reload.
 - `⚠ roster divergence: DB has <n> agent defs, engine last committed <m>` — live count ≠ last committed roster (e.g. the engine restarted during a DB outage); send `SIGUSR1` after restore to reload.
