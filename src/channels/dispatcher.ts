@@ -568,6 +568,12 @@ export class Dispatcher {
 
     if (policy === "notify" && outage.episodes.firstForThread(provider, adapterKeyFor(item), threadKeyFor(item))) {
       await this.deliverOutageNotice(item, agentId, adapter, outageNoticeFor(item.source.kind));
+      log.info("Outage notice delivered", {
+        agentId,
+        provider,
+        adapterKey: adapterKeyFor(item),
+        threadKey: threadKeyFor(item),
+      });
       outage.store.markNoticeSent(item.id, agentId).catch(() => {});
     } else if (policy === "silent") {
       log.info("Outage turn queued silently (system one-shot)", { agentId, provider });
