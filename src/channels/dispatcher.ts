@@ -10,6 +10,18 @@ import type { RetryQueue } from "../sweeper/retry-queue.js";
 import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
 import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
+import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
+import { classifyTurnResult, HARD_FAULT_KINDS } from "../agents/provider-adapters/error-classification.js";
+import type { OutageQueueStore, OutageQueueConfig } from "../outage/outage-queue-store.js";
+import {
+  OutageEpisodeTracker,
+  adapterKeyFor,
+  outageNoticeFor,
+  overflowNoticeFor,
+  policyFor,
+  terminalFailureNotice,
+  threadKeyFor,
+} from "../outage/outage-notices.js";
 
 const log = createLogger("dispatcher");
 
@@ -40,6 +52,18 @@ interface ResolvedAgent {
   meetingPreamble?: string;
 }
 
+/**
+ * KPR-307: honest-outage handling seam. Injected via `setOutageHandling`
+ * only when `config.outageQueue.enabled` is true; when absent every outage
+ * path in the dispatcher is dormant and behavior is identical to post-KPR-306
+ * raw error surfacing.
+ */
+export interface OutageHandlingDeps {
+  store: OutageQueueStore;
+  episodes: OutageEpisodeTracker;
+  config: OutageQueueConfig;
+}
+
 export class Dispatcher {
   private adapters = new Map<string, ChannelAdapter>();
   private registry: AgentRegistry;
@@ -55,6 +79,7 @@ export class Dispatcher {
   private fallbackAuditChannelId?: string;
   private taskLedger?: TaskLedger;
   private retryQueue?: RetryQueue;
+  private outage?: OutageHandlingDeps;
   private teamStore?: import("../team/team-store.js").TeamStore;
   private slackAdapter?: SlackAdapter;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
@@ -85,6 +110,15 @@ export class Dispatcher {
     this.retryQueue = queue;
   }
 
+  /**
+   * KPR-307: wire honest-outage handling. Never called when
+   * `config.outageQueue.enabled` is false — in that case every path below is
+   * dormant and behavior is identical to post-KPR-306 raw error surfacing.
+   */
+  setOutageHandling(deps: OutageHandlingDeps): void {
+    this.outage = deps;
+  }
+
   setTeamStore(store: import("../team/team-store.js").TeamStore): void {
     this.teamStore = store;
   }
@@ -100,8 +134,13 @@ export class Dispatcher {
   }
 
   async dispatch(item: WorkItem): Promise<void> {
-    // 0. Deduplicate — if two adapters see the same Slack message, only process it once
-    if (this.recentMessageIds.has(item.id)) {
+    // 0. Deduplicate — if two adapters see the same Slack message, only process it once.
+    //    KPR-307: outage replays are engine-authored redispatches of the ORIGINAL
+    //    item id (no synthetic per-attempt id — Finding 1 r1: §5-2g doesn't count
+    //    fast-fails, so a synthetic id would repeat and dedup would silently drop
+    //    every replay after the first). Dedup exists for externally-duplicated
+    //    deliveries; a replay has nothing to dedup against — bypass it.
+    if (this.recentMessageIds.has(item.id) && !item.meta?.outageReplay) {
       log.debug("Duplicate message skipped", { id: item.id, source: item.source.adapterId });
       return;
     }
@@ -132,6 +171,29 @@ export class Dispatcher {
         }
       }
       return;
+    }
+
+    // KPR-307 (§7.2, Finding 6 r2): a replay resolves ONLY via its pinned
+    // agent. If the pinned agent was deleted (resolveAgents step 0 would fall
+    // through to name/channel matching — a substitute must NOT answer) or
+    // disabled (the disabled filter would return empty), the queued doc
+    // terminates as `expired`. This single pre-check subsumes both
+    // early-return paths for replay items; non-replay items are untouched.
+    if (this.outage && item.meta?.outageReplay) {
+      const pinnedId = item.meta.targetAgentId as string | undefined;
+      const pinned = pinnedId ? this.registry.get(pinnedId) : undefined;
+      if (!pinned || pinned.disabled) {
+        log.warn("Outage replay expired — pinned agent deleted or disabled", {
+          itemId: item.id,
+          agentId: pinnedId,
+        });
+        if (pinnedId) {
+          await this.outage.store
+            .release(item.id, pinnedId, "expired", "agent disabled/deleted — will not be replayed")
+            .catch((err) => log.error("Outage replay expire-release failed", { error: String(err) }));
+        }
+        return;
+      }
     }
 
     // 2. Resolve agent(s) — may fan out to multiple when several agents are named
@@ -204,6 +266,28 @@ export class Dispatcher {
     try {
       const runResult = this.convertTurnResult(await this.agentManager.runWorkItemTurn(agentId, item));
 
+      // KPR-307 (§7.2 second leg): a COMPLETED turn with a hard provider fault
+      // — or a hang-type timeout — while this provider's breaker is open is a
+      // probe-failure / trip-crossing turn: queue + notice instead of
+      // delivering "Something went wrong: …" or a bare "_No response._".
+      if (await this.maybeHandlePostTurnOutage(item, agentId, adapter, runResult)) {
+        return;
+      }
+
+      // KPR-307 (§5-2g): a replay attempt that errored with the breaker
+      // CLOSED is a real failure — attempts+1, terminal `failed` at the cap
+      // (with a plain-text notice on notify policy). The raw error result is
+      // never delivered for a replay item: SMS/iMessage would swallow it and
+      // Slack would spam one per attempt.
+      // Deliberate: this also fires with the breaker still OPEN when the
+      // result classifies as `non-provider` (maybeHandlePostTurnOutage above
+      // only handles HARD_FAULT_KINDS) — a tool error is outage-independent,
+      // so it counts as a real attempt regardless of breaker state.
+      if (this.outage && item.meta?.outageReplay && runResult.error) {
+        await this.resolveReplayRealFailure(item, agentId, adapter, runResult.error);
+        return;
+      }
+
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
@@ -255,24 +339,17 @@ export class Dispatcher {
           toolSummary: runResult.toolSummary,
         });
       }
-    } catch (err) {
-      const errorResult: WorkResult = {
-        text: `Something went wrong: ${String(err)}`,
-        agentId,
-        workItem: item,
-        costUsd: 0,
-        durationMs: 0,
-        error: String(err),
-      };
-      if (adapter) {
-        try {
-          await adapter.deliver(errorResult);
-        } catch (deliverErr) {
-          log.warn("Error delivery failed, queuing for retry", { error: String(deliverErr) });
-          this.retryQueue?.enqueue(errorResult, adapter);
-        }
+
+      // KPR-307: success bookkeeping — replay doc → done (delivered OR
+      // non-response-suppressed: the model chose not to answer, nothing left
+      // to redeliver); episode ends only while this provider's breaker is
+      // observed not-open at this moment (Finding 3 r1 — a pre-trip turn
+      // landing after the trip must not clear the episode mid-outage).
+      if (!runResult.error) {
+        await this.recordTurnSuccess(item, agentId);
       }
-      log.error("Dispatch failed", { agentId, error: String(err) });
+    } catch (err) {
+      await this.handleTurnFailure(err, item, agentId, adapter);
     } finally {
       await adapter?.onProcessingEnd?.(item, agentId);
     }
@@ -318,12 +395,261 @@ export class Dispatcher {
       ephemeral5mTokens: turn.ephemeral5mTokens,
       ephemeral1hTokens: turn.ephemeral1hTokens,
       error: turn.errors[0],
-      // Dispatcher's RunResult.aborted is never read downstream — grep-confirmed
-      // all `.aborted` references live inside agent-manager.ts. Hardcoding
-      // `false` is harmless because no caller distinguishes aborted from normal
-      // completion in RunResult.
-      aborted: false,
+      // KPR-307: aborted/timedOut ARE now read downstream — the post-turn
+      // outage gate classifies `timedOut && aborted` as a hang-type provider
+      // fault (the pre-KPR-307 hardcoded `aborted: false` claimed "never read
+      // downstream"; that stopped being true here).
+      aborted: turn.aborted ?? false,
+      timedOut: turn.timedOut,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // KPR-307: honest outage behavior — interception, notices, replay outcomes.
+  // Every branch below is a no-op when setOutageHandling was never called.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Shared failure handler — extracted from the two near-duplicate catch
+   * bodies (pre-existing debt this change would otherwise triple). §7.2
+   * classification:
+   *   - ProviderCircuitOpenError            → outage path (provider from err)
+   *   - thrown legacy error on a replay     → release doc → pending, attempts
+   *     unchanged (transient resource contention — e.g. "Spawn budget
+   *     exceeded" — is not a provider verdict; Finding 2 r2: without this the
+   *     doc strands in `replaying` forever), then today's error delivery
+   *   - everything else                     → today's error path, unchanged.
+   */
+  private async handleTurnFailure(
+    err: unknown,
+    item: WorkItem,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+  ): Promise<void> {
+    if (this.outage) {
+      if (err instanceof ProviderCircuitOpenError) {
+        const handled = await this.handleOutageTurn(item, agentId, adapter, err.provider);
+        if (handled) return;
+      } else if (item.meta?.outageReplay) {
+        await this.outage.store
+          .release(item.id, agentId, "pending", String(err))
+          .catch((releaseErr) => log.error("Outage replay release failed", { error: String(releaseErr) }));
+      }
+    }
+
+    const errorResult: WorkResult = {
+      text: `Something went wrong: ${String(err)}`,
+      agentId,
+      workItem: item,
+      costUsd: 0,
+      durationMs: 0,
+      error: String(err),
+    };
+    if (adapter) {
+      try {
+        await adapter.deliver(errorResult);
+      } catch (deliverErr) {
+        log.warn("Error delivery failed, queuing for retry", { error: String(deliverErr) });
+        this.retryQueue?.enqueue(errorResult, adapter);
+      }
+    }
+    log.error("Dispatch failed", { agentId, error: String(err) });
+  }
+
+  /**
+   * §7.2 second classification leg (post-turn gate): the turn COMPLETED but
+   * the provider's breaker is open. Fires when the result classifies into
+   * HARD_FAULT_KINDS OR `timedOut && aborted` (Finding 3 r2 — a runner-
+   * deadline timeout typically leaves `error` unset, so `errors` alone never
+   * fires for hang-type outages). Gated on snapshot.enabled so shadow mode
+   * stays fully observational. A `non-provider` classification with the
+   * breaker coincidentally open follows the LEGACY path — a partially-
+   * executed tool turn's side effects must not be silently re-run
+   * (Finding 4 r1).
+   */
+  private async maybeHandlePostTurnOutage(
+    item: WorkItem,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+    runResult: RunResult,
+  ): Promise<boolean> {
+    const outage = this.outage;
+    if (!outage) return false;
+    if (!runResult.error && runResult.timedOut !== true) return false; // healthy turn — cheap exit
+
+    const provider = this.agentManager.providerFor(agentId);
+    if (!provider) return false;
+    const snapshot = this.agentManager.circuitBreakers.stateFor(provider);
+    if (!snapshot || snapshot.state !== "open" || snapshot.enabled !== true) return false;
+
+    const classification = classifyTurnResult({
+      error: runResult.error,
+      timedOut: runResult.timedOut,
+      aborted: runResult.aborted,
+    });
+    const hardFault = classification.outcome === "fault" && HARD_FAULT_KINDS.has(classification.kind);
+    const hangTimeout = runResult.timedOut === true && runResult.aborted === true;
+    if (!hardFault && !hangTimeout) return false;
+
+    return this.handleOutageTurn(item, agentId, adapter, provider);
+  }
+
+  /**
+   * §7.2 outage path. Returns true when the turn was fully handled (queued /
+   * released / skipped / overflow-noticed); false only on a store failure —
+   * the caller then falls back to the legacy error path rather than dropping
+   * the turn with no user-visible signal at all.
+   */
+  private async handleOutageTurn(
+    item: WorkItem,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+    provider: string,
+  ): Promise<boolean> {
+    const outage = this.outage;
+    if (!outage) return false;
+
+    const policy = policyFor(item);
+    if (policy === "skip") {
+      log.info("Outage fast-fail skipped — cron turn re-fires at next match", { agentId, provider });
+      return true;
+    }
+
+    if (outage.episodes.begin(provider)) {
+      // Sustained-condition discipline (§7.6): one warn per episode start.
+      log.warn("Outage episode began — provider circuit open, queueing turns for replay", { provider, agentId });
+    }
+
+    // Release-before-depth ordering (Finding 1 r2): a replayed fast-fail
+    // already holds a queue slot — depth is irrelevant to it. It must resolve
+    // the existing doc, never take the overflow branch and strand `replaying`.
+    if (item.meta?.outageReplay) {
+      await outage.store
+        .release(item.id, agentId, "pending")
+        .catch((err) => log.error("Outage replay pending-release failed", { error: String(err) }));
+      log.info("Outage replay fast-failed again — back to pending, attempts unchanged", {
+        provider,
+        agentId,
+      });
+      return true;
+    }
+
+    try {
+      const depth = await outage.store.pendingCount();
+      if (depth >= outage.config.maxDepth) {
+        // §5-2f: honest about the drop — drop-oldest would silently break
+        // promises already made to other threads.
+        log.warn("Outage queue at max depth — turn NOT queued", {
+          depth,
+          maxDepth: outage.config.maxDepth,
+          agentId,
+          provider,
+        });
+        // Advisory 3 (plan review round 1): one overflow notice per thread
+        // per episode, not one per overflowed message — a chatty outage with
+        // a full queue would otherwise cost one SMS per dropped message.
+        // Reuses the episode tracker's synchronous test-and-set with a
+        // suffixed adapter key so this dedup key never collides with the
+        // queued-turn notice's own key on the same thread/episode.
+        if (
+          policy === "notify" &&
+          outage.episodes.firstForThread(provider, `${adapterKeyFor(item)}:overflow`, threadKeyFor(item))
+        ) {
+          await this.deliverOutageNotice(item, agentId, adapter, overflowNoticeFor(item.source.kind));
+        }
+        return true;
+      }
+
+      await outage.store.enqueue({ itemId: item.id, agentId, provider, workItem: item, policy });
+    } catch (storeErr) {
+      log.error("Outage enqueue failed — falling back to legacy error path", { error: String(storeErr) });
+      return false;
+    }
+
+    if (policy === "notify" && outage.episodes.firstForThread(provider, adapterKeyFor(item), threadKeyFor(item))) {
+      await this.deliverOutageNotice(item, agentId, adapter, outageNoticeFor(item.source.kind));
+      outage.store.markNoticeSent(item.id, agentId).catch(() => {});
+    } else if (policy === "silent") {
+      log.info("Outage turn queued silently (system one-shot)", { agentId, provider });
+    }
+    return true;
+  }
+
+  /**
+   * §5-2g "real failure" row: replay errored while the breaker is closed —
+   * attempts+1; terminal `failed` at maxReplayAttempts delivers a plain-text
+   * notice on notify policy (Finding 6 r1: the normal error path sets
+   * `result.error`, which SMS/iMessage silently skip). Silent-policy items
+   * fail without a notice, consistent with their enqueue-time silence.
+   */
+  private async resolveReplayRealFailure(
+    item: WorkItem,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+    error: string,
+  ): Promise<void> {
+    const outage = this.outage;
+    if (!outage) return;
+    const { terminal, doc } = await outage.store.recordFailedAttempt(
+      item.id,
+      agentId,
+      error,
+      outage.config.maxReplayAttempts,
+    );
+    log.error("Outage replay attempt failed (breaker closed)", {
+      agentId,
+      attempts: doc?.attempts,
+      terminal,
+    });
+    if (terminal && doc?.policy === "notify") {
+      await this.deliverOutageNotice(item, agentId, adapter, terminalFailureNotice(doc.enqueuedAt));
+    }
+  }
+
+  /** Success bookkeeping: replay → done; episode-end gate (Finding 3 r1). */
+  private async recordTurnSuccess(item: WorkItem, agentId: string): Promise<void> {
+    const outage = this.outage;
+    if (!outage) return;
+    if (item.meta?.outageReplay) {
+      await outage.store
+        .release(item.id, agentId, "done")
+        .catch((err) => log.error("Outage replay done-release failed", { error: String(err) }));
+    }
+    const provider = this.agentManager.providerFor(agentId);
+    if (provider && outage.episodes.hasActiveEpisode(provider)) {
+      const snapshot = this.agentManager.circuitBreakers.stateFor(provider);
+      if (snapshot?.state !== "open") {
+        outage.episodes.clear(provider);
+        log.info("Outage episode ended — provider recovered", { provider });
+      }
+    }
+  }
+
+  /**
+   * Plain-text outage notice: `error` deliberately UNSET so every adapter
+   * actually delivers it (`result.error` → formatError on Slack, delivery
+   * SKIP on SMS/iMessage, raw Error frame on WS — zero adapter changes).
+   * Delivery failure → existing retry queue, like any message. Public: the
+   * replay processor uses it for batched expiry notices.
+   */
+  async deliverOutageNotice(
+    item: WorkItem,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+    text: string,
+  ): Promise<void> {
+    const target = adapter ?? this.adapters.get(item.source.adapterId ?? item.source.kind);
+    if (!target) {
+      log.warn("Outage notice has no adapter — dropped", { agentId, source: item.source.kind });
+      return;
+    }
+    const notice: WorkResult = { text, agentId, workItem: item, costUsd: 0, durationMs: 0 };
+    try {
+      await target.deliver(notice);
+    } catch (err) {
+      log.warn("Outage notice delivery failed, queuing for retry", { error: String(err) });
+      this.retryQueue?.enqueue(notice, target);
+    }
   }
 
   /**
@@ -598,6 +924,17 @@ export class Dispatcher {
 
     try {
       const runResult = this.convertTurnResult(await this.agentManager.runWorkItemTurn(agentId, effectiveItem));
+
+      // KPR-307: same post-turn outage gate + replay-failure gate as the
+      // single-dispatch path — the fan-out body is a near-duplicate.
+      if (await this.maybeHandlePostTurnOutage(effectiveItem, agentId, adapter, runResult)) {
+        return;
+      }
+      if (this.outage && effectiveItem.meta?.outageReplay && runResult.error) {
+        await this.resolveReplayRealFailure(effectiveItem, agentId, adapter, runResult.error);
+        return;
+      }
+
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
@@ -643,23 +980,13 @@ export class Dispatcher {
           durationMs: runResult.durationMs,
         });
       }
-    } catch (err) {
-      const errorResult: WorkResult = {
-        text: `Something went wrong: ${String(err)}`,
-        agentId,
-        workItem: effectiveItem,
-        costUsd: 0,
-        durationMs: 0,
-        error: String(err),
-      };
-      if (adapter) {
-        try {
-          await adapter.deliver(errorResult);
-        } catch (deliverErr) {
-          this.retryQueue?.enqueue(errorResult, adapter);
-        }
+
+      // KPR-307: success bookkeeping (replay → done; episode-end gate).
+      if (!runResult.error) {
+        await this.recordTurnSuccess(effectiveItem, agentId);
       }
-      log.error("Fan-out dispatch failed", { agentId, error: String(err) });
+    } catch (err) {
+      await this.handleTurnFailure(err, effectiveItem, agentId, adapter);
     }
   }
 
