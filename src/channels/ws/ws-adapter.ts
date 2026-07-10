@@ -392,6 +392,39 @@ export class WsAdapter implements ChannelAdapter {
     }
   }
 
+  /**
+   * KPR-308: outage-mode broadcast delivery. Diverted agent-initiated items
+   * (scheduler/Slack-sourced) carry no meta.deviceId, so deliver() cannot
+   * route them; whoever is connected on the LAN during an outage *is* the
+   * floor. Sends the standard message frame to every open connection and
+   * returns the delivered count.
+   *
+   * Deliberately NO pendingMessages buffering (unlike deliver()) — an outage
+   * notice queued for a device that reconnects next week is noise, and the
+   * dispatcher's fall-through covers the zero-connections case.
+   */
+  async deliverBroadcast(result: WorkResult): Promise<number> {
+    const text = result.error ? `Error: ${result.error}` : result.text;
+    const agentName = this.agentRegistry.get(result.agentId)?.name ?? result.agentId;
+    const msg: ServerMessage = {
+      type: "message",
+      text,
+      agentId: result.agentId,
+      agentName,
+      replyTo: result.workItem.id,
+    };
+
+    let delivered = 0;
+    for (const ws of this.connections.values()) {
+      if (ws.readyState === WebSocket.OPEN) {
+        this.send(ws, msg);
+        delivered++;
+      }
+    }
+    log.info("Broadcast delivery", { agentId: result.agentId, connections: delivered });
+    return delivered;
+  }
+
   async onProcessingStart(item: WorkItem, agentId: string): Promise<void> {
     // The dispatcher passes the resolved handler id directly — we no longer
     // need to re-derive it from `item.meta`. Pre-KPR-12 this function used a
