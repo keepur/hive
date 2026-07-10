@@ -58,6 +58,9 @@ import { checkFirstBoot } from "./startup/first-boot.js";
 import { SlackInternalApi } from "./slack/slack-internal-api.js";
 import { preflightBotScopes } from "./slack/slack-scope-preflight.js";
 import { installKeepAliveDispatcher } from "./http/loopback-dispatcher.js";
+import { OutageQueueStore, type OutageQueueDoc } from "./outage/outage-queue-store.js";
+import { OutageEpisodeTracker } from "./outage/outage-notices.js";
+import { OutageReplayProcessor } from "./outage/outage-replay-processor.js";
 const log = createLogger("index");
 
 function provisionAgentDirs(agentIds: string[]): void {
@@ -743,6 +746,27 @@ async function main(): Promise<void> {
   });
   dispatcher.setRetryQueue(retryQueue);
 
+  // KPR-307: honest outage behavior — durable outage queue + episode tracker
+  // + 15s replay poller. enabled:false = interception fully off (independent
+  // kill-switch from the breaker's; behavior identical to post-KPR-306 raw
+  // error surfacing).
+  let outageReplayProcessor: OutageReplayProcessor | undefined;
+  if (config.outageQueue.enabled) {
+    const outageStore = new OutageQueueStore(db.collection<OutageQueueDoc>("outage_queue"));
+    await outageStore.ensureIndexes();
+    dispatcher.setOutageHandling({
+      store: outageStore,
+      episodes: new OutageEpisodeTracker(),
+      config: config.outageQueue,
+    });
+    outageReplayProcessor = new OutageReplayProcessor(outageStore, dispatcher, config.outageQueue);
+    outageReplayProcessor.start();
+    log.info("Outage queue enabled", {
+      replayIntervalMs: config.outageQueue.replayIntervalMs,
+      maxDepth: config.outageQueue.maxDepth,
+    });
+  }
+
   const slackAdapters = [slackAdapter];
   const slackGateways = [slack];
 
@@ -812,6 +836,7 @@ async function main(): Promise<void> {
     if (wsAdapter) await wsAdapter.stop();
     voiceAdapter?.stop();
     scheduler.stop();
+    outageReplayProcessor?.stop();
     await bgTaskManager.stop();
     await codeTaskManager.stop();
     await prefetcher?.close();

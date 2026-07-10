@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
 import { DEFAULT_CIRCUIT_BREAKER_CONFIG, type CircuitBreakerConfig } from "./agents/provider-circuit-breaker.js";
+import { DEFAULT_OUTAGE_QUEUE_CONFIG, type OutageQueueConfig } from "./outage/outage-queue-store.js";
 import { fromKeychain as fromKeychainRaw } from "./keychain/from-keychain.js";
 import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
 
@@ -67,6 +68,26 @@ export function resolveCircuitBreakerConfig(raw: unknown): CircuitBreakerConfig 
     p95WindowSize: windowSize,
     p95MinSamples: Math.min(num(src.p95MinSamples, d.p95MinSamples), windowSize),
     p95ThresholdMs: num(src.p95ThresholdMs, d.p95ThresholdMs),
+  };
+}
+
+/**
+ * KPR-307: liberal-loader resolver for the `outageQueue` hive.yaml section
+ * (KPR-225 F3 — all keys optional, unknown keys ignored, absent section =
+ * all defaults). Exported pure for unit tests.
+ */
+export function resolveOutageQueueConfig(raw: unknown): OutageQueueConfig {
+  const d = DEFAULT_OUTAGE_QUEUE_CONFIG;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ...d };
+  const r = raw as Record<string, unknown>;
+  const posNum = (v: unknown, fallback: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
+  return {
+    enabled: typeof r.enabled === "boolean" ? r.enabled : d.enabled,
+    replayIntervalMs: posNum(r.replayIntervalMs, d.replayIntervalMs),
+    maxAgeHours: posNum(r.maxAgeHours, d.maxAgeHours),
+    maxDepth: posNum(r.maxDepth, d.maxDepth),
+    maxReplayAttempts: posNum(r.maxReplayAttempts, d.maxReplayAttempts),
   };
 }
 
@@ -334,6 +355,9 @@ export const config = {
   // KPR-306: provider circuit breaker (hive.yaml `circuitBreaker`, all keys
   // optional; enabled:false = shadow mode — observe + telemetry, never fast-fail).
   circuitBreaker: resolveCircuitBreakerConfig(hive.circuitBreaker),
+  // KPR-307: Mongo-backed outage queue (hive.yaml `outageQueue`, all keys
+  // optional; enabled:false = interception off, fast-fails fall back to the raw error path).
+  outageQueue: resolveOutageQueueConfig(hive.outageQueue),
   sweeper: {
     intervalMs: parseInt(optional("SWEEPER_INTERVAL_MS", "300000"), 10),
     threadTtlMs: parseInt(optional("SWEEPER_THREAD_TTL_MS", "86400000"), 10),

@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
+import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
+import {
+  OutageEpisodeTracker,
+  OUTAGE_NOTICE_DEFAULT,
+  OUTAGE_OVERFLOW_NOTICE_DEFAULT,
+} from "../outage/outage-notices.js";
 
 // KPR-220 Phase 1: shared mock so tests can assert what dispatcher logs to
 // `info` (e.g., per-turn telemetry breakdown — llmMs/toolMs/toolCalls/etc).
@@ -192,6 +198,8 @@ function makeMockAgentManager() {
     getSessionStore: vi.fn().mockReturnValue({
       get: vi.fn().mockResolvedValue(undefined),
     }),
+    providerFor: vi.fn().mockReturnValue("claude"),
+    circuitBreakers: { stateFor: vi.fn().mockReturnValue(null) },
   };
 }
 
@@ -1052,5 +1060,377 @@ describe("per-agent audit routing", () => {
       }),
     );
     expect(auditCall()).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KPR-307: honest outage behavior
+// ---------------------------------------------------------------------------
+
+function makeCircuitOpenError(provider = "claude") {
+  return new ProviderCircuitOpenError(provider as never, Date.now(), 15_000, "connect-fail", "fetch failed");
+}
+
+function makeOutageStore() {
+  return {
+    enqueue: vi.fn().mockResolvedValue(undefined),
+    release: vi.fn().mockResolvedValue(undefined),
+    recordFailedAttempt: vi.fn().mockResolvedValue({ terminal: false, doc: null }),
+    markNoticeSent: vi.fn().mockResolvedValue(undefined),
+    pendingCount: vi.fn().mockResolvedValue(0),
+    statusOf: vi.fn().mockResolvedValue(null),
+    expireOlderThan: vi.fn().mockResolvedValue([]),
+    recoverStaleReplaying: vi.fn().mockResolvedValue(0),
+    ensureIndexes: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+const OUTAGE_CONFIG = {
+  enabled: true,
+  replayIntervalMs: 15_000,
+  maxAgeHours: 4,
+  maxDepth: 500,
+  maxReplayAttempts: 3,
+};
+
+function makeTurn(overrides: Record<string, unknown> = {}) {
+  return {
+    finalMessage: "turn response",
+    newSessionId: "s2",
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      contextWindow: 0,
+      costUsd: 0.01,
+      durationMs: 800,
+    },
+    errors: [] as string[],
+    llmMs: 0,
+    toolMs: 0,
+    toolCalls: 0,
+    toolSummary: null,
+    streamed: false,
+    compactions: 0,
+    ...overrides,
+  };
+}
+
+describe("outage interception (KPR-307)", () => {
+  let dispatcher: Dispatcher;
+  let agentManager: ReturnType<typeof makeMockAgentManager>;
+  let adapter: ReturnType<typeof makeMockAdapter>;
+  let store: ReturnType<typeof makeOutageStore>;
+  let episodes: OutageEpisodeTracker;
+
+  beforeEach(() => {
+    agentManager = makeMockAgentManager();
+    adapter = makeMockAdapter();
+    store = makeOutageStore();
+    episodes = new OutageEpisodeTracker();
+    dispatcher = new Dispatcher(
+      makeMockRegistry() as never,
+      agentManager as never,
+      makeMockHealthReporter() as never,
+      "executive-assistant",
+    );
+    dispatcher.registerAdapter(adapter as never);
+    dispatcher.setOutageHandling({ store: store as never, episodes, config: OUTAGE_CONFIG });
+  });
+
+  // Route to the dedicated channel of the default enabled agent so resolution
+  // is deterministic (mock registry: executive-assistant owns "general").
+  function slackItem(overrides: Partial<WorkItem> = {}): WorkItem {
+    return makeWorkItem({ source: { kind: "slack", id: "C999", label: "general" }, ...overrides });
+  }
+
+  function replayItem(overrides: Partial<WorkItem> = {}): WorkItem {
+    return slackItem({
+      meta: { outageReplay: true, targetAgentId: "executive-assistant" },
+      ...overrides,
+    });
+  }
+
+  it("instanceof path: queues + delivers a plain-text notice with error UNSET (SMS-skip regression guard)", async () => {
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+
+    expect(store.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ itemId: "m1", agentId: "executive-assistant", provider: "claude", policy: "notify" }),
+    );
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    const delivered = adapter.deliver.mock.calls[0][0];
+    expect(delivered.text).toBe(OUTAGE_NOTICE_DEFAULT);
+    expect(delivered.error).toBeUndefined();
+  });
+
+  it("once per thread per episode: follow-up turns queue silently, a second thread notices once", async () => {
+    agentManager.runWorkItemTurn.mockRejectedValue(makeCircuitOpenError());
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    await dispatcher.dispatch(slackItem({ id: "m2", threadId: "t1" }));
+    await dispatcher.dispatch(slackItem({ id: "m3", threadId: "t2" }));
+
+    expect(store.enqueue).toHaveBeenCalledTimes(3);
+    expect(adapter.deliver).toHaveBeenCalledTimes(2); // t1 once, t2 once
+  });
+
+  it("post-turn open-state path: errored TurnResult + open enabled snapshot → outage path, no error delivery", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ errors: ["connect ECONNREFUSED api"] }));
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(store.enqueue).toHaveBeenCalledTimes(1);
+    // Only the notice was delivered — never the "Something went wrong"/error result.
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].error).toBeUndefined();
+  });
+
+  it("non-provider classification while open → legacy error path, unqueued (Finding 4 r1)", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ errors: ["Something exploded in a tool handler"] }));
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+
+    await dispatcher.dispatch(slackItem());
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].error).toBe("Something exploded in a tool handler");
+  });
+
+  it("closed snapshot → legacy error path; shadow (enabled:false) open snapshot → legacy path", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValue(makeTurn({ errors: ["connect ECONNREFUSED api"] }));
+
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "closed", enabled: true });
+    await dispatcher.dispatch(slackItem({ id: "m1" }));
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: false });
+    await dispatcher.dispatch(slackItem({ id: "m2" }));
+
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it("★ timeout gate: timedOut && aborted with breaker open → outage path even with empty errors", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(
+      makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true }),
+    );
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(store.enqueue).toHaveBeenCalledTimes(1);
+    // No bare "_No response._" delivery — only the honest notice.
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toBe(OUTAGE_NOTICE_DEFAULT);
+  });
+
+  it("★ timedOut with breaker closed → legacy path, unqueued", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(
+      makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true }),
+    );
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "closed", enabled: true });
+
+    await dispatcher.dispatch(slackItem());
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // "_No response._" as today
+  });
+
+  it("sched: turns skip with a log — never queued, never noticed", async () => {
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(
+      slackItem({ id: "sched:executive-assistant:daily:1", meta: { targetAgentId: "executive-assistant" } }),
+    );
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).not.toHaveBeenCalled();
+  });
+
+  it("callback:/event:/team- turns queue silently (no notice, no error delivery)", async () => {
+    agentManager.runWorkItemTurn.mockRejectedValue(makeCircuitOpenError());
+    for (const id of ["callback:abc", "event:abc:executive-assistant", "team-abc"]) {
+      await dispatcher.dispatch(slackItem({ id, meta: { targetAgentId: "executive-assistant" } }));
+    }
+    expect(store.enqueue).toHaveBeenCalledTimes(3);
+    for (const call of store.enqueue.mock.calls) {
+      expect(call[0].policy).toBe("silent");
+    }
+    expect(adapter.deliver).not.toHaveBeenCalled();
+  });
+
+  it("overflow at maxDepth: NOT queued, one overflow notice per thread per episode (notify policy)", async () => {
+    store.pendingCount.mockResolvedValue(500);
+    agentManager.runWorkItemTurn.mockRejectedValue(makeCircuitOpenError());
+
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toBe(OUTAGE_OVERFLOW_NOTICE_DEFAULT);
+    expect(adapter.deliver.mock.calls[0][0].error).toBeUndefined();
+
+    // Advisory 3: a second overflowed message on the SAME thread during the
+    // same episode must NOT re-notice — dedup is per-thread, not per-message.
+    await dispatcher.dispatch(slackItem({ id: "m2", threadId: "t1" }));
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("★ release-before-depth: replayed fast-fail at maxDepth resolves its doc, never the overflow branch", async () => {
+    store.pendingCount.mockResolvedValue(500);
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+
+    await dispatcher.dispatch(replayItem({ id: "m1" }));
+    expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "pending");
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).not.toHaveBeenCalled(); // no overflow notice, no second outage notice
+  });
+
+  it("replay re-entrancy + dedup bypass: same id redispatches; non-replay duplicate still drops", async () => {
+    agentManager.runWorkItemTurn.mockRejectedValue(makeCircuitOpenError());
+    await dispatcher.dispatch(replayItem({ id: "m1" }));
+    await dispatcher.dispatch(replayItem({ id: "m1" })); // second replay tick, same id — must NOT be deduped
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    expect(store.release).toHaveBeenCalledTimes(2);
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).not.toHaveBeenCalled();
+
+    // Non-replay duplicate id within the 60s window still drops.
+    agentManager.runWorkItemTurn.mockResolvedValue(makeTurn());
+    await dispatcher.dispatch(slackItem({ id: "dup-1" }));
+    await dispatcher.dispatch(slackItem({ id: "dup-1" }));
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(3); // only one of the two dup-1 dispatches ran
+  });
+
+  it("★ legacy thrown branch: replay + non-outage throw (breaker closed) → doc back to pending, attempts unchanged, then today's error delivery", async () => {
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(new Error("Spawn budget exceeded for executive-assistant"));
+    await dispatcher.dispatch(replayItem({ id: "m1" }));
+
+    expect(store.release).toHaveBeenCalledWith(
+      "m1",
+      "executive-assistant",
+      "pending",
+      expect.stringContaining("Spawn budget exceeded"),
+    );
+    expect(store.recordFailedAttempt).not.toHaveBeenCalled(); // attempts unchanged
+    // Legacy delivery continues as today.
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].error).toContain("Spawn budget exceeded");
+  });
+
+  it("disabled pinned-agent replay → expired (chief-of-staff is disabled in the mock registry)", async () => {
+    await dispatcher.dispatch(replayItem({ id: "m1", meta: { outageReplay: true, targetAgentId: "chief-of-staff" } }));
+    expect(store.release).toHaveBeenCalledWith(
+      "m1",
+      "chief-of-staff",
+      "expired",
+      "agent disabled/deleted — will not be replayed",
+    );
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
+  });
+
+  it("★ deleted/unresolvable pinned-agent replay → expired, NO fall-through resolution", async () => {
+    // Item text names an existing agent ("hey Jasper") — a fall-through
+    // resolution would match jasper; the pinned-agent rule forbids it.
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        text: "hey Jasper, are we live?",
+        meta: { outageReplay: true, targetAgentId: "ghost-agent" },
+      }),
+    );
+    expect(store.release).toHaveBeenCalledWith(
+      "m1",
+      "ghost-agent",
+      "expired",
+      "agent disabled/deleted — will not be replayed",
+    );
+    expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
+  });
+
+  it("episode cleared on success ONLY when stateFor is not open at completion (Finding 3 r1)", async () => {
+    // Open the episode.
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // the notice
+
+    // A pre-trip turn lands successfully while the breaker is STILL open → episode must survive.
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn());
+    await dispatcher.dispatch(slackItem({ id: "m2", threadId: "t1" }));
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(slackItem({ id: "m3", threadId: "t1" }));
+    expect(adapter.deliver).toHaveBeenCalledTimes(2); // m2's answer only; m3 queued silently — NO second notice
+
+    // Success while the breaker reads closed → episode ends → next outage re-notices.
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "closed", enabled: true });
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn());
+    await dispatcher.dispatch(slackItem({ id: "m4", threadId: "t1" }));
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(slackItem({ id: "m5", threadId: "t1" }));
+    const texts = adapter.deliver.mock.calls.map((c: any[]) => c[0].text);
+    expect(texts.filter((t: string) => t === OUTAGE_NOTICE_DEFAULT)).toHaveLength(2); // m1 + m5
+  });
+
+  it("fan-out: two agents fast-fail on one thread → two enqueues (composite key), exactly one notice", async () => {
+    agentManager.runWorkItemTurn.mockRejectedValue(makeCircuitOpenError());
+    // "Jasper and River" name-resolves to two agents in the mock registry →
+    // multi-agent fan-out under Promise.all (the Finding 8 race surface).
+    await dispatcher.dispatch(
+      makeWorkItem({
+        id: "m1",
+        threadId: "t1",
+        text: "hey Jasper, and River: thoughts?",
+        source: { kind: "slack", id: "C999", label: "random" },
+      }),
+    );
+    expect(store.enqueue).toHaveBeenCalledTimes(2);
+    const agentIds = store.enqueue.mock.calls.map((c: any[]) => c[0].agentId).sort();
+    expect(new Set(agentIds).size).toBe(2);
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // one thread, one notice
+  });
+
+  it("terminal failed: notify-policy replay delivers a plain-text terminal notice; silent policy none", async () => {
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "closed", enabled: true });
+    agentManager.runWorkItemTurn.mockResolvedValue(makeTurn({ errors: ["boom"] }));
+
+    store.recordFailedAttempt.mockResolvedValueOnce({
+      terminal: true,
+      doc: { policy: "notify", enqueuedAt: new Date(), itemId: "m1", agentId: "executive-assistant" },
+    });
+    await dispatcher.dispatch(replayItem({ id: "m1" }));
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toContain("could not be answered");
+    expect(adapter.deliver.mock.calls[0][0].error).toBeUndefined();
+
+    store.recordFailedAttempt.mockResolvedValueOnce({
+      terminal: true,
+      doc: { policy: "silent", enqueuedAt: new Date(), itemId: "m2", agentId: "executive-assistant" },
+    });
+    await dispatcher.dispatch(replayItem({ id: "m2" }));
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // unchanged — silent stays silent
+  });
+
+  it("replay success releases done", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn());
+    await dispatcher.dispatch(replayItem({ id: "m1" }));
+    expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "done");
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // the real answer, delivered normally
+  });
+
+  it("non-response-suppressed replay also releases done (§5-2g: nothing left to redeliver)", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ finalMessage: "No response needed." }));
+    await dispatcher.dispatch(replayItem({ id: "m1" }));
+    expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "done");
+    expect(adapter.deliver).not.toHaveBeenCalled();
+  });
+
+  it("outage wiring absent (setOutageHandling never called) → behavior identical to today", async () => {
+    const bare = new Dispatcher(
+      makeMockRegistry() as never,
+      agentManager as never,
+      makeMockHealthReporter() as never,
+      "executive-assistant",
+    );
+    bare.registerAdapter(adapter as never);
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await bare.dispatch(slackItem({ id: "m1" }));
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toContain("Something went wrong");
   });
 });

@@ -2068,6 +2068,35 @@ describe("AgentManager", () => {
         expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
       });
     });
+
+    describe("providerFor + TurnResult timedOut/aborted propagation (KPR-307)", () => {
+      it("providerFor maps bare model → claude, prefixed → provider, unknown agent → null", () => {
+        // agent-a's fixture model is a bare id (claude-haiku-4-5) → claude.
+        expect(manager.providerFor("agent-a")).toBe("claude");
+        expect(manager.providerFor("no-such-agent")).toBeNull();
+        // Add a gemini-routed agent to the same registry map the manager reads
+        // live (makeMockRegistry.get resolves from _agents on every call).
+        registry._agents.set(
+          "agent-gemini",
+          makeAgentConfig({ id: "agent-gemini", name: "AgentGemini", model: "gemini/gemini-2.5-pro" }),
+        );
+        expect(manager.providerFor("agent-gemini")).toBe("gemini");
+      });
+
+      it("spawnTurn's TurnResult carries timedOut/aborted from RunResult", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ timedOut: true, aborted: true }));
+        const result = await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr307-timeout" }));
+        expect(result.timedOut).toBe(true);
+        expect(result.aborted).toBe(true);
+      });
+
+      it("healthy turns leave timedOut/aborted falsy", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({}));
+        const result = await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr307-clean" }));
+        expect(result.timedOut ?? false).toBe(false);
+        expect(result.aborted ?? false).toBe(false);
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------
