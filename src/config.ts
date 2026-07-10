@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
+import { DEFAULT_CIRCUIT_BREAKER_CONFIG, type CircuitBreakerConfig } from "./agents/provider-circuit-breaker.js";
 import { fromKeychain as fromKeychainRaw } from "./keychain/from-keychain.js";
 import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
 
@@ -41,6 +42,32 @@ export function normalizeGoogleAccounts(raw: unknown): Record<string, string[]> 
     }
   }
   return out;
+}
+
+/**
+ * KPR-306: resolve the optional hive.yaml `circuitBreaker` section.
+ * Liberal-loader style (KPR-225 F3): all keys optional, unknown keys
+ * ignored, non-object/garbage input → all defaults. Numbers must be finite
+ * and > 0 or they fall back; p95MinSamples is clamped to p95WindowSize so a
+ * misconfigured gate can't make the p95 rule unreachable silently.
+ * Read once at boot (registry construction) — changes need a restart, like
+ * every other hive.yaml key.
+ */
+export function resolveCircuitBreakerConfig(raw: unknown): CircuitBreakerConfig {
+  const d = DEFAULT_CIRCUIT_BREAKER_CONFIG;
+  const src = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  const num = (v: unknown, fallback: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
+  const windowSize = num(src.p95WindowSize, d.p95WindowSize);
+  return {
+    enabled: typeof src.enabled === "boolean" ? src.enabled : d.enabled,
+    consecutiveFaultThreshold: num(src.consecutiveFaultThreshold, d.consecutiveFaultThreshold),
+    openBaseMs: num(src.openBaseMs, d.openBaseMs),
+    openMaxMs: num(src.openMaxMs, d.openMaxMs),
+    p95WindowSize: windowSize,
+    p95MinSamples: Math.min(num(src.p95MinSamples, d.p95MinSamples), windowSize),
+    p95ThresholdMs: num(src.p95ThresholdMs, d.p95ThresholdMs),
+  };
 }
 
 /**
@@ -304,6 +331,9 @@ export const config = {
     model: optional("MODEL_ROUTER_MODEL", "claude-haiku-4-5-20251001"),
     timeoutMs: parseInt(optional("MODEL_ROUTER_TIMEOUT_MS", "8000"), 10),
   },
+  // KPR-306: provider circuit breaker (hive.yaml `circuitBreaker`, all keys
+  // optional; enabled:false = shadow mode — observe + telemetry, never fast-fail).
+  circuitBreaker: resolveCircuitBreakerConfig(hive.circuitBreaker),
   sweeper: {
     intervalMs: parseInt(optional("SWEEPER_INTERVAL_MS", "300000"), 10),
     threadTtlMs: parseInt(optional("SWEEPER_THREAD_TTL_MS", "86400000"), 10),

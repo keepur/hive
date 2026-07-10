@@ -23,6 +23,7 @@ import { AgentManager } from "./agents/agent-manager.js";
 import { PrefixCache } from "./agents/prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./agents/prefix-invalidation.js";
 import { SpawnCoordinatorHeartbeat } from "./agents/spawn-coordinator-heartbeat.js";
+import { CircuitBreakerHeartbeat } from "./agents/circuit-breaker-heartbeat.js";
 import { TeamCache } from "./team-roster/team-cache.js";
 import { TeamRoster } from "./team-roster/team-roster.js";
 import { ContactsWatcher } from "./team-roster/contacts-watcher.js";
@@ -514,6 +515,14 @@ async function main(): Promise<void> {
   await spawnCoordinatorHeartbeat.writeOnce();
   spawnCoordinatorHeartbeat.start();
 
+  // KPR-306: provider circuit-breaker stats heartbeat — same cadence and
+  // shape as the spawn-coordinator heartbeat; one telemetry row per provider
+  // that has actually been used (lazy registry — boot writeOnce is a no-op
+  // until the first turn).
+  const circuitBreakerHeartbeat = new CircuitBreakerHeartbeat(agentManager, telemetryCollection);
+  await circuitBreakerHeartbeat.writeOnce();
+  circuitBreakerHeartbeat.start();
+
   // KPR-241: memory-lifecycle stats heartbeat. Same cadence + pattern as
   // SpawnCoordinatorHeartbeat. `telemetryCollection` is the existing local
   // ref; do not re-call db.collection("telemetry").
@@ -808,6 +817,7 @@ async function main(): Promise<void> {
     await prefetcher?.close();
     meetingMonitor?.stop();
     spawnCoordinatorHeartbeat.stop();
+    circuitBreakerHeartbeat.stop();
     memoryLifecycleHeartbeat.stop();
     dbIdentityMonitor.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer

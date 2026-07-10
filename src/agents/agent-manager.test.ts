@@ -139,6 +139,7 @@ import { AgentManager, type TurnContext } from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
 import type { RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
+import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./provider-circuit-breaker.js";
 import type { WorkItem } from "../types/work-item.js";
 import { routeModel } from "./model-router.js";
 
@@ -1946,6 +1947,126 @@ describe("AgentManager", () => {
       // Drain.
       release!();
       await Promise.all([p1, p2]);
+    });
+
+    // Nested inside `spawnTurn (KPR-216)` (not a sibling) so `smsCtx` stays in
+    // scope — it's a local `function` declared at the top of that describe,
+    // not module-level. `routeModel` is already imported/mocked module-wide
+    // (see the existing `import { routeModel } from "./model-router.js"`).
+    describe("provider circuit breaker at the wrap point (KPR-306)", () => {
+      // agent-a's model is a bare id in these fixtures → provider "claude".
+      const CONNECT_FAIL = "TypeError: fetch failed: connect ECONNREFUSED 127.0.0.1:443";
+
+      async function tripBreaker(threadPrefix = "trip") {
+        for (let i = 0; i < 3; i++) {
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: CONNECT_FAIL }));
+          await manager.spawnTurn(smsCtx({ threadId: `sms:line-1:${threadPrefix}-${i}` }));
+        }
+      }
+
+      it("three consecutive hard faults open the breaker; the next spawnTurn fast-fails before the adapter", async () => {
+        // Router must be enabled for this assertion to mean anything — with
+        // the module-mocked config's default `modelRouter.enabled: false`
+        // (test file line 46), `routeModel` is never called regardless of
+        // where the circuit-breaker rejection lands, making a bare
+        // `not.toHaveBeenCalled()` vacuous. Enable it here with try/finally
+        // restore, mirroring the voice carve-out precedent (test file
+        // ~2186-2205).
+        (appConfig as any).modelRouter.enabled = true;
+        try {
+          // Pattern per test file :610 — resolve routeModel so tripBreaker's
+          // setup turns (which now also invoke the router) don't hang.
+          vi.mocked(routeModel).mockResolvedValue({
+            tier: "sonnet",
+            model: "claude-sonnet-4-7",
+            costUsd: 0,
+            durationMs: 0,
+            resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
+          });
+
+          await tripBreaker();
+          expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
+
+          const callsBefore = mockRunnerSend.mock.calls.length;
+          const routerCallsBefore = vi.mocked(routeModel).mock.calls.length;
+          await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:fast-fail" }))).rejects.toBeInstanceOf(
+            ProviderCircuitOpenError,
+          );
+          // Adapter never invoked for the fast-failed turn (pre-prepareSpawn throw).
+          expect(mockRunnerSend.mock.calls.length).toBe(callsBefore);
+          // Router also never invoked for the fast-failed turn specifically:
+          // pin the *call-count delta* across just this turn (routeModel was
+          // already called `routerCallsBefore` times by tripBreaker's setup
+          // turns, since the router is enabled here) — mirroring the
+          // `mockRunnerSend` count-delta assertion immediately above, not an
+          // absolute "never called" claim.
+          expect(vi.mocked(routeModel).mock.calls.length).toBe(routerCallsBefore);
+        } finally {
+          (appConfig as any).modelRouter.enabled = false;
+        }
+      });
+
+      it("fast-fail releases the ticket cleanly: no active spawns, no lock leak, repeatable", async () => {
+        await tripBreaker();
+        const threadId = "sms:line-1:cleanliness";
+        await expect(manager.spawnTurn(smsCtx({ threadId }))).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+
+        const perAgent = manager.getSnapshot().perAgent["agent-a"];
+        expect(perAgent?.activeSpawns ?? 0).toBe(0);
+        expect(perAgent?.activeThreadKeys ?? []).toEqual([]);
+
+        // Same thread again: rejects with the breaker error — NOT a budget or
+        // lock error — proving the finally released everything.
+        await expect(manager.spawnTurn(smsCtx({ threadId }))).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+      });
+
+      it("record-once under auth-rebuild retry: only the retry's outcome feeds the breaker", async () => {
+        // First attempt: auth sentinel (with a resumable session) → retried.
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
+        // Retry: success.
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered", sessionId: "s2" }));
+        await manager.spawnTurn(smsCtx({ sessionId: "s1", threadId: "sms:line-1:auth-retry" }));
+
+        const snap = manager.circuitBreakers.stateFor("claude")!;
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0); // retry success recorded, first attempt never counted
+      });
+
+      it("auth-rebuild retry that also fails records exactly one auth fault", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
+        await manager.spawnTurn(smsCtx({ sessionId: "s1", threadId: "sms:line-1:auth-fail" }));
+        expect(manager.circuitBreakers.stateFor("claude")!.consecutiveHardFaults).toBe(1);
+      });
+
+      it("a thrown adapter error is classified and rethrown", async () => {
+        mockRunnerSend.mockRejectedValueOnce(new Error("fetch failed"));
+        await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:thrown" }))).rejects.toThrow("fetch failed");
+        expect(manager.circuitBreakers.stateFor("claude")!.consecutiveHardFaults).toBe(1);
+      });
+
+      it("non-provider errors (tool failures) never trip", async () => {
+        for (let i = 0; i < 5; i++) {
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "tool handler exploded: boom" }));
+          await manager.spawnTurn(smsCtx({ threadId: `sms:line-1:np-${i}` }));
+        }
+        expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
+      });
+
+      it("probe recovery end-to-end: post-cooldown turn is admitted and closes the breaker", async () => {
+        // Swap in a registry with an injected clock (readonly is compile-time only).
+        let t = 0;
+        (manager as unknown as { circuitBreakers: ProviderCircuitBreakerRegistry }).circuitBreakers =
+          new ProviderCircuitBreakerRegistry(undefined, () => t);
+        await tripBreaker("probe");
+        expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
+
+        t += 15_000; // past cooldown — next real turn becomes the probe
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "back", sessionId: "s-probe" }));
+        const result = await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:probe-turn" }));
+        expect(result.finalMessage).toBe("back");
+        expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
+      });
     });
   });
 
