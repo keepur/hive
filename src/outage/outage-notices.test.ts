@@ -46,7 +46,9 @@ describe("policyFor (§5-3a source policy table)", () => {
 
 describe("keys", () => {
   it("adapterKeyFor prefers adapterId over kind", () => {
-    expect(adapterKeyFor(item({ source: { kind: "sms", id: "x", label: "x", adapterId: "sms-line-2" } }))).toBe("sms-line-2");
+    expect(adapterKeyFor(item({ source: { kind: "sms", id: "x", label: "x", adapterId: "sms-line-2" } }))).toBe(
+      "sms-line-2",
+    );
     expect(adapterKeyFor(item())).toBe("slack");
   });
   it("threadKeyFor falls back to sender (SMS has no threads — per-sender key)", () => {
@@ -99,10 +101,7 @@ describe("OutageEpisodeTracker (§7.3)", () => {
 
   it("synchronous test-and-set: two immediate calls yield exactly one true (fan-out race)", () => {
     const tracker = new OutageEpisodeTracker();
-    const results = [
-      tracker.firstForThread("claude", "slack", "t1"),
-      tracker.firstForThread("claude", "slack", "t1"),
-    ];
+    const results = [tracker.firstForThread("claude", "slack", "t1"), tracker.firstForThread("claude", "slack", "t1")];
     expect(results.filter(Boolean)).toHaveLength(1);
   });
 

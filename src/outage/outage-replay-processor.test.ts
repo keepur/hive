@@ -141,8 +141,12 @@ describe("OutageReplayProcessor (KPR-307 §7.4)", () => {
     await processor.tick();
     expect(dispatcher.deliverOutageNotice).toHaveBeenCalledTimes(2);
     const texts = dispatcher.deliverOutageNotice.mock.calls.map((c: any[]) => c[3]);
-    expect(texts).toContain("Service is back — I couldn't get to 2 earlier messages from during the outage. Please re-send anything still needed.");
-    expect(texts).toContain("Service is back — I couldn't get to 1 earlier message from during the outage. Please re-send anything still needed.");
+    expect(texts).toContain(
+      "Service is back — I couldn't get to 2 earlier messages from during the outage. Please re-send anything still needed.",
+    );
+    expect(texts).toContain(
+      "Service is back — I couldn't get to 1 earlier message from during the outage. Please re-send anything still needed.",
+    );
   });
 
   it("tick is re-entrancy guarded", async () => {

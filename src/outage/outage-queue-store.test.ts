@@ -162,7 +162,12 @@ describe("OutageQueueStore (KPR-307)", () => {
     await store.claimNext();
 
     await store.release("msg-1", "agent-a", "pending", "circuit still open");
-    expect(fake.docs[0]).toMatchObject({ status: "pending", attempts: 0, doneAt: null, lastError: "circuit still open" });
+    expect(fake.docs[0]).toMatchObject({
+      status: "pending",
+      attempts: 0,
+      doneAt: null,
+      lastError: "circuit still open",
+    });
 
     await store.claimNext();
     await store.release("msg-1", "agent-a", "done");
@@ -171,7 +176,10 @@ describe("OutageQueueStore (KPR-307)", () => {
 
     await store.enqueue(makeInput({ itemId: "msg-2" }));
     await store.release("msg-2", "agent-a", "expired", "agent disabled/deleted — will not be replayed");
-    expect(fake.docs[1]).toMatchObject({ status: "expired", lastError: "agent disabled/deleted — will not be replayed" });
+    expect(fake.docs[1]).toMatchObject({
+      status: "expired",
+      lastError: "agent disabled/deleted — will not be replayed",
+    });
     expect(fake.docs[1].doneAt).toBeInstanceOf(Date);
   });
 
