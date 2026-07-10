@@ -149,6 +149,21 @@ describe("OutageReplayProcessor (KPR-307 §7.4)", () => {
     );
   });
 
+  it("expiry: fan-out to two agents counts as one user message (distinct itemIds, not raw docs)", async () => {
+    // One user message fanned to two agents → two docs, same itemId, same thread.
+    store.expireOlderThan.mockResolvedValueOnce([
+      makeDoc({ itemId: "f1", agentId: "agent-a" }),
+      makeDoc({ itemId: "f1", agentId: "agent-b" }),
+    ]);
+
+    await processor.tick();
+    expect(dispatcher.deliverOutageNotice).toHaveBeenCalledTimes(1);
+    const texts = dispatcher.deliverOutageNotice.mock.calls.map((c: any[]) => c[3]);
+    expect(texts).toContain(
+      "It's been a while since your message — I couldn't get to 1 earlier message sent during the outage. Please re-send anything still needed if it's still relevant.",
+    );
+  });
+
   it("tick is re-entrancy guarded", async () => {
     let resolveClaim!: (v: null) => void;
     store.claimNext.mockReturnValueOnce(new Promise((r) => (resolveClaim = r)));

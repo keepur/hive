@@ -75,7 +75,11 @@ export class OutageReplayProcessor {
     }
     for (const docs of groups.values()) {
       const sample = docs[0];
-      await this.dispatcher.deliverOutageNotice(sample.workItem, sample.agentId, undefined, expiryNotice(docs.length));
+      // Count distinct user messages, not raw docs: a fan-out dispatch enqueues
+      // one doc per fanned agent for the same itemId, so docs.length would
+      // over-count from the user's perspective (§5-2c-ii).
+      const messageCount = new Set(docs.map((d) => d.itemId)).size;
+      await this.dispatcher.deliverOutageNotice(sample.workItem, sample.agentId, undefined, expiryNotice(messageCount));
     }
   }
 
