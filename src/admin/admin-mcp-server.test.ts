@@ -781,3 +781,48 @@ describe("KPR-221 — delegateServers validation rejects context-dependent serve
     }
   });
 });
+
+describe("KPR-308 — floorCritical write boundary", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+  });
+
+  it("agent_create persists floorCritical: true from the fields bag", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const result = await handler({
+      _id: "floor-agent",
+      name: "Floor Agent",
+      model: "haiku",
+      homeBase: "agent-floor",
+      roles: ["Shop Floor"],
+      fields: { floorCritical: true },
+    });
+    expect(result.isError).toBeUndefined();
+    expect(agentDocsStore.get("floor-agent").floorCritical).toBe(true);
+  });
+
+  it("agent_create defaults floorCritical to false when absent", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    await handler({ _id: "plain-agent", name: "Plain", model: "haiku", homeBase: "agent-plain", roles: ["X"] });
+    expect(agentDocsStore.get("plain-agent").floorCritical).toBe(false);
+  });
+
+  it("agent_update round-trips floorCritical", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const handler = getHandler(makeTools(), "agent_update");
+    const result = await handler({ agent_id: "existing-agent", fields: { floorCritical: true } });
+    expect(result.isError).toBeUndefined();
+    expect(agentDocsStore.get("existing-agent").floorCritical).toBe(true);
+
+    await handler({ agent_id: "existing-agent", fields: { floorCritical: false } });
+    expect(agentDocsStore.get("existing-agent").floorCritical).toBe(false);
+  });
+
+  it("agent_update coerces garbage floorCritical to strict false", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const handler = getHandler(makeTools(), "agent_update");
+    await handler({ agent_id: "existing-agent", fields: { floorCritical: "yes" } });
+    expect(agentDocsStore.get("existing-agent").floorCritical).toBe(false);
+  });
+});

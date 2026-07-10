@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  renderCircuitBreakerSection,
+  renderOutageQueueSection,
   renderDatastoreIdentitySection,
   renderPrefixCacheSection,
   renderPromptCacheSection,
@@ -334,6 +336,135 @@ describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
     );
     const out = lines.join("\n");
     expect(out).toContain("last error: something broke");
+  });
+});
+
+describe("renderCircuitBreakerSection (KPR-306)", () => {
+  function collect() {
+    const lines: string[] = [];
+    return { lines, emit: (l: string) => lines.push(l) };
+  }
+  const baseRow = {
+    provider: "claude",
+    state: "closed" as const,
+    enabled: true,
+    reason: null,
+    consecutiveHardFaults: 0,
+    tripCount: 0,
+    lastTripAt: null,
+    fastFailCount: 0,
+    lastFaultMessage: null,
+    p95Ms: null,
+    sampleCount: 0,
+    probeInFlight: false,
+    openedAt: null,
+    nextProbeEligibleAt: null,
+    staleSeconds: 5,
+  };
+
+  it("renders 'no heartbeat yet' when no rows are available", () => {
+    const { lines, emit } = collect();
+    renderCircuitBreakerSection([], emit);
+    expect(lines[1]).toContain("no heartbeat yet");
+  });
+
+  it("renders a closed row with trips, streak, p95 and fast-fails", () => {
+    const { lines, emit } = collect();
+    renderCircuitBreakerSection(
+      [{ ...baseRow, tripCount: 2, p95Ms: 41_000, sampleCount: 37, fastFailCount: 118 }],
+      emit,
+    );
+    expect(lines[1]).toContain("claude: state=closed trips=2 consec-faults=0 p95=41s (n=37) fast-fails=118");
+    expect(lines[1]).not.toContain("[");
+  });
+
+  it("renders an open row with reason, next-probe countdown, [OPEN] flag and last-fault line", () => {
+    const { lines, emit } = collect();
+    renderCircuitBreakerSection(
+      [
+        {
+          ...baseRow,
+          provider: "gemini",
+          state: "open",
+          reason: "connect-fail",
+          openedAt: Date.now() - 45_000,
+          nextProbeEligibleAt: Date.now() + 14_000,
+          lastFaultMessage: "fetch failed: connect ECONNREFUSED",
+          fastFailCount: 9,
+        },
+      ],
+      emit,
+    );
+    expect(lines[1]).toContain("state=open reason=connect-fail");
+    expect(lines[1]).toContain("[OPEN]");
+    expect(lines[2]).toContain("last fault: fetch failed: connect ECONNREFUSED");
+  });
+
+  it("flags shadow mode and half-open state", () => {
+    const { lines, emit } = collect();
+    renderCircuitBreakerSection(
+      [{ ...baseRow, state: "half-open", reason: "auth", probeInFlight: true, enabled: false }],
+      emit,
+    );
+    expect(lines[1]).toContain("state=half-open");
+    expect(lines[1]).toContain("probe-in-flight=true");
+    expect(lines[1]).toContain("[HALF-OPEN,shadow]");
+  });
+
+  it("warns on stale heartbeat (>120s) without any failure semantics", () => {
+    const { lines, emit } = collect();
+    renderCircuitBreakerSection([{ ...baseRow, staleSeconds: 300 }], emit);
+    expect(lines[1]).toContain("stale-heartbeat");
+    expect(lines[2]).toContain("⚠ heartbeat is stale");
+    // Renderer returns void — structurally incapable of flipping the exit
+    // code (D4): only renderDatastoreIdentitySection returns a verdict.
+    expect(renderCircuitBreakerSection([], () => {})).toBeUndefined();
+  });
+});
+
+describe("renderOutageQueueSection (KPR-307, informational — D4)", () => {
+  function capture() {
+    const lines: string[] = [];
+    return { lines, emit: (l: string) => lines.push(l) };
+  }
+
+  it("renders null stats as unavailable", () => {
+    const { lines, emit } = capture();
+    renderOutageQueueSection(null, false, emit);
+    expect(lines.join("\n")).toContain("unavailable");
+  });
+
+  it("renders an all-zero queue as empty", () => {
+    const { lines, emit } = capture();
+    renderOutageQueueSection(
+      { pending: 0, replaying: 0, oldestPendingAgeSeconds: null, expired24h: 0, failed24h: 0 },
+      false,
+      emit,
+    );
+    expect(lines.join("\n")).toContain("empty — no queued outage turns");
+  });
+
+  it("renders counts and flags stuck drain only when pending > 0 with no breaker open", () => {
+    const stats = { pending: 3, replaying: 1, oldestPendingAgeSeconds: 124, expired24h: 0, failed24h: 1 };
+    const stuck = capture();
+    renderOutageQueueSection(stats, false, stuck.emit);
+    expect(stuck.lines.join("\n")).toContain("pending=3 (oldest 124s) replaying=1 expired(24h)=0 failed(24h)=1");
+    expect(stuck.lines.join("\n")).toContain("⚠ pending items while no breaker is open");
+
+    const draining = capture();
+    renderOutageQueueSection(stats, true, draining.emit);
+    expect(draining.lines.join("\n")).not.toContain("⚠");
+  });
+
+  it("emits only — returns void (cannot alter the exit code, D4)", () => {
+    const { emit } = capture();
+    expect(
+      renderOutageQueueSection(
+        { pending: 9, replaying: 0, oldestPendingAgeSeconds: 1, expired24h: 0, failed24h: 9 },
+        false,
+        emit,
+      ),
+    ).toBeUndefined();
   });
 });
 

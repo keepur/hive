@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { normalizeGoogleAccounts, warnIfLegacyGoogleAccount } from "./config.js";
+import {
+  normalizeGoogleAccounts,
+  warnIfLegacyGoogleAccount,
+  resolveCircuitBreakerConfig,
+  resolveOutageQueueConfig,
+} from "./config.js";
+import { DEFAULT_CIRCUIT_BREAKER_CONFIG } from "./agents/provider-circuit-breaker.js";
+import { DEFAULT_OUTAGE_QUEUE_CONFIG } from "./outage/outage-queue-store.js";
 
 describe("normalizeGoogleAccounts (KPR-242)", () => {
   it("returns an empty record for undefined or non-object input", () => {
@@ -87,5 +94,66 @@ describe("warnIfLegacyGoogleAccount (KPR-242)", () => {
   it("does not warn when `google` is non-object", () => {
     warnIfLegacyGoogleAccount({ google: "not an object" } as unknown as Record<string, unknown>);
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveCircuitBreakerConfig (KPR-306)", () => {
+  it("returns all defaults for an absent or garbage section", () => {
+    expect(resolveCircuitBreakerConfig(undefined)).toEqual(DEFAULT_CIRCUIT_BREAKER_CONFIG);
+    expect(resolveCircuitBreakerConfig(null)).toEqual(DEFAULT_CIRCUIT_BREAKER_CONFIG);
+    expect(resolveCircuitBreakerConfig("nope")).toEqual(DEFAULT_CIRCUIT_BREAKER_CONFIG);
+    expect(resolveCircuitBreakerConfig([])).toEqual(DEFAULT_CIRCUIT_BREAKER_CONFIG);
+  });
+
+  it("applies per-key ?? semantics for a partial section", () => {
+    const resolved = resolveCircuitBreakerConfig({ enabled: false, openBaseMs: 5_000 });
+    expect(resolved.enabled).toBe(false);
+    expect(resolved.openBaseMs).toBe(5_000);
+    expect(resolved.consecutiveFaultThreshold).toBe(DEFAULT_CIRCUIT_BREAKER_CONFIG.consecutiveFaultThreshold);
+    expect(resolved.p95ThresholdMs).toBe(DEFAULT_CIRCUIT_BREAKER_CONFIG.p95ThresholdMs);
+  });
+
+  it("rejects garbage-typed values back to defaults and clamps p95MinSamples to the window", () => {
+    const resolved = resolveCircuitBreakerConfig({
+      enabled: "yes",
+      consecutiveFaultThreshold: -1,
+      openBaseMs: "fast",
+      p95WindowSize: 10,
+      p95MinSamples: 500,
+    });
+    expect(resolved.enabled).toBe(true);
+    expect(resolved.consecutiveFaultThreshold).toBe(3);
+    expect(resolved.openBaseMs).toBe(15_000);
+    expect(resolved.p95WindowSize).toBe(10);
+    expect(resolved.p95MinSamples).toBe(10); // clamped
+  });
+});
+
+describe("resolveOutageQueueConfig (KPR-307)", () => {
+  it("returns all defaults for absent/garbage sections", () => {
+    expect(resolveOutageQueueConfig(undefined)).toEqual(DEFAULT_OUTAGE_QUEUE_CONFIG);
+    expect(resolveOutageQueueConfig(null)).toEqual(DEFAULT_OUTAGE_QUEUE_CONFIG);
+    expect(resolveOutageQueueConfig("nope")).toEqual(DEFAULT_OUTAGE_QUEUE_CONFIG);
+    expect(resolveOutageQueueConfig([])).toEqual(DEFAULT_OUTAGE_QUEUE_CONFIG);
+  });
+
+  it("applies per-key ?? on partial sections", () => {
+    const resolved = resolveOutageQueueConfig({ enabled: false, maxDepth: 100 });
+    expect(resolved.enabled).toBe(false);
+    expect(resolved.maxDepth).toBe(100);
+    expect(resolved.replayIntervalMs).toBe(15_000);
+    expect(resolved.maxAgeHours).toBe(4);
+    expect(resolved.maxReplayAttempts).toBe(3);
+  });
+
+  it("rejects garbage-typed and non-positive values per key", () => {
+    const resolved = resolveOutageQueueConfig({
+      enabled: "yes",
+      replayIntervalMs: "fast",
+      maxAgeHours: -4,
+      maxDepth: NaN,
+      maxReplayAttempts: 0,
+    });
+    expect(resolved).toEqual(DEFAULT_OUTAGE_QUEUE_CONFIG);
   });
 });

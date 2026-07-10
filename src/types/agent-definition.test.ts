@@ -119,6 +119,25 @@ describe("toAgentConfig — spawn budget passthrough (KPR-220 Phase 17)", () => 
   });
 });
 
+describe("toAgentConfig — floorCritical projection (KPR-308)", () => {
+  it("defaults to false when absent", () => {
+    expect(toAgentConfig(makeDefinition()).floorCritical).toBe(false);
+  });
+
+  it("passes true through", () => {
+    expect(toAgentConfig(makeDefinition({ floorCritical: true })).floorCritical).toBe(true);
+  });
+
+  it("passes false through", () => {
+    expect(toAgentConfig(makeDefinition({ floorCritical: false })).floorCritical).toBe(false);
+  });
+
+  it("coerces garbage to false (liberal loader)", () => {
+    expect(toAgentConfig(makeDefinition({ floorCritical: "yes" as unknown as boolean })).floorCritical).toBe(false);
+    expect(toAgentConfig(makeDefinition({ floorCritical: 1 as unknown as boolean })).floorCritical).toBe(false);
+  });
+});
+
 describe("toAgentConfig — coreServers/delegateServers fallback", () => {
   it("falls back to the baseline when a definition is missing coreServers", () => {
     // Simulate a malformed/legacy definition that lacks coreServers (upstream callers

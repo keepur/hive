@@ -134,13 +134,18 @@ vi.mock("mongodb", () => {
   const estimatedDocumentCount = vi.fn();
   const findOne = vi.fn();
   const aggregate = vi.fn();
-  const collection = vi.fn(() => ({ estimatedDocumentCount, findOne, aggregate }));
+  const find = vi.fn();
+  const countDocuments = vi.fn();
+  const collection = vi.fn(() => ({ estimatedDocumentCount, findOne, aggregate, find, countDocuments }));
   const command = vi.fn((cmd: unknown) => ping(cmd));
   const db = vi.fn(() => ({ command, collection }));
   const connect = vi.fn();
   const close = vi.fn();
   const MongoClient = vi.fn(() => ({ connect, db, close }));
-  return { MongoClient, __mocks: { connect, close, ping, estimatedDocumentCount, findOne, aggregate } };
+  return {
+    MongoClient,
+    __mocks: { connect, close, ping, estimatedDocumentCount, findOne, aggregate, find, countDocuments },
+  };
 });
 
 import * as mongodb from "mongodb";
@@ -286,6 +291,79 @@ describe("cacheHitRatesForDoctor", () => {
   it("returns [] when the connection throws", async () => {
     mongoMocks.connect.mockRejectedValueOnce(new Error("ECONNREFUSED"));
     await expect(cacheHitRatesForDoctor("mongodb://x", "hive_test")).resolves.toEqual([]);
+  });
+});
+
+import { circuitBreakerStatsForDoctor } from "./doctor-checks.js";
+
+describe("circuitBreakerStatsForDoctor (KPR-306)", () => {
+  beforeEach(() => {
+    mongoMocks.connect.mockReset().mockResolvedValue(undefined);
+    mongoMocks.close.mockReset().mockResolvedValue(undefined);
+    mongoMocks.find.mockReset();
+  });
+
+  it("maps docs with defaults for missing fields and filters provider-less docs", async () => {
+    const updatedAt = new Date(Date.now() - 10_000);
+    mongoMocks.find.mockReturnValue({
+      toArray: async () => [
+        { provider: "claude", state: "open", reason: "connect-fail", tripCount: 1, updatedAt },
+        { kind: "circuit_breaker_stats" }, // no provider → filtered
+      ],
+    });
+    const rows = await circuitBreakerStatsForDoctor("mongodb://x", "hive_test");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      provider: "claude",
+      state: "open",
+      reason: "connect-fail",
+      tripCount: 1,
+      enabled: true, // default
+      fastFailCount: 0, // default
+      probeInFlight: false, // default
+    });
+    expect(rows[0].staleSeconds).toBeGreaterThanOrEqual(9);
+  });
+
+  it("returns [] when the connection throws", async () => {
+    mongoMocks.connect.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    await expect(circuitBreakerStatsForDoctor("mongodb://x", "hive_test")).resolves.toEqual([]);
+  });
+});
+
+// ── outage queue (KPR-307) ───────────────────────────────────────────────
+
+import { outageQueueStatsForDoctor } from "./doctor-checks.js";
+
+describe("outageQueueStatsForDoctor (KPR-307)", () => {
+  beforeEach(() => {
+    mongoMocks.connect.mockReset().mockResolvedValue(undefined);
+    mongoMocks.close.mockReset().mockResolvedValue(undefined);
+    mongoMocks.countDocuments.mockReset();
+    mongoMocks.find.mockReset();
+  });
+
+  it("returns counts and oldest-pending age from the collection", async () => {
+    // countDocuments is called in order: pending, replaying, expired, failed.
+    mongoMocks.countDocuments
+      .mockResolvedValueOnce(3)
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(0)
+      .mockResolvedValueOnce(1);
+    // find().sort().limit().toArray() → one pending doc enqueued 2 min ago.
+    const enqueuedAt = new Date(Date.now() - 120_000);
+    mongoMocks.find.mockReturnValue({
+      sort: () => ({ limit: () => ({ toArray: async () => [{ enqueuedAt }] }) }),
+    });
+    const stats = await outageQueueStatsForDoctor("mongodb://localhost", "hive_test");
+    expect(stats).toMatchObject({ pending: 3, replaying: 1, expired24h: 0, failed24h: 1 });
+    expect(stats!.oldestPendingAgeSeconds).toBeGreaterThanOrEqual(119);
+  });
+
+  it("returns null when the connection fails", async () => {
+    mongoMocks.connect.mockReset().mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    const stats = await outageQueueStatsForDoctor("mongodb://down", "hive_test");
+    expect(stats).toBeNull();
   });
 });
 

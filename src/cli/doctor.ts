@@ -7,10 +7,14 @@ import {
   type PromptCacheRow,
   type PrefixCacheStatsRow,
   type SpawnCoordinatorRow,
+  type CircuitBreakerRow,
+  type OutageQueueStats,
   type MemoryLifecycleRow,
   type DatastoreIdentityReport,
   brewServiceRunning,
   cacheHitRatesForDoctor,
+  circuitBreakerStatsForDoctor,
+  outageQueueStatsForDoctor,
   commandExists,
   datastoreIdentityForDoctor,
   defaultAgentExists,
@@ -140,6 +144,82 @@ export function renderSpawnCoordinatorSection(
     if (r.lastError) {
       emit(`    last error: ${r.lastError}`);
     }
+  }
+}
+
+/**
+ * KPR-306: render the per-provider circuit-breaker section. INFORMATIONAL
+ * tier (Gate 1 D4) — a trip is an incident signal, not a doctor failure;
+ * this section never affects the exit code. Same >120s staleness threshold
+ * as the sibling sections.
+ */
+export function renderCircuitBreakerSection(
+  rows: CircuitBreakerRow[],
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nProvider circuit breakers (live engine, per provider)");
+  if (rows.length === 0) {
+    emit("  ○ no heartbeat yet — start the engine and re-check");
+    return;
+  }
+  for (const r of rows) {
+    const stale = r.staleSeconds === null ? "?" : `${r.staleSeconds}s ago`;
+    const flags: string[] = [];
+    if (r.state === "open") flags.push("OPEN");
+    if (r.state === "half-open") flags.push("HALF-OPEN");
+    if (!r.enabled) flags.push("shadow");
+    if (r.staleSeconds !== null && r.staleSeconds > 120) flags.push("stale-heartbeat");
+    const flagStr = flags.length > 0 ? ` [${flags.join(",")}]` : "";
+    let body: string;
+    if (r.state === "closed") {
+      const p95 = r.p95Ms === null ? "n/a" : `${Math.round(r.p95Ms / 1000)}s`;
+      body = `state=closed trips=${r.tripCount} consec-faults=${r.consecutiveHardFaults} p95=${p95} (n=${r.sampleCount}) fast-fails=${r.fastFailCount}`;
+    } else if (r.state === "open") {
+      const opened = r.openedAt === null ? "?" : `${Math.round((Date.now() - r.openedAt) / 1000)}s ago`;
+      const nextProbe =
+        r.nextProbeEligibleAt === null
+          ? "?"
+          : `${Math.max(0, Math.round((r.nextProbeEligibleAt - Date.now()) / 1000))}s`;
+      body = `state=open reason=${r.reason ?? "?"} opened ${opened}, next probe in ${nextProbe} fast-fails=${r.fastFailCount}`;
+    } else {
+      body = `state=half-open reason=${r.reason ?? "?"} probe-in-flight=${r.probeInFlight} fast-fails=${r.fastFailCount}`;
+    }
+    emit(`  ${r.provider}: ${body}${flagStr} (heartbeat ${stale})`);
+    if (r.staleSeconds !== null && r.staleSeconds > 120) {
+      emit("  ⚠ heartbeat is stale — engine may not be running, or stats writer is failing");
+    }
+    if (r.state !== "closed" && r.lastFaultMessage) {
+      emit(`    last fault: ${r.lastFaultMessage}`);
+    }
+  }
+}
+
+/**
+ * KPR-307: informational outage-queue section (D4 — NEVER affects the exit
+ * code; identity-class incidents alone may fail the doctor). `anyBreakerOpen`
+ * comes from the circuit-breaker rows: pending items while every breaker is
+ * closed is the stuck-drain signal (§7.6).
+ */
+export function renderOutageQueueSection(
+  stats: OutageQueueStats | null,
+  anyBreakerOpen: boolean,
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nOutage queue (honest outage behavior)");
+  if (stats === null) {
+    emit("  ○ unavailable — mongo unreachable");
+    return;
+  }
+  if (stats.pending === 0 && stats.replaying === 0 && stats.expired24h === 0 && stats.failed24h === 0) {
+    emit("  ○ empty — no queued outage turns");
+    return;
+  }
+  const oldest = stats.oldestPendingAgeSeconds === null ? "n/a" : `${stats.oldestPendingAgeSeconds}s`;
+  emit(
+    `  pending=${stats.pending} (oldest ${oldest}) replaying=${stats.replaying} expired(24h)=${stats.expired24h} failed(24h)=${stats.failed24h}`,
+  );
+  if (stats.pending > 0 && !anyBreakerOpen) {
+    emit("  ⚠ pending items while no breaker is open — replay drain may be stuck; check engine logs (outage-replay)");
   }
 }
 
@@ -616,6 +696,17 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // KPR-220 Phase 11: spawn-coordinator per-agent stats.
     const coordinatorRows = await spawnCoordinatorStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderSpawnCoordinatorSection(coordinatorRows);
+    // KPR-306: provider circuit-breaker per-provider stats. Informational —
+    // NEVER contributes to allPassed (D4).
+    const breakerRows = await circuitBreakerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+    renderCircuitBreakerSection(breakerRows);
+    // KPR-307: outage queue (informational — D4). Reuses the breaker rows
+    // already fetched above to derive the stuck-drain signal.
+    const outageStats = await outageQueueStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+    renderOutageQueueSection(
+      outageStats,
+      breakerRows.some((r) => r.state === "open"),
+    );
     // KPR-241: memory lifecycle per-agent stats.
     const memoryRows = await memoryLifecycleStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderMemoryLifecycleSection(memoryRows, console.log, config.memory.spendWarnThresholdUsd ?? 5);
@@ -627,6 +718,10 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     console.log("\nPrefix cache (live engine)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nSpawn coordinator (live engine, per agent)");
+    console.log("  ○ skipped: config not loaded");
+    console.log("\nProvider circuit breakers (live engine, per provider)");
+    console.log("  ○ skipped: config not loaded");
+    console.log("\nOutage queue (honest outage behavior)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nMemory lifecycle: skipped (config not loaded)");
   }

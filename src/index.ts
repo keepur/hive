@@ -23,6 +23,7 @@ import { AgentManager } from "./agents/agent-manager.js";
 import { PrefixCache } from "./agents/prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./agents/prefix-invalidation.js";
 import { SpawnCoordinatorHeartbeat } from "./agents/spawn-coordinator-heartbeat.js";
+import { CircuitBreakerHeartbeat } from "./agents/circuit-breaker-heartbeat.js";
 import { TeamCache } from "./team-roster/team-cache.js";
 import { TeamRoster } from "./team-roster/team-roster.js";
 import { ContactsWatcher } from "./team-roster/contacts-watcher.js";
@@ -57,6 +58,9 @@ import { checkFirstBoot } from "./startup/first-boot.js";
 import { SlackInternalApi } from "./slack/slack-internal-api.js";
 import { preflightBotScopes } from "./slack/slack-scope-preflight.js";
 import { installKeepAliveDispatcher } from "./http/loopback-dispatcher.js";
+import { OutageQueueStore, type OutageQueueDoc } from "./outage/outage-queue-store.js";
+import { OutageEpisodeTracker } from "./outage/outage-notices.js";
+import { OutageReplayProcessor } from "./outage/outage-replay-processor.js";
 const log = createLogger("index");
 
 function provisionAgentDirs(agentIds: string[]): void {
@@ -514,6 +518,14 @@ async function main(): Promise<void> {
   await spawnCoordinatorHeartbeat.writeOnce();
   spawnCoordinatorHeartbeat.start();
 
+  // KPR-306: provider circuit-breaker stats heartbeat — same cadence and
+  // shape as the spawn-coordinator heartbeat; one telemetry row per provider
+  // that has actually been used (lazy registry — boot writeOnce is a no-op
+  // until the first turn).
+  const circuitBreakerHeartbeat = new CircuitBreakerHeartbeat(agentManager, telemetryCollection);
+  await circuitBreakerHeartbeat.writeOnce();
+  circuitBreakerHeartbeat.start();
+
   // KPR-241: memory-lifecycle stats heartbeat. Same cadence + pattern as
   // SpawnCoordinatorHeartbeat. `telemetryCollection` is the existing local
   // ref; do not re-call db.collection("telemetry").
@@ -734,6 +746,35 @@ async function main(): Promise<void> {
   });
   dispatcher.setRetryQueue(retryQueue);
 
+  // KPR-308: outage-mode delivery-preference seam (spec §5.3). Explicitly
+  // dormant — this call is the documented wiring point for KPR-306's
+  // provider-circuit breaker. Replacing the stub with the breaker-state
+  // surface KPR-306 exports (sync getter or cached snapshot — the seam
+  // absorbs either) is a LATER integration step, possibly in KPR-306's or
+  // KPR-307's lane, NOT part of the KPR-308 slice.
+  dispatcher.setOutageStateProvider(() => false);
+
+  // KPR-307: honest outage behavior — durable outage queue + episode tracker
+  // + 15s replay poller. enabled:false = interception fully off (independent
+  // kill-switch from the breaker's; behavior identical to post-KPR-306 raw
+  // error surfacing).
+  let outageReplayProcessor: OutageReplayProcessor | undefined;
+  if (config.outageQueue.enabled) {
+    const outageStore = new OutageQueueStore(db.collection<OutageQueueDoc>("outage_queue"));
+    await outageStore.ensureIndexes();
+    dispatcher.setOutageHandling({
+      store: outageStore,
+      episodes: new OutageEpisodeTracker(),
+      config: config.outageQueue,
+    });
+    outageReplayProcessor = new OutageReplayProcessor(outageStore, dispatcher, config.outageQueue);
+    outageReplayProcessor.start();
+    log.info("Outage queue enabled", {
+      replayIntervalMs: config.outageQueue.replayIntervalMs,
+      maxDepth: config.outageQueue.maxDepth,
+    });
+  }
+
   const slackAdapters = [slackAdapter];
   const slackGateways = [slack];
 
@@ -803,11 +844,13 @@ async function main(): Promise<void> {
     if (wsAdapter) await wsAdapter.stop();
     voiceAdapter?.stop();
     scheduler.stop();
+    outageReplayProcessor?.stop();
     await bgTaskManager.stop();
     await codeTaskManager.stop();
     await prefetcher?.close();
     meetingMonitor?.stop();
     spawnCoordinatorHeartbeat.stop();
+    circuitBreakerHeartbeat.stop();
     memoryLifecycleHeartbeat.stop();
     dbIdentityMonitor.stop();
     agentManager.stopAll(); // Note: doesn't await in-flight turns — some final records may not reach the buffer

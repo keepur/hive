@@ -31,3 +31,20 @@ export interface ChannelAdapter {
   /** Optional: processing complete, clear indicators */
   onProcessingEnd?(item: WorkItem, agentId: string): Promise<void>;
 }
+
+/**
+ * KPR-308: adapters that can broadcast a WorkResult to every currently
+ * connected client, with no per-device routing. Used by the dispatcher's
+ * outage-mode delivery preference for diverted items that carry no
+ * meta.deviceId (scheduler/Slack-sourced agent output).
+ *
+ * Returns the number of connections the frame was delivered to — 0 means
+ * "not delivered"; callers must fall through to their normal delivery path.
+ */
+export interface BroadcastCapableAdapter extends ChannelAdapter {
+  deliverBroadcast(result: WorkResult): Promise<number>;
+}
+
+export function isBroadcastCapable(adapter: ChannelAdapter): adapter is BroadcastCapableAdapter {
+  return typeof (adapter as Partial<BroadcastCapableAdapter>).deliverBroadcast === "function";
+}

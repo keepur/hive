@@ -375,6 +375,128 @@ export async function spawnCoordinatorStatsForDoctor(uri: string, dbName: string
 }
 
 /**
+ * KPR-306: per-provider circuit-breaker snapshot row from `telemetry`
+ * (kind=circuit_breaker_stats heartbeat). Informational only — D4.
+ */
+export interface CircuitBreakerRow {
+  provider: string;
+  state: "closed" | "open" | "half-open";
+  enabled: boolean;
+  reason: string | null;
+  consecutiveHardFaults: number;
+  tripCount: number;
+  lastTripAt: number | null;
+  fastFailCount: number;
+  lastFaultMessage: string | null;
+  p95Ms: number | null;
+  sampleCount: number;
+  probeInFlight: boolean;
+  openedAt: number | null;
+  nextProbeEligibleAt: number | null;
+  /** Seconds since the engine last wrote this doc; null if no doc found yet. */
+  staleSeconds: number | null;
+}
+
+/**
+ * Read-only doctor adapter for `kind="circuit_breaker_stats"` heartbeat docs.
+ * Mirrors `spawnCoordinatorStatsForDoctor` — short-lived MongoClient,
+ * defaults for missing fields, empty array on error, sorted by provider.
+ */
+export async function circuitBreakerStatsForDoctor(uri: string, dbName: string): Promise<CircuitBreakerRow[]> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const docs = await client
+      .db(dbName)
+      .collection("telemetry")
+      .find<{
+        provider?: string;
+        state?: "closed" | "open" | "half-open";
+        enabled?: boolean;
+        reason?: string | null;
+        consecutiveHardFaults?: number;
+        tripCount?: number;
+        lastTripAt?: number | null;
+        fastFailCount?: number;
+        lastFaultMessage?: string | null;
+        p95Ms?: number | null;
+        sampleCount?: number;
+        probeInFlight?: boolean;
+        openedAt?: number | null;
+        nextProbeEligibleAt?: number | null;
+        updatedAt?: Date;
+      }>({ kind: "circuit_breaker_stats" })
+      .toArray();
+    return docs
+      .filter((d) => typeof d.provider === "string")
+      .map((d) => {
+        const updatedAt = d.updatedAt instanceof Date ? d.updatedAt : null;
+        return {
+          provider: d.provider as string,
+          state: d.state ?? "closed",
+          enabled: d.enabled ?? true,
+          reason: d.reason ?? null,
+          consecutiveHardFaults: d.consecutiveHardFaults ?? 0,
+          tripCount: d.tripCount ?? 0,
+          lastTripAt: d.lastTripAt ?? null,
+          fastFailCount: d.fastFailCount ?? 0,
+          lastFaultMessage: d.lastFaultMessage ?? null,
+          p95Ms: d.p95Ms ?? null,
+          sampleCount: d.sampleCount ?? 0,
+          probeInFlight: d.probeInFlight ?? false,
+          openedAt: d.openedAt ?? null,
+          nextProbeEligibleAt: d.nextProbeEligibleAt ?? null,
+          staleSeconds: updatedAt ? Math.round((Date.now() - updatedAt.getTime()) / 1000) : null,
+        };
+      })
+      .sort((a, b) => a.provider.localeCompare(b.provider));
+  } catch {
+    return [];
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+/**
+ * KPR-307: outage-queue snapshot. Direct collection read — the queue is
+ * durable, so unlike the breaker no heartbeat proxy is needed. Returns null
+ * when Mongo is unreachable.
+ */
+export interface OutageQueueStats {
+  pending: number;
+  replaying: number;
+  oldestPendingAgeSeconds: number | null;
+  expired24h: number;
+  failed24h: number;
+}
+
+export async function outageQueueStatsForDoctor(uri: string, dbName: string): Promise<OutageQueueStats | null> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const collection = client.db(dbName).collection("outage_queue");
+    const dayAgo = new Date(Date.now() - 24 * 3600_000);
+    const [pending, replaying, expired24h, failed24h, oldest] = await Promise.all([
+      collection.countDocuments({ status: "pending" }),
+      collection.countDocuments({ status: "replaying" }),
+      collection.countDocuments({ status: "expired", doneAt: { $gte: dayAgo } }),
+      collection.countDocuments({ status: "failed", doneAt: { $gte: dayAgo } }),
+      collection.find<{ enqueuedAt?: Date }>({ status: "pending" }).sort({ enqueuedAt: 1 }).limit(1).toArray(),
+    ]);
+    const oldestDoc = oldest[0];
+    const oldestPendingAgeSeconds =
+      oldestDoc?.enqueuedAt instanceof Date ? Math.round((Date.now() - oldestDoc.enqueuedAt.getTime()) / 1000) : null;
+    return { pending, replaying, oldestPendingAgeSeconds, expired24h, failed24h };
+  } catch {
+    return null;
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+/**
  * KPR-241: per-agent memory lifecycle snapshot row from `telemetry`
  * (kind=memory_lifecycle_stats heartbeat).
  *

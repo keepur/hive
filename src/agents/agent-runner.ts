@@ -138,6 +138,7 @@ export interface RunResult {
   preCompactTokens?: number; // Token count before last compaction (from compact_metadata.pre_tokens)
   error?: string;
   aborted?: boolean;
+  timedOut?: boolean; // KPR-306: deadline fired; distinguishes timeout-abort from operator abort
 }
 
 /**
@@ -1809,12 +1810,24 @@ export class AgentRunner {
     let activeToolName: string | null = null;
 
     const timeoutMs = resourceLimits?.timeoutMs ?? this.agentConfig.timeoutMs ?? 300_000; // 5 min default
+    // KPR-306: stamp timedOut ONLY when the deadline actually cancels an
+    // active query — mirrors abort()'s own null guard. The gap this closes:
+    // an operator abort() nulls activeQuery immediately, BEFORE the in-flight
+    // try/finally has cleared this timer; an unguarded late deadline fire
+    // would then mislabel the operator abort as a timeout fault. (The
+    // result-tail converse is not a race: clearTimeout(deadline) and
+    // activeQuery = null run back-to-back, synchronously, in send()'s
+    // finally.)
+    let timedOut = false;
     const deadline = setTimeout(() => {
-      log.warn("Agent query timed out, aborting", {
-        agent: this.agentConfig.id,
-        timeoutMs,
-      });
-      this.abort();
+      if (this.activeQuery) {
+        timedOut = true;
+        log.warn("Agent query timed out, aborting", {
+          agent: this.agentConfig.id,
+          timeoutMs,
+        });
+        this.abort();
+      }
     }, timeoutMs);
 
     try {
@@ -2016,6 +2029,7 @@ export class AgentRunner {
       ephemeral5mTokens, ephemeral1hTokens,
       contextWindow, compactions, preCompactTokens,
       error, aborted: this._aborted,
+      ...(timedOut ? { timedOut: true } : {}),
     };
   }
 

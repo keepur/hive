@@ -18,6 +18,12 @@ export interface AgentConfig {
   passiveChannels: string[];
   keywords: string[];
   isDefault: boolean;
+  /**
+   * KPR-308: outage-mode delivery preference (see AgentDefinition.floorCritical).
+   * Always a strict boolean after toAgentConfig projection; optional on the
+   * type so hand-built configs (tests, fixtures) don't churn.
+   */
+  floorCritical?: boolean;
   schedule: AgentSchedule[];
   budgetUsd: number;
   maxTurns: number;
