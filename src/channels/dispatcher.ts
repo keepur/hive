@@ -429,14 +429,22 @@ export class Dispatcher {
     // Review advisory: error-carrying results always deliver via the source
     // adapter — no error frames on the floor broadcast.
     if (result.error) return false;
-    if (!this.outageStateProvider()) return false;
-    const sourceKind = result.workItem.source.kind;
-    if (sourceKind !== "slack" && sourceKind !== "scheduler") return false;
-    if (this.registry.get(result.agentId)?.floorCritical !== true) return false;
-    const wsAdapter = this.adapters.get("ws");
-    if (!wsAdapter || !isBroadcastCapable(wsAdapter)) return false;
 
+    // The entire guard chain — provider probe, source/floorCritical checks, and
+    // the broadcast — runs inside one try so that ANY synchronous throw (not
+    // just a broadcast rejection) falls through to the normal source-adapter
+    // path, honoring this method's documented "any failure ... falls through"
+    // contract. This matters once KPR-306's real breaker state is wired into
+    // outageStateProvider(): a throwing provider must never surface as a
+    // "Something went wrong" error on an otherwise-successful agent turn.
     try {
+      if (!this.outageStateProvider()) return false;
+      const sourceKind = result.workItem.source.kind;
+      if (sourceKind !== "slack" && sourceKind !== "scheduler") return false;
+      if (this.registry.get(result.agentId)?.floorCritical !== true) return false;
+      const wsAdapter = this.adapters.get("ws");
+      if (!wsAdapter || !isBroadcastCapable(wsAdapter)) return false;
+
       const delivered = await wsAdapter.deliverBroadcast(result);
       if (delivered === 0) {
         log.info("Outage diversion: no connected devices, falling through", {
@@ -453,7 +461,7 @@ export class Dispatcher {
       });
       return true;
     } catch (err) {
-      log.warn("Outage diversion: broadcast failed, falling through", {
+      log.warn("Outage diversion: guard/broadcast failed, falling through", {
         agentId: result.agentId,
         error: String(err),
       });

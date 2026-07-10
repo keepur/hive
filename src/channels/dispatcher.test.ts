@@ -1553,6 +1553,25 @@ describe("outage-mode delivery preference (KPR-308)", () => {
     expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
   });
 
+  it("falls through to the source adapter when the outage-state provider itself throws (review r2)", async () => {
+    // Guards the KPR-306 hand-off: once a real breaker-state probe is wired into
+    // the provider, a throw from it must fall through to normal delivery, not
+    // propagate out of deliverAgentResult and turn a good turn into an error.
+    dispatcher.setOutageStateProvider(() => {
+      throw new Error("breaker probe exploded");
+    });
+    await expect(dispatcher.dispatch(makeSchedulerSynthItem())).resolves.not.toThrow();
+    expect(wsAdapter.deliverBroadcast).not.toHaveBeenCalled();
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+    // The successful agent turn is delivered verbatim — NOT converted into a
+    // "Something went wrong" error frame by handleTurnFailure. Pre-fix, the
+    // throw escaped tryOutageDiversion and did exactly that.
+    const delivered = slackAdapter.deliver.mock.calls[0][0];
+    expect(delivered.agentId).toBe("floor-agent");
+    expect(delivered.error).toBeUndefined();
+    expect(delivered.text).toBe("turn response");
+  });
+
   it("falls through when no ws adapter is registered", async () => {
     const bare = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
     bare.registerAdapter(slackAdapter as any);
