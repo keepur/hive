@@ -182,6 +182,18 @@ describe("WsAdapter.buildAgentList()", () => {
     const result = (adapter as any).buildAgentList();
     expect(result[0].title).toBeNull();
   });
+
+  it("exposes floorCritical, defaulting false", () => {
+    const flagged = makeAgent({ id: "floor", floorCritical: true });
+    const plain = makeAgent({ id: "plain" });
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([flagged, plain]) },
+      { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
+    );
+    const result = (adapter as any).buildAgentList();
+    expect(result.find((a: any) => a.id === "floor").floorCritical).toBe(true);
+    expect(result.find((a: any) => a.id === "plain").floorCritical).toBe(false);
+  });
 });
 
 describe("WsAdapter upgrade handler", () => {
@@ -924,5 +936,97 @@ describe("WsAdapter buffering on disconnect (KPR-223 coverage migration)", () =>
     expect(sent).toHaveLength(0);
     const pending = (adapter as any).pendingMessages as Map<string, any[]>;
     expect(pending.has("fresh-device")).toBe(false);
+  });
+});
+
+describe("WsAdapter.deliverBroadcast (KPR-308)", () => {
+  function makeResult(overrides: Record<string, any> = {}) {
+    return {
+      text: "outage update",
+      agentId: "floor-agent",
+      workItem: {
+        id: "sched-1",
+        text: "[Scheduled task]",
+        source: { kind: "slack", id: "agent-floor", label: "agent-floor" },
+        sender: "system",
+        timestamp: new Date(),
+        meta: { targetAgentId: "floor-agent" },
+      },
+      costUsd: 0,
+      durationMs: 0,
+      ...overrides,
+    } as any;
+  }
+
+  function fakeSocket(readyState: number) {
+    return { readyState, send: vi.fn() } as any;
+  }
+
+  it("sends the standard message frame to every open connection and returns the count", async () => {
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([]), get: vi.fn().mockReturnValue({ name: "Floor Agent" }) },
+      { getState: vi.fn(), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
+    );
+    const wsA = fakeSocket(1); // WebSocket.OPEN
+    const wsB = fakeSocket(1);
+    (adapter as any).connections.set("dev-a", wsA);
+    (adapter as any).connections.set("dev-b", wsB);
+
+    const count = await adapter.deliverBroadcast(makeResult());
+
+    expect(count).toBe(2);
+    for (const ws of [wsA, wsB]) {
+      expect(ws.send).toHaveBeenCalledTimes(1);
+      const frame = JSON.parse(ws.send.mock.calls[0][0]);
+      expect(frame).toMatchObject({
+        type: "message",
+        text: "outage update",
+        agentId: "floor-agent",
+        agentName: "Floor Agent",
+        replyTo: "sched-1",
+      });
+    }
+  });
+
+  it("skips non-open sockets and does not count them", async () => {
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([]), get: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn(), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
+    );
+    const open = fakeSocket(1);
+    const closed = fakeSocket(3); // WebSocket.CLOSED
+    (adapter as any).connections.set("dev-open", open);
+    (adapter as any).connections.set("dev-closed", closed);
+
+    const count = await adapter.deliverBroadcast(makeResult());
+
+    expect(count).toBe(1);
+    expect(open.send).toHaveBeenCalledTimes(1);
+    expect(closed.send).not.toHaveBeenCalled();
+  });
+
+  it("returns 0 with no connections and never touches pendingMessages", async () => {
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([]), get: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn(), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
+    );
+
+    const count = await adapter.deliverBroadcast(makeResult());
+
+    expect(count).toBe(0);
+    expect((adapter as any).pendingMessages.size).toBe(0);
+  });
+
+  it("falls back to agent id when the agent is missing from the registry", async () => {
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([]), get: vi.fn().mockReturnValue(undefined) },
+      { getState: vi.fn(), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
+    );
+    const ws = fakeSocket(1);
+    (adapter as any).connections.set("dev-a", ws);
+
+    await adapter.deliverBroadcast(makeResult());
+
+    expect(JSON.parse(ws.send.mock.calls[0][0]).agentName).toBe("floor-agent");
   });
 });

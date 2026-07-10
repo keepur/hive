@@ -746,6 +746,14 @@ async function main(): Promise<void> {
   });
   dispatcher.setRetryQueue(retryQueue);
 
+  // KPR-308: outage-mode delivery-preference seam (spec §5.3). Explicitly
+  // dormant — this call is the documented wiring point for KPR-306's
+  // provider-circuit breaker. Replacing the stub with the breaker-state
+  // surface KPR-306 exports (sync getter or cached snapshot — the seam
+  // absorbs either) is a LATER integration step, possibly in KPR-306's or
+  // KPR-307's lane, NOT part of the KPR-308 slice.
+  dispatcher.setOutageStateProvider(() => false);
+
   // KPR-307: honest outage behavior — durable outage queue + episode tracker
   // + 15s replay poller. enabled:false = interception fully off (independent
   // kill-switch from the breaker's; behavior identical to post-KPR-306 raw

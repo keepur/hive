@@ -1,6 +1,7 @@
 import { createLogger } from "../logging/logger.js";
 import type { WorkItem, WorkResult } from "../types/work-item.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
+import { isBroadcastCapable } from "./channel-adapter.js";
 import type { AgentManager, TurnContext, TurnResult, SpawnTurnStreamCallback } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
@@ -53,6 +54,14 @@ interface ResolvedAgent {
 }
 
 /**
+ * KPR-308 §5.3: breaker dependency seam. `true` = outage mode active.
+ * The dispatcher must NOT import KPR-306's breaker implementation — index.ts
+ * wires whatever surface KPR-306 exports into this one-function seam, in a
+ * later integration step. Until then the stub default keeps the slice dormant.
+ */
+export type OutageStateProvider = () => boolean;
+
+/**
  * KPR-307: honest-outage handling seam. Injected via `setOutageHandling`
  * only when `config.outageQueue.enabled` is true; when absent every outage
  * path in the dispatcher is dormant and behavior is identical to post-KPR-306
@@ -79,6 +88,7 @@ export class Dispatcher {
   private fallbackAuditChannelId?: string;
   private taskLedger?: TaskLedger;
   private retryQueue?: RetryQueue;
+  private outageStateProvider: OutageStateProvider = () => false;
   private outage?: OutageHandlingDeps;
   private teamStore?: import("../team/team-store.js").TeamStore;
   private slackAdapter?: SlackAdapter;
@@ -108,6 +118,10 @@ export class Dispatcher {
 
   setRetryQueue(queue: RetryQueue): void {
     this.retryQueue = queue;
+  }
+
+  setOutageStateProvider(fn: OutageStateProvider): void {
+    this.outageStateProvider = fn;
   }
 
   /**
@@ -309,14 +323,7 @@ export class Dispatcher {
           error: runResult.error,
         };
 
-        if (adapter) {
-          try {
-            await adapter.deliver(workResult);
-          } catch (err) {
-            log.warn("Agent response delivery failed, queuing for retry", { error: String(err) });
-            this.retryQueue?.enqueue(workResult, adapter);
-          }
-        }
+        await this.deliverAgentResult(workResult, adapter);
 
         if (tracked) {
           this.taskLedger!.onComplete(workResult).catch((err) =>
@@ -402,6 +409,80 @@ export class Dispatcher {
       aborted: turn.aborted ?? false,
       timedOut: turn.timedOut,
     };
+  }
+
+  /**
+   * KPR-308 §5.2: outage-mode delivery preference. Applied at both agent-
+   * response delivery sites before the source adapter is used. Diverts to a
+   * WS broadcast only when ALL hold: the result carries no error; outage mode
+   * active; the handling agent is floorCritical; the item is slack- or
+   * scheduler-sourced (app/team/sms replies already route correctly and must
+   * never divert); the ws adapter is registered and broadcast-capable; and at
+   * least one device is connected (deliverBroadcast's returned count is the
+   * authoritative check — no redundant connectionCount pre-check). Any
+   * failure or zero-count falls through to the normal source-adapter path.
+   *
+   * The "scheduler" leg is defensive: ChannelKind includes it, but nothing
+   * produces it today — the scheduler synthesizes kind:"slack" sources.
+   */
+  private async tryOutageDiversion(result: WorkResult): Promise<boolean> {
+    // Review advisory: error-carrying results always deliver via the source
+    // adapter — no error frames on the floor broadcast.
+    if (result.error) return false;
+
+    // The entire guard chain — provider probe, source/floorCritical checks, and
+    // the broadcast — runs inside one try so that ANY synchronous throw (not
+    // just a broadcast rejection) falls through to the normal source-adapter
+    // path, honoring this method's documented "any failure ... falls through"
+    // contract. This matters once KPR-306's real breaker state is wired into
+    // outageStateProvider(): a throwing provider must never surface as a
+    // "Something went wrong" error on an otherwise-successful agent turn.
+    try {
+      if (!this.outageStateProvider()) return false;
+      const sourceKind = result.workItem.source.kind;
+      if (sourceKind !== "slack" && sourceKind !== "scheduler") return false;
+      if (this.registry.get(result.agentId)?.floorCritical !== true) return false;
+      const wsAdapter = this.adapters.get("ws");
+      if (!wsAdapter || !isBroadcastCapable(wsAdapter)) return false;
+
+      const delivered = await wsAdapter.deliverBroadcast(result);
+      if (delivered === 0) {
+        log.info("Outage diversion: no connected devices, falling through", {
+          agentId: result.agentId,
+          sourceKind,
+        });
+        return false;
+      }
+      // Log-redaction convention: agent id, source kind, count — no message text.
+      log.info("Outage diversion: delivered via app broadcast", {
+        agentId: result.agentId,
+        sourceKind,
+        connections: delivered,
+      });
+      return true;
+    } catch (err) {
+      log.warn("Outage diversion: guard/broadcast failed, falling through", {
+        agentId: result.agentId,
+        error: String(err),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * KPR-308: shared agent-response delivery for the two dispatch paths.
+   * Diversion guard first; otherwise the pre-existing source-adapter
+   * delivery with retry-queue semantics, unchanged.
+   */
+  private async deliverAgentResult(workResult: WorkResult, sourceAdapter: ChannelAdapter | undefined): Promise<void> {
+    if (await this.tryOutageDiversion(workResult)) return;
+    if (!sourceAdapter) return;
+    try {
+      await sourceAdapter.deliver(workResult);
+    } catch (err) {
+      log.warn("Agent response delivery failed, queuing for retry", { error: String(err) });
+      this.retryQueue?.enqueue(workResult, sourceAdapter);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -955,13 +1036,7 @@ export class Dispatcher {
           durationMs: runResult.durationMs,
           error: runResult.error,
         };
-        if (adapter) {
-          try {
-            await adapter.deliver(workResult);
-          } catch (err) {
-            this.retryQueue?.enqueue(workResult, adapter);
-          }
-        }
+        await this.deliverAgentResult(workResult, adapter);
 
         // Conference mode: trigger depth-1 peer reactions
         if (resolved.conferenceMode && resolved.conferenceRound === 0 && !isNonResponse) {

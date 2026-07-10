@@ -89,6 +89,16 @@ function makeMockRegistry() {
     homeBase: "agent-sige",
     isDefault: false,
   });
+  agents.set("floor-agent", {
+    id: "floor-agent",
+    name: "Floory",
+    channels: ["agent-floor"],
+    passiveChannels: [],
+    keywords: [],
+    homeBase: "agent-floor",
+    isDefault: false,
+    floorCritical: true,
+  });
 
   return {
     get: (id: string) => agents.get(id),
@@ -1432,5 +1442,205 @@ describe("outage interception (KPR-307)", () => {
     expect(store.enqueue).not.toHaveBeenCalled();
     expect(adapter.deliver).toHaveBeenCalledTimes(1);
     expect(adapter.deliver.mock.calls[0][0].text).toContain("Something went wrong");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KPR-308 — outage-mode delivery preference
+// ---------------------------------------------------------------------------
+
+describe("outage-mode delivery preference (KPR-308)", () => {
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let agentManager: ReturnType<typeof makeMockAgentManager>;
+  let healthReporter: ReturnType<typeof makeMockHealthReporter>;
+  let slackAdapter: ReturnType<typeof makeMockAdapter>;
+  let wsAdapter: ReturnType<typeof makeMockAdapter> & { deliverBroadcast: ReturnType<typeof vi.fn> };
+  let dispatcher: Dispatcher;
+
+  function makeSchedulerSynthItem(agentId = "floor-agent"): WorkItem {
+    // Mirrors scheduler.ts synthesis: slack-kind source, meta.targetAgentId.
+    return makeWorkItem({
+      source: { kind: "slack", id: "agent-floor", label: "agent-floor" },
+      sender: "system",
+      threadId: `scheduler:${agentId}:task:${Date.now()}-${workItemCounter}`,
+      meta: { targetAgentId: agentId },
+    });
+  }
+
+  beforeEach(() => {
+    registry = makeMockRegistry();
+    agentManager = makeMockAgentManager();
+    healthReporter = makeMockHealthReporter();
+    slackAdapter = makeMockAdapter();
+    wsAdapter = {
+      ...makeMockAdapter(),
+      id: "ws",
+      kind: "app" as const,
+      deliverBroadcast: vi.fn().mockResolvedValue(1),
+    };
+    dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
+    dispatcher.registerAdapter(slackAdapter as any);
+    dispatcher.registerAdapter(wsAdapter as any);
+  });
+
+  it("does not divert when the provider reports no outage (dormant default)", async () => {
+    await dispatcher.dispatch(makeSchedulerSynthItem());
+    expect(wsAdapter.deliverBroadcast).not.toHaveBeenCalled();
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("diverts a floor-critical agent's slack-sourced item to the broadcast during an outage", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    await dispatcher.dispatch(makeSchedulerSynthItem());
+    expect(wsAdapter.deliverBroadcast).toHaveBeenCalledTimes(1);
+    expect(wsAdapter.deliverBroadcast.mock.calls[0][0].agentId).toBe("floor-agent");
+    expect(slackAdapter.deliver).not.toHaveBeenCalled();
+  });
+
+  it("diverts the defensive scheduler source kind (type-union branch; no live producer today)", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    const item = makeWorkItem({
+      source: { kind: "scheduler", id: "agent-floor", label: "agent-floor" },
+      meta: { targetAgentId: "floor-agent" },
+    });
+    await dispatcher.dispatch(item);
+    expect(wsAdapter.deliverBroadcast).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not divert non-floor-critical agents during an outage", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    await dispatcher.dispatch(makeSchedulerSynthItem("jasper"));
+    expect(wsAdapter.deliverBroadcast).not.toHaveBeenCalled();
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("never diverts app-sourced replies (source-keyed round-trip untouched)", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    const item = makeWorkItem({
+      source: { kind: "app", id: "dev-1", label: "app:Shop", adapterId: "ws" },
+      meta: { targetAgentId: "floor-agent", deviceId: "dev-1" },
+    });
+    await dispatcher.dispatch(item);
+    expect(wsAdapter.deliverBroadcast).not.toHaveBeenCalled();
+    expect(wsAdapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("never diverts sms-sourced items (an SMS user is not on the shop floor)", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
+    dispatcher.registerAdapter(smsAdapter as any);
+    const item = makeWorkItem({
+      source: { kind: "sms", id: "+15550001111", label: "sms" },
+      meta: { targetAgentId: "floor-agent" },
+    });
+    await dispatcher.dispatch(item);
+    expect(wsAdapter.deliverBroadcast).not.toHaveBeenCalled();
+    expect(smsAdapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls through to the source adapter when the broadcast reaches zero devices", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    wsAdapter.deliverBroadcast.mockResolvedValue(0);
+    await dispatcher.dispatch(makeSchedulerSynthItem());
+    expect(wsAdapter.deliverBroadcast).toHaveBeenCalledTimes(1);
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls through to the source adapter when the broadcast throws", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    wsAdapter.deliverBroadcast.mockRejectedValue(new Error("boom"));
+    await dispatcher.dispatch(makeSchedulerSynthItem());
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls through to the source adapter when the outage-state provider itself throws (review r2)", async () => {
+    // Guards the KPR-306 hand-off: once a real breaker-state probe is wired into
+    // the provider, a throw from it must fall through to normal delivery, not
+    // propagate out of deliverAgentResult and turn a good turn into an error.
+    dispatcher.setOutageStateProvider(() => {
+      throw new Error("breaker probe exploded");
+    });
+    await expect(dispatcher.dispatch(makeSchedulerSynthItem())).resolves.not.toThrow();
+    expect(wsAdapter.deliverBroadcast).not.toHaveBeenCalled();
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+    // The successful agent turn is delivered verbatim — NOT converted into a
+    // "Something went wrong" error frame by handleTurnFailure. Pre-fix, the
+    // throw escaped tryOutageDiversion and did exactly that.
+    const delivered = slackAdapter.deliver.mock.calls[0][0];
+    expect(delivered.agentId).toBe("floor-agent");
+    expect(delivered.error).toBeUndefined();
+    expect(delivered.text).toBe("turn response");
+  });
+
+  it("falls through when no ws adapter is registered", async () => {
+    const bare = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
+    bare.registerAdapter(slackAdapter as any);
+    bare.setOutageStateProvider(() => true);
+    await bare.dispatch(makeSchedulerSynthItem());
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("existing retry-queue semantics survive the fall-through path", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    wsAdapter.deliverBroadcast.mockResolvedValue(0);
+    slackAdapter.deliver.mockRejectedValue(new Error("slack down"));
+    const retryQueue = { enqueue: vi.fn() };
+    dispatcher.setRetryQueue(retryQueue as any);
+    await dispatcher.dispatch(makeSchedulerSynthItem());
+    expect(retryQueue.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it("never diverts a result carrying an error, even when every other condition holds (review advisory)", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    agentManager.runWorkItemTurn.mockResolvedValueOnce({
+      finalMessage: "partial output before the failure",
+      newSessionId: "s2",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 0,
+        costUsd: 0.01,
+        durationMs: 800,
+      },
+      errors: ["tool call failed"],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+    });
+    await dispatcher.dispatch(makeSchedulerSynthItem());
+    expect(wsAdapter.deliverBroadcast).not.toHaveBeenCalled();
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+    expect(slackAdapter.deliver.mock.calls[0][0].error).toBe("tool call failed");
+  });
+
+  it("fan-out path (dispatchToAgent, site 2): floor-critical agent's reply diverts to broadcast, the other delivers normally", async () => {
+    dispatcher.setOutageStateProvider(() => true);
+    const item = makeWorkItem({ text: "Floory, and Jasper, coordinate on this" });
+    await dispatcher.dispatch(item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    expect(wsAdapter.deliverBroadcast).toHaveBeenCalledTimes(1);
+    expect(wsAdapter.deliverBroadcast.mock.calls[0][0].agentId).toBe("floor-agent");
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+    expect(slackAdapter.deliver.mock.calls[0][0].agentId).toBe("jasper");
+  });
+});
+
+describe("BroadcastCapableAdapter seam contract (KPR-308)", () => {
+  it("a real WsAdapter instance satisfies isBroadcastCapable; a bare mock does not", async () => {
+    const { isBroadcastCapable } = await import("./channel-adapter.js");
+    const { WsAdapter } = await import("./ws/ws-adapter.js");
+    const real = new WsAdapter(0, {
+      teamStore: {} as any,
+      commandRegistry: {} as any,
+      agentRegistry: { getAll: vi.fn().mockReturnValue([]), get: vi.fn() } as any,
+      agentManager: { getState: vi.fn(), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) } as any,
+    });
+    expect(isBroadcastCapable(real)).toBe(true);
+    expect(isBroadcastCapable(makeMockAdapter() as any)).toBe(false);
   });
 });
