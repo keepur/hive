@@ -135,13 +135,17 @@ vi.mock("mongodb", () => {
   const findOne = vi.fn();
   const aggregate = vi.fn();
   const find = vi.fn();
-  const collection = vi.fn(() => ({ estimatedDocumentCount, findOne, aggregate, find }));
+  const countDocuments = vi.fn();
+  const collection = vi.fn(() => ({ estimatedDocumentCount, findOne, aggregate, find, countDocuments }));
   const command = vi.fn((cmd: unknown) => ping(cmd));
   const db = vi.fn(() => ({ command, collection }));
   const connect = vi.fn();
   const close = vi.fn();
   const MongoClient = vi.fn(() => ({ connect, db, close }));
-  return { MongoClient, __mocks: { connect, close, ping, estimatedDocumentCount, findOne, aggregate, find } };
+  return {
+    MongoClient,
+    __mocks: { connect, close, ping, estimatedDocumentCount, findOne, aggregate, find, countDocuments },
+  };
 });
 
 import * as mongodb from "mongodb";
@@ -324,6 +328,42 @@ describe("circuitBreakerStatsForDoctor (KPR-306)", () => {
   it("returns [] when the connection throws", async () => {
     mongoMocks.connect.mockRejectedValueOnce(new Error("ECONNREFUSED"));
     await expect(circuitBreakerStatsForDoctor("mongodb://x", "hive_test")).resolves.toEqual([]);
+  });
+});
+
+// ── outage queue (KPR-307) ───────────────────────────────────────────────
+
+import { outageQueueStatsForDoctor } from "./doctor-checks.js";
+
+describe("outageQueueStatsForDoctor (KPR-307)", () => {
+  beforeEach(() => {
+    mongoMocks.connect.mockReset().mockResolvedValue(undefined);
+    mongoMocks.close.mockReset().mockResolvedValue(undefined);
+    mongoMocks.countDocuments.mockReset();
+    mongoMocks.find.mockReset();
+  });
+
+  it("returns counts and oldest-pending age from the collection", async () => {
+    // countDocuments is called in order: pending, replaying, expired, failed.
+    mongoMocks.countDocuments
+      .mockResolvedValueOnce(3)
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(0)
+      .mockResolvedValueOnce(1);
+    // find().sort().limit().toArray() → one pending doc enqueued 2 min ago.
+    const enqueuedAt = new Date(Date.now() - 120_000);
+    mongoMocks.find.mockReturnValue({
+      sort: () => ({ limit: () => ({ toArray: async () => [{ enqueuedAt }] }) }),
+    });
+    const stats = await outageQueueStatsForDoctor("mongodb://localhost", "hive_test");
+    expect(stats).toMatchObject({ pending: 3, replaying: 1, expired24h: 0, failed24h: 1 });
+    expect(stats!.oldestPendingAgeSeconds).toBeGreaterThanOrEqual(119);
+  });
+
+  it("returns null when the connection fails", async () => {
+    mongoMocks.connect.mockReset().mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    const stats = await outageQueueStatsForDoctor("mongodb://down", "hive_test");
+    expect(stats).toBeNull();
   });
 });
 

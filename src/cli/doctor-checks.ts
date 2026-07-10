@@ -459,6 +459,44 @@ export async function circuitBreakerStatsForDoctor(uri: string, dbName: string):
 }
 
 /**
+ * KPR-307: outage-queue snapshot. Direct collection read — the queue is
+ * durable, so unlike the breaker no heartbeat proxy is needed. Returns null
+ * when Mongo is unreachable.
+ */
+export interface OutageQueueStats {
+  pending: number;
+  replaying: number;
+  oldestPendingAgeSeconds: number | null;
+  expired24h: number;
+  failed24h: number;
+}
+
+export async function outageQueueStatsForDoctor(uri: string, dbName: string): Promise<OutageQueueStats | null> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const collection = client.db(dbName).collection("outage_queue");
+    const dayAgo = new Date(Date.now() - 24 * 3600_000);
+    const [pending, replaying, expired24h, failed24h, oldest] = await Promise.all([
+      collection.countDocuments({ status: "pending" }),
+      collection.countDocuments({ status: "replaying" }),
+      collection.countDocuments({ status: "expired", doneAt: { $gte: dayAgo } }),
+      collection.countDocuments({ status: "failed", doneAt: { $gte: dayAgo } }),
+      collection.find<{ enqueuedAt?: Date }>({ status: "pending" }).sort({ enqueuedAt: 1 }).limit(1).toArray(),
+    ]);
+    const oldestDoc = oldest[0];
+    const oldestPendingAgeSeconds =
+      oldestDoc?.enqueuedAt instanceof Date ? Math.round((Date.now() - oldestDoc.enqueuedAt.getTime()) / 1000) : null;
+    return { pending, replaying, oldestPendingAgeSeconds, expired24h, failed24h };
+  } catch {
+    return null;
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+/**
  * KPR-241: per-agent memory lifecycle snapshot row from `telemetry`
  * (kind=memory_lifecycle_stats heartbeat).
  *

@@ -8,11 +8,13 @@ import {
   type PrefixCacheStatsRow,
   type SpawnCoordinatorRow,
   type CircuitBreakerRow,
+  type OutageQueueStats,
   type MemoryLifecycleRow,
   type DatastoreIdentityReport,
   brewServiceRunning,
   cacheHitRatesForDoctor,
   circuitBreakerStatsForDoctor,
+  outageQueueStatsForDoctor,
   commandExists,
   datastoreIdentityForDoctor,
   defaultAgentExists,
@@ -189,6 +191,35 @@ export function renderCircuitBreakerSection(
     if (r.state !== "closed" && r.lastFaultMessage) {
       emit(`    last fault: ${r.lastFaultMessage}`);
     }
+  }
+}
+
+/**
+ * KPR-307: informational outage-queue section (D4 — NEVER affects the exit
+ * code; identity-class incidents alone may fail the doctor). `anyBreakerOpen`
+ * comes from the circuit-breaker rows: pending items while every breaker is
+ * closed is the stuck-drain signal (§7.6).
+ */
+export function renderOutageQueueSection(
+  stats: OutageQueueStats | null,
+  anyBreakerOpen: boolean,
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nOutage queue (honest outage behavior)");
+  if (stats === null) {
+    emit("  ○ unavailable — mongo unreachable");
+    return;
+  }
+  if (stats.pending === 0 && stats.replaying === 0 && stats.expired24h === 0 && stats.failed24h === 0) {
+    emit("  ○ empty — no queued outage turns");
+    return;
+  }
+  const oldest = stats.oldestPendingAgeSeconds === null ? "n/a" : `${stats.oldestPendingAgeSeconds}s`;
+  emit(
+    `  pending=${stats.pending} (oldest ${oldest}) replaying=${stats.replaying} expired(24h)=${stats.expired24h} failed(24h)=${stats.failed24h}`,
+  );
+  if (stats.pending > 0 && !anyBreakerOpen) {
+    emit("  ⚠ pending items while no breaker is open — replay drain may be stuck; check engine logs (outage-replay)");
   }
 }
 
@@ -669,6 +700,13 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // NEVER contributes to allPassed (D4).
     const breakerRows = await circuitBreakerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderCircuitBreakerSection(breakerRows);
+    // KPR-307: outage queue (informational — D4). Reuses the breaker rows
+    // already fetched above to derive the stuck-drain signal.
+    const outageStats = await outageQueueStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+    renderOutageQueueSection(
+      outageStats,
+      breakerRows.some((r) => r.state === "open"),
+    );
     // KPR-241: memory lifecycle per-agent stats.
     const memoryRows = await memoryLifecycleStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderMemoryLifecycleSection(memoryRows, console.log, config.memory.spendWarnThresholdUsd ?? 5);
@@ -682,6 +720,8 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     console.log("\nSpawn coordinator (live engine, per agent)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nProvider circuit breakers (live engine, per provider)");
+    console.log("  ○ skipped: config not loaded");
+    console.log("\nOutage queue (honest outage behavior)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nMemory lifecycle: skipped (config not loaded)");
   }
