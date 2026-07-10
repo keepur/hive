@@ -30,7 +30,7 @@ import {
 } from "./provider-adapters/codex-subscription-adapter.js";
 import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
-import type { AgentProviderAdapter } from "./provider-adapters/types.js";
+import type { AgentProviderAdapter, AgentProviderId } from "./provider-adapters/types.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
 
@@ -122,6 +122,15 @@ export interface TurnResult {
   preCompactTokens?: number;
   ephemeral5mTokens?: number;
   ephemeral1hTokens?: number;
+  /**
+   * KPR-307: propagated from RunResult.timedOut (KPR-306 — runner deadline
+   * fired). Consumed by the dispatcher's post-turn outage gate: a hang-type
+   * timeout leaves `errors` empty (the abort path returns before a provider
+   * error string is captured), so the flag is the only signal.
+   */
+  timedOut?: boolean;
+  /** KPR-307: propagated from RunResult.aborted (operator abort or deadline abort). */
+  aborted?: boolean;
 }
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
@@ -524,6 +533,18 @@ export class AgentManager {
     };
 
     return this.spawnTurn(ctx, onStream);
+  }
+
+  /**
+   * KPR-307: the provider an agent's turns route to — additive read-only
+   * surface for the dispatcher's post-turn outage gate. One-liner over the
+   * same resolveProviderModel the KPR-306 wrap point uses, so dispatcher and
+   * breaker always agree on the provider key.
+   */
+  providerFor(agentId: string): AgentProviderId | null {
+    const agentConfig = this.registry.get(agentId);
+    if (!agentConfig) return null;
+    return resolveProviderModel(agentConfig.model).provider;
   }
 
   /**
@@ -1243,6 +1264,8 @@ export class AgentManager {
       preCompactTokens: result.preCompactTokens,
       ephemeral5mTokens: result.ephemeral5mTokens,
       ephemeral1hTokens: result.ephemeral1hTokens,
+      timedOut: result.timedOut,
+      aborted: result.aborted,
     };
   }
 
