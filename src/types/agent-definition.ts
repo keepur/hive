@@ -28,6 +28,15 @@ export interface AgentDefinition {
   passiveChannels: string[];
   keywords: string[];
   isDefault: boolean;
+  /**
+   * KPR-308: outage-mode delivery preference. When true and the dispatcher's
+   * outage-state provider reports an active outage, this agent's slack/
+   * scheduler-sourced output is diverted to the app (WS) channel via
+   * broadcast so the shop floor keeps receiving it while the WAN is down.
+   * Optional on the doc; projected to a strict boolean (default false) by
+   * toAgentConfig — liberal-loader pattern, garbage coerces to false.
+   */
+  floorCritical?: boolean;
 
   // Capabilities
   coreServers: string[];
@@ -130,6 +139,8 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     passiveChannels: doc.passiveChannels ?? AGENT_DEFINITION_DEFAULTS.passiveChannels,
     keywords: doc.keywords ?? AGENT_DEFINITION_DEFAULTS.keywords,
     isDefault: doc.isDefault ?? false,
+    // KPR-308: strict-boolean coercion — absent/garbage → false (spec §5.7).
+    floorCritical: doc.floorCritical === true,
     schedule: doc.schedule ?? AGENT_DEFINITION_DEFAULTS.schedule,
     budgetUsd: doc.budgetUsd ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
     maxTurns: doc.maxTurns ?? AGENT_DEFINITION_DEFAULTS.maxTurns,
