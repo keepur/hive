@@ -4,6 +4,8 @@ import type { ServerResponse } from "node:http";
 import { VoiceAdapter, isAuthError } from "./voice-adapter.js";
 import type { OpenAIChatRequest } from "./openai-translator.js";
 import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
+import { ProviderCircuitOpenError } from "../../agents/provider-circuit-breaker.js";
+import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../../outage/outage-notices.js";
 
 // ---------------------------------------------------------------------------
 // Mocks shared across the file
@@ -510,6 +512,61 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     expect(res.statusCode).toBe(503);
     const body = JSON.parse(res.written.join(""));
     expect(body.error).toBe("Voice unavailable");
+  });
+});
+
+describe("VoiceAdapter — provider circuit open (KPR-307)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function circuitOpenError() {
+    return new ProviderCircuitOpenError("claude" as never, Date.now(), 15_000, "connect-fail", "fetch failed");
+  }
+
+  it("non-streaming: speaks the outage notice as a 200 completion, not a generic 500", async () => {
+    const am = makeAgentManager();
+    am.spawnTurn.mockRejectedValue(circuitOpenError());
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["Content-Type"]).toBe("application/json");
+    const body = res.written.join("");
+    expect(body).toContain(VOICE_OUTAGE_SPOKEN_NOTICE);
+    expect(body).not.toContain("Internal error");
+  });
+
+  it("streaming: emits one SSE text chunk with the notice plus a done frame", async () => {
+    const am = makeAgentManager();
+    am.spawnTurn.mockRejectedValue(circuitOpenError());
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: true });
+
+    await callHandle(adapter, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["Content-Type"]).toBe("text/event-stream");
+    const written = res.written.join("");
+    expect(written).toContain(VOICE_OUTAGE_SPOKEN_NOTICE);
+    expect(written).toContain("[DONE]");
+  });
+
+  it("does NOT fire the outer resume-retry for circuit-open fast-fails", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValue("session-abc"); // resume present
+    am.spawnTurn.mockRejectedValue(circuitOpenError());
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
   });
 });
 
