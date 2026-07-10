@@ -539,7 +539,7 @@ export class Dispatcher {
       if (depth >= outage.config.maxDepth) {
         // §5-2f: honest about the drop — drop-oldest would silently break
         // promises already made to other threads.
-        log.warn("Outage queue at max depth — turn NOT queued", {
+        log.error("Outage queue at max depth — turn NOT queued", {
           depth,
           maxDepth: outage.config.maxDepth,
           agentId,

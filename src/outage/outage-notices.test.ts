@@ -68,8 +68,10 @@ describe("templates", () => {
   });
   it("terminal + expiry notices carry the operative facts", () => {
     expect(terminalFailureNotice(new Date())).toContain("could not be answered");
-    expect(expiryNotice(1)).toContain("1 earlier message from");
-    expect(expiryNotice(3)).toContain("3 earlier messages from");
+    expect(expiryNotice(1)).toContain("1 earlier message sent");
+    expect(expiryNotice(3)).toContain("3 earlier messages sent");
+    // No false recovery claim — expiry can fire mid-outage (§5-2c-ii).
+    expect(expiryNotice(1)).not.toContain("Service is back");
   });
   it("replayWrap: notify variant asks for a delay acknowledgment; silent variant is minimal", () => {
     const notify = replayWrap("original question", new Date(), "notify");

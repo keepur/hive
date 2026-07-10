@@ -65,9 +65,14 @@ export function terminalFailureNotice(enqueuedAt: Date): string {
   return `I still can't reach my AI service after several tries — your message from ${formatNoticeTime(enqueuedAt)} could not be answered. Please re-send it.`;
 }
 
-/** §5-2c-ii batched per-thread expiry notice, delivered at drain time. */
+/**
+ * §5-2c-ii batched per-thread expiry notice, delivered at drain time. No
+ * recovery claim: `expireOlderThan` runs on every poller tick regardless of
+ * breaker state, so a message can age out (past `maxAgeHours`) and get this
+ * notice while the outage is still ongoing — "service is back" would be a lie.
+ */
 export function expiryNotice(count: number): string {
-  return `Service is back — I couldn't get to ${count} earlier message${count === 1 ? "" : "s"} from during the outage. Please re-send anything still needed.`;
+  return `It's been a while since your message — I couldn't get to ${count} earlier message${count === 1 ? "" : "s"} sent during the outage. Please re-send anything still needed if it's still relevant.`;
 }
 
 /**

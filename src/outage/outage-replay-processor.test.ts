@@ -142,10 +142,10 @@ describe("OutageReplayProcessor (KPR-307 §7.4)", () => {
     expect(dispatcher.deliverOutageNotice).toHaveBeenCalledTimes(2);
     const texts = dispatcher.deliverOutageNotice.mock.calls.map((c: any[]) => c[3]);
     expect(texts).toContain(
-      "Service is back — I couldn't get to 2 earlier messages from during the outage. Please re-send anything still needed.",
+      "It's been a while since your message — I couldn't get to 2 earlier messages sent during the outage. Please re-send anything still needed if it's still relevant.",
     );
     expect(texts).toContain(
-      "Service is back — I couldn't get to 1 earlier message from during the outage. Please re-send anything still needed.",
+      "It's been a while since your message — I couldn't get to 1 earlier message sent during the outage. Please re-send anything still needed if it's still relevant.",
     );
   });
 
