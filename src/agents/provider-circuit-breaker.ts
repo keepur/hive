@@ -143,6 +143,14 @@ export class ProviderCircuitBreaker {
   private windowCursor = 0;
   private probe: InternalPermit | null = null;
   private probeStartedAt: number | null = null;
+  // Episode marker: epoch ms of the most recent half-open → closed
+  // transition. -Infinity for a breaker that has never tripped, so no
+  // permit issued at a real timestamp is ever rejected as cross-episode.
+  // record() uses this to distinguish a stale pre-trip permit (belongs to
+  // an already-resolved episode) from a genuine current-episode permit,
+  // even once the breaker's *state* has cycled back to "closed" — see
+  // record() for why the state check alone isn't sufficient.
+  private lastClosedAt = -Infinity;
 
   constructor(
     readonly provider: AgentProviderId,
@@ -213,7 +221,12 @@ export class ProviderCircuitBreaker {
    * Record the outcome of a permitted turn. Idempotent per permit. Only the
    * designated half-open probe's outcome drives half-open transitions; late
    * permits (acquired closed, finishing after a trip) feed lastFault*
-   * telemetry only and never transition state.
+   * telemetry only and never transition state. Permits that outlive a full
+   * trip→recover cycle (issued before the breaker's most recent close) are
+   * likewise telemetry-only even though the breaker is "closed" again by
+   * the time they resolve — otherwise a stale cohort of pre-trip turns can
+   * re-pollute the freshly reset streak/p95 window and flap a recovered
+   * provider back open.
    */
   record(permit: TurnPermit, classification: TurnClassification, llmMs: number): void {
     const p = permit as InternalPermit;
@@ -235,6 +248,15 @@ export class ProviderCircuitBreaker {
     }
 
     if (this.state !== "closed") return; // late permit — telemetry only
+
+    // Episode gate: a permit issued before the breaker's most recent close
+    // belongs to a prior (already-resolved) episode — a late hard-fault or
+    // success from a stale pre-trip cohort must not feed the current
+    // episode's streak or p95 window. Strict `<` so a permit issued at
+    // exactly lastClosedAt (same clock tick as the close) still counts as
+    // current-episode. Never true for a breaker that hasn't tripped yet
+    // (lastClosedAt is -Infinity).
+    if (p.issuedAt < this.lastClosedAt) return; // cross-episode — telemetry only
 
     switch (classification.outcome) {
       case "success": {
@@ -369,6 +391,9 @@ export class ProviderCircuitBreaker {
     this.reason = null;
     this.consecutiveHardFaults = 0;
     this.backoffExponent = 0;
+    // Mark the episode boundary — record() uses this to reject stale
+    // pre-trip permits that resolve after recovery (cross-episode gate).
+    this.lastClosedAt = now;
     // Clear the window so pre-outage latencies can't instantly re-trip a
     // recovered provider.
     this.window = [];

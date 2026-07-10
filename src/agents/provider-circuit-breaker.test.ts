@@ -311,6 +311,77 @@ describe("ProviderCircuitBreaker — open / half-open / recovery", () => {
   });
 });
 
+describe("ProviderCircuitBreaker — cross-episode late records (post-recovery flapping guard)", () => {
+  it("late hard-fault records from a stale pre-trip cohort are ignored after trip→recover (flapping scenario in miniature)", () => {
+    const { registry, advance } = makeRegistry();
+    // A hang-type outage: these three turns were admitted while the breaker
+    // was still closed, but they don't resolve until well after recovery.
+    const stale1 = registry.acquire("claude");
+    const stale2 = registry.acquire("claude");
+    const stale3 = registry.acquire("claude");
+    // Trip the breaker via three unrelated, fresher permits.
+    registry.record(registry.acquire("claude"), hardFault(), 0);
+    registry.record(registry.acquire("claude"), hardFault(), 0);
+    registry.record(registry.acquire("claude"), hardFault(), 0);
+    expect(registry.stateFor("claude")!.state).toBe("open");
+    expect(registry.stateFor("claude")!.tripCount).toBe(1);
+    // Recover via a successful half-open probe.
+    advance(15_000);
+    registry.record(registry.acquire("claude"), success(), 100);
+    expect(registry.stateFor("claude")!.state).toBe("closed");
+    // The stale, pre-trip permits finally resolve as hard faults — a burst
+    // of exactly the trip threshold, from an already-resolved episode. Pre-
+    // fix these pass the `state !== "closed"` gate (state is closed again)
+    // and re-trip a healthy provider.
+    registry.record(stale1, hardFault(), 0);
+    registry.record(stale2, hardFault(), 0);
+    registry.record(stale3, hardFault(), 0);
+    const snap = registry.stateFor("claude")!;
+    expect(snap.state).toBe("closed");
+    expect(snap.consecutiveHardFaults).toBe(0);
+    expect(snap.tripCount).toBe(1); // unchanged — no re-open from stale evidence
+  });
+
+  it("late SUCCESS records from a stale pre-trip cohort do not seed the p95 window", () => {
+    const { registry, advance } = makeRegistry({
+      p95WindowSize: 5,
+      p95MinSamples: 3,
+      p95ThresholdMs: 1_000,
+    });
+    const stale = registry.acquire("claude"); // issued pre-trip, closed
+    registry.record(registry.acquire("claude"), hardFault(), 0);
+    registry.record(registry.acquire("claude"), hardFault(), 0);
+    registry.record(registry.acquire("claude"), hardFault(), 0);
+    expect(registry.stateFor("claude")!.state).toBe("open");
+    advance(15_000);
+    // Probe succeeds → closes and seeds the fresh window with its own sample.
+    registry.record(registry.acquire("claude"), success(), 50);
+    expect(registry.stateFor("claude")!.sampleCount).toBe(1);
+    // Stale cross-episode success resolves after recovery.
+    registry.record(stale, success(), 2_000);
+    const snap = registry.stateFor("claude")!;
+    expect(snap.sampleCount).toBe(1); // unchanged — stale sample not admitted
+    expect(snap.state).toBe("closed");
+  });
+
+  it("a permit issued in the current episode (post-close, same tick as lastClosedAt) still records normally", () => {
+    const { registry, advance, turn } = makeRegistry();
+    turn(hardFault());
+    turn(hardFault());
+    turn(hardFault()); // trip
+    advance(15_000);
+    registry.record(registry.acquire("claude"), success(), 100); // probe closes
+    expect(registry.stateFor("claude")!.state).toBe("closed");
+    // Acquired at the exact same clock tick as the close (no advance in
+    // between) — issuedAt === lastClosedAt. Must count as current-episode
+    // (strict `<` in the episode gate), not stale.
+    const current = registry.acquire("claude");
+    expect(registry.stateFor("claude")!.consecutiveHardFaults).toBe(0);
+    registry.record(current, hardFault(), 0);
+    expect(registry.stateFor("claude")!.consecutiveHardFaults).toBe(1);
+  });
+});
+
 describe("ProviderCircuitBreakerRegistry — isolation, shadow mode, defaults", () => {
   it("per-provider isolation: claude open, gemini still grants", () => {
     const { registry, turn } = makeRegistry();
