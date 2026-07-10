@@ -182,6 +182,18 @@ describe("WsAdapter.buildAgentList()", () => {
     const result = (adapter as any).buildAgentList();
     expect(result[0].title).toBeNull();
   });
+
+  it("exposes floorCritical, defaulting false", () => {
+    const flagged = makeAgent({ id: "floor", floorCritical: true });
+    const plain = makeAgent({ id: "plain" });
+    const adapter = makeAdapter(
+      { getAll: vi.fn().mockReturnValue([flagged, plain]) },
+      { getState: vi.fn().mockReturnValue(undefined), getSnapshot: vi.fn().mockReturnValue({ perAgent: {} }) },
+    );
+    const result = (adapter as any).buildAgentList();
+    expect(result.find((a: any) => a.id === "floor").floorCritical).toBe(true);
+    expect(result.find((a: any) => a.id === "plain").floorCritical).toBe(false);
+  });
 });
 
 describe("WsAdapter upgrade handler", () => {

@@ -515,6 +515,7 @@ export class WsAdapter implements ChannelAdapter {
         tools: [...new Set([...agent.coreServers, ...agent.delegateServers])].sort(),
         schedule: agent.schedule.map((s) => ({ cron: s.cron, task: s.task })),
         channels: agent.channels,
+        floorCritical: agent.floorCritical === true,
         messagesProcessed: state?.messagesProcessed ?? 0,
         lastActivity: state ? state.lastActivity.toISOString() : null,
       };
