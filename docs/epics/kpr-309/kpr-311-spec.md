@@ -9,7 +9,7 @@
 ## Key Points
 
 - **Two halves finally talk:** the tier router (KPR-224) emits a per-turn model that today reaches only `runner.send(modelOverride)` on the Claude path; the provider-adapter layer (KPR-231–234) picks its adapter and pilot model from the *static* `agent.model` prefix. This ticket routes one merged decision through both.
-- **`ModelRouterResult` += `provider?: AgentProviderId`, `effort?: ReasoningEffort`** — both optional; absent = inherit from the agent's static route. `routeModel` itself sets neither in W3; `effort` is carriage-only — even if set, the W3 merge drops it (§7 names the gate/clamp lift it depends on).
+- **`ModelRouterResult` += `provider?: AgentProviderId`, `effort?: ReasoningEffort`** — both optional; absent = inherit from the agent's static route. `routeModel` itself sets neither in W3.2 (this ticket); `effort` is never merged into the route — Claude-path delivery arrives in W3.3 (KPR-312) via the `SpawnShaping.effortOverride` parallel channel (no lift needed), while **pilot** delivery remains gated on the §5 clamp/gate lift. *[amended at KPR-312 spec gate (driver reconciliation)]*
 - **Provider clamp (W3 invariant):** effective provider ≡ static provider. A router result naming a different provider is ignored with a warning (model+effort dropped too). Load-bearing for R7: the breaker permit is acquired on the static provider as the first statement of the withSpawnTicket lambda, *before* the router runs; the clamp keeps `acquire()`/`record()` keyed correctly without moving anything across the R7 boundary. `providerFor()` (dispatcher outage gate, KPR-307) also stays consistent.
 - **Router call gated to Claude-static agents.** ⚠ Behavior change (delegated, non-blocking): today a router-enabled pilot agent (e.g. `codex/gpt-5.5:medium`) still gets a `routeModel` call whose Claude-model output the pilot ignores — but it *is* charged `routerCostUsd` and, worse, the Claude model is misattributed as `model` in turn telemetry + activity audit. W3 skips the router when the static provider ≠ `claude`, fixing both.
 - **`modelOverride` threading is kept, not collapsed** ⚠ (delegated, non-blocking): `AgentProviderTurnRequest.modelOverride` and `runner.send(..., modelOverride, ...)` stay as-is — the Claude adapter consumes it, pilots keep ignoring it. Adapter *construction* (already per-spawn-attempt) is what newly consumes the route.
@@ -72,16 +72,20 @@ export interface ModelRouterResult {
   /** Absent ⇒ inherit the agent's static provider (resolveProviderModel(agent.model)).
    *  Dormant in W3: routeModel never sets it, AND even if set it is inert — a value
    *  matching the static provider is a no-op, a mismatch is clamped to static (§2/§5).
-   *  Carriage-only until the same pilot-gate/clamp lift as effort. */
+   *  Carriage-only until the §5 pilot-gate/clamp lift (the same lift that gates
+   *  pilot effort delivery). */
   provider?: AgentProviderId;
-  /** Dormant in W3: routeModel never sets it, AND the W3 merge drops it even if set
-   *  (the claude route variant carries no effort; pilots never reach the merge — see §7).
-   *  Carriage-only until the pilot-gate/clamp lift. */
+  /** Dormant in W3.2 (this ticket): routeModel never sets it. Never merged into the
+   *  route — the claude route variant carries no effort field; pilots never reach the
+   *  merge (see §7). From W3.3 (KPR-312): routeModel emits it and prepareSpawn delivers
+   *  it per-turn to the Claude adapter via SpawnShaping.effortOverride — a parallel
+   *  channel like modelOverride. Pilot delivery still gated on the §5 lift.
+   *  [amended at KPR-312 spec gate (driver reconciliation)] */
   effort?: ReasoningEffort;
 }
 ```
 
-The `types.ts → model-router.ts` import already exists (`ResourceLimits`); the reverse import is `import type` only, erased at compile time — no runtime cycle. `routeModel`'s signature and all its return sites are unchanged (optional fields, never set in W3). R3 untouched: no `error-classification.ts` change.
+The `types.ts → model-router.ts` import already exists (`ResourceLimits`); the reverse import is `import type` only, erased at compile time — no runtime cycle. `routeModel`'s signature and all its return sites are unchanged (optional fields, never set in W3.2 — W3.3 starts emitting `effort`). R3 untouched: no `error-classification.ts` change.
 
 ### 2. `prepareSpawn`: effective-route derivation
 
@@ -114,7 +118,9 @@ else:
         log.warn("router provider ignored — cross-provider per-turn routing unsupported (W3 clamp)")
         → { route: staticRoute, modelOverride: undefined, routerTier: result.tier, resourceLimits: result.resourceLimits, routerCostUsd: result.costUsd }
     route = { provider: "claude", model: result.model }         // typechecks on the claude variant — it carries NO reasoningEffort field,
-                                                                // so effort is NOT merged in W3 (dropped even if set; see §7)
+                                                                // so effort is never merged into the route; W3.3 (KPR-312) carries it
+                                                                // beside the route via SpawnShaping.effortOverride
+                                                                // [amended at KPR-312 spec gate (driver reconciliation)]
     modelOverride = result.model !== agentConfig.model ? result.model : undefined   // unchanged rule
     → { route, modelOverride, routerTier: result.tier, resourceLimits: result.resourceLimits, routerCostUsd: result.costUsd }
 ```
@@ -136,7 +142,7 @@ In W3 the passed route is behaviorally identical to the static resolution for pi
 
 At HEAD `:977`: `const adapter = this.createProviderAdapter(ctx.agentId)` → `this.createProviderAdapter(ctx.agentId, shaping.route)`. The `adapter.runTurn({... modelOverride: shaping.modelOverride, resourceLimits: shaping.resourceLimits ...})` call is **unchanged**.
 
-Decision — *threading kept, not collapsed*: `AgentProviderTurnRequest.modelOverride` remains the Claude-path per-turn model channel (`agent-runner.ts:1495-1496` is tested code; collapsing the model into `AgentRunner`/`ClaudeAgentAdapter` construction would touch the runner's signature for zero behavior gain). Pilots continue to ignore `modelOverride`/`resourceLimits` at `runTurn` — with the pilot gate in §2, they now correctly never receive one. Provider + effort ride the route into *construction*, which is already per-spawn-attempt (fresh adapter per attempt, HEAD `:974-977`), so no lifecycle change is needed anywhere.
+Decision — *threading kept, not collapsed*: `AgentProviderTurnRequest.modelOverride` remains the Claude-path per-turn model channel (`agent-runner.ts:1495-1496` is tested code; collapsing the model into `AgentRunner`/`ClaudeAgentAdapter` construction would touch the runner's signature for zero behavior gain). Pilots continue to ignore `modelOverride`/`resourceLimits` at `runTurn` — with the pilot gate in §2, they now correctly never receive one. Provider + static (suffix-parsed) effort ride the route into *construction*, which is already per-spawn-attempt (fresh adapter per attempt, HEAD `:974-977`), so no lifecycle change is needed anywhere.
 
 ### 5. R7 interaction (breaker wrap-point)
 
@@ -150,7 +156,7 @@ Post-W2 lambda order (kpr-305 `:568-660`): breaker `acquire()` on `resolveProvid
 
 The verdict frames switch cost as a router-*policy* input; the epic's W3.3 owns policy. This ticket's whole obligation is that the seam exposes enough to build it:
 
-1. **Decision object reaches the seam:** `ModelRouterResult` (tier, model, cost, provider?, effort?) flows intact into `prepareSpawn`'s merge — but per the carriage-only contract (§7), the W3 merge drops `effort` even if set and clamps a mismatched `provider`; only tier/model/cost/limits flow onward. W3.3 can change what `routeModel` returns, but *delivering* provider/effort additionally requires the gate/clamp lift parked in §5 (plus a Claude thinking mapping for effort, per §7).
+1. **Decision object reaches the seam:** `ModelRouterResult` (tier, model, cost, provider?, effort?) flows intact into `prepareSpawn`'s merge — effort is never merged into the route, and a mismatched `provider` is clamped; only tier/model/cost/limits flow onward through the route in this ticket. W3.3 (KPR-312) changes what `routeModel` returns and delivers `effort` on the Claude path via the `SpawnShaping.effortOverride` parallel channel (no lift needed, per §7); delivering `provider` — or `effort` to a **pilot** — remains gated on the clamp/gate lift parked in §5. *[amended at KPR-312 spec gate (driver reconciliation)]*
 2. **Per-turn switch visibility:** `recordSpawnObservability` sets `modelTier: shaping.routerTier` in the activity audit (HEAD `:1140` today: `modelTier: undefined // Model router tier not currently passed through`). Signature: pass `shaping` (or add the tier param) — implementation detail for the plan.
 3. **Switch cost is already measurable:** `turnTelemetryStore` records `cacheReadTokens`/`cacheCreationTokens` per turn (HEAD `:1101-1102`); a cold switch shows as `cacheRead=0, cacheCreation≫0` exactly as in the spike's M2/M4/M6 rows.
 
@@ -159,7 +165,7 @@ No cost model, no TTL tracking, no switch-suppression logic in this ticket.
 ### 7. Effort contract: today vs later
 
 - **Today (this ticket):** `effort?` exists on `ModelRouterResult` but is never set. Static effort still comes from the `:suffix` parse in `resolveProviderModel`/`splitProviderModel` and reaches the codex pilot constructor via the route. The Claude adapter ignores effort entirely (hive sets no `thinking` config; verdict M9 is informative-only); the claude `ProviderModelRoute` variant deliberately gains **no** `reasoningEffort` field. `OpenAIAgentsAdapter` continues not receiving `reasoningEffort` in its constructor call — pre-existing shape, not changed here.
-- **Later — honest statement of the dependency:** under this design, a router-set `effort` can **never** reach a pilot constructor: the pilot gate (§2) means `routeModel` never runs for non-Claude-static agents, and the clamp (§5) forbids routing *to* a pilot provider — so the §2 merge branch is only ever reachable for Claude-static agents, whose route variant carries no effort. Activating `effort?` therefore **depends on lifting the pilot gate and/or the provider clamp** — the same decision parked in §5 for W3.5 (the sidecar LLM registry ticket) — plus, for Claude, an effort→`thinking`-config mapping in `ClaudeAgentAdapter`/runner. W3.3's classifier may *emit* `effort` against this contract; the field is carriage-only until that lift. The seam's W3 contract is **carriage, not interpretation or delivery**.
+- **Later — honest statement of the dependency:** under this design, a router-set `effort` can **never** reach a pilot constructor: the pilot gate (§2) means `routeModel` never runs for non-Claude-static agents, and the clamp (§5) forbids routing *to* a pilot provider — so the §2 merge branch is only ever reachable for Claude-static agents, whose route variant carries no effort. Activating `effort?` for a **pilot** therefore depends on lifting the pilot gate and/or the provider clamp — the same decision parked in §5 for W3.5 (the sidecar LLM registry ticket). The **Claude** path needs no lift: W3.3 (KPR-312) emits `effort` and delivers it per-turn via `SpawnShaping.effortOverride` → `AgentProviderTurnRequest.effort` → an effort mapping in `ClaudeAgentAdapter`/runner — a parallel channel beside the route, mirroring `modelOverride`, leaving the clamp, gate, and route shape untouched. This seam's (W3.2's) own contract remains **carriage, not interpretation or delivery**. *[amended at KPR-312 spec gate (driver reconciliation) — the original clause gated delivery "to any adapter" on the §5 lift; that gate is pilot-only.]*
 
 ## D3: non-Claude adapters (pilot-grade)
 
@@ -217,7 +223,7 @@ Rationale: pilots are constructor-baked per D3 and stay pilot-grade in W3; the d
 
 **New tests the plan must add:**
 
-1. Unit — route derivation in `prepareSpawn`: router-on merge (routed model on a claude route that carries no effort — including that a router-set `effort` is dropped), router-off/static passthrough, `sender === "system"` skip (currently unpinned!), pilot gate (`routeModel` **not** called for `codex/...` agent with router enabled), voice static route.
+1. Unit — route derivation in `prepareSpawn`: router-on merge (routed model on a claude route that carries no effort — including that a router-set `effort` is never merged into the route; in W3.2, before KPR-312's `effortOverride` channel, the turn is byte-identical to a no-effort route), router-off/static passthrough, `sender === "system"` skip (currently unpinned!), pilot gate (`routeModel` **not** called for `codex/...` agent with router enabled), voice static route.
 2. Unit — provider clamp: mocked `routeModel` returning `provider: "openai"` for a Claude-static agent → static route used, warn logged, cost/tier still recorded.
 3. Unit — `createProviderAdapter(agentId, route)`: Claude route → `ClaudeAgentAdapter`; pilot route → pilot constructor receives `route.model`/`route.reasoningEffort` (not a re-resolve of `config.model`).
 4. Integration (spawn path) — auth-rebuild retry calls `routeModel` exactly once (route reuse across attempts).
@@ -233,6 +239,6 @@ Rationale: pilots are constructor-baked per D3 and stay pilot-grade in W3; the d
 4. ⚠ **Retry reuses first routing decision** — no re-route on the auth-rebuild second attempt. *Non-blocking.*
 5. ⚠ **`activityLogger.modelTier` fill is in-scope** — one-line close of an existing TODO in the touched function, mandated by the verdict's policy-input framing as the observability hook. *Non-blocking.*
 6. ⚠ **`ReasoningEffort` moves to `provider-adapters/types.ts`** with `CodexReasoningEffort` back-compat alias. *Non-blocking, mechanical.*
-7. ⚠ **`routeModel` never sets `provider`/`effort` in W3** — fields land dormant (carriage-only); W3.3 may emit them, but delivery of `effort` to any adapter additionally depends on the pilot-gate/clamp lift parked in §5. *Non-blocking.*
+7. ⚠ **`routeModel` never sets `provider`/`effort` in W3.2 (this ticket)** — fields land dormant here; W3.3 (KPR-312) emits `effort` and delivers it on the **Claude** path via the `SpawnShaping.effortOverride` parallel channel (§7); `provider` stays dormant, and **pilot** effort delivery remains gated on the §5 lift. *Non-blocking. [amended at KPR-312 spec gate (driver reconciliation)]*
 
 No blocking product ambiguity found — Gate 1 D2/D3 plus the KPR-310 verdict cover every decision above.

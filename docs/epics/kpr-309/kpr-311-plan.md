@@ -32,7 +32,7 @@ Everything lands in the existing spawn pipeline inside `src/agents/agent-manager
 
 **Unit — `required`** — all in `src/agents/agent-manager.test.ts` (everything under test runs through `spawnTurn` against the existing mock harness; `model-router.test.ts` needs no change — `routeModel` is module-mocked everywhere and the `ModelRouterResult` field additions are type-level until W3.3). The spec's numbered tests 1–7:
 
-1. **Route derivation in `prepareSpawn`** — `src/agents/agent-manager.test.ts`, new `describe("router→adapter seam (KPR-311)")` nested in `spawnTurn shaping (KPR-224)`. Minimum assertions: (a) router-on merge — routed model reaches `runner.send` as `modelOverride`, routed `resourceLimits` reach position 6, and a router-set `effort` is dropped (turn behaves byte-identically to a no-effort route); (b) `sender === "system"` skip — `routeModel` not called, override/limits undefined (**currently unpinned**); (c) pilot gate — `routeModel` **not** called for a `codex/...` agent with router enabled, pilot constructor still gets static `{model, reasoningEffort}`; (d) router-off static passthrough and voice static route stay pinned by existing tests (`:625`, `:2182` — regression surface, not new code).
+1. **Route derivation in `prepareSpawn`** — `src/agents/agent-manager.test.ts`, new `describe("router→adapter seam (KPR-311)")` nested in `spawnTurn shaping (KPR-224)`. Minimum assertions: (a) router-on merge — routed model reaches `runner.send` as `modelOverride`, routed `resourceLimits` reach position 6, and a router-set `effort` is never merged into the route — in W3.2, before KPR-312's `effortOverride` channel, the turn is byte-identical to a no-effort route *[amended at KPR-312 spec gate (driver reconciliation)]*; (b) `sender === "system"` skip — `routeModel` not called, override/limits undefined (**currently unpinned**); (c) pilot gate — `routeModel` **not** called for a `codex/...` agent with router enabled, pilot constructor still gets static `{model, reasoningEffort}`; (d) router-off static passthrough and voice static route stay pinned by existing tests (`:625`, `:2182` — regression surface, not new code).
 2. **Provider clamp** — same describe. Mocked `routeModel` returns `provider: "openai"` for a Claude-static agent → Claude adapter runs (OpenAI pilot constructor NOT called), `modelOverride` undefined, routed `resourceLimits` **retained** (D3), router cost added to `usage.costUsd`, `modelTier` still reaches the audit, clamp warning logged with `routerProvider`/`staticProvider`.
 3. **`createProviderAdapter(agentId, route)` consumes the passed route** — same describe. Registry model mutated mid-turn (inside the `formatFilesForPrompt` mock, i.e. after `prepareSpawn`'s route resolution, before adapter construction): pilot constructor receives the **shaping route's** model/effort, not a re-resolve of the live `config.model`. (This test fails against pre-change code — negative-verify property.)
 4. **Auth-rebuild retry reuses the routing decision** (integration through the spawn path) — same describe. First attempt returns `401 Unauthorized` with a resumable session, retry succeeds: `routeModel` called exactly once, both `runner.send` calls carry the same `modelOverride`.
@@ -74,7 +74,7 @@ Expected: all suites pass; `check` = typecheck + lint + format + test, zero fail
 - One harness tweak (Task 3): the logger mock's `warn` becomes a hoisted shared spy so the clamp warning is assertable. No other mock changes; no DB, no network, no live SDK.
 
 ### Non-Required Rationale
-- No `model-router.test.ts` additions: `routeModel` never sets `provider`/`effort` in W3 (⚠7) — the fields are type-level carriage; testing them router-side would test nothing until W3.3.
+- No `model-router.test.ts` additions: `routeModel` never sets `provider`/`effort` in W3.2 (⚠7) — the fields are type-level carriage; testing them router-side would test nothing until W3.3.
 - No adapter test changes: adapter `runTurn`/constructor contracts are unchanged; the alias keeps types identical.
 - No E2E/live-SDK: see Integration/E2E judgments above.
 
@@ -211,7 +211,7 @@ export interface ModelRouterResult {
 }
 ```
 
-New (JSDoc adapted from spec §1 — same carriage-only contract; section pointers adjusted for in-source context):
+New (JSDoc adapted from spec §1 — section pointers adjusted for in-source context; `effort` JSDoc amended at KPR-312 spec gate — driver reconciliation, matches amended spec §1):
 
 ```ts
 export interface ModelRouterResult {
@@ -223,16 +223,19 @@ export interface ModelRouterResult {
   /** Absent ⇒ inherit the agent's static provider (resolveProviderModel(agent.model)).
    *  Dormant in W3: routeModel never sets it, AND even if set it is inert — a value
    *  matching the static provider is a no-op, a mismatch is clamped to static (spec §2/§5).
-   *  Carriage-only until the same pilot-gate/clamp lift as effort. */
+   *  Carriage-only until the spec §5 pilot-gate/clamp lift (the same lift that
+   *  gates pilot effort delivery). */
   provider?: AgentProviderId;
-  /** Dormant in W3: routeModel never sets it, AND the W3 merge drops it even if set
-   *  (the claude route variant carries no effort; pilots never reach the merge — spec §7).
-   *  Carriage-only until the pilot-gate/clamp lift. */
+  /** Dormant in W3.2 (this ticket): routeModel never sets it. Never merged into the
+   *  route — the claude route variant carries no effort field; pilots never reach the
+   *  merge (spec §7). From W3.3 (KPR-312): routeModel emits it and prepareSpawn delivers
+   *  it per-turn to the Claude adapter via SpawnShaping.effortOverride — a parallel
+   *  channel like modelOverride. Pilot delivery still gated on the spec §5 lift. */
   effort?: ReasoningEffort;
 }
 ```
 
-**Do not touch anything else in `model-router.ts`** — `routeModel`'s signature, prompt, tiers, ceiling, fallback, and all return sites are unchanged (optional fields, never set in W3; R3-adjacent classifier freeze).
+**Do not touch anything else in `model-router.ts`** — `routeModel`'s signature, prompt, tiers, ceiling, fallback, and all return sites are unchanged (optional fields, never set in W3.2 — W3.3 starts emitting `effort`; R3-adjacent classifier freeze).
 
 - [ ] Verify:
 
@@ -389,8 +392,9 @@ interface SpawnShaping {
       }
 
       // Effective route. The claude ProviderModelRoute variant carries NO
-      // reasoningEffort field, so a router-set `effort` is dropped here by
-      // construction — carriage-only in W3 (spec §7).
+      // reasoningEffort field — effort is never merged into the route; W3.3
+      // (KPR-312) carries it beside the route via SpawnShaping.effortOverride
+      // (spec §7). [amended at KPR-312 spec gate (driver reconciliation)]
       const route: ProviderModelRoute = { provider: "claude", model: result.model };
       return {
         prompt,
@@ -618,11 +622,12 @@ function makeRouterResult(overrides: Partial<ModelRouterResult> = {}): ModelRout
         (appConfig as any).modelRouter.enabled = false;
       });
 
-      it("merges the routed model into the effective route and drops a router-set effort (carriage-only)", async () => {
+      it("merges the routed model into the effective route without merging a router-set effort into the route", async () => {
         (appConfig as any).modelRouter.enabled = true;
-        // effort set to prove the W3 merge drops it: the claude route
-        // variant carries no effort field, so the turn must be
-        // byte-identical to a no-effort route.
+        // effort set to prove it is never merged into the route: the claude
+        // route variant carries no effort field, so the route (and, until
+        // W3.3's effortOverride channel, the turn) must be byte-identical
+        // to a no-effort route.
         vi.mocked(routeModel).mockResolvedValueOnce(
           makeRouterResult({ provider: "claude", effort: "high" }),
         );
