@@ -75,6 +75,13 @@ export interface AgentDefinition {
    * may consult both fields.
    */
   spawnBudget?: number;
+  /**
+   * KPR-329: per-agent tool-search (deferred MCP tool loading) override.
+   * Absent ⇒ inherit hive.yaml `toolSearch.mode` (engine default "auto").
+   * Validated at admin write time; sanitized at registry load (invalid →
+   * treated as absent, error logged) — KPR-184 pattern.
+   */
+  toolSearch?: "auto" | "on" | "off";
   timeoutMs: number;
   resourceTiers?: ResourceTierOverrides;
 
@@ -160,6 +167,9 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     // via the def via registry.get, not via cfg).
     maxConcurrent: doc.maxConcurrent,
     spawnBudget: doc.spawnBudget,
+    // KPR-329: pass through as-is; agent-registry sanitizes invalid values
+    // (from legacy/hand-edited docs) to undefined at load time.
+    toolSearch: doc.toolSearch,
     timeoutMs: doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
     betas: doc.betas,
     metadata: doc.metadata,
