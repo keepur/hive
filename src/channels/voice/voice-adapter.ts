@@ -15,6 +15,8 @@ import type { AgentManager, SpawnTurnStreamCallback, TurnContext, TurnResult } f
 import type { Dispatcher } from "../../channels/dispatcher.js";
 import type { WorkItem } from "../../types/work-item.js";
 import { config } from "../../config.js";
+import { ProviderCircuitOpenError } from "../../agents/provider-circuit-breaker.js";
+import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../../outage/outage-notices.js";
 
 const log = createLogger("voice-adapter");
 
@@ -299,7 +301,8 @@ export class VoiceAdapter {
     const runOnce = async (
       spawnCtx: TurnContext,
     ): Promise<
-      { ok: true; result: TurnResult; bytesSent: boolean } | { ok: false; reason: string; bytesSent: boolean }
+      | { ok: true; result: TurnResult; bytesSent: boolean }
+      | { ok: false; reason: string; circuitOpen?: boolean; bytesSent: boolean }
     > => {
       try {
         // KPR-223: route through dispatcher when wired (applies taskLedger +
@@ -313,7 +316,14 @@ export class VoiceAdapter {
         }
         return { ok: true, result, bytesSent: headersSent };
       } catch (err) {
-        return { ok: false, reason: String(err), bytesSent: headersSent };
+        return {
+          ok: false,
+          reason: String(err),
+          // KPR-307: detected here (instanceof survives — same process) so the
+          // failure block below can speak an honest completion, not a 500.
+          circuitOpen: err instanceof ProviderCircuitOpenError,
+          bytesSent: headersSent,
+        };
       }
     };
 
@@ -324,7 +334,7 @@ export class VoiceAdapter {
     // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
     // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
     // cover (stale id without auth-error pattern, etc.).
-    if (!outcome.ok && effectiveResume && !outcome.bytesSent) {
+    if (!outcome.ok && !outcome.circuitOpen && effectiveResume && !outcome.bytesSent) {
       log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
         callId,
         reason: outcome.reason,
@@ -341,6 +351,18 @@ export class VoiceAdapter {
     }
 
     if (!outcome.ok) {
+      if (outcome.circuitOpen) {
+        // KPR-307 §5-1b: honest SPOKEN completion — today's baseline is a
+        // generic 500 "Internal error" (only auth/budget get 503s), and both
+        // a bare 500 and a 503 render as dead air to Vapi. ⚠ Confirm Vapi
+        // renders a normal completion better than a 500/503 during rollout.
+        log.warn("Voice turn fast-failed — provider circuit open, speaking outage notice", {
+          callId,
+          agentId,
+        });
+        this.endWithSpokenText(res, VOICE_OUTAGE_SPOKEN_NOTICE, isStreaming, outcome.bytesSent, completionId, model);
+        return;
+      }
       if (isAuthError(outcome.reason)) {
         log.error("Voice spawnTurn failed — OAuth credentials unavailable", {
           callId,
@@ -434,6 +456,38 @@ export class VoiceAdapter {
       res.write(formatSSEDone(completionId, model, "error"));
       res.end();
     }
+  }
+
+  /**
+   * KPR-307: end the turn with a normal 200 completion carrying spoken text.
+   * Streaming: emit one SSE text chunk + the standard done frame (headers
+   * lazily if no bytes were sent yet). Non-streaming: standard JSON body.
+   */
+  private endWithSpokenText(
+    res: ServerResponse,
+    text: string,
+    isStreaming: boolean,
+    bytesSent: boolean,
+    completionId: string,
+    model: string,
+  ): void {
+    if (isStreaming) {
+      if (!bytesSent) {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+      }
+      if (!res.writableEnded) {
+        res.write(formatSSETextChunk(completionId, text, model));
+        res.write(formatSSEDone(completionId, model));
+        res.end();
+      }
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(formatNonStreamingResponse(completionId, text, model)));
   }
 
   /**

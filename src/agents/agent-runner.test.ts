@@ -31,10 +31,12 @@ vi.mock("node:fs", () => ({
 // ── SDK mock ────────────────────────────────────────────────────────
 const mockQuery = vi.fn();
 let mockMessages: any[] | null = null; // Override per-test; null = default result
+let mockQueryOverride: (() => any) | null = null; // KPR-306: per-test query-object override
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: (...args: any[]) => {
     mockQuery(...args);
+    if (mockQueryOverride) return mockQueryOverride();
     return {
       close: vi.fn(),
       [Symbol.asyncIterator]: async function* () {
@@ -2909,5 +2911,79 @@ describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
     const servers = getCapturedServers();
     const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
     expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
+  });
+});
+
+describe("RunResult.timedOut (KPR-306)", () => {
+  beforeEach(() => {
+    mockQueryOverride = null;
+  });
+  afterEach(() => {
+    mockQueryOverride = null;
+    vi.useRealTimers();
+  });
+
+  it("deadline fire sets timedOut: true and aborted: true", async () => {
+    // Query hangs until close() releases it — abort() calls activeQuery.close().
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mockQueryOverride = () => ({
+      close: () => release(),
+      // eslint-disable-next-line require-yield -- intentionally hangs until abort() calls close()
+      [Symbol.asyncIterator]: async function* () {
+        await gate;
+      },
+    });
+    const runner = makeRunner({ timeoutMs: 25 });
+    const result = await runner.send("hi");
+    expect(result.aborted).toBe(true);
+    expect(result.timedOut).toBe(true);
+  });
+
+  it("operator abort sets aborted only — timedOut stays unset", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started!: () => void;
+    const startedP = new Promise<void>((r) => (started = r));
+    mockQueryOverride = () => ({
+      close: () => release(),
+      // eslint-disable-next-line require-yield -- intentionally hangs until abort() calls close()
+      [Symbol.asyncIterator]: async function* () {
+        started();
+        await gate;
+      },
+    });
+    const runner = makeRunner(); // default 300s deadline — never fires here
+    const resultP = runner.send("hi");
+    await startedP; // activeQuery is set before iteration begins
+    runner.abort();
+    const result = await resultP;
+    expect(result.aborted).toBe(true);
+    expect(result.timedOut).toBeUndefined();
+  });
+
+  it("operator-abort-then-late-deadline leaves timedOut unset (the guard's reason to exist)", async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started!: () => void;
+    const startedP = new Promise<void>((r) => (started = r));
+    mockQueryOverride = () => ({
+      close: vi.fn(), // deliberately does NOT release — keeps the finally (and clearTimeout) pending
+      // eslint-disable-next-line require-yield -- intentionally hangs until release() resolves the gate
+      [Symbol.asyncIterator]: async function* () {
+        started();
+        await gate;
+      },
+    });
+    const runner = makeRunner(); // 300s default deadline
+    const resultP = runner.send("hi");
+    await startedP;
+    runner.abort(); // nulls activeQuery + sets _aborted — deadline timer still pending
+    await vi.advanceTimersByTimeAsync(300_000); // late deadline fires: guard must no-op
+    release(); // let the hung iterator finish so send() unwinds
+    const result = await resultP;
+    expect(result.aborted).toBe(true);
+    expect(result.timedOut).toBeUndefined();
   });
 });

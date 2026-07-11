@@ -30,7 +30,9 @@ import {
 } from "./provider-adapters/codex-subscription-adapter.js";
 import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
-import type { AgentProviderAdapter } from "./provider-adapters/types.js";
+import type { AgentProviderAdapter, AgentProviderId } from "./provider-adapters/types.js";
+import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
+import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -120,6 +122,15 @@ export interface TurnResult {
   preCompactTokens?: number;
   ephemeral5mTokens?: number;
   ephemeral1hTokens?: number;
+  /**
+   * KPR-307: propagated from RunResult.timedOut (KPR-306 — runner deadline
+   * fired). Consumed by the dispatcher's post-turn outage gate: a hang-type
+   * timeout leaves `errors` empty (the abort path returns before a provider
+   * error string is captured), so the flag is the only signal.
+   */
+  timedOut?: boolean;
+  /** KPR-307: propagated from RunResult.aborted (operator abort or deadline abort). */
+  aborted?: boolean;
 }
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
@@ -330,6 +341,12 @@ export class AgentManager {
   private lastSpawnAt = new Map<string, number>();
   // KPR-220 Phase 11: most-recent spawn error per agent (truncated).
   private lastSpawnError = new Map<string, string>();
+  /**
+   * KPR-306: per-provider circuit breakers. Read-only surface — KPR-307's
+   * dispatcher-side consumer and the CircuitBreakerHeartbeat both reach it
+   * via the AgentManager instance (no new wiring surface).
+   */
+  readonly circuitBreakers: ProviderCircuitBreakerRegistry;
 
   constructor(
     registry: AgentRegistry,
@@ -359,6 +376,9 @@ export class AgentManager {
     this.memoryLifecycle = memoryLifecycle;
     // KPR-220 Phase 6: 30s default; tests inject a small value for speed.
     this.reflectionDebounceMs = options?.reflectionDebounceMs ?? 30_000;
+    // KPR-306: registry defaults internally when appConfig.circuitBreaker is
+    // absent (test config mocks omit it).
+    this.circuitBreakers = new ProviderCircuitBreakerRegistry(appConfig.circuitBreaker);
     this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
@@ -516,6 +536,18 @@ export class AgentManager {
   }
 
   /**
+   * KPR-307: the provider an agent's turns route to — additive read-only
+   * surface for the dispatcher's post-turn outage gate. One-liner over the
+   * same resolveProviderModel the KPR-306 wrap point uses, so dispatcher and
+   * breaker always agree on the provider key.
+   */
+  providerFor(agentId: string): AgentProviderId | null {
+    const agentConfig = this.registry.get(agentId);
+    if (!agentConfig) return null;
+    return resolveProviderModel(agentConfig.model).provider;
+  }
+
+  /**
    * KPR-216: per-turn spawn API (Phase A). Spawns a fresh `query()` per
    * turn with `options.resume = ctx.sessionId`. Replaces the long-lived
    * AgentRunner.send() path for opt-in channels.
@@ -536,6 +568,18 @@ export class AgentManager {
     }
 
     return this.withSpawnTicket(ctx, async (ticket) => {
+      // KPR-306: circuit-breaker admission — FIRST thing in the lambda, so a
+      // fast-fail spends no session I/O and no model-router call. Throws
+      // ProviderCircuitOpenError while the provider's circuit is open;
+      // withSpawnTicket's finally releases the per-thread lock, budget slot,
+      // and ticket set on the way out (no new cleanup path). The lock is
+      // held for microseconds during a fast-fail — no I/O precedes the throw.
+      const route = resolveProviderModel(this.registry.get(ctx.agentId)?.model ?? "");
+      const permit = this.circuitBreakers.acquire(route.provider, {
+        agentId: ctx.agentId,
+        threadId: ctx.threadId,
+      });
+
       // KPR-220 Phase 15: re-resolve sessionId post-lock for reflection
       // turns. The reflection timer may have fired while a user turn was
       // in flight on the same thread; that turn could have rotated the
@@ -564,22 +608,42 @@ export class AgentManager {
       // regression prevention.
       const shaping = await this.prepareSpawn(effectiveCtx);
 
-      const result = await this.runOneSpawnAttempt(effectiveCtx, shaping, ticket, onStream);
-
-      let turnResult: TurnResult;
-      if (result.error && isAuthRebuildResumeError(result.error) && effectiveCtx.sessionId) {
-        log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
-          agentId: effectiveCtx.agentId,
-          threadId: effectiveCtx.threadId,
-          reason: result.error,
-        });
-        const retry = await this.runOneSpawnAttempt({ ...effectiveCtx, sessionId: undefined }, shaping, ticket, onStream);
-        turnResult = this.finalizeSpawnResult(effectiveCtx, retry);
-        this.recordSpawnObservability(effectiveCtx, shaping.prompt, shaping.modelOverride, retry);
-      } else {
-        turnResult = this.finalizeSpawnResult(effectiveCtx, result);
-        this.recordSpawnObservability(effectiveCtx, shaping.prompt, shaping.modelOverride, result);
+      // KPR-306: exactly one breaker record per spawnTurn, on the FINALIZED
+      // attempt. The auth-rebuild first attempt is locally recoverable —
+      // when the retry fires, only the retry's result reaches the breaker
+      // (record-once falls out of recording whichever result becomes the
+      // turn result). Thrown adapter errors (rare pre-request throws, e.g.
+      // codex missing OAuth) classify via classifyThrown and rethrow.
+      // AgentStoppedError never originates inside this try (stop checkpoints
+      // live in withSpawnTicket), and ProviderCircuitOpenError cannot reach
+      // it (acquire threw before a permit existed) — the guard is
+      // belt-and-braces for future refactors.
+      let finalResult: RunResult;
+      try {
+        finalResult = await this.runOneSpawnAttempt(effectiveCtx, shaping, ticket, onStream);
+        if (finalResult.error && isAuthRebuildResumeError(finalResult.error) && effectiveCtx.sessionId) {
+          log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
+            agentId: effectiveCtx.agentId,
+            threadId: effectiveCtx.threadId,
+            reason: finalResult.error,
+          });
+          finalResult = await this.runOneSpawnAttempt(
+            { ...effectiveCtx, sessionId: undefined },
+            shaping,
+            ticket,
+            onStream,
+          );
+        }
+      } catch (err) {
+        if (!(err instanceof AgentStoppedError)) {
+          this.circuitBreakers.record(permit, classifyThrown(err), 0);
+        }
+        throw err;
       }
+      this.circuitBreakers.record(permit, classifyTurnResult(finalResult), finalResult.llmMs);
+
+      const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult);
+      this.recordSpawnObservability(effectiveCtx, shaping.prompt, shaping.modelOverride, finalResult);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
       // turns themselves don't reschedule (kind="reflection" guard).
@@ -1200,6 +1264,8 @@ export class AgentManager {
       preCompactTokens: result.preCompactTokens,
       ephemeral5mTokens: result.ephemeral5mTokens,
       ephemeral1hTokens: result.ephemeral1hTokens,
+      timedOut: result.timedOut,
+      aborted: result.aborted,
     };
   }
 

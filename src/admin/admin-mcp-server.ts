@@ -171,6 +171,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
           lines.push(`Passive Channels: [${(doc.passiveChannels ?? []).join(", ")}]`);
           lines.push(`Keywords: [${(doc.keywords ?? []).join(", ")}]`);
           lines.push(`Is Default: ${doc.isDefault ?? false}`);
+          lines.push(`Floor Critical: ${doc.floorCritical ?? false}`);
           lines.push(`Core Servers: [${(doc.coreServers ?? []).join(", ")}]`);
           lines.push(`Delegate Servers: [${(doc.delegateServers ?? []).join(", ")}]`);
           if (doc.plugins?.length) lines.push(`Plugins: [${doc.plugins.join(", ")}]`);
@@ -312,6 +313,8 @@ export function buildAdminTools(deps: AdminToolDeps) {
             passiveChannels: (f.passiveChannels as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.passiveChannels],
             keywords: (f.keywords as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.keywords],
             isDefault: (f.isDefault as boolean) ?? false,
+            // KPR-308: strict-boolean at the write boundary — garbage never persists.
+            floorCritical: f.floorCritical === true,
             coreServers: (f.coreServers as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.coreServers],
             delegateServers: (f.delegateServers as string[]) ?? [...AGENT_DEFINITION_DEFAULTS.delegateServers],
             delegatePrompts: (f.delegatePrompts as Record<string, string>) ?? {
@@ -444,6 +447,11 @@ export function buildAdminTools(deps: AdminToolDeps) {
             merged.spawnBudget = merged.maxConcurrent;
           }
           delete merged.maxConcurrent;
+
+          // KPR-308: floorCritical is a plain boolean (no cross-field
+          // constraints — KPR-184-style delegateServers rules do NOT apply).
+          // Coerce at the write boundary so docs stay clean.
+          if ("floorCritical" in merged) merged.floorCritical = merged.floorCritical === true;
 
           const changedFields = Object.keys(merged);
           if (changedFields.length === 0) {

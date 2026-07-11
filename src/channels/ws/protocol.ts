@@ -182,6 +182,8 @@ export interface AgentInfo {
   tools: string[];
   schedule: { cron: string; task: string }[];
   channels: string[];
+  /** KPR-308: badge for agents whose output diverts to the app during a WAN outage. */
+  floorCritical: boolean;
   messagesProcessed: number;
   lastActivity: string | null; // ISO 8601, null when agent has never received a message
 }
