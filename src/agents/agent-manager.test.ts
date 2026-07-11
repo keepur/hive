@@ -26,11 +26,14 @@ afterAll(() => {
   rmSync(TEST_HIVE_HOME, { recursive: true, force: true });
 });
 
-// Mock logger
+// Mock logger — warn is a hoisted shared spy so KPR-311 clamp warnings are
+// assertable (cleared by vi.clearAllMocks in beforeEach; nothing else
+// asserts on logger calls).
+const { mockLogWarn } = vi.hoisted(() => ({ mockLogWarn: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
     info: vi.fn(),
-    warn: vi.fn(),
+    warn: mockLogWarn,
     error: vi.fn(),
     debug: vi.fn(),
   }),
@@ -142,6 +145,7 @@ import type { AgentConfig } from "../types/agent-config.js";
 import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./provider-circuit-breaker.js";
 import type { WorkItem } from "../types/work-item.js";
 import { routeModel } from "./model-router.js";
+import type { ModelRouterResult } from "./model-router.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -197,6 +201,17 @@ function makeRunResult(overrides: Partial<RunResult> = {}) {
     cacheCreationTokens: 5,
     contextWindow: 200000,
     compactions: 0,
+    ...overrides,
+  };
+}
+
+function makeRouterResult(overrides: Partial<ModelRouterResult> = {}): ModelRouterResult {
+  return {
+    tier: "haiku",
+    model: "claude-haiku-4-5-routed",
+    costUsd: 0.001,
+    durationMs: 50,
+    resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
     ...overrides,
   };
 }
@@ -2353,6 +2368,163 @@ describe("AgentManager", () => {
       } finally {
         (appConfig as any).modelRouter.enabled = false;
       }
+    });
+
+    describe("router→adapter seam (KPR-311)", () => {
+      afterEach(() => {
+        (appConfig as any).modelRouter.enabled = false;
+      });
+
+      it("merges the routed model into the effective route without merging a router-set effort into the route", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        // effort set to prove it is never merged into the route: the claude
+        // route variant carries no effort field, so the route (and, until
+        // W3.3's effortOverride channel, the turn) must be byte-identical
+        // to a no-effort route.
+        vi.mocked(routeModel).mockResolvedValueOnce(
+          makeRouterResult({ provider: "claude", effort: "high" }),
+        );
+
+        const item = makeWorkItem({ text: "route me", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(modelOverride).toBe("claude-haiku-4-5-routed");
+        expect(resourceLimits).toEqual({ timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 });
+      });
+
+      it("skips the router for sender === 'system' (scheduler/cron)", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        const item = makeWorkItem({
+          text: "execute your scheduled digest task",
+          sender: "system",
+          source: { kind: "sms", id: "line-1", label: "May" },
+        });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+
+        expect(routeModel).not.toHaveBeenCalled();
+        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(modelOverride).toBeUndefined();
+        expect(resourceLimits).toBeUndefined();
+      });
+
+      it("pilot gate: routeModel is never called for a non-Claude-static agent, even with the router enabled", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult()); // defined pre-fix behavior for negative-verify
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({
+            id: "codex-pilot",
+            name: "Codex Pilot",
+            model: "codex/gpt-5.5:medium",
+            coreServers: [],
+            soul: "pilot soul",
+            systemPrompt: "pilot system",
+          }),
+        );
+
+        const item = makeWorkItem({ text: "hello codex", source: { kind: "sms", id: "line-1", label: "May" } });
+        const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+        // No router call → no cost, no misattributed override.
+        expect(routeModel).not.toHaveBeenCalled();
+        // Pilot constructed from the static route, exactly as with the router disabled.
+        expect(mockCodexConstructor).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "gpt-5.5", reasoningEffort: "medium" }),
+        );
+        expect(mockCodexRunTurn).toHaveBeenCalledWith(expect.objectContaining({ modelOverride: undefined }));
+        expect(result.finalMessage).toBe("codex response");
+      });
+
+      it("provider clamp: a router result naming a different provider is ignored — static route, warn, cost+tier+limits retained", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValueOnce(
+          makeRouterResult({
+            tier: "sonnet",
+            model: "gpt-9-preview",
+            provider: "openai",
+            effort: "low",
+            costUsd: 0.003,
+            resourceLimits: { timeoutMs: 300_000, maxTurns: 50, budgetUsd: 5 },
+          }),
+        );
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ costUsd: 0.05, sessionId: "s-clamp" }));
+
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+
+        const item = makeWorkItem({ text: "clamp me", source: { kind: "sms", id: "line-1", label: "May" } });
+        const result = await localManager.spawnTurn(makeCtx(item, "sms"));
+
+        // Static route used: Claude adapter ran, no pilot constructed, no override.
+        expect(mockOpenAIConstructor).not.toHaveBeenCalled();
+        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(modelOverride).toBeUndefined();
+        // D3: routed resourceLimits are RETAINED (provider-agnostic execution
+        // bounds for the Claude turn that actually runs).
+        expect(resourceLimits).toEqual({ timeoutMs: 300_000, maxTurns: 50, budgetUsd: 5 });
+        // Clamp-path bookkeeping: router cost still charged, tier still audited.
+        expect(result.usage.costUsd).toBeCloseTo(0.053, 5);
+        expect(activityLogger.record).toHaveBeenCalledWith(expect.objectContaining({ modelTier: "sonnet" }));
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("cross-provider per-turn routing unsupported"),
+          expect.objectContaining({ routerProvider: "openai", staticProvider: "claude" }),
+        );
+      });
+
+      it("createProviderAdapter consumes the shaping route, not a re-resolve of the live registry model", async () => {
+        const { formatFilesForPrompt } = await import("../files/file-processor.js");
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({
+            id: "codex-pilot",
+            name: "Codex Pilot",
+            model: "codex/gpt-5.5:medium",
+            coreServers: [],
+            soul: "",
+            systemPrompt: "pilot system",
+          }),
+        );
+        // Mutate the registry model AFTER prepareSpawn resolves the static
+        // route (formatFilesForPrompt runs inside prepareSpawn, after the
+        // route read) but BEFORE adapter construction. A re-resolve inside
+        // createProviderAdapter would see gpt-9:low; the passed route must
+        // carry gpt-5.5:medium. (Fails against pre-KPR-311 code.)
+        vi.mocked(formatFilesForPrompt).mockImplementationOnce(() => {
+          registry._agents.set(
+            "codex-pilot",
+            makeAgentConfig({
+              id: "codex-pilot",
+              name: "Codex Pilot",
+              model: "codex/gpt-9:low",
+              coreServers: [],
+              soul: "",
+              systemPrompt: "pilot system",
+            }),
+          );
+          return "";
+        });
+
+        const item = makeWorkItem({
+          text: "seam check",
+          source: { kind: "sms", id: "line-1", label: "May" },
+          files: [{ name: "doc.txt", url: "https://example.com/doc.txt" } as any],
+        });
+        await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+        expect(mockCodexConstructor).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "gpt-5.5", reasoningEffort: "medium" }),
+        );
+      });
     });
   });
 
