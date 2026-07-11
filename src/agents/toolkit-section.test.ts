@@ -278,3 +278,26 @@ describe("buildToolkitSection", () => {
     expect(memoryIdx).toBeGreaterThan(capIdx);
   });
 });
+
+describe("deferred-loading hint (KPR-329)", () => {
+  const HINT = "Some tool schemas load on demand";
+
+  it("is NOT emitted while TOOLKIT_DEFERRED_HINT is disabled, even when deferral is active", () => {
+    // Locks the conservative default: the hint ships dark until the CLI
+    // double-prompting question (spec §4.4 / open assumption #3) is settled
+    // against a live instance.
+    const out = buildToolkitSection(bareBonesInput({ deferredLoadingActive: true }));
+    expect(out).not.toContain(HINT);
+  });
+
+  it("is NOT emitted when deferral is inactive or unspecified", () => {
+    expect(buildToolkitSection(bareBonesInput({ deferredLoadingActive: false }))).not.toContain(HINT);
+    expect(buildToolkitSection(bareBonesInput())).not.toContain(HINT);
+  });
+
+  it("output is unchanged by the new optional input (byte-identical)", () => {
+    expect(buildToolkitSection(bareBonesInput({ deferredLoadingActive: true }))).toBe(
+      buildToolkitSection(bareBonesInput()),
+    );
+  });
+});
