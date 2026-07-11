@@ -33,6 +33,13 @@ export interface ToolkitSectionInput {
    * AgentRunner.filterCoreServers — keep both sites in sync.
    */
   autoInjectedServers: ReadonlySet<string>;
+  /**
+   * KPR-329: true when this agent's resolved tool-search mode ≠ "off" —
+   * i.e. MCP tool schemas may be deferred and discovered on demand. Gates
+   * the optional discovery-hint line (see TOOLKIT_DEFERRED_HINT below).
+   * Optional so existing callers/tests are unaffected.
+   */
+  deferredLoadingActive?: boolean;
 }
 
 /**
@@ -94,6 +101,23 @@ function blurbFor(entry: ServerCatalogEntry): string {
 function formatToolkitLine(name: string, entry: ServerCatalogEntry): string {
   return `- ${name} — ${blurbFor(entry)}`;
 }
+
+/**
+ * KPR-329 / spec §4.4 — deferred-tool discovery hint, INTENTIONALLY DISABLED.
+ *
+ * The CLI may already inject equivalent "search for deferred tools" guidance
+ * when tool search is active: it demonstrably does in interactive Claude
+ * Code, but whether SDK-spawned sessions get the same injection is
+ * unverified (spec open assumption #3), and verifying requires a live hive
+ * instance. Shipping this line before that check risks double-prompting the
+ * agent with two overlapping instructions.
+ *
+ * To enable: run the spec §6 live verification (inspect a spawned session's
+ * system context under toolSearch mode "on" for CLI-injected discovery
+ * guidance); if the CLI does NOT inject it, flip this to true. No other
+ * change is needed — the gating input is already wired from prefix-builder.
+ */
+const TOOLKIT_DEFERRED_HINT = false;
 
 /**
  * Build the "Your toolkit" markdown section.
@@ -162,6 +186,14 @@ export function buildToolkitSection(input: ToolkitSectionInput): string {
       .join("\n");
     sections.push(
       "### Delegated capability MCPs (via Agent tool)\n" + lines,
+    );
+  }
+
+  // KPR-329: optional discovery hint — only when deferral can be active for
+  // this agent AND the hint is enabled (see TOOLKIT_DEFERRED_HINT rationale).
+  if (TOOLKIT_DEFERRED_HINT && input.deferredLoadingActive) {
+    sections.push(
+      "Some tool schemas load on demand — if a listed tool isn't directly callable, search for it by name first.",
     );
   }
 

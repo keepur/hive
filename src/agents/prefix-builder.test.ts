@@ -15,6 +15,8 @@ vi.mock("../config.js", () => ({
   config: {
     memory: { hotBudgetTokens: 3000 },
     workflow: { enabled: false },
+    // KPR-329: engine-default tool-search config for the mocked module.
+    toolSearch: { mode: "auto", source: "default" },
   },
 }));
 

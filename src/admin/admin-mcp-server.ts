@@ -67,6 +67,18 @@ function checkDelegateContextDependent(value: unknown): string | null {
   );
 }
 
+/**
+ * KPR-329: validate the optional `toolSearch` field at the write boundary.
+ * Returns an error string for the tool response, or null if acceptable.
+ * `undefined`/`null` are acceptable (absent / explicit unset — inherit the
+ * hive.yaml global). The registry re-sanitizes at load as defense in depth.
+ */
+function checkToolSearch(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (value === "auto" || value === "on" || value === "off") return null;
+  return `Invalid toolSearch: "${String(value)}". Must be one of: auto, on, off — or omit the field to inherit the hive.yaml toolSearch.mode (engine default: auto).`;
+}
+
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
   servers: { configured: [], unconfigured: [], broken: [] },
@@ -300,6 +312,11 @@ export function buildAdminTools(deps: AdminToolDeps) {
           if (contextError) {
             return { isError: true, content: [{ type: "text", text: contextError }] };
           }
+          // KPR-329: reject invalid toolSearch at the write boundary.
+          const toolSearchError = checkToolSearch(f.toolSearch);
+          if (toolSearchError) {
+            return { isError: true, content: [{ type: "text", text: toolSearchError }] };
+          }
           const now = new Date();
           const doc: AgentDefinition = {
             _id,
@@ -339,6 +356,8 @@ export function buildAdminTools(deps: AdminToolDeps) {
               (f.spawnBudget as number | undefined) ??
               (f.maxConcurrent as number | undefined) ??
               AGENT_DEFINITION_DEFAULTS.spawnBudget,
+            // KPR-329: optional; absent = inherit hive.yaml toolSearch.mode.
+            toolSearch: f.toolSearch as "auto" | "on" | "off" | undefined,
             timeoutMs: (f.timeoutMs as number) ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
             disabled: (f.disabled as boolean) ?? false,
             slackBot: f.slackBot as string | undefined,
@@ -437,6 +456,15 @@ export function buildAdminTools(deps: AdminToolDeps) {
             const contextError = checkDelegateContextDependent(merged.delegateServers);
             if (contextError) {
               return { isError: true, content: [{ type: "text", text: contextError }] };
+            }
+          }
+
+          // KPR-329: reject invalid toolSearch at the write boundary. null is
+          // allowed through (explicit unset — registry treats it as absent).
+          if ("toolSearch" in merged) {
+            const toolSearchError = checkToolSearch(merged.toolSearch);
+            if (toolSearchError) {
+              return { isError: true, content: [{ type: "text", text: toolSearchError }] };
             }
           }
 

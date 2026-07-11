@@ -119,6 +119,10 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
       delegateServerNames: ctx.activeDelegateNames,
       plugins: ctx.plugins,
       autoInjectedServers: ctx.autoInjectedServers,
+      // KPR-329: resolved mode ≠ "off" (agent override → hive.yaml → auto).
+      // Lives in the cached prefix: the agent-def field change invalidates via
+      // the definition-update path; hive.yaml changes require restart anyway.
+      deferredLoadingActive: (agentConfig.toolSearch ?? config.toolSearch.mode) !== "off",
     }),
   );
 
