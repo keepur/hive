@@ -2525,6 +2525,91 @@ describe("AgentManager", () => {
           expect.objectContaining({ model: "gpt-5.5", reasoningEffort: "medium" }),
         );
       });
+
+      it("auth-rebuild retry reuses the first routing decision — routeModel called exactly once, same override on both attempts", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered", sessionId: "s2" }));
+
+        const item = makeWorkItem({ text: "retry me", source: { kind: "sms", id: "line-1", label: "May" } });
+        // sessionId present — the auth-rebuild retry only fires on resumable turns.
+        await manager.spawnTurn(makeCtx(item, "sms", "s1"));
+
+        expect(routeModel).toHaveBeenCalledTimes(1); // no re-route, no double routerCostUsd
+        expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+        expect(mockRunnerSend.mock.calls[0]![4]).toBe("claude-haiku-4-5-routed");
+        expect(mockRunnerSend.mock.calls[1]![4]).toBe("claude-haiku-4-5-routed");
+      });
+
+      it("activity audit modelTier: routed tier when the router ran, undefined when disabled", async () => {
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+
+        // Router on → tier reaches the audit.
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ tier: "opus", model: "claude-opus-4-7" }));
+        const item1 = makeWorkItem({ text: "tier check", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item1, "sms"));
+        expect(activityLogger.record).toHaveBeenLastCalledWith(
+          expect.objectContaining({ modelTier: "opus", model: "claude-opus-4-7" }),
+        );
+
+        // Router off → undefined (pre-KPR-311 behavior preserved). Assert the
+        // property EXISTS and is undefined — objectContaining({modelTier:
+        // undefined}) would also pass on an absent key.
+        (appConfig as any).modelRouter.enabled = false;
+        const item2 = makeWorkItem({ text: "no tier", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item2, "sms"));
+        const offArg = activityLogger.record.mock.calls.at(-1)![0];
+        expect("modelTier" in offArg).toBe(true);
+        expect(offArg.modelTier).toBeUndefined();
+      });
+
+      it("misattribution fix: a router-enabled pilot agent audits its static model, no tier, no router call", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult()); // would misattribute pre-fix
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({
+            id: "codex-pilot",
+            name: "Codex Pilot",
+            model: "codex/gpt-5.5:medium",
+            coreServers: [],
+            soul: "",
+            systemPrompt: "pilot system",
+          }),
+        );
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+
+        const item = makeWorkItem({ text: "audit me", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+        expect(routeModel).not.toHaveBeenCalled();
+        // Static pilot model in the audit — NOT a Claude router output.
+        expect(activityLogger.record).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "codex/gpt-5.5:medium" }),
+        );
+        // modelTier: property present AND undefined (see comment above).
+        const pilotArg = activityLogger.record.mock.calls.at(-1)![0];
+        expect("modelTier" in pilotArg).toBe(true);
+        expect(pilotArg.modelTier).toBeUndefined();
+      });
     });
   });
 
