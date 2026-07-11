@@ -2112,6 +2112,72 @@ describe("AgentManager", () => {
         expect(result.aborted ?? false).toBe(false);
       });
     });
+
+    describe("router→adapter seam invariants (KPR-311)", () => {
+      it("breaker permit provider === effective route provider for claude and pilot agents (stable registry state)", async () => {
+        // R7: acquire() keys on the static provider before the router runs;
+        // the W3 clamp makes shaping.route.provider agree whenever both
+        // registry reads observe the same state. NOT asserted across a
+        // mid-turn registry mutation (see the SIGUSR1 race test below).
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:seam-claude" }));
+        expect(acquireSpy).toHaveBeenLastCalledWith("claude", expect.objectContaining({ agentId: "agent-a" }));
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1); // Claude adapter ran — same provider as the permit
+
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:seam-codex" }));
+        expect(acquireSpy).toHaveBeenLastCalledWith("codex", expect.objectContaining({ agentId: "codex-pilot" }));
+        expect(mockCodexConstructor).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.5" }));
+      });
+
+      it("SIGUSR1 removal race: prepareSpawn never throws on a vanished agent — failure lands inside the recorded try, record() once, no wedged permit", async () => {
+        const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+        // Flip the registry to "agent removed" the instant the breaker
+        // permit is issued: the acquire-site read (argument evaluation)
+        // still sees the agent; every later read — prepareSpawn's guarded
+        // read and createProviderAdapter's — sees undefined. This is the
+        // hot-reload race the `?.model ?? ""` guard exists for.
+        let vanished = false;
+        const realAcquire = manager.circuitBreakers.acquire.bind(manager.circuitBreakers);
+        vi.spyOn(manager.circuitBreakers, "acquire").mockImplementation((provider, meta) => {
+          const permit = realAcquire(provider, meta);
+          vanished = true;
+          return permit;
+        });
+        registry.get.mockImplementation((id: string) =>
+          vanished && id === "agent-a" ? undefined : registry._agents.get(id),
+        );
+
+        // Rejects with the createProviderAdapter throw — NOT a TypeError
+        // from an unguarded agentConfig.model dereference in prepareSpawn.
+        await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:hot-reload" }))).rejects.toThrow(
+          /Unknown agent: agent-a/,
+        );
+
+        // Exactly one record(), on the permit acquired pre-removal,
+        // classified non-provider (never trips) from the thrown error.
+        expect(recordSpy).toHaveBeenCalledTimes(1);
+        const [permit, classification] = recordSpy.mock.calls[0]!;
+        expect(permit.provider).toBe("claude");
+        expect(classification).toEqual({
+          outcome: "fault",
+          kind: "non-provider",
+          message: expect.stringContaining("Unknown agent"),
+        });
+        const snap = manager.circuitBreakers.stateFor("claude")!;
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0);
+
+        // No wedge, no lock leak: restore the registry, same thread runs clean.
+        registry.get.mockImplementation((id: string) => registry._agents.get(id));
+        const result = await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:hot-reload" }));
+        expect(result.finalMessage).toBe("response");
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------
