@@ -126,7 +126,14 @@ vi.mock("../config.js", () => ({
     memory: { hotBudgetTokens: 3000 },
     workflow: { enabled: false },
     voice: { apiKey: "", phoneNumberId: "", assistants: {} },
+    // KPR-329: engine-default tool-search config for the mocked module.
+    toolSearch: { mode: "auto", source: "default" },
   },
+  // KPR-329: real stub matching config.ts's type guard — agent-runner.ts
+  // imports this; the mock factory must export it or every test in this
+  // file throws at import time.
+  isToolSearchMode: (v: unknown): v is "auto" | "on" | "off" =>
+    v === "auto" || v === "on" || v === "off",
 }));
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -175,7 +182,7 @@ function getCapturedOptions(): Record<string, any> {
 }
 
 // ── Import after mocks ──────────────────────────────────────────────
-import { AgentRunner } from "./agent-runner.js";
+import { AgentRunner, resolveToolSearchEnv, resolveToolSearchMode } from "./agent-runner.js";
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 
@@ -2378,6 +2385,85 @@ describe("AgentRunner betas passthrough (via send)", () => {
     const options = getCapturedOptions();
 
     expect(options).not.toHaveProperty("betas");
+  });
+});
+
+describe("resolveToolSearchEnv (KPR-329)", () => {
+  it("agent override wins over every hive mode", () => {
+    for (const hive of ["auto", "on", "off"]) {
+      expect(resolveToolSearchEnv("auto", hive)).toBe("auto");
+      expect(resolveToolSearchEnv("on", hive)).toBe("true");
+      expect(resolveToolSearchEnv("off", hive)).toBe("false");
+    }
+  });
+
+  it("falls back to hive mode when agent field is absent", () => {
+    expect(resolveToolSearchEnv(undefined, "auto")).toBe("auto");
+    expect(resolveToolSearchEnv(undefined, "on")).toBe("true");
+    expect(resolveToolSearchEnv(undefined, "off")).toBe("false");
+  });
+
+  it("falls back to engine default auto when both are absent/invalid", () => {
+    expect(resolveToolSearchEnv(undefined, "")).toBe("auto");
+    expect(resolveToolSearchEnv(undefined, "garbage")).toBe("auto");
+  });
+
+  it("treats an invalid agent value as absent (inherit hive mode)", () => {
+    expect(resolveToolSearchEnv("always", "off")).toBe("false");
+    expect(resolveToolSearchEnv("", "on")).toBe("true");
+    expect(resolveToolSearchEnv("TRUE", "auto")).toBe("auto");
+  });
+
+  it("reports resolution source: agent | hive.yaml | default", () => {
+    expect(resolveToolSearchMode("on", "auto")).toEqual({ mode: "on", source: "agent" });
+    expect(resolveToolSearchMode(undefined, "off")).toEqual({ mode: "off", source: "hive.yaml" });
+    expect(resolveToolSearchMode(undefined, "auto", "default")).toEqual({ mode: "auto", source: "default" });
+    expect(resolveToolSearchMode("bogus", "junk")).toEqual({ mode: "auto", source: "default" });
+  });
+});
+
+describe("AgentRunner ENABLE_TOOL_SEARCH env pinning (via send) (KPR-329)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("pins ENABLE_TOOL_SEARCH to 'auto' by default (no agent field, default config)", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const options = getCapturedOptions();
+    expect(options.env.ENABLE_TOOL_SEARCH).toBe("auto");
+  });
+
+  it("agent toolSearch 'on' yields the literal string 'true'", async () => {
+    const runner = new AgentRunner(makeAgentConfig({ toolSearch: "on" }), memoryManager as any);
+    await runner.send("hello");
+    expect(getCapturedOptions().env.ENABLE_TOOL_SEARCH).toBe("true");
+  });
+
+  // Spec §6.6 negative-verify: 'off' must produce the literal string "false"
+  // in the spawn env map — NOT merely absent/undefined (absent would let the
+  // CLI's implicit experimental default back in).
+  it("agent toolSearch 'off' yields the literal string 'false', not undefined", async () => {
+    const runner = new AgentRunner(makeAgentConfig({ toolSearch: "off" }), memoryManager as any);
+    await runner.send("hello");
+    const env = getCapturedOptions().env;
+    expect(env.ENABLE_TOOL_SEARCH).not.toBeUndefined();
+    expect(env.ENABLE_TOOL_SEARCH).toBe("false");
+  });
+
+  it("engine value overrides ambient process.env.ENABLE_TOOL_SEARCH", async () => {
+    process.env.ENABLE_TOOL_SEARCH = "true";
+    try {
+      const runner = new AgentRunner(makeAgentConfig({ toolSearch: "off" }), memoryManager as any);
+      await runner.send("hello");
+      expect(getCapturedOptions().env.ENABLE_TOOL_SEARCH).toBe("false");
+    } finally {
+      delete process.env.ENABLE_TOOL_SEARCH;
+    }
   });
 });
 

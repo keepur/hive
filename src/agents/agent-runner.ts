@@ -8,7 +8,7 @@ import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
-import { config } from "../config.js";
+import { config, isToolSearchMode } from "../config.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin, HttpPluginMcpServer } from "../plugins/types.js";
@@ -261,6 +261,62 @@ function mcpPath(devSubpath: string): string {
     if (existsSync(pkgBundle)) return pkgBundle;
   }
   return resolve(DIST_DIR, devSubpath);
+}
+
+// ── KPR-329: tool-search (deferred MCP tool loading) resolution ──────────────
+
+/** Resolution-chain provenance for the spawn debug log. */
+export type ToolSearchSource = "agent" | "hive.yaml" | "default";
+
+/**
+ * KPR-329: resolve the effective tool-search mode + provenance.
+ * Chain: agent-definition `toolSearch` field → hive.yaml `toolSearch.mode` →
+ * engine default "auto". The agent value is defensively re-validated here
+ * (registry sanitizes on load, but hand-built configs in tests/fixtures
+ * bypass the registry).
+ */
+export function resolveToolSearchMode(
+  agentToolSearch: string | undefined,
+  hiveMode: string,
+  hiveSource: "hive.yaml" | "default" = "hive.yaml",
+): { mode: "auto" | "on" | "off"; source: ToolSearchSource } {
+  if (isToolSearchMode(agentToolSearch)) return { mode: agentToolSearch, source: "agent" };
+  if (isToolSearchMode(hiveMode)) return { mode: hiveMode, source: hiveSource };
+  return { mode: "auto", source: "default" };
+}
+
+/**
+ * KPR-329: map the resolved mode to the CLI's `ENABLE_TOOL_SEARCH` env value
+ * (spec §4.1 table): auto → "auto" (tst-auto threshold mode), on → "true"
+ * (always defer), off → "false" (standard/eager — the rollback posture).
+ * The value is ALWAYS set on the spawn env — never left to ambient
+ * process.env or the CLI's drifting experimental default.
+ */
+export function resolveToolSearchEnv(
+  agentToolSearch: string | undefined,
+  hiveMode: string,
+): "auto" | "true" | "false" {
+  const { mode } = resolveToolSearchMode(agentToolSearch, hiveMode);
+  return mode === "on" ? "true" : mode === "off" ? "false" : "auto";
+}
+
+/**
+ * KPR-329: ambient CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS force-disables tool
+ * search inside the CLI regardless of ENABLE_TOOL_SEARCH — it would silently
+ * defeat `on`/`auto`. Warn once per process (the CLI itself logs once per
+ * process; per-spawn would be log spam).
+ */
+let warnedToolSearchForceDisabled = false;
+export function __resetToolSearchWarnForTests(): void {
+  warnedToolSearchForceDisabled = false;
+}
+function warnIfToolSearchForceDisabled(): void {
+  if (warnedToolSearchForceDisabled || !process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS) return;
+  warnedToolSearchForceDisabled = true;
+  log.warn(
+    "Ambient CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is set — the CLI force-disables tool search; toolSearch mode 'on'/'auto' will silently run eager (KPR-329)",
+    { value: process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS },
+  );
 }
 
 export class AgentRunner {
@@ -1742,6 +1798,21 @@ export class AgentRunner {
       }
     }
 
+    // KPR-329: resolve tool-search mode for this spawn. The env value is
+    // always pinned (see env block below) so hive owns the policy — the CLI's
+    // implicit default is never in play.
+    const toolSearch = resolveToolSearchMode(
+      this.agentConfig.toolSearch,
+      config.toolSearch.mode,
+      config.toolSearch.source,
+    );
+    log.debug("Tool search mode resolved", {
+      agent: this.agentConfig.id,
+      mode: toolSearch.mode,
+      source: toolSearch.source,
+    });
+    warnIfToolSearchForceDisabled();
+
     const q = query({
       prompt,
       options: {
@@ -1773,6 +1844,9 @@ export class AgentRunner {
           ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
           CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
           CLAUDECODE: undefined,
+          // KPR-329: always pinned — overrides any ambient ENABLE_TOOL_SEARCH.
+          ENABLE_TOOL_SEARCH:
+            toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto",
         },
         // Pass --strict-mcp-config to the spawned claude CLI so it ignores all
         // MCP sources except the engine-supplied `mcpServers` above (which the
