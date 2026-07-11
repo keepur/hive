@@ -92,6 +92,45 @@ export function resolveOutageQueueConfig(raw: unknown): OutageQueueConfig {
 }
 
 /**
+ * KPR-329: tool-search (deferred MCP tool loading) mode. Controls the
+ * `ENABLE_TOOL_SEARCH` env var pinned on every Claude-provider spawn:
+ *   auto → CLI threshold mode (defer only past ~10% context) — engine default
+ *   on   → always defer eligible MCP tool schemas
+ *   off  → eager loading (today's intended behavior) — the rollback posture
+ */
+export type ToolSearchMode = "auto" | "on" | "off";
+
+export interface ToolSearchConfig {
+  mode: ToolSearchMode;
+  /** Where `mode` came from — explicit hive.yaml value vs engine default.
+   *  Feeds the per-spawn debug log (`source=agent|hive.yaml|default`). */
+  source: "hive.yaml" | "default";
+}
+
+export const DEFAULT_TOOL_SEARCH_CONFIG: ToolSearchConfig = { mode: "auto", source: "default" };
+
+/** Type guard shared by the loader; agent-side guards live at their own boundaries. */
+export function isToolSearchMode(v: unknown): v is ToolSearchMode {
+  return v === "auto" || v === "on" || v === "off";
+}
+
+/**
+ * KPR-329: liberal-loader resolver for the `toolSearch` hive.yaml section
+ * (KPR-225 F3 — all keys optional, unknown keys ignored, absent section =
+ * all defaults, invalid mode → warn + default). Exported pure for unit tests.
+ */
+export function resolveToolSearchConfig(raw: unknown): ToolSearchConfig {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ...DEFAULT_TOOL_SEARCH_CONFIG };
+  const r = raw as Record<string, unknown>;
+  if (r.mode === undefined) return { ...DEFAULT_TOOL_SEARCH_CONFIG };
+  if (isToolSearchMode(r.mode)) return { mode: r.mode, source: "hive.yaml" };
+  console.warn(
+    `[config] toolSearch.mode "${String(r.mode)}" is invalid — expected auto | on | off; defaulting to "auto".`,
+  );
+  return { ...DEFAULT_TOOL_SEARCH_CONFIG };
+}
+
+/**
  * KPR-242: warn once at config load if hive.yaml still carries the deprecated
  * `google.account` field. Exported so unit tests can exercise it directly.
  */
@@ -358,6 +397,9 @@ export const config = {
   // KPR-307: Mongo-backed outage queue (hive.yaml `outageQueue`, all keys
   // optional; enabled:false = interception off, fast-fails fall back to the raw error path).
   outageQueue: resolveOutageQueueConfig(hive.outageQueue),
+  // KPR-329: tool-search / deferred MCP tool loading (hive.yaml `toolSearch`,
+  // all keys optional; mode: off = eager loading, the rollback posture).
+  toolSearch: resolveToolSearchConfig(hive.toolSearch),
   sweeper: {
     intervalMs: parseInt(optional("SWEEPER_INTERVAL_MS", "300000"), 10),
     threadTtlMs: parseInt(optional("SWEEPER_THREAD_TTL_MS", "86400000"), 10),

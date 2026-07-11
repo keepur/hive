@@ -4,6 +4,8 @@ import {
   warnIfLegacyGoogleAccount,
   resolveCircuitBreakerConfig,
   resolveOutageQueueConfig,
+  resolveToolSearchConfig,
+  DEFAULT_TOOL_SEARCH_CONFIG,
 } from "./config.js";
 import { DEFAULT_CIRCUIT_BREAKER_CONFIG } from "./agents/provider-circuit-breaker.js";
 import { DEFAULT_OUTAGE_QUEUE_CONFIG } from "./outage/outage-queue-store.js";
@@ -155,5 +157,46 @@ describe("resolveOutageQueueConfig (KPR-307)", () => {
       maxReplayAttempts: 0,
     });
     expect(resolved).toEqual(DEFAULT_OUTAGE_QUEUE_CONFIG);
+  });
+});
+
+describe("resolveToolSearchConfig (KPR-329)", () => {
+  it("returns defaults for absent/garbage section", () => {
+    expect(resolveToolSearchConfig(undefined)).toEqual({ mode: "auto", source: "default" });
+    expect(resolveToolSearchConfig(null)).toEqual({ mode: "auto", source: "default" });
+    expect(resolveToolSearchConfig("off")).toEqual({ mode: "auto", source: "default" });
+    expect(resolveToolSearchConfig(42)).toEqual({ mode: "auto", source: "default" });
+    expect(resolveToolSearchConfig([])).toEqual({ mode: "auto", source: "default" });
+  });
+
+  it("returns a copy of defaults, not the shared object", () => {
+    const a = resolveToolSearchConfig(undefined);
+    expect(a).not.toBe(DEFAULT_TOOL_SEARCH_CONFIG);
+  });
+
+  it("accepts each valid mode with source hive.yaml", () => {
+    expect(resolveToolSearchConfig({ mode: "auto" })).toEqual({ mode: "auto", source: "hive.yaml" });
+    expect(resolveToolSearchConfig({ mode: "on" })).toEqual({ mode: "on", source: "hive.yaml" });
+    expect(resolveToolSearchConfig({ mode: "off" })).toEqual({ mode: "off", source: "hive.yaml" });
+  });
+
+  it("warns and defaults to auto on an invalid mode value", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(resolveToolSearchConfig({ mode: "yes" })).toEqual({ mode: "auto", source: "default" });
+      expect(resolveToolSearchConfig({ mode: true })).toEqual({ mode: "auto", source: "default" });
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("toolSearch.mode");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("treats an empty section as defaults and ignores unknown keys", () => {
+    expect(resolveToolSearchConfig({})).toEqual({ mode: "auto", source: "default" });
+    expect(resolveToolSearchConfig({ mode: "on", autoThresholdPercent: 5 })).toEqual({
+      mode: "on",
+      source: "hive.yaml",
+    });
   });
 });
