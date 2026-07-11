@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { RunResult } from "../agent-runner.js";
 import type { HiveToolTransportDescriptor } from "./tool-transport.js";
-import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
+import type { AgentProviderAdapter, AgentProviderTurnRequest, ReasoningEffort } from "./types.js";
 import { createCodexOpenAITokenProvider } from "./oauth-credentials.js";
 
 const DEFAULT_CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_CODEX_MODEL = "gpt-5.4-mini";
 
-export type CodexReasoningEffort = "minimal" | "none" | "low" | "medium" | "high" | "xhigh";
+/** Back-compat alias — KPR-311 moved the canonical type to types.ts. */
+export type CodexReasoningEffort = ReasoningEffort;
 
 export interface CodexSubscriptionAdapterOptions {
   name: string;

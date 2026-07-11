@@ -9,7 +9,7 @@ import type { TurnTelemetryStore } from "./turn-telemetry.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { Db } from "mongodb";
 import { formatFilesForPrompt } from "../files/file-processor.js";
-import { routeModel, type ResourceLimits } from "./model-router.js";
+import { routeModel, type ModelTier, type ResourceLimits } from "./model-router.js";
 import { config as appConfig } from "../config.js";
 import { loadPlugins, rescanPluginBrokenServers } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
@@ -180,6 +180,30 @@ function splitProviderModel(providerModel: string): { model: string; reasoningEf
   const suffix = providerModel.slice(colon + 1);
   if (!REASONING_EFFORTS.has(suffix as CodexReasoningEffort)) return { model: providerModel };
   return { model: providerModel.slice(0, colon), reasoningEffort: suffix as CodexReasoningEffort };
+}
+
+/**
+ * KPR-311: per-turn spawn shaping — shaped prompt plus the effective
+ * per-turn route. `route` is provider-clamped to the agent's static
+ * provider (W3 invariant): it keeps the KPR-306 breaker permit — acquired
+ * on the static provider before the router runs (R7) — keyed to the
+ * provider that actually executes, and keeps providerFor() (KPR-307)
+ * consistent. Lifting the clamp is parked in the spec (§5) for W3.5.
+ */
+interface SpawnShaping {
+  prompt: string;
+  /** Effective per-turn route — provider-clamped; consumed by createProviderAdapter. */
+  route: ProviderModelRoute;
+  /**
+   * Claude-path per-turn model when the router chose ≠ static; threaded to
+   * runner.send via AgentProviderTurnRequest.modelOverride + observability.
+   * Derivation unchanged from KPR-224.
+   */
+  modelOverride: string | undefined;
+  /** Router tier for activity-audit modelTier (cache-cliff observability hook, KPR-310 C1–C3). */
+  routerTier: ModelTier | undefined;
+  resourceLimits: ResourceLimits | undefined;
+  routerCostUsd: number;
 }
 
 function buildPilotInstructions(name: string, soul: string, systemPrompt: string): string {
@@ -413,12 +437,18 @@ export class AgentManager {
     return [...tickets].map((t) => t.workItem);
   }
 
-  private createProviderAdapter(agentId: string): AgentProviderAdapter {
+  /**
+   * KPR-311: the route is the effective per-turn route derived by
+   * prepareSpawn (provider-clamped to static in W3) — the static
+   * agent.model prefix is no longer re-resolved here, so the breaker
+   * permit and the adapter always key off the same resolution (R7).
+   * Single call site (runOneSpawnAttempt); parameter required, no default.
+   */
+  private createProviderAdapter(agentId: string, route: ProviderModelRoute): AgentProviderAdapter {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
     const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle);
-    const route = resolveProviderModel(config.model);
     if (route.provider === "claude") {
       return new ClaudeAgentAdapter(runner);
     }
@@ -643,7 +673,7 @@ export class AgentManager {
       this.circuitBreakers.record(permit, classifyTurnResult(finalResult), finalResult.llmMs);
 
       const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult);
-      this.recordSpawnObservability(effectiveCtx, shaping.prompt, shaping.modelOverride, finalResult);
+      this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
       // turns themselves don't reschedule (kind="reflection" guard).
@@ -1026,19 +1056,14 @@ export class AgentManager {
 
   private async runOneSpawnAttempt(
     ctx: TurnContext,
-    shaping: {
-      prompt: string;
-      modelOverride: string | undefined;
-      resourceLimits: ResourceLimits | undefined;
-      routerCostUsd: number;
-    },
+    shaping: SpawnShaping,
     ticket: SpawnTicket,
     onStream?: SpawnTurnStreamCallback,
   ): Promise<RunResult> {
     // Fresh provider adapter per spawn — its lazy-built in-process MCPs are therefore
     // also fresh, with channel/thread ctx captured at construction. The
     // long-lived path keeps reusing one runner per agent.
-    const adapter = this.createProviderAdapter(ctx.agentId);
+    const adapter = this.createProviderAdapter(ctx.agentId, shaping.route);
     ticket.attachAbort(() => adapter.abort());
 
     const bgContext: WorkItemContext = {
@@ -1067,30 +1092,43 @@ export class AgentManager {
   }
 
   /**
-   * KPR-224: shared shaping helper for both `spawnTurn` (per-turn path) and
-   * `processQueue` (legacy path). Centralizes:
+   * KPR-224 + KPR-311: per-turn shaping for `spawnTurn` (its single caller
+   * post-KPR-220). Centralizes:
    *  - sender identity prepending (`[user:X via Y in #Z]:` for team /
    *    `[Y in #Z, thread=ts]:` for slack-with-sender)
    *  - file-attachment text appending
-   *  - model router (modelOverride + resourceLimits + routerCostUsd)
+   *  - effective per-turn route derivation (KPR-311): the model router's
+   *    per-turn decision merged with the agent's static
+   *    resolveProviderModel(agent.model) route. W3 invariants: the
+   *    effective provider is clamped to the static provider, and the
+   *    router only runs for Claude-static agents (pilot gate — pilots are
+   *    constructor-baked; TIER_MODELS is Claude-only).
    *
    * Voice carve-out: voice has its own `systemPromptOverride` injection
-   * (KPR-219) and explicitly bypasses sender prepending + model router.
-   * Returns raw text + no router for `ctx.channel === "voice"`.
+   * (KPR-219) and explicitly bypasses prepending + model router. Returns
+   * raw text + the static route for `ctx.channel === "voice"`.
    */
-  private async prepareSpawn(ctx: TurnContext): Promise<{
-    prompt: string;
-    modelOverride: string | undefined;
-    resourceLimits: ResourceLimits | undefined;
-    routerCostUsd: number;
-  }> {
+  private async prepareSpawn(ctx: TurnContext): Promise<SpawnShaping> {
     const item = ctx.workItem;
+
+    // Static route — resolved ONCE per turn, here; createProviderAdapter
+    // consumes it (KPR-311). The `?.model ?? ""` guard mirrors the breaker
+    // acquire site (KPR-306): SIGUSR1 hot-reload can remove the agent
+    // between spawnTurn's registry pre-check and this point, and an
+    // unguarded dereference would throw OUTSIDE the recorded try — skipping
+    // the breaker's record() and wedging a half-open probe permit for up to
+    // PROBE_STALE_MS. The degenerate route ({provider:"claude", model:""})
+    // flows on instead; the turn then fails INSIDE the recorded try via
+    // createProviderAdapter's `Unknown agent` throw (classifyThrown →
+    // non-provider → never trips).
+    const agentConfig = this.registry.get(ctx.agentId);
+    const staticRoute = resolveProviderModel(agentConfig?.model ?? "");
 
     // Voice carve-out: KPR-219 supplies its own systemPromptOverride and
     // explicitly bypasses prepending + model router. Pin via this branch so
     // future prepareSpawn edits cannot accidentally re-shape voice prompts.
     if (ctx.channel === "voice") {
-      return { prompt: item.text, modelOverride: undefined, resourceLimits: undefined, routerCostUsd: 0 };
+      return { prompt: item.text, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0 };
     }
 
     const senderLabel = item.senderName ?? item.sender;
@@ -1116,37 +1154,65 @@ export class AgentManager {
       prompt += formatFilesForPrompt(item.files);
     }
 
-    let modelOverride: string | undefined;
-    let routerCostUsd = 0;
-    let resourceLimits: ResourceLimits | undefined;
-    if (appConfig.modelRouter.enabled && item.sender !== "system") {
-      try {
-        const agentConfig = this.registry.get(ctx.agentId);
-        if (agentConfig) {
-          const route = await routeModel(item.text, agentConfig.model, agentConfig.resourceTiers);
-          modelOverride = route.model !== agentConfig.model ? route.model : undefined;
-          routerCostUsd = route.costUsd;
-          resourceLimits = route.resourceLimits;
-        }
-      } catch (err) {
-        log.warn("Model router failed, using default", { agentId: ctx.agentId, error: String(err) });
-      }
+    // Router gate (KPR-311): skip when disabled, for system senders
+    // (scheduler/cron), when the agent vanished mid-turn (guard above), or
+    // when the agent's static provider isn't Claude (pilot gate — calling
+    // the router for a pilot charged routerCostUsd for an output the pilot
+    // ignores and misattributed the Claude model in telemetry/audit).
+    if (!agentConfig || !appConfig.modelRouter.enabled || item.sender === "system" || staticRoute.provider !== "claude") {
+      return { prompt, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0 };
     }
 
-    return { prompt, modelOverride, resourceLimits, routerCostUsd };
+    try {
+      const result = await routeModel(item.text, agentConfig.model, agentConfig.resourceTiers);
+
+      if (result.provider !== undefined && result.provider !== staticRoute.provider) {
+        // W3 provider clamp: cross-provider per-turn routing is
+        // unsupported — the breaker permit (KPR-306) and the dispatcher
+        // outage gate (KPR-307 providerFor) key on the static provider.
+        // Model + effort are dropped; routed resourceLimits are RETAINED
+        // (provider-agnostic runner-side execution bounds for the Claude
+        // turn that actually runs) and cost/tier are still recorded — the
+        // router call happened. Unreachable in production until W3.3+
+        // (routeModel never sets `provider` in W3); semantics pinned by
+        // unit test so W3.3 lands against defined behavior.
+        log.warn("Model router provider ignored — cross-provider per-turn routing unsupported (W3 clamp)", {
+          agentId: ctx.agentId,
+          routerProvider: result.provider,
+          staticProvider: staticRoute.provider,
+        });
+        return { prompt, route: staticRoute, modelOverride: undefined, routerTier: result.tier, resourceLimits: result.resourceLimits, routerCostUsd: result.costUsd };
+      }
+
+      // Effective route. The claude ProviderModelRoute variant carries NO
+      // reasoningEffort field — effort is never merged into the route; W3.3
+      // (KPR-312) carries it beside the route via SpawnShaping.effortOverride
+      // (spec §7). [amended at KPR-312 spec gate (driver reconciliation)]
+      const route: ProviderModelRoute = { provider: "claude", model: result.model };
+      return {
+        prompt,
+        route,
+        modelOverride: result.model !== agentConfig.model ? result.model : undefined,
+        routerTier: result.tier,
+        resourceLimits: result.resourceLimits,
+        routerCostUsd: result.costUsd,
+      };
+    } catch (err) {
+      log.warn("Model router failed, using default", { agentId: ctx.agentId, error: String(err) });
+      return { prompt, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0 };
+    }
   }
 
   /**
-   * KPR-224: shared post-spawn observability helper for both `spawnTurn` and
-   * `processQueue`. Records turn telemetry (per-turn cache window),
+   * KPR-224: post-spawn observability for `spawnTurn` (its single caller
+   * post-KPR-220). Records turn telemetry (per-turn cache window),
    * conversation index (semantic recall), and activity audit. All three
-   * fail-soft — telemetry/index/audit failures cannot cascade into the turn
-   * pipeline (matches existing `processQueue` pattern).
+   * fail-soft — telemetry/index/audit failures cannot cascade into the
+   * turn pipeline.
    */
   private recordSpawnObservability(
     ctx: TurnContext,
-    prompt: string,
-    modelOverride: string | undefined,
+    shaping: SpawnShaping,
     result: RunResult,
   ): void {
     const item = ctx.workItem;
@@ -1159,7 +1225,7 @@ export class AgentManager {
           agentId: ctx.agentId,
           threadId: ctx.threadId,
           sessionId: result.sessionId,
-          model: modelOverride ?? this.registry.get(ctx.agentId)?.model,
+          model: shaping.modelOverride ?? this.registry.get(ctx.agentId)?.model,
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
           cacheReadTokens: result.cacheReadTokens,
@@ -1183,7 +1249,7 @@ export class AgentManager {
           senderName: item.senderName ?? "unknown",
           timestampUnix: Math.floor(Date.now() / 1000),
           timestamp: new Date().toISOString(),
-          inbound: prompt,
+          inbound: shaping.prompt,
           response: result.text,
         })
         .catch((err) =>
@@ -1200,8 +1266,8 @@ export class AgentManager {
       senderName: item.senderName,
       channel: item.source.label,
       channelKind: item.source.kind,
-      model: modelOverride ?? this.registry.get(ctx.agentId)?.model ?? "unknown",
-      modelTier: undefined, // Model router tier not currently passed through
+      model: shaping.modelOverride ?? this.registry.get(ctx.agentId)?.model ?? "unknown",
+      modelTier: shaping.routerTier, // KPR-311: router tier reaches the audit (cache-cliff observability, KPR-310 C1–C3)
       costUsd: result.costUsd,
       durationMs: result.durationMs,
       inputTokens: result.inputTokens,
