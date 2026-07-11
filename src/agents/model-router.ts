@@ -1,6 +1,7 @@
 import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
+import type { AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 
 const log = createLogger("model-router");
 
@@ -62,6 +63,18 @@ export interface ModelRouterResult {
   costUsd: number;
   durationMs: number;
   resourceLimits: ResourceLimits;
+  /** Absent ⇒ inherit the agent's static provider (resolveProviderModel(agent.model)).
+   *  Dormant in W3: routeModel never sets it, AND even if set it is inert — a value
+   *  matching the static provider is a no-op, a mismatch is clamped to static (spec §2/§5).
+   *  Carriage-only until the spec §5 pilot-gate/clamp lift (the same lift that
+   *  gates pilot effort delivery). */
+  provider?: AgentProviderId;
+  /** Dormant in W3.2 (this ticket): routeModel never sets it. Never merged into the
+   *  route — the claude route variant carries no effort field; pilots never reach the
+   *  merge (spec §7). From W3.3 (KPR-312): routeModel emits it and prepareSpawn delivers
+   *  it per-turn to the Claude adapter via SpawnShaping.effortOverride — a parallel
+   *  channel like modelOverride. Pilot delivery still gated on the spec §5 lift. */
+  effort?: ReasoningEffort;
 }
 
 const ROUTER_PROMPT = `You are a model router. Your job is to classify the complexity of a user message and decide which AI model tier should handle it.

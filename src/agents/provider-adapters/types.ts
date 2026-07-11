@@ -3,6 +3,13 @@ import type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner
 
 export type AgentProviderId = "claude" | "openai" | "gemini" | "codex";
 
+/**
+ * Neutral reasoning-effort scale (KPR-311). Canonical home — pilot adapter
+ * options and ModelRouterResult carriage both reference this. Values mirror
+ * the codex effort suffix scale parsed by splitProviderModel.
+ */
+export type ReasoningEffort = "minimal" | "none" | "low" | "medium" | "high" | "xhigh";
+
 export interface AgentProviderTurnRequest {
   prompt: string;
   sessionId?: string;
