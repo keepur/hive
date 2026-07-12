@@ -234,6 +234,21 @@ function buildPilotInstructions(name: string, soul: string, systemPrompt: string
 }
 
 /**
+ * KPR-313 §3.4: hive-owned handoff annotation, prepended by prepareSpawn
+ * when spawnTurn's session-identity guard reset thread continuity. Binding
+ * content requirements (spec): the engine changed, prior turns in this
+ * thread are not in context, agent memory is intact. The conversation_search
+ * recall clause is Claude-target only — pilot adapters run tool-free
+ * (assertToolFreePilot in codex/gemini; openai gets the no-tool variant regardless), so the pilot variant must not suggest a tool the
+ * agent cannot reach. Voice never sees either (carve-out returns first;
+ * voice's handoff is its full-transcript re-send).
+ */
+const SESSION_HANDOFF_NOTICE_CLAUDE =
+  "[System notice: this thread's session continuity was reset because your underlying engine changed. Earlier turns in this thread are not in your context, but your agent memory is intact — use conversation_search if you need prior context from this thread.]\n";
+const SESSION_HANDOFF_NOTICE_PILOT =
+  "[System notice: this thread's session continuity was reset because your underlying engine changed. Earlier turns in this thread are not in your context, but your agent memory is intact.]\n";
+
+/**
  * Voice-adapter sentinel: SDK auth-rebuild-resume errors are retried once
  * with a rebuilt resume id. Mirrors voice-adapter.ts:isAuthError so
  * KPR-219's voice rope-back can route through this same API without
@@ -650,6 +665,45 @@ export class AgentManager {
         // mismatch, and (worse) assign a ref where a string id belongs.
         if (fresh?.sessionId !== ctx.sessionId || fresh?.provider !== ctx.sessionProvider) {
           effectiveCtx = { ...ctx, sessionId: fresh?.sessionId, sessionProvider: fresh?.provider };
+        }
+      }
+
+      // KPR-313: session-identity guard. Resume only a same-provider handle;
+      // on any provider transition with prior thread state, hand off (fresh +
+      // memory + annotation). Hot path is a pure compare — zero I/O; R7 order
+      // (acquire → re-resolve → guard → recordSpawn → prepareSpawn → record)
+      // intact. On trip ONLY: one authoritative post-lock store re-read —
+      // non-reflection turns capture sessionId+tag PRE-lock (runWorkItemTurn),
+      // so under same-thread contention across a provider transition the
+      // captured tag is stale by a full turn; the re-read adopts the queue-
+      // predecessor's already-switched session instead of dropping its
+      // exchange (⚠A9). The trip condition keys on sessionProvider alone, not
+      // sessionId: a codex-tagged row with sessionId:"" read by a claude turn
+      // has nothing to resume but DOES have invisible prior thread turns —
+      // the annotation must still fire. `route` is the acquire-time static
+      // route; under the W3 clamp it is provably ≡ shaping.route.provider
+      // (KPR-311 §5). Lifting the clamp re-keys acquire AND this guard
+      // together (parked: kpr-311-spec §5 → W3.5/KPR-314). The re-read is
+      // withRetry fail-soft (never throws) and dereferences no registry —
+      // no new throw surface inside the R7 window.
+      if (effectiveCtx.sessionProvider && effectiveCtx.sessionProvider !== route.provider) {
+        const fresh = await this.sessionStore.get(ctx.agentId, ctx.threadId); // post-lock ⇒ authoritative
+        if (fresh?.provider === route.provider) {
+          // A queued predecessor already performed the switch — adopt its
+          // state, no handoff. fresh.sessionId may itself be undefined
+          // (predecessor was a stateless pilot turn): the turn then runs
+          // fresh WITHOUT an annotation, which is exactly the same-provider
+          // stateless case where no transition annotation is owed.
+          effectiveCtx = { ...effectiveCtx, sessionId: fresh.sessionId, sessionProvider: fresh.provider };
+        } else {
+          log.warn("Session provider mismatch — fresh session with memory handoff (KPR-313)", {
+            agentId: ctx.agentId,
+            threadId: ctx.threadId,
+            stored: effectiveCtx.sessionProvider,
+            turn: route.provider,
+            hadSessionId: !!effectiveCtx.sessionId,
+          });
+          effectiveCtx = { ...effectiveCtx, sessionId: undefined, sessionHandoff: true };
         }
       }
 
@@ -1180,6 +1234,19 @@ export class AgentManager {
 
     if (item.files?.length) {
       prompt += formatFilesForPrompt(item.files);
+    }
+
+    // KPR-313 §3.4: hive-owned handoff annotation — sessionHandoff is set
+    // ONLY by spawnTurn's session-identity guard. Prepended ahead of the
+    // sender prefix; memory carryover needs nothing here (every fresh spawn
+    // already assembles the full system prompt incl. agent memory). Variant
+    // keyed on the static provider (≡ effective under the W3 clamp): pilots
+    // are tool-free, so only Claude targets get the conversation_search clause.
+    if (ctx.sessionHandoff) {
+      prompt =
+        (staticRoute.provider === "claude"
+          ? SESSION_HANDOFF_NOTICE_CLAUDE
+          : SESSION_HANDOFF_NOTICE_PILOT) + prompt;
     }
 
     // Router gate (KPR-311): skip when disabled, for system senders
