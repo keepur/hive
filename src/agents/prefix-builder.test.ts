@@ -11,14 +11,21 @@ vi.mock("../logging/logger.js", () => ({
   }),
 }));
 
-vi.mock("../config.js", () => ({
-  config: {
-    memory: { hotBudgetTokens: 3000 },
-    workflow: { enabled: false },
-    // KPR-329: engine-default tool-search config for the mocked module.
-    toolSearch: { mode: "auto", source: "default" },
-  },
-}));
+vi.mock("../config.js", async (importOriginal) => {
+  // KPR-326: partial mock — keep the real resolveToolSearchMode/isToolSearchMode
+  // (prefix-builder.ts now imports resolveToolSearchMode from here) while
+  // stubbing out the `config` singleton itself.
+  const actual = await importOriginal<typeof import("../config.js")>();
+  return {
+    ...actual,
+    config: {
+      memory: { hotBudgetTokens: 3000 },
+      workflow: { enabled: false },
+      // KPR-329: engine-default tool-search config for the mocked module.
+      toolSearch: { mode: "auto", source: "default" },
+    },
+  };
+});
 
 import { buildPrefix, type PrefixBuildContext } from "./prefix-builder.js";
 

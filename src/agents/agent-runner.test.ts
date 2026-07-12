@@ -146,11 +146,27 @@ vi.mock("../config.js", () => ({
     // KPR-329: engine-default tool-search config for the mocked module.
     toolSearch: { mode: "auto", source: "default" },
   },
-  // KPR-329: real stub matching config.ts's type guard — agent-runner.ts
-  // imports this; the mock factory must export it or every test in this
-  // file throws at import time.
+  // KPR-326: real stubs matching config.ts's implementations — agent-runner.ts
+  // imports these (and re-exports resolveToolSearchMode/resolveToolSearchEnv);
+  // the mock factory must provide them or every test in this file throws at
+  // import time.
   isToolSearchMode: (v: unknown): v is "auto" | "on" | "off" =>
     v === "auto" || v === "on" || v === "off",
+  resolveToolSearchMode: (
+    agentToolSearch: string | undefined,
+    hiveMode: string,
+    hiveSource: "hive.yaml" | "default" = "hive.yaml",
+  ): { mode: "auto" | "on" | "off"; source: "agent" | "hive.yaml" | "default" } => {
+    const isMode = (v: unknown): v is "auto" | "on" | "off" => v === "auto" || v === "on" || v === "off";
+    if (isMode(agentToolSearch)) return { mode: agentToolSearch, source: "agent" };
+    if (isMode(hiveMode)) return { mode: hiveMode, source: hiveSource };
+    return { mode: "auto", source: "default" };
+  },
+  resolveToolSearchEnv: (agentToolSearch: string | undefined, hiveMode: string): "auto" | "true" | "false" => {
+    const isMode = (v: unknown): v is "auto" | "on" | "off" => v === "auto" || v === "on" || v === "off";
+    const mode = isMode(agentToolSearch) ? agentToolSearch : isMode(hiveMode) ? hiveMode : "auto";
+    return mode === "on" ? "true" : mode === "off" ? "false" : "auto";
+  },
 }));
 
 // ── Helpers ─────────────────────────────────────────────────────────

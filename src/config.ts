@@ -130,6 +130,40 @@ export function resolveToolSearchConfig(raw: unknown): ToolSearchConfig {
   return { ...DEFAULT_TOOL_SEARCH_CONFIG };
 }
 
+// ── KPR-329: tool-search (deferred MCP tool loading) resolution ──────────────
+
+/** Resolution-chain provenance for the spawn debug log. */
+export type ToolSearchSource = "agent" | "hive.yaml" | "default";
+
+/**
+ * KPR-329: resolve the effective tool-search mode + provenance.
+ * Chain: agent-definition `toolSearch` field → hive.yaml `toolSearch.mode` →
+ * engine default "auto". The agent value is defensively re-validated here
+ * (registry sanitizes on load, but hand-built configs in tests/fixtures
+ * bypass the registry).
+ */
+export function resolveToolSearchMode(
+  agentToolSearch: string | undefined,
+  hiveMode: string,
+  hiveSource: "hive.yaml" | "default" = "hive.yaml",
+): { mode: "auto" | "on" | "off"; source: ToolSearchSource } {
+  if (isToolSearchMode(agentToolSearch)) return { mode: agentToolSearch, source: "agent" };
+  if (isToolSearchMode(hiveMode)) return { mode: hiveMode, source: hiveSource };
+  return { mode: "auto", source: "default" };
+}
+
+/**
+ * KPR-329: map the resolved mode to the CLI's `ENABLE_TOOL_SEARCH` env value
+ * (spec §4.1 table): auto → "auto" (tst-auto threshold mode), on → "true"
+ * (always defer), off → "false" (standard/eager — the rollback posture).
+ * The value is ALWAYS set on the spawn env — never left to ambient
+ * process.env or the CLI's drifting experimental default.
+ */
+export function resolveToolSearchEnv(agentToolSearch: string | undefined, hiveMode: string): "auto" | "true" | "false" {
+  const { mode } = resolveToolSearchMode(agentToolSearch, hiveMode);
+  return mode === "on" ? "true" : mode === "off" ? "false" : "auto";
+}
+
 /**
  * KPR-242: warn once at config load if hive.yaml still carries the deprecated
  * `google.account` field. Exported so unit tests can exercise it directly.

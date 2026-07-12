@@ -26,7 +26,7 @@ import type { SkillIndex } from "./skill-loader.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import { getArchetype } from "../archetypes/registry.js";
 import { buildToolkitSection } from "./toolkit-section.js";
-import { config } from "../config.js";
+import { config, resolveToolSearchMode } from "../config.js";
 
 const log = createLogger("prefix-builder");
 
@@ -122,7 +122,7 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
       // KPR-329: resolved mode ≠ "off" (agent override → hive.yaml → auto).
       // Lives in the cached prefix: the agent-def field change invalidates via
       // the definition-update path; hive.yaml changes require restart anyway.
-      deferredLoadingActive: (agentConfig.toolSearch ?? config.toolSearch.mode) !== "off",
+      deferredLoadingActive: resolveToolSearchMode(agentConfig.toolSearch, config.toolSearch.mode).mode !== "off",
     }),
   );
 
