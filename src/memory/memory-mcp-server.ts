@@ -55,8 +55,7 @@ const VIEW_TRUNCATE_CHARS = 16000;
  * KPR-328 verdict §1 captures the 16,000-char threshold but no literal notice
  * string from the native contract; this is hive's concrete rendering.
  */
-const TRUNCATION_NOTICE =
-  "\n[Output truncated at 16,000 characters — use view_range to view the rest of the file.]";
+const TRUNCATION_NOTICE = "\n[Output truncated at 16,000 characters — use view_range to view the rest of the file.]";
 /** Exact legacy wording — carried forward unchanged (pre-KPR-327 lines 261/314). */
 const FS_HISTORY_ERROR = "history/rollback not supported for filesystem scopes — use git or equivalent";
 
@@ -412,9 +411,7 @@ export function buildMemoryTools(deps: MemoryToolDeps) {
           if (insert_line > lines.length) {
             return fail(`Invalid insert_line ${insert_line}: must be between 0 and ${lines.length}`);
           }
-          const toInsert = insert_text.endsWith("\n")
-            ? insert_text.slice(0, -1).split("\n")
-            : insert_text.split("\n");
+          const toInsert = insert_text.endsWith("\n") ? insert_text.slice(0, -1).split("\n") : insert_text.split("\n");
           lines.splice(insert_line, 0, ...toInsert);
           await target.write(lines.join("\n"), "memory-mcp-insert");
           return ok(`Inserted ${toInsert.length} line(s) after line ${insert_line} in ${path}`);

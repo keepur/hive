@@ -427,8 +427,7 @@ describe("filesystem scopes", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  const scoped = (onWrite?: any) =>
-    makeTools({ onWrite, scopes: [{ id: "workshop", backing: "filesystem", dir }] });
+  const scoped = (onWrite?: any) => makeTools({ onWrite, scopes: [{ id: "workshop", backing: "filesystem", dir }] });
 
   it("view lists the scope root and reads scope files", async () => {
     mkdirSync(dir, { recursive: true });
@@ -467,7 +466,10 @@ describe("filesystem scopes", () => {
     const del = await getHandler(tools, "delete")({ path: "/memories/scopes/workshop/x.md" });
     expect(del.isError).toBe(true);
     expect(del.content[0].text).toBe("delete not supported on filesystem scopes");
-    const rn = await getHandler(tools, "rename")({
+    const rn = await getHandler(
+      tools,
+      "rename",
+    )({
       old_path: "/memories/scopes/workshop/x.md",
       new_path: "/memories/scopes/workshop/y.md",
     });
@@ -487,17 +489,16 @@ describe("filesystem scopes", () => {
     const tools = scoped();
     const hist = await getHandler(tools, "memory_history")({ path: "/memories/scopes/workshop/x.md" });
     expect(hist.isError).toBe(true);
-    expect(hist.content[0].text).toBe(
-      "history/rollback not supported for filesystem scopes — use git or equivalent",
-    );
-    const rb = await getHandler(tools, "memory_rollback")({
+    expect(hist.content[0].text).toBe("history/rollback not supported for filesystem scopes — use git or equivalent");
+    const rb = await getHandler(
+      tools,
+      "memory_rollback",
+    )({
       path: "/memories/scopes/workshop/x.md",
       version_index: 0,
     });
     expect(rb.isError).toBe(true);
-    expect(rb.content[0].text).toBe(
-      "history/rollback not supported for filesystem scopes — use git or equivalent",
-    );
+    expect(rb.content[0].text).toBe("history/rollback not supported for filesystem scopes — use git or equivalent");
   });
 
   it("onWrite does NOT fire for fs-scope writes (parity with legacy)", async () => {
@@ -524,7 +525,10 @@ describe("memory_history / memory_rollback", () => {
     const onWrite = vi.fn();
     const tools = makeTools({ onWrite });
     await getHandler(tools, "create")({ path: "/memories/agents/alice/x.md", file_text: "v2" });
-    const res = await getHandler(tools, "memory_rollback")({
+    const res = await getHandler(
+      tools,
+      "memory_rollback",
+    )({
       path: "/memories/agents/alice/x.md",
       version_index: 0,
     });
@@ -551,7 +555,16 @@ describe("legacy surface removed", () => {
     expect(names).not.toContain("memory_write");
     expect(names).not.toContain("memory_list");
     expect(names).toEqual(
-      expect.arrayContaining(["view", "create", "str_replace", "insert", "delete", "rename", "memory_history", "memory_rollback"]),
+      expect.arrayContaining([
+        "view",
+        "create",
+        "str_replace",
+        "insert",
+        "delete",
+        "rename",
+        "memory_history",
+        "memory_rollback",
+      ]),
     );
     expect(names).toHaveLength(8);
   });
