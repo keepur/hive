@@ -516,6 +516,78 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     const body = JSON.parse(res.written.join(""));
     expect(body.error).toBe("Voice unavailable");
   });
+
+  it("KPR-313: provider mismatch at the read ⇒ no resume, no tag, FULL-transcript prompt (voice's native handoff), no annotation", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "resp_openai_123", provider: "openai" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "first user line" },
+        { role: "assistant", content: "first agent line" },
+        { role: "user", content: "latest user line" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    const ctx = am.calls[0]!.ctx;
+    expect(ctx.sessionId).toBeUndefined(); // mismatched handle never attempted
+    expect(ctx.sessionProvider).toBeUndefined(); // spawnTurn guard has nothing to trip on
+    // FULL transcript, not latest-message-only — pre-313 the doomed resume
+    // failed HARD and the outer retry re-sent the transcript; a naive
+    // guard-strip downstream would have silently sent only the last line.
+    expect(ctx.workItem.text).toContain("Caller: first user line");
+    expect(ctx.workItem.text).toContain("You: first agent line");
+    expect(ctx.workItem.text).toContain("Caller: latest user line");
+    // Voice carve-out: annotation-free (the transcript IS the handoff).
+    expect(ctx.workItem.text).not.toContain("session continuity was reset");
+  });
+
+  it("KPR-313: codex-tagged mapping-only row (no handle) ⇒ full transcript, no resume", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: undefined, provider: "codex" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "user", content: "still here" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    const ctx = am.calls[0]!.ctx;
+    expect(ctx.sessionId).toBeUndefined();
+    expect(ctx.workItem.text).toContain("Caller: hi");
+    expect(ctx.workItem.text).toContain("Caller: still here");
+  });
+
+  it("KPR-313: matching provider keeps today's behavior — latest-message prompt, resume, tag set", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "resume-sid-match", provider: "claude" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "earlier line" },
+        { role: "user", content: "latest user line" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    const ctx = am.calls[0]!.ctx;
+    expect(ctx.sessionId).toBe("resume-sid-match");
+    expect(ctx.sessionProvider).toBe("claude");
+    expect(ctx.workItem.text).toBe("latest user line");
+    expect(am.providerFor).toHaveBeenCalledWith("mokie");
+  });
 });
 
 describe("VoiceAdapter — provider circuit open (KPR-307)", () => {
