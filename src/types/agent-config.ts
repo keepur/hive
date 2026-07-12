@@ -40,6 +40,13 @@ export interface AgentConfig {
    * to `maxConcurrent` then to engine default (5) if unset.
    */
   spawnBudget?: number;
+  /**
+   * KPR-329: per-agent tool-search override ("auto" | "on" | "off").
+   * Absent ⇒ inherit hive.yaml toolSearch.mode. Guaranteed valid-or-undefined
+   * post-registry-load (sanitized there); hand-built configs may carry
+   * anything, which resolveToolSearchEnv treats as absent.
+   */
+  toolSearch?: "auto" | "on" | "off";
   timeoutMs?: number; // Response timeout in ms. Default 300000 (5 min)
   betas?: string[]; // SDK beta features. Note: "context-1m-2025-08-07" retires 2026-04-30
   metadata?: Record<string, unknown>; // plugin-managed bag — read via agent-env dotted paths

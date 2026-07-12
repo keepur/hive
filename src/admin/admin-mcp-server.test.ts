@@ -707,6 +707,78 @@ describe("KPR-184 — delegateServers validation rejects in-process-ported serve
   });
 });
 
+describe("toolSearch validation (KPR-329)", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+  });
+
+  it("agent_create rejects an invalid toolSearch value", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "bad-toolsearch",
+      name: "Bad",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-bad-ts",
+      roles: ["Generic"],
+      fields: { toolSearch: "always" },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Invalid toolSearch");
+    expect(agentDocsStore.has("bad-toolsearch")).toBe(false);
+  });
+
+  it("agent_create persists a valid toolSearch value", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "good-toolsearch",
+      name: "Good",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-good-ts",
+      roles: ["Generic"],
+      fields: { toolSearch: "off" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("good-toolsearch").toolSearch).toBe("off");
+  });
+
+  it("agent_create leaves toolSearch absent when omitted", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    await handler({
+      _id: "no-toolsearch",
+      name: "NoTS",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-no-ts",
+      roles: ["Generic"],
+      fields: {},
+    });
+    expect(agentDocsStore.get("no-toolsearch").toolSearch).toBeUndefined();
+  });
+
+  it("agent_update rejects an invalid toolSearch value without writing", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const handler = getHandler(makeTools(), "agent_update");
+    const res = await handler({
+      agent_id: "existing-agent",
+      fields: { toolSearch: "TRUE" },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Invalid toolSearch");
+    expect(agentDocsStore.get("existing-agent").toolSearch).toBeUndefined();
+  });
+
+  it("agent_update accepts a valid toolSearch value", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const handler = getHandler(makeTools(), "agent_update");
+    const res = await handler({
+      agent_id: "existing-agent",
+      fields: { toolSearch: "on" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("existing-agent").toolSearch).toBe("on");
+  });
+});
+
 describe("KPR-221 — delegateServers validation rejects context-dependent servers", () => {
   beforeEach(() => {
     agentDocsStore = new Map();

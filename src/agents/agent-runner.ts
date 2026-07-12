@@ -8,7 +8,7 @@ import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
-import { config } from "../config.js";
+import { config, resolveToolSearchMode } from "../config.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin, HttpPluginMcpServer } from "../plugins/types.js";
@@ -225,11 +225,13 @@ export function ensurePluginNodeModulesLink(pluginDir: string): void {
 // KPR-183: the 10 KPR-122-ported in-process servers (memory, structured-memory,
 // contacts, admin, callback, schedule, event-bus, team, code-search, workflow)
 // are not in this map. They have no per-server bundle — they only run
-// in-process via createSdkMcpServer wired in send(). The vestigial stdio
-// entries in buildAllServerConfigs are kept solely so filterCoreServers and
-// the toolkit listing keep treating them as "core servers"; production runs
-// never spawn the subprocess because send() overwrites the slot with the
-// in-process SDK server.
+// in-process via createSdkMcpServer wired in send(). Nine of them still keep a
+// vestigial stdio entry in buildAllServerConfigs solely so filterCoreServers
+// and the toolkit listing keep treating them as "core servers"; production
+// runs never spawn the subprocess because send() overwrites the slot with the
+// in-process SDK server. KPR-327: `memory` no longer has that vestigial stdio
+// entry — it is wired only in send(), and its two dependents (the plugin
+// name-conflict guard and buildToolTransportInventory) compensate explicitly.
 //
 // KPR-184: these same 10 servers cannot appear in `delegateServers`. The
 // constant is defined in ./in-process-servers.ts (re-exported here for
@@ -261,6 +263,32 @@ function mcpPath(devSubpath: string): string {
     if (existsSync(pkgBundle)) return pkgBundle;
   }
   return resolve(DIST_DIR, devSubpath);
+}
+
+// ── KPR-329: tool-search (deferred MCP tool loading) resolution ──────────────
+// resolveToolSearchMode / resolveToolSearchEnv / ToolSearchSource moved to
+// ../config.js (KPR-326) to break a circular-import constraint with
+// prefix-builder.ts, which also needs the resolver. Re-exported below for
+// backward compatibility with existing importers.
+export { resolveToolSearchMode, resolveToolSearchEnv } from "../config.js";
+
+/**
+ * KPR-329: ambient CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS force-disables tool
+ * search inside the CLI regardless of ENABLE_TOOL_SEARCH — it would silently
+ * defeat `on`/`auto`. Warn once per process (the CLI itself logs once per
+ * process; per-spawn would be log spam).
+ */
+let warnedToolSearchForceDisabled = false;
+export function __resetToolSearchWarnForTests(): void {
+  warnedToolSearchForceDisabled = false;
+}
+function warnIfToolSearchForceDisabled(): void {
+  if (warnedToolSearchForceDisabled || !process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS) return;
+  warnedToolSearchForceDisabled = true;
+  log.warn(
+    "Ambient CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is set — the CLI force-disables tool search; toolSearch mode 'on'/'auto' will silently run eager (KPR-329)",
+    { value: process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS },
+  );
 }
 
 export class AgentRunner {
@@ -451,30 +479,13 @@ export class AgentRunner {
       }
     }
 
-    // Memory MCP server — KPR-122: in-process at runtime (replaced in send()
-    // when `this.db` is present). The stdio entry below is a placeholder kept
-    // for two reasons:
-    //  - `filterCoreServers` keeps `memory` in the post-filter map and the
-    //    toolkit section sees `memory` in `coreServerNames`.
-    //  - The SDK's AgentMcpServerSpec type for delegate subagents only accepts
-    //    process-transport configs (stdio/http/sse), not in-process refs.
-    // KPR-183: the stdio shim at the bottom of memory-mcp-server.ts was
-    // removed (it raced with pkg/server.min.js's entry-point check), so this
-    // stdio config no longer maps to a runnable subprocess — production runs
-    // never spawn it because send() overwrites the slot with the in-process
-    // SDK server. Delegate-mode for these ported servers is an open follow-up.
-    const memoryScopes: ScopeDecl[] = this.resolveMemoryScopes();
-    servers["memory"] = {
-      type: "stdio",
-      command: "node",
-      args: [mcpPath("memory/memory-mcp-server.js")],
-      env: {
-        AGENT_ID: this.agentConfig.id,
-        MONGODB_URI: config.mongo.uri,
-        MONGODB_DB: config.mongo.dbName,
-        MEMORY_SCOPES_JSON: JSON.stringify(memoryScopes),
-      },
-    };
+    // KPR-327: the `memory` server has no stdio placeholder here anymore. It
+    // was a KPR-183 leftover — send() always overwrote the slot with the
+    // in-process SDK server when `this.db` is present, and the native
+    // six-command cutover made the placeholder purely vestigial. The plugin
+    // name-conflict guard and the tool-transport inventory (which used to ride
+    // on this key existing) are compensated explicitly below. The other nine
+    // KPR-122-ported servers keep their placeholders.
 
     // Structured Memory MCP server — semantic + temporal memory with vector search
     servers["structured-memory"] = {
@@ -816,7 +827,10 @@ export class AgentRunner {
           continue;
         }
 
-        if (servers[name]) {
+        // KPR-327: in-process ported server names are reserved even when they
+        // have no stdio placeholder in `servers` (memory lost its placeholder
+        // with the native-contract cutover) — a plugin must never claim one.
+        if (servers[name] || IN_PROCESS_PORTED_SERVERS.has(name)) {
           log.warn("Plugin server name conflicts with core server, skipping", {
             plugin: plugin.name, server: name,
           });
@@ -1216,6 +1230,21 @@ export class AgentRunner {
       }));
     }
 
+    // KPR-327: "memory" has no stdio placeholder in buildAllServerConfigs
+    // anymore (native-contract cutover), so it is absent from the filtered
+    // map — surface its in-process descriptor explicitly, mirroring the
+    // runtime wiring in send().
+    if (!!this.db && this.shouldEnableInProcessServer("memory") && !mcpServers["memory"]) {
+      inventory.push(classifyToolTransport({
+        name: "memory",
+        transport: "sdk-in-process",
+        source: "core",
+        requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("memory"),
+        requiresHiveRuntime: true,
+        inProcess: true,
+      }));
+    }
+
     if (this.teamRoster) {
       inventory.push(classifyToolTransport({
         name: "team-roster",
@@ -1519,10 +1548,11 @@ export class AgentRunner {
       mcpServers["team-roster"] = this.teamRosterMcpServer;
     }
 
-    // KPR-122: memory MCP — in-process. The stdio entry in
-    // buildAllServerConfigs is a vestigial placeholder (KPR-183 removed the
-    // shim in memory-mcp-server.ts); we overwrite the slot here with the
-    // in-process SDK server when (a) the runner has a shared `db` (runtime
+    // KPR-122/KPR-327: memory MCP — in-process. This is the ONLY wiring for the
+    // memory server post-KPR-327: buildAllServerConfigs no longer holds a stdio
+    // placeholder for it (KPR-183 removed the shim in memory-mcp-server.ts; the
+    // native-contract cutover dropped the placeholder key entirely). We register
+    // the in-process SDK server when (a) the runner has a shared `db` (runtime
     // path; tests without `db` skip) and (b) the agent's coreServers includes
     // "memory". The cached SDK server is safe to reuse across turns: the
     // resolved scope list depends only on constructor-time agent + archetype
@@ -1742,6 +1772,21 @@ export class AgentRunner {
       }
     }
 
+    // KPR-329: resolve tool-search mode for this spawn. The env value is
+    // always pinned (see env block below) so hive owns the policy — the CLI's
+    // implicit default is never in play.
+    const toolSearch = resolveToolSearchMode(
+      this.agentConfig.toolSearch,
+      config.toolSearch.mode,
+      config.toolSearch.source,
+    );
+    log.debug("Tool search mode resolved", {
+      agent: this.agentConfig.id,
+      mode: toolSearch.mode,
+      source: toolSearch.source,
+    });
+    warnIfToolSearchForceDisabled();
+
     const q = query({
       prompt,
       options: {
@@ -1773,6 +1818,9 @@ export class AgentRunner {
           ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
           CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
           CLAUDECODE: undefined,
+          // KPR-329: always pinned — overrides any ambient ENABLE_TOOL_SEARCH.
+          ENABLE_TOOL_SEARCH:
+            toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto",
         },
         // Pass --strict-mcp-config to the spawned claude CLI so it ignores all
         // MCP sources except the engine-supplied `mcpServers` above (which the

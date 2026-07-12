@@ -118,6 +118,13 @@ describe("toAgentConfig", () => {
   });
 });
 
+describe("toolSearch field (KPR-329)", () => {
+  it("toAgentConfig passes toolSearch through and leaves it undefined when absent", () => {
+    expect(toAgentConfig(makeDefinition({ toolSearch: "on" }), {}).toolSearch).toBe("on");
+    expect(toAgentConfig(makeDefinition(), {}).toolSearch).toBeUndefined();
+  });
+});
+
 describe("toAgentConfig autonomy resolution", () => {
   it("resolves autonomy flags from definition and instance ceiling", () => {
     const def = makeDefinition({
@@ -585,6 +592,34 @@ describe("KPR-184 — AgentRegistry sanitizes in-process-ported servers from del
     // Agent still loads — sanitization is non-fatal.
     expect(result.added).toContain("sanitized-agent");
     expect(registry.get("sanitized-agent")).toBeDefined();
+  });
+});
+
+describe("AgentRegistry toolSearch sanitization (KPR-329)", () => {
+  beforeAll(async () => {
+    const registryModule = await import("./agent-registry.js");
+    AgentRegistry = registryModule.AgentRegistry;
+  });
+
+  it("strips an invalid toolSearch value at load, logs an error, and keeps the agent active", async () => {
+    const def = makeDefinition({ _id: "bad-ts", toolSearch: "always" as never });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await registry.load();
+      const cfg = registry.get("bad-ts");
+      expect(cfg).toBeDefined();
+      expect(cfg!.toolSearch).toBeUndefined(); // inherit global
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("preserves a valid toolSearch value at load", async () => {
+    const def = makeDefinition({ _id: "good-ts", toolSearch: "off" });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    await registry.load();
+    expect(registry.get("good-ts")!.toolSearch).toBe("off");
   });
 });
 
