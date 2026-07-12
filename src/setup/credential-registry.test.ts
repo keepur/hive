@@ -12,6 +12,7 @@ import { SERVER_CATALOG } from "../tools/server-catalog.js";
 // `server` doesn't slip through unnoticed.
 const NON_CATALOG_SERVERS = new Set([
   "gemini", // file-ingestion vision, not its own MCP server
+  "model-router", // pseudo-server: LLM complexity classifier (KPR-312), not an MCP server
 ]);
 
 describe("CREDENTIAL_REGISTRY", () => {
