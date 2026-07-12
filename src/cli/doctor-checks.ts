@@ -69,9 +69,7 @@ export function requiredEnvVarsFromConfig(configTsPath: string): string[] {
  * false-positive). Pure string producer — no failure channel by construction.
  */
 export function modelRouterModeLine(apiKeyPresent: boolean): string {
-  return apiKeyPresent
-    ? "model router: LLM classification"
-    : "model router: heuristics-only (no ANTHROPIC_API_KEY)";
+  return apiKeyPresent ? "model router: LLM classification" : "model router: heuristics-only (no ANTHROPIC_API_KEY)";
 }
 
 // ── launchctl print parsing ─────────────────────────────────────────────
