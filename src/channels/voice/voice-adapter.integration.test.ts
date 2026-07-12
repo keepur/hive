@@ -69,9 +69,9 @@ function makeAdapter(opts: {
   dispatcher?: Dispatcher;
 }) {
   const captured: CapturedSpawn[] = [];
-  const sessionStoreGet = vi.fn().mockResolvedValue(
-    opts.storedSessionId ? { sessionId: opts.storedSessionId, provider: "claude" } : undefined,
-  );
+  const sessionStoreGet = vi
+    .fn()
+    .mockResolvedValue(opts.storedSessionId ? { sessionId: opts.storedSessionId, provider: "claude" } : undefined);
   const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {

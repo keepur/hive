@@ -260,9 +260,7 @@ export class VoiceAdapter {
     // vanished mid-call, SIGUSR1) degrades to no-resume — fail-soft.
     const staticProvider = agentManager.providerFor(agentId);
     const resumableId =
-      storedRef && staticProvider && storedRef.provider === staticProvider
-        ? storedRef.sessionId
-        : undefined;
+      storedRef && staticProvider && storedRef.provider === staticProvider ? storedRef.sessionId : undefined;
 
     // Choose prompt based on resume-presence (mirrors current voice behavior).
     const turnPrompt = resumableId
