@@ -7,25 +7,41 @@ import type { LoadedPlugin } from "../plugins/types.js";
 // vi.hoisted() runs before vi.mock factory, avoiding the TDZ error that
 // occurs when paths.ts (imported transitively) calls existsSync at module
 // load time before plain const-declared mocks are initialized.
-const { mockExistsSync, mockStatSync, mockMkdirSync, mockSymlinkSync, mockLstatSync } = vi.hoisted(() => ({
-  mockExistsSync: vi.fn().mockReturnValue(true),
-  mockStatSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
-  mockMkdirSync: vi.fn(),
-  mockSymlinkSync: vi.fn(),
-  // Default: lstat throws (link target not present) so ensurePluginNodeModulesLink
-  // will proceed to create a symlink.
-  mockLstatSync: vi.fn().mockImplementation(() => {
-    const err: NodeJS.ErrnoException = new Error("ENOENT");
-    err.code = "ENOENT";
-    throw err;
-  }),
-}));
+const { mockExistsSync, mockStatSync, mockMkdirSync, mockSymlinkSync, mockLstatSync, mockReadFileSync, mockReaddirSync } =
+  vi.hoisted(() => ({
+    mockExistsSync: vi.fn().mockReturnValue(true),
+    mockStatSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
+    mockMkdirSync: vi.fn(),
+    mockSymlinkSync: vi.fn(),
+    // Default: lstat throws (link target not present) so ensurePluginNodeModulesLink
+    // will proceed to create a symlink.
+    mockLstatSync: vi.fn().mockImplementation(() => {
+      const err: NodeJS.ErrnoException = new Error("ENOENT");
+      err.code = "ENOENT";
+      throw err;
+    }),
+    // KPR-326: config.ts's `import "../config.js"` now flows through the real
+    // module (partial mock below) instead of a synthetic factory. Its
+    // module-load-time `dotenv.config()` call does `fs.existsSync(path)`
+    // (mocked true above) then `fs.readFileSync(path, ...)` — without this
+    // stub that throws (no real .env file in the test sandbox) and blows up
+    // every test in this file at import time. Empty string = no vars parsed,
+    // matching the previous synthetic mock's behavior of not touching real env.
+    mockReadFileSync: vi.fn().mockReturnValue(""),
+    // KPR-326: config.ts's discoverPluginDirs() also runs at module load —
+    // with mockExistsSync defaulting true, it falls into readdirSync(). Empty
+    // list = no auto-discovered plugin dirs, matching prior synthetic-mock
+    // behavior (config.codeTask wasn't exercised by this file's tests).
+    mockReaddirSync: vi.fn().mockReturnValue([]),
+  }));
 vi.mock("node:fs", () => ({
   existsSync: (...args: any[]) => mockExistsSync(...args),
   statSync: (...args: any[]) => mockStatSync(...args),
   mkdirSync: (...args: any[]) => mockMkdirSync(...args),
   symlinkSync: (...args: any[]) => mockSymlinkSync(...args),
   lstatSync: (...args: any[]) => mockLstatSync(...args),
+  readFileSync: (...args: any[]) => mockReadFileSync(...args),
+  readdirSync: (...args: any[]) => mockReaddirSync(...args),
 }));
 
 // ── SDK mock ────────────────────────────────────────────────────────
@@ -103,71 +119,59 @@ vi.mock("../keychain/from-keychain.js", () => ({
 }));
 
 // ── Config mock ─────────────────────────────────────────────────────
-vi.mock("../config.js", () => ({
-  config: {
-    instance: { id: "hive", portBase: 3100 },
-    slack: { mcpToken: "" },
-    mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
-    google: { client: "test-client", accounts: { "test-agent": ["test@example.com"] }, sharedFolder: "test-folder" },
-    quo: { apiKey: "", phoneNumberId: "", lines: [] },
-    taskLedger: {
-      apiUrl: "http://localhost:3000",
-      apiKey: "global-key",
-      agentKeys: { "agent-a": "key-a" } as Record<string, string>,
+// KPR-326: partial mock (mirrors prefix-builder.test.ts) — keep the real
+// resolveToolSearchMode/resolveToolSearchEnv/isToolSearchMode (agent-runner.ts
+// imports and re-exports these from config.ts) while stubbing out the
+// `config` singleton itself. Requires the node:fs mock above to also stub
+// readFileSync so config.ts's module-load-time dotenv.config() call succeeds.
+vi.mock("../config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config.js")>();
+  return {
+    ...actual,
+    config: {
+      instance: { id: "hive", portBase: 3100 },
+      slack: { mcpToken: "" },
+      mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
+      google: { client: "test-client", accounts: { "test-agent": ["test@example.com"] }, sharedFolder: "test-folder" },
+      quo: { apiKey: "", phoneNumberId: "", lines: [] },
+      taskLedger: {
+        apiUrl: "http://localhost:3000",
+        apiKey: "global-key",
+        agentKeys: { "agent-a": "key-a" } as Record<string, string>,
+      },
+      brave: { apiKey: "" },
+      resend: {
+        apiKey: "",
+        emailDomain: "test.com",
+        businessName: "TestBiz",
+        fromAddress: "",
+        defaultCc: "",
+        defaultBcc: "",
+      },
+      linear: { apiKey: "", teamId: "" },
+      clickup: { apiToken: "" },
+      github: { repo: "", token: "" },
+      recall: {
+        apiKey: "",
+        region: "",
+        monitorPort: 3100,
+        monitorPublicUrl: "",
+        webhookSecret: "test-webhook-secret",
+      },
+      background: { port: 3200, authToken: "test-bg-token" },
+      codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
+      anthropic: { apiKey: "test-key" },
+      defaultAgent: "chief-of-staff",
+      autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      browser: { cdpEndpoint: "" },
+      memory: { hotBudgetTokens: 3000 },
+      workflow: { enabled: false },
+      voice: { apiKey: "", phoneNumberId: "", assistants: {} },
+      // KPR-329: engine-default tool-search config for the mocked module.
+      toolSearch: { mode: "auto", source: "default" },
     },
-    brave: { apiKey: "" },
-    resend: {
-      apiKey: "",
-      emailDomain: "test.com",
-      businessName: "TestBiz",
-      fromAddress: "",
-      defaultCc: "",
-      defaultBcc: "",
-    },
-    linear: { apiKey: "", teamId: "" },
-    clickup: { apiToken: "" },
-    github: { repo: "", token: "" },
-    recall: {
-      apiKey: "",
-      region: "",
-      monitorPort: 3100,
-      monitorPublicUrl: "",
-      webhookSecret: "test-webhook-secret",
-    },
-    background: { port: 3200, authToken: "test-bg-token" },
-    codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
-    anthropic: { apiKey: "test-key" },
-    defaultAgent: "chief-of-staff",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
-    browser: { cdpEndpoint: "" },
-    memory: { hotBudgetTokens: 3000 },
-    workflow: { enabled: false },
-    voice: { apiKey: "", phoneNumberId: "", assistants: {} },
-    // KPR-329: engine-default tool-search config for the mocked module.
-    toolSearch: { mode: "auto", source: "default" },
-  },
-  // KPR-326: real stubs matching config.ts's implementations — agent-runner.ts
-  // imports these (and re-exports resolveToolSearchMode/resolveToolSearchEnv);
-  // the mock factory must provide them or every test in this file throws at
-  // import time.
-  isToolSearchMode: (v: unknown): v is "auto" | "on" | "off" =>
-    v === "auto" || v === "on" || v === "off",
-  resolveToolSearchMode: (
-    agentToolSearch: string | undefined,
-    hiveMode: string,
-    hiveSource: "hive.yaml" | "default" = "hive.yaml",
-  ): { mode: "auto" | "on" | "off"; source: "agent" | "hive.yaml" | "default" } => {
-    const isMode = (v: unknown): v is "auto" | "on" | "off" => v === "auto" || v === "on" || v === "off";
-    if (isMode(agentToolSearch)) return { mode: agentToolSearch, source: "agent" };
-    if (isMode(hiveMode)) return { mode: hiveMode, source: hiveSource };
-    return { mode: "auto", source: "default" };
-  },
-  resolveToolSearchEnv: (agentToolSearch: string | undefined, hiveMode: string): "auto" | "true" | "false" => {
-    const isMode = (v: unknown): v is "auto" | "on" | "off" => v === "auto" || v === "on" || v === "off";
-    const mode = isMode(agentToolSearch) ? agentToolSearch : isMode(hiveMode) ? hiveMode : "auto";
-    return mode === "on" ? "true" : mode === "off" ? "false" : "auto";
-  },
-}));
+  };
+});
 
 // ── Helpers ─────────────────────────────────────────────────────────
 function makeMockMemoryManager() {
