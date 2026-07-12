@@ -1951,7 +1951,17 @@ export class AgentRunner {
           }
 
           if (result.subtype === "success") {
-            resultText = result.result || resultText;
+            if (result.is_error === true) {
+              // KPR-312 (KPR-310 M8): the SDK can emit subtype "success" with
+              // is_error: true and the error text in `result` (observed for a
+              // rejected model id). Adopting that text as the reply mis-reads
+              // the turn — classify it as an error. In M8 a subsequent SDK
+              // throw rescued the turn anyway; this guard keeps classification
+              // correct even if a future SDK version stops throwing.
+              error = result.result || "unknown error (is_error result)";
+            } else {
+              resultText = result.result || resultText;
+            }
           } else {
             error = result.subtype;
             if ("errors" in result && Array.isArray(result.errors)) {
