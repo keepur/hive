@@ -8,7 +8,7 @@ import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
-import { config, resolveToolSearchMode, resolveToolSearchEnv } from "../config.js";
+import { config, resolveToolSearchMode } from "../config.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin, HttpPluginMcpServer } from "../plugins/types.js";
