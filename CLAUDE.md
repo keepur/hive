@@ -81,7 +81,7 @@ Message (Slack/SMS/WebSocket/Scheduler)
 **KPR-122**: engine-internal Mongo-backed MCPs are **in-process** SDK servers (`createSdkMcpServer`) — they share the engine's MongoClient pool, eliminating per-turn TIME_WAIT churn from stdio subprocess spawn/exit. Per-call context (`AGENT_ID` is constructor-stable; `CHANNEL_ID`/`THREAD_ID`/`WorkItemContext` metadata for context-sensitive servers) is threaded into tool handlers via a mutable `*ContextRef` the runner updates each turn before `query()`. **Crash isolation trade-off**: every in-process tool handler is wrapped in try/catch returning a structured error response, so a handler exception never crashes the hive — the SDK loop survives and the agent sees the error. If instability surfaces, individual MCPs can selectively revert to stdio. Stdio remains for tier-3 servers that require process boundaries (`code-task`, `background`, `keychain`) and tier-2 vendor-API stdio servers (`slack` local, `quo`, `resend`, `linear`, `github-issues`, `clickup`, `recall`, `google`, `voice`, `tasks`, `brave-search`, `browser`).
 
 All in `src/` — each agent only gets servers listed in its `coreServers`/`delegateServers` fields in the agent definition:
-- `memory-mcp-server.ts` — read/write/list/history/rollback agent memory (MongoDB) [in-process]
+- `memory-mcp-server.ts` — Anthropic native memory-tool six-command surface (view/create/str_replace/insert/delete/rename) over a `/memories` virtual mount, plus `memory_history`/`memory_rollback` extensions (MongoDB) [in-process]
 - `google/google-mcp-server.ts` — Gmail + Calendar + Drive via `gog` CLI
 - `keychain-mcp-server.ts` — macOS Keychain read-only
 - `contacts-mcp-server.ts` — contact lookups (MongoDB) [in-process]

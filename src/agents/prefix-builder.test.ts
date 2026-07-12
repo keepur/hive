@@ -165,4 +165,25 @@ describe("buildPrefix", () => {
     const out = await buildPrefix(cfg, makeCtx({ memoryManager: mm as any }));
     expect(out).toContain("LEGACY-MEMORY-BODY");
   });
+
+  it("KPR-327: includes memory-first block only when agent has the memory server", async () => {
+    const cfg = makeAgentConfig();
+    const withMemory = await buildPrefix(cfg, makeCtx({ coreServerNames: ["memory"] }));
+    expect(withMemory).toContain("## File-Tier Memory");
+    expect(withMemory).toContain("/memories");
+    expect(withMemory).toContain("view, create, str_replace, insert, delete, rename");
+    const without = await buildPrefix(cfg, makeCtx({ coreServerNames: [] }));
+    expect(without).not.toContain("## File-Tier Memory");
+  });
+
+  it("KPR-327: legacy fallback references view with /memories paths, not memory_read", async () => {
+    const mm = makeMemoryManager({
+      getHotTierPrompt: vi.fn().mockResolvedValue(null),
+      list: vi.fn().mockResolvedValue(["notes.md"]),
+    });
+    const out = await buildPrefix(makeAgentConfig(), makeCtx({ memoryManager: mm as any }));
+    expect(out).toContain("- /memories/agents/test-agent/notes.md");
+    expect(out).toContain("`view`");
+    expect(out).not.toContain("memory_read");
+  });
 });

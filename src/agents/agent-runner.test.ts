@@ -70,6 +70,23 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   })),
 }));
 
+// KPR-327: the memory server's stdio placeholder (and its MEMORY_SCOPES_JSON
+// env serialization) no longer exists — the scope-wiring tests observe what
+// send() passes to createMemoryMcpServer instead. Wrapping mock: capture deps,
+// delegate to the real factory (whose createSdkMcpServer import is the SDK
+// mock above, so returned servers keep the {name, type: "sdk"} test shape).
+const memoryDepsCapture = vi.hoisted(() => ({ deps: [] as any[] }));
+vi.mock("../memory/memory-mcp-server.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../memory/memory-mcp-server.js")>();
+  return {
+    ...actual,
+    createMemoryMcpServer: vi.fn((deps: any) => {
+      memoryDepsCapture.deps.push(deps);
+      return actual.createMemoryMcpServer(deps);
+    }),
+  };
+});
+
 // ── Logger mock ─────────────────────────────────────────────────────
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
@@ -200,6 +217,23 @@ function makeRunner(overrides: Partial<AgentConfig> = {}, teamRoster?: any): Age
   );
 }
 
+// KPR-327: memory has no stdio placeholder — tests that assert its presence
+// must run the in-process branch, which requires a db handle. Collection
+// methods are no-op stubs; in-process factories only close over them.
+function makeFakeInProcessDb(): any {
+  const col = {
+    findOne: vi.fn(async () => null),
+    find: vi.fn(() => ({ project: vi.fn(() => ({ toArray: vi.fn(async () => []) })), toArray: vi.fn(async () => []), sort: vi.fn(() => ({ limit: vi.fn(() => ({ toArray: vi.fn(async () => []) })) })) })),
+    insertOne: vi.fn(async () => ({})),
+    updateOne: vi.fn(async () => ({})),
+    deleteOne: vi.fn(async () => ({})),
+    deleteMany: vi.fn(async () => ({})),
+    createIndex: vi.fn(async () => "idx"),
+    countDocuments: vi.fn(async () => 0),
+  };
+  return { collection: vi.fn(() => col) };
+}
+
 function makeGooglePlugin(): LoadedPlugin {
   return {
     name: "@keepur/hive-plugin-google",
@@ -240,7 +274,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
   it("includes core servers (memory, keychain, google, etc.)", async () => {
     const coreServers = ["memory", "keychain", "google", "contacts", "background", "callback", "admin"];
-    runner = new AgentRunner(makeAgentConfig({ coreServers }), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ coreServers }), memoryManager as any, [], new Map(), "{}", undefined, undefined, makeFakeInProcessDb());
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -258,6 +292,12 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     runner = new AgentRunner(
       makeAgentConfig({ coreServers: ["memory", "keychain"] }),
       memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
     );
     await runner.send("hello");
     const servers = getCapturedServers();
@@ -800,14 +840,46 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
       brokenServers: {},
     };
 
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin], new Map(), "{}", undefined, undefined, makeFakeInProcessDb());
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    // Core in-process memory server wins; the plugin server never registers.
+    expect(servers.memory.type).toBe("sdk");
+    expect(servers.memory.args).toBeUndefined();
+  });
+
+  it("skips plugin server conflicting with a reserved in-process name even with no db (guard branch)", async () => {
+    // No db positional arg → the in-process branch never runs. Only the
+    // IN_PROCESS_PORTED_SERVERS.has(name) guard prevents the plugin's stdio
+    // server named "memory" from becoming the live server. If that guard is
+    // removed, servers.memory would be the plugin stdio server instead of undefined.
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          memory: {
+            // conflicts with reserved in-process "memory" server name
+            entry: "mcp-servers/memory/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin]);
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    // Should still be core memory server, not the plugin one.
-    // Path differs by mode: dev (dist/memory/memory-mcp-server.js) vs npm bundle (mcp/memory.min.js).
-    expect(servers.memory.args[0]).toMatch(/memory[/-](?:memory-mcp-server\.js|min\.js)$|mcp\/memory\.min\.js$/);
-    expect(servers.memory.args[0]).not.toContain("/plugins/");
+    // Plugin server was skipped by the guard; no in-process branch ran (no db).
+    expect(servers.memory).toBeUndefined();
   });
 
   it("uses per-agent task ledger key when available", async () => {
@@ -1497,6 +1569,12 @@ describe("AgentRunner server sub-agents (via send)", () => {
         delegateServers: ["google", "contacts"],
       }),
       memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(), // KPR-327: memory only appears via the in-process branch (needs a db)
     );
     await runner.send("hello");
     const servers = getCapturedServers();
@@ -1657,6 +1735,12 @@ describe("AgentRunner toolkit section prompt (via send)", () => {
         delegateServers: [],
       }),
       memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(), // KPR-327: memory is toolkit-listed only when the in-process branch runs (needs a db)
     );
     await runner.send("hello");
     const options = getCapturedOptions();
@@ -2918,18 +3002,33 @@ describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
   });
 });
 
-describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
+describe("AgentRunner — memoryScopes wiring into createMemoryMcpServer (KPR-327)", () => {
+  function makeScopesRunner(overrides: Partial<AgentConfig> = {}) {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"], ...overrides }),
+      makeMockMemoryManager() as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
+    );
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMessages = null;
+    memoryDepsCapture.deps.length = 0; // plain array — clearAllMocks does not reset it
     __resetRegistryForTests();
   });
   afterEach(() => __resetRegistryForTests());
 
   it("defaults to self-mongo only when no archetype is set", async () => {
-    const runner = makeRunner({ coreServers: ["memory"] });
+    const runner = makeScopesRunner();
     await runner.send("hello");
-    const servers = getCapturedServers();
-    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
     expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
   });
 
@@ -2945,10 +3044,10 @@ describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
       ],
       sessionOptions: () => ({}),
     });
-    const runner = makeRunner({ archetype: "scoped", archetypeConfig: {}, coreServers: ["memory"] });
+    const runner = makeScopesRunner({ archetype: "scoped", archetypeConfig: {} });
     await runner.send("hello");
-    const servers = getCapturedServers();
-    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
     expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
     expect(scopes).toHaveLength(3);
     expect(scopes.find((s: { id: string }) => s.id === "workshop")).toEqual({
@@ -2971,10 +3070,10 @@ describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
       ],
       sessionOptions: () => ({}),
     });
-    const runner = makeRunner({ archetype: "with-self", archetypeConfig: {}, coreServers: ["memory"] });
+    const runner = makeScopesRunner({ archetype: "with-self", archetypeConfig: {} });
     await runner.send("hello");
-    const servers = getCapturedServers();
-    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
     const selfEntries = scopes.filter((s: { id: string }) => s.id === "self");
     expect(selfEntries).toHaveLength(1);
     expect(selfEntries[0]).toEqual({ id: "self", backing: "mongo" });
@@ -2992,10 +3091,10 @@ describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
       },
       sessionOptions: () => ({}),
     });
-    const runner = makeRunner({ archetype: "throwing", archetypeConfig: {}, coreServers: ["memory"] });
+    const runner = makeScopesRunner({ archetype: "throwing", archetypeConfig: {} });
     await runner.send("hello");
-    const servers = getCapturedServers();
-    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
     expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
   });
 });
