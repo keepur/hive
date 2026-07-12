@@ -2443,14 +2443,18 @@ describe("AgentManager", () => {
         (appConfig as any).modelRouter.enabled = false;
       });
 
-      it("merges the routed model into the effective route without merging a router-set effort into the route", async () => {
+      it("merges the routed model into the effective route and delivers router effort beside it (KPR-312)", async () => {
         (appConfig as any).modelRouter.enabled = true;
-        // effort set to prove it is never merged into the route: the claude
-        // route variant carries no effort field, so the route (and, until
-        // W3.3's effortOverride channel, the turn) must be byte-identical
-        // to a no-effort route.
+        // The route object still carries no effort (the claude variant has no
+        // such field); the value travels BESIDE it via SpawnShaping.effortOverride
+        // → runner.send position 7 (KPR-312).
         vi.mocked(routeModel).mockResolvedValueOnce(
-          makeRouterResult({ provider: "claude", effort: "high" }),
+          makeRouterResult({
+            provider: "claude",
+            tier: "sonnet",
+            model: "claude-sonnet-4-6-routed",
+            effort: "high",
+          }),
         );
 
         const item = makeWorkItem({ text: "route me", source: { kind: "sms", id: "line-1", label: "May" } });
@@ -2458,9 +2462,10 @@ describe("AgentManager", () => {
 
         expect(routeModel).toHaveBeenCalledTimes(1);
         expect(mockRunnerSend).toHaveBeenCalledTimes(1);
-        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
-        expect(modelOverride).toBe("claude-haiku-4-5-routed");
+        const [, , , , modelOverride, resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(modelOverride).toBe("claude-sonnet-4-6-routed");
         expect(resourceLimits).toEqual({ timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 });
+        expect(effort).toBe("high");
       });
 
       it("skips the router for sender === 'system' (scheduler/cron)", async () => {
@@ -2540,6 +2545,8 @@ describe("AgentManager", () => {
         // D3: routed resourceLimits are RETAINED (provider-agnostic execution
         // bounds for the Claude turn that actually runs).
         expect(resourceLimits).toEqual({ timeoutMs: 300_000, maxTurns: 50, budgetUsd: 5 });
+        // KPR-312: the clamp drops effort along with the model.
+        expect(mockRunnerSend.mock.calls[0]![7]).toBeUndefined();
         // Clamp-path bookkeeping: router cost still charged, tier still audited.
         expect(result.usage.costUsd).toBeCloseTo(0.053, 5);
         expect(activityLogger.record).toHaveBeenCalledWith(expect.objectContaining({ modelTier: "sonnet" }));
@@ -2677,6 +2684,90 @@ describe("AgentManager", () => {
         const pilotArg = activityLogger.record.mock.calls.at(-1)![0];
         expect("modelTier" in pilotArg).toBe(true);
         expect(pilotArg.modelTier).toBeUndefined();
+      });
+
+      describe("effort delivery channel (KPR-312)", () => {
+        it("threads hasFiles into routeModel's 4th arg", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
+
+          const noFiles = makeWorkItem({ text: "no files", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn(makeCtx(noFiles, "sms"));
+          expect(vi.mocked(routeModel).mock.calls[0]![3]).toEqual({ hasFiles: false });
+
+          const withFiles = makeWorkItem({
+            text: "",
+            source: { kind: "sms", id: "line-1", label: "May" },
+            files: [{ name: "doc.txt", url: "https://example.com/doc.txt" } as any],
+          });
+          await manager.spawnTurn({ ...makeCtx(withFiles, "sms"), threadId: "sms:line-1:files" });
+          expect(vi.mocked(routeModel).mock.calls[1]![3]).toEqual({ hasFiles: true });
+        });
+
+        it("router-off and system-sender paths deliver no effort", async () => {
+          (appConfig as any).modelRouter.enabled = false;
+          const off = makeWorkItem({ text: "plain", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn(makeCtx(off, "sms"));
+          expect(mockRunnerSend.mock.calls[0]![7]).toBeUndefined();
+
+          (appConfig as any).modelRouter.enabled = true;
+          const sys = makeWorkItem({
+            text: "execute your scheduled digest task",
+            sender: "system",
+            source: { kind: "sms", id: "line-1", label: "May" },
+          });
+          await manager.spawnTurn({ ...makeCtx(sys, "sms"), threadId: "sms:line-1:sys" });
+          expect(routeModel).not.toHaveBeenCalled();
+          expect(mockRunnerSend.mock.calls[1]![7]).toBeUndefined();
+        });
+
+        it("voice path delivers no effort (carve-out — router never runs)", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "high" }));
+          // Mirror the existing voice carve-out test's ctx/item construction (rule 1).
+          const item = makeWorkItem({ text: "voice turn", source: { kind: "ws", id: "voice-1", label: "voice" } });
+          await manager.spawnTurn({ ...makeCtx(item, "voice"), threadId: "voice:1" });
+          expect(routeModel).not.toHaveBeenCalled();
+          expect(mockRunnerSend.mock.calls[0]![7]).toBeUndefined();
+        });
+
+        it("delivers effort even when the routed model equals the agent model (no override — spec §7 edge row)", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          const agentModel = registry._agents.get("agent-a")!.model; // the harness's default Claude agent
+          vi.mocked(routeModel).mockResolvedValueOnce(
+            makeRouterResult({ tier: "sonnet", model: agentModel, effort: "low" }),
+          );
+
+          const item = makeWorkItem({ text: "same model", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn(makeCtx(item, "sms"));
+
+          const [, , , , modelOverride, , , effort] = mockRunnerSend.mock.calls[0]!;
+          expect(modelOverride).toBeUndefined(); // unchanged rule: no override when router picks the agent model
+          expect(effort).toBe("low"); // effort works with or without a model switch
+        });
+
+        it("pilot runTurn request carries effort: undefined (gate: router never ran)", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "high" }));
+          registry._agents.set(
+            "codex-pilot",
+            makeAgentConfig({
+              id: "codex-pilot",
+              name: "Codex Pilot",
+              model: "codex/gpt-5.5:medium",
+              coreServers: [],
+              soul: "",
+              systemPrompt: "pilot system",
+            }),
+          );
+
+          const item = makeWorkItem({ text: "hello codex", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+          expect(routeModel).not.toHaveBeenCalled();
+          const req = mockCodexRunTurn.mock.calls[0]![0];
+          expect(req.effort).toBeUndefined();
+        });
       });
     });
   });

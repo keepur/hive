@@ -2002,6 +2002,37 @@ describe("AgentRunner resource limits override (via send)", () => {
   });
 });
 
+describe("AgentRunner effort option (KPR-312, via send)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockExistsSync.mockReturnValue(true);
+    mockStatSync.mockReturnValue({ isDirectory: () => true });
+  });
+
+  it("maps effort into query options and never sets thinking", async () => {
+    const runner = makeRunner();
+    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, undefined, "low");
+    const opts = getCapturedOptions();
+    expect(opts.effort).toBe("low");
+    expect("thinking" in opts).toBe(false);
+  });
+
+  it("omits the effort key entirely when no effort is passed", async () => {
+    const runner = makeRunner();
+    await runner.send("hi");
+    const opts = getCapturedOptions();
+    expect("effort" in opts).toBe(false);
+    expect("thinking" in opts).toBe(false);
+  });
+
+  it("drops values outside the SDK-deliverable subset (defensive)", async () => {
+    const runner = makeRunner();
+    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, undefined, "xhigh" as never);
+    expect("effort" in getCapturedOptions()).toBe(false);
+  });
+});
+
 // ── Token tracking and compaction tests ──────────────────────────
 describe("AgentRunner token tracking and compaction (via send)", () => {
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;

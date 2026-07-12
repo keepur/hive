@@ -31,6 +31,7 @@ describe("ClaudeAgentAdapter", () => {
         modelOverride: "claude-haiku-4-5",
         resourceLimits,
         systemPromptOverride: "voice prompt",
+        effort: "low",
       }),
     ).resolves.toBe(result);
 
@@ -42,7 +43,7 @@ describe("ClaudeAgentAdapter", () => {
       "claude-haiku-4-5",
       resourceLimits,
       "voice prompt",
-      undefined,
+      "low",
     );
   });
 
