@@ -31,6 +31,7 @@ import {
 import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
+import { RESUMABLE_SESSION_PROVIDERS } from "./provider-adapters/types.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
 
@@ -72,6 +73,20 @@ export interface TurnContext {
   agentId: string;
   /** undefined on first turn; SDK may rotate post-compaction (KPR-211). */
   sessionId: string | undefined;
+  /**
+   * KPR-313: provider tag of the stored session — set wherever sessionId is
+   * resolved from the session store (runWorkItemTurn, reflection reads,
+   * voice's eligibility-filtered read). Consumed by spawnTurn's
+   * session-identity guard. undefined ⇒ nothing known about the row's
+   * producer (first turn, or a caller that resolved no session).
+   */
+  sessionProvider?: AgentProviderId;
+  /**
+   * KPR-313: set ONLY by spawnTurn's session-identity guard when this turn
+   * starts fresh due to a provider change; prepareSpawn prepends the handoff
+   * annotation. Never set by callers.
+   */
+  sessionHandoff?: boolean;
   channelId: string;
   threadId: string;
   workItem: WorkItem;
@@ -558,11 +573,12 @@ export class AgentManager {
     onStream?: SpawnTurnStreamCallback,
   ): Promise<TurnResult> {
     const threadId = item.threadId ?? item.id;
-    const sessionId = await this.sessionStore.get(agentId, threadId);
+    const stored = await this.sessionStore.get(agentId, threadId);
 
     const ctx: TurnContext = {
       agentId,
-      sessionId,
+      sessionId: stored?.sessionId,
+      sessionProvider: stored?.provider,
       channelId: item.source.id,
       threadId,
       workItem: item,
@@ -628,9 +644,12 @@ export class AgentManager {
       // spawnTurn, so the window is microseconds and tolerated.
       let effectiveCtx = ctx;
       if (ctx.kind === "reflection") {
-        const freshSessionId = await this.sessionStore.get(ctx.agentId, ctx.threadId);
-        if (freshSessionId !== ctx.sessionId) {
-          effectiveCtx = { ...ctx, sessionId: freshSessionId };
+        const fresh = await this.sessionStore.get(ctx.agentId, ctx.threadId);
+        // KPR-313: FIELD-wise staleness compare. get() now returns a ref — a
+        // naive `fresh !== ctx.sessionId` would compare ref-vs-string, always
+        // mismatch, and (worse) assign a ref where a string id belongs.
+        if (fresh?.sessionId !== ctx.sessionId || fresh?.provider !== ctx.sessionProvider) {
+          effectiveCtx = { ...ctx, sessionId: fresh?.sessionId, sessionProvider: fresh?.provider };
         }
       }
 
@@ -679,7 +698,7 @@ export class AgentManager {
       }
       this.circuitBreakers.record(permit, classifyTurnResult(finalResult), finalResult.llmMs);
 
-      const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult);
+      const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult, shaping.route);
       this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
@@ -987,7 +1006,7 @@ export class AgentManager {
     // lock is acquired (see spawnTurn's effectiveCtx logic for ctx.kind ===
     // "reflection"). The capture here is best-effort for any pre-lock logic
     // that needs it; the post-lock re-resolve is the authoritative read.
-    const sessionId = await this.sessionStore.get(agentId, threadId);
+    const stored = await this.sessionStore.get(agentId, threadId);
     const workItem: WorkItem = {
       id: `reflection-${threadId}-${Date.now()}`,
       text: REFLECTION_PROMPT,
@@ -998,7 +1017,8 @@ export class AgentManager {
     };
     const ctx: TurnContext = {
       agentId,
-      sessionId,
+      sessionId: stored?.sessionId,
+      sessionProvider: stored?.provider,
       channelId: state.lastChannelId,
       threadId,
       workItem,
@@ -1297,20 +1317,42 @@ export class AgentManager {
     });
   }
 
-  private finalizeSpawnResult(ctx: TurnContext, result: RunResult): TurnResult {
+  private finalizeSpawnResult(ctx: TurnContext, result: RunResult, route: ProviderModelRoute): TurnResult {
     const newSessionId = result.sessionId || ctx.sessionId || "";
     if (result.sessionId && !result.aborted) {
-      // Persist post-spawn — captures session-id rotation post-compaction
-      // (KPR-211 verified this fires on resume).
-      this.sessionStore.set(ctx.agentId, ctx.threadId, result.sessionId, {
-        inputTokens: result.inputTokens,
-        outputTokens: result.outputTokens,
-        cacheReadTokens: result.cacheReadTokens,
-        cacheCreationTokens: result.cacheCreationTokens,
-        contextWindow: result.contextWindow,
-        compactions: result.compactions,
-        preCompactTokens: result.preCompactTokens,
-      });
+      // KPR-313 §3.2: persist a resumable handle ONLY for providers whose
+      // adapters actually resume. Stateless pilots keep the ROW (the session
+      // store doubles as the dispatcher's thread→agent map via
+      // findAgentByThread) with an empty sessionId — the row persists, the
+      // fake handle never does.
+      const resumable = RESUMABLE_SESSION_PROVIDERS.has(route.provider);
+      // ⚠A4 churn-mint rider: an ERROR turn that attempted a resume and came
+      // back with a DIFFERENT id is a failed-resume mint (the CLI's
+      // error_during_execution result carries a freshly minted session_id) —
+      // never let it overwrite the row. Error turns may only re-persist the
+      // SAME id they resumed (TTL refresh; harmless per M7b — ids are stable
+      // and the prior value stays the right handle if the session exists at
+      // all). Success-path compaction rotation (KPR-211) is unaffected: no
+      // error ⇒ rider never fires.
+      const churnMint = !!result.error && !!ctx.sessionId && result.sessionId !== ctx.sessionId;
+      if (churnMint) {
+        log.warn("Skipping session persist — errored turn returned a different id than it resumed (KPR-313)", {
+          agentId: ctx.agentId,
+          threadId: ctx.threadId,
+        });
+      } else {
+        // Persist post-spawn — captures session-id rotation post-compaction
+        // (KPR-211 verified this fires on resume).
+        this.sessionStore.set(ctx.agentId, ctx.threadId, resumable ? result.sessionId : "", route.provider, {
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          cacheReadTokens: result.cacheReadTokens,
+          cacheCreationTokens: result.cacheCreationTokens,
+          contextWindow: result.contextWindow,
+          compactions: result.compactions,
+          preCompactTokens: result.preCompactTokens,
+        });
+      }
     }
 
     const state = this.states.get(ctx.agentId)!;

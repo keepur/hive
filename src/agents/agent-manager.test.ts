@@ -146,6 +146,7 @@ import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./prov
 import type { WorkItem } from "../types/work-item.js";
 import { routeModel } from "./model-router.js";
 import type { ModelRouterResult } from "./model-router.js";
+import type { AgentProviderId } from "./provider-adapters/types.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -269,17 +270,29 @@ function makeMockRegistry() {
 }
 
 function makeMockSessionStore() {
-  const sessions = new Map<string, string>();
+  // KPR-313: records mirror the real store's rows; get() applies the same
+  // ""-⇒-undefined normalization the real choke point does.
+  const sessions = new Map<string, { sessionId: string; provider: string }>();
   return {
     get: vi.fn().mockImplementation(async (agentId: string, threadId: string) => {
-      return sessions.get(`${agentId}:${threadId}`);
+      const rec = sessions.get(`${agentId}:${threadId}`);
+      if (!rec) return undefined;
+      return { sessionId: rec.sessionId || undefined, provider: rec.provider };
     }),
-    set: vi.fn().mockImplementation(async (agentId: string, threadId: string, sessionId: string, _tokenData?: any) => {
-      sessions.set(`${agentId}:${threadId}`, sessionId);
-    }),
+    set: vi.fn().mockImplementation(
+      async (agentId: string, threadId: string, sessionId: string, provider: string, _tokenData?: any) => {
+        sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      },
+    ),
     delete: vi.fn(),
     clearAgent: vi.fn(),
-    findAgentByThread: vi.fn().mockResolvedValue(undefined),
+    findAgentByThread: vi.fn().mockImplementation(async (threadId: string) => {
+      for (const key of sessions.keys()) {
+        if (key.endsWith(`:${threadId}`)) return key.slice(0, key.length - threadId.length - 1);
+      }
+      return undefined;
+    }),
+    _sessions: sessions,
   };
 }
 
@@ -810,6 +823,7 @@ describe("AgentManager", () => {
     function smsCtx(overrides: Partial<{
       agentId: string;
       sessionId: string | undefined;
+      sessionProvider: AgentProviderId | undefined;
       threadId: string;
       channelId: string;
       text: string;
@@ -826,6 +840,7 @@ describe("AgentManager", () => {
       return {
         agentId,
         sessionId: overrides.sessionId,
+        sessionProvider: overrides.sessionProvider,
         channelId,
         threadId,
         workItem,
@@ -854,6 +869,7 @@ describe("AgentManager", () => {
         "agent-a",
         ctx.threadId,
         "session-sms-1",
+        "claude",
         expect.objectContaining({ inputTokens: 100, outputTokens: 50 }),
       );
 
@@ -976,7 +992,7 @@ describe("AgentManager", () => {
     it("KPR-220 Phase 3: runWorkItemTurn resolves session via store and delegates to spawnTurn", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       // Pre-seed a session so the wrapper's lookup hits.
-      sessionStore.set("agent-a", "sms:line-1:wrap", "stored-session", undefined as any);
+      sessionStore.set("agent-a", "sms:line-1:wrap", "stored-session", "claude", undefined as any);
       mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "stored-session" }));
 
       const item = makeWorkItem({
@@ -1877,21 +1893,27 @@ describe("AgentManager", () => {
       // Turn 1
       const sess0 = await sessionStore.get("agent-a", threadId);
       expect(sess0).toBeUndefined();
-      const turn1 = await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess0 }));
+      const turn1 = await manager.spawnTurn(
+        smsCtx({ threadId, channelId, sessionId: sess0?.sessionId, sessionProvider: sess0?.provider }),
+      );
       expect(turn1.newSessionId).toBe("session-A");
-      expect(await sessionStore.get("agent-a", threadId)).toBe("session-A");
+      expect((await sessionStore.get("agent-a", threadId))?.sessionId).toBe("session-A");
 
       // Turn 2 — adapter resumes against the stored id, SDK rotates inside.
       const sess1 = await sessionStore.get("agent-a", threadId);
-      const turn2 = await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess1 }));
+      const turn2 = await manager.spawnTurn(
+        smsCtx({ threadId, channelId, sessionId: sess1?.sessionId, sessionProvider: sess1?.provider }),
+      );
       expect(turn2.newSessionId).toBe("session-B");
       // Persistence side has rotated to the new id.
-      expect(await sessionStore.get("agent-a", threadId)).toBe("session-B");
+      expect((await sessionStore.get("agent-a", threadId))?.sessionId).toBe("session-B");
 
       // Turn 3 — adapter resumes against the rotated id.
       const sess2 = await sessionStore.get("agent-a", threadId);
-      expect(sess2).toBe("session-B");
-      await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess2 }));
+      expect(sess2?.sessionId).toBe("session-B");
+      await manager.spawnTurn(
+        smsCtx({ threadId, channelId, sessionId: sess2?.sessionId, sessionProvider: sess2?.provider }),
+      );
 
       // The third runner.send call resumed against session-B, not the original session-A.
       const [, thirdResume] = mockRunnerSend.mock.calls[2]!;

@@ -63,6 +63,7 @@ interface AgentManagerStub {
   spawnTurn: ReturnType<typeof vi.fn>;
   sessionStoreGet: ReturnType<typeof vi.fn>;
   sessionStoreSet: ReturnType<typeof vi.fn>;
+  providerFor: ReturnType<typeof vi.fn>;
   calls: Array<{ ctx: TurnContext; onStream?: (chunk: string) => void }>;
 }
 
@@ -70,6 +71,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
   const calls: AgentManagerStub["calls"] = [];
   const sessionStoreGet = vi.fn().mockResolvedValue(undefined as string | undefined);
   const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
+  const providerFor = vi.fn().mockReturnValue("claude");
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
     calls.push({ ctx, onStream });
@@ -91,7 +93,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
     } satisfies TurnResult;
   });
 
-  return { spawnTurn, sessionStoreGet, sessionStoreSet, calls };
+  return { spawnTurn, sessionStoreGet, sessionStoreSet, providerFor, calls };
 }
 
 function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: ReturnType<typeof vi.fn> }) {
@@ -111,6 +113,7 @@ function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: 
           get: am.sessionStoreGet,
           set: am.sessionStoreSet,
         }),
+        providerFor: am.providerFor,
       }
     : undefined;
   return new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager, dispatcher as any);
@@ -283,7 +286,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
   it("uses extractLatestUserMessage prompt + resume id when session-store has a sessionId", async () => {
     const am = makeAgentManager();
-    am.sessionStoreGet.mockResolvedValueOnce("resume-sid-xyz");
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "resume-sid-xyz", provider: "claude" });
     const adapter = makeVoiceAdapter(am);
     const res = new MockServerResponse();
     const req = makeRequest({
@@ -387,7 +390,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
   it("outer retry: when first spawnTurn errors with sessionId set and no bytes sent, retries with full transcript and stripped sessionId", async () => {
     const am = makeAgentManager();
-    am.sessionStoreGet.mockResolvedValueOnce("stale-sid");
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "stale-sid", provider: "claude" });
     // First call errors (in errors[]), second succeeds.
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
@@ -430,7 +433,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
   it("outer retry double-failure: stale sessionId is not pre-emptively cleared; next call resumes against it cleanly", async () => {
     const am = makeAgentManager();
-    am.sessionStoreGet.mockResolvedValue("persistent-stale-sid");
+    am.sessionStoreGet.mockResolvedValue({ sessionId: "persistent-stale-sid", provider: "claude" });
 
     const failingTurn = async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
@@ -558,7 +561,7 @@ describe("VoiceAdapter — provider circuit open (KPR-307)", () => {
 
   it("does NOT fire the outer resume-retry for circuit-open fast-fails", async () => {
     const am = makeAgentManager();
-    am.sessionStoreGet.mockResolvedValue("session-abc"); // resume present
+    am.sessionStoreGet.mockResolvedValue({ sessionId: "session-abc", provider: "claude" }); // resume present
     am.spawnTurn.mockRejectedValue(circuitOpenError());
     const adapter = makeVoiceAdapter(am);
     const res = new MockServerResponse();

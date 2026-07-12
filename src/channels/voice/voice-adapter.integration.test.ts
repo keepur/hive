@@ -69,7 +69,9 @@ function makeAdapter(opts: {
   dispatcher?: Dispatcher;
 }) {
   const captured: CapturedSpawn[] = [];
-  const sessionStoreGet = vi.fn().mockResolvedValue(opts.storedSessionId);
+  const sessionStoreGet = vi.fn().mockResolvedValue(
+    opts.storedSessionId ? { sessionId: opts.storedSessionId, provider: "claude" } : undefined,
+  );
   const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
@@ -89,6 +91,7 @@ function makeAdapter(opts: {
   const agentManager: any = {
     spawnTurn,
     getSessionStore: () => ({ get: sessionStoreGet, set: sessionStoreSet }),
+    providerFor: vi.fn().mockReturnValue("claude"),
   };
 
   const adapter = opts.dispatcher
