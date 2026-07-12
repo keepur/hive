@@ -706,7 +706,7 @@ export function createMemoryMcpServer(deps: MemoryToolDeps) {
 - [ ] Step 2: Verify — `npx tsc --noEmit -p .` (or `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run typecheck`). Expected: zero errors in `src/memory/memory-mcp-server.ts`. The old test file will now fail to compile/run — that is expected until Task 2; do NOT run the full test suite yet.
 - [ ] Step 3: Commit —
 ```bash
-cd /Users/mokie/github/kpr-326-work
+cd /Users/mokie/github/kpr-327-work
 git add src/memory/memory-mcp-server.ts
 git commit -m "KPR-327: rewrite memory MCP server to native six-command contract
 
@@ -1292,7 +1292,7 @@ describe("legacy surface removed", () => {
 - [ ] Step 2: Verify — `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/memory/memory-mcp-server.test.ts`. Expected: all tests pass (~35 tests). Negative-verify once: comment out the `/%2e|%2f|%5c/i` check in `canonicalize`, rerun, confirm the `%2e%2e` guard tests FAIL, restore, rerun green.
 - [ ] Step 3: Commit —
 ```bash
-cd /Users/mokie/github/kpr-326-work
+cd /Users/mokie/github/kpr-327-work
 git add src/memory/memory-mcp-server.test.ts
 git commit -m "KPR-327: rewrite memory MCP server tests for native contract
 
@@ -1306,9 +1306,23 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ### Task 3: agent-runner cleanup — drop the vestigial stdio placeholder
 
+> **Revision 2026-07-12 (post-demotion).** The 2026-07-11 deliver lane demoted this ticket at this task (see the KPR-327 demotion comment): the `describe("AgentRunner — MEMORY_SCOPES_JSON wiring")` block (`agent-runner.test.ts:2857-2936`, 4 tests) observes `resolveMemoryScopes()` output **solely** via `servers.memory.env.MEMORY_SCOPES_JSON` on the stdio placeholder this task deletes — an observation seam the original plan failed to enumerate. Resolution (option 1 of the demotion comment, sharpened): capture the deps `AgentRunner.send()` passes to `createMemoryMcpServer` at the **factory boundary** via a wrapping module mock, and assert on `deps.memoryScopes`. This preserves the block's wiring-level coverage intent — that `send()` threads the resolved scope list into the memory server — which a direct `resolveMemoryScopes()` unit test would lose and deleting the block would abandon (the function is live, called code). The capture must sit on `createMemoryMcpServer` itself, **not** the SDK's `createSdkMcpServer` mock: the SDK layer receives only `{name, version, tools}` where the tools close over deps opaquely. Steps 0 and 5(d) below are new; the uncommitted WIP already present in the child worktree implements Steps 1–5(a-c) faithfully and is kept, not redone.
+>
+> **Worktree note (applies to every task in this plan):** the deliver lane executes in the child worktree `/Users/mokie/github/kpr-327-work` (branch `may/kpr-327-memory-legacy-cutover`) — never on the epic branch. This plan's `/Users/mokie/github/kpr-326-work/...` file paths in **Files:** headers are epic-worktree spellings from drafting time; resolve them against the child worktree. All commit-step `cd` lines were corrected to the child worktree in this revision (caught by plan-review round 2).
+
 **Files:**
 - Modify: `/Users/mokie/github/kpr-326-work/src/agents/agent-runner.ts` (lines ~454-477 removed; small edits at ~225-232, ~819, ~1195-1217, ~1522-1529)
-- Modify: `/Users/mokie/github/kpr-326-work/src/agents/agent-runner.test.ts` (tests at lines ~234, ~250, ~775-804)
+- Modify: `/Users/mokie/github/kpr-326-work/src/agents/agent-runner.test.ts` (tests at lines ~234, ~250, ~775-804; **plus** the scope-wiring block at ~2857-2936 and a top-of-file capture mock — Step 5d)
+
+- [ ] Step 0 (added 2026-07-12): sync the child branch with the epic head before resuming. The child branch was cut from `fa4fa6a`; the epic branch has since merged KPR-329 (`2bb6a4b`, touches agent-runner.ts tool-search wiring — disjoint from this task's regions) plus this plan revision. The branch is local-only (never pushed), so rebase:
+```bash
+cd /Users/mokie/github/kpr-327-work
+git stash -u        # preserve the Task 3 WIP (agent-runner.ts + agent-runner.test.ts)
+git fetch origin
+git rebase origin/kpr-326
+git stash pop       # expect clean; WIP regions are test ~193-268/~793-816, source ~225-232/~453-477/~801/~1204/~1522
+```
+  If `git stash pop` reports conflicts, the stash entry is retained — resolve the conflicted hunks manually (the WIP hunk regions above are disjoint from the epic's KPR-329 hunks, so conflicts are unexpected), verify the working tree matches the WIP intent, then `git stash drop`. Then re-verify the two committed tasks still hold post-rebase: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/memory/memory-mcp-server.test.ts` → 46/46. Line anchors throughout this task may drift slightly post-rebase — anchor by the quoted code, not the numbers.
 
 Everything else in agent-runner.ts stays untouched: `createMemoryMcpServer` call in `send()`, `IN_PROCESS_PORTED_SERVERS`, structured-memory auto-pairing and its stdio placeholder, `resolveMemoryScopes`, `invalidatePrefixCacheByMemoryPath` wiring. Confirmed by research: the in-process branch at ~1530 sets `mcpServers["memory"]` independently of the placeholder, and `buildSystemPrompt` derives `coreServerNames` from `Object.keys(mcpServers)` AFTER that overwrite (line ~1684), so the toolkit section is unaffected by the removal.
 
@@ -1373,10 +1387,136 @@ function makeFakeInProcessDb(): any {
     expect(servers.memory.args).toBeUndefined();
 ```
   (c) If other tests fail on a missing `memory` key or a factory calling an unstubbed collection method, extend the stub — do not weaken assertions. The tool-transport test at ~1163 must pass UNCHANGED (it already passes `{} as any` as db and never invokes collection methods).
-- [ ] Step 6: Verify — `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/agent-runner.test.ts` → all pass, including the unchanged test at :1163. Then `npm run typecheck` with the same env → clean.
+
+  (d) **(added 2026-07-12)** Rewrite the `describe("AgentRunner — MEMORY_SCOPES_JSON wiring")` block (~2857-2936) onto the factory-boundary capture seam. Two pieces:
+
+  **(d-i)** Top of file, alongside the existing `vi.mock("@anthropic-ai/claude-agent-sdk", …)` block, add a wrapping module mock. `vi.hoisted` is required — `vi.mock` factories are hoisted above `const` bindings:
+
+```typescript
+// KPR-327: the memory server's stdio placeholder (and its MEMORY_SCOPES_JSON
+// env serialization) no longer exists — the scope-wiring tests observe what
+// send() passes to createMemoryMcpServer instead. Wrapping mock: capture deps,
+// delegate to the real factory (whose createSdkMcpServer import is the SDK
+// mock above, so returned servers keep the {name, type: "sdk"} test shape).
+const memoryDepsCapture = vi.hoisted(() => ({ deps: [] as any[] }));
+vi.mock("../memory/memory-mcp-server.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../memory/memory-mcp-server.js")>();
+  return {
+    ...actual,
+    createMemoryMcpServer: vi.fn((deps: any) => {
+      memoryDepsCapture.deps.push(deps);
+      return actual.createMemoryMcpServer(deps);
+    }),
+  };
+});
+```
+
+  **(d-ii)** Replace the describe block. The four archetype-registration setups are **verbatim from the current tests** — only the runner construction (now needs a db so `send()` takes the in-process branch; `AgentRunner` is cached per-instance so each fresh runner captures exactly once) and the observation lines change. Assertions are unchanged: `send()` passes `resolveMemoryScopes()`'s full output (self included) as `deps.memoryScopes`, exactly what `MEMORY_SCOPES_JSON` used to serialize:
+
+```typescript
+describe("AgentRunner — memoryScopes wiring into createMemoryMcpServer (KPR-327)", () => {
+  function makeScopesRunner(overrides: Partial<AgentConfig> = {}) {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"], ...overrides }),
+      makeMockMemoryManager() as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryDepsCapture.deps.length = 0; // plain array — clearAllMocks does not reset it
+    __resetRegistryForTests();
+  });
+  afterEach(() => __resetRegistryForTests());
+
+  it("defaults to self-mongo only when no archetype is set", async () => {
+    const runner = makeScopesRunner();
+    await runner.send("hello");
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
+    expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
+  });
+
+  it("leads with self-mongo and appends archetype scopes", async () => {
+    registerArchetype({
+      id: "scoped",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [
+        { id: "workshop", backing: "filesystem", dir: "/tmp/workshop" },
+        { id: "workspace:dodi_v2", backing: "filesystem", dir: "/tmp/dodi" },
+      ],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeScopesRunner({ archetype: "scoped", archetypeConfig: {} });
+    await runner.send("hello");
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
+    expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
+    expect(scopes).toHaveLength(3);
+    expect(scopes.find((s: { id: string }) => s.id === "workshop")).toEqual({
+      id: "workshop",
+      backing: "filesystem",
+      dir: "/tmp/workshop",
+    });
+    expect(scopes.find((s: { id: string }) => s.id === "workspace:dodi_v2")).toBeDefined();
+  });
+
+  it("dedupes self when an archetype incorrectly returns its own self entry", async () => {
+    registerArchetype({
+      id: "with-self",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => [
+        { id: "self", backing: "filesystem", dir: "/tmp/should-be-filtered" },
+        { id: "workshop", backing: "filesystem", dir: "/tmp/workshop" },
+      ],
+      sessionOptions: () => ({}),
+    });
+    const runner = makeScopesRunner({ archetype: "with-self", archetypeConfig: {} });
+    await runner.send("hello");
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
+    const selfEntries = scopes.filter((s: { id: string }) => s.id === "self");
+    expect(selfEntries).toHaveLength(1);
+    expect(selfEntries[0]).toEqual({ id: "self", backing: "mongo" });
+    expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
+  });
+
+  it("falls back to self-mongo only when memoryScopes throws", async () => {
+    registerArchetype({
+      id: "throwing",
+      validateConfig: (c) => c,
+      systemPromptCard: () => "",
+      preToolUseHooks: () => [],
+      memoryScopes: () => {
+        throw new Error("intentional");
+      },
+      sessionOptions: () => ({}),
+    });
+    const runner = makeScopesRunner({ archetype: "throwing", archetypeConfig: {} });
+    await runner.send("hello");
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
+    expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
+  });
+});
+```
+
+  Notes: other tests in the file will also push into `memoryDepsCapture.deps` when they run with a db — harmless; these tests read `.at(-1)` immediately after their own `send()`. The pre-existing local `makeFakeDb` helper inside the in-process describe (~2740) is left as-is (optional consolidation with `makeFakeInProcessDb` is non-blocking implementer judgment). The wrapping mock changes no behavior for any other test: it delegates to the real factory.
+- [ ] Step 6: Verify — `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/agent-runner.test.ts` → all pass, including the unchanged test at :1163 and the four rewritten scope-wiring tests. Then `npm run typecheck` with the same env → clean.
 - [ ] Step 7: Commit —
 ```bash
-cd /Users/mokie/github/kpr-326-work
+cd /Users/mokie/github/kpr-327-work
 git add src/agents/agent-runner.ts src/agents/agent-runner.test.ts
 git commit -m "KPR-327: drop vestigial memory stdio placeholder (KPR-183 leftover)
 
@@ -1451,7 +1591,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - [ ] Step 4: Verify — `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/prefix-builder.test.ts` → all pass (existing 10 + new 2).
 - [ ] Step 5: Commit —
 ```bash
-cd /Users/mokie/github/kpr-326-work
+cd /Users/mokie/github/kpr-327-work
 git add src/agents/prefix-builder.ts src/agents/prefix-builder.test.ts
 git commit -m "KPR-327: memory-first prompt block + view reference in legacy fallback
 
@@ -1470,7 +1610,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 - [ ] Step 1: In-repo legacy-name sweep (spec §4.7 — must come back clean after Tasks 1-4):
 ```bash
-cd /Users/mokie/github/kpr-326-work
+cd /Users/mokie/github/kpr-327-work
 grep -rn "memory_read\|memory_write\|memory_list" src/ docs/ seeds/ scripts/ --include="*.ts" --include="*.md" | grep -v "kpr-32[678]" || echo CLEAN
 ```
   Expected: `CLEAN` (the epic docs themselves may reference the legacy names historically — excluded). `memory_history`/`memory_rollback` legitimately remain. The DB-stored-prompt sweep on live instances (dodi/keepur) is an operator rollout item per spec §4.7, NOT part of this ticket's code or gates.
@@ -1481,7 +1621,7 @@ SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run chec
   Expected: typecheck + lint + format + test all green. If format rewrites files, re-stage and amend the relevant task commit or add a `KPR-327: format` commit.
 - [ ] Step 3: Commit — only if Step 2 produced fixes:
 ```bash
-cd /Users/mokie/github/kpr-326-work
+cd /Users/mokie/github/kpr-327-work
 git add -A && git commit -m "KPR-327: quality-gate fixes
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
