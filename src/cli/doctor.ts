@@ -32,6 +32,7 @@ import {
   slackAuthOk,
   spawnCoordinatorStatsForDoctor,
   memoryLifecycleStatsForDoctor,
+  modelRouterModeLine,
 } from "./doctor-checks.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -710,6 +711,10 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // KPR-241: memory lifecycle per-agent stats.
     const memoryRows = await memoryLifecycleStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderMemoryLifecycleSection(memoryRows, console.log, config.memory.spendWarnThresholdUsd ?? 5);
+    // KPR-312: model-router classifier mode — informational only, never
+    // contributes to allPassed. ANTHROPIC_API_KEY resolves env→Keychain via
+    // config.ts optional(); presence ⇔ LLM classification path.
+    console.log(`\n${modelRouterModeLine(Boolean(config.anthropic.apiKey))}`);
   } else {
     console.log("\nDatastore identity");
     console.log("  ○ skipped: config not loaded");
@@ -724,6 +729,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     console.log("\nOutage queue (honest outage behavior)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nMemory lifecycle: skipped (config not loaded)");
+    console.log("\nmodel router: skipped (config not loaded)");
   }
 
   if (!allPassed) {
