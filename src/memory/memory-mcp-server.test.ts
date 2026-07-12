@@ -287,6 +287,28 @@ describe("str_replace", () => {
     expect(versionDocs).toHaveLength(0);
   });
 
+  it("replaces literally — $$ and $& in new_str are not treated as replacement patterns", async () => {
+    seed("agents/alice/x.md", "the item PRICE_PLACEHOLDER today");
+    const sr = getHandler(makeTools(), "str_replace");
+    const res = await sr({
+      path: "/memories/agents/alice/x.md",
+      old_str: "PRICE_PLACEHOLDER",
+      new_str: "costs $$50 ($& escaped)",
+    });
+    expect(res.isError).toBeFalsy();
+    expect(memoryDocs.get("agents/alice/x.md")?.content).toBe("the item costs $$50 ($& escaped) today");
+  });
+
+  it("rejects empty old_str — no snapshot, no write", async () => {
+    seed("agents/alice/x.md", "content");
+    const sr = getHandler(makeTools(), "str_replace");
+    const res = await sr({ path: "/memories/agents/alice/x.md", old_str: "", new_str: "y" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/non-empty/);
+    expect(memoryDocs.get("agents/alice/x.md")?.content).toBe("content");
+    expect(versionDocs).toHaveLength(0);
+  });
+
   it("sequential same-file edits are last-write-wins with both priors snapshotted", async () => {
     seed("agents/alice/x.md", "base one two");
     const sr = getHandler(makeTools(), "str_replace");

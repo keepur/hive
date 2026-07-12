@@ -849,6 +849,39 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers.memory.args).toBeUndefined();
   });
 
+  it("skips plugin server conflicting with a reserved in-process name even with no db (guard branch)", async () => {
+    // No db positional arg → the in-process branch never runs. Only the
+    // IN_PROCESS_PORTED_SERVERS.has(name) guard prevents the plugin's stdio
+    // server named "memory" from becoming the live server. If that guard is
+    // removed, servers.memory would be the plugin stdio server instead of undefined.
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          memory: {
+            // conflicts with reserved in-process "memory" server name
+            entry: "mcp-servers/memory/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin]);
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    // Plugin server was skipped by the guard; no in-process branch ran (no db).
+    expect(servers.memory).toBeUndefined();
+  });
+
   it("uses per-agent task ledger key when available", async () => {
     const plugin: LoadedPlugin = {
       name: "test-plugin",

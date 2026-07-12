@@ -373,6 +373,9 @@ export function buildMemoryTools(deps: MemoryToolDeps) {
       },
       async ({ path, old_str, new_str }) => {
         try {
+          if (old_str === "") {
+            return fail("No replacement was performed: old_str must be non-empty");
+          }
           const r = resolvePath(path);
           const target = await readForEdit(r, path);
           if ("isError" in target || "content" in target === false) return target as ToolResult;
@@ -386,7 +389,10 @@ export function buildMemoryTools(deps: MemoryToolDeps) {
               `No replacement was performed: found ${occurrences} occurrences of old_str in ${path} — old_str must be unique`,
             );
           }
-          const next = target.content.replace(old_str, new_str ?? "");
+          // Literal splice — String.prototype.replace processes $$, $&, $`, $' in the
+          // replacement string, which would silently corrupt content containing those
+          // sequences. Uniqueness is already enforced above, so split/join is exact.
+          const next = target.content.split(old_str).join(new_str ?? "");
           await target.write(next, "memory-mcp-str_replace");
           return ok(`The file ${path} has been edited`);
         } catch (err) {
@@ -459,7 +465,7 @@ export function buildMemoryTools(deps: MemoryToolDeps) {
     ),
     tool(
       "rename",
-      "Rename or move a memory file or directory. Root and mount roots cannot be renamed; the destination must not already exist. Not supported on filesystem scopes, and renames may not cross the Mongo/filesystem boundary.",
+      "Rename or move a memory file or directory. Root and mount roots cannot be renamed; the destination must not already exist. Not supported on filesystem scopes, and renames may not cross the Mongo/filesystem boundary. Version history remains keyed to the pre-rename path: after renaming a→b, use memory_history with the old path to view prior versions, and a memory_rollback of the old path recreates the file at the old path.",
       {
         old_path: z.string().describe("Current path"),
         new_path: z.string().describe("New path"),
