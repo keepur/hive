@@ -635,6 +635,7 @@ describe("AgentManager", () => {
         "claude-opus-4-7",
         mockRoute.resourceLimits,
         undefined,
+        undefined,
       );
     });
 
@@ -649,6 +650,7 @@ describe("AgentManager", () => {
         undefined,
         undefined,
         expect.any(Object),
+        undefined,
         undefined,
         undefined,
         undefined,

@@ -55,6 +55,7 @@ import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
+import type { ReasoningEffort } from "./provider-adapters/types.js";
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -1493,7 +1494,7 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits, systemPromptOverride?: string): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: ReasoningEffort): Promise<RunResult> {
     const effectiveModel = modelOverride ?? this.agentConfig.model;
 
     log.info("Sending prompt to agent", {
@@ -1752,6 +1753,15 @@ export class AgentRunner {
 
         maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
         maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
+        // KPR-312: per-turn reasoning effort from the complexity classifier.
+        // ReasoningEffort and the SDK's EffortLevel overlap but neither is a
+        // superset (ReasoningEffort has minimal/none/xhigh; EffortLevel has
+        // max) — only the shared {low, medium, high} subset is deliverable
+        // (routeModel emits nothing else; the narrowing also satisfies the
+        // SDK's EffortLevel type). Deliberately NO `thinking` key: toggling
+        // thinking config turn-to-turn invalidates the messages-tier prompt
+        // cache — the exact cost class KPR-312 avoids.
+        ...(effort === "low" || effort === "medium" || effort === "high" ? { effort } : {}),
         // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
         // may return arbitrary SDK options, but we explicitly pick only the safe ones
         // so a rogue archetype can't override security invariants (permissionMode,

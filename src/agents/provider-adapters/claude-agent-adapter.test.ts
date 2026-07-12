@@ -42,6 +42,7 @@ describe("ClaudeAgentAdapter", () => {
       "claude-haiku-4-5",
       resourceLimits,
       "voice prompt",
+      undefined,
     );
   });
 
