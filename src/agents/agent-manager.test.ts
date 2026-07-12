@@ -2202,6 +2202,244 @@ describe("AgentManager", () => {
         expect(result.finalMessage).toBe("response");
       });
     });
+
+    describe("session-identity guard + persist rule (KPR-313)", () => {
+      function seed(threadId: string, sessionId: string, provider: string, agentId = "agent-a") {
+        sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      }
+
+      it("trips on stored tag ≠ turn provider: fresh session, claude annotation, new-session metric, exactly ONE trip-path store read", async () => {
+        const recordSpawnSpy = vi.spyOn(manager as any, "recordSpawn");
+        const threadId = "sms:line-1:kpr313-trip";
+        seed(threadId, "resp_stale", "openai");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "s-new" }));
+
+        await manager.spawnTurn(smsCtx({ threadId, sessionId: "resp_stale", sessionProvider: "openai" }));
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined(); // resume stripped
+        expect(prompt.startsWith("[System notice:")).toBe(true); // annotation prepended before sender prefix
+        expect(prompt).toContain("session continuity was reset");
+        expect(prompt).toContain("conversation_search"); // claude-target variant
+        expect(prompt).toContain("hello over sms"); // original text intact
+        expect(recordSpawnSpy).toHaveBeenCalledTimes(1); // counted as a new session
+        expect(sessionStore.get).toHaveBeenCalledTimes(1); // the authoritative re-read — trip path only
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("provider mismatch"),
+          expect.objectContaining({ stored: "openai", turn: "claude", hadSessionId: true }),
+        );
+      });
+
+      it("same-provider tag resumes with ZERO store reads on the hot path (also the untagged-legacy fleet-upgrade pin — grandfathered rows arrive as claude)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1" }));
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr313-match", sessionId: "s-1", sessionProvider: "claude" }),
+        );
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBe("s-1");
+        expect(prompt).not.toContain("session continuity was reset");
+        expect(sessionStore.get).not.toHaveBeenCalled(); // zero-I/O hot path
+      });
+
+      it("codex-tagged empty row + claude turn: nothing to resume AND the annotation still fires (round-trip return leg)", async () => {
+        const threadId = "sms:line-1:kpr313-return";
+        seed(threadId, "", "codex"); // re-read stays codex ⇒ handoff, not adopt
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "back", sessionId: "s-back" }));
+
+        await manager.spawnTurn(smsCtx({ threadId, sessionId: undefined, sessionProvider: "codex" }));
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined();
+        expect(prompt).toContain("session continuity was reset"); // keyed on the TAG, not the id
+      });
+
+      it("claude→pilot handoff uses the pilot annotation variant (no conversation_search — pilots are tool-free)", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        const threadId = "sms:line-1:kpr313-topilot";
+        seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+        );
+
+        const req = mockCodexRunTurn.mock.calls[0]![0];
+        expect(req.sessionId).toBeUndefined();
+        expect(req.prompt).toContain("session continuity was reset");
+        expect(req.prompt).not.toContain("conversation_search");
+      });
+
+      it("⚠A9 re-resolve-on-trip: queued same-thread turn ADOPTS the predecessor's switched session instead of double-dropping", async () => {
+        const threadId = "sms:line-1:kpr313-race";
+        seed(threadId, "resp_stale", "openai");
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ text: "A", sessionId: "s-A" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "B", sessionId: "s-A" }));
+
+        // Both turns read the store PRE-lock (runWorkItemTurn) and capture the
+        // stale openai tag; the per-thread lock then serializes the spawns.
+        // Determinism note: both pre-lock reads resolve before A persists only
+        // under the all-mocked microtask scheduling — if the harness gains real
+        // async, add an explicit ordering assertion (A's set before B's send).
+        const mk = (text: string) =>
+          makeWorkItem({ text, threadId, source: { kind: "sms" as const, id: "line-1", label: "May" }, sender: "+1" });
+        const p1 = manager.runWorkItemTurn("agent-a", mk("turn A"));
+        const p2 = manager.runWorkItemTurn("agent-a", mk("turn B"));
+        await Promise.all([p1, p2]);
+
+        // Turn A tripped: fresh + handoff, persisted (s-A, claude).
+        const [promptA, resumeA] = mockRunnerSend.mock.calls[0]!;
+        expect(resumeA).toBeUndefined();
+        expect(promptA).toContain("session continuity was reset");
+        // Turn B's captured tag was a full turn stale — the post-lock re-read
+        // returned A's claude row and B adopted it: resumed s-A, NO second
+        // handoff, A's exchange preserved.
+        const [promptB, resumeB] = mockRunnerSend.mock.calls[1]!;
+        expect(resumeB).toBe("s-A");
+        expect(promptB).not.toContain("session continuity was reset");
+      });
+
+      it("persist rule: claude id+tag; codex ''+tag with findAgentByThread intact; gemini ''+tag", async () => {
+        // Claude
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-c" }));
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr313-p-claude" }));
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-a", "sms:line-1:kpr313-p-claude", "s-c", "claude", expect.anything(),
+        );
+
+        // Codex — adapter returns a fabricated id ("codex-session" fixture); store must get "".
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr313-p-codex" }));
+        expect(sessionStore.set).toHaveBeenLastCalledWith(
+          "codex-pilot", "sms:line-1:kpr313-p-codex", "", "codex", expect.anything(),
+        );
+        // The ROW survives — thread→agent mapping intact (the ticket's rule, literally).
+        await expect(sessionStore.findAgentByThread("sms:line-1:kpr313-p-codex")).resolves.toBe("codex-pilot");
+
+        // Gemini
+        registry._agents.set(
+          "gemini-pilot",
+          makeAgentConfig({ id: "gemini-pilot", name: "Gemini Pilot", model: "gemini/gemini-3-pro", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr313-p-gem" }));
+        expect(sessionStore.set).toHaveBeenLastCalledWith(
+          "gemini-pilot", "sms:line-1:kpr313-p-gem", "", "gemini", expect.anything(),
+        );
+      });
+
+      it("persist rule: openai persists its resp id with the openai tag (genuinely resumable)", async () => {
+        registry._agents.set(
+          "openai-pilot",
+          makeAgentConfig({ id: "openai-pilot", name: "OpenAI Pilot", model: "openai/gpt-5.5:medium", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr313-p-oai" }));
+        expect(sessionStore.set).toHaveBeenLastCalledWith(
+          "openai-pilot", "sms:line-1:kpr313-p-oai", "openai-session", "openai", expect.anything(),
+        );
+      });
+
+      it("⚠A4 churn-mint rider: errored turn that resumed and returned a DIFFERENT id never overwrites the row", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ error: "No conversation found with session ID: s-old", sessionId: "s-minted" }),
+        );
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr313-mint", sessionId: "s-old", sessionProvider: "claude" }),
+        );
+        expect(sessionStore.set).not.toHaveBeenCalled();
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("different id"),
+          expect.objectContaining({ agentId: "agent-a" }),
+        );
+      });
+
+      it("errored turn that returned the SAME id it resumed re-persists (TTL refresh — M7b fault non-poisoning)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "tool blew up", sessionId: "s-same" }));
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr313-same", sessionId: "s-same", sessionProvider: "claude" }),
+        );
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-a", "sms:line-1:kpr313-same", "s-same", "claude", expect.anything(),
+        );
+      });
+
+      it("first-turn error with a fresh id persists (rider scoped to attempted resumes)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "tool blew up", sessionId: "s-first" }));
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr313-first" }));
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-a", "sms:line-1:kpr313-first", "s-first", "claude", expect.anything(),
+        );
+      });
+
+      it("end-to-end claude→codex→claude round trip via runWorkItemTurn: both directions trip, both variants, row state correct after each turn", async () => {
+        registry._agents.set("flip", makeAgentConfig({ id: "flip", name: "Flip", model: "claude-sonnet-4-6" }));
+        const threadId = "sms:line-1:kpr313-flip";
+        const mk = (text: string) =>
+          makeWorkItem({ text, threadId, source: { kind: "sms" as const, id: "line-1", label: "May" }, sender: "+1" });
+
+        // Turn 1 — claude: persists (s-1, claude).
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1" }));
+        await manager.runWorkItemTurn("flip", mk("t1"));
+        expect(sessionStore._sessions.get(`flip:${threadId}`)).toEqual({ sessionId: "s-1", provider: "claude" });
+
+        // Operator flips to codex (SIGUSR1 analog) — claude→pilot direction.
+        registry._agents.set(
+          "flip",
+          makeAgentConfig({ id: "flip", name: "Flip", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        await manager.runWorkItemTurn("flip", mk("t2"));
+        const codexReq = mockCodexRunTurn.mock.calls.at(-1)![0];
+        expect(codexReq.sessionId).toBeUndefined();
+        expect(codexReq.prompt).toContain("session continuity was reset");
+        expect(codexReq.prompt).not.toContain("conversation_search"); // pilot variant
+        expect(sessionStore._sessions.get(`flip:${threadId}`)).toEqual({ sessionId: "", provider: "codex" });
+
+        // Flip back — pilot→claude direction.
+        registry._agents.set("flip", makeAgentConfig({ id: "flip", name: "Flip", model: "claude-sonnet-4-6" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-3" }));
+        await manager.runWorkItemTurn("flip", mk("t3"));
+        const [prompt3, resume3] = mockRunnerSend.mock.calls.at(-1)!;
+        expect(resume3).toBeUndefined(); // codex row had nothing to resume
+        expect(prompt3).toContain("conversation_search"); // claude variant fired off the TAG alone
+        expect(sessionStore._sessions.get(`flip:${threadId}`)).toEqual({ sessionId: "s-3", provider: "claude" });
+      });
+
+      it("reflection re-resolve is FIELD-wise: same stored id/provider still hands runner.send the STRING id (ref-vs-string regression pin), one get only", async () => {
+        const threadId = "sms:line-1:kpr313-reflect";
+        seed(threadId, "s-r", "claude");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-r" }));
+
+        await manager.spawnTurn({
+          ...smsCtx({ threadId, sessionId: "s-r", sessionProvider: "claude" }),
+          kind: "reflection" as const,
+        });
+
+        const [, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBe("s-r"); // a string — a ref-vs-string compare would have rebuilt ctx with a ref here
+        expect(sessionStore.get).toHaveBeenCalledTimes(1); // re-resolve only; guard added no trip read
+      });
+
+      it("reflection after a provider edit runs fresh without throwing (re-resolve surfaces the tag, guard handles it)", async () => {
+        const threadId = "sms:line-1:kpr313-reflect-flip";
+        seed(threadId, "resp_x", "openai"); // stale reflection capture: agent now claude-static
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "reflected fresh", sessionId: "s-fresh" }));
+
+        const result = await manager.spawnTurn({
+          ...smsCtx({ threadId, sessionId: undefined, sessionProvider: undefined }),
+          kind: "reflection" as const,
+        });
+
+        expect(result.errors).toEqual([]);
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined();
+        expect(prompt).toContain("session continuity was reset"); // no special-casing for reflection (⚠A7)
+        expect(sessionStore.get).toHaveBeenCalledTimes(2); // re-resolve + trip re-read (redundant-but-idempotent)
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------
