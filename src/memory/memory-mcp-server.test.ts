@@ -247,6 +247,17 @@ describe("create", () => {
       expect(res.isError).toBe(true);
     }
   });
+
+  it("round-trips through view with line-numbered rendering on a Mongo mount", async () => {
+    const tools = makeTools();
+    const create = getHandler(tools, "create");
+    const view = getHandler(tools, "view");
+    await create({ path: "/memories/agents/alice/roundtrip.md", file_text: "alpha\nbeta" });
+    const res = await view({ path: "/memories/agents/alice/roundtrip.md" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toContain("     1\talpha");
+    expect(res.content[0].text).toContain("     2\tbeta");
+  });
 });
 
 // ── str_replace ─────────────────────────────────────────────────────
@@ -547,6 +558,7 @@ describe("memory_history / memory_rollback", () => {
     const onWrite = vi.fn();
     const tools = makeTools({ onWrite });
     await getHandler(tools, "create")({ path: "/memories/agents/alice/x.md", file_text: "v2" });
+    expect(versionDocs).toHaveLength(1); // create-overwrite snapshotted v1
     const res = await getHandler(
       tools,
       "memory_rollback",
@@ -557,6 +569,10 @@ describe("memory_history / memory_rollback", () => {
     expect(res.isError).toBeFalsy();
     expect(memoryDocs.get("agents/alice/x.md")?.content).toBe("v1");
     expect(onWrite).toHaveBeenCalledWith("agents/alice/x.md", "memory-mcp-rollback");
+    // "snapshots current first": rollback must snapshot the pre-rollback content (v2)
+    // before overwriting with the restored version, in the same {path, content, savedAt, savedBy} shape.
+    expect(versionDocs).toHaveLength(2);
+    expect(versionDocs[1]).toMatchObject({ path: "agents/alice/x.md", content: "v2", savedBy: "alice" });
   });
 
   it("history accepts legacy bare paths for backward compatibility", async () => {
