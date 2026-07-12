@@ -1,4 +1,5 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
+import Anthropic from "@anthropic-ai/sdk";
+import { jsonSchemaOutputFormat } from "@anthropic-ai/sdk/helpers/json-schema";
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
 import type { AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
@@ -50,6 +51,33 @@ const TIER_MODELS: Record<ModelTier, string> = {
   opus: "claude-opus-4-7",
 };
 
+/**
+ * KPR-312: interim classifier pricing (claude-haiku-4-5), USD per million
+ * tokens — the direct API returns token usage, not total_cost_usd, so
+ * routerCostUsd is computed here. Cache fields are ignored: the router
+ * prompt (~300 tok) is far below haiku's 4096-token cacheable minimum.
+ * TODO(KPR-314): the W3.5 sidecar LLM registry owns model metadata/pricing.
+ */
+const ROUTER_INPUT_USD_PER_MTOK = 1;
+const ROUTER_OUTPUT_USD_PER_MTOK = 5;
+
+/** KPR-312 §3.3: classifier input bound — bounds worst-case cost/latency. */
+const MAX_CLASSIFIER_INPUT = 4000;
+
+/**
+ * KPR-312 H2: exact-match ack/greeting allowlist (case-insensitive, trimmed).
+ * EXACT MATCH ONLY — no substring/length heuristics, so "fire the sales team"
+ * can never short-circuit. Membership is a plan-level constant (spec ⚠8).
+ */
+const ACK_ALLOWLIST: ReadonlySet<string> = new Set([
+  "hi", "hello", "hey",
+  "thanks", "thank you", "thx",
+  "ok", "okay",
+  "yes", "no", "yep", "nope",
+  "got it", "sounds good", "sure", "will do",
+  "👍",
+]);
+
 /** Infer tier from a model ID string */
 function modelToTier(model: string): ModelTier {
   if (model.includes("opus")) return "opus";
@@ -69,157 +97,252 @@ export interface ModelRouterResult {
    *  Carriage-only until the spec §5 pilot-gate/clamp lift (the same lift that
    *  gates pilot effort delivery). */
   provider?: AgentProviderId;
-  /** Dormant in W3.2 (this ticket): routeModel never sets it. Never merged into the
-   *  route — the claude route variant carries no effort field; pilots never reach the
-   *  merge (spec §7). From W3.3 (KPR-312): routeModel emits it and prepareSpawn delivers
-   *  it per-turn to the Claude adapter via SpawnShaping.effortOverride — a parallel
-   *  channel like modelOverride. Pilot delivery still gated on the spec §5 lift. */
+  /** KPR-312: emitted by the model path only (method: "model"), ∈ {low, medium, high}
+   *  (schema-constrained; the subset valid on both ReasoningEffort and the agent
+   *  SDK's EffortLevel). Dropped inside routeModel when the post-cap tier is haiku
+   *  (claude-haiku-4-5 rejects the effort param). Never merged into the route —
+   *  delivered beside it via SpawnShaping.effortOverride → AgentProviderTurnRequest.effort
+   *  → SDK Options.effort. Pilot delivery still gated on the 311 spec §5 lift. */
   effort?: ReasoningEffort;
+  /** KPR-312: how the decision was made — heuristic short-circuit, model call,
+   *  key-less mode, or failure fallback. Observability-only. "no-key"
+   *  (unconfigured — steady state, surface once) is deliberately distinct from
+   *  "fallback" (API failing — incident to alarm on). */
+  method?: "heuristic" | "model" | "no-key" | "fallback";
 }
 
-const ROUTER_PROMPT = `You are a model router. Your job is to classify the complexity of a user message and decide which AI model tier should handle it.
+/**
+ * KPR-312: classifier v2 system prompt. Changes vs v1: adds the effort rubric,
+ * drops the "Respond with ONLY a JSON object" plea (structured outputs enforce
+ * the shape), drops the dead scheduled/cron rule (prepareSpawn gates the router
+ * with sender !== "system"; every scheduler/cron/callback producer sets it).
+ * No prompt-cache marker: ~300 tokens is far below haiku-4-5's 4096-token
+ * cacheable minimum.
+ */
+const ROUTER_PROMPT_V2 = `You are a model router. Classify the complexity of a user message: decide which AI model tier should handle it, and how much reasoning effort the turn deserves.
 
 Tiers:
 - **haiku**: Greetings, simple factual questions, acknowledgments, status checks, yes/no answers, brief lookups, routine updates. Fast and cheap.
 - **sonnet**: Multi-step tasks, drafting emails/messages, summarizing data, moderate analysis, tool-heavy workflows, most day-to-day business work. Balanced.
 - **opus**: Complex reasoning, strategic planning, nuanced judgment calls, multi-faceted analysis, creative problem-solving, anything where getting it wrong has real consequences. Maximum intelligence.
 
+Effort (how hard the chosen tier should work on this turn):
+- **low**: Routine lookups, short answers, single simple actions within the chosen tier.
+- **medium**: Typical multi-step work — most tasks land here.
+- **high**: Consequential judgment, intricate multi-part work, high cost of getting it wrong.
+
 Rules:
 - When in doubt, pick sonnet — it handles most things well.
 - Short messages are NOT automatically haiku — "fire the sales team" is short but definitely opus.
-- Look at the TASK complexity, not the message length.
-- Scheduled/cron tasks that say "execute your scheduled X task" are routine → haiku unless the task itself is complex.
+- Look at the TASK complexity, not the message length.`;
 
-Respond with ONLY a JSON object: { "tier": "haiku" | "sonnet" | "opus" }`;
+/** Strict output schema — server-compiled once, 24h-cached (GA, no beta header). */
+const OUTPUT_FORMAT = jsonSchemaOutputFormat({
+  type: "object",
+  properties: {
+    tier: { type: "string", enum: ["haiku", "sonnet", "opus"] },
+    effort: { type: "string", enum: ["low", "medium", "high"] },
+  },
+  required: ["tier", "effort"],
+  additionalProperties: false,
+} as const);
 
-function parseRouterOutput(text: string): ModelTier | null {
-  // Try direct parse
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed.tier && TIER_RANK[parsed.tier as ModelTier] !== undefined) {
-      return parsed.tier as ModelTier;
-    }
-  } catch { /* fall through */ }
+// ── Anthropic client (module-level, lazy, shared) ──────────────────────
+// KPR-312: one keep-alive client for all classifier calls — no per-turn
+// process/connection churn (the same motivation as KPR-122's in-process
+// MCPs). Null ⇔ no ANTHROPIC_API_KEY ⇔ heuristics-only mode.
+let client: Anthropic | null = null;
+let noKeyModeAnnounced = false;
 
-  // Try finding JSON in text
-  const braceStart = text.indexOf("{");
-  const braceEnd = text.lastIndexOf("}");
-  if (braceStart !== -1 && braceEnd > braceStart) {
-    try {
-      const parsed = JSON.parse(text.slice(braceStart, braceEnd + 1));
-      if (parsed.tier && TIER_RANK[parsed.tier as ModelTier] !== undefined) {
-        return parsed.tier as ModelTier;
-      }
-    } catch { /* fall through */ }
-  }
+function getClient(): Anthropic | null {
+  if (!config.anthropic.apiKey) return null; // key checked every call — mode follows live config
+  return (client ??= new Anthropic({
+    apiKey: config.anthropic.apiKey,
+    timeout: config.modelRouter.timeoutMs, // ms — per-request wall clock (TS SDK unit)
+    maxRetries: 0, // fail fast into the sonnet fallback; retrying would stack timeouts
+  }));
+}
 
-  return null;
+/** Test-only seam (precedent: __resetRegistryForTests in archetypes/registry.ts). */
+export function __resetRouterClientForTests(): void {
+  client = null;
+  noKeyModeAnnounced = false;
+}
+
+function heuristicHaiku(resourceTierOverrides?: ResourceTierOverrides): ModelRouterResult {
+  return {
+    tier: "haiku",
+    model: TIER_MODELS.haiku,
+    costUsd: 0,
+    durationMs: 0,
+    resourceLimits: resolveResourceLimits("haiku", resourceTierOverrides),
+    method: "heuristic",
+  };
 }
 
 /**
- * Classify a message and return the recommended model tier.
+ * Failure fallback — same tier semantics as v1's error path (sonnet capped at
+ * ceiling), minus up to 8 seconds of subprocess. Never emits effort (a $0
+ * decision shouldn't tune a lever it didn't reason about).
+ */
+function sonnetFallback(
+  ceilingTier: ModelTier,
+  resourceTierOverrides?: ResourceTierOverrides,
+): ModelRouterResult {
+  const fallbackTier: ModelTier = TIER_RANK[ceilingTier] >= TIER_RANK.sonnet ? "sonnet" : ceilingTier;
+  return {
+    tier: fallbackTier,
+    model: TIER_MODELS[fallbackTier],
+    costUsd: 0,
+    durationMs: 0,
+    resourceLimits: resolveResourceLimits(fallbackTier, resourceTierOverrides),
+    method: "fallback",
+  };
+}
+
+/**
+ * Classify a message and return the recommended model tier (+ per-turn effort).
  * The result is capped at `ceilingModel` — the agent's configured maximum.
+ *
+ * KPR-312: deterministic heuristics (H1–H3, first match wins) short-circuit
+ * before any client/API work; the model path is one direct structured-outputs
+ * call (client.messages.parse) — the per-turn Claude Code CLI subprocess is
+ * gone. Key-less instances run heuristics-only (`method: "no-key"`).
+ *
+ * NOTE (spec §7): this call deliberately does NOT route through the provider
+ * adapters — never breaker-recorded, never permit-gated. A classifier fault
+ * must not count toward turn-provider health; its own timeout + fallback
+ * bounds damage to one cheap fallback per turn.
+ *
+ * @param opts.hasFiles — file-bearing messages must not be mis-short-circuited
+ *   by the empty-text rule (H3): the router only sees `item.text`, while file
+ *   content is appended into the assembled prompt downstream.
  */
 export async function routeModel(
   text: string,
   ceilingModel: string,
   resourceTierOverrides?: ResourceTierOverrides,
+  opts?: { hasFiles?: boolean },
 ): Promise<ModelRouterResult> {
   const ceilingTier = modelToTier(ceilingModel);
-  const routerModel = config.modelRouter.model;
 
-  // If ceiling is already the cheapest tier, skip the call entirely
+  // H1 — ceiling is already the cheapest tier: skip everything (v1 behavior, kept verbatim).
   if (ceilingTier === "haiku") {
-    return { tier: "haiku", model: TIER_MODELS.haiku, costUsd: 0, durationMs: 0, resourceLimits: resolveResourceLimits("haiku", resourceTierOverrides) };
+    return heuristicHaiku(resourceTierOverrides);
   }
 
-  let q: Query | null = null;
-  let resultText = "";
-  let costUsd = 0;
-  let durationMs = 0;
+  const trimmed = text.trim();
 
-  const deadline = setTimeout(() => {
-    if (q) {
-      log.warn("Model router timed out", { timeoutMs: config.modelRouter.timeoutMs });
-      q.close();
+  // H2 — exact-match ack/greeting allowlist.
+  if (ACK_ALLOWLIST.has(trimmed.toLowerCase())) {
+    return heuristicHaiku(resourceTierOverrides);
+  }
+
+  // H3 — empty text and no files: nothing to classify. File-bearing items skip
+  // this — files mean real work the classifier can't see.
+  if (trimmed.length === 0 && !opts?.hasFiles) {
+    return heuristicHaiku(resourceTierOverrides);
+  }
+
+  const anthropic = getClient();
+  if (!anthropic) {
+    // No-key mode (spec §3.3): keep the agent's default model with its default
+    // tier's resource limits — conservative, never a wrong upshift. Announce
+    // once per boot; `hive doctor` carries the standing line.
+    if (!noKeyModeAnnounced) {
+      noKeyModeAnnounced = true;
+      log.info(
+        "Model router running heuristics-only (no ANTHROPIC_API_KEY) — non-obvious turns keep the agent default model",
+      );
     }
-  }, config.modelRouter.timeoutMs);
+    const tier = modelToTier(ceilingModel);
+    return {
+      tier,
+      model: ceilingModel,
+      costUsd: 0,
+      durationMs: 0,
+      resourceLimits: resolveResourceLimits(tier, resourceTierOverrides),
+      method: "no-key",
+    };
+  }
 
+  // Model path — bound the classifier input (same pattern as knowledge-extractor).
+  const truncated =
+    trimmed.length > MAX_CLASSIFIER_INPUT
+      ? trimmed.slice(0, MAX_CLASSIFIER_INPUT) + "\n[...truncated]"
+      : trimmed;
+  // Empty text + files reaches the model path (H3 skipped) — the API rejects
+  // empty text blocks, so classify a placeholder instead.
+  const classifierInput = truncated.length > 0 ? truncated : "(attachment-only message, no text)";
+
+  const startedAt = Date.now();
   try {
-    q = query({
-      prompt: text,
-      options: {
-        model: routerModel,
-        systemPrompt: ROUTER_PROMPT,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        maxTurns: 1,
-        maxBudgetUsd: 0.01,
-        persistSession: false,
-        disallowedTools: ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "WebFetch", "WebSearch", "NotebookEdit"],
-        env: {
-          ...process.env,
-          ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
-          CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
-          CLAUDECODE: undefined as unknown as string,
-        },
-      },
+    const response = await anthropic.messages.parse({
+      model: config.modelRouter.model, // default claude-haiku-4-5-20251001
+      max_tokens: 100,
+      system: ROUTER_PROMPT_V2,
+      messages: [{ role: "user", content: classifierInput }],
+      output_config: { format: OUTPUT_FORMAT },
     });
 
-    for await (const message of q) {
-      const msg = message as SDKMessage;
-
-      if (msg.type === "assistant") {
-        const content = (msg as any).message?.content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === "text") {
-              resultText = block.text;
-            }
-          }
-        }
-      }
-
-      if (msg.type === "result") {
-        const result = msg as SDKResultMessage;
-        costUsd = result.total_cost_usd;
-        durationMs = result.duration_ms;
-        if (result.subtype === "success" && result.result) {
-          resultText = result.result;
-        }
-      }
+    const parsed = response.parsed_output;
+    if (
+      response.stop_reason === "refusal" ||
+      response.stop_reason === "max_tokens" ||
+      !parsed ||
+      TIER_RANK[parsed.tier] === undefined
+    ) {
+      log.warn("Model router returned unusable output, defaulting to sonnet", {
+        stopReason: response.stop_reason,
+        hasParsedOutput: Boolean(parsed),
+      });
+      return sonnetFallback(ceilingTier, resourceTierOverrides);
     }
+
+    const requested = parsed.tier;
+    const effort: ReasoningEffort | undefined =
+      parsed.effort === "low" || parsed.effort === "medium" || parsed.effort === "high"
+        ? parsed.effort
+        : undefined;
+    const costUsd =
+      (response.usage.input_tokens * ROUTER_INPUT_USD_PER_MTOK +
+        response.usage.output_tokens * ROUTER_OUTPUT_USD_PER_MTOK) /
+      1_000_000;
+    const durationMs = Date.now() - startedAt;
+
+    // Cap at ceiling (kept from v1).
+    let finalTier = requested;
+    if (TIER_RANK[requested] > TIER_RANK[ceilingTier]) {
+      finalTier = ceilingTier;
+      log.debug("Model router capped by ceiling", { requested, ceiling: ceilingTier });
+    }
+
+    // Log-redaction convention: no message text / input previews (v1's
+    // textPreview is deliberately dropped).
+    log.info("Model router decision", {
+      tier: finalTier,
+      requested,
+      effort,
+      ceiling: ceilingTier,
+      costUsd,
+      durationMs,
+    });
+
+    return {
+      tier: finalTier,
+      model: TIER_MODELS[finalTier],
+      costUsd,
+      durationMs,
+      resourceLimits: resolveResourceLimits(finalTier, resourceTierOverrides),
+      method: "model",
+      // §3.2 rule 2: drop effort when the FINAL (post-cap) tier is haiku —
+      // claude-haiku-4-5 rejects the effort param; emitting it would 400 the turn.
+      ...(finalTier === "haiku" || effort === undefined ? {} : { effort }),
+    };
   } catch (err) {
-    log.warn("Model router query failed, defaulting to sonnet", { error: String(err) });
-    const fallbackTier = TIER_RANK[ceilingTier] >= TIER_RANK.sonnet ? "sonnet" : ceilingTier;
-    return { tier: fallbackTier, model: TIER_MODELS[fallbackTier], costUsd: 0, durationMs: 0, resourceLimits: resolveResourceLimits(fallbackTier, resourceTierOverrides) };
-  } finally {
-    clearTimeout(deadline);
-    q = null;
+    // maxRetries: 0 — any timeout / 429 / 5xx / 404 (misconfigured
+    // MODEL_ROUTER_MODEL) lands here. Operator-visible noise by design.
+    log.warn("Model router call failed, defaulting to sonnet", { error: String(err) });
+    return sonnetFallback(ceilingTier, resourceTierOverrides);
   }
-
-  const parsed = parseRouterOutput(resultText);
-  if (!parsed) {
-    log.warn("Model router parse failed, defaulting to sonnet", { rawText: resultText.slice(0, 200) });
-    const fallbackTier = TIER_RANK[ceilingTier] >= TIER_RANK.sonnet ? "sonnet" : ceilingTier;
-    return { tier: fallbackTier, model: TIER_MODELS[fallbackTier], costUsd: 0, durationMs: 0, resourceLimits: resolveResourceLimits(fallbackTier, resourceTierOverrides) };
-  }
-
-  // Cap at ceiling
-  let finalTier = parsed;
-  if (TIER_RANK[parsed] > TIER_RANK[ceilingTier]) {
-    finalTier = ceilingTier;
-    log.debug("Model router capped by ceiling", { requested: parsed, ceiling: ceilingTier });
-  }
-
-  log.info("Model router decision", {
-    tier: finalTier,
-    requested: parsed,
-    ceiling: ceilingTier,
-    costUsd,
-    durationMs,
-    textPreview: text.slice(0, 100),
-  });
-
-  return { tier: finalTier, model: TIER_MODELS[finalTier], costUsd, durationMs, resourceLimits: resolveResourceLimits(finalTier, resourceTierOverrides) };
 }

@@ -30,7 +30,7 @@ import {
 } from "./provider-adapters/codex-subscription-adapter.js";
 import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
-import type { AgentProviderAdapter, AgentProviderId } from "./provider-adapters/types.js";
+import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
 
@@ -202,6 +202,13 @@ interface SpawnShaping {
   modelOverride: string | undefined;
   /** Router tier for activity-audit modelTier (cache-cliff observability hook, KPR-310 C1–C3). */
   routerTier: ModelTier | undefined;
+  /**
+   * KPR-312: per-turn reasoning effort for the Claude turn — carried BESIDE
+   * the route, never in it (the claude ProviderModelRoute variant has no
+   * effort field; clamp and pilot gate untouched). Set only by the router
+   * merge branch; undefined on voice/skip/clamp/failure paths and for pilots.
+   */
+  effortOverride: ReasoningEffort | undefined;
   resourceLimits: ResourceLimits | undefined;
   routerCostUsd: number;
 }
@@ -1084,6 +1091,7 @@ export class AgentManager {
       modelOverride: shaping.modelOverride,
       resourceLimits: shaping.resourceLimits,
       systemPromptOverride: ctx.systemPromptOverride,
+      effort: shaping.effortOverride,
     });
     // KPR-224: model router cost lives outside RunResult; add it here so
     // finalizeSpawnResult and recordSpawnObservability see the full cost.
@@ -1128,7 +1136,7 @@ export class AgentManager {
     // explicitly bypasses prepending + model router. Pin via this branch so
     // future prepareSpawn edits cannot accidentally re-shape voice prompts.
     if (ctx.channel === "voice") {
-      return { prompt: item.text, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0 };
+      return { prompt: item.text, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
     }
 
     const senderLabel = item.senderName ?? item.sender;
@@ -1160,11 +1168,16 @@ export class AgentManager {
     // the router for a pilot charged routerCostUsd for an output the pilot
     // ignores and misattributed the Claude model in telemetry/audit).
     if (!agentConfig || !appConfig.modelRouter.enabled || item.sender === "system" || staticRoute.provider !== "claude") {
-      return { prompt, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0 };
+      return { prompt, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
     }
 
     try {
-      const result = await routeModel(item.text, agentConfig.model, agentConfig.resourceTiers);
+      const result = await routeModel(item.text, agentConfig.model, agentConfig.resourceTiers, {
+        // H3 guard (KPR-312): file-bearing messages must not short-circuit on
+        // empty text — file content is appended into `prompt` above and never
+        // reaches the classifier.
+        hasFiles: Boolean(item.files?.length),
+      });
 
       if (result.provider !== undefined && result.provider !== staticRoute.provider) {
         // W3 provider clamp: cross-provider per-turn routing is
@@ -1181,13 +1194,13 @@ export class AgentManager {
           routerProvider: result.provider,
           staticProvider: staticRoute.provider,
         });
-        return { prompt, route: staticRoute, modelOverride: undefined, routerTier: result.tier, resourceLimits: result.resourceLimits, routerCostUsd: result.costUsd };
+        return { prompt, route: staticRoute, modelOverride: undefined, routerTier: result.tier, resourceLimits: result.resourceLimits, routerCostUsd: result.costUsd, effortOverride: undefined };
       }
 
       // Effective route. The claude ProviderModelRoute variant carries NO
-      // reasoningEffort field — effort is never merged into the route; W3.3
-      // (KPR-312) carries it beside the route via SpawnShaping.effortOverride
-      // (spec §7). [amended at KPR-312 spec gate (driver reconciliation)]
+      // reasoningEffort field — effort is never merged into the route; it is
+      // carried beside it (KPR-312): SpawnShaping.effortOverride →
+      // AgentProviderTurnRequest.effort → SDK Options.effort.
       const route: ProviderModelRoute = { provider: "claude", model: result.model };
       return {
         prompt,
@@ -1196,10 +1209,13 @@ export class AgentManager {
         routerTier: result.tier,
         resourceLimits: result.resourceLimits,
         routerCostUsd: result.costUsd,
+        // KPR-312: emission rules live inside routeModel (model-path only,
+        // {low,medium,high}, dropped post-cap for haiku) — trust the field.
+        effortOverride: result.effort,
       };
     } catch (err) {
       log.warn("Model router failed, using default", { agentId: ctx.agentId, error: String(err) });
-      return { prompt, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0 };
+      return { prompt, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
     }
   }
 

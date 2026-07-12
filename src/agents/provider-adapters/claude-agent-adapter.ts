@@ -15,6 +15,7 @@ export class ClaudeAgentAdapter implements AgentProviderAdapter {
       request.modelOverride,
       request.resourceLimits,
       request.systemPromptOverride,
+      request.effort,
     );
   }
 

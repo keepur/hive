@@ -61,6 +61,17 @@ export function requiredEnvVarsFromConfig(configTsPath: string): string[] {
   return [...keys].sort();
 }
 
+/**
+ * KPR-312: one informational line for `hive doctor` — which mode the model
+ * router's complexity classifier runs in. Key-less (subscription-auth)
+ * instances run heuristics-only: a deliberate steady state, never a failing
+ * check (spec #157: ANTHROPIC_API_KEY is optional-with-fallback and must not
+ * false-positive). Pure string producer — no failure channel by construction.
+ */
+export function modelRouterModeLine(apiKeyPresent: boolean): string {
+  return apiKeyPresent ? "model router: LLM classification" : "model router: heuristics-only (no ANTHROPIC_API_KEY)";
+}
+
 // ── launchctl print parsing ─────────────────────────────────────────────
 
 export interface LaunchdState {

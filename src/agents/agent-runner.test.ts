@@ -2002,6 +2002,37 @@ describe("AgentRunner resource limits override (via send)", () => {
   });
 });
 
+describe("AgentRunner effort option (KPR-312, via send)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockExistsSync.mockReturnValue(true);
+    mockStatSync.mockReturnValue({ isDirectory: () => true });
+  });
+
+  it("maps effort into query options and never sets thinking", async () => {
+    const runner = makeRunner();
+    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, undefined, "low");
+    const opts = getCapturedOptions();
+    expect(opts.effort).toBe("low");
+    expect("thinking" in opts).toBe(false);
+  });
+
+  it("omits the effort key entirely when no effort is passed", async () => {
+    const runner = makeRunner();
+    await runner.send("hi");
+    const opts = getCapturedOptions();
+    expect("effort" in opts).toBe(false);
+    expect("thinking" in opts).toBe(false);
+  });
+
+  it("drops values outside the SDK-deliverable subset (defensive)", async () => {
+    const runner = makeRunner();
+    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, undefined, "xhigh" as never);
+    expect("effort" in getCapturedOptions()).toBe(false);
+  });
+});
+
 // ── Token tracking and compaction tests ──────────────────────────
 describe("AgentRunner token tracking and compaction (via send)", () => {
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;
@@ -2985,5 +3016,52 @@ describe("RunResult.timedOut (KPR-306)", () => {
     const result = await resultP;
     expect(result.aborted).toBe(true);
     expect(result.timedOut).toBeUndefined();
+  });
+});
+
+describe("AgentRunner is_error result guard (KPR-312, via send)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockExistsSync.mockReturnValue(true);
+    mockStatSync.mockReturnValue({ isDirectory: () => true });
+  });
+
+  it("treats subtype success + is_error true as an error, not a response (M8 shape)", async () => {
+    const M8_ERROR =
+      "There's an issue with the selected model (claude-nonexistent-9). It may not exist or you may not have access to it.";
+    mockMessages = [
+      {
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        result: M8_ERROR,
+        total_cost_usd: 0.0001,
+        duration_ms: 50,
+        session_id: "s-m8",
+      },
+    ];
+    const runner = makeRunner();
+    const result = await runner.send("hello");
+    expect(result.error).toBe(M8_ERROR);
+    expect(result.text).toBe(""); // error text NOT adopted as the reply
+  });
+
+  it("still adopts result text when is_error is false", async () => {
+    mockMessages = [
+      {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "fine",
+        total_cost_usd: 0.001,
+        duration_ms: 10,
+        session_id: "s-ok",
+      },
+    ];
+    const runner = makeRunner();
+    const result = await runner.send("hello");
+    expect(result.text).toBe("fine");
+    expect(result.error).toBeUndefined();
   });
 });
