@@ -46,7 +46,7 @@ import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
 import { RetentionSweeper } from "./retention/retention-sweeper.js";
-import { setGeminiApiKey } from "./files/file-processor.js";
+import { setVisionLlmClient } from "./files/file-processor.js";
 import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
@@ -102,11 +102,11 @@ async function main(): Promise<void> {
   initInstanceGit(hiveHome);
   checkUpgradeNotice(hiveStateDir, skillsDir);
 
-  // Initialize Gemini vision for image processing
-  if (config.gemini.apiKey) {
-    setGeminiApiKey(config.gemini.apiKey);
-    log.info("Gemini vision enabled", { model: config.gemini.visionModel });
-  }
+  // KPR-314: image description rides the LLM registry's vision task —
+  // provider/model/key knowledge lives in the catalog, not here. Key-less
+  // instances degrade to null descriptions inside describeImage (unchanged
+  // behavior); the registry's construction log reports provider presence.
+  setVisionLlmClient(getLLMRegistry());
 
   // Shared MongoDB client — KPR-121: single pool for the whole hive process.
   // All in-process Mongo consumers (MemoryManager, MemoryStore, SessionStore,
