@@ -11,7 +11,7 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Dispatcher (routing, dedup, status)
             ↓
-       Model router (Haiku / Sonnet classifier; respects per-agent ceiling)
+       Model router (effort-only classifier — every turn runs the agent's static model; KPR-338)
             ↓
        Agent manager (spawn coordinator: per-thread lock + per-agent budget)
             ↓
@@ -43,7 +43,7 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 - `src/agents/provider-adapters/` — one-turn provider boundary and tool transport classification. `AgentManager` selects the adapter from the selected agent's `model` string: Claude by default, or provider-prefixed `codex/...`, `openai/...`, and `gemini/...` models for the non-Claude adapters. `ClaudeAgentAdapter` delegates to `AgentRunner`; `OpenAIAgentsAdapter`, `GeminiAdkAdapter`, and `CodexSubscriptionAdapter` are tool-free provider paths until the tool bridge lands.
 - `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes the coordinator snapshot to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent for the doctor to read.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
-- `src/agents/model-router.ts` — Haiku/Sonnet classification.
+- `src/agents/model-router.ts` — per-turn effort classifier (KPR-338: models are static per agent; the classifier tunes reasoning effort only).
 - `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue.
 - `src/channels/slack-adapter.ts` — Slack events → `WorkItem` → delivery.
 - `src/channels/sms-adapter.ts` — SMS via Quo/OpenPhone.

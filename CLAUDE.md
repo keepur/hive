@@ -55,7 +55,7 @@ Design specs and implementation plans live in the **private** companion repo `ke
 Message (Slack/SMS/WebSocket/Scheduler)
   → Channel Adapter (slack, sms, ws)
   → Dispatcher (routing, dedup, status interception)
-  → Model Router (Haiku/Sonnet classification, respects agent ceiling)
+  → Model Router (effort-only classifier — every turn runs the agent's static model, KPR-338)
   → Agent Manager (spawn coordinator: per-thread lock + per-agent budget)
   → Agent Runner (spawns Claude session + MCP servers)
   → Response → Channel Adapter → delivery
@@ -70,7 +70,7 @@ Message (Slack/SMS/WebSocket/Scheduler)
 - `src/agents/provider-circuit-breaker.ts` — per-provider circuit breaker + Open-Circuit Contract (`ProviderCircuitOpenError`, snapshot API); heartbeated by `src/agents/circuit-breaker-heartbeat.ts` (`kind=circuit_breaker_stats`)
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB
 - `src/agents/session-store.ts` — manages agent session state in MongoDB
-- `src/agents/model-router.ts` — complexity classifier for model selection
+- `src/agents/model-router.ts` — per-turn effort classifier (KPR-338: models are static per agent; the classifier tunes reasoning effort only)
 - `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue
 - `src/channels/slack-adapter.ts` — Slack events → WorkItems → delivery
 - `src/channels/sms-adapter.ts` — SMS message adapter via Quo/OpenPhone

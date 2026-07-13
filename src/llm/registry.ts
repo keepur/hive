@@ -60,7 +60,7 @@ export class LLMRegistry {
     });
     if (!this.providers.has("anthropic")) {
       log.info(
-        "LLM sidecar: anthropic unavailable (no ANTHROPIC_API_KEY) — meeting classifier degrades to all-roster, memory dream LLM phases skip (router: heuristics-only per KPR-312)",
+        "LLM sidecar: anthropic unavailable (no ANTHROPIC_API_KEY) — meeting classifier degrades to all-roster, memory dream LLM phases skip (router: heuristics-only, no per-turn effort hints — KPR-338)",
       );
     }
     if (!this.providers.has("gemini")) {

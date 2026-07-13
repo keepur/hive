@@ -4,7 +4,8 @@ import type { CatalogModel, LLMPricing, LLMTaskRequest } from "./types.js";
  * KPR-314: the single owner of sidecar-LLM model metadata (spec §3.1) —
  * the catalog KPR-312 punted (its model-router.ts TODO(KPR-314) pricing
  * constants land here). Constants ride engine releases — same maintenance
- * class as TIER_MODELS; no runtime pricing fetch (spec §7).
+ * class the router's TIER_MODELS constants once were (deleted by KPR-338); no
+ * runtime pricing fetch (spec §7).
  *
  * Pricing is present only where a call site consumes computed cost:
  * haiku feeds router/meeting-classifier cost telemetry and the memory
