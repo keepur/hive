@@ -1,7 +1,7 @@
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
 import { getLLMRegistry } from "../llm/registry.js";
-import type { AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
+import type { ReasoningEffort } from "./provider-adapters/types.js";
 
 const log = createLogger("model-router");
 
@@ -40,16 +40,6 @@ export function resolveResourceLimits(
   };
 }
 
-/** Ordered from least to most capable */
-const TIER_RANK: Record<ModelTier, number> = { haiku: 0, sonnet: 1, opus: 2 };
-
-/** Map tier names to actual model IDs */
-const TIER_MODELS: Record<ModelTier, string> = {
-  haiku: "claude-haiku-4-5-20251001",
-  sonnet: "claude-sonnet-4-6",
-  opus: "claude-opus-4-7",
-};
-
 /** KPR-312 §3.3: classifier input bound — bounds worst-case cost/latency. */
 const MAX_CLASSIFIER_INPUT = 4000;
 
@@ -80,67 +70,57 @@ export function modelToTier(model: string): ModelTier {
   return "sonnet";
 }
 
+/**
+ * KPR-338: effort-only result. The router no longer names tiers, models,
+ * providers, or resource limits — a turn's model is always agentConfig.model
+ * (fixed-tier invariant, kpr-338-spec §1.3); execution bounds derive from the
+ * agent's static tier in prepareSpawn. The tier-axis analog of KPR-311's
+ * provider clamp (R-311.1): an agent's engine identity is static per turn,
+ * changed only by operator action.
+ */
 export interface ModelRouterResult {
-  tier: ModelTier;
-  model: string;
   costUsd: number;
   durationMs: number;
-  resourceLimits: ResourceLimits;
-  /** Absent ⇒ inherit the agent's static provider (resolveProviderModel(agent.model)).
-   *  Dormant in W3: routeModel never sets it, AND even if set it is inert — a value
-   *  matching the static provider is a no-op, a mismatch is clamped to static (spec §2/§5).
-   *  Carriage-only until the spec §5 pilot-gate/clamp lift (the same lift that
-   *  gates pilot effort delivery). */
-  provider?: AgentProviderId;
-  /** KPR-312: emitted by the model path only (method: "model"), ∈ {low, medium, high}
-   *  (schema-constrained; the subset valid on both ReasoningEffort and the agent
-   *  SDK's EffortLevel). Dropped inside routeModel when the post-cap tier is haiku
-   *  (claude-haiku-4-5 rejects the effort param). Never merged into the route —
-   *  delivered beside it via SpawnShaping.effortOverride → AgentProviderTurnRequest.effort
-   *  → SDK Options.effort. Pilot delivery still gated on the 311 spec §5 lift. */
+  /** KPR-312 semantics unchanged: emitted by the model path only
+   *  (method: "model"), ∈ {low, medium, high} (schema-constrained; the subset
+   *  valid on both ReasoningEffort and the SDK's EffortLevel). H2/H3
+   *  heuristics emit "low". Delivered beside the route via
+   *  SpawnShaping.effortOverride → AgentProviderTurnRequest.effort →
+   *  Options.effort — prepareSpawn only routes here when the static model is
+   *  effort-capable (KPR-338 skip), so no drop rule is needed in this file. */
   effort?: ReasoningEffort;
-  /** KPR-312: how the decision was made — heuristic short-circuit, model call,
-   *  key-less mode, or failure fallback. Observability-only. "no-key"
-   *  (unconfigured — steady state, surface once) is deliberately distinct from
-   *  "fallback" (API failing — incident to alarm on). */
+  /** KPR-312: how the decision was made — heuristic short-circuit, model
+   *  call, key-less mode, or failure fallback. Observability-only. "no-key"
+   *  (unconfigured — steady state, surface once) is deliberately distinct
+   *  from "fallback" (API failing — incident to alarm on). */
   method?: "heuristic" | "model" | "no-key" | "fallback";
 }
 
 /**
- * KPR-312: classifier v2 system prompt. Changes vs v1: adds the effort rubric,
- * drops the "Respond with ONLY a JSON object" plea (structured outputs enforce
- * the shape), drops the dead scheduled/cron rule (prepareSpawn gates the router
- * with sender !== "system"; every scheduler/cron/callback producer sets it).
- * No prompt-cache marker: ~300 tokens is far below haiku-4-5's 4096-token
- * cacheable minimum.
+ * KPR-338: classifier v3 prompt — the tier rubric is gone (tier is a
+ * per-agent fact, not a per-turn decision); only the KPR-312 effort rubric
+ * survives. No prompt-cache marker: far below the cacheable minimum.
  */
-const ROUTER_PROMPT_V2 = `You are a model router. Classify the complexity of a user message: decide which AI model tier should handle it, and how much reasoning effort the turn deserves.
+const ROUTER_PROMPT_V3 = `You are an effort classifier. Decide how much reasoning effort an AI agent should spend on a user message.
 
-Tiers:
-- **haiku**: Greetings, simple factual questions, acknowledgments, status checks, yes/no answers, brief lookups, routine updates. Fast and cheap.
-- **sonnet**: Multi-step tasks, drafting emails/messages, summarizing data, moderate analysis, tool-heavy workflows, most day-to-day business work. Balanced.
-- **opus**: Complex reasoning, strategic planning, nuanced judgment calls, multi-faceted analysis, creative problem-solving, anything where getting it wrong has real consequences. Maximum intelligence.
-
-Effort (how hard the chosen tier should work on this turn):
-- **low**: Routine lookups, short answers, single simple actions within the chosen tier.
-- **medium**: Typical multi-step work — most tasks land here.
-- **high**: Consequential judgment, intricate multi-part work, high cost of getting it wrong.
+Effort levels:
+- **low**: Greetings, acknowledgments, routine lookups, status checks, yes/no answers, short factual questions, single simple actions.
+- **medium**: Typical multi-step work — drafting emails/messages, summarizing data, moderate analysis, tool-heavy workflows. Most tasks land here.
+- **high**: Consequential judgment, strategic planning, intricate multi-part work, nuanced analysis — anything where getting it wrong has real consequences.
 
 Rules:
-- When in doubt, pick sonnet — it handles most things well.
-- Short messages are NOT automatically haiku — "fire the sales team" is short but definitely opus.
-- Look at the TASK complexity, not the message length.`;
+- When in doubt, pick medium.
+- Short messages do NOT automatically mean low effort — "fire the sales team" is short but demands high effort.
+- Judge the TASK complexity, not the message length.`;
 
-/** Strict output schema — KPR-314: passed raw to the registry's anthropic
- *  provider, which wraps it in the SDK's jsonSchemaOutputFormat (GA,
- *  server-compiled + cached — 312's exact mechanism, one layer down). */
+/** Strict output schema — KPR-314 mechanism unchanged (registry wraps it in
+ *  the SDK's jsonSchemaOutputFormat); KPR-338: effort is the only field. */
 const ROUTER_SCHEMA = {
   type: "object",
   properties: {
-    tier: { type: "string", enum: ["haiku", "sonnet", "opus"] },
     effort: { type: "string", enum: ["low", "medium", "high"] },
   },
-  required: ["tier", "effort"],
+  required: ["effort"],
   additionalProperties: false,
 } as const;
 
@@ -157,50 +137,35 @@ export function __resetRouterStateForTests(): void {
   noKeyModeAnnounced = false;
 }
 
-function heuristicHaiku(resourceTierOverrides?: ResourceTierOverrides): ModelRouterResult {
-  return {
-    tier: "haiku",
-    model: TIER_MODELS.haiku,
-    costUsd: 0,
-    durationMs: 0,
-    resourceLimits: resolveResourceLimits("haiku", resourceTierOverrides),
-    method: "heuristic",
-  };
+function heuristicLow(): ModelRouterResult {
+  return { costUsd: 0, durationMs: 0, effort: "low", method: "heuristic" };
 }
 
 /**
- * Failure fallback — same tier semantics as v1's error path (sonnet capped at
- * ceiling), minus up to 8 seconds of subprocess. Never emits effort (a $0
- * decision shouldn't tune a lever it didn't reason about).
+ * Failure/no-reasoning fallback — NO effort key (a $0 decision doesn't tune a
+ * lever it didn't reason about — unchanged KPR-312 principle). The pre-338
+ * sonnet-fallback *tier* concept is gone: a fallback now simply means "no
+ * effort hint this turn".
  */
-function sonnetFallback(
-  ceilingTier: ModelTier,
-  resourceTierOverrides?: ResourceTierOverrides,
-): ModelRouterResult {
-  const fallbackTier: ModelTier = TIER_RANK[ceilingTier] >= TIER_RANK.sonnet ? "sonnet" : ceilingTier;
-  return {
-    tier: fallbackTier,
-    model: TIER_MODELS[fallbackTier],
-    costUsd: 0,
-    durationMs: 0,
-    resourceLimits: resolveResourceLimits(fallbackTier, resourceTierOverrides),
-    method: "fallback",
-  };
+function classifierFallback(): ModelRouterResult {
+  return { costUsd: 0, durationMs: 0, method: "fallback" };
 }
 
 /**
- * Classify a message and return the recommended model tier (+ per-turn effort).
- * The result is capped at `ceilingModel` — the agent's configured maximum.
+ * Classify a message's per-turn reasoning effort (KPR-338: the classifier's
+ * only remaining output — tier selection was removed; the turn's model is
+ * always the agent's static model, and haiku-static / effort-incapable agents
+ * never reach this call at all — prepareSpawn skips them).
  *
- * KPR-312: deterministic heuristics (H1–H3, first match wins) short-circuit
- * before any client/API work; the model path is one direct structured-outputs
- * call (client.messages.parse) — the per-turn Claude Code CLI subprocess is
- * gone. Key-less instances run heuristics-only (`method: "no-key"`).
+ * KPR-312 heuristics H2–H3 (first match wins) short-circuit before any
+ * registry work; the model path is one structured-outputs call through the
+ * KPR-314 sidecar registry. Key-less instances run heuristics-only
+ * (`method: "no-key"`).
  *
- * NOTE (spec §7): this call deliberately does NOT route through the provider
- * adapters — never breaker-recorded, never permit-gated. A classifier fault
- * must not count toward turn-provider health; its own timeout + fallback
- * bounds damage to one cheap fallback per turn.
+ * NOTE (KPR-312 §7): this call deliberately does NOT route through the
+ * provider adapters — never breaker-recorded, never permit-gated. A
+ * classifier fault must not count toward turn-provider health; its own
+ * timeout + fallback bounds damage to one cheap fallback per turn.
  *
  * @param opts.hasFiles — file-bearing messages must not be mis-short-circuited
  *   by the empty-text rule (H3): the router only sees `item.text`, while file
@@ -208,50 +173,35 @@ function sonnetFallback(
  */
 export async function routeModel(
   text: string,
-  ceilingModel: string,
-  resourceTierOverrides?: ResourceTierOverrides,
   opts?: { hasFiles?: boolean },
 ): Promise<ModelRouterResult> {
-  const ceilingTier = modelToTier(ceilingModel);
-
-  // H1 — ceiling is already the cheapest tier: skip everything (v1 behavior, kept verbatim).
-  if (ceilingTier === "haiku") {
-    return heuristicHaiku(resourceTierOverrides);
-  }
-
   const trimmed = text.trim();
 
-  // H2 — exact-match ack/greeting allowlist.
+  // H2 — exact-match ack/greeting allowlist (membership unchanged; any-turn
+  // scope decided in kpr-338-spec §1.2(3): a miss now costs an effort hint on
+  // the agent's own model, not a model/budget downgrade).
   if (ACK_ALLOWLIST.has(trimmed.toLowerCase())) {
-    return heuristicHaiku(resourceTierOverrides);
+    return heuristicLow();
   }
 
-  // H3 — empty text and no files: nothing to classify. File-bearing items skip
-  // this — files mean real work the classifier can't see.
+  // H3 — empty text and no files: nothing to classify. File-bearing items
+  // skip this — files mean real work the classifier can't see.
   if (trimmed.length === 0 && !opts?.hasFiles) {
-    return heuristicHaiku(resourceTierOverrides);
+    return heuristicLow();
   }
 
   const registry = getLLMRegistry();
   if (!registry.hasProvider("anthropic")) {
-    // No-key mode (spec §3.3): keep the agent's default model with its default
-    // tier's resource limits — conservative, never a wrong upshift. Announce
-    // once per boot; `hive doctor` carries the standing line.
+    // No-key mode (KPR-312 §3.3, truth condition unchanged): heuristics-only.
+    // KPR-338: every turn keeps the agent's static model by construction —
+    // what no-key mode actually loses now is per-turn effort hints.
     if (!noKeyModeAnnounced) {
       noKeyModeAnnounced = true;
       log.info(
-        "Model router running heuristics-only (no ANTHROPIC_API_KEY) — non-obvious turns keep the agent default model",
+        "Model router running heuristics-only (no ANTHROPIC_API_KEY) — no per-turn effort hints; every turn runs the agent's static model regardless",
       );
     }
-    const tier = modelToTier(ceilingModel);
-    return {
-      tier,
-      model: ceilingModel,
-      costUsd: 0,
-      durationMs: 0,
-      resourceLimits: resolveResourceLimits(tier, resourceTierOverrides),
-      method: "no-key",
-    };
+    return { costUsd: 0, durationMs: 0, method: "no-key" };
   }
 
   // Model path — bound the classifier input (same pattern as knowledge-extractor).
@@ -266,74 +216,39 @@ export async function routeModel(
   try {
     const result = await registry.generateForTask("routerClassifier", {
       prompt: classifierInput,
-      systemPrompt: ROUTER_PROMPT_V2,
+      systemPrompt: ROUTER_PROMPT_V3,
       maxOutputTokens: 100,
       jsonSchema: ROUTER_SCHEMA,
-      timeoutMs: config.modelRouter.timeoutMs, // per-request wall clock (was 312's client-level timeout)
+      timeoutMs: config.modelRouter.timeoutMs, // per-request wall clock (KPR-314)
     });
 
-    // KPR-312's fallback conditions, byte-preserved across the transport
-    // swap (LLMResult.stopReason exists for exactly this).
-    const parsed = result.parsed as { tier?: string; effort?: string } | undefined;
-    if (
-      result.stopReason === "refusal" ||
-      result.stopReason === "max_tokens" ||
-      !parsed ||
-      TIER_RANK[parsed.tier as ModelTier] === undefined
-    ) {
-      log.warn("Model router returned unusable output, defaulting to sonnet", {
+    // KPR-312's fallback conditions, translated to the effort-only contract
+    // (plan D5): unusable output = refusal/max_tokens stop, missing parsed
+    // output, or an out-of-enum effort (near-dead under schema enforcement).
+    const parsed = result.parsed as { effort?: string } | undefined;
+    const effort: ReasoningEffort | undefined =
+      parsed?.effort === "low" || parsed?.effort === "medium" || parsed?.effort === "high"
+        ? parsed.effort
+        : undefined;
+    if (result.stopReason === "refusal" || result.stopReason === "max_tokens" || effort === undefined) {
+      log.warn("Model router returned unusable output — no effort hint this turn", {
         stopReason: result.stopReason,
         hasParsedOutput: Boolean(parsed),
       });
-      return sonnetFallback(ceilingTier, resourceTierOverrides);
+      return classifierFallback();
     }
 
-    const requested = parsed.tier as ModelTier;
-    const effort: ReasoningEffort | undefined =
-      parsed.effort === "low" || parsed.effort === "medium" || parsed.effort === "high"
-        ? parsed.effort
-        : undefined;
-    // KPR-314: cost computed by the registry (usage × catalog pricing — the
-    // 312 TODO hand-off). Off-catalog MODEL_ROUTER_MODEL override ⇒ undefined
-    // ⇒ 0: cost telemetry degrades, routing doesn't (registry warns once).
+    // KPR-314: cost computed by the registry (usage × catalog pricing).
+    // Off-catalog MODEL_ROUTER_MODEL override ⇒ undefined ⇒ 0: cost telemetry
+    // degrades, routing doesn't (registry warns once).
     const costUsd = result.costUsd ?? 0;
-    const durationMs = result.durationMs;
-
-    // Cap at ceiling (kept from v1).
-    let finalTier = requested;
-    if (TIER_RANK[requested] > TIER_RANK[ceilingTier]) {
-      finalTier = ceilingTier;
-      log.debug("Model router capped by ceiling", { requested, ceiling: ceilingTier });
-    }
-
     // Log-redaction convention: no message text / input previews.
-    log.info("Model router decision", {
-      tier: finalTier,
-      requested,
-      effort,
-      ceiling: ceilingTier,
-      costUsd,
-      durationMs,
-    });
-
-    return {
-      tier: finalTier,
-      model: TIER_MODELS[finalTier],
-      costUsd,
-      durationMs,
-      resourceLimits: resolveResourceLimits(finalTier, resourceTierOverrides),
-      method: "model",
-      // KPR-312 §3.2 rule 2, catalog-driven since KPR-314: drop effort when
-      // the FINAL (post-cap) model doesn't support the param (haiku today —
-      // same behavior, now data instead of a hardcoded tier check).
-      ...(effort === undefined || !registry.supportsEffort(TIER_MODELS[finalTier])
-        ? {}
-        : { effort }),
-    };
+    log.info("Model router decision", { effort, costUsd, durationMs: result.durationMs });
+    return { costUsd, durationMs: result.durationMs, effort, method: "model" };
   } catch (err) {
     // maxRetries: 0 — any timeout / 429 / 5xx / 404 (misconfigured
     // MODEL_ROUTER_MODEL) lands here. Operator-visible noise by design.
-    log.warn("Model router call failed, defaulting to sonnet", { error: String(err) });
-    return sonnetFallback(ceilingTier, resourceTierOverrides);
+    log.warn("Model router call failed — no effort hint this turn", { error: String(err) });
+    return classifierFallback();
   }
 }

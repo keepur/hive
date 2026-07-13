@@ -1290,7 +1290,7 @@ export class AgentManager {
     }
 
     try {
-      const result = await routeModel(item.text, agentConfig.model, agentConfig.resourceTiers, {
+      const result = await routeModel(item.text, {
         // H3 guard (KPR-312): file-bearing messages must not short-circuit on
         // empty text — file content is appended into `prompt` above and never
         // reaches the classifier.

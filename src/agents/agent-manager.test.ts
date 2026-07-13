@@ -221,14 +221,7 @@ function makeRunResult(overrides: Partial<RunResult> = {}) {
 }
 
 function makeRouterResult(overrides: Partial<ModelRouterResult> = {}): ModelRouterResult {
-  return {
-    tier: "haiku",
-    model: "claude-haiku-4-5-routed",
-    costUsd: 0.001,
-    durationMs: 50,
-    resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
-    ...overrides,
-  };
+  return { costUsd: 0.001, durationMs: 50, method: "model", ...overrides };
 }
 
 /**
@@ -650,15 +643,10 @@ describe("AgentManager", () => {
 
     it("delivers STATIC-tier limits on the router-on path (KPR-338)", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
-      // Legacy-shape result with junk tier/model/limits — KPR-338 ignores them:
-      // the turn's model is the agent's static model, limits are static-tier.
-      vi.mocked(routeModel).mockResolvedValue(
-        makeRouterResult({
-          tier: "opus",
-          model: "junk-should-be-ignored",
-          resourceLimits: { timeoutMs: 999, maxTurns: 999, budgetUsd: 999 },
-        }),
-      );
+      // Effort-only result (KPR-338) — the router no longer names tier/model/
+      // limits: the turn's model is the agent's static model, limits are
+      // static-tier, resolved in prepareSpawn regardless of the router output.
+      vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
 
       await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
 
@@ -680,7 +668,7 @@ describe("AgentManager", () => {
           resourceTiers: { sonnet: { budgetUsd: 2 } },
         }),
       );
-      vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ tier: "sonnet", model: "junk" }));
+      vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
 
       await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s-override" }));
 
@@ -2086,17 +2074,11 @@ describe("AgentManager", () => {
         // breaker is per-provider and both resolve to claude.
         (appConfig as any).modelRouter.enabled = true;
         try {
-          // Legacy-shape stub (reshaped to makeRouterResult() in T2d); at T1
-          // the old ModelRouterResult still accepts it. Only an admitted
-          // agent-s turn would consume it — tripBreaker's agent-a turns skip
-          // the router (haiku, KPR-338).
-          vi.mocked(routeModel).mockResolvedValue({
-            tier: "sonnet",
-            model: "claude-sonnet-4-7",
-            costUsd: 0,
-            durationMs: 0,
-            resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
-          });
+          // Effort-only stub (T2d reshape — the KPR-338 ModelRouterResult no
+          // longer carries tier/model/limits). Only an admitted agent-s turn
+          // would consume it — tripBreaker's agent-a turns skip the router
+          // (haiku, KPR-338).
+          vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
 
           await tripBreaker();
           expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
@@ -2587,11 +2569,9 @@ describe("AgentManager", () => {
     it("calls model router and delivers no override + static limits in runner.send (KPR-338 §3.2)", async () => {
       (appConfig as any).modelRouter.enabled = true;
       try {
-        // Legacy-shape junk model/limits — KPR-338 ignores them: model stays
+        // Effort-only result (KPR-338) — no routed model/limits: model stays
         // static, limits are the agent's STATIC tier (agent-s → sonnet).
-        vi.mocked(routeModel).mockResolvedValueOnce(
-          makeRouterResult({ tier: "opus", model: "claude-haiku-4-5-routed" }),
-        );
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult());
 
         const item = makeWorkItem({
           text: "shape me",
@@ -2770,16 +2750,10 @@ describe("AgentManager", () => {
 
       it("delivers effort beside the static route (KPR-312 channel; KPR-338: no model merge)", async () => {
         (appConfig as any).modelRouter.enabled = true;
-        // KPR-338: the routed `model` is no longer read — the turn runs the
+        // KPR-338: the router no longer names a model — the turn runs the
         // agent's static model. Effort still travels BESIDE the route via
         // SpawnShaping.effortOverride → runner.send position 7 (KPR-312).
-        vi.mocked(routeModel).mockResolvedValueOnce(
-          makeRouterResult({
-            tier: "sonnet",
-            model: "claude-sonnet-4-6-routed",
-            effort: "high",
-          }),
-        );
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "high" }));
 
         const item = makeWorkItem({ text: "route me", source: { kind: "sms", id: "line-1", label: "May" } });
         await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
@@ -2840,11 +2814,9 @@ describe("AgentManager", () => {
       // invariant re-pinned below.
       it("shaped route ≡ static route on every path (KPR-338 invariant re-pin)", async () => {
         (appConfig as any).modelRouter.enabled = true;
-        // A full router result naming junk tier/model — none of it moves the
-        // turn off the agent's static route.
-        vi.mocked(routeModel).mockResolvedValueOnce(
-          makeRouterResult({ tier: "opus", model: "junk-should-be-ignored", effort: "high" }),
-        );
+        // An effort-only router result — nothing in it moves the turn off the
+        // agent's static route (KPR-338: no tier/model to name).
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "high" }));
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ costUsd: 0.05, sessionId: "s-static" }));
 
         const activityLogger = { record: vi.fn() };
@@ -2954,9 +2926,9 @@ describe("AgentManager", () => {
           activityLogger as any,
         );
 
-        // Router on → static tier reaches the audit (routed junk ignored).
+        // Router on → static tier reaches the audit (router output is effort-only).
         (appConfig as any).modelRouter.enabled = true;
-        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ tier: "opus", model: "junk" }));
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult());
         const item1 = makeWorkItem({ text: "tier check", source: { kind: "sms", id: "line-1", label: "May" } });
         await localManager.spawnTurn({ ...makeCtx(item1, "sms"), agentId: "agent-s" });
         expect(activityLogger.record).toHaveBeenLastCalledWith(
@@ -3012,14 +2984,17 @@ describe("AgentManager", () => {
       });
 
       describe("effort delivery channel (KPR-312)", () => {
-        it("threads hasFiles into routeModel's 4th arg", async () => {
+        it("threads hasFiles into routeModel's 2nd arg", async () => {
           (appConfig as any).modelRouter.enabled = true;
           vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
 
           // agent-s (sonnet) — the haiku default skips the router entirely.
           const noFiles = makeWorkItem({ text: "no files", source: { kind: "sms", id: "line-1", label: "May" } });
           await manager.spawnTurn({ ...makeCtx(noFiles, "sms"), agentId: "agent-s" });
-          expect(vi.mocked(routeModel).mock.calls[0]![3]).toEqual({ hasFiles: false });
+          expect(vi.mocked(routeModel).mock.calls[0]![1]).toEqual({ hasFiles: false });
+          // Exact-args pin (KPR-338 2-arg contract): text + opts only — no
+          // ceiling, no resourceTiers overrides.
+          expect(vi.mocked(routeModel)).toHaveBeenCalledWith("no files", { hasFiles: false });
 
           const withFiles = makeWorkItem({
             text: "",
@@ -3027,7 +3002,7 @@ describe("AgentManager", () => {
             files: [{ name: "doc.txt", url: "https://example.com/doc.txt" } as any],
           });
           await manager.spawnTurn({ ...makeCtx(withFiles, "sms"), agentId: "agent-s", threadId: "sms:line-1:files" });
-          expect(vi.mocked(routeModel).mock.calls[1]![3]).toEqual({ hasFiles: true });
+          expect(vi.mocked(routeModel).mock.calls[1]![1]).toEqual({ hasFiles: true });
         });
 
         it("router-off and system-sender paths deliver no effort", async () => {
@@ -3059,11 +3034,9 @@ describe("AgentManager", () => {
 
         it("delivers effort with no model override anywhere (KPR-338)", async () => {
           (appConfig as any).modelRouter.enabled = true;
-          // Routed `model` is junk — KPR-338 never reads it; the turn runs the
-          // agent's static model, effort still rides beside the route.
-          vi.mocked(routeModel).mockResolvedValueOnce(
-            makeRouterResult({ tier: "sonnet", model: "junk-ignored", effort: "low" }),
-          );
+          // KPR-338: the router names no model; the turn runs the agent's
+          // static model, effort still rides beside the route.
+          vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "low" }));
 
           const item = makeWorkItem({ text: "same model", source: { kind: "sms", id: "line-1", label: "May" } });
           await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
