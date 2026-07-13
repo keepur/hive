@@ -29,7 +29,12 @@ afterAll(() => {
 // Mock logger — warn is a hoisted shared spy so KPR-311 clamp warnings are
 // assertable (cleared by vi.clearAllMocks in beforeEach; nothing else
 // asserts on logger calls).
-const { mockLogWarn } = vi.hoisted(() => ({ mockLogWarn: vi.fn() }));
+const { mockLogWarn, mockSupportsEffort } = vi.hoisted(() => ({
+  mockLogWarn: vi.fn(),
+  // KPR-338: real-catalog shape — every haiku-family id is effort-incapable,
+  // everything else is capable. Tests override per-case (e.g. off-catalog id).
+  mockSupportsEffort: vi.fn((m: string) => !m.includes("haiku")),
+}));
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
     info: vi.fn(),
@@ -37,6 +42,12 @@ vi.mock("../logging/logger.js", () => ({
     error: vi.fn(),
     debug: vi.fn(),
   }),
+}));
+
+// KPR-338: prepareSpawn consults getLLMRegistry().supportsEffort to decide the
+// haiku/effort-capability skip. Mock the registry surface only.
+vi.mock("../llm/registry.js", () => ({
+  getLLMRegistry: () => ({ supportsEffort: mockSupportsEffort }),
 }));
 
 // Mock config
@@ -56,8 +67,11 @@ vi.mock("../plugins/plugin-loader.js", () => ({
   loadPlugins: vi.fn().mockReturnValue([]),
 }));
 
-// Mock model router
-vi.mock("./model-router.js", () => ({
+// Mock model router. KPR-338: spread-original — agent-manager.ts now imports
+// modelToTier + resolveResourceLimits as runtime values (the static-limits
+// pins assert real resolution math), so only routeModel is stubbed.
+vi.mock("./model-router.js", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
   routeModel: vi.fn(),
 }));
 
@@ -144,7 +158,7 @@ import type { RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./provider-circuit-breaker.js";
 import type { WorkItem } from "../types/work-item.js";
-import { routeModel } from "./model-router.js";
+import { routeModel, RESOURCE_TIER_DEFAULTS } from "./model-router.js";
 import type { ModelRouterResult } from "./model-router.js";
 import type { AgentProviderId } from "./provider-adapters/types.js";
 
@@ -259,6 +273,9 @@ function makeMockRegistry() {
   const agents = new Map<string, AgentConfig>();
   agents.set("agent-a", makeAgentConfig({ id: "agent-a", name: "AgentA", maxConcurrent: 2 }));
   agents.set("agent-b", makeAgentConfig({ id: "agent-b", name: "AgentB" }));
+  // KPR-338: sonnet-static fixture — the haiku default (agent-a) now SKIPS the
+  // classifier, so every router-on/model-path test must run on agent-s.
+  agents.set("agent-s", makeAgentConfig({ id: "agent-s", name: "AgentS", model: "claude-sonnet-4-6" }));
 
   return {
     get: vi.fn().mockImplementation((id: string) => agents.get(id)),
@@ -319,6 +336,10 @@ describe("AgentManager", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // KPR-338: clearAllMocks resets call history but not implementations —
+    // re-establish the real-catalog default so a per-test override (D1) can't
+    // leak into the next test.
+    mockSupportsEffort.mockImplementation((m: string) => !m.includes("haiku"));
     workItemCounter = 0;
     registry = makeMockRegistry();
     sessionStore = makeMockSessionStore();
@@ -627,29 +648,78 @@ describe("AgentManager", () => {
       (appConfig as any).modelRouter.enabled = false;
     });
 
-    it("passes resource limits from router to runner.send()", async () => {
+    it("delivers STATIC-tier limits on the router-on path (KPR-338)", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
-      const mockRoute = {
-        tier: "opus" as const,
-        model: "claude-opus-4-7",
-        costUsd: 0.001,
-        durationMs: 50,
-        resourceLimits: { timeoutMs: 600_000, maxTurns: 200, budgetUsd: 50 },
-      };
-      vi.mocked(routeModel).mockResolvedValue(mockRoute);
+      // Legacy-shape result with junk tier/model/limits — KPR-338 ignores them:
+      // the turn's model is the agent's static model, limits are static-tier.
+      vi.mocked(routeModel).mockResolvedValue(
+        makeRouterResult({
+          tier: "opus",
+          model: "junk-should-be-ignored",
+          resourceLimits: { timeoutMs: 999, maxTurns: 999, budgetUsd: 999 },
+        }),
+      );
 
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
+
+      const [, , , , model, resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      // Position 4 (model override) is undefined — no per-turn model switch.
+      expect(model).toBeUndefined();
+      // Position 5 (limits) = agent-s's STATIC sonnet tier, not the routed junk.
+      expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+    });
+
+    it("merges per-agent resourceTiers overrides into the static limits (KPR-338)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      registry._agents.set(
+        "agent-s-override",
+        makeAgentConfig({
+          id: "agent-s-override",
+          name: "AgentSOverride",
+          model: "claude-sonnet-4-6",
+          resourceTiers: { sonnet: { budgetUsd: 2 } },
+        }),
+      );
+      vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ tier: "sonnet", model: "junk" }));
+
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s-override" }));
+
+      const [, , , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual({ timeoutMs: 300_000, maxTurns: 50, budgetUsd: 2 });
+    });
+
+    it("haiku-static agent skips the classifier — haiku-tier limits, no effort (KPR-338, replaces H1)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // agent-a's default model is claude-haiku-4-5 → staticTier haiku → skip.
       await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
 
-      expect(mockRunnerSend).toHaveBeenCalledWith(
-        expect.any(String),
-        undefined,
-        undefined,
-        expect.any(Object),
-        "claude-opus-4-7",
-        mockRoute.resourceLimits,
-        undefined,
-        undefined,
+      expect(routeModel).not.toHaveBeenCalled();
+      const [, , , , model, resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+      expect(model).toBeUndefined();
+      expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.haiku);
+      expect(effort).toBeUndefined();
+    });
+
+    it("off-catalog effort-incapable model: skip + warn-once across turns (KPR-338 D1/D2)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Non-haiku-named id (staticTier resolves to the sonnet default) that the
+      // catalog reports effort-incapable — the D1 warn-once path.
+      mockSupportsEffort.mockReturnValue(false);
+      registry._agents.set(
+        "agent-nova",
+        makeAgentConfig({ id: "agent-nova", name: "AgentNova", model: "claude-nova-9" }),
       );
+
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-nova", threadId: "sms:line-1:nova-1" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-nova", threadId: "sms:line-1:nova-2" }));
+
+      expect(routeModel).not.toHaveBeenCalled();
+      // Static limits still enforced (substring default tier = sonnet).
+      const [, , , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+      // Warn fired exactly once across two turns (warn-once per model id).
+      const effortWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("effort hints disabled"));
+      expect(effortWarns).toHaveLength(1);
     });
 
     it("passes undefined resource limits when model router is disabled", async () => {
@@ -2004,17 +2074,22 @@ describe("AgentManager", () => {
       }
 
       it("three consecutive hard faults open the breaker; the next spawnTurn fast-fails before the adapter", async () => {
-        // Router must be enabled for this assertion to mean anything — with
-        // the module-mocked config's default `modelRouter.enabled: false`
-        // (test file line 46), `routeModel` is never called regardless of
-        // where the circuit-breaker rejection lands, making a bare
-        // `not.toHaveBeenCalled()` vacuous. Enable it here with try/finally
-        // restore, mirroring the voice carve-out precedent (test file
-        // ~2186-2205).
+        // Router must be enabled for this assertion to mean anything, AND the
+        // fast-failed turn must run on a router-ELIGIBLE agent. Post-KPR-338
+        // haiku-static agents skip the classifier entirely (agent-a is
+        // haiku), so a fast-fail on agent-a would leave routeModel uncalled
+        // for a reason unrelated to the breaker — the delta pin below would
+        // pass vacuously. agent-s is sonnet-static (still router-eligible): an
+        // ADMITTED turn WOULD spend a router call, so a zero delta across the
+        // fast-failed agent-s turn genuinely pins "breaker permit before any
+        // model-router spend" (CLAUDE.md). tripBreaker stays on agent-a — the
+        // breaker is per-provider and both resolve to claude.
         (appConfig as any).modelRouter.enabled = true;
         try {
-          // Pattern per test file :610 — resolve routeModel so tripBreaker's
-          // setup turns (which now also invoke the router) don't hang.
+          // Legacy-shape stub (reshaped to makeRouterResult() in T2d); at T1
+          // the old ModelRouterResult still accepts it. Only an admitted
+          // agent-s turn would consume it — tripBreaker's agent-a turns skip
+          // the router (haiku, KPR-338).
           vi.mocked(routeModel).mockResolvedValue({
             tier: "sonnet",
             model: "claude-sonnet-4-7",
@@ -2028,17 +2103,16 @@ describe("AgentManager", () => {
 
           const callsBefore = mockRunnerSend.mock.calls.length;
           const routerCallsBefore = vi.mocked(routeModel).mock.calls.length;
-          await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:fast-fail" }))).rejects.toBeInstanceOf(
-            ProviderCircuitOpenError,
-          );
+          await expect(
+            manager.spawnTurn(smsCtx({ agentId: "agent-s", threadId: "sms:line-1:fast-fail" })),
+          ).rejects.toBeInstanceOf(ProviderCircuitOpenError);
           // Adapter never invoked for the fast-failed turn (pre-prepareSpawn throw).
           expect(mockRunnerSend.mock.calls.length).toBe(callsBefore);
           // Router also never invoked for the fast-failed turn specifically:
-          // pin the *call-count delta* across just this turn (routeModel was
-          // already called `routerCallsBefore` times by tripBreaker's setup
-          // turns, since the router is enabled here) — mirroring the
-          // `mockRunnerSend` count-delta assertion immediately above, not an
-          // absolute "never called" claim.
+          // pin the *call-count delta* across just this turn. tripBreaker's
+          // agent-a turns skip the router (haiku, KPR-338), so routerCallsBefore
+          // is 0; the point is that the admitted-but-for-the-breaker agent-s
+          // turn spends nothing — the permit gates before any router call.
           expect(vi.mocked(routeModel).mock.calls.length).toBe(routerCallsBefore);
         } finally {
           (appConfig as any).modelRouter.enabled = false;
@@ -2510,28 +2584,25 @@ describe("AgentManager", () => {
       expect(prompt.endsWith("[attachment summary]")).toBe(true);
     });
 
-    it("calls model router and uses override + resourceLimits in runner.send", async () => {
+    it("calls model router and delivers no override + static limits in runner.send (KPR-338 §3.2)", async () => {
       (appConfig as any).modelRouter.enabled = true;
       try {
-        const mockRoute = {
-          tier: "haiku" as const,
-          model: "claude-haiku-4-5-routed",
-          costUsd: 0.001,
-          durationMs: 50,
-          resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
-        };
-        vi.mocked(routeModel).mockResolvedValueOnce(mockRoute);
+        // Legacy-shape junk model/limits — KPR-338 ignores them: model stays
+        // static, limits are the agent's STATIC tier (agent-s → sonnet).
+        vi.mocked(routeModel).mockResolvedValueOnce(
+          makeRouterResult({ tier: "opus", model: "claude-haiku-4-5-routed" }),
+        );
 
         const item = makeWorkItem({
           text: "shape me",
           source: { kind: "sms", id: "line-1", label: "May" },
         });
-        await manager.spawnTurn(makeCtx(item, "sms"));
+        await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
         expect(routeModel).toHaveBeenCalledTimes(1);
         const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
-        expect(modelOverride).toBe("claude-haiku-4-5-routed");
-        expect(resourceLimits).toEqual(mockRoute.resourceLimits);
+        expect(modelOverride).toBeUndefined();
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
       } finally {
         (appConfig as any).modelRouter.enabled = false;
       }
@@ -2540,18 +2611,11 @@ describe("AgentManager", () => {
     it("adds router cost to TurnResult.usage.costUsd", async () => {
       (appConfig as any).modelRouter.enabled = true;
       try {
-        const mockRoute = {
-          tier: "haiku" as const,
-          model: "claude-haiku-4-5-routed",
-          costUsd: 0.0042,
-          durationMs: 50,
-          resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
-        };
-        vi.mocked(routeModel).mockResolvedValueOnce(mockRoute);
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ costUsd: 0.0042 }));
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ costUsd: 0.05, sessionId: "s-cost" }));
 
         const item = makeWorkItem({ text: "cost test", source: { kind: "sms", id: "line-1", label: "May" } });
-        const result = await manager.spawnTurn(makeCtx(item, "sms"));
+        const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
         // 0.05 (runner) + 0.0042 (router) = 0.0542
         expect(result.usage.costUsd).toBeCloseTo(0.0542, 5);
@@ -2587,8 +2651,9 @@ describe("AgentManager", () => {
       expect(mockCodexRunTurn).toHaveBeenCalledWith(expect.objectContaining({
         prompt: "hello codex",
         sessionId: undefined,
-        modelOverride: undefined,
       }));
+      // KPR-338: the manager no longer sets modelOverride on the turn request.
+      expect("modelOverride" in mockCodexRunTurn.mock.calls[0]![0]).toBe(false);
       expect(result.finalMessage).toBe("codex response");
       expect(result.newSessionId).toBe("codex-session");
     });
@@ -2703,14 +2768,13 @@ describe("AgentManager", () => {
         (appConfig as any).modelRouter.enabled = false;
       });
 
-      it("merges the routed model into the effective route and delivers router effort beside it (KPR-312)", async () => {
+      it("delivers effort beside the static route (KPR-312 channel; KPR-338: no model merge)", async () => {
         (appConfig as any).modelRouter.enabled = true;
-        // The route object still carries no effort (the claude variant has no
-        // such field); the value travels BESIDE it via SpawnShaping.effortOverride
-        // → runner.send position 7 (KPR-312).
+        // KPR-338: the routed `model` is no longer read — the turn runs the
+        // agent's static model. Effort still travels BESIDE the route via
+        // SpawnShaping.effortOverride → runner.send position 7 (KPR-312).
         vi.mocked(routeModel).mockResolvedValueOnce(
           makeRouterResult({
-            provider: "claude",
             tier: "sonnet",
             model: "claude-sonnet-4-6-routed",
             effort: "high",
@@ -2718,13 +2782,13 @@ describe("AgentManager", () => {
         );
 
         const item = makeWorkItem({ text: "route me", source: { kind: "sms", id: "line-1", label: "May" } });
-        await manager.spawnTurn(makeCtx(item, "sms"));
+        await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
         expect(routeModel).toHaveBeenCalledTimes(1);
         expect(mockRunnerSend).toHaveBeenCalledTimes(1);
         const [, , , , modelOverride, resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
-        expect(modelOverride).toBe("claude-sonnet-4-6-routed");
-        expect(resourceLimits).toEqual({ timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 });
+        expect(modelOverride).toBeUndefined();
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
         expect(effort).toBe("high");
       });
 
@@ -2767,23 +2831,21 @@ describe("AgentManager", () => {
         expect(mockCodexConstructor).toHaveBeenCalledWith(
           expect.objectContaining({ model: "gpt-5.5", reasoningEffort: "medium" }),
         );
-        expect(mockCodexRunTurn).toHaveBeenCalledWith(expect.objectContaining({ modelOverride: undefined }));
+        // KPR-338: the manager no longer sets modelOverride on the turn request.
+        expect("modelOverride" in mockCodexRunTurn.mock.calls[0]![0]).toBe(false);
         expect(result.finalMessage).toBe("codex response");
       });
 
-      it("provider clamp: a router result naming a different provider is ignored — static route, warn, cost+tier+limits retained", async () => {
+      // KPR-338 §3.2: clamp branch deleted with ModelRouterResult.provider;
+      // invariant re-pinned below.
+      it("shaped route ≡ static route on every path (KPR-338 invariant re-pin)", async () => {
         (appConfig as any).modelRouter.enabled = true;
+        // A full router result naming junk tier/model — none of it moves the
+        // turn off the agent's static route.
         vi.mocked(routeModel).mockResolvedValueOnce(
-          makeRouterResult({
-            tier: "sonnet",
-            model: "gpt-9-preview",
-            provider: "openai",
-            effort: "low",
-            costUsd: 0.003,
-            resourceLimits: { timeoutMs: 300_000, maxTurns: 50, budgetUsd: 5 },
-          }),
+          makeRouterResult({ tier: "opus", model: "junk-should-be-ignored", effort: "high" }),
         );
-        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ costUsd: 0.05, sessionId: "s-clamp" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ costUsd: 0.05, sessionId: "s-static" }));
 
         const activityLogger = { record: vi.fn() };
         const localManager = new AgentManager(
@@ -2795,24 +2857,22 @@ describe("AgentManager", () => {
           activityLogger as any,
         );
 
-        const item = makeWorkItem({ text: "clamp me", source: { kind: "sms", id: "line-1", label: "May" } });
-        const result = await localManager.spawnTurn(makeCtx(item, "sms"));
+        const item = makeWorkItem({ text: "static me", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
-        // Static route used: Claude adapter ran, no pilot constructed, no override.
+        // Claude adapter ran — no pilot constructor for any provider.
         expect(mockOpenAIConstructor).not.toHaveBeenCalled();
-        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(mockCodexConstructor).not.toHaveBeenCalled();
+        expect(mockGeminiConstructor).not.toHaveBeenCalled();
+        // send's model position (4) is undefined — no per-turn model switch.
+        const [, , , , modelOverride] = mockRunnerSend.mock.calls[0]!;
         expect(modelOverride).toBeUndefined();
-        // D3: routed resourceLimits are RETAINED (provider-agnostic execution
-        // bounds for the Claude turn that actually runs).
-        expect(resourceLimits).toEqual({ timeoutMs: 300_000, maxTurns: 50, budgetUsd: 5 });
-        // KPR-312: the clamp drops effort along with the model.
-        expect(mockRunnerSend.mock.calls[0]![7]).toBeUndefined();
-        // Clamp-path bookkeeping: router cost still charged, tier still audited.
-        expect(result.usage.costUsd).toBeCloseTo(0.053, 5);
-        expect(activityLogger.record).toHaveBeenCalledWith(expect.objectContaining({ modelTier: "sonnet" }));
-        expect(mockLogWarn).toHaveBeenCalledWith(
-          expect.stringContaining("cross-provider per-turn routing unsupported"),
-          expect.objectContaining({ routerProvider: "openai", staticProvider: "claude" }),
+        // Telemetry + audit both read the agent's STATIC model, not the route junk.
+        expect(turnTelemetryStore.record).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "claude-sonnet-4-6" }),
+        );
+        expect(activityLogger.record).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "claude-sonnet-4-6" }),
         );
       });
 
@@ -2861,23 +2921,29 @@ describe("AgentManager", () => {
         );
       });
 
-      it("auth-rebuild retry reuses the first routing decision — routeModel called exactly once, same override on both attempts", async () => {
+      it("auth-rebuild retry reuses the first routing decision — routeModel once, same limits/effort, no override on both attempts", async () => {
         (appConfig as any).modelRouter.enabled = true;
-        vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "medium" }));
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered", sessionId: "s2" }));
 
         const item = makeWorkItem({ text: "retry me", source: { kind: "sms", id: "line-1", label: "May" } });
         // sessionId present — the auth-rebuild retry only fires on resumable turns.
-        await manager.spawnTurn(makeCtx(item, "sms", "s1"));
+        await manager.spawnTurn({ ...makeCtx(item, "sms", "s1"), agentId: "agent-s" });
 
         expect(routeModel).toHaveBeenCalledTimes(1); // no re-route, no double routerCostUsd
         expect(mockRunnerSend).toHaveBeenCalledTimes(2);
-        expect(mockRunnerSend.mock.calls[0]![4]).toBe("claude-haiku-4-5-routed");
-        expect(mockRunnerSend.mock.calls[1]![4]).toBe("claude-haiku-4-5-routed");
+        // KPR-338: no per-turn model override on either attempt; identical
+        // static limits + effort reused (shaping resolved once).
+        expect(mockRunnerSend.mock.calls[0]![4]).toBeUndefined();
+        expect(mockRunnerSend.mock.calls[1]![4]).toBeUndefined();
+        expect(mockRunnerSend.mock.calls[0]![5]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(mockRunnerSend.mock.calls[1]![5]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(mockRunnerSend.mock.calls[0]![7]).toBe("medium");
+        expect(mockRunnerSend.mock.calls[1]![7]).toBe("medium");
       });
 
-      it("activity audit modelTier: routed tier when the router ran, undefined when disabled", async () => {
+      it("activity audit modelTier: STATIC tier on both router-on and router-off claude turns (KPR-338 D4)", async () => {
         const activityLogger = { record: vi.fn() };
         const localManager = new AgentManager(
           registry as any,
@@ -2888,24 +2954,23 @@ describe("AgentManager", () => {
           activityLogger as any,
         );
 
-        // Router on → tier reaches the audit.
+        // Router on → static tier reaches the audit (routed junk ignored).
         (appConfig as any).modelRouter.enabled = true;
-        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ tier: "opus", model: "claude-opus-4-7" }));
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ tier: "opus", model: "junk" }));
         const item1 = makeWorkItem({ text: "tier check", source: { kind: "sms", id: "line-1", label: "May" } });
-        await localManager.spawnTurn(makeCtx(item1, "sms"));
+        await localManager.spawnTurn({ ...makeCtx(item1, "sms"), agentId: "agent-s" });
         expect(activityLogger.record).toHaveBeenLastCalledWith(
-          expect.objectContaining({ modelTier: "opus", model: "claude-opus-4-7" }),
+          expect.objectContaining({ modelTier: "sonnet", model: "claude-sonnet-4-6" }),
         );
 
-        // Router off → undefined (pre-KPR-311 behavior preserved). Assert the
-        // property EXISTS and is undefined — objectContaining({modelTier:
-        // undefined}) would also pass on an absent key.
+        // Router off → STILL the static tier (KPR-338 D4: tier is a per-agent
+        // fact, was undefined pre-338). Property present AND "sonnet".
         (appConfig as any).modelRouter.enabled = false;
         const item2 = makeWorkItem({ text: "no tier", source: { kind: "sms", id: "line-1", label: "May" } });
-        await localManager.spawnTurn(makeCtx(item2, "sms"));
+        await localManager.spawnTurn({ ...makeCtx(item2, "sms"), agentId: "agent-s" });
         const offArg = activityLogger.record.mock.calls.at(-1)![0];
         expect("modelTier" in offArg).toBe(true);
-        expect(offArg.modelTier).toBeUndefined();
+        expect(offArg.modelTier).toBe("sonnet");
       });
 
       it("misattribution fix: a router-enabled pilot agent audits its static model, no tier, no router call", async () => {
@@ -2951,8 +3016,9 @@ describe("AgentManager", () => {
           (appConfig as any).modelRouter.enabled = true;
           vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
 
+          // agent-s (sonnet) — the haiku default skips the router entirely.
           const noFiles = makeWorkItem({ text: "no files", source: { kind: "sms", id: "line-1", label: "May" } });
-          await manager.spawnTurn(makeCtx(noFiles, "sms"));
+          await manager.spawnTurn({ ...makeCtx(noFiles, "sms"), agentId: "agent-s" });
           expect(vi.mocked(routeModel).mock.calls[0]![3]).toEqual({ hasFiles: false });
 
           const withFiles = makeWorkItem({
@@ -2960,7 +3026,7 @@ describe("AgentManager", () => {
             source: { kind: "sms", id: "line-1", label: "May" },
             files: [{ name: "doc.txt", url: "https://example.com/doc.txt" } as any],
           });
-          await manager.spawnTurn({ ...makeCtx(withFiles, "sms"), threadId: "sms:line-1:files" });
+          await manager.spawnTurn({ ...makeCtx(withFiles, "sms"), agentId: "agent-s", threadId: "sms:line-1:files" });
           expect(vi.mocked(routeModel).mock.calls[1]![3]).toEqual({ hasFiles: true });
         });
 
@@ -2991,19 +3057,20 @@ describe("AgentManager", () => {
           expect(mockRunnerSend.mock.calls[0]![7]).toBeUndefined();
         });
 
-        it("delivers effort even when the routed model equals the agent model (no override — spec §7 edge row)", async () => {
+        it("delivers effort with no model override anywhere (KPR-338)", async () => {
           (appConfig as any).modelRouter.enabled = true;
-          const agentModel = registry._agents.get("agent-a")!.model; // the harness's default Claude agent
+          // Routed `model` is junk — KPR-338 never reads it; the turn runs the
+          // agent's static model, effort still rides beside the route.
           vi.mocked(routeModel).mockResolvedValueOnce(
-            makeRouterResult({ tier: "sonnet", model: agentModel, effort: "low" }),
+            makeRouterResult({ tier: "sonnet", model: "junk-ignored", effort: "low" }),
           );
 
           const item = makeWorkItem({ text: "same model", source: { kind: "sms", id: "line-1", label: "May" } });
-          await manager.spawnTurn(makeCtx(item, "sms"));
+          await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
           const [, , , , modelOverride, , , effort] = mockRunnerSend.mock.calls[0]!;
-          expect(modelOverride).toBeUndefined(); // unchanged rule: no override when router picks the agent model
-          expect(effort).toBe("low"); // effort works with or without a model switch
+          expect(modelOverride).toBeUndefined(); // KPR-338: never a per-turn model override
+          expect(effort).toBe("low"); // effort still delivered beside the static route
         });
 
         it("pilot runTurn request carries effort: undefined (gate: router never ran)", async () => {
@@ -3039,10 +3106,10 @@ describe("AgentManager", () => {
     it("KPR-220 Phase 16: includes every registered agent on a fresh engine (no traffic yet)", () => {
       // Phase 16: snapshot includes registry.listIds() so the heartbeat
       // writes meaningful rows on first poll even without traffic. Mock
-      // registry has agent-a and agent-b; both should appear with
-      // zero-valued fields.
+      // registry has agent-a, agent-b, and agent-s (KPR-338 sonnet fixture);
+      // all should appear with zero-valued fields.
       const snapshot = manager.getSnapshot();
-      expect(Object.keys(snapshot.perAgent).sort()).toEqual(["agent-a", "agent-b"]);
+      expect(Object.keys(snapshot.perAgent).sort()).toEqual(["agent-a", "agent-b", "agent-s"]);
       const a = snapshot.perAgent["agent-a"]!;
       expect(a.activeSpawns).toBe(0);
       expect(a.activeThreadKeys).toEqual([]);

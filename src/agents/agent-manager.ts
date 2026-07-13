@@ -9,7 +9,8 @@ import type { TurnTelemetryStore } from "./turn-telemetry.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { Db } from "mongodb";
 import { formatFilesForPrompt } from "../files/file-processor.js";
-import { routeModel, type ModelTier, type ResourceLimits } from "./model-router.js";
+import { routeModel, modelToTier, resolveResourceLimits, type ResourceLimits } from "./model-router.js";
+import { getLLMRegistry } from "../llm/registry.js";
 import { config as appConfig } from "../config.js";
 import { loadPlugins, rescanPluginBrokenServers } from "../plugins/plugin-loader.js";
 import type { LoadedPlugin } from "../plugins/types.js";
@@ -198,32 +199,31 @@ function splitProviderModel(providerModel: string): { model: string; reasoningEf
 }
 
 /**
- * KPR-311: per-turn spawn shaping — shaped prompt plus the effective
- * per-turn route. `route` is provider-clamped to the agent's static
- * provider (W3 invariant): it keeps the KPR-306 breaker permit — acquired
- * on the static provider before the router runs (R7) — keyed to the
- * provider that actually executes, and keeps providerFor() (KPR-307)
- * consistent. Lifting the clamp is parked in the spec (§5) for W3.5.
+ * KPR-311 → KPR-338: per-turn spawn shaping — shaped prompt plus the agent's
+ * static route. Post-KPR-338 the route IS the static route on every path
+ * (resolveProviderModel(agent.model)): the router no longer names models or
+ * providers, so the W3 provider clamp (R-311.1) survives structurally rather
+ * than as a branch. The route keeps the KPR-306 breaker permit — acquired on
+ * the static provider before any shaping — keyed to the provider that
+ * actually runs, and keeps providerFor() (KPR-307) consistent. Cross-provider
+ * per-turn routing stays parked (kpr-311-spec §5 → KPR-337).
  */
 interface SpawnShaping {
   prompt: string;
-  /** Effective per-turn route — provider-clamped; consumed by createProviderAdapter. */
+  /** The agent's static route — consumed by createProviderAdapter. */
   route: ProviderModelRoute;
   /**
-   * Claude-path per-turn model when the router chose ≠ static; threaded to
-   * runner.send via AgentProviderTurnRequest.modelOverride + observability.
-   * Derivation unchanged from KPR-224.
-   */
-  modelOverride: string | undefined;
-  /** Router tier for activity-audit modelTier (cache-cliff observability hook, KPR-310 C1–C3). */
-  routerTier: ModelTier | undefined;
-  /**
-   * KPR-312: per-turn reasoning effort for the Claude turn — carried BESIDE
-   * the route, never in it (the claude ProviderModelRoute variant has no
-   * effort field; clamp and pilot gate untouched). Set only by the router
-   * merge branch; undefined on voice/skip/clamp/failure paths and for pilots.
+   * KPR-312 → KPR-338: per-turn reasoning effort — the classifier's ONLY
+   * surviving output. Carried BESIDE the route, never in it (R-312.3 channel,
+   * meaning untouched). Set only by the router merge branch, which is only
+   * reached when the static model is effort-capable (prepareSpawn's skip
+   * guarantees deliverability); undefined on voice/skip/failure paths and
+   * for pilots.
    */
   effortOverride: ReasoningEffort | undefined;
+  /** Static-tier execution bounds — set ONLY on the router-on path (KPR-338
+   *  path-preserving rule); undefined elsewhere so the runner's per-agent
+   *  legacy fallback (timeoutMs/maxTurns/budgetUsd) stays live config. */
   resourceLimits: ResourceLimits | undefined;
   routerCostUsd: number;
 }
@@ -402,6 +402,10 @@ export class AgentManager {
   private lastSpawnAt = new Map<string, number>();
   // KPR-220 Phase 11: most-recent spawn error per agent (truncated).
   private lastSpawnError = new Map<string, string>();
+  /** KPR-338 D1: warn-once per model id when effort hints are disabled for an
+   *  off-catalog (non-haiku-tier) static model — supportsEffort is
+   *  conservative (unknown ⇒ false) and the operator deserves a signal. */
+  private readonly effortIncapableWarned = new Set<string>();
   /**
    * KPR-306: per-provider circuit breakers. Read-only surface — KPR-307's
    * dispatcher-side consumer and the CircuitBreakerHeartbeat both reach it
@@ -475,11 +479,12 @@ export class AgentManager {
   }
 
   /**
-   * KPR-311: the route is the effective per-turn route derived by
-   * prepareSpawn (provider-clamped to static in W3) — the static
-   * agent.model prefix is no longer re-resolved here, so the breaker
-   * permit and the adapter always key off the same resolution (R7).
-   * Single call site (runOneSpawnAttempt); parameter required, no default.
+   * KPR-311 → KPR-338: the route is the agent's static per-turn route
+   * derived by prepareSpawn (static by construction post-KPR-338 — clamp
+   * invariant, R-311.1) — the static agent.model prefix is no longer
+   * re-resolved here, so the breaker permit and the adapter always key off
+   * the same resolution (R7). Single call site (runOneSpawnAttempt);
+   * parameter required, no default.
    */
   private createProviderAdapter(agentId: string, route: ProviderModelRoute): AgentProviderAdapter {
     const config = this.registry.get(agentId);
@@ -683,7 +688,7 @@ export class AgentManager {
       // the annotation must still fire. `route` is the acquire-time static
       // route; under the W3 clamp it is provably ≡ shaping.route.provider
       // (KPR-311 §5). Lifting the clamp re-keys acquire AND this guard
-      // together (parked: kpr-311-spec §5 → W3.5/KPR-314). The re-read is
+      // together (parked: kpr-311-spec §5 → KPR-337). The re-read is
       // withRetry fail-soft (never throws) and dereferences no registry —
       // no new throw surface inside the R7 window.
       if (effectiveCtx.sessionProvider && effectiveCtx.sessionProvider !== route.provider) {
@@ -712,7 +717,7 @@ export class AgentManager {
       // KPR-224 + KPR-226: shape prompt + resolve model router once at the
       // spawnTurn level so both the happy-path call and any auth-rebuild
       // retry use the same shaped values, and recordSpawnObservability sees
-      // prompt / modelOverride in scope. Kept INSIDE the HOF lambda so any
+      // the shaped prompt/effort in scope. Kept INSIDE the HOF lambda so any
       // throw in shaping (e.g., formatFilesForPrompt on malformed file
       // metadata) cannot leak the per-thread lock or budget slot — KPR-226
       // regression prevention.
@@ -1162,7 +1167,6 @@ export class AgentManager {
       sessionId: ctx.sessionId,
       onStream,
       workItemContext: bgContext,
-      modelOverride: shaping.modelOverride,
       resourceLimits: shaping.resourceLimits,
       systemPromptOverride: ctx.systemPromptOverride,
       effort: shaping.effortOverride,
@@ -1179,12 +1183,11 @@ export class AgentManager {
    *  - sender identity prepending (`[user:X via Y in #Z]:` for team /
    *    `[Y in #Z, thread=ts]:` for slack-with-sender)
    *  - file-attachment text appending
-   *  - effective per-turn route derivation (KPR-311): the model router's
-   *    per-turn decision merged with the agent's static
-   *    resolveProviderModel(agent.model) route. W3 invariants: the
-   *    effective provider is clamped to the static provider, and the
-   *    router only runs for Claude-static agents (pilot gate — pilots are
-   *    constructor-baked; TIER_MODELS is Claude-only).
+   *  - static per-turn route (KPR-338): the route is ALWAYS the agent's
+   *    static resolveProviderModel(agent.model) — the router no longer
+   *    merges a per-turn model decision (kpr-338-spec §1.3). The classifier
+   *    contributes reasoning effort only. The router still runs only for
+   *    Claude-static agents (pilot gate — pilots are constructor-baked).
    *
    * Voice carve-out: voice has its own `systemPromptOverride` injection
    * (KPR-219) and explicitly bypasses prepending + model router. Returns
@@ -1205,12 +1208,16 @@ export class AgentManager {
     // non-provider → never trips).
     const agentConfig = this.registry.get(ctx.agentId);
     const staticRoute = resolveProviderModel(agentConfig?.model ?? "");
+    // KPR-338: static tier — guarded like staticRoute (KPR-306 wedged-permit
+    // hazard; see the comment above). Only meaningful on the claude-static
+    // router-on path below.
+    const staticTier = modelToTier(agentConfig?.model ?? "");
 
     // Voice carve-out: KPR-219 supplies its own systemPromptOverride and
     // explicitly bypasses prepending + model router. Pin via this branch so
     // future prepareSpawn edits cannot accidentally re-shape voice prompts.
     if (ctx.channel === "voice") {
-      return { prompt: item.text, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+      return { prompt: item.text, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
     }
 
     const senderLabel = item.senderName ?? item.sender;
@@ -1253,9 +1260,33 @@ export class AgentManager {
     // (scheduler/cron), when the agent vanished mid-turn (guard above), or
     // when the agent's static provider isn't Claude (pilot gate — calling
     // the router for a pilot charged routerCostUsd for an output the pilot
-    // ignores and misattributed the Claude model in telemetry/audit).
+    // ignores and misattributed the Claude model in telemetry/audit — R-311.2).
     if (!agentConfig || !appConfig.modelRouter.enabled || item.sender === "system" || staticRoute.provider !== "claude") {
-      return { prompt, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+      return { prompt, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+    }
+
+    // KPR-338: the turn's model is ALWAYS agentConfig.model (fixed-tier
+    // invariant, kpr-338-spec §1.3). Execution bounds derive from the agent's
+    // STATIC tier — same path that carried router-derived limits before
+    // (path-preserving), explicitly NOT effort-keyed.
+    const staticLimits = resolveResourceLimits(staticTier, agentConfig.resourceTiers);
+
+    // Haiku-skip (replaces router H1) + effort-capability gate (kpr-338-spec
+    // §3.1 residual, plan D1/D2): when the static model cannot receive the
+    // effort param, the classifier's only remaining output is undeliverable —
+    // skip the call entirely (zero classifier cost/latency; today's
+    // haiku-tier envelope preserved). supportsEffort is catalog-driven
+    // (KPR-314); unknown ids are conservatively false — warn once so an
+    // off-catalog operator model doesn't silently lose the effort lever.
+    if (staticTier === "haiku" || !getLLMRegistry().supportsEffort(agentConfig.model)) {
+      if (staticTier !== "haiku" && !this.effortIncapableWarned.has(agentConfig.model)) {
+        this.effortIncapableWarned.add(agentConfig.model);
+        log.warn(
+          "Per-turn effort hints disabled — agent model is not effort-capable in the LLM catalog (off-catalog id?)",
+          { agentId: ctx.agentId, model: agentConfig.model },
+        );
+      }
+      return { prompt, route: staticRoute, resourceLimits: staticLimits, routerCostUsd: 0, effortOverride: undefined };
     }
 
     try {
@@ -1265,44 +1296,17 @@ export class AgentManager {
         // reaches the classifier.
         hasFiles: Boolean(item.files?.length),
       });
-
-      if (result.provider !== undefined && result.provider !== staticRoute.provider) {
-        // W3 provider clamp: cross-provider per-turn routing is
-        // unsupported — the breaker permit (KPR-306) and the dispatcher
-        // outage gate (KPR-307 providerFor) key on the static provider.
-        // Model + effort are dropped; routed resourceLimits are RETAINED
-        // (provider-agnostic runner-side execution bounds for the Claude
-        // turn that actually runs) and cost/tier are still recorded — the
-        // router call happened. Unreachable in production until W3.3+
-        // (routeModel never sets `provider` in W3); semantics pinned by
-        // unit test so W3.3 lands against defined behavior.
-        log.warn("Model router provider ignored — cross-provider per-turn routing unsupported (W3 clamp)", {
-          agentId: ctx.agentId,
-          routerProvider: result.provider,
-          staticProvider: staticRoute.provider,
-        });
-        return { prompt, route: staticRoute, modelOverride: undefined, routerTier: result.tier, resourceLimits: result.resourceLimits, routerCostUsd: result.costUsd, effortOverride: undefined };
-      }
-
-      // Effective route. The claude ProviderModelRoute variant carries NO
-      // reasoningEffort field — effort is never merged into the route; it is
-      // carried beside it (KPR-312): SpawnShaping.effortOverride →
-      // AgentProviderTurnRequest.effort → SDK Options.effort.
-      const route: ProviderModelRoute = { provider: "claude", model: result.model };
-      return {
-        prompt,
-        route,
-        modelOverride: result.model !== agentConfig.model ? result.model : undefined,
-        routerTier: result.tier,
-        resourceLimits: result.resourceLimits,
-        routerCostUsd: result.costUsd,
-        // KPR-312: emission rules live inside routeModel (model-path only,
-        // {low,medium,high}, dropped post-cap for haiku) — trust the field.
-        effortOverride: result.effort,
-      };
+      // Effort rides BESIDE the route (R-312.3, byte-untouched channel):
+      // SpawnShaping.effortOverride → AgentProviderTurnRequest.effort →
+      // Options.effort. The classifier's tier/model outputs are no longer
+      // read (deleted from the contract in the next commit).
+      return { prompt, route: staticRoute, resourceLimits: staticLimits, routerCostUsd: result.costUsd, effortOverride: result.effort };
     } catch (err) {
-      log.warn("Model router failed, using default", { agentId: ctx.agentId, error: String(err) });
-      return { prompt, route: staticRoute, modelOverride: undefined, routerTier: undefined, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+      // Belt-and-braces (routeModel owns its own fallback and should not
+      // throw). Degenerate shape preserved: resourceLimits stays undefined on
+      // this path (KPR-338 path-preserving rule — runner legacy fallback).
+      log.warn("Model router failed, using defaults", { agentId: ctx.agentId, error: String(err) });
+      return { prompt, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
     }
   }
 
@@ -1328,7 +1332,7 @@ export class AgentManager {
           agentId: ctx.agentId,
           threadId: ctx.threadId,
           sessionId: result.sessionId,
-          model: shaping.modelOverride ?? this.registry.get(ctx.agentId)?.model,
+          model: this.registry.get(ctx.agentId)?.model,
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
           cacheReadTokens: result.cacheReadTokens,
@@ -1369,8 +1373,12 @@ export class AgentManager {
       senderName: item.senderName,
       channel: item.source.label,
       channelKind: item.source.kind,
-      model: shaping.modelOverride ?? this.registry.get(ctx.agentId)?.model ?? "unknown",
-      modelTier: shaping.routerTier, // KPR-311: router tier reaches the audit (cache-cliff observability, KPR-310 C1–C3)
+      model: this.registry.get(ctx.agentId)?.model ?? "unknown",
+      // KPR-338 D4: tier is a static per-agent fact — audited on every
+      // claude-static turn (R-311.7's observability feed, now static).
+      // Pilots carry no tier: modelToTier is a Claude-id substring heuristic,
+      // meaningless on provider-prefixed ids.
+      modelTier: shaping.route.provider === "claude" ? modelToTier(shaping.route.model) : undefined,
       costUsd: result.costUsd,
       durationMs: result.durationMs,
       inputTokens: result.inputTokens,

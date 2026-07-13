@@ -67,8 +67,14 @@ const ACK_ALLOWLIST: ReadonlySet<string> = new Set([
   "👍",
 ]);
 
-/** Infer tier from a model ID string */
-function modelToTier(model: string): ModelTier {
+/**
+ * Infer tier from a model ID string. KPR-338: exported — prepareSpawn derives
+ * the agent's STATIC tier for resource limits and audit (tier is a per-agent
+ * fact now, never a per-turn decision). Claude-id substring heuristic —
+ * meaningless on provider-prefixed pilot ids; callers gate on the
+ * claude-static route.
+ */
+export function modelToTier(model: string): ModelTier {
   if (model.includes("opus")) return "opus";
   if (model.includes("haiku")) return "haiku";
   return "sonnet";
