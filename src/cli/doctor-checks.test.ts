@@ -682,9 +682,7 @@ describe("llmSidecarLine (KPR-314)", () => {
     expect(llmSidecarLine(false, true)).toBe(
       "llm sidecar: anthropic ✗ (meeting classifier → all-roster, memory dream → skipped), gemini ✓",
     );
-    expect(llmSidecarLine(true, false)).toBe(
-      "llm sidecar: anthropic ✓, gemini ✗ (image description → off)",
-    );
+    expect(llmSidecarLine(true, false)).toBe("llm sidecar: anthropic ✓, gemini ✗ (image description → off)");
     expect(llmSidecarLine(false, false)).toBe(
       "llm sidecar: anthropic ✗ (meeting classifier → all-roster, memory dream → skipped), gemini ✗ (image description → off)",
     );

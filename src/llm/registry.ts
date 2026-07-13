@@ -136,8 +136,7 @@ export class LLMRegistry {
     const missing =
       binding.requiredCapability && !model.capabilities.includes(binding.requiredCapability)
         ? binding.requiredCapability
-        : request.jsonSchema &&
-            !model.capabilities.some((c) => c === "structured-outputs" || c === "json")
+        : request.jsonSchema && !model.capabilities.some((c) => c === "structured-outputs" || c === "json")
           ? ("structured-outputs" as const)
           : undefined;
     if (!missing) return;

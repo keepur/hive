@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockLog, mockConfig, mockAnthropicGenerate, mockGeminiGenerate, anthropicCtor, geminiCtor } =
-  vi.hoisted(() => ({
+const { mockLog, mockConfig, mockAnthropicGenerate, mockGeminiGenerate, anthropicCtor, geminiCtor } = vi.hoisted(
+  () => ({
     mockLog: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     mockConfig: {
       anthropic: { apiKey: "ant-key" },
@@ -12,7 +12,8 @@ const { mockLog, mockConfig, mockAnthropicGenerate, mockGeminiGenerate, anthropi
     mockGeminiGenerate: vi.fn(),
     anthropicCtor: vi.fn(),
     geminiCtor: vi.fn(),
-  }));
+  }),
+);
 
 vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
 vi.mock("../config.js", () => ({ config: mockConfig }));
@@ -200,10 +201,7 @@ describe("estimateCostUsd (the memory gate's math — spec §3.4 triple)", () =>
 
   it("registry-level estimate uses the task's bound model pricing; pricing-less task ⇒ undefined", () => {
     const r = new LLMRegistry({ anthropicApiKey: "a", geminiApiKey: "g" });
-    expect(r.estimateCostUsd("memory", { prompt: "x".repeat(32_640), maxOutputTokens: 256 })).toBeCloseTo(
-      0.00944,
-      8,
-    );
+    expect(r.estimateCostUsd("memory", { prompt: "x".repeat(32_640), maxOutputTokens: 256 })).toBeCloseTo(0.00944, 8);
     expect(r.estimateCostUsd("vision", { prompt: "p", maxOutputTokens: 2048 })).toBeUndefined();
   });
 

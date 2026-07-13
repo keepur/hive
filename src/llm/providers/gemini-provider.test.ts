@@ -67,9 +67,7 @@ describe("GeminiProvider", () => {
 
   it("never leaks the API key into thrown errors", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("denied", { status: 403 })));
-    const err = (await new GeminiProvider("gem-secret")
-      .generate({ model: "m", prompt: "p" })
-      .catch((e) => e)) as Error;
+    const err = (await new GeminiProvider("gem-secret").generate({ model: "m", prompt: "p" }).catch((e) => e)) as Error;
     expect(err).toBeInstanceOf(Error);
     expect(err.message).not.toContain("gem-secret");
   });

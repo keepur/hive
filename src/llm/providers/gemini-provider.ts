@@ -45,9 +45,7 @@ export class GeminiProvider implements LLMProvider {
         headers: { "content-type": "application/json" },
         signal: withTimeout(request.timeoutMs),
         body: JSON.stringify({
-          ...(request.systemPrompt
-            ? { system_instruction: { parts: [{ text: request.systemPrompt }] } }
-            : {}),
+          ...(request.systemPrompt ? { system_instruction: { parts: [{ text: request.systemPrompt }] } } : {}),
           contents: [{ role: "user", parts }],
           generationConfig: {
             ...(request.maxOutputTokens ? { maxOutputTokens: request.maxOutputTokens } : {}),

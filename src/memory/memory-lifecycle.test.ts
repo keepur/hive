@@ -1126,15 +1126,13 @@ describe("MemoryLifecycle — sidecar LLM registry (KPR-314)", () => {
 
   it("the removed subscription-limit break: an error CONTAINING 'hit your limit' no longer aborts the run", async () => {
     const llm = makeMockLlm();
-    llm.generateForTask
-      .mockRejectedValueOnce(new Error("You've hit your limit for today"))
-      .mockResolvedValue({
-        text: "Summary text",
-        model: "claude-haiku-4-5-20251001",
-        provider: "anthropic",
-        durationMs: 1,
-        costUsd: 0,
-      });
+    llm.generateForTask.mockRejectedValueOnce(new Error("You've hit your limit for today")).mockResolvedValue({
+      text: "Summary text",
+      model: "claude-haiku-4-5-20251001",
+      provider: "anthropic",
+      durationMs: 1,
+      costUsd: 0,
+    });
     store.getAgentIds.mockResolvedValue(["agent-1", "agent-2"]);
     store.countAutoDreamCandidates.mockResolvedValue(99);
     store.getAutoDreamState.mockResolvedValue(null);

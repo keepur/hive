@@ -57,9 +57,7 @@ export class AnthropicProvider implements LLMProvider {
         {
           ...params,
           output_config: {
-            format: jsonSchemaOutputFormat(
-              request.jsonSchema as Parameters<typeof jsonSchemaOutputFormat>[0],
-            ),
+            format: jsonSchemaOutputFormat(request.jsonSchema as Parameters<typeof jsonSchemaOutputFormat>[0]),
           },
         },
         requestOptions,
@@ -71,12 +69,7 @@ export class AnthropicProvider implements LLMProvider {
     return this.toResult(request.model, response, undefined, started);
   }
 
-  private toResult(
-    model: string,
-    response: Anthropic.Message,
-    parsed: unknown,
-    started: number,
-  ): LLMResult {
+  private toResult(model: string, response: Anthropic.Message, parsed: unknown, started: number): LLMResult {
     const text = response.content
       .filter((block): block is Anthropic.TextBlock => block.type === "text")
       .map((block) => block.text)
