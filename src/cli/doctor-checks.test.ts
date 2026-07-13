@@ -9,6 +9,7 @@ import {
   requiredEnvVarsFromConfig,
   resolveServicePath,
   modelRouterModeLine,
+  llmSidecarLine,
 } from "./doctor-checks.js";
 
 // execFileSync and fetch are mocked per-test via vi.mock for subprocess checks.
@@ -671,6 +672,27 @@ describe("modelRouterModeLine (KPR-312)", () => {
     // allPassed (structural — the helper cannot return a failure signal).
     for (const mode of [true, false]) {
       expect(modelRouterModeLine(mode).length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("llmSidecarLine (KPR-314)", () => {
+  it("pins all four key permutations verbatim", () => {
+    expect(llmSidecarLine(true, true)).toBe("llm sidecar: anthropic ✓, gemini ✓");
+    expect(llmSidecarLine(false, true)).toBe(
+      "llm sidecar: anthropic ✗ (meeting classifier → all-roster, memory dream → skipped), gemini ✓",
+    );
+    expect(llmSidecarLine(true, false)).toBe("llm sidecar: anthropic ✓, gemini ✗ (image description → off)");
+    expect(llmSidecarLine(false, false)).toBe(
+      "llm sidecar: anthropic ✗ (meeting classifier → all-roster, memory dream → skipped), gemini ✗ (image description → off)",
+    );
+  });
+
+  it("is informational by construction — every mode yields a printable line, no failure channel", () => {
+    for (const a of [true, false]) {
+      for (const g of [true, false]) {
+        expect(llmSidecarLine(a, g).length).toBeGreaterThan(0);
+      }
     }
   });
 });

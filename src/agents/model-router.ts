@@ -1,7 +1,6 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { jsonSchemaOutputFormat } from "@anthropic-ai/sdk/helpers/json-schema";
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
+import { getLLMRegistry } from "../llm/registry.js";
 import type { AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 
 const log = createLogger("model-router");
@@ -50,16 +49,6 @@ const TIER_MODELS: Record<ModelTier, string> = {
   sonnet: "claude-sonnet-4-6",
   opus: "claude-opus-4-7",
 };
-
-/**
- * KPR-312: interim classifier pricing (claude-haiku-4-5), USD per million
- * tokens — the direct API returns token usage, not total_cost_usd, so
- * routerCostUsd is computed here. Cache fields are ignored: the router
- * prompt (~300 tok) is far below haiku's 4096-token cacheable minimum.
- * TODO(KPR-314): the W3.5 sidecar LLM registry owns model metadata/pricing.
- */
-const ROUTER_INPUT_USD_PER_MTOK = 1;
-const ROUTER_OUTPUT_USD_PER_MTOK = 5;
 
 /** KPR-312 §3.3: classifier input bound — bounds worst-case cost/latency. */
 const MAX_CLASSIFIER_INPUT = 4000;
@@ -136,8 +125,10 @@ Rules:
 - Short messages are NOT automatically haiku — "fire the sales team" is short but definitely opus.
 - Look at the TASK complexity, not the message length.`;
 
-/** Strict output schema — server-compiled once, 24h-cached (GA, no beta header). */
-const OUTPUT_FORMAT = jsonSchemaOutputFormat({
+/** Strict output schema — KPR-314: passed raw to the registry's anthropic
+ *  provider, which wraps it in the SDK's jsonSchemaOutputFormat (GA,
+ *  server-compiled + cached — 312's exact mechanism, one layer down). */
+const ROUTER_SCHEMA = {
   type: "object",
   properties: {
     tier: { type: "string", enum: ["haiku", "sonnet", "opus"] },
@@ -145,27 +136,18 @@ const OUTPUT_FORMAT = jsonSchemaOutputFormat({
   },
   required: ["tier", "effort"],
   additionalProperties: false,
-} as const);
+} as const;
 
-// ── Anthropic client (module-level, lazy, shared) ──────────────────────
-// KPR-312: one keep-alive client for all classifier calls — no per-turn
-// process/connection churn (the same motivation as KPR-122's in-process
-// MCPs). Null ⇔ no ANTHROPIC_API_KEY ⇔ heuristics-only mode.
-let client: Anthropic | null = null;
+// ── Transport (KPR-314) ────────────────────────────────────────────────
+// The classifier call rides the LLM registry's shared anthropic provider —
+// one keep-alive client across router + meeting classifier + memory sites.
+// No-key mode derives from hasProvider("anthropic") (identical truth
+// condition to 312's getClient() null check: key presence).
 let noKeyModeAnnounced = false;
 
-function getClient(): Anthropic | null {
-  if (!config.anthropic.apiKey) return null; // key checked every call — mode follows live config
-  return (client ??= new Anthropic({
-    apiKey: config.anthropic.apiKey,
-    timeout: config.modelRouter.timeoutMs, // ms — per-request wall clock (TS SDK unit)
-    maxRetries: 0, // fail fast into the sonnet fallback; retrying would stack timeouts
-  }));
-}
-
-/** Test-only seam (precedent: __resetRegistryForTests in archetypes/registry.ts). */
-export function __resetRouterClientForTests(): void {
-  client = null;
+/** Test-only seam (renamed from 312's __resetRouterClientForTests — the
+ *  router no longer holds a client; the registry has its own reset). */
+export function __resetRouterStateForTests(): void {
   noKeyModeAnnounced = false;
 }
 
@@ -244,8 +226,8 @@ export async function routeModel(
     return heuristicHaiku(resourceTierOverrides);
   }
 
-  const anthropic = getClient();
-  if (!anthropic) {
+  const registry = getLLMRegistry();
+  if (!registry.hasProvider("anthropic")) {
     // No-key mode (spec §3.3): keep the agent's default model with its default
     // tier's resource limits — conservative, never a wrong upshift. Announce
     // once per boot; `hive doctor` carries the standing line.
@@ -275,40 +257,41 @@ export async function routeModel(
   // empty text blocks, so classify a placeholder instead.
   const classifierInput = truncated.length > 0 ? truncated : "(attachment-only message, no text)";
 
-  const startedAt = Date.now();
   try {
-    const response = await anthropic.messages.parse({
-      model: config.modelRouter.model, // default claude-haiku-4-5-20251001
-      max_tokens: 100,
-      system: ROUTER_PROMPT_V2,
-      messages: [{ role: "user", content: classifierInput }],
-      output_config: { format: OUTPUT_FORMAT },
+    const result = await registry.generateForTask("routerClassifier", {
+      prompt: classifierInput,
+      systemPrompt: ROUTER_PROMPT_V2,
+      maxOutputTokens: 100,
+      jsonSchema: ROUTER_SCHEMA,
+      timeoutMs: config.modelRouter.timeoutMs, // per-request wall clock (was 312's client-level timeout)
     });
 
-    const parsed = response.parsed_output;
+    // KPR-312's fallback conditions, byte-preserved across the transport
+    // swap (LLMResult.stopReason exists for exactly this).
+    const parsed = result.parsed as { tier?: string; effort?: string } | undefined;
     if (
-      response.stop_reason === "refusal" ||
-      response.stop_reason === "max_tokens" ||
+      result.stopReason === "refusal" ||
+      result.stopReason === "max_tokens" ||
       !parsed ||
-      TIER_RANK[parsed.tier] === undefined
+      TIER_RANK[parsed.tier as ModelTier] === undefined
     ) {
       log.warn("Model router returned unusable output, defaulting to sonnet", {
-        stopReason: response.stop_reason,
+        stopReason: result.stopReason,
         hasParsedOutput: Boolean(parsed),
       });
       return sonnetFallback(ceilingTier, resourceTierOverrides);
     }
 
-    const requested = parsed.tier;
+    const requested = parsed.tier as ModelTier;
     const effort: ReasoningEffort | undefined =
       parsed.effort === "low" || parsed.effort === "medium" || parsed.effort === "high"
         ? parsed.effort
         : undefined;
-    const costUsd =
-      (response.usage.input_tokens * ROUTER_INPUT_USD_PER_MTOK +
-        response.usage.output_tokens * ROUTER_OUTPUT_USD_PER_MTOK) /
-      1_000_000;
-    const durationMs = Date.now() - startedAt;
+    // KPR-314: cost computed by the registry (usage × catalog pricing — the
+    // 312 TODO hand-off). Off-catalog MODEL_ROUTER_MODEL override ⇒ undefined
+    // ⇒ 0: cost telemetry degrades, routing doesn't (registry warns once).
+    const costUsd = result.costUsd ?? 0;
+    const durationMs = result.durationMs;
 
     // Cap at ceiling (kept from v1).
     let finalTier = requested;
@@ -317,8 +300,7 @@ export async function routeModel(
       log.debug("Model router capped by ceiling", { requested, ceiling: ceilingTier });
     }
 
-    // Log-redaction convention: no message text / input previews (v1's
-    // textPreview is deliberately dropped).
+    // Log-redaction convention: no message text / input previews.
     log.info("Model router decision", {
       tier: finalTier,
       requested,
@@ -335,9 +317,12 @@ export async function routeModel(
       durationMs,
       resourceLimits: resolveResourceLimits(finalTier, resourceTierOverrides),
       method: "model",
-      // §3.2 rule 2: drop effort when the FINAL (post-cap) tier is haiku —
-      // claude-haiku-4-5 rejects the effort param; emitting it would 400 the turn.
-      ...(finalTier === "haiku" || effort === undefined ? {} : { effort }),
+      // KPR-312 §3.2 rule 2, catalog-driven since KPR-314: drop effort when
+      // the FINAL (post-cap) model doesn't support the param (haiku today —
+      // same behavior, now data instead of a hardcoded tier check).
+      ...(effort === undefined || !registry.supportsEffort(TIER_MODELS[finalTier])
+        ? {}
+        : { effort }),
     };
   } catch (err) {
     // maxRetries: 0 — any timeout / 429 / 5xx / 404 (misconfigured
