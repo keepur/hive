@@ -650,10 +650,8 @@ describe("AgentManager", () => {
 
       await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
 
-      const [, , , , model, resourceLimits] = mockRunnerSend.mock.calls[0]!;
-      // Position 4 (model override) is undefined — no per-turn model switch.
-      expect(model).toBeUndefined();
-      // Position 5 (limits) = agent-s's STATIC sonnet tier, not the routed junk.
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      // Position 4 (limits) = agent-s's STATIC sonnet tier, not the routed junk.
       expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
     });
 
@@ -672,7 +670,7 @@ describe("AgentManager", () => {
 
       await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s-override" }));
 
-      const [, , , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
       expect(resourceLimits).toEqual({ timeoutMs: 300_000, maxTurns: 50, budgetUsd: 2 });
     });
 
@@ -682,8 +680,7 @@ describe("AgentManager", () => {
       await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
 
       expect(routeModel).not.toHaveBeenCalled();
-      const [, , , , model, resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
-      expect(model).toBeUndefined();
+      const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
       expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.haiku);
       expect(effort).toBeUndefined();
     });
@@ -703,7 +700,7 @@ describe("AgentManager", () => {
 
       expect(routeModel).not.toHaveBeenCalled();
       // Static limits still enforced (substring default tier = sonnet).
-      const [, , , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
       expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
       // Warn fired exactly once across two turns (warn-once per model id).
       const effortWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("effort hints disabled"));
@@ -721,7 +718,6 @@ describe("AgentManager", () => {
         undefined,
         undefined,
         expect.any(Object),
-        undefined,
         undefined,
         undefined,
         undefined,
@@ -2580,8 +2576,7 @@ describe("AgentManager", () => {
         await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
         expect(routeModel).toHaveBeenCalledTimes(1);
-        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
-        expect(modelOverride).toBeUndefined();
+        const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
         expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
       } finally {
         (appConfig as any).modelRouter.enabled = false;
@@ -2693,8 +2688,8 @@ describe("AgentManager", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      // Telemetry — fired with shaped prompt's modelOverride (undefined when
-      // router disabled) and the runner's session/token counts.
+      // Telemetry — fired with the shaped prompt and the runner's
+      // session/token counts.
       expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
       const telArg = turnTelemetryStore.record.mock.calls[0][0];
       expect(telArg.agentId).toBe("agent-a");
@@ -2752,7 +2747,7 @@ describe("AgentManager", () => {
         (appConfig as any).modelRouter.enabled = true;
         // KPR-338: the router no longer names a model — the turn runs the
         // agent's static model. Effort still travels BESIDE the route via
-        // SpawnShaping.effortOverride → runner.send position 7 (KPR-312).
+        // SpawnShaping.effortOverride → runner.send position 6 (KPR-312).
         vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "high" }));
 
         const item = makeWorkItem({ text: "route me", source: { kind: "sms", id: "line-1", label: "May" } });
@@ -2760,8 +2755,7 @@ describe("AgentManager", () => {
 
         expect(routeModel).toHaveBeenCalledTimes(1);
         expect(mockRunnerSend).toHaveBeenCalledTimes(1);
-        const [, , , , modelOverride, resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
-        expect(modelOverride).toBeUndefined();
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
         expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
         expect(effort).toBe("high");
       });
@@ -2776,8 +2770,7 @@ describe("AgentManager", () => {
         await manager.spawnTurn(makeCtx(item, "sms"));
 
         expect(routeModel).not.toHaveBeenCalled();
-        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
-        expect(modelOverride).toBeUndefined();
+        const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
         expect(resourceLimits).toBeUndefined();
       });
 
@@ -2836,9 +2829,9 @@ describe("AgentManager", () => {
         expect(mockOpenAIConstructor).not.toHaveBeenCalled();
         expect(mockCodexConstructor).not.toHaveBeenCalled();
         expect(mockGeminiConstructor).not.toHaveBeenCalled();
-        // send's model position (4) is undefined — no per-turn model switch.
-        const [, , , , modelOverride] = mockRunnerSend.mock.calls[0]!;
-        expect(modelOverride).toBeUndefined();
+        // KPR-338: send carries no per-turn model — arity pin proves no extra
+        // positional survives (the type system enforces the rest).
+        expect(mockRunnerSend.mock.calls[0]!.length).toBe(7);
         // Telemetry + audit both read the agent's STATIC model, not the route junk.
         expect(turnTelemetryStore.record).toHaveBeenCalledWith(
           expect.objectContaining({ model: "claude-sonnet-4-6" }),
@@ -2907,12 +2900,10 @@ describe("AgentManager", () => {
         expect(mockRunnerSend).toHaveBeenCalledTimes(2);
         // KPR-338: no per-turn model override on either attempt; identical
         // static limits + effort reused (shaping resolved once).
-        expect(mockRunnerSend.mock.calls[0]![4]).toBeUndefined();
-        expect(mockRunnerSend.mock.calls[1]![4]).toBeUndefined();
-        expect(mockRunnerSend.mock.calls[0]![5]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
-        expect(mockRunnerSend.mock.calls[1]![5]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
-        expect(mockRunnerSend.mock.calls[0]![7]).toBe("medium");
-        expect(mockRunnerSend.mock.calls[1]![7]).toBe("medium");
+        expect(mockRunnerSend.mock.calls[0]![4]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(mockRunnerSend.mock.calls[1]![4]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(mockRunnerSend.mock.calls[0]![6]).toBe("medium");
+        expect(mockRunnerSend.mock.calls[1]![6]).toBe("medium");
       });
 
       it("activity audit modelTier: STATIC tier on both router-on and router-off claude turns (KPR-338 D4)", async () => {
@@ -3009,7 +3000,7 @@ describe("AgentManager", () => {
           (appConfig as any).modelRouter.enabled = false;
           const off = makeWorkItem({ text: "plain", source: { kind: "sms", id: "line-1", label: "May" } });
           await manager.spawnTurn(makeCtx(off, "sms"));
-          expect(mockRunnerSend.mock.calls[0]![7]).toBeUndefined();
+          expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
 
           (appConfig as any).modelRouter.enabled = true;
           const sys = makeWorkItem({
@@ -3019,7 +3010,7 @@ describe("AgentManager", () => {
           });
           await manager.spawnTurn({ ...makeCtx(sys, "sms"), threadId: "sms:line-1:sys" });
           expect(routeModel).not.toHaveBeenCalled();
-          expect(mockRunnerSend.mock.calls[1]![7]).toBeUndefined();
+          expect(mockRunnerSend.mock.calls[1]![6]).toBeUndefined();
         });
 
         it("voice path delivers no effort (carve-out — router never runs)", async () => {
@@ -3029,7 +3020,7 @@ describe("AgentManager", () => {
           const item = makeWorkItem({ text: "voice turn", source: { kind: "ws", id: "voice-1", label: "voice" } });
           await manager.spawnTurn({ ...makeCtx(item, "voice"), threadId: "voice:1" });
           expect(routeModel).not.toHaveBeenCalled();
-          expect(mockRunnerSend.mock.calls[0]![7]).toBeUndefined();
+          expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
         });
 
         it("delivers effort with no model override anywhere (KPR-338)", async () => {
@@ -3041,8 +3032,7 @@ describe("AgentManager", () => {
           const item = makeWorkItem({ text: "same model", source: { kind: "sms", id: "line-1", label: "May" } });
           await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
-          const [, , , , modelOverride, , , effort] = mockRunnerSend.mock.calls[0]!;
-          expect(modelOverride).toBeUndefined(); // KPR-338: never a per-turn model override
+          const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
           expect(effort).toBe("low"); // effort still delivered beside the static route
         });
 

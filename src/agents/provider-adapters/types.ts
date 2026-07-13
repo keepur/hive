@@ -33,14 +33,13 @@ export interface AgentProviderTurnRequest {
   sessionId?: string;
   onStream?: StreamCallback;
   workItemContext?: WorkItemContext;
-  modelOverride?: string;
   resourceLimits?: ResourceLimits;
   systemPromptOverride?: string;
   /**
    * KPR-312: per-turn reasoning effort from the model router's complexity
    * classifier — a parallel channel beside the route (the route carries no
    * effort). Claude adapter forwards it to runner.send → SDK Options.effort;
-   * pilots ignore it (same tested precedent as modelOverride/resourceLimits),
+   * pilots ignore it (same tested precedent as resourceLimits),
    * and under the KPR-311 pilot gate they never receive one.
    */
   effort?: ReasoningEffort;

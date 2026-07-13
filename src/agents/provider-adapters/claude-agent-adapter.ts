@@ -12,7 +12,6 @@ export class ClaudeAgentAdapter implements AgentProviderAdapter {
       request.sessionId,
       request.onStream,
       request.workItemContext,
-      request.modelOverride,
       request.resourceLimits,
       request.systemPromptOverride,
       request.effort,

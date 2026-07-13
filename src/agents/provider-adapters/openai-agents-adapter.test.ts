@@ -112,13 +112,12 @@ describe("OpenAIAgentsAdapter", () => {
     expect(result.llmMs).toBe(result.durationMs);
   });
 
-  it("uses systemPromptOverride and ignores modelOverride", async () => {
+  it("uses systemPromptOverride", async () => {
     runMock.mockResolvedValueOnce(makeSdkResult() as never);
 
     await makeAdapter().runTurn({
       prompt: "hello",
       systemPromptOverride: "voice prompt",
-      modelOverride: "claude-sonnet-4-6",
     });
 
     expect(AgentMock).toHaveBeenCalledWith({
