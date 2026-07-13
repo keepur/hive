@@ -51,6 +51,7 @@ import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
 import { MemoryLifecycleHeartbeat } from "./memory/memory-lifecycle-heartbeat.js";
+import { getLLMRegistry } from "./llm/registry.js";
 import { AdminApi } from "./admin/admin-api.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
@@ -306,6 +307,9 @@ async function main(): Promise<void> {
       coldRetentionDays: config.memory.coldRetentionDays,
       purgeRetentionDays: config.memory.purgeRetentionDays,
     },
+    // KPR-314: injected sidecar-LLM client — autoDream's runDreamQuery rides
+    // the registry's anthropic provider (no more per-call CLI subprocess).
+    getLLMRegistry(),
     config.autoDream,
     async () => new Set(registry!.listIds()),
   );
