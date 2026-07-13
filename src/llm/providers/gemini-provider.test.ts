@@ -39,7 +39,9 @@ describe("GeminiProvider", () => {
     });
     const [url, init] = fetchSpy.mock.calls[0]!;
     expect(url).toContain("/models/gemini-2.5-flash:generateContent");
-    expect(url).toContain("key=gem-key");
+    // Key must ride the header, never the query string (review r1 finding).
+    expect(url).not.toContain("gem-key");
+    expect(init.headers["x-goog-api-key"]).toBe("gem-key");
     expect(init.signal).toBeInstanceOf(AbortSignal);
     const body = JSON.parse(init.body);
     expect(body.contents[0].parts[0]).toEqual({ inline_data: { mime_type: "image/png", data: "AAAA" } });

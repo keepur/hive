@@ -38,23 +38,22 @@ export class GeminiProvider implements LLMProvider {
       });
     }
 
-    const response = await fetch(
-      `${BASE_URL}/models/${encodeURIComponent(request.model)}:generateContent?key=${encodeURIComponent(this.apiKey)}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        signal: withTimeout(request.timeoutMs),
-        body: JSON.stringify({
-          ...(request.systemPrompt ? { system_instruction: { parts: [{ text: request.systemPrompt }] } } : {}),
-          contents: [{ role: "user", parts }],
-          generationConfig: {
-            ...(request.maxOutputTokens ? { maxOutputTokens: request.maxOutputTokens } : {}),
-            ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
-            ...(request.jsonSchema ? { responseMimeType: "application/json" } : {}),
-          },
-        }),
-      },
-    );
+    const response = await fetch(`${BASE_URL}/models/${encodeURIComponent(request.model)}:generateContent`, {
+      method: "POST",
+      // Key rides the x-goog-api-key header, never the query string —
+      // URL-borne secrets can surface in intermediary access logs.
+      headers: { "content-type": "application/json", "x-goog-api-key": this.apiKey },
+      signal: withTimeout(request.timeoutMs),
+      body: JSON.stringify({
+        ...(request.systemPrompt ? { system_instruction: { parts: [{ text: request.systemPrompt }] } } : {}),
+        contents: [{ role: "user", parts }],
+        generationConfig: {
+          ...(request.maxOutputTokens ? { maxOutputTokens: request.maxOutputTokens } : {}),
+          ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
+          ...(request.jsonSchema ? { responseMimeType: "application/json" } : {}),
+        },
+      }),
+    });
 
     const body = await parseJsonResponse<GeminiResponse>(response, this.id);
     const candidate = body.candidates?.[0];
