@@ -33,6 +33,7 @@ import {
   spawnCoordinatorStatsForDoctor,
   memoryLifecycleStatsForDoctor,
   modelRouterModeLine,
+  llmSidecarLine,
 } from "./doctor-checks.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -715,6 +716,9 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // contributes to allPassed. ANTHROPIC_API_KEY resolves env→Keychain via
     // config.ts optional(); presence ⇔ LLM classification path.
     console.log(`\n${modelRouterModeLine(Boolean(config.anthropic.apiKey))}`);
+    // KPR-314: sidecar LLM registry presence — informational only, never
+    // touches allPassed. Both keys resolve env→Keychain via config optional().
+    console.log(`\n${llmSidecarLine(Boolean(config.anthropic.apiKey), Boolean(config.gemini.apiKey))}`);
   } else {
     console.log("\nDatastore identity");
     console.log("  ○ skipped: config not loaded");
@@ -730,6 +734,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     console.log("  ○ skipped: config not loaded");
     console.log("\nMemory lifecycle: skipped (config not loaded)");
     console.log("\nmodel router: skipped (config not loaded)");
+    console.log("\nllm sidecar: skipped (config not loaded)");
   }
 
   if (!allPassed) {
