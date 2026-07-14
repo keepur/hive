@@ -461,7 +461,7 @@ and extend the started log: `log.info("Voice adapter started", { port: this.port
 
 (Local variable names verified at `index.ts:706-707`: the registry local is `registry` — not `agentRegistry` — and `memoryManager`; keep whatever the delivery-time call site actually names them.)
 
-- [ ] **Step 6:** Tests. Add to `voice-adapter.test.ts` a `describe("E1 bridge auth (KPR-322)")` block implementing Testing-Contract E1 assertions 1–6 and 8 via the file's existing helpers — `makeRequest` (body builder), `MockServerResponse`, `makeAgentManager` (bearer header variants × body shapes: worker-shape `{ stream, messages, call: { id, metadata: { hive_agent_id } } }` with NO `assistant`; Vapi-shape with `assistant.metadata.hive_agent_id`; assertion 8 = valid token + Vapi-shape → 200 via the token path). Add to `voice-adapter.integration.test.ts` an over-the-wire case for assertion 7. **Harness extension (explicit):** today `makeAdapter(opts)` builds the setup and `startAdapter(setup)` returns a bare `Promise<number>` (the port) — extend `makeAdapter` opts with `serverSecret`/`bridgeToken` (threaded to the constructor args) and change `startAdapter` to return `{ server, port }`, updating its existing call sites in the file; extend `postChatCompletion` with an optional headers argument if it does not accept one today:
+- [ ] **Step 6:** Tests. Add to `voice-adapter.test.ts` a `describe("E1 bridge auth (KPR-322)")` block implementing Testing-Contract E1 assertions 1–6 and 8 via the file's existing helpers — `makeRequest` (body builder), `MockServerResponse`, `makeAgentManager` (bearer header variants × body shapes: worker-shape `{ stream, messages, call: { id, metadata: { hive_agent_id } } }` with NO `assistant`; Vapi-shape with `assistant.metadata.hive_agent_id`; assertion 8 = valid token + Vapi-shape → 200 via the token path). Add to `voice-adapter.integration.test.ts` an over-the-wire case for assertion 7. **Harness extension (explicit):** today `makeAdapter(opts)` builds the setup and `startAdapter(setup)` returns a bare `Promise<number>` (the port) — extend `makeAdapter` opts with `serverSecret`/`bridgeToken` (threaded to the constructor args) and change `startAdapter` to return `{ server, port }`, updating its existing call sites in the file; extend `postChatCompletion` from today's `(port, body)` shape to `(port, { headers?, body })`, still returning `{ status, ... }` — the snippets below assume this extended call shape and read `res.status`:
 
 ```typescript
   it("binds loopback by default and accepts bridge-token requests without VAPI secret (KPR-322 E1)", async () => {
@@ -476,7 +476,7 @@ and extend the started log: `log.info("Voice adapter started", { port: this.port
         call: { id: "call-abc", metadata: { hive_agent_id: "test-agent" } },
       },
     });
-    expect(res.statusCode).toBe(200); // spawn ran via the mock AgentManager
+    expect(res.status).toBe(200); // spawn ran via the mock AgentManager
   });
 ```
 
@@ -674,7 +674,7 @@ describe("abortThread (KPR-322 E2)", () => {
     const abortThread = vi.fn();
     const { port } = await startAdapter(makeAdapter({ spawn: echoSpawn(), abortThread }));
     const res = await postChatCompletion(port, { body: workerShapedBody("call-ok") });
-    expect(res.statusCode).toBe(200);
+    expect(res.status).toBe(200);
     expect(abortThread).not.toHaveBeenCalled();
   });
 
@@ -703,7 +703,7 @@ describe("abortThread (KPR-322 E2)", () => {
   });
 ```
 
-(`startAdapterWithHangingSpawn`/`startAdapterWithHangingSessionStore`/`beginStreamingChat` are small helpers in the same file following its existing `makeAdapter`/`startAdapter`/`postChatCompletion` idiom — `startAdapter` returns `{ server, port }` after the Task 2 harness extension. The hanging-spawn stub invokes `onStream("first ")` then awaits a promise the `abortThread` mock (or, for the throw-safety case, the socket-destroy hook) resolves — this encodes "the abort is what unblocks the zombie". The hanging-session-store helper wires the mock AgentManager's `getSessionStore().get` to a gate promise exposing `{ reached, release, settled }`.)
+(`echoSpawn`/`startAdapterWithHangingSpawn`/`startAdapterWithHangingSessionStore`/`beginStreamingChat` are small helpers in the same file — `echoSpawn()` is a one-line spawn stub that invokes `onStream` once with a fixed line and resolves success; the others follow the file's existing `makeAdapter`/`startAdapter`/`postChatCompletion` idiom — `startAdapter` returns `{ server, port }` after the Task 2 harness extension. The hanging-spawn stub invokes `onStream("first ")` then awaits a promise the `abortThread` mock (or, for the throw-safety case, the socket-destroy hook) resolves — this encodes "the abort is what unblocks the zombie". The hanging-session-store helper wires the mock AgentManager's `getSessionStore().get` to a gate promise exposing `{ reached, release, settled }`.)
 
 - [ ] **Step 6:** Verify — `npx vitest run src/agents/agent-manager.test.ts src/channels/voice` all green (pre-existing suites untouched).
 - [ ] **Step 7:** **Negative-verify (CI-side):** run the Verification-Rules stash protocol; record the two failing outputs, then `git stash pop` and confirm green again.
@@ -2215,7 +2215,7 @@ Verify the forward answers again (Quo line rings), then repeat the assignment bl
 | 8 | Interruption-marker wording (delivery-tunable) + TTS markdown-normalization need (plugin-native handling may suffice) | Tasks 15/17 |
 | 9 | Twilio `voice_url` persistence across trunk assign/detach (rollback path) | Task 19 |
 | 10 | Stock TTS voice choice per persona (config'd at PoC; cloning out of scope) | Task 14 |
-| 11 | Engine config accessor names — instance id **RESOLVED**: `config.instance.id` (`config.ts:256`, review round 1); mongo `config.mongo.uri`/`config.mongo.dbName` confirmed at `config.ts:306` — re-check only if Task 0 finds config.ts reshaped | Tasks 5, 11 |
+| 11 | Engine config accessor names — instance id **RESOLVED**: `config.instance.id` (`config.ts:256`, review round 1); mongo `config.mongo.uri`/`config.mongo.dbName` confirmed at `config.ts:305-306` — re-check only if Task 0 finds config.ts reshaped | Tasks 5, 11 |
 
 ---
 
