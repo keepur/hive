@@ -101,7 +101,7 @@ Gates: **G1** = business-identity submission (prepared by B1, entered by A4), **
 | # | Step | Gate | Depends on |
 |---|---|---|---|
 | B1 | Prepare the Trust Hub **Business Profile** submission from A3 inputs — assemble the field set + document checklist; present at G1 for May to enter (A4) | **G1** (present) | A1–A3 |
-| B2 | Search voice-capable local numbers per §5.1 criteria; shortlist 2–3; present with monthly + per-minute cost | **G2** | A2 |
+| B2 | Search voice-capable local numbers per §5.1 criteria; shortlist 2–3; present with monthly + per-minute cost | **G2** | A2, A7 (Twilio API auth available — §9 mechanism) |
 | B3 | Purchase chosen number | (covered by G2) | B2 |
 | B4 | Create **SHAKEN/STIR trust product**; assign Business Profile + number; submit for vetting | — (no new identity/spend) | B1 approved, B3 |
 | B5 | Prepare the **CNAM trust product** submission — display name `{CNAM_DISPLAY_NAME}` (proposed: `DodiHome` — 8 chars, letters only, well under the 15-char limit; industry displays often uppercase to `DODIHOME`) plus fallback variants (§5.2); present at G3 for May to enter (A5) | **G3** (present) | B1 approved, B3 |
@@ -112,7 +112,7 @@ Gates: **G1** = business-identity submission (prepared by B1, entered by A4), **
 | B10 | Vendor announcement (§6.2): draft per-agent messages, review with May/ops, send from Nora + Sige's own identities | **G4** | B9 |
 | B11 | Record handoff artifacts for KPR-322 (§8) + close out verification checklist (§10) | — | B7–B10 |
 
-Steps B4/B5 parallelize after B1 (approved) + B3; B6 is off-critical-path and can run any time after B3; B7 needs A6 done first — the credential list must exist before the trunk shell can reference it.
+Steps B4/B5 parallelize after B1 (approved) + B3; B6 is off-critical-path and can run any time after B3; B7 needs A6 done first — the credential list must exist before the trunk shell can reference it. More generally, **every agent-driven Twilio API step (B2 onward) requires A6 + A7 complete** — B2's dependency cell carries this precondition and it cascades through B3/B4/B6 via their B-side dependencies.
 
 ### 5.1 Number selection criteria (B2)
 
@@ -185,6 +185,8 @@ Explicitly deferred to 322: origination URI creation, number→trunk assignment 
 
 Per the security posture: credentials live in macOS Keychain via Honeypot (`hive/<instanceId>/<KEY>`, instance = dodi), resolved as `secret-env` at MCP/worker spawn. **Never** in cloud-model-facing context, never in `.env` committed anywhere, never pasted into an agent session — the values are **created by May in Twilio's console (Track A6)** and **seeded into Honeypot by May (Track A7)**, in that order. Track B (B7) only ever references the credential list by SID when wiring the trunk shell — it never generates or sees the username/password.
 
+**Track B API auth mechanism** (this ticket ships no MCP/worker, so `secret-env`-at-spawn does not apply here): the ops session resolves the key **inside the subprocess invocation** — keychain lookup piped directly into the process environment or auth flag (the `curl -u "$SID:$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)" …` shape), so the secret flows shell → process env → TLS and is **never echoed, logged, or interpolated into the session transcript**. Same pattern as the established Honeypot API fallback; commands that would print the resolved value are prohibited. This is B2's `A7` precondition — no Track B Twilio API step can run before the keys are seeded.
+
 | Key (Honeypot, `hive/dodi/<KEY>`) | What |
 |---|---|
 | `TWILIO_ACCOUNT_SID` | Account SID (low-sensitivity, kept with its siblings) — created A1, seeded A7 |
@@ -226,7 +228,7 @@ Non-secret config (future `hive.yaml`, **reserved names for KPR-322 to wire** �
 **Teardown checklist (mid-chain abandonment, any point after A1):**
 
 - [ ] Release the purchased number, if any — or, if May chooses to keep it dormant deliberately, note the ~$1.15/mo carrying cost and that keeping it is her call
-- [ ] Delete the Elastic SIP trunk + credential list (if B7 ran)
+- [ ] Delete the Elastic SIP trunk (if B7 ran); delete the credential list (if A6 ran — it exists from A6 whether or not B7 attached it)
 - [ ] Remove the Honeypot keys seeded in A7 (`hive credentials remove <KEY>` for each §9 key)
 - [ ] Downgrade or leave the Twilio account dormant — May's call at the point of abandonment, not automatic
 - [ ] **Only if abandonment happens after B10** (announcement already sent): send a vendor retraction/correction note, under the same identity-and-approval rules as the original announcement (§6.2 — Nora/Sige's own identity, G4-equivalent review before sending)
