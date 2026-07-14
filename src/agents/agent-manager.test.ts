@@ -3020,6 +3020,7 @@ describe("AgentManager", () => {
           const item = makeWorkItem({ text: "voice turn", source: { kind: "ws", id: "voice-1", label: "voice" } });
           await manager.spawnTurn({ ...makeCtx(item, "voice"), threadId: "voice:1" });
           expect(routeModel).not.toHaveBeenCalled();
+          expect(mockRunnerSend.mock.calls[0]![4]).toBeUndefined(); // resourceLimits pinned undefined
           expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
         });
 
@@ -3057,6 +3058,7 @@ describe("AgentManager", () => {
           expect(routeModel).not.toHaveBeenCalled();
           const req = mockCodexRunTurn.mock.calls[0]![0];
           expect(req.effort).toBeUndefined();
+          expect(req.resourceLimits).toBeUndefined();
         });
       });
     });
