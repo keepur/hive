@@ -50,13 +50,13 @@ TW_ACCT="$(security find-generic-password -s hive/dodi/TWILIO_ACCOUNT_SID -w)"
 
 | Placeholder | Source | First needed |
 |---|---|---|
-| `{LEGAL_ENTITY_NAME}`, `{EIN}`, `{BUSINESS_ADDRESS}`, `{AUTHORIZED_REP_NAME/EMAIL/TITLE}` | A3 (May) | B1 |
+| `{LEGAL_ENTITY_NAME}`, `{EIN}`, `{BUSINESS_ADDRESS}`, `{AUTHORIZED_REP_NAME/EMAIL/TITLE}` | A3 (May) — the rep **email** is retained contact info per the Task 3 carve-out; the rest are G1-prep-scoped identity fields | B1 (email again at T14) |
 | `{AREA_CODE}` | Delegated default: Quo ops line's area code; May confirms at G2 | B2 |
 | `{CNAM_DISPLAY_NAME}` | Proposed `DodiHome`; May's call at G3 | B5 |
 | `{INBOUND_FORWARD_TARGET}` | Delegated default: existing Quo ops line (E.164) | A6 card / B6 |
 | `{NEW_NUMBER}` / `{NEW_NUMBER_PN_SID}` | B3 output | B4 onward |
 | `{BP_SID}` | Business Profile SID (BU…), created A4, read via API Task 9 | B4, B5 |
-| `{TEAM_PHONE_*}` | Test-call observer numbers (May/Mike/Corey handsets + one landline/VoIP) | Task 13, B8, B9 |
+| `{TEAM_PHONE_*}` | Task 0 (observer numbers collected with availability + consent: one landline/VoIP + AT&T/Verizon/T-Mobile mobiles) | Task 13, B8, B9 |
 
 ### 0.5 Fixed constants (doc-verified 2026-07-13)
 
@@ -100,8 +100,8 @@ T1(A1)──T2(A2)──┬── T3(A3)──T5(B1 prep)──T6[G1]+A4──T7
 | T11 | G2 | **G2** | B2 | May's time |
 | T12 | B3 | (G2) | G2 yes | instant |
 | T13 | §5.1 taint test | — | B3 | minutes |
-| T14 | B4 | — | T7 approved + B3 | ≤72h vetting |
-| T15 | B5 | — | T7 approved + B3 | — |
+| T14 | B4 | — | T7 approved + T13 | ≤72h vetting |
+| T15 | B5 | — | T7 approved + T13 | — |
 | T16 | G3 + A5 | **G3** | B5 | May's time |
 | T17 | CNAM approval poll | — | A5 | ~2–5 business days (budget) |
 | T18 | B6 | — | B3 (+ A6 card's TwiML bin) | — |
@@ -122,6 +122,7 @@ Parallelism: T4/T5b/T8 run during T7's vetting wait. T14, T15/T16, T18, T9 all p
 - [ ] Confirm no Twilio keys already exist: run `hive credentials list` (dodi instance) — expect none of the five §9 keys set. If any are set, stop and ask May whether a previous attempt exists (possible partial state; see Appendix A inventory commands).
 - [ ] Open the ops-notes surface for this run (KPR-321 Linear comment thread at execution + agent memory). Create the empty §8 artifact table and the §10 close-out checklist copies there.
 - [ ] Confirm with May a rough availability window for the Track A cards (A1–A3 together take ~20–30 min; A4 ~10–15 min; A5/A6/A7 ~15 min) so gates don't stall on scheduling.
+- [ ] Collect `{TEAM_PHONE_*}` observer numbers for the test-call work — at least one **landline or VoIP** line plus AT&T / Verizon / T-Mobile mobiles (May/Mike/Corey/team handsets) — and confirm each owner's availability + consent to receive short test calls. Consumed at Task 13, B8 (T19), and B9 (T20).
 
 ### Task 1 — Card A1: Create the Twilio account (May)
 
@@ -150,7 +151,8 @@ Present this card to May verbatim (values pre-filled where possible):
 ### Task 3 — A3: Collect business-identity fields (May → lane, for B1 prep)
 
 - [ ] Ask May for the G1 prep inputs, as a fill-in list: `{LEGAL_ENTITY_NAME}` (exactly as on IRS/EIN records), `{EIN}`, `{BUSINESS_ADDRESS}` (registered business address), `{AUTHORIZED_REP_NAME/EMAIL/TITLE}` (rep should be May per spec).
-- [ ] **Handling rule:** these values are collected for checklist assembly only (B1). The lane never enters them into any external form (that's A4), never commits them to the repo, never puts them in Linear. Hold them in the session/private ops note for the duration of G1 prep only.
+- [ ] **Handling rule (identity fields):** `{LEGAL_ENTITY_NAME}`, `{EIN}`, `{BUSINESS_ADDRESS}`, and the rep's **name/title** are collected for checklist assembly only (B1). The lane never enters them into any external form or API call (that's A4 — per the spec §5 reconciliation, agents don't enter government/business identifiers into external systems), never commits them to the repo, never puts them in Linear. Hold them in the session/private ops note for the duration of G1 prep only.
+- [ ] **Carve-out (retained contact info):** `{AUTHORIZED_REP_EMAIL}` is designated **retained non-identity contact info** — it is a status-notification address, not a government/business identifier, so it sits outside the never-enter guardrail the spec's reconciliation protects. The lane keeps it for the life of the ticket and is permitted to send it as the `Email` param in T14's `POST /v1/TrustProducts`. It still never goes into the repo.
 - [ ] Confirm with May which area code the Quo ops line uses → provisional `{AREA_CODE}` (final confirmation happens at G2).
 - [ ] Confirm `{INBOUND_FORWARD_TARGET}` default = Quo ops line E.164 (delegated default per §11; May can override here or at the A6 card).
 
@@ -262,10 +264,10 @@ TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
 TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
 TW_ACCT="$(security find-generic-password -s hive/dodi/TWILIO_ACCOUNT_SID -w)"
 curl -sS -u "$TW_KEY:$TW_SEC" "https://api.twilio.com/2010-04-01/Accounts/$TW_ACCT.json" \
-  | jq '{sid, friendly_name, status, type}'
+  | jq '{friendly_name, status, type}'
 ```
 
-- Expected: `status: "active"`, `type: "Full"`.
+- Expected: `status: "active"`, `type: "Full"`. (jq deliberately omits `sid` — the Account SID stays out of agent-session transcripts, consistent with card A1.)
 - `type: "Trial"` → A2 incomplete; re-present card A2.
 - 401/20003 → A7 mis-seeded (wrong value or key name); re-present card A7 for the failing key.
 - [ ] Run the deliberate-failure drill (validates §0.3 interpretation; zero risk):
@@ -316,7 +318,18 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST "https://trunking.twilio.com/v1/Trunks/{TK
 ```
 
 - Expected: association echoes the CL sid + `trunk_sid`.
-- [ ] Per-step verify (V1): `GET https://trunking.twilio.com/v1/Trunks/{TK_SID}/CredentialLists` (same prelude + `-u`, pipe `| jq '.credential_lists[] | {sid, friendly_name}'`) — expect `{CL_SID}` present.
+- [ ] Per-step verify (V1) — trunk + attachment in one invocation:
+
+```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
+curl -sS -u "$TW_KEY:$TW_SEC" "https://trunking.twilio.com/v1/Trunks/{TK_SID}" \
+  | jq '{sid, domain_name}'
+curl -sS -u "$TW_KEY:$TW_SEC" "https://trunking.twilio.com/v1/Trunks/{TK_SID}/CredentialLists" \
+  | jq '.credential_lists[] | {sid, friendly_name}'
+```
+
+  - Expected: trunk `domain_name` as created; `{CL_SID}` present in the credential-lists output. (This block is also the T22/V3 re-read for the trunk artifacts.)
 - [ ] **DO-NOT list (KPR-322's surface — creating any of these here is scope breach):** do **not** create an origination URI; do **not** assign the phone number to the trunk (mutually exclusive with the B6 TwiML routing); do **not** enable secure trunking / TLS options.
 - [ ] Record in §8 artifact table: trunk SID, termination (domain) URI, `{CL_SID}`.
 
@@ -380,7 +393,18 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST "https://api.twilio.com/2010-04-01/Account
 
 - Expected: `sid` starting `PN` (record as `{NEW_NUMBER_PN_SID}`), `phone_number` = chosen E.164, `capabilities.voice: true`.
 - Failure: 400 `code 21422` (or "not available") → the number was taken between search and purchase; buy the next shortlist entry (covered by G2); if the whole shortlist is gone, re-run Task 10 and return to G2.
-- [ ] Per-step verify (V1): `GET https://api.twilio.com/2010-04-01/Accounts/$TW_ACCT/IncomingPhoneNumbers/{NEW_NUMBER_PN_SID}.json` (same prelude/auth, `| jq '{sid, phone_number, status, voice_url}'`) — expect the number owned, `voice_url` empty for now.
+- [ ] Per-step verify (V1):
+
+```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
+TW_ACCT="$(security find-generic-password -s hive/dodi/TWILIO_ACCOUNT_SID -w)"
+curl -sS -u "$TW_KEY:$TW_SEC" \
+  "https://api.twilio.com/2010-04-01/Accounts/$TW_ACCT/IncomingPhoneNumbers/{NEW_NUMBER_PN_SID}.json" \
+  | jq '{sid, phone_number, status, voice_url, voice_method}'
+```
+
+  - Expected: the number owned, `voice_url` empty for now (T18 sets it; this same block re-checks it there and at T22/V3).
 - [ ] Record `{NEW_NUMBER}` + `{NEW_NUMBER_PN_SID}` in §8 artifact table.
 
 ### Task 13 — §5.1 post-purchase spam-taint check (lane + human observers)
@@ -401,18 +425,30 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST "https://api.twilio.com/2010-04-01/Account
 - Expected: `sid` starting `CA`, `status: "queued"`; phone rings within seconds. Record each `CA` sid.
 - [ ] Ask each observer: what did the incoming-call screen show? **Pass:** number displays with no "Spam Likely" / "Scam Likely" / "Telemarketer" label. (Pre-SHAKEN/STIR it may show as plain unverified number — that's expected and fine at this stage.)
 - [ ] **If spam-labeled on any handset (recycled-number taint):** release and re-pick per §5.1 — do not remediate.
-  - Release: `curl -sS -u "$TW_KEY:$TW_SEC" -X DELETE "https://api.twilio.com/2010-04-01/Accounts/$TW_ACCT/IncomingPhoneNumbers/{NEW_NUMBER_PN_SID}.json"` (same prelude) — expect HTTP 204, no body (add `-w '%{http_code}\n'` to see it).
+  - Release:
+
+```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
+TW_ACCT="$(security find-generic-password -s hive/dodi/TWILIO_ACCOUNT_SID -w)"
+curl -sS -o /dev/null -w '%{http_code}\n' -u "$TW_KEY:$TW_SEC" -X DELETE \
+  "https://api.twilio.com/2010-04-01/Accounts/$TW_ACCT/IncomingPhoneNumbers/{NEW_NUMBER_PN_SID}.json"
+```
+
+  - Expected: `204` (no body).
   - ⚠ verify-at-execution: Twilio's number-release/refund window (spec §5.1 flags this as unverified) — check the console billing line or support docs at the moment of release; the monthly fee may not be refundable, which is a ≤$1.15 write-off, note it.
   - Replacement from the approved shortlist/budget → re-run Task 12/13 (no new gate). Outside shortlist/budget → fresh G2.
 - [ ] Tick §10 item "Number purchased; voice-capable; criteria §5.1 met; not spam-tainted (test calls)".
 
-### Task 14 — B4: SHAKEN/STIR trust product (lane; needs T7 approved + B3)
+### Task 14 — B4: SHAKEN/STIR trust product (lane; needs T7 approved + T13 passed — don't register trust products against a number the taint test may still release)
 
-Doc-verified sequence (2026-07-13). All commands use the standard prelude + `-u "$TW_KEY:$TW_SEC"`; shown compressed here — each is still one self-contained invocation with the prelude.
+Doc-verified sequence (2026-07-13). Trust Hub URLs don't embed the Account SID, so these blocks resolve only the key pair — each block below is one self-contained invocation, paste-as-shown.
 
 - [ ] 1. Assign the number to the Business Profile:
 
 ```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
 curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
   "https://trusthub.twilio.com/v1/CustomerProfiles/{BP_SID}/ChannelEndpointAssignments" \
   --data-urlencode "ChannelEndpointType=phone-number" \
@@ -424,6 +460,8 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
 - [ ] 2. Create the SHAKEN/STIR trust product:
 
 ```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
 curl -sS -u "$TW_KEY:$TW_SEC" -X POST "https://trusthub.twilio.com/v1/TrustProducts" \
   --data-urlencode "FriendlyName=DodiHome SHAKEN-STIR (KPR-321)" \
   --data-urlencode "Email={AUTHORIZED_REP_EMAIL}" \
@@ -432,9 +470,12 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST "https://trusthub.twilio.com/v1/TrustProdu
 ```
 
   - Expected: `sid` starting `BU` (record `{SS_TP_SID}`), `status: "draft"`.
+  - `Email` = `{AUTHORIZED_REP_EMAIL}` — permitted for the lane to send: it is retained non-identity contact info under the Task 3 carve-out (a status-notification address, not a business identifier).
 - [ ] 3. Connect it to the Business Profile:
 
 ```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
 curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
   "https://trusthub.twilio.com/v1/TrustProducts/{SS_TP_SID}/EntityAssignments" \
   --data-urlencode "ObjectSid={BP_SID}" \
@@ -445,6 +486,8 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
 - [ ] 4. Assign the number to the trust product:
 
 ```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
 curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
   "https://trusthub.twilio.com/v1/TrustProducts/{SS_TP_SID}/ChannelEndpointAssignments" \
   --data-urlencode "ChannelEndpointType=phone-number" \
@@ -455,6 +498,8 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
 - [ ] 5. Pre-submission evaluation (catches assembly errors before the 72h clock starts):
 
 ```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
 curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
   "https://trusthub.twilio.com/v1/TrustProducts/{SS_TP_SID}/Evaluations" \
   --data-urlencode "PolicySid=RN7a97559effdf62d00f4298208492a5ea" \
@@ -465,15 +510,26 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
 - [ ] 6. Submit for vetting:
 
 ```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
 curl -sS -u "$TW_KEY:$TW_SEC" -X POST "https://trusthub.twilio.com/v1/TrustProducts/{SS_TP_SID}" \
   --data-urlencode "Status=pending-review" \
   | jq '{sid, status}'
 ```
 
   - Expected: `status: "pending-review"`. (No new gate — no identity entry, no spend; per spec B4 row.)
-- [ ] 7. Poll (cadence: 12h, budget ≤72h): `GET https://trusthub.twilio.com/v1/TrustProducts/{SS_TP_SID}` → `status: "twilio-approved"`. `twilio-rejected` → read failure details + notification email (May's mailbox), fix assignment/profile mismatch, resubmit once; a second rejection → Twilio support ticket via May.
+- [ ] 7. Poll (cadence: 12h, budget ≤72h):
 
-### Task 15 — B5: Prepare the CNAM submission (lane; needs T7 approved + B3)
+```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
+curl -sS -u "$TW_KEY:$TW_SEC" "https://trusthub.twilio.com/v1/TrustProducts/{SS_TP_SID}" \
+  | jq '{sid, status}'
+```
+
+  - Expected done: `status: "twilio-approved"`. `twilio-rejected` → read failure details + notification email (May's mailbox), fix assignment/profile mismatch, resubmit once; a second rejection → Twilio support ticket via May.
+
+### Task 15 — B5: Prepare the CNAM submission (lane; needs T7 approved + T13 passed)
 
 - [ ] Assemble the G3 pack:
   - Primary display name: `DodiHome` (8 chars, starts with letter, letters only — compliant with §0.5 rules; carriers often render uppercase `DODIHOME`).
@@ -538,9 +594,9 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST \
 ```
 
 - Expected: `voice_url` = the `https://handler.twilio.com/twiml/EH…` URL.
-- **Alternative (only if the TwiML bin wasn't created at A6 and May isn't reachable):** set `VoiceUrl=https://twimlets.com/forward?PhoneNumber=%2B1XXXXXXXXXX` with `VoiceMethod=GET`. ⚠ verify-at-execution: Twimlets is Twilio Labs (unsupported; no deprecation notice found as of 2026-07-13) — pre-check with an unauthenticated `curl -sS "https://twimlets.com/forward?PhoneNumber=%2B15555550100"` and confirm it returns `<Response><Dial>…` XML before pointing the live number at it. Prefer the bin; swap to it at the next May console session.
+- **Alternative (only if the TwiML bin wasn't created at A6 and May isn't reachable):** re-run the block above with the two params swapped to `--data-urlencode "VoiceUrl=https://twimlets.com/forward?PhoneNumber=%2B1XXXXXXXXXX"` and `--data-urlencode "VoiceMethod=GET"`. ⚠ verify-at-execution: Twimlets is Twilio Labs (unsupported; no deprecation notice found as of 2026-07-13) — pre-check with an unauthenticated `curl -sS "https://twimlets.com/forward?PhoneNumber=%2B15555550100"` and confirm it returns `<Response><Dial>…` XML before pointing the live number at it. Prefer the bin; swap to it at the next May console session.
 - [ ] **Live inbound verify (V2/§10):** call `{NEW_NUMBER}` from an outside phone → it must ring through to `{INBOUND_FORWARD_TARGET}` (Quo ops line), no dead air. Record who tested + result.
-- Failure: dead air / error tone → fetch the number (`GET …/IncomingPhoneNumbers/{PN}.json | jq '{voice_url, voice_method}'`) and re-check the bin URL; test the bin URL directly with `curl -sS -X POST {TWIML_BIN_URL}` — expect the `<Response><Dial>` XML back. Voicemail-only is the documented fallback if forwarding misbehaves persistently (§5.3) — that requires a May console edit of the bin content (new card, 2 min).
+- Failure: dead air / error tone → re-run the Task 12 per-step verify block and check `voice_url`/`voice_method` against the bin URL; test the bin URL directly with `curl -sS -X POST {TWIML_BIN_URL}` (unauthenticated) — expect the `<Response><Dial>` XML back. Voicemail-only is the documented fallback if forwarding misbehaves persistently (§5.3) — that requires a May console edit of the bin content (new card, 2 min).
 - [ ] Record the interim routing in ops notes (feeds the §8 "inbound path note" artifact and §3 interim-state map below).
 
 ### Task 19 — B8: Milestone — SHAKEN/STIR attestation A (lane + observer; needs T14 approved)
@@ -644,7 +700,7 @@ curl -sS -u "$TW_KEY:$TW_SEC" "https://lookups.twilio.com/v2/PhoneNumbers/{NEW_N
   - [ ] Vendor announcements sent (T21)
   - [ ] Fallback doc (§7) acknowledged by May — present her the one-paragraph summary: *Verified Caller ID can present the Quo number if KPR-325 pickup rates disappoint; caps at B attestation, voice-only, CNAM not ours to set via Twilio; flip decision is a May/ops check-in.* Record her ack.
 - [ ] Record the interim-state map (§3 below) status as the final state handed to KPR-322; note explicitly in the KPR-322-facing artifact note that **the TwiML forward stays live** — B11 does not remove it.
-- [ ] Purge any A3 identity values still sitting in lane-side notes (they were G1-prep-scoped; Twilio is now the system of record).
+- [ ] Purge any A3 **identity** values still sitting in lane-side notes — legal name, EIN, address, rep name/title (they were G1-prep-scoped; Twilio is now the system of record). **Exemption:** `{AUTHORIZED_REP_EMAIL}` is retained ops contact info under the Task 3 carve-out (it is live on the T14 trust product as the notification address), not an identity value — keep it with the ops notes.
 
 ---
 
@@ -737,8 +793,27 @@ curl -sS -o /dev/null -w '%{http_code}\n' -u "$TW_KEY:$TW_SEC" -X DELETE \
 ```
 
   Expected: `204`. Verify: the V1 number GET now returns 404.
-- [ ] **Delete the trunk** (lane, if B7 ran): `curl -sS -o /dev/null -w '%{http_code}\n' -u "$TW_KEY:$TW_SEC" -X DELETE "https://trunking.twilio.com/v1/Trunks/{TK_SID}"` (with prelude) → `204`.
-- [ ] **Delete the credential list** (lane, if A6 ran — it exists from A6 whether or not B7 attached it; delete the trunk first so no association remains): `curl -sS -o /dev/null -w '%{http_code}\n' -u "$TW_KEY:$TW_SEC" -X DELETE "https://api.twilio.com/2010-04-01/Accounts/$TW_ACCT/SIP/CredentialLists/{CL_SID}.json"` (with prelude) → `204`.
+- [ ] **Delete the trunk** (lane, if B7 ran):
+
+```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
+curl -sS -o /dev/null -w '%{http_code}\n' -u "$TW_KEY:$TW_SEC" -X DELETE \
+  "https://trunking.twilio.com/v1/Trunks/{TK_SID}"
+```
+
+  Expected: `204`.
+- [ ] **Delete the credential list** (lane, if A6 ran — it exists from A6 whether or not B7 attached it; delete the trunk first so no association remains):
+
+```bash
+TW_KEY="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SID -w)"
+TW_SEC="$(security find-generic-password -s hive/dodi/TWILIO_API_KEY_SECRET -w)"
+TW_ACCT="$(security find-generic-password -s hive/dodi/TWILIO_ACCOUNT_SID -w)"
+curl -sS -o /dev/null -w '%{http_code}\n' -u "$TW_KEY:$TW_SEC" -X DELETE \
+  "https://api.twilio.com/2010-04-01/Accounts/$TW_ACCT/SIP/CredentialLists/{CL_SID}.json"
+```
+
+  Expected: `204`.
 - [ ] **Remove Honeypot keys** (May, if A7 ran): `hive credentials remove <KEY>` for each of the five §9 keys; confirm with `hive credentials list`. (Do this **after** the lane's API deletions above — the lane needs auth to tear down.)
 - [ ] **Account disposition** (May): downgrade / leave dormant / close — explicitly her call at the point of abandonment, not automatic. Card offered, not pushed.
 - [ ] **Vendor retraction — ONLY if abandonment happens after B10** (announcement already sent): Nora + Sige send a correction note from their own identities, with a G4-equivalent May/ops review of the draft before sending (§6.2 rules apply unchanged).
