@@ -21,9 +21,9 @@
 ### Required Test Groups
 
 - Unit: **required**
-  - Scope: E1 auth semantics (`voice-adapter.test.ts`), E2 `abortThread` lock-release (`agent-manager.test.ts`), E3 config resolver (`config.test.ts`), E4 tool schema/dispatch payload, worker pure modules (`sse.ts`, `chat-ctx.ts`, `interruption-marker.ts`, `tts-normalize.ts`, `error-map.ts`, `cells.ts`), worker heartbeat (`voice-worker-heartbeat.test.ts`), doctor reader (`doctor-checks.test.ts`), setup-script planning logic (`livekit-setup.test.ts` — pure diff function, fake client).
+  - Scope: E1 auth semantics (`voice-adapter.test.ts`), E2 `abortThread` lock-release (`agent-manager.test.ts`), E3 config resolver (`config.test.ts`), E4 dispatch payload (`src/voice/livekit-dispatch.test.ts` — imports the pure module only, never the stdio server, whose top level env-gates via `process.exit` and connects a transport), worker pure modules (`sse.ts`, `chat-ctx.ts`, `interruption-marker.ts`, `tts-normalize.ts`, `error-map.ts`, `cells.ts`), worker telemetry + heartbeat (`telemetry.test.ts`), doctor reader (`doctor-checks.test.ts`), setup-script planning logic (`livekit-setup-plan.test.ts` — pure diff function, fake state).
   - Reason: E1/E2 are security- and correctness-load-bearing engine changes on a live shared endpoint (Vapi coexists); the bridge's SSE/error/marker logic is the worker's core contract and is fully testable without LiveKit media.
-  - Minimum assertions (E1 — all seven, exactly these):
+  - Minimum assertions (E1 — all eight, exactly these):
     1. Valid `Authorization: Bearer <HIVE_VOICE_BRIDGE_TOKEN>` + worker-shaped body (NO `assistant` object, `call.metadata.hive_agent_id` set) → 200, spawn runs.
     2. Non-matching bearer (`Bearer no-credentials-provided`) + Vapi-shaped body (`assistant` present) → **falls through** to the shape check and succeeds (Vapi default-header behavior unbroken).
     3. Neither token nor Vapi shape (no `assistant`, wrong/absent bearer) → 401 (the token is load-bearing for the worker path).
@@ -31,8 +31,9 @@
     5. Bridge token configured but body has no resolvable `call.metadata.hive_agent_id` → 400 (authenticated but malformed; distinct from 401).
     6. `bridgeToken === ""` (LiveKit disabled) → every Vapi request byte-identical to pre-E1 behavior (regression).
     7. Loopback bind: adapter listens on `bindHost` (integration: `server.address()` reports `127.0.0.1`; request over `127.0.0.1` succeeds).
-  - Minimum assertions (E2): `abortThread` aborts the ticket-holding spawn and the queued same-thread turn then proceeds (real `AgentManager`, hanging mocked runner); `abortThread` returns false when idle; adapter fires `abortThread(agentId, "voice:<callId>")` on premature socket close mid-stream; adapter does NOT fire it on normal completion; no response write after premature close (no throw, no `write after end`); outer retry suppressed when client is gone. **Negative-verify (CI-documented + P3-live):** see Verification Rules below.
-  - Minimum assertions (worker pure modules): SSE parser yields one chunk per `delta.content`, terminates on `data: [DONE]`, tolerates split frames across network chunks, zero-content stream → empty turn (no synthesis); full-transcript serialization (every turn, system dropped worker-side is NOT done — system never sent); interruption marker prefixes ONLY the next user message after an interrupted turn, ~15-word tail; error map covers every §8 row (spoken-notice 200 passthrough, budget-503 retry-once, auth-503/401 no-retry, 500 retry-once, ECONNREFUSED → `engine_unreachable`, mid-stream error → delivered-text-is-the-turn); cell resolver maps all four §14.1 cells + rejects unknown.
+    8. Valid bridge token + **Vapi-shaped** body (`assistant` present) → accepted via the token path (200); agent resolution still proceeds through the existing three-priority chain — completes the inverse-direction matrix (token × shape, all four quadrants covered).
+  - Minimum assertions (E2): `abortThread` aborts the ticket-holding spawn and the queued same-thread turn then proceeds (real `AgentManager`, hanging mocked runner); `abortThread` returns false when idle; adapter fires `abortThread(agentId, "voice:<callId>")` on premature socket close mid-stream; adapter does NOT fire it on normal completion; no response write after premature close (no throw, no `write after end`); outer retry suppressed when client is gone; **disconnect-before-spawn** — a disconnect during the pre-spawn awaits (`buildVoiceSystemPrompt` / `sessionStore.get`) means the spawn is never dispatched (the `close` listener is registered before the first await, and `clientGone` is seeded from `res.destroyed` for sockets already closed at registration — Node does not replay `close` for late listeners); **throw-safety** — a throwing `ticket.abort()` neither escapes `abortThread` nor the adapter's `close` listener (a synchronous throw in an HTTP event listener is an uncaughtException; `index.ts:878` registers only `unhandledRejection`). **Negative-verify (CI-documented + P3-live):** see Verification Rules below.
+  - Minimum assertions (worker pure modules): SSE parser yields one chunk per `delta.content`, terminates on `data: [DONE]`, tolerates split frames across network chunks, zero-content stream → empty turn (no synthesis); full-transcript serialization (every turn, system dropped worker-side is NOT done — system never sent); interruption marker prefixes ONLY the next user message after an interrupted turn, ~15-word tail; error map covers every §8 row (spoken-notice 200 passthrough, budget-503 retry-once, auth-503/401 no-retry, 500 retry-once, ECONNREFUSED → `engine_unreachable`, mid-stream error → delivered-text-is-the-turn); cell resolver maps all four §14.1 cells + rejects unknown; `resolveFailureAction` yields exactly ONE spoken line per terminal outcome for every failure class × retry state (its return type makes double-speak unrepresentable).
 
 - Integration: **required**
   - Scope: `voice-adapter.integration.test.ts` (real HTTP server, port 0, real client sockets) for E1 auth matrix over the wire, loopback bind, and E2 socket-destroy; `hive-llm` bridge against a stub SSE engine server (real HTTP, canned SSE frames, abort observation).
@@ -205,15 +206,16 @@ export function resolveVoiceLivekitConfig(raw: unknown): VoiceLivekitConfig {
 
 /**
  * KPR-322: env-first / Honeypot-second secret resolution for out-of-engine
- * processes (the voice worker reuses the engine loader; this is the same
- * `optional()` semantics exposed for worker-side vendor keys).
+ * processes (the voice worker reuses the engine loader). Delegates to the
+ * loader's own `optional()` so the semantics can never drift from the
+ * engine's resolution order.
  */
 export function resolveSecretEnv(key: string): string {
-  return process.env[key] || fromKeychain(key) || "";
+  return optional(key, "");
 }
 ```
 
-(`fromKeychain` is the existing module-level closure at `config.ts:210`.)
+(`optional()` is the loader's existing env→Keychain→fallback helper at `config.ts:22-24`; do not re-implement its body.)
 
 - [ ] **Step 2:** Extend the `voice` block (at `config.ts:408-417`) and add `telephony` beside it:
 
@@ -446,7 +448,7 @@ and extend the started log: `log.info("Voice adapter started", { port: this.port
       config.voice.port,
       config.voice.serverSecret,
       config.voice.bridgeToken,
-      agentRegistry,
+      registry,
       memoryManager,
       agentManager,
       dispatcher, // KPR-223
@@ -457,16 +459,16 @@ and extend the started log: `log.info("Voice adapter started", { port: this.port
   }
 ```
 
-(Match the existing local variable names at the call site — `agentRegistry`/`memoryManager` per `index.ts:703-709`.)
+(Local variable names verified at `index.ts:706-707`: the registry local is `registry` — not `agentRegistry` — and `memoryManager`; keep whatever the delivery-time call site actually names them.)
 
-- [ ] **Step 6:** Tests. Add to `voice-adapter.test.ts` a `describe("E1 bridge auth (KPR-322)")` block implementing Testing-Contract E1 assertions 1–6 via the file's existing `makeReq`/mock-res helpers (bearer header variants × body shapes: worker-shape `{ stream, messages, call: { id, metadata: { hive_agent_id } } }` with NO `assistant`; Vapi-shape with `assistant.metadata.hive_agent_id`). Add to `voice-adapter.integration.test.ts` an over-the-wire case for assertion 7:
+- [ ] **Step 6:** Tests. Add to `voice-adapter.test.ts` a `describe("E1 bridge auth (KPR-322)")` block implementing Testing-Contract E1 assertions 1–6 and 8 via the file's existing helpers — `makeRequest` (body builder), `MockServerResponse`, `makeAgentManager` (bearer header variants × body shapes: worker-shape `{ stream, messages, call: { id, metadata: { hive_agent_id } } }` with NO `assistant`; Vapi-shape with `assistant.metadata.hive_agent_id`; assertion 8 = valid token + Vapi-shape → 200 via the token path). Add to `voice-adapter.integration.test.ts` an over-the-wire case for assertion 7. **Harness extension (explicit):** today `makeAdapter(opts)` builds the setup and `startAdapter(setup)` returns a bare `Promise<number>` (the port) — extend `makeAdapter` opts with `serverSecret`/`bridgeToken` (threaded to the constructor args) and change `startAdapter` to return `{ server, port }`, updating its existing call sites in the file; extend `postChatCompletion` with an optional headers argument if it does not accept one today:
 
 ```typescript
   it("binds loopback by default and accepts bridge-token requests without VAPI secret (KPR-322 E1)", async () => {
-    // makeAdapter extended: serverSecret "", bridgeToken "tok-1", bindHost default.
-    const { server, port } = await startAdapter({ serverSecret: "", bridgeToken: "tok-1" });
+    const setup = makeAdapter({ spawn: echoSpawn(), serverSecret: "", bridgeToken: "tok-1" });
+    const { server, port } = await startAdapter(setup);
     expect((server.address() as AddressInfo).address).toBe("127.0.0.1");
-    const res = await postChat(port, {
+    const res = await postChatCompletion(port, {
       headers: { authorization: "Bearer tok-1" },
       body: {
         stream: true,
@@ -509,8 +511,15 @@ Plus the negative twin: same request with `authorization: "Bearer wrong"` → 40
     let aborted = false;
     for (const ticket of tickets) {
       if (ticket.threadKey === threadKey) {
-        ticket.abort();
-        aborted = true;
+        try {
+          ticket.abort();
+          aborted = true;
+        } catch (err) {
+          // Throw-safety (review round 1 B2): one bad ticket must not skip
+          // the rest — and callers include an HTTP `close` listener where a
+          // synchronous throw would be an uncaughtException.
+          log.warn("ticket.abort() threw during abortThread", { agentId, threadId, error: String(err) });
+        }
       }
     }
     if (aborted) {
@@ -520,20 +529,30 @@ Plus the negative twin: same request with `authorization: "Bearer wrong"` → 40
   }
 ```
 
-- [ ] **Step 2:** Adapter wiring in `spawnTurnViaAgentManager`. Insert after `const onStream ...` / before `const ctx: TurnContext = {` (around `voice-adapter.ts:290`):
+- [ ] **Step 2:** Adapter wiring in `spawnTurnViaAgentManager`. Register the listener as the **first statements of the method body** — immediately after the synchronous locals (`agentManager`/`completionId`/`threadId` consts, `voice-adapter.ts:232-237`) and **before the first `await`** (`buildVoiceSystemPrompt` at `:243`, `sessionStore.get` at `:249`). Node does NOT replay `close` for late listeners: registering after those awaits (the earlier draft's `:290` placement) would leave `clientGone=false` for a disconnect during them and spawn into a dead socket with the lock held — the exact hazard E2 fixes. `res.destroyed` seeds the flag for a socket already closed before registration:
 
 ```typescript
     // KPR-322 E2: abort the in-flight spawn when the client disconnects
     // pre-completion (LiveKit barge-in cancels the bridge's HTTP request;
-    // a Vapi hang-up benefits identically). `close` also fires after a
-    // normal `end()` — `writableEnded` distinguishes premature closes.
-    // All later response writes are suppressed via `clientGone`.
-    let clientGone = false;
+    // a Vapi hang-up benefits identically). Registered BEFORE any await —
+    // `close` is not replayed for late listeners, and the prompt-build /
+    // session-store lookups below are real suspension points. `close` also
+    // fires after a normal `end()` — `writableEnded` distinguishes premature
+    // closes. All later response writes are suppressed via `clientGone`.
+    let clientGone = res.destroyed === true;
     res.on("close", () => {
       if (res.writableEnded) return;
       clientGone = true;
-      const abortedInFlight = agentManager.abortThread(agentId, threadId);
-      log.info("Voice client disconnected mid-turn", { callId, agentId, abortedInFlight });
+      try {
+        const abortedInFlight = agentManager.abortThread(agentId, threadId);
+        log.info("Voice client disconnected mid-turn", { callId, agentId, abortedInFlight });
+      } catch (err) {
+        // Throw-safety (review round 1 B2): a synchronous throw in an HTTP
+        // event listener is an uncaughtException — index.ts registers only
+        // an unhandledRejection handler (:878) — and would crash the engine
+        // mid-Vapi-coexistence. Log and swallow; the socket is gone anyway.
+        log.error("abort-on-disconnect failed", { callId, agentId, error: String(err) });
+      }
     });
 ```
 
@@ -616,6 +635,19 @@ describe("abortThread (KPR-322 E2)", () => {
     release(makeRunResult());
     await inflight;
   });
+
+  it("is throw-safe: a throwing ticket.abort() never escapes abortThread (KPR-322 review B2)", async () => {
+    mockConversationIndex.mockResolvedValue(undefined);
+    let release!: (r: ReturnType<typeof makeRunResult>) => void;
+    mockRunnerSend.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+    mockRunnerAbort.mockImplementationOnce(() => { throw new Error("boom"); });
+    const inflight = manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+    await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(1));
+    expect(() => manager.abortThread("agent-a", "voice:call-1")).not.toThrow();
+    expect(mockRunnerAbort).toHaveBeenCalledTimes(1);
+    release(makeRunResult());
+    await inflight;
+  });
 });
 ```
 
@@ -640,14 +672,38 @@ describe("abortThread (KPR-322 E2)", () => {
 
   it("does not call abortThread on normal completion", async () => {
     const abortThread = vi.fn();
-    const { port } = await startAdapter({ abortThread });
-    const res = await postChat(port, workerShapedBody("call-ok"));
+    const { port } = await startAdapter(makeAdapter({ spawn: echoSpawn(), abortThread }));
+    const res = await postChatCompletion(port, { body: workerShapedBody("call-ok") });
     expect(res.statusCode).toBe(200);
     expect(abortThread).not.toHaveBeenCalled();
   });
+
+  it("never dispatches the spawn when the client disconnects during the pre-spawn awaits (KPR-322 review B1)", async () => {
+    // sessionStore.get hangs behind a gate — emulates the real suspension
+    // points at voice-adapter.ts:243/:249. The close listener is registered
+    // BEFORE them, so the disconnect must be observed and the spawn skipped.
+    const spawn = vi.fn();
+    const { port, sessionGate } = await startAdapterWithHangingSessionStore({ spawn });
+    const req = beginStreamingChat(port, workerShapedBody("call-pre"));
+    await sessionGate.reached; // adapter is suspended pre-spawn
+    req.destroySocket();       // disconnect while awaiting session-store
+    sessionGate.release();
+    await sessionGate.settled; // handler returned
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("close listener is throw-safe when abortThread throws (KPR-322 review B2)", async () => {
+    const abortThread = vi.fn(() => { throw new Error("boom"); });
+    const { port, spawnFinished } = await startAdapterWithHangingSpawn({ abortThread, resolveSpawnOnDestroy: true });
+    const req = beginStreamingChat(port, workerShapedBody("call-throw"));
+    await req.firstChunk();
+    req.destroySocket();
+    await spawnFinished; // adapter returned cleanly; no uncaughtException, test process alive
+    expect(abortThread).toHaveBeenCalled();
+  });
 ```
 
-(`startAdapterWithHangingSpawn`/`beginStreamingChat` are small helpers in the same file following its existing `makeAdapter`/request-builder idiom: the spawn stub invokes `onStream("first ")` then awaits a promise the `abortThread` mock resolves — this encodes "the abort is what unblocks the zombie".)
+(`startAdapterWithHangingSpawn`/`startAdapterWithHangingSessionStore`/`beginStreamingChat` are small helpers in the same file following its existing `makeAdapter`/`startAdapter`/`postChatCompletion` idiom — `startAdapter` returns `{ server, port }` after the Task 2 harness extension. The hanging-spawn stub invokes `onStream("first ")` then awaits a promise the `abortThread` mock (or, for the throw-safety case, the socket-destroy hook) resolves — this encodes "the abort is what unblocks the zombie". The hanging-session-store helper wires the mock AgentManager's `getSessionStore().get` to a gate promise exposing `{ reached, release, settled }`.)
 
 - [ ] **Step 6:** Verify — `npx vitest run src/agents/agent-manager.test.ts src/channels/voice` all green (pre-existing suites untouched).
 - [ ] **Step 7:** **Negative-verify (CI-side):** run the Verification-Rules stash protocol; record the two failing outputs, then `git stash pop` and confirm green again.
@@ -658,12 +714,50 @@ describe("abortThread (KPR-322 E2)", () => {
 > Severable per spec §12: delivery may move this whole task to KPR-325 without touching any other task. If severed, skip and note in lane notes.
 
 **Files:**
+- Create: `src/voice/livekit-dispatch.ts` (pure payload builder — testable without the stdio server)
 - Create: `src/voice/livekit-voice-mcp-server.ts`
 - Modify: `src/agents/agent-runner.ts` (registration beside the Vapi block `:552-570`; min-js map `:245`)
 - Modify: `build/bundle.ts` (entry map, beside `:91`)
-- Test: `src/voice/livekit-voice-mcp-server.test.ts` (payload-builder unit test)
+- Test: `src/voice/livekit-dispatch.test.ts` (imports the pure module only)
 
-- [ ] **Step 1:** Server (stdio, tier-2 vendor pattern; exact same `to`/`goal`/`context` schema as `voice-mcp-server.ts:53-64`):
+- [ ] **Step 1:** Pure module `src/voice/livekit-dispatch.ts` (mirrors the Task 11 `livekit-setup-plan.ts` pattern — the stdio server's top level `process.exit`s on missing env and connects a transport, so tests must never import it):
+
+```typescript
+/**
+ * Pure dispatch-payload builder for the LiveKit voice_call tool (KPR-322 E4).
+ * Kept import-light (node:crypto only) and free of env reads / side effects
+ * so unit tests can import it without tripping the stdio server's env gate.
+ */
+import { randomUUID } from "node:crypto";
+
+export interface DispatchArgs {
+  roomName: string;
+  agentName: string;
+  metadata: string;
+}
+
+export function buildDispatchArgs(input: {
+  to: string;
+  goal: string;
+  context?: string;
+  agentId: string;
+  agentName: string;
+}): DispatchArgs {
+  return {
+    roomName: `call-${randomUUID()}`,
+    agentName: "hive-voice",
+    metadata: JSON.stringify({
+      hive_agent_id: input.agentId,
+      agent_name: input.agentName,
+      to: input.to,
+      goal: input.goal,
+      context: input.context ?? "",
+    }),
+  };
+}
+```
+
+- [ ] **Step 2:** Server (stdio, tier-2 vendor pattern; exact same `to`/`goal`/`context` schema as `voice-mcp-server.ts:53-64`):
 
 ```typescript
 #!/usr/bin/env node
@@ -679,9 +773,9 @@ describe("abortThread (KPR-322 E2)", () => {
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { AgentDispatchClient } from "livekit-server-sdk";
+import { buildDispatchArgs } from "./livekit-dispatch.js";
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL ?? "";
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY ?? "";
@@ -692,25 +786,6 @@ const AGENT_NAME = process.env.AGENT_NAME ?? "";
 if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
   process.stderr.write("livekit-voice-mcp-server: LIVEKIT_URL/API_KEY/API_SECRET are required\n");
   process.exit(1);
-}
-
-/** Exported for unit tests — pure dispatch-payload builder. */
-export function buildDispatchArgs(input: { to: string; goal: string; context?: string }): {
-  roomName: string;
-  agentName: string;
-  metadata: string;
-} {
-  return {
-    roomName: `call-${randomUUID()}`,
-    agentName: "hive-voice",
-    metadata: JSON.stringify({
-      hive_agent_id: AGENT_ID,
-      agent_name: AGENT_NAME,
-      to: input.to,
-      goal: input.goal,
-      context: input.context ?? "",
-    }),
-  };
 }
 
 const server = new McpServer({ name: "voice-livekit", version: "1.0.0" });
@@ -729,7 +804,7 @@ server.tool(
   },
   async ({ to, goal, context }) => {
     try {
-      const args = buildDispatchArgs({ to, goal, context });
+      const args = buildDispatchArgs({ to, goal, context, agentId: AGENT_ID, agentName: AGENT_NAME });
       const client = new AgentDispatchClient(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
       const dispatch = await client.createDispatch(args.roomName, args.agentName, { metadata: args.metadata });
       return {
@@ -762,7 +837,7 @@ await server.connect(transport);
 
 (Match the file tail — `server.connect` idiom — to `voice-mcp-server.ts`'s exact bottom lines.)
 
-- [ ] **Step 2:** Registration in `agent-runner.ts`, directly after the Vapi voice block (`:552-570`):
+- [ ] **Step 3:** Registration in `agent-runner.ts`, directly after the Vapi voice block (`:552-570`):
 
 ```typescript
     // LiveKit voice MCP server (KPR-322 E4) — outbound calls via the
@@ -786,9 +861,9 @@ await server.connect(transport);
 
 Add to the min-js path map (`agent-runner.ts:245`): `"voice/livekit-voice-mcp-server.js": "voice-livekit.min.js",` and to `build/bundle.ts` beside `:91`: `"mcp/voice-livekit": "dist/voice/livekit-voice-mcp-server.js",` (confirm the entry-key ↔ min-js naming convention against the existing `mcp/voice` pair and keep it consistent).
 
-- [ ] **Step 3:** Unit test `src/voice/livekit-voice-mcp-server.test.ts`: `buildDispatchArgs` returns `call-`-prefixed room, `agentName: "hive-voice"`, metadata JSON round-trips `{hive_agent_id, to, goal, context}` and defaults `context` to `""`. (No live client call — constructor-only import risk is covered by the Task 5 dep smoke test.)
-- [ ] **Step 4:** Verify — `npx vitest run src/voice` green; `npm run check:bundle` green (proves engine bundle + stdio bundle gates absorb the new entry).
-- [ ] **Step 5:** Commit — `git commit -m "feat(kpr-322): E4 voice_call LiveKit dispatch MCP tool (severable)"`
+- [ ] **Step 4:** Unit test `src/voice/livekit-dispatch.test.ts` — imports ONLY the pure module (importing the server would `process.exit(1)` on the missing env and top-level-await a transport connect): `buildDispatchArgs` returns `call-`-prefixed room, `agentName: "hive-voice"`, metadata JSON round-trips `{hive_agent_id, agent_name, to, goal, context}` from the input fields, and defaults `context` to `""`. (No live client call — dep import risk is covered by the Task 5 smoke test.)
+- [ ] **Step 5:** Verify — `npx vitest run src/voice` green; `npm run check:bundle` green (proves engine bundle + stdio bundle gates absorb the new entry).
+- [ ] **Step 6:** Commit — `git commit -m "feat(kpr-322): E4 voice_call LiveKit dispatch MCP tool (severable)"`
 
 ### Task 5 — Worker: dependencies, config, skeleton
 
@@ -1140,9 +1215,31 @@ export function classifyHttpFailure(status: number, bodySnippet: string): Bridge
   }
   return "spawn_failed";
 }
+
+/**
+ * KPR-322 review-round-1 B5: single-action failure decision. The session's
+ * error handler executes EXACTLY the returned action — at most ONE spoken
+ * line per outcome; the return type makes a double-speak path
+ * unrepresentable. Pure; exported for unit tests.
+ */
+export type FailureAction =
+  | { kind: "retry"; sayFirst: "hold_on" | null; delayMs: number }
+  | { kind: "continue" } // midstream_error: delivered text was already spoken; the call goes on
+  | { kind: "end"; say: "apologize_end" | "canned_engine_down" };
+
+export function resolveFailureAction(cls: BridgeFailureClass, retryAlreadyConsumed: boolean): FailureAction {
+  const b = FAILURE_BEHAVIOR[cls];
+  if (b.retryOnce && !retryAlreadyConsumed) {
+    return { kind: "retry", sayFirst: b.speak === "hold_on" ? "hold_on" : null, delayMs: b.retryDelayMs };
+  }
+  if (!b.endCall && !b.retryOnce) return { kind: "continue" };
+  // Terminal: exhausted retry (budget_saturated / spawn_failed) or hard-end
+  // rows (engine_auth / bridge_auth / engine_unreachable).
+  return { kind: "end", say: b.speak === "canned_engine_down" ? "canned_engine_down" : "apologize_end" };
+}
 ```
 
-Escalation composition (documented behavior, asserted in Task 7 tests): `budget_saturated` retry that fails again → speak `apologize_end`, end call; `spawn_failed` retry that fails again → same. Circuit-open is NOT here — the engine speaks it as a normal 200 completion (§8 row 1; zero worker code).
+Escalation composition is enforced by `resolveFailureAction`: `budget_saturated`/`spawn_failed` retry that fails again → one `apologize_end`, end call; `engine_unreachable` → one `canned_engine_down`, end call — never two lines for one outcome. Circuit-open is NOT here — the engine speaks it as a normal 200 completion (§8 row 1; zero worker code).
 
 - [ ] **Step 6:** `src/voice-worker/hive-llm.ts` — the bridge class (⚠ Task-0 pin banner as in Task 5; base-class method names adjusted mechanically):
 
@@ -1343,7 +1440,7 @@ import type { JobContext } from "@livekit/agents";
 import { createLogger } from "../logging/logger.js";
 import { HiveLLM } from "./hive-llm.js";
 import { BridgeError } from "./hive-llm.js";
-import { FAILURE_BEHAVIOR, FALLBACK_LINES } from "./error-map.js";
+import { FAILURE_BEHAVIOR, FALLBACK_LINES, resolveFailureAction } from "./error-map.js";
 import { normalizeForTTS } from "./tts-normalize.js";
 import type { VendorCell } from "./cells.js";
 import type { WorkerConfig } from "./worker-config.js";
@@ -1434,6 +1531,8 @@ export async function runCallSession(
   });
 
   // §8 rows: BridgeError surfaces from the LLM node via session error events.
+  // Review-round-1 B5: the handler executes exactly ONE resolveFailureAction
+  // outcome — at most one spoken line per terminal outcome, never two.
   session.on("error", async (err: unknown) => {
     const failure = err instanceof BridgeError ? err : null;
     if (!failure) {
@@ -1442,21 +1541,20 @@ export async function runCallSession(
     }
     const behavior = FAILURE_BEHAVIOR[failure.failureClass];
     stats.recordFailure(behavior.telemetryOutcome);
-    if (behavior.retryOnce && !stats.retryConsumed(failure.failureClass)) {
-      if (behavior.speak === "hold_on") await session.say(FALLBACK_LINES.hold_on);
-      await new Promise((r) => setTimeout(r, behavior.retryDelayMs));
+    // Consume the one-retry budget only for retryable classes.
+    const retrySpent = behavior.retryOnce ? stats.retryConsumed(failure.failureClass) : true;
+    const action = resolveFailureAction(failure.failureClass, retrySpent);
+    if (action.kind === "retry") {
+      if (action.sayFirst) await session.say(FALLBACK_LINES[action.sayFirst]).catch(() => {});
+      await new Promise((r) => setTimeout(r, action.delayMs));
       session.generateReply(); // re-fire the turn once
       return;
     }
-    if (behavior.speak !== "none") {
-      const line = behavior.speak === "canned_engine_down" ? FALLBACK_LINES.canned_engine_down : FALLBACK_LINES.apologize_end;
-      await session.say(line);
-    }
-    if (behavior.endCall || behavior.retryOnce /* second failure */) {
-      await session.say(FALLBACK_LINES.apologize_end).catch(() => {});
-      await stats.flush("failed");
-      ctx.shutdown();
-    }
+    if (action.kind === "continue") return; // midstream: delivered text was spoken; call continues
+    // Terminal: speak exactly ONE line, then end the call.
+    await session.say(FALLBACK_LINES[action.say]).catch(() => {});
+    await stats.flush("failed");
+    ctx.shutdown();
   });
 
   const agent = new voice.Agent({
@@ -1492,7 +1590,7 @@ async function inboundCalledNumber(ctx: JobContext): Promise<string | undefined>
 }
 ```
 
-- [ ] **Step 2:** `session.test.ts` — pure parts only (no LiveKit session construction): `resolveInboundAgent` (mapped number → agentId + generic vendor-callback goal/context; unmapped/undefined → null); failure-behavior composition table asserts every `BridgeFailureClass` maps to defined behavior and that `budget_saturated` is the only `hold_on`+retry row (mirrors §8 exactly).
+- [ ] **Step 2:** `session.test.ts` — pure parts only (no LiveKit session construction): `resolveInboundAgent` (mapped number → agentId + generic vendor-callback goal/context; unmapped/undefined → null); `resolveFailureAction` truth table over every `BridgeFailureClass` × {retry-available, retry-consumed}: `budget_saturated`+available → `retry` with `sayFirst: "hold_on"`; `budget_saturated`+consumed → `end` with `apologize_end`; `spawn_failed`+available → `retry` with `sayFirst: null`; `spawn_failed`+consumed → `end` `apologize_end`; `engine_auth`/`bridge_auth` → `end` `apologize_end`; `engine_unreachable` → `end` `canned_engine_down`; `midstream_error` → `continue`. This is the CI-expressible form of "speaks exactly once per terminal outcome" (review round 1 B5) — the action type carries at most one line, so the double-speak bug class cannot compile. Belt-and-braces: P0's checklist (Task 14) also listens for a single closing line on any induced failure.
 - [ ] **Step 3:** Verify — `npx vitest run src/voice-worker` green; `npm run typecheck` green (this is where Task-0's pinned typings prove out mechanically).
 - [ ] **Step 4:** Commit — `git commit -m "feat(kpr-322): voice worker session orchestration + §8 failure behaviors"`
 
@@ -1876,7 +1974,7 @@ const dry = process.argv.includes("--dry");
 
 function honeypot(key: string): string {
   // argv-array subprocess (repo security rule) — value never echoed.
-  const instanceId = process.env.HIVE_INSTANCE_ID || config.instanceId || "hive";
+  const instanceId = process.env.HIVE_INSTANCE_ID || config.instance.id || "hive";
   try {
     return execFileSync("security", ["find-generic-password", "-s", `hive/${instanceId}/${key}`, "-w"], {
       encoding: "utf-8",
@@ -1963,7 +2061,7 @@ main().catch((err) => {
 });
 ```
 
-(⚠ Task-0 pin: `SipClient` method names/option shapes against the pinned `livekit-server-sdk`; adjust mechanically. `config.instanceId` accessor: use the engine config's actual instance-id field per `config.ts` — verify name at implementation.)
+(⚠ Task-0 pin: `SipClient` method names/option shapes against the pinned `livekit-server-sdk`; adjust mechanically. Instance-id accessor resolved at review round 1: `config.instance.id` — `config.ts:256`.)
 
 - [ ] **Step 3:** `livekit-setup-plan.test.ts`: empty state → create all three; full state (all three names present) → create none + existing IDs surfaced; partial state → only missing objects created. Assert the three name constants are distinct and stable.
 - [ ] **Step 4:** Verify — `npx vitest run src/voice-worker/livekit-setup-plan.test.ts` green; `npm run lint` green (script included via `eslint src/ setup/`? scripts/ is not linted today — keep the script's pure logic in `src/` (done) and hold the script itself to the same style manually).
@@ -2011,6 +2109,7 @@ curl -sS -u "$TW_KEY:$TW_SEC" -X POST "https://trunking.twilio.com/v1/Trunks/{TK
 - [ ] Bridge pre-smoke (no PSTN): `curl` the adapter from the box with the bridge token and a worker-shaped body → expect SSE deltas + `[DONE]`. (Token resolved in-invocation from Honeypot; command mirrors Task 13's prelude shape.)
 - [ ] P0 call: `lk dispatch create --agent-name hive-voice --metadata '{"hive_agent_id":"voice-pilot","to":"<operator phone>","goal":"Test call — greet, confirm two-way audio, say goodbye.","context":"P0 smoke"}'` (or E4 tool if Task 4 landed).
 - [ ] **Pass criteria (§15 P0):** call connects; hive-authored greeting heard; two-way audio; clean hangup. Record pass/fail + `voice_call_stats` doc snapshot in ops notes.
+- [ ] **Single-line failure check (review B5 belt-and-braces):** if any failure line is spoken during P0 attempts, confirm by ear it is exactly ONE closing line per outcome — never two stacked fallback lines (CI form: the `resolveFailureAction` truth table, Task 7 Step 2).
 - [ ] Fail → diagnose from worker logs + engine "Voice turn complete" telemetry; fixes re-enter the relevant task; re-request go only if vendor spend materially changes.
 
 ### Task 15 — [GATE: operator go, D3] P1 conversation feasibility
@@ -2116,7 +2215,7 @@ Verify the forward answers again (Quo line rings), then repeat the assignment bl
 | 8 | Interruption-marker wording (delivery-tunable) + TTS markdown-normalization need (plugin-native handling may suffice) | Tasks 15/17 |
 | 9 | Twilio `voice_url` persistence across trunk assign/detach (rollback path) | Task 19 |
 | 10 | Stock TTS voice choice per persona (config'd at PoC; cloning out of scope) | Task 14 |
-| 11 | `config.instanceId` / mongo accessor field names in the engine config object | Tasks 5, 11 |
+| 11 | Engine config accessor names — instance id **RESOLVED**: `config.instance.id` (`config.ts:256`, review round 1); mongo `config.mongo.uri`/`config.mongo.dbName` confirmed at `config.ts:306` — re-check only if Task 0 finds config.ts reshaped | Tasks 5, 11 |
 
 ---
 
