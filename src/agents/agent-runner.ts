@@ -1494,13 +1494,12 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: ReasoningEffort): Promise<RunResult> {
-    const effectiveModel = modelOverride ?? this.agentConfig.model;
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: ReasoningEffort): Promise<RunResult> {
+    const effectiveModel = this.agentConfig.model;
 
     log.info("Sending prompt to agent", {
       agent: this.agentConfig.id,
       model: effectiveModel,
-      modelOverride: modelOverride ? true : false,
       resumeSession: sessionId ?? "new",
       promptLength: prompt.length,
       streaming: !!onStream,

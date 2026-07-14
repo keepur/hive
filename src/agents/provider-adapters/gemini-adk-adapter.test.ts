@@ -127,14 +127,13 @@ describe("GeminiAdkAdapter", () => {
     expect(result.llmMs).toBe(result.durationMs);
   });
 
-  it("uses systemPromptOverride and ignores modelOverride", async () => {
+  it("uses systemPromptOverride", async () => {
     runEphemeralMock.mockReturnValueOnce(events({ finalText: "ok" }));
     isFinalResponseMock.mockReturnValue(true);
 
     await makeAdapter().runTurn({
       prompt: "hello",
       systemPromptOverride: "voice prompt",
-      modelOverride: "claude-sonnet-4-6",
     });
 
     expect(LlmAgentMock).toHaveBeenCalledWith({

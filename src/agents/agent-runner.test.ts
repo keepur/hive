@@ -1977,7 +1977,7 @@ describe("AgentRunner resource limits override (via send)", () => {
       memoryManager as any,
     );
 
-    await runner.send("test", undefined, undefined, undefined, undefined, {
+    await runner.send("test", undefined, undefined, undefined, {
       timeoutMs: 600_000,
       maxTurns: 200,
       budgetUsd: 50,
@@ -2012,7 +2012,7 @@ describe("AgentRunner effort option (KPR-312, via send)", () => {
 
   it("maps effort into query options and never sets thinking", async () => {
     const runner = makeRunner();
-    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, undefined, "low");
+    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, "low");
     const opts = getCapturedOptions();
     expect(opts.effort).toBe("low");
     expect("thinking" in opts).toBe(false);
@@ -2028,7 +2028,7 @@ describe("AgentRunner effort option (KPR-312, via send)", () => {
 
   it("drops values outside the SDK-deliverable subset (defensive)", async () => {
     const runner = makeRunner();
-    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, undefined, "xhigh" as never);
+    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, "xhigh" as never);
     expect("effort" in getCapturedOptions()).toBe(false);
   });
 });

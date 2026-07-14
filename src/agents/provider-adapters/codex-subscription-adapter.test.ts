@@ -104,7 +104,6 @@ describe("CodexSubscriptionAdapter", () => {
       const result = await adapter.runTurn({
         prompt: "say hello",
         sessionId: "resp-prev",
-        modelOverride: "gpt-5.4",
         systemPromptOverride: "voice prompt",
         onStream,
       });
@@ -147,22 +146,7 @@ describe("CodexSubscriptionAdapter", () => {
     }
   });
 
-  it("ignores Claude router modelOverride values", async () => {
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response(sse([{ event: "response.output_text.done", data: { text: "done" } }])));
-    const { adapter, cleanup } = makeAdapter({ model: "gpt-5.5" }, fetchMock);
-
-    try {
-      await adapter.runTurn({ prompt: "hello", modelOverride: "claude-sonnet-4-6" });
-
-      expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toMatchObject({
-        model: "gpt-5.5",
-      });
-    } finally {
-      cleanup();
-    }
-  });
+  // KPR-338 D3: modelOverride deleted from AgentProviderTurnRequest — nothing left to ignore
 
   it("sends reasoning effort when configured", async () => {
     const fetchMock = vi
