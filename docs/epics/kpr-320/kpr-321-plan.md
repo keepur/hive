@@ -40,7 +40,7 @@ TW_ACCT="$(security find-generic-password -s hive/dodi/TWILIO_ACCOUNT_SID -w)"
 
 | Symptom | Meaning | Action |
 |---|---|---|
-| HTTP 401, body `code: 20003` | Auth failed — key not seeded, mistyped service name, or key revoked | Re-check A7 seeding (`hive credentials list`), re-run auth smoke test (Task 6) |
+| HTTP 401, body `code: 20003` | Auth failed — key not seeded, mistyped service name, or key revoked | Re-check A7 seeding (`hive credentials list`), re-run auth smoke test (Task 8) |
 | HTTP 404 on a resource URL | Wrong SID or wrong subdomain | Re-read the SID from the producing step's ops note |
 | HTTP 400 with Twilio `code` + `message` | Validation failure — body says exactly what | Interpret per the step's specific table; don't retry blind |
 | HTTP 429 | Rate limited | Back off ≥30s; these are single-shot ops calls, so this signals something looping — stop and inspect |
