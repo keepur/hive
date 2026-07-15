@@ -35,6 +35,7 @@
     9. **Interrupt escalation:** fake `interrupt()` rejection → lease closes (`interrupt-failed:*` reason), no unhandled rejection (process-level listener assertion).
     10. **Stream death:** fake Query output ends (`done: true`) mid-turn → turn returns an error result (never hangs).
     11. **Queue contract:** `push()` after `end()` is a silent no-op; iterator `return()` ends the queue.
+    12. **Silent-wedge backstop:** `interrupt()` resolves but the interrupted turn's `result` never arrives → after `WARM_INTERRUPT_GRACE_MS` (fake timers) the lease closes with reason `interrupt-noop` and the blocked `runTurn` settles with an error result; a turn whose `result` arrives within grace, and a successor turn started after a clean interrupt, never trip the backstop (turn-identity check).
   - Minimum assertions (C4 config): `resolveVoiceWarmPathConfig` — literal `true` → enabled; `"true"`/`1`/absent/garbage/array → disabled.
   - Minimum assertions (C6 baseline script): nearest-rank percentile correctness on known vectors (incl. n=1, n=2, exact-boundary ranks); line parser accepts only `msg === "Voice turn complete"` + `component === "voice-adapter"` + matching agent + `mode === "streaming"`, tolerates non-JSON lines; window filtering; missing-`firstTokenMs` lines excluded from BOTH buckets and counted in `excludedMissingFirstToken`; resumed/nonResumed split on `sdkSessionResumeAttempted`; artifact matches the spec §3.3 schema exactly (`kind`, `version: 1`, empty `blessing`); shortfall recorded in `notes` when minimums (50/20) unmet; output contains no callIds, no text fields.
   - Minimum assertions (C1 runner): fake query emitting `init → delta → result` → `RunResult.bootToInitMs` and `initToFirstTokenMs` are non-negative numbers; a no-init no-delta run leaves both undefined.
@@ -42,7 +43,7 @@
 - Integration: **required**
   - Scope: `src/agents/agent-manager.test.ts` — real `AgentManager` + the file's mocked `AgentRunner` extended with `openVoiceStreamingSession` returning a scripted fake streaming Query (echo pump over the lease's input iterable). This is where lock/budget/ticket/reflection invariants are proved against the real coordinator. **Additive cases only — zero edits to existing cases, zero edits to 322's committed E2 cases.**
   - Reason: the lease is a first-class citizen of `withSpawnTicket` machinery (spec §4.3 "preserved, not carved out") — only the real coordinator can prove lock-held-for-call-duration, budget accounting, stop semantics, and the abortThread dispatch.
-  - Harness: **existing** (`agent-manager.test.ts` — real manager, `mockRunnerSend`/`mockRunnerAbort`, `makeWorkItem`/`makeRunResult`/`makeSmsCtx` helpers, hoisted config mock). Extension required: `makeVoiceCtx` helper, `mockRunnerOpenStream` on the AgentRunner mock, fake-Query factory, `voice: { warmPath: { enabled: false } }` added to the config mock (flipped per-describe).
+  - Harness: **existing** (`agent-manager.test.ts` — real manager, `mockRunnerSend`/`mockRunnerAbort`, `makeWorkItem`/`makeRunResult`/`makeSmsCtx` helpers, hoisted config mock, plus 322's landed `makeVoiceCtx` — 322-plan Task 3 Step 4 adds it and 322-lands-first is a stated precondition; reuse it via its overrides parameter only, adding it only if absent at delivery HEAD). Extension required: `mockRunnerOpenStream` on the AgentRunner mock, fake-Query factory, `voice: { warmPath: { enabled: false } }` added to the config mock (flipped per-describe).
   - Minimum assertions (all of these, exactly):
     1. **Flag off (regression):** voice ctx with `warmPath.enabled: false` → cold path exactly (runner `send` called, `openVoiceStreamingSession` never called, no lease in snapshot) — byte-identical today-path.
     2. **Lease open:** flag on, voice ctx, no lease → `openVoiceStreamingSession` called once with `sessionId` === the ctx's `sessionId` EXACTLY as passed (asserted for both `undefined` and a set id — the §4.2 resume-source rule); snapshot shows `activeSpawns: 1` and the thread key held AFTER turn 1's promise resolves (ticket outlives the turn).
@@ -456,7 +457,7 @@ and extend the "Voice turn complete" log (`:423-432`) — full replacement of th
 `firstTokenMs` semantics unchanged (request-arrival → first SSE byte) so warm/cold/baseline numbers stay directly comparable (spec §4.6).
 
 - [ ] **Step 7:** Tests (additive):
-  - `agent-manager.test.ts`: add `makeVoiceCtx` (mirrors `makeSmsCtx`: `channel: "voice"`, `threadId: "voice:call-1"`, workItem `text: "hello"`, `source: { kind: "voice", id: "call-1", label: "voice:call-1" }`, `systemPromptOverride: "voice prompt"`). Cases: voice ctx → `result.stageTimings` defined, `lockWaitMs >= 0`, `spawnPrepMs >= 0`; SMS ctx → `stageTimings` undefined.
+  - `agent-manager.test.ts`: reuse 322's landed `makeVoiceCtx` (322-plan Task 3 Step 4 adds it; extend via its overrides parameter only — e.g. workItem `text: "hello"` where a case pins the turn text — so the Task 9 additions-only audit stays clean; add the helper only if absent at delivery HEAD, shaped: `channel: "voice"`, `threadId: "voice:call-1"`, workItem `text: "hello"`, `source: { kind: "voice", id: "call-1", label: "voice:call-1" }`, `systemPromptOverride: "voice prompt"`). Cases: voice ctx → `result.stageTimings` defined, `lockWaitMs >= 0`, `spawnPrepMs >= 0`; SMS ctx → `stageTimings` undefined.
   - `agent-runner.test.ts`: using the file's existing query-mock idiom, emit `system/init` then a `stream_event` text_delta then `result` → returned `RunResult.bootToInitMs` and `initToFirstTokenMs` are numbers ≥ 0; a run with neither → both undefined.
   - `voice-adapter.test.ts`: capture the mocked logger (extend the file's logger mock to spies via `vi.hoisted`, matching the `agent-manager.test.ts` idiom, if it does not already expose them) and assert the "Voice turn complete" entry carries numeric `promptBuildMs`/`sessionLookupMs` and `warmPath: false`. All pre-existing cases untouched and green.
 - [ ] **Step 8:** Verify — `npx vitest run src/agents src/channels/voice` green; typecheck green.
@@ -476,7 +477,7 @@ Spec §9.4: the lease needs a session-opening sibling to `send()` reusing the sa
 import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUserMessage, type McpServerConfig, ... } from "@anthropic-ai/claude-agent-sdk";
 ```
 
-- [ ] **Step 2:** Extract `send()`'s pre-query assembly into a private method. **Cut boundaries (re-pin at Task 0):** everything from `const allServerConfigs = this.buildAllServerConfigs(context);` (`:1537`) through the end of the `options` literal (`:1833`) moves verbatim into the new method, with exactly four parameter substitutions — `onStream`→`params.streaming`, `sessionId`→`params.sessionId`, `systemPromptOverride`→`params.systemPromptOverride`, `context`/`modelOverride`/`resourceLimits`→`params.*` — and the options literal assigned to a local instead of inlined into `query()`:
+- [ ] **Step 2:** Extract `send()`'s pre-query assembly into a private method. **Cut boundaries (re-pin at Task 0):** the assembly `:1537-1788` plus the options literal `:1791-1833` (reified as a local instead of inlined into `query()`) move verbatim into the new method — starting at `const allServerConfigs = this.buildAllServerConfigs(context);` — with exactly four parameter substitutions — `onStream`→`params.streaming`, `sessionId`→`params.sessionId`, `systemPromptOverride`→`params.systemPromptOverride`, `context`/`modelOverride`/`resourceLimits`→`params.*`:
 
 ```typescript
   /**
@@ -496,8 +497,9 @@ import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUser
     streaming: boolean;
   }): Promise<SdkQueryOptions> {
     const effectiveModel = params.modelOverride ?? this.agentConfig.model;
-    // ... [moved body: agent-runner.ts:1537-1788 verbatim, with the four
-    //      substitutions above; no logic edits] ...
+    // ... [moved: same cut as stated above — assembly :1537-1788 verbatim,
+    //      then the :1791-1833 options literal reified as the local below;
+    //      four parameter substitutions, no logic edits] ...
     const options: SdkQueryOptions = {
       model: effectiveModel,
       systemPrompt,
@@ -617,6 +619,12 @@ const log = createLogger("warm-voice-session");
  */
 export const WARM_IDLE_TIMEOUT_MS = 120_000;
 export const WARM_LIFETIME_CAP_MS = 2 * 60 * 60 * 1000;
+/**
+ * Grace window after a RESOLVED interrupt() for the interrupted turn's
+ * `result` to arrive before the silent-wedge backstop closes the lease
+ * (plan review r1 adv. 5). Constant, not config — same ruling as above.
+ */
+export const WARM_INTERRUPT_GRACE_MS = 10_000;
 
 /**
  * Push-based AsyncIterable used as the streaming-input `prompt` of the
@@ -776,18 +784,48 @@ export class WarmVoiceSession {
   requestInterrupt(reason: string): void {
     if (this.closed || !this.query) return;
     this.interruptRequested = true;
-    this.query.interrupt().catch((err) => {
-      log.warn("Warm voice interrupt failed — closing lease (cold fallback)", {
-        ...this.logCtx(),
-        reason,
-        error: String(err),
-      });
-      try {
-        this.close(`interrupt-failed:${reason}`);
-      } catch {
-        // close() never throws; belt-and-braces.
-      }
-    });
+    const interruptedTurn = this.turnCount;
+    const hadTurnInFlight = this.turnInFlight;
+    this.query.interrupt().then(
+      () => {
+        // Silent-wedge backstop (plan review r1 adv. 5 — distinct from the
+        // rejection path below): interrupt() resolved but the SDK never
+        // emits the interrupted turn's `result`. The turn chain would block
+        // with the idle timer disarmed, leaving reclaim to the 2h cap. If
+        // THAT turn (identity-checked — a barge-in successor turn must not
+        // trip this) is still in flight after the grace window, close:
+        // close() terminates the output stream, unblocking consumeOneTurn
+        // into the standard turn-failure → cold-fallback path (§6).
+        if (!hadTurnInFlight) return;
+        const grace = setTimeout(() => {
+          try {
+            if (!this.closed && this.turnInFlight && this.turnCount === interruptedTurn) {
+              log.warn("Interrupted turn yielded no result within grace — closing lease (cold fallback)", {
+                ...this.logCtx(),
+                reason,
+                graceMs: WARM_INTERRUPT_GRACE_MS,
+              });
+              this.close("interrupt-noop");
+            }
+          } catch (err) {
+            log.error("interrupt-noop close threw — swallowed", { ...this.logCtx(), error: String(err) });
+          }
+        }, WARM_INTERRUPT_GRACE_MS);
+        grace.unref?.();
+      },
+      (err) => {
+        log.warn("Warm voice interrupt failed — closing lease (cold fallback)", {
+          ...this.logCtx(),
+          reason,
+          error: String(err),
+        });
+        try {
+          this.close(`interrupt-failed:${reason}`);
+        } catch {
+          // close() never throws; belt-and-braces.
+        }
+      },
+    );
   }
 
   /**
@@ -1067,7 +1105,7 @@ export class WarmVoiceSession {
 }
 ```
 
-- [ ] **Step 2:** Create `src/agents/warm-voice-session.test.ts` implementing Testing-Contract warm-voice-session assertions 1–11 exactly. Harness core (no SDK runtime import — types only):
+- [ ] **Step 2:** Create `src/agents/warm-voice-session.test.ts` implementing Testing-Contract warm-voice-session assertions 1–12 exactly. Harness core (no SDK runtime import — types only):
 
 ```typescript
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -1128,7 +1166,7 @@ function makeLease(overrides: { onClosed?: (i: { reason: string; turns: number }
 }
 ```
 
-Representative cases (write all 11 from the contract; demux + no-generator-close shown):
+Representative cases (write all 12 from the contract; demux + no-generator-close shown):
 
 ```typescript
   it("demuxes sequential turns on per-pushed-message result boundaries with zero bleed", async () => {
@@ -1157,7 +1195,7 @@ Representative cases (write all 11 from the contract; demux + no-generator-close
 
 Timer cases use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync(WARM_IDLE_TIMEOUT_MS)`; the interrupt-escalation case asserts via a scoped `process.on("unhandledRejection")` listener that no rejection floats.
 
-- [ ] **Step 3:** Verify — `npx vitest run src/agents/warm-voice-session.test.ts` green (all 11 contract assertions present and passing); typecheck green.
+- [ ] **Step 3:** Verify — `npx vitest run src/agents/warm-voice-session.test.ts` green (all 12 contract assertions present and passing); typecheck green.
 - [ ] **Step 4:** Commit — `git commit -m "feat(kpr-323): C2 warm voice session lease module (input queue, demux, watchdog, no-throw close)"`
 
 ### Task 5 — C2: manager integration (registry, gate, open, warm turn, release-time reflection)
@@ -1339,6 +1377,15 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
     try {
       if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
 
+      // Accepted trade-off (plan review r1 adv. 4): a circuit-open at call
+      // START pays one CLI boot + MCP handshake here before turn 1's
+      // per-turn breaker acquire fast-fails — unlike the cold path, which
+      // fast-fails before any I/O. Deliberate, not an oversight: a pre-open
+      // acquire probe would either leak a permit or double-record against
+      // KPR-306's record-once-per-turn discipline, and the waste is bounded
+      // (one subprocess boot + a budget slot held ≤120s idle) in an
+      // already-degraded state — while the opened lease keeps half-open
+      // probes warm mid-call (spec §5 breaker row).
       // Build the runner once; open the streaming session with resume =
       // ctx.sessionId EXACTLY as passed (§4.2 resume-source rule — the
       // adapter stays the single authority on resume-vs-full-prompt; the
@@ -1423,6 +1470,16 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
     const turnResult = this.finalizeSpawnResult(ctx, runResult);
     turnResult.warmPath = true;
     turnResult.warmTurnSeq = lease.turns;
+    // C1 on warm turns (plan review r1 adv. 3): admission/spawn stages do
+    // not exist on a warm turn — zeros by definition — and
+    // initToFirstTokenMs is the lease's push → first-delta measurement
+    // (RunResult field comment, Task 2). Populated so the adapter's log
+    // spread carries it instead of computing-and-dropping it.
+    turnResult.stageTimings = {
+      lockWaitMs: 0,
+      spawnPrepMs: 0,
+      initToFirstTokenMs: runResult.initToFirstTokenMs,
+    };
     this.recordSpawnObservability(ctx, ctx.workItem.text, undefined, runResult);
     lease.lastTurn = { ctx, result: turnResult };
 
@@ -1468,8 +1525,19 @@ afterEach(() => { (appConfig as any).voice = { warmPath: { enabled: false } }; }
 Fake-Query echo pump (answers each pushed message; init emitted once):
 
 ```typescript
-function installEchoStreamingRunner(opts: { failOnTurn?: number } = {}) {
-  const interrupt = vi.fn().mockResolvedValue(undefined);
+function installEchoStreamingRunner(opts: { failOnTurn?: number; hangOnTurn?: number } = {}) {
+  // hangOnTurn (plan review r1 adv. 2): withhold that turn's `result` until
+  // releaseHang() is called or interrupt() fires — gives integration
+  // assertions 13 (circuit-open needs an established lease) and 14
+  // (timed-out turn) a real in-flight turn without ad-hoc harness invention.
+  let releaseHang: () => void = () => {};
+  const hangReleased = new Promise<void>((r) => {
+    releaseHang = r;
+  });
+  const interrupt = vi.fn(() => {
+    releaseHang(); // an interrupt releases the withheld result (aborted-shaped turn)
+    return Promise.resolve();
+  });
   const close = vi.fn();
   const pushed: string[] = [];
   mockRunnerOpenStream.mockImplementation(async ({ input }: { input: AsyncIterable<any> }) => {
@@ -1486,6 +1554,9 @@ function installEchoStreamingRunner(opts: { failOnTurn?: number } = {}) {
           continue;
         }
         out.push({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: `reply-${n} ` } } });
+        if (opts.hangOnTurn === n) {
+          await hangReleased;
+        }
         out.push({ type: "result", subtype: "success", result: `reply-${n}`, session_id: `sess-warm-${n}`, total_cost_usd: 0.01, duration_ms: 10, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
       }
       out.end();
@@ -1497,7 +1568,7 @@ function installEchoStreamingRunner(opts: { failOnTurn?: number } = {}) {
       [Symbol.asyncIterator]() { return this; },
     };
   });
-  return { interrupt, close, pushed };
+  return { interrupt, close, pushed, releaseHang };
 }
 ```
 
@@ -1528,7 +1599,7 @@ function installEchoStreamingRunner(opts: { failOnTurn?: number } = {}) {
   });
 ```
 
-(Adapt `mockSessionStoreSet` to the file's existing SessionStore mock idiom; if the suite passes a real in-memory store stub, assert on it instead — cosmetic.) The remaining cases follow the contract list mechanically: budget saturation (fill the budget with hanging SMS spawns on OTHER threads, then expect the voice open to reject with `"Spawn budget exceeded"`); stop-mid-call (stopAgent → close spy called → snapshot 0); failure-closes-lease-first + fresh-lease-on-retry-ctx (`failOnTurn: 1`, then a second spawnTurn with `sessionId: undefined` → `mockRunnerOpenStream` called a second time with `sessionId: undefined`); circuit-open (force the breaker open via its test surface or a registry stub → nothing pushed, lease open); timeout-keeps-open; reflection credit (fake timers: 3 turns → idle-close → advance debounce → exactly one reflection spawn with `kind: "reflection"`, and with `reflectionMinTurns: 3` it fires after ONE 3-turn call); no per-turn reflection timers between warm turns.
+(Adapt `mockSessionStoreSet` to the file's existing SessionStore mock idiom; if the suite passes a real in-memory store stub, assert on it instead — cosmetic.) The remaining cases follow the contract list mechanically: budget saturation (fill the budget with hanging SMS spawns on OTHER threads, then expect the voice open to reject with `"Spawn budget exceeded"`); stop-mid-call (stopAgent → close spy called → snapshot 0); failure-closes-lease-first + fresh-lease-on-retry-ctx (`failOnTurn: 1`, then a second spawnTurn with `sessionId: undefined` → `mockRunnerOpenStream` called a second time with `sessionId: undefined`); circuit-open (establish the lease with a normal turn 1, force the breaker open via its test surface or a registry stub → turn 2 throws pre-push, `pushed.length === 1`, lease open); timeout-keeps-open (`hangOnTurn: 2` + fake timers advancing the per-turn watchdog — the watchdog's interrupt releases the hang, the turn returns `timedOut: true` with empty errors, lease open); reflection credit (fake timers: 3 turns → idle-close → advance debounce → exactly one reflection spawn with `kind: "reflection"`, and with `reflectionMinTurns: 3` it fires after ONE 3-turn call); no per-turn reflection timers between warm turns.
 
 - [ ] **Step 9:** Verify — `npx vitest run src/agents/agent-manager.test.ts` green INCLUDING every pre-existing case untouched; full `npx vitest run src/agents src/channels/voice` green; flag-off equivalence spot-check (assertion 1) present.
 - [ ] **Step 10:** Commit — `git commit -m "feat(kpr-323): C2 warm lease coordinator integration (gate, open, warm turns, release-time reflection credit)"`
@@ -1951,7 +2022,7 @@ npx tsx scripts/voice-latency-baseline.ts \
 - [ ] **Latency pass rule:** turns 2..N warm `firstTokenMs` p50 ≤ the W1-bound values. Compare via the C1/C2 log fields (`warmPath`, `warmTurnSeq`, `firstTokenMs` — semantics identical across cells).
 - [ ] **Behavior checks (each recorded pass/fail):**
   - Demux: every turn's spoken reply answers its own utterance across all 10 turns × 5 warm calls — zero cross-turn bleed. **Failure = material → demote to spec lane** (spec §7).
-  - Interrupt-then-continue: barge-in mid-answer → generation stops, next turn answers in-session (`warmTurnSeq` increments, no lease re-open in logs). **Failure = material → demote.**
+  - Interrupt-then-continue: barge-in mid-answer → generation stops, next turn answers in-session (`warmTurnSeq` increments, no lease re-open in logs). **Failure = material → demote.** (If the `interrupt-noop` grace backstop fires here instead — interrupt resolved but no `result` — record it: barge-in degrades to lease-close + cold next turn, the ⚠ #2 fallback; not a demote by itself.)
   - Interrupt-on-idle: hang up / disconnect during the adapter's pre-spawn awaits on turn N → verify the session either survives or degrades cleanly to a closed lease + cold next turn (spec §4.4 edge; either outcome passes, a wedged call fails).
   - Fallback drill: `kill` the lease's claude subprocess mid-call (identify via `ps` + the call's start time) → the in-flight turn errors, lease closes, next utterance recovers via the cold outer retry within ONE turn (caller hears one slower turn, none lost).
   - Session-id rotation + per-turn usage attribution (⚠ registry #3/#4): confirm per-turn `sessionStore` writes and sane per-turn (non-cumulative) usage numbers in the logs; anomalies are recorded (telemetry-accuracy impact only) — not gate failures unless rotation loss breaks the fallback drill.
@@ -1991,7 +2062,7 @@ npx tsx scripts/voice-latency-baseline.ts \
 | # | Claim to re-verify | Where |
 |---|---|---|
 | 1 | **SDK streaming-input per-pushed-message `result` emission** — the lease's turn boundary (§4.2; the spec's single biggest assumption). Typings pinned at Task 0; live at W2. Failure = **material demote** | Task 0 → Task 4 → Task 12 |
-| 2 | **`interrupt()` leaves the session usable** for the next queued turn (§4.4). Live at W2; fallback if false: interrupt degrades to lease-close + cold next turn (correct, loses the barge-in win) | Task 12 |
+| 2 | **`interrupt()` leaves the session usable** for the next queued turn (§4.4). Live at W2; fallback if false: interrupt degrades to lease-close + cold next turn (correct, loses the barge-in win). Both failure shapes escalate to close in code: rejection → immediate `interrupt-failed` close; resolve-but-no-`result` → `interrupt-noop` grace close (Task 4 backstop, unit assertion 12) | Tasks 4, 12 |
 | 3 | Session-id rotation visibility per turn in streaming mode (KPR-211 semantics under streaming input) — full-transcript retry covers the gap regardless | Task 0 → Task 12 |
 | 4 | Per-turn usage/cost attribution in streaming mode (per-exchange, not cumulative) — telemetry/activity-log accuracy only | Task 12 |
 | 5 | `maxTurns` / `maxBudgetUsd` scope under streaming input (per-exchange vs whole-session). If cumulative: warm envelope omits/raises them — one-line decision recorded at Task 0 | Task 0 → Task 3 |
