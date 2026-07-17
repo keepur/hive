@@ -7,25 +7,41 @@ import type { LoadedPlugin } from "../plugins/types.js";
 // vi.hoisted() runs before vi.mock factory, avoiding the TDZ error that
 // occurs when paths.ts (imported transitively) calls existsSync at module
 // load time before plain const-declared mocks are initialized.
-const { mockExistsSync, mockStatSync, mockMkdirSync, mockSymlinkSync, mockLstatSync } = vi.hoisted(() => ({
-  mockExistsSync: vi.fn().mockReturnValue(true),
-  mockStatSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
-  mockMkdirSync: vi.fn(),
-  mockSymlinkSync: vi.fn(),
-  // Default: lstat throws (link target not present) so ensurePluginNodeModulesLink
-  // will proceed to create a symlink.
-  mockLstatSync: vi.fn().mockImplementation(() => {
-    const err: NodeJS.ErrnoException = new Error("ENOENT");
-    err.code = "ENOENT";
-    throw err;
-  }),
-}));
+const { mockExistsSync, mockStatSync, mockMkdirSync, mockSymlinkSync, mockLstatSync, mockReadFileSync, mockReaddirSync } =
+  vi.hoisted(() => ({
+    mockExistsSync: vi.fn().mockReturnValue(true),
+    mockStatSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
+    mockMkdirSync: vi.fn(),
+    mockSymlinkSync: vi.fn(),
+    // Default: lstat throws (link target not present) so ensurePluginNodeModulesLink
+    // will proceed to create a symlink.
+    mockLstatSync: vi.fn().mockImplementation(() => {
+      const err: NodeJS.ErrnoException = new Error("ENOENT");
+      err.code = "ENOENT";
+      throw err;
+    }),
+    // KPR-326: config.ts's `import "../config.js"` now flows through the real
+    // module (partial mock below) instead of a synthetic factory. Its
+    // module-load-time `dotenv.config()` call does `fs.existsSync(path)`
+    // (mocked true above) then `fs.readFileSync(path, ...)` — without this
+    // stub that throws (no real .env file in the test sandbox) and blows up
+    // every test in this file at import time. Empty string = no vars parsed,
+    // matching the previous synthetic mock's behavior of not touching real env.
+    mockReadFileSync: vi.fn().mockReturnValue(""),
+    // KPR-326: config.ts's discoverPluginDirs() also runs at module load —
+    // with mockExistsSync defaulting true, it falls into readdirSync(). Empty
+    // list = no auto-discovered plugin dirs, matching prior synthetic-mock
+    // behavior (config.codeTask wasn't exercised by this file's tests).
+    mockReaddirSync: vi.fn().mockReturnValue([]),
+  }));
 vi.mock("node:fs", () => ({
   existsSync: (...args: any[]) => mockExistsSync(...args),
   statSync: (...args: any[]) => mockStatSync(...args),
   mkdirSync: (...args: any[]) => mockMkdirSync(...args),
   symlinkSync: (...args: any[]) => mockSymlinkSync(...args),
   lstatSync: (...args: any[]) => mockLstatSync(...args),
+  readFileSync: (...args: any[]) => mockReadFileSync(...args),
+  readdirSync: (...args: any[]) => mockReaddirSync(...args),
 }));
 
 // ── SDK mock ────────────────────────────────────────────────────────
@@ -70,6 +86,23 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   })),
 }));
 
+// KPR-327: the memory server's stdio placeholder (and its MEMORY_SCOPES_JSON
+// env serialization) no longer exists — the scope-wiring tests observe what
+// send() passes to createMemoryMcpServer instead. Wrapping mock: capture deps,
+// delegate to the real factory (whose createSdkMcpServer import is the SDK
+// mock above, so returned servers keep the {name, type: "sdk"} test shape).
+const memoryDepsCapture = vi.hoisted(() => ({ deps: [] as any[] }));
+vi.mock("../memory/memory-mcp-server.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../memory/memory-mcp-server.js")>();
+  return {
+    ...actual,
+    createMemoryMcpServer: vi.fn((deps: any) => {
+      memoryDepsCapture.deps.push(deps);
+      return actual.createMemoryMcpServer(deps);
+    }),
+  };
+});
+
 // ── Logger mock ─────────────────────────────────────────────────────
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
@@ -86,48 +119,59 @@ vi.mock("../keychain/from-keychain.js", () => ({
 }));
 
 // ── Config mock ─────────────────────────────────────────────────────
-vi.mock("../config.js", () => ({
-  config: {
-    instance: { id: "hive", portBase: 3100 },
-    slack: { mcpToken: "" },
-    mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
-    google: { client: "test-client", accounts: { "test-agent": ["test@example.com"] }, sharedFolder: "test-folder" },
-    quo: { apiKey: "", phoneNumberId: "", lines: [] },
-    taskLedger: {
-      apiUrl: "http://localhost:3000",
-      apiKey: "global-key",
-      agentKeys: { "agent-a": "key-a" } as Record<string, string>,
+// KPR-326: partial mock (mirrors prefix-builder.test.ts) — keep the real
+// resolveToolSearchMode/resolveToolSearchEnv/isToolSearchMode (agent-runner.ts
+// imports and re-exports these from config.ts) while stubbing out the
+// `config` singleton itself. Requires the node:fs mock above to also stub
+// readFileSync so config.ts's module-load-time dotenv.config() call succeeds.
+vi.mock("../config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config.js")>();
+  return {
+    ...actual,
+    config: {
+      instance: { id: "hive", portBase: 3100 },
+      slack: { mcpToken: "" },
+      mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
+      google: { client: "test-client", accounts: { "test-agent": ["test@example.com"] }, sharedFolder: "test-folder" },
+      quo: { apiKey: "", phoneNumberId: "", lines: [] },
+      taskLedger: {
+        apiUrl: "http://localhost:3000",
+        apiKey: "global-key",
+        agentKeys: { "agent-a": "key-a" } as Record<string, string>,
+      },
+      brave: { apiKey: "" },
+      resend: {
+        apiKey: "",
+        emailDomain: "test.com",
+        businessName: "TestBiz",
+        fromAddress: "",
+        defaultCc: "",
+        defaultBcc: "",
+      },
+      linear: { apiKey: "", teamId: "" },
+      clickup: { apiToken: "" },
+      github: { repo: "", token: "" },
+      recall: {
+        apiKey: "",
+        region: "",
+        monitorPort: 3100,
+        monitorPublicUrl: "",
+        webhookSecret: "test-webhook-secret",
+      },
+      background: { port: 3200, authToken: "test-bg-token" },
+      codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
+      anthropic: { apiKey: "test-key" },
+      defaultAgent: "chief-of-staff",
+      autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      browser: { cdpEndpoint: "" },
+      memory: { hotBudgetTokens: 3000 },
+      workflow: { enabled: false },
+      voice: { apiKey: "", phoneNumberId: "", assistants: {} },
+      // KPR-329: engine-default tool-search config for the mocked module.
+      toolSearch: { mode: "auto", source: "default" },
     },
-    brave: { apiKey: "" },
-    resend: {
-      apiKey: "",
-      emailDomain: "test.com",
-      businessName: "TestBiz",
-      fromAddress: "",
-      defaultCc: "",
-      defaultBcc: "",
-    },
-    linear: { apiKey: "", teamId: "" },
-    clickup: { apiToken: "" },
-    github: { repo: "", token: "" },
-    recall: {
-      apiKey: "",
-      region: "",
-      monitorPort: 3100,
-      monitorPublicUrl: "",
-      webhookSecret: "test-webhook-secret",
-    },
-    background: { port: 3200, authToken: "test-bg-token" },
-    codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
-    anthropic: { apiKey: "test-key" },
-    defaultAgent: "chief-of-staff",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
-    browser: { cdpEndpoint: "" },
-    memory: { hotBudgetTokens: 3000 },
-    workflow: { enabled: false },
-    voice: { apiKey: "", phoneNumberId: "", assistants: {} },
-  },
-}));
+  };
+});
 
 // ── Helpers ─────────────────────────────────────────────────────────
 function makeMockMemoryManager() {
@@ -175,7 +219,7 @@ function getCapturedOptions(): Record<string, any> {
 }
 
 // ── Import after mocks ──────────────────────────────────────────────
-import { AgentRunner } from "./agent-runner.js";
+import { AgentRunner, resolveToolSearchEnv, resolveToolSearchMode } from "./agent-runner.js";
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 
@@ -191,6 +235,23 @@ function makeRunner(overrides: Partial<AgentConfig> = {}, teamRoster?: any): Age
     undefined,
     teamRoster,
   );
+}
+
+// KPR-327: memory has no stdio placeholder — tests that assert its presence
+// must run the in-process branch, which requires a db handle. Collection
+// methods are no-op stubs; in-process factories only close over them.
+function makeFakeInProcessDb(): any {
+  const col = {
+    findOne: vi.fn(async () => null),
+    find: vi.fn(() => ({ project: vi.fn(() => ({ toArray: vi.fn(async () => []) })), toArray: vi.fn(async () => []), sort: vi.fn(() => ({ limit: vi.fn(() => ({ toArray: vi.fn(async () => []) })) })) })),
+    insertOne: vi.fn(async () => ({})),
+    updateOne: vi.fn(async () => ({})),
+    deleteOne: vi.fn(async () => ({})),
+    deleteMany: vi.fn(async () => ({})),
+    createIndex: vi.fn(async () => "idx"),
+    countDocuments: vi.fn(async () => 0),
+  };
+  return { collection: vi.fn(() => col) };
 }
 
 function makeGooglePlugin(): LoadedPlugin {
@@ -233,7 +294,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
 
   it("includes core servers (memory, keychain, google, etc.)", async () => {
     const coreServers = ["memory", "keychain", "google", "contacts", "background", "callback", "admin"];
-    runner = new AgentRunner(makeAgentConfig({ coreServers }), memoryManager as any);
+    runner = new AgentRunner(makeAgentConfig({ coreServers }), memoryManager as any, [], new Map(), "{}", undefined, undefined, makeFakeInProcessDb());
     await runner.send("hello");
     const servers = getCapturedServers();
 
@@ -251,6 +312,12 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     runner = new AgentRunner(
       makeAgentConfig({ coreServers: ["memory", "keychain"] }),
       memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
     );
     await runner.send("hello");
     const servers = getCapturedServers();
@@ -793,14 +860,46 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
       brokenServers: {},
     };
 
+    runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin], new Map(), "{}", undefined, undefined, makeFakeInProcessDb());
+    await runner.send("hello");
+    const servers = getCapturedServers();
+
+    // Core in-process memory server wins; the plugin server never registers.
+    expect(servers.memory.type).toBe("sdk");
+    expect(servers.memory.args).toBeUndefined();
+  });
+
+  it("skips plugin server conflicting with a reserved in-process name even with no db (guard branch)", async () => {
+    // No db positional arg → the in-process branch never runs. Only the
+    // IN_PROCESS_PORTED_SERVERS.has(name) guard prevents the plugin's stdio
+    // server named "memory" from becoming the live server. If that guard is
+    // removed, servers.memory would be the plugin stdio server instead of undefined.
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          memory: {
+            // conflicts with reserved in-process "memory" server name
+            entry: "mcp-servers/memory/index.ts",
+            env: [],
+            envMap: {},
+            agentEnv: {},
+          },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+
     runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any, [plugin]);
     await runner.send("hello");
     const servers = getCapturedServers();
 
-    // Should still be core memory server, not the plugin one.
-    // Path differs by mode: dev (dist/memory/memory-mcp-server.js) vs npm bundle (mcp/memory.min.js).
-    expect(servers.memory.args[0]).toMatch(/memory[/-](?:memory-mcp-server\.js|min\.js)$|mcp\/memory\.min\.js$/);
-    expect(servers.memory.args[0]).not.toContain("/plugins/");
+    // Plugin server was skipped by the guard; no in-process branch ran (no db).
+    expect(servers.memory).toBeUndefined();
   });
 
   it("uses per-agent task ledger key when available", async () => {
@@ -1490,6 +1589,12 @@ describe("AgentRunner server sub-agents (via send)", () => {
         delegateServers: ["google", "contacts"],
       }),
       memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(), // KPR-327: memory only appears via the in-process branch (needs a db)
     );
     await runner.send("hello");
     const servers = getCapturedServers();
@@ -1650,6 +1755,12 @@ describe("AgentRunner toolkit section prompt (via send)", () => {
         delegateServers: [],
       }),
       memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(), // KPR-327: memory is toolkit-listed only when the in-process branch runs (needs a db)
     );
     await runner.send("hello");
     const options = getCapturedOptions();
@@ -2412,6 +2523,85 @@ describe("AgentRunner betas passthrough (via send)", () => {
   });
 });
 
+describe("resolveToolSearchEnv (KPR-329)", () => {
+  it("agent override wins over every hive mode", () => {
+    for (const hive of ["auto", "on", "off"]) {
+      expect(resolveToolSearchEnv("auto", hive)).toBe("auto");
+      expect(resolveToolSearchEnv("on", hive)).toBe("true");
+      expect(resolveToolSearchEnv("off", hive)).toBe("false");
+    }
+  });
+
+  it("falls back to hive mode when agent field is absent", () => {
+    expect(resolveToolSearchEnv(undefined, "auto")).toBe("auto");
+    expect(resolveToolSearchEnv(undefined, "on")).toBe("true");
+    expect(resolveToolSearchEnv(undefined, "off")).toBe("false");
+  });
+
+  it("falls back to engine default auto when both are absent/invalid", () => {
+    expect(resolveToolSearchEnv(undefined, "")).toBe("auto");
+    expect(resolveToolSearchEnv(undefined, "garbage")).toBe("auto");
+  });
+
+  it("treats an invalid agent value as absent (inherit hive mode)", () => {
+    expect(resolveToolSearchEnv("always", "off")).toBe("false");
+    expect(resolveToolSearchEnv("", "on")).toBe("true");
+    expect(resolveToolSearchEnv("TRUE", "auto")).toBe("auto");
+  });
+
+  it("reports resolution source: agent | hive.yaml | default", () => {
+    expect(resolveToolSearchMode("on", "auto")).toEqual({ mode: "on", source: "agent" });
+    expect(resolveToolSearchMode(undefined, "off")).toEqual({ mode: "off", source: "hive.yaml" });
+    expect(resolveToolSearchMode(undefined, "auto", "default")).toEqual({ mode: "auto", source: "default" });
+    expect(resolveToolSearchMode("bogus", "junk")).toEqual({ mode: "auto", source: "default" });
+  });
+});
+
+describe("AgentRunner ENABLE_TOOL_SEARCH env pinning (via send) (KPR-329)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("pins ENABLE_TOOL_SEARCH to 'auto' by default (no agent field, default config)", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const options = getCapturedOptions();
+    expect(options.env.ENABLE_TOOL_SEARCH).toBe("auto");
+  });
+
+  it("agent toolSearch 'on' yields the literal string 'true'", async () => {
+    const runner = new AgentRunner(makeAgentConfig({ toolSearch: "on" }), memoryManager as any);
+    await runner.send("hello");
+    expect(getCapturedOptions().env.ENABLE_TOOL_SEARCH).toBe("true");
+  });
+
+  // Spec §6.6 negative-verify: 'off' must produce the literal string "false"
+  // in the spawn env map — NOT merely absent/undefined (absent would let the
+  // CLI's implicit experimental default back in).
+  it("agent toolSearch 'off' yields the literal string 'false', not undefined", async () => {
+    const runner = new AgentRunner(makeAgentConfig({ toolSearch: "off" }), memoryManager as any);
+    await runner.send("hello");
+    const env = getCapturedOptions().env;
+    expect(env.ENABLE_TOOL_SEARCH).not.toBeUndefined();
+    expect(env.ENABLE_TOOL_SEARCH).toBe("false");
+  });
+
+  it("engine value overrides ambient process.env.ENABLE_TOOL_SEARCH", async () => {
+    process.env.ENABLE_TOOL_SEARCH = "true";
+    try {
+      const runner = new AgentRunner(makeAgentConfig({ toolSearch: "off" }), memoryManager as any);
+      await runner.send("hello");
+      expect(getCapturedOptions().env.ENABLE_TOOL_SEARCH).toBe("false");
+    } finally {
+      delete process.env.ENABLE_TOOL_SEARCH;
+    }
+  });
+});
+
 // ── Archetype card injection ─────────────────────────────────────
 describe("buildSystemPrompt — archetype card", () => {
   beforeEach(() => {
@@ -2863,18 +3053,33 @@ describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
   });
 });
 
-describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
+describe("AgentRunner — memoryScopes wiring into createMemoryMcpServer (KPR-327)", () => {
+  function makeScopesRunner(overrides: Partial<AgentConfig> = {}) {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"], ...overrides }),
+      makeMockMemoryManager() as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
+    );
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
+    mockMessages = null;
+    memoryDepsCapture.deps.length = 0; // plain array — clearAllMocks does not reset it
     __resetRegistryForTests();
   });
   afterEach(() => __resetRegistryForTests());
 
   it("defaults to self-mongo only when no archetype is set", async () => {
-    const runner = makeRunner({ coreServers: ["memory"] });
+    const runner = makeScopesRunner();
     await runner.send("hello");
-    const servers = getCapturedServers();
-    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
     expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
   });
 
@@ -2890,10 +3095,10 @@ describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
       ],
       sessionOptions: () => ({}),
     });
-    const runner = makeRunner({ archetype: "scoped", archetypeConfig: {}, coreServers: ["memory"] });
+    const runner = makeScopesRunner({ archetype: "scoped", archetypeConfig: {} });
     await runner.send("hello");
-    const servers = getCapturedServers();
-    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
     expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
     expect(scopes).toHaveLength(3);
     expect(scopes.find((s: { id: string }) => s.id === "workshop")).toEqual({
@@ -2916,10 +3121,10 @@ describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
       ],
       sessionOptions: () => ({}),
     });
-    const runner = makeRunner({ archetype: "with-self", archetypeConfig: {}, coreServers: ["memory"] });
+    const runner = makeScopesRunner({ archetype: "with-self", archetypeConfig: {} });
     await runner.send("hello");
-    const servers = getCapturedServers();
-    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
     const selfEntries = scopes.filter((s: { id: string }) => s.id === "self");
     expect(selfEntries).toHaveLength(1);
     expect(selfEntries[0]).toEqual({ id: "self", backing: "mongo" });
@@ -2937,10 +3142,10 @@ describe("AgentRunner — MEMORY_SCOPES_JSON wiring", () => {
       },
       sessionOptions: () => ({}),
     });
-    const runner = makeRunner({ archetype: "throwing", archetypeConfig: {}, coreServers: ["memory"] });
+    const runner = makeScopesRunner({ archetype: "throwing", archetypeConfig: {} });
     await runner.send("hello");
-    const servers = getCapturedServers();
-    const scopes = JSON.parse(servers.memory.env.MEMORY_SCOPES_JSON);
+    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
+    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
     expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
   });
 });

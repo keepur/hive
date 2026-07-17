@@ -55,6 +55,26 @@ function sanitizeDelegateServers(agentId: string, delegateServers: string[]): st
 }
 
 /**
+ * KPR-329: sanitize the optional `toolSearch` field. Invalid values (anything
+ * other than "auto" | "on" | "off" | absent) are treated as absent — the agent
+ * inherits the global hive.yaml mode — and an error is logged so the operator
+ * can repair the doc. Mirrors the KPR-184 delegateServers sanitizer: the admin
+ * tool rejects malformed inputs at create/update; this guards pre-existing or
+ * hand-edited data on engine boot. `null` is treated as an intentional unset
+ * (no log) — Mongo docs cleared via `$set: null` should not spam errors.
+ */
+function sanitizeToolSearch(agentId: string, value: unknown): "auto" | "on" | "off" | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (value === "auto" || value === "on" || value === "off") return value;
+  log.error("Invalid toolSearch value — must be auto | on | off. Treating as absent (inherit global).", {
+    agent: agentId,
+    value: String(value),
+    remediation: 'Fix via admin_agent_update (toolSearch: "auto" | "on" | "off") or unset the field.',
+  });
+  return undefined;
+}
+
+/**
  * KPR-221: hard-reject context-dependent servers in `delegateServers`.
  * Throws so the caller in `load()` can evict the offending agent and
  * surface the error to the operator. The admin tool rejects these at
@@ -222,6 +242,9 @@ export class AgentRegistry {
       // any downstream consumer (subagent assembly, toolkit listing, etc.)
       // sees the value. Logs an error if any are stripped.
       agentConfig.delegateServers = sanitizeDelegateServers(agentConfig.id, agentConfig.delegateServers);
+      // KPR-329: sanitize the optional toolSearch override before any
+      // downstream consumer (spawn env resolution, prefix builder) sees it.
+      agentConfig.toolSearch = sanitizeToolSearch(agentConfig.id, agentConfig.toolSearch);
       currentIds.add(agentConfig.id);
 
       // Disabled check FIRST — skip all validation for disabled agents.

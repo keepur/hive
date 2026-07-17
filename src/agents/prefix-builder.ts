@@ -26,7 +26,7 @@ import type { SkillIndex } from "./skill-loader.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import { getArchetype } from "../archetypes/registry.js";
 import { buildToolkitSection } from "./toolkit-section.js";
-import { config } from "../config.js";
+import { config, resolveToolSearchMode } from "../config.js";
 
 const log = createLogger("prefix-builder");
 
@@ -119,8 +119,27 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
       delegateServerNames: ctx.activeDelegateNames,
       plugins: ctx.plugins,
       autoInjectedServers: ctx.autoInjectedServers,
+      // KPR-329: resolved mode ≠ "off" (agent override → hive.yaml → auto).
+      // Lives in the cached prefix: the agent-def field change invalidates via
+      // the definition-update path; hive.yaml changes require restart anyway.
+      deferredLoadingActive: resolveToolSearchMode(agentConfig.toolSearch, config.toolSearch.mode).mode !== "off",
     }),
   );
+
+  // KPR-327: manual "memory-first" guidance for the native-shaped file-tier
+  // memory MCP. The Agent SDK injects no system instruction for MCP tools
+  // (unlike the native memory_20250818 API tool), so hive authors it here —
+  // explicitly deferring to the hot tier injected below to avoid redundant
+  // view-everything-first round-trips. Static text: lives in the cached
+  // prefix; KPR-213 invalidation semantics are unchanged.
+  if (ctx.coreServerNames.includes("memory")) {
+    parts.push(
+      "## File-Tier Memory\n" +
+        "You have a file-tier memory at `/memories` (tools: view, create, str_replace, insert, delete, rename). " +
+        "Your hot-tier memory is already injected in this prompt — do **not** re-`view` files to rediscover what's already here. " +
+        "`view` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there.",
+    );
+  }
 
   // --- Memory injection (changes on memory writes — cache invalidated then) ---
 
@@ -139,8 +158,8 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
     if (mdFiles.length > 0) {
       parts.push(
         `## Available Memory Files\nYou have ${mdFiles.length} reference file(s) in your memory directory:\n` +
-          mdFiles.map((f) => `- ${memoryDir}/${f}`).join("\n") +
-          `\n\nRead relevant files via the memory MCP server (\`memory_read\`) before starting tasks that may relate to them.`,
+          mdFiles.map((f) => `- /memories/${memoryDir}/${f}`).join("\n") +
+          `\n\nRead relevant files via the memory MCP server (\`view\`) before starting tasks that may relate to them.`,
       );
     }
   }
