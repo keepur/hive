@@ -112,10 +112,53 @@ describe("classifyThrown", () => {
 });
 
 describe("HARD_FAULT_KINDS", () => {
-  it("contains every kind except non-provider", () => {
+  it("contains every kind except non-provider and bad-model", () => {
     expect([...HARD_FAULT_KINDS].sort()).toEqual(
       ["auth", "connect-fail", "rate-limit", "server-error", "timeout"].sort(),
     );
     expect(HARD_FAULT_KINDS.has("non-provider")).toBe(false);
+  });
+});
+
+describe("bad-model (KPR-312 — KPR-310 verdict anomaly 1, M8)", () => {
+  // Pinned VERBATIM, character-for-character, so pattern drift against the
+  // observed SDK surface is caught (spec §6).
+  const M8_ERROR =
+    "There's an issue with the selected model (claude-nonexistent-9). It may not exist or you may not have access to it.";
+
+  it("classifies the verbatim M8 string via classifyTurnResult", () => {
+    expect(classifyTurnResult({ error: M8_ERROR })).toEqual({
+      outcome: "fault",
+      kind: "bad-model",
+      message: M8_ERROR,
+    });
+  });
+
+  it("classifies the verbatim M8 string via classifyThrown (the path M8 actually took)", () => {
+    expect(classifyThrown(new Error(M8_ERROR))).toMatchObject({ kind: "bad-model" });
+  });
+
+  it("classifies the FULL observed M8 throw shape (SDK wrapper prefix + M8 text)", () => {
+    // The observed throw wraps the M8 text — classifyThrown String()s it into
+    // "Error: Claude Code returned an error result: <M8 text>"; the row must
+    // match inside that envelope, not only the bare substring.
+    expect(
+      classifyThrown(new Error(`Claude Code returned an error result: ${M8_ERROR}`)),
+    ).toMatchObject({ kind: "bad-model" });
+  });
+
+  it("matches each alternate independently", () => {
+    expect(faultKind("issue with the selected model")).toBe("bad-model");
+    expect(faultKind("It may not exist or you may not have access to it")).toBe("bad-model");
+  });
+
+  it("is never breaker-eligible", () => {
+    expect(HARD_FAULT_KINDS.has("bad-model")).toBe(false);
+  });
+
+  it("is the LAST row — earlier rows keep precedence on overlapping strings", () => {
+    // A string matching both server-error and bad-model classifies server-error
+    // (first match wins), proving the appended row cannot re-bucket old inputs.
+    expect(faultKind("503 issue with the selected model")).toBe("server-error");
   });
 });

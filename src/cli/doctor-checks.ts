@@ -61,6 +61,31 @@ export function requiredEnvVarsFromConfig(configTsPath: string): string[] {
   return [...keys].sort();
 }
 
+/**
+ * KPR-312: one informational line for `hive doctor` — which mode the model
+ * router's complexity classifier runs in. Key-less (subscription-auth)
+ * instances run heuristics-only: a deliberate steady state, never a failing
+ * check (spec #157: ANTHROPIC_API_KEY is optional-with-fallback and must not
+ * false-positive). Pure string producer — no failure channel by construction.
+ */
+export function modelRouterModeLine(apiKeyPresent: boolean): string {
+  return apiKeyPresent ? "model router: LLM classification" : "model router: heuristics-only (no ANTHROPIC_API_KEY)";
+}
+
+/**
+ * KPR-314: one informational line for `hive doctor` — sidecar LLM provider
+ * presence and what degrades without each key. Key-less is a deliberate
+ * steady state (subscription-auth instances), never a failing check —
+ * pure string producer, no failure channel by construction (312 precedent).
+ */
+export function llmSidecarLine(anthropicPresent: boolean, geminiPresent: boolean): string {
+  const anthropic = anthropicPresent
+    ? "anthropic ✓"
+    : "anthropic ✗ (meeting classifier → all-roster, memory dream → skipped)";
+  const gemini = geminiPresent ? "gemini ✓" : "gemini ✗ (image description → off)";
+  return `llm sidecar: ${anthropic}, ${gemini}`;
+}
+
 // ── launchctl print parsing ─────────────────────────────────────────────
 
 export interface LaunchdState {

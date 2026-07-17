@@ -126,6 +126,15 @@ export const CREDENTIAL_REGISTRY: CredentialEntry[] = [
       "`google.accounts.<agent-id>` — a string for a single account, a list for multi-account agents " +
       "(first entry is the default).",
   },
+  {
+    server: "model-router",
+    title: "Anthropic API",
+    description:
+      "Direct Anthropic API key — powers the model router's LLM complexity classifier (KPR-312). Key-less instances run heuristics-only routing.",
+    helpUrl: "https://console.anthropic.com/settings/keys",
+    kind: "secret",
+    fields: [{ key: "ANTHROPIC_API_KEY", label: "Anthropic API Key" }],
+  },
 ];
 
 export function findCredentialEntry(server: string): CredentialEntry | undefined {

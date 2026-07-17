@@ -423,7 +423,9 @@ export const config = {
   modelRouter: {
     enabled: optional("MODEL_ROUTER_ENABLED", "true") === "true",
     model: optional("MODEL_ROUTER_MODEL", "claude-haiku-4-5-20251001"),
-    timeoutMs: parseInt(optional("MODEL_ROUTER_TIMEOUT_MS", "8000"), 10),
+    // KPR-312: 8000 → 4000 — the CLI-startup headroom is gone; a direct haiku
+    // call at p50 ~0.5s doesn't need 8s before falling back.
+    timeoutMs: parseInt(optional("MODEL_ROUTER_TIMEOUT_MS", "4000"), 10),
   },
   // KPR-306: provider circuit breaker (hive.yaml `circuitBreaker`, all keys
   // optional; enabled:false = shadow mode — observe + telemetry, never fast-fail).

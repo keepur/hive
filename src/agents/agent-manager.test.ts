@@ -26,14 +26,28 @@ afterAll(() => {
   rmSync(TEST_HIVE_HOME, { recursive: true, force: true });
 });
 
-// Mock logger
+// Mock logger — warn is a hoisted shared spy so KPR-311 clamp warnings are
+// assertable (cleared by vi.clearAllMocks in beforeEach; nothing else
+// asserts on logger calls).
+const { mockLogWarn, mockSupportsEffort } = vi.hoisted(() => ({
+  mockLogWarn: vi.fn(),
+  // KPR-338: real-catalog shape — every haiku-family id is effort-incapable,
+  // everything else is capable. Tests override per-case (e.g. off-catalog id).
+  mockSupportsEffort: vi.fn((m: string) => !m.includes("haiku")),
+}));
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
     info: vi.fn(),
-    warn: vi.fn(),
+    warn: mockLogWarn,
     error: vi.fn(),
     debug: vi.fn(),
   }),
+}));
+
+// KPR-338: prepareSpawn consults getLLMRegistry().supportsEffort to decide the
+// haiku/effort-capability skip. Mock the registry surface only.
+vi.mock("../llm/registry.js", () => ({
+  getLLMRegistry: () => ({ supportsEffort: mockSupportsEffort }),
 }));
 
 // Mock config
@@ -53,8 +67,11 @@ vi.mock("../plugins/plugin-loader.js", () => ({
   loadPlugins: vi.fn().mockReturnValue([]),
 }));
 
-// Mock model router
-vi.mock("./model-router.js", () => ({
+// Mock model router. KPR-338: spread-original — agent-manager.ts now imports
+// modelToTier + resolveResourceLimits as runtime values (the static-limits
+// pins assert real resolution math), so only routeModel is stubbed.
+vi.mock("./model-router.js", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
   routeModel: vi.fn(),
 }));
 
@@ -141,7 +158,9 @@ import type { RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./provider-circuit-breaker.js";
 import type { WorkItem } from "../types/work-item.js";
-import { routeModel } from "./model-router.js";
+import { routeModel, RESOURCE_TIER_DEFAULTS } from "./model-router.js";
+import type { ModelRouterResult } from "./model-router.js";
+import type { AgentProviderId } from "./provider-adapters/types.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -201,6 +220,10 @@ function makeRunResult(overrides: Partial<RunResult> = {}) {
   };
 }
 
+function makeRouterResult(overrides: Partial<ModelRouterResult> = {}): ModelRouterResult {
+  return { costUsd: 0.001, durationMs: 50, method: "model", ...overrides };
+}
+
 /**
  * KPR-220 Phase 10: shared spawnTurn ctx helper (replaces sendMessage in tests
  * that need to drive a turn through the manager without caring about
@@ -243,6 +266,9 @@ function makeMockRegistry() {
   const agents = new Map<string, AgentConfig>();
   agents.set("agent-a", makeAgentConfig({ id: "agent-a", name: "AgentA", maxConcurrent: 2 }));
   agents.set("agent-b", makeAgentConfig({ id: "agent-b", name: "AgentB" }));
+  // KPR-338: sonnet-static fixture — the haiku default (agent-a) now SKIPS the
+  // classifier, so every router-on/model-path test must run on agent-s.
+  agents.set("agent-s", makeAgentConfig({ id: "agent-s", name: "AgentS", model: "claude-sonnet-4-6" }));
 
   return {
     get: vi.fn().mockImplementation((id: string) => agents.get(id)),
@@ -254,17 +280,29 @@ function makeMockRegistry() {
 }
 
 function makeMockSessionStore() {
-  const sessions = new Map<string, string>();
+  // KPR-313: records mirror the real store's rows; get() applies the same
+  // ""-⇒-undefined normalization the real choke point does.
+  const sessions = new Map<string, { sessionId: string; provider: string }>();
   return {
     get: vi.fn().mockImplementation(async (agentId: string, threadId: string) => {
-      return sessions.get(`${agentId}:${threadId}`);
+      const rec = sessions.get(`${agentId}:${threadId}`);
+      if (!rec) return undefined;
+      return { sessionId: rec.sessionId || undefined, provider: rec.provider };
     }),
-    set: vi.fn().mockImplementation(async (agentId: string, threadId: string, sessionId: string, _tokenData?: any) => {
-      sessions.set(`${agentId}:${threadId}`, sessionId);
-    }),
+    set: vi.fn().mockImplementation(
+      async (agentId: string, threadId: string, sessionId: string, provider: string, _tokenData?: any) => {
+        sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      },
+    ),
     delete: vi.fn(),
     clearAgent: vi.fn(),
-    findAgentByThread: vi.fn().mockResolvedValue(undefined),
+    findAgentByThread: vi.fn().mockImplementation(async (threadId: string) => {
+      for (const key of sessions.keys()) {
+        if (key.endsWith(`:${threadId}`)) return key.slice(0, key.length - threadId.length - 1);
+      }
+      return undefined;
+    }),
+    _sessions: sessions,
   };
 }
 
@@ -291,6 +329,10 @@ describe("AgentManager", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // KPR-338: clearAllMocks resets call history but not implementations —
+    // re-establish the real-catalog default so a per-test override (D1) can't
+    // leak into the next test.
+    mockSupportsEffort.mockImplementation((m: string) => !m.includes("haiku"));
     workItemCounter = 0;
     registry = makeMockRegistry();
     sessionStore = makeMockSessionStore();
@@ -599,28 +641,70 @@ describe("AgentManager", () => {
       (appConfig as any).modelRouter.enabled = false;
     });
 
-    it("passes resource limits from router to runner.send()", async () => {
+    it("delivers STATIC-tier limits on the router-on path (KPR-338)", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
-      const mockRoute = {
-        tier: "opus" as const,
-        model: "claude-opus-4-7",
-        costUsd: 0.001,
-        durationMs: 50,
-        resourceLimits: { timeoutMs: 600_000, maxTurns: 200, budgetUsd: 50 },
-      };
-      vi.mocked(routeModel).mockResolvedValue(mockRoute);
+      // Effort-only result (KPR-338) — the router no longer names tier/model/
+      // limits: the turn's model is the agent's static model, limits are
+      // static-tier, resolved in prepareSpawn regardless of the router output.
+      vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
 
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
+
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      // Position 4 (limits) = agent-s's STATIC sonnet tier, not the routed junk.
+      expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+    });
+
+    it("merges per-agent resourceTiers overrides into the static limits (KPR-338)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      registry._agents.set(
+        "agent-s-override",
+        makeAgentConfig({
+          id: "agent-s-override",
+          name: "AgentSOverride",
+          model: "claude-sonnet-4-6",
+          resourceTiers: { sonnet: { budgetUsd: 2 } },
+        }),
+      );
+      vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
+
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s-override" }));
+
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual({ timeoutMs: 300_000, maxTurns: 50, budgetUsd: 2 });
+    });
+
+    it("haiku-static agent skips the classifier — haiku-tier limits, no effort (KPR-338, replaces H1)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // agent-a's default model is claude-haiku-4-5 → staticTier haiku → skip.
       await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
 
-      expect(mockRunnerSend).toHaveBeenCalledWith(
-        expect.any(String),
-        undefined,
-        undefined,
-        expect.any(Object),
-        "claude-opus-4-7",
-        mockRoute.resourceLimits,
-        undefined,
+      expect(routeModel).not.toHaveBeenCalled();
+      const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.haiku);
+      expect(effort).toBeUndefined();
+    });
+
+    it("off-catalog effort-incapable model: skip + warn-once across turns (KPR-338 D1/D2)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Non-haiku-named id (staticTier resolves to the sonnet default) that the
+      // catalog reports effort-incapable — the D1 warn-once path.
+      mockSupportsEffort.mockReturnValue(false);
+      registry._agents.set(
+        "agent-nova",
+        makeAgentConfig({ id: "agent-nova", name: "AgentNova", model: "claude-nova-9" }),
       );
+
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-nova", threadId: "sms:line-1:nova-1" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-nova", threadId: "sms:line-1:nova-2" }));
+
+      expect(routeModel).not.toHaveBeenCalled();
+      // Static limits still enforced (substring default tier = sonnet).
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+      // Warn fired exactly once across two turns (warn-once per model id).
+      const effortWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("effort hints disabled"));
+      expect(effortWarns).toHaveLength(1);
     });
 
     it("passes undefined resource limits when model router is disabled", async () => {
@@ -793,6 +877,7 @@ describe("AgentManager", () => {
     function smsCtx(overrides: Partial<{
       agentId: string;
       sessionId: string | undefined;
+      sessionProvider: AgentProviderId | undefined;
       threadId: string;
       channelId: string;
       text: string;
@@ -809,6 +894,7 @@ describe("AgentManager", () => {
       return {
         agentId,
         sessionId: overrides.sessionId,
+        sessionProvider: overrides.sessionProvider,
         channelId,
         threadId,
         workItem,
@@ -837,6 +923,7 @@ describe("AgentManager", () => {
         "agent-a",
         ctx.threadId,
         "session-sms-1",
+        "claude",
         expect.objectContaining({ inputTokens: 100, outputTokens: 50 }),
       );
 
@@ -959,7 +1046,7 @@ describe("AgentManager", () => {
     it("KPR-220 Phase 3: runWorkItemTurn resolves session via store and delegates to spawnTurn", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       // Pre-seed a session so the wrapper's lookup hits.
-      sessionStore.set("agent-a", "sms:line-1:wrap", "stored-session", undefined as any);
+      sessionStore.set("agent-a", "sms:line-1:wrap", "stored-session", "claude", undefined as any);
       mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "stored-session" }));
 
       const item = makeWorkItem({
@@ -1860,21 +1947,27 @@ describe("AgentManager", () => {
       // Turn 1
       const sess0 = await sessionStore.get("agent-a", threadId);
       expect(sess0).toBeUndefined();
-      const turn1 = await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess0 }));
+      const turn1 = await manager.spawnTurn(
+        smsCtx({ threadId, channelId, sessionId: sess0?.sessionId, sessionProvider: sess0?.provider }),
+      );
       expect(turn1.newSessionId).toBe("session-A");
-      expect(await sessionStore.get("agent-a", threadId)).toBe("session-A");
+      expect((await sessionStore.get("agent-a", threadId))?.sessionId).toBe("session-A");
 
       // Turn 2 — adapter resumes against the stored id, SDK rotates inside.
       const sess1 = await sessionStore.get("agent-a", threadId);
-      const turn2 = await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess1 }));
+      const turn2 = await manager.spawnTurn(
+        smsCtx({ threadId, channelId, sessionId: sess1?.sessionId, sessionProvider: sess1?.provider }),
+      );
       expect(turn2.newSessionId).toBe("session-B");
       // Persistence side has rotated to the new id.
-      expect(await sessionStore.get("agent-a", threadId)).toBe("session-B");
+      expect((await sessionStore.get("agent-a", threadId))?.sessionId).toBe("session-B");
 
       // Turn 3 — adapter resumes against the rotated id.
       const sess2 = await sessionStore.get("agent-a", threadId);
-      expect(sess2).toBe("session-B");
-      await manager.spawnTurn(smsCtx({ threadId, channelId, sessionId: sess2 }));
+      expect(sess2?.sessionId).toBe("session-B");
+      await manager.spawnTurn(
+        smsCtx({ threadId, channelId, sessionId: sess2?.sessionId, sessionProvider: sess2?.provider }),
+      );
 
       // The third runner.send call resumed against session-B, not the original session-A.
       const [, thirdResume] = mockRunnerSend.mock.calls[2]!;
@@ -1965,41 +2058,39 @@ describe("AgentManager", () => {
       }
 
       it("three consecutive hard faults open the breaker; the next spawnTurn fast-fails before the adapter", async () => {
-        // Router must be enabled for this assertion to mean anything — with
-        // the module-mocked config's default `modelRouter.enabled: false`
-        // (test file line 46), `routeModel` is never called regardless of
-        // where the circuit-breaker rejection lands, making a bare
-        // `not.toHaveBeenCalled()` vacuous. Enable it here with try/finally
-        // restore, mirroring the voice carve-out precedent (test file
-        // ~2186-2205).
+        // Router must be enabled for this assertion to mean anything, AND the
+        // fast-failed turn must run on a router-ELIGIBLE agent. Post-KPR-338
+        // haiku-static agents skip the classifier entirely (agent-a is
+        // haiku), so a fast-fail on agent-a would leave routeModel uncalled
+        // for a reason unrelated to the breaker — the delta pin below would
+        // pass vacuously. agent-s is sonnet-static (still router-eligible): an
+        // ADMITTED turn WOULD spend a router call, so a zero delta across the
+        // fast-failed agent-s turn genuinely pins "breaker permit before any
+        // model-router spend" (CLAUDE.md). tripBreaker stays on agent-a — the
+        // breaker is per-provider and both resolve to claude.
         (appConfig as any).modelRouter.enabled = true;
         try {
-          // Pattern per test file :610 — resolve routeModel so tripBreaker's
-          // setup turns (which now also invoke the router) don't hang.
-          vi.mocked(routeModel).mockResolvedValue({
-            tier: "sonnet",
-            model: "claude-sonnet-4-7",
-            costUsd: 0,
-            durationMs: 0,
-            resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
-          });
+          // Effort-only stub (T2d reshape — the KPR-338 ModelRouterResult no
+          // longer carries tier/model/limits). Only an admitted agent-s turn
+          // would consume it — tripBreaker's agent-a turns skip the router
+          // (haiku, KPR-338).
+          vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
 
           await tripBreaker();
           expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
 
           const callsBefore = mockRunnerSend.mock.calls.length;
           const routerCallsBefore = vi.mocked(routeModel).mock.calls.length;
-          await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:fast-fail" }))).rejects.toBeInstanceOf(
-            ProviderCircuitOpenError,
-          );
+          await expect(
+            manager.spawnTurn(smsCtx({ agentId: "agent-s", threadId: "sms:line-1:fast-fail" })),
+          ).rejects.toBeInstanceOf(ProviderCircuitOpenError);
           // Adapter never invoked for the fast-failed turn (pre-prepareSpawn throw).
           expect(mockRunnerSend.mock.calls.length).toBe(callsBefore);
           // Router also never invoked for the fast-failed turn specifically:
-          // pin the *call-count delta* across just this turn (routeModel was
-          // already called `routerCallsBefore` times by tripBreaker's setup
-          // turns, since the router is enabled here) — mirroring the
-          // `mockRunnerSend` count-delta assertion immediately above, not an
-          // absolute "never called" claim.
+          // pin the *call-count delta* across just this turn. tripBreaker's
+          // agent-a turns skip the router (haiku, KPR-338), so routerCallsBefore
+          // is 0; the point is that the admitted-but-for-the-breaker agent-s
+          // turn spends nothing — the permit gates before any router call.
           expect(vi.mocked(routeModel).mock.calls.length).toBe(routerCallsBefore);
         } finally {
           (appConfig as any).modelRouter.enabled = false;
@@ -2097,6 +2188,310 @@ describe("AgentManager", () => {
         expect(result.aborted ?? false).toBe(false);
       });
     });
+
+    describe("router→adapter seam invariants (KPR-311)", () => {
+      it("breaker permit provider === effective route provider for claude and pilot agents (stable registry state)", async () => {
+        // R7: acquire() keys on the static provider before the router runs;
+        // the W3 clamp makes shaping.route.provider agree whenever both
+        // registry reads observe the same state. NOT asserted across a
+        // mid-turn registry mutation (see the SIGUSR1 race test below).
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:seam-claude" }));
+        expect(acquireSpy).toHaveBeenLastCalledWith("claude", expect.objectContaining({ agentId: "agent-a" }));
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1); // Claude adapter ran — same provider as the permit
+
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:seam-codex" }));
+        expect(acquireSpy).toHaveBeenLastCalledWith("codex", expect.objectContaining({ agentId: "codex-pilot" }));
+        expect(mockCodexConstructor).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.5" }));
+      });
+
+      it("SIGUSR1 removal race: prepareSpawn never throws on a vanished agent — failure lands inside the recorded try, record() once, no wedged permit", async () => {
+        const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+        // Flip the registry to "agent removed" the instant the breaker
+        // permit is issued: the acquire-site read (argument evaluation)
+        // still sees the agent; every later read — prepareSpawn's guarded
+        // read and createProviderAdapter's — sees undefined. This is the
+        // hot-reload race the `?.model ?? ""` guard exists for.
+        let vanished = false;
+        const realAcquire = manager.circuitBreakers.acquire.bind(manager.circuitBreakers);
+        vi.spyOn(manager.circuitBreakers, "acquire").mockImplementation((provider, meta) => {
+          const permit = realAcquire(provider, meta);
+          vanished = true;
+          return permit;
+        });
+        registry.get.mockImplementation((id: string) =>
+          vanished && id === "agent-a" ? undefined : registry._agents.get(id),
+        );
+
+        // Rejects with the createProviderAdapter throw — NOT a TypeError
+        // from an unguarded agentConfig.model dereference in prepareSpawn.
+        await expect(manager.spawnTurn(smsCtx({ threadId: "sms:line-1:hot-reload" }))).rejects.toThrow(
+          /Unknown agent: agent-a/,
+        );
+
+        // Exactly one record(), on the permit acquired pre-removal,
+        // classified non-provider (never trips) from the thrown error.
+        expect(recordSpy).toHaveBeenCalledTimes(1);
+        const [permit, classification] = recordSpy.mock.calls[0]!;
+        expect(permit.provider).toBe("claude");
+        expect(classification).toEqual({
+          outcome: "fault",
+          kind: "non-provider",
+          message: expect.stringContaining("Unknown agent"),
+        });
+        const snap = manager.circuitBreakers.stateFor("claude")!;
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0);
+
+        // No wedge, no lock leak: restore the registry, same thread runs clean.
+        registry.get.mockImplementation((id: string) => registry._agents.get(id));
+        const result = await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:hot-reload" }));
+        expect(result.finalMessage).toBe("response");
+      });
+    });
+
+    describe("session-identity guard + persist rule (KPR-313)", () => {
+      function seed(threadId: string, sessionId: string, provider: string, agentId = "agent-a") {
+        sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      }
+
+      it("trips on stored tag ≠ turn provider: fresh session, claude annotation, new-session metric, exactly ONE trip-path store read", async () => {
+        const recordSpawnSpy = vi.spyOn(manager as any, "recordSpawn");
+        const threadId = "sms:line-1:kpr313-trip";
+        seed(threadId, "resp_stale", "openai");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "s-new" }));
+
+        await manager.spawnTurn(smsCtx({ threadId, sessionId: "resp_stale", sessionProvider: "openai" }));
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined(); // resume stripped
+        expect(prompt.startsWith("[System notice:")).toBe(true); // annotation prepended before sender prefix
+        expect(prompt).toContain("session continuity was reset");
+        expect(prompt).toContain("conversation_search"); // claude-target variant
+        expect(prompt).toContain("hello over sms"); // original text intact
+        expect(recordSpawnSpy).toHaveBeenCalledTimes(1); // counted as a new session
+        expect(sessionStore.get).toHaveBeenCalledTimes(1); // the authoritative re-read — trip path only
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("provider mismatch"),
+          expect.objectContaining({ stored: "openai", turn: "claude", hadSessionId: true }),
+        );
+      });
+
+      it("same-provider tag resumes with ZERO store reads on the hot path (also the untagged-legacy fleet-upgrade pin — grandfathered rows arrive as claude)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1" }));
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr313-match", sessionId: "s-1", sessionProvider: "claude" }),
+        );
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBe("s-1");
+        expect(prompt).not.toContain("session continuity was reset");
+        expect(sessionStore.get).not.toHaveBeenCalled(); // zero-I/O hot path
+      });
+
+      it("codex-tagged empty row + claude turn: nothing to resume AND the annotation still fires (round-trip return leg)", async () => {
+        const threadId = "sms:line-1:kpr313-return";
+        seed(threadId, "", "codex"); // re-read stays codex ⇒ handoff, not adopt
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "back", sessionId: "s-back" }));
+
+        await manager.spawnTurn(smsCtx({ threadId, sessionId: undefined, sessionProvider: "codex" }));
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined();
+        expect(prompt).toContain("session continuity was reset"); // keyed on the TAG, not the id
+      });
+
+      it("claude→pilot handoff uses the pilot annotation variant (no conversation_search — pilots are tool-free)", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        const threadId = "sms:line-1:kpr313-topilot";
+        seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+        );
+
+        const req = mockCodexRunTurn.mock.calls[0]![0];
+        expect(req.sessionId).toBeUndefined();
+        expect(req.prompt).toContain("session continuity was reset");
+        expect(req.prompt).not.toContain("conversation_search");
+      });
+
+      it("⚠A9 re-resolve-on-trip: queued same-thread turn ADOPTS the predecessor's switched session instead of double-dropping", async () => {
+        const threadId = "sms:line-1:kpr313-race";
+        seed(threadId, "resp_stale", "openai");
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ text: "A", sessionId: "s-A" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "B", sessionId: "s-A" }));
+
+        // Both turns read the store PRE-lock (runWorkItemTurn) and capture the
+        // stale openai tag; the per-thread lock then serializes the spawns.
+        // Determinism note: both pre-lock reads resolve before A persists only
+        // under the all-mocked microtask scheduling — if the harness gains real
+        // async, add an explicit ordering assertion (A's set before B's send).
+        const mk = (text: string) =>
+          makeWorkItem({ text, threadId, source: { kind: "sms" as const, id: "line-1", label: "May" }, sender: "+1" });
+        const p1 = manager.runWorkItemTurn("agent-a", mk("turn A"));
+        const p2 = manager.runWorkItemTurn("agent-a", mk("turn B"));
+        await Promise.all([p1, p2]);
+
+        // Turn A tripped: fresh + handoff, persisted (s-A, claude).
+        const [promptA, resumeA] = mockRunnerSend.mock.calls[0]!;
+        expect(resumeA).toBeUndefined();
+        expect(promptA).toContain("session continuity was reset");
+        // Turn B's captured tag was a full turn stale — the post-lock re-read
+        // returned A's claude row and B adopted it: resumed s-A, NO second
+        // handoff, A's exchange preserved.
+        const [promptB, resumeB] = mockRunnerSend.mock.calls[1]!;
+        expect(resumeB).toBe("s-A");
+        expect(promptB).not.toContain("session continuity was reset");
+      });
+
+      it("persist rule: claude id+tag; codex ''+tag with findAgentByThread intact; gemini ''+tag", async () => {
+        // Claude
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-c" }));
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr313-p-claude" }));
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-a", "sms:line-1:kpr313-p-claude", "s-c", "claude", expect.anything(),
+        );
+
+        // Codex — adapter returns a fabricated id ("codex-session" fixture); store must get "".
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr313-p-codex" }));
+        expect(sessionStore.set).toHaveBeenLastCalledWith(
+          "codex-pilot", "sms:line-1:kpr313-p-codex", "", "codex", expect.anything(),
+        );
+        // The ROW survives — thread→agent mapping intact (the ticket's rule, literally).
+        await expect(sessionStore.findAgentByThread("sms:line-1:kpr313-p-codex")).resolves.toBe("codex-pilot");
+
+        // Gemini
+        registry._agents.set(
+          "gemini-pilot",
+          makeAgentConfig({ id: "gemini-pilot", name: "Gemini Pilot", model: "gemini/gemini-3-pro", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr313-p-gem" }));
+        expect(sessionStore.set).toHaveBeenLastCalledWith(
+          "gemini-pilot", "sms:line-1:kpr313-p-gem", "", "gemini", expect.anything(),
+        );
+      });
+
+      it("persist rule: openai persists its resp id with the openai tag (genuinely resumable)", async () => {
+        registry._agents.set(
+          "openai-pilot",
+          makeAgentConfig({ id: "openai-pilot", name: "OpenAI Pilot", model: "openai/gpt-5.5:medium", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr313-p-oai" }));
+        expect(sessionStore.set).toHaveBeenLastCalledWith(
+          "openai-pilot", "sms:line-1:kpr313-p-oai", "openai-session", "openai", expect.anything(),
+        );
+      });
+
+      it("⚠A4 churn-mint rider: errored turn that resumed and returned a DIFFERENT id never overwrites the row", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ error: "No conversation found with session ID: s-old", sessionId: "s-minted" }),
+        );
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr313-mint", sessionId: "s-old", sessionProvider: "claude" }),
+        );
+        expect(sessionStore.set).not.toHaveBeenCalled();
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("different id"),
+          expect.objectContaining({ agentId: "agent-a" }),
+        );
+      });
+
+      it("errored turn that returned the SAME id it resumed re-persists (TTL refresh — M7b fault non-poisoning)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "tool blew up", sessionId: "s-same" }));
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr313-same", sessionId: "s-same", sessionProvider: "claude" }),
+        );
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-a", "sms:line-1:kpr313-same", "s-same", "claude", expect.anything(),
+        );
+      });
+
+      it("first-turn error with a fresh id persists (rider scoped to attempted resumes)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "tool blew up", sessionId: "s-first" }));
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr313-first" }));
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-a", "sms:line-1:kpr313-first", "s-first", "claude", expect.anything(),
+        );
+      });
+
+      it("end-to-end claude→codex→claude round trip via runWorkItemTurn: both directions trip, both variants, row state correct after each turn", async () => {
+        registry._agents.set("flip", makeAgentConfig({ id: "flip", name: "Flip", model: "claude-sonnet-4-6" }));
+        const threadId = "sms:line-1:kpr313-flip";
+        const mk = (text: string) =>
+          makeWorkItem({ text, threadId, source: { kind: "sms" as const, id: "line-1", label: "May" }, sender: "+1" });
+
+        // Turn 1 — claude: persists (s-1, claude).
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1" }));
+        await manager.runWorkItemTurn("flip", mk("t1"));
+        expect(sessionStore._sessions.get(`flip:${threadId}`)).toEqual({ sessionId: "s-1", provider: "claude" });
+
+        // Operator flips to codex (SIGUSR1 analog) — claude→pilot direction.
+        registry._agents.set(
+          "flip",
+          makeAgentConfig({ id: "flip", name: "Flip", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        await manager.runWorkItemTurn("flip", mk("t2"));
+        const codexReq = mockCodexRunTurn.mock.calls.at(-1)![0];
+        expect(codexReq.sessionId).toBeUndefined();
+        expect(codexReq.prompt).toContain("session continuity was reset");
+        expect(codexReq.prompt).not.toContain("conversation_search"); // pilot variant
+        expect(sessionStore._sessions.get(`flip:${threadId}`)).toEqual({ sessionId: "", provider: "codex" });
+
+        // Flip back — pilot→claude direction.
+        registry._agents.set("flip", makeAgentConfig({ id: "flip", name: "Flip", model: "claude-sonnet-4-6" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-3" }));
+        await manager.runWorkItemTurn("flip", mk("t3"));
+        const [prompt3, resume3] = mockRunnerSend.mock.calls.at(-1)!;
+        expect(resume3).toBeUndefined(); // codex row had nothing to resume
+        expect(prompt3).toContain("conversation_search"); // claude variant fired off the TAG alone
+        expect(sessionStore._sessions.get(`flip:${threadId}`)).toEqual({ sessionId: "s-3", provider: "claude" });
+      });
+
+      it("reflection re-resolve is FIELD-wise: same stored id/provider still hands runner.send the STRING id (ref-vs-string regression pin), one get only", async () => {
+        const threadId = "sms:line-1:kpr313-reflect";
+        seed(threadId, "s-r", "claude");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-r" }));
+
+        await manager.spawnTurn({
+          ...smsCtx({ threadId, sessionId: "s-r", sessionProvider: "claude" }),
+          kind: "reflection" as const,
+        });
+
+        const [, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBe("s-r"); // a string — a ref-vs-string compare would have rebuilt ctx with a ref here
+        expect(sessionStore.get).toHaveBeenCalledTimes(1); // re-resolve only; guard added no trip read
+      });
+
+      it("reflection after a provider edit runs fresh without throwing (re-resolve surfaces the tag, guard handles it)", async () => {
+        const threadId = "sms:line-1:kpr313-reflect-flip";
+        seed(threadId, "resp_x", "openai"); // stale reflection capture: agent now claude-static
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "reflected fresh", sessionId: "s-fresh" }));
+
+        const result = await manager.spawnTurn({
+          ...smsCtx({ threadId, sessionId: undefined, sessionProvider: undefined }),
+          kind: "reflection" as const,
+        });
+
+        expect(result.errors).toEqual([]);
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined();
+        expect(prompt).toContain("session continuity was reset"); // no special-casing for reflection (⚠A7)
+        expect(sessionStore.get).toHaveBeenCalledTimes(2); // re-resolve + trip re-read (redundant-but-idempotent)
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -2167,28 +2562,22 @@ describe("AgentManager", () => {
       expect(prompt.endsWith("[attachment summary]")).toBe(true);
     });
 
-    it("calls model router and uses override + resourceLimits in runner.send", async () => {
+    it("calls model router and delivers no override + static limits in runner.send (KPR-338 §3.2)", async () => {
       (appConfig as any).modelRouter.enabled = true;
       try {
-        const mockRoute = {
-          tier: "haiku" as const,
-          model: "claude-haiku-4-5-routed",
-          costUsd: 0.001,
-          durationMs: 50,
-          resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
-        };
-        vi.mocked(routeModel).mockResolvedValueOnce(mockRoute);
+        // Effort-only result (KPR-338) — no routed model/limits: model stays
+        // static, limits are the agent's STATIC tier (agent-s → sonnet).
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult());
 
         const item = makeWorkItem({
           text: "shape me",
           source: { kind: "sms", id: "line-1", label: "May" },
         });
-        await manager.spawnTurn(makeCtx(item, "sms"));
+        await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
         expect(routeModel).toHaveBeenCalledTimes(1);
-        const [, , , , modelOverride, resourceLimits] = mockRunnerSend.mock.calls[0]!;
-        expect(modelOverride).toBe("claude-haiku-4-5-routed");
-        expect(resourceLimits).toEqual(mockRoute.resourceLimits);
+        const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
       } finally {
         (appConfig as any).modelRouter.enabled = false;
       }
@@ -2197,18 +2586,11 @@ describe("AgentManager", () => {
     it("adds router cost to TurnResult.usage.costUsd", async () => {
       (appConfig as any).modelRouter.enabled = true;
       try {
-        const mockRoute = {
-          tier: "haiku" as const,
-          model: "claude-haiku-4-5-routed",
-          costUsd: 0.0042,
-          durationMs: 50,
-          resourceLimits: { timeoutMs: 60_000, maxTurns: 25, budgetUsd: 1 },
-        };
-        vi.mocked(routeModel).mockResolvedValueOnce(mockRoute);
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ costUsd: 0.0042 }));
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ costUsd: 0.05, sessionId: "s-cost" }));
 
         const item = makeWorkItem({ text: "cost test", source: { kind: "sms", id: "line-1", label: "May" } });
-        const result = await manager.spawnTurn(makeCtx(item, "sms"));
+        const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
 
         // 0.05 (runner) + 0.0042 (router) = 0.0542
         expect(result.usage.costUsd).toBeCloseTo(0.0542, 5);
@@ -2244,8 +2626,9 @@ describe("AgentManager", () => {
       expect(mockCodexRunTurn).toHaveBeenCalledWith(expect.objectContaining({
         prompt: "hello codex",
         sessionId: undefined,
-        modelOverride: undefined,
       }));
+      // KPR-338: the manager no longer sets modelOverride on the turn request.
+      expect("modelOverride" in mockCodexRunTurn.mock.calls[0]![0]).toBe(false);
       expect(result.finalMessage).toBe("codex response");
       expect(result.newSessionId).toBe("codex-session");
     });
@@ -2305,8 +2688,8 @@ describe("AgentManager", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      // Telemetry — fired with shaped prompt's modelOverride (undefined when
-      // router disabled) and the runner's session/token counts.
+      // Telemetry — fired with the shaped prompt and the runner's
+      // session/token counts.
       expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
       const telArg = turnTelemetryStore.record.mock.calls[0][0];
       expect(telArg.agentId).toBe("agent-a");
@@ -2354,6 +2737,331 @@ describe("AgentManager", () => {
         (appConfig as any).modelRouter.enabled = false;
       }
     });
+
+    describe("router→adapter seam (KPR-311)", () => {
+      afterEach(() => {
+        (appConfig as any).modelRouter.enabled = false;
+      });
+
+      it("delivers effort beside the static route (KPR-312 channel; KPR-338: no model merge)", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        // KPR-338: the router no longer names a model — the turn runs the
+        // agent's static model. Effort still travels BESIDE the route via
+        // SpawnShaping.effortOverride → runner.send position 6 (KPR-312).
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "high" }));
+
+        const item = makeWorkItem({ text: "route me", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
+
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(effort).toBe("high");
+      });
+
+      it("skips the router for sender === 'system' (scheduler/cron)", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        const item = makeWorkItem({
+          text: "execute your scheduled digest task",
+          sender: "system",
+          source: { kind: "sms", id: "line-1", label: "May" },
+        });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+
+        expect(routeModel).not.toHaveBeenCalled();
+        const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toBeUndefined();
+      });
+
+      it("pilot gate: routeModel is never called for a non-Claude-static agent, even with the router enabled", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult()); // defined pre-fix behavior for negative-verify
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({
+            id: "codex-pilot",
+            name: "Codex Pilot",
+            model: "codex/gpt-5.5:medium",
+            coreServers: [],
+            soul: "pilot soul",
+            systemPrompt: "pilot system",
+          }),
+        );
+
+        const item = makeWorkItem({ text: "hello codex", source: { kind: "sms", id: "line-1", label: "May" } });
+        const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+        // No router call → no cost, no misattributed override.
+        expect(routeModel).not.toHaveBeenCalled();
+        // Pilot constructed from the static route, exactly as with the router disabled.
+        expect(mockCodexConstructor).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "gpt-5.5", reasoningEffort: "medium" }),
+        );
+        // KPR-338: the manager no longer sets modelOverride on the turn request.
+        expect("modelOverride" in mockCodexRunTurn.mock.calls[0]![0]).toBe(false);
+        expect(result.finalMessage).toBe("codex response");
+      });
+
+      // KPR-338 §3.2: clamp branch deleted with ModelRouterResult.provider;
+      // invariant re-pinned below.
+      it("shaped route ≡ static route on every path (KPR-338 invariant re-pin)", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        // An effort-only router result — nothing in it moves the turn off the
+        // agent's static route (KPR-338: no tier/model to name).
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "high" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ costUsd: 0.05, sessionId: "s-static" }));
+
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+
+        const item = makeWorkItem({ text: "static me", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
+
+        // Claude adapter ran — no pilot constructor for any provider.
+        expect(mockOpenAIConstructor).not.toHaveBeenCalled();
+        expect(mockCodexConstructor).not.toHaveBeenCalled();
+        expect(mockGeminiConstructor).not.toHaveBeenCalled();
+        // KPR-338: send carries no per-turn model — arity pin proves no extra
+        // positional survives (the type system enforces the rest).
+        expect(mockRunnerSend.mock.calls[0]!.length).toBe(7);
+        // Telemetry + audit both read the agent's STATIC model, not the route junk.
+        expect(turnTelemetryStore.record).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "claude-sonnet-4-6" }),
+        );
+        expect(activityLogger.record).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "claude-sonnet-4-6" }),
+        );
+      });
+
+      it("createProviderAdapter consumes the shaping route, not a re-resolve of the live registry model", async () => {
+        const { formatFilesForPrompt } = await import("../files/file-processor.js");
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({
+            id: "codex-pilot",
+            name: "Codex Pilot",
+            model: "codex/gpt-5.5:medium",
+            coreServers: [],
+            soul: "",
+            systemPrompt: "pilot system",
+          }),
+        );
+        // Mutate the registry model AFTER prepareSpawn resolves the static
+        // route (formatFilesForPrompt runs inside prepareSpawn, after the
+        // route read) but BEFORE adapter construction. A re-resolve inside
+        // createProviderAdapter would see gpt-9:low; the passed route must
+        // carry gpt-5.5:medium. (Fails against pre-KPR-311 code.)
+        vi.mocked(formatFilesForPrompt).mockImplementationOnce(() => {
+          registry._agents.set(
+            "codex-pilot",
+            makeAgentConfig({
+              id: "codex-pilot",
+              name: "Codex Pilot",
+              model: "codex/gpt-9:low",
+              coreServers: [],
+              soul: "",
+              systemPrompt: "pilot system",
+            }),
+          );
+          return "";
+        });
+
+        const item = makeWorkItem({
+          text: "seam check",
+          source: { kind: "sms", id: "line-1", label: "May" },
+          files: [{ name: "doc.txt", url: "https://example.com/doc.txt" } as any],
+        });
+        await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+        expect(mockCodexConstructor).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "gpt-5.5", reasoningEffort: "medium" }),
+        );
+      });
+
+      it("auth-rebuild retry reuses the first routing decision — routeModel once, same limits/effort, no override on both attempts", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "medium" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "401 Unauthorized" }));
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "recovered", sessionId: "s2" }));
+
+        const item = makeWorkItem({ text: "retry me", source: { kind: "sms", id: "line-1", label: "May" } });
+        // sessionId present — the auth-rebuild retry only fires on resumable turns.
+        await manager.spawnTurn({ ...makeCtx(item, "sms", "s1"), agentId: "agent-s" });
+
+        expect(routeModel).toHaveBeenCalledTimes(1); // no re-route, no double routerCostUsd
+        expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+        // KPR-338: no per-turn model override on either attempt; identical
+        // static limits + effort reused (shaping resolved once).
+        expect(mockRunnerSend.mock.calls[0]![4]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(mockRunnerSend.mock.calls[1]![4]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(mockRunnerSend.mock.calls[0]![6]).toBe("medium");
+        expect(mockRunnerSend.mock.calls[1]![6]).toBe("medium");
+      });
+
+      it("activity audit modelTier: STATIC tier on both router-on and router-off claude turns (KPR-338 D4)", async () => {
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+
+        // Router on → static tier reaches the audit (router output is effort-only).
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult());
+        const item1 = makeWorkItem({ text: "tier check", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn({ ...makeCtx(item1, "sms"), agentId: "agent-s" });
+        expect(activityLogger.record).toHaveBeenLastCalledWith(
+          expect.objectContaining({ modelTier: "sonnet", model: "claude-sonnet-4-6" }),
+        );
+
+        // Router off → STILL the static tier (KPR-338 D4: tier is a per-agent
+        // fact, was undefined pre-338). Property present AND "sonnet".
+        (appConfig as any).modelRouter.enabled = false;
+        const item2 = makeWorkItem({ text: "no tier", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn({ ...makeCtx(item2, "sms"), agentId: "agent-s" });
+        const offArg = activityLogger.record.mock.calls.at(-1)![0];
+        expect("modelTier" in offArg).toBe(true);
+        expect(offArg.modelTier).toBe("sonnet");
+      });
+
+      it("misattribution fix: a router-enabled pilot agent audits its static model, no tier, no router call", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult()); // would misattribute pre-fix
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({
+            id: "codex-pilot",
+            name: "Codex Pilot",
+            model: "codex/gpt-5.5:medium",
+            coreServers: [],
+            soul: "",
+            systemPrompt: "pilot system",
+          }),
+        );
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+
+        const item = makeWorkItem({ text: "audit me", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+        expect(routeModel).not.toHaveBeenCalled();
+        // Static pilot model in the audit — NOT a Claude router output.
+        expect(activityLogger.record).toHaveBeenCalledWith(
+          expect.objectContaining({ model: "codex/gpt-5.5:medium" }),
+        );
+        // modelTier: property present AND undefined (see comment above).
+        const pilotArg = activityLogger.record.mock.calls.at(-1)![0];
+        expect("modelTier" in pilotArg).toBe(true);
+        expect(pilotArg.modelTier).toBeUndefined();
+      });
+
+      describe("effort delivery channel (KPR-312)", () => {
+        it("threads hasFiles into routeModel's 2nd arg", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
+
+          // agent-s (sonnet) — the haiku default skips the router entirely.
+          const noFiles = makeWorkItem({ text: "no files", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn({ ...makeCtx(noFiles, "sms"), agentId: "agent-s" });
+          expect(vi.mocked(routeModel).mock.calls[0]![1]).toEqual({ hasFiles: false });
+          // Exact-args pin (KPR-338 2-arg contract): text + opts only — no
+          // ceiling, no resourceTiers overrides.
+          expect(vi.mocked(routeModel)).toHaveBeenCalledWith("no files", { hasFiles: false });
+
+          const withFiles = makeWorkItem({
+            text: "",
+            source: { kind: "sms", id: "line-1", label: "May" },
+            files: [{ name: "doc.txt", url: "https://example.com/doc.txt" } as any],
+          });
+          await manager.spawnTurn({ ...makeCtx(withFiles, "sms"), agentId: "agent-s", threadId: "sms:line-1:files" });
+          expect(vi.mocked(routeModel).mock.calls[1]![1]).toEqual({ hasFiles: true });
+        });
+
+        it("router-off and system-sender paths deliver no effort", async () => {
+          (appConfig as any).modelRouter.enabled = false;
+          const off = makeWorkItem({ text: "plain", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn(makeCtx(off, "sms"));
+          expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+
+          (appConfig as any).modelRouter.enabled = true;
+          const sys = makeWorkItem({
+            text: "execute your scheduled digest task",
+            sender: "system",
+            source: { kind: "sms", id: "line-1", label: "May" },
+          });
+          await manager.spawnTurn({ ...makeCtx(sys, "sms"), threadId: "sms:line-1:sys" });
+          expect(routeModel).not.toHaveBeenCalled();
+          expect(mockRunnerSend.mock.calls[1]![6]).toBeUndefined();
+        });
+
+        it("voice path delivers no effort (carve-out — router never runs)", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "high" }));
+          // Mirror the existing voice carve-out test's ctx/item construction (rule 1).
+          const item = makeWorkItem({ text: "voice turn", source: { kind: "ws", id: "voice-1", label: "voice" } });
+          await manager.spawnTurn({ ...makeCtx(item, "voice"), threadId: "voice:1" });
+          expect(routeModel).not.toHaveBeenCalled();
+          expect(mockRunnerSend.mock.calls[0]![4]).toBeUndefined(); // resourceLimits pinned undefined
+          expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+        });
+
+        it("delivers effort with no model override anywhere (KPR-338)", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          // KPR-338: the router names no model; the turn runs the agent's
+          // static model, effort still rides beside the route.
+          vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "low" }));
+
+          const item = makeWorkItem({ text: "same model", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s" });
+
+          const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+          expect(effort).toBe("low"); // effort still delivered beside the static route
+        });
+
+        it("pilot runTurn request carries effort: undefined (gate: router never ran)", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "high" }));
+          registry._agents.set(
+            "codex-pilot",
+            makeAgentConfig({
+              id: "codex-pilot",
+              name: "Codex Pilot",
+              model: "codex/gpt-5.5:medium",
+              coreServers: [],
+              soul: "",
+              systemPrompt: "pilot system",
+            }),
+          );
+
+          const item = makeWorkItem({ text: "hello codex", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+
+          expect(routeModel).not.toHaveBeenCalled();
+          const req = mockCodexRunTurn.mock.calls[0]![0];
+          expect(req.effort).toBeUndefined();
+          expect(req.resourceLimits).toBeUndefined();
+        });
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -2363,10 +3071,10 @@ describe("AgentManager", () => {
     it("KPR-220 Phase 16: includes every registered agent on a fresh engine (no traffic yet)", () => {
       // Phase 16: snapshot includes registry.listIds() so the heartbeat
       // writes meaningful rows on first poll even without traffic. Mock
-      // registry has agent-a and agent-b; both should appear with
-      // zero-valued fields.
+      // registry has agent-a, agent-b, and agent-s (KPR-338 sonnet fixture);
+      // all should appear with zero-valued fields.
       const snapshot = manager.getSnapshot();
-      expect(Object.keys(snapshot.perAgent).sort()).toEqual(["agent-a", "agent-b"]);
+      expect(Object.keys(snapshot.perAgent).sort()).toEqual(["agent-a", "agent-b", "agent-s"]);
       const a = snapshot.perAgent["agent-a"]!;
       expect(a.activeSpawns).toBe(0);
       expect(a.activeThreadKeys).toEqual([]);

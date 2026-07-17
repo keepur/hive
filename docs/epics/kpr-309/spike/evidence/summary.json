@@ -1,0 +1,877 @@
+{
+  "runId": "run-2026-07-10T05-59-45-819Z",
+  "timestamp": "2026-07-10T06:01:42.132Z",
+  "sdkVersion": "0.2.104",
+  "seed": 310,
+  "withM9": true,
+  "ruling": "SAFE-WITH-CONSTRAINTS",
+  "constraints": [
+    "M2 T2: prompt-cache miss on switch - cacheRead=0 vs M1 baseline 16330, creation=27153",
+    "M4 T2: prompt-cache miss on switch - cacheRead=0 vs M1 baseline 16330, creation=23758",
+    "M6 T2: prompt-cache miss on switch - cacheRead=0 vs M1 baseline 16330, creation=27493"
+  ],
+  "totalCostUsd": 0.9168,
+  "totalTurnAttempts": 33,
+  "cells": [
+    {
+      "id": "M1",
+      "title": "control: sonnet->sonnet->sonnet",
+      "chain": "claude-sonnet-4-6 -> claude-sonnet-4-6 -> claude-sonnet-4-6",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M1.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "PASS",
+      "caveats": [],
+      "notes": [],
+      "optional": false,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "7611228a-c7fd-4f58-8e79-6f0bb4482e78",
+          "resumedSessionId": null,
+          "cacheRead": 16296,
+          "cacheCreation": 0,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.0049578,
+          "wallMs": 4184,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "7611228a-c7fd-4f58-8e79-6f0bb4482e78",
+          "resumedSessionId": "7611228a-c7fd-4f58-8e79-6f0bb4482e78",
+          "cacheRead": 16330,
+          "cacheCreation": 0,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.005043,
+          "wallMs": 2428,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "7611228a-c7fd-4f58-8e79-6f0bb4482e78",
+          "resumedSessionId": "7611228a-c7fd-4f58-8e79-6f0bb4482e78",
+          "cacheRead": 16362,
+          "cacheCreation": 0,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "expect:n2": true
+          },
+          "costUsd": 0.0051275999999999995,
+          "wallMs": 3217,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        }
+      ]
+    },
+    {
+      "id": "M2",
+      "title": "router downshift: sonnet->haiku->sonnet",
+      "chain": "claude-sonnet-4-6 -> claude-haiku-4-5-20251001 -> claude-sonnet-4-6",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M2.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "DEGRADED",
+      "caveats": [
+        "M2 T2: prompt-cache miss on switch - cacheRead=0 vs M1 baseline 16330, creation=27153"
+      ],
+      "notes": [],
+      "optional": false,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "87d4d4d8-7248-4352-b5cb-55d0c157c495",
+          "resumedSessionId": null,
+          "cacheRead": 14907,
+          "cacheCreation": 1391,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.00975735,
+          "wallMs": 2419,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-haiku-4-5-20251001",
+          "observedModels": [
+            "claude-haiku-4-5-20251001"
+          ],
+          "sessionId": "87d4d4d8-7248-4352-b5cb-55d0c157c495",
+          "resumedSessionId": "87d4d4d8-7248-4352-b5cb-55d0c157c495",
+          "cacheRead": 0,
+          "cacheCreation": 27153,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.03433125,
+          "wallMs": 2751,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "87d4d4d8-7248-4352-b5cb-55d0c157c495",
+          "resumedSessionId": "87d4d4d8-7248-4352-b5cb-55d0c157c495",
+          "cacheRead": 16298,
+          "cacheCreation": 140,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "expect:n2": true
+          },
+          "costUsd": 0.0056784,
+          "wallMs": 2931,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": true
+        }
+      ]
+    },
+    {
+      "id": "M3",
+      "title": "router upshift: haiku->sonnet->haiku",
+      "chain": "claude-haiku-4-5-20251001 -> claude-sonnet-4-6 -> claude-haiku-4-5-20251001",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M3.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "PASS",
+      "caveats": [],
+      "notes": [],
+      "optional": false,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-haiku-4-5-20251001",
+          "observedModels": [
+            "claude-haiku-4-5-20251001"
+          ],
+          "sessionId": "fd429331-42c1-4ca6-85ca-438357aa2dfd",
+          "resumedSessionId": null,
+          "cacheRead": 25645,
+          "cacheCreation": 1471,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.004688250000000001,
+          "wallMs": 2347,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "fd429331-42c1-4ca6-85ca-438357aa2dfd",
+          "resumedSessionId": "fd429331-42c1-4ca6-85ca-438357aa2dfd",
+          "cacheRead": 14907,
+          "cacheCreation": 1481,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.01015485,
+          "wallMs": 7672,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-haiku-4-5-20251001",
+          "observedModels": [
+            "claude-haiku-4-5-20251001"
+          ],
+          "sessionId": "fd429331-42c1-4ca6-85ca-438357aa2dfd",
+          "resumedSessionId": "fd429331-42c1-4ca6-85ca-438357aa2dfd",
+          "cacheRead": 27116,
+          "cacheCreation": 124,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "expect:n2": true
+          },
+          "costUsd": 0.0032966000000000002,
+          "wallMs": 2293,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": true
+        }
+      ]
+    },
+    {
+      "id": "M4",
+      "title": "ceiling pair: sonnet->opus->sonnet",
+      "chain": "claude-sonnet-4-6 -> claude-opus-4-7 -> claude-sonnet-4-6",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M4.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "DEGRADED",
+      "caveats": [
+        "M4 T2: prompt-cache miss on switch - cacheRead=0 vs M1 baseline 16330, creation=23758"
+      ],
+      "notes": [],
+      "optional": false,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "da8c76d9-0496-479d-b486-846e02230cb2",
+          "resumedSessionId": null,
+          "cacheRead": 14907,
+          "cacheCreation": 1389,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.00974985,
+          "wallMs": 3335,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-opus-4-7",
+          "observedModels": [
+            "claude-opus-4-7"
+          ],
+          "sessionId": "da8c76d9-0496-479d-b486-846e02230cb2",
+          "resumedSessionId": "da8c76d9-0496-479d-b486-846e02230cb2",
+          "cacheRead": 0,
+          "cacheCreation": 23758,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.44637750000000004,
+          "wallMs": 4379,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "da8c76d9-0496-479d-b486-846e02230cb2",
+          "resumedSessionId": "da8c76d9-0496-479d-b486-846e02230cb2",
+          "cacheRead": 16296,
+          "cacheCreation": 68,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "expect:n2": true
+          },
+          "costUsd": 0.0053928000000000005,
+          "wallMs": 3009,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": true
+        }
+      ]
+    },
+    {
+      "id": "M5",
+      "title": "max distance: opus->haiku->opus",
+      "chain": "claude-opus-4-7 -> claude-haiku-4-5-20251001 -> claude-opus-4-7",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M5.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "PASS",
+      "caveats": [],
+      "notes": [],
+      "optional": false,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-opus-4-7",
+          "observedModels": [
+            "claude-opus-4-7"
+          ],
+          "sessionId": "b1a531ec-2d00-40c5-a329-ca8895341687",
+          "resumedSessionId": null,
+          "cacheRead": 21707,
+          "cacheCreation": 2000,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.0706005,
+          "wallMs": 3884,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-haiku-4-5-20251001",
+          "observedModels": [
+            "claude-haiku-4-5-20251001"
+          ],
+          "sessionId": "b1a531ec-2d00-40c5-a329-ca8895341687",
+          "resumedSessionId": "b1a531ec-2d00-40c5-a329-ca8895341687",
+          "cacheRead": 25645,
+          "cacheCreation": 1506,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.004857,
+          "wallMs": 3101,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-opus-4-7",
+          "observedModels": [
+            "claude-opus-4-7"
+          ],
+          "sessionId": "b1a531ec-2d00-40c5-a329-ca8895341687",
+          "resumedSessionId": "b1a531ec-2d00-40c5-a329-ca8895341687",
+          "cacheRead": 23707,
+          "cacheCreation": 197,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "expect:n2": true
+          },
+          "costUsd": 0.040694249999999994,
+          "wallMs": 3949,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": true
+        }
+      ]
+    },
+    {
+      "id": "M6",
+      "title": "tool-state carryover: sonnet->haiku->sonnet with in-process MCP tool",
+      "chain": "claude-sonnet-4-6 -> claude-haiku-4-5-20251001 -> claude-sonnet-4-6",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M6.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "DEGRADED",
+      "caveats": [
+        "M6 T2: prompt-cache miss on switch - cacheRead=0 vs M1 baseline 16330, creation=27493"
+      ],
+      "notes": [],
+      "optional": false,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "4210ea0f-ed6e-41e0-b931-e4aa29da07eb",
+          "resumedSessionId": null,
+          "cacheRead": 47781,
+          "cacheCreation": 1738,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:sw": true
+          },
+          "costUsd": 0.024022799999999997,
+          "wallMs": 8464,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-haiku-4-5-20251001",
+          "observedModels": [
+            "claude-haiku-4-5-20251001"
+          ],
+          "sessionId": "4210ea0f-ed6e-41e0-b931-e4aa29da07eb",
+          "resumedSessionId": "4210ea0f-ed6e-41e0-b931-e4aa29da07eb",
+          "cacheRead": 0,
+          "cacheCreation": 27493,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.034751250000000004,
+          "wallMs": 2475,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "4210ea0f-ed6e-41e0-b931-e4aa29da07eb",
+          "resumedSessionId": "4210ea0f-ed6e-41e0-b931-e4aa29da07eb",
+          "cacheRead": 16645,
+          "cacheCreation": 159,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:sw": true,
+            "expect:n1": true,
+            "expect:n2": true
+          },
+          "costUsd": 0.005913749999999999,
+          "wallMs": 3283,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": true
+        }
+      ]
+    },
+    {
+      "id": "M7a",
+      "title": "fork semantics: sonnet chain with forkSession on T2",
+      "chain": "claude-sonnet-4-6 -> claude-sonnet-4-6 -> claude-sonnet-4-6 -> claude-sonnet-4-6",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M7a.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "PASS",
+      "caveats": [],
+      "notes": [],
+      "optional": false,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "86c6f76e-baa5-4b35-a2f3-e7ac04719fb4",
+          "resumedSessionId": null,
+          "cacheRead": 14907,
+          "cacheCreation": 1388,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.009746099999999999,
+          "wallMs": 2916,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "5c1983fb-4e11-4873-bdf7-55f70c51278d",
+          "resumedSessionId": "86c6f76e-baa5-4b35-a2f3-e7ac04719fb4",
+          "cacheRead": 16295,
+          "cacheCreation": 37,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.005156249999999999,
+          "wallMs": 5605,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3a",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "5c1983fb-4e11-4873-bdf7-55f70c51278d",
+          "resumedSessionId": "5c1983fb-4e11-4873-bdf7-55f70c51278d",
+          "cacheRead": 16332,
+          "cacheCreation": 31,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "expect:n2": true
+          },
+          "costUsd": 0.00526485,
+          "wallMs": 3447,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3b",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "86c6f76e-baa5-4b35-a2f3-e7ac04719fb4",
+          "resumedSessionId": "86c6f76e-baa5-4b35-a2f3-e7ac04719fb4",
+          "cacheRead": 16295,
+          "cacheCreation": 24,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "forbid:n2": false
+          },
+          "costUsd": 0.005107499999999999,
+          "wallMs": 3391,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        }
+      ]
+    },
+    {
+      "id": "M7b",
+      "title": "stale-id resume: plain sonnet chain, T3 resumes T1's superseded id",
+      "chain": "claude-sonnet-4-6 -> claude-sonnet-4-6 -> claude-sonnet-4-6",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M7b.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "PASS",
+      "caveats": [],
+      "notes": [
+        "T3: observed nonce \"n2\" VISIBLE (recorded invariant for KPR-313)"
+      ],
+      "optional": false,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "fc372da6-63ba-4e74-993a-9f6c912b5996",
+          "resumedSessionId": null,
+          "cacheRead": 14907,
+          "cacheCreation": 1389,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.00974985,
+          "wallMs": 3391,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "fc372da6-63ba-4e74-993a-9f6c912b5996",
+          "resumedSessionId": "fc372da6-63ba-4e74-993a-9f6c912b5996",
+          "cacheRead": 16296,
+          "cacheCreation": 35,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.005164050000000001,
+          "wallMs": 6267,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "fc372da6-63ba-4e74-993a-9f6c912b5996",
+          "resumedSessionId": "fc372da6-63ba-4e74-993a-9f6c912b5996",
+          "cacheRead": 16331,
+          "cacheCreation": 29,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "observe:n2": true
+          },
+          "costUsd": 0.00524205,
+          "wallMs": 3535,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        }
+      ]
+    },
+    {
+      "id": "M9",
+      "title": "OPTIONAL informative: opus+adaptive-thinking->haiku->opus",
+      "chain": "claude-opus-4-7 -> claude-haiku-4-5-20251001 -> claude-opus-4-7",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M9.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "PASS",
+      "caveats": [],
+      "notes": [],
+      "optional": true,
+      "faultCell": false,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-opus-4-7",
+          "observedModels": [
+            "claude-opus-4-7"
+          ],
+          "sessionId": "5f4ef12b-4ea2-4f8d-9268-0e86b8a27948",
+          "resumedSessionId": null,
+          "cacheRead": 21707,
+          "cacheCreation": 2000,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.0706005,
+          "wallMs": 2983,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-haiku-4-5-20251001",
+          "observedModels": [
+            "claude-haiku-4-5-20251001"
+          ],
+          "sessionId": "5f4ef12b-4ea2-4f8d-9268-0e86b8a27948",
+          "resumedSessionId": "5f4ef12b-4ea2-4f8d-9268-0e86b8a27948",
+          "cacheRead": 25645,
+          "cacheCreation": 1506,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.004877,
+          "wallMs": 2811,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-opus-4-7",
+          "observedModels": [
+            "claude-opus-4-7"
+          ],
+          "sessionId": "5f4ef12b-4ea2-4f8d-9268-0e86b8a27948",
+          "resumedSessionId": "5f4ef12b-4ea2-4f8d-9268-0e86b8a27948",
+          "cacheRead": 23707,
+          "cacheCreation": 200,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true,
+            "expect:n2": true
+          },
+          "costUsd": 0.040675499999999996,
+          "wallMs": 3352,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": true
+        }
+      ]
+    },
+    {
+      "id": "M8",
+      "title": "fault cell: sonnet->bogus->sonnet + post-fault probe",
+      "chain": "claude-sonnet-4-6 -> claude-nonexistent-9 -> claude-sonnet-4-6 -> claude-sonnet-4-6 -> claude-sonnet-4-6",
+      "provenance": {
+        "runId": "run-2026-07-10T05-59-45-819Z",
+        "sourceJsonl": "evidence/M8.jsonl",
+        "attemptGraded": 1
+      },
+      "grade": "PASS",
+      "caveats": [],
+      "notes": [
+        "M8 T2 fault shape: THROWN Error: Claude Code returned an error result: There's an issue with the selected model (claude-nonexistent-9). It may not exist or you may not have access to it. Run --model to pick a different model."
+      ],
+      "optional": false,
+      "faultCell": true,
+      "turns": [
+        {
+          "label": "T1",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "c0dc02ec-bf60-446c-a9e5-dc6fa502f40a",
+          "resumedSessionId": null,
+          "cacheRead": 14907,
+          "cacheCreation": 1389,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.00974985,
+          "wallMs": 3025,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T2",
+          "attempt": 1,
+          "requestedModel": "claude-nonexistent-9",
+          "observedModels": [],
+          "sessionId": "c0dc02ec-bf60-446c-a9e5-dc6fa502f40a",
+          "resumedSessionId": "c0dc02ec-bf60-446c-a9e5-dc6fa502f40a",
+          "cacheRead": 0,
+          "cacheCreation": 0,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0,
+          "wallMs": 1640,
+          "timedOut": false,
+          "thrown": "Error: Claude Code returned an error result: There's an issue with the selected model (claude-nonexistent-9). It may not exist or you may not have access to it. Run --model to pick a different model.",
+          "cacheWindowOk": null
+        },
+        {
+          "label": "T3",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "c0dc02ec-bf60-446c-a9e5-dc6fa502f40a",
+          "resumedSessionId": "c0dc02ec-bf60-446c-a9e5-dc6fa502f40a",
+          "cacheRead": 16296,
+          "cacheCreation": 51,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:n1": true
+          },
+          "costUsd": 0.00522405,
+          "wallMs": 2468,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "P1",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "1b324aa5-5979-41a9-b4c0-8a2b79d15344",
+          "resumedSessionId": null,
+          "cacheRead": 14907,
+          "cacheCreation": 1388,
+          "subtype": "success",
+          "nonceRecall": {},
+          "costUsd": 0.009746099999999999,
+          "wallMs": 2352,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        },
+        {
+          "label": "P2",
+          "attempt": 1,
+          "requestedModel": "claude-sonnet-4-6",
+          "observedModels": [
+            "claude-sonnet-4-6"
+          ],
+          "sessionId": "1b324aa5-5979-41a9-b4c0-8a2b79d15344",
+          "resumedSessionId": "1b324aa5-5979-41a9-b4c0-8a2b79d15344",
+          "cacheRead": 16295,
+          "cacheCreation": 20,
+          "subtype": "success",
+          "nonceRecall": {
+            "expect:probe": true
+          },
+          "costUsd": 0.0050925,
+          "wallMs": 2985,
+          "timedOut": false,
+          "thrown": null,
+          "cacheWindowOk": null
+        }
+      ]
+    }
+  ]
+}

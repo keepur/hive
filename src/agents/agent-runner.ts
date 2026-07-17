@@ -55,6 +55,7 @@ import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
+import type { ReasoningEffort } from "./provider-adapters/types.js";
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -1522,13 +1523,12 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits, systemPromptOverride?: string): Promise<RunResult> {
-    const effectiveModel = modelOverride ?? this.agentConfig.model;
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: ReasoningEffort): Promise<RunResult> {
+    const effectiveModel = this.agentConfig.model;
 
     log.info("Sending prompt to agent", {
       agent: this.agentConfig.id,
       model: effectiveModel,
-      modelOverride: modelOverride ? true : false,
       resumeSession: sessionId ?? "new",
       promptLength: prompt.length,
       streaming: !!onStream,
@@ -1797,6 +1797,15 @@ export class AgentRunner {
 
         maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
         maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
+        // KPR-312: per-turn reasoning effort from the complexity classifier.
+        // ReasoningEffort and the SDK's EffortLevel overlap but neither is a
+        // superset (ReasoningEffort has minimal/none/xhigh; EffortLevel has
+        // max) — only the shared {low, medium, high} subset is deliverable
+        // (routeModel emits nothing else; the narrowing also satisfies the
+        // SDK's EffortLevel type). Deliberately NO `thinking` key: toggling
+        // thinking config turn-to-turn invalidates the messages-tier prompt
+        // cache — the exact cost class KPR-312 avoids.
+        ...(effort === "low" || effort === "medium" || effort === "high" ? { effort } : {}),
         // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
         // may return arbitrary SDK options, but we explicitly pick only the safe ones
         // so a rogue archetype can't override security invariants (permissionMode,
@@ -1989,7 +1998,17 @@ export class AgentRunner {
           }
 
           if (result.subtype === "success") {
-            resultText = result.result || resultText;
+            if (result.is_error === true) {
+              // KPR-312 (KPR-310 M8): the SDK can emit subtype "success" with
+              // is_error: true and the error text in `result` (observed for a
+              // rejected model id). Adopting that text as the reply mis-reads
+              // the turn — classify it as an error. In M8 a subsequent SDK
+              // throw rescued the turn anyway; this guard keeps classification
+              // correct even if a future SDK version stops throwing.
+              error = result.result || "unknown error (is_error result)";
+            } else {
+              resultText = result.result || resultText;
+            }
           } else {
             error = result.subtype;
             if ("errors" in result && Array.isArray(result.errors)) {
