@@ -65,6 +65,10 @@ const ACK_ALLOWLIST: ReadonlySet<string> = new Set([
  * claude-static route.
  */
 export function modelToTier(model: string): ModelTier {
+  // Mythos-class models (Fable/Mythos 5) sit above Opus — give them the
+  // opus resource envelope; without this branch they'd substring-match
+  // nothing and silently land on sonnet limits.
+  if (model.includes("fable") || model.includes("mythos")) return "opus";
   if (model.includes("opus")) return "opus";
   if (model.includes("haiku")) return "haiku";
   return "sonnet";

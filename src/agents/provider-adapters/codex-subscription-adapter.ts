@@ -5,7 +5,7 @@ import type { AgentProviderAdapter, AgentProviderTurnRequest, ReasoningEffort } 
 import { createCodexOpenAITokenProvider } from "./oauth-credentials.js";
 
 const DEFAULT_CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
-const DEFAULT_CODEX_MODEL = "gpt-5.4-mini";
+const DEFAULT_CODEX_MODEL = "gpt-5.6-luna";
 
 /** Back-compat alias — KPR-311 moved the canonical type to types.ts. */
 export type CodexReasoningEffort = ReasoningEffort;

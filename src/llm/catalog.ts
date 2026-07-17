@@ -36,6 +36,24 @@ export const LLM_CATALOG: readonly CatalogModel[] = [
     capabilities: ["json", "structured-outputs", "vision", "effort"],
   },
   {
+    // 2026-07 model sync: current generation. Capability entries so
+    // supportsEffort() passes for fleet agents on these models; pricing
+    // absent (agent turns run subscription auth — no cost consumer).
+    id: "claude-sonnet-5",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
+    id: "claude-opus-4-8",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
+    id: "claude-fable-5",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
     // Default vision-task model (config.gemini.visionModel default).
     id: "gemini-2.5-flash",
     provider: "gemini",

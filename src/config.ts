@@ -275,7 +275,7 @@ export const config = {
     agentModel: optional("OPENAI_AGENT_MODEL", ""),
   },
   codex: {
-    agentModel: optional("CODEX_AGENT_MODEL", "gpt-5.4-mini"),
+    agentModel: optional("CODEX_AGENT_MODEL", "gpt-5.6-luna"),
   },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),

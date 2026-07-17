@@ -34,8 +34,23 @@ import {
   resolveResourceLimits,
   RESOURCE_TIER_DEFAULTS,
   __resetRouterStateForTests,
+  modelToTier,
   type ModelRouterResult,
 } from "./model-router.js";
+
+describe("modelToTier", () => {
+  it("maps opus/haiku/sonnet ids by substring", () => {
+    expect(modelToTier("claude-opus-4-8")).toBe("opus");
+    expect(modelToTier("claude-haiku-4-5")).toBe("haiku");
+    expect(modelToTier("claude-sonnet-5")).toBe("sonnet");
+    expect(modelToTier("opus")).toBe("opus");
+  });
+
+  it("maps Mythos-class models (fable/mythos) to the opus envelope", () => {
+    expect(modelToTier("claude-fable-5")).toBe("opus");
+    expect(modelToTier("claude-mythos-5")).toBe("opus");
+  });
+});
 
 describe("resolveResourceLimits", () => {
   it("returns global defaults when no agent overrides", () => {

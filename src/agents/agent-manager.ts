@@ -512,7 +512,7 @@ export class AgentManager {
       return new OpenAIAgentsAdapter({
         name: config.name,
         instructions,
-        model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
+        model: route.model || appConfig.openai.agentModel || "gpt-5.6-luna",
         toolInventory,
       });
     }
