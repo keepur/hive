@@ -57,7 +57,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run test",
-    "check:bundle": "npm run bundle && node scripts/check-bundle-strings.mjs && node scripts/check-bundle-pack.mjs && node scripts/check-bundle-runtime.mjs",
+    "check:bundle": "npm run bundle && node scripts/check-bundle-strings.mjs && node scripts/check-bundle-pack.mjs && node scripts/check-bundle-runtime.mjs && node scripts/check-bundle-qdrant-stub.mjs",
     "bundle": "npm run build && npx tsx build/bundle.ts",
     "prepublishOnly": "npm run bundle"
   },
