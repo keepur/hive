@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { Agent } from "undici";
+import { Agent, fetch as undiciFetch } from "undici";
 import { KEEPALIVE_TIMEOUT_MS, createKeepAliveAgent, installKeepAliveDispatcher } from "./loopback-dispatcher.js";
 import { DEFAULT_REGISTRATION_INTERVAL_MS } from "../beekeeper-client.js";
 
@@ -37,6 +37,17 @@ describe("loopback-dispatcher", () => {
     }).not.toThrow();
   });
 
+  it("registers both modern and legacy global dispatcher symbols (Node 22-26 compat, KPR-344)", () => {
+    // undici v8 setGlobalDispatcher writes `.2` (raw agent, read by Node 26+
+    // internals) AND `.1` (Dispatcher1Wrapper-wrapped, read by Node 22/24
+    // internals). undici v6 wrote only `.1`, which made KPR-252 pooling a
+    // silent no-op on Node 26. This test fails on any undici <7 downgrade.
+    installKeepAliveDispatcher();
+    const g = globalThis as unknown as Record<symbol, unknown>;
+    expect(g[Symbol.for("undici.globalDispatcher.2")]).toBeDefined();
+    expect(g[Symbol.for("undici.globalDispatcher.1")]).toBeDefined();
+  });
+
   it("reuses a single TCP connection across sequential requests", async () => {
     let connections = 0;
     server = createServer((_req, res) => {
@@ -50,11 +61,10 @@ describe("loopback-dispatcher", () => {
     agent = createKeepAliveAgent();
 
     for (let i = 0; i < 5; i++) {
-      // Test files are excluded from tsc (see tsconfig), so `dispatcher` can be
-      // passed inline at runtime here. Typechecked source resolves the global
-      // RequestInit to the DOM variant (no `dispatcher`) and needs a typed
-      // intersection — see src/beekeeper-client.ts.
-      const res = await fetch(`http://127.0.0.1:${port}/`, { dispatcher: agent });
+      // Per-request dispatchers must pair with undici's own fetch — the
+      // runtime's built-in fetch rejects cross-major per-request dispatchers
+      // (KPR-344).
+      const res = await undiciFetch(`http://127.0.0.1:${port}/`, { dispatcher: agent });
       await res.text();
       // Yield one macrotask tick so undici recycles the just-used socket back
       // into the free pool before the next dispatch. Without this, back-to-back
@@ -83,7 +93,7 @@ describe("loopback-dispatcher", () => {
 
     for (let i = 0; i < 5; i++) {
       const perCall = createKeepAliveAgent();
-      const res = await fetch(`http://127.0.0.1:${port}/`, { dispatcher: perCall });
+      const res = await undiciFetch(`http://127.0.0.1:${port}/`, { dispatcher: perCall });
       await res.text();
       await perCall.close();
     }

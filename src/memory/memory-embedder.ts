@@ -3,6 +3,7 @@ import { createLogger } from "../logging/logger.js";
 import { embedOllama } from "../search/embed-utils.js";
 import type { MemoryRecallFilters, MemoryTier } from "./memory-types.js";
 import type { MemoryVectorIndex } from "./memory-vector-index.js";
+import { describeError } from "../logging/describe-error.js";
 
 const log = createLogger("memory-embedder");
 
@@ -183,7 +184,7 @@ export class MemoryEmbedder implements MemoryVectorIndex {
         points: pointIds,
       });
     } catch (err) {
-      log.warn("setTierPayload failed", { count: pointIds.length, tier, error: String(err) });
+      log.warn("setTierPayload failed", { count: pointIds.length, tier, error: describeError(err) });
     }
   }
 }

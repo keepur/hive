@@ -5,7 +5,7 @@
  * Prereq: npm run build (tsc → dist/)
  * Output: pkg/ (publish-ready minified bundles)
  */
-import { build } from "esbuild";
+import { build, type Plugin } from "esbuild";
 import { rmSync, mkdirSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -28,7 +28,6 @@ const external = [
   "@slack/socket-mode",
   "@slack/web-api",
   "@linear/sdk",
-  "@qdrant/js-client-rest",
   // File-processing libs with complex internal asset loading
   "pdf-parse",
   "mammoth",
@@ -36,6 +35,28 @@ const external = [
   // Third-party MCP servers (resolved via createRequire at runtime)
   "brave-search-mcp",
 ];
+
+// KPR-344: neutralize @qdrant/js-client-rest's per-request undici dispatcher.
+// Per-request dispatchers have no cross-undici-major compat (its v6 Agent
+// breaks fetch on Node 26 internals; a v8 Agent breaks on Node 22/24), so no
+// version pin can satisfy the whole support matrix. Plain global fetch works
+// on every major and still pools through the KPR-252 global keep-alive agent.
+// The marker property survives minification (side effect on a used symbol)
+// and is asserted by scripts/check-bundle-qdrant-stub.mjs.
+const qdrantDispatcherStub: Plugin = {
+  name: "qdrant-dispatcher-stub",
+  setup(b) {
+    b.onLoad(
+      { filter: /[\\/]@qdrant[\\/]js-client-rest[\\/]dist[\\/][^\\/]+[\\/]dispatcher\.js$/ },
+      () => ({
+        contents:
+          "export const createDispatcher = () => undefined;\n" +
+          'createDispatcher.hiveStub = "hive-qdrant-dispatcher-stub";\n',
+        loader: "js",
+      }),
+    );
+  },
+};
 
 const shared = {
   outdir: PKG_DIR,
@@ -46,6 +67,7 @@ const shared = {
   target: "node22",
   format: "esm" as const,
   external,
+  plugins: [qdrantDispatcherStub],
   logLevel: "info" as const,
   banner: {
     js: "import { createRequire as __hiveCreateRequire } from 'module'; const require = __hiveCreateRequire(import.meta.url);",

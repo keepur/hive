@@ -24,15 +24,16 @@ else
   log "Homebrew already installed."
 fi
 
-# 3. Node 22 (or higher major)
+# 3. Node >= 22.19 (undici 8 floor; matches package.json engines)
 NODE_OK=0
 if command -v node >/dev/null 2>&1; then
   NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-  if [[ "$NODE_MAJOR" -ge 22 ]]; then
+  NODE_MINOR="$(node -p 'process.versions.node.split(".")[1]')"
+  if [[ "$NODE_MAJOR" -gt 22 || ( "$NODE_MAJOR" -eq 22 && "$NODE_MINOR" -ge 19 ) ]]; then
     log "Node $(node -v) already installed."
     NODE_OK=1
   else
-    warn "Found Node $(node -v); hive needs >=22. Installing node@22 via Homebrew."
+    warn "Found Node $(node -v); hive needs >=22.19 (undici 8 floor). Installing node@22 via Homebrew."
   fi
 fi
 if [[ "$NODE_OK" -eq 0 ]]; then
