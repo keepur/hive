@@ -171,6 +171,9 @@ describe("catalog metadata (spec §3.2 pins)", () => {
     expect(r.supportsEffort("claude-haiku-4-5-20251001")).toBe(false);
     expect(r.supportsEffort("claude-sonnet-4-6")).toBe(true);
     expect(r.supportsEffort("claude-opus-4-7")).toBe(true);
+    expect(r.supportsEffort("claude-opus-4-8")).toBe(true);
+    expect(r.supportsEffort("claude-sonnet-5")).toBe(true);
+    expect(r.supportsEffort("claude-fable-5")).toBe(true);
     expect(r.supportsEffort("mystery-model")).toBe(false);
   });
 

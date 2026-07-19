@@ -36,6 +36,23 @@ export const LLM_CATALOG: readonly CatalogModel[] = [
     capabilities: ["json", "structured-outputs", "vision", "effort"],
   },
   {
+    id: "claude-opus-4-8",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
+    id: "claude-sonnet-5",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
+    // Thinking is always on for fable-5 (no disable), but the effort param is
+    // accepted, so the KPR-338 per-turn effort lever stays live.
+    id: "claude-fable-5",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
     // Default vision-task model (config.gemini.visionModel default).
     id: "gemini-2.5-flash",
     provider: "gemini",
