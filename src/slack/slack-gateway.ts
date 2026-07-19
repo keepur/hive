@@ -171,8 +171,27 @@ export class SlackGateway {
           count: event.files.length,
           names: event.files.map((f: any) => f.name),
         });
+        // Enrich file objects via files.info — Socket Mode events often carry
+        // partial file metadata (missing url_private_download / url_private).
+        // files.info returns the full object including the download URL.
+        const enrichedFiles = await Promise.all(
+          (event.files as any[]).map(async (f: any) => {
+            if (f.url_private_download || f.url_private) return f;
+            try {
+              const info = await this.web.files.info({ file: f.id as string });
+              return (info.file as any) ?? f;
+            } catch (err) {
+              log.warn("files.info failed, using partial file object", {
+                id: f.id,
+                name: f.name,
+                error: String(err),
+              });
+              return f;
+            }
+          }),
+        );
         const results = await Promise.all(
-          event.files.map((f: any) => downloadAndProcess(f as SlackFile, this.botToken)),
+          enrichedFiles.map((f: any) => downloadAndProcess(f as SlackFile, this.botToken)),
         );
         processedFiles = results.filter(Boolean) as ProcessedFile[];
       }
