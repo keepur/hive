@@ -509,8 +509,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
         const [major, minor] = process.versions.node.split(".").map((n) => parseInt(n, 10));
         return major > 22 || (major === 22 && minor >= 19);
       },
-      remedy:
-        "Install Node >= 22.19 (undici 8 floor): brew install node@22 && brew link --overwrite node@22",
+      remedy: "Install Node >= 22.19 (undici 8 floor): brew install node@22 && brew link --overwrite node@22",
     },
     {
       name: "Homebrew",
