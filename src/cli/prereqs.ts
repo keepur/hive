@@ -93,11 +93,16 @@ const prereqs: Prereq[] = [
     },
   },
   {
-    name: "Node.js >= 22",
+    name: "Node.js >= 22.19",
     required: true,
-    check: () => parseInt(process.versions.node.split(".")[0]) >= 22,
+    // Floor is 22.19.0, not just major 22: undici 8 (a transitive dep) requires
+    // >=22.19.0, and package.json `engines` was bumped to match.
+    check: () => {
+      const [major, minor] = process.versions.node.split(".").map((n) => parseInt(n, 10));
+      return major > 22 || (major === 22 && minor >= 19);
+    },
     install: () => {
-      console.log("  Installing Node.js via Homebrew...");
+      console.log("  Installing Node.js >= 22.19 (undici 8 floor) via Homebrew...");
       execFileSync("brew", ["install", "node"], { stdio: "inherit" });
     },
   },
