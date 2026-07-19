@@ -499,11 +499,18 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
   const checks: Check[] = [
     // ── Prereqs (preserved from existing doctor) ─────────────────────────
     {
-      name: "Node.js >= 22",
+      name: "Node.js >= 22.19",
       group: "prereq",
       required: true,
-      test: () => parseInt(process.versions.node.split(".")[0]) >= 22,
-      remedy: "Install Node 22+: brew install node@22 && brew link --overwrite node@22",
+      // Floor is 22.19.0, not just major 22: undici 8 (a transitive dep) requires
+      // >=22.19.0, and package.json `engines` was bumped to match. Compare
+      // major.minor so 22.0–22.18 correctly fails here instead of slipping through.
+      test: () => {
+        const [major, minor] = process.versions.node.split(".").map((n) => parseInt(n, 10));
+        return major > 22 || (major === 22 && minor >= 19);
+      },
+      remedy:
+        "Install Node >= 22.19 (undici 8 floor): brew install node@22 && brew link --overwrite node@22",
     },
     {
       name: "Homebrew",
