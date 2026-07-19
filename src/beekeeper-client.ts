@@ -11,6 +11,7 @@
  */
 
 import { createLogger } from "./logging/logger.js";
+import { describeError } from "./logging/describe-error.js";
 import { getLoopbackDispatcher } from "./http/loopback-dispatcher.js";
 import { fetch as undiciFetch, type Dispatcher } from "undici";
 
@@ -73,7 +74,7 @@ export function startBeekeeperRegistration(opts: BeekeeperRegistrationOptions): 
         log.warn("Beekeeper registration failed", { status: res.status, body: text });
       }
     } catch (err) {
-      log.warn("Beekeeper registration error", { error: String(err) });
+      log.warn("Beekeeper registration error", { error: describeError(err) });
     }
   };
 
