@@ -832,6 +832,13 @@ export class Dispatcher {
 
     // 2. Thread participant resolution — scan for new mentions in existing threads
     if (item.threadId) {
+      // Belt-and-suspenders: dedicated channel ownership always beats thread affinity.
+      // Step 1 above already checks this, but thread routing must never override a
+      // channel's registered owner — re-check here so a label mismatch or any other
+      // edge case in step 1 can't silently hand the message to the wrong agent.
+      const dedicatedOwner = this.registry.findByChannel(item.source.label);
+      if (dedicatedOwner) return [{ agentId: dedicatedOwner.id }];
+
       const newMentions = this.registry.findAllByName(item.text);
       const newMentionIds = new Set(newMentions.map((a) => a.id));
 
