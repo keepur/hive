@@ -52,7 +52,8 @@ async function loadLabelCache(teamId?: string): Promise<Map<string, string>> {
   const key = labelCacheKey(teamId);
   if (!labelCaches.has(key)) {
     const labels = await linearClient.listLabels(teamId);
-    labelCaches.set(key, new Map(labels.map((l) => [l.name.toLowerCase(), l.id])));
+    // Group labels can't be applied to issues — keep them out of the resolvable set
+    labelCaches.set(key, new Map(labels.filter((l) => !l.isGroup).map((l) => [l.name.toLowerCase(), l.id])));
   }
   return labelCaches.get(key)!;
 }
@@ -75,7 +76,7 @@ async function resolveLabelNames(names: string[], teamId?: string): Promise<{ id
 }
 
 function unknownLabelsMessage(unknown: string[]): string {
-  return `Unknown label(s): ${unknown.join(", ")}. Use linear_list_labels to see available labels, or linear_create_label to create one.`;
+  return `Unknown label(s): ${unknown.join(", ")}. Use linear_list_labels to see available labels (group labels cannot be applied to issues), or linear_create_label to create one.`;
 }
 
 // ── Issue ID Resolution ────────────────────────────────────────────────────
@@ -212,7 +213,7 @@ server.registerTool(
         labelIds,
       });
       if (!result) {
-        return { content: [{ type: "text", text: "Failed to create issue." }] };
+        return { content: [{ type: "text", text: "Failed to create issue." }], isError: true };
       }
       return { content: [{ type: "text", text: `Created ${result.identifier}: ${result.url}` }] };
     } catch (err) {
@@ -253,7 +254,9 @@ server.registerTool(
       const labelNames = [...(addLabels ?? []), ...(removeLabels ?? [])];
       const labelIdByName = new Map<string, string>();
       if (labelNames.length > 0) {
-        const resolved = await resolveLabelNames(labelNames);
+        // Resolve against the issue's own team — it may not be the default team
+        const issueTeamId = await linearClient.getIssueTeamId(resolvedId);
+        const resolved = await resolveLabelNames(labelNames, issueTeamId);
         if (resolved.unknown.length > 0) {
           return { content: [{ type: "text", text: unknownLabelsMessage(resolved.unknown) }], isError: true };
         }
@@ -277,7 +280,7 @@ server.registerTool(
           },
         );
         if (!ok) {
-          return { content: [{ type: "text", text: "Failed to update issue." }] };
+          return { content: [{ type: "text", text: "Failed to update issue." }], isError: true };
         }
       }
 

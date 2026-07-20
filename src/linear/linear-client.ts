@@ -247,6 +247,7 @@ export class LinearClient {
       const filter = resolvedTeamId
         ? { or: [{ team: { id: { eq: resolvedTeamId } } }, { team: { null: true } }] }
         : undefined;
+      // 250 is Linear's max page size; workspaces beyond that need pagination (not yet needed)
       const result = await this.client.issueLabels({ filter, first: 250 });
       return result.nodes.map((l) => ({
         id: l.id,
@@ -280,6 +281,17 @@ export class LinearClient {
     } catch (err) {
       log.error("Failed to create label", { error: String(err), name });
       return null;
+    }
+  }
+
+  async getIssueTeamId(issueId: string): Promise<string | undefined> {
+    try {
+      const issue = await this.client.issue(issueId);
+      const team = await issue.team;
+      return team?.id;
+    } catch (err) {
+      log.error("Failed to get issue team", { error: String(err), issueId });
+      return undefined;
     }
   }
 
