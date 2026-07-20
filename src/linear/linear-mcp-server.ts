@@ -2,7 +2,8 @@
 
 /**
  * Linear MCP Server — runs as a stdio subprocess inside each agent's Claude Code session.
- * Gives agents the ability to list teams, create/read/update/search issues, and manage workflow states.
+ * Gives agents the ability to list teams, create/read/update/search issues, manage workflow states,
+ * and manage labels (list/create labels, add/remove labels on issues).
  *
  * Env vars:
  *   LINEAR_API_KEY  — Linear API key (required)
@@ -37,6 +38,44 @@ async function resolveStateName(name: string, teamId?: string): Promise<string |
     stateCaches.set(tid, new Map(states.map((s) => [s.name.toLowerCase(), s.id])));
   }
   return stateCaches.get(tid)!.get(name.toLowerCase());
+}
+
+// ── Label Name Resolution ──────────────────────────────────────────────────
+
+const labelCaches = new Map<string, Map<string, string>>();
+
+function labelCacheKey(teamId?: string): string {
+  return teamId ?? DEFAULT_TEAM_ID ?? "*";
+}
+
+async function loadLabelCache(teamId?: string): Promise<Map<string, string>> {
+  const key = labelCacheKey(teamId);
+  if (!labelCaches.has(key)) {
+    const labels = await linearClient.listLabels(teamId);
+    labelCaches.set(key, new Map(labels.map((l) => [l.name.toLowerCase(), l.id])));
+  }
+  return labelCaches.get(key)!;
+}
+
+/** Resolve label names to IDs. Refreshes the cache once on a miss (labels may be newly created). */
+async function resolveLabelNames(names: string[], teamId?: string): Promise<{ ids: string[]; unknown: string[] }> {
+  let cache = await loadLabelCache(teamId);
+  if (names.some((n) => !cache.has(n.toLowerCase()))) {
+    labelCaches.delete(labelCacheKey(teamId));
+    cache = await loadLabelCache(teamId);
+  }
+  const ids: string[] = [];
+  const unknown: string[] = [];
+  for (const name of names) {
+    const id = cache.get(name.toLowerCase());
+    if (id) ids.push(id);
+    else unknown.push(name);
+  }
+  return { ids, unknown };
+}
+
+function unknownLabelsMessage(unknown: string[]): string {
+  return `Unknown label(s): ${unknown.join(", ")}. Use linear_list_labels to see available labels, or linear_create_label to create one.`;
 }
 
 // ── Issue ID Resolution ────────────────────────────────────────────────────
@@ -148,19 +187,29 @@ server.registerTool(
       description: z.string().optional().describe("Issue description (markdown)"),
       priority: z.number().optional().describe("Priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low"),
       stateName: z.string().optional().describe("Workflow state name (e.g. 'In Progress', 'Todo')"),
+      labels: z.array(z.string()).optional().describe("Label names to apply (see linear_list_labels)"),
     },
   },
-  async ({ title, teamId, description, priority, stateName }) => {
+  async ({ title, teamId, description, priority, stateName, labels }) => {
     try {
       let stateId: string | undefined;
       if (stateName) {
         stateId = await resolveStateName(stateName, teamId);
+      }
+      let labelIds: string[] | undefined;
+      if (labels && labels.length > 0) {
+        const resolved = await resolveLabelNames(labels, teamId);
+        if (resolved.unknown.length > 0) {
+          return { content: [{ type: "text", text: unknownLabelsMessage(resolved.unknown) }], isError: true };
+        }
+        labelIds = resolved.ids;
       }
       const result = await linearClient.createIssue(title, {
         teamId,
         description,
         priority,
         stateId,
+        labelIds,
       });
       if (!result) {
         return { content: [{ type: "text", text: "Failed to create issue." }] };
@@ -185,9 +234,11 @@ server.registerTool(
       description: z.string().optional().describe("New description (markdown)"),
       priority: z.number().optional().describe("Priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low"),
       stateName: z.string().optional().describe("Workflow state name (e.g. 'In Progress', 'Done')"),
+      addLabels: z.array(z.string()).optional().describe("Label names to add (see linear_list_labels)"),
+      removeLabels: z.array(z.string()).optional().describe("Label names to remove"),
     },
   },
-  async ({ issueId, title, description, priority, stateName }) => {
+  async ({ issueId, title, description, priority, stateName, addLabels, removeLabels }) => {
     try {
       const resolvedId = await resolveIssueId(issueId);
       if (!resolvedId) {
@@ -199,23 +250,51 @@ server.registerTool(
         stateId = await resolveStateName(stateName);
       }
 
+      const labelNames = [...(addLabels ?? []), ...(removeLabels ?? [])];
+      const labelIdByName = new Map<string, string>();
+      if (labelNames.length > 0) {
+        const resolved = await resolveLabelNames(labelNames);
+        if (resolved.unknown.length > 0) {
+          return { content: [{ type: "text", text: unknownLabelsMessage(resolved.unknown) }], isError: true };
+        }
+        labelNames.forEach((name, i) => labelIdByName.set(name, resolved.ids[i]));
+      }
+
       const fields: Record<string, unknown> = {};
       if (title !== undefined) fields.title = title;
       if (description !== undefined) fields.description = description;
       if (priority !== undefined) fields.priority = priority;
       if (stateId !== undefined) fields.stateId = stateId;
 
-      const ok = await linearClient.updateIssue(
-        resolvedId,
-        fields as {
-          title?: string;
-          description?: string;
-          priority?: number;
-          stateId?: string;
-        },
-      );
-      if (!ok) {
-        return { content: [{ type: "text", text: "Failed to update issue." }] };
+      if (Object.keys(fields).length > 0) {
+        const ok = await linearClient.updateIssue(
+          resolvedId,
+          fields as {
+            title?: string;
+            description?: string;
+            priority?: number;
+            stateId?: string;
+          },
+        );
+        if (!ok) {
+          return { content: [{ type: "text", text: "Failed to update issue." }] };
+        }
+      }
+
+      const labelFailures: string[] = [];
+      for (const name of addLabels ?? []) {
+        const ok = await linearClient.addLabelToIssue(resolvedId, labelIdByName.get(name)!);
+        if (!ok) labelFailures.push(`add ${name}`);
+      }
+      for (const name of removeLabels ?? []) {
+        const ok = await linearClient.removeLabelFromIssue(resolvedId, labelIdByName.get(name)!);
+        if (!ok) labelFailures.push(`remove ${name}`);
+      }
+      if (labelFailures.length > 0) {
+        return {
+          content: [{ type: "text", text: `Issue updated, but label changes failed: ${labelFailures.join(", ")}.` }],
+          isError: true,
+        };
       }
       return { content: [{ type: "text", text: "Issue updated." }] };
     } catch (err) {
@@ -332,6 +411,63 @@ server.registerTool(
       return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Failed to list workflow states: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: linear_list_labels ───────────────────────────────────────────────
+
+server.registerTool(
+  "linear_list_labels",
+  {
+    title: "List Labels",
+    description:
+      "List issue labels available to a team (team labels plus workspace-level labels). Use this to see label names before applying them to issues.",
+    inputSchema: {
+      teamId: z.string().optional().describe("Team ID (defaults to LINEAR_TEAM_ID env var)"),
+    },
+  },
+  async ({ teamId }) => {
+    try {
+      const labels = await linearClient.listLabels(teamId);
+      if (labels.length === 0) {
+        return { content: [{ type: "text", text: "No labels found." }] };
+      }
+      const lines = labels.map(
+        (l) =>
+          `${l.name} (${l.color})${l.isGroup ? " [group — not directly assignable]" : ""}${l.description ? ` — ${l.description}` : ""}`,
+      );
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to list labels: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: linear_create_label ──────────────────────────────────────────────
+
+server.registerTool(
+  "linear_create_label",
+  {
+    title: "Create Label",
+    description: "Create a new issue label in the specified or default Linear team.",
+    inputSchema: {
+      name: z.string().describe("Label name"),
+      teamId: z.string().optional().describe("Team ID (defaults to LINEAR_TEAM_ID env var)"),
+      color: z.string().optional().describe("Hex color (e.g. '#5e6ad2'); Linear assigns one if omitted"),
+      description: z.string().optional().describe("Label description"),
+    },
+  },
+  async ({ name, teamId, color, description }) => {
+    try {
+      const label = await linearClient.createLabel(name, { teamId, color, description });
+      if (!label) {
+        return { content: [{ type: "text", text: "Failed to create label." }], isError: true };
+      }
+      labelCaches.clear();
+      return { content: [{ type: "text", text: `Created label "${label.name}" (${label.color}).` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed to create label: ${String(err)}` }], isError: true };
     }
   },
 );
