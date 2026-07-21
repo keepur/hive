@@ -17,7 +17,7 @@ import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildPrefix } from "./prefix-builder.js";
+import { buildPrefix, SECTION_JOINER, formatDateTimeTrailer } from "./prefix-builder.js";
 import type { PrefixCache } from "./prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./prefix-invalidation.js";
 import {
@@ -372,10 +372,9 @@ export class AgentRunner {
       : await buildPrefix(this.agentConfig, buildContext);
 
     // Date/time last — changes every minute, so placing it at the end
-    // preserves the static prefix for prompt caching.
-    const now = new Date();
-    const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
-    return `${prefix}\n\n---\n\n**Current date/time**: ${pacific} (Pacific Time)`;
+    // preserves the static prefix for prompt caching. Single definition
+    // shared with Lane B (KPR-349 §D1: the two lanes cannot drift).
+    return `${prefix}${SECTION_JOINER}${formatDateTimeTrailer()}`;
   }
 
 
