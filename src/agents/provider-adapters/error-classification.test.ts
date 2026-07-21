@@ -3,6 +3,7 @@ import {
   classifyTurnResult,
   classifyThrown,
   HARD_FAULT_KINDS,
+  TurnAssemblyError,
   type ProviderFaultKind,
 } from "./error-classification.js";
 
@@ -160,5 +161,17 @@ describe("bad-model (KPR-312 — KPR-310 verdict anomaly 1, M8)", () => {
     // A string matching both server-error and bad-model classifies server-error
     // (first match wins), proving the appended row cannot re-bucket old inputs.
     expect(faultKind("503 issue with the selected model")).toBe("server-error");
+  });
+});
+
+describe("TurnAssemblyError (KPR-347 §D6)", () => {
+  it("a wrapped Mongo ECONNREFUSED classifies non-provider — the instanceof pre-check beats the pattern tables", () => {
+    const msg = "connect ECONNREFUSED 127.0.0.1:27017";
+    expect(classifyThrown(new TurnAssemblyError(msg, { cause: new Error(msg) }))).toEqual({
+      outcome: "fault", kind: "non-provider", message: msg,
+    });
+    // Contrast case: the SAME message unwrapped pattern-matches connect-fail —
+    // proving the type, not string luck, carries the classification.
+    expect(classifyThrown(new Error(msg))).toMatchObject({ outcome: "fault", kind: "connect-fail" });
   });
 });

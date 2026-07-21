@@ -32,7 +32,7 @@ import {
 import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
-import { RESUMABLE_SESSION_PROVIDERS } from "./provider-adapters/types.js";
+import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
 
@@ -1400,7 +1400,7 @@ export class AgentManager {
       // store doubles as the dispatcher's thread→agent map via
       // findAgentByThread) with an empty sessionId — the row persists, the
       // fake handle never does.
-      const resumable = RESUMABLE_SESSION_PROVIDERS.has(route.provider);
+      const resumable = persistsResumableHandle(sessionSemanticsFor(route.provider));
       // ⚠A4 churn-mint rider: an ERROR turn that attempted a resume and came
       // back with a DIFFERENT id is a failed-resume mint (the CLI's
       // error_during_execution result carries a freshly minted session_id) —

@@ -58,6 +58,7 @@ function makeDescriptor(
       claude: "direct",
       openai: geminiCompatibility,
       gemini: geminiCompatibility,
+      codex: geminiCompatibility,
     },
   };
 }
