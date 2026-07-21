@@ -12,14 +12,13 @@ import type { Event, StructuredEvent } from "@google/adk";
 import { randomUUID } from "node:crypto";
 import type { RunResult } from "../agent-runner.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
-import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import { envValue, isProviderAuthError, resolveGoogleVertexOAuthConfig } from "./oauth-credentials.js";
 
 export interface GeminiAdkAdapterOptions {
   name: string;
-  instructions: string;
+  assembly: ProviderTurnAssembly;
   model?: string;
-  toolInventory?: HiveToolTransportDescriptor[];
   appName?: string;
   userId?: string;
   apiKey?: string;
@@ -47,8 +46,6 @@ export class GeminiAdkAdapter implements AgentProviderAdapter {
   constructor(private readonly options: GeminiAdkAdapterOptions) {}
 
   async runTurn(request: AgentProviderTurnRequest): Promise<RunResult> {
-    this.assertToolFreePilot();
-
     const startedAt = Date.now();
     this.aborted = false;
 
@@ -88,13 +85,6 @@ export class GeminiAdkAdapter implements AgentProviderAdapter {
     return this.aborted;
   }
 
-  private assertToolFreePilot(): void {
-    const unsupported = this.options.toolInventory?.find((entry) => entry.compatibility.gemini !== "claude-only");
-    if (unsupported) {
-      throw new Error(`Gemini ADK tool bridge is not implemented in KPR-234: ${unsupported.name}`);
-    }
-  }
-
   private async runWithAuthFallback(
     request: AgentProviderTurnRequest,
     sessionId: string,
@@ -128,8 +118,12 @@ export class GeminiAdkAdapter implements AgentProviderAdapter {
   ): Promise<RunResult> {
     const agent = new LlmAgent({
       name: sanitizeAgentName(this.options.name),
-      instruction: request.systemPromptOverride ?? this.options.instructions,
+      instruction: request.systemPromptOverride ?? this.options.assembly.instructions,
       model,
+      // KPR-347: assembly.toolInventory is carried but deliberately NOT
+      // advertised — an agent with a tools param but no executor invites
+      // tool calls nothing handles. KPR-348 flips this (no non-empty `tools`
+      // here until then).
       tools: [],
     });
     const runner = new InMemoryRunner({

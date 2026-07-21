@@ -7,7 +7,9 @@ import {
   consumeBufferedSseEvents,
   consumeCodexSse,
 } from "./codex-subscription-adapter.js";
-import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+import type { ProviderTurnAssembly } from "./turn-assembly.js";
+import { buildPilotInstructions } from "./turn-assembly.js";
+import type { HiveToolInventoryEntry } from "./tool-transport.js";
 
 function makeAdapter(
   overrides: Partial<ConstructorParameters<typeof CodexSubscriptionAdapter>[0]> = {},
@@ -19,7 +21,7 @@ function makeAdapter(
 
   const adapter = new CodexSubscriptionAdapter({
     name: "Pilot",
-    instructions: "Be useful.",
+    assembly: makeAssembly(),
     model: "gpt-5.4-mini",
     endpoint: "https://chatgpt.test/backend-api/codex/responses",
     codexAuthPath: authPath,
@@ -34,22 +36,33 @@ function makeAdapter(
   };
 }
 
-function makeDescriptor(
-  openaiCompatibility: HiveToolTransportDescriptor["compatibility"]["openai"],
-): HiveToolTransportDescriptor {
+function makeAssembly(overrides: Partial<ProviderTurnAssembly> = {}): ProviderTurnAssembly {
   return {
-    name: `tool-${openaiCompatibility}`,
-    transport: "stdio",
+    instructions: "Be useful.",
+    toolInventory: [],
+    omittedTools: [],
+    guardrailGate: async () => ({ behavior: "allow" }),
+    memory: {},
+    skillIndex: [],
+    ...overrides,
+  };
+}
+
+function makeInventoryEntry(name = "memory"): HiveToolInventoryEntry {
+  return {
+    name,
+    transport: "sdk-in-process",
     source: "core",
     requiresTurnContext: false,
-    requiresHiveRuntime: false,
-    inProcess: false,
+    requiresHiveRuntime: true,
+    inProcess: true,
     compatibility: {
       claude: "direct",
-      openai: openaiCompatibility,
-      gemini: openaiCompatibility,
-      codex: openaiCompatibility,
+      openai: "requires-hive-bridge",
+      gemini: "requires-hive-bridge",
+      codex: "requires-hive-bridge",
     },
+    schemas: { kind: "connect-time" },
   };
 }
 
@@ -257,19 +270,43 @@ describe("CodexSubscriptionAdapter", () => {
     }
   });
 
-  it("rejects non-Claude tool inventory before calling Codex", async () => {
-    const fetchMock = vi.fn<typeof fetch>();
-    for (const compatibility of ["mcp-bridge-candidate", "requires-hive-bridge", "unsupported"] as const) {
-      const { adapter, cleanup } = makeAdapter({ toolInventory: [makeDescriptor(compatibility)] }, fetchMock);
-      try {
-        await expect(adapter.runTurn({ prompt: "hello" })).rejects.toThrow(
-          "Codex subscription tool bridge is not implemented in Phase B",
-        );
-      } finally {
-        cleanup();
-      }
+  it("KPR-347 T1: construction + runTurn with a non-empty bridgeable inventory resolves and posts tools: []", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(sse([{ event: "response.output_text.done", data: { text: "done" } }])));
+    const { adapter, cleanup } = makeAdapter(
+      { assembly: makeAssembly({ toolInventory: [makeInventoryEntry()] }) },
+      fetchMock,
+    );
+
+    try {
+      await expect(adapter.runTurn({ prompt: "hello" })).resolves.toMatchObject({
+        text: "done",
+        aborted: false,
+      });
+      const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.tools).toEqual([]);
+    } finally {
+      cleanup();
     }
-    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("KPR-347 T1: instructions are byte-identical to buildPilotInstructions output", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(sse([{ event: "response.output_text.done", data: { text: "done" } }])));
+    const { adapter, cleanup } = makeAdapter(
+      { assembly: makeAssembly({ instructions: buildPilotInstructions("Pilot", "soul", "system") }) },
+      fetchMock,
+    );
+
+    try {
+      await adapter.runTurn({ prompt: "hello" });
+      const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.instructions).toBe("soul\n\nsystem");
+    } finally {
+      cleanup();
+    }
   });
 });
 

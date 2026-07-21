@@ -33,6 +33,7 @@ import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
+import { assembleProviderTurn } from "./provider-adapters/turn-assembly.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
 
@@ -228,18 +229,14 @@ interface SpawnShaping {
   routerCostUsd: number;
 }
 
-function buildPilotInstructions(name: string, soul: string, systemPrompt: string): string {
-  const sections = [soul.trim(), systemPrompt.trim()].filter(Boolean);
-  return sections.length ? sections.join("\n\n") : `You are ${name}.`;
-}
-
 /**
  * KPR-313 §3.4: hive-owned handoff annotation, prepended by prepareSpawn
  * when spawnTurn's session-identity guard reset thread continuity. Binding
  * content requirements (spec): the engine changed, prior turns in this
  * thread are not in context, agent memory is intact. The conversation_search
- * recall clause is Claude-target only — pilot adapters run tool-free
- * (assertToolFreePilot in codex/gemini; openai gets the no-tool variant regardless), so the pilot variant must not suggest a tool the
+ * recall clause is Claude-target only — pilot adapters advertise zero tools
+ * until KPR-348 wires the bridge — KPR-347 deleted the assertToolFreePilot
+ * guards, so the pilot variant must not suggest a tool the
  * agent cannot reach. Voice never sees either (carve-out returns first;
  * voice's handoff is its full-transcript re-send).
  */
@@ -484,9 +481,15 @@ export class AgentManager {
    * invariant, R-311.1) — the static agent.model prefix is no longer
    * re-resolved here, so the breaker permit and the adapter always key off
    * the same resolution (R7). Single call site (runOneSpawnAttempt);
-   * parameter required, no default.
+   * parameter required, no default. KPR-347: async — Lane B construction
+   * awaits turn assembly; Claude branch has no awaits and is unchanged in
+   * logic.
    */
-  private createProviderAdapter(agentId: string, route: ProviderModelRoute): AgentProviderAdapter {
+  private async createProviderAdapter(
+    agentId: string,
+    route: ProviderModelRoute,
+    workItemContext?: WorkItemContext,
+  ): Promise<AgentProviderAdapter> {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
@@ -495,33 +498,38 @@ export class AgentManager {
       return new ClaudeAgentAdapter(runner);
     }
 
-    const instructions = buildPilotInstructions(config.name, config.soul, config.systemPrompt);
-    const toolInventory: [] = [];
+    // KPR-347 (§D5): Lane B per-spawn assembly — real inventory through the
+    // compatibility partition; instructions byte-identical to the pre-347
+    // buildPilotInstructions output. Assembly throws are TurnAssemblyError
+    // (classifies non-provider inside the caller's recorded try).
+    const assembly = await assembleProviderTurn({
+      runner,
+      config,
+      provider: route.provider,
+      workItemContext,
+    });
 
     if (route.provider === "codex") {
       return new CodexSubscriptionAdapter({
         name: config.name,
-        instructions,
         model: route.model || appConfig.codex.agentModel,
         reasoningEffort: route.reasoningEffort,
-        toolInventory,
+        assembly,
       });
     }
 
     if (route.provider === "openai") {
       return new OpenAIAgentsAdapter({
         name: config.name,
-        instructions,
         model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
-        toolInventory,
+        assembly,
       });
     }
 
     return new GeminiAdkAdapter({
       name: config.name,
-      instructions,
       model: route.model || appConfig.gemini.agentModel || "gemini-2.5-flash",
-      toolInventory,
+      assembly,
     });
   }
 
@@ -1146,12 +1154,8 @@ export class AgentManager {
     ticket: SpawnTicket,
     onStream?: SpawnTurnStreamCallback,
   ): Promise<RunResult> {
-    // Fresh provider adapter per spawn — its lazy-built in-process MCPs are therefore
-    // also fresh, with channel/thread ctx captured at construction. The
-    // long-lived path keeps reusing one runner per agent.
-    const adapter = this.createProviderAdapter(ctx.agentId, shaping.route);
-    ticket.attachAbort(() => adapter.abort());
-
+    // KPR-347: built BEFORE adapter construction so Lane B assembly receives
+    // the turn's WorkItemContext (context-sensitive server configs).
     const bgContext: WorkItemContext = {
       adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,
       channelId: ctx.channelId,
@@ -1161,6 +1165,22 @@ export class AgentManager {
       slackTs: (ctx.workItem.meta?.slackTs as string) ?? "",
       slackThreadTs: (ctx.workItem.meta?.slackThreadTs as string) ?? "",
     };
+
+    // Fresh provider adapter per spawn — its lazy-built in-process MCPs are therefore
+    // also fresh, with channel/thread ctx captured at construction. The
+    // long-lived path keeps reusing one runner per agent.
+    //
+    // KPR-347 abort-window closure (§D5): construction is now async; an
+    // abort landing while assembly is in flight must not become a lost
+    // no-op (abortHandle unset). Flag early, re-attach after construction,
+    // re-check. Aborted results stay breaker-neutral (classifyTurnResult).
+    let abortedEarly = false;
+    ticket.attachAbort(() => {
+      abortedEarly = true;
+    });
+    const adapter = await this.createProviderAdapter(ctx.agentId, shaping.route, bgContext);
+    ticket.attachAbort(() => adapter.abort());
+    if (abortedEarly) adapter.abort();
 
     const result = await adapter.runTurn({
       prompt: shaping.prompt,
