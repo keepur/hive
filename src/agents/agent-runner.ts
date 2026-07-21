@@ -23,7 +23,7 @@ import { invalidatePrefixCacheByMemoryPath } from "./prefix-invalidation.js";
 import {
   CLAUDE_SDK_BUILTIN_TOOL_NAMES,
   classifyToolTransport,
-  type HiveToolTransportDescriptor,
+  type HiveToolInventoryEntry,
   type HiveToolTransportKind,
   type HiveToolTransportSource,
 } from "./provider-adapters/tool-transport.js";
@@ -1206,12 +1206,12 @@ export class AgentRunner {
     return "stdio";
   }
 
-  buildToolTransportInventory(context?: WorkItemContext): HiveToolTransportDescriptor[] {
+  buildToolTransportInventory(context?: WorkItemContext): HiveToolInventoryEntry[] {
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
     const autoInjectedServers = AgentRunner.autoInjectedServerNames();
     const pluginServerNames = this.pluginServerNames();
-    const inventory: HiveToolTransportDescriptor[] = [];
+    const inventory: HiveToolInventoryEntry[] = [];
 
     for (const [name, serverConfig] of Object.entries(mcpServers)) {
       const inProcess = !!this.db && IN_PROCESS_PORTED_SERVERS.has(name) && this.shouldEnableInProcessServer(name);
@@ -1221,14 +1221,23 @@ export class AgentRunner {
           ? "plugin"
           : "core";
 
-      inventory.push(classifyToolTransport({
+      const descriptor = classifyToolTransport({
         name,
         transport: inProcess ? "sdk-in-process" : AgentRunner.transportKindForServerConfig(serverConfig),
         source,
         requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has(name),
         requiresHiveRuntime: inProcess,
         inProcess,
-      }));
+      });
+      // KPR-347 (§D1.2): schemas materialize at bridge time — both discovery
+      // mechanics declare connect-time. serverConfig rides ONLY on external
+      // MCP entries; an in-process entry's stdio placeholder is wrong by
+      // construction (send() overrides it with the factory).
+      inventory.push(
+        inProcess
+          ? { ...descriptor, schemas: { kind: "connect-time" } }
+          : { ...descriptor, schemas: { kind: "connect-time" }, serverConfig },
+      );
     }
 
     // KPR-327: "memory" has no stdio placeholder in buildAllServerConfigs
@@ -1236,41 +1245,54 @@ export class AgentRunner {
     // map — surface its in-process descriptor explicitly, mirroring the
     // runtime wiring in send().
     if (!!this.db && this.shouldEnableInProcessServer("memory") && !mcpServers["memory"]) {
-      inventory.push(classifyToolTransport({
-        name: "memory",
-        transport: "sdk-in-process",
-        source: "core",
-        requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("memory"),
-        requiresHiveRuntime: true,
-        inProcess: true,
-      }));
+      inventory.push({
+        ...classifyToolTransport({
+          name: "memory",
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("memory"),
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
     }
 
     if (this.teamRoster) {
-      inventory.push(classifyToolTransport({
-        name: "team-roster",
-        transport: "sdk-in-process",
-        source: "engine",
-        requiresTurnContext: false,
-        requiresHiveRuntime: true,
-        inProcess: true,
-      }));
+      inventory.push({
+        ...classifyToolTransport({
+          name: "team-roster",
+          transport: "sdk-in-process",
+          source: "engine",
+          requiresTurnContext: false,
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
     }
 
     for (const name of this.activeDelegateNames(allServerConfigs)) {
-      inventory.push(classifyToolTransport({
-        name,
-        transport: "claude-subagent",
-        source: "delegate",
-      }));
+      inventory.push({
+        ...classifyToolTransport({
+          name,
+          transport: "claude-subagent",
+          source: "delegate",
+        }),
+        schemas: { kind: "unavailable" },
+      });
     }
 
     for (const name of CLAUDE_SDK_BUILTIN_TOOL_NAMES) {
-      inventory.push(classifyToolTransport({
-        name,
-        transport: "claude-builtin",
-        source: "sdk-builtin",
-      }));
+      inventory.push({
+        ...classifyToolTransport({
+          name,
+          transport: "claude-builtin",
+          source: "sdk-builtin",
+        }),
+        // KPR-348 flips claude-builtin to { kind: "static" } with the executor.
+        schemas: { kind: "unavailable" },
+      });
     }
 
     return inventory;

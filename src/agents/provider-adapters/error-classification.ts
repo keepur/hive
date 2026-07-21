@@ -124,5 +124,24 @@ export function classifyTurnResult(input: TurnFaultInput): TurnClassification {
  * missing-OAuth throw pre-RunResult). Same tables, same fail-safe default.
  */
 export function classifyThrown(err: unknown): TurnClassification {
+  if (err instanceof TurnAssemblyError) {
+    return { outcome: "fault", kind: "non-provider", message: err.message };
+  }
   return classifyErrorString(String(err));
+}
+
+/**
+ * KPR-347: typed wrapper for any throw during Lane B turn assembly
+ * (inventory build, prompt assembly, gate construction — the pre-runTurn
+ * phase). Exists because assembly failure causes are hive-internal (Mongo,
+ * config, filesystem) but their MESSAGES can pattern-match provider-fault
+ * rows — a Mongo blip's "ECONNREFUSED" would classify connect-fail and
+ * count toward a healthy foreign provider's trip streak. The instanceof
+ * short-circuit in classifyThrown runs BEFORE the pattern tables.
+ */
+export class TurnAssemblyError extends Error {
+  override readonly name = "TurnAssemblyError";
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+  }
 }

@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, OpenAIProvider, Runner, run } from "@openai/agents";
 import { OpenAIAgentsAdapter, coerceFinalOutput } from "./openai-agents-adapter.js";
-import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+import type { ProviderTurnAssembly } from "./turn-assembly.js";
+import { buildPilotInstructions } from "./turn-assembly.js";
+import type { HiveToolInventoryEntry } from "./tool-transport.js";
 
 const { runnerRunMock } = vi.hoisted(() => ({
   runnerRunMock: vi.fn(),
@@ -31,28 +33,40 @@ const runMock = vi.mocked(run);
 function makeAdapter(overrides: Partial<ConstructorParameters<typeof OpenAIAgentsAdapter>[0]> = {}) {
   return new OpenAIAgentsAdapter({
     name: "Pilot",
-    instructions: "Be useful.",
+    assembly: makeAssembly(),
     model: "gpt-5.4-mini",
     preferOAuth: false,
     ...overrides,
   });
 }
 
-function makeDescriptor(
-  openaiCompatibility: HiveToolTransportDescriptor["compatibility"]["openai"],
-): HiveToolTransportDescriptor {
+function makeAssembly(overrides: Partial<ProviderTurnAssembly> = {}): ProviderTurnAssembly {
   return {
-    name: `tool-${openaiCompatibility}`,
-    transport: "stdio",
+    instructions: "Be useful.",
+    toolInventory: [],
+    omittedTools: [],
+    guardrailGate: async () => ({ behavior: "allow" }),
+    memory: {},
+    skillIndex: [],
+    ...overrides,
+  };
+}
+
+function makeInventoryEntry(name = "memory"): HiveToolInventoryEntry {
+  return {
+    name,
+    transport: "sdk-in-process",
     source: "core",
     requiresTurnContext: false,
-    requiresHiveRuntime: false,
-    inProcess: false,
+    requiresHiveRuntime: true,
+    inProcess: true,
     compatibility: {
       claude: "direct",
-      openai: openaiCompatibility,
-      gemini: openaiCompatibility,
+      openai: "requires-hive-bridge",
+      gemini: "requires-hive-bridge",
+      codex: "requires-hive-bridge",
     },
+    schemas: { kind: "connect-time" },
   };
 }
 
@@ -248,27 +262,31 @@ describe("OpenAIAgentsAdapter", () => {
     expect(coerceFinalOutput(null)).toBe("");
   });
 
-  it("rejects non-Claude tool inventory before calling the SDK", async () => {
-    for (const compatibility of ["mcp-bridge-candidate", "requires-hive-bridge", "unsupported"] as const) {
-      const adapter = makeAdapter({ toolInventory: [makeDescriptor(compatibility)] });
-      await expect(adapter.runTurn({ prompt: "hello" })).rejects.toThrow(
-        "OpenAI tool bridge is not implemented in KPR-233",
-      );
-    }
-    expect(runMock).not.toHaveBeenCalled();
-  });
-
-  it("ignores Claude-only inventory for a tool-free run", async () => {
+  it("KPR-347 T1: construction + runTurn with a non-empty bridgeable inventory resolves and advertises zero tools", async () => {
     runMock.mockResolvedValueOnce(makeSdkResult() as never);
 
-    await expect(
-      makeAdapter({ toolInventory: [makeDescriptor("claude-only")] }).runTurn({ prompt: "hello" }),
-    ).resolves.toMatchObject({
+    const adapter = makeAdapter({ assembly: makeAssembly({ toolInventory: [makeInventoryEntry()] }) });
+    await expect(adapter.runTurn({ prompt: "hello" })).resolves.toMatchObject({
       text: "hello",
       aborted: false,
     });
 
-    expect(runMock).toHaveBeenCalledTimes(1);
+    const agentOptions = AgentMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect("tools" in agentOptions).toBe(false);
+  });
+
+  it("KPR-347 T1: instructions are byte-identical to buildPilotInstructions output", async () => {
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+
+    await makeAdapter({
+      assembly: makeAssembly({ instructions: buildPilotInstructions("Pilot", "soul", "system") }),
+    }).runTurn({ prompt: "hello" });
+
+    expect(AgentMock).toHaveBeenCalledWith({
+      name: "Pilot",
+      instructions: "soul\n\nsystem",
+      model: "gpt-5.4-mini",
+    });
   });
 });
 

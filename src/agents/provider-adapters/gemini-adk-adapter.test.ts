@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventType, Gemini, InMemoryRunner, LlmAgent, isFinalResponse, toStructuredEvents } from "@google/adk";
 import { GeminiAdkAdapter, coerceGeminiOutput, extractTextChunks } from "./gemini-adk-adapter.js";
-import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+import type { ProviderTurnAssembly } from "./turn-assembly.js";
+import { buildPilotInstructions } from "./turn-assembly.js";
+import type { HiveToolInventoryEntry } from "./tool-transport.js";
 
 const { runEphemeralMock } = vi.hoisted(() => ({
   runEphemeralMock: vi.fn(),
@@ -38,27 +40,39 @@ const toStructuredEventsMock = vi.mocked(toStructuredEvents);
 function makeAdapter(overrides: Partial<ConstructorParameters<typeof GeminiAdkAdapter>[0]> = {}) {
   return new GeminiAdkAdapter({
     name: "Gemini Pilot",
-    instructions: "Be useful.",
+    assembly: makeAssembly(),
     model: "gemini-flash-latest",
     ...overrides,
   });
 }
 
-function makeDescriptor(
-  geminiCompatibility: HiveToolTransportDescriptor["compatibility"]["gemini"],
-): HiveToolTransportDescriptor {
+function makeAssembly(overrides: Partial<ProviderTurnAssembly> = {}): ProviderTurnAssembly {
   return {
-    name: `tool-${geminiCompatibility}`,
-    transport: "stdio",
+    instructions: "Be useful.",
+    toolInventory: [],
+    omittedTools: [],
+    guardrailGate: async () => ({ behavior: "allow" }),
+    memory: {},
+    skillIndex: [],
+    ...overrides,
+  };
+}
+
+function makeInventoryEntry(name = "memory"): HiveToolInventoryEntry {
+  return {
+    name,
+    transport: "sdk-in-process",
     source: "core",
     requiresTurnContext: false,
-    requiresHiveRuntime: false,
-    inProcess: false,
+    requiresHiveRuntime: true,
+    inProcess: true,
     compatibility: {
       claude: "direct",
-      openai: geminiCompatibility,
-      gemini: geminiCompatibility,
+      openai: "requires-hive-bridge",
+      gemini: "requires-hive-bridge",
+      codex: "requires-hive-bridge",
     },
+    schemas: { kind: "connect-time" },
   };
 }
 
@@ -277,28 +291,33 @@ describe("GeminiAdkAdapter", () => {
     });
   });
 
-  it("rejects non-Claude tool inventory before constructing ADK objects", async () => {
-    for (const compatibility of ["mcp-bridge-candidate", "requires-hive-bridge", "unsupported"] as const) {
-      const adapter = makeAdapter({ toolInventory: [makeDescriptor(compatibility)] });
-      await expect(adapter.runTurn({ prompt: "hello" })).rejects.toThrow(
-        "Gemini ADK tool bridge is not implemented in KPR-234",
-      );
-    }
-    expect(LlmAgentMock).not.toHaveBeenCalled();
-    expect(runEphemeralMock).not.toHaveBeenCalled();
-  });
-
-  it("ignores Claude-only inventory for a tool-free run", async () => {
+  it("KPR-347 T1: construction + runTurn with a non-empty bridgeable inventory resolves and advertises zero tools", async () => {
     isFinalResponseMock.mockReturnValue(true);
     runEphemeralMock.mockReturnValueOnce(events({ finalText: "hello" }));
 
-    await expect(
-      makeAdapter({ toolInventory: [makeDescriptor("claude-only")] }).runTurn({ prompt: "hello" }),
-    ).resolves.toMatchObject({
+    const adapter = makeAdapter({ assembly: makeAssembly({ toolInventory: [makeInventoryEntry()] }) });
+    await expect(adapter.runTurn({ prompt: "hello" })).resolves.toMatchObject({
       text: "hello",
       aborted: false,
     });
 
-    expect(runEphemeralMock).toHaveBeenCalledTimes(1);
+    const agentOptions = LlmAgentMock.mock.calls[0]![0] as { tools: unknown };
+    expect(agentOptions.tools).toEqual([]);
+  });
+
+  it("KPR-347 T1: instruction is byte-identical to buildPilotInstructions output", async () => {
+    isFinalResponseMock.mockReturnValue(true);
+    runEphemeralMock.mockReturnValueOnce(events({ finalText: "hello" }));
+
+    await makeAdapter({
+      assembly: makeAssembly({ instructions: buildPilotInstructions("Pilot", "soul", "system") }),
+    }).runTurn({ prompt: "hello" });
+
+    expect(LlmAgentMock).toHaveBeenCalledWith({
+      name: "Gemini_Pilot",
+      instruction: "soul\n\nsystem",
+      model: "gemini-flash-latest",
+      tools: [],
+    });
   });
 });

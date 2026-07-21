@@ -1165,6 +1165,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       claude: "direct",
       openai: "mcp-bridge-candidate",
       gemini: "mcp-bridge-candidate",
+      codex: "mcp-bridge-candidate",
     });
   });
 
@@ -1359,6 +1360,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       claude: "direct",
       openai: "claude-only",
       gemini: "claude-only",
+      codex: "claude-only",
     });
   });
 
@@ -1379,6 +1381,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
         claude: "direct",
         openai: "claude-only",
         gemini: "claude-only",
+        codex: "claude-only",
       });
     }
   });
@@ -1423,6 +1426,76 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     const names = runner.buildToolTransportInventory().map((entry) => entry.name);
     expect(names).not.toContain("code-task");
     expect(names).not.toContain("code-search");
+  });
+
+  // ── KPR-347 (T7): per-entry schema sourcing + serverConfig carriage ──
+  it("sources external stdio entries as connect-time with a serverConfig deep-equal to the built config", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["keychain"] }),
+      memoryManager as any,
+    );
+
+    const keychain = inventoryByName(runner, "keychain");
+    expect(keychain.schemas).toEqual({ kind: "connect-time" });
+    expect(keychain.serverConfig).toBeDefined();
+    expect(keychain.serverConfig).toEqual(runner.buildServerConfig("keychain"));
+  });
+
+  it("sources external http entries as connect-time with an http serverConfig", async () => {
+    const { config } = await import("../config.js");
+    const origToken = config.slack.mcpToken;
+    const origLocal = (config.slack as any).localMcpServer;
+    (config.slack as any).mcpToken = "xoxp-test";
+    (config.slack as any).localMcpServer = false;
+    try {
+      const runner = new AgentRunner(
+        makeAgentConfig({ coreServers: ["slack"] }),
+        memoryManager as any,
+      );
+
+      const slack = inventoryByName(runner, "slack");
+      expect(slack.schemas).toEqual({ kind: "connect-time" });
+      expect(slack.serverConfig).toBeDefined();
+      expect(slack.serverConfig!.type).toBe("http");
+    } finally {
+      (config.slack as any).mcpToken = origToken;
+      (config.slack as any).localMcpServer = origLocal;
+    }
+  });
+
+  it("sources sdk-in-process entries (memory, schedule, team-roster) as connect-time WITHOUT a serverConfig", () => {
+    const teamRoster = { teamSummary: async () => "## Team\n- Alice" };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+      {} as any,
+    );
+
+    for (const name of ["memory", "schedule", "team-roster"]) {
+      const entry = inventoryByName(runner, name);
+      expect(entry.schemas).toEqual({ kind: "connect-time" });
+      expect("serverConfig" in entry).toBe(false);
+    }
+  });
+
+  it("sources claude-builtin and claude-subagent entries as unavailable WITHOUT a serverConfig", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [], delegateServers: ["google"] }),
+      memoryManager as any,
+    );
+
+    const bash = inventoryByName(runner, "Bash");
+    expect(bash.schemas).toEqual({ kind: "unavailable" });
+    expect("serverConfig" in bash).toBe(false);
+
+    const google = inventoryByName(runner, "google");
+    expect(google.schemas).toEqual({ kind: "unavailable" });
+    expect("serverConfig" in google).toBe(false);
   });
 });
 

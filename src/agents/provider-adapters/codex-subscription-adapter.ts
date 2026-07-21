@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { RunResult } from "../agent-runner.js";
-import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest, ReasoningEffort } from "./types.js";
 import { createCodexOpenAITokenProvider } from "./oauth-credentials.js";
 
@@ -12,11 +12,10 @@ export type CodexReasoningEffort = ReasoningEffort;
 
 export interface CodexSubscriptionAdapterOptions {
   name: string;
-  instructions: string;
+  assembly: ProviderTurnAssembly;
   model?: string;
   reasoningEffort?: CodexReasoningEffort;
   endpoint?: string;
-  toolInventory?: HiveToolTransportDescriptor[];
   codexAuthPath?: string;
   codexRefreshCommand?: string;
   fetch?: typeof fetch;
@@ -55,8 +54,6 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
   constructor(private readonly options: CodexSubscriptionAdapterOptions) {}
 
   async runTurn(request: AgentProviderTurnRequest): Promise<RunResult> {
-    this.assertToolFreePilot();
-
     const startedAt = Date.now();
     const abortController = new AbortController();
     this.currentAbortController = abortController;
@@ -85,11 +82,14 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
         },
         body: JSON.stringify({
           model: this.options.model ?? DEFAULT_CODEX_MODEL,
-          instructions: request.systemPromptOverride ?? this.options.instructions,
+          instructions: request.systemPromptOverride ?? this.options.assembly.instructions,
           reasoning: this.options.reasoningEffort ? { effort: this.options.reasoningEffort } : undefined,
           input: [{ role: "user", content: [{ type: "input_text", text: request.prompt }] }],
           stream: true,
           store: false,
+          // KPR-347: assembly.toolInventory is carried but deliberately NOT
+          // advertised — posting tools with no executor invites tool calls
+          // nothing handles. KPR-348 flips this (tools stays [] until then).
           tools: [],
         }),
       });
@@ -164,13 +164,6 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
 
   get wasAborted(): boolean {
     return this.aborted;
-  }
-
-  private assertToolFreePilot(): void {
-    const unsupported = this.options.toolInventory?.find((entry) => entry.compatibility.openai !== "claude-only");
-    if (unsupported) {
-      throw new Error(`Codex subscription tool bridge is not implemented in Phase B: ${unsupported.name}`);
-    }
   }
 
   private fetchImpl(): typeof fetch {

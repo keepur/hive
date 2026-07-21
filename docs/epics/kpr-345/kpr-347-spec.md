@@ -378,10 +378,13 @@ let abortedEarly = false;
 ticket.attachAbort(() => { abortedEarly = true; });
 const adapter = await this.createProviderAdapter(ctx.agentId, shaping.route, bgContext);
 ticket.attachAbort(() => adapter.abort());
-if (abortedEarly) adapter.abort();
+if (abortedEarly) {
+  adapter.abort();                                          // signal any stateful adapter (harmless)
+  return this.synthesizeAbortedResult(ctx.sessionId ?? ""); // skip runTurn; breaker-neutral aborted result
+}
 ```
 
-An abort during assembly then aborts the turn at first opportunity instead of silently completing. (Aborted results are breaker-neutral per `classifyTurnResult` — no classification change.)
+An abort during assembly then aborts the turn at first opportunity instead of silently completing. **Correction (pre-PR final review):** a flag-only `adapter.abort()` re-check is functionally inert — all three pilot adapters reset their `aborted` flag at `runTurn()` entry and `ClaudeAgentAdapter.abort()` is a pre-send no-op, so an abort landing during assembly would still run the full turn. The closure is therefore **manager-owned**: when `abortedEarly` is set after construction, skip `runTurn()` entirely and synthesize an aborted `RunResult` (provider-agnostic, no adapter edits). The result is a normal aborted completion, not a thrown error. (Aborted results are breaker-neutral per `classifyTurnResult` — no classification change.)
 
 ### D6 — Error classification (`error-classification.ts`)
 

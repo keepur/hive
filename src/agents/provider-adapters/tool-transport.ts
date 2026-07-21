@@ -1,3 +1,6 @@
+import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import type { LaneBProviderId } from "./types.js";
+
 export type HiveToolTransportKind =
   | "stdio"
   | "http"
@@ -27,11 +30,7 @@ export interface HiveToolTransportDescriptor {
   requiresTurnContext: boolean;
   requiresHiveRuntime: boolean;
   inProcess: boolean;
-  compatibility: {
-    claude: ProviderToolCompatibility;
-    openai: ProviderToolCompatibility;
-    gemini: ProviderToolCompatibility;
-  };
+  compatibility: Record<"claude" | LaneBProviderId, ProviderToolCompatibility>;
 }
 
 /**
@@ -77,6 +76,7 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
         claude: "unsupported",
         openai: "unsupported",
         gemini: "unsupported",
+        codex: "unsupported",
       },
     };
   }
@@ -93,6 +93,7 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
         claude: "direct",
         openai: "claude-only",
         gemini: "claude-only",
+        codex: "claude-only",
       },
     };
   }
@@ -113,6 +114,91 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
       claude: "direct",
       openai: nonClaudeCompatibility,
       gemini: nonClaudeCompatibility,
+      codex: nonClaudeCompatibility,
     },
   };
+}
+
+/** One provider-facing tool with its JSON-schema input contract. */
+export interface HiveToolSchemaEntry {
+  /** Provider-facing tool name, e.g. "mcp__memory__view" or "Bash". */
+  name: string;
+  description: string;
+  /**
+   * JSON Schema for the tool input, as emitted by the MCP SDK's zod
+   * conversion (in-process/stdio discovery) or authored (builtin executor,
+   * KPR-348). Opaque at the type level — the bridge passes it through to
+   * the provider SDK; hive never interprets it.
+   */
+  inputSchema: Record<string, unknown>;
+}
+
+/**
+ * Where an entry's per-tool schemas come from. KPR-347 populates the
+ * declaration only; KPR-348 materializes:
+ *  - "connect-time": schemas are discovered by the bridge when it connects
+ *    (stdio/http/sse → MCP tools/list) or instantiates the server
+ *    (sdk-in-process → the same factory outputs AgentRunner.send() wires).
+ *  - "static": hive holds the schemas now (KPR-348's authored builtin-
+ *    executor tools; any future eagerly-manifested server).
+ *  - "unavailable": no schema surface exists (claude-builtin until the
+ *    executor is authored; claude-subagent until child 9). Entries in this
+ *    state are claude-only by classification and never reach a bridge.
+ */
+export type ToolSchemaAvailability =
+  | { kind: "static"; tools: HiveToolSchemaEntry[] }
+  | { kind: "connect-time" }
+  | { kind: "unavailable" };
+
+export interface HiveToolInventoryEntry extends HiveToolTransportDescriptor {
+  schemas: ToolSchemaAvailability;
+  /**
+   * Present on external MCP transports (stdio | http | sse) only: the exact
+   * server config the Claude lane would pass to the SDK, resolved env
+   * (incl. secret-env) and all — KPR-348 translates it to MCPServerStdio /
+   * MCPServerStreamableHttp params. Credential posture unchanged: this
+   * object is bridge-facing, never model-facing, and MUST never be logged
+   * (log entry NAMES only). Omitted for sdk-in-process entries — their
+   * stdio-placeholder config is wrong by construction (send() overrides it);
+   * the bridge instantiates from the factories instead.
+   */
+  serverConfig?: McpServerConfig;
+}
+
+/** Compatibility classes the Lane B bridge can carry (KPR-348 implements per class). */
+export const BRIDGEABLE_COMPATIBILITIES: ReadonlySet<ProviderToolCompatibility> = new Set([
+  "direct",
+  "mcp-bridge-candidate",
+  "requires-hive-bridge",
+]);
+
+/** R3 honesty record: one tool the partition removed for a provider. */
+export interface OmittedToolRecord {
+  name: string;
+  transport: HiveToolTransportKind;
+  /** Why it was omitted: "claude-only" | "unsupported" for this provider. */
+  compatibility: ProviderToolCompatibility;
+}
+
+/**
+ * KPR-347 (§D4): pure compatibility partition — replaces the pilot
+ * assertToolFreePilot throws. Order-preserving; provider-column lookup only.
+ * Omitted entries carry names + reasons ONLY (never serverConfig) — safe to
+ * log and to feed the parity matrix (child 10).
+ */
+export function partitionInventoryForProvider(
+  inventory: readonly HiveToolInventoryEntry[],
+  provider: LaneBProviderId,
+): { bridgeable: HiveToolInventoryEntry[]; omitted: OmittedToolRecord[] } {
+  const bridgeable: HiveToolInventoryEntry[] = [];
+  const omitted: OmittedToolRecord[] = [];
+  for (const entry of inventory) {
+    const compatibility = entry.compatibility[provider];
+    if (BRIDGEABLE_COMPATIBILITIES.has(compatibility)) {
+      bridgeable.push(entry);
+    } else {
+      omitted.push({ name: entry.name, transport: entry.transport, compatibility });
+    }
+  }
+  return { bridgeable, omitted };
 }

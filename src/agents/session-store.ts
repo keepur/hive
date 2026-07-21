@@ -1,6 +1,11 @@
 import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import { RESUMABLE_SESSION_PROVIDERS, type AgentProviderId } from "./provider-adapters/types.js";
+import {
+  SESSION_SEMANTICS,
+  persistsResumableHandle,
+  type AgentProviderId,
+  type SessionSemantics,
+} from "./provider-adapters/types.js";
 
 const log = createLogger("session-store");
 
@@ -102,8 +107,17 @@ export class SessionStore {
   private normalizeRef(doc: SessionDoc): StoredSessionRef {
     // Tagged row (post-KPR-313 write).
     if (doc.provider) {
+      // KPR-347 (review advisory): fail-closed on out-of-union provider
+      // strings. doc.provider is typed AgentProviderId, but the DB is not
+      // bound by the union — a row written by a newer/older engine may carry
+      // a provider this build doesn't know. The old Set's .has() scrubbed
+      // unknowns implicitly; the ?? preserves exactly that posture (unknown
+      // ⇒ stateless-replay ⇒ no handle).
+      const semantics: SessionSemantics | undefined = SESSION_SEMANTICS[doc.provider];
       return {
-        sessionId: RESUMABLE_SESSION_PROVIDERS.has(doc.provider) ? doc.sessionId || undefined : undefined,
+        sessionId: persistsResumableHandle(semantics ?? "stateless-replay")
+          ? doc.sessionId || undefined
+          : undefined,
         provider: doc.provider,
       };
     }

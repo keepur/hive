@@ -87,6 +87,13 @@ describe("SessionStore — StoredSessionRef normalization + scrub (KPR-313)", ()
     });
   });
 
+  it("KPR-347 fail-closed: out-of-union provider tag on a row yields NO handle (old .has() scrub posture preserved)", async () => {
+    mocks.findOne.mockResolvedValueOnce(doc("some-real-looking-id", "kimi"));
+    const ref = await store.get("agent-a", "sms:line-1:t1");
+    expect(ref?.sessionId).toBeUndefined();
+    expect(ref?.provider).toBe("kimi"); // provenance passes through; handle does not
+  });
+
   it("legacy untagged plain uuid grandfathers as claude (fleet-upgrade no-op)", async () => {
     mocks.findOne.mockResolvedValueOnce(doc("3f2a77aa-1111-4222-8333-444455556666"));
     await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({

@@ -2,14 +2,13 @@ import { Agent, OpenAIProvider, Runner, run } from "@openai/agents";
 import OpenAI from "openai";
 import type { RunResult } from "../agent-runner.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
-import type { HiveToolTransportDescriptor } from "./tool-transport.js";
+import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import { createCodexOpenAITokenProvider, envValue, isProviderAuthError } from "./oauth-credentials.js";
 
 export interface OpenAIAgentsAdapterOptions {
   name: string;
-  instructions: string;
+  assembly: ProviderTurnAssembly;
   model?: string;
-  toolInventory?: HiveToolTransportDescriptor[];
   apiKey?: string;
   preferOAuth?: boolean;
   codexAuthPath?: string;
@@ -40,8 +39,6 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
   constructor(private readonly options: OpenAIAgentsAdapterOptions) {}
 
   async runTurn(request: AgentProviderTurnRequest): Promise<RunResult> {
-    this.assertToolFreePilot();
-
     const startedAt = Date.now();
     const abortController = new AbortController();
     this.currentAbortController = abortController;
@@ -51,9 +48,13 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     const sessionId = request.sessionId ?? "";
 
     try {
+      // KPR-347: assembly.toolInventory is carried but deliberately NOT
+      // advertised — an Agent with a tools param but no executor invites
+      // tool calls nothing handles. KPR-348 flips this (no `tools` key here
+      // until then).
       const agent = new Agent({
         name: this.options.name,
-        instructions: request.systemPromptOverride ?? this.options.instructions,
+        instructions: request.systemPromptOverride ?? this.options.assembly.instructions,
         model: this.options.model,
       });
 
@@ -125,13 +126,6 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
 
   get wasAborted(): boolean {
     return this.aborted;
-  }
-
-  private assertToolFreePilot(): void {
-    const unsupported = this.options.toolInventory?.find((entry) => entry.compatibility.openai !== "claude-only");
-    if (unsupported) {
-      throw new Error(`OpenAI tool bridge is not implemented in KPR-233: ${unsupported.name}`);
-    }
   }
 
   private async runWithAuthFallback(

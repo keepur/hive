@@ -4,22 +4,74 @@ import type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner
 export type AgentProviderId = "claude" | "openai" | "gemini" | "codex";
 
 /**
- * KPR-313: providers whose adapters return a GENUINELY resumable session
- * handle. This is the per-adapter session contract — the write-side
- * never-persist rule (finalizeSpawnResult) and the read-side belt-and-braces
- * (SessionStore.get) both key on it. Resumability is a static per-provider
- * fact, not a per-result flag (spec §3.2 / §7):
- *  - claude: SDK resume via query({ resume }) — KPR-310-verified; ids are
- *    stable on 0.2.104 and an older persisted id resumes the LATEST state (M7b).
- *  - openai: previousResponseId chaining (openai-agents-adapter.ts returns
- *    lastResponseId; server retention 30d > store TTL 7d).
- *  - codex: posts store:false and sends no previous_response_id — stateless by
- *    construction; its codex-pilot-* / resp_* returns are not handles.
- *  - gemini: runEphemeral — stateless; gemini-pilot-* returns are not handles.
- * If a pilot ever implements real chaining, adding it here is that ticket's
+ * KPR-347: the native-lane (Lane B) adapter providers — the set whose
+ * adapters run a provider SDK/API directly and need the hive bridge.
+ * DELIBERATELY a literal union, NOT Exclude<AgentProviderId, "claude">:
+ * Lane A providers (kimi/deepseek — child 1) join AgentProviderId but run
+ * the Claude-lane runtime and must NEVER gain a compatibility column or a
+ * bridge path. Growing this union is a Lane B replication child's explicit
  * one-line concern.
  */
-export const RESUMABLE_SESSION_PROVIDERS: ReadonlySet<AgentProviderId> = new Set(["claude", "openai"]);
+export type LaneBProviderId = "openai" | "gemini" | "codex";
+
+/**
+ * KPR-347 (epic §D3): per-provider session continuity semantics. Drives
+ * AgentManager persistence (write side) and SessionStore normalization
+ * (read side). Supersedes RESUMABLE_SESSION_PROVIDERS (deleted) while
+ * preserving the KPR-313 principle it encoded: resumability is a static
+ * per-provider fact, not a per-result flag.
+ *
+ *  - "server-resumable":   provider holds session state; the returned
+ *                          sessionId is a real server handle (openai
+ *                          previousResponseId chaining today — server
+ *                          retention 30d > store TTL 7d).
+ *  - "conversation-store": provider-side durable conversation object; the
+ *                          persisted ref is a conversation id (KPR-350's
+ *                          OpenAI Conversations candidate; unoccupied today).
+ *  - "client-transcript":  session id is persisted and resume works via
+ *                          client-side transcript replay (Claude CLI today —
+ *                          KPR-310-verified stable ids; Lane A passthrough
+ *                          providers — child 1).
+ *  - "stateless-replay":   NO provider-side resumable handle exists;
+ *                          continuity, if any, is hive-persisted history
+ *                          replayed client-side. Codex posts store:false and
+ *                          sends no previous_response_id; gemini runs
+ *                          runEphemeral — their pilot-fabricated ids are not
+ *                          handles. Replay implementation status is
+ *                          per-provider (codex gains replay in KPR-350;
+ *                          gemini leaves this category when Interactions
+ *                          lands) — the persistence behavior (never persist
+ *                          a handle) is identical either way, which is what
+ *                          this descriptor keys.
+ */
+export type SessionSemantics =
+  | "server-resumable"
+  | "conversation-store"
+  | "client-transcript"
+  | "stateless-replay";
+
+/**
+ * Exhaustive by construction: adding a provider id without declaring its
+ * semantics is a compile error (the property the old Set silently lacked —
+ * an undeclared provider was implicitly non-resumable). Child 1 adds Lane A
+ * ids here as "client-transcript"; KPR-350 and the replication children
+ * change values, one line each, in the same PR as the mechanism.
+ */
+export const SESSION_SEMANTICS: Readonly<Record<AgentProviderId, SessionSemantics>> = {
+  claude: "client-transcript",
+  openai: "server-resumable",
+  gemini: "stateless-replay",
+  codex: "stateless-replay",
+};
+
+export function sessionSemanticsFor(provider: AgentProviderId): SessionSemantics {
+  return SESSION_SEMANTICS[provider];
+}
+
+/** True ⇔ the persisted sessionId is a real handle worth storing/resuming. */
+export function persistsResumableHandle(semantics: SessionSemantics): boolean {
+  return semantics !== "stateless-replay";
+}
 
 /**
  * Neutral reasoning-effort scale (KPR-311). Canonical home — pilot adapter
@@ -51,3 +103,24 @@ export interface AgentProviderAdapter {
   abort(): void;
   readonly wasAborted: boolean;
 }
+
+/** KPR-347 (§D1.3): one tool call presented to the guardrail gate. */
+export interface GuardrailToolCall {
+  toolName: string;
+  input: unknown;
+  workItemContext?: WorkItemContext;
+}
+
+export type GuardrailDecision =
+  | { behavior: "allow" }
+  | { behavior: "deny"; reason: string };
+
+/**
+ * KPR-347 (consumed by KPR-348's dispatch loop): fail-closed pre-execution
+ * gate — the Lane B analog of the archetype PreToolUse hooks. The bridge
+ * MUST call it before every tool execution and MUST treat a gate throw as
+ * deny (contained per the epic §D4 exception-containment invariant: a gate
+ * throw becomes a structured error result, classifies non-provider, and
+ * never escapes runTurn).
+ */
+export type GuardrailGate = (call: GuardrailToolCall) => Promise<GuardrailDecision>;

@@ -96,15 +96,21 @@ vi.mock("./agent-runner.js", () => ({
   DIST_DIR: "/mock/dist",
 }));
 
-const { mockCodexConstructor, mockCodexRunTurn, mockOpenAIConstructor, mockOpenAIRunTurn, mockGeminiConstructor, mockGeminiRunTurn } =
-  vi.hoisted(() => ({
-    mockCodexConstructor: vi.fn(),
-    mockCodexRunTurn: vi.fn(),
-    mockOpenAIConstructor: vi.fn(),
-    mockOpenAIRunTurn: vi.fn(),
-    mockGeminiConstructor: vi.fn(),
-    mockGeminiRunTurn: vi.fn(),
-  }));
+const {
+  mockCodexConstructor, mockCodexRunTurn, mockCodexAbort,
+  mockOpenAIConstructor, mockOpenAIRunTurn, mockOpenAIAbort,
+  mockGeminiConstructor, mockGeminiRunTurn, mockGeminiAbort,
+} = vi.hoisted(() => ({
+  mockCodexConstructor: vi.fn(),
+  mockCodexRunTurn: vi.fn(),
+  mockCodexAbort: vi.fn(),
+  mockOpenAIConstructor: vi.fn(),
+  mockOpenAIRunTurn: vi.fn(),
+  mockOpenAIAbort: vi.fn(),
+  mockGeminiConstructor: vi.fn(),
+  mockGeminiRunTurn: vi.fn(),
+  mockGeminiAbort: vi.fn(),
+}));
 
 vi.mock("./provider-adapters/codex-subscription-adapter.js", () => ({
   CodexSubscriptionAdapter: vi.fn().mockImplementation((options) => {
@@ -112,7 +118,7 @@ vi.mock("./provider-adapters/codex-subscription-adapter.js", () => ({
     return {
       provider: "codex",
       runTurn: mockCodexRunTurn,
-      abort: vi.fn(),
+      abort: mockCodexAbort,
       wasAborted: false,
     };
   }),
@@ -124,7 +130,7 @@ vi.mock("./provider-adapters/openai-agents-adapter.js", () => ({
     return {
       provider: "openai",
       runTurn: mockOpenAIRunTurn,
-      abort: vi.fn(),
+      abort: mockOpenAIAbort,
       wasAborted: false,
     };
   }),
@@ -136,7 +142,7 @@ vi.mock("./provider-adapters/gemini-adk-adapter.js", () => ({
     return {
       provider: "gemini",
       runTurn: mockGeminiRunTurn,
-      abort: vi.fn(),
+      abort: mockGeminiAbort,
       wasAborted: false,
     };
   }),
@@ -2158,6 +2164,81 @@ describe("AgentManager", () => {
         expect(result.finalMessage).toBe("back");
         expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
       });
+
+      it("KPR-347 T5: assembly throws with a provider-fault-shaped message — classifies non-provider, breaker closed after 3 repeats", async () => {
+        registry._agents.set(
+          "oai-pilot",
+          makeAgentConfig({ id: "oai-pilot", name: "OAI", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        mockRunnerToolInventory.mockImplementation(() => {
+          throw new Error("connect ECONNREFUSED 127.0.0.1:27017");
+        });
+        // try/finally: restore the mock even if an assertion below throws, so a
+        // failed run doesn't leak the throwing implementation into later tests
+        // (belt-and-braces — beforeEach already re-primes mockRunnerToolInventory).
+        try {
+          for (let i = 0; i < 3; i++) {
+            await expect(
+              manager.spawnTurn(smsCtx({ agentId: "oai-pilot", threadId: `sms:line-1:kpr347-asm-${i}` })),
+            ).rejects.toThrow(/Lane B turn assembly failed/);
+          }
+          // The killer assertion: three ECONNREFUSED-worded failures did NOT open
+          // the openai circuit — TurnAssemblyError short-circuited the pattern
+          // tables (§D6). A raw Error with this message would have tripped it.
+          const snap = manager.circuitBreakers.stateFor("openai");
+          expect(snap?.state).toBe("closed");
+          expect(snap?.consecutiveHardFaults).toBe(0);
+        } finally {
+          mockRunnerToolInventory.mockReturnValue([]);
+        }
+      });
+
+      it("KPR-347 T6: abort landing DURING async assembly skips runTurn — synthesized aborted result, breaker-neutral", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5", coreServers: [] }),
+        );
+        mockRunnerToolInventory.mockImplementationOnce(() => {
+          // Fires ticket.abort() while assembly is in flight — after the
+          // early-flag attach, before the adapter exists. §D5: the manager-owned
+          // skip must bypass runTurn() entirely (the pilot adapter would reset
+          // its aborted flag at runTurn entry, so a flag-only re-check is inert).
+          manager.stopAgent("codex-pilot");
+          return [];
+        });
+        // No runTurn stub: the real mechanism must NOT call it. If the skip
+        // regressed, mockCodexRunTurn would resolve undefined and the turn
+        // would blow up — a stronger signal than a fabricated aborted result.
+        const result = await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr347-abortwin" }));
+        expect(mockCodexRunTurn).not.toHaveBeenCalled(); // §D5 skip — no provider call
+        expect(mockCodexAbort).toHaveBeenCalled(); // the re-check still fired adapter.abort()
+        expect(result.finalMessage).toBe("");
+        expect(result.aborted).toBe(true); // synthesized aborted completion, not a throw
+        // Aborted turns are breaker-neutral (classifyTurnResult → aborted).
+        expect(manager.circuitBreakers.stateFor("codex")?.consecutiveHardFaults ?? 0).toBe(0);
+        manager.restartAgent("codex-pilot"); // don't leak stopped state into later tests
+      });
+
+      it("KPR-347: abort BEFORE runTurn yields an aborted result with zero provider calls (per-mechanism pin)", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5", coreServers: [] }),
+        );
+        // Abort mid-assembly. The synthesized aborted RunResult is the ONLY path
+        // that closes the §D5 window — the pilot adapters reset `aborted` at
+        // runTurn() entry, so any turn that reached runTurn would run to
+        // completion. Assert both halves of the mechanism explicitly.
+        mockRunnerToolInventory.mockImplementationOnce(() => {
+          manager.stopAgent("codex-pilot");
+          return [];
+        });
+        const result = await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr347-premech" }));
+        expect(result.aborted).toBe(true);
+        expect(result.finalMessage).toBe("");
+        expect(mockCodexRunTurn).not.toHaveBeenCalled();
+        expect(mockCodexConstructor).toHaveBeenCalledTimes(1); // adapter WAS constructed (abort races construction)
+        manager.restartAgent("codex-pilot");
+      });
     });
 
     describe("providerFor + TurnResult timedOut/aborted propagation (KPR-307)", () => {
@@ -2618,10 +2699,15 @@ describe("AgentManager", () => {
       expect(mockRunnerSend).not.toHaveBeenCalled();
       expect(mockCodexConstructor).toHaveBeenCalledWith({
         name: "Codex Pilot",
-        instructions: "pilot soul\n\npilot system",
         model: "gpt-5.5",
         reasoningEffort: "medium",
-        toolInventory: [],
+        assembly: expect.objectContaining({
+          instructions: "pilot soul\n\npilot system",
+          toolInventory: [],
+          omittedTools: [],
+          memory: {},
+          skillIndex: [],
+        }),
       });
       expect(mockCodexRunTurn).toHaveBeenCalledWith(expect.objectContaining({
         prompt: "hello codex",
@@ -2657,11 +2743,52 @@ describe("AgentManager", () => {
       expect(mockRunnerSend).not.toHaveBeenCalled();
       expect(constructorMock).toHaveBeenCalledWith(expect.objectContaining({
         name: "Pilot",
-        instructions: "pilot system",
+        assembly: expect.objectContaining({ instructions: "pilot system" }),
       }));
       expect(runTurnMock).toHaveBeenCalledWith(expect.objectContaining({ prompt: "ping" }));
       expect(result.finalMessage).toBe(text);
       expect(result.newSessionId).toBe(sessionId);
+    });
+
+    it("KPR-347: pilots construct and run with a REAL non-empty inventory — guards are gone, partition feeds the assembly", async () => {
+      registry._agents.set(
+        "codex-pilot",
+        makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+      );
+      mockRunnerToolInventory.mockReturnValueOnce([
+        {
+          name: "memory", transport: "sdk-in-process", source: "core",
+          requiresTurnContext: false, requiresHiveRuntime: true, inProcess: true,
+          compatibility: { claude: "direct", openai: "requires-hive-bridge", gemini: "requires-hive-bridge", codex: "requires-hive-bridge" },
+          schemas: { kind: "connect-time" },
+        },
+        {
+          name: "Bash", transport: "claude-builtin", source: "sdk-builtin",
+          requiresTurnContext: false, requiresHiveRuntime: false, inProcess: false,
+          compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only" },
+          schemas: { kind: "unavailable" },
+        },
+      ]);
+      const item = makeWorkItem({
+        text: "hello codex",
+        source: { kind: "sms", id: "line-1-seam", label: "May" },
+        threadId: "sms:line-1:seam-inv-ctx",
+      });
+      const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+      expect(result.finalMessage).toBe("codex response");
+      const options = mockCodexConstructor.mock.calls.at(-1)![0];
+      expect(options.assembly.toolInventory.map((e: { name: string }) => e.name)).toEqual(["memory"]);
+      expect(options.assembly.omittedTools).toEqual([
+        { name: "Bash", transport: "claude-builtin", compatibility: "claude-only" },
+      ]);
+      // KPR-347 NIT: the inventory is built with the turn's WorkItemContext
+      // (bgContext hoisted BEFORE createProviderAdapter). Pin the seam so
+      // reverting the hoist — passing undefined / stale ctx to Lane B
+      // assembly — fails here rather than silently degrading context-sensitive
+      // server configs.
+      expect(mockRunnerToolInventory).toHaveBeenCalledWith(
+        expect.objectContaining({ channelId: "line-1-seam", threadId: "sms:line-1:seam-inv-ctx" }),
+      );
     });
 
     it("records telemetry, conversation index, and activity audit on success", async () => {
