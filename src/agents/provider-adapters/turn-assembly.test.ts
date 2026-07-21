@@ -127,21 +127,25 @@ describe("buildDefaultGuardrailGate (KPR-347 §D1.5, T8)", () => {
     await expect(gate({ toolName: "anything", input: {} })).resolves.toEqual({ behavior: "allow" });
   });
 
-  it("archetyped agent (def + config both present) → deny-all with the KPR-348 reason", async () => {
+  // KPR-348: the KPR-347 "archetyped agent ⇒ deny-all placeholder" assertion is
+  // RELOCATED (not deleted) — the placeholder body is gone; the archetyped path
+  // now ports buildHooks' real evaluation. The remaining fail-closed obligation
+  // this test pins is: a matcher-production throw ⇒ deny-all (canon 6 fallback).
+  it("archetyped agent whose preToolUseHooks throws at production → deny-all (fail-closed port of buildHooks)", async () => {
     registerArchetype({
-      id: "kpr347-stub",
+      id: "kpr348-throwing-stub",
       validateConfig: (c: unknown) => c,
-      preToolUseHooks: () => [],
+      preToolUseHooks: () => {
+        throw new Error("boom at production");
+      },
       systemPromptCard: () => "",
     } as never);
     const gate = buildDefaultGuardrailGate(
-      makeAgentConfig({ archetype: "kpr347-stub", archetypeConfig: {} }),
+      makeAgentConfig({ archetype: "kpr348-throwing-stub", archetypeConfig: {} }),
     );
     const decision = await gate({ toolName: "Bash", input: { command: "ls" } });
-    expect(decision).toEqual({
-      behavior: "deny",
-      reason: "Archetype tool policy (kpr347-stub) is not yet enforced on the native provider lane; tool blocked fail-closed (KPR-348).",
-    });
+    expect(decision.behavior).toBe("deny");
+    expect((decision as { reason: string }).reason).toContain("Archetype hook initialization failed");
   });
 
   it("archetype id that does not resolve → allow-all (unreachable post-registry-sanitization; posture matches buildHooks)", async () => {
