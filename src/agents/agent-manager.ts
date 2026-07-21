@@ -1180,7 +1180,22 @@ export class AgentManager {
     });
     const adapter = await this.createProviderAdapter(ctx.agentId, shaping.route, bgContext);
     ticket.attachAbort(() => adapter.abort());
-    if (abortedEarly) adapter.abort();
+
+    // KPR-347 §D5: an abort that landed while the async assembly above was in
+    // flight must not run the full turn. A flag-only re-check on the adapter
+    // cannot close the window — all three pilot adapters reset `aborted` at
+    // runTurn() entry and ClaudeAgentAdapter's abort is a pre-send no-op — so
+    // the skip is manager-owned and provider-agnostic: bypass runTurn()
+    // entirely and synthesize a breaker-neutral aborted RunResult. adapter.abort()
+    // still fires to signal any adapter holding state (harmless). The result is
+    // a normal aborted completion (classifyTurnResult → "aborted"), NOT a thrown
+    // error, so the KPR-306 recorded-try classification stays neutral.
+    if (abortedEarly) {
+      adapter.abort();
+      const aborted = this.synthesizeAbortedResult(ctx.sessionId ?? "");
+      aborted.costUsd += shaping.routerCostUsd;
+      return aborted;
+    }
 
     const result = await adapter.runTurn({
       prompt: shaping.prompt,
@@ -1195,6 +1210,36 @@ export class AgentManager {
     // finalizeSpawnResult and recordSpawnObservability see the full cost.
     result.costUsd += shaping.routerCostUsd;
     return result;
+  }
+
+  /**
+   * KPR-347 §D5: minimal breaker-neutral aborted RunResult for the early-abort
+   * skip in runOneSpawnAttempt (no runTurn() call was made). Mirrors the pilot
+   * adapters' buildResult zero-shape (all counters 0, toolSummary "none") with
+   * `aborted: true` so classifyTurnResult resolves to "aborted" and the
+   * downstream finalize path (session persist skipped on aborted, telemetry
+   * skipped) behaves exactly as a real adapter-emitted abort. sessionId is the
+   * resumed handle (if any) so finalizeSpawnResult's newSessionId stays intact.
+   */
+  private synthesizeAbortedResult(sessionId: string): RunResult {
+    return {
+      text: "",
+      sessionId,
+      costUsd: 0,
+      durationMs: 0,
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: "none",
+      streamed: false,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      contextWindow: 0,
+      compactions: 0,
+      aborted: true,
+    };
   }
 
   /**

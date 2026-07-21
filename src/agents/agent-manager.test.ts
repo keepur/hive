@@ -2193,25 +2193,51 @@ describe("AgentManager", () => {
         }
       });
 
-      it("KPR-347 T6: abort landing DURING async assembly is not lost — adapter aborted at construction completion, breaker-neutral", async () => {
+      it("KPR-347 T6: abort landing DURING async assembly skips runTurn — synthesized aborted result, breaker-neutral", async () => {
         registry._agents.set(
           "codex-pilot",
           makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5", coreServers: [] }),
         );
         mockRunnerToolInventory.mockImplementationOnce(() => {
           // Fires ticket.abort() while assembly is in flight — after the
-          // early-flag attach, before the adapter exists. Without the §D5
-          // closure this abort is a lost no-op (abortHandle unset).
+          // early-flag attach, before the adapter exists. §D5: the manager-owned
+          // skip must bypass runTurn() entirely (the pilot adapter would reset
+          // its aborted flag at runTurn entry, so a flag-only re-check is inert).
           manager.stopAgent("codex-pilot");
           return [];
         });
-        mockCodexRunTurn.mockResolvedValueOnce(makeRunResult({ text: "", sessionId: "", aborted: true }));
+        // No runTurn stub: the real mechanism must NOT call it. If the skip
+        // regressed, mockCodexRunTurn would resolve undefined and the turn
+        // would blow up — a stronger signal than a fabricated aborted result.
         const result = await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr347-abortwin" }));
-        expect(mockCodexAbort).toHaveBeenCalled(); // the re-check fired adapter.abort()
+        expect(mockCodexRunTurn).not.toHaveBeenCalled(); // §D5 skip — no provider call
+        expect(mockCodexAbort).toHaveBeenCalled(); // the re-check still fired adapter.abort()
         expect(result.finalMessage).toBe("");
+        expect(result.aborted).toBe(true); // synthesized aborted completion, not a throw
         // Aborted turns are breaker-neutral (classifyTurnResult → aborted).
         expect(manager.circuitBreakers.stateFor("codex")?.consecutiveHardFaults ?? 0).toBe(0);
         manager.restartAgent("codex-pilot"); // don't leak stopped state into later tests
+      });
+
+      it("KPR-347: abort BEFORE runTurn yields an aborted result with zero provider calls (per-mechanism pin)", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5", coreServers: [] }),
+        );
+        // Abort mid-assembly. The synthesized aborted RunResult is the ONLY path
+        // that closes the §D5 window — the pilot adapters reset `aborted` at
+        // runTurn() entry, so any turn that reached runTurn would run to
+        // completion. Assert both halves of the mechanism explicitly.
+        mockRunnerToolInventory.mockImplementationOnce(() => {
+          manager.stopAgent("codex-pilot");
+          return [];
+        });
+        const result = await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr347-premech" }));
+        expect(result.aborted).toBe(true);
+        expect(result.finalMessage).toBe("");
+        expect(mockCodexRunTurn).not.toHaveBeenCalled();
+        expect(mockCodexConstructor).toHaveBeenCalledTimes(1); // adapter WAS constructed (abort races construction)
+        manager.restartAgent("codex-pilot");
       });
     });
 
@@ -2743,7 +2769,11 @@ describe("AgentManager", () => {
           schemas: { kind: "unavailable" },
         },
       ]);
-      const item = makeWorkItem({ text: "hello codex", source: { kind: "sms", id: "line-1", label: "May" } });
+      const item = makeWorkItem({
+        text: "hello codex",
+        source: { kind: "sms", id: "line-1-seam", label: "May" },
+        threadId: "sms:line-1:seam-inv-ctx",
+      });
       const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
       expect(result.finalMessage).toBe("codex response");
       const options = mockCodexConstructor.mock.calls.at(-1)![0];
@@ -2751,6 +2781,14 @@ describe("AgentManager", () => {
       expect(options.assembly.omittedTools).toEqual([
         { name: "Bash", transport: "claude-builtin", compatibility: "claude-only" },
       ]);
+      // KPR-347 NIT: the inventory is built with the turn's WorkItemContext
+      // (bgContext hoisted BEFORE createProviderAdapter). Pin the seam so
+      // reverting the hoist — passing undefined / stale ctx to Lane B
+      // assembly — fails here rather than silently degrading context-sensitive
+      // server configs.
+      expect(mockRunnerToolInventory).toHaveBeenCalledWith(
+        expect.objectContaining({ channelId: "line-1-seam", threadId: "sms:line-1:seam-inv-ctx" }),
+      );
     });
 
     it("records telemetry, conversation index, and activity audit on success", async () => {
