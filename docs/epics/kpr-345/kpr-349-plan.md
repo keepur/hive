@@ -66,7 +66,7 @@
 - **Claude lane byte-identical:** `buildPrefix` signature and output unchanged (golden-gated); `buildSystemPrompt` output unchanged (datetime pin); `buildToolkitSection` output untouched; `getHotTierPrompt` default-call output untouched (existing `memory-manager.test.ts:95+` assertions pass unmodified). Existing `prefix-builder.test.ts`, `agent-runner.test.ts`, `toolkit-section.test.ts` suites pass with **zero edits to existing assertions** (new describes are additive).
 - **KPR-213 cache untouched:** `prefix-cache.ts` / `prefix-invalidation.ts` unmodified; their suites pass unmodified; Lane B is uncached by ruling (T1 spy).
 - **KPR-348 bridge:** `tool-bridge.ts` modified in `applyNameAndCapEdges` only; all existing `tool-bridge.test.ts` cases pass except the one 348 cap-order case this ruling supersedes (see Step 4.2 — that assertion is *updated to the ruled behavior*, not deleted).
-- **Sessions/adapters:** `SESSION_SEMANTICS`, `types.ts`, all four adapter files, `agent-manager.ts`, `tool-transport.ts`, `archetype-gate.ts` untouched (Task 6 empty-diff checks).
+- **Sessions/adapters:** `SESSION_SEMANTICS`, `types.ts`, all four adapter files, `tool-transport.ts`, `archetype-gate.ts` untouched (Task 6 empty-diff checks). `agent-manager.ts` gets exactly one **comment-only** edit in Task 3 (the stale `buildPilotInstructions` reference at `:503` is reworded to name the replacement — `buildProviderInstructions`/`assembleProviderTurn`); this is not a functional/seam change and is authorized explicitly (see File Structure and Step 3.2b) — Task 6 checks its diff is comment-only, not empty.
 - **`turn-assembly.test.ts`:** the two KPR-347 pilot-byte-identity pins are **inverted by design** (spec T0) — replaced with assertions that `instructions` carries the real assembly; every other existing assertion (partition, omitted, gate, inProcessServers, sessionCwd) passes unmodified.
 
 ### Commands
@@ -117,12 +117,16 @@
 | `src/agents/prefix-builder.provider.test.ts` | create (Task 2) | T2 — `buildProviderInstructions` composition + memory tool-claim gate |
 | `src/agents/provider-adapters/turn-assembly.ts` | modify (Task 3) | `TOOL_EXECUTING_PROVIDERS`, step-1 swap, delete `buildPilotInstructions`, populate `memory`/`skillIndex`, doc-comment refresh |
 | `src/agents/provider-adapters/turn-assembly.test.ts` | modify (Task 3) | Pilot pins inverted; T7 assembly-fault + breaker-closed |
+| `src/agents/agent-manager.ts` | modify (Task 3, comment-only) | Reword the stale `buildPilotInstructions` comment at `:503` to name the replacement (`buildProviderInstructions`/`assembleProviderTurn`) — no functional/seam change |
+| `src/agents/provider-adapters/openai-agents-adapter.test.ts` | modify (Task 3) | KPR-347 byte-identity pin inverted: inline literal fixture (`"soul\n\nsystem"`) replaces the `buildPilotInstructions` import/call |
+| `src/agents/provider-adapters/gemini-adk-adapter.test.ts` | modify (Task 3) | Same inversion as above |
+| `src/agents/provider-adapters/codex-subscription-adapter.test.ts` | modify (Task 3) | Same inversion as above |
 | `src/agents/provider-adapters/tool-bridge.test.ts` | modify (Task 3 additive, Task 4) | T5 memory pin + T6 `load_skill` e2e (Task 3); T8 + updated cap-order case (Task 4) |
 | `src/agents/provider-adapters/tool-bridge.ts` | modify (Task 4 ONLY) | §D7 two-tier cap priority in `applyNameAndCapEdges` — the only bridge edit |
 | `src/agents/provider-adapters/builtin-executor.ts` | modify (Task 5 ONLY — rider commit) | §D8 `allowEmpty` on `Write.content`/`Edit.new_string` |
 | `src/agents/provider-adapters/builtin-executor.test.ts` | modify (Task 5) | T9 |
 
-**NOT touched (spec Integration table):** `prefix-cache.ts`, `prefix-invalidation.ts`, `tool-transport.ts`, `archetype-gate.ts`, `types.ts` (incl. `SESSION_SEMANTICS`), `agent-manager.ts`, `openai-agents-adapter.ts`, `gemini-adk-adapter.ts`, `codex-subscription-adapter.ts`, `claude-agent-adapter.ts`, `tool-bridge.ts` outside `applyNameAndCapEdges` (`wrap`/`connect*`/`close`/`buildLoadSkillTool`/containment/stats), `buildToolkitSection` body, `buildHooks`, `buildToolTransportInventory`, `buildInProcessServers`, `send()`.
+**NOT touched (spec Integration table):** `prefix-cache.ts`, `prefix-invalidation.ts`, `tool-transport.ts`, `archetype-gate.ts`, `types.ts` (incl. `SESSION_SEMANTICS`), `openai-agents-adapter.ts`, `gemini-adk-adapter.ts`, `codex-subscription-adapter.ts`, `claude-agent-adapter.ts`, `tool-bridge.ts` outside `applyNameAndCapEdges` (`wrap`/`connect*`/`close`/`buildLoadSkillTool`/containment/stats), `buildToolkitSection` body, `buildHooks`, `buildToolTransportInventory`, `buildInProcessServers`, `send()`. **`agent-manager.ts` is the one deliberate exception:** it gets a single comment-only edit in Task 3 (see file table above) — its call-site logic (`createProviderAdapter`, the `assembleProviderTurn` call, per-provider adapter construction) is untouched; only the stale in-line comment naming the deleted `buildPilotInstructions` is reworded.
 
 ---
 
@@ -707,7 +711,7 @@ Temporarily weaken `memorySections`: delete the `\n\nRead relevant files via the
 SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/prefix-builder.golden.test.ts
 ```
 
-Expected: **G9 and G12 snapshots FAIL** (trailer sentence missing). Record the failing output (paste into the PR description under "negative-verify: byte-parity gate"). Restore the line; re-run; green.
+Expected: **only the G9 snapshot FAILS** (trailer sentence missing). G12 stays green: its `memoryManager.getHotTierPrompt` mock resolves `HOT_TIER_FIXTURE` (non-null), so `memorySections` returns on the hot-tier branch and never reaches the legacy-file-listing code this perturbation touches — G12 exercises the hot-tier trailer (`memory_recall`), not the legacy-fallback sentence, so it is unaffected by this specific weakening. Record the failing output (G9 only) in the PR description under "negative-verify: byte-parity gate". Restore the line; re-run; green.
 
 - [ ] **Step 1.5: Verify + commit**
 
@@ -1071,6 +1075,10 @@ git commit -m "KPR-349: Lane B instruction builder — provider toolkit, skill-i
 - Modify: `src/agents/provider-adapters/turn-assembly.test.ts` (pins inverted + T7 + T1 spy)
 - Modify (additive): `src/agents/provider-adapters/tool-bridge.test.ts` (T5 + T6)
 - Modify (additive): `src/agents/agent-runner.test.ts` (T1 Claude-lane + Lane B cache spies)
+- Modify (comment-only): `src/agents/agent-manager.ts` — reword the stale `buildPilotInstructions` comment at `:503`; no functional change (see Step 3.2b)
+- Modify: `src/agents/provider-adapters/openai-agents-adapter.test.ts` — invert the KPR-347 byte-identity pin (Step 3.4)
+- Modify: `src/agents/provider-adapters/gemini-adk-adapter.test.ts` — same inversion (Step 3.4)
+- Modify: `src/agents/provider-adapters/codex-subscription-adapter.test.ts` — same inversion (Step 3.4)
 
 - [ ] **Step 3.1: `src/agents/agent-runner.ts` — public `buildProviderPrompt` (the 348 pattern)**
 
@@ -1178,6 +1186,30 @@ export const TOOL_EXECUTING_PROVIDERS: ReadonlySet<LaneBProviderId> = new Set(["
    - `memory` comment `// {} until KPR-349` → `// {hotTierPrompt} when the agent's hot tier rendered`.
    - The file-header comment (`:1-8`): update the "KPR-349 swaps…" sentence to past tense.
 
+- [ ] **Step 3.2b: `src/agents/agent-manager.ts` — reword the stale comment (comment-only, no functional change)**
+
+`createProviderAdapter`'s existing comment at `agent-manager.ts:501-504` names the just-deleted `buildPilotInstructions`:
+
+```typescript
+    // KPR-347 (§D5): Lane B per-spawn assembly — real inventory through the
+    // compatibility partition; instructions byte-identical to the pre-347
+    // buildPilotInstructions output. Assembly throws are TurnAssemblyError
+    // (classifies non-provider inside the caller's recorded try).
+```
+
+Reword the middle two lines to describe what actually renders post-349 — no other line in this method changes, no call-site/argument/control-flow edit:
+
+```typescript
+    // KPR-347 (§D5): Lane B per-spawn assembly — real inventory through the
+    // compatibility partition; KPR-349: instructions are the real prompt from
+    // buildProviderInstructions (via the runner's buildProviderPrompt),
+    // assembled inside assembleProviderTurn. Assembly throws are
+    // TurnAssemblyError (classifies non-provider inside the caller's
+    // recorded try).
+```
+
+This is the one authorized edit to `agent-manager.ts` in this ticket — a comment reword, not a functional/seam change. It resolves the otherwise-unsatisfiable pair of Task 6 checks (§6.2): the grep for `buildPilotInstructions` returning zero hits, and the `agent-manager.ts` diff check (downgraded from "empty" to "comment-only" — see Step 6.2).
+
 - [ ] **Step 3.3: `turn-assembly.test.ts` — invert the pilot pins, add T7 + spy**
 
 The existing first assertion block (`:57-79`) changes: remove the `buildPilotInstructions` import and the two byte-identity expects (`assembly.instructions` toBe pilot output / `"pilot soul\n\npilot system"`), and remove `expect(assembly.memory).toEqual({})` / `expect(assembly.skillIndex).toEqual([])`. `makeRunner` (`:42-53`) gains a `buildProviderPrompt` mock:
@@ -1201,7 +1233,23 @@ New/updated cases:
   - [ ] T7b: skill-derivation throw forced past fail-soft — `buildProviderPrompt` mock throwing synchronously → still `TurnAssemblyError` (the wrapper try contains sync throws too)
   - [ ] every other existing assertion in the file: unmodified and green
 
-- [ ] **Step 3.4: `agent-runner.test.ts` — T1 cache-neutrality spies (additive describe)**
+- [ ] **Step 3.4: Invert the KPR-347 byte-identity pins in the three pilot adapter test files**
+
+Each of `openai-agents-adapter.test.ts`, `gemini-adk-adapter.test.ts`, `codex-subscription-adapter.test.ts` has one test ("KPR-347 T1: instructions are byte-identical to `buildPilotInstructions` output") that imports the now-deleted function and calls `buildPilotInstructions("Pilot", "soul", "system")` to build its `makeAssembly({instructions: ...})` fixture. For those literal arguments this call is exactly the string `"soul\n\nsystem"` (`buildPilotInstructions` trims each arg and joins non-empty sections with `"\n\n"` — `"soul".trim()` and `"system".trim()` are unchanged, so `["soul", "system"].join("\n\n")`). None of the three tests need the real function; they only need that fixed fixture string.
+
+In each file:
+1. Remove `import { buildPilotInstructions } from "./turn-assembly.js";`.
+2. Replace the call `buildPilotInstructions("Pilot", "soul", "system")` with the inline literal `"soul\n\nsystem"`.
+3. Leave every other line of the test untouched — including the assertions that the adapter forwards `assembly.instructions` verbatim to the provider SDK (`instructions: "soul\n\nsystem"` / `instruction: "soul\n\nsystem"` / `body.instructions` equal to `"soul\n\nsystem"`). The test still pins pass-through byte-identity; it just no longer round-trips through the deleted builder to construct its own fixture.
+
+Exact call sites (this worktree's HEAD):
+- `openai-agents-adapter.test.ts:14` (import), `:402` (call, inside the test declared at `:398`)
+- `gemini-adk-adapter.test.ts:8` (import), `:315` (call, inside the test declared at `:310`)
+- `codex-subscription-adapter.test.ts:11` (import), `:301` (call, inside the test declared at `:296`)
+
+Test names/descriptions may stay as-is (they still document the pass-through-verbatim contract) or be reworded to drop the now-inaccurate "byte-identical to `buildPilotInstructions` output" phrasing (e.g. "instructions are forwarded to the provider SDK verbatim") — implementer's judgment, not load-bearing.
+
+- [ ] **Step 3.5: `agent-runner.test.ts` — T1 cache-neutrality spies (additive describe)**
 
 Construct a real `AgentRunner` with a spy `PrefixCache` (object with `getOrBuild: vi.fn((id, b) => b())`, `invalidateAgent: vi.fn()`, `invalidateAll: vi.fn()` cast as never — 9th constructor arg):
 
@@ -1209,7 +1257,7 @@ Construct a real `AgentRunner` with a spy `PrefixCache` (object with `getOrBuild
   - [ ] Claude lane: `await (runner as … ).buildSystemPrompt([])` → `getOrBuild` called exactly once (read-through unchanged, `agent-runner.ts:370-372`)
   - [ ] `buildProviderPrompt` result: instructions end with the datetime trailer regex; with a memoryManager mock returning a hot-tier block, `hotTierPrompt` equals the block and appears **exactly once** in `instructions` (unit half of the single-injection rule)
 
-- [ ] **Step 3.5: `tool-bridge.test.ts` — T5 memory pin + T6 `load_skill` e2e (additive describes)**
+- [ ] **Step 3.6: `tool-bridge.test.ts` — T5 memory pin + T6 `load_skill` e2e (additive describes)**
 
 **T5 — memory tools pin (integration):** construct a real `AgentRunner` with `makeFakeInProcessDb()` and `coreServers: ["memory"]` (pattern: `agent-runner.test.ts:297`; import the helpers or replicate the minimal fake locally in tool-bridge.test.ts — replicate, don't export test helpers across files). Then:
 
@@ -1234,13 +1282,13 @@ tools = await bridge.connect()
   - [ ] deny-all gate fixture (`async () => ({behavior: "deny", reason: "e2e-denied"})`) → `Tool call denied by policy: e2e-denied` (goes through the gated wrapper)
   - [ ] **dark-pin negative-verify (348 invariant still holds):** `skillIndex: []` → no `load_skill` in the bridged list
 
-- [ ] **Step 3.6: Verify + commit**
+- [ ] **Step 3.7: Verify + commit**
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check`
-Expected: exit 0; goldens untouched; `grep -rn "buildPilotInstructions" src/` returns nothing.
+Expected: exit 0; goldens untouched; `grep -rn "buildPilotInstructions" src/` returns nothing — including inside the three adapter test files edited in Step 3.4 and the reworded comment in `agent-manager.ts` (Step 3.2b): the symbol name must not survive anywhere, in code or in comments.
 
 ```bash
-git add src/agents/agent-runner.ts src/agents/agent-runner.test.ts src/agents/provider-adapters/turn-assembly.ts src/agents/provider-adapters/turn-assembly.test.ts src/agents/provider-adapters/tool-bridge.test.ts
+git add src/agents/agent-runner.ts src/agents/agent-runner.test.ts src/agents/agent-manager.ts src/agents/provider-adapters/turn-assembly.ts src/agents/provider-adapters/turn-assembly.test.ts src/agents/provider-adapters/tool-bridge.test.ts src/agents/provider-adapters/openai-agents-adapter.test.ts src/agents/provider-adapters/gemini-adk-adapter.test.ts src/agents/provider-adapters/codex-subscription-adapter.test.ts
 git commit -m "KPR-349: seam swap — real Lane B instructions, memory/skillIndex populated, load_skill lit, pilot stub deleted"
 ```
 
@@ -1365,10 +1413,12 @@ Expected: exit 0 — typecheck + lint + format + full vitest suite green; **snap
 
 - [ ] **Step 6.2: Neutrality by diff** (use `$(git merge-base kpr-345 HEAD)` so checks survive a rebase)
 
-  - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/provider-adapters/types.ts src/agents/provider-adapters/tool-transport.ts src/agents/provider-adapters/archetype-gate.ts src/agents/provider-adapters/openai-agents-adapter.ts src/agents/provider-adapters/gemini-adk-adapter.ts src/agents/provider-adapters/codex-subscription-adapter.ts src/agents/provider-adapters/claude-agent-adapter.ts src/agents/agent-manager.ts src/agents/prefix-cache.ts src/agents/prefix-invalidation.ts` → **empty** (`SESSION_SEMANTICS`, adapters, cache internals untouched)
+  - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/provider-adapters/types.ts src/agents/provider-adapters/tool-transport.ts src/agents/provider-adapters/archetype-gate.ts src/agents/provider-adapters/openai-agents-adapter.ts src/agents/provider-adapters/gemini-adk-adapter.ts src/agents/provider-adapters/codex-subscription-adapter.ts src/agents/provider-adapters/claude-agent-adapter.ts src/agents/prefix-cache.ts src/agents/prefix-invalidation.ts` → **empty** (`SESSION_SEMANTICS`, adapters — the four production `.ts` files, not their `.test.ts` files — cache internals untouched)
+  - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/agent-manager.ts` → **not** empty, but comment-only: exactly the two reworded comment lines from Step 3.2b (`agent-manager.ts:502-503`), zero lines of executable code touched — eyeball-confirm every changed line starts with `//`
+  - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/provider-adapters/openai-agents-adapter.test.ts src/agents/provider-adapters/gemini-adk-adapter.test.ts src/agents/provider-adapters/codex-subscription-adapter.test.ts` → **not** empty (Step 3.4's inversion), but confined per file to the removed import line + the one `buildPilotInstructions(...)` call site replaced with the `"soul\n\nsystem"` literal — no other test in these files touched
   - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/provider-adapters/tool-bridge.ts` → hunks confined to `applyNameAndCapEdges` + one import (eyeball: `wrap`/`connect*`/`close`/`buildLoadSkillTool` zero lines touched)
   - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/agent-runner.ts` → targeted eyeball: only the datetime-trailer lines in `buildSystemPrompt` + the new `buildProviderPrompt` method; cache read-through (`:370-372`), `buildToolkitSection` call, `buildToolTransportInventory`, `buildInProcessServers`, `buildHooks`, `send()` zero lines touched
-  - [ ] `grep -rn "buildPilotInstructions" src/ docs/epics/kpr-345/kpr-349-plan.md --include="*.ts"` → no source hits
+  - [ ] `grep -rn "buildPilotInstructions" src/ docs/epics/kpr-345/kpr-349-plan.md --include="*.ts"` → **zero hits, anywhere** — not merely "no source hits": this now also covers the three inverted adapter test files (Step 3.4) and the reworded `agent-manager.ts` comment (Step 3.2b), both of which would otherwise have kept the deleted symbol alive as a dangling reference
 
 - [ ] **Step 6.3: E2E real-instance byte-diff spot-check (dev Mac, evidence in PR)**
 
