@@ -10,9 +10,9 @@
 
 **Tech Stack:** TypeScript strict, `@openai/agents` 0.11.x (MCP server client classes from `@openai/agents-core` re-exports), `@modelcontextprotocol/sdk` (`Client` + `InMemoryTransport`), `@anthropic-ai/claude-agent-sdk` types (`McpServerConfig`, `McpSdkServerConfigWithInstance`, `HookCallbackMatcher`), vitest, `tinyglobby` (new dep, declared in spec §D5).
 
-**Decision-register canon (epic, 7 entries) honored:** (1) schemas connect-time / static-for-builtins — Task 2.5; (2) codex column ≡ openai at the classify site — Task 2.4; (3) `SESSION_SEMANTICS` untouched — no task touches it; (4) `ProviderTurnAssembly` payload + `TurnAssemblyError` containment — Task 2.3; (5) manager-owned early abort done, this ticket owns only mid-bridge abort — Steps 1.1/2.2/3.4; (6) gate predicate canon, deny-all body → real archetype evaluation — Task 3.1; (7) `prepareSpawn` gap out of scope — nowhere in this plan.
+**Decision-register canon (epic, 7 entries) honored:** (1) schemas connect-time / static-for-builtins — Task 2.5; (2) codex column ≡ openai at the classify site — Task 2.4; (3) `SESSION_SEMANTICS` untouched — no task touches it; (4) `ProviderTurnAssembly` payload + `TurnAssemblyError` containment — Step 2.8; (5) manager-owned early abort done, this ticket owns only mid-bridge abort — Steps 1.1/2.2/3.4; (6) gate predicate canon, deny-all body → real archetype evaluation — Task 3.1; (7) `prepareSpawn` gap out of scope — nowhere in this plan.
 
-**Final-review advisories reflected:** (1) `close()` per-server catch-and-log never-throw + T5 asserts a faulting `close()` doesn't reject `runTurn` — Tasks 1.2 (code) and 3.4 (test); (2) `llmMs = Math.max(0, durationMs - toolMs)` clamp — Task 3.3.
+**Final-review advisories reflected:** (1) `close()` per-server catch-and-log never-throw + T5 asserts a faulting `close()` doesn't reject `runTurn` — Step 1.1 (code) and 3.4 (test); (2) `llmMs = Math.max(0, durationMs - toolMs)` clamp — Step 3.2 (code) with the pin in Step 3.4 (test).
 
 ---
 
@@ -42,7 +42,7 @@
 - T1 exception containment: throwing gate / in-process handler / builtin / MCP `callTool` ⇒ structured error text, `runTurn` resolves, `RunResult.error` unset, `classifyTurnResult` → success, breaker stays closed; negative-verify that an unwrapped throw *does* reject.
 - T2 gate port parity: software-engineer archetype — workspace Edit deny (reason steers to `code_task`), outside-workspace allow, Bash allow, NotebookEdit path extraction, assembly-time throw → deny-all, call-time throw → deny, matcher regex honored, archetype-less allow-all; negative-verify vs pre-348 deny-all body.
 - T3 builtin executor agent-facing semantics (all six tools).
-- T4 bridge materialization: names, normalized schemas, claude-only never materialized, fail-soft + `runtimeOmissions`, no env values in logs.
+- T4 bridge materialization: names, normalized schemas, claude-only never materialized, fail-soft + `runtimeOmissions`, no env values in logs; `load_skill` present/absent by skill-index emptiness, valid-name content return, unknown-name and non-string-name contained errors.
 - T5 abort mid-bridge: process-group kill, in-flight results discarded, `close()` on every server on every path, faulting `close()` never rejects, no unhandled rejections.
 - T6 in-process InMemory round-trip incl. `*ContextRef` visibility.
 - T7 adapter integration: gate consulted → executed → result to model; `stats` → `RunResult`; zero-tools pin inverted for openai only; `llmMs = durationMs - toolMs` pin; streamed variant.
@@ -329,7 +329,19 @@ export interface ToolBridgeOptions {
   skillIndex: ProviderSkillIndexEntry[];
 }
 
-/** Uniform client view over the three MCP mechanisms. */
+/**
+ * Uniform client view over the three MCP mechanisms. NOTE (S1 spike record):
+ * the Agents-SDK `MCPServerStdio`/`MCPServerStreamableHttp`/`MCPServerSSE`
+ * `.callTool()` may resolve with the bare `content` array rather than the
+ * full `CallToolResult` (where `isError` lives) — unlike the raw
+ * `@modelcontextprotocol/sdk` `Client.callTool()` path used for in-process
+ * servers, which always returns the full result shape. `openAgentsSdkConnection`
+ * (below) must normalize its `callTool` to always resolve a full
+ * `CallToolResult`-shaped value (synthesizing `{content, isError: false}`
+ * when the SDK gave back a bare content array) so `isErrorResult`/
+ * `shapeCallToolResult` in `discover()` behave uniformly across all three
+ * MCP mechanisms — do not special-case discover() per transport.
+ */
 interface McpConnection {
   serverName: string;
   listTools(): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>>;
@@ -483,7 +495,18 @@ export class ToolBridge {
     return {
       serverName,
       listTools: async () => (await server.listTools()) as Array<{ name: string; description?: string; inputSchema?: unknown }>,
-      callTool: (toolName, args) => server.callTool(toolName, args),
+      callTool: async (toolName, args) => {
+        const raw = await server.callTool(toolName, args);
+        // NOTE (S1 spike): the agents-SDK server's callTool may resolve the
+        // bare content array rather than a full CallToolResult (where isError
+        // lives) — unlike the raw MCP Client path (connectInProcess) which
+        // always returns the full shape. Normalize here so discover()'s
+        // isErrorResult/shapeCallToolResult behave uniformly across all
+        // three MCP mechanisms.
+        return raw && typeof raw === "object" && "content" in (raw as Record<string, unknown>)
+          ? raw
+          : { content: raw, isError: false };
+      },
       close: () => server.close(),
     };
   }
@@ -769,6 +792,10 @@ Required cases (each a named `it`):
   - [ ] entry missing `serverConfig` → omitted, no throw
   - [ ] secrecy: spy on the logger (or capture warn calls); assert no log/omission projection contains any `env` value planted in the fixture config (plant a sentinel like `"SECRET_SENTINEL"` and assert absence)
   - [ ] `shapeCallToolResult`: text items joined with `\n`; image item → `[non-text content: image — not supported on this provider lane]`
+  - [ ] `load_skill` (spec §D6, §D-open-assumptions contract test): non-empty fixture skill index (`skillIndex` with one entry pointing at a fixture SKILL.md on disk) → the `load_skill` tool is rendered/present in the returned `BridgedTool[]`, and `execute({name: <that entry's name>})` resolves with the fixture SKILL.md's file content
+  - [ ] `load_skill`: unknown skill name (not in `skillIndex`) → `execute({name: "nonexistent"})` resolves to contained error text (`load_skill failed: unknown skill '...'`), no throw
+  - [ ] `load_skill`: non-string `name` argument (e.g. `execute({name: 123})`) → resolves to contained error text (`load_skill failed: 'name' must be a string`), no throw
+  - [ ] `load_skill`: empty skill index (`skillIndex: []`) → `load_skill` is absent from the bridged tool list entirely (`buildLoadSkillTool` returns `null`)
 
 **T1 (bridge half) — containment:**
   - [ ] gate throws → `execute()` resolves to `Tool call denied by policy: guardrail gate error: …`
