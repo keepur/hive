@@ -1,8 +1,9 @@
-import { Agent, OpenAIProvider, Runner, run } from "@openai/agents";
+import { Agent, OpenAIProvider, Runner, run, tool } from "@openai/agents";
 import OpenAI from "openai";
 import type { RunResult } from "../agent-runner.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
+import { ToolBridge, type BridgedTool } from "./tool-bridge.js";
 import { createCodexOpenAITokenProvider, envValue, isProviderAuthError } from "./oauth-credentials.js";
 
 export interface OpenAIAgentsAdapterOptions {
@@ -47,15 +48,30 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     const streamed = !!request.onStream;
     const sessionId = request.sessionId ?? "";
 
+    // KPR-348 (§D8): per-spawn tool bridge — construction-time ≡ turn-time
+    // (per-spawn adapter). It gets the abort signal now (canon 5: mid-bridge
+    // abort only); abort() and agent-manager are untouched.
+    const bridge = new ToolBridge({
+      inventory: this.options.assembly.toolInventory,
+      inProcessServers: this.options.assembly.inProcessServers,
+      gate: this.options.assembly.guardrailGate,
+      workItemContext: request.workItemContext,
+      signal: abortController.signal,
+      agentId: this.options.name,
+      sessionCwd: this.options.assembly.sessionCwd,
+      skillIndex: this.options.assembly.skillIndex,
+    });
+
     try {
-      // KPR-347: assembly.toolInventory is carried but deliberately NOT
-      // advertised — an Agent with a tools param but no executor invites
-      // tool calls nothing handles. KPR-348 flips this (no `tools` key here
-      // until then).
+      // KPR-348: connect() is fail-soft per server and never throws (§D7);
+      // a fully-failed bridge yields [] and the turn runs tool-less.
+      const bridged = await bridge.connect();
+      const tools = bridged.map((bt) => bindTool(bt));
       const agent = new Agent({
         name: this.options.name,
         instructions: request.systemPromptOverride ?? this.options.assembly.instructions,
         model: this.options.model,
+        ...(tools.length > 0 ? { tools } : {}),
       });
 
       const runOptions = {
@@ -77,6 +93,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
           durationMs,
           streamed,
           aborted: false,
+          toolStats: bridge.stats,
         });
       }
 
@@ -91,6 +108,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
         durationMs,
         streamed,
         aborted: false,
+        toolStats: bridge.stats,
       });
     } catch (error) {
       const durationMs = Date.now() - startedAt;
@@ -101,6 +119,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
           durationMs,
           streamed,
           aborted: true,
+          toolStats: bridge.stats,
         });
       }
 
@@ -111,8 +130,10 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
         streamed,
         aborted: false,
         error: errorMessage(error),
+        toolStats: bridge.stats,
       });
     } finally {
+      await bridge.close(); // never throws/rejects (advisory 1)
       if (this.currentAbortController === abortController) {
         this.currentAbortController = null;
       }
@@ -223,6 +244,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     streamed,
     aborted,
     error,
+    toolStats,
   }: {
     text: string;
     sessionId: string;
@@ -230,16 +252,27 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     streamed: boolean;
     aborted: boolean;
     error?: string;
+    toolStats?: { toolCalls: number; toolMs: number; perTool: Map<string, number> };
   }): RunResult {
+    const toolMs = toolStats?.toolMs ?? 0;
+    const toolCalls = toolStats?.toolCalls ?? 0;
+    const toolSummary =
+      toolStats && toolStats.perTool.size > 0
+        ? [...toolStats.perTool.entries()].map(([n, c]) => `${n}×${c}`).join(", ")
+        : "none";
     return {
       text,
       sessionId,
       costUsd: 0,
       durationMs,
-      llmMs: durationMs,
-      toolMs: 0,
-      toolCalls: 0,
-      toolSummary: "none",
+      // §D8 + final-review advisory 2: llmMs excludes tool time (mirrors
+      // agent-runner.ts:2089) — the breaker's p95 latency window samples
+      // llmMs; folding tool time in would let slow-but-healthy tools trip a
+      // healthy endpoint. Clamped: mocked/degenerate timing can't go negative.
+      llmMs: Math.max(0, durationMs - toolMs),
+      toolMs,
+      toolCalls,
+      toolSummary,
       streamed,
       inputTokens: 0,
       outputTokens: 0,
@@ -251,6 +284,25 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
       ...(error ? { error } : {}),
     };
   }
+}
+
+/**
+ * Bind a provider-neutral BridgedTool to the Agents SDK tool() shape
+ * (SPIKE S4/S5): JSON schema passed as parameters with strict:false — the
+ * bridge already normalized the schema. errorFunction is belt-and-suspenders
+ * (§D3): even an SDK-internal invocation fault becomes model-visible text,
+ * not a run-loop rejection.
+ */
+function bindTool(bt: BridgedTool) {
+  return tool({
+    name: bt.name,
+    description: bt.description,
+    parameters: bt.inputSchema as never, // normalized JSON schema, non-strict (spike S4)
+    strict: false,
+    execute: (input: unknown) => bt.execute(input),
+    errorFunction: (_ctx: unknown, err: unknown) =>
+      `Tool execution failed (${bt.name}): ${err instanceof Error ? err.message : String(err)}`,
+  } as never);
 }
 
 export function coerceFinalOutput(output: unknown): string {

@@ -6,11 +6,13 @@
  * the shared prompt builder and populates memory/skillIndex — this file is
  * the single seam both edit.
  */
+import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../../logging/logger.js";
 import { getArchetype } from "../../archetypes/registry.js";
 import type { AgentConfig } from "../../types/agent-config.js";
 import type { AgentRunner, WorkItemContext } from "../agent-runner.js";
 import type { GuardrailGate, LaneBProviderId } from "./types.js";
+import { buildArchetypeGuardrailGate } from "./archetype-gate.js";
 import {
   partitionInventoryForProvider,
   type HiveToolInventoryEntry,
@@ -61,6 +63,17 @@ export interface ProviderTurnAssembly {
   guardrailGate: GuardrailGate;
   memory: ProviderMemoryBundle; // {} until KPR-349
   skillIndex: ProviderSkillIndexEntry[]; // [] until KPR-349
+  /**
+   * KPR-348 (spec §D4): the SAME in-process McpServer instances the Claude
+   * lane would run (same handlers, same *ContextRef closures) — the bridge
+   * connects to them over InMemoryTransport. The inventory remains the
+   * single source of WHICH servers the agent gets; this record is merely
+   * the carrier for HOW. Built inside the TurnAssemblyError try: a Mongo
+   * fault during factory construction classifies non-provider.
+   */
+  inProcessServers: Record<string, McpSdkServerConfigWithInstance>;
+  /** KPR-348 (spec §D5-cwd): resolved per-spawn session cwd for the builtin executor. */
+  sessionCwd: string;
 }
 
 /**
@@ -76,19 +89,26 @@ export function buildPilotInstructions(name: string, soul: string, systemPrompt:
  * KPR-347 (§D1.5): default fail-closed guardrail gate — the mirror of the
  * buildHooks posture (agent-runner.ts). Predicate is the identical two-part
  * presence check buildHooks uses (archetypeDef && archetypeConfig):
- *  - both present → deny-all until KPR-348 ports real archetype evaluation
- *    (behaviorally invisible pre-348 — no tools execute — but the posture
- *    ships in code, not prose);
+ *  - both present → real archetype PreToolUse evaluation (KPR-348 canon 6 —
+ *    a port of buildHooks' semantics; the deny-all placeholder body is gone);
  *  - otherwise → allow-all, exactly the Claude lane (no PreToolUse hooks
  *    unless both parts resolve). Registry sanitization strips unresolvable
  *    archetype ids at load time, so the mixed state is unreachable for any
  *    registry-loaded agent.
+ *
+ * KPR-348 (canon 6): predicate, allow-all branch, location, and export are
+ * preserved; the signature gains one optional trailing param so matcher
+ * production takes the turn's context, exactly as buildHooks(context) does.
  */
-export function buildDefaultGuardrailGate(config: AgentConfig): GuardrailGate {
+export function buildDefaultGuardrailGate(
+  config: AgentConfig,
+  workItemContext?: WorkItemContext,
+): GuardrailGate {
   const archetypeDef = config.archetype ? getArchetype(config.archetype) : undefined;
   if (archetypeDef && config.archetypeConfig) {
-    const reason = `Archetype tool policy (${config.archetype}) is not yet enforced on the native provider lane; tool blocked fail-closed (KPR-348).`;
-    return async () => ({ behavior: "deny", reason });
+    // KPR-348 (canon 6): real archetype PreToolUse evaluation — ports
+    // buildHooks' semantics (the deny-all placeholder body is gone).
+    return buildArchetypeGuardrailGate(config, archetypeDef, workItemContext);
   }
   return async () => ({ behavior: "allow" });
 }
@@ -119,7 +139,11 @@ export async function assembleProviderTurn(input: {
       bridgeable: bridgeable.length,
       omitted: omitted.map((o) => `${o.name}:${o.compatibility}`),
     });
-    const guardrailGate = buildDefaultGuardrailGate(input.config);
+    const guardrailGate = buildDefaultGuardrailGate(input.config, input.workItemContext);
+    // KPR-348 (§D4): *ContextRef.current is set here with the turn's context —
+    // per-spawn adapters make construction-time ≡ turn-time (canon 4).
+    const inProcessServers = input.runner.buildInProcessServers(input.workItemContext);
+    const sessionCwd = input.runner.resolveTurnCwd(input.workItemContext);
     return {
       instructions,
       toolInventory: bridgeable,
@@ -127,6 +151,8 @@ export async function assembleProviderTurn(input: {
       guardrailGate,
       memory: {},
       skillIndex: [],
+      inProcessServers,
+      sessionCwd,
     };
   } catch (err) {
     throw new TurnAssemblyError(

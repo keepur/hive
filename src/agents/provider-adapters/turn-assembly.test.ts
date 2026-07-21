@@ -39,9 +39,16 @@ function makeEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInv
   };
 }
 
-function makeRunner(inventory: HiveToolInventoryEntry[] | (() => HiveToolInventoryEntry[])): AgentRunner {
+function makeRunner(
+  inventory: HiveToolInventoryEntry[] | (() => HiveToolInventoryEntry[]),
+  extra: Partial<Pick<AgentRunner, "buildInProcessServers" | "resolveTurnCwd">> = {},
+): AgentRunner {
   const impl = typeof inventory === "function" ? inventory : () => inventory;
-  return { buildToolTransportInventory: vi.fn(impl) } as unknown as AgentRunner;
+  return {
+    buildToolTransportInventory: vi.fn(impl),
+    buildInProcessServers: extra.buildInProcessServers ?? vi.fn(() => ({})),
+    resolveTurnCwd: extra.resolveTurnCwd ?? vi.fn(() => "/tmp/kpr348-assembly-cwd"),
+  } as unknown as AgentRunner;
 }
 
 beforeEach(() => vi.clearAllMocks());
@@ -54,8 +61,12 @@ describe("assembleProviderTurn (KPR-347 §D1.4)", () => {
       compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only" },
       schemas: { kind: "unavailable" },
     });
+    const plantedServers = { memory: { instance: {} } } as never;
     const assembly = await assembleProviderTurn({
-      runner: makeRunner([bridgeable, omittedEntry]),
+      runner: makeRunner([bridgeable, omittedEntry], {
+        buildInProcessServers: vi.fn(() => plantedServers),
+        resolveTurnCwd: vi.fn(() => "/tmp/kpr348-planted-cwd"),
+      }),
       config: makeAgentConfig(),
       provider: "openai",
     });
@@ -65,6 +76,24 @@ describe("assembleProviderTurn (KPR-347 §D1.4)", () => {
     expect(assembly.omittedTools).toEqual([{ name: "Bash", transport: "claude-builtin", compatibility: "claude-only" }]);
     expect(assembly.memory).toEqual({});
     expect(assembly.skillIndex).toEqual([]);
+    // KPR-348: the assembly carries the in-process servers + resolved cwd.
+    expect(assembly.inProcessServers).toBe(plantedServers);
+    expect(assembly.sessionCwd).toBe("/tmp/kpr348-planted-cwd");
+  });
+
+  it("KPR-348: a resolveTurnCwd throw rejects with TurnAssemblyError (classifies non-provider)", async () => {
+    const promise = assembleProviderTurn({
+      runner: makeRunner([], {
+        resolveTurnCwd: vi.fn(() => {
+          throw new Error("Archetype cwd unavailable at session start — refusing to run");
+        }),
+      }),
+      config: makeAgentConfig(),
+      provider: "openai",
+    });
+    await expect(promise).rejects.toBeInstanceOf(TurnAssemblyError);
+    const err = await promise.catch((e: unknown) => e);
+    expect(classifyThrown(err)).toMatchObject({ outcome: "fault", kind: "non-provider" });
   });
 
   it("omission log carries names + reasons only — never serverConfig/env values (§edge: serverConfig secrecy)", async () => {
@@ -98,21 +127,25 @@ describe("buildDefaultGuardrailGate (KPR-347 §D1.5, T8)", () => {
     await expect(gate({ toolName: "anything", input: {} })).resolves.toEqual({ behavior: "allow" });
   });
 
-  it("archetyped agent (def + config both present) → deny-all with the KPR-348 reason", async () => {
+  // KPR-348: the KPR-347 "archetyped agent ⇒ deny-all placeholder" assertion is
+  // RELOCATED (not deleted) — the placeholder body is gone; the archetyped path
+  // now ports buildHooks' real evaluation. The remaining fail-closed obligation
+  // this test pins is: a matcher-production throw ⇒ deny-all (canon 6 fallback).
+  it("archetyped agent whose preToolUseHooks throws at production → deny-all (fail-closed port of buildHooks)", async () => {
     registerArchetype({
-      id: "kpr347-stub",
+      id: "kpr348-throwing-stub",
       validateConfig: (c: unknown) => c,
-      preToolUseHooks: () => [],
+      preToolUseHooks: () => {
+        throw new Error("boom at production");
+      },
       systemPromptCard: () => "",
     } as never);
     const gate = buildDefaultGuardrailGate(
-      makeAgentConfig({ archetype: "kpr347-stub", archetypeConfig: {} }),
+      makeAgentConfig({ archetype: "kpr348-throwing-stub", archetypeConfig: {} }),
     );
     const decision = await gate({ toolName: "Bash", input: { command: "ls" } });
-    expect(decision).toEqual({
-      behavior: "deny",
-      reason: "Archetype tool policy (kpr347-stub) is not yet enforced on the native provider lane; tool blocked fail-closed (KPR-348).",
-    });
+    expect(decision.behavior).toBe("deny");
+    expect((decision as { reason: string }).reason).toContain("Archetype hook initialization failed");
   });
 
   it("archetype id that does not resolve → allow-all (unreachable post-registry-sanitization; posture matches buildHooks)", async () => {

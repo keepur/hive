@@ -1364,12 +1364,12 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     });
   });
 
-  it("includes representative Claude SDK built-ins as Claude-only descriptors", () => {
+  it("includes non-executor Claude SDK built-ins as Claude-only descriptors", () => {
     const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
 
-    const bash = inventoryByName(runner, "Bash");
-    const task = inventoryByName(runner, "Task");
-    for (const descriptor of [bash, task]) {
+    // Task/WebFetch are claude-builtin NOT backed by the executor → claude-only.
+    for (const name of ["Task", "WebFetch"]) {
+      const descriptor = inventoryByName(runner, name);
       expect(descriptor).toMatchObject({
         transport: "claude-builtin",
         source: "sdk-builtin",
@@ -1383,6 +1383,43 @@ describe("AgentRunner.buildToolTransportInventory", () => {
         gemini: "claude-only",
         codex: "claude-only",
       });
+    }
+  });
+
+  // KPR-348 (Step 2.9.2): per-tool builtin names + static schemas for the six.
+  it("emits per-tool builtin names (no compound display names)", () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const names = new Set(runner.buildToolTransportInventory().map((e) => e.name));
+    for (const n of ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]) {
+      expect(names).toContain(n);
+    }
+    expect(names).not.toContain("Read / Write / Edit");
+    expect(names).not.toContain("Glob / Grep");
+    expect(names).not.toContain("WebFetch / WebSearch");
+  });
+
+  it("sources the six executor-backed builtins as { kind: 'static' } with a matching single tool def", () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    for (const name of ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]) {
+      const entry = inventoryByName(runner, name);
+      expect(entry.compatibility).toEqual({
+        claude: "direct",
+        openai: "requires-hive-bridge",
+        gemini: "requires-hive-bridge",
+        codex: "requires-hive-bridge",
+      });
+      expect(entry.schemas.kind).toBe("static");
+      if (entry.schemas.kind === "static") {
+        expect(entry.schemas.tools).toHaveLength(1);
+        expect(entry.schemas.tools[0]!.name).toBe(name);
+      }
+    }
+  });
+
+  it("keeps WebFetch/WebSearch/NotebookEdit/TodoWrite/Task builtins unavailable", () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    for (const name of ["WebFetch", "WebSearch", "NotebookEdit", "TodoWrite", "Task"]) {
+      expect(inventoryByName(runner, name).schemas).toEqual({ kind: "unavailable" });
     }
   });
 
@@ -1483,19 +1520,94 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     }
   });
 
-  it("sources claude-builtin and claude-subagent entries as unavailable WITHOUT a serverConfig", () => {
+  it("sources non-executor claude-builtin and claude-subagent entries as unavailable WITHOUT a serverConfig", () => {
     const runner = new AgentRunner(
       makeAgentConfig({ coreServers: [], delegateServers: ["google"] }),
       memoryManager as any,
     );
 
+    // WebFetch is a claude-builtin NOT backed by the executor → unavailable.
+    const webFetch = inventoryByName(runner, "WebFetch");
+    expect(webFetch.schemas).toEqual({ kind: "unavailable" });
+    expect("serverConfig" in webFetch).toBe(false);
+
+    // KPR-348: executor-backed builtins are now static, WITH no serverConfig.
     const bash = inventoryByName(runner, "Bash");
-    expect(bash.schemas).toEqual({ kind: "unavailable" });
+    expect(bash.schemas.kind).toBe("static");
     expect("serverConfig" in bash).toBe(false);
 
     const google = inventoryByName(runner, "google");
     expect(google.schemas).toEqual({ kind: "unavailable" });
     expect("serverConfig" in google).toBe(false);
+  });
+});
+
+// ── KPR-348 (Step 2.9.3): buildInProcessServers extraction equivalence ──
+// The block was cut VERBATIM out of send(); these pin that the extracted
+// method wires the same server keys the send() path used to assign inline.
+describe("AgentRunner.buildInProcessServers (KPR-348 extraction)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("no db + no roster → {}", () => {
+    const runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any);
+    expect(runner.buildInProcessServers()).toEqual({});
+  });
+
+  it("roster present (no db) → only team-roster", () => {
+    const teamRoster = { teamSummary: async () => "## Team\n- Alice" };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+    );
+    expect(Object.keys(runner.buildInProcessServers())).toEqual(["team-roster"]);
+  });
+
+  it("db present → db-gated in-process servers wired (memory/schedule)", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory", "schedule"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
+    );
+    const keys = Object.keys(runner.buildInProcessServers());
+    expect(keys).toContain("memory");
+    expect(keys).toContain("schedule");
+  });
+
+  it("send() and buildInProcessServers wire the same in-process server keys (equivalence)", async () => {
+    const teamRoster = { teamSummary: async () => "## Team\n- Alice" };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory", "schedule"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+      makeFakeInProcessDb(),
+    );
+    const extracted = new Set(Object.keys(runner.buildInProcessServers()));
+    await runner.send("hello");
+    const runtimeServerNames = Object.keys(getCapturedServers());
+    // every extracted in-process key is present in the runtime-wired server map
+    for (const key of extracted) {
+      expect(runtimeServerNames).toContain(key);
+    }
   });
 });
 
