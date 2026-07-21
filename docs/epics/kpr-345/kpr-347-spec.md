@@ -13,7 +13,7 @@ Expand the Lane B provider contract so it can *express* full parity — per-tool
 
 - **Contract, not capability.** After this ticket, pilots still advertise zero tools to their providers and produce byte-identical instructions (`buildPilotInstructions`, relocated not rewritten). What changes: the real inventory flows through the seam, guards stop throwing, semantics drive persistence, and every downstream child has a typed surface to land on. Behavior-neutrality is a tested invariant (§Testing T1).
 - **`AgentProviderAdapter`/`AgentProviderTurnRequest` interfaces stay unchanged.** Adapters are per-spawn (fresh instance per turn, `agent-manager.ts:1149-1152`), so adapter-lifetime payload ≡ turn payload; parity flows through a new per-spawn `ProviderTurnAssembly` passed at construction. This keeps `ClaudeAgentAdapter`'s passthrough untouched and `runTurn()` minimal.
-- **Codex gets its own compatibility dimension** (ruling, §D2): `compatibility` grows from `{claude, openai, gemini}` to `{claude, openai, gemini, codex}`, populated identically to `openai` by the single classifier today. The codex adapter's implicit `.openai` read (`codex-subscription-adapter.ts:170`) is exactly the hidden coupling this epic exists to remove.
+- **Codex gets its own compatibility dimension** (ruling, §D2): `compatibility` grows from `{claude, openai, gemini}` to `{claude, openai, gemini, codex}`; the new `codex` column will be populated identically to `openai` by the single classifier (`classifyToolTransport`) once this ticket lands — there is no `codex` column today. The codex adapter's implicit `.openai` read (`codex-subscription-adapter.ts:170`) is exactly the hidden coupling this epic exists to remove.
 - **Session semantics is a static per-provider fact** (ruling, §D3): `SESSION_SEMANTICS: Record<AgentProviderId, SessionSemantics>` with the four epic-canon values; exhaustive `Record` forces every future provider id to declare semantics at compile time. Supersedes and deletes `RESUMABLE_SESSION_PROVIDERS`; both call sites (write-side `finalizeSpawnResult`, read-side `SessionStore.normalizeRef`) re-key with today's behavior preserved exactly.
 - **Schemas materialize at bridge time, not assembly time** (ruling, §D1.2): stdio/http/sse *and* sdk-in-process entries declare `{kind: "connect-time"}` — KPR-348's bridge discovers/holds schemas when it connects or instantiates the server. KPR-347 does zero schema extraction; the type carries `{kind: "static", tools}` for KPR-348's authored builtin-executor schemas.
 - **The compatibility filter replaces the throw:** `partitionInventoryForProvider()` (pure, in `tool-transport.ts`) splits bridgeable vs omitted; omitted entries are recorded on the assembly (`omittedTools`) and logged once per spawn — R3's "nothing silently dropped" honesty surface, feeding the parity matrix (child 10).
@@ -169,14 +169,9 @@ export type GuardrailGate = (call: GuardrailToolCall) => Promise<GuardrailDecisi
 
 #### D1.4 Turn assembly (new file: `src/agents/provider-adapters/turn-assembly.ts`)
 
-```ts
-export interface OmittedToolRecord {
-  name: string;
-  transport: HiveToolTransportKind;
-  /** Why it was omitted: "claude-only" | "unsupported" for this provider. */
-  compatibility: ProviderToolCompatibility;
-}
+`OmittedToolRecord` is declared in `tool-transport.ts` (§D4), beside `partitionInventoryForProvider` which produces it — not here — so this file imports the type rather than the reverse, eliminating a circular type-only reference between the two modules.
 
+```ts
 /**
  * KPR-349 populates both of the following; shapes are deliberately minimal
  * placeholders KPR-349's spec may refine ADDITIVELY (new optional fields
@@ -238,10 +233,13 @@ export async function assembleProviderTurn(input: {
 
 #### D1.5 Default guardrail gate (this ticket's construction; KPR-348 ports real evaluation)
 
-Mirror of `buildHooks` posture (`agent-runner.ts:1439-1477`):
+Mirror of `buildHooks` posture (`agent-runner.ts:1439-1477`).
 
-- No `archetype`/`archetypeConfig` on the agent → `async () => ({ behavior: "allow" })` — exactly the Claude lane, which installs no PreToolUse hooks for archetype-less agents.
-- Archetype present → deny-all with reason `"Archetype tool policy (<archetype>) is not yet enforced on the native provider lane; tool blocked fail-closed (KPR-348)."` — the analog of the deny-all fallback at `agent-runner.ts:1459-1473`. Behaviorally invisible until KPR-348 executes tools, but the fail-closed posture ships in code (code-enforce, don't prose-enforce).
+**Gate predicate, exact:** keys on `archetypeDef && archetypeConfig` both present — the identical two-part presence check `buildHooks` uses at `agent-runner.ts:1444-1445`, not a looser "archetype field is set" test.
+
+- `archetypeDef && archetypeConfig` both present → deny-all with reason `"Archetype tool policy (<archetype>) is not yet enforced on the native provider lane; tool blocked fail-closed (KPR-348)."` — the analog of the deny-all fallback at `agent-runner.ts:1459-1473`. Behaviorally invisible until KPR-348 executes tools, but the fail-closed posture ships in code (code-enforce, don't prose-enforce).
+- Otherwise (no archetype, or an archetype id with no resolvable config) → `async () => ({ behavior: "allow" })` — exactly the Claude lane, which installs no PreToolUse hooks unless both parts resolve.
+- **Note:** registry sanitization (`agent-registry.ts:291-317`) strips an archetype id that doesn't resolve to a valid config at load time, so the mixed state — archetype id present but `archetypeConfig` absent — is unreachable at runtime for any agent the registry has loaded. In practice this collapses to a binary: "archetype present → deny-all" and "archetype absent → allow-all" describe the same two reachable states as the exact `archetypeDef && archetypeConfig` predicate.
 
 #### D1.6 What does NOT change
 
@@ -252,7 +250,7 @@ Mirror of `buildHooks` posture (`agent-runner.ts:1439-1477`):
 **Decision: explicit `codex` column, not an alias of `openai`.**
 
 - The status quo — codex adapter reading `compatibility.openai` (`codex-subscription-adapter.ts:170`) — is a live latent coupling: any future openai-only compatibility upgrade (e.g. hosted-MCP `direct` classification) would silently change codex behavior on a surface (subscription OAuth, hard `store:false`, raw Responses fetch — no Agents SDK) that has not been validated for it.
-- The classifier (`classifyToolTransport`, `tool-transport.ts:62-118`) populates `codex` identically to `openai` at all three return sites **today** — one code path emits both, so there is no duplication to drift; divergence, when it comes (KPR-348 may bridge MCP via Agents SDK classes for openai but plain function-calling for codex), is a deliberate per-site edit.
+- The classifier (`classifyToolTransport`, `tool-transport.ts:62-118`) will populate `codex` identically to `openai` at all three return sites — one code path emits both, so there is no duplication to drift; divergence, when it comes (KPR-348 may bridge MCP via Agents SDK classes for openai but plain function-calling for codex), is a deliberate per-site edit.
 - The parity matrix (child 10) needs per-provider cells regardless; the type-level cost is one field.
 - Session/storage differences (resume, `store:false`) live in the session-semantics descriptor (§D3), **not** in tool compatibility — the two dimensions are orthogonal by design.
 
@@ -334,6 +332,13 @@ export const BRIDGEABLE_COMPATIBILITIES: ReadonlySet<ProviderToolCompatibility> 
   "requires-hive-bridge",
 ]);
 
+export interface OmittedToolRecord {
+  name: string;
+  transport: HiveToolTransportKind;
+  /** Why it was omitted: "claude-only" | "unsupported" for this provider. */
+  compatibility: ProviderToolCompatibility;
+}
+
 export function partitionInventoryForProvider(
   inventory: readonly HiveToolInventoryEntry[],
   provider: LaneBProviderId,
@@ -371,7 +376,7 @@ Call-site reorder in `runOneSpawnAttempt` (`agent-manager.ts:1143-1178`): `bgCon
 ```ts
 let abortedEarly = false;
 ticket.attachAbort(() => { abortedEarly = true; });
-const adapter = await this.createProviderAdapter(effectiveCtx.agentId, shaping.route, bgContext);
+const adapter = await this.createProviderAdapter(ctx.agentId, shaping.route, bgContext);
 ticket.attachAbort(() => adapter.abort());
 if (abortedEarly) adapter.abort();
 ```
@@ -426,7 +431,7 @@ The module stays pure/dependency-free (an Error subclass adds no imports). `clas
 
 - **Agent removed by SIGUSR1 mid-turn:** `createProviderAdapter`'s `Unknown agent` throw stays inside the recorded try (§D5); classifies `non-provider` via the fail-safe default, exactly as today (`agent-manager.ts:1199-1208` contract preserved).
 - **Abort during assembly:** early-flag attach (§D5) — turn aborts at construction completion; breaker-neutral.
-- **Empty inventory** (agent with no servers, no delegates): partition returns `{[], […builtins]}`; adapters construct normally; log reads `0 bridgeable`.
+- **Empty inventory** (agent with no servers, no delegates): partition returns `{[], […builtins]}`; adapters construct normally; log reads `0 bridgeable` (unreachable in production — the runner is always constructed with `teamRoster` (`agent-manager.ts:493`), and the `team-roster` entry classifies `sdk-in-process` → `requires-hive-bridge`, which is bridgeable, so a true `0 bridgeable` outcome only arises in a rosterless test harness; T2's "empty input" case below is that harness case, not a production state).
 - **Reflection turns on a Lane B agent:** route through the same `runOneSpawnAttempt` seam; assembly runs identically (reflection prompt is `shaping.prompt`, unaffected).
 - **Voice:** pinned Claude lane by epic ruling; `systemPromptOverride` precedence in adapters preserved verbatim regardless.
 - **`serverConfig` secrecy:** carried on bridge-facing entries only; the omission log and any future telemetry emit entry *names* only (tested: log-line assertion contains no env values).
@@ -438,7 +443,7 @@ The module stays pure/dependency-free (an Error subclass adds no imports). `clas
 All tests beside source (`src/**/*.test.ts`), vitest, `npm run check` green. New/updated:
 
 - **T1 — behavior-neutrality (the headline invariant):**
-  - Pilot construction through the real seam with a non-empty inventory **does not throw** — negative-verified against the pre-change guards (revert-source check per regression-test discipline: same input throws at baseline).
+  - Pilot construction through the real seam with a non-empty inventory, **followed by a `runTurn()` invocation against a mocked provider transport**, **does not throw** — negative-verified against the pre-change guards (revert-source check per regression-test discipline: same input throws at baseline, and the baseline throw is expected from `runTurn()`, not construction — `assertToolFreePilot()` is called at the top of `runTurn()` in all three pilots, not in their constructors, which are bare field assignments: `openai-agents-adapter.ts:42-43`, `gemini-adk-adapter.ts:49-50`, `codex-subscription-adapter.ts:57-58`).
   - Each pilot still advertises zero tools: openai `Agent` constructed without `tools`; codex request body `tools: []`; gemini `tools: []` (existing adapter test harnesses extended).
   - `instructions` byte-equal to `buildPilotInstructions` output for a fixture agent.
 - **T2 — partition:** each compatibility class × each `LaneBProviderId`; codex column consulted (a claude-only-for-codex/bridgeable-for-openai synthetic entry partitions differently per provider); order preservation; empty input.
