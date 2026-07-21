@@ -18,6 +18,7 @@
  */
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import type { LoadedPlugin } from "../plugins/types.js";
+import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
 
 export interface ToolkitSectionInput {
   /** MCP servers actually configured for this agent's parent session
@@ -197,5 +198,86 @@ export function buildToolkitSection(input: ToolkitSectionInput): string {
     );
   }
 
+  return sections.join("\n\n");
+}
+
+// ── Lane B toolkit (KPR-349 §D4) ───────────────────────────────────
+
+/** Per-tool blurbs for the six executor-backed builtins. */
+const PROVIDER_BUILTIN_BLURBS: Record<string, string> = {
+  Bash: "run shell commands",
+  Read: "read files",
+  Write: "write files",
+  Edit: "edit files (exact string replacement)",
+  Glob: "find files by pattern",
+  Grep: "search file contents",
+};
+
+export interface ProviderToolkitInput {
+  /** PARTITIONED inventory (assembly.toolInventory) — claude-only and
+   *  claude-subagent entries never reach this function by construction. */
+  toolInventory: HiveToolInventoryEntry[];
+  plugins: LoadedPlugin[];
+}
+
+/**
+ * Render the Lane B toolkit from the bridged inventory so the model's
+ * tool-selection surface stays honest (epic §D5):
+ *  - Built-in: only static-schema claude-builtin survivors (the six executor
+ *    tools) — per-tool lines; WebFetch/WebSearch/NotebookEdit/TodoWrite/Task
+ *    are partition-omitted and can never appear.
+ *  - Engine-provided / Capability: MCP entries grouped by `source`
+ *    (engine → engine-provided; core/plugin → capability), one line per
+ *    SERVER (the bridge exposes tools as mcp__<server>__<tool>, so
+ *    server-level listing stays truthful).
+ *  - Omitted: delegated-MCPs section, deferred-loading hint (Claude-CLI
+ *    mechanisms). Header/"try them" framing reused verbatim.
+ * Known honesty limit: renders at assembly time, before connect() — a
+ * connect-time fail-soft omission is still listed; runtimeOmissions is the
+ * honest record.
+ */
+export function buildProviderToolkitSection(input: ProviderToolkitInput): string {
+  const builtinLines: string[] = [];
+  const engineLines: string[] = [];
+  const capabilityLines: string[] = [];
+
+  for (const entry of input.toolInventory) {
+    if (entry.transport === "claude-builtin") {
+      if (entry.schemas.kind !== "static") continue; // partition guarantees; belt-and-suspenders
+      for (const def of entry.schemas.tools) {
+        builtinLines.push(`- ${def.name} — ${PROVIDER_BUILTIN_BLURBS[def.name] ?? def.description}`);
+      }
+      continue;
+    }
+    if (
+      entry.transport === "stdio" ||
+      entry.transport === "http" ||
+      entry.transport === "sse" ||
+      entry.transport === "sdk-in-process"
+    ) {
+      const line = formatToolkitLine(entry.name, resolveCatalogEntry(entry.name, input.plugins));
+      if (entry.source === "engine") {
+        engineLines.push(line);
+      } else {
+        capabilityLines.push(line);
+      }
+    }
+    // claude-subagent: unreachable post-partition — deliberately no rendering.
+  }
+
+  const sections: string[] = [];
+  sections.push(
+    "## Your toolkit\n\n" +
+      "You have access to the following tools this session. Try them; don't guess at availability.",
+  );
+  if (builtinLines.length > 0) {
+    sections.push(`### Built-in (always available)\n${builtinLines.join("\n")}`);
+  }
+  if (engineLines.length > 0) {
+    sections.push("### Engine-provided (always available to every agent)\n" + engineLines.join("\n"));
+  }
+  if (capabilityLines.length > 0) {
+    sections.push("### Capability MCPs (provisioned for your role)\n" + capabilityLines.join("\n"));
+  }
   return sections.join("\n\n");
 }

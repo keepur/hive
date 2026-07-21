@@ -25,8 +25,10 @@ import type { LoadedPlugin } from "../plugins/types.js";
 import type { SkillIndex } from "./skill-loader.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import { getArchetype } from "../archetypes/registry.js";
-import { buildToolkitSection } from "./toolkit-section.js";
+import { buildToolkitSection, buildProviderToolkitSection } from "./toolkit-section.js";
 import { config, resolveToolSearchMode } from "../config.js";
+import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
+import type { ProviderSkillIndexEntry } from "./provider-adapters/turn-assembly.js";
 
 const log = createLogger("prefix-builder");
 
@@ -259,4 +261,94 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
   parts.push(...memory.blocks);
 
   return parts.join(SECTION_JOINER);
+}
+
+// ── Lane B composition (KPR-349 §D1/§D3) ───────────────────────────
+
+export interface ProviderInstructionsInput {
+  /** Partitioned bridgeable inventory (assembly.toolInventory). */
+  toolInventory: HiveToolInventoryEntry[];
+  /** Derived skill index (§D6) — skills section renders iff non-empty AND toolsExecutable. */
+  skillIndex: ProviderSkillIndexEntry[];
+  /**
+   * §D3 honesty gate, delivered as a PLAIN BOOLEAN — the provider set
+   * (TOOL_EXECUTING_PROVIDERS) lives at the assembly seam, never here.
+   * Gates: toolkit, file-tier guidance, skills section, and the two
+   * tool-instruction lines inside the memory block (memorySections).
+   */
+  toolsExecutable: boolean;
+  memoryManager: MemoryManager;
+  teamRoster?: TeamRoster;
+  plugins: LoadedPlugin[];
+}
+
+export interface ProviderInstructionsResult {
+  /** Full Lane B instruction text, datetime last (provider prompt caching is prefix-based too). */
+  instructions: string;
+  /** Raw hot-tier block → assembly.memory.hotTierPrompt. Single-injection: already folded into instructions. */
+  hotTierPrompt?: string;
+}
+
+/** §D6 skills section — mirrors the SDK's function (index in context, content on demand), not its bytes. */
+export function skillsSection(skillIndex: ProviderSkillIndexEntry[]): string {
+  return (
+    "## Your skills\n" +
+    "Named procedures for specific jobs. When a task matches one, call load_skill with its name FIRST and follow the returned instructions.\n" +
+    skillIndex.map((s) => `- ${s.name} — ${s.description}`).join("\n")
+  );
+}
+
+/**
+ * Lane B instructions: the SAME section helpers as buildPrefix, minus
+ * Claude-specific fragments, plus the inventory-rendered toolkit and the
+ * skills section. Layer order (spec G2, † = gated by toolsExecutable):
+ * soul → archetype card → systemPrompt → constitution → team summary →
+ * †toolkit → †file-tier guidance (iff memory entry in inventory) →
+ * †skills (iff index non-empty) → hot-tier/legacy memory (interior
+ * tool-claim lines separately gated) → datetime trailer.
+ */
+export async function buildProviderInstructions(
+  agentConfig: AgentConfig,
+  input: ProviderInstructionsInput,
+): Promise<ProviderInstructionsResult> {
+  const parts: string[] = [];
+
+  const soul = soulSection(agentConfig);
+  if (soul) parts.push(soul);
+
+  const card = archetypeCardSection(agentConfig);
+  if (card) parts.push(card);
+
+  parts.push(systemPromptSection(agentConfig));
+
+  const constitution = await constitutionSection(input.memoryManager);
+  if (constitution) parts.push(constitution);
+
+  const teamSummary = await teamSummarySection(agentConfig.id, input.teamRoster);
+  if (teamSummary) parts.push(teamSummary);
+
+  if (input.toolsExecutable) {
+    parts.push(buildProviderToolkitSection({ toolInventory: input.toolInventory, plugins: input.plugins }));
+    // §D1: guidance keyed on the INVENTORY (same predicate spirit as the
+    // Claude lane's coreServerNames check — but the inventory is Lane B's
+    // source of truth for what is actually bridged).
+    if (input.toolInventory.some((e) => e.name === "memory")) {
+      parts.push(fileTierMemoryGuidance());
+    }
+    if (input.skillIndex.length > 0) {
+      parts.push(skillsSection(input.skillIndex));
+    }
+  }
+
+  const memory = await memorySections(input.memoryManager, agentConfig.id, {
+    toolsExecutable: input.toolsExecutable,
+    // §D5 option (a): the bridged tool name — the model-visible name of the
+    // structured-memory server's memory_recall tool on every Lane B bridge.
+    recallToolName: input.toolsExecutable ? "mcp__structured-memory__memory_recall" : undefined,
+  });
+  parts.push(...memory.blocks);
+
+  parts.push(formatDateTimeTrailer());
+
+  return { instructions: parts.join(SECTION_JOINER), hotTierPrompt: memory.hotTierPrompt };
 }

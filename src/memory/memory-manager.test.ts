@@ -219,3 +219,60 @@ describe("MemoryManager.getHotTierPrompt", () => {
     expect(result).toContain("(critical, pinned)");
   });
 });
+
+// ── KPR-349 §D5: recall-trailer tool-claim gate (Lane B) ────────────
+describe("MemoryManager.getHotTierPrompt recall-trailer variants (KPR-349 §D5)", () => {
+  let manager: MemoryManager;
+  let mockStore: ReturnType<typeof makeMockMemoryStore>;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    manager = new MemoryManager(mockDb as any);
+    await manager.init();
+    mockStore = makeMockMemoryStore();
+    mockStore.getHotTier.mockResolvedValue([makeRecord({ content: "active memory" })]);
+    manager.memoryStore = mockStore as any;
+  });
+
+  it("default (no opts) pins the pre-349 bare `memory_recall` trailer bytes", async () => {
+    mockStore.countNonHot.mockResolvedValueOnce(7);
+    const result = await manager.getHotTierPrompt("agent-1", 10000);
+    expect(result).toContain(
+      "---\nYou have 7 additional memories available via `memory_recall`. Use it to search for context before starting tasks.",
+    );
+  });
+
+  it("recallToolName qualified → names the bridged tool; the bare backticked form is absent", async () => {
+    mockStore.countNonHot.mockResolvedValueOnce(7);
+    const result = await manager.getHotTierPrompt("agent-1", 10000, {
+      recallToolName: "mcp__structured-memory__memory_recall",
+    });
+    expect(result).toContain(
+      "---\nYou have 7 additional memories available via `mcp__structured-memory__memory_recall`. Use it to search for context before starting tasks.",
+    );
+    // The qualified name contains the substring memory_recall, but the bare
+    // backticked token never appears.
+    expect(result).not.toContain("`memory_recall`");
+  });
+
+  it("recallToolName null → reworded count-only trailer; no tool claim at all", async () => {
+    mockStore.countNonHot.mockResolvedValueOnce(7);
+    const result = await manager.getHotTierPrompt("agent-1", 10000, { recallToolName: null });
+    expect(result).toContain("---\nYou have 7 additional memories.");
+    expect(result).not.toContain("memory_recall");
+    expect(result).not.toContain("Use it to search");
+  });
+
+  it("countNonHot === 0 → no trailer under any opts variant", async () => {
+    for (const opts of [
+      undefined,
+      { recallToolName: "mcp__structured-memory__memory_recall" },
+      { recallToolName: null },
+    ] as const) {
+      mockStore.countNonHot.mockResolvedValueOnce(0);
+      const result = await manager.getHotTierPrompt("agent-1", 10000, opts);
+      expect(result).not.toContain("additional memories");
+      expect(result).not.toContain("memory_recall");
+    }
+  });
+});

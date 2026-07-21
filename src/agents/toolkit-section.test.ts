@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { buildToolkitSection } from "./toolkit-section.js";
+import { buildToolkitSection, buildProviderToolkitSection } from "./toolkit-section.js";
 import type { LoadedPlugin } from "../plugins/types.js";
+import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
+import { BUILTIN_TOOL_DEFINITIONS } from "./provider-adapters/builtin-executor.js";
 
 // MUST mirror AgentRunner.autoInjectedServerNames() — keep in sync.
 // (KPR-174 audit caught the test fixture out-of-sync with runtime: team-roster
@@ -299,5 +301,139 @@ describe("deferred-loading hint (KPR-329)", () => {
     expect(buildToolkitSection(bareBonesInput({ deferredLoadingActive: true }))).toBe(
       buildToolkitSection(bareBonesInput()),
     );
+  });
+});
+
+describe("buildProviderToolkitSection (KPR-349 §D4)", () => {
+  function invEntry(overrides: Partial<HiveToolInventoryEntry>): HiveToolInventoryEntry {
+    return {
+      name: "x",
+      transport: "sdk-in-process",
+      source: "core",
+      requiresTurnContext: false,
+      requiresHiveRuntime: true,
+      inProcess: true,
+      compatibility: {
+        claude: "direct",
+        openai: "requires-hive-bridge",
+        gemini: "requires-hive-bridge",
+        codex: "requires-hive-bridge",
+      },
+      schemas: { kind: "connect-time" },
+      ...overrides,
+    };
+  }
+
+  // One claude-builtin entry per executor tool (schemas static, single tool).
+  const builtinEntries: HiveToolInventoryEntry[] = BUILTIN_TOOL_DEFINITIONS.map((def) =>
+    invEntry({
+      name: def.name,
+      transport: "claude-builtin",
+      source: "sdk-builtin",
+      inProcess: false,
+      requiresHiveRuntime: false,
+      schemas: { kind: "static", tools: [def] },
+    }),
+  );
+
+  const goldenPlugin: LoadedPlugin = {
+    name: "golden-plugin",
+    dir: "/plugins/golden-plugin",
+    manifest: {
+      name: "golden-plugin",
+      description: "Golden",
+      mcpServers: {
+        "golden-plugin-server": {
+          entry: "mcp-servers/golden/index.ts",
+          description: "Golden plugin capability",
+          env: [],
+          envMap: {},
+          agentEnv: {},
+        },
+      },
+      agentSeeds: [],
+    },
+    brokenServers: {},
+  } as never;
+
+  function richInventory(): HiveToolInventoryEntry[] {
+    return [
+      invEntry({ name: "contacts", transport: "sdk-in-process", source: "core" }),
+      invEntry({ name: "keychain", transport: "stdio", source: "core", inProcess: false, requiresHiveRuntime: false }),
+      invEntry({ name: "slack", transport: "http", source: "engine", inProcess: false, requiresHiveRuntime: false }),
+      invEntry({
+        name: "golden-plugin-server",
+        transport: "stdio",
+        source: "plugin",
+        inProcess: false,
+        requiresHiveRuntime: false,
+      }),
+      ...builtinEntries,
+      // Partition-leak simulations — both must render nothing.
+      invEntry({
+        name: "WebFetch",
+        transport: "claude-builtin",
+        source: "sdk-builtin",
+        inProcess: false,
+        requiresHiveRuntime: false,
+        schemas: { kind: "unavailable" },
+      }),
+      invEntry({
+        name: "__subagent__",
+        transport: "claude-subagent",
+        source: "delegate",
+        inProcess: false,
+        requiresHiveRuntime: false,
+        schemas: { kind: "unavailable" },
+      }),
+    ];
+  }
+
+  it("emits the reused header and 'try them' framing", () => {
+    const out = buildProviderToolkitSection({ toolInventory: richInventory(), plugins: [goldenPlugin] });
+    expect(out).toContain("## Your toolkit");
+    expect(out).toContain("Try them; don't guess at availability.");
+  });
+
+  it("Built-in subsection lists exactly the six executor tools as per-tool lines", () => {
+    const out = buildProviderToolkitSection({ toolInventory: richInventory(), plugins: [goldenPlugin] });
+    expect(out).toContain("### Built-in (always available)");
+    expect(out).toContain("- Bash — run shell commands");
+    expect(out).toContain("- Read — read files");
+    expect(out).toContain("- Write — write files");
+    expect(out).toContain("- Edit — edit files (exact string replacement)");
+    expect(out).toContain("- Glob — find files by pattern");
+    expect(out).toContain("- Grep — search file contents");
+  });
+
+  it("skips unavailable-schema builtins and claude-subagent entries", () => {
+    const out = buildProviderToolkitSection({ toolInventory: richInventory(), plugins: [goldenPlugin] });
+    expect(out).not.toContain("WebFetch");
+    expect(out).not.toContain("__subagent__");
+  });
+
+  it("groups MCP entries: engine → Engine-provided, core/plugin → Capability", () => {
+    const out = buildProviderToolkitSection({ toolInventory: richInventory(), plugins: [goldenPlugin] });
+    expect(out).toContain("### Engine-provided (always available to every agent)");
+    expect(out.split("### Engine-provided")[1]).toContain("- slack —");
+    expect(out).toContain("### Capability MCPs (provisioned for your role)");
+    const capPart = out.split("### Capability MCPs")[1]!;
+    expect(capPart).toContain("- contacts —");
+    expect(capPart).toContain("- keychain —");
+    expect(capPart).toContain("- golden-plugin-server — Golden plugin capability");
+  });
+
+  it("omits the Delegated subsection and the deferred-loading hint", () => {
+    const out = buildProviderToolkitSection({ toolInventory: richInventory(), plugins: [goldenPlugin] });
+    expect(out).not.toContain("### Delegated capability MCPs");
+    expect(out).not.toContain("Some tool schemas load on demand");
+  });
+
+  it("empty inventory → header only, no subsections", () => {
+    const out = buildProviderToolkitSection({ toolInventory: [], plugins: [] });
+    expect(out).toContain("## Your toolkit");
+    expect(out).not.toContain("### Built-in");
+    expect(out).not.toContain("### Engine-provided");
+    expect(out).not.toContain("### Capability MCPs");
   });
 });
