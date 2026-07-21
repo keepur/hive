@@ -7,6 +7,7 @@ import { z } from "zod";
 import type { McpSdkServerConfigWithInstance, SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
 import { ToolBridge, normalizeSchema, shapeCallToolResult } from "./tool-bridge.js";
 import type { ToolBridgeOptions } from "./tool-bridge.js";
+import { BUILTIN_TOOL_DEFINITIONS } from "./builtin-executor.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import type { ProviderSkillIndexEntry } from "./turn-assembly.js";
 // KPR-349 T5/T6: real round-trips through production code paths.
@@ -494,6 +495,109 @@ describe("T9 — name and cap edges", () => {
     expect(tools).toHaveLength(128);
     const capped = bridge.runtimeOmissions.filter((o) => o.reason === "provider-tool-cap");
     expect(capped).toHaveLength(2);
+    await bridge.close();
+  });
+});
+
+// --- KPR-349 T8: §D7 cap-priority ruling (two-tier pin) --------------------
+// Tier 0 — the six executor builtins + load_skill — is structurally
+// load-bearing (toolkit + skills prompt sections claim them) and is NEVER
+// cap-dropped. Tier 1 (MCP-discovered) keeps inventory order and absorbs the
+// entire tail-drop. The 348-shipped tail-splice inverted this: load_skill,
+// pushed last in connectInner, was the first casualty.
+
+describe("KPR-349 T8 — §D7 cap-priority (builtins + load_skill pinned)", () => {
+  let dir: string;
+  let skillPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "kpr349-t8-"));
+    skillPath = join(dir, "SKILL.md");
+    writeFileSync(skillPath, "# T8 fixture skill\nbody");
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const BUILTIN_NAMES = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"];
+
+  /**
+   * 125 MCP tools (mcp__big__t0..t124) + 6 static builtins + load_skill = 132.
+   * connectInner order: external MCP → in-process → builtins → load_skill, so
+   * every MCP tool precedes every builtin, and load_skill is dead last.
+   */
+  function overCapBridge(mcpCount = 125): ToolBridge {
+    const many = Array.from({ length: mcpCount }, (_, i) => ({ name: `t${i}`, inputSchema: {} }));
+    setBehavior("big", { listTools: async () => many });
+    return makeBridge({
+      inventory: [
+        makeEntry({ name: "big", transport: "stdio" }),
+        makeEntry({
+          name: "builtins",
+          transport: "claude-builtin",
+          serverConfig: undefined,
+          schemas: { kind: "static", tools: BUILTIN_TOOL_DEFINITIONS },
+        }),
+      ],
+      skillIndex: [{ name: "fixture-skill", description: "A fixture", path: skillPath }],
+    });
+  }
+
+  it("pins builtins + load_skill and tail-drops the last 4 Tier-1 MCP tools", async () => {
+    const bridge = overCapBridge(125);
+    const tools = await bridge.connect();
+
+    // Exactly at the cap.
+    expect(tools).toHaveLength(128);
+
+    const names = tools.map((t) => t.name);
+    // Every pinned tool survived.
+    for (const b of BUILTIN_NAMES) expect(names).toContain(b);
+    expect(names).toContain("load_skill");
+
+    // The four dropped are the LAST four Tier-1 tools in inventory order.
+    const droppedNames = ["mcp__big__t121", "mcp__big__t122", "mcp__big__t123", "mcp__big__t124"];
+    for (const d of droppedNames) expect(names).not.toContain(d);
+    // The one just above the drop line survived.
+    expect(names).toContain("mcp__big__t120");
+
+    // Exactly four provider-tool-cap omissions, for those four names.
+    const capped = bridge.runtimeOmissions.filter((o) => o.reason === "provider-tool-cap");
+    expect(capped).toHaveLength(4);
+    expect(capped.map((o) => o.server).sort()).toEqual([...droppedNames].sort());
+
+    await bridge.close();
+  });
+
+  it("preserves original relative order — pinned tools are NOT hoisted to the front", async () => {
+    const bridge = overCapBridge(125);
+    const tools = await bridge.connect();
+    const names = tools.map((t) => t.name);
+
+    // mcp__big__t0 precedes Bash in the input inventory order; it must still
+    // precede Bash in the output (no reordering of survivors to the front).
+    expect(names.indexOf("mcp__big__t0")).toBeGreaterThanOrEqual(0);
+    expect(names.indexOf("mcp__big__t0")).toBeLessThan(names.indexOf("Bash"));
+    // load_skill remains last, as assembled.
+    expect(names[names.length - 1]).toBe("load_skill");
+
+    await bridge.close();
+  });
+
+  it("under the cap — builtins + load_skill present, list passes through untouched", async () => {
+    const bridge = overCapBridge(10); // 10 MCP + 6 builtins + load_skill = 17
+    const tools = await bridge.connect();
+    const names = tools.map((t) => t.name);
+
+    const expected = [
+      ...Array.from({ length: 10 }, (_, i) => `mcp__big__t${i}`),
+      ...BUILTIN_NAMES,
+      "load_skill",
+    ];
+    expect(names).toEqual(expected); // exact contents AND order preserved
+
+    // No cap omissions.
+    expect(bridge.runtimeOmissions.filter((o) => o.reason === "provider-tool-cap")).toHaveLength(0);
+
     await bridge.close();
   });
 });

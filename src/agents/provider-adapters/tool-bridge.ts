@@ -23,7 +23,7 @@ import type { WorkItemContext } from "../agent-runner.js";
 import type { GuardrailDecision, GuardrailGate } from "./types.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import type { ProviderSkillIndexEntry } from "./turn-assembly.js";
-import { BuiltinExecutor } from "./builtin-executor.js"; // Task 2 creates; Task 1 ships a stub (Step 1.2)
+import { BuiltinExecutor, EXECUTOR_BACKED_BUILTIN_NAMES } from "./builtin-executor.js"; // Task 2 creates; Task 1 ships a stub (Step 1.2)
 
 const log = createLogger("tool-bridge");
 
@@ -385,13 +385,28 @@ export class ToolBridge {
       out.push(candidate === t.name ? t : { ...t, name: candidate });
     }
     if (out.length > MAX_PROVIDER_TOOLS) {
-      const dropped = out.splice(MAX_PROVIDER_TOOLS);
+      // KPR-349 (§D7 ruling, canon delegation from KPR-348): two tiers.
+      // Tier 0 — the six executor builtins + load_skill (≤7 tools) are
+      // structurally load-bearing (the prompt's toolkit and skills sections
+      // claim them) and are NEVER cap-dropped. Tier 1 — everything else
+      // (MCP-discovered) keeps inventory order and takes the entire
+      // tail-drop. The 348-shipped order (load_skill first, builtins next)
+      // was precisely inverted. Original relative order is preserved for
+      // every survivor.
+      const pinnedNames = new Set<string>([...EXECUTOR_BACKED_BUILTIN_NAMES, "load_skill"]);
+      const pinned = out.filter((t) => pinnedNames.has(t.name));
+      const tier1 = out.filter((t) => !pinnedNames.has(t.name));
+      const tier1Budget = MAX_PROVIDER_TOOLS - pinned.length;
+      const dropped = tier1.slice(tier1Budget);
       for (const d of dropped) this.runtimeOmissions.push({ server: d.name, reason: "provider-tool-cap" });
-      log.warn("Bridged tool surface exceeds provider cap — tail dropped", {
+      log.warn("Bridged tool surface exceeds provider cap — Tier-1 tail dropped (builtins + load_skill pinned)", {
         agent: this.opts.agentId,
         cap: MAX_PROVIDER_TOOLS,
+        pinned: pinned.map((t) => t.name),
         dropped: dropped.map((d) => d.name),
       });
+      const surviving = new Set([...pinned, ...tier1.slice(0, tier1Budget)]);
+      return out.filter((t) => surviving.has(t));
     }
     return out;
   }
