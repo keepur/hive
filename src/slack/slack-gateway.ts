@@ -724,9 +724,7 @@ export class SlackGateway {
             }),
           );
 
-          const processed = await Promise.all(
-            enrichedFiles.map((f) => downloadAndProcess(f, this.botToken)),
-          );
+          const processed = await Promise.all(enrichedFiles.map((f) => downloadAndProcess(f, this.botToken)));
 
           const hiveFiles = processed
             .filter((f): f is ProcessedFile => f !== null)
