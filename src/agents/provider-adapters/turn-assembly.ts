@@ -6,6 +6,7 @@
  * the shared prompt builder and populates memory/skillIndex — this file is
  * the single seam both edit.
  */
+import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../../logging/logger.js";
 import { getArchetype } from "../../archetypes/registry.js";
 import type { AgentConfig } from "../../types/agent-config.js";
@@ -61,6 +62,17 @@ export interface ProviderTurnAssembly {
   guardrailGate: GuardrailGate;
   memory: ProviderMemoryBundle; // {} until KPR-349
   skillIndex: ProviderSkillIndexEntry[]; // [] until KPR-349
+  /**
+   * KPR-348 (spec §D4): the SAME in-process McpServer instances the Claude
+   * lane would run (same handlers, same *ContextRef closures) — the bridge
+   * connects to them over InMemoryTransport. The inventory remains the
+   * single source of WHICH servers the agent gets; this record is merely
+   * the carrier for HOW. Built inside the TurnAssemblyError try: a Mongo
+   * fault during factory construction classifies non-provider.
+   */
+  inProcessServers: Record<string, McpSdkServerConfigWithInstance>;
+  /** KPR-348 (spec §D5-cwd): resolved per-spawn session cwd for the builtin executor. */
+  sessionCwd: string;
 }
 
 /**
@@ -120,6 +132,10 @@ export async function assembleProviderTurn(input: {
       omitted: omitted.map((o) => `${o.name}:${o.compatibility}`),
     });
     const guardrailGate = buildDefaultGuardrailGate(input.config);
+    // KPR-348 (§D4): *ContextRef.current is set here with the turn's context —
+    // per-spawn adapters make construction-time ≡ turn-time (canon 4).
+    const inProcessServers = input.runner.buildInProcessServers(input.workItemContext);
+    const sessionCwd = input.runner.resolveTurnCwd(input.workItemContext);
     return {
       instructions,
       toolInventory: bridgeable,
@@ -127,6 +143,8 @@ export async function assembleProviderTurn(input: {
       guardrailGate,
       memory: {},
       skillIndex: [],
+      inProcessServers,
+      sessionCwd,
     };
   } catch (err) {
     throw new TurnAssemblyError(

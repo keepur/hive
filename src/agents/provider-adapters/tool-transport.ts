@@ -1,5 +1,9 @@
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { LaneBProviderId } from "./types.js";
+// Runtime import direction: tool-transport → builtin-executor. builtin-executor's
+// import of HiveToolSchemaEntry from this file is type-only and erased, so no
+// runtime cycle (KPR-348 spec §D5).
+import { EXECUTOR_BACKED_BUILTIN_NAMES } from "./builtin-executor.js";
 
 export type HiveToolTransportKind =
   | "stdio"
@@ -34,15 +38,19 @@ export interface HiveToolTransportDescriptor {
 }
 
 /**
- * Claude Agent SDK built-ins advertised by Hive's toolkit section.
- * The SDK does not expose a runtime manifest, so KPR-232 mirrors the visible
- * toolkit names here for provider compatibility inventory.
+ * Claude Agent SDK built-ins advertised by Hive's toolkit section — per-tool
+ * (KPR-348 replaced the compound display names so archetype rules and the
+ * builtin executor address tools by their real names).
  */
 export const CLAUDE_SDK_BUILTIN_TOOL_NAMES: readonly string[] = [
   "Bash",
-  "Read / Write / Edit",
-  "Glob / Grep",
-  "WebFetch / WebSearch",
+  "Read",
+  "Write",
+  "Edit",
+  "Glob",
+  "Grep",
+  "WebFetch",
+  "WebSearch",
   "NotebookEdit",
   "Task",
   "TodoWrite",
@@ -82,6 +90,14 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
   }
 
   if (input.transport === "claude-builtin" || input.transport === "claude-subagent") {
+    // KPR-348 (spec §D5, canon 2): the six executor-backed builtins are
+    // bridgeable on every Lane B provider — ONE code path emits openai,
+    // gemini, and codex identically (codex ≡ openai at the classify site;
+    // gemini upgraded for classification honesty — its adapter still
+    // advertises zero tools until KPR-352, only its omission record changes).
+    const executorBacked =
+      input.transport === "claude-builtin" && EXECUTOR_BACKED_BUILTIN_NAMES.has(input.name);
+    const nonClaude: ProviderToolCompatibility = executorBacked ? "requires-hive-bridge" : "claude-only";
     return {
       name: input.name,
       transport: input.transport,
@@ -91,9 +107,9 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
       inProcess,
       compatibility: {
         claude: "direct",
-        openai: "claude-only",
-        gemini: "claude-only",
-        codex: "claude-only",
+        openai: nonClaude,
+        gemini: nonClaude,
+        codex: nonClaude,
       },
     };
   }

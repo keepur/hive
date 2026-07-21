@@ -76,10 +76,11 @@ describe("classifyToolTransport", () => {
   });
 
   it.each(["claude-builtin", "claude-subagent"] as const)(
-    "marks %s as Claude-only outside Claude",
+    "marks non-executor %s as Claude-only outside Claude",
     (transport) => {
       const descriptor = classifyToolTransport({
-        name: transport === "claude-builtin" ? "Bash" : "google",
+        // WebFetch is a claude-builtin NOT backed by the executor → claude-only.
+        name: transport === "claude-builtin" ? "WebFetch" : "google",
         transport,
         source: transport === "claude-builtin" ? "sdk-builtin" : "delegate",
       });
@@ -92,6 +93,39 @@ describe("classifyToolTransport", () => {
       });
     },
   );
+
+  // KPR-348 (Step 2.9): the six executor-backed builtins bridge on every Lane B
+  // provider; codex ≡ openai (canon-2) pinned explicitly.
+  it.each(["Bash", "Read", "Write", "Edit", "Glob", "Grep"])(
+    "marks executor-backed builtin %s as requires-hive-bridge outside Claude",
+    (name) => {
+      const d = classifyToolTransport({ name, transport: "claude-builtin", source: "sdk-builtin" });
+      expect(d.compatibility).toEqual({
+        claude: "direct",
+        openai: "requires-hive-bridge",
+        gemini: "requires-hive-bridge",
+        codex: "requires-hive-bridge",
+      });
+      expect(d.compatibility.codex).toEqual(d.compatibility.openai);
+    },
+  );
+
+  it.each(["WebFetch", "WebSearch", "NotebookEdit", "TodoWrite", "Task"])(
+    "keeps non-executor builtin %s claude-only",
+    (name) => {
+      const d = classifyToolTransport({ name, transport: "claude-builtin", source: "sdk-builtin" });
+      expect(d.compatibility.openai).toBe("claude-only");
+      expect(d.compatibility.gemini).toBe("claude-only");
+      expect(d.compatibility.codex).toBe("claude-only");
+    },
+  );
+
+  it("keeps claude-subagent claude-only even for an executor-shared name", () => {
+    // A delegate sub-agent named like a builtin must NOT be upgraded — only
+    // transport === "claude-builtin" is executor-backed.
+    const d = classifyToolTransport({ name: "Bash", transport: "claude-subagent", source: "delegate" });
+    expect(d.compatibility.openai).toBe("claude-only");
+  });
 
   it("can classify broken transports as unsupported for diagnostics", () => {
     const descriptor = classifyToolTransport({

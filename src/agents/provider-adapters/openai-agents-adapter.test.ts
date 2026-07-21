@@ -48,6 +48,8 @@ function makeAssembly(overrides: Partial<ProviderTurnAssembly> = {}): ProviderTu
     guardrailGate: async () => ({ behavior: "allow" }),
     memory: {},
     skillIndex: [],
+    inProcessServers: {},
+    sessionCwd: tmpdir(),
     ...overrides,
   };
 }

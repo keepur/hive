@@ -90,6 +90,9 @@ vi.mock("./agent-runner.js", () => ({
     abort: mockRunnerAbort,
     wasAborted: false,
     buildToolTransportInventory: mockRunnerToolInventory,
+    // KPR-348: assembleProviderTurn now carries in-process servers + session cwd.
+    buildInProcessServers: vi.fn().mockReturnValue({}),
+    resolveTurnCwd: vi.fn().mockReturnValue("/tmp/kpr348-test-cwd"),
   })),
   // Re-exported from agent-runner for plugin-loader path resolution; the test
   // manager doesn't use it, so a sentinel path is fine.
