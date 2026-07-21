@@ -3455,3 +3455,24 @@ describe("AgentRunner is_error result guard (KPR-312, via send)", () => {
     expect(result.error).toBeUndefined();
   });
 });
+
+describe("buildSystemPrompt datetime composition (KPR-349 §D2 pin)", () => {
+  it("output is <prefix> + joiner + Pacific datetime trailer, datetime last", async () => {
+    const memoryManager = makeMockMemoryManager();
+    const runner = new AgentRunner(
+      makeAgentConfig({ systemPrompt: "PIN-SYSTEM-PROMPT" }),
+      memoryManager as never,
+    );
+    const out = await (
+      runner as unknown as { buildSystemPrompt(c: string[], d?: string[]): Promise<string> }
+    ).buildSystemPrompt([]);
+    // Full-output shape: prefix, then the exact joiner, then the trailer — nothing after.
+    expect(out).toMatch(/^[\s\S]+\n\n---\n\n\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    expect(out).toContain("PIN-SYSTEM-PROMPT");
+    // Trailer text renders an en-US Pacific timestamp (weekday, month day, year, h:mm AM/PM).
+    const trailer = out.slice(out.lastIndexOf("**Current date/time**"));
+    expect(trailer).toMatch(
+      /^\*\*Current date\/time\*\*: (Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), [A-Z][a-z]+ \d{1,2}, \d{4} at \d{1,2}:\d{2} (AM|PM) \(Pacific Time\)$/,
+    );
+  });
+});

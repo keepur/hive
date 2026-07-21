@@ -1,0 +1,339 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G1: bare-bones agent (no soul/archetype/roster/memory) 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G2: soul + constitution present 1`] = `
+"GOLDEN-SOUL: warm, precise.
+
+---
+
+GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+GOLDEN-CONSTITUTION: rule one.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G3: archetype card rendered (archetypeConfig present) 1`] = `
+"GOLDEN-ARCHETYPE-CARD: fixture discipline card.
+
+---
+
+GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G4: archetype card throws → omitted, rest of prefix intact 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G5: archetype id resolves but archetypeConfig absent → card skipped (prefix-builder.ts:75 conjunction) 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G6: team summary present 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+GOLDEN-TEAM: roster of two.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G7: team summary throws → omitted 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G8: memory in coreServers → file-tier guidance + hot-tier block 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session
+
+### Capability MCPs (provisioned for your role)
+- memory — Read and write your personal agent memory
+- structured-memory — Semantic + temporal memory tiers (recall, save, pin)
+
+---
+
+## File-Tier Memory
+You have a file-tier memory at \`/memories\` (tools: view, create, str_replace, insert, delete, rename). Your hot-tier memory is already injected in this prompt — do **not** re-\`view\` files to rediscover what's already here. \`view\` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there.
+
+---
+
+## Your Memory
+
+### Key Facts
+- [2026-07-01] Golden fact one (high)
+- [2026-07-02] Golden fact two (medium)
+
+### Pinned
+- Golden pinned entry (high, pinned)
+
+---
+You have 7 additional memories available via \`memory_recall\`. Use it to search for context before starting tasks."
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G9: legacy memory.md + extra files fallback (hot tier null) 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session
+
+---
+
+## Your Memory
+GOLDEN-LEGACY-MEMORY body.
+
+---
+
+## Available Memory Files
+You have 2 reference file(s) in your memory directory:
+- /memories/agents/golden-agent/projects.md
+- /memories/agents/golden-agent/contacts.md
+
+Read relevant files via the memory MCP server (\`view\`) before starting tasks that may relate to them."
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G10: toolkit subsections — core + plugins + delegates + auto-injected 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session
+
+### Engine-provided (always available to every agent)
+- schedule — Manage your scheduled tasks (recurring or one-time)
+- team — Direct messaging to peer hive agents (not Slack DMs)
+
+### Capability MCPs (provisioned for your role)
+- contacts — Contact lookups by name, email, or phone
+- golden-plugin-server — golden plugin capability
+
+### Delegated capability MCPs (via Agent tool)
+- crm-search — crm-search"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G11: toolSearch off vs auto — byte-identical today (hint dark), pinned 1`] = `
+"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session"
+`;
+
+exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G12: kitchen sink — every layer at once 1`] = `
+"GOLDEN-SOUL: warm, precise.
+
+---
+
+GOLDEN-ARCHETYPE-CARD: fixture discipline card.
+
+---
+
+GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
+
+---
+
+GOLDEN-CONSTITUTION: rule one.
+
+---
+
+GOLDEN-TEAM: roster of two.
+
+---
+
+## Your toolkit
+
+You have access to the following tools this session. Try them; don't guess at availability.
+
+### Built-in (always available)
+- Bash — run shell commands
+- Read / Write / Edit — file I/O
+- Glob / Grep — file/content search
+- WebFetch / WebSearch — web access
+- NotebookEdit — Jupyter notebook editing
+- Task — delegate to a subagent (see Delegated capability MCPs below)
+- TodoWrite — track multi-step tasks within this session
+
+### Engine-provided (always available to every agent)
+- schedule — Manage your scheduled tasks (recurring or one-time)
+- team — Direct messaging to peer hive agents (not Slack DMs)
+
+### Capability MCPs (provisioned for your role)
+- memory — Read and write your personal agent memory
+- contacts — Contact lookups by name, email, or phone
+
+### Delegated capability MCPs (via Agent tool)
+- crm-search — crm-search
+
+---
+
+## File-Tier Memory
+You have a file-tier memory at \`/memories\` (tools: view, create, str_replace, insert, delete, rename). Your hot-tier memory is already injected in this prompt — do **not** re-\`view\` files to rediscover what's already here. \`view\` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there.
+
+---
+
+## Your Memory
+
+### Key Facts
+- [2026-07-01] Golden fact one (high)
+- [2026-07-02] Golden fact two (medium)
+
+### Pinned
+- Golden pinned entry (high, pinned)
+
+---
+You have 7 additional memories available via \`memory_recall\`. Use it to search for context before starting tasks."
+`;
