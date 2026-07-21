@@ -555,7 +555,7 @@ SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest r
   src/agents/provider-adapters/codex-subscription-adapter.test.ts
 ```
 
-  Expected: green, including the "rejects tool inventories that require a bridge" tests (openai :250–266, gemini :279–297, codex :258–270) which assert `runTurn()` **rejects** on any non-`claude-only` entry while **construction does not throw**. These tests are deleted in Task 2.3 in the same commit that deletes the guards — their passing run here is the recorded revert-source evidence that T1's "construction + runTurn does not throw" flips real baseline behavior (regression-test discipline: same input, baseline throws from runTurn).
+  Expected: green, including the "rejects non-Claude tool inventory before calling the SDK / before constructing ADK objects / before calling Codex" tests (openai :251–259, gemini :280–289, codex :259–272 — Task 2.3's ranges are the deletion authority) which assert `runTurn()` **rejects** on any non-`claude-only` entry while **construction does not throw**. These tests are deleted in Task 2.3 in the same commit that deletes the guards — their passing run here is the recorded revert-source evidence that T1's "construction + runTurn does not throw" flips real baseline behavior (regression-test discipline: same input, baseline throws from runTurn).
 
 ### Task 2.1 — New file `src/agents/provider-adapters/turn-assembly.ts`
 
