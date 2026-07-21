@@ -233,6 +233,52 @@ describe("BuiltinExecutor.Grep", () => {
   });
 });
 
+describe("BuiltinExecutor §D8 empty-string parity (T9)", () => {
+  it("Edit with empty new_string deletes the matched substring", async () => {
+    const p = join(tmp, "d.txt");
+    writeFileSync(p, "goodbye world");
+    const out = await exec.execute("Edit", { file_path: p, old_string: "goodbye ", new_string: "" });
+    expect(out).toBe(`Edited ${p} (1 replacement)`);
+    expect(readFileSync(p, "utf8")).toBe("world");
+  });
+
+  it("Write with empty content truncates an existing file to zero bytes", async () => {
+    const p = join(tmp, "t.txt");
+    writeFileSync(p, "some existing content");
+    const out = await exec.execute("Write", { file_path: p, content: "" });
+    expect(out).toBe(`Wrote 0 bytes to ${p}`);
+    expect(readFileSync(p, "utf8")).toBe("");
+  });
+
+  it("Edit still rejects an empty old_string (throws, bridge contains it)", async () => {
+    const p = join(tmp, "e.txt");
+    writeFileSync(p, "hello");
+    await expect(
+      exec.execute("Edit", { file_path: p, old_string: "", new_string: "x" }),
+    ).rejects.toThrow(/missing required string parameter 'old_string'/);
+  });
+
+  it("Edit still rejects an empty file_path (throws)", async () => {
+    await expect(
+      exec.execute("Edit", { file_path: "", old_string: "a", new_string: "b" }),
+    ).rejects.toThrow(/missing required string parameter 'file_path'/);
+  });
+
+  it("Write still rejects an empty file_path (throws)", async () => {
+    await expect(
+      exec.execute("Write", { file_path: "", content: "hi" }),
+    ).rejects.toThrow(/missing required string parameter 'file_path'/);
+  });
+
+  it("identity guard still fires when old_string === new_string (both non-empty)", async () => {
+    const p = join(tmp, "id.txt");
+    writeFileSync(p, "x marks");
+    const out = await exec.execute("Edit", { file_path: p, old_string: "x", new_string: "x" });
+    expect(out).toBe("Edit failed: old_string and new_string are identical");
+    expect(readFileSync(p, "utf8")).toBe("x marks");
+  });
+});
+
 describe("BuiltinExecutor unknown tool", () => {
   it("unknown builtin → contained result text", async () => {
     const out = await exec.execute("Nonexistent", {});
