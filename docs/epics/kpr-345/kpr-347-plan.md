@@ -419,7 +419,7 @@ export function classifyThrown(err: unknown): TurnClassification {
 ### Task 1.7 — Chunk 1 tests
 
 - [ ] **Compile-fix the three adapter test literals** (compat Record grew `codex`): in `makeDescriptor` in `openai-agents-adapter.test.ts` (:41–57), `gemini-adk-adapter.test.ts`, and `codex-subscription-adapter.test.ts`, add `codex: <same value as openai>` to the `compatibility` literal. No behavioral change — the guards and their tests still pass in chunk 1.
-- [ ] **`tool-transport.test.ts`** — update every `compatibility` `toEqual` literal to include `codex` (mechanical, compile-enforced), then add:
+- [ ] **`tool-transport.test.ts`** — extend the import block: the file currently imports only `classifyToolTransport` from `./tool-transport.js`; add `partitionInventoryForProvider`, `type HiveToolInventoryEntry`, `type OmittedToolRecord` to that import, and add a new `import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";` (needed by the serverConfig-secrecy case below). Then update every `compatibility` `toEqual` literal to include `codex` (mechanical, compile-enforced), then add:
   - **T3 codex-column pin** — for every transport class (`stdio`, `http`, `sse`, `sdk-in-process`, `claude-builtin`, `claude-subagent`, and the `broken: true` case), assert `descriptor.compatibility.codex === descriptor.compatibility.openai`. Comment: pinned so future divergence is a deliberate test edit (spec T3).
   - **T2 partition** — new `describe("partitionInventoryForProvider (KPR-347)")` with a helper:
 
@@ -480,24 +480,19 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
 });
 ```
 
-- [ ] **`session-store.test.ts`** — existing normalizeRef tests must pass **unchanged** (assertions untouched — that is the re-key evidence). Add one fail-closed test (advisory):
+- [ ] **`session-store.test.ts`** — existing normalizeRef tests must pass **unchanged** (assertions untouched — that is the re-key evidence). Add one fail-closed test (advisory). The file's harness is a fully mocked db (`makeMockDb()`, `vi.fn()` collection methods) — there is no real collection and no `collection.insertOne`; every existing `get()` test seeds via `mocks.findOne.mockResolvedValueOnce(doc(sessionId, provider))` using the file's own `doc()` helper (lines 26–34). Follow that exact pattern:
 
 ```ts
   it("KPR-347 fail-closed: out-of-union provider tag on a row yields NO handle (old .has() scrub posture preserved)", async () => {
-    await collection.insertOne({
-      _id: "a:t-unknown", agentId: "a", threadId: "t-unknown",
-      sessionId: "some-real-looking-id", provider: "kimi",
-      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
-      contextWindow: 0, compactions: 0, createdAt: new Date(), updatedAt: new Date(),
-    } as never);
-    const ref = await store.get("a", "t-unknown");
+    mocks.findOne.mockResolvedValueOnce(doc("some-real-looking-id", "kimi"));
+    const ref = await store.get("agent-a", "sms:line-1:t1");
     expect(ref?.sessionId).toBeUndefined();
     expect(ref?.provider).toBe("kimi"); // provenance passes through; handle does not
   });
 ```
 
-  (Adapt the raw-insert helper to whatever the file's existing fixture writer is — it seeds docs via the collection; follow the pattern at its `set()`/insert tests.)
-- [ ] **`error-classification.test.ts`** — **T5 unit half (the killer test)**:
+  No `as never` needed — the `doc()` helper's `provider?: string` parameter already accepts out-of-union strings.
+- [ ] **`error-classification.test.ts`** — extend the import block: add `TurnAssemblyError` to the existing `import { classifyTurnResult, classifyThrown, HARD_FAULT_KINDS, type ProviderFaultKind } from "./error-classification.js";`. Then add **T5 unit half (the killer test)**:
 
 ```ts
 describe("TurnAssemblyError (KPR-347 §D6)", () => {
@@ -770,7 +765,11 @@ function makeInventoryEntry(name = "memory"): HiveToolInventoryEntry {
 }
 ```
 
-- [ ] Update `makeAdapter` to pass `assembly: makeAssembly()` instead of `instructions: "Be useful."`; delete `makeDescriptor` and the old guard-throw `describe`/`it.each` blocks (openai :250–266, gemini :279–297, codex :258–270 — baseline evidence already recorded in Task 2.0).
+- [ ] Update `makeAdapter` to pass `assembly: makeAssembly()` instead of `instructions: "Be useful."`; delete `makeDescriptor` and the old guard tests (baseline evidence already recorded in Task 2.0):
+  - **`openai-agents-adapter.test.ts`** — delete `"rejects non-Claude tool inventory before calling the SDK"` (:251–259) AND `"ignores Claude-only inventory for a tool-free run"` (:261–272; describe block closes at :273).
+  - **`gemini-adk-adapter.test.ts`** — delete `"rejects non-Claude tool inventory before constructing ADK objects"` (:280–289) AND `"ignores Claude-only inventory for a tool-free run"` (:291–303; describe block closes at :304).
+  - **`codex-subscription-adapter.test.ts`** — delete `"rejects non-Claude tool inventory before calling Codex"` (:259–272; describe block closes at :273). Codex has no separate "ignores Claude-only inventory" test — the reject test is the only guard-throw test in this file.
+  - Both `"ignores Claude-only inventory for a tool-free run"` tests (openai, gemini) reference the deleted `toolInventory` constructor option and cannot survive Task 2.2's option swap — they must be deleted in the same commit as the guards, not left dangling to fail compilation. Rationale: their claude-only-passes behavior (construction + `runTurn()` succeed when the only inventory entry is claude-only) is superseded by T1's stronger non-empty-**bridgeable**-entry case (this task's T1 bullet below), which proves the same "construction + runTurn does not throw" fact against a real bridgeable inventory, not merely a claude-only one.
 - [ ] Every existing assertion that reads the instructions (e.g. openai test asserting `Agent` was constructed with `instructions: "Be useful."`, codex body assertions, gemini `LlmAgent` assertions) keeps passing unchanged — that is part of the neutrality evidence.
 - [ ] Add **T1** per adapter (adapt mocks per file's harness):
   - **openai**: `const adapter = makeAdapter({ assembly: makeAssembly({ toolInventory: [makeInventoryEntry()] }) });` → `await adapter.runTurn({ prompt: "hello" })` resolves (mock `run`/`runnerRunMock` as the existing happy-path tests do); then `const agentOptions = AgentMock.mock.calls[0]![0] as Record<string, unknown>; expect("tools" in agentOptions).toBe(false);` — construction + runTurn with a non-empty bridgeable inventory does not throw AND the Agent advertises zero tools.
@@ -1050,7 +1049,7 @@ describe("buildDefaultGuardrailGate (KPR-347 §D1.5, T8)", () => {
 ```
 
   - it.each at :2659–2662: `expect(constructorMock).toHaveBeenCalledWith(expect.objectContaining({ name: "Pilot", assembly: expect.objectContaining({ instructions: "pilot system" }) }));`
-  - Sweep the remaining `objectContaining({ ... instructions` / `toolInventory` constructor assertions (:2210, :2798, :2884 region) with the same pattern — `grep -n "instructions\|toolInventory" src/agents/agent-manager.test.ts` after editing must show no stale top-level-options expectation.
+  - Confirm :2210/:2798/:2884 need no edit — they pin model/effort only (`expect.objectContaining({ model: "gpt-5.5" })` at :2210, `expect.objectContaining({ model: "gpt-5.5", reasoningEffort: "medium" })` at :2798 and :2884), never `instructions`/`toolInventory`. After editing the two constructor-shape sites above, `grep -n "instructions\|toolInventory" src/agents/agent-manager.test.ts` will legitimately hit the NEW `assembly: expect.objectContaining({ instructions: ... })` forms — the gate is "no stale top-level-options expectation" verified by inspecting each grep hit, not an empty grep result.
   - The byte-identity claim is pinned here: `"pilot soul\n\npilot system"` is the exact pre-347 expectation, now flowing through `assembly.instructions` — same fixture, same bytes (T1's third bullet at the seam).
 - [ ] **T1 seam-level (non-empty inventory does not throw)** — new test in the pilot-routing describe:
 
@@ -1096,18 +1095,24 @@ describe("buildDefaultGuardrailGate (KPR-347 §D1.5, T8)", () => {
       mockRunnerToolInventory.mockImplementation(() => {
         throw new Error("connect ECONNREFUSED 127.0.0.1:27017");
       });
-      for (let i = 0; i < 3; i++) {
-        await expect(
-          manager.spawnTurn(smsCtx({ agentId: "oai-pilot", threadId: `sms:line-1:kpr347-asm-${i}` })),
-        ).rejects.toThrow(/Lane B turn assembly failed/);
+      // try/finally: restore the mock even if an assertion below throws, so a
+      // failed run doesn't leak the throwing implementation into later tests
+      // (belt-and-braces — beforeEach already re-primes mockRunnerToolInventory).
+      try {
+        for (let i = 0; i < 3; i++) {
+          await expect(
+            manager.spawnTurn(smsCtx({ agentId: "oai-pilot", threadId: `sms:line-1:kpr347-asm-${i}` })),
+          ).rejects.toThrow(/Lane B turn assembly failed/);
+        }
+        // The killer assertion: three ECONNREFUSED-worded failures did NOT open
+        // the openai circuit — TurnAssemblyError short-circuited the pattern
+        // tables (§D6). A raw Error with this message would have tripped it.
+        const snap = manager.circuitBreakers.stateFor("openai");
+        expect(snap?.state).toBe("closed");
+        expect(snap?.consecutiveHardFaults).toBe(0);
+      } finally {
+        mockRunnerToolInventory.mockReturnValue([]);
       }
-      // The killer assertion: three ECONNREFUSED-worded failures did NOT open
-      // the openai circuit — TurnAssemblyError short-circuited the pattern
-      // tables (§D6). A raw Error with this message would have tripped it.
-      const snap = manager.circuitBreakers.stateFor("openai");
-      expect(snap?.state).toBe("closed");
-      expect(snap?.consecutiveHardFaults).toBe(0);
-      mockRunnerToolInventory.mockReturnValue([]);
     });
 ```
 
@@ -1145,10 +1150,10 @@ describe("buildDefaultGuardrailGate (KPR-347 §D1.5, T8)", () => {
 
 ```bash
 cd /Users/mokie/github/hive-mature-kpr-347
-SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run test
+SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check
 ```
 
-  Expected: full suite green — including the new `turn-assembly.test.ts`, `types.test.ts`, updated adapter suites (old guard tests deleted, T1 present), and the untouched-assertion legacy of `agent-manager.test.ts`.
+  Expected: typecheck + lint + format + full test suite all green — including the new `turn-assembly.test.ts`, `types.test.ts`, updated adapter suites (old guard tests deleted, T1 present), and the untouched-assertion legacy of `agent-manager.test.ts`. Chunk 2 is check-green at its commit, same bar as chunk 1.
 - [ ] Grep gates (each must return nothing):
 
 ```bash
