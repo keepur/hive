@@ -235,3 +235,127 @@ Flip to `getAllMcpTools` + `FunctionTool.invoke` decoration was gated on S4 show
 | Per-turn spawn cost | matrix note only | note | 3 concurrent stdio servers connected in **393 ms** — no KPR-122-class churn signal; pooling remains a follow-up only if live turns show worse. |
 
 **STOP condition:** not triggered — S1 and S2 both GREEN.
+
+---
+
+# KPR-348 Task 4 — Live e2e evidence (T0b) + final verification
+
+**Worktree:** `hive-lane-kpr-348` @ branch `kpr-348`, HEAD `e7ec72c` (Chunks 1-3 committed) · Node v24.16.0 · macOS.
+**Scripts:** throwaway drivers in the session scratchpad (symlinked `node_modules` → worktree, `{"type":"module"}` package.json, run under tsx ESM). Reproduced verbatim below; not committed. Secret *values* never logged — presence + result *shape* only; the keychain payload (Honeypot key names) is elided.
+
+**T0b verdict:** live model-turn leg **BLOCKED** (no Responses-capable OpenAI credential exists anywhere — concrete external blocker, not a code defect; the post-implementation adapter reaches the provider and 401s exactly at the credential boundary). Every leg that can run WITHOUT the model was driven green via the mandatory scratch-driver path: bridged-MCP (stdio) **GREEN**, builtin **GREEN**, abort/containment **GREEN**, connect cost noted. **Final verification (Step 4.2) fully GREEN.**
+
+## §T0b.0 — Credential probe (presence/absence only — no values read)
+
+Repeating the S4 concern's remediation checklist against every location:
+
+```
+OPENAI_API_KEY env:            NOT SET
+Honeypot hive/dodi/OPENAI_API_KEY:    ABSENT
+Honeypot hive/keepur/OPENAI_API_KEY:  ABSENT
+Honeypot hive/dodi/OPENAI_KEY:        ABSENT
+Honeypot hive/keepur/OPENAI_KEY:      ABSENT
+~/.codex/auth.json:            PRESENT (codex ChatGPT-subscription OAuth — the S4 token; cannot call api.responses.write)
+dodi/keepur hive.yaml openai:  (no openai section)
+keychain generic-passwords matching openai/responses/gpt: none (only "Codex Safe Storage" — the codex CLI's own store)
+```
+
+**Conclusion:** no `api.responses.write`-capable credential is reachable. The only OpenAI-adjacent credential is the codex subscription token the spike (§S4) already proved 401s against the Responses API. The live model turn cannot be exercised. Per the plan's verification rules this is a **concrete blocker to report** — recorded here; every non-model leg was still run. Follow-up: T0b's live model turn (and the model-driven halves of legs 1-2 + live connect-cost) remain outstanding until a Responses-capable `OPENAI_API_KEY` (or a codex-token-compatible base URL/backend path) is available; whoever obtains it re-runs `t0b-liveturn.ts` + a tool-forcing turn.
+
+## §T0b.1 — Live-turn attempt against the POST-implementation adapter (credential boundary)
+
+Constructs the real `OpenAIAgentsAdapter` (agent-manager.ts:521-527 shape) with a minimal hand-built assembly (empty inventory — the model authenticates before any tool dispatch, so tools are irrelevant to the credential boundary this leg probes) and runs a turn. `runTurn` never throws on provider errors (openai-agents-adapter.ts:126-134) — the 401 returns as `result.error`.
+
+Script (`t0b-liveturn.ts`):
+
+```ts
+import { OpenAIAgentsAdapter } from ".../src/agents/provider-adapters/openai-agents-adapter.js";
+const assembly: any = {
+  instructions: "You are a terse test agent. Reply with a single word.",
+  toolInventory: [], omittedTools: [], guardrailGate: async () => ({ behavior: "allow" }),
+  memory: {}, skillIndex: [], inProcessServers: {}, sessionCwd: WT,
+};
+const adapter = new OpenAIAgentsAdapter({ name: "t0b-openai", model: "gpt-5.4-mini", assembly });
+const result = await adapter.runTurn({ prompt: "Say hello in one word." });
+console.log(`aborted=${result.aborted} textChars=${result.text.length} error=${result.error ?? "(none)"}`);
+```
+
+Observed:
+
+```
+OPENAI_API_KEY env present: false
+runTurn returned in 765ms
+  aborted=false textChars=0
+  error=401 You have insufficient permissions for this operation. Missing scopes: api.responses.write. Check that you have the correct role in your organization (Reader, Writer, Owner) and project (Member, Owner), and if you're using a restricted API key, that it has the necessary scopes.
+```
+
+**Verdict:** the post-implementation adapter's `runWithAuthFallback` builds the codex-oauth attempt, reaches `api.openai.com` Responses, and fails **only** at the credential scope — byte-for-byte the S4 finding, now reproduced against the delivered code. Wiring is correct up to the credential boundary; the blocker is purely credential. Model-driven legs cannot proceed.
+
+## §T0b.2 — Bridge-direct legs (mandatory scratch-driver path; model-independent)
+
+Constructs `ToolBridge` **exactly as `OpenAIAgentsAdapter.runTurn()` does** (openai-agents-adapter.ts:54-63) — same options, same `AbortController` whose `.abort()` is precisely what `adapter.abort()` invokes (openai-agents-adapter.ts:145) — and drives `bridge.connect()` + `BridgedTool.execute()` directly. This exercises the real §D3 dispatch (gate→execute→contain→meter), §D5 builtin executor, and abort/containment code; only the model's *decision* to call a tool is absent (credential-blocked above). Hand-built inventory = keychain stdio (real `dist/keychain/keychain-mcp-server.js`) + `BUILTIN_TOOL_DEFINITIONS` (Read, Bash); allow-all gate (call-counted).
+
+Script (`t0b-bridge.ts`, abridged to the load-bearing shape):
+
+```ts
+const controller = new AbortController();
+let gateCalls = 0;
+const bridge = new ToolBridge({
+  inventory,                       // [keychain stdio (connect-time), builtins (static: Read, Bash)]
+  inProcessServers: {},
+  gate: async () => { gateCalls++; return { behavior: "allow" }; },
+  workItemContext: undefined,
+  signal: controller.signal,       // adapter.abort() → controller.abort() (adapter:145)
+  agentId: "t0b-spike", sessionCwd: WT, skillIndex: [],
+});
+const tools = await bridge.connect();                                    // Leg 4: time this
+// Leg 1: await tools.find(t=>t.name==="mcp__keychain__secret_list").execute({});
+// Leg 2: await tools.find(t=>t.name==="Read").execute({file_path:`${WT}/package.json`, limit:4});
+// Leg 3: p = tools.find(t=>t.name==="Bash").execute({command:`sleep 37 && echo ${MARKER}`});
+//        sleep 2s → pgrep MARKER (running) → controller.abort() → await p → pgrep MARKER (empty)
+```
+
+Note (macOS): the abort command must be **compound** (`sleep 37 && echo MARKER`) — `bash -c "sleep 37 # marker"` exec-replaces bash with `sleep` and strips the comment, so the marker vanishes from all argv and `pgrep -f` can't see it. The compound form keeps bash resident (marker in its argv) with a real `sleep` child in the same process group; the group kill takes both.
+
+Observed:
+
+```
+[connect] 101ms; tools=mcp__keychain__secret_get,mcp__keychain__secret_list,Bash,Read
+[connect] runtimeOmissions=[]
+
+[LEG1] found bridged tool: mcp__keychain__secret_list
+[LEG1] gateCallsSoFar=1 deniedOrFailed=false resultChars=1935 tsvRows=36 (payload ELIDED — Honeypot key names)
+
+[LEG2] found builtin tool: Read
+[LEG2] Read(package.json, limit=4) →
+     1	{
+     2	  "name": "@keepur/hive",
+     3	  "version": "0.10.0",
+     4	  "hiveApi": "1.0.0",
+[106 more lines — use offset/limit to read further]
+
+[LEG3] found builtin tool: Bash
+[LEG3] pgrep before start: []
+[LEG3] pgrep after ~2s (expect non-empty): ["37122"]
+[LEG3] execute resolved 1ms after abort; resultChars=0
+[LEG3] pgrep ~1.2s after abort (expect empty): []
+[LEG3] engine process healthy: pid=37090 alive, uptime=3.7s
+
+[close] pgrep after bridge.close(): []
+[close] orphan keychain-mcp-server pids: []
+```
+
+**Per-leg verdicts:**
+- **Leg 1 — bridged MCP (keychain stdio) — GREEN.** Gate consulted (`gateCalls=1`, allow), not denied/failed, real tool output round-tripped (1935 chars / 36 TSV rows — payload elided). §D3 dispatch over an external stdio transport confirmed end-to-end.
+- **Leg 2 — builtin (Read) — GREEN.** Reply reflects real file content (`package.json` lines 1-4 via the §D5 executor's cat-n render).
+- **Leg 3 — abort/containment — GREEN.** Child alive during the turn (`pgrep`→`["37122"]`); `controller.abort()` (≡ `adapter.abort()`) → `execute` resolved in 1ms with empty output, child gone (`pgrep`→`[]`), engine process healthy, no orphan after close. Faithful to the plan's `Bash sleep 30` + `adapter.abort()` clause save for the model's tool-call decision (credential-blocked).
+- **Leg 4 — per-turn connect cost — note.** `bridge.connect()` (keychain stdio + builtins) = **101ms**; the live model round-trip to the 401 = 765ms (§T0b.1). Consistent with S1's 393ms/3-server figure — no KPR-122-class churn signal; pooling stays a follow-up only.
+
+## §T0b.3 — Final verification (Step 4.2)
+
+- **`SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` → exit 0.** typecheck (`tsc --noEmit`) clean; eslint `✖ 1244 problems (0 errors, 1244 warnings)` — pre-existing warnings only, non-failing; `prettier --check` clean; vitest **2294 passed | 3 skipped (138 files)**.
+- **Behavior-neutrality (merge-base `71c77e5`..HEAD `e7ec72c`):**
+  - `gemini-adk-adapter.ts` + `codex-subscription-adapter.ts` + `types.ts` → diff **empty** (0 lines).
+  - `agent-manager.ts` → diff **empty** (0 lines).
+  - `claude-agent-adapter.ts` → diff **empty** (0 lines).
+  - `agent-runner.ts` → modified (233 ins / 201 del: `buildInProcessServers`/`resolveTurnCwd`/`resolveSessionCwd` extractions), but the **`buildHooks` method body is byte-identical** — extracted both revisions' method ranges (MB lines 1461-1500, HEAD lines 1683-1722, 40 lines each) and `diff` reports IDENTICAL. buildHooks only *relocated* (down 222 lines by the extractions above it); zero lines of buildHooks itself touched. Neutrality claim is inspected, not asserted.
