@@ -10,7 +10,7 @@
 
 **Tech Stack:** TypeScript strict, `@openai/agents` 0.11.x (MCP server client classes from `@openai/agents-core` re-exports), `@modelcontextprotocol/sdk` (`Client` + `InMemoryTransport`), `@anthropic-ai/claude-agent-sdk` types (`McpServerConfig`, `McpSdkServerConfigWithInstance`, `HookCallbackMatcher`), vitest, `tinyglobby` (new dep, declared in spec §D5).
 
-**Decision-register canon (epic, 7 entries) honored:** (1) schemas connect-time / static-for-builtins — Task 2.5; (2) codex column ≡ openai at the classify site — Task 2.4; (3) `SESSION_SEMANTICS` untouched — no task touches it; (4) `ProviderTurnAssembly` payload + `TurnAssemblyError` containment — Task 2.3; (5) manager-owned early abort done, this ticket owns only mid-bridge abort — Tasks 1.2/2.2/3.3; (6) gate predicate canon, deny-all body → real archetype evaluation — Task 3.1; (7) `prepareSpawn` gap out of scope — nowhere in this plan.
+**Decision-register canon (epic, 7 entries) honored:** (1) schemas connect-time / static-for-builtins — Task 2.5; (2) codex column ≡ openai at the classify site — Task 2.4; (3) `SESSION_SEMANTICS` untouched — no task touches it; (4) `ProviderTurnAssembly` payload + `TurnAssemblyError` containment — Task 2.3; (5) manager-owned early abort done, this ticket owns only mid-bridge abort — Steps 1.1/2.2/3.4; (6) gate predicate canon, deny-all body → real archetype evaluation — Task 3.1; (7) `prepareSpawn` gap out of scope — nowhere in this plan.
 
 **Final-review advisories reflected:** (1) `close()` per-server catch-and-log never-throw + T5 asserts a faulting `close()` doesn't reject `runTurn` — Tasks 1.2 (code) and 3.4 (test); (2) `llmMs = Math.max(0, durationMs - toolMs)` clamp — Task 3.3.
 
@@ -224,6 +224,8 @@ Using S1/S2 schema dumps plus in-process samples (run a scratch script that inst
   - [ ] tally which fleet schemas lack `required` and/or `additionalProperties`
   - [ ] feed one raw and one normalized (`required: []`, `additionalProperties: false` filled) schema to Agents SDK `tool({..., parameters: schema, strict: false})` and run a **live** minimal `openai/…` agent turn (Codex OAuth creds via existing `createCodexOpenAITokenProvider` path, or `OPENAI_API_KEY` if set for the spike only) that calls the tool once
   - [ ] record: does `tool()` accept plain JSON schema with `strict: false`? Are normalized defaults required or merely tolerated?
+
+S4 is the plan's one **non-blocking** spike leg (unlike the S1/S2 blocking pair): if the Codex OAuth token at `~/.codex/auth.json` is stale at spike time, the live-turn half of S4 may be evidence-deferred to Task 4's T0b (Step 4.1) rather than gating Tasks 1-3 — record the deferral explicitly in the notes file if taken. S1/S2 have no such deferral; a failed blocking leg (with a failed fallback) is a STOP per Step 0.7.
 
 - [ ] **Step 0.6: S5 — `getAllMcpTools` vs hand-rolled decision**
 
@@ -512,7 +514,18 @@ export class ToolBridge {
         `mcp__${conn.serverName}__${t.name}`,
         t.description ?? "",
         normalizeSchema(t.inputSchema),
-        async (input) => shapeCallToolResult(await conn.callTool(t.name, asRecord(input))),
+        async (input) => {
+          const result = await conn.callTool(t.name, asRecord(input));
+          // MCP SDK contract: a handler THROW makes callTool RESOLVE with
+          // {isError: true, content: [...]} — it does not reject. Convert
+          // that here into a throw so wrap()'s catch applies the single
+          // containment prefix ("Tool execution failed (<name>): …") and
+          // records the failure the same way every other failure path
+          // does (gate throw, builtin throw, transport-level rejection) —
+          // no separate isError-branch duplicating that logic.
+          if (isErrorResult(result)) throw new Error(shapeCallToolResult(result));
+          return shapeCallToolResult(result);
+        },
       ),
     );
   }
@@ -675,6 +688,11 @@ export function normalizeSchema(schema: unknown): Record<string, unknown> {
   return s;
 }
 
+/** True when a CallToolResult reports a handler-side error (resolves, does not reject — see discover()). */
+function isErrorResult(result: unknown): boolean {
+  return Boolean((result as { isError?: boolean } | undefined)?.isError);
+}
+
 /** §D3.1: MCP CallToolResult → model-visible text. */
 export function shapeCallToolResult(result: unknown): string {
   const content = (result as { content?: Array<Record<string, unknown>> })?.content;
@@ -706,7 +724,9 @@ function errorText(err: unknown): string {
 }
 
 function errorClass(err: unknown): string {
-  if (err instanceof Error) return `${err.name}: ${err.message}`;
+  // KPR-347 secrecy rule: error CLASS only — never the message (which can
+  // carry configs/env/paths); trimmed to err.name per plan-review round-1.
+  if (err instanceof Error) return err.name;
   return String(err);
 }
 ```
@@ -754,7 +774,7 @@ Required cases (each a named `it`):
   - [ ] gate throws → `execute()` resolves to `Tool call denied by policy: guardrail gate error: …`
   - [ ] gate denies → `Tool call denied by policy: <reason>`; underlying NOT called (spy)
   - [ ] mocked MCP `callTool` rejects → `Tool execution failed (mcp__x__y): …`
-  - [ ] in-process fixture handler throws → `Tool execution failed (…): …` (real `McpServer` fixture whose handler throws — note: the MCP protocol surfaces it as `isError` content or a client error; either path must land in the contained text, assert on the prefix)
+  - [ ] in-process fixture handler throws → `execute()` resolves to exactly `Tool execution failed (mcp__<server>__<tool>): …` (real `McpServer` fixture whose handler throws; `Client.callTool` resolves with `{isError:true,...}` rather than rejecting — `discover()`'s `isErrorResult` check converts this to a throw so `wrap()`'s catch applies the prefix deterministically; single assertion on the exact prefix, no either/or hedge)
   - [ ] property: for every bridged tool in a mixed fixture, `await execute(badInput)` never rejects (wrap in `expect(...).resolves.toBeTypeOf("string")` across all tools)
 
 **T6 — in-process round-trip:**
@@ -805,9 +825,9 @@ Contract = the **agent-facing behavior** (spec §D5), not CLI internals. Schemas
  * in the spec).
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, statSync } from "node:fs";
-import { readFile, writeFile, stat, readdir } from "node:fs/promises";
-import { dirname, extname, resolve as resolvePath } from "node:path";
+import { mkdirSync } from "node:fs";
+import { readFile, writeFile, stat } from "node:fs/promises";
+import { dirname, extname } from "node:path";
 import { glob } from "tinyglobby";
 import type { HiveToolSchemaEntry } from "./tool-transport.js";
 
@@ -1142,7 +1162,7 @@ export class BuiltinExecutor {
       const fst = await stat(file).catch(() => null);
       if (!fst?.isFile() || fst.size > GREP_MAX_FILE_BYTES) continue;
       const raw = await readFile(file, "utf8").catch(() => null);
-      if (raw === null || raw.includes(" ")) continue; // unreadable / binary
+      if (raw === null || raw.includes("\0")) continue; // unreadable / binary
       const lines = raw.split("\n");
       const matchIdx: number[] = [];
       lines.forEach((line, i) => {
@@ -1210,7 +1230,7 @@ Required cases:
   - [ ] Glob: two files with distinct mtimes (set via `utimes`) → newest first, absolute paths; no match → `No files found`
   - [ ] Grep: files_with_matches default; count mode; content mode with `-n` and `context: 1`; `-i`; `glob: "*.ts"` filter excludes `.md`; no match → `No matches found`
   - [ ] contract violations throw (missing `command`, invalid regex) — asserted with `rejects.toThrow` (containment is the BRIDGE's job; T1 pins that side)
-  - [ ] T5 (kill half): start `Bash sleep 30`, call `killAll()`, poll until `process.kill(pid, 0)` throws ESRCH (find pid via the child's process group — expose a test-only `activeChildCount()`/pids getter or assert via `pgrep -f` of a unique marker arg like `sleep 30# kpr348-t5`)
+  - [ ] T5 (kill half): start `Bash sleep 30`, call `killAll()`, poll until `process.kill(pid, 0)` throws ESRCH. **Default (deterministic):** expose a test-only pid getter (e.g. `activeChildCount()`/pids accessor) on `BuiltinExecutor` and read the pid directly off it. **Fallback only if the getter proves impractical:** assert via `pgrep -f` of a unique marker arg (e.g. `sleep 30 # kpr348-t5`).
 
 - [ ] **Step 2.4: `tool-transport.ts` — per-tool builtin names + executor-backed classify branch**
 
@@ -1447,6 +1467,8 @@ and add both to the returned object. Gate construction line is untouched in this
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check`
 Expected: exit 0. Pay attention to: no regression in `agent-runner.test.ts` (extraction), adapter fixture compile errors all swept (Step 2.8.4).
 
+**PR description must call out two documented spec deviations from this chunk** (both intentional, both explained in the reviewer notes at the bottom of this plan): (1) `BUILTIN_TOOL_DEFINITIONS` are plain JSON-schema constants, not spec §D5's "authored as zod, emitted as JSON schema"; (2) `Bash` uses `spawn(..., {detached: true})`, not the spec's literal `execFile` — argv-array posture (no shell-string interpolation) is preserved, and `detached: true` is required for T5's process-group kill (`killGroup`'s `process.kill(-pid, …)`).
+
 ```bash
 git add -A src/ package.json package-lock.json
 git commit -m "KPR-348: builtin executor, in-process carriage, inventory static schemas, shared cwd"
@@ -1618,7 +1640,9 @@ Modify `src/agents/provider-adapters/openai-agents-adapter.ts`:
       // …existing runOptions/streamed/non-streamed paths unchanged, except
       // every buildResult call gains: toolStats: bridge.stats
     } catch (error) {
-      // existing catch unchanged (isAbortError path etc.)
+      // Existing catch LOGIC unchanged (isAbortError path etc.) — but its
+      // buildResult call site is one of the ones item 3 below governs: it
+      // also gains toolStats: bridge.stats, same as every other call site.
     } finally {
       await bridge.close(); // never throws/rejects (advisory 1)
       if (this.currentAbortController === abortController) {
@@ -1724,6 +1748,8 @@ Cases:
   - [ ] breaker-neutrality: run 3 consecutive tool-throw turns, feed each result's classification into a real `ProviderCircuitBreaker` instance (constructor/usage per `provider-circuit-breaker` tests) → breaker state stays closed
   - [ ] **negative-verify (unwrapped throw is load-bearing):** hand the mocked run an `agent.options.tools` array containing a RAW throwing execute (bypassing the bridge — constructed inline in the test) → `runTurn` resolves with `RunResult.error` SET (adapter's last-resort catch) — proving the wrapper, not the adapter catch, is what keeps tool faults out of `RunResult.error`. Then negative-verify the negative: same turn through the real bridge → `error` unset.
 
+Note (record in the PR description too): spec §Critical-flows T1 sketches an unwrapped throw as something that would reject `runTurn`; this plan's deliberate refinement is that it instead surfaces as `RunResult.error` SET via the adapter's last-resort catch, so `runTurn` itself still resolves. This is a documented refinement, not a spec deviation — flag it for reviewers so the assertion above isn't mistaken for a regression.
+
 **T5 — abort (adapter half):**
   - [ ] abort during a long-running fake in-process tool (sleeps 10s; abort after 100ms; mocked run rejects with AbortError when signal fires) → `RunResult.aborted === true`, `bridge.close()` invoked (spy via in-process client close), `wasAborted === true`, no unhandledRejection (probe armed) even after the sleeping tool eventually settles
   - [ ] abort during a real `Bash` sleep through the executor (builtin entry, mocked run drives `Bash {command:"sleep 30"}` then rejects on abort) → child process gone within ~6s (pid probe), aborted result
@@ -1746,6 +1772,8 @@ git commit -m "KPR-348: archetype guardrail gate port, openai adapter tool wirin
 - [ ] **Step 4.1: T0b — live end-to-end `openai/…` turn** (dev Mac, real creds — the spike-deferred e2e leg; T0 splits: T0a = Task 0 pre-implementation legs, T0b = this, post-implementation)
 
 Scratch driver (tsx): construct `AgentRunner` + `assembleProviderTurn` + `OpenAIAgentsAdapter` the way `agent-manager.ts:488-534` does (or run a real dev hive with a test agent whose model is `openai/gpt-5.4-mini`), then:
+
+The scratch-driver path is **mandatory** for the abort leg below — the "run a real dev hive" alternative has no way to reach into the adapter and call `adapter.abort()` mid-turn; only the scratch driver holds a direct reference to the adapter instance.
   - [ ] one turn whose prompt forces a bridged MCP tool call (e.g. keychain list via stdio, or slack via hosted MCP) — transcript shows gate-allowed execution and real tool output in the reply
   - [ ] one turn forcing a builtin (`Read` a known file) — reply reflects file content
   - [ ] one turn with `Bash sleep 30` + `adapter.abort()` after ~2s — aborted result, `pgrep sleep` empty, engine process healthy
@@ -1758,10 +1786,11 @@ Append all transcripts to `docs/epics/kpr-345/kpr-348-spike-notes.md` under a `#
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check`
 Expected: exit 0 — typecheck + lint + format + full vitest suite green.
 
-Then confirm behavior-neutrality by inspection:
-  - [ ] `git diff e774260..HEAD -- src/agents/provider-adapters/gemini-adk-adapter.ts src/agents/provider-adapters/codex-subscription-adapter.ts src/agents/provider-adapters/types.ts` → empty
-  - [ ] `git diff e774260..HEAD -- src/agents/agent-manager.ts` → empty
+Then confirm behavior-neutrality by inspection (use `$(git merge-base kpr-345 HEAD)` rather than the fixed `e774260` sha so these survive a mid-sprint rebase):
+  - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/provider-adapters/gemini-adk-adapter.ts src/agents/provider-adapters/codex-subscription-adapter.ts src/agents/provider-adapters/types.ts` → empty
+  - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/agent-manager.ts` → empty
   - [ ] `claude-agent-adapter.ts` untouched
+  - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/agent-runner.ts` → targeted eyeball of the `buildHooks` region specifically (not just an empty-diff check, since this file IS modified for the `buildInProcessServers`/cwd extractions) — confirm `buildHooks` itself has zero lines touched, making the buildHooks-neutrality claim inspectable rather than asserted
 
 - [ ] **Step 4.3: Commit**
 
