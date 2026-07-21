@@ -93,6 +93,14 @@ vi.mock("./agent-runner.js", () => ({
     // KPR-348: assembleProviderTurn now carries in-process servers + session cwd.
     buildInProcessServers: vi.fn().mockReturnValue({}),
     resolveTurnCwd: vi.fn().mockReturnValue("/tmp/kpr348-test-cwd"),
+    // KPR-349: the seam now delegates instruction assembly to the runner.
+    // Content-agnostic stub — instruction CONTENT is pinned in
+    // agent-runner.test.ts / turn-assembly.test.ts; these manager tests pin
+    // ROUTING (adapter selection, inventory partition, memory/skillIndex shape).
+    buildProviderPrompt: vi.fn(async () => ({
+      instructions: "PILOT-ASSEMBLED-INSTRUCTIONS",
+      skillEntries: [],
+    })),
   })),
   // Re-exported from agent-runner for plugin-loader path resolution; the test
   // manager doesn't use it, so a sentinel path is fine.
@@ -2705,7 +2713,9 @@ describe("AgentManager", () => {
         model: "gpt-5.5",
         reasoningEffort: "medium",
         assembly: expect.objectContaining({
-          instructions: "pilot soul\n\npilot system",
+          // KPR-349: instructions now come from the runner's buildProviderPrompt
+          // (mocked here); content is pinned in agent-runner/turn-assembly tests.
+          instructions: "PILOT-ASSEMBLED-INSTRUCTIONS",
           toolInventory: [],
           omittedTools: [],
           memory: {},
@@ -2746,7 +2756,7 @@ describe("AgentManager", () => {
       expect(mockRunnerSend).not.toHaveBeenCalled();
       expect(constructorMock).toHaveBeenCalledWith(expect.objectContaining({
         name: "Pilot",
-        assembly: expect.objectContaining({ instructions: "pilot system" }),
+        assembly: expect.objectContaining({ instructions: "PILOT-ASSEMBLED-INSTRUCTIONS" }),
       }));
       expect(runTurnMock).toHaveBeenCalledWith(expect.objectContaining({ prompt: "ping" }));
       expect(result.finalMessage).toBe(text);

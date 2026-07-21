@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { EventType, Gemini, InMemoryRunner, LlmAgent, isFinalResponse, toStructuredEvents } from "@google/adk";
 import { GeminiAdkAdapter, coerceGeminiOutput, extractTextChunks } from "./gemini-adk-adapter.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
-import { buildPilotInstructions } from "./turn-assembly.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 
 const { runEphemeralMock } = vi.hoisted(() => ({
@@ -307,12 +306,12 @@ describe("GeminiAdkAdapter", () => {
     expect(agentOptions.tools).toEqual([]);
   });
 
-  it("KPR-347 T1: instruction is byte-identical to buildPilotInstructions output", async () => {
+  it("KPR-347 T1: adapter forwards assembly instruction verbatim to the provider SDK", async () => {
     isFinalResponseMock.mockReturnValue(true);
     runEphemeralMock.mockReturnValueOnce(events({ finalText: "hello" }));
 
     await makeAdapter({
-      assembly: makeAssembly({ instructions: buildPilotInstructions("Pilot", "soul", "system") }),
+      assembly: makeAssembly({ instructions: "soul\n\nsystem" }),
     }).runTurn({ prompt: "hello" });
 
     expect(LlmAgentMock).toHaveBeenCalledWith({
