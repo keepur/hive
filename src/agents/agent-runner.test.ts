@@ -3455,3 +3455,93 @@ describe("AgentRunner is_error result guard (KPR-312, via send)", () => {
     expect(result.error).toBeUndefined();
   });
 });
+
+describe("buildSystemPrompt datetime composition (KPR-349 §D2 pin)", () => {
+  it("output is <prefix> + joiner + Pacific datetime trailer, datetime last", async () => {
+    const memoryManager = makeMockMemoryManager();
+    const runner = new AgentRunner(
+      makeAgentConfig({ systemPrompt: "PIN-SYSTEM-PROMPT" }),
+      memoryManager as never,
+    );
+    const out = await (
+      runner as unknown as { buildSystemPrompt(c: string[], d?: string[]): Promise<string> }
+    ).buildSystemPrompt([]);
+    // Full-output shape: prefix, then the exact joiner, then the trailer — nothing after.
+    expect(out).toMatch(/^[\s\S]+\n\n---\n\n\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    expect(out).toContain("PIN-SYSTEM-PROMPT");
+    // Trailer text renders an en-US Pacific timestamp (weekday, month day, year, h:mm AM/PM).
+    const trailer = out.slice(out.lastIndexOf("**Current date/time**"));
+    expect(trailer).toMatch(
+      /^\*\*Current date\/time\*\*: (Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), [A-Z][a-z]+ \d{1,2}, \d{4} at \d{1,2}:\d{2} (AM|PM) \(Pacific Time\)$/,
+    );
+  });
+});
+
+describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
+  function makeSpyPrefixCache() {
+    return {
+      getOrBuild: vi.fn(<T>(_id: string, build: () => T) => build()),
+      invalidateAgent: vi.fn(),
+      invalidateAll: vi.fn(),
+    };
+  }
+
+  function makeRunnerWithCache(
+    cache: ReturnType<typeof makeSpyPrefixCache>,
+    memoryManager = makeMockMemoryManager(),
+    overrides: Partial<AgentConfig> = {},
+  ): AgentRunner {
+    // Constructor arg order: (config, memoryManager, plugins, skillIndex,
+    // eventSubscribersJson, prefetcher, teamRoster, db, prefixCache, ...).
+    return new AgentRunner(
+      makeAgentConfig(overrides),
+      memoryManager as never,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      undefined,
+      cache as never,
+    );
+  }
+
+  it("Lane B: buildProviderPrompt never touches the prefix cache (uncached by ruling)", async () => {
+    const cache = makeSpyPrefixCache();
+    const runner = makeRunnerWithCache(cache);
+    await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
+    expect(cache.getOrBuild).not.toHaveBeenCalled();
+    expect(cache.invalidateAgent).not.toHaveBeenCalled();
+    expect(cache.invalidateAll).not.toHaveBeenCalled();
+  });
+
+  it("Claude lane: buildSystemPrompt reads through the prefix cache exactly once (unchanged)", async () => {
+    const cache = makeSpyPrefixCache();
+    const runner = makeRunnerWithCache(cache);
+    await (
+      runner as unknown as { buildSystemPrompt(c: string[], d?: string[]): Promise<string> }
+    ).buildSystemPrompt([]);
+    expect(cache.getOrBuild).toHaveBeenCalledTimes(1);
+  });
+
+  it("Lane B: instructions end with the Pacific datetime trailer", async () => {
+    const cache = makeSpyPrefixCache();
+    const runner = makeRunnerWithCache(cache);
+    const { instructions } = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
+    expect(instructions).toMatch(/\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+  });
+
+  it("Lane B: a rendered hot-tier block is returned AND folded into instructions exactly once (single-injection)", async () => {
+    const HOT = "HOT-TIER-UNIQUE-MARKER-XYZ";
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(HOT);
+    const cache = makeSpyPrefixCache();
+    const runner = makeRunnerWithCache(cache, memoryManager);
+    const { instructions, hotTierPrompt } = await runner.buildProviderPrompt({
+      toolInventory: [],
+      toolsExecutable: false,
+    });
+    expect(hotTierPrompt).toBe(HOT);
+    expect(instructions.split(HOT).length - 1).toBe(1);
+  });
+});

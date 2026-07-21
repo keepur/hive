@@ -1,14 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { McpSdkServerConfigWithInstance, SdkPluginConfig } from "@anthropic-ai/claude-agent-sdk";
 import { ToolBridge, normalizeSchema, shapeCallToolResult } from "./tool-bridge.js";
 import type { ToolBridgeOptions } from "./tool-bridge.js";
+import { BUILTIN_TOOL_DEFINITIONS } from "./builtin-executor.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import type { ProviderSkillIndexEntry } from "./turn-assembly.js";
+// KPR-349 T5/T6: real round-trips through production code paths.
+import { AgentRunner } from "../agent-runner.js";
+import { buildProviderInstructions } from "../prefix-builder.js";
+import { deriveProviderSkillIndex } from "./skill-index.js";
+import type { AgentConfig } from "../../types/agent-config.js";
 
 /**
  * KPR-348 Task 1 (Chunk 1): T1 (bridge half), T4, T5 (bridge half), T6, T9.
@@ -489,6 +495,322 @@ describe("T9 — name and cap edges", () => {
     expect(tools).toHaveLength(128);
     const capped = bridge.runtimeOmissions.filter((o) => o.reason === "provider-tool-cap");
     expect(capped).toHaveLength(2);
+    await bridge.close();
+  });
+});
+
+// --- KPR-349 T8: §D7 cap-priority ruling (two-tier pin) --------------------
+// Tier 0 — the six executor builtins + load_skill — is structurally
+// load-bearing (toolkit + skills prompt sections claim them) and is NEVER
+// cap-dropped. Tier 1 (MCP-discovered) keeps inventory order and absorbs the
+// entire tail-drop. The 348-shipped tail-splice inverted this: load_skill,
+// pushed last in connectInner, was the first casualty.
+
+describe("KPR-349 T8 — §D7 cap-priority (builtins + load_skill pinned)", () => {
+  let dir: string;
+  let skillPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "kpr349-t8-"));
+    skillPath = join(dir, "SKILL.md");
+    writeFileSync(skillPath, "# T8 fixture skill\nbody");
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const BUILTIN_NAMES = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"];
+
+  /**
+   * 125 MCP tools (mcp__big__t0..t124) + 6 static builtins + load_skill = 132.
+   * connectInner order: external MCP → in-process → builtins → load_skill, so
+   * every MCP tool precedes every builtin, and load_skill is dead last.
+   */
+  function overCapBridge(mcpCount = 125): ToolBridge {
+    const many = Array.from({ length: mcpCount }, (_, i) => ({ name: `t${i}`, inputSchema: {} }));
+    setBehavior("big", { listTools: async () => many });
+    return makeBridge({
+      inventory: [
+        makeEntry({ name: "big", transport: "stdio" }),
+        makeEntry({
+          name: "builtins",
+          transport: "claude-builtin",
+          serverConfig: undefined,
+          schemas: { kind: "static", tools: BUILTIN_TOOL_DEFINITIONS },
+        }),
+      ],
+      skillIndex: [{ name: "fixture-skill", description: "A fixture", path: skillPath }],
+    });
+  }
+
+  it("pins builtins + load_skill and tail-drops the last 4 Tier-1 MCP tools", async () => {
+    const bridge = overCapBridge(125);
+    const tools = await bridge.connect();
+
+    // Exactly at the cap.
+    expect(tools).toHaveLength(128);
+
+    const names = tools.map((t) => t.name);
+    // Every pinned tool survived.
+    for (const b of BUILTIN_NAMES) expect(names).toContain(b);
+    expect(names).toContain("load_skill");
+
+    // The four dropped are the LAST four Tier-1 tools in inventory order.
+    const droppedNames = ["mcp__big__t121", "mcp__big__t122", "mcp__big__t123", "mcp__big__t124"];
+    for (const d of droppedNames) expect(names).not.toContain(d);
+    // The one just above the drop line survived.
+    expect(names).toContain("mcp__big__t120");
+
+    // Exactly four provider-tool-cap omissions, for those four names.
+    const capped = bridge.runtimeOmissions.filter((o) => o.reason === "provider-tool-cap");
+    expect(capped).toHaveLength(4);
+    expect(capped.map((o) => o.server).sort()).toEqual([...droppedNames].sort());
+
+    await bridge.close();
+  });
+
+  it("preserves original relative order — pinned tools are NOT hoisted to the front", async () => {
+    const bridge = overCapBridge(125);
+    const tools = await bridge.connect();
+    const names = tools.map((t) => t.name);
+
+    // mcp__big__t0 precedes Bash in the input inventory order; it must still
+    // precede Bash in the output (no reordering of survivors to the front).
+    expect(names.indexOf("mcp__big__t0")).toBeGreaterThanOrEqual(0);
+    expect(names.indexOf("mcp__big__t0")).toBeLessThan(names.indexOf("Bash"));
+    // load_skill remains last, as assembled.
+    expect(names[names.length - 1]).toBe("load_skill");
+
+    await bridge.close();
+  });
+
+  it("under the cap — builtins + load_skill present, list passes through untouched", async () => {
+    const bridge = overCapBridge(10); // 10 MCP + 6 builtins + load_skill = 17
+    const tools = await bridge.connect();
+    const names = tools.map((t) => t.name);
+
+    const expected = [
+      ...Array.from({ length: 10 }, (_, i) => `mcp__big__t${i}`),
+      ...BUILTIN_NAMES,
+      "load_skill",
+    ];
+    expect(names).toEqual(expected); // exact contents AND order preserved
+
+    // No cap omissions.
+    expect(bridge.runtimeOmissions.filter((o) => o.reason === "provider-tool-cap")).toHaveLength(0);
+
+    await bridge.close();
+  });
+});
+
+// --- KPR-349 T5: memory tools pin (integration) ---------------------------
+// Real AgentRunner → real in-process memory + structured-memory McpServers →
+// real bridge → real InMemoryTransport round-trip. Fake Mongo db (handlers
+// close over it; no real connection). Proves the memory family bridges and
+// dispatches, not a synthetic fixture.
+
+function makeMemMgr(): unknown {
+  return {
+    read: async () => null,
+    write: async () => {},
+    list: async () => [],
+    delete: async () => {},
+    history: async () => [],
+    rollback: async () => {},
+    getHotTierPrompt: async () => null,
+  };
+}
+
+function makeFakeInProcessDb(): unknown {
+  const col = {
+    findOne: async () => null,
+    find: () => ({
+      project: () => ({ toArray: async () => [] }),
+      toArray: async () => [],
+      sort: () => ({ limit: () => ({ toArray: async () => [] }) }),
+    }),
+    insertOne: async () => ({}),
+    updateOne: async () => ({}),
+    deleteOne: async () => ({}),
+    deleteMany: async () => ({}),
+    createIndex: async () => "idx",
+    countDocuments: async () => 0,
+  };
+  return { collection: () => col };
+}
+
+function makeMemoryAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+  return {
+    id: "mem-agent",
+    name: "MemAgent",
+    model: "openai/gpt-5.4-mini",
+    channels: [],
+    passiveChannels: [],
+    keywords: [],
+    isDefault: false,
+    schedule: [],
+    budgetUsd: 10,
+    maxTurns: 25,
+    icon: "",
+    coreServers: ["memory"],
+    delegateServers: [],
+    soul: "mem soul",
+    systemPrompt: "mem system",
+    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    ...overrides,
+  };
+}
+
+function makeMemoryRunner(): AgentRunner {
+  // Constructor: (config, memoryManager, plugins, skillIndex, eventSubscribersJson,
+  // prefetcher, teamRoster, db, ...). db present → in-process memory family wires.
+  return new AgentRunner(
+    makeMemoryAgentConfig(),
+    makeMemMgr() as never,
+    [],
+    new Map(),
+    "{}",
+    undefined,
+    undefined,
+    makeFakeInProcessDb() as never,
+  );
+}
+
+describe("KPR-349 T5 — memory tools pin (real AgentRunner + bridge)", () => {
+  it("bridges memory + structured-memory and round-trips a real view/recall call", async () => {
+    const runner = makeMemoryRunner();
+    const inventory = runner
+      .buildToolTransportInventory()
+      .filter((e) => e.transport === "sdk-in-process");
+    const inProcessServers = runner.buildInProcessServers();
+    const bridge = new ToolBridge({
+      inventory,
+      inProcessServers,
+      gate: async () => ({ behavior: "allow" }),
+      signal: new AbortController().signal,
+      agentId: "mem-agent",
+      sessionCwd: tmpdir(),
+      skillIndex: [],
+    });
+    const tools = await bridge.connect();
+    const names = tools.map((t) => t.name);
+    expect(names).toContain("mcp__memory__view");
+    expect(names.some((n) => n.startsWith("mcp__structured-memory__"))).toBe(true);
+
+    // Real round-trip through the memory handler — not a synthetic fixture.
+    const view = tools.find((t) => t.name === "mcp__memory__view")!;
+    const viewOut = await view.execute({ path: "/memories" });
+    expect(typeof viewOut).toBe("string");
+    expect(viewOut.startsWith("Tool execution failed")).toBe(false);
+
+    // Structured-memory recall — content not asserted, only non-throw/string.
+    const recall = tools.find((t) => t.name === "mcp__structured-memory__memory_recall")!;
+    const recallOut = await recall.execute({ query: "x" });
+    expect(typeof recallOut).toBe("string");
+
+    await expect(bridge.close()).resolves.toBeUndefined();
+  });
+
+  it("file-tier guidance renders iff the memory entry is in the inventory", async () => {
+    const runner = makeMemoryRunner();
+    const inventory = runner
+      .buildToolTransportInventory()
+      .filter((e) => e.transport === "sdk-in-process");
+    expect(inventory.some((e) => e.name === "memory")).toBe(true);
+    const cfg = makeMemoryAgentConfig();
+    const memMgr = makeMemMgr();
+    const withMem = await buildProviderInstructions(cfg, {
+      toolInventory: inventory,
+      skillIndex: [],
+      toolsExecutable: true,
+      memoryManager: memMgr as never,
+      plugins: [],
+    });
+    expect(withMem.instructions).toContain("## File-Tier Memory");
+    const withoutMem = await buildProviderInstructions(cfg, {
+      toolInventory: inventory.filter((e) => e.name !== "memory"),
+      skillIndex: [],
+      toolsExecutable: true,
+      memoryManager: memMgr as never,
+      plugins: [],
+    });
+    expect(withoutMem.instructions).not.toContain("## File-Tier Memory");
+  });
+});
+
+// --- KPR-349 T6: load_skill end-to-end ------------------------------------
+// deriveProviderSkillIndex (real plugin-tree read) → bridge load_skill →
+// real SKILL.md read-and-return, plus the deny-gate and empty-index dark pin.
+
+describe("KPR-349 T6 — load_skill end-to-end", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "kpr349-e2e-skill-"));
+    mkdirSync(join(dir, "skills", "golden-e2e"), { recursive: true });
+    writeFileSync(
+      join(dir, "skills", "golden-e2e", "SKILL.md"),
+      "---\nname: golden-e2e\ndescription: E2E fixture skill\n---\nE2E-SKILL-BODY: follow these steps.\n",
+    );
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function e2eIndex(): ProviderSkillIndexEntry[] {
+    const plugins: SdkPluginConfig[] = [{ type: "local", path: dir }];
+    return deriveProviderSkillIndex(plugins);
+  }
+
+  function makeSkillBridge(
+    skillIndex: ProviderSkillIndexEntry[],
+    gate: ToolBridgeOptions["gate"] = async () => ({ behavior: "allow" }),
+  ): ToolBridge {
+    return new ToolBridge({
+      inventory: [],
+      inProcessServers: {},
+      gate,
+      signal: new AbortController().signal,
+      agentId: "skill-agent",
+      sessionCwd: tmpdir(),
+      skillIndex,
+    });
+  }
+
+  it("derives one entry and load_skill returns the SKILL.md body", async () => {
+    const index = e2eIndex();
+    expect(index).toHaveLength(1);
+    const bridge = makeSkillBridge(index);
+    const tools = await bridge.connect();
+    const loadSkill = tools.find((t) => t.name === "load_skill");
+    expect(loadSkill).toBeDefined();
+    const out = await loadSkill!.execute({ name: "golden-e2e" });
+    expect(out).toContain("E2E-SKILL-BODY");
+    await bridge.close();
+  });
+
+  it("unknown skill name → contained error text", async () => {
+    const bridge = makeSkillBridge(e2eIndex());
+    const tools = await bridge.connect();
+    const loadSkill = tools.find((t) => t.name === "load_skill")!;
+    await expect(loadSkill.execute({ name: "nope" })).resolves.toBe(
+      "load_skill failed: unknown skill 'nope'",
+    );
+    await bridge.close();
+  });
+
+  it("deny-all gate → load_skill dispatch is blocked by policy", async () => {
+    const bridge = makeSkillBridge(e2eIndex(), async () => ({ behavior: "deny", reason: "e2e-denied" }));
+    const tools = await bridge.connect();
+    const loadSkill = tools.find((t) => t.name === "load_skill")!;
+    await expect(loadSkill.execute({ name: "golden-e2e" })).resolves.toBe(
+      "Tool call denied by policy: e2e-denied",
+    );
+    await bridge.close();
+  });
+
+  it("dark pin: empty skillIndex → no load_skill in the bridged tool list (348 invariant)", async () => {
+    const bridge = makeSkillBridge([]);
+    const tools = await bridge.connect();
+    expect(tools.find((t) => t.name === "load_skill")).toBeUndefined();
     await bridge.close();
   });
 });

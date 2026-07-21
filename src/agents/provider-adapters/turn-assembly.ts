@@ -2,9 +2,9 @@
  * KPR-347 (§D1.4): the Lane B per-spawn assembly seam. Everything a native
  * provider adapter needs beyond the per-turn request is built here,
  * asynchronously, and passed at adapter construction. KPR-348 consumes
- * toolInventory + guardrailGate; KPR-349 swaps buildPilotInstructions for
- * the shared prompt builder and populates memory/skillIndex — this file is
- * the single seam both edit.
+ * toolInventory + guardrailGate; KPR-349 swapped the pilot instruction stub
+ * for the shared prompt builder (runner.buildProviderPrompt) and populated
+ * memory/skillIndex — this file is the single seam both edit.
  */
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../../logging/logger.js";
@@ -28,7 +28,12 @@ const log = createLogger("turn-assembly");
  * only — downstream children pin the existing fields).
  */
 export interface ProviderMemoryBundle {
-  /** Rendered hot-tier memory block, ready for instruction fold-in. */
+  /**
+   * Rendered hot-tier memory block. Single-injection rule: it is ALREADY
+   * folded into `instructions` by buildProviderInstructions — this field is
+   * the raw carrier for consumers that want the block alone, and must never
+   * be re-injected into the prompt on top of `instructions`.
+   */
   hotTierPrompt?: string;
 }
 
@@ -50,10 +55,11 @@ export interface ProviderSkillIndexEntry {
  */
 export interface ProviderTurnAssembly {
   /**
-   * Assembled system instructions. KPR-347: buildPilotInstructions output
-   * (soul + systemPrompt, byte-identical to pre-347). KPR-349 swaps in the
-   * shared prompt builder (minus Claude-specific fragments, plus toolkit
-   * rendered from toolInventory).
+   * Assembled system instructions — the full Lane B prompt from the shared
+   * section helpers (buildProviderInstructions via runner.buildProviderPrompt):
+   * soul → archetype card → systemPrompt → constitution → team summary →
+   * memory → datetime, with the tool-dependent sections (toolkit, file-tier
+   * guidance, skills) gated by TOOL_EXECUTING_PROVIDERS (§D3).
    */
   instructions: string;
   /** Bridgeable subset for the route provider — already partitioned. */
@@ -61,8 +67,8 @@ export interface ProviderTurnAssembly {
   /** R3 honesty record: what the partition removed, for logging/telemetry/matrix. */
   omittedTools: OmittedToolRecord[];
   guardrailGate: GuardrailGate;
-  memory: ProviderMemoryBundle; // {} until KPR-349
-  skillIndex: ProviderSkillIndexEntry[]; // [] until KPR-349
+  memory: ProviderMemoryBundle; // {hotTierPrompt} when the agent's hot tier rendered, else {}
+  skillIndex: ProviderSkillIndexEntry[]; // derived per spawn; a non-empty index lights up the bridge's load_skill
   /**
    * KPR-348 (spec §D4): the SAME in-process McpServer instances the Claude
    * lane would run (same handlers, same *ContextRef closures) — the bridge
@@ -77,13 +83,15 @@ export interface ProviderTurnAssembly {
 }
 
 /**
- * Relocated verbatim from agent-manager.ts (KPR-347 §D1.4 step 1) so
- * KPR-349 has a single seam file to edit. Output is byte-identical.
+ * KPR-349 (§D3): tool-honesty gate. Only providers whose adapters actually
+ * execute bridged tools get tool-dependent prompt sections (toolkit,
+ * file-tier guidance, skills) and the memory block's tool-instruction
+ * lines. KPR-352/353 each add their provider IN THE SAME COMMIT that flips
+ * their adapter's zero-tools stub — the set and the flip are one review
+ * surface (same one-line-per-provider growth pattern as SESSION_SEMANTICS).
+ * Delete-candidate once all three Lane B providers execute tools.
  */
-export function buildPilotInstructions(name: string, soul: string, systemPrompt: string): string {
-  const sections = [soul.trim(), systemPrompt.trim()].filter(Boolean);
-  return sections.length ? sections.join("\n\n") : `You are ${name}.`;
-}
+export const TOOL_EXECUTING_PROVIDERS: ReadonlySet<LaneBProviderId> = new Set(["openai"]);
 
 /**
  * KPR-347 (§D1.5): default fail-closed guardrail gate — the mirror of the
@@ -127,7 +135,6 @@ export async function assembleProviderTurn(input: {
   workItemContext?: WorkItemContext;
 }): Promise<ProviderTurnAssembly> {
   try {
-    const instructions = buildPilotInstructions(input.config.name, input.config.soul, input.config.systemPrompt);
     const inventory = input.runner.buildToolTransportInventory(input.workItemContext);
     const { bridgeable, omitted } = partitionInventoryForProvider(inventory, input.provider);
     // R3 honesty surface: once per spawn, names + compatibility reasons ONLY
@@ -139,6 +146,14 @@ export async function assembleProviderTurn(input: {
       bridgeable: bridgeable.length,
       omitted: omitted.map((o) => `${o.name}:${o.compatibility}`),
     });
+    // KPR-349 (§D1/§D3): the real system prompt — shared section helpers via
+    // the runner; skill derivation + memory fold-in run INSIDE this try, so
+    // a Mongo blip classifies non-provider (§D9, T7).
+    const toolsExecutable = TOOL_EXECUTING_PROVIDERS.has(input.provider);
+    const { instructions, hotTierPrompt, skillEntries } = await input.runner.buildProviderPrompt({
+      toolInventory: bridgeable,
+      toolsExecutable,
+    });
     const guardrailGate = buildDefaultGuardrailGate(input.config, input.workItemContext);
     // KPR-348 (§D4): *ContextRef.current is set here with the turn's context —
     // per-spawn adapters make construction-time ≡ turn-time (canon 4).
@@ -149,8 +164,8 @@ export async function assembleProviderTurn(input: {
       toolInventory: bridgeable,
       omittedTools: omitted,
       guardrailGate,
-      memory: {},
-      skillIndex: [],
+      memory: hotTierPrompt === undefined ? {} : { hotTierPrompt },
+      skillIndex: skillEntries,
       inProcessServers,
       sessionCwd,
     };

@@ -8,7 +8,6 @@ import {
   consumeCodexSse,
 } from "./codex-subscription-adapter.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
-import { buildPilotInstructions } from "./turn-assembly.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 
 function makeAdapter(
@@ -293,12 +292,12 @@ describe("CodexSubscriptionAdapter", () => {
     }
   });
 
-  it("KPR-347 T1: instructions are byte-identical to buildPilotInstructions output", async () => {
+  it("KPR-347 T1: adapter forwards assembly instructions verbatim to the provider SDK", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(sse([{ event: "response.output_text.done", data: { text: "done" } }])));
     const { adapter, cleanup } = makeAdapter(
-      { assembly: makeAssembly({ instructions: buildPilotInstructions("Pilot", "soul", "system") }) },
+      { assembly: makeAssembly({ instructions: "soul\n\nsystem" }) },
       fetchMock,
     );
 

@@ -278,7 +278,7 @@ export class BuiltinExecutor {
 
   private async write(args: Record<string, unknown>): Promise<string> {
     const filePath = requireString(args, "file_path");
-    const content = requireString(args, "content");
+    const content = requireString(args, "content", { allowEmpty: true });
     mkdirSync(dirname(filePath), { recursive: true });
     await writeFile(filePath, content, "utf8");
     return `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${filePath}`;
@@ -287,7 +287,7 @@ export class BuiltinExecutor {
   private async edit(args: Record<string, unknown>): Promise<string> {
     const filePath = requireString(args, "file_path");
     const oldString = requireString(args, "old_string");
-    const newString = requireString(args, "new_string");
+    const newString = requireString(args, "new_string", { allowEmpty: true });
     const replaceAll = args.replace_all === true;
     if (oldString === newString) return "Edit failed: old_string and new_string are identical";
     let raw: string;
@@ -385,9 +385,13 @@ export class BuiltinExecutor {
   }
 }
 
-function requireString(args: Record<string, unknown>, key: string): string {
+function requireString(
+  args: Record<string, unknown>,
+  key: string,
+  opts?: { allowEmpty?: boolean },
+): string {
   const v = args[key];
-  if (typeof v !== "string" || v.length === 0) {
+  if (typeof v !== "string" || (v.length === 0 && !opts?.allowEmpty)) {
     throw new Error(`missing required string parameter '${key}'`); // bridge wrapper contains this
   }
   return v;

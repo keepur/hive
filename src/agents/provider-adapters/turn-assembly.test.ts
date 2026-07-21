@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, type Mock } from "vitest";
 import type { AgentConfig } from "../../types/agent-config.js";
 import type { AgentRunner } from "../agent-runner.js";
 import { registerArchetype } from "../../archetypes/registry.js";
@@ -7,8 +7,12 @@ import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import {
   assembleProviderTurn,
   buildDefaultGuardrailGate,
-  buildPilotInstructions,
+  TOOL_EXECUTING_PROVIDERS,
 } from "./turn-assembly.js";
+import {
+  ProviderCircuitBreakerRegistry,
+  DEFAULT_CIRCUIT_BREAKER_CONFIG,
+} from "../provider-circuit-breaker.js";
 
 const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
 vi.mock("../../logging/logger.js", () => ({
@@ -39,22 +43,33 @@ function makeEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInv
   };
 }
 
+type RunnerExtra = Partial<
+  Pick<AgentRunner, "buildInProcessServers" | "resolveTurnCwd" | "buildProviderPrompt">
+>;
+
 function makeRunner(
   inventory: HiveToolInventoryEntry[] | (() => HiveToolInventoryEntry[]),
-  extra: Partial<Pick<AgentRunner, "buildInProcessServers" | "resolveTurnCwd">> = {},
+  extra: RunnerExtra = {},
 ): AgentRunner {
   const impl = typeof inventory === "function" ? inventory : () => inventory;
   return {
     buildToolTransportInventory: vi.fn(impl),
     buildInProcessServers: extra.buildInProcessServers ?? vi.fn(() => ({})),
     resolveTurnCwd: extra.resolveTurnCwd ?? vi.fn(() => "/tmp/kpr348-assembly-cwd"),
+    buildProviderPrompt:
+      extra.buildProviderPrompt ??
+      vi.fn(async () => ({
+        instructions: "ASSEMBLED-INSTRUCTIONS\n\n---\n\n**Current date/time**: fixture (Pacific Time)",
+        hotTierPrompt: "HOT-TIER-BLOCK",
+        skillEntries: [{ name: "fixture-skill", description: "d", path: "/tmp/fixture/SKILL.md" }],
+      })),
   } as unknown as AgentRunner;
 }
 
 beforeEach(() => vi.clearAllMocks());
 
-describe("assembleProviderTurn (KPR-347 §D1.4)", () => {
-  it("instructions are byte-identical to buildPilotInstructions; inventory partitioned; placeholders empty", async () => {
+describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
+  it("KPR-349 inversion: instructions come from buildProviderPrompt; memory + skillIndex populated; inventory partitioned", async () => {
     const bridgeable = makeEntry();
     const omittedEntry = makeEntry({
       name: "Bash", transport: "claude-builtin", inProcess: false, requiresHiveRuntime: false,
@@ -62,23 +77,64 @@ describe("assembleProviderTurn (KPR-347 §D1.4)", () => {
       schemas: { kind: "unavailable" },
     });
     const plantedServers = { memory: { instance: {} } } as never;
+    const runner = makeRunner([bridgeable, omittedEntry], {
+      buildInProcessServers: vi.fn(() => plantedServers),
+      resolveTurnCwd: vi.fn(() => "/tmp/kpr348-planted-cwd"),
+    });
     const assembly = await assembleProviderTurn({
-      runner: makeRunner([bridgeable, omittedEntry], {
-        buildInProcessServers: vi.fn(() => plantedServers),
-        resolveTurnCwd: vi.fn(() => "/tmp/kpr348-planted-cwd"),
-      }),
+      runner,
       config: makeAgentConfig(),
       provider: "openai",
     });
-    expect(assembly.instructions).toBe(buildPilotInstructions("Pilot", "pilot soul", "pilot system"));
-    expect(assembly.instructions).toBe("pilot soul\n\npilot system");
+    // Instructions are the runner-assembled prompt (NOT the old soul\n\nsystem shape).
+    expect(assembly.instructions).toContain("ASSEMBLED-INSTRUCTIONS");
+    expect(assembly.instructions).toMatch(/\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    expect(assembly.instructions).not.toBe("pilot soul\n\npilot system");
     expect(assembly.toolInventory).toEqual([bridgeable]);
     expect(assembly.omittedTools).toEqual([{ name: "Bash", transport: "claude-builtin", compatibility: "claude-only" }]);
-    expect(assembly.memory).toEqual({});
-    expect(assembly.skillIndex).toEqual([]);
+    expect(assembly.memory).toEqual({ hotTierPrompt: "HOT-TIER-BLOCK" });
+    expect(assembly.skillIndex).toEqual([{ name: "fixture-skill", description: "d", path: "/tmp/fixture/SKILL.md" }]);
+    // buildProviderPrompt receives the PARTITIONED (bridgeable) inventory + toolsExecutable:true for openai.
+    expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith({
+      toolInventory: [bridgeable],
+      toolsExecutable: true,
+    });
     // KPR-348: the assembly carries the in-process servers + resolved cwd.
     expect(assembly.inProcessServers).toBe(plantedServers);
     expect(assembly.sessionCwd).toBe("/tmp/kpr348-planted-cwd");
+  });
+
+  it("KPR-349 §D3: TOOL_EXECUTING_PROVIDERS is exactly {openai} (352/353 grow it with their adapter flip)", () => {
+    expect(TOOL_EXECUTING_PROVIDERS).toEqual(new Set(["openai"]));
+  });
+
+  it("KPR-349 §D3: toolsExecutable false for gemini (pre-352)", async () => {
+    const runner = makeRunner([makeEntry()]);
+    await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "gemini" });
+    expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith(
+      expect.objectContaining({ toolsExecutable: false }),
+    );
+  });
+
+  it("KPR-349 §D3: toolsExecutable false for codex (pre-353)", async () => {
+    const runner = makeRunner([makeEntry()]);
+    await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "codex" });
+    expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith(
+      expect.objectContaining({ toolsExecutable: false }),
+    );
+  });
+
+  it("KPR-349: runner returning hotTierPrompt undefined → assembly.memory is {} (347 optional-field shape preserved)", async () => {
+    const runner = makeRunner([makeEntry()], {
+      buildProviderPrompt: vi.fn(async () => ({
+        instructions: "X\n\n---\n\n**Current date/time**: fixture (Pacific Time)",
+        hotTierPrompt: undefined,
+        skillEntries: [],
+      })),
+    });
+    const assembly = await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "openai" });
+    expect(assembly.memory).toEqual({});
+    expect(assembly.skillIndex).toEqual([]);
   });
 
   it("KPR-348: a resolveTurnCwd throw rejects with TurnAssemblyError (classifies non-provider)", async () => {
@@ -115,6 +171,41 @@ describe("assembleProviderTurn (KPR-347 §D1.4)", () => {
       config: makeAgentConfig(),
       provider: "gemini",
     });
+    await expect(promise).rejects.toBeInstanceOf(TurnAssemblyError);
+    const err = await promise.catch((e: unknown) => e);
+    expect(classifyThrown(err)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+  });
+
+  it("T7: buildProviderPrompt rejecting with a Mongo error → TurnAssemblyError → non-provider; openai breaker stays closed after 3", async () => {
+    const runner = makeRunner([makeEntry()], {
+      buildProviderPrompt: vi.fn(async () => {
+        throw new Error("MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017");
+      }),
+    });
+    const promise = assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "openai" });
+    await expect(promise).rejects.toBeInstanceOf(TurnAssemblyError);
+    const err = await promise.catch((e: unknown) => e);
+    const classification = classifyThrown(err);
+    expect(classification).toMatchObject({ outcome: "fault", kind: "non-provider" });
+
+    // Feed the classified fault through a real breaker 3× — non-provider must
+    // never trip a healthy foreign provider's circuit (§D9).
+    const registry = new ProviderCircuitBreakerRegistry(DEFAULT_CIRCUIT_BREAKER_CONFIG, () => 0);
+    for (let i = 0; i < 3; i++) {
+      const permit = registry.acquire("openai");
+      registry.record(permit, classification, 0);
+    }
+    expect(registry.stateFor("openai")?.state).toBe("closed");
+  });
+
+  it("T7b: buildProviderPrompt throwing SYNCHRONOUSLY is still wrapped as TurnAssemblyError", async () => {
+    const runner = makeRunner([makeEntry()], {
+      // Not `async` — throws synchronously when invoked, before returning a promise.
+      buildProviderPrompt: vi.fn(() => {
+        throw new Error("synchronous boom inside buildProviderPrompt");
+      }) as never,
+    });
+    const promise = assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "openai" });
     await expect(promise).rejects.toBeInstanceOf(TurnAssemblyError);
     const err = await promise.catch((e: unknown) => e);
     expect(classifyThrown(err)).toMatchObject({ outcome: "fault", kind: "non-provider" });

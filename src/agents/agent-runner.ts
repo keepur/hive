@@ -17,7 +17,9 @@ import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildPrefix } from "./prefix-builder.js";
+import { buildPrefix, buildProviderInstructions, SECTION_JOINER, formatDateTimeTrailer } from "./prefix-builder.js";
+import { deriveProviderSkillIndex } from "./provider-adapters/skill-index.js";
+import type { ProviderSkillIndexEntry } from "./provider-adapters/turn-assembly.js";
 import type { PrefixCache } from "./prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./prefix-invalidation.js";
 import {
@@ -372,10 +374,9 @@ export class AgentRunner {
       : await buildPrefix(this.agentConfig, buildContext);
 
     // Date/time last — changes every minute, so placing it at the end
-    // preserves the static prefix for prompt caching.
-    const now = new Date();
-    const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
-    return `${prefix}\n\n---\n\n**Current date/time**: ${pacific} (Pacific Time)`;
+    // preserves the static prefix for prompt caching. Single definition
+    // shared with Lane B (KPR-349 §D1: the two lanes cannot drift).
+    return `${prefix}${SECTION_JOINER}${formatDateTimeTrailer()}`;
   }
 
 
@@ -1518,6 +1519,37 @@ export class AgentRunner {
       }
     }
     return resolveSessionCwd({ archetypeCwd, agentId: this.agentConfig.id });
+  }
+
+  /**
+   * KPR-349 (spec §D1): assemble the Lane B instruction prompt — public
+   * method following the KPR-348 precedent (buildInProcessServers /
+   * resolveTurnCwd) so the runner's private memoryManager / teamRoster /
+   * plugins / skillIndex stay private. Thin: derives the skill entries
+   * (§D6) from the SAME agent-scoped SDK plugin list the Claude lane passes
+   * to query() (buildNativeSkills), then delegates to the shared builder.
+   *
+   * toolsExecutable arrives as a plain boolean — the provider set
+   * (TOOL_EXECUTING_PROVIDERS) lives at the assembly seam (§D3), and
+   * prefix-builder carries no per-provider branches by design.
+   *
+   * UNCACHED by ruling (spec §D2): never touches PrefixCache — Lane B
+   * rebuilds per spawn (per-spawn adapters, construction-time ≡ turn-time).
+   */
+  async buildProviderPrompt(opts: {
+    toolInventory: HiveToolInventoryEntry[];
+    toolsExecutable: boolean;
+  }): Promise<{ instructions: string; hotTierPrompt?: string; skillEntries: ProviderSkillIndexEntry[] }> {
+    const skillEntries = deriveProviderSkillIndex(this.buildNativeSkills());
+    const result = await buildProviderInstructions(this.agentConfig, {
+      toolInventory: opts.toolInventory,
+      skillIndex: skillEntries,
+      toolsExecutable: opts.toolsExecutable,
+      memoryManager: this.memoryManager,
+      teamRoster: this.teamRoster,
+      plugins: this.plugins,
+    });
+    return { instructions: result.instructions, hotTierPrompt: result.hotTierPrompt, skillEntries };
   }
 
   /**

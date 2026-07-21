@@ -11,7 +11,6 @@ import { Agent, OpenAIProvider, Runner, run } from "@openai/agents";
 import { OpenAIAgentsAdapter, coerceFinalOutput } from "./openai-agents-adapter.js";
 import { ToolBridge } from "./tool-bridge.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
-import { buildPilotInstructions } from "./turn-assembly.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import { BUILTIN_TOOL_DEFINITIONS } from "./builtin-executor.js";
 import { classifyTurnResult } from "./error-classification.js";
@@ -395,11 +394,11 @@ describe("OpenAIAgentsAdapter", () => {
     expect("tools" in agentOptions).toBe(false);
   });
 
-  it("KPR-347 T1: instructions are byte-identical to buildPilotInstructions output", async () => {
+  it("KPR-347 T1: adapter forwards assembly instructions verbatim to the provider SDK", async () => {
     runMock.mockResolvedValueOnce(makeSdkResult() as never);
 
     await makeAdapter({
-      assembly: makeAssembly({ instructions: buildPilotInstructions("Pilot", "soul", "system") }),
+      assembly: makeAssembly({ instructions: "soul\n\nsystem" }),
     }).runTurn({ prompt: "hello" });
 
     expect(AgentMock).toHaveBeenCalledWith({

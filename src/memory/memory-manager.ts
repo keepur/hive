@@ -70,7 +70,19 @@ export class MemoryManager {
    * Delegates to MemoryStore for the correctly-sorted hot-tier query.
    * Returns null if no structured memories exist for this agent.
    */
-  async getHotTierPrompt(agentId: string, budgetTokens: number): Promise<string | null> {
+  async getHotTierPrompt(
+    agentId: string,
+    budgetTokens: number,
+    opts?: {
+      /**
+       * KPR-349 (§D5): the tool name the warm/cold trailer teaches, or null
+       * to render the reworded count-only trailer (tool-claim gate for
+       * non-executing Lane B providers). Undefined ⇒ "memory_recall" —
+       * byte-identical to pre-349 output (Claude lane, golden-pinned).
+       */
+      recallToolName?: string | null;
+    },
+  ): Promise<string | null> {
     if (!this._memoryStore) return null;
     const hotRecords = await this._memoryStore.getHotTier(agentId);
     if (hotRecords.length === 0) return null;
@@ -117,8 +129,14 @@ export class MemoryManager {
 
     const warmColdCount = await this._memoryStore.countNonHot(agentId);
     if (warmColdCount > 0) {
+      const recallToolName = opts?.recallToolName === undefined ? "memory_recall" : opts.recallToolName;
       parts.push(
-        `---\nYou have ${warmColdCount} additional memories available via \`memory_recall\`. Use it to search for context before starting tasks.`,
+        recallToolName === null
+          ? // §D5 gated variant (KPR-349 final-gate ruling): reworded, count
+            // stays, imperative tool sentence gone — NOT a naive line-drop
+            // of the fused sentence.
+            `---\nYou have ${warmColdCount} additional memories.`
+          : `---\nYou have ${warmColdCount} additional memories available via \`${recallToolName}\`. Use it to search for context before starting tasks.`,
       );
     }
 

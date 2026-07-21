@@ -499,9 +499,11 @@ export class AgentManager {
     }
 
     // KPR-347 (§D5): Lane B per-spawn assembly — real inventory through the
-    // compatibility partition; instructions byte-identical to the pre-347
-    // buildPilotInstructions output. Assembly throws are TurnAssemblyError
-    // (classifies non-provider inside the caller's recorded try).
+    // compatibility partition; KPR-349: instructions are the real prompt from
+    // buildProviderInstructions (via the runner's buildProviderPrompt),
+    // assembled inside assembleProviderTurn. Assembly throws are
+    // TurnAssemblyError (classifies non-provider inside the caller's
+    // recorded try).
     const assembly = await assembleProviderTurn({
       runner,
       config,
