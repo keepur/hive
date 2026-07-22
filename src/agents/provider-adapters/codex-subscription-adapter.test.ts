@@ -328,7 +328,7 @@ describe("consumeCodexSse", () => {
   });
 
   it("returns incomplete buffered SSE frames", () => {
-    const state = { text: "", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
+    const state = { text: "", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, outputItems: [] };
     const remainder = consumeBufferedSseEvents(
       'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n' +
         'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":" there"}',
@@ -337,6 +337,76 @@ describe("consumeCodexSse", () => {
 
     expect(state.text).toBe("hi");
     expect(remainder).toContain(" there");
+  });
+});
+
+describe("consumeCodexSse — KPR-353 SSE consumer groundwork (Task 2)", () => {
+  it("captures response.completed output items verbatim", async () => {
+    const output = [
+      { id: "rs_1", type: "reasoning", content: [], encrypted_content: "blob", summary: null },
+      {
+        id: "msg_1",
+        type: "message",
+        status: "completed",
+        content: [{ type: "output_text", annotations: [], logprobs: [], text: "hi" }],
+        role: "assistant",
+      },
+    ];
+    const result = await consumeCodexSse(
+      sse([
+        {
+          event: "response.completed",
+          data: { type: "response.completed", response: { id: "resp-c", output } },
+        },
+      ]),
+      undefined,
+    );
+
+    expect(result.outputItems).toEqual(output);
+  });
+
+  it("prefers the completed response id over an earlier created id", async () => {
+    const result = await consumeCodexSse(
+      sse([
+        { event: "response.created", data: { type: "response.created", response: { id: "resp-created" } } },
+        { event: "response.completed", data: { type: "response.completed", response: { id: "resp-complete" } } },
+      ]),
+      undefined,
+    );
+
+    expect(result.responseId).toBe("resp-complete");
+  });
+
+  it("T6: accumulates usage from response.completed only, not interim in_progress payloads", async () => {
+    const result = await consumeCodexSse(
+      sse([
+        {
+          event: "response.in_progress",
+          data: { type: "response.in_progress", response: { id: "resp-p", usage: { input_tokens: 7, output_tokens: 2 } } },
+        },
+        {
+          event: "response.completed",
+          data: { type: "response.completed", response: { id: "resp-c", usage: { input_tokens: 10, output_tokens: 3 } } },
+        },
+      ]),
+      undefined,
+    );
+
+    expect(result.inputTokens).toBe(10);
+    expect(result.outputTokens).toBe(3);
+  });
+
+  it("leaves outputItems empty when the stream is cut before completion", async () => {
+    const result = await consumeCodexSse(
+      sse([
+        { event: "response.created", data: { type: "response.created", response: { id: "resp-created" } } },
+        { event: "response.output_text.delta", data: { type: "response.output_text.delta", delta: "partial" } },
+      ]),
+      undefined,
+    );
+
+    expect(result.outputItems).toEqual([]);
+    expect(result.text).toBe("partial");
   });
 });
 

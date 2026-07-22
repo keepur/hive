@@ -38,6 +38,11 @@ interface CodexStreamState {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  /** KPR-353 (§D2): the full response.output item array captured from the
+   *  response.completed payload — messages, reasoning (with
+   *  encrypted_content when include requests it), function_call items.
+   *  Feeds the dispatch loop's next-round input and the §D3 turn record. */
+  outputItems: unknown[];
 }
 
 interface SseEvent {
@@ -234,6 +239,7 @@ export async function consumeCodexSse(
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
+    outputItems: [],
   };
   let buffer = "";
 
@@ -318,8 +324,13 @@ function applyCodexEvent(event: SseEvent, state: CodexStreamState, onStream?: (c
     return;
   }
 
-  if (type === "response.created" || type === "response.completed" || type === "response.in_progress") {
-    applyResponsePayload(objectField(payload, "response"), state);
+  if (type === "response.created" || type === "response.in_progress") {
+    applyInterimResponsePayload(objectField(payload, "response"), state);
+    return;
+  }
+
+  if (type === "response.completed") {
+    applyCompletedResponsePayload(objectField(payload, "response"), state);
     return;
   }
 
@@ -330,15 +341,40 @@ function applyCodexEvent(event: SseEvent, state: CodexStreamState, onStream?: (c
   }
 }
 
-function applyResponsePayload(response: Record<string, unknown> | undefined, state: CodexStreamState): void {
+/**
+ * Interim events (response.created / response.in_progress): id overwrite
+ * ONLY. KPR-353 (§D2): usage is deliberately NOT read here — interim payloads
+ * can carry (partial) usage, and accumulating it would multi-count within a
+ * round. Usage keys on response.completed exclusively (pinned, T6).
+ */
+function applyInterimResponsePayload(
+  response: Record<string, unknown> | undefined,
+  state: CodexStreamState,
+): void {
   if (!response) return;
   const payload = response as CodexResponsePayload;
   if (payload.id) state.responseId = payload.id;
-  if (payload.usage?.input_tokens) state.inputTokens = payload.usage.input_tokens;
-  if (payload.usage?.output_tokens) state.outputTokens = payload.usage.output_tokens;
+}
+
+/**
+ * response.completed: id + usage accumulation + output-item capture.
+ * Accumulation (+=) is per completed response — the KPR-353 dispatch loop
+ * sums per-round states into turn totals, one completed event per round.
+ */
+function applyCompletedResponsePayload(
+  response: Record<string, unknown> | undefined,
+  state: CodexStreamState,
+): void {
+  if (!response) return;
+  const payload = response as CodexResponsePayload;
+  if (payload.id) state.responseId = payload.id;
+  if (payload.usage?.input_tokens) state.inputTokens += payload.usage.input_tokens;
+  if (payload.usage?.output_tokens) state.outputTokens += payload.usage.output_tokens;
   if (payload.usage?.input_tokens_details?.cached_tokens) {
-    state.cacheReadTokens = payload.usage.input_tokens_details.cached_tokens;
+    state.cacheReadTokens += payload.usage.input_tokens_details.cached_tokens;
   }
+  const output = response["output"];
+  if (Array.isArray(output)) state.outputItems.push(...output);
 }
 
 async function responseErrorMessage(response: Response): Promise<string> {
