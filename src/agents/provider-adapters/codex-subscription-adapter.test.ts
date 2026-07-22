@@ -19,8 +19,11 @@ import { classifyTurnResult } from "./error-classification.js";
 import { TurnHistoryStore } from "../turn-history-store.js";
 
 // The adapter (and the real TurnHistoryStore / ToolBridge it drives) now log.
+// Shared (hoisted) mock so the §D7 self-heal warn is assertable; cleared per
+// test by the beforeEach vi.clearAllMocks() in each describe.
+const logMock = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }));
 vi.mock("../../logging/logger.js", () => ({
-  createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+  createLogger: () => logMock,
 }));
 
 function makeAdapter(
@@ -777,6 +780,120 @@ describe("CodexSubscriptionAdapter — KPR-353 §D7 (poisoned-replay self-heal)"
       expect(result.error).toContain("503");
       expect(store.clear).not.toHaveBeenCalled();
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      // 5xx keeps full breaker weight — classifies as a provider server-error
+      // fault (never the non-provider self-heal path).
+      expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "server-error" });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("heal: first-round 400 after a non-empty replay → history dropped + clear + ONE retry, success, warn logged", async () => {
+    const store = makeFakeStore([{ role: "user", content: [{ type: "input_text", text: "poison" }] }]);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response('{"error":{"message":"invalid encrypted content"}}', { status: 400 }),
+      )
+      .mockResolvedValueOnce(new Response(sse([completed([{ type: "message", role: "assistant", content: [] }])])));
+    const { adapter, cleanup } = makeAdapter(
+      { assembly: makeAssembly(), historyStore: store, agentId: "agent-x" },
+      fetchMock,
+    );
+    try {
+      const result = await adapter.runTurn({ prompt: "go", workItemContext: threadContext("sms:t1") });
+      // SUCCESS — the poisoned replay healed on the fresh retry.
+      expect(result.error).toBeUndefined();
+      expect(classifyTurnResult(result)).toEqual({ outcome: "success" });
+      // exactly one clear, keyed on (agentId, threadId).
+      expect(store.clear).toHaveBeenCalledTimes(1);
+      expect(store.clear).toHaveBeenCalledWith("agent-x", "sms:t1");
+      // two fetches: the rejected replay + the fresh retry.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // retry drops the replayed history — only the user item is posted.
+      expect(bodyOf(fetchMock, 1).input).toEqual([
+        { role: "user", content: [{ type: "input_text", text: "go" }] },
+      ]);
+      // §D7 warn emitted with the 4xx status.
+      expect(logMock.warn).toHaveBeenCalledWith(
+        expect.stringContaining("KPR-353 §D7"),
+        expect.objectContaining({ status: 400 }),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("healed turn persists: append records the fresh (post-heal) turn's items", async () => {
+    const store = makeFakeStore([{ role: "user", content: [{ type: "input_text", text: "poison" }] }]);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response('{"error":{"message":"invalid encrypted content"}}', { status: 400 }),
+      )
+      .mockResolvedValueOnce(new Response(sse([completed([{ type: "message", role: "assistant", content: [] }])])));
+    const { adapter, cleanup } = makeAdapter(
+      { assembly: makeAssembly(), historyStore: store, agentId: "agent-x" },
+      fetchMock,
+    );
+    try {
+      const result = await adapter.runTurn({ prompt: "go", workItemContext: threadContext("sms:t1") });
+      expect(result.error).toBeUndefined();
+      // §D3 record is the HEALED turn only: the fresh user item + the healed
+      // round's assistant output (no trace of the dropped poisoned history).
+      expect(store.append).toHaveBeenCalledTimes(1);
+      expect(store.append).toHaveBeenCalledWith("agent-x", "sms:t1", "codex", [
+        { role: "user", content: [{ type: "input_text", text: "go" }] },
+        { type: "message", role: "assistant", content: [] },
+      ]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a second 4xx after a heal does NOT retry again (selfHealed guard) — two fetches, error surfaced", async () => {
+    const store = makeFakeStore([{ role: "user", content: [{ type: "input_text", text: "poison" }] }]);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('{"error":{"message":"invalid encrypted content"}}', { status: 400 }))
+      .mockResolvedValueOnce(new Response('{"error":{"message":"still bad"}}', { status: 400 }));
+    const { adapter, cleanup } = makeAdapter(
+      { assembly: makeAssembly(), historyStore: store, agentId: "agent-x" },
+      fetchMock,
+    );
+    try {
+      const result = await adapter.runTurn({ prompt: "go", workItemContext: threadContext("sms:t1") });
+      // second 4xx is surfaced — the selfHealed guard forbids a third attempt.
+      expect(result.error).toContain("Codex subscription request failed (400)");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // the one heal still cleared the poisoned doc.
+      expect(store.clear).toHaveBeenCalledTimes(1);
+      // errored turn never persists (§D3).
+      expect(store.append).not.toHaveBeenCalled();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a mid-turn (round >= 2) 4xx never self-heals — error surfaced, no clear, two fetches", async () => {
+    const store = makeFakeStore([{ role: "user", content: [{ type: "input_text", text: "poison" }] }]);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      // round 1: good SSE that emits a tool call → forces a second round.
+      .mockResolvedValueOnce(new Response(sse([completed([callItem("mcp__fixture__echo", '{"text":"hi"}')])])))
+      // round 2: 4xx — past round 1, the self-heal guard (round === 1) is closed.
+      .mockResolvedValueOnce(new Response('{"error":{"message":"invalid encrypted content"}}', { status: 400 }));
+    const { adapter, cleanup } = makeAdapter(
+      { assembly: makeAssembly(echoAssembly()), historyStore: store, agentId: "agent-x" },
+      fetchMock,
+    );
+    try {
+      const result = await adapter.runTurn({ prompt: "go", workItemContext: threadContext("sms:t1") });
+      expect(result.error).toContain("Codex subscription request failed (400)");
+      // no self-heal past round 1 — the poisoned-replay reset is a first-round
+      // affordance only; a mid-turn 4xx keeps full breaker weight.
+      expect(store.clear).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     } finally {
       cleanup();
     }
