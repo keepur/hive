@@ -86,12 +86,13 @@ export interface ProviderTurnAssembly {
  * KPR-349 (§D3): tool-honesty gate. Only providers whose adapters actually
  * execute bridged tools get tool-dependent prompt sections (toolkit,
  * file-tier guidance, skills) and the memory block's tool-instruction
- * lines. KPR-352/353 each add their provider IN THE SAME COMMIT that flips
- * their adapter's zero-tools stub — the set and the flip are one review
- * surface (same one-line-per-provider growth pattern as SESSION_SEMANTICS).
- * Delete-candidate once all three Lane B providers execute tools.
+ * lines. KPR-353 added codex in the same commit as its adapter's zero-tools
+ * flip; KPR-352 adds gemini the same way — the set and the flip are one
+ * review surface (same one-line-per-provider growth pattern as
+ * SESSION_SEMANTICS). Delete-candidate once all three Lane B providers
+ * execute tools.
  */
-export const TOOL_EXECUTING_PROVIDERS: ReadonlySet<LaneBProviderId> = new Set(["openai"]);
+export const TOOL_EXECUTING_PROVIDERS: ReadonlySet<LaneBProviderId> = new Set(["openai", "codex"]);
 
 /**
  * KPR-347 (§D1.5): default fail-closed guardrail gate — the mirror of the
