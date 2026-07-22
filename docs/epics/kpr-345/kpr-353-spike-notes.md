@@ -113,3 +113,42 @@ The correct answer proves the replayed encrypted reasoning items were accepted a
 ## Gate result
 
 **GREEN — all four legs green. Tasks 1–7 may proceed.** No demote-to-spec. The two surfaced deltas are in-scope body adjustments for Task 3, recorded verbatim above.
+
+---
+
+## Post-implementation live e2e (Task 7.3 — real adapter, full tool-flip surface)
+
+Re-run of the T0 surface **after** the implementation landed — but through the **real `CodexSubscriptionAdapter`** end to end (not raw HTTP): a hand-built `ProviderTurnAssembly` advertising the `Bash` claude-builtin, an allow-all guardrail gate, a Map-backed `TurnHistoryStore` stand-in, and a two-turn same-thread conversation that forces a real tool call and then a stateless-replay continuation. Encrypted content is recorded as `<len=N>` only — never the value.
+
+**Environment header:** HEAD `3fac469` · node v24.16.0 · dev Mac (fleet codex subscription auth `~/.codex/auth.json`) · 2026-07-21 · model `gpt-5.4-mini`, `reasoning.effort=high` (medium first run produced no reasoning item for the trivial task — expected model-behavior variance; high reliably exercises the encrypted-reasoning path, capture code unchanged).
+
+### Turn 1 — real Bash tool call (redacted)
+
+Prompt: `"Run \`echo hive-353-live\` with the Bash tool and tell me its output."`
+
+- `result.text` = `hive-353-live` → **contains marker ✓**
+- `result.toolCalls` = **1** (`>= 1` ✓)
+- `result.toolMs` = **9** (`> 0` ✓)
+- `result.durationMs` = 3141, `result.llmMs` = 3132 → **`llmMs === durationMs - toolMs` ✓** (§D6 tool-time excluded from the breaker p95 window)
+- store received **exactly one `append`**; its flattened items (in order):
+
+  | # | type | shape (redacted) |
+  |---|------|------------------|
+  | 1 | `user` | the prompt input_text |
+  | 2 | `reasoning` | `encrypted_content` present, `<len=1080>` |
+  | 3 | `function_call` | name `Bash`, arguments JSON string |
+  | 4 | `function_call_output` | hive-executed output `hive-353-live\n` |
+  | 5 | `message` | assistant final text |
+
+  → reasoning-item-with-`encrypted_content` **AND** a `function_call`/`function_call_output` pair both present in the single persisted turn record ✓
+
+### Turn 2 — stateless replay continuity (redacted)
+
+Prompt (same thread `kpr353-live-thread`): `"What was the exact string you echoed a moment ago?"`
+
+- The adapter `load()`ed turn 1's flattened items (incl. the real `<len=1080>` encrypted reasoning item) and prefixed them to the new user item — the full `store:false` replay path.
+- `result.text` = `hive-353-live` → **replay continuity confirmed ✓** (the model recovered the echoed string from replayed history alone)
+- **No §D7 heal fired** — stdout/stderr scanned for the `"Codex replay rejected"` warn across the whole turn: **not seen** ✓. The backend accepted the replayed encrypted-reasoning list (HTTP 200), matching T0 leg (d2).
+- `result.error` = null (request accepted); second `append` recorded (append-total 2).
+
+**Verdict: ALL_PASS.** The tool-flip surface — bridged Responses function tools → hive-owned dispatch loop → encrypted-reasoning capture → whole-turn persist → next-turn stateless replay — works live on the real subscription endpoint, post-implementation.
