@@ -38,11 +38,13 @@ export type LaneBProviderId = "openai" | "gemini" | "codex";
  *                          sends no previous_response_id; gemini runs
  *                          runEphemeral — their pilot-fabricated ids are not
  *                          handles. Replay implementation status is
- *                          per-provider (codex gains replay in KPR-350;
- *                          gemini leaves this category when Interactions
- *                          lands) — the persistence behavior (never persist
- *                          a handle) is identical either way, which is what
- *                          this descriptor keys.
+ *                          per-provider (codex replay shipped in KPR-353 —
+ *                          TurnHistoryStore / provider_turn_history, replayed
+ *                          client-side by the adapter; gemini leaves this
+ *                          category when Interactions lands) — the
+ *                          persistence behavior (never persist a handle) is
+ *                          identical either way, which is what this
+ *                          descriptor keys.
  */
 export type SessionSemantics =
   | "server-resumable"
