@@ -5,6 +5,7 @@ import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkIt
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
+import type { TurnHistoryStore } from "./turn-history-store.js";
 import type { TurnTelemetryStore } from "./turn-telemetry.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { Db } from "mongodb";
@@ -372,6 +373,11 @@ export class AgentManager {
   private prefixCache?: PrefixCache;
   private db: Db;
   private memoryLifecycle?: MemoryLifecycle;
+  /** KPR-353 (§D3/§D4): stateless-replay turn history. Optional so bare test
+   *  constructions stay valid; production wiring (index.ts) always passes it.
+   *  Absent ⇒ codex turns run stateless (pre-353 floor) and the handoff hook
+   *  no-ops. */
+  private turnHistoryStore?: TurnHistoryStore;
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
   // KPR-216: in-flight per-turn spawn count per agent. Bounded by
@@ -422,6 +428,7 @@ export class AgentManager {
     prefixCache?: PrefixCache,
     options?: { reflectionDebounceMs?: number },
     memoryLifecycle?: MemoryLifecycle,
+    turnHistoryStore?: TurnHistoryStore,
   ) {
     this.registry = registry;
     this.memoryManager = memoryManager;
@@ -436,6 +443,7 @@ export class AgentManager {
     this.teamRoster = teamRoster;
     this.prefixCache = prefixCache;
     this.memoryLifecycle = memoryLifecycle;
+    this.turnHistoryStore = turnHistoryStore;
     // KPR-220 Phase 6: 30s default; tests inject a small value for speed.
     this.reflectionDebounceMs = options?.reflectionDebounceMs ?? 30_000;
     // KPR-306: registry defaults internally when appConfig.circuitBreaker is
@@ -517,6 +525,10 @@ export class AgentManager {
         model: route.model || appConfig.codex.agentModel,
         reasoningEffort: route.reasoningEffort,
         assembly,
+        // KPR-353 (§D3): hive-persisted stateless-replay history. agentId is
+        // config.id (the store key); `name` above stays the display label.
+        historyStore: this.turnHistoryStore,
+        agentId: config.id,
       });
     }
 
@@ -718,6 +730,22 @@ export class AgentManager {
             turn: route.provider,
             hadSessionId: !!effectiveCtx.sessionId,
           });
+          // KPR-353 (§D4): a provider handoff invalidates the thread's replay
+          // history (validity is contiguous-same-provider by construction).
+          // AWAITED — load-bearing: this very turn proceeds through
+          // prepareSpawn to the adapter's load(), so only a clear that
+          // resolves before the spawn continues orders the Mongo delete ahead
+          // of the read; fire-and-forget would let the post-handoff turn
+          // replay the stale doc. An awaited fail-soft Mongo op inside the R7
+          // window is established posture (the sessionStore.get above), and
+          // clear() never throws (§D3) — the catch is belt-and-braces for
+          // foreign store impls/mocks. Accepted residual (spec §D4): if the
+          // swallowed clear FAILS, the stale doc survives until TTL
+          // (same-provider turns never re-trip the guard) — warn-logged in
+          // the store, tolerated; a resulting 4xx lands in the §D7 self-heal.
+          if (this.turnHistoryStore) {
+            await this.turnHistoryStore.clear(ctx.agentId, ctx.threadId).catch(() => {});
+          }
           effectiveCtx = { ...effectiveCtx, sessionId: undefined, sessionHandoff: true };
         }
       }
