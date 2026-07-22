@@ -19,7 +19,7 @@
 - *codex ≡ openai at classify sites* — no `tool-transport.ts` changes; existing compatibility pins stay green (Task 7 empty-diff).
 - *Auth single-path* — `createCodexOpenAITokenProvider` + the pinned chatgpt.com endpoint stay exactly as-is; **no `runWithAuthFallback` analog** (§D5); `oauth-credentials.ts` untouched.
 
-**Spec rulings reflected:** the §D4 handoff-clear is **awaited** (ordering pinned by T4, not mere invocation); usage accumulation keys on `response.completed` only (§D2, T6); trim keeps the newest turn via the `turns.length > 1` loop guard (§D3); persist is success-only; §D7 self-heal is one retry, first round, 4xx-with-replay only.
+**Spec rulings reflected:** the §D4 handoff-clear is **awaited** (ordering pinned by T4, not mere invocation); usage accumulation keys on `response.completed` only (§D2, T6); trim keeps the newest turn via the `turns.length > 1` loop guard (§D3); persist is success-only; §D7 self-heal is one retry, first round, 4xx-with-replay only (breadth pinned: ALL 4xx incl. 401/403/429 heal-and-clear — transient-fault over-clear accepted, T7).
 
 ---
 
@@ -53,7 +53,7 @@
 - **T4 — KPR-313 interplay (ORDERING, not invocation):** manager-level — a deferred (manually-resolved) `clear` promise must resolve before the codex adapter is constructed/`runTurn` invoked (`load()` lives inside `runTurn`, so runTurn-not-reached ⇒ load-not-reached; the adapter-level companion pin asserts `load()` precedes the first fetch); rejected `clear` doesn't throw in the guard window (catch-swallow, turn proceeds); adopt branch doesn't call `clear`; sessions row still written `sessionId: ""` provider `codex` (existing pins pass unmodified); codex branch passes `historyStore` + `agentId: config.id` (constructor-options pin).
 - **T5 — assembly flip:** `TOOL_EXECUTING_PROVIDERS` equals `new Set(["openai", "codex"])` (pin at `turn-assembly.test.ts:107-109` updated); codex `assembleProviderTurn` now passes `toolsExecutable: true` (pin at `:119-125` inverted; negative-verify pre-flip); gemini pin (`:111-117`) untouched and green.
 - **T6 — telemetry:** nonzero `bridge.stats.toolMs` ⇒ `llmMs = max(0, durationMs − toolMs)`; `toolCalls`/`toolSummary` from `bridge.stats`; **usage keyed on `response.completed` only** — a round whose SSE carries usage on `response.in_progress` AND `response.completed` counts the completed value once (no multi-count); usage summed across two loop rounds.
-- **T7 — self-heal (§D7):** 4xx on a first POST that replayed non-empty history → exactly one fresh retry (`input` = user item only) + `clear` called; 4xx with empty history → no retry; 5xx with history → no retry, no clear, error classifies `server-error` (breaker weight preserved); second 4xx after the heal → error result (no loop).
+- **T7 — self-heal (§D7):** 4xx on a first POST that replayed non-empty history → exactly one fresh retry (`input` = user item only) + `clear` called; **accepted-breadth pin: 429-with-replay-history → heals + clears** (all 4xx incl. 401/403/429 per §D7 — transient-fault over-clear accepted, one bounded reset); 4xx with empty history → no retry; 5xx with history → no retry, no clear, error classifies `server-error` (breaker weight preserved); second 4xx after the heal → error result (no loop).
 - **T8 — abort:** mid-round and mid-tool-execution abort → `aborted: true`, `bridge.close()` (prototype spy) called on every path, no persist, no second POST, no unhandled rejections.
 
 ### Regression Surface
@@ -61,7 +61,7 @@
 - **Other adapters:** `openai-agents-adapter.ts`, `gemini-adk-adapter.ts`, `claude-agent-adapter.ts` + their test files — zero edits, suites pass unmodified (incl. gemini's `tools: []`-equivalent pins).
 - **Bridge/executor/transport:** `tool-bridge.ts`, `builtin-executor.ts`, `tool-transport.ts` — zero edits (Task 7 empty-diff); codex ≡ openai compatibility columns already pinned in `tool-transport.test.ts` stay green.
 - **Session plumbing:** `session-store.ts`, `SESSION_SEMANTICS` values, write-side persist rules (`agent-manager.ts:1462-1498`) untouched; every existing KPR-313 pin in `agent-manager.test.ts:2350+` and `session-store.test.ts` passes **unmodified**.
-- **Existing codex adapter tests:** only the `tools: []` pin (`:274-293`) is inverted; every other existing assertion (SSE parsing incl. `:143`'s empty-inventory `tools: []` body, abort, missing-OAuth error, instructions-verbatim, usage mapping) passes unmodified — the Task 2 usage split is output-equivalent for well-formed single-round streams.
+- **Existing codex adapter tests:** only the `tools: []` pin (`:274-293`) is inverted, plus one **type-only** touch: the bare state literal at `:331` gains `outputItems: []` when `CodexStreamState` grows the required field (Task 2 — named in its edit boundary, zero assertion changes); every other existing assertion (SSE parsing incl. `:143`'s empty-inventory `tools: []` body, abort, missing-OAuth error, instructions-verbatim, usage mapping) passes unmodified — the Task 2 usage split is output-equivalent for well-formed single-round streams.
 - **Breaker:** `error-classification.ts` untouched; `TurnAssemblyError` boundary untouched; history I/O runs inside `runTurn` and is store-contained (T3).
 - **Claude lane:** nothing on the Claude path is touched (no `prefix-builder.ts`/`agent-runner.ts` edits at all in this child) — KPR-349's golden suite passes untouched by construction.
 
@@ -135,7 +135,9 @@ The spec's one blocking assumption, resolved by spike, not by a human. The fleet
  *  (c) include: ["reasoning.encrypted_content"] accepted + items present;
  *  (d) replayed input-item lists accepted (same-turn continuation AND next-turn shape).
  *  NEVER COMMIT. No secret values printed. */
-import { createCodexOpenAITokenProvider } from "/Users/mokie/github/hive-mature-kpr-353/src/agents/provider-adapters/oauth-credentials.js";
+// ADJUST to the executing worktree: the driver lives in the session scratchpad,
+// so this must be the absolute path to <your-worktree>/src/agents/provider-adapters/oauth-credentials.js.
+import { createCodexOpenAITokenProvider } from "<worktree>/src/agents/provider-adapters/oauth-credentials.js";
 
 const ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
 const MODEL = process.env.SPIKE_MODEL ?? "gpt-5.4-mini"; // config.ts:278 default
@@ -214,6 +216,10 @@ if (!call) throw new Error("LEG b FAILED: no function_call item in completed out
 console.log("function_call shape:", { call_id: typeof call.call_id, name: call.name, arguments: typeof call.arguments });
 const hasEnc = out1.some((i) => typeof (i as { encrypted_content?: unknown }).encrypted_content === "string");
 console.log("reasoning item with encrypted_content present:", hasEnc);
+// Leg (c) must GATE like (a)/(b)/(d) — a backend that silently ignores the
+// include (HTTP 200, no encrypted reasoning) would otherwise false-pass, and
+// leg (c) feeds Task 3's request body + the §D3 turn-record shape.
+if (!hasEnc) throw new Error("LEG c FAILED: no reasoning item with encrypted_content in completed output");
 
 // Leg (d) half 1 — same-turn continuation: replay round-1 output + function_call_output.
 const fco = { type: "function_call_output", call_id: call.call_id, output: new Date().toISOString() };
@@ -451,6 +457,8 @@ interface CodexStreamState {
 
 Initialize `outputItems: []` in `consumeCodexSse`'s state literal (`:232-237`).
 
+**Known one-token test touch (edit boundary, not a regression):** the existing "returns incomplete buffered SSE frames" test (`codex-subscription-adapter.test.ts:331`) constructs a bare state literal passed to `consumeBufferedSseEvents`; once `CodexStreamState` gains required `outputItems`, that literal needs `outputItems: []` added to typecheck. That single field addition is the ONLY permitted edit to a pre-existing test in this chunk — every existing assertion still passes unmodified.
+
 Replace the event-routing block in `applyCodexEvent` (`:321-324`):
 
 ```typescript
@@ -671,11 +679,15 @@ Replace the whole `runTurn` body (`:56-158`) with:
 
     try {
       // §D3: load NEVER throws and NEVER returns Mongo error text (breaker
-      // safety — store-owned contract). Deliberately BEFORE the auth check:
-      // degradation ordering is deterministic and manager-level ordering
-      // tests (T4) observe load via runTurn without a credential.
+      // safety — store-owned contract; the .catch is belt-and-braces against
+      // a future non-conforming store impl leaking Mongo text into
+      // RunResult.error). Deliberately BEFORE the auth check: degradation
+      // ordering is deterministic and manager-level ordering tests (T4)
+      // observe load via runTurn without a credential.
       const replayed = historyKey
-        ? await historyKey.store.load(historyKey.agentId, historyKey.threadId, "codex")
+        ? await historyKey.store
+            .load(historyKey.agentId, historyKey.threadId, "codex")
+            .catch((): unknown[] => [])
         : [];
 
       const tokenProvider = createCodexOpenAITokenProvider({
@@ -707,6 +719,10 @@ Replace the whole `runTurn` body (`:56-158`) with:
       let replayedNonEmpty = replayed.length > 0;
       let selfHealed = false;
 
+      // Note `maxTurns: 0` ⇒ maxRounds 0 (`??` passes 0 through) ⇒ immediate
+      // error_max_turns without a POST. Deliberate divergence from the openai
+      // lane, which hands 0 to the SDK — a zero budget honestly means "no
+      // model rounds" here; not normalized.
       const maxRounds = request.resourceLimits?.maxTurns ?? DEFAULT_MAX_ROUNDS;
       let round = 0;
       for (;;) {
@@ -757,6 +773,10 @@ Replace the whole `runTurn` body (`:56-158`) with:
           // replayed non-empty history ⇒ ONE retry with history dropped +
           // clear the doc. 5xx/network keep full breaker weight — no retry,
           // no clear. A non-replay 4xx never retries.
+          // Breadth PINNED (deliberate): ALL 4xx incl. 401/403/429 heal-and-
+          // clear per §D7 — a transient-fault over-clear (expired token, rate
+          // limit) costs one bounded reset + one retry; accepted as the §D7
+          // backstop rather than status-sniffing. T7 pins the 429 case.
           if (
             round === 1 &&
             !selfHealed &&
@@ -769,7 +789,8 @@ Replace the whole `runTurn` body (`:56-158`) with:
               agentId: historyKey.agentId,
               status: response.status,
             });
-            await historyKey.store.clear(historyKey.agentId, historyKey.threadId); // never throws (§D3)
+            // never throws (§D3); .catch = belt-and-braces store-impl guard
+            await historyKey.store.clear(historyKey.agentId, historyKey.threadId).catch(() => {});
             inputItems.length = 0;
             inputItems.push(userItem);
             replayedNonEmpty = false;
@@ -795,7 +816,14 @@ Replace the whole `runTurn` body (`:56-158`) with:
 
         if (this.aborted || abortController.signal.aborted) return abortedResult();
 
-        const calls = state.outputItems.filter(isFunctionCallItem);
+        // Dedupe by call_id: closes the degenerate double-`response.completed`
+        // case (both payloads captured into outputItems) that would otherwise
+        // double-execute the tool and double-append its output item.
+        const seenCallIds = new Set<string>();
+        const calls = state.outputItems.filter(
+          (item): item is FunctionCallItem =>
+            isFunctionCallItem(item) && !seenCallIds.has(item.call_id) && !!seenCallIds.add(item.call_id),
+        );
         if (calls.length === 0) break;
 
         // Sequential by design (spec ⚠: hive's in-process handlers are not
@@ -815,9 +843,12 @@ Replace the whole `runTurn` body (`:56-158`) with:
 
       // §D3 persist policy: success only — error/aborted turns never persist
       // (an errored turn's item may be re-delivered by the retry/outage path;
-      // persisting would duplicate the user message on replay). Fail-soft void.
+      // persisting would duplicate the user message on replay). Fail-soft
+      // void; .catch = belt-and-braces store-impl guard.
       if (historyKey) {
-        await historyKey.store.append(historyKey.agentId, historyKey.threadId, "codex", thisTurnItems);
+        await historyKey.store
+          .append(historyKey.agentId, historyKey.threadId, "codex", thisTurnItems)
+          .catch(() => {});
       }
 
       return this.buildResult({
@@ -1031,7 +1062,7 @@ Plus: empty-inventory turn still posts `tools: []` (keeps the `:143` body shape 
   - [ ] gate-deny (assembly `guardrailGate: async () => ({behavior:"deny", reason:"nope"})`) → the `function_call_output`'s `output` contains the bridge's denial text, loop continues to round 2, turn succeeds
   - [ ] unknown tool name (`callItem("not_a_tool")`) → output `"Tool execution failed (not_a_tool): unknown tool"`, no throw, round 2 proceeds
   - [ ] bad-JSON arguments (`callItem("mcp__fixture__echo", "{nope")`) → output contains `arguments were not valid JSON`, no throw
-  - [ ] `resourceLimits: {maxTurns: 1}` with round-1 emitting a call → `result.error === "error_max_turns"`, exactly one fetch, `classifyTurnResult(result)` → `{outcome:"fault", kind:"non-provider"}` (import from `./error-classification.js`), and a fake `historyStore`'s `append` NOT called
+  - [ ] `resourceLimits: {maxTurns: 1}` with round-1 emitting a call → `result.error === "error_max_turns"`, exactly one fetch, `classifyTurnResult(result)` → `{outcome:"fault", kind:"non-provider"}` (import from `./error-classification.js`), and a fake `historyStore`'s `append` NOT called — **fixture note:** this case (unlike the rest of the loop describe) must construct the adapter WITH the fake store + `agentId` + a `workItemContext` carrying `threadId` (the Task-3 history-fixture trio below), otherwise "append not called" is vacuous — no `historyKey` ⇒ append unreachable regardless
 
 **History replay/persist (adapter half of T3/§D3), with a fake store (`{load: vi.fn(async () => […]), append: vi.fn(async () => {}), clear: vi.fn(async () => {})}` cast as `TurnHistoryStore`) + `agentId: "agent-x"` + `workItemContext` carrying `threadId: "sms:t1"`:**
 
@@ -1058,7 +1089,7 @@ Plus: empty-inventory turn still posts `tools: []` (keeps the `:143` body shape 
 
 - [ ] **Step 3.6: Verify + commit (one commit — the canon surface)**
 
-Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` → exit 0. Boundary checks: `git diff --stat` shows exactly the four files of this task; `git diff -- src/agents/provider-adapters/turn-assembly.ts` shows the set literal + comment hunk only.
+Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` → exit 0. Boundary checks (run BEFORE `git add`, and use `HEAD` so staged-vs-worktree splits can't hide a stray file): `git diff HEAD --stat` shows exactly the four files of this task; `git diff HEAD -- src/agents/provider-adapters/turn-assembly.ts` shows the set literal + comment hunk only.
 
 ```bash
 git add src/agents/provider-adapters/codex-subscription-adapter.ts src/agents/provider-adapters/codex-subscription-adapter.test.ts src/agents/provider-adapters/turn-assembly.ts src/agents/provider-adapters/turn-assembly.test.ts
@@ -1079,6 +1110,7 @@ The §D7 branch is part of Step 3.1's loop (a 4xx before any SSE consumption); t
 
   - [ ] **heal:** `load` → `[staleItem]`; fetchMock call 1 → `new Response("{\"error\":{\"message\":\"invalid encrypted content\"}}", {status: 400})`, call 2 → good SSE → assertions: fetch called twice; second body `input` = `[userItem]` only (history dropped); `store.clear` called exactly once with `("agent-x", "sms:t1")`; result is a SUCCESS (`error` undefined); warn logged
   - [ ] **healed turn persists:** after the heal, `append` called with the fresh turn's items (the §D3 record of the healed turn)
+  - [ ] **accepted-breadth pin (429-with-replay-history → heals + clears):** `load` → `[staleItem]`; call 1 → 429 response, call 2 → good SSE → heal fires exactly as for 400 (`clear` called once, retry `input` = `[userItem]`, success). This pins the DELIBERATE §D7 breadth: all 4xx incl. 401/403/429 heal-and-clear; a transient-fault over-clear (expired token / rate limit) is accepted — one bounded reset, §D7 backstop
   - [ ] **non-replay 4xx never retries:** `load` → `[]`; 400 response → one fetch, error result containing `Codex subscription request failed (400)`, `clear` NOT called
   - [ ] **5xx keeps breaker weight:** `load` → `[staleItem]`; 500 response → one fetch, no retry, no clear; `classifyTurnResult(result)` → `{outcome:"fault", kind:"server-error"}`
   - [ ] **second 4xx after heal:** both fetches 400 → two fetches total, error result (no third attempt — `selfHealed` guard)
@@ -1210,13 +1242,13 @@ Harness: a fake store `makeFakeTurnHistoryStore()` returning `{load: vi.fn(async
 
   - [ ] **codex-branch options pin:** spawn a codex turn → `mockCodexConstructor` called with `expect.objectContaining({ historyStore: fakeStore, agentId: "codex-pilot" })` (and `name` still the display name `"Codex Pilot"`)
   - [ ] **handoff clears (claude→codex):** seed `(threadId, "claude-uuid-1", "claude")`, spawn codex with `sessionProvider: "claude"` → `fakeStore.clear` called exactly once with `("codex-pilot", threadId)`
-  - [ ] **ORDERING pin (the T4 headline — negative-verify leg 4 runs against this):** make `clear` return a manually-deferred promise. Start the spawn WITHOUT awaiting; flush microtasks (`await Promise.resolve()` ×3 or `await vi.waitFor` on `clear` having been called) → assert `mockCodexConstructor` and `mockCodexRunTurn` have NOT been called while `clear` is pending (the adapter — and therefore its `load()`, per the Task-3 adapter-half pin that `load` precedes the first fetch inside `runTurn` — is unreachable until the clear resolves); resolve the deferred; `await` the spawn → turn completes, `mockCodexRunTurn` called
+  - [ ] **ORDERING pin (the T4 headline — negative-verify leg 4 runs against this):** make `clear` return a manually-deferred promise. Start the spawn WITHOUT awaiting; settle via `await vi.waitFor(() => fakeStore.clear.mock.calls.length > 0)` **then a generous microtask flush (`await Promise.resolve()` ×10)** — NOT merely "clear was called", which both the fixed and fire-and-forget variants satisfy immediately (vacuous-pass risk under the mutant) → assert `mockCodexConstructor` and `mockCodexRunTurn` have NOT been called while `clear` is pending (the adapter — and therefore its `load()`, per the Task-3 adapter-half pin that `load` precedes the first fetch inside `runTurn` — is unreachable until the clear resolves); resolve the deferred; `await` the spawn → turn completes, `mockCodexRunTurn` called
   - [ ] **rejected clear swallowed:** `clear` rejecting → spawn resolves normally (no throw), `mockCodexRunTurn` called
   - [ ] **adopt branch doesn't clear:** seed so the post-lock re-read returns the TURN's provider (the `:2418+` ⚠A9 adopt pattern) → `clear` not called
   - [ ] **no store ⇒ no-op:** manager constructed without the 12th arg → handoff spawn completes exactly as before (existing suite behavior), nothing throws
   - [ ] **existing pins unmodified:** the whole pre-existing KPR-313 describe (incl. "sessions row written with `sessionId: ''` provider codex") passes with zero edits
 
-  **Negative-verify leg 4 (mandatory, recorded):** temporarily change the Step-5.3 line to fire-and-forget (`void this.turnHistoryStore.clear(…)`) → the ORDERING pin fails (runTurn reached while clear pending) → restore → green. Record the failing output.
+  **Negative-verify leg 4 (mandatory, recorded):** temporarily change the Step-5.3 line to fire-and-forget (`void this.turnHistoryStore.clear(…)`) → the ORDERING pin fails (runTurn reached while clear pending); in this mutant run, settle on the STRONG signal — `await vi.waitFor(() => mockCodexRunTurn.mock.calls.length > 0)` succeeds while `clear` is still pending — proving the settle window is long enough for the mutant to be caught (non-vacuous) → restore → green. Record the failing output.
 
 - [ ] **Step 5.6: Verify + commit**
 
@@ -1294,7 +1326,7 @@ Expected: exit 0 — typecheck + lint + format + full vitest suite green (incl. 
 - [ ] **Step 7.2: Neutrality by diff** (base: `$(git merge-base kpr-345 HEAD)`; use `origin/kpr-345` if the local branch is absent)
 
   - [ ] `git diff $(git merge-base kpr-345 HEAD)..HEAD -- src/agents/provider-adapters/tool-bridge.ts src/agents/provider-adapters/builtin-executor.ts src/agents/provider-adapters/tool-transport.ts src/agents/provider-adapters/archetype-gate.ts src/agents/provider-adapters/skill-index.ts src/agents/provider-adapters/oauth-credentials.ts src/agents/provider-adapters/error-classification.ts src/agents/provider-adapters/openai-agents-adapter.ts src/agents/provider-adapters/gemini-adk-adapter.ts src/agents/provider-adapters/claude-agent-adapter.ts src/agents/session-store.ts src/agents/prefix-builder.ts src/agents/toolkit-section.ts src/agents/agent-runner.ts` → **empty** (bind-don't-redesign; codex ≡ openai classify sites; Claude lane untouched)
-  - [ ] `git diff … -- src/agents/provider-adapters/types.ts` → **comment-only** (eyeball: every changed line inside the `SESSION_SEMANTICS` doc comment; `grep -n '"stateless-replay"' src/agents/provider-adapters/types.ts` still shows codex)
+  - [ ] `git diff … -- src/agents/provider-adapters/types.ts` → **comment-only**: `git diff … -- src/agents/provider-adapters/types.ts | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -vE '^[+-]\s*\*'` → **zero lines** (every changed line is a ` * ` block-comment line), and `grep -n 'codex: "stateless-replay"' src/agents/provider-adapters/types.ts` still matches exactly one line (the value pin — crisper than grepping the bare string, which also hits the union + gemini lines)
   - [ ] `git diff … -- src/agents/provider-adapters/turn-assembly.ts` → the set literal + its doc comment, nothing else
   - [ ] `git diff … -- src/agents/agent-manager.ts` → exactly the three Task-5 hunks; the guard's compare/adopt logic and `finalizeSpawnResult` show zero changed lines
   - [ ] `git diff … -- src/agents/provider-adapters/openai-agents-adapter.test.ts src/agents/provider-adapters/gemini-adk-adapter.test.ts` → **empty** (gemini pins live and green)
@@ -1310,7 +1342,7 @@ Record the redacted transcript (encrypted content as lengths, no secrets) as a c
 
 - [ ] **Step 7.4: Evidence into the PR description + spike-notes commit**
 
-The four negative-verify records (Steps 2.2, 3.5×2, 5.5 — plus Task 1's inline store leg), the T0 spike verdict table, the live-turn transcript, and the §R note (KPR-350 non-dependency, `types.ts` comment handed back truthful).
+The four negative-verify records (Steps 2.2, 3.5×2, 5.5 — plus Task 1's inline store leg), the T0 spike verdict table, the live-turn transcript, the §R note (KPR-350 non-dependency, `types.ts` comment handed back truthful), and an explicit **§D7 accepted-breadth callout** (all 4xx incl. 401/403/429 heal-and-clear the thread history — deliberate, T7-pinned) so KPR-351's live validation doesn't discover 429-clears-history as a surprise in production.
 
 ```bash
 git add docs/epics/kpr-345/kpr-353-spike-notes.md
@@ -1329,5 +1361,5 @@ git commit -m "KPR-353: post-implementation live evidence — real tool call + r
 6. **`tools` is always present in the request body** (`[]` when the bridge yields nothing) — keeps the wire shape stable, keeps the `:143` existing body assertion green for tool-less agents, and makes the T1 inversion a clean pin.
 7. **The `agentId` adapter option is added rather than reusing `name`** — `name` is the display label (`config.name`, e.g. "Codex Pilot") and feeds bridge logging (openai parity); history keys must be `config.id`. The options doc comments carry the distinction.
 8. **Task 2 lands the SSE groundwork as its own behavior-neutral commit** so the Task-3 flip commit review surface is exactly what the canon names: the tools flip, the loop that justifies it, the set literal, and the inverted pins.
-9. **Store fail-soft mirrors `session-store.ts:71-81`'s `withRetry` idiom** (private `withFallback`) — same logging shape, same "fallback on persistent failure" semantics; the breaker-safety invariant lives in the store (never-throw contract) with a belt-and-braces `.catch(() => {})` at the manager's clear call site per spec T4.
+9. **Store fail-soft mirrors `session-store.ts:71-81`'s `withRetry` idiom** (private `withFallback`) — same logging shape, same "fallback on persistent failure" semantics; the breaker-safety invariant lives in the store (never-throw contract) with belt-and-braces `.catch` mirrors at every consumer call site — the manager's clear (spec T4) and the adapter's three sites (`load`/`append`/heal-`clear`, Step 3.1) — so a future non-conforming store impl can't leak Mongo text into `RunResult.error` either.
 10. **Spike contingency is bounded (Task 0):** observed field-name/header deltas fold into Tasks 2/3 verbatim from the spike notes; wholesale rejection of any leg is a demote-to-spec STOP — the plan never improvises a protocol the spike didn't witness.
