@@ -2583,6 +2583,157 @@ describe("AgentManager", () => {
         expect(prompt).toContain("session continuity was reset"); // no special-casing for reflection (⚠A7)
         expect(sessionStore.get).toHaveBeenCalledTimes(2); // re-resolve + trip re-read (redundant-but-idempotent)
       });
+
+      // KPR-353 (T4): TurnHistoryStore wiring — codex-branch options, the
+      // §D4 handoff-clear, and its AWAITED ordering guarantee.
+      describe("TurnHistoryStore wiring (KPR-353 §D3/§D4)", () => {
+        function makeFakeTurnHistoryStore() {
+          return {
+            load: vi.fn(async () => [] as unknown[]),
+            append: vi.fn(async () => {}),
+            clear: vi.fn(async () => {}),
+            init: vi.fn(async () => {}),
+          };
+        }
+
+        // Local manager with the store wired as the 12th ctor arg (positions
+        // 6–11 undefined, mirroring the 5-arg construction in beforeEach).
+        function makeManagerWithStore(fakeStore: ReturnType<typeof makeFakeTurnHistoryStore>) {
+          return new AgentManager(
+            registry as any,
+            memoryManager as any,
+            sessionStore as any,
+            undefined as any,
+            turnTelemetryStore as any,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            fakeStore as any,
+          );
+        }
+
+        function registerCodexPilot() {
+          registry._agents.set(
+            "codex-pilot",
+            makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+          );
+        }
+
+        it("codex-branch options: adapter constructed with historyStore + agentId (store key = config.id), name stays the display label", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+
+          await mgr.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr353-opts" }));
+
+          expect(mockCodexConstructor).toHaveBeenCalledWith(
+            expect.objectContaining({ historyStore: fakeStore, agentId: "codex-pilot", name: "Codex Pilot" }),
+          );
+        });
+
+        it("handoff (claude→codex) clears exactly once with (agentId, threadId)", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-handoff";
+          seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+
+          expect(fakeStore.clear).toHaveBeenCalledTimes(1);
+          expect(fakeStore.clear).toHaveBeenCalledWith("codex-pilot", threadId);
+        });
+
+        it("ORDERING pin: the clear is AWAITED — the codex adapter (and its load) is unreachable until clear resolves", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-order";
+          seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+
+          // Manually-deferred clear: the guard's `await …clear()` parks here.
+          let resolveClear!: () => void;
+          const deferred = new Promise<void>((res) => {
+            resolveClear = res;
+          });
+          fakeStore.clear.mockReturnValueOnce(deferred as any);
+
+          // Start WITHOUT awaiting.
+          const spawnP = mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+
+          // Settle: wait until the guard has actually called clear, THEN flush a
+          // generous run of microtasks. A vacuous "clear was called" assertion
+          // passes under BOTH the awaited and the fire-and-forget variants — the
+          // microtask flush is what lets the mutant race past the parked clear
+          // and reach the adapter, so the pin below can catch it.
+          await vi.waitFor(() => expect(fakeStore.clear.mock.calls.length).toBeGreaterThan(0));
+          for (let i = 0; i < 10; i++) await Promise.resolve();
+
+          // The adapter — and therefore its load() — is unreachable while clear
+          // is pending. An awaited clear orders the Mongo delete ahead of the
+          // read; fire-and-forget would let this turn replay the stale doc.
+          expect(mockCodexConstructor).not.toHaveBeenCalled();
+          expect(mockCodexRunTurn).not.toHaveBeenCalled();
+
+          // Release the clear → the turn proceeds to the adapter and completes.
+          resolveClear();
+          await spawnP;
+          expect(mockCodexRunTurn).toHaveBeenCalled();
+        });
+
+        it("rejected clear is swallowed: the turn proceeds and completes normally", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-reject";
+          seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+          fakeStore.clear.mockRejectedValueOnce(new Error("mongo down"));
+
+          const result = await mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+
+          expect(result.errors).toEqual([]);
+          expect(mockCodexRunTurn).toHaveBeenCalled();
+        });
+
+        it("adopt branch does NOT clear (predecessor's own guard trip already cleared)", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-adopt";
+          // Post-lock re-read returns the TURN's provider (codex) — the ⚠A9
+          // adopt path — while the captured tag is a stale "claude".
+          seed(threadId, "", "codex", "codex-pilot");
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: undefined, sessionProvider: "claude" }),
+          );
+
+          expect(fakeStore.clear).not.toHaveBeenCalled();
+        });
+
+        it("no store ⇒ handoff hook no-ops: the turn completes exactly as before, nothing throws", async () => {
+          // `manager` (beforeEach) is constructed WITHOUT the 12th arg.
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-nostore";
+          seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+
+          const result = await manager.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+
+          expect(result.errors).toEqual([]);
+          expect(mockCodexRunTurn).toHaveBeenCalled();
+        });
+      });
     });
   });
 
@@ -2721,6 +2872,10 @@ describe("AgentManager", () => {
           memory: {},
           skillIndex: [],
         }),
+        // KPR-353 (§D3): store wiring. This `manager` (beforeEach) carries no
+        // TurnHistoryStore ⇒ historyStore is undefined; agentId is the store key.
+        historyStore: undefined,
+        agentId: "codex-pilot",
       });
       expect(mockCodexRunTurn).toHaveBeenCalledWith(expect.objectContaining({
         prompt: "hello codex",

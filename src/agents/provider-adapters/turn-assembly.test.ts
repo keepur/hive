@@ -104,8 +104,8 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     expect(assembly.sessionCwd).toBe("/tmp/kpr348-planted-cwd");
   });
 
-  it("KPR-349 §D3: TOOL_EXECUTING_PROVIDERS is exactly {openai} (352/353 grow it with their adapter flip)", () => {
-    expect(TOOL_EXECUTING_PROVIDERS).toEqual(new Set(["openai"]));
+  it("KPR-353 §D1: TOOL_EXECUTING_PROVIDERS is exactly {openai, codex} (352 grows it with the gemini flip)", () => {
+    expect(TOOL_EXECUTING_PROVIDERS).toEqual(new Set(["openai", "codex"]));
   });
 
   it("KPR-349 §D3: toolsExecutable false for gemini (pre-352)", async () => {
@@ -116,11 +116,11 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     );
   });
 
-  it("KPR-349 §D3: toolsExecutable false for codex (pre-353)", async () => {
+  it("KPR-353 §D1: toolsExecutable TRUE for codex (flip commit — same commit as the adapter's tools flip)", async () => {
     const runner = makeRunner([makeEntry()]);
     await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "codex" });
     expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith(
-      expect.objectContaining({ toolsExecutable: false }),
+      expect.objectContaining({ toolsExecutable: true }),
     );
   });
 
