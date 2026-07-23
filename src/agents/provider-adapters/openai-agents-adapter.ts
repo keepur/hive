@@ -72,6 +72,14 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
         name: this.options.name,
         instructions: request.systemPromptOverride ?? this.options.assembly.instructions,
         model: this.options.model,
+        // KPR-350 (§D2): chaining posture pinned, not defaulted. store:true is
+        // the previous_response_id prerequisite (the codex surface hard-
+        // enforces the opposite — the default-flip precedent is live);
+        // truncation:"auto" is the Lane B compaction analog (server-side
+        // context reconstruction on a long thread degrades by truncation
+        // instead of 400). Nested KPR-354 delegate constructions share this
+        // path deliberately (unreferenced 30d-self-expiring residue only).
+        modelSettings: { store: true, truncation: "auto" },
         ...(tools.length > 0 ? { tools } : {}),
       });
 

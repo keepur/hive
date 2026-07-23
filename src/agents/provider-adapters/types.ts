@@ -23,11 +23,18 @@ export type LaneBProviderId = "openai" | "gemini" | "codex";
  *
  *  - "server-resumable":   provider holds session state; the returned
  *                          sessionId is a real server handle (openai
- *                          previousResponseId chaining today — server
- *                          retention 30d > store TTL 7d).
+ *                          previous_response_id chaining — KPR-350 §D1 ruling;
+ *                          server retention 30d > store TTL 7d; stale handles
+ *                          self-heal, §D3).
  *  - "conversation-store": provider-side durable conversation object; the
- *                          persisted ref is a conversation id (KPR-350's
- *                          OpenAI Conversations candidate; unoccupied today).
+ *                          persisted ref would be a conversation id.
+ *                          UNOCCUPIED BY RULING (KPR-350 §D1): chaining won
+ *                          for openai — hive's 7d sessions TTL makes >30d
+ *                          durability unreachable, and Conversations adds a
+ *                          create-lifecycle + org-affinity hazard + indefinite
+ *                          vendor-side residue. Category retained for a
+ *                          hypothetical future provider whose only durable
+ *                          layer is a conversation object.
  *  - "client-transcript":  session id is persisted and resume works via
  *                          client-side transcript replay (Claude CLI today —
  *                          KPR-310-verified stable ids; Lane A passthrough

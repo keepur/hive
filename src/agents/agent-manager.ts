@@ -280,6 +280,23 @@ function isAuthRebuildResumeError(reason: string): boolean {
 }
 
 /**
+ * KPR-350 (§D3): stale server-handle sentinel for server-resumable routes.
+ * Matches the Responses previous-response-gone surface ("Previous response
+ * with id 'resp_…' not found", 404/400-shaped, incl. the previous_response_id
+ * param variant). Deliberately NARROW — bounded gaps, anchored on the
+ * "previous response(_id)" prefix — because a false positive silently drops
+ * one turn's context (the self-heal retries fresh). Docs/community-sourced;
+ * refined against KPR-351's live capture (L2) if the production string
+ * differs. Exported for the narrowness-matrix unit pins.
+ */
+export function isStaleServerHandleError(reason: string): boolean {
+  return (
+    /previous response[\s\S]{0,80}?(not found|expired|no longer (?:exists|available))/i.test(reason) ||
+    /previous_response_id[\s\S]{0,80}?(not found|invalid|expired)/i.test(reason)
+  );
+}
+
+/**
  * KPR-220 Phase 2: thrown by `withSpawnTicket` when the agent is in
  * `stoppedAgents` at any of three checkpoints (pre-wait, mid-wait,
  * post-lock). Caller decides whether to swallow (reflection) or surface
@@ -951,6 +968,40 @@ export class AgentManager {
             agentId: effectiveCtx.agentId,
             threadId: effectiveCtx.threadId,
             reason: finalResult.error,
+          });
+          finalResult = await this.runOneSpawnAttempt(
+            { ...effectiveCtx, sessionId: undefined },
+            shaping,
+            ticket,
+            onStream,
+          );
+        } else if (
+          // KPR-350 (§D3): stale server-handle self-heal. The store held a
+          // handle the server no longer honors (30d expiry edge, deletion,
+          // org rotation) — without this arm the thread errors identically
+          // every turn until the row TTLs out (up to 7 days). One fresh
+          // retry; a successful retry overwrites the row via the normal
+          // finalizeSpawnResult path (no explicit scrub — the write path
+          // self-corrects); a failed retry surfaces normally and the
+          // churn-mint rider keeps the stale handle for the next turn's
+          // re-trip (bounded waste: one extra attempt per turn, never a dead
+          // thread). SEMANTICS gate, not provider gate — the KPR-347 seam:
+          // dead for client-transcript (their resume errors mean other
+          // things) and stateless-replay (no handle exists to be stale).
+          // `else if` ⇒ at most one retry per turn, and record-once is
+          // untouched: only the finalized attempt reaches the breaker.
+          finalResult.error &&
+          isStaleServerHandleError(finalResult.error) &&
+          effectiveCtx.sessionId &&
+          sessionSemanticsFor(shaping.route.provider) === "server-resumable"
+        ) {
+          // Deliberately NOT logging the error string: the provider's stale-
+          // handle message embeds the resp_ handle value (log-redaction
+          // posture — spec §D3 "no handle value").
+          log.warn("spawnTurn stale-server-handle — retrying without resume (KPR-350)", {
+            agentId: effectiveCtx.agentId,
+            threadId: effectiveCtx.threadId,
+            provider: shaping.route.provider,
           });
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: undefined },
