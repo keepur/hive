@@ -2428,6 +2428,28 @@ describe("AgentManager", () => {
         expect(req.prompt).not.toContain("conversation_search");
       });
 
+      it("KPR-350 §D4: claude→openai handoff — fresh session, annotation, first turn persists the openai handle", async () => {
+        // openai→claude direction (:2371-2388) and the openai write-side persist
+        // pin (:2492-2500) already exist; this pins the missing claude→openai
+        // direction: guard strips the claude id, the annotation fires, and the
+        // first openai turn persists its lastResponseId under the openai tag.
+        registry._agents.set(
+          "openai-pilot",
+          makeAgentConfig({ id: "openai-pilot", name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        const threadId = "sms:line-1:kpr350-c2o";
+        seed(threadId, "claude-uuid-1", "claude", "openai-pilot");
+        await manager.spawnTurn(
+          smsCtx({ agentId: "openai-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+        );
+        const req = mockOpenAIRunTurn.mock.calls[0]![0];
+        expect(req.sessionId).toBeUndefined(); // guard stripped the claude id
+        expect(req.prompt).toContain("session continuity was reset"); // §3.4 annotation
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "openai-pilot", threadId, "openai-session", "openai", expect.anything(),
+        ); // first openai turn persists the first lastResponseId
+      });
+
       it("⚠A9 re-resolve-on-trip: queued same-thread turn ADOPTS the predecessor's switched session instead of double-dropping", async () => {
         const threadId = "sms:line-1:kpr313-race";
         seed(threadId, "resp_stale", "openai");
@@ -4116,6 +4138,16 @@ describe("AgentManager", () => {
           makeRunResult({ text: "Delegate turn failed (google): 500 Internal Server Error" }),
         ),
       ).toEqual({ outcome: "success" });
+    });
+
+    it("KPR-350 §D5: nested delegate turn is session-less — no sessionId in, no persist out", async () => {
+      const runner = await setupOpenAIParent();
+      const setsBefore = sessionStore.set.mock.calls.length;
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ text: "out", sessionId: "resp-nested-discard" }));
+      await call(runner);
+      const nestedReq = mockOpenAIRunTurn.mock.calls.at(-1)![0];
+      expect(nestedReq.sessionId).toBeUndefined(); // ⇒ previousResponseId undefined on the nested run
+      expect(sessionStore.set.mock.calls.length).toBe(setsBefore); // result id discarded, store untouched
     });
   });
 });
