@@ -60,6 +60,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
       agentId: this.options.name,
       sessionCwd: this.options.assembly.sessionCwd,
       skillIndex: this.options.assembly.skillIndex,
+      delegateRunner: this.options.assembly.delegateTurnRunner, // KPR-354 (§D3)
     });
 
     try {

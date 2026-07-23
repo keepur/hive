@@ -169,6 +169,27 @@ function makeExternalEntry(name: string): HiveToolInventoryEntry {
   };
 }
 
+/** KPR-354: a claude-subagent inventory entry (Task-synthesis input). */
+function makeSubagentEntry(name: string, description?: string): HiveToolInventoryEntry {
+  return {
+    name,
+    transport: "claude-subagent",
+    source: "delegate",
+    requiresTurnContext: false,
+    requiresHiveRuntime: false,
+    inProcess: false,
+    compatibility: {
+      claude: "direct",
+      openai: "requires-hive-bridge",
+      gemini: "requires-hive-bridge",
+      codex: "requires-hive-bridge",
+    },
+    schemas: { kind: "unavailable" },
+    serverConfig: { type: "stdio", command: "x" } as never,
+    description,
+  };
+}
+
 /**
  * Drive the mocked non-streaming run: find the named tool on the agent, await
  * its execute(input), and fold the result into finalOutput.
@@ -478,6 +499,26 @@ describe("OpenAIAgentsAdapter — KPR-348 T7 (bridge integration)", () => {
     expect(result.toolCalls).toBe(1);
     expect(result.toolMs).toBeGreaterThan(0);
     expect(result.toolSummary).toBe("mcp__fixture__echo×1");
+  });
+
+  it("KPR-354: subagent entry + delegateTurnRunner ⇒ Agent gets a Task tool that reaches the runner", async () => {
+    const runner = vi.fn(async () => "delegate result");
+    driveNonStreaming("Task", { description: "do", prompt: "do it", subagent_type: "google" });
+
+    const result = await makeAdapter({
+      assembly: makeAssembly({
+        toolInventory: [makeSubagentEntry("google", "Google MCP")],
+        delegateTurnRunner: runner,
+      }),
+    }).runTurn({ prompt: "delegate please" });
+
+    const agentOptions = AgentMock.mock.calls[0]![0] as { tools?: Array<{ name: string }> };
+    expect(agentOptions.tools?.map((t) => t.name)).toEqual(["Task"]);
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(runner).toHaveBeenCalledWith(
+      expect.objectContaining({ delegate: "google", prompt: "do it" }),
+    );
+    expect(result.text).toContain("delegate result");
   });
 
   it("builtin Read entry executes through the executor and returns cat -n text", async () => {

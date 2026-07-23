@@ -9,6 +9,7 @@ import { ToolBridge, normalizeSchema, shapeCallToolResult } from "./tool-bridge.
 import type { ToolBridgeOptions } from "./tool-bridge.js";
 import { BUILTIN_TOOL_DEFINITIONS } from "./builtin-executor.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
+import { classifyToolTransport } from "./tool-transport.js";
 import type { ProviderSkillIndexEntry } from "./turn-assembly.js";
 // KPR-349 T5/T6: real round-trips through production code paths.
 import { AgentRunner } from "../agent-runner.js";
@@ -812,5 +813,252 @@ describe("KPR-349 T6 — load_skill end-to-end", () => {
     const tools = await bridge.connect();
     expect(tools.find((t) => t.name === "load_skill")).toBeUndefined();
     await bridge.close();
+  });
+});
+
+// --- KPR-354 T3: Task synthesis in the bridge (§D3) ------------------------
+// A single Claude-lane-identical Task function tool is synthesized from the
+// claude-subagent inventory entries, routed through wrap() (gate/abort/
+// containment/metering free), enum-restricted to the active delegate names,
+// and cap-pinned alongside the six builtins + load_skill. Present only when a
+// delegateRunner is supplied AND at least one subagent entry exists — else
+// fail-dark (no Task tool).
+
+describe("KPR-354 T3 — Task synthesis (§D3)", () => {
+  function makeSubagentEntry(name: string, description?: string): HiveToolInventoryEntry {
+    return {
+      ...classifyToolTransport({ name, transport: "claude-subagent", source: "delegate" }),
+      schemas: { kind: "unavailable" },
+      serverConfig: { type: "stdio", command: "x" } as never,
+      description,
+    };
+  }
+
+  const workItemContext = {
+    adapterId: "test",
+    channelId: "C1",
+    channelKind: "slack",
+    channelLabel: "#test",
+    threadId: "T1",
+    slackTs: "",
+    slackThreadTs: "",
+  };
+
+  it("entries + runner → exactly one Task tool with the Step-3.1 enum schema", async () => {
+    const runner = vi.fn(async () => "delegate says hi");
+    const bridge = makeBridge({
+      inventory: [makeSubagentEntry("google", "Google MCP"), makeSubagentEntry("resend", "Resend MCP")],
+      delegateRunner: runner,
+    });
+    const tools = await bridge.connect();
+    const taskTools = tools.filter((t) => t.name === "Task");
+    expect(taskTools).toHaveLength(1);
+    expect(taskTools[0].inputSchema).toEqual({
+      type: "object",
+      properties: {
+        description: { type: "string", description: "A short (3-5 word) summary of the task" },
+        prompt: { type: "string", description: "The task for the delegate to perform" },
+        subagent_type: {
+          type: "string",
+          enum: ["google", "resend"], // insertion order
+          description: "The delegate to use (see the list in the tool description)",
+        },
+      },
+      required: ["description", "prompt", "subagent_type"],
+      additionalProperties: false,
+    });
+    await bridge.close();
+  });
+
+  it("description carries one line per delegate, falling back to the name", async () => {
+    const runner = vi.fn(async () => "ok");
+    const bridge = makeBridge({
+      inventory: [makeSubagentEntry("google", "Google MCP"), makeSubagentEntry("resend")],
+      delegateRunner: runner,
+    });
+    const tools = await bridge.connect();
+    const task = tools.find((t) => t.name === "Task")!;
+    expect(task.description).toContain("- google — Google MCP");
+    expect(task.description).toContain("- resend — resend"); // name fallback
+    await bridge.close();
+  });
+
+  it("entries WITHOUT runner → no Task tool (fail-dark)", async () => {
+    const bridge = makeBridge({ inventory: [makeSubagentEntry("google", "Google MCP")] });
+    const tools = await bridge.connect();
+    expect(tools.find((t) => t.name === "Task")).toBeUndefined();
+    await bridge.close();
+  });
+
+  it("runner WITHOUT entries → no Task tool", async () => {
+    const runner = vi.fn(async () => "ok");
+    const bridge = makeBridge({ inventory: [], delegateRunner: runner });
+    const tools = await bridge.connect();
+    expect(tools.find((t) => t.name === "Task")).toBeUndefined();
+    await bridge.close();
+  });
+
+  it("no MCP connection for delegate entries — subagent-only inventory yields only Task, zero omissions", async () => {
+    const runner = vi.fn(async () => "ok");
+    const bridge = makeBridge({
+      inventory: [makeSubagentEntry("google", "Google MCP"), makeSubagentEntry("resend", "Resend MCP")],
+      delegateRunner: runner,
+    });
+    const tools = await bridge.connect();
+    expect(tools.map((t) => t.name)).toEqual(["Task"]);
+    expect(bridge.runtimeOmissions).toHaveLength(0);
+    await bridge.close();
+  });
+
+  it("valid args → runner called once with the full DelegateTurnCall; resolves its text", async () => {
+    const runner = vi.fn(async () => "delegate says hi");
+    const entry = makeSubagentEntry("google", "Google MCP");
+    const controller = new AbortController();
+    const bridge = makeBridge({
+      inventory: [entry, makeSubagentEntry("resend", "Resend MCP")],
+      delegateRunner: runner,
+      signal: controller.signal,
+      workItemContext,
+    });
+    const tools = await bridge.connect();
+    const task = tools.find((t) => t.name === "Task")!;
+    const out = await task.execute({ description: "do", prompt: "do it", subagent_type: "google" });
+    expect(out).toBe("delegate says hi");
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(runner).toHaveBeenCalledWith({
+      delegate: "google",
+      prompt: "do it",
+      entry,
+      signal: controller.signal,
+      workItemContext,
+    });
+    await bridge.close();
+  });
+
+  it("unknown subagent_type → contained error, runner NOT called", async () => {
+    const runner = vi.fn(async () => "ok");
+    const bridge = makeBridge({
+      inventory: [makeSubagentEntry("google", "Google MCP"), makeSubagentEntry("resend", "Resend MCP")],
+      delegateRunner: runner,
+    });
+    const tools = await bridge.connect();
+    const task = tools.find((t) => t.name === "Task")!;
+    await expect(
+      task.execute({ description: "do", prompt: "do it", subagent_type: "nope" }),
+    ).resolves.toBe("Task failed: unknown subagent_type 'nope'. Valid: google, resend");
+    expect(runner).not.toHaveBeenCalled();
+    await bridge.close();
+  });
+
+  it("empty / non-string prompt → contained error, runner NOT called", async () => {
+    const runner = vi.fn(async () => "ok");
+    const bridge = makeBridge({
+      inventory: [makeSubagentEntry("google", "Google MCP")],
+      delegateRunner: runner,
+    });
+    const tools = await bridge.connect();
+    const task = tools.find((t) => t.name === "Task")!;
+    await expect(
+      task.execute({ description: "do", prompt: "", subagent_type: "google" }),
+    ).resolves.toBe("Task failed: 'prompt' must be a non-empty string");
+    await expect(
+      task.execute({ description: "do", prompt: 42, subagent_type: "google" }),
+    ).resolves.toBe("Task failed: 'prompt' must be a non-empty string");
+    expect(runner).not.toHaveBeenCalled();
+    await bridge.close();
+  });
+
+  it("gate deny → policy text, runner NOT called (wrap() order pin)", async () => {
+    const runner = vi.fn(async () => "ok");
+    const bridge = makeBridge({
+      inventory: [makeSubagentEntry("google", "Google MCP")],
+      delegateRunner: runner,
+      gate: async () => ({ behavior: "deny", reason: "no-task" }),
+    });
+    const tools = await bridge.connect();
+    const task = tools.find((t) => t.name === "Task")!;
+    await expect(
+      task.execute({ description: "do", prompt: "do it", subagent_type: "google" }),
+    ).resolves.toBe("Tool call denied by policy: no-task");
+    expect(runner).not.toHaveBeenCalled();
+    await bridge.close();
+  });
+
+  it("pre-aborted signal → aborted text, runner NOT called", async () => {
+    const runner = vi.fn(async () => "ok");
+    const controller = new AbortController();
+    controller.abort();
+    const bridge = makeBridge({
+      inventory: [makeSubagentEntry("google", "Google MCP")],
+      delegateRunner: runner,
+      signal: controller.signal,
+    });
+    const tools = await bridge.connect();
+    const task = tools.find((t) => t.name === "Task")!;
+    await expect(
+      task.execute({ description: "do", prompt: "do it", subagent_type: "google" }),
+    ).resolves.toBe("Tool execution aborted (Task).");
+    expect(runner).not.toHaveBeenCalled();
+    await bridge.close();
+  });
+
+  it("runner rejecting (contract violation) → wrap() containment prefix", async () => {
+    const runner = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    const bridge = makeBridge({
+      inventory: [makeSubagentEntry("google", "Google MCP")],
+      delegateRunner: runner,
+    });
+    const tools = await bridge.connect();
+    const task = tools.find((t) => t.name === "Task")!;
+    await expect(
+      task.execute({ description: "do", prompt: "do it", subagent_type: "google" }),
+    ).resolves.toBe("Tool execution failed (Task): boom");
+    await bridge.close();
+  });
+
+  it("cap pin: 130 MCP + 6 builtins + load_skill + Task → Task survives, Tier-1 tail dropped", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kpr354-t3-cap-"));
+    const skillPath = join(dir, "SKILL.md");
+    writeFileSync(skillPath, "# fixture\nbody");
+    try {
+      const many = Array.from({ length: 130 }, (_, i) => ({ name: `t${i}`, inputSchema: {} }));
+      setBehavior("big", { listTools: async () => many });
+      const runner = vi.fn(async () => "ok");
+      const bridge = makeBridge({
+        inventory: [
+          makeEntry({ name: "big", transport: "stdio" }),
+          makeEntry({
+            name: "builtins",
+            transport: "claude-builtin",
+            serverConfig: undefined,
+            schemas: { kind: "static", tools: BUILTIN_TOOL_DEFINITIONS },
+          }),
+          makeSubagentEntry("google", "Google MCP"),
+        ],
+        skillIndex: [{ name: "fixture-skill", description: "A fixture", path: skillPath }],
+        delegateRunner: runner,
+      });
+      const tools = await bridge.connect();
+      const names = tools.map((t) => t.name);
+
+      expect(tools).toHaveLength(128);
+      // All 8 Tier-0 pins survived.
+      for (const b of ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]) expect(names).toContain(b);
+      expect(names).toContain("load_skill");
+      expect(names).toContain("Task");
+
+      // 8 pins + 120 Tier-1 survivors = 128; last 10 MCP tools dropped.
+      for (const d of Array.from({ length: 10 }, (_, i) => `mcp__big__t${120 + i}`)) {
+        expect(names).not.toContain(d);
+      }
+      expect(names).toContain("mcp__big__t119");
+      const capped = bridge.runtimeOmissions.filter((o) => o.reason === "provider-tool-cap");
+      expect(capped).toHaveLength(10);
+      await bridge.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
