@@ -369,7 +369,7 @@ describe("buildProviderToolkitSection (KPR-349 §D4)", () => {
         requiresHiveRuntime: false,
       }),
       ...builtinEntries,
-      // Partition-leak simulations — both must render nothing.
+      // Unavailable-schema builtin — partition belt-and-suspenders, still skipped.
       invEntry({
         name: "WebFetch",
         transport: "claude-builtin",
@@ -378,6 +378,17 @@ describe("buildProviderToolkitSection (KPR-349 §D4)", () => {
         requiresHiveRuntime: false,
         schemas: { kind: "unavailable" },
       }),
+      // KPR-354 §D6: claude-subagent entries now render as delegates.
+      // Catalog-known name → catalog blurb.
+      invEntry({
+        name: "clickup",
+        transport: "claude-subagent",
+        source: "delegate",
+        inProcess: false,
+        requiresHiveRuntime: false,
+        schemas: { kind: "unavailable" },
+      }),
+      // Unknown name → name-as-description fallback.
       invEntry({
         name: "__subagent__",
         transport: "claude-subagent",
@@ -406,10 +417,17 @@ describe("buildProviderToolkitSection (KPR-349 §D4)", () => {
     expect(out).toContain("- Grep — search file contents");
   });
 
-  it("skips unavailable-schema builtins and claude-subagent entries", () => {
+  it("skips unavailable-schema builtins but renders claude-subagent entries as delegates", () => {
     const out = buildProviderToolkitSection({ toolInventory: richInventory(), plugins: [goldenPlugin] });
+    // Unavailable-schema builtin still skipped (unchanged half).
     expect(out).not.toContain("WebFetch");
-    expect(out).not.toContain("__subagent__");
+    // claude-subagent entries now render the delegates subsection (KPR-354 §D6).
+    expect(out).toContain("### Delegated capability MCPs (via the Task tool)");
+    const delPart = out.split("### Delegated capability MCPs")[1]!;
+    // Catalog-known name → catalog blurb.
+    expect(delPart).toContain("- clickup — Task management — tasks, lists, spaces, comments, custom fields");
+    // Unknown name → name-as-description fallback.
+    expect(delPart).toContain("- __subagent__ — __subagent__");
   });
 
   it("groups MCP entries: engine → Engine-provided, core/plugin → Capability", () => {
@@ -423,10 +441,30 @@ describe("buildProviderToolkitSection (KPR-349 §D4)", () => {
     expect(capPart).toContain("- golden-plugin-server — Golden plugin capability");
   });
 
-  it("omits the Delegated subsection and the deferred-loading hint", () => {
-    const out = buildProviderToolkitSection({ toolInventory: richInventory(), plugins: [goldenPlugin] });
+  it("no claude-subagent entries → no delegates section (byte-identical) + no deferred hint", () => {
+    const noSubagent = richInventory().filter((e) => e.transport !== "claude-subagent");
+    const out = buildProviderToolkitSection({ toolInventory: noSubagent, plugins: [goldenPlugin] });
     expect(out).not.toContain("### Delegated capability MCPs");
+    // Deferred-loading hint is Claude-CLI-only — never in the Lane B section.
     expect(out).not.toContain("Some tool schemas load on demand");
+    // Full-string pin: delegates-free output is byte-identical to pre-KPR-354.
+    expect(out).toBe(
+      "## Your toolkit\n\n" +
+        "You have access to the following tools this session. Try them; don't guess at availability.\n\n" +
+        "### Built-in (always available)\n" +
+        "- Bash — run shell commands\n" +
+        "- Read — read files\n" +
+        "- Write — write files\n" +
+        "- Edit — edit files (exact string replacement)\n" +
+        "- Glob — find files by pattern\n" +
+        "- Grep — search file contents\n\n" +
+        "### Engine-provided (always available to every agent)\n" +
+        "- slack — Slack channels, messages, and threads\n\n" +
+        "### Capability MCPs (provisioned for your role)\n" +
+        "- contacts — Contact lookups by name, email, or phone\n" +
+        "- keychain — Read secrets from macOS Keychain\n" +
+        "- golden-plugin-server — Golden plugin capability",
+    );
   });
 
   it("empty inventory → header only, no subsections", () => {
