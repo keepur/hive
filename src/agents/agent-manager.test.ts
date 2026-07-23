@@ -57,10 +57,20 @@ vi.mock("../config.js", () => ({
     openai: { agentModel: "" },
     codex: { agentModel: "gpt-5.4-mini" },
     gemini: { agentModel: "" },
+    // KPR-346: Lane A passthrough model overrides + instance id consumed by
+    // createProviderAdapter's resolvePassthroughSpawn call.
+    kimi: { agentModel: "" },
+    deepseek: { agentModel: "" },
+    instance: { id: "test-instance" },
     modelRouter: { enabled: false },
     memory: { reflectionMinTurns: 3 },
   },
 }));
+
+// KPR-346: the Lane A credential chain is env → Keychain. Stub the Keychain
+// leg so no real `security` subprocess ever runs; env (KIMI_API_KEY /
+// DEEPSEEK_API_KEY, set per-test) is the only live source in the suite.
+vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: vi.fn(() => "") }));
 
 // Mock plugin loader
 vi.mock("../plugins/plugin-loader.js", () => ({
@@ -171,7 +181,7 @@ vi.mock("../search/conversation-index.js", () => ({
 
 import { AgentManager, type TurnContext } from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
-import type { RunResult } from "./agent-runner.js";
+import { AgentRunner, type RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./provider-circuit-breaker.js";
 import type { WorkItem } from "../types/work-item.js";
@@ -2733,6 +2743,237 @@ describe("AgentManager", () => {
           expect(result.errors).toEqual([]);
           expect(mockCodexRunTurn).toHaveBeenCalled();
         });
+      });
+    });
+
+    describe("Lane A passthrough (KPR-346)", () => {
+      function seed(threadId: string, sessionId: string, provider: string, agentId: string) {
+        sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      }
+
+      // The last AgentRunner construction's options bag (11th ctor arg).
+      function lastRunnerOptions() {
+        const call = vi.mocked(AgentRunner).mock.calls.at(-1)!;
+        return call[10];
+      }
+
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        // Env is the only live credential source (Keychain leg stubbed to "").
+        process.env.KIMI_API_KEY = "test-kimi-key";
+        process.env.DEEPSEEK_API_KEY = "test-dseek-key";
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3", coreServers: [] }),
+        );
+        registry._agents.set(
+          "agent-dseek",
+          makeAgentConfig({ id: "agent-dseek", name: "AgentDseek", model: "deepseek/deepseek-v4-pro", coreServers: [] }),
+        );
+      });
+
+      afterEach(() => {
+        delete process.env.KIMI_API_KEY;
+        delete process.env.DEEPSEEK_API_KEY;
+      });
+
+      // --- T1: routing ------------------------------------------------------
+      it("T1: providerFor maps kimi/deepseek prefixes; unknown prefix and slashless fall to claude", () => {
+        expect(manager.providerFor("agent-kimi")).toBe("kimi");
+        expect(manager.providerFor("agent-dseek")).toBe("deepseek");
+
+        registry._agents.set(
+          "agent-mystery",
+          makeAgentConfig({ id: "agent-mystery", name: "AgentMystery", model: "mystery/m" }),
+        );
+        expect(manager.providerFor("agent-mystery")).toBe("claude"); // unknown prefix → claude (KPR-231)
+
+        registry._agents.set(
+          "agent-slashless",
+          makeAgentConfig({ id: "agent-slashless", name: "AgentSlashless", model: "kimi" }),
+        );
+        expect(manager.providerFor("agent-slashless")).toBe("claude"); // no slash → claude (documented)
+      });
+
+      // --- T3: adapter selection -------------------------------------------
+      it("T3: kimi turn constructs AgentRunner with the laneAPassthrough bag and runs the Claude adapter — no Lane B", async () => {
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-adapter" }));
+
+        expect(lastRunnerOptions()).toEqual({
+          laneAPassthrough: expect.objectContaining({
+            provider: "kimi",
+            model: "kimi-k3",
+            baseUrl: "https://api.moonshot.ai/anthropic",
+            authToken: "test-kimi-key",
+          }),
+        });
+        expect(mockRunnerSend).toHaveBeenCalled();
+        // Lane B adapters + assembly never entered.
+        expect(mockCodexConstructor).not.toHaveBeenCalled();
+        expect(mockOpenAIConstructor).not.toHaveBeenCalled();
+        expect(mockGeminiConstructor).not.toHaveBeenCalled();
+        const kimiRunner = vi.mocked(AgentRunner).mock.results.at(-1)!.value as { buildProviderPrompt: ReturnType<typeof vi.fn> };
+        expect(kimiRunner.buildProviderPrompt).not.toHaveBeenCalled();
+      });
+
+      // --- T3: model chain -------------------------------------------------
+      it("T3: model chain — empty route model falls to the table default", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-default" }));
+        expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("kimi-k3");
+      });
+
+      // --- T1: routing — `:effort`-only suffix passes through as a bad model id
+      // `splitProviderModel(":high")` hits the `colon <= 0` guard: model stays
+      // `":high"` (NON-empty, so no default-chain fallback) and no effort is
+      // extracted. The foreign endpoint receives `":high"` as a model id → 4xx
+      // bad-model config fault (breaker-safe), identical to `codex/:high`.
+      it("T1: `:effort`-only suffix (kimi/:high) → model ':high', no effort", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/:high", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-only" }));
+        expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe(":high");
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBeUndefined();
+      });
+
+      it("T3: model chain — configured agentModel wins over the table default", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/", coreServers: [] }),
+        );
+        (appConfig as any).kimi.agentModel = "kimi-k2.6";
+        try {
+          await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-configmodel" }));
+          expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("kimi-k2.6");
+        } finally {
+          (appConfig as any).kimi.agentModel = "";
+        }
+      });
+
+      // --- T3: credential fault, breaker-invisible -------------------------
+      it("T3: missing credential throws a config fault that never trips the kimi breaker", async () => {
+        delete process.env.KIMI_API_KEY;
+        for (let i = 0; i < 3; i++) {
+          await expect(
+            manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: `sms:line-1:kpr346-cred-${i}` })),
+          ).rejects.toThrow(/Passthrough credential missing \(authentication\): KIMI_API_KEY/);
+        }
+        // Breaker never tripped — restore the key and the 4th spawn RUNS.
+        process.env.KIMI_API_KEY = "test-kimi-key";
+        const result = await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-cred-ok" }));
+        expect(result.errors).toEqual([]);
+        expect(mockRunnerSend).toHaveBeenCalled();
+        expect(manager.circuitBreakers.stateFor("kimi")?.state ?? "closed").toBe("closed");
+      });
+
+      // --- T6: breaker attribution -----------------------------------------
+      it("T6: three hard faults open the kimi breaker; a claude agent on the same manager is unaffected", async () => {
+        for (let i = 0; i < 3; i++) {
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "connect ECONNREFUSED 1.2.3.4:443" }));
+          await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: `sms:line-1:kpr346-trip-${i}` }));
+        }
+        expect(manager.circuitBreakers.stateFor("kimi")!.state).toBe("open");
+
+        await expect(
+          manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-fastfail" })),
+        ).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+
+        // A claude-model agent (agent-a) still completes — per-provider breaker.
+        const result = await manager.spawnTurn(smsCtx({ agentId: "agent-a", threadId: "sms:line-1:kpr346-claude-ok" }));
+        expect(result.finalMessage).toBe("response");
+      });
+
+      // --- T7: KPR-313 session-identity guard ------------------------------
+      it("T7: claude-tagged row + kimi turn trips handoff with the CLAUDE variant (conversation_search)", async () => {
+        const threadId = "sms:line-1:kpr346-t7-trip";
+        seed(threadId, "s-old", "claude", "agent-kimi");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "s-new" }));
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "agent-kimi", threadId, sessionId: "s-old", sessionProvider: "claude" }),
+        );
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined(); // resume stripped
+        expect(prompt.startsWith("[System notice:")).toBe(true);
+        expect(prompt).toContain("conversation_search"); // §D7 claude-variant pin
+      });
+
+      it("T7: same kimi tag resumes with no handoff", async () => {
+        const threadId = "sms:line-1:kpr346-t7-match";
+        seed(threadId, "s-1", "kimi", "agent-kimi");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1" }));
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "agent-kimi", threadId, sessionId: "s-1", sessionProvider: "kimi" }),
+        );
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBe("s-1");
+        expect(prompt).not.toContain("session continuity was reset");
+      });
+
+      it("T7: kimi tag + deepseek turn trips handoff (cross-Lane-A provider transition)", async () => {
+        const threadId = "sms:line-1:kpr346-t7-cross";
+        seed(threadId, "s-1", "kimi", "agent-dseek");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "s-d" }));
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "agent-dseek", threadId, sessionId: "s-1", sessionProvider: "kimi" }),
+        );
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined();
+        expect(prompt).toContain("session continuity was reset");
+      });
+
+      // --- T2: persist ------------------------------------------------------
+      it("T2: kimi turn persists the real handle under the kimi tag (client-transcript)", async () => {
+        const threadId = "sms:line-1:kpr346-persist";
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-kimi-new" }));
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId }));
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-kimi", threadId, "s-kimi-new", "kimi", expect.anything(),
+        );
+      });
+
+      // --- T5: effort + limits ---------------------------------------------
+      it("T5: deliverable :effort suffix flows to the runner; the router is never called", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:high", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-high" }));
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBe("high");
+        expect(vi.mocked(routeModel)).not.toHaveBeenCalled();
+      });
+
+      it("T5: out-of-set :effort suffix is clamped to undefined with exactly one warn per (agent,model)", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:xhigh", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-x1" }));
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBeUndefined();
+
+        // A second xhigh turn: still exactly one clamp warn (once-per key).
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-x2" }));
+        const clampWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("outside the deliverable"));
+        expect(clampWarns).toHaveLength(1);
+      });
+
+      it("T5: Lane A resourceLimits stays undefined (runner legacy fallback)", async () => {
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-limits" }));
+        const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toBeUndefined();
       });
     });
   });

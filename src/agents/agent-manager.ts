@@ -35,6 +35,11 @@ import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.j
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
 import { assembleProviderTurn } from "./provider-adapters/turn-assembly.js";
+import {
+  isLaneAProvider,
+  resolvePassthroughSpawn,
+  type PassthroughSpawnConfig,
+} from "./provider-adapters/passthrough-providers.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
 
@@ -167,7 +172,11 @@ type ProviderModelRoute =
   | { provider: "claude"; model: string }
   | { provider: "openai"; model: string; reasoningEffort?: CodexReasoningEffort }
   | { provider: "gemini"; model: string }
-  | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort };
+  | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort }
+  // KPR-346 (§D2): Lane A passthrough — Claude runtime, foreign endpoint.
+  // reasoningEffort survives splitProviderModel and delivers via the Claude
+  // adapter's existing effort channel (clamped in prepareSpawn, §D6).
+  | { provider: "kimi" | "deepseek"; model: string; reasoningEffort?: CodexReasoningEffort };
 
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
 
@@ -186,6 +195,12 @@ function resolveProviderModel(model: string): ProviderModelRoute {
   }
   if (provider === "gemini" || provider === "google-gemini") {
     return { provider: "gemini", model: providerModel };
+  }
+  if (provider === "kimi") {
+    return { provider: "kimi", model: providerModel, reasoningEffort };
+  }
+  if (provider === "deepseek") {
+    return { provider: "deepseek", model: providerModel, reasoningEffort };
   }
 
   return { provider: "claude", model: normalized };
@@ -220,7 +235,8 @@ interface SpawnShaping {
    * meaning untouched). Set only by the router merge branch, which is only
    * reached when the static model is effort-capable (prepareSpawn's skip
    * guarantees deliverability); undefined on voice/skip/failure paths and
-   * for pilots.
+   * for pilots. KPR-346: ALSO set by prepareSpawn's Lane A branch (clamped
+   * static :effort suffix — §D6).
    */
   effortOverride: ReasoningEffort | undefined;
   /** Static-tier execution bounds — set ONLY on the router-on path (KPR-338
@@ -409,6 +425,9 @@ export class AgentManager {
    *  off-catalog (non-haiku-tier) static model — supportsEffort is
    *  conservative (unknown ⇒ false) and the operator deserves a signal. */
   private readonly effortIncapableWarned = new Set<string>();
+  /** KPR-346 (§D6): once-per-(agent,model) warn when a Lane A :effort suffix
+   *  is outside the SDK-deliverable {low,medium,high} set. */
+  private readonly laneAEffortClampWarned = new Set<string>();
   /**
    * KPR-306: per-provider circuit breakers. Read-only surface — KPR-307's
    * dispatcher-side consumer and the CircuitBreakerHeartbeat both reach it
@@ -501,8 +520,31 @@ export class AgentManager {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle);
+
+    // KPR-346 (§D3/§D4): Lane A passthrough — credential + model resolved
+    // per spawn, BEFORE runner construction. A missing credential throws
+    // TurnAssemblyError here, inside runOneSpawnAttempt's recorded try:
+    // classifyThrown short-circuits it to non-provider, so a config fault
+    // never counts toward the foreign breaker's trip streak and never
+    // engages the outage queue (epic §D2).
+    let laneAPassthrough: PassthroughSpawnConfig | undefined;
+    if (route.provider === "kimi" || route.provider === "deepseek") {
+      laneAPassthrough = resolvePassthroughSpawn(route.provider, route.model, {
+        configuredModel: appConfig[route.provider].agentModel,
+        instanceId: appConfig.instance.id,
+      });
+    }
+
+    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, laneAPassthrough ? { laneAPassthrough } : undefined);
     if (route.provider === "claude") {
+      return new ClaudeAgentAdapter(runner);
+    }
+    // KPR-346 (§D3): Lane A runs the FULL Claude runtime against the vendor
+    // endpoint — ClaudeAgentAdapter, never the Lane B assembly path below.
+    // The adapter's `readonly provider = "claude"` stays as-is per canon:
+    // the adapter class is an execution-path detail; every ops surface
+    // (breaker, outage gate, session tag, KPR-313 guard) keys on the ROUTE.
+    if (route.provider === "kimi" || route.provider === "deepseek") {
       return new ClaudeAgentAdapter(runner);
     }
 
@@ -1273,6 +1315,33 @@ export class AgentManager {
   }
 
   /**
+   * KPR-346 (§D6): Lane A :effort delivery. The runner's existing narrowing
+   * (agent-runner.ts — only {low,medium,high} reach SDK Options.effort) is
+   * the deliverable set; clamping HERE (with a warn) makes the drop explicit
+   * at the shaping seam instead of silently swallowed by the runner.
+   * Whether the foreign endpoint honors, ignores, or rejects the param is
+   * validation item V4 (Task 5).
+   */
+  private clampLaneAEffort(
+    agentId: string,
+    model: string,
+    effort: CodexReasoningEffort | undefined,
+  ): ReasoningEffort | undefined {
+    if (!effort) return undefined;
+    if (effort === "low" || effort === "medium" || effort === "high") return effort;
+    const key = `${agentId}:${model}`;
+    if (!this.laneAEffortClampWarned.has(key)) {
+      this.laneAEffortClampWarned.add(key);
+      log.warn("Lane A :effort suffix outside the deliverable {low,medium,high} set — dropped", {
+        agentId,
+        model,
+        effort,
+      });
+    }
+    return undefined;
+  }
+
+  /**
    * KPR-224 + KPR-311: per-turn shaping for `spawnTurn` (its single caller
    * post-KPR-220). Centralizes:
    *  - sender identity prepending (`[user:X via Y in #Z]:` for team /
@@ -1345,10 +1414,34 @@ export class AgentManager {
     // keyed on the static provider (≡ effective under the W3 clamp): pilots
     // are tool-free, so only Claude targets get the conversation_search clause.
     if (ctx.sessionHandoff) {
+      // KPR-346 (§D7): variant keys on CLAUDE-RUNTIME LANE MEMBERSHIP, not
+      // === "claude" — Lane A agents run the full runtime and have
+      // conversation_search. Future ids fail toward the tool-free pilot
+      // variant (safe default).
       prompt =
-        (staticRoute.provider === "claude"
+        (staticRoute.provider === "claude" || isLaneAProvider(staticRoute.provider)
           ? SESSION_HANDOFF_NOTICE_CLAUDE
           : SESSION_HANDOFF_NOTICE_PILOT) + prompt;
+    }
+
+    // KPR-346 (§D6): Lane A — the router stays skipped (foreign ids are
+    // off-catalog, supportsEffort false, KPR-322 rule stands; zero classifier
+    // cost) but the static :effort suffix delivers through the Claude
+    // adapter's existing channel. resourceLimits stays undefined — the
+    // runner's per-agent legacy fallback applies; Claude static-tier limits
+    // are never computed for foreign models.
+    if (isLaneAProvider(staticRoute.provider)) {
+      return {
+        prompt,
+        route: staticRoute,
+        resourceLimits: undefined,
+        routerCostUsd: 0,
+        effortOverride: this.clampLaneAEffort(
+          ctx.agentId,
+          agentConfig?.model ?? "",
+          "reasoningEffort" in staticRoute ? staticRoute.reasoningEffort : undefined,
+        ),
+      };
     }
 
     // Router gate (KPR-311): skip when disabled, for system senders
