@@ -4446,6 +4446,93 @@ describe("AgentManager", () => {
       expect(nestedReq.sessionId).toBeUndefined(); // ⇒ previousResponseId undefined on the nested run
       expect(sessionStore.set.mock.calls.length).toBe(setsBefore); // result id discarded, store untouched
     });
+
+    // -------------------------------------------------------------------------
+    // KPR-352 §D6: nested delegate turns on a gemini-routed parent. The
+    // partition routes claude-subagent ⇒ requires-hive-bridge for gemini
+    // (Task 1), so the parent's bridge synthesizes Task and the manager's
+    // nested branch now constructs a session-less GeminiInteractionsAdapter —
+    // the pre-352 "provider does not execute tools" return is inverted.
+    // -------------------------------------------------------------------------
+    async function setupGeminiParent(cfg: Partial<AgentConfig> = {}): Promise<DelegateTurnRunner> {
+      registry._agents.set(
+        "gp",
+        makeAgentConfig({
+          id: "gp",
+          name: "TestAgent",
+          model: "gemini/gemini-3.6-flash:high",
+          delegateServers: ["google"],
+          coreServers: [],
+          ...cfg,
+        }),
+      );
+      mockRunnerToolInventory.mockReturnValue([makeSubagentEntry()]);
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "gp" }));
+      return mockGeminiConstructor.mock.calls[0]![0].assembly.delegateTurnRunner as DelegateTurnRunner;
+    }
+
+    const nestedGeminiConstructions = () =>
+      mockGeminiConstructor.mock.calls.filter((c) => c[0].name === NESTED_NAME);
+
+    it("(KPR-352 nested-1) gemini parent: bridge invocation constructs a nested gemini adapter (inverts the pre-352 not-called path)", async () => {
+      const runner = await setupGeminiParent();
+      const constructionsBefore = mockGeminiConstructor.mock.calls.length;
+      mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "delegate output" }));
+
+      expect(await call(runner)).toBe("delegate output");
+
+      // Inversion pin: the gemini constructor fired a SECOND time (pre-352 this
+      // path returned "provider does not execute tools" without constructing).
+      expect(mockGeminiConstructor.mock.calls.length).toBe(constructionsBefore + 1);
+      const nested = nestedGeminiConstructions();
+      expect(nested.length).toBe(1);
+      const opts = nested[0]![0];
+      expect(opts.name).toBe(NESTED_NAME);
+      expect(opts.model).toBe("gemini-3.6-flash"); // parent route's model
+      expect(opts.apiKey).toBe("test-gemini-key"); // config apiKey threaded
+      expect(opts.reasoningEffort).toBe("high"); // parent route's effort
+      expect(opts.assembly.instructions).toBe(buildGenericDelegatePrompt("google"));
+      // Structural depth-1: nested assembly carries no delegate runner.
+      expect(opts.assembly.delegateTurnRunner).toBeUndefined();
+      expect(opts.assembly.omittedTools).toEqual([]);
+    });
+
+    it("(KPR-352 nested-2) gemini nested turn is session-less — no sessionId in, discarded out", async () => {
+      const runner = await setupGeminiParent();
+      const setsBefore = sessionStore.set.mock.calls.length;
+      mockGeminiRunTurn.mockResolvedValueOnce(
+        makeRunResult({ text: "out", sessionId: "interactions/discard-me" }),
+      );
+      await call(runner);
+      const nestedReq = mockGeminiRunTurn.mock.calls.at(-1)![0];
+      expect(nestedReq.sessionId).toBeUndefined(); // fresh chain — no previous_interaction_id
+      expect(sessionStore.set.mock.calls.length).toBe(setsBefore); // result id discarded, store untouched
+    });
+
+    it("(KPR-352 nested-3) gemini nested fault stays in tool text; breaker-invisible (parent records once)", async () => {
+      const runner = await setupGeminiParent();
+      // The parent turn recorded on the breaker before this spy is installed;
+      // the nested fault must add no record → breaker sees exactly the parent.
+      const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+      mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ error: "500 Internal Server Error", text: "" }));
+
+      expect(await call(runner)).toBe("Delegate turn failed (google): 500 Internal Server Error");
+      expect(recordSpy).not.toHaveBeenCalled();
+    });
+
+    it("(KPR-352 nested-4) gemini nested spawn holds a budget slot then releases in finally", async () => {
+      const runner = await setupGeminiParent();
+      let resolveNested!: (v: unknown) => void;
+      mockGeminiRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+
+      const p = call(runner);
+      await Promise.resolve();
+      expect(activeSlots("gp")).toBe(1); // slot held during the hanging nested turn
+      resolveNested(makeRunResult({ text: "x" }));
+      await p;
+      expect(activeSlots("gp")).toBe(0); // released in finally
+    });
   });
 });
 

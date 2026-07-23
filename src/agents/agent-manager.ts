@@ -652,10 +652,24 @@ export class AgentManager {
             // replay and persist by construction — provider_turn_history is
             // provably untouched by nested turns.
           });
+        } else if (route.provider === "gemini") {
+          nested = new GeminiInteractionsAdapter({
+            name: `${config.name}:${call.delegate}`,
+            model: route.model || appConfig.gemini.agentModel || "gemini-3.6-flash",
+            apiKey: appConfig.gemini.apiKey || undefined,
+            reasoningEffort: route.reasoningEffort,
+            assembly: nestedAssembly,
+            // Session-less by construction (§D6): no sessionId flows into the
+            // nested runTurn below, the nested turn starts a fresh chain, and
+            // the D5.7 shaping discards the final id — nothing persists.
+            // Accepted residue: unreferenced store:true interactions self-
+            // expire at vendor retention (55d paid) — KPR-350's 30d shape.
+          });
         } else {
-          // gemini pre-KPR-352: its adapter advertises zero tools, so the
-          // bridge never synthesizes Task — unreachable; contained anyway.
-          return `Delegate turn failed (${call.delegate}): provider ${route.provider} does not execute tools`;
+          // Unreachable while LaneBProviderId = {openai, codex, gemini} —
+          // kept as containment for a future provider that ships tool-less
+          // (KPR-354 belt-and-braces; §D6).
+          return `Delegate turn failed (${call.delegate}): provider ${String((route as { provider: string }).provider)} does not execute tools`;
         }
         if (call.signal.aborted) return `Delegate turn aborted (${call.delegate}).`;
         // D5.5 (spec-review directive 1): the listener body is try/caught —
