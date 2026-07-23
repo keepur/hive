@@ -19,7 +19,12 @@ import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
 import { buildPrefix, buildProviderInstructions, SECTION_JOINER, formatDateTimeTrailer } from "./prefix-builder.js";
 import { deriveProviderSkillIndex } from "./provider-adapters/skill-index.js";
-import type { ProviderSkillIndexEntry } from "./provider-adapters/turn-assembly.js";
+import {
+  buildGenericDelegatePrompt,
+  DELEGATE_MAX_TURNS_CUSTOM,
+  DELEGATE_MAX_TURNS_GENERIC,
+  type ProviderSkillIndexEntry,
+} from "./provider-adapters/turn-assembly.js";
 import { buildPassthroughEnv, type PassthroughSpawnConfig } from "./provider-adapters/passthrough-providers.js";
 import type { PrefixCache } from "./prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./prefix-invalidation.js";
@@ -1632,17 +1637,18 @@ export class AgentRunner {
       // Get description from server catalog or plugin manifest
       const description = this.getServerCatalogEntry(serverName).description;
 
-      // Use custom delegate prompt if available, otherwise generic
+      // Use custom delegate prompt if available, otherwise generic.
+      // KPR-354 (§D5.3): prompt + maxTurns constants shared with the Lane B
+      // nested assembly (turn-assembly.ts) — extraction, output-identical.
       const customPrompt = this.agentConfig.delegatePrompts?.[serverName];
-      const prompt = customPrompt
-        || `You are a tool specialist for ${serverName}. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.`;
+      const prompt = customPrompt || buildGenericDelegatePrompt(serverName);
 
       agents[serverName] = {
         description,
         prompt,
         mcpServers: [{ [serverName]: serverConfig }], // Record form — NOT string reference
         model: "inherit",
-        maxTurns: customPrompt ? 7 : 10, // Intent-aware delegates need fewer turns
+        maxTurns: customPrompt ? DELEGATE_MAX_TURNS_CUSTOM : DELEGATE_MAX_TURNS_GENERIC,
         disallowedTools: ["Agent"], // subagents cannot spawn sub-subagents
       };
 
