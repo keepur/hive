@@ -95,9 +95,15 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
     // gemini, and codex identically (codex ≡ openai at the classify site;
     // gemini upgraded for classification honesty — its adapter still
     // advertises zero tools until KPR-352, only its omission record changes).
+    // KPR-354 (spec §D1): claude-subagent entries are Task-synthesis inputs —
+    // requires-hive-bridge on all three Lane B columns, same one-code-path
+    // rule. claude-builtin behavior unchanged: only executor-backed builtins
+    // escape claude-only; the Task BUILTIN entry stays claude-only — the
+    // honest carrier for "general-purpose subagents are Claude-lane-only".
     const executorBacked =
       input.transport === "claude-builtin" && EXECUTOR_BACKED_BUILTIN_NAMES.has(input.name);
-    const nonClaude: ProviderToolCompatibility = executorBacked ? "requires-hive-bridge" : "claude-only";
+    const nonClaude: ProviderToolCompatibility =
+      input.transport === "claude-subagent" || executorBacked ? "requires-hive-bridge" : "claude-only";
     return {
       name: input.name,
       transport: input.transport,
@@ -157,9 +163,11 @@ export interface HiveToolSchemaEntry {
  *    (sdk-in-process → the same factory outputs AgentRunner.send() wires).
  *  - "static": hive holds the schemas now (KPR-348's authored builtin-
  *    executor tools; any future eagerly-manifested server).
- *  - "unavailable": no schema surface exists (claude-builtin until the
- *    executor is authored; claude-subagent until child 9). Entries in this
- *    state are claude-only by classification and never reach a bridge.
+ *  - "unavailable": no schema surface exists (claude-builtin without an
+ *    authored executor; claude-subagent — post-KPR-354 these reach the
+ *    bridge as Task-SYNTHESIS inputs, not as schema-bearing tools, so
+ *    "unavailable" remains their truthful schema state: the Task schema is
+ *    hive-authored, not discovered).
  */
 export type ToolSchemaAvailability =
   | { kind: "static"; tools: HiveToolSchemaEntry[] }
@@ -169,10 +177,18 @@ export type ToolSchemaAvailability =
 export interface HiveToolInventoryEntry extends HiveToolTransportDescriptor {
   schemas: ToolSchemaAvailability;
   /**
-   * Present on external MCP transports (stdio | http | sse) only: the exact
-   * server config the Claude lane would pass to the SDK, resolved env
-   * (incl. secret-env) and all — KPR-348 translates it to MCPServerStdio /
-   * MCPServerStreamableHttp params. Credential posture unchanged: this
+   * KPR-354 (§D2): catalog/manifest description carried for claude-subagent
+   * entries — feeds the synthesized Task tool's delegate listing (the Claude
+   * lane feeds the same catalog text into AgentDefinition.description).
+   * Optional/additive; absent on every other transport.
+   */
+  description?: string;
+  /**
+   * Present on external MCP transports (stdio | http | sse) AND, post-KPR-354,
+   * on claude-subagent entries (the delegate's underlying external MCP config —
+   * external by construction, KPR-184): the exact server config the Claude
+   * lane would pass to the SDK, resolved env (incl. secret-env) and all.
+   * Credential posture unchanged: this
    * object is bridge-facing, never model-facing, and MUST never be logged
    * (log entry NAMES only). Omitted for sdk-in-process entries — their
    * stdio-placeholder config is wrong by construction (send() overrides it);

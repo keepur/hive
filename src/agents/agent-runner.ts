@@ -1296,6 +1296,14 @@ export class AgentRunner {
           source: "delegate",
         }),
         schemas: { kind: "unavailable" },
+        // KPR-354 (§D2): Task-synthesis carriage. serverConfig is safe by
+        // construction — KPR-184 bars in-process servers from delegateServers
+        // and activeDelegateNames drops config-less names, so every surviving
+        // delegate is a real stdio/http/sse config. Secrecy rule unchanged:
+        // bridge-facing, never model-facing, never logged. description is the
+        // same catalog text the Claude lane feeds AgentDefinition.description.
+        serverConfig: allServerConfigs[name],
+        description: this.getServerCatalogEntry(name).description,
       });
     }
 
