@@ -188,6 +188,9 @@ import type { WorkItem } from "../types/work-item.js";
 import { routeModel, RESOURCE_TIER_DEFAULTS } from "./model-router.js";
 import type { ModelRouterResult } from "./model-router.js";
 import type { AgentProviderId } from "./provider-adapters/types.js";
+import { buildGenericDelegatePrompt, type DelegateTurnRunner } from "./provider-adapters/turn-assembly.js";
+import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
+import { classifyTurnResult } from "./provider-adapters/error-classification.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -3727,6 +3730,312 @@ describe("AgentManager", () => {
       const snap = manager.getSnapshot();
       expect(snap.perAgent["agent-b"]!.budgetSource).toBe("default");
       expect(snap.perAgent["agent-b"]!.budget).toBe(5);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // KPR-354 §D5: the nested-turn runner (THE LIGHT-UP). Exercises the
+  // manager-built delegateTurnRunner carried on the Lane B assembly — captured
+  // off the real assembleProviderTurn output and invoked directly.
+  // ---------------------------------------------------------------------------
+  describe("KPR-354 nested delegate turns", () => {
+    const NESTED_NAME = "TestAgent:google";
+
+    function makeSubagentEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInventoryEntry {
+      return {
+        name: "google",
+        transport: "claude-subagent",
+        source: "core",
+        requiresTurnContext: false,
+        requiresHiveRuntime: false,
+        inProcess: false,
+        compatibility: {
+          claude: "direct",
+          openai: "requires-hive-bridge",
+          gemini: "requires-hive-bridge",
+          codex: "requires-hive-bridge",
+        },
+        schemas: { kind: "unavailable" },
+        description: "Gmail + Calendar",
+        serverConfig: { type: "stdio", command: "gog-mcp" } as never,
+        ...overrides,
+      };
+    }
+
+    const call = (
+      runner: DelegateTurnRunner,
+      signal: AbortSignal = new AbortController().signal,
+    ): Promise<string> => runner({ delegate: "google", prompt: "p", entry: makeSubagentEntry(), signal });
+
+    // Run one parent openai spawn (resolves immediately) and hand back the
+    // delegateTurnRunner off the FIRST openai construction's assembly.
+    async function setupOpenAIParent(cfg: Partial<AgentConfig> = {}): Promise<DelegateTurnRunner> {
+      registry._agents.set(
+        "np",
+        makeAgentConfig({
+          id: "np",
+          name: "TestAgent",
+          model: "openai/gpt-5.4-mini",
+          delegateServers: ["google"],
+          coreServers: [],
+          ...cfg,
+        }),
+      );
+      mockRunnerToolInventory.mockReturnValue([makeSubagentEntry()]);
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "np" }));
+      return mockOpenAIConstructor.mock.calls[0]![0].assembly.delegateTurnRunner as DelegateTurnRunner;
+    }
+
+    const nestedOpenAIConstructions = () =>
+      mockOpenAIConstructor.mock.calls.filter((c) => c[0].name === NESTED_NAME);
+
+    // The budget slot the nested runner holds is `activeSpawnCount` (the same
+    // map withSpawnTicket uses) — NOT `activeTickets`, which drives
+    // getSnapshot().activeSpawns and which the nested runner deliberately never
+    // touches (no ticket, no updateStatus, no lock). Observe the real slot.
+    const activeSlots = (id: string): number =>
+      ((manager as unknown as { activeSpawnCount: Map<string, number> }).activeSpawnCount.get(id) ?? 0);
+
+    it("(1) happy path: resolves delegate text; nested built with parent route + generic prompt + no runner", async () => {
+      const runner = await setupOpenAIParent();
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ text: "delegate output" }));
+
+      expect(await call(runner)).toBe("delegate output");
+
+      const nested = nestedOpenAIConstructions();
+      expect(nested.length).toBe(1);
+      const opts = nested[0]![0];
+      expect(opts.name).toBe(NESTED_NAME);
+      expect(opts.model).toBe("gpt-5.4-mini"); // parent route's model
+      expect(opts.assembly.instructions).toBe(buildGenericDelegatePrompt("google"));
+      // Structural depth-1: nested assembly carries no delegate runner.
+      expect(opts.assembly.delegateTurnRunner).toBeUndefined();
+      // Directive 2 pin: nested assembly omitted nothing (all-bridgeable).
+      expect(opts.assembly.omittedTools).toEqual([]);
+    });
+
+    it("(2) empty text / error / aborted results shape to the D5.7 strings", async () => {
+      const runner = await setupOpenAIParent();
+
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ text: "" }));
+      expect(await call(runner)).toBe("Delegate 'google' returned no output.");
+
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: "boom" }));
+      expect(await call(runner)).toBe("Delegate turn failed (google): boom");
+
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ aborted: true }));
+      expect(await call(runner)).toBe("Delegate turn aborted (google).");
+    });
+
+    it("(3) nested runTurn REJECTS → never-rejects string AND slot released", async () => {
+      const runner = await setupOpenAIParent();
+      mockOpenAIRunTurn.mockRejectedValueOnce(new Error("kaboom"));
+
+      expect(await call(runner)).toBe("Delegate turn failed (google): kaboom");
+      // Negative-verify leg 3: removing the finally decrement leaves this at 1.
+      expect(activeSlots("np")).toBe(0);
+    });
+
+    it("(4) directive 3 pin — synchronous stop+budget: 3 sync calls at budget 2 → exactly 2 nested, third denied", async () => {
+      const runner = await setupOpenAIParent({ spawnBudget: 2 });
+      let resolve1!: (v: unknown) => void;
+      let resolve2!: (v: unknown) => void;
+      mockOpenAIRunTurn
+        .mockImplementationOnce(() => new Promise((r) => { resolve1 = r; }))
+        .mockImplementationOnce(() => new Promise((r) => { resolve2 = r; }));
+
+      // No await between the three invocations — the sync stop/budget prefix of
+      // each runs to its first internal await before the next begins.
+      const p1 = call(runner);
+      const p2 = call(runner);
+      const p3 = call(runner);
+
+      expect(await p3).toBe(
+        "Task denied: spawn budget exhausted (2/2). Retry later or proceed without the delegate.",
+      );
+      expect(nestedOpenAIConstructions().length).toBe(2);
+      expect(manager.getSnapshot().perAgent["np"]!.saturationCount).toBe(1);
+
+      resolve1(makeRunResult({ text: "d1" }));
+      resolve2(makeRunResult({ text: "d2" }));
+      expect(await p1).toBe("d1");
+      expect(await p2).toBe("d2");
+      expect(activeSlots("np")).toBe(0);
+    });
+
+    it("(5) saturation denial does not leak a slot", async () => {
+      const runner = await setupOpenAIParent({ spawnBudget: 2 });
+      let resolve1!: (v: unknown) => void;
+      let resolve2!: (v: unknown) => void;
+      mockOpenAIRunTurn
+        .mockImplementationOnce(() => new Promise((r) => { resolve1 = r; }))
+        .mockImplementationOnce(() => new Promise((r) => { resolve2 = r; }));
+
+      const p1 = call(runner);
+      const p2 = call(runner);
+      const slotsBeforeDenial = activeSlots("np");
+      expect(slotsBeforeDenial).toBe(2);
+      await call(runner); // denial
+      expect(activeSlots("np")).toBe(slotsBeforeDenial);
+
+      resolve1(makeRunResult({ text: "d1" }));
+      resolve2(makeRunResult({ text: "d2" }));
+      await Promise.all([p1, p2]);
+    });
+
+    it("(6) stopped agent → denied, no nested construction", async () => {
+      const runner = await setupOpenAIParent();
+      manager.stopAgent("np");
+      const before = mockOpenAIConstructor.mock.calls.length;
+
+      expect(await call(runner)).toBe("Task denied: agent is stopped.");
+      expect(mockOpenAIConstructor.mock.calls.length).toBe(before);
+    });
+
+    it("(7) abort chain: mid-flight abort calls nested.abort() then resolves aborted; pre-aborted short-circuits the turn", async () => {
+      const runner = await setupOpenAIParent();
+
+      // Mid-flight: hang the nested turn, fire the parent signal.
+      let resolveNested!: (v: unknown) => void;
+      mockOpenAIRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+      const ac = new AbortController();
+      const p = call(runner, ac.signal);
+      await Promise.resolve();
+      ac.abort();
+      expect(mockOpenAIAbort).toHaveBeenCalled();
+      resolveNested(makeRunResult({ aborted: true }));
+      expect(await p).toBe("Delegate turn aborted (google).");
+
+      // Pre-aborted: §D5 constructs the adapter before the aborted short-circuit
+      // (verbatim order), but the nested TURN never runs — runTurn is not
+      // invoked for the delegate.
+      const preAbort = new AbortController();
+      preAbort.abort();
+      const runTurnCallsBefore = mockOpenAIRunTurn.mock.calls.length;
+      expect(await call(runner, preAbort.signal)).toBe("Delegate turn aborted (google).");
+      expect(mockOpenAIRunTurn.mock.calls.length).toBe(runTurnCallsBefore);
+    });
+
+    it("(8) directive 1 pin — abort() throw inside the listener is contained (never escapes)", async () => {
+      const runner = await setupOpenAIParent();
+      mockOpenAIAbort.mockImplementation(() => {
+        throw new Error("abort boom");
+      });
+      let resolveNested!: (v: unknown) => void;
+      mockOpenAIRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+
+      const ac = new AbortController();
+      const p = call(runner, ac.signal);
+      await Promise.resolve();
+      // Negative-verify leg 4: without the listener try/catch this throw escapes
+      // as a worker-level uncaught error and fails the test.
+      ac.abort();
+      resolveNested(makeRunResult({ aborted: true }));
+      await expect(p).resolves.toBe("Delegate turn aborted (google).");
+    });
+
+    it("(9) directive 2 pin — nested run leaves lastSpawnAt untouched and status idle", async () => {
+      const runner = await setupOpenAIParent();
+      const before = manager.getSnapshot().perAgent["np"]!.lastSpawnAt;
+      await call(runner); // full nested run (default openai resolve)
+      expect(manager.getSnapshot().perAgent["np"]!.lastSpawnAt).toBe(before);
+
+      // Mid-flight: no parent in flight → status stays idle through the nested turn.
+      let resolveNested!: (v: unknown) => void;
+      mockOpenAIRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+      const p = call(runner);
+      await Promise.resolve();
+      expect(manager.getState("np")!.status).toBe("idle");
+      resolveNested(makeRunResult({ text: "x" }));
+      await p;
+    });
+
+    it("(10) slot visibility — the budget slot is held (1) during a hanging nested turn", async () => {
+      const runner = await setupOpenAIParent();
+      let resolveNested!: (v: unknown) => void;
+      mockOpenAIRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+
+      const p = call(runner);
+      await Promise.resolve();
+      expect(activeSlots("np")).toBe(1);
+      // getSnapshot().activeSpawns stays 0 — nested turns hold a budget slot but
+      // register no activeTicket (no lock/status), by construction (§D5.2).
+      expect(manager.getSnapshot().perAgent["np"]!.activeSpawns).toBe(0);
+      resolveNested(makeRunResult({ text: "x" }));
+      await p;
+      expect(activeSlots("np")).toBe(0);
+    });
+
+    it("(11) codex parent — nested gets NO historyStore/agentId, route effort, and touches no session/history store", async () => {
+      const historyStore = {
+        load: vi.fn().mockResolvedValue([]),
+        append: vi.fn().mockResolvedValue(undefined),
+        clear: vi.fn().mockResolvedValue(undefined),
+      };
+      const localManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        historyStore as any,
+      );
+      registry._agents.set(
+        "cp",
+        makeAgentConfig({
+          id: "cp",
+          name: "TestAgent",
+          model: "codex/gpt-5.5:medium",
+          delegateServers: ["google"],
+          coreServers: [],
+        }),
+      );
+      mockRunnerToolInventory.mockReturnValue([makeSubagentEntry()]);
+      mockConversationIndex.mockResolvedValue(undefined);
+      await localManager.spawnTurn(makeSmsCtx({ agentId: "cp" }));
+      const runner = mockCodexConstructor.mock.calls[0]![0].assembly.delegateTurnRunner as DelegateTurnRunner;
+
+      // Baselines captured AFTER the parent spawn — the nested invocation must
+      // add nothing.
+      const loadBefore = historyStore.load.mock.calls.length;
+      const appendBefore = historyStore.append.mock.calls.length;
+      const clearBefore = historyStore.clear.mock.calls.length;
+      const setBefore = sessionStore.set.mock.calls.length;
+
+      await call(runner);
+
+      const nested = mockCodexConstructor.mock.calls.find((c) => c[0].name === NESTED_NAME)![0];
+      expect(nested.historyStore).toBeUndefined();
+      expect(nested.agentId).toBeUndefined();
+      expect(nested.reasoningEffort).toBe("medium"); // route's effort
+      expect(nested.model).toBe("gpt-5.5");
+      expect(historyStore.load.mock.calls.length).toBe(loadBefore);
+      expect(historyStore.append.mock.calls.length).toBe(appendBefore);
+      expect(historyStore.clear.mock.calls.length).toBe(clearBefore);
+      expect(sessionStore.set.mock.calls.length).toBe(setBefore);
+    });
+
+    it("(12) T8 breaker neutrality — a 5xx tool fault stays in tool text; no breaker record; classifies success", async () => {
+      const runner = await setupOpenAIParent();
+      const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: "500 Internal Server Error", text: "" }));
+
+      expect(await call(runner)).toBe("Delegate turn failed (google): 500 Internal Server Error");
+      expect(recordSpy).not.toHaveBeenCalled();
+      // The fault lives only in tool text — the parent turn's own result (a
+      // successful string return) classifies success.
+      expect(
+        classifyTurnResult(
+          makeRunResult({ text: "Delegate turn failed (google): 500 Internal Server Error" }),
+        ),
+      ).toEqual({ outcome: "success" });
     });
   });
 });
