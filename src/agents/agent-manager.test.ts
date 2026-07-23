@@ -3004,9 +3004,11 @@ describe("AgentManager", () => {
 
     describe("stale-handle self-heal — gemini (KPR-352 §D3)", () => {
       // Binding delta (Task-0/1 spike): the live Interactions API returns 400
-      // for fabricated AND malformed ids; the adapter tags round-1 400/403/404
-      // whose carried previous_interaction_id was the persisted handle with the
-      // "gemini interaction resume rejected" sentinel.
+      // for fabricated AND malformed ids; the adapter tags only round-1
+      // status-400 failures (STALE_HANDLE_STATUSES = {400}) whose carried
+      // previous_interaction_id was the persisted handle with the
+      // "gemini interaction resume rejected" sentinel — 403/404 stay untagged
+      // (this file's own status-breadth test pins it).
       const TAGGED =
         "gemini interaction resume rejected (status 400): the referenced previous_interaction_id is invalid";
       function geminiAgent(id = "gem") {
