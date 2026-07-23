@@ -3,9 +3,10 @@
 Evidence contract: spec §D6. Per leg: intent → action → observed → verdict GREEN/AMBER/RED → deltas (tagged with the spec section they refine).
 
 ## Global
-- Pinned SHA + `check:bundle` gate output: TBD (Task 6)
-- Rebase-onto-main taken? (spec ⚠, driver's call): TBD
-- P0 state snapshot (paths + timestamps): TBD
+- Pinned SHA + `check:bundle` gate output: **PINNED_SHA `e16bc2a794d5216d66a52d1ebccae396b748e1b6`** (2026-07-23); `npm run check:bundle` exit 0 — bundle + all four gates green (strings, pack, runtime "server.min.js loaded / exited on missing config — expected", qdrant-stub present in 2 bundles).
+- Rebase-onto-main taken? (spec ⚠, driver's call): **NO** — 3-commit delta (#324, v0.10.1 bump, #325) accepted for the window per spec Key Points; avoids re-review churn mid-lane.
+- P0 state snapshot (paths + timestamps): `~/kpr351-evidence/p0/` 2026-07-23T13:34-0700 — full `mongodump` (hive_keepur, incl. memory_versions 68,293 docs); `luna-def.json` (R4 restore reference — confirms `model: codex/gpt-5.5:medium`, `delegateServers: []`, `maxConcurrent: 3`, no `spawnBudget`, no `archetype`); `sessions-all.json` (4 rows, 1 luna row; field names: `_id, agentId, cacheCreationTokens, cacheReadTokens, compactions, contextWindow, createdAt, inputTokens, outputTokens, provider, sessionId, threadId, updatedAt`); `provider_turn_history` **0 rows** (expected — 0.10.1 predates KPR-353).
+- Pre-flight (Task 6 Step 4): codex OAuth `~/.codex/auth.json` present; no deploy automation targeting keepur (crontab hive entries are dodi-side embed/index jobs; LaunchAgents = keepur.agent + rotate-logs only); service running pid 76679; engine 0.10.1 confirmed. M1 token seeded (Keychain only, inverse in ledger).
 - G0 sign-off (May, window): TBD · G1: TBD · G2a/b/c: TBD · G3 (May, two decision points): TBD
 - R4 decision record — keep-epic-build? park-Luna-on-sonnet?: TBD (explicit May calls, defaults are rollback + restore)
 
@@ -19,7 +20,7 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 ## Mutation ledger (every def/config mutation, inverse recorded BEFORE applying)
 | # | When | Mutation | Inverse | Applied | Reverted |
 |---|---|---|---|---|---|
-| M1 | P0 | Keychain add hive/keepur/ADMIN_API_TOKEN | security delete-generic-password -s hive/keepur/ADMIN_API_TOKEN + kickstart | TBD | TBD |
+| M1 | P0 | Keychain add hive/keepur/ADMIN_API_TOKEN | security delete-generic-password -s hive/keepur/ADMIN_API_TOKEN + kickstart | 2026-07-23 | TBD |
 | M2 | P1 | engine .hive → epic build (deploy.sh) | `hive rollback` (.hive.prev = 0.10.1) | TBD | TBD |
 | M3 | P2 | Luna model → claude-sonnet-4-6 | PATCH model codex/gpt-5.5:medium | TBD | TBD |
 | M4 | P2 | Luna model → codex/gpt-5.5:medium | (flagship state — reverted by M8/M9 chain) | TBD | TBD |
