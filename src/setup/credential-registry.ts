@@ -135,6 +135,24 @@ export const CREDENTIAL_REGISTRY: CredentialEntry[] = [
     kind: "secret",
     fields: [{ key: "ANTHROPIC_API_KEY", label: "Anthropic API Key" }],
   },
+  {
+    server: "kimi",
+    title: "Kimi (Moonshot AI)",
+    description:
+      "Lane A passthrough provider (KPR-346) — agents with model: kimi/… run the Claude runtime against Moonshot's Anthropic-compatible endpoint.",
+    helpUrl: "https://platform.moonshot.ai/console/api-keys",
+    kind: "secret",
+    fields: [{ key: "KIMI_API_KEY", label: "Moonshot (Kimi) API Key" }],
+  },
+  {
+    server: "deepseek",
+    title: "DeepSeek",
+    description:
+      "Lane A passthrough provider (KPR-346) — agents with model: deepseek/… run the Claude runtime against DeepSeek's Anthropic-compatible endpoint.",
+    helpUrl: "https://platform.deepseek.com/api_keys",
+    kind: "secret",
+    fields: [{ key: "DEEPSEEK_API_KEY", label: "DeepSeek API Key" }],
+  },
 ];
 
 export function findCredentialEntry(server: string): CredentialEntry | undefined {
