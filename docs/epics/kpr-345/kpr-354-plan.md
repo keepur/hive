@@ -102,7 +102,7 @@
 | File | Action | Responsibility |
 |---|---|---|
 | `src/agents/provider-adapters/tool-transport.ts` | modify (Task 1) | §D1 classify flip (one path, three columns); `description?` field on `HiveToolInventoryEntry`; `ToolSchemaAvailability` + `serverConfig` doc-comment corrections |
-| `src/agents/provider-adapters/tool-transport.test.ts` | modify (Task 1) | T1 pin inversions (`:78`, `:123`, partition case `:154`) + new partition-routing pins |
+| `src/agents/provider-adapters/tool-transport.test.ts` | modify (Task 1) | T1 pin inversions (`:78`, `:123`) + new partition-routing pins in the partition describe (`:185`) |
 | `src/agents/agent-runner.ts` | modify (Tasks 1, 2) | delegate-loop carriage (§D2, Task 1); `buildServerSubAgents` consumes shared prompt/maxTurns constants (§D5.3, Task 2 — output-identical) |
 | `src/agents/agent-runner.test.ts` | modify (Task 1) | T2 carriage pins (invert `:1343` compatibility half, update `:1523` serverConfig half) |
 | `src/agents/provider-adapters/turn-assembly.ts` | modify (Task 2) | `DelegateTurnCall`/`DelegateTurnRunner` types; `delegateTurnRunner?` on assembly + input; shared constants; `buildNestedDelegateAssembly()` (§D4/§D5.3) |
@@ -219,7 +219,7 @@ Correct the `ToolSchemaAvailability` `unavailable` bullet (`:160-162`) to:
   - [ ] Invert the `:78` parameterized case: split `claude-builtin` / `claude-subagent` — subagent now expects `{claude: "direct", openai: "requires-hive-bridge", gemini: "requires-hive-bridge", codex: "requires-hive-bridge"}` asserted from ONE `classifyToolTransport` call (one-code-path pin).
   - [ ] Invert `:123` ("keeps claude-subagent claude-only even for an executor-shared name") → a `claude-subagent` entry named `Bash` is `requires-hive-bridge` on all three (the ruling keys on transport, not name).
   - [ ] Non-executor claude-builtin (`Task`, `WebFetch`, `TodoWrite`) still `claude-only` on all three (unchanged pins stay green).
-  - [ ] Partition: an inventory with one `claude-subagent` entry now routes it to `bridgeable` for openai, gemini, AND codex; the omitted list carries no delegate record (update the `:154` case).
+  - [ ] Partition: an inventory with one `claude-subagent` entry now routes it to `bridgeable` for openai, gemini, AND codex; the omitted list carries no delegate record. Land this in the partition describe starting at `:185` — the `:154` `subagent` fixture inside the "codex === openai" it.each passes unmodified post-flip (equality assertion, both columns flip together); do not touch it.
   - [ ] **Negative-verify leg 1 (record output):** temporarily restore the old emission (`const nonClaude = executorBacked ? … : "claude-only"`) → inverted pins fail → restore → green.
 
 `agent-runner.test.ts`:
@@ -672,6 +672,8 @@ Replace the `const assembly = await assembleProviderTurn({...})` block with:
           delegate: call.delegate,
           entry: call.entry,
           workItemContext: call.workItemContext,
+          // "" arm is dead by construction: the delegate callback can only run
+          // after the parent adapter is constructed, which requires assembly.
           sessionCwd: parentAssembly?.sessionCwd ?? "",
         });
         let nested: AgentProviderAdapter;
