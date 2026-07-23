@@ -2749,6 +2749,86 @@ describe("AgentManager", () => {
       });
     });
 
+    describe("stale-handle self-heal (KPR-350 §D3)", () => {
+      const STALE = "Previous response with id 'resp_stale' not found.";
+      function openaiAgent(id = "openai-pilot") {
+        registry._agents.set(
+          id,
+          makeAgentConfig({ id, name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        return id;
+      }
+      const octx = (threadId: string, sessionId = "resp_stale") =>
+        smsCtx({ agentId: openaiAgent(), threadId, sessionId, sessionProvider: "openai" });
+
+      it("retries exactly once with sessionId stripped; success persists the fresh handle", async () => {
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-fresh" }));
+        const ctx = octx("sms:line-1:kpr350-heal");
+        const result = await manager.spawnTurn(ctx);
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+        expect(mockOpenAIRunTurn.mock.calls[0]![0].sessionId).toBe("resp_stale");
+        expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBeUndefined(); // fresh retry
+        expect(result.finalMessage).toBe("healed");
+        expect(result.newSessionId).toBe("resp-fresh");
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "openai-pilot", ctx.threadId, "resp-fresh", "openai", expect.anything(),
+        ); // write path self-corrects — no explicit scrub
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("stale-server-handle"),
+          expect.not.objectContaining({ reason: expect.anything() }), // no handle value logged
+        );
+      });
+
+      it("failed retry: churn-mint blocks the minted id, error surfaces, stale handle survives for next-turn re-trip", async () => {
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "resp-minted" }));
+        const result = await manager.spawnTurn(octx("sms:line-1:kpr350-heal-fail"));
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+        expect(result.errors).toEqual(["boom"]);
+        expect(sessionStore.set).not.toHaveBeenCalled(); // ⚠A4 rider: error + different id than resumed
+      });
+
+      it("breaker record-once: stale→success records success; stale→failure records non-provider — streak 0 both ways", async () => {
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "resp-f2" }));
+        await manager.spawnTurn(octx("sms:line-1:kpr350-brk-1"));
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "resp_stale" }));
+        await manager.spawnTurn(octx("sms:line-1:kpr350-brk-2"));
+        const snap = manager.circuitBreakers.stateFor("openai")!; // non-null-assertion per stateFor("claude")! precedent under strict TS
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0); // stale string AND "boom" are non-provider; first attempts never recorded
+      });
+
+      it("gating: dead on client-transcript (claude), stateless-replay (codex), missing sessionId, non-matching 404", async () => {
+        // claude route, same string, sessionId present → no retry
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "s1" }));
+        await manager.spawnTurn(smsCtx({ sessionId: "s1", sessionProvider: "claude", threadId: "sms:line-1:kpr350-g1" }));
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        // codex route → no retry (stateless-replay; semantics conjunct is the discriminating gate).
+        // Pass a sessionId so the sessionId conjunct is satisfied and the leg is non-vacuous —
+        // production codex rows never carry handles (belt-and-braces), but this makes the
+        // semantics gate itself bite (plan-review/1/fable advisory).
+        registry._agents.set("codex-pilot", makeAgentConfig({ id: "codex-pilot", name: "CP", model: "codex/gpt-5.5:medium", coreServers: [] }));
+        mockCodexRunTurn.mockResolvedValueOnce(makeRunResult({ error: STALE }));
+        await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr350-g2", sessionId: "resp_x", sessionProvider: "codex" }));
+        expect(mockCodexRunTurn).toHaveBeenCalledTimes(1);
+        // openai route, NO sessionId → no retry
+        mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: STALE }));
+        await manager.spawnTurn(smsCtx({ agentId: openaiAgent(), threadId: "sms:line-1:kpr350-g3", sessionId: undefined }));
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+        // openai route, generic 404 → no retry (matcher narrowness at the arm)
+        mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: "404 Not Found", sessionId: "resp_x" }));
+        await manager.spawnTurn(octx("sms:line-1:kpr350-g4", "resp_x"));
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2); // 1 (g3) + 1 (g4), no retries
+      });
+    });
+
     describe("Lane A passthrough (KPR-346)", () => {
       function seed(threadId: string, sessionId: string, provider: string, agentId: string) {
         sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });

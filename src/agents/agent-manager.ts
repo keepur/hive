@@ -975,6 +975,40 @@ export class AgentManager {
             ticket,
             onStream,
           );
+        } else if (
+          // KPR-350 (§D3): stale server-handle self-heal. The store held a
+          // handle the server no longer honors (30d expiry edge, deletion,
+          // org rotation) — without this arm the thread errors identically
+          // every turn until the row TTLs out (up to 7 days). One fresh
+          // retry; a successful retry overwrites the row via the normal
+          // finalizeSpawnResult path (no explicit scrub — the write path
+          // self-corrects); a failed retry surfaces normally and the
+          // churn-mint rider keeps the stale handle for the next turn's
+          // re-trip (bounded waste: one extra attempt per turn, never a dead
+          // thread). SEMANTICS gate, not provider gate — the KPR-347 seam:
+          // dead for client-transcript (their resume errors mean other
+          // things) and stateless-replay (no handle exists to be stale).
+          // `else if` ⇒ at most one retry per turn, and record-once is
+          // untouched: only the finalized attempt reaches the breaker.
+          finalResult.error &&
+          isStaleServerHandleError(finalResult.error) &&
+          effectiveCtx.sessionId &&
+          sessionSemanticsFor(shaping.route.provider) === "server-resumable"
+        ) {
+          // Deliberately NOT logging the error string: the provider's stale-
+          // handle message embeds the resp_ handle value (log-redaction
+          // posture — spec §D3 "no handle value").
+          log.warn("spawnTurn stale-server-handle — retrying without resume (KPR-350)", {
+            agentId: effectiveCtx.agentId,
+            threadId: effectiveCtx.threadId,
+            provider: shaping.route.provider,
+          });
+          finalResult = await this.runOneSpawnAttempt(
+            { ...effectiveCtx, sessionId: undefined },
+            shaping,
+            ticket,
+            onStream,
+          );
         }
       } catch (err) {
         if (!(err instanceof AgentStoppedError)) {
