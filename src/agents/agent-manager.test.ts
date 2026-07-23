@@ -2826,6 +2826,22 @@ describe("AgentManager", () => {
         expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("kimi-k3");
       });
 
+      // --- T1: routing — `:effort`-only suffix passes through as a bad model id
+      // `splitProviderModel(":high")` hits the `colon <= 0` guard: model stays
+      // `":high"` (NON-empty, so no default-chain fallback) and no effort is
+      // extracted. The foreign endpoint receives `":high"` as a model id → 4xx
+      // bad-model config fault (breaker-safe), identical to `codex/:high`.
+      it("T1: `:effort`-only suffix (kimi/:high) → model ':high', no effort", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/:high", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-only" }));
+        expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe(":high");
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBeUndefined();
+      });
+
       it("T3: model chain — configured agentModel wins over the table default", async () => {
         registry._agents.set(
           "agent-kimi",

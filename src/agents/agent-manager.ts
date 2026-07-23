@@ -1315,22 +1315,6 @@ export class AgentManager {
   }
 
   /**
-   * KPR-224 + KPR-311: per-turn shaping for `spawnTurn` (its single caller
-   * post-KPR-220). Centralizes:
-   *  - sender identity prepending (`[user:X via Y in #Z]:` for team /
-   *    `[Y in #Z, thread=ts]:` for slack-with-sender)
-   *  - file-attachment text appending
-   *  - static per-turn route (KPR-338): the route is ALWAYS the agent's
-   *    static resolveProviderModel(agent.model) — the router no longer
-   *    merges a per-turn model decision (kpr-338-spec §1.3). The classifier
-   *    contributes reasoning effort only. The router still runs only for
-   *    Claude-static agents (pilot gate — pilots are constructor-baked).
-   *
-   * Voice carve-out: voice has its own `systemPromptOverride` injection
-   * (KPR-219) and explicitly bypasses prepending + model router. Returns
-   * raw text + the static route for `ctx.channel === "voice"`.
-   */
-  /**
    * KPR-346 (§D6): Lane A :effort delivery. The runner's existing narrowing
    * (agent-runner.ts — only {low,medium,high} reach SDK Options.effort) is
    * the deliverable set; clamping HERE (with a warn) makes the drop explicit
@@ -1357,6 +1341,22 @@ export class AgentManager {
     return undefined;
   }
 
+  /**
+   * KPR-224 + KPR-311: per-turn shaping for `spawnTurn` (its single caller
+   * post-KPR-220). Centralizes:
+   *  - sender identity prepending (`[user:X via Y in #Z]:` for team /
+   *    `[Y in #Z, thread=ts]:` for slack-with-sender)
+   *  - file-attachment text appending
+   *  - static per-turn route (KPR-338): the route is ALWAYS the agent's
+   *    static resolveProviderModel(agent.model) — the router no longer
+   *    merges a per-turn model decision (kpr-338-spec §1.3). The classifier
+   *    contributes reasoning effort only. The router still runs only for
+   *    Claude-static agents (pilot gate — pilots are constructor-baked).
+   *
+   * Voice carve-out: voice has its own `systemPromptOverride` injection
+   * (KPR-219) and explicitly bypasses prepending + model router. Returns
+   * raw text + the static route for `ctx.channel === "voice"`.
+   */
   private async prepareSpawn(ctx: TurnContext): Promise<SpawnShaping> {
     const item = ctx.workItem;
 
