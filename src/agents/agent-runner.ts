@@ -20,6 +20,7 @@ import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
 import { buildPrefix, buildProviderInstructions, SECTION_JOINER, formatDateTimeTrailer } from "./prefix-builder.js";
 import { deriveProviderSkillIndex } from "./provider-adapters/skill-index.js";
 import type { ProviderSkillIndexEntry } from "./provider-adapters/turn-assembly.js";
+import { buildPassthroughEnv, type PassthroughSpawnConfig } from "./provider-adapters/passthrough-providers.js";
 import type { PrefixCache } from "./prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./prefix-invalidation.js";
 import {
@@ -299,6 +300,13 @@ function warnIfToolSearchForceDisabled(): void {
   );
 }
 
+/** KPR-346: optional per-spawn runner options (currently Lane A only). */
+export interface AgentRunnerOptions {
+  /** Set by AgentManager.createProviderAdapter for kimi/deepseek routes —
+   *  triggers §D5 env substitution in send(). Absent ⇒ vanilla Claude spawn. */
+  laneAPassthrough?: PassthroughSpawnConfig;
+}
+
 export class AgentRunner {
   static registryRef?: import("./agent-registry.js").AgentRegistry;
 
@@ -337,8 +345,9 @@ export class AgentRunner {
   // index.ts; tests that don't pass one fall through to a direct buildPrefix
   // call (no cache) so per-test isolation isn't a concern.
   private prefixCache?: PrefixCache;
+  private readonly laneAPassthrough?: PassthroughSpawnConfig;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache, memoryLifecycle?: MemoryLifecycle) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache, memoryLifecycle?: MemoryLifecycle, runnerOptions?: AgentRunnerOptions) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
@@ -349,6 +358,7 @@ export class AgentRunner {
     this.db = db;
     this.prefixCache = prefixCache;
     this.memoryLifecycle = memoryLifecycle;
+    this.laneAPassthrough = runnerOptions?.laneAPassthrough;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
@@ -1800,7 +1810,11 @@ export class AgentRunner {
   }
 
   async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: ReasoningEffort): Promise<RunResult> {
-    const effectiveModel = this.agentConfig.model;
+    // KPR-346 (§D5): Lane A passthrough — the CLI model is the FOREIGN id;
+    // agentConfig.model keeps the prefixed string (kimi/…) so telemetry and
+    // the activity log attribute the provider via the model string untouched.
+    const passthrough = this.laneAPassthrough;
+    const effectiveModel = passthrough?.model ?? this.agentConfig.model;
 
     log.info("Sending prompt to agent", {
       agent: this.agentConfig.id,
@@ -1808,6 +1822,7 @@ export class AgentRunner {
       resumeSession: sessionId ?? "new",
       promptLength: prompt.length,
       streaming: !!onStream,
+      ...(passthrough ? { passthroughProvider: passthrough.provider } : {}),
     });
 
     const allServerConfigs = this.buildAllServerConfigs(context);
@@ -1861,17 +1876,32 @@ export class AgentRunner {
     // KPR-329: resolve tool-search mode for this spawn. The env value is
     // always pinned (see env block below) so hive owns the policy — the CLI's
     // implicit default is never in play.
-    const toolSearch = resolveToolSearchMode(
-      this.agentConfig.toolSearch,
-      config.toolSearch.mode,
-      config.toolSearch.source,
-    );
-    log.debug("Tool search mode resolved", {
-      agent: this.agentConfig.id,
-      mode: toolSearch.mode,
-      source: toolSearch.source,
-    });
-    warnIfToolSearchForceDisabled();
+    // KPR-346 (§D5): passthrough spawns BYPASS resolveToolSearchMode — tool
+    // search is forced off (tool_reference blocks are unsupported on vendor
+    // Anthropic-compat endpoints; same failure mode as the KPR-329 proxy
+    // note). No ToolSearchSource union change — the forced mode is logged,
+    // not sourced.
+    let toolSearchEnvValue: string;
+    if (passthrough) {
+      toolSearchEnvValue = "false";
+      log.debug("Tool search forced off for Lane A passthrough spawn", {
+        agent: this.agentConfig.id,
+        provider: passthrough.provider,
+      });
+    } else {
+      const toolSearch = resolveToolSearchMode(
+        this.agentConfig.toolSearch,
+        config.toolSearch.mode,
+        config.toolSearch.source,
+      );
+      log.debug("Tool search mode resolved", {
+        agent: this.agentConfig.id,
+        mode: toolSearch.mode,
+        source: toolSearch.source,
+      });
+      warnIfToolSearchForceDisabled();
+      toolSearchEnvValue = toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto";
+    }
 
     const q = query({
       prompt,
@@ -1914,8 +1944,10 @@ export class AgentRunner {
           CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
           CLAUDECODE: undefined,
           // KPR-329: always pinned — overrides any ambient ENABLE_TOOL_SEARCH.
-          ENABLE_TOOL_SEARCH:
-            toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto",
+          ENABLE_TOOL_SEARCH: toolSearchEnvValue,
+          // KPR-346 (§D5): Lane A pins — base URL, vendor token, foreign-model
+          // pins (incl. subagents), ANTHROPIC_API_KEY scrub, tool search off.
+          ...(passthrough ? buildPassthroughEnv(passthrough) : {}),
         },
         // Pass --strict-mcp-config to the spawned claude CLI so it ignores all
         // MCP sources except the engine-supplied `mcpServers` above (which the

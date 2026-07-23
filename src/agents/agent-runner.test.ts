@@ -2787,6 +2787,124 @@ describe("AgentRunner ENABLE_TOOL_SEARCH env pinning (via send) (KPR-329)", () =
   });
 });
 
+// ── KPR-346 §D5: Lane A passthrough env substitution ─────────────
+describe("AgentRunner Lane A passthrough env substitution (via send) (KPR-346)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+  let origBaseUrl: string | undefined;
+  let origAuthToken: string | undefined;
+
+  const PASSTHROUGH = {
+    provider: "kimi" as const,
+    model: "kimi-k3",
+    baseUrl: "https://api.moonshot.ai/anthropic",
+    authToken: "tok-test",
+  };
+
+  function makePassthroughRunner(overrides: Partial<AgentConfig> = {}) {
+    return new AgentRunner(
+      makeAgentConfig({ model: "kimi/kimi-k3", ...overrides }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { laneAPassthrough: PASSTHROUGH },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+    // Ambient-pollution guard: the `...process.env` spread would otherwise
+    // leak an ambient ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN into the vanilla
+    // regression case (exactly as with ANTHROPIC_API_KEY).
+    origBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    origAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    delete process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+  });
+
+  afterEach(() => {
+    if (origBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = origBaseUrl;
+    if (origAuthToken === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+    else process.env.ANTHROPIC_AUTH_TOKEN = origAuthToken;
+  });
+
+  it("passes the FOREIGN model id to options.model while agentConfig.model keeps the prefix", async () => {
+    const runner = makePassthroughRunner();
+    await runner.send("hello");
+    expect(getCapturedOptions().model).toBe("kimi-k3");
+    // The prefixed string survives on the config for provider attribution.
+    expect((runner as any).agentConfig.model).toBe("kimi/kimi-k3");
+  });
+
+  it("pins base URL, vendor token, all five model pins + subagent model, and scrubs the entrypoint", async () => {
+    // Present-as-key scrub of CLAUDE_CODE_ENTRYPOINT (spike finding): an
+    // inherited entrypoint would force OAuth over the injected carrier.
+    const origEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+    process.env.CLAUDE_CODE_ENTRYPOINT = "claude";
+    try {
+      const runner = makePassthroughRunner();
+      await runner.send("hello");
+      const env = getCapturedOptions().env;
+      expect(env.ANTHROPIC_BASE_URL).toBe("https://api.moonshot.ai/anthropic");
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe("tok-test");
+      expect(env.ANTHROPIC_MODEL).toBe("kimi-k3");
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBe("kimi-k3");
+      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("kimi-k3");
+      expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("kimi-k3");
+      expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("kimi-k3");
+      expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("kimi-k3");
+      // Scrubbed even though ambient set it to "claude".
+      expect(env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
+    } finally {
+      if (origEntrypoint === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+      else process.env.CLAUDE_CODE_ENTRYPOINT = origEntrypoint;
+    }
+  });
+
+  it("scrubs ANTHROPIC_API_KEY even with config apiKey AND an ambient value set", async () => {
+    process.env.ANTHROPIC_API_KEY = "ambient";
+    try {
+      const runner = makePassthroughRunner();
+      await runner.send("hello");
+      // config mock carries anthropic.apiKey: "test-key"; the passthrough
+      // spread (LAST) beats both the conditional injection and the ambient.
+      expect(getCapturedOptions().env.ANTHROPIC_API_KEY).toBeUndefined();
+    } finally {
+      delete process.env.ANTHROPIC_API_KEY;
+    }
+  });
+
+  it("forces ENABLE_TOOL_SEARCH to 'false' even when the agent config sets toolSearch 'on'", async () => {
+    const runner = makePassthroughRunner({ toolSearch: "on" });
+    await runner.send("hello");
+    expect(getCapturedOptions().env.ENABLE_TOOL_SEARCH).toBe("false");
+  });
+
+  it("preserves session resume on a passthrough spawn", async () => {
+    const runner = makePassthroughRunner();
+    await runner.send("hello", "sess-1");
+    expect(getCapturedOptions().resume).toBe("sess-1");
+  });
+
+  it("regression: a vanilla runner injects no passthrough keys and keeps KPR-329 tool-search behavior", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const env = getCapturedOptions().env;
+    expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+    expect("ANTHROPIC_AUTH_TOKEN" in env).toBe(false);
+    // Default agent + default config → the KPR-329 "auto" pin, unchanged.
+    expect(env.ENABLE_TOOL_SEARCH).toBe("auto");
+  });
+});
+
 // ── Archetype card injection ─────────────────────────────────────
 describe("buildSystemPrompt — archetype card", () => {
   beforeEach(() => {
