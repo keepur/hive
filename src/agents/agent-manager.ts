@@ -301,11 +301,14 @@ export function isStaleServerHandleError(reason: string): boolean {
     /previous response[\s\S]{0,80}?(not found|expired|no longer (?:exists|available))/i.test(reason) ||
     /previous_response_id[\s\S]{0,80}?(not found|invalid|expired)/i.test(reason) ||
     // KPR-352 (§D3): the gemini adapter's hive-owned sentinel — emitted ONLY
-    // for round-1 400/403/404 failures whose carried previous_interaction_id
-    // was the persisted sessions-store handle (deterministic, not prose-
-    // guessed; also keeps expired-handle 403s out of the auth row's breaker
-    // streak). Generic malformed-request 400s without the sentinel stay
-    // ordinary provider faults.
+    // for round-1 status-400 failures (the live-probed set; T0 spike showed
+    // fabricated AND malformed ids both 400) whose carried
+    // previous_interaction_id was the persisted sessions-store handle, gated
+    // by a message discriminator so generic malformed-request 400s stay
+    // ordinary provider faults. If a genuinely aged-out handle is ever
+    // observed to 403 (55d/1d retention — unprobeable at spike time), fold
+    // that status + a permission-message discriminator into the adapter's
+    // STALE_HANDLE_STATUSES/STALE_HANDLE_MESSAGE, not here.
     /gemini interaction resume rejected/i.test(reason)
   );
 }
