@@ -22,7 +22,7 @@ import { createLogger } from "../../logging/logger.js";
 import type { WorkItemContext } from "../agent-runner.js";
 import type { GuardrailDecision, GuardrailGate } from "./types.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
-import type { ProviderSkillIndexEntry } from "./turn-assembly.js";
+import type { ProviderSkillIndexEntry, DelegateTurnRunner } from "./turn-assembly.js";
 import { BuiltinExecutor, EXECUTOR_BACKED_BUILTIN_NAMES } from "./builtin-executor.js"; // Task 2 creates; Task 1 ships a stub (Step 1.2)
 
 const log = createLogger("tool-bridge");
@@ -58,6 +58,12 @@ export interface ToolBridgeOptions {
   sessionCwd: string;
   /** load_skill source (spec §D6) — [] until KPR-349 populates it. */
   skillIndex: ProviderSkillIndexEntry[];
+  /**
+   * KPR-354 (§D3): manager-owned nested-turn executor. Present ⇒
+   * claude-subagent inventory entries synthesize the Task tool; absent ⇒
+   * fail-dark (no Task tool, entries inert).
+   */
+  delegateRunner?: DelegateTurnRunner;
 }
 
 /**
@@ -131,6 +137,9 @@ export class ToolBridge {
     const builtins = this.opts.inventory.filter(
       (e) => e.transport === "claude-builtin" && e.schemas.kind === "static",
     );
+    // KPR-354 (§D3): claude-subagent entries — consumed by Task synthesis
+    // ONLY. No MCP connection is opened for them at the parent level.
+    const delegates = this.opts.inventory.filter((e) => e.transport === "claude-subagent");
 
     // External MCP servers: connect + discover in parallel, fail-soft each.
     const externalResults = await Promise.allSettled(
@@ -176,6 +185,9 @@ export class ToolBridge {
     // load_skill (spec §D6): rendered whenever the index is non-empty — dark until KPR-349.
     const loadSkill = this.buildLoadSkillTool();
     if (loadSkill) tools.push(loadSkill);
+
+    const taskTool = this.buildTaskTool(delegates);
+    if (taskTool) tools.push(taskTool);
 
     return this.applyNameAndCapEdges(tools);
   }
@@ -362,6 +374,66 @@ export class ToolBridge {
     );
   }
 
+  /**
+   * KPR-354 (§D3): ONE Claude-lane-identical Task function tool synthesized
+   * from the claude-subagent entries. Name + input schema match the SDK's
+   * Task tool (description/prompt/subagent_type) so archetype rules written
+   * against `Task` transfer verbatim (KPR-348 name-preservation canon);
+   * subagent_type is enum-restricted to the active delegate names. Routed
+   * through wrap(): gate-deny, pre-execute abort check, containment, and
+   * metering all come free — Task wall time lands in stats.toolMs, so the
+   * parent's llmMs correctly excludes nested-turn time. No name collision
+   * with the Task BUILTIN entry: that one is claude-only, partition-omitted
+   * on Lane B, so this is the only Task in the bridged surface.
+   */
+  private buildTaskTool(entries: HiveToolInventoryEntry[]): BridgedTool | null {
+    const runner = this.opts.delegateRunner;
+    if (!runner || entries.length === 0) return null;
+    const byName = new Map(entries.map((e) => [e.name, e]));
+    const names = [...byName.keys()];
+    const listing = entries.map((e) => `- ${e.name} — ${e.description ?? e.name}`).join("\n");
+    return this.wrap(
+      "Task",
+      "Launch a delegate subagent to handle a task using one of your delegated capability MCPs. " +
+        "The delegate runs a bounded turn with that server's tools and returns its result.\n" +
+        "Available delegates (subagent_type):\n" +
+        listing,
+      {
+        type: "object",
+        properties: {
+          description: { type: "string", description: "A short (3-5 word) summary of the task" },
+          prompt: { type: "string", description: "The task for the delegate to perform" },
+          subagent_type: {
+            type: "string",
+            enum: names,
+            description: "The delegate to use (see the list in the tool description)",
+          },
+        },
+        required: ["description", "prompt", "subagent_type"],
+        additionalProperties: false,
+      },
+      async (input) => {
+        const args = asRecord(input) as { prompt?: unknown; subagent_type?: unknown };
+        const subagentType = args.subagent_type;
+        if (typeof subagentType !== "string" || !byName.has(subagentType)) {
+          return `Task failed: unknown subagent_type '${String(subagentType)}'. Valid: ${names.join(", ")}`;
+        }
+        if (typeof args.prompt !== "string" || args.prompt.length === 0) {
+          return "Task failed: 'prompt' must be a non-empty string";
+        }
+        // Runner contract: NEVER throws (D5.7) — wrap()'s catch is
+        // belt-and-suspenders on top.
+        return await runner({
+          delegate: subagentType,
+          prompt: args.prompt,
+          entry: byName.get(subagentType)!,
+          signal: this.opts.signal,
+          workItemContext: this.opts.workItemContext,
+        });
+      },
+    );
+  }
+
   /** Spec §D8 edges: sanitize/truncate-with-hash, collision dedupe, 128 cap. */
   private applyNameAndCapEdges(tools: BridgedTool[]): BridgedTool[] {
     const seen = new Set<string>();
@@ -385,15 +457,12 @@ export class ToolBridge {
       out.push(candidate === t.name ? t : { ...t, name: candidate });
     }
     if (out.length > MAX_PROVIDER_TOOLS) {
-      // KPR-349 (§D7 ruling, canon delegation from KPR-348): two tiers.
-      // Tier 0 — the six executor builtins + load_skill (≤7 tools) are
-      // structurally load-bearing (the prompt's toolkit and skills sections
-      // claim them) and are NEVER cap-dropped. Tier 1 — everything else
-      // (MCP-discovered) keeps inventory order and takes the entire
-      // tail-drop. The 348-shipped order (load_skill first, builtins next)
-      // was precisely inverted. Original relative order is preserved for
-      // every survivor.
-      const pinnedNames = new Set<string>([...EXECUTOR_BACKED_BUILTIN_NAMES, "load_skill"]);
+      // KPR-349 §D7 ruling + KPR-354: Tier 0 — the six executor builtins,
+      // load_skill, AND Task (≤8 tools) are structurally load-bearing (the
+      // toolkit and the Task description claim them) and are NEVER
+      // cap-dropped. Tier 1 — everything else (MCP-discovered) keeps
+      // inventory order and takes the entire tail-drop.
+      const pinnedNames = new Set<string>([...EXECUTOR_BACKED_BUILTIN_NAMES, "load_skill", "Task"]);
       const pinned = out.filter((t) => pinnedNames.has(t.name));
       const tier1 = out.filter((t) => !pinnedNames.has(t.name));
       const tier1Budget = MAX_PROVIDER_TOOLS - pinned.length;

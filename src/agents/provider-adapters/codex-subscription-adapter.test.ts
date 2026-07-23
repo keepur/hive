@@ -131,6 +131,27 @@ function makeBuiltinEntry(toolName: string): HiveToolInventoryEntry {
   };
 }
 
+/** KPR-354: a claude-subagent inventory entry (Task-synthesis input). */
+function makeSubagentEntry(name: string, description?: string): HiveToolInventoryEntry {
+  return {
+    name,
+    transport: "claude-subagent",
+    source: "delegate",
+    requiresTurnContext: false,
+    requiresHiveRuntime: false,
+    inProcess: false,
+    compatibility: {
+      claude: "direct",
+      openai: "requires-hive-bridge",
+      gemini: "requires-hive-bridge",
+      codex: "requires-hive-bridge",
+    },
+    schemas: { kind: "unavailable" },
+    serverConfig: { type: "stdio", command: "x" } as never,
+    description,
+  };
+}
+
 /** An echo in-process server registered under name "fixture" — real ToolBridge
  *  dispatch over InMemoryTransport (mirrors the openai test's echo shape). */
 function makeEchoServer(delayMs = 0): McpSdkServerConfigWithInstance {
@@ -440,6 +461,65 @@ describe("CodexSubscriptionAdapter", () => {
     try {
       await expect(adapter.runTurn({ prompt: "hello" })).resolves.toMatchObject({ text: "done", aborted: false });
       expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string).tools).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("KPR-354 T4: subagent entry + runner → Task advertised as a function tool with the enum schema", async () => {
+    const runner = vi.fn(async () => "ok");
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(sse([completed([{ type: "message", role: "assistant", content: [] }])])),
+    );
+    const { adapter, cleanup } = makeAdapter(
+      {
+        assembly: makeAssembly({
+          toolInventory: [makeSubagentEntry("google", "Google MCP")],
+          delegateTurnRunner: runner,
+        }),
+      },
+      fetchMock,
+    );
+    try {
+      await expect(adapter.runTurn({ prompt: "hello" })).resolves.toMatchObject({ aborted: false });
+      const body = bodyOf(fetchMock, 0);
+      expect(body.tools).toEqual([
+        expect.objectContaining({ type: "function", name: "Task", strict: false }),
+      ]);
+      const task = (body.tools as Array<{ parameters: Record<string, unknown> }>)[0];
+      const props = task.parameters.properties as Record<string, { enum?: unknown }>;
+      expect(props.subagent_type.enum).toEqual(["google"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("KPR-354 T4: scripted Task function_call dispatches to the runner; round-2 carries its text", async () => {
+    const runner = vi.fn(async () => "delegate result");
+    const fetchMock = sseScript(
+      [completed([callItem("Task", '{"description":"d","prompt":"do it","subagent_type":"google"}')])],
+      [completed([{ type: "message", role: "assistant", content: [] }])],
+    );
+    const { adapter, cleanup } = makeAdapter(
+      {
+        assembly: makeAssembly({
+          toolInventory: [makeSubagentEntry("google", "Google MCP")],
+          delegateTurnRunner: runner,
+        }),
+      },
+      fetchMock,
+    );
+    try {
+      const result = await adapter.runTurn({ prompt: "go" });
+      expect(runner).toHaveBeenCalledTimes(1);
+      expect(runner).toHaveBeenCalledWith(
+        expect.objectContaining({ delegate: "google", prompt: "do it" }),
+      );
+      const out = (bodyOf(fetchMock, 1).input as Array<{ type?: string; output?: string }>).find(
+        (i) => i.type === "function_call_output",
+      );
+      expect(out?.output).toBe("delegate result");
+      expect(result.toolCalls).toBe(1);
     } finally {
       cleanup();
     }

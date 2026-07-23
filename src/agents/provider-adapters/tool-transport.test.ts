@@ -75,24 +75,38 @@ describe("classifyToolTransport", () => {
     });
   });
 
-  it.each(["claude-builtin", "claude-subagent"] as const)(
-    "marks non-executor %s as Claude-only outside Claude",
-    (transport) => {
-      const descriptor = classifyToolTransport({
-        // WebFetch is a claude-builtin NOT backed by the executor → claude-only.
-        name: transport === "claude-builtin" ? "WebFetch" : "google",
-        transport,
-        source: transport === "claude-builtin" ? "sdk-builtin" : "delegate",
-      });
+  it("marks a non-executor claude-builtin as Claude-only outside Claude", () => {
+    // WebFetch is a claude-builtin NOT backed by the executor → claude-only.
+    const descriptor = classifyToolTransport({
+      name: "WebFetch",
+      transport: "claude-builtin",
+      source: "sdk-builtin",
+    });
 
-      expect(descriptor.compatibility).toEqual({
-        claude: "direct",
-        openai: "claude-only",
-        gemini: "claude-only",
-        codex: "claude-only",
-      });
-    },
-  );
+    expect(descriptor.compatibility).toEqual({
+      claude: "direct",
+      openai: "claude-only",
+      gemini: "claude-only",
+      codex: "claude-only",
+    });
+  });
+
+  it("marks claude-subagent as requires-hive-bridge on all three Lane B columns (KPR-354 §D1)", () => {
+    // Post-KPR-354: delegate sub-agents are Task-synthesis inputs — bridgeable
+    // on every Lane B provider from ONE classifyToolTransport call (one-code-path).
+    const descriptor = classifyToolTransport({
+      name: "google",
+      transport: "claude-subagent",
+      source: "delegate",
+    });
+
+    expect(descriptor.compatibility).toEqual({
+      claude: "direct",
+      openai: "requires-hive-bridge",
+      gemini: "requires-hive-bridge",
+      codex: "requires-hive-bridge",
+    });
+  });
 
   // KPR-348 (Step 2.9): the six executor-backed builtins bridge on every Lane B
   // provider; codex ≡ openai (canon-2) pinned explicitly.
@@ -120,11 +134,13 @@ describe("classifyToolTransport", () => {
     },
   );
 
-  it("keeps claude-subagent claude-only even for an executor-shared name", () => {
-    // A delegate sub-agent named like a builtin must NOT be upgraded — only
-    // transport === "claude-builtin" is executor-backed.
+  it("classifies claude-subagent as requires-hive-bridge on the transport, not the name (KPR-354 §D1)", () => {
+    // The ruling keys on transport, not name: a delegate sub-agent named like a
+    // builtin bridges as a Task-synthesis input on all three Lane B columns.
     const d = classifyToolTransport({ name: "Bash", transport: "claude-subagent", source: "delegate" });
-    expect(d.compatibility.openai).toBe("claude-only");
+    expect(d.compatibility.openai).toBe("requires-hive-bridge");
+    expect(d.compatibility.gemini).toBe("requires-hive-bridge");
+    expect(d.compatibility.codex).toBe("requires-hive-bridge");
   });
 
   it("can classify broken transports as unsupported for diagnostics", () => {
@@ -212,6 +228,26 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     expect(omitted).toEqual<OmittedToolRecord[]>([
       { name: "gated", transport: "claude-builtin", compatibility: cls },
     ]);
+  });
+
+  // KPR-354 (§D1): a claude-subagent entry now partitions to bridgeable for
+  // every Lane B provider; the omitted list carries no delegate record.
+  it.each(providers)("routes a claude-subagent entry to bridgeable for %s (KPR-354 §D1)", (provider) => {
+    const entry = makeEntry({
+      name: "google",
+      transport: "claude-subagent",
+      source: "delegate",
+      compatibility: {
+        claude: "direct",
+        openai: "requires-hive-bridge",
+        gemini: "requires-hive-bridge",
+        codex: "requires-hive-bridge",
+      },
+      schemas: { kind: "unavailable" },
+    });
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], provider);
+    expect(bridgeable).toEqual([entry]);
+    expect(omitted).toEqual([]);
   });
 
   // 2. Per-provider divergence: the codex column is genuinely consulted.

@@ -14,10 +14,12 @@ import type { AgentRunner, WorkItemContext } from "../agent-runner.js";
 import type { GuardrailGate, LaneBProviderId } from "./types.js";
 import { buildArchetypeGuardrailGate } from "./archetype-gate.js";
 import {
+  classifyToolTransport,
   partitionInventoryForProvider,
   type HiveToolInventoryEntry,
   type OmittedToolRecord,
 } from "./tool-transport.js";
+import { BUILTIN_TOOL_DEFINITIONS, EXECUTOR_BACKED_BUILTIN_NAMES } from "./builtin-executor.js";
 import { TurnAssemblyError } from "./error-classification.js";
 
 const log = createLogger("turn-assembly");
@@ -43,6 +45,40 @@ export interface ProviderSkillIndexEntry {
   /** Absolute path to SKILL.md — consumed by the load_skill function tool (KPR-348/349, epic §D5). */
   path: string;
 }
+
+/** KPR-354 (§D4): one nested delegate-turn invocation, bridge → manager. */
+export interface DelegateTurnCall {
+  /** Validated subagent_type — an active delegate name. */
+  delegate: string;
+  /** Task prompt for the delegate. */
+  prompt: string;
+  /** The claude-subagent inventory entry (carries serverConfig, description). */
+  entry: HiveToolInventoryEntry;
+  /** Parent bridge signal — the abort chain rides it. */
+  signal: AbortSignal;
+  workItemContext?: WorkItemContext;
+}
+
+/**
+ * KPR-354 (§D5): manager-owned nested-turn executor. NEVER throws — every
+ * path resolves model-visible text (denials, aborts, failures included).
+ * Built at the manager seam (provider resolution + budget machinery live
+ * there); carried here as an opaque callback so the assembly stays
+ * provider-blind.
+ */
+export type DelegateTurnRunner = (call: DelegateTurnCall) => Promise<string>;
+
+/**
+ * KPR-354 (§D5.3): delegate-subagent constants shared VERBATIM between the
+ * Claude lane (AgentRunner.buildServerSubAgents) and the Lane B nested
+ * assembly — single-source extraction so the two lanes cannot drift.
+ */
+export function buildGenericDelegatePrompt(serverName: string): string {
+  return `You are a tool specialist for ${serverName}. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.`;
+}
+/** Intent-aware (custom-prompt) delegates need fewer turns. */
+export const DELEGATE_MAX_TURNS_CUSTOM = 7;
+export const DELEGATE_MAX_TURNS_GENERIC = 10;
 
 /**
  * Everything a Lane B adapter needs beyond the per-turn request. Built
@@ -80,6 +116,13 @@ export interface ProviderTurnAssembly {
   inProcessServers: Record<string, McpSdkServerConfigWithInstance>;
   /** KPR-348 (spec §D5-cwd): resolved per-spawn session cwd for the builtin executor. */
   sessionCwd: string;
+  /**
+   * KPR-354 (§D3/§D5): present ⇒ the bridge synthesizes the Task tool from
+   * claude-subagent entries and routes execution through this callback.
+   * Absent (tests, nested assemblies, gemini pre-352 if ever gated) ⇒ no
+   * Task tool — fail-dark, not fail-broken.
+   */
+  delegateTurnRunner?: DelegateTurnRunner;
 }
 
 /**
@@ -134,6 +177,7 @@ export async function assembleProviderTurn(input: {
   config: AgentConfig;
   provider: LaneBProviderId;
   workItemContext?: WorkItemContext;
+  delegateTurnRunner?: DelegateTurnRunner;
 }): Promise<ProviderTurnAssembly> {
   try {
     const inventory = input.runner.buildToolTransportInventory(input.workItemContext);
@@ -169,6 +213,7 @@ export async function assembleProviderTurn(input: {
       skillIndex: skillEntries,
       inProcessServers,
       sessionCwd,
+      delegateTurnRunner: input.delegateTurnRunner,
     };
   } catch (err) {
     throw new TurnAssemblyError(
@@ -176,4 +221,81 @@ export async function assembleProviderTurn(input: {
       { cause: err },
     );
   }
+}
+
+export interface NestedDelegateAssemblyInput {
+  config: AgentConfig;
+  delegate: string;
+  /** The claude-subagent entry (serverConfig + description carriage, §D2). */
+  entry: HiveToolInventoryEntry;
+  workItemContext?: WorkItemContext;
+  /** Parent assembly's resolved sessionCwd — nested builtins share it (§D5.3). */
+  sessionCwd: string;
+}
+
+/**
+ * KPR-354 (§D5.3): pure nested-assembly builder — unit-testable without a
+ * manager. Claude parity: the delegate prompt is the subagent's WHOLE system
+ * prompt (no datetime trailer, no memory, no constitution — exactly
+ * AgentDefinition.prompt on the Claude lane); the tool surface is the
+ * delegate's one MCP server + the six executor builtins (Claude subagents
+ * inherit builtins). Structural depth-1: the inventory contains no
+ * claude-subagent entries and no delegateTurnRunner is set, so a nested
+ * bridge can never synthesize Task — the parity twin of
+ * disallowedTools: ["Agent"].
+ */
+export function buildNestedDelegateAssembly(input: NestedDelegateAssemblyInput): {
+  assembly: ProviderTurnAssembly;
+  maxTurns: number;
+} {
+  const customPrompt = input.config.delegatePrompts?.[input.delegate];
+  const instructions = customPrompt ?? buildGenericDelegatePrompt(input.delegate);
+  const maxTurns = customPrompt ? DELEGATE_MAX_TURNS_CUSTOM : DELEGATE_MAX_TURNS_GENERIC;
+
+  const toolInventory: HiveToolInventoryEntry[] = [];
+  const serverConfig = input.entry.serverConfig;
+  if (serverConfig) {
+    // Re-express the delegate at its REAL transport — same derivation rule
+    // as AgentRunner.transportKindForServerConfig (http/sse by type, else
+    // stdio). Kept inline: importing agent-runner at runtime here would
+    // invert the module direction Step 2.3 establishes.
+    const transport =
+      serverConfig.type === "http" || serverConfig.type === "sse" ? serverConfig.type : "stdio";
+    toolInventory.push({
+      ...classifyToolTransport({ name: input.entry.name, transport, source: "core" }),
+      schemas: { kind: "connect-time" },
+      serverConfig,
+    });
+  } else {
+    // Foreign/test inventory without carriage (spec §Edge cases): degraded
+    // builtin-only nested surface — contained, never a throw. NAME only.
+    log.warn("Delegate entry missing serverConfig — nested turn runs builtin-only", {
+      agentId: input.config.id,
+      delegate: input.delegate,
+    });
+  }
+  for (const def of BUILTIN_TOOL_DEFINITIONS) {
+    if (!EXECUTOR_BACKED_BUILTIN_NAMES.has(def.name)) continue; // all six are — belt-and-suspenders
+    toolInventory.push({
+      ...classifyToolTransport({ name: def.name, transport: "claude-builtin", source: "sdk-builtin" }),
+      schemas: { kind: "static", tools: [def] },
+    });
+  }
+
+  return {
+    assembly: {
+      instructions,
+      toolInventory,
+      // Directive 2 ([D5] spec-review): nothing was partitioned away — the
+      // nested inventory is all-bridgeable by construction. Pinned (T4).
+      omittedTools: [],
+      guardrailGate: buildDefaultGuardrailGate(input.config, input.workItemContext),
+      memory: {},
+      skillIndex: [],
+      inProcessServers: {},
+      sessionCwd: input.sessionCwd,
+      // NO delegateTurnRunner — structural depth-1 (see doc comment).
+    },
+    maxTurns,
+  };
 }

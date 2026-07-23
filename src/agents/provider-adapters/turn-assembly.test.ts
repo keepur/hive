@@ -7,6 +7,8 @@ import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import {
   assembleProviderTurn,
   buildDefaultGuardrailGate,
+  buildGenericDelegatePrompt,
+  buildNestedDelegateAssembly,
   TOOL_EXECUTING_PROVIDERS,
 } from "./turn-assembly.js";
 import {
@@ -249,5 +251,141 @@ describe("buildDefaultGuardrailGate (KPR-347 §D1.5, T8)", () => {
   it("gate never throws for well-formed input", async () => {
     const gate = buildDefaultGuardrailGate(makeAgentConfig());
     await expect(gate({ toolName: "", input: undefined })).resolves.toBeDefined();
+  });
+});
+
+describe("buildNestedDelegateAssembly (KPR-354 §D5.3, T4)", () => {
+  function makeSubagentEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInventoryEntry {
+    return makeEntry({
+      name: "google", transport: "claude-subagent", inProcess: false, requiresHiveRuntime: false,
+      compatibility: {
+        claude: "direct", openai: "requires-hive-bridge",
+        gemini: "requires-hive-bridge", codex: "requires-hive-bridge",
+      },
+      schemas: { kind: "unavailable" },
+      description: "Gmail + Calendar",
+      serverConfig: { type: "stdio", command: "gog-mcp" } as never,
+      ...overrides,
+    });
+  }
+
+  it("custom delegate prompt → instructions verbatim, maxTurns 7", () => {
+    const { assembly, maxTurns } = buildNestedDelegateAssembly({
+      config: makeAgentConfig({ delegatePrompts: { google: "Custom google prompt" } }),
+      delegate: "google", entry: makeSubagentEntry(), sessionCwd: "/tmp/nested",
+    });
+    expect(assembly.instructions).toBe("Custom google prompt");
+    expect(maxTurns).toBe(7);
+  });
+
+  it("no custom prompt → generic prompt (verbatim pre-extraction text), maxTurns 10", () => {
+    const { assembly, maxTurns } = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google", entry: makeSubagentEntry(), sessionCwd: "/tmp/nested",
+    });
+    expect(assembly.instructions).toBe(buildGenericDelegatePrompt("google"));
+    // Verbatim pin against the literal pre-extraction agent-runner text.
+    expect(assembly.instructions).toBe(
+      "You are a tool specialist for google. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.",
+    );
+    expect(maxTurns).toBe(10);
+  });
+
+  it("inventory = delegate server (connect-time, same serverConfig) + six static builtins (7 entries)", () => {
+    const entry = makeSubagentEntry();
+    const { assembly } = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google", entry, sessionCwd: "/tmp/nested",
+    });
+    expect(assembly.toolInventory).toHaveLength(7);
+    const [server, ...builtins] = assembly.toolInventory;
+    expect(server.name).toBe("google");
+    expect(server.transport).toBe("stdio");
+    expect(server.schemas.kind).toBe("connect-time");
+    expect(server.serverConfig).toBe(entry.serverConfig);
+    expect(builtins.map((b) => b.name)).toEqual(["Bash", "Read", "Write", "Edit", "Glob", "Grep"]);
+    for (const b of builtins) {
+      expect(b.transport).toBe("claude-builtin");
+      expect(b.schemas.kind).toBe("static");
+    }
+  });
+
+  it("http/sse serverConfig → transport re-expressed as http/sse", () => {
+    const http = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google",
+      entry: makeSubagentEntry({ serverConfig: { type: "http", url: "https://x" } as never }),
+      sessionCwd: "/tmp/nested",
+    });
+    expect(http.assembly.toolInventory[0].transport).toBe("http");
+    const sse = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google",
+      entry: makeSubagentEntry({ serverConfig: { type: "sse", url: "https://x" } as never }),
+      sessionCwd: "/tmp/nested",
+    });
+    expect(sse.assembly.toolInventory[0].transport).toBe("sse");
+  });
+
+  it("directive 2 pin: omittedTools strictly equals []", () => {
+    const { assembly } = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google", entry: makeSubagentEntry(), sessionCwd: "/tmp/nested",
+    });
+    expect(assembly.omittedTools).toEqual([]);
+  });
+
+  it("structural depth-1: no claude-subagent entries, no delegateTurnRunner, empty skill/inproc/memory", () => {
+    const { assembly } = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google", entry: makeSubagentEntry(), sessionCwd: "/tmp/nested",
+    });
+    expect(assembly.toolInventory.some((e) => e.transport === "claude-subagent")).toBe(false);
+    expect(assembly.delegateTurnRunner).toBeUndefined();
+    expect(assembly.skillIndex).toEqual([]);
+    expect(assembly.inProcessServers).toEqual({});
+    expect(assembly.memory).toEqual({});
+  });
+
+  it("missing serverConfig → builtin-only inventory (6 entries), no throw", () => {
+    const { assembly } = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google",
+      entry: makeSubagentEntry({ serverConfig: undefined }), sessionCwd: "/tmp/nested",
+    });
+    expect(assembly.toolInventory).toHaveLength(6);
+    expect(assembly.toolInventory.map((e) => e.name)).toEqual(["Bash", "Read", "Write", "Edit", "Glob", "Grep"]);
+  });
+
+  it("sessionCwd passed through verbatim", () => {
+    const { assembly } = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google", entry: makeSubagentEntry(),
+      sessionCwd: "/tmp/nested-cwd-verbatim",
+    });
+    expect(assembly.sessionCwd).toBe("/tmp/nested-cwd-verbatim");
+  });
+
+  it("archetyped config → gate is the archetype gate, not the allow-all stub", async () => {
+    // Reuse the buildDefaultGuardrailGate describe's throwing archetype fixture
+    // (registration is idempotent) — its rule denies (fail-closed).
+    registerArchetype({
+      id: "kpr348-throwing-stub",
+      validateConfig: (c: unknown) => c,
+      preToolUseHooks: () => {
+        throw new Error("boom at production");
+      },
+      systemPromptCard: () => "",
+    } as never);
+    const { assembly } = buildNestedDelegateAssembly({
+      config: makeAgentConfig({ archetype: "kpr348-throwing-stub", archetypeConfig: {} }),
+      delegate: "google", entry: makeSubagentEntry(), sessionCwd: "/tmp/nested",
+    });
+    const decision = await assembly.guardrailGate({ toolName: "Bash", input: { command: "ls" } });
+    expect(decision.behavior).toBe("deny");
+  });
+
+  it("passthrough pin: assembleProviderTurn carries delegateTurnRunner; omitted → undefined", async () => {
+    const fn = vi.fn(async () => "delegate result");
+    const withRunner = await assembleProviderTurn({
+      runner: makeRunner([makeEntry()]), config: makeAgentConfig(), provider: "openai", delegateTurnRunner: fn,
+    });
+    expect(withRunner.delegateTurnRunner).toBe(fn);
+    const without = await assembleProviderTurn({
+      runner: makeRunner([makeEntry()]), config: makeAgentConfig(), provider: "openai",
+    });
+    expect(without.delegateTurnRunner).toBeUndefined();
   });
 });

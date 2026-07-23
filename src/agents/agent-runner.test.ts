@@ -1340,7 +1340,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     expect(teamRosterDescriptor.compatibility.openai).toBe("requires-hive-bridge");
   });
 
-  it("classifies delegate servers as Claude sub-agents and Claude-only for non-Claude providers", () => {
+  it("classifies delegate servers as Claude sub-agents, bridgeable on Lane B, carrying serverConfig + description (KPR-354 §D1/§D2)", () => {
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: [],
@@ -1356,12 +1356,47 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       requiresTurnContext: false,
       requiresHiveRuntime: false,
     });
+    // KPR-354 §D1: delegate entries now bridge on every Lane B column.
     expect(google.compatibility).toEqual({
       claude: "direct",
-      openai: "claude-only",
-      gemini: "claude-only",
-      codex: "claude-only",
+      openai: "requires-hive-bridge",
+      gemini: "requires-hive-bridge",
+      codex: "requires-hive-bridge",
     });
+    // KPR-354 §D2: the entry carries the delegate's real external MCP config
+    // (the same object buildAllServerConfigs resolves) and the catalog text
+    // the Claude lane feeds AgentDefinition.description. google is catalog-known.
+    expect(google.serverConfig).toBeDefined();
+    expect(google.serverConfig!.type).toBe("stdio");
+    expect((google.serverConfig as any).env.GOG_ACCOUNTS).toBe("test@example.com");
+    expect(google.description).toBe("Email (Gmail), calendar, Google Drive files");
+  });
+
+  it("carries the delegate name as its own description when the server is not catalog-known (KPR-354 §D2)", () => {
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          // No per-server description → getServerCatalogEntry falls back to the name.
+          "custom-server": { entry: "mcp-servers/custom/index.ts", env: [], envMap: {}, agentEnv: {} },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [], delegateServers: ["custom-server"] }),
+      memoryManager as any,
+      [plugin],
+    );
+
+    const custom = inventoryByName(runner, "custom-server");
+    expect(custom.transport).toBe("claude-subagent");
+    expect(custom.serverConfig).toBeDefined();
+    expect(custom.description).toBe("custom-server");
   });
 
   it("includes non-executor Claude SDK built-ins as Claude-only descriptors", () => {
@@ -1520,13 +1555,13 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     }
   });
 
-  it("sources non-executor claude-builtin and claude-subagent entries as unavailable WITHOUT a serverConfig", () => {
+  it("sources non-executor claude-builtin entries as unavailable WITHOUT a serverConfig; claude-subagent entries as unavailable WITH serverConfig + description (KPR-354 §D2)", () => {
     const runner = new AgentRunner(
       makeAgentConfig({ coreServers: [], delegateServers: ["google"] }),
       memoryManager as any,
     );
 
-    // WebFetch is a claude-builtin NOT backed by the executor → unavailable.
+    // WebFetch is a claude-builtin NOT backed by the executor → unavailable, no config.
     const webFetch = inventoryByName(runner, "WebFetch");
     expect(webFetch.schemas).toEqual({ kind: "unavailable" });
     expect("serverConfig" in webFetch).toBe(false);
@@ -1536,9 +1571,14 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     expect(bash.schemas.kind).toBe("static");
     expect("serverConfig" in bash).toBe(false);
 
+    // KPR-354 §D2: the claude-subagent schema state stays "unavailable" (the Task
+    // schema is hive-authored, not discovered), but the entry now carries the
+    // delegate's serverConfig + catalog description for later Task synthesis.
     const google = inventoryByName(runner, "google");
     expect(google.schemas).toEqual({ kind: "unavailable" });
-    expect("serverConfig" in google).toBe(false);
+    expect(google.serverConfig).toBeDefined();
+    expect(google.serverConfig!.type).toBe("stdio");
+    expect(google.description).toBe("Email (Gmail), calendar, Google Drive files");
   });
 });
 

@@ -34,7 +34,12 @@ import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
-import { assembleProviderTurn } from "./provider-adapters/turn-assembly.js";
+import {
+  assembleProviderTurn,
+  buildNestedDelegateAssembly,
+  type DelegateTurnRunner,
+  type ProviderTurnAssembly,
+} from "./provider-adapters/turn-assembly.js";
 import {
   isLaneAProvider,
   resolvePassthroughSpawn,
@@ -554,12 +559,137 @@ export class AgentManager {
     // assembled inside assembleProviderTurn. Assembly throws are
     // TurnAssemblyError (classifies non-provider inside the caller's
     // recorded try).
+    // KPR-354 (§D5): manager-owned nested-turn runner for delegate
+    // subagents. Built BEFORE assembly and carried on it as an opaque
+    // callback (provider-blindness canon — provider resolution and budget
+    // machinery stay here). The body runs only inside the parent adapter's
+    // runTurn, after `parentAssembly` is assigned below. NEVER throws —
+    // every path resolves model-visible text (D5.7); tool faults stay
+    // breaker-invisible (no breaker acquire/record anywhere in the body).
+    // Forward-referenced binding: the closure below reads parentAssembly at
+    // call-time, assigned after assembly is built — must be `let`.
+    // eslint-disable-next-line prefer-const
+    let parentAssembly: ProviderTurnAssembly | undefined;
+    const delegateTurnRunner: DelegateTurnRunner = async (call) => {
+      const startedAt = Date.now();
+      // D5.1 + D5.2 (spec-review directive 3): stop check and budget
+      // check-and-increment are SYNCHRONOUS with no await between them —
+      // atomic under parallel openai Task calls (no interleaving without an
+      // await point). Denials never increment.
+      if (this.stoppedAgents.has(agentId)) {
+        return "Task denied: agent is stopped.";
+      }
+      const active = this.activeSpawnCount.get(agentId) ?? 0;
+      const budget = this.spawnBudgetFor(agentId);
+      if (active >= budget) {
+        this.recordSaturation(agentId, active, budget);
+        return `Task denied: spawn budget exhausted (${active}/${budget}). Retry later or proceed without the delegate.`;
+      }
+      this.activeSpawnCount.set(agentId, active + 1);
+      // Slot held from here; released in the finally (withSpawnTicket's
+      // delete-at-zero idiom). Deliberately NOT touched (D5.2 + directive 2):
+      // the per-thread lock (the parent holds agentId:threadId for the whole
+      // outer turn — a nested wait would deadlock permanently; same-thread
+      // serialization is a message-level concern the parent already
+      // provides), lastSpawnAt, updateStatus, breaker acquire/record,
+      // sessionStore, reflection scheduling.
+      let removeAbortListener: (() => void) | undefined;
+      try {
+        const { assembly: nestedAssembly, maxTurns } = buildNestedDelegateAssembly({
+          config,
+          delegate: call.delegate,
+          entry: call.entry,
+          workItemContext: call.workItemContext,
+          // "" arm is dead by construction: the delegate callback can only run
+          // after the parent adapter is constructed, which requires assembly.
+          sessionCwd: parentAssembly?.sessionCwd ?? "",
+        });
+        let nested: AgentProviderAdapter;
+        if (route.provider === "openai") {
+          nested = new OpenAIAgentsAdapter({
+            name: `${config.name}:${call.delegate}`,
+            model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
+            assembly: nestedAssembly,
+          });
+        } else if (route.provider === "codex") {
+          nested = new CodexSubscriptionAdapter({
+            name: `${config.name}:${call.delegate}`,
+            model: route.model || appConfig.codex.agentModel,
+            reasoningEffort: route.reasoningEffort,
+            assembly: nestedAssembly,
+            // NO historyStore / agentId (G4): the KPR-353 wiring then skips
+            // replay and persist by construction — provider_turn_history is
+            // provably untouched by nested turns.
+          });
+        } else {
+          // gemini pre-KPR-352: its adapter advertises zero tools, so the
+          // bridge never synthesizes Task — unreachable; contained anyway.
+          return `Delegate turn failed (${call.delegate}): provider ${route.provider} does not execute tools`;
+        }
+        if (call.signal.aborted) return `Delegate turn aborted (${call.delegate}).`;
+        // D5.5 (spec-review directive 1): the listener body is try/caught —
+        // an abort() throw inside EventTarget dispatch would NOT surface
+        // through this async frame and would escape all containment; the
+        // never-throws contract is structural, not assumed.
+        const onAbort = () => {
+          try {
+            nested.abort();
+          } catch (err) {
+            log.warn("Nested delegate abort threw — contained (KPR-354 D5.5)", {
+              agentId,
+              delegate: call.delegate,
+              error: String(err),
+            });
+          }
+        };
+        call.signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => call.signal.removeEventListener("abort", onAbort);
+        const result = await nested.runTurn({
+          prompt: call.prompt,
+          workItemContext: call.workItemContext,
+          // Only maxTurns is consumed on Lane B (openai run options + codex
+          // round budget); timeoutMs/budgetUsd are Claude-lane concepts —
+          // neutral values.
+          resourceLimits: { maxTurns, timeoutMs: 600_000, budgetUsd: 0 },
+        });
+        // D5.8: one info log keyed on the ROUTE provider (resolved-provider
+        // attribution canon). Nested usage is logged, not folded into the
+        // parent RunResult (⚠ spec Key Points; costUsd is 0 on both Lane B
+        // surfaces anyway).
+        log.info("Nested delegate turn complete", {
+          agentId,
+          provider: route.provider,
+          delegate: call.delegate,
+          durationMs: Date.now() - startedAt,
+          toolCalls: result.toolCalls,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          ...(result.error ? { error: result.error } : {}),
+        });
+        // D5.7 result shaping (never throws). Nested sessionId DISCARDED;
+        // sessionStore untouched (G4).
+        if (result.aborted) return `Delegate turn aborted (${call.delegate}).`;
+        if (result.error) return `Delegate turn failed (${call.delegate}): ${result.error}`;
+        return result.text || `Delegate '${call.delegate}' returned no output.`;
+      } catch (err) {
+        // Belt-and-suspenders (D5.7): the runner contract is never-throws.
+        return `Delegate turn failed (${call.delegate}): ${err instanceof Error ? err.message : String(err)}`;
+      } finally {
+        removeAbortListener?.();
+        const next = (this.activeSpawnCount.get(agentId) ?? 1) - 1;
+        if (next <= 0) this.activeSpawnCount.delete(agentId);
+        else this.activeSpawnCount.set(agentId, next);
+      }
+    };
+
     const assembly = await assembleProviderTurn({
       runner,
       config,
       provider: route.provider,
       workItemContext,
+      delegateTurnRunner,
     });
+    parentAssembly = assembly;
 
     if (route.provider === "codex") {
       return new CodexSubscriptionAdapter({

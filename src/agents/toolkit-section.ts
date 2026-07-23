@@ -214,8 +214,9 @@ const PROVIDER_BUILTIN_BLURBS: Record<string, string> = {
 };
 
 export interface ProviderToolkitInput {
-  /** PARTITIONED inventory (assembly.toolInventory) — claude-only and
-   *  claude-subagent entries never reach this function by construction. */
+  /** PARTITIONED inventory (assembly.toolInventory) — claude-only entries
+   *  never reach this function; claude-subagent entries DO post-KPR-354
+   *  (bridgeable — rendered as the delegates subsection). */
   toolInventory: HiveToolInventoryEntry[];
   plugins: LoadedPlugin[];
 }
@@ -230,8 +231,10 @@ export interface ProviderToolkitInput {
  *    (engine → engine-provided; core/plugin → capability), one line per
  *    SERVER (the bridge exposes tools as mcp__<server>__<tool>, so
  *    server-level listing stays truthful).
- *  - Omitted: delegated-MCPs section, deferred-loading hint (Claude-CLI
- *    mechanisms). Header/"try them" framing reused verbatim.
+ *  - Delegated: claude-subagent entries render as the delegates subsection
+ *    (KPR-354 §D6 — now bridgeable via the Task tool).
+ *  - Omitted: deferred-loading hint (Claude-CLI mechanism only).
+ *    Header/"try them" framing reused verbatim.
  * Known honesty limit: renders at assembly time, before connect() — a
  * connect-time fail-soft omission is still listed; runtimeOmissions is the
  * honest record.
@@ -240,8 +243,14 @@ export function buildProviderToolkitSection(input: ProviderToolkitInput): string
   const builtinLines: string[] = [];
   const engineLines: string[] = [];
   const capabilityLines: string[] = [];
+  const delegateLines: string[] = [];
 
   for (const entry of input.toolInventory) {
+    if (entry.transport === "claude-subagent") {
+      // KPR-354 (§D6): now-bridgeable delegates — via-Task framing.
+      delegateLines.push(formatToolkitLine(entry.name, resolveCatalogEntry(entry.name, input.plugins)));
+      continue;
+    }
     if (entry.transport === "claude-builtin") {
       if (entry.schemas.kind !== "static") continue; // partition guarantees; belt-and-suspenders
       for (const def of entry.schemas.tools) {
@@ -262,7 +271,6 @@ export function buildProviderToolkitSection(input: ProviderToolkitInput): string
         capabilityLines.push(line);
       }
     }
-    // claude-subagent: unreachable post-partition — deliberately no rendering.
   }
 
   const sections: string[] = [];
@@ -278,6 +286,11 @@ export function buildProviderToolkitSection(input: ProviderToolkitInput): string
   }
   if (capabilityLines.length > 0) {
     sections.push("### Capability MCPs (provisioned for your role)\n" + capabilityLines.join("\n"));
+  }
+  if (delegateLines.length > 0) {
+    sections.push(
+      "### Delegated capability MCPs (via the Task tool)\n" + delegateLines.join("\n"),
+    );
   }
   return sections.join("\n\n");
 }

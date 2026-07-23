@@ -359,7 +359,7 @@ describe("buildProviderInstructions — memory tool-claim gate", () => {
 // ── Toolkit honesty ─────────────────────────────────────────────────
 
 describe("buildProviderInstructions — toolkit honesty", () => {
-  it("Lane B toolkit never advertises Claude-CLI-only tools or a delegated section", async () => {
+  it("Lane B toolkit never advertises Claude-CLI-only builtins; delegates render via the Task tool (KPR-354 §D6)", async () => {
     const { instructions } = await buildProviderInstructions(
       makeAgentConfig(),
       makeInput({
@@ -367,11 +367,15 @@ describe("buildProviderInstructions — toolkit honesty", () => {
         toolInventory: [builtinEntry(), makeEntry({ name: "memory" }), engineEntry("slack"), subagentEntry()],
       }),
     );
-    for (const forbidden of ["WebFetch", "WebSearch", "NotebookEdit", "TodoWrite", "Task", "Delegated capability"]) {
+    // Claude-CLI-only builtins are partition-omitted from Lane B.
+    for (const forbidden of ["WebFetch", "WebSearch", "NotebookEdit", "TodoWrite"]) {
       expect(instructions).not.toContain(forbidden);
     }
     // The six executor builtins DO render as per-tool lines.
     expect(instructions).toContain("- Bash — run shell commands");
+    // KPR-354 §D6: claude-subagent entries render the delegated section via-Task.
+    expect(instructions).toContain("### Delegated capability MCPs (via the Task tool)");
+    expect(instructions).toContain("- __subagent__ — __subagent__");
   });
 });
 
