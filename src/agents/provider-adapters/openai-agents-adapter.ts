@@ -199,11 +199,17 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
   private buildClient(): OpenAI {
     const apiKey = this.options.apiKey ?? envValue("OPENAI_API_KEY");
     if (!apiKey) {
-      // Message shaped to the auth row's existing `api.?key is not
-      // available` alternate (error-classification.ts FAULT_PATTERNS) —
-      // `hive credentials add OPENAI_API_KEY` recovers on the next spawn.
+      // Message prefix shaped to the auth row's existing `api.?key is not
+      // available` alternate (error-classification.ts FAULT_PATTERNS) — keep
+      // "OpenAI API key is not available" verbatim so it classifies auth.
+      // Remediation: the only working path today is seeding OPENAI_API_KEY in
+      // the instance .env + a service restart (env→Keychain fallback fires at
+      // process boot, not next spawn). `hive credentials add OPENAI_API_KEY`
+      // hard-rejects — there is no CREDENTIAL_REGISTRY entry for this key and
+      // no config.openai.apiKey resolution yet; registry/Keychain wiring is
+      // future work (KPR-350 L0 leg seeds via .env).
       throw new Error(
-        "OpenAI API key is not available; set OPENAI_API_KEY (hive credentials add OPENAI_API_KEY)",
+        "OpenAI API key is not available; set OPENAI_API_KEY in the instance .env and restart — hive credentials add does not carry this key yet",
       );
     }
     return new OpenAI({ apiKey });

@@ -364,7 +364,7 @@ describe("OpenAIAgentsAdapter", () => {
     // beforeEach deleted OPENAI_API_KEY; explicit undefined overrides the harness default.
     const result = await makeAdapter({ apiKey: undefined }).runTurn({ prompt: "hello" });
     expect(result.error).toBe(
-      "OpenAI API key is not available; set OPENAI_API_KEY (hive credentials add OPENAI_API_KEY)",
+      "OpenAI API key is not available; set OPENAI_API_KEY in the instance .env and restart — hive credentials add does not carry this key yet",
     );
     expect(result.aborted).toBe(false);
     expect(RunnerMock).not.toHaveBeenCalled();

@@ -71,7 +71,7 @@ describe("classifyTurnResult (KPR-306)", () => {
     // KPR-351 R1: the OpenAIAgentsAdapter missing-key throw — pinned per the
     // auth row's standing rule (alternates land with their sentinel). No row
     // edit needed: the existing `api.?key is not available` alternate matches.
-    "OpenAI API key is not available; set OPENAI_API_KEY (hive credentials add OPENAI_API_KEY)",
+    "OpenAI API key is not available; set OPENAI_API_KEY in the instance .env and restart — hive credentials add does not carry this key yet",
   ])("auth: %s", (s) => expect(faultKind(s)).toBe("auth"));
 
   // The auth row MUST be a superset of every isAuthRebuildResumeError
