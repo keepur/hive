@@ -95,7 +95,8 @@ export interface ProviderTurnAssembly {
    * section helpers (buildProviderInstructions via runner.buildProviderPrompt):
    * soul → archetype card → systemPrompt → constitution → team summary →
    * memory → datetime, with the tool-dependent sections (toolkit, file-tier
-   * guidance, skills) gated by TOOL_EXECUTING_PROVIDERS (§D3).
+   * guidance, skills) rendered unconditionally post-KPR-352
+   * (`toolsExecutable: true` — Lane B invariant).
    */
   instructions: string;
   /** Bridgeable subset for the route provider — already partitioned. */
@@ -124,18 +125,6 @@ export interface ProviderTurnAssembly {
    */
   delegateTurnRunner?: DelegateTurnRunner;
 }
-
-/**
- * KPR-349 (§D3): tool-honesty gate. Only providers whose adapters actually
- * execute bridged tools get tool-dependent prompt sections (toolkit,
- * file-tier guidance, skills) and the memory block's tool-instruction
- * lines. KPR-353 added codex in the same commit as its adapter's zero-tools
- * flip; KPR-352 adds gemini the same way — the set and the flip are one
- * review surface (same one-line-per-provider growth pattern as
- * SESSION_SEMANTICS). Delete-candidate once all three Lane B providers
- * execute tools.
- */
-export const TOOL_EXECUTING_PROVIDERS: ReadonlySet<LaneBProviderId> = new Set(["openai", "codex"]);
 
 /**
  * KPR-347 (§D1.5): default fail-closed guardrail gate — the mirror of the
@@ -194,7 +183,14 @@ export async function assembleProviderTurn(input: {
     // KPR-349 (§D1/§D3): the real system prompt — shared section helpers via
     // the runner; skill derivation + memory fold-in run INSIDE this try, so
     // a Mongo blip classifies non-provider (§D9, T7).
-    const toolsExecutable = TOOL_EXECUTING_PROVIDERS.has(input.provider);
+    // KPR-352 (§D4): TOOL_EXECUTING_PROVIDERS completed {openai, codex,
+    // gemini} = LaneBProviderId and DISSOLVED per KPR-349 canon — every
+    // native Lane B adapter executes bridged tools, so the honesty gate is
+    // vacuously open. The builder's `toolsExecutable: boolean` param SURVIVES
+    // as the provider-blind seam (KPR-349 canon: never a provider id): a
+    // future non-tool-executing LaneBProviderId addition must re-gate here
+    // explicitly — that child's one-line concern.
+    const toolsExecutable = true;
     const { instructions, hotTierPrompt, skillEntries } = await input.runner.buildProviderPrompt({
       toolInventory: bridgeable,
       toolsExecutable,

@@ -30,7 +30,7 @@ import {
   CodexSubscriptionAdapter,
   type CodexReasoningEffort,
 } from "./provider-adapters/codex-subscription-adapter.js";
-import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
+import { GeminiInteractionsAdapter } from "./provider-adapters/gemini-interactions-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
@@ -176,7 +176,7 @@ const DEFAULT_PER_AGENT_SPAWN_BUDGET = 5;
 type ProviderModelRoute =
   | { provider: "claude"; model: string }
   | { provider: "openai"; model: string; reasoningEffort?: CodexReasoningEffort }
-  | { provider: "gemini"; model: string }
+  | { provider: "gemini"; model: string; reasoningEffort?: CodexReasoningEffort }
   | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort }
   // KPR-346 (§D2): Lane A passthrough — Claude runtime, foreign endpoint.
   // reasoningEffort survives splitProviderModel and delivers via the Claude
@@ -199,7 +199,7 @@ function resolveProviderModel(model: string): ProviderModelRoute {
     return { provider: "openai", model: providerModel, reasoningEffort };
   }
   if (provider === "gemini" || provider === "google-gemini") {
-    return { provider: "gemini", model: providerModel };
+    return { provider: "gemini", model: providerModel, reasoningEffort };
   }
   if (provider === "kimi") {
     return { provider: "kimi", model: providerModel, reasoningEffort };
@@ -288,11 +288,28 @@ function isAuthRebuildResumeError(reason: string): boolean {
  * one turn's context (the self-heal retries fresh). Docs/community-sourced;
  * refined against KPR-351's live capture (L2) if the production string
  * differs. Exported for the narrowness-matrix unit pins.
+ *
+ * KPR-352 (§D3): a third alternate matches the gemini adapter's hive-owned
+ * stale-resume sentinel ("gemini interaction resume rejected"). Unlike the
+ * openai alternates (which match the vendor's prose surface), the gemini
+ * sentinel is emitted deterministically by the adapter — only for a round-1
+ * 4xx whose carried previous_interaction_id was the persisted handle — so the
+ * matcher is a sentinel check, not a prose guess.
  */
 export function isStaleServerHandleError(reason: string): boolean {
   return (
     /previous response[\s\S]{0,80}?(not found|expired|no longer (?:exists|available))/i.test(reason) ||
-    /previous_response_id[\s\S]{0,80}?(not found|invalid|expired)/i.test(reason)
+    /previous_response_id[\s\S]{0,80}?(not found|invalid|expired)/i.test(reason) ||
+    // KPR-352 (§D3): the gemini adapter's hive-owned sentinel — emitted ONLY
+    // for round-1 status-400 failures (the live-probed set; T0 spike showed
+    // fabricated AND malformed ids both 400) whose carried
+    // previous_interaction_id was the persisted sessions-store handle, gated
+    // by a message discriminator so generic malformed-request 400s stay
+    // ordinary provider faults. If a genuinely aged-out handle is ever
+    // observed to 403 (55d/1d retention — unprobeable at spike time), fold
+    // that status + a permission-message discriminator into the adapter's
+    // STALE_HANDLE_STATUSES/STALE_HANDLE_MESSAGE, not here.
+    /gemini interaction resume rejected/i.test(reason)
   );
 }
 
@@ -638,10 +655,24 @@ export class AgentManager {
             // replay and persist by construction — provider_turn_history is
             // provably untouched by nested turns.
           });
+        } else if (route.provider === "gemini") {
+          nested = new GeminiInteractionsAdapter({
+            name: `${config.name}:${call.delegate}`,
+            model: route.model || appConfig.gemini.agentModel || "gemini-3.6-flash",
+            apiKey: appConfig.gemini.apiKey || undefined,
+            reasoningEffort: route.reasoningEffort,
+            assembly: nestedAssembly,
+            // Session-less by construction (§D6): no sessionId flows into the
+            // nested runTurn below, the nested turn starts a fresh chain, and
+            // the D5.7 shaping discards the final id — nothing persists.
+            // Accepted residue: unreferenced store:true interactions self-
+            // expire at vendor retention (55d paid) — KPR-350's 30d shape.
+          });
         } else {
-          // gemini pre-KPR-352: its adapter advertises zero tools, so the
-          // bridge never synthesizes Task — unreachable; contained anyway.
-          return `Delegate turn failed (${call.delegate}): provider ${route.provider} does not execute tools`;
+          // Unreachable while LaneBProviderId = {openai, codex, gemini} —
+          // kept as containment for a future provider that ships tool-less
+          // (KPR-354 belt-and-braces; §D6).
+          return `Delegate turn failed (${call.delegate}): provider ${String((route as { provider: string }).provider)} does not execute tools`;
         }
         if (call.signal.aborted) return `Delegate turn aborted (${call.delegate}).`;
         // D5.5 (spec-review directive 1): the listener body is try/caught —
@@ -729,9 +760,13 @@ export class AgentManager {
       });
     }
 
-    return new GeminiAdkAdapter({
+    return new GeminiInteractionsAdapter({
       name: config.name,
-      model: route.model || appConfig.gemini.agentModel || "gemini-2.5-flash",
+      // KPR-352 plan-time pin: Interactions-supported default (pre-352
+      // literal "gemini-2.5-flash" predates the surface).
+      model: route.model || appConfig.gemini.agentModel || "gemini-3.6-flash",
+      apiKey: appConfig.gemini.apiKey || undefined,
+      reasoningEffort: route.reasoningEffort,
       assembly,
     });
   }

@@ -60,11 +60,13 @@ const SDK_NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_exec
  * First match wins, in row order. The auth row MUST remain a superset of
  * every `isAuthRebuildResumeError` alternate (agent-manager.ts — currently:
  * resolve authentication | credentials\.json | not authenticated |
- * 401 Unauthorized | ANTHROPIC_API_KEY | authToken). A sentinel the auth row
- * misses would classify non-provider and RESET the hard-fault streak, so a
- * persistent auth outage would never trip. Any future addition to the
- * sentinel list must extend this row in the same change (regression-pinned
- * per-alternate in error-classification.test.ts).
+ * 401 Unauthorized | ANTHROPIC_API_KEY | authToken). It also carries the
+ * gemini missing-key sentinel (`api.?key is not available` — KPR-352 §D7: the
+ * GeminiInteractionsAdapter's pre-request throw when no Gemini/Google key
+ * resolves). A sentinel the auth row misses would classify non-provider and
+ * RESET the hard-fault streak, so a persistent auth outage would never trip.
+ * Any future addition to the sentinel list must extend this row in the same
+ * change (regression-pinned per-alternate in error-classification.test.ts).
  */
 const FAULT_PATTERNS: ReadonlyArray<
   readonly [Exclude<ProviderFaultKind, "non-provider" | "timeout">, RegExp]
@@ -76,7 +78,7 @@ const FAULT_PATTERNS: ReadonlyArray<
   ["rate-limit", /\b429\b|rate.?limit|too many requests/i],
   [
     "auth",
-    /\b401\b|\b403\b|authentication|unauthorized|invalid.?api.?key|OAuth session is not available|not.?authenticated|credentials\.json|ANTHROPIC_API_KEY|authToken|resolve authentication/i,
+    /\b401\b|\b403\b|authentication|unauthorized|invalid.?api.?key|OAuth session is not available|api.?key is not available|not.?authenticated|credentials\.json|ANTHROPIC_API_KEY|authToken|resolve authentication/i,
   ],
   ["server-error", /\b5\d\d\b|overloaded|internal server error|service unavailable|bad gateway|upstream/i],
   [

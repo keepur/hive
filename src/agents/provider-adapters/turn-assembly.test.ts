@@ -9,7 +9,6 @@ import {
   buildDefaultGuardrailGate,
   buildGenericDelegatePrompt,
   buildNestedDelegateAssembly,
-  TOOL_EXECUTING_PROVIDERS,
 } from "./turn-assembly.js";
 import {
   ProviderCircuitBreakerRegistry,
@@ -106,15 +105,11 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     expect(assembly.sessionCwd).toBe("/tmp/kpr348-planted-cwd");
   });
 
-  it("KPR-353 §D1: TOOL_EXECUTING_PROVIDERS is exactly {openai, codex} (352 grows it with the gemini flip)", () => {
-    expect(TOOL_EXECUTING_PROVIDERS).toEqual(new Set(["openai", "codex"]));
-  });
-
-  it("KPR-349 §D3: toolsExecutable false for gemini (pre-352)", async () => {
+  it("KPR-352 §D4: toolsExecutable TRUE for gemini (flip commit — set completed and dissolved)", async () => {
     const runner = makeRunner([makeEntry()]);
     await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "gemini" });
     expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith(
-      expect.objectContaining({ toolsExecutable: false }),
+      expect.objectContaining({ toolsExecutable: true }),
     );
   });
 
