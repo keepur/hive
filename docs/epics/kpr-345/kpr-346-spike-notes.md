@@ -85,14 +85,18 @@ The precedence guarantee holds by default under launchd, **but** is conditional 
 
 ---
 
-## V2–V6 delivery checklist (placeholder — Task 5 fills this in)
+## V2–V6 delivery checklist (Task 5)
 
 Delivery-time live-endpoint validation, graceful-degradation posture (funded vendor keys optional/deferred/non-gating per HUMAN_DIRECTIVE precedent — keys absent ⇒ document + defer, code still ships; production reassignment stays gated).
 
-| Leg | What to run | Verdict |
-|---|---|---|
-| V2 full-runtime fidelity | Reassign one dev agent `kimi/…` then `deepseek/…` (`admin_agent_update` + SIGUSR1): MCP round-trips (in-process + stdio), archetype PreToolUse hook, skill load, one Task subagent spawn (**no Claude model id in vendor console logs**), streaming partials, second-turn resume (provider-tagged `sessions` row) | _TBD (Task 5)_ |
-| V3 server-side tool absence | Invoke WebSearch/WebFetch on the foreign endpoint; record failure shape; file strip-server-side-tools follow-up if turn-fatal & non-trivial | _TBD (Task 5)_ |
-| V4 `:effort` delivery | Turn with `:high` — vendor accepts/ignores without turn-fatal error | _TBD (Task 5)_ |
-| V5 breaker/outage live | Point table baseUrl at an unreachable host: 3 turns → `kimi` circuit opens (`circuit_breaker_stats` provider `kimi`), one honest-outage notice, queue + replay on restore; a Claude agent keeps working | _TBD (Task 5)_ |
-| V6 KPR-313 live | Reassign a threaded agent `claude→kimi` mid-thread: annotation observed, fresh session; reverse and verify inverse | _TBD (Task 5)_ |
+**Key-presence verdict (2026-07-23, both instances):** funded vendor keys ABSENT — `hive/dodi/KIMI_API_KEY`, `hive/dodi/DEEPSEEK_API_KEY`, `hive/keepur/KIMI_API_KEY`, `hive/keepur/DEEPSEEK_API_KEY` all absent (presence-only check by the dispatcher). Per the plan (Task 5 preamble) + HUMAN_DIRECTIVE precedent, **every leg V2–V6 is recorded `DEFERRED — no funded vendor key`**; the code and V1 evidence are complete without them, so the child ships. **Production reassignment stays gated on running V2–V6 once keys are seeded.**
+
+**Funded-key procedure (plan lines 916–922) — what the future executor runs once keys land.** Seed the key(s): `hive credentials add KIMI_API_KEY` and/or `hive credentials add DEEPSEEK_API_KEY` (takes effect next spawn — no restart), then execute each leg's procedure below on a dev instance and replace the verdict with the live observation.
+
+| Leg | What it validates (funded-key path) | Verdict | Deferral posture |
+|---|---|---|---|
+| V2 full-runtime fidelity | Reassign one dev agent to `kimi/…` then `deepseek/…` (`admin_agent_update` + SIGUSR1): MCP round-trips (in-process + stdio), archetype PreToolUse hook fires, skill load, one Task subagent spawn (**no Claude model id in vendor console logs** — pin-set sufficiency check, spec open-assumption 2), streaming partials, second turn resumes (context retained; `sessions` row provider-tagged) | **DEFERRED — no funded vendor key (2026-07-23, both instances)** | Gate note — production reassignment stays gated on this leg; V1 precedence + pin-set evidence (§L1, §Task 2 §D5 defensive `CLAUDE_CODE_ENTRYPOINT` scrub) stands offline. |
+| V3 server-side tool absence | Invoke WebSearch/WebFetch on the foreign endpoint; record observed failure shape. Turn-fatal (not tool-error-shaped) ⇒ file the strip-server-side-tools follow-up unless trivially small (clean-wrap canon) | **DEFERRED — no funded vendor key (2026-07-23, both instances)** | Caveat already documented — the "no Anthropic server-side tools (WebFetch/WebSearch)" limitation is recorded in the CLAUDE.md Lane A rider (Step 4.2); live failure-shape capture is confirmatory only. |
+| V4 `:effort` delivery | Turn with `:high` — vendor accepts/ignores without turn-fatal error | **DEFERRED — no funded vendor key (2026-07-23, both instances)** | Clamp already tested offline — the `:effort` clamp/pass-through path has offline coverage; live leg only confirms the vendor tolerates the suffix. |
+| V5 breaker/outage live | Point the table's baseUrl at an unreachable host on the dev instance: 3 turns → `kimi` circuit opens (`circuit_breaker_stats` provider `kimi`), one honest-outage notice, queue + replay on restore; a Claude agent keeps working throughout | **DEFERRED — no funded vendor key (2026-07-23, both instances)** | Offline T6 covers attribution — per-provider breaker/outage-queue attribution (`kimi` route isolated) is covered by offline test T6; live leg is end-to-end confirmation. |
+| V6 KPR-313 live | Reassign a threaded agent `claude→kimi` mid-thread: annotation observed, fresh session; reverse and verify inverse | **DEFERRED — no funded vendor key (2026-07-23, both instances)** | Offline T7 covers both directions — the KPR-313 provider-handoff annotation + fresh-session behavior (both directions) is covered by offline test T7. |
