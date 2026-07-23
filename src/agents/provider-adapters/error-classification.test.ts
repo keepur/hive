@@ -175,3 +175,17 @@ describe("TurnAssemblyError (KPR-347 §D6)", () => {
     expect(classifyThrown(new Error(msg))).toMatchObject({ outcome: "fault", kind: "connect-fail" });
   });
 });
+
+describe("KPR-350 §D3 — stale-resume strings stay non-provider (no 404 row, ever)", () => {
+  it.each([
+    "Previous response with id 'resp_abc123' not found.",
+    "400 invalid_request_error: previous_response_id 'resp_x' not found",
+    "Previous response resp_9 has expired",
+  ])("classifies non-provider: %s", (error) => {
+    expect(classifyTurnResult({ error })).toEqual({
+      outcome: "fault",
+      kind: "non-provider",
+      message: error,
+    });
+  });
+});

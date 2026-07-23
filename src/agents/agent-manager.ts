@@ -280,6 +280,23 @@ function isAuthRebuildResumeError(reason: string): boolean {
 }
 
 /**
+ * KPR-350 (§D3): stale server-handle sentinel for server-resumable routes.
+ * Matches the Responses previous-response-gone surface ("Previous response
+ * with id 'resp_…' not found", 404/400-shaped, incl. the previous_response_id
+ * param variant). Deliberately NARROW — bounded gaps, anchored on the
+ * "previous response(_id)" prefix — because a false positive silently drops
+ * one turn's context (the self-heal retries fresh). Docs/community-sourced;
+ * refined against KPR-351's live capture (L2) if the production string
+ * differs. Exported for the narrowness-matrix unit pins.
+ */
+export function isStaleServerHandleError(reason: string): boolean {
+  return (
+    /previous response[\s\S]{0,80}?(not found|expired|no longer (?:exists|available))/i.test(reason) ||
+    /previous_response_id[\s\S]{0,80}?(not found|invalid|expired)/i.test(reason)
+  );
+}
+
+/**
  * KPR-220 Phase 2: thrown by `withSpawnTicket` when the agent is in
  * `stoppedAgents` at any of three checkpoints (pre-wait, mid-wait,
  * post-lock). Caller decides whether to swallow (reflection) or surface

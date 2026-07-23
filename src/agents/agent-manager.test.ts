@@ -179,7 +179,7 @@ vi.mock("../search/conversation-index.js", () => ({
   })),
 }));
 
-import { AgentManager, type TurnContext } from "./agent-manager.js";
+import { AgentManager, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
 import { AgentRunner, type RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -4037,5 +4037,35 @@ describe("AgentManager", () => {
         ),
       ).toEqual({ outcome: "success" });
     });
+  });
+});
+
+describe("isStaleServerHandleError (KPR-350 §D3) — narrowness matrix", () => {
+  const MUST_MATCH = [
+    "Previous response with id 'resp_abc123' not found.",
+    "previous response not found",
+    "Previous response resp_9 has expired",
+    "400 invalid_request_error: previous_response_id 'resp_x' not found",
+    "previous_response_id is invalid",
+    "Previous response with id 'resp_x' no longer exists",
+  ];
+  const MUST_NOT_MATCH = [
+    "404 Not Found",
+    "getaddrinfo ENOTFOUND api.openai.com",
+    "model not found",
+    "tool not found",
+    "conversation not found",
+    "error_during_execution",
+    "401 Unauthorized",
+    "No response received from previous request",
+    "",
+  ];
+  it.each(MUST_MATCH)("matches: %s", (s) => expect(isStaleServerHandleError(s)).toBe(true));
+  it.each(MUST_NOT_MATCH)("does NOT match: %s", (s) => expect(isStaleServerHandleError(s)).toBe(false));
+  it("is disjoint from the auth-rebuild sentinel on every stale string (arm independence)", () => {
+    // isAuthRebuildResumeError is module-private; assert via its published
+    // alternates: none of the stale strings contain an auth sentinel.
+    const AUTH = /resolve authentication|credentials\.json|not authenticated|401 Unauthorized|ANTHROPIC_API_KEY|authToken/i;
+    for (const s of MUST_MATCH) expect(AUTH.test(s)).toBe(false);
   });
 });
