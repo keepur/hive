@@ -55,7 +55,7 @@ vi.mock("@openai/agents", () => {
     Runner: vi.fn(function Runner(options: unknown) {
       return { options, run: runnerRunMock };
     }),
-    run: vi.fn(),
+    run: runnerRunMock,
     // bindTool passes the cfg through; tests read cfg.name/cfg.execute directly.
     tool: vi.fn((cfg: unknown) => cfg),
     MCPServerStdio: vi.fn(mcpFactory()),
@@ -74,7 +74,7 @@ function makeAdapter(overrides: Partial<ConstructorParameters<typeof OpenAIAgent
     name: "Pilot",
     assembly: makeAssembly(),
     model: "gpt-5.4-mini",
-    preferOAuth: false,
+    apiKey: "sk-test",
     ...overrides,
   });
 }
@@ -360,34 +360,42 @@ describe("OpenAIAgentsAdapter", () => {
     });
   });
 
-  it("prefers Codex OAuth and falls back to API-key auth on OpenAI auth failures", async () => {
-    process.env.OPENAI_API_KEY = "sk-fallback";
-    const dir = mkdtempSync(join(tmpdir(), "hive-codex-auth-"));
-    const authPath = join(dir, "auth.json");
-    writeFileSync(authPath, JSON.stringify({ tokens: { access_token: makeJwt({ exp: 60 * 60 }) } }));
-    runnerRunMock
-      .mockRejectedValueOnce(Object.assign(new Error("Missing scopes: api.responses.write"), { status: 401 }))
-      .mockResolvedValueOnce(makeSdkResult({ finalOutput: "used fallback", lastResponseId: "resp-fallback" }));
+  it("KPR-351 R1: missing key ⇒ pre-request fail — auth-shaped RunResult.error, no Runner, turn resolves", async () => {
+    // beforeEach deleted OPENAI_API_KEY; explicit undefined overrides the harness default.
+    const result = await makeAdapter({ apiKey: undefined }).runTurn({ prompt: "hello" });
+    expect(result.error).toBe(
+      "OpenAI API key is not available; set OPENAI_API_KEY (hive credentials add OPENAI_API_KEY)",
+    );
+    expect(result.aborted).toBe(false);
+    expect(RunnerMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+    // The honest-outage contract: the message classifies auth (breaker food),
+    // via the RunResult path this adapter actually takes AND the throw path.
+    expect(classifyTurnResult({ error: result.error })).toEqual({
+      outcome: "fault",
+      kind: "auth",
+      message: result.error,
+    });
+  });
 
-    try {
-      const result = await makeAdapter({ preferOAuth: true, codexAuthPath: authPath }).runTurn({ prompt: "hello" });
+  it("KPR-351 R1: single API-key path — exactly one Runner/client per turn, string key, from options.apiKey", async () => {
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+    await makeAdapter().runTurn({ prompt: "hello" });
+    expect(RunnerMock).toHaveBeenCalledTimes(1);
+    expect(OpenAIProviderMock).toHaveBeenCalledTimes(1);
+    const client = (OpenAIProviderMock.mock.calls[0]![0] as any).openAIClient;
+    // A token-provider client (the deleted codex-oauth attempt) carried a
+    // FUNCTION apiKey — string-typed is the single-path pin.
+    expect(client._options.apiKey).toBe("sk-test");
+    expect(typeof client._options.apiKey).toBe("string");
+  });
 
-      expect(result).toMatchObject({
-        text: "used fallback",
-        sessionId: "resp-fallback",
-        aborted: false,
-      });
-      expect(runMock).not.toHaveBeenCalled();
-      expect(RunnerMock).toHaveBeenCalledTimes(2);
-      expect(OpenAIProviderMock).toHaveBeenCalledTimes(2);
-
-      const firstClient = (OpenAIProviderMock.mock.calls[0][0] as any).openAIClient;
-      const secondClient = (OpenAIProviderMock.mock.calls[1][0] as any).openAIClient;
-      expect(typeof firstClient._options.apiKey).toBe("function");
-      expect(secondClient._options.apiKey).toBe("sk-fallback");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it("KPR-351 R1: OPENAI_API_KEY env resolves when options.apiKey is absent", async () => {
+    process.env.OPENAI_API_KEY = "sk-env";
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+    await makeAdapter({ apiKey: undefined }).runTurn({ prompt: "hello" });
+    const client = (OpenAIProviderMock.mock.calls[0]![0] as any).openAIClient;
+    expect(client._options.apiKey).toBe("sk-env");
   });
 
   it("coerces finalOutput values", async () => {
@@ -804,15 +812,3 @@ describe("OpenAIAgentsAdapter — KPR-348 T5 (abort, adapter half)", () => {
     });
   });
 });
-
-function makeJwt(payload: Record<string, unknown>): string {
-  const now = Math.floor(Date.now() / 1000);
-  const encoded = Buffer.from(
-    JSON.stringify({
-      aud: ["https://api.openai.com/v1"],
-      ...payload,
-      exp: now + Number(payload.exp ?? 60 * 60),
-    }),
-  ).toString("base64url");
-  return `header.${encoded}.signature`;
-}
