@@ -96,9 +96,9 @@ Model resolution chain: `route.model || appConfig.<provider>.agentModel || table
 
 `resolvePassthroughSpawn` resolves the credential **per spawn**: `process.env[authTokenKey] || fromKeychain(config.instance.id, authTokenKey)` — the exact secret-env pattern the runner already uses for plugin stdio servers (`agent-runner.ts:914`). Per-spawn (not boot-time `optional()`) so `hive credentials add KIMI_API_KEY` takes effect on the next spawn without a restart, and no vendor secret sits in the long-lived config object.
 
-Missing/empty credential → `throw new TurnAssemblyError("Passthrough credential missing: <KEY> (hive credentials add <KEY>)")`:
+Missing/empty credential → `throw new TurnAssemblyError("Passthrough credential missing (authentication): <KEY> — seed it via hive credentials add <KEY>")`:
 
-- The throw happens inside `runOneSpawnAttempt` → inside spawnTurn's recorded try → `classifyThrown` short-circuits `TurnAssemblyError` to `non-provider` (`error-classification.ts:126-129`) **before** the pattern tables — critical, because a plain-Error message mentioning "API key" would regex-match the `auth` fault row and count toward the foreign breaker's trip streak.
+- The throw happens inside `runOneSpawnAttempt` → inside spawnTurn's recorded try → `classifyThrown` short-circuits `TurnAssemblyError` to `non-provider` (`error-classification.ts:126-129`) **before** the pattern tables. The message deliberately contains "authentication" so that, absent the `TurnAssemblyError` wrapper, it *would* regex-match the `auth` fault row (`error-classification.ts:78-80`) and count toward the foreign breaker's trip streak — which makes the negative-verify leg (swap to plain `Error` → breaker-invisibility test must fail) prove the short-circuit is load-bearing rather than vacuously pass.
 - Result: operator-visible error, no breaker trip, no outage-queue episode. Config fault, not provider fault (epic D2).
 
 Keychain read cost (one `execFileSync security` call per spawn) is microseconds-scale and matches existing per-spawn stdio-server resolution; no caching (rotation-friendly, simplicity canon).
