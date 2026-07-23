@@ -2964,18 +2964,28 @@ describe("AgentManager", () => {
         expect(sessionStore.set).not.toHaveBeenCalled(); // ⚠A4 rider: error + different id than resumed
       });
 
-      it("breaker record-once: stale→success records success; stale→failure records non-provider — streak 0 both ways", async () => {
+      it("breaker record-once: exactly one record per spawnTurn, classification = finalized attempt's; streak 0 both ways", async () => {
+        // KPR-351 (R3): the streak-0 assertions alone were vacuous — stale
+        // AND "boom" both classify non-provider, so streak 0 held even if
+        // the first attempt were recorded. The spy makes the pin bite.
+        const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
         mockOpenAIRunTurn
           .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
           .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "resp-f2" }));
         await manager.spawnTurn(octx("sms:line-1:kpr350-brk-1"));
+        expect(recordSpy).toHaveBeenCalledTimes(1); // first attempt's stale fault never recorded
+        expect(recordSpy.mock.calls[0]![1]).toEqual({ outcome: "success" });
+
         mockOpenAIRunTurn
           .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
           .mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "resp_stale" }));
         await manager.spawnTurn(octx("sms:line-1:kpr350-brk-2"));
-        const snap = manager.circuitBreakers.stateFor("openai")!; // non-null-assertion per stateFor("claude")! precedent under strict TS
+        expect(recordSpy).toHaveBeenCalledTimes(2);
+        expect(recordSpy.mock.calls[1]![1]).toEqual({ outcome: "fault", kind: "non-provider", message: "boom" });
+
+        const snap = manager.circuitBreakers.stateFor("openai")!; // non-null-assertion per stateFor("claude")! precedent
         expect(snap.state).toBe("closed");
-        expect(snap.consecutiveHardFaults).toBe(0); // stale string AND "boom" are non-provider; first attempts never recorded
+        expect(snap.consecutiveHardFaults).toBe(0);
       });
 
       it("gating: dead on client-transcript (claude), stateless-replay (codex), missing sessionId, non-matching 404", async () => {
