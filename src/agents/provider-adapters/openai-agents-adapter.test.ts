@@ -229,6 +229,7 @@ describe("OpenAIAgentsAdapter", () => {
       name: "Pilot",
       instructions: "Be useful.",
       model: "gpt-5.4-mini",
+      modelSettings: { store: true, truncation: "auto" },
     });
     expect(runMock).toHaveBeenCalledWith(expect.anything(), "hello", {
       stream: false,
@@ -253,6 +254,21 @@ describe("OpenAIAgentsAdapter", () => {
     expect(result.llmMs).toBe(result.durationMs);
   });
 
+  it("KPR-350 §D2: chaining posture pinned — store:true + truncation:auto on every construction", async () => {
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+    await makeAdapter().runTurn({ prompt: "hi" });
+    const opts = AgentMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(opts.modelSettings).toEqual({ store: true, truncation: "auto" });
+  });
+
+  it("KPR-350 §D1 ruling pin: run options never carry conversationId (Conversations API ruled out)", async () => {
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+    await makeAdapter().runTurn({ prompt: "hi", sessionId: "resp-prev" });
+    const runOpts = runMock.mock.calls[0]![2] as Record<string, unknown>;
+    expect(runOpts.previousResponseId).toBe("resp-prev");
+    expect("conversationId" in runOpts).toBe(false);
+  });
+
   it("uses systemPromptOverride", async () => {
     runMock.mockResolvedValueOnce(makeSdkResult() as never);
 
@@ -265,6 +281,7 @@ describe("OpenAIAgentsAdapter", () => {
       name: "Pilot",
       instructions: "voice prompt",
       model: "gpt-5.4-mini",
+      modelSettings: { store: true, truncation: "auto" },
     });
   });
 
@@ -426,6 +443,7 @@ describe("OpenAIAgentsAdapter", () => {
       name: "Pilot",
       instructions: "soul\n\nsystem",
       model: "gpt-5.4-mini",
+      modelSettings: { store: true, truncation: "auto" },
     });
   });
 });
