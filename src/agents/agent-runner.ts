@@ -1552,9 +1552,12 @@ export class AgentRunner {
    * (§D6) from the SAME agent-scoped SDK plugin list the Claude lane passes
    * to query() (buildNativeSkills), then delegates to the shared builder.
    *
-   * toolsExecutable arrives as a plain boolean — the provider set
-   * (TOOL_EXECUTING_PROVIDERS) lives at the assembly seam (§D3), and
-   * prefix-builder carries no per-provider branches by design.
+   * toolsExecutable arrives as a plain boolean — the gating decision lives
+   * at the assembly seam (§D3). Post-KPR-352 (§D4) every Lane B provider
+   * executes tools, so the old provider allowlist dissolved and assembly
+   * passes `true` unconditionally; prefix-builder carries no per-provider
+   * branches by design and the boolean seam survives for a future
+   * non-executing provider.
    *
    * UNCACHED by ruling (spec §D2): never touches PrefixCache — Lane B
    * rebuilds per spawn (per-spawn adapters, construction-time ≡ turn-time).

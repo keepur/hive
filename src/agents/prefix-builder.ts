@@ -271,8 +271,11 @@ export interface ProviderInstructionsInput {
   /** Derived skill index (§D6) — skills section renders iff non-empty AND toolsExecutable. */
   skillIndex: ProviderSkillIndexEntry[];
   /**
-   * §D3 honesty gate, delivered as a PLAIN BOOLEAN — the provider set
-   * (TOOL_EXECUTING_PROVIDERS) lives at the assembly seam, never here.
+   * §D3 honesty gate, delivered as a PLAIN BOOLEAN — the gating decision
+   * lives at the assembly seam, never here. Post-KPR-352 (§D4) every Lane B
+   * provider executes tools, so the old provider allowlist dissolved and
+   * assembly passes `true` unconditionally; the boolean seam survives so a
+   * future non-executing provider can re-gate without a signature change.
    * Gates: toolkit, file-tier guidance, skills section, and the two
    * tool-instruction lines inside the memory block (memorySections).
    */
