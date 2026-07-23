@@ -3000,6 +3000,86 @@ describe("AgentManager", () => {
         await manager.spawnTurn(octx("sms:line-1:kpr350-g4", "resp_x"));
         expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2); // 1 (g3) + 1 (g4), no retries
       });
+
+      describe("chain-orphan re-read (KPR-351 R2)", () => {
+        function seedRow(threadId: string, sessionId: string, provider = "openai") {
+          sessionStore._sessions.set(`openai-pilot:${threadId}`, { sessionId, provider });
+        }
+
+        it("contender-healed row is adopted: retry carries the contender's handle, success persists normally", async () => {
+          const ctx = octx("sms:line-1:kpr351-adopt");
+          seedRow(ctx.threadId, "resp-contender");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "adopted", sessionId: "resp-contender-2" }));
+          const result = await manager.spawnTurn(ctx);
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+          expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBe("resp-contender"); // adopt, NOT fresh
+          expect(result.finalMessage).toBe("adopted");
+          expect(sessionStore.set).toHaveBeenCalledWith(
+            "openai-pilot", ctx.threadId, "resp-contender-2", "openai", expect.anything(),
+          );
+          // Redaction: adoption is a boolean; no handle value in any warn meta.
+          expect(mockLogWarn).toHaveBeenCalledWith(
+            expect.stringContaining("stale-server-handle"),
+            expect.objectContaining({ adoptedContenderHandle: true }),
+          );
+          const leaked = mockLogWarn.mock.calls.some(([, meta]) =>
+            JSON.stringify(meta ?? "").includes("resp-contender"),
+          );
+          expect(leaked).toBe(false);
+        });
+
+        it("row holds the SAME stale handle (no contender heal) ⇒ fresh retry, as KPR-350 shipped", async () => {
+          const ctx = octx("sms:line-1:kpr351-same");
+          seedRow(ctx.threadId, "resp_stale");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-fresh" }));
+          await manager.spawnTurn(ctx);
+          expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBeUndefined();
+          expect(mockLogWarn).toHaveBeenCalledWith(
+            expect.stringContaining("stale-server-handle"),
+            expect.objectContaining({ adoptedContenderHandle: false }),
+          );
+        });
+
+        it("row absent, empty-handle row, or foreign-provider row ⇒ fresh retry (no cross-provider adoption)", async () => {
+          // absent
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-a" }));
+          await manager.spawnTurn(octx("sms:line-1:kpr351-absent"));
+          expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBeUndefined();
+          // empty handle ("" normalizes to undefined in the store's get())
+          const ctx2 = octx("sms:line-1:kpr351-empty");
+          seedRow(ctx2.threadId, "");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-b" }));
+          await manager.spawnTurn(ctx2);
+          expect(mockOpenAIRunTurn.mock.calls[3]![0].sessionId).toBeUndefined();
+          // foreign provider tag
+          const ctx3 = octx("sms:line-1:kpr351-xprov");
+          seedRow(ctx3.threadId, "claude-uuid-9", "claude");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-c" }));
+          await manager.spawnTurn(ctx3);
+          expect(mockOpenAIRunTurn.mock.calls[5]![0].sessionId).toBeUndefined();
+        });
+
+        it("adopted retry that errors stale AGAIN ⇒ no second retry (single-retry semantics intact)", async () => {
+          const ctx = octx("sms:line-1:kpr351-twice");
+          seedRow(ctx.threadId, "resp-contender");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp-contender" }));
+          const result = await manager.spawnTurn(ctx);
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+          expect(result.errors).toEqual([STALE]);
+        });
+      });
     });
 
     describe("stale-handle self-heal — gemini (KPR-352 §D3)", () => {
