@@ -326,7 +326,7 @@ describe("stale-handle self-heal (KPR-350 §D3)", () => {
       .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
       .mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "resp_stale" }));
     await manager.spawnTurn(octx("sms:line-1:kpr350-brk-2"));
-    const snap = manager.circuitBreakers.stateFor("openai");
+    const snap = manager.circuitBreakers.stateFor("openai")!; // non-null-assertion per stateFor("claude")! precedent under strict TS
     expect(snap.state).toBe("closed");
     expect(snap.consecutiveHardFaults).toBe(0); // stale string AND "boom" are non-provider; first attempts never recorded
   });
@@ -336,10 +336,13 @@ describe("stale-handle self-heal (KPR-350 §D3)", () => {
     mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "s1" }));
     await manager.spawnTurn(smsCtx({ sessionId: "s1", sessionProvider: "claude", threadId: "sms:line-1:kpr350-g1" }));
     expect(mockRunnerSend).toHaveBeenCalledTimes(1);
-    // codex route → no retry (stateless-replay; no handle to be stale)
+    // codex route → no retry (stateless-replay; semantics conjunct is the discriminating gate).
+    // Pass a sessionId so the sessionId conjunct is satisfied and the leg is non-vacuous —
+    // production codex rows never carry handles (belt-and-braces), but this makes the
+    // semantics gate itself bite (plan-review/1/fable advisory).
     registry._agents.set("codex-pilot", makeAgentConfig({ id: "codex-pilot", name: "CP", model: "codex/gpt-5.5:medium", coreServers: [] }));
     mockCodexRunTurn.mockResolvedValueOnce(makeRunResult({ error: STALE }));
-    await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr350-g2", sessionProvider: "codex" }));
+    await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr350-g2", sessionId: "resp_x", sessionProvider: "codex" }));
     expect(mockCodexRunTurn).toHaveBeenCalledTimes(1);
     // openai route, NO sessionId → no retry
     mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: STALE }));
@@ -397,7 +400,7 @@ Commit: `KPR-350: stale-handle self-heal arm — one fresh retry on server-resum
       });
 ```
 
-(`ModelSettings.store` / `.truncation` verified in `@openai/agents-core/dist/model.d.ts:212,221` per spec provider-surface evidence.) No other adapter change — `previousResponseId` wiring (`:81`), `extractSessionId` (`:230`), auth attempts (`:153-216`) untouched.
+(`ModelSettings.store` / `.truncation` verified in `@openai/agents-core/dist/model.d.ts:212,221` per spec provider-surface evidence — `node_modules` is absent in a fresh worktree, so re-confirm the field names post-`npm ci` before pinning; plan-review/1/fable advisory.) No other adapter change — `previousResponseId` wiring (`:81`), `extractSessionId` (`:230`), auth attempts (`:153-216`) untouched.
 
 - [ ] **Step 3.2: Update the three exact-shape pins + add T7 pins**
 
