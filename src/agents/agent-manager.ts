@@ -30,7 +30,7 @@ import {
   CodexSubscriptionAdapter,
   type CodexReasoningEffort,
 } from "./provider-adapters/codex-subscription-adapter.js";
-import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
+import { GeminiInteractionsAdapter } from "./provider-adapters/gemini-interactions-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
@@ -176,7 +176,7 @@ const DEFAULT_PER_AGENT_SPAWN_BUDGET = 5;
 type ProviderModelRoute =
   | { provider: "claude"; model: string }
   | { provider: "openai"; model: string; reasoningEffort?: CodexReasoningEffort }
-  | { provider: "gemini"; model: string }
+  | { provider: "gemini"; model: string; reasoningEffort?: CodexReasoningEffort }
   | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort }
   // KPR-346 (§D2): Lane A passthrough — Claude runtime, foreign endpoint.
   // reasoningEffort survives splitProviderModel and delivers via the Claude
@@ -199,7 +199,7 @@ function resolveProviderModel(model: string): ProviderModelRoute {
     return { provider: "openai", model: providerModel, reasoningEffort };
   }
   if (provider === "gemini" || provider === "google-gemini") {
-    return { provider: "gemini", model: providerModel };
+    return { provider: "gemini", model: providerModel, reasoningEffort };
   }
   if (provider === "kimi") {
     return { provider: "kimi", model: providerModel, reasoningEffort };
@@ -729,9 +729,13 @@ export class AgentManager {
       });
     }
 
-    return new GeminiAdkAdapter({
+    return new GeminiInteractionsAdapter({
       name: config.name,
-      model: route.model || appConfig.gemini.agentModel || "gemini-2.5-flash",
+      // KPR-352 plan-time pin: Interactions-supported default (pre-352
+      // literal "gemini-2.5-flash" predates the surface).
+      model: route.model || appConfig.gemini.agentModel || "gemini-3.6-flash",
+      apiKey: appConfig.gemini.apiKey || undefined,
+      reasoningEffort: route.reasoningEffort,
       assembly,
     });
   }

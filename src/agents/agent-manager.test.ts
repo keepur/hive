@@ -56,7 +56,7 @@ vi.mock("../config.js", () => ({
     plugins: [],
     openai: { agentModel: "" },
     codex: { agentModel: "gpt-5.4-mini" },
-    gemini: { agentModel: "" },
+    gemini: { agentModel: "", apiKey: "test-gemini-key" },
     // KPR-346: Lane A passthrough model overrides + instance id consumed by
     // createProviderAdapter's resolvePassthroughSpawn call.
     kimi: { agentModel: "" },
@@ -157,8 +157,8 @@ vi.mock("./provider-adapters/openai-agents-adapter.js", () => ({
   }),
 }));
 
-vi.mock("./provider-adapters/gemini-adk-adapter.js", () => ({
-  GeminiAdkAdapter: vi.fn().mockImplementation((options) => {
+vi.mock("./provider-adapters/gemini-interactions-adapter.js", () => ({
+  GeminiInteractionsAdapter: vi.fn().mockImplementation((options) => {
     mockGeminiConstructor(options);
     return {
       provider: "gemini",
@@ -3262,6 +3262,45 @@ describe("AgentManager", () => {
       expect(runTurnMock).toHaveBeenCalledWith(expect.objectContaining({ prompt: "ping" }));
       expect(result.finalMessage).toBe(text);
       expect(result.newSessionId).toBe(sessionId);
+    });
+
+    it("KPR-352 §D5/T7: gemini-branch options — :effort carried, apiKey from config, Interactions model", async () => {
+      registry._agents.set(
+        "gemini-effort-pilot",
+        makeAgentConfig({
+          id: "gemini-effort-pilot",
+          name: "Gemini Effort Pilot",
+          model: "gemini/gemini-3.6-flash:high",
+          coreServers: [],
+        }),
+      );
+
+      const item = makeWorkItem({ text: "ping", source: { kind: "sms", id: "line-1", label: "May" } });
+      await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "gemini-effort-pilot" });
+
+      expect(mockGeminiConstructor).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Gemini Effort Pilot",
+          model: "gemini-3.6-flash",
+          reasoningEffort: "high",
+          apiKey: "test-gemini-key",
+          assembly: expect.objectContaining({ instructions: "PILOT-ASSEMBLED-INSTRUCTIONS" }),
+        }),
+      );
+    });
+
+    it("KPR-352: bare gemini/ (empty agentModel config) falls back to the Interactions default model", async () => {
+      registry._agents.set(
+        "gemini-default-pilot",
+        makeAgentConfig({ id: "gemini-default-pilot", name: "Gemini Default Pilot", model: "gemini/", coreServers: [] }),
+      );
+
+      const item = makeWorkItem({ text: "ping", source: { kind: "sms", id: "line-1", label: "May" } });
+      await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "gemini-default-pilot" });
+
+      expect(mockGeminiConstructor).toHaveBeenCalledWith(
+        expect.objectContaining({ model: "gemini-3.6-flash" }),
+      );
     });
 
     it("KPR-347: pilots construct and run with a REAL non-empty inventory — guards are gone, partition feeds the assembly", async () => {
