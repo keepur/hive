@@ -288,11 +288,25 @@ function isAuthRebuildResumeError(reason: string): boolean {
  * one turn's context (the self-heal retries fresh). Docs/community-sourced;
  * refined against KPR-351's live capture (L2) if the production string
  * differs. Exported for the narrowness-matrix unit pins.
+ *
+ * KPR-352 (§D3): a third alternate matches the gemini adapter's hive-owned
+ * stale-resume sentinel ("gemini interaction resume rejected"). Unlike the
+ * openai alternates (which match the vendor's prose surface), the gemini
+ * sentinel is emitted deterministically by the adapter — only for a round-1
+ * 4xx whose carried previous_interaction_id was the persisted handle — so the
+ * matcher is a sentinel check, not a prose guess.
  */
 export function isStaleServerHandleError(reason: string): boolean {
   return (
     /previous response[\s\S]{0,80}?(not found|expired|no longer (?:exists|available))/i.test(reason) ||
-    /previous_response_id[\s\S]{0,80}?(not found|invalid|expired)/i.test(reason)
+    /previous_response_id[\s\S]{0,80}?(not found|invalid|expired)/i.test(reason) ||
+    // KPR-352 (§D3): the gemini adapter's hive-owned sentinel — emitted ONLY
+    // for round-1 400/403/404 failures whose carried previous_interaction_id
+    // was the persisted sessions-store handle (deterministic, not prose-
+    // guessed; also keeps expired-handle 403s out of the auth row's breaker
+    // streak). Generic malformed-request 400s without the sentinel stay
+    // ordinary provider faults.
+    /gemini interaction resume rejected/i.test(reason)
   );
 }
 

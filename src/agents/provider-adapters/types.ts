@@ -25,7 +25,10 @@ export type LaneBProviderId = "openai" | "gemini" | "codex";
  *                          sessionId is a real server handle (openai
  *                          previous_response_id chaining — KPR-350 §D1 ruling;
  *                          server retention 30d > store TTL 7d; stale handles
- *                          self-heal, §D3).
+ *                          self-heal, §D3); gemini previous_interaction_id
+ *                          chaining — KPR-352: server retention 55d paid / 1d
+ *                          free vs 7d store TTL, stale handles self-heal
+ *                          through the same §D3 arm.
  *  - "conversation-store": provider-side durable conversation object; the
  *                          persisted ref would be a conversation id.
  *                          UNOCCUPIED BY RULING (KPR-350 §D1): chaining won
@@ -42,16 +45,13 @@ export type LaneBProviderId = "openai" | "gemini" | "codex";
  *  - "stateless-replay":   NO provider-side resumable handle exists;
  *                          continuity, if any, is hive-persisted history
  *                          replayed client-side. Codex posts store:false and
- *                          sends no previous_response_id; gemini runs
- *                          runEphemeral — their pilot-fabricated ids are not
- *                          handles. Replay implementation status is
- *                          per-provider (codex replay shipped in KPR-353 —
- *                          TurnHistoryStore / provider_turn_history, replayed
- *                          client-side by the adapter; gemini leaves this
- *                          category when Interactions lands) — the
- *                          persistence behavior (never persist a handle) is
- *                          identical either way, which is what this
- *                          descriptor keys.
+ *                          sends no previous_response_id — its pilot-fabricated
+ *                          ids are not handles. Replay shipped in KPR-353
+ *                          (TurnHistoryStore / provider_turn_history, replayed
+ *                          client-side by the adapter); the persistence
+ *                          behavior (never persist a handle) is what this
+ *                          descriptor keys. (gemini exited this category in
+ *                          KPR-352 — see server-resumable.)
  */
 export type SessionSemantics =
   | "server-resumable"
@@ -69,7 +69,10 @@ export type SessionSemantics =
 export const SESSION_SEMANTICS: Readonly<Record<AgentProviderId, SessionSemantics>> = {
   claude: "client-transcript",
   openai: "server-resumable",
-  gemini: "stateless-replay",
+  // KPR-352 (§D3): gemini exits stateless-replay — the Interactions adapter
+  // chains previous_interaction_id, a real server handle persisted and resumed
+  // through the same paths as openai (stale handles self-heal via the §D3 arm).
+  gemini: "server-resumable",
   codex: "stateless-replay",
   // KPR-346 (§D2): Lane A passthrough — the Claude CLI's session ids are
   // local transcript handles independent of the completions endpoint; resume

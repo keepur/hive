@@ -8,17 +8,20 @@ import {
 } from "./types.js";
 
 describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
-  // Equivalence pin: persistsResumableHandle(sessionSemanticsFor(p)) must
-  // equal the deleted RESUMABLE_SESSION_PROVIDERS = {claude, openai}
-  // membership for all four current ids (spec T4 — behavior preserved).
+  // Persistence pin: persistsResumableHandle(sessionSemanticsFor(p)) is true
+  // for every provider that holds a real resumable handle. This once mirrored
+  // the deleted RESUMABLE_SESSION_PROVIDERS = {claude, openai} membership, but
+  // gemini exited stateless-replay in KPR-352 (§D3 — Interactions adapter
+  // chains previous_interaction_id, a real server handle), so the old-Set
+  // equivalence no longer holds for gemini. codex remains stateless-replay.
   it.each([
     ["claude", true],
     ["openai", true],
-    ["gemini", false],
+    ["gemini", true],
     ["codex", false],
     ["kimi", true],
     ["deepseek", true],
-  ] as const)("%s → persistsResumableHandle=%s (old Set membership preserved)", (provider, expected) => {
+  ] as const)("%s → persistsResumableHandle=%s", (provider, expected) => {
     expect(persistsResumableHandle(sessionSemanticsFor(provider as AgentProviderId))).toBe(expected);
   });
 

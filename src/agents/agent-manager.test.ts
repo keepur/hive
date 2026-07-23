@@ -2450,6 +2450,86 @@ describe("AgentManager", () => {
         ); // first openai turn persists the first lastResponseId
       });
 
+      // KPR-352 §D5/T4: gemini joins server-resumable, so provider transitions
+      // into and out of gemini exercise the same KPR-313 guard. The KPR-350
+      // obligation: pin every direction a gemini handle could wrongly cross.
+      describe("KPR-352 §D5/T4: gemini provider transitions", () => {
+        function geminiAgent(id = "gem") {
+          registry._agents.set(
+            id,
+            makeAgentConfig({ id, name: "Gem", model: "gemini/gemini-3.6-flash", coreServers: [] }),
+          );
+          return id;
+        }
+
+        it("claude→gemini: guard trips, fresh gemini turn, PILOT notice (tool-free), row rewritten with the interaction handle", async () => {
+          const id = geminiAgent();
+          const threadId = "sms:line-1:kpr352-c2g";
+          seed(threadId, "claude-uuid-1", "claude", id);
+          mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/new" }));
+          await manager.spawnTurn(
+            smsCtx({ agentId: id, threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.sessionId).toBeUndefined(); // guard stripped the claude id
+          expect(req.prompt).toContain("session continuity was reset");
+          expect(req.prompt).not.toContain("conversation_search"); // gemini gets the pilot variant
+          expect(sessionStore.set).toHaveBeenCalledWith(id, threadId, "interactions/new", "gemini", expect.anything());
+        });
+
+        it("gemini→claude: guard trips, fresh claude turn, CLAUDE notice variant (conversation_search)", async () => {
+          registry._agents.set("flipper", makeAgentConfig({ id: "flipper", name: "Flipper", model: "claude-sonnet-4-6" }));
+          const threadId = "sms:line-1:kpr352-g2c";
+          seed(threadId, "interactions/old", "gemini", "flipper");
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "c", sessionId: "s-new" }));
+          await manager.spawnTurn(
+            smsCtx({ agentId: "flipper", threadId, sessionId: "interactions/old", sessionProvider: "gemini" }),
+          );
+          const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+          expect(sessionArg).toBeUndefined(); // gemini handle never adopted by claude
+          expect(prompt).toContain("session continuity was reset");
+          expect(prompt).toContain("conversation_search"); // claude-target variant
+        });
+
+        it("openai→gemini: server-resumable→server-resumable STILL trips on provider mismatch — the openai handle never crosses", async () => {
+          const id = geminiAgent();
+          const threadId = "sms:line-1:kpr352-o2g";
+          seed(threadId, "resp_openai", "openai", id);
+          mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/new" }));
+          await manager.spawnTurn(
+            smsCtx({ agentId: id, threadId, sessionId: "resp_openai", sessionProvider: "openai" }),
+          );
+          expect(mockGeminiRunTurn.mock.calls[0]![0].sessionId).toBeUndefined();
+          expect(sessionStore.set).toHaveBeenCalledWith(id, threadId, "interactions/new", "gemini", expect.anything());
+        });
+
+        it("gemini→openai: the interaction handle never crosses into an openai turn", async () => {
+          registry._agents.set(
+            "oai",
+            makeAgentConfig({ id: "oai", name: "Oai", model: "openai/gpt-5.4-mini", coreServers: [] }),
+          );
+          const threadId = "sms:line-1:kpr352-g2o";
+          seed(threadId, "interactions/old", "gemini", "oai");
+          await manager.spawnTurn(
+            smsCtx({ agentId: "oai", threadId, sessionId: "interactions/old", sessionProvider: "gemini" }),
+          );
+          expect(mockOpenAIRunTurn.mock.calls[0]![0].sessionId).toBeUndefined();
+          expect(sessionStore.set).toHaveBeenCalledWith("oai", threadId, "openai-session", "openai", expect.anything());
+        });
+
+        it("adopt: a seeded gemini row matching a gemini turn resumes the handle with NO handoff notice", async () => {
+          const id = geminiAgent();
+          const threadId = "sms:line-1:kpr352-gem-adopt";
+          seed(threadId, "interactions/keep", "gemini", id);
+          await manager.spawnTurn(
+            smsCtx({ agentId: id, threadId, sessionId: "interactions/keep", sessionProvider: "gemini" }),
+          );
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.sessionId).toBe("interactions/keep"); // same-provider hot path resumes
+          expect(req.prompt).not.toContain("session continuity was reset");
+        });
+      });
+
       it("⚠A9 re-resolve-on-trip: queued same-thread turn ADOPTS the predecessor's switched session instead of double-dropping", async () => {
         const threadId = "sms:line-1:kpr313-race";
         seed(threadId, "resp_stale", "openai");
@@ -2480,7 +2560,7 @@ describe("AgentManager", () => {
         expect(promptB).not.toContain("session continuity was reset");
       });
 
-      it("persist rule: claude id+tag; codex ''+tag with findAgentByThread intact; gemini ''+tag", async () => {
+      it("persist rule: claude id+tag; codex ''+tag with findAgentByThread intact; gemini id+tag (server-resumable)", async () => {
         // Claude
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-c" }));
         await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr313-p-claude" }));
@@ -2500,15 +2580,50 @@ describe("AgentManager", () => {
         // The ROW survives — thread→agent mapping intact (the ticket's rule, literally).
         await expect(sessionStore.findAgentByThread("sms:line-1:kpr313-p-codex")).resolves.toBe("codex-pilot");
 
-        // Gemini
+        // Gemini — KPR-352: server-resumable now, so the real Interactions
+        // handle is persisted under the gemini tag (was ""+tag pre-flip).
         registry._agents.set(
           "gemini-pilot",
           makeAgentConfig({ id: "gemini-pilot", name: "Gemini Pilot", model: "gemini/gemini-3-pro", coreServers: [] }),
         );
+        mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/xyz" }));
         await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr313-p-gem" }));
         expect(sessionStore.set).toHaveBeenLastCalledWith(
-          "gemini-pilot", "sms:line-1:kpr313-p-gem", "", "gemini", expect.anything(),
+          "gemini-pilot", "sms:line-1:kpr313-p-gem", "interactions/xyz", "gemini", expect.anything(),
         );
+      });
+
+      it("KPR-352 churn-mint: errored gemini turn that resumed and minted a DIFFERENT interaction id never overwrites the row", async () => {
+        registry._agents.set(
+          "gemini-pilot",
+          makeAgentConfig({ id: "gemini-pilot", name: "Gemini Pilot", model: "gemini/gemini-3-pro", coreServers: [] }),
+        );
+        mockGeminiRunTurn.mockResolvedValueOnce(
+          makeRunResult({ error: "some tool blew up mid-turn", sessionId: "interactions/new" }),
+        );
+        await manager.spawnTurn(
+          smsCtx({
+            agentId: "gemini-pilot",
+            threadId: "sms:line-1:kpr352-gem-mint",
+            sessionId: "interactions/old",
+            sessionProvider: "gemini",
+          }),
+        );
+        expect(sessionStore.set).not.toHaveBeenCalled();
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("different id"),
+          expect.objectContaining({ agentId: "gemini-pilot" }),
+        );
+      });
+
+      it("KPR-352: errored FRESH gemini turn returning sessionId:'' does not persist (falsy guard)", async () => {
+        registry._agents.set(
+          "gemini-pilot",
+          makeAgentConfig({ id: "gemini-pilot", name: "Gemini Pilot", model: "gemini/gemini-3-pro", coreServers: [] }),
+        );
+        mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "" }));
+        await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr352-gem-fresh-err" }));
+        expect(sessionStore.set).not.toHaveBeenCalled();
       });
 
       it("persist rule: openai persists its resp id with the openai tag (genuinely resumable)", async () => {
@@ -2684,6 +2799,42 @@ describe("AgentManager", () => {
           expect(fakeStore.clear).toHaveBeenCalledWith("codex-pilot", threadId);
         });
 
+        it("KPR-352: gemini→codex handoff clears the codex history exactly once (provider-agnostic — the KPR-350 obligation)", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr352-g2codex";
+          seed(threadId, "interactions/old", "gemini", "codex-pilot");
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "interactions/old", sessionProvider: "gemini" }),
+          );
+
+          expect(fakeStore.clear).toHaveBeenCalledTimes(1);
+          expect(fakeStore.clear).toHaveBeenCalledWith("codex-pilot", threadId);
+        });
+
+        it("KPR-352: codex→gemini handoff — guard trips, the gemini turn starts a fresh chain, no history flows in", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registry._agents.set(
+            "gem",
+            makeAgentConfig({ id: "gem", name: "Gem", model: "gemini/gemini-3.6-flash", coreServers: [] }),
+          );
+          const threadId = "sms:line-1:kpr352-codex2g";
+          seed(threadId, "", "codex", "gem");
+          mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/fresh" }));
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "gem", threadId, sessionId: undefined, sessionProvider: "codex" }),
+          );
+
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.sessionId).toBeUndefined(); // fresh gemini chain
+          expect(req.prompt).toContain("session continuity was reset");
+          expect(sessionStore.set).toHaveBeenCalledWith("gem", threadId, "interactions/fresh", "gemini", expect.anything());
+        });
+
         it("ORDERING pin: the clear is AWAITED — the codex adapter (and its load) is unreachable until clear resolves", async () => {
           const fakeStore = makeFakeTurnHistoryStore();
           const mgr = makeManagerWithStore(fakeStore);
@@ -2848,6 +2999,113 @@ describe("AgentManager", () => {
         mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: "404 Not Found", sessionId: "resp_x" }));
         await manager.spawnTurn(octx("sms:line-1:kpr350-g4", "resp_x"));
         expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2); // 1 (g3) + 1 (g4), no retries
+      });
+    });
+
+    describe("stale-handle self-heal — gemini (KPR-352 §D3)", () => {
+      // Binding delta (Task-0/1 spike): the live Interactions API returns 400
+      // for fabricated AND malformed ids; the adapter tags round-1 400/403/404
+      // whose carried previous_interaction_id was the persisted handle with the
+      // "gemini interaction resume rejected" sentinel.
+      const TAGGED =
+        "gemini interaction resume rejected (status 400): the referenced previous_interaction_id is invalid";
+      function geminiAgent(id = "gem") {
+        registry._agents.set(
+          id,
+          makeAgentConfig({ id, name: "Gem", model: "gemini/gemini-3.6-flash", coreServers: [] }),
+        );
+        return id;
+      }
+      function seed(threadId: string, sessionId: string, provider: string, agentId: string) {
+        sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      }
+      const gctx = (threadId: string, sessionId = "interactions/stale") =>
+        smsCtx({ agentId: geminiAgent(), threadId, sessionId, sessionProvider: "gemini" });
+
+      it("tagged stale-resume error retries exactly once with sessionId stripped; success persists the fresh handle", async () => {
+        mockGeminiRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "interactions/new" }));
+        const ctx = gctx("sms:line-1:kpr352-heal");
+        const result = await manager.spawnTurn(ctx);
+        expect(mockGeminiRunTurn).toHaveBeenCalledTimes(2);
+        expect(mockGeminiRunTurn.mock.calls[0]![0].sessionId).toBe("interactions/stale");
+        expect(mockGeminiRunTurn.mock.calls[1]![0].sessionId).toBeUndefined(); // fresh retry
+        expect(result.finalMessage).toBe("healed");
+        expect(result.newSessionId).toBe("interactions/new");
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          ctx.agentId, ctx.threadId, "interactions/new", "gemini", expect.anything(),
+        ); // write path self-corrects — the row is overwritten
+        // Redaction pin: the self-heal warn carries {agentId, threadId, provider}
+        // only — the provider message (which embeds the handle) is never logged.
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("stale-server-handle"),
+          expect.not.objectContaining({ reason: expect.anything() }),
+        );
+        const leaked = mockLogWarn.mock.calls.some(([, meta]) =>
+          JSON.stringify(meta ?? "").includes("resume rejected"),
+        );
+        expect(leaked).toBe(false);
+      });
+
+      it("failed retry: fresh attempt errors with '', error surfaces, no persist, seeded stale handle survives for next-turn re-trip", async () => {
+        const id = geminiAgent();
+        const threadId = "sms:line-1:kpr352-heal-fail";
+        seed(threadId, "interactions/stale", "gemini", id);
+        mockGeminiRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/stale" }))
+          .mockResolvedValueOnce(makeRunResult({ error: "still broken", sessionId: "" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ agentId: id, threadId, sessionId: "interactions/stale", sessionProvider: "gemini" }),
+        );
+        expect(mockGeminiRunTurn).toHaveBeenCalledTimes(2);
+        expect(result.errors).toEqual(["still broken"]);
+        expect(sessionStore.set).not.toHaveBeenCalled(); // falsy sessionId guard on the errored fresh retry
+        expect(sessionStore._sessions.get(`${id}:${threadId}`)).toEqual({
+          sessionId: "interactions/stale",
+          provider: "gemini",
+        }); // stale handle survives
+      });
+
+      it("breaker record-once: tagged→success and tagged→'boom' both leave the gemini streak at 0 (first attempts never reach the breaker)", async () => {
+        mockGeminiRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "interactions/f2" }));
+        await manager.spawnTurn(gctx("sms:line-1:kpr352-brk-1"));
+        mockGeminiRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/stale" }))
+          .mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "interactions/stale" }));
+        await manager.spawnTurn(gctx("sms:line-1:kpr352-brk-2"));
+        const snap = manager.circuitBreakers.stateFor("gemini")!;
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0); // tagged first attempts + non-provider "boom" never trip
+      });
+
+      it("narrowness: the tagged string on a CLAUDE-routed agent → no retry (client-transcript gate)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "s1" }));
+        await manager.spawnTurn(
+          smsCtx({ sessionId: "s1", sessionProvider: "claude", threadId: "sms:line-1:kpr352-narrow-c" }),
+        );
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      });
+
+      it("narrowness: the tagged string on a CODEX-routed agent → no retry (stateless-replay gate)", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "CP", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        mockCodexRunTurn.mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/x" }));
+        await manager.spawnTurn(
+          smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr352-narrow-x", sessionId: "interactions/x", sessionProvider: "codex" }),
+        );
+        expect(mockCodexRunTurn).toHaveBeenCalledTimes(1);
+      });
+
+      it("no-sessionId guard: the tagged string on a thread with no stored handle → no retry (arm requires effectiveCtx.sessionId)", async () => {
+        const id = geminiAgent();
+        mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "" }));
+        await manager.spawnTurn(smsCtx({ agentId: id, threadId: "sms:line-1:kpr352-nosess", sessionId: undefined }));
+        expect(mockGeminiRunTurn).toHaveBeenCalledTimes(1);
       });
     });
 
@@ -4199,6 +4457,10 @@ describe("isStaleServerHandleError (KPR-350 §D3) — narrowness matrix", () => 
     "400 invalid_request_error: previous_response_id 'resp_x' not found",
     "previous_response_id is invalid",
     "Previous response with id 'resp_x' no longer exists",
+    // KPR-352: the gemini adapter's hive-owned stale-resume sentinel (matched
+    // regardless of the embedded 400/403/404 status the live API returns).
+    "gemini interaction resume rejected (status 400): the referenced previous_interaction_id is invalid",
+    "gemini interaction resume rejected (status 403): You do not have permission to access the content",
   ];
   const MUST_NOT_MATCH = [
     "404 Not Found",
@@ -4210,6 +4472,10 @@ describe("isStaleServerHandleError (KPR-350 §D3) — narrowness matrix", () => 
     "401 Unauthorized",
     "No response received from previous request",
     "",
+    // KPR-352: a genuine gemini fault WITHOUT the resume-rejected sentinel is an
+    // ordinary provider fault — never tagged (adapter's generic-400 guard).
+    "Gemini interaction request failed (403): You do not have permission to access the content",
+    "Gemini interaction request failed (400): invalid request payload",
   ];
   it.each(MUST_MATCH)("matches: %s", (s) => expect(isStaleServerHandleError(s)).toBe(true));
   it.each(MUST_NOT_MATCH)("does NOT match: %s", (s) => expect(isStaleServerHandleError(s)).toBe(false));

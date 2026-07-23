@@ -70,8 +70,20 @@ describe("SessionStore — StoredSessionRef normalization + scrub (KPR-313)", ()
     expect(mocks.deleteOne).not.toHaveBeenCalled();
   });
 
-  it("belt-and-braces: non-resumable tag with a non-empty id yields NO handle (and no scrub)", async () => {
-    mocks.findOne.mockResolvedValueOnce(doc("resp_abc", "gemini"));
+  it("KPR-352: gemini-tagged interactions/ row IS resumable (previous_interaction_id chaining)", async () => {
+    // §D3: gemini exited stateless-replay — a tagged row with a real Interactions
+    // handle now returns that handle (was NO-handle pre-flip). Tagged rows are
+    // never scrubbed regardless.
+    mocks.findOne.mockResolvedValueOnce(doc("interactions/abc123", "gemini"));
+    await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+      sessionId: "interactions/abc123",
+      provider: "gemini",
+    });
+    expect(mocks.deleteOne).not.toHaveBeenCalled();
+  });
+
+  it('KPR-352: gemini-tagged sessionId:"" (pre-352 write) ⇒ NO handle — no poisoned resume on upgrade day', async () => {
+    mocks.findOne.mockResolvedValueOnce(doc("", "gemini"));
     await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
       sessionId: undefined,
       provider: "gemini",
