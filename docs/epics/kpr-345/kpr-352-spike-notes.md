@@ -153,3 +153,17 @@ e: previous_interaction_id=<a1.id> (a2 already chained from a1), input "What is 
 ## Gate result
 
 **DONE — no STOP condition.** Chaining, function tools, thinking_level, sibling fork all GREEN; stale-id status captured. Tasks 1–5 proceed. Five in-scope shape deltas (§Deltas 1–5) fold into Task 1 verbatim; one carries a matcher-over-match concern into Task 3 (stale-handle status 400 is generic — gate on more than the status code).
+
+---
+
+## Task 6 (Step 6.3) — post-implementation live turn (evidence-recorded)
+
+Scratch tsx driver (scratchpad, never committed) constructed the **real** `GeminiInteractionsAdapter` against a minimal assembly: one real in-process trivial MCP tool (`get_magic_number`, empty-param, returns a fixed sentinel string), an allow-all guardrail gate, `sessionCwd = repo cwd`, empty skill index, and the Honeypot key (`hive/keepur/GEMINI_API_KEY`). Three back-to-back turns, each a fresh per-spawn adapter. Model: default `gemini-3.6-flash`. IDs/shapes only below — no key material, id tails redacted to char-length.
+
+| Leg | Prompt | Observed result | Verdict |
+|---|---|---|---|
+| **Turn 1** (fresh chain, tool-forcing) | "What is the magic number? Use your tool." | `toolCalls=1`, `toolSummary=mcp__trivial__get_magic_number×1`, `error=none`, final text coherent and contained the tool-returned number (`…the magic number is 74619.`), returned a real interaction id (shape `<70chars>`). | **GREEN** — ≥1 real tool executed through the bridge, final text coherent, interaction id minted. |
+| **Turn 2** (chain turn-1 id as `sessionId`, no-tool recall) | "Without calling any tool, what number did you just tell me?" | `toolCalls=0`, `error=none`, final text `"74619"` (`recalls-number=true`), new id shape `<70chars>`. | **GREEN** — `previous_interaction_id` chaining recalled turn-1 context server-side; no client replay. |
+| **Turn 3** (fabricated id) | `sessionId="interactions/fabricated-nonexistent-000000000000"`, prompt "hello" | `RunResult.error = "gemini interaction resume rejected (status 400): 400 Request contains an invalid argument."`, `toolCalls=0`, `text=""`. | **GREEN** — round-1 resume-carrying create failed with the live status (400) AND the invalid-argument discriminator, tagged with the `STALE_HANDLE_SENTINEL` the KPR-350 manager arm consumes. |
+
+Driver exited 0; file deleted post-run (never `git add`-ed). Live status confirms the Task-0 leg-(d) refinement: stale/fabricated `previous_interaction_id` returns **HTTP 400 "Request contains an invalid argument."**, matched by `STALE_HANDLE_STATUSES = {400}` + `STALE_HANDLE_MESSAGE`. Free-tier caveat unchanged (1d retention + training — production gemini assignment needs a paid-tier key).
