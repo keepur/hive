@@ -1,7 +1,7 @@
 import type { ResourceLimits } from "../model-router.js";
 import type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner.js";
 
-export type AgentProviderId = "claude" | "openai" | "gemini" | "codex";
+export type AgentProviderId = "claude" | "openai" | "gemini" | "codex" | "kimi" | "deepseek";
 
 /**
  * KPR-347: the native-lane (Lane B) adapter providers — the set whose
@@ -64,6 +64,12 @@ export const SESSION_SEMANTICS: Readonly<Record<AgentProviderId, SessionSemantic
   openai: "server-resumable",
   gemini: "stateless-replay",
   codex: "stateless-replay",
+  // KPR-346 (§D2): Lane A passthrough — the Claude CLI's session ids are
+  // local transcript handles independent of the completions endpoint; resume
+  // replays the transcript client-side (cold vendor cache, re-billed tokens —
+  // documented parity-matrix caveat).
+  kimi: "client-transcript",
+  deepseek: "client-transcript",
 };
 
 export function sessionSemanticsFor(provider: AgentProviderId): SessionSemantics {

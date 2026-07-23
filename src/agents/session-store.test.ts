@@ -87,11 +87,23 @@ describe("SessionStore — StoredSessionRef normalization + scrub (KPR-313)", ()
     });
   });
 
+  it("KPR-346: kimi-tagged row IS resumable (Lane A client-transcript ⇒ handle returned)", async () => {
+    mocks.findOne.mockResolvedValueOnce(doc("sess-kimi-1", "kimi"));
+    await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+      sessionId: "sess-kimi-1",
+      provider: "kimi",
+    });
+    expect(mocks.deleteOne).not.toHaveBeenCalled();
+  });
+
   it("KPR-347 fail-closed: out-of-union provider tag on a row yields NO handle (old .has() scrub posture preserved)", async () => {
-    mocks.findOne.mockResolvedValueOnce(doc("some-real-looking-id", "kimi"));
+    // KPR-346: kimi joined the union (Lane A), so this fail-closed pin now uses
+    // a genuinely out-of-union provider string — behavior of the source is
+    // unchanged (any unknown provider ⇒ stateless-replay ⇒ no handle).
+    mocks.findOne.mockResolvedValueOnce(doc("some-real-looking-id", "some-future-provider"));
     const ref = await store.get("agent-a", "sms:line-1:t1");
     expect(ref?.sessionId).toBeUndefined();
-    expect(ref?.provider).toBe("kimi"); // provenance passes through; handle does not
+    expect(ref?.provider).toBe("some-future-provider"); // provenance passes through; handle does not
   });
 
   it("legacy untagged plain uuid grandfathers as claude (fleet-upgrade no-op)", async () => {

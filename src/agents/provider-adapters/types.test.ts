@@ -4,6 +4,7 @@ import {
   persistsResumableHandle,
   sessionSemanticsFor,
   type AgentProviderId,
+  type LaneBProviderId,
 } from "./types.js";
 
 describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
@@ -15,11 +16,26 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
     ["openai", true],
     ["gemini", false],
     ["codex", false],
+    ["kimi", true],
+    ["deepseek", true],
   ] as const)("%s → persistsResumableHandle=%s (old Set membership preserved)", (provider, expected) => {
     expect(persistsResumableHandle(sessionSemanticsFor(provider as AgentProviderId))).toBe(expected);
   });
 
-  it("declares exactly the four current provider ids (Record exhaustiveness is compile-time)", () => {
-    expect(Object.keys(SESSION_SEMANTICS).sort()).toEqual(["claude", "codex", "gemini", "openai"]);
+  it("declares exactly the six current provider ids (Record exhaustiveness is compile-time)", () => {
+    expect(Object.keys(SESSION_SEMANTICS).sort()).toEqual([
+      "claude",
+      "codex",
+      "deepseek",
+      "gemini",
+      "kimi",
+      "openai",
+    ]);
   });
+});
+
+it("LaneBProviderId stays exactly {openai, gemini, codex} — Lane A never joins (KPR-346 canon pin)", () => {
+  // Compile-time exhaustiveness in both directions; runtime assert is a formality.
+  const laneB: Record<LaneBProviderId, true> = { openai: true, gemini: true, codex: true };
+  expect(Object.keys(laneB)).toHaveLength(3);
 });
