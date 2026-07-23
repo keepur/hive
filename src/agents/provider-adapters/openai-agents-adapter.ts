@@ -203,8 +203,8 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
       // available` alternate (error-classification.ts FAULT_PATTERNS) — keep
       // "OpenAI API key is not available" verbatim so it classifies auth.
       // Remediation: the only working path today is seeding OPENAI_API_KEY in
-      // the instance .env + a service restart (env→Keychain fallback fires at
-      // process boot, not next spawn). `hive credentials add OPENAI_API_KEY`
+      // the instance .env + a service restart (.env loads into process.env at
+      // boot via dotenv; no Keychain leg exists for this key). `hive credentials add OPENAI_API_KEY`
       // hard-rejects — there is no CREDENTIAL_REGISTRY entry for this key and
       // no config.openai.apiKey resolution yet; registry/Keychain wiring is
       // future work (KPR-350 L0 leg seeds via .env).
