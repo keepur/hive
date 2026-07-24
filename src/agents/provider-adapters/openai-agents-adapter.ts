@@ -1,19 +1,16 @@
-import { Agent, OpenAIProvider, Runner, run, tool } from "@openai/agents";
+import { Agent, OpenAIProvider, Runner, tool } from "@openai/agents";
 import OpenAI from "openai";
 import type { RunResult } from "../agent-runner.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import { ToolBridge, type BridgedTool } from "./tool-bridge.js";
-import { createCodexOpenAITokenProvider, envValue, isProviderAuthError } from "./oauth-credentials.js";
+import { envValue } from "./oauth-credentials.js";
 
 export interface OpenAIAgentsAdapterOptions {
   name: string;
   assembly: ProviderTurnAssembly;
   model?: string;
   apiKey?: string;
-  preferOAuth?: boolean;
-  codexAuthPath?: string;
-  codexRefreshCommand?: string;
 }
 
 interface OpenAIResultLike {
@@ -24,11 +21,6 @@ interface OpenAIResultLike {
 interface OpenAIStreamResultLike extends OpenAIResultLike {
   completed: Promise<void>;
   toTextStream(options: { compatibleWithNodeStreams: true }): AsyncIterable<unknown>;
-}
-
-interface OpenAIAuthAttempt {
-  source: "codex-oauth" | "api-key";
-  client: OpenAI;
 }
 
 export class OpenAIAgentsAdapter implements AgentProviderAdapter {
@@ -64,6 +56,15 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     });
 
     try {
+      // KPR-351 (R1): API-key single path — resolve the client BEFORE
+      // connecting tool servers, so persistent misconfig fails in
+      // microseconds. The throw is caught by this method's own catch and
+      // lands in RunResult.error, where the auth row's existing
+      // `api.?key is not available` alternate classifies it `auth` →
+      // breaker → honest outage (gemini-identical posture, KPR-352 §D7).
+      // The finally below still runs bridge.close() on this path.
+      const client = this.buildClient();
+
       // KPR-348: connect() is fail-soft per server and never throws (§D7);
       // a fully-failed bridge yields [] and the turn runs tool-less.
       const bridged = await bridge.connect();
@@ -90,7 +91,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
       };
 
       if (streamed) {
-        const result = await this.runWithAuthFallback(agent, request.prompt, {
+        const result = await this.runWithClient(client, agent, request.prompt, {
           ...runOptions,
           stream: true,
         });
@@ -106,7 +107,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
         });
       }
 
-      const result = await this.runWithAuthFallback(agent, request.prompt, {
+      const result = await this.runWithClient(client, agent, request.prompt, {
         ...runOptions,
         stream: false,
       });
@@ -158,69 +159,60 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     return this.aborted;
   }
 
-  private async runWithAuthFallback(
+  private async runWithClient(
+    client: OpenAI,
     agent: Agent,
     prompt: string,
     options: { stream: true; maxTurns?: number; signal: AbortSignal; previousResponseId?: string },
   ): Promise<OpenAIStreamResultLike>;
-  private async runWithAuthFallback(
+  private async runWithClient(
+    client: OpenAI,
     agent: Agent,
     prompt: string,
     options: { stream: false; maxTurns?: number; signal: AbortSignal; previousResponseId?: string },
   ): Promise<OpenAIResultLike>;
-  private async runWithAuthFallback(
+  private async runWithClient(
+    client: OpenAI,
     agent: Agent,
     prompt: string,
     options:
       | { stream: true; maxTurns?: number; signal: AbortSignal; previousResponseId?: string }
       | { stream: false; maxTurns?: number; signal: AbortSignal; previousResponseId?: string },
   ): Promise<OpenAIResultLike | OpenAIStreamResultLike> {
-    const attempts = this.buildAuthAttempts();
-    if (attempts.length === 0) {
-      return run(agent, prompt, options as never) as Promise<OpenAIResultLike | OpenAIStreamResultLike>;
-    }
-
-    let lastError: unknown;
-    for (const [index, attempt] of attempts.entries()) {
-      try {
-        const runner = new Runner({
-          modelProvider: new OpenAIProvider({ openAIClient: attempt.client as never }),
-        });
-        return (await runner.run(agent, prompt, options as never)) as OpenAIResultLike | OpenAIStreamResultLike;
-      } catch (error) {
-        lastError = error;
-        if (index === attempts.length - 1 || !isProviderAuthError(error)) throw error;
-      }
-    }
-
-    throw lastError;
+    const runner = new Runner({
+      modelProvider: new OpenAIProvider({ openAIClient: client as never }),
+    });
+    return (await runner.run(agent, prompt, options as never)) as OpenAIResultLike | OpenAIStreamResultLike;
   }
 
-  private buildAuthAttempts(): OpenAIAuthAttempt[] {
-    const attempts: OpenAIAuthAttempt[] = [];
-
-    if (this.options.preferOAuth !== false) {
-      const tokenProvider = createCodexOpenAITokenProvider({
-        authPath: this.options.codexAuthPath,
-        refreshCommand: this.options.codexRefreshCommand,
-      });
-      if (tokenProvider) {
-        attempts.push({
-          source: "codex-oauth",
-          client: new OpenAI({ apiKey: tokenProvider }),
-        });
-      }
-    }
-
+  /**
+   * KPR-351 (R1): API-key single path. The codex-oauth attempt is DELETED —
+   * the KPR-348 spike proved the codex subscription token authenticates the
+   * chatgpt.com backend only and 401s against api.openai.com Responses, so
+   * the attempt could only burn one doomed network round-trip per turn and
+   * kept a dead org-affinity hazard alive (KPR-350 §Edge). Mirrors the
+   * KPR-352 §D7 Vertex deletion: surface-driven single-path auth.
+   * `createCodexOpenAITokenProvider` survives in oauth-credentials.ts — the
+   * codex adapter is its consumer. Revisit trigger: OpenAI ever serving
+   * Responses under subscription auth is a NEW ticket, not a re-add here.
+   */
+  private buildClient(): OpenAI {
     const apiKey = this.options.apiKey ?? envValue("OPENAI_API_KEY");
-    if (apiKey) {
-      attempts.push({
-        source: "api-key",
-        client: new OpenAI({ apiKey }),
-      });
+    if (!apiKey) {
+      // Message prefix shaped to the auth row's existing `api.?key is not
+      // available` alternate (error-classification.ts FAULT_PATTERNS) — keep
+      // "OpenAI API key is not available" verbatim so it classifies auth.
+      // Remediation: the only working path today is seeding OPENAI_API_KEY in
+      // the instance .env + a service restart (.env loads into process.env at
+      // boot via dotenv; no Keychain leg exists for this key). `hive credentials add OPENAI_API_KEY`
+      // hard-rejects — there is no CREDENTIAL_REGISTRY entry for this key and
+      // no config.openai.apiKey resolution yet; registry/Keychain wiring is
+      // future work (KPR-350 L0 leg seeds via .env).
+      throw new Error(
+        "OpenAI API key is not available; set OPENAI_API_KEY in the instance .env and restart — hive credentials add does not carry this key yet",
+      );
     }
-
-    return attempts;
+    return new OpenAI({ apiKey });
   }
 
   private async consumeTextStream(result: OpenAIStreamResultLike, onStream?: (chunk: string) => void): Promise<string> {

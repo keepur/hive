@@ -1030,16 +1030,38 @@ export class AgentManager {
           effectiveCtx.sessionId &&
           sessionSemanticsFor(shaping.route.provider) === "server-resumable"
         ) {
-          // Deliberately NOT logging the error string: the provider's stale-
-          // handle message embeds the resp_ handle value (log-redaction
-          // posture — spec §D3 "no handle value").
-          log.warn("spawnTurn stale-server-handle — retrying without resume (KPR-350)", {
+          // KPR-351 (R2): chain-orphan closure. Two same-thread turns can
+          // both resolve the same stale handle PRE-lock; the first heals and
+          // persists a fresh chain head; the queued second then trips this
+          // arm and — without a re-read — would retry fresh, orphaning the
+          // healed chain (one exchange lost, healed handle overwritten). One
+          // post-lock sessionStore re-read (authoritative under the per-
+          // thread lock — the KPR-313 adopt-branch's own idiom above) adopts
+          // a contender's same-provider, non-empty, DIFFERENT handle; every
+          // other shape falls through to the fresh retry exactly as KPR-350
+          // shipped it. Single-retry semantics (`else if`), record-once,
+          // churn-mint, and the auth-rebuild arm are untouched; the store
+          // read is withRetry fail-soft — no new throw surface inside the
+          // recorded try.
+          const contender = await this.sessionStore.get(effectiveCtx.agentId, effectiveCtx.threadId);
+          const adoptedSessionId =
+            contender?.provider === shaping.route.provider &&
+            contender.sessionId &&
+            contender.sessionId !== effectiveCtx.sessionId
+              ? contender.sessionId
+              : undefined;
+          // Deliberately NOT logging the error string or any handle value:
+          // the provider's stale-handle message embeds the resp_ handle
+          // (log-redaction posture — KPR-350 §D3 "no handle value"); R2
+          // adoption is surfaced as a boolean only.
+          log.warn("spawnTurn stale-server-handle — self-heal retry (KPR-350, adopt-or-fresh KPR-351)", {
             agentId: effectiveCtx.agentId,
             threadId: effectiveCtx.threadId,
             provider: shaping.route.provider,
+            adoptedContenderHandle: adoptedSessionId !== undefined,
           });
           finalResult = await this.runOneSpawnAttempt(
-            { ...effectiveCtx, sessionId: undefined },
+            { ...effectiveCtx, sessionId: adoptedSessionId },
             shaping,
             ticket,
             onStream,

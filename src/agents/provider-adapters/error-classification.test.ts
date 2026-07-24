@@ -68,6 +68,10 @@ describe("classifyTurnResult (KPR-306)", () => {
     // KPR-352 §D7: the GeminiInteractionsAdapter missing-key throw — pinned
     // per the auth row's standing rule (alternates land with their sentinel).
     "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY",
+    // KPR-351 R1: the OpenAIAgentsAdapter missing-key throw — pinned per the
+    // auth row's standing rule (alternates land with their sentinel). No row
+    // edit needed: the existing `api.?key is not available` alternate matches.
+    "OpenAI API key is not available; set OPENAI_API_KEY in the instance .env and restart — hive credentials add does not carry this key yet",
   ])("auth: %s", (s) => expect(faultKind(s)).toBe("auth"));
 
   // The auth row MUST be a superset of every isAuthRebuildResumeError
