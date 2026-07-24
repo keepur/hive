@@ -7,7 +7,7 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 - Rebase-onto-main taken? (spec ⚠, driver's call): **NO** — 3-commit delta (#324, v0.10.1 bump, #325) accepted for the window per spec Key Points; avoids re-review churn mid-lane.
 - P0 state snapshot (paths + timestamps): `~/kpr351-evidence/p0/` 2026-07-23T13:34-0700 — full `mongodump` (hive_keepur, incl. memory_versions 68,293 docs); `luna-def.json` (R4 restore reference — confirms `model: codex/gpt-5.5:medium`, `delegateServers: []`, `maxConcurrent: 3`, no `spawnBudget`, no `archetype`); `sessions-all.json` (4 rows, 1 luna row; field names: `_id, agentId, cacheCreationTokens, cacheReadTokens, compactions, contextWindow, createdAt, inputTokens, outputTokens, provider, sessionId, threadId, updatedAt`); `provider_turn_history` **0 rows** (expected — 0.10.1 predates KPR-353).
 - Pre-flight (Task 6 Step 4): codex OAuth `~/.codex/auth.json` present; no deploy automation targeting keepur (crontab hive entries are dodi-side embed/index jobs; LaunchAgents = keepur.agent + rotate-logs only); service running pid 76679; engine 0.10.1 confirmed. M1 token seeded (Keychain only, inverse in ledger).
-- G0 sign-off (May, window): **GO — 2026-07-23 ~13:45 PT, interactively in the driver session** · G1: TBD · G2a/b/c: TBD · G3 (May, decided at G0): **pre-ruled**, see R4 line
+- G0 sign-off (May, window): **GO — 2026-07-23 ~13:45 PT, interactively in the driver session** · G1: **PASS 2026-07-23 ~22:01 PT** (deploy healthy + rollback verified + C0 GREEN) · G2a/b/c: TBD · G3 (May, decided at G0): **pre-ruled**, see R4 line
 - R4 decision record (May, pre-ruled at G0 2026-07-23): **(1) keep the epic build — no engine rollback (M8 SKIPPED)**; (2) "that's fine" on the Luna end-state question — driver interpretation recorded: with the build staying, the park-on-sonnet premise (tool-free codex) is void, so **M9 default holds: Luna restored to her P0 def (`codex/gpt-5.5:medium`), now tool-capable on the epic build**. May can flip to sonnet with one line.
 
 ## Plan-time facts (2026-07-23, read-only)
@@ -21,7 +21,7 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 | # | When | Mutation | Inverse | Applied | Reverted |
 |---|---|---|---|---|---|
 | M1 | P0 | Keychain add hive/keepur/ADMIN_API_TOKEN | security delete-generic-password -s hive/keepur/ADMIN_API_TOKEN + kickstart | 2026-07-23 | TBD |
-| M2 | P1 | engine .hive → epic build (deploy.sh) | `hive rollback` (.hive.prev = 0.10.1) | TBD | TBD |
+| M2 | P1 | engine .hive → epic build (deploy.sh) | `hive rollback` (.hive.prev = 0.10.1) | 2026-07-23 | SKIPPED per May G3 ruling (keep build) |
 | M3 | P2 | Luna model → claude-sonnet-4-6 | PATCH model codex/gpt-5.5:medium | TBD | TBD |
 | M4 | P2 | Luna model → codex/gpt-5.5:medium | (flagship state — reverted by M8/M9 chain) | TBD | TBD |
 | M5 | C6 | Luna delegateServers → ["google"] | PATCH delegateServers [] | TBD | TBD |
@@ -31,7 +31,11 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 | M9 | P5 | Luna → observed P0 def (model + delegateServers, field-scoped) | — (this IS the restore) | TBD | — |
 
 ## Legs
-### C0 — Hermi Claude-lane smoke (G1 gate) …
+### C0 — Hermi Claude-lane smoke (G1 gate) — **GREEN**
+- Intent: prove the Claude lane healthy on the epic build before touching Luna. Action: May posted in #agent-hermi: "Hermi, quick smoke test: look up Alexandria in contacts and tell me her role."
+- Observed: slack-gateway received (channel agent-hermi, 2026-07-24T05:00:10Z); `mcp__contacts__contacts_search` tool call (1x/3.3s); response complete `hasError:false`, durationMs 11743, llmMs 8481, toolMs 3262, cost $0.354; dispatcher dispatched; telemetry row createdAt 05:00:26.863Z matches. Reply correct and *better than the prompt deserved*: no contact record → correctly identified Alexandria as an agent via team roster, offered team_lookup_agent.
+- hive.err: only chronic socket-mode pong warnings (pre-existing under 0.10.1, ambient). One pre-existing warn: per-turn effort hints disabled for hermi (`model: "opus"` alias is off-catalog — predates the epic build; not a regression; candidate hygiene note).
+- Deploy record (M2 applied 2026-07-23 ~14:19 PT): fetch fell back to rsync from the worktree as designed; health check PASS; BUILD_INFO stamped `kpr-345 epic 7ec2d9f... 2026-07-23`; .hive.prev=0.10.1 verified; doctor Datastore identity all ✓.
 ### P2 — staged claude baseline + claude→codex handoff (G2a) …
 ### C1 — tool turn … ### C2 — stateless-replay continuity … ### C3 — memory …
 ### C4 — skills + legacy layout … ### C5 — guardrail posture (structural) …
