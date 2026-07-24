@@ -52,7 +52,6 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 ### C2 — stateless-replay continuity — **GREEN (the flagship replay proof)**
 - "What was the mascot again, and who did you just look up?" → **both facts recalled** ("cobalt heron, badge 42" + "just looked up Mike Williams") in a 3,997ms turn with **zero tool calls** — pure KPR-353 client-side replay context, turn-over-turn codex continuity proven.
 - `provider_turn_history` doc (exported `~/kpr351-evidence/c2-history.json`, C7 before-state): 4 turns (incl. the codex reflection turn w/ memory_save), item types reasoning×4/function_call×3/function_call_output×3/message×4, **encrypted_content present on all 4 reasoning items** (`:medium` effort ⇒ effort-gated replay exercised). Sessions row still `provider:"codex", sessionId:""` ✓.
-### C3 — memory …
 ### C3 — memory — **GREEN**
 - `mcp__structured-memory__memory_recall×1` (06:25:38Z, the exact KPR-349 Lane B qualified name); reply grounded in real store content (2026-05-08 review record, KPR-45 follow-up flag); hot-tier guidance visibly steering the recited routine.
 ### C4 — skills + legacy layout — **GREEN (path delta recorded)**
