@@ -7,7 +7,7 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 - Rebase-onto-main taken? (spec ⚠, driver's call): **NO** — 3-commit delta (#324, v0.10.1 bump, #325) accepted for the window per spec Key Points; avoids re-review churn mid-lane.
 - P0 state snapshot (paths + timestamps): `~/kpr351-evidence/p0/` 2026-07-23T13:34-0700 — full `mongodump` (hive_keepur, incl. memory_versions 68,293 docs); `luna-def.json` (R4 restore reference — confirms `model: codex/gpt-5.5:medium`, `delegateServers: []`, `maxConcurrent: 3`, no `spawnBudget`, no `archetype`); `sessions-all.json` (4 rows, 1 luna row; field names: `_id, agentId, cacheCreationTokens, cacheReadTokens, compactions, contextWindow, createdAt, inputTokens, outputTokens, provider, sessionId, threadId, updatedAt`); `provider_turn_history` **0 rows** (expected — 0.10.1 predates KPR-353).
 - Pre-flight (Task 6 Step 4): codex OAuth `~/.codex/auth.json` present; no deploy automation targeting keepur (crontab hive entries are dodi-side embed/index jobs; LaunchAgents = keepur.agent + rotate-logs only); service running pid 76679; engine 0.10.1 confirmed. M1 token seeded (Keychain only, inverse in ledger).
-- G0 sign-off (May, window): **GO — 2026-07-23 ~13:45 PT, interactively in the driver session** · G1: **PASS 2026-07-23 ~22:01 PT** (deploy healthy + rollback verified + C0 GREEN) · G2a: **PASS ~22:27 PT** · G2b/c: TBD · G3 (May, decided at G0): **pre-ruled**, see R4 line
+- G0 sign-off (May, window): **GO — 2026-07-23 ~13:45 PT, interactively in the driver session** · G1: **PASS ~22:01 PT** · G2a: **PASS ~22:27 PT** · G2b: **PASS ~23:58 PT** (C0–C8 all GREEN) · G2c: **PASS ~23:58 PT** · G3: **COMPLETE ~00:02 PT 07-24** · G3 (May, decided at G0): **pre-ruled**, see R4 line
 - R4 decision record (May, pre-ruled at G0 2026-07-23): **(1) keep the epic build — no engine rollback (M8 SKIPPED)**; (2) "that's fine" on the Luna end-state question — driver interpretation recorded: with the build staying, the park-on-sonnet premise (tool-free codex) is void, so **M9 default holds: Luna restored to her P0 def (`codex/gpt-5.5:medium`), now tool-capable on the epic build**. May can flip to sonnet with one line.
 
 ## Plan-time facts (2026-07-23, read-only)
@@ -20,15 +20,15 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 ## Mutation ledger (every def/config mutation, inverse recorded BEFORE applying)
 | # | When | Mutation | Inverse | Applied | Reverted |
 |---|---|---|---|---|---|
-| M1 | P0 | Keychain add hive/keepur/ADMIN_API_TOKEN | security delete-generic-password -s hive/keepur/ADMIN_API_TOKEN + kickstart | 2026-07-23 | TBD |
+| M1 | P0 | Keychain add hive/keepur/ADMIN_API_TOKEN | security delete-generic-password -s hive/keepur/ADMIN_API_TOKEN + kickstart | 2026-07-23 | 2026-07-23 |
 | M2 | P1 | engine .hive → epic build (deploy.sh) | `hive rollback` (.hive.prev = 0.10.1) | 2026-07-23 | SKIPPED per May G3 ruling (keep build) |
 | M3 | P2 | Luna model → claude-sonnet-4-6 | PATCH model codex/gpt-5.5:medium | 2026-07-23 | 2026-07-23 (M4) |
 | M4 | P2 | Luna model → codex/gpt-5.5:medium | (flagship state — reverted by M8/M9 chain) | 2026-07-23 | — |
 | M5 | C6 | Luna delegateServers → ["google"] → revised ["conversation-search"] (google correctly dropped: no gog account for luna) | PATCH delegateServers [] | 2026-07-23 | 2026-07-23 |
 | M6 | C7 | Luna model → codex/gpt-5.4-mini:medium | PATCH model codex/gpt-5.5:medium | 2026-07-23 | 2026-07-23 |
-| M7 | P4 | Luna model → claude-sonnet-4-6 | PATCH model codex/gpt-5.5:medium | TBD | TBD |
-| M8 | P5 | engine rollback → 0.10.1 | (May G3 call could skip) | TBD | — |
-| M9 | P5 | Luna → observed P0 def (model + delegateServers, field-scoped) | — (this IS the restore) | TBD | — |
+| M7 | P4 | Luna model → claude-sonnet-4-6 | PATCH model codex/gpt-5.5:medium | 2026-07-23 | 2026-07-23 (M9) |
+| M8 | P5 | engine rollback → 0.10.1 | (May G3 call could skip) | SKIPPED (May: keep build) | — |
+| M9 | P5 | Luna → observed P0 def (model + delegateServers, field-scoped) | — (this IS the restore) | 2026-07-23 | — |
 
 ## Legs
 ### C0 — Hermi Claude-lane smoke (G1 gate) — **GREEN**
@@ -73,12 +73,20 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 - Split invariant `durationMs = llmMs + toolMs` holds exactly on every codex row: G2a (13571=13401+170), C1 (24179=24169+10), C2 (3997+0), C3 (8306=8184+122), C4 (105794=17584+88210), C6 (19408=10546+8862, nested wall in toolMs), C7 (9625+0).
 - `costUsd: 0` on all codex rows (nominal-cost caveat, per canon); toolSummary populated and truthful on every row; usage single-counted (C6 nested tokens logged route-keyed in the nested-complete line, not folded into parent).
 - Codex breaker **closed, 0 trips, entire window** (telemetry `circuit_breaker_stats`).
-### P4 — inverse transition (KPR-313 proof, G2c) …
-### P5 — restore + diff-empty gate (G3) …
-### L0–L3 (key-conditioned) — NOT RUN unless OPENAI_API_KEY appears: …
-### N1–N2 (optional gemini) …
+### P4 — inverse transition (KPR-313 proof, G2c) — **GREEN, all five §D5 items**
+- Pre-state: `p4-history-before.json` (11 codex turns, non-empty) exported. M7 applied (→ claude-sonnet-4-6, SIGUSR1).
+- (1) reverse guard warn exact: stored:"codex" turn:"claude" hadSessionId:false (06:56:25Z) ✓ · (2) `provider_turn_history` **0 records — doc deleted; the first production non-empty KPR-313 clear** ✓ · (3) sessions row → provider:"claude", real handle `f6df3250-cdf2-4dfe-97a1-1257ae117bba` ✓ · (4) handoff fired (warn + fresh session; annotation text log-redacted per posture — user-visible corroboration: Luna narrated "memory came through the session reset intact" unprompted) ✓ · (5) coherent reply, memory the bridge — mascot recalled from her reflection-saved hot-tier record after a claude→codex→claude round-trip ✓.
+- G2c resume proof: follow-up turn resumed `f6df3250` (log: resume=f6df3250, same id returned; total guard warns in the entire window = exactly 2 — the two designed transitions, zero spurious). **G2c: PASS.**
+### P5 — restore + diff-empty gate (G3) — **GREEN (adapted per May's G0 pre-rulings)**
+- M8 SKIPPED (May: keep the epic build; no engine rollback — the build stays as keepur's production engine). M9 field-scoped restore applied (`{model, delegateServers}` only): admin API confirmed codex/gpt-5.5:medium + []. Diff-empty gate: **only `updatedAt`/`updatedBy` differ** (the specified honest exceptions); `maxConcurrent: 3` intact; **no `spawnBudget` key appeared**.
+- M1 inverse: ADMIN_API_TOKEN deleted from Keychain + kickstart (new pid 48302); "Hive is running"; port 3304 connection-refused (curl exit 7); doctor exit 0. Status quo ante on the admin surface. **G3: complete** (both decision points executed as pre-ruled).
+### P6 — non-gating legs — **SKIPPED (recorded)**
+- openai L0–L3: expected skip — no OPENAI_API_KEY on the instance (May offered no key in-window). **R5: no-op — no OPENAI_API_KEY in window; matcher ships as KPR-350 built it.**
+- gemini N1–N2: skipped with May's assent — N1 needs a >1d-idle Interactions thread (unavailable in-window); absence changes only KPR-355 wording.
 
 ## KPR-355 row-fact deltas
-- codex rows → live-validated (cite leg evidence): TBD
-- openai rows: unchanged unless P6 ran: TBD
-- Lane A (kimi/deepseek): explicitly restated live-unvalidated (KPR-346 canon).
+- **codex rows → LIVE-VALIDATED in production** (keepur/Luna flagship arc, 2026-07-23/24): tools (C1 bridged contacts_search; C4 builtins Glob/Read), stateless-replay continuity incl. encrypted reasoning ×4 (C2), memory via Lane B `mcp__structured-memory__memory_recall` (C3), skills via projection (C4), guardrail allow-all structural (C5), delegate Task turn w/ live enum acceptance (C6), poisoned-replay observed TOLERATED gpt-5.5→gpt-5.4-mini (C7 — §D7 self-heal remains unit-pinned, no live firing), telemetry split exact + breaker closed (C8), KPR-313 both directions incl. first production non-empty history clear (P2/P4).
+- openai rows: **unchanged** (L0–L3 skipped, no key; still bridge-validated-at-401-boundary + unit/contract evidence per KPR-348/350).
+- gemini rows: unchanged from KPR-352 (dev-key live evidence; N1/N2 skipped this pass).
+- Lane A (kimi/deepseek): explicitly restated **live-unvalidated** (KPR-346 canon; V2–V6 deferred pending funded keys).
+- New provisioning caveat for the matrix: delegate servers with per-agent account gates (google/gog) require provisioning before Task synthesis lights up — correct four-layer behavior, surfaced live by C6 attempt 1.
