@@ -24,7 +24,7 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 | M2 | P1 | engine .hive → epic build (deploy.sh) | `hive rollback` (.hive.prev = 0.10.1) | 2026-07-23 | SKIPPED per May G3 ruling (keep build) |
 | M3 | P2 | Luna model → claude-sonnet-4-6 | PATCH model codex/gpt-5.5:medium | 2026-07-23 | 2026-07-23 (M4) |
 | M4 | P2 | Luna model → codex/gpt-5.5:medium | (flagship state — reverted by M8/M9 chain) | 2026-07-23 | — |
-| M5 | C6 | Luna delegateServers → ["google"] | PATCH delegateServers [] | TBD | TBD |
+| M5 | C6 | Luna delegateServers → ["google"] → revised ["conversation-search"] (google correctly dropped: no gog account for luna) | PATCH delegateServers [] | 2026-07-23 | TBD |
 | M6 | C7 | Luna model → codex/gpt-5.4-mini:medium | PATCH model codex/gpt-5.5:medium | TBD | TBD |
 | M7 | P4 | Luna model → claude-sonnet-4-6 | PATCH model codex/gpt-5.5:medium | TBD | TBD |
 | M8 | P5 | engine rollback → 0.10.1 | (May G3 call could skip) | TBD | — |
@@ -61,7 +61,10 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 ### C5 — guardrail posture (structural) — **GREEN (structural, as ruled)**
 - No live denial leg by spec ruling (Luna has no archetype ⇒ allow-all IS her production posture; a synthetic denial would mutate her config unrepresentatively).
 - Evidence: archetype registry loaded at epic-build boot (21:19:18.839Z, `Registered archetype software-engineer`); every C1–C4 tool call flowed through the bridge's single gated dispatch path (`wrap()` by construction — no ungated path exists in `tool-bridge.ts`); deny path remains unit-pinned (KPR-348 archetype-gate suite). Matrix-noted honestly: live deny-path evidence not produced on this pass.
-### C6 — delegate Task turn (KPR-354 enum confirmation) … ### C7 — poisoned-replay (deliberate) …
+### C6 — delegate Task turn (KPR-354 enum confirmation)
+- **Attempt 1 (google): no Task synthesized — correct provisioning gate, not a parity gap.** M5 (delegateServers ["google"]) applied + reloaded in time (06:30:14 reload < 06:30:50 spawn), but the spawn's partition stayed bridgeable:19 with no delegate entry. Root cause traced in source: `buildAllServerConfigs` skips the google plugin server for agents with no gog accounts (`config.google.accounts[agentId]` — Luna has none; Hermi does), so `activeDelegateNames` drops config-less "google" → no synthesis. Identical behavior would occur on the Claude lane (same `activeDelegateNames` feeds both) — a **provisioning-layer** gate per the Day-1-OOB four-layer model, exercised live for the first time via a Lane B delegate. Luna's honest fallback (`mcp__team__list_agents×1`, "I don't see a Google helper") is itself good agent behavior. Delta noted for the plan's plan-time-resolution #2: the catalog/traits/plugin-installed checks were necessary but not sufficient — per-agent account provisioning is the fourth gate.
+- **Attempt 2: fallback delegate `conversation-search`** (plan's named fallback; also a Luna coreServer — core-vs-delegate name collision behavior to be recorded). M5 revised + SIGUSR1 2026-07-23 ~23:35 PT. Result: TBD
+### C7 — poisoned-replay (deliberate) …
 ### C8 — telemetry honesty … ### P4 — inverse transition (KPR-313 proof, G2c) …
 ### P5 — restore + diff-empty gate (G3) …
 ### L0–L3 (key-conditioned) — NOT RUN unless OPENAI_API_KEY appears: …
