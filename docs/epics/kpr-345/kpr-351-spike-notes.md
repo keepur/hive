@@ -3,7 +3,7 @@
 Evidence contract: spec §D6. Per leg: intent → action → observed → verdict GREEN/AMBER/RED → deltas (tagged with the spec section they refine).
 
 ## Global
-- Pinned SHA + `check:bundle` gate output: **PINNED_SHA `e16bc2a794d5216d66a52d1ebccae396b748e1b6`** (2026-07-23); `npm run check:bundle` exit 0 — bundle + all four gates green (strings, pack, runtime "server.min.js loaded / exited on missing config — expected", qdrant-stub present in 2 bundles).
+- Pinned SHA + `check:bundle` gate output: **PINNED_SHA `e16bc2a794d5216d66a52d1ebccae396b748e1b6`** (2026-07-23); BUILD_INFO stamps `7ec2d9f` — the delta `e16bc2a..7ec2d9f` is docs-only (this file), artifact identical; `npm run check:bundle` exit 0 — bundle + all four gates green (strings, pack, runtime "server.min.js loaded / exited on missing config — expected", qdrant-stub present in 2 bundles).
 - Rebase-onto-main taken? (spec ⚠, driver's call): **NO** — 3-commit delta (#324, v0.10.1 bump, #325) accepted for the window per spec Key Points; avoids re-review churn mid-lane.
 - P0 state snapshot (paths + timestamps): `~/kpr351-evidence/p0/` 2026-07-23T13:34-0700 — full `mongodump` (hive_keepur, incl. memory_versions 68,293 docs); `luna-def.json` (R4 restore reference — confirms `model: codex/gpt-5.5:medium`, `delegateServers: []`, `maxConcurrent: 3`, no `spawnBudget`, no `archetype`); `sessions-all.json` (4 rows, 1 luna row; field names: `_id, agentId, cacheCreationTokens, cacheReadTokens, compactions, contextWindow, createdAt, inputTokens, outputTokens, provider, sessionId, threadId, updatedAt`); `provider_turn_history` **0 rows** (expected — 0.10.1 predates KPR-353).
 - Pre-flight (Task 6 Step 4): codex OAuth `~/.codex/auth.json` present; no deploy automation targeting keepur (crontab hive entries are dodi-side embed/index jobs; LaunchAgents = keepur.agent + rotate-logs only); service running pid 76679; engine 0.10.1 confirmed. M1 token seeded (Keychain only, inverse in ledger).
@@ -82,6 +82,9 @@ Evidence contract: spec §D6. Per leg: intent → action → observed → verdic
 ### P6 — non-gating legs — **SKIPPED (recorded)**
 - openai L0–L3: expected skip — no OPENAI_API_KEY on the instance (May offered no key in-window). **R5: no-op — no OPENAI_API_KEY in window; matcher ships as KPR-350 built it.**
 - gemini N1–N2: skipped with May's assent — N1 needs a >1d-idle Interactions thread (unavailable in-window); absence changes only KPR-355 wording.
+
+## Evidence retention
+- `~/kpr351-evidence/` (incl. the full P0 `mongodump` of hive_keepur): retain until the KPR-345 epic PR merges, then operator cleanup (contains business data — do not commit, do not sync).
 
 ## KPR-355 row-fact deltas
 - **codex rows → LIVE-VALIDATED in production** (keepur/Luna flagship arc, 2026-07-23/24): tools (C1 bridged contacts_search; C4 builtins Glob/Read), stateless-replay continuity incl. encrypted reasoning ×4 (C2), memory via Lane B `mcp__structured-memory__memory_recall` (C3), skills via projection (C4), guardrail allow-all structural (C5), delegate Task turn w/ live enum acceptance (C6), poisoned-replay observed TOLERATED gpt-5.5→gpt-5.4-mini (C7 — §D7 self-heal remains unit-pinned, no live firing), telemetry split exact + breaker closed (C8), KPR-313 both directions incl. first production non-empty history clear (P2/P4).
