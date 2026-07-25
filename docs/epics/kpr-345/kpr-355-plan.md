@@ -12,7 +12,7 @@
 
 ## Plan-ruled cell resolutions (spec-review advisories — the writer follows these, not their own judgment)
 
-1. **Row 6, Lane A cell value is `caveat(tool-search off; eager schemas only)` — NOT `full`.** Spec §D3 Row 6's first line reads "claude, kimi/deepseek: `full` — …" and then overrides Lane A at the end of the sentence ("→ note as `caveat(...)` for Lane A"). The `full` lead token belongs to the claude column ONLY. Final Row 6 cells: claude `full` (tool-search deferral available per KPR-329); kimi/deepseek `caveat(tool-search off; eager schemas only)`; openai/gemini/codex `caveat(128-tool cap, two-tier)` with the honesty footnote (assembly-time toolkit vs connect-time fail-soft).
+1. **Row 6, Lane A cell value is `caveat(tool-search off; eager schemas only)` — NOT `full`.** Spec §D3 Row 6's first line reads "claude, kimi/deepseek: `full` — …" and then overrides Lane A at the end of the sentence ("→ note as `caveat(...)` for Lane A"). The `full` lead token belongs to the claude column ONLY. Final Row 6 cells: claude `full` (tool-search deferral available — describe the behavior, no ticket number in the cell); kimi/deepseek `caveat(tool-search off; eager schemas only)`; openai/gemini/codex `caveat(128-tool cap, two-tier)` with the honesty footnote (assembly-time toolkit vs connect-time fail-soft).
 2. **Row 15 merges into ONE cell per column** — the spec states it as two half-rows ("All five: `full` for breaker/outage/attribution" + per-provider usage/cost caveats); the doc must not ship it that way. Final Row 15 cells: claude `full`; kimi/deepseek `caveat(costUsd nominal — Claude pricing math)`; openai `caveat(token counts report 0)`; gemini `caveat(costUsd 0; real token counts)`; codex `caveat(costUsd 0; real token counts)`. One shared footnote carries the whole-row truth: circuit breaker, honest-outage queue, and telemetry attribution are **full on all five columns**, keyed on the route provider (a kimi outage trips the `kimi` breaker only; tool/assembly faults never trip; `llmMs` excludes tool time on every tool-executing lane) — the caveats scope to usage/cost reporting only. The openai footnote may note this is a flagged follow-up candidate (spec ⚠ A2), without a ticket number in the matrix body.
 3. **Row 5's claude cell drops `Task`** for row orthogonality — it lists WebFetch/WebSearch/NotebookEdit/TodoWrite only; Row 11 owns subagents/Task entirely. (Spec review authorized this drop.)
 4. **The public doc carries NO `src/…` file:line citations** — spec §Edge-cases rules this explicitly ("don't — the public doc states behavior; file:line stays in this spec"). Notes name behaviors and, where useful, plain mechanism nouns (e.g. "hive-persisted replay history", "the tool bridge"); never paths-with-line-numbers. Ticket references stay out of the matrix; the trailing History line names the KPR-345 epic.
@@ -33,9 +33,9 @@
 1. **`npm run check` green** — docs are outside the TS build, but the gate is the workflow standard and cheap; run it with the env stubs at every commit. Expected: exit 0, trivially (no compiled surface changes).
 2. **Zero-code-diff proof** — `git diff 4d2a9de..HEAD --stat -- src/` → **empty output**. The whole child's diff is `docs/providers.md` (new), `docs/architecture.md`, `CLAUDE.md`, and this epic-docs directory.
 3. **Cell-fidelity self-check (Task 5)** — the writer re-reads spec §D3 row by row against the shipped matrix and checks off all 17 rows × 5 columns: cell value token correct (`full`/`caveat`/`claude-only`/`n/a`), note substance preserved, no invented content, no dropped canon-bound clause. Recorded as a checklist in the PR description.
-4. **Citation-policy check** — `grep -nE 'src/[A-Za-z0-9_/.-]+\.ts' docs/providers.md` → **no matches** (no source paths in the public doc; ruling 4 above).
-5. **Staleness-purge greps** — `grep -n 'tool-free\|GeminiAdk\|until the provider tool bridge lands' docs/architecture.md` → **no matches**; `grep -n 'applies to codex/openai' CLAUDE.md` → **no matches**.
-6. **Markdown rendering sanity** — `awk -F'|' '/^\|/ {print NF}' docs/providers.md | sort -u` prints exactly **one** value (every table line has the same column count — 7 fields for a 5-column matrix with row labels); visually confirm the rendered table (any markdown preview) has no broken pipes and each `caveat(note)` stays on one line (long notes go to footnotes per §D1).
+4. **Citation-policy check** — `grep -nE '(src/[A-Za-z0-9_/.-]+\.ts|\.ts:[0-9])' docs/providers.md` → **no matches** (no source paths in the public doc; ruling 4 above); `grep -n 'KPR-[0-9]' docs/providers.md` → matches **only** in the trailing History line (no ticket ids in the matrix body); `grep -n 'providers.md' docs/architecture.md` → **≥1 match** (the §D1-required cross-link landed).
+5. **Staleness-purge greps** — `grep -n 'tool-free\|GeminiAdk\|until the provider tool bridge lands\|future provider-specific tool bridge\|future bridge\|intentionally attach no tools' docs/architecture.md` → **no matches**; `grep -n 'applies to codex/openai' CLAUDE.md` → **no matches**.
+6. **Markdown rendering sanity** — `awk -F'|' '/^\|/ {print NF}' docs/providers.md | sort -u` prints exactly **one** value (every table line has the same column count; with conventional leading and trailing pipes a `| label | c1 | … | c5 |` row splits to **NF=8** under `awk -F'|'` — 8 is the expected value, not a defect); visually confirm the rendered table (any markdown preview) has no broken pipes and each `caveat(note)` stays on one line (long notes go to footnotes per §D1).
 
 ### Commands
 
@@ -110,7 +110,7 @@ One footnote per marker used in Step 1.2 (§D1: notes over ~1 line go here). Mus
 
 - [ ] **Step 1.4: Verify + commit**
 
-`awk -F'|' '/^\|/ {print NF}' docs/providers.md | sort -u` → one value. `grep -nE 'src/[A-Za-z0-9_/.-]+\.ts' docs/providers.md` → empty. `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` → exit 0.
+`awk -F'|' '/^\|/ {print NF}' docs/providers.md | sort -u` → one value. `grep -nE '(src/[A-Za-z0-9_/.-]+\.ts|\.ts:[0-9])' docs/providers.md` → empty. `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` → exit 0.
 
 ```bash
 git add docs/providers.md
@@ -157,7 +157,7 @@ git commit -m "KPR-355: providers.md — ruled non-goals, out-of-scope rulings, 
 - [ ] **Step 3.2: Overview sentence (line 27)** — replace the sentence `Claude still receives the direct SDK MCP wiring; non-Claude adapters remain tool-free until the provider tool bridge lands.` with:
 
 ```
-Claude receives the direct SDK MCP wiring; the Lane B adapters (`openai/...`, `gemini/...`, `codex/...`) execute the same hive tool surface through the hive tool bridge, and the Lane A passthrough providers (`kimi/...`, `deepseek/...`) run the full Claude runtime against vendor Anthropic-compatible endpoints. See [docs/providers.md](./providers.md) for the supported-provider parity matrix.
+Claude receives the direct SDK MCP wiring; the Lane B adapters (`openai/...`, `gemini/...`, `codex/...`) execute the hive tool surface through the hive tool bridge (claude-only exceptions and caps in the matrix), and the Lane A passthrough providers (`kimi/...`, `deepseek/...`) run the full Claude runtime against vendor Anthropic-compatible endpoints. See [docs/providers.md](./providers.md) for the supported-provider parity matrix.
 ```
 
 (The trailing `A new AgentRunner instance…` sentence in that paragraph stays verbatim.) This sentence doubles as the §D1-required cross-link.
@@ -175,7 +175,7 @@ Claude receives the direct SDK MCP wiring; the Lane B adapters (`openai/...`, `g
 
 - [ ] **Step 3.5: Verify + commit**
 
-`grep -n 'tool-free\|GeminiAdk\|until the provider tool bridge lands' docs/architecture.md` → **no matches**. `git diff --stat -- docs/architecture.md` shows only the four regions + heading-adjacent lines. `npm run check` (env stubs) → exit 0.
+`grep -n 'tool-free\|GeminiAdk\|until the provider tool bridge lands\|future provider-specific tool bridge\|future bridge\|intentionally attach no tools' docs/architecture.md` → **no matches**. `git diff --stat -- docs/architecture.md` shows only the four regions + heading-adjacent lines. `npm run check` (env stubs) → exit 0.
 
 ```bash
 git add docs/architecture.md
@@ -219,10 +219,12 @@ git commit -m "KPR-355: CLAUDE.md :effort sentence corrected — codex+gemini co
 
 ```bash
 git diff 4d2a9de..HEAD --stat -- src/                                   # expected: empty
-grep -n 'tool-free\|GeminiAdk\|until the provider tool bridge lands' docs/architecture.md   # expected: no matches
+grep -n 'tool-free\|GeminiAdk\|until the provider tool bridge lands\|future provider-specific tool bridge\|future bridge\|intentionally attach no tools' docs/architecture.md   # expected: no matches
 grep -n 'applies to codex/openai' CLAUDE.md                             # expected: no matches
-grep -nE 'src/[A-Za-z0-9_/.-]+\.ts' docs/providers.md                   # expected: no matches
-awk -F'|' '/^\|/ {print NF}' docs/providers.md | sort -u                # expected: exactly one value
+grep -nE '(src/[A-Za-z0-9_/.-]+\.ts|\.ts:[0-9])' docs/providers.md                   # expected: no matches
+grep -n 'KPR-[0-9]' docs/providers.md                                   # expected: matches only in the trailing History line
+grep -n 'providers.md' docs/architecture.md                             # expected: >=1 match (cross-link landed)
+awk -F'|' '/^\|/ {print NF}' docs/providers.md | sort -u                # expected: exactly one value (NF=8 with conventional pipes)
 SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check   # expected: exit 0
 ```
 
