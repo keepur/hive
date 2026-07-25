@@ -17,14 +17,14 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Provider adapter (selected from the agent's model string)
             ↓
-       Tool transport inventory → future provider-specific tool bridge
+       Claude lane: AgentRunner + direct SDK MCP wiring · Lane B: hive tool bridge (bridged MCP + hive builtins)
             ↓
        Agent runner (spawns Claude session + MCP servers as subprocesses, fresh per turn)
             ↓
        Response → channel adapter → delivery
 ```
 
-A single hive process serves multiple agents and multiple channel adapters. Inbound work from Slack, SMS, WebSocket, scheduler, voice, or other sources is normalized into a `WorkItem`, then routed to an agent. Provider/model selection is derived from that selected agent's `model` string: unprefixed models use Claude, while provider-prefixed models such as `codex/...`, `openai/...`, or `gemini/...` select the matching adapter. Claude still receives the direct SDK MCP wiring; non-Claude adapters remain tool-free until the provider tool bridge lands. A new `AgentRunner` instance is constructed per Claude spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
+A single hive process serves multiple agents and multiple channel adapters. Inbound work from Slack, SMS, WebSocket, scheduler, voice, or other sources is normalized into a `WorkItem`, then routed to an agent. Provider/model selection is derived from that selected agent's `model` string: unprefixed models use Claude, while provider-prefixed models such as `codex/...`, `openai/...`, or `gemini/...` select the matching adapter. Claude receives the direct SDK MCP wiring; the Lane B adapters (`openai/...`, `gemini/...`, `codex/...`) execute the hive tool surface through the hive tool bridge (claude-only exceptions and caps in the matrix), and the Lane A passthrough providers (`kimi/...`, `deepseek/...`) run the full Claude runtime against vendor Anthropic-compatible endpoints. See [docs/providers.md](./providers.md) for the supported-provider parity matrix. A new `AgentRunner` instance is constructed per Claude spawn so MCP servers, hooks, and `WorkItemContext` (channel id, thread id, source metadata) are captured at spawn time — no stale state survives across turns.
 
 The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, threadId)`, per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface used by `hive doctor`, the Slack health report, and the WebSocket agent roster.
 
@@ -40,7 +40,7 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
 - `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
 - `src/agents/agent-manager.ts` — spawn coordinator: lock, budget, ticket lifecycle, reflection scheduler, snapshot surface.
-- `src/agents/provider-adapters/` — one-turn provider boundary and tool transport classification. `AgentManager` selects the adapter from the selected agent's `model` string: Claude by default, or provider-prefixed `codex/...`, `openai/...`, and `gemini/...` models for the non-Claude adapters. `ClaudeAgentAdapter` delegates to `AgentRunner`; `OpenAIAgentsAdapter`, `GeminiAdkAdapter`, and `CodexSubscriptionAdapter` are tool-free provider paths until the tool bridge lands.
+- `src/agents/provider-adapters/` — one-turn provider boundary and tool transport classification. `AgentManager` selects the adapter from the selected agent's `model` string: Claude by default, or provider-prefixed `codex/...`, `openai/...`, and `gemini/...` models for the non-Claude adapters. `ClaudeAgentAdapter` delegates to `AgentRunner`; `OpenAIAgentsAdapter`, `GeminiInteractionsAdapter`, and `CodexSubscriptionAdapter` execute real hive tools through the hive tool bridge; `kimi/...` and `deepseek/...` route through the Claude runtime with per-spawn env substitution (Lane A passthrough).
 - `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes the coordinator snapshot to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent for the doctor to read.
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB.
 - `src/agents/model-router.ts` — per-turn effort classifier (KPR-338: models are static per agent; the classifier tunes reasoning effort only).
@@ -86,17 +86,11 @@ Plugins (e.g. CRM integrations, business-specific tools) are separately-publishe
 
 ### Provider tool transport compatibility
 
-KPR-232 adds `AgentRunner.buildToolTransportInventory()` as a read-only inventory of the tool transports visible to a turn. The inventory describes Claude SDK built-ins, parent-session MCP servers, in-process SDK MCP servers, `team-roster`, and delegated sub-agent tools without exporting the Claude SDK `McpServerConfig` shape as the public boundary.
+`AgentRunner.buildToolTransportInventory()` classifies every tool a turn can see (direct SDK wiring, MCP-bridge candidate, requires-hive-bridge, claude-only, or unsupported). The compatibility path `Provider adapter → tool transport inventory → hive tool bridge` is **live** for all three Lane B providers (`openai`, `gemini`, `codex`), not a future state.
 
-The compatibility path is:
+The bridge lives inside hive itself, not inside each provider adapter: external MCP servers are consumed as MCP clients, in-process engine MCPs ride the same server instances the Claude lane uses over an in-memory transport, six builtins (Bash/Read/Write/Edit/Glob/Grep) run on a hive-native executor, and every execution crosses one fail-closed guardrail gate. Honeypot/Keychain credential resolution stays local; `WorkItemContext` is preserved for context-dependent servers.
 
-```
-Provider adapter → tool transport inventory → provider-specific tool bridge
-```
-
-This is a compatibility layer only. Claude continues to use direct Claude Agent SDK `mcpServers`, in-process SDK MCP servers, SDK built-ins, hooks, plugins/native skills, and `agents:` sub-agent wiring. Non-Claude adapters must not consume the Claude-shaped `mcpServers` object directly. The KPR-233 OpenAI pilot and KPR-234 Gemini pilot intentionally attach no tools: they ignore Claude-only built-ins/sub-agents and reject any inventory entry that would require a provider bridge. OpenAI/Gemini tool bridging, provider selection, and memory/session policy are deferred.
-
-The future bridge belongs inside Hive, not inside each provider adapter. It should keep Honeypot/Keychain resolution local, preserve `WorkItemContext` for context-dependent servers, and expose only selected tools through provider-supported MCP or native function surfaces. SDK plugins/native skills, hooks, prompt assembly, settings sources, and SDK `extraArgs` are out of this inventory and remain Claude runtime behavior unless a later spec gives another provider an equivalent implementation.
+Claude-only tools (WebFetch, WebSearch, NotebookEdit, TodoWrite, general-purpose Task) are partition-omitted with logged reasons — never silently dropped. Claude continues to use direct SDK wiring end-to-end. For the full per-capability parity picture across all providers, see [docs/providers.md](./providers.md).
 
 ## Coordination primitives
 
