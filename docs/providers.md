@@ -4,7 +4,7 @@ Hive agents are not locked to Anthropic. An agent's `model` field selects the pr
 
 There are two lanes behind that routing:
 
-**Lane A — passthrough (`kimi/...`, `deepseek/...`).** These providers run the full Claude runtime end to end: same adapter, same tool wiring, same skills and memory, same session mechanics. Only the network endpoint, the credential, and the default model differ, resolved per spawn. Because the underlying runtime is identical to Claude's, Lane A tracks Claude's column for most capabilities; the differences — tool-search disabled, an effort-level clamp, nominal cost reporting, and validation status — are called out in their rows.
+**Lane A — passthrough (`kimi/...`, `deepseek/...`).** These providers run the full Claude runtime end to end: same adapter, same tool wiring, same skills and memory, same session mechanics. Only the network endpoint, the credential, and the default model differ, resolved per spawn. Because the underlying runtime is identical to Claude's, Lane A tracks Claude's column for most capabilities; where it differs (for example tool-search disabled, an effort-level clamp, no Anthropic server-side tools, cold vendor prompt cache on resume and its cache economics, nominal cost reporting, and validation status), the difference is called out in its row.
 
 **Lane B — native provider loops (`openai/...`, `gemini/...`, `codex/...`).** These providers run their own bounded tool-calling loop against the vendor's native API, executing real hive tools through a tool bridge that sits inside hive (not inside each adapter). They get the same prompt assembly, the same skills, the same memory, and most of the same tool surface as Claude — with a documented, capped set of differences, captured cell by cell below.
 
@@ -67,7 +67,7 @@ There are two lanes behind that routing:
 
 - Session retention needs grow past the current durable-resume horizon, or a continuity requirement longer than that horizon shows up — re-evaluate a provider-native conversation-history API as a new piece of work, not a patch to this matrix.
 - A provider's newer agentic API ships on a cloud-platform-hosted auth surface it doesn't support today — re-evaluate that auth path as new work.
-- A provider currently reached only via subscription OAuth begins serving its native agentic API under that same subscription auth. Concretely: if OpenAI's API surface becomes usable under subscription auth (the way codex's backend is today), revisit the openai flagship's key-conditioned items as new work — not a re-add of the Conversations API or Vertex paths this epic deliberately removed.
+- A provider currently reached only via subscription OAuth begins serving its native agentic API under that same subscription auth. Concretely: if OpenAI's API surface becomes usable under subscription auth (the way codex's backend is today), revisit the OpenAI key-conditioned items as new work — not a re-add of the Conversations API path this epic deliberately left unused.
 - Any future Lane B provider that genuinely has no tool access must explicitly re-declare that state rather than silently inheriting "tools executable" as a default.
 
 ## History
