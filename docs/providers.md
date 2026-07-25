@@ -47,3 +47,26 @@ There are two lanes behind that routing:
 [^15]: **Ops integration.** The circuit breaker, the honest-outage queue, and telemetry attribution are `full` on every column — they key on the resolved route provider (an outage on kimi only trips the kimi breaker; a tool or assembly fault never trips any breaker; timing metrics exclude tool execution time on every tool-executing lane). The caveats in this row scope narrowly to usage/cost reporting: Lane A reports a nominal cost computed with Claude's own pricing math (it is, after all, running the Claude runtime); openai currently reports zero for every token count (a known gap, flagged as a follow-up candidate); gemini and codex report zero cost (subscription/API billing is out of scope for cost telemetry) but accurate real token counts.
 [^16]: **Auth & credentials.** Claude and codex both authenticate via subscription OAuth — no API key in the loop. Lane A resolves a per-provider API key from the environment, falling back to the local credential store; a credential rotation takes effect on the provider's next spawn, and a missing key fails as a config error that never touches the breaker. Kimi's default endpoint and model are the Moonshot Anthropic-compatible endpoint and `kimi-k3`; Deepseek's are the Deepseek Anthropic-compatible endpoint and `deepseek-v4-pro`. openai is API-key-only today, read from the instance's environment file with no credential-store integration yet — a missing key fails the turn as an honest outage. gemini is also API-key-only; a free-tier key trains on submitted data, so production traffic requires a paid-tier key, and there is no Google Cloud Vertex path.
 
+## Ruled non-goals
+
+1. **Translation proxies** (community LiteLLM-style routers, `claude-code-router`, and similar) are not a supported way to reach Lane A in production. Anything sitting between hive and the vendor endpoint is an unowned middlebox in the credential and fidelity path; only vendor-operated, Anthropic-compatible endpoints qualify.
+2. **Carrying conversation history across a provider change.** Reassigning an agent's model to a different provider always starts a fresh session; a short memory-handoff annotation is the continuity bridge, not a transcript carry-over. (Codex additionally clears any replayed turn history it was holding.)
+3. **Catalog-driven, per-turn effort tuning for non-Claude models.** Foreign models get the static `:effort` suffix on the model string; the adaptive effort classifier stays a Claude-lane capability.
+
+## Out of scope (epic rulings)
+
+- **Voice is pinned to the Claude lane, by code.** A voice-enabled agent configured with a non-Claude model still runs its voice turns on the engine's default Claude model. This is a documented caveat on voice-enabled agents today, and a candidate for revisit once the matrix has been live for a while.
+- **OpenAI-compatible "sidecar" providers** for non-agentic, one-shot LLM calls elsewhere in the engine are a separate concern from this matrix, which covers agent turns only.
+- **Gemini's managed-agent offering** (a preview capability at time of writing) is not a design target here.
+- **Cross-provider cost/pricing normalization** beyond what each column's existing telemetry already reports.
+
+### Revisit triggers
+
+- Session retention needs grow past the current durable-resume horizon, or a continuity requirement longer than that horizon shows up — re-evaluate a provider-native conversation-history API as a new piece of work, not a patch to this matrix.
+- A provider's newer agentic API ships on a cloud-platform-hosted auth surface it doesn't support today — re-evaluate that auth path as new work.
+- A provider currently reached only via subscription OAuth begins serving its native agentic API under that same subscription auth — that's new work, not a re-add of a path this epic deliberately removed.
+- Any future Lane B provider that genuinely has no tool access must explicitly re-declare that state rather than silently inheriting "tools executable" as a default.
+
+## History
+
+This matrix was ruled and transcribed as part of the KPR-345 provider-agnostic-runtime epic, against the epic branch at its final merged code child (commit `4d2a9de`). Every future provider child inherits the duty of updating the affected rows here alongside its code change.
