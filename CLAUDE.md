@@ -240,7 +240,7 @@ Per-turn `query()` with `options.resume = sessionId` is the **only** execution p
 
 ## Provider adapters
 
-Agents can run on providers other than Claude. The agent's `model` field selects the provider via `resolveProviderModel` (`src/agents/agent-manager.ts`): a bare model id (no `/`) routes to **Claude** (the default); a `<provider>/<model>[:<reasoningEffort>]` prefix routes elsewhere — `openai`, `gemini`/`google-gemini`, `codex`/`openai-codex`, or the Lane A passthrough providers kimi/deepseek (KPR-346). Unknown prefixes fall back to Claude. The optional `:effort` suffix (`minimal`|`none`|`low`|`medium`|`high`|`xhigh`) applies to codex/openai.
+Agents can run on providers other than Claude. The agent's `model` field selects the provider via `resolveProviderModel` (`src/agents/agent-manager.ts`): a bare model id (no `/`) routes to **Claude** (the default); a `<provider>/<model>[:<reasoningEffort>]` prefix routes elsewhere — `openai`, `gemini`/`google-gemini`, `codex`/`openai-codex`, or the Lane A passthrough providers kimi/deepseek (KPR-346). Unknown prefixes fall back to Claude. The optional `:effort` suffix (`minimal`|`none`|`low`|`medium`|`high`|`xhigh`) is consumed by codex (`reasoning.effort` — also gates encrypted-reasoning replay) and gemini (`thinking_level`, `none→minimal`/`xhigh→high` coerced), delivered clamped to `{low,medium,high}` on Lane A, and currently parsed-but-not-delivered on openai.
 
 `AgentManager.createProviderAdapter()` builds the adapter per spawn:
 
