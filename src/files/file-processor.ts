@@ -126,6 +126,29 @@ export async function extractContent(
 ): Promise<{ textContent: string | null; isImage: false } | null> {
   const ext = extname(filename).slice(1).toLowerCase();
 
+  // HTML — strip tags to get readable plain text (Slack posts / rich-text snippets)
+  if (ext === "html" || mimetype === "text/html") {
+    const raw = buffer.toString("utf-8");
+    const plain = raw
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<\/div>/gi, "\n")
+      .replace(/<\/li>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, " ")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return { textContent: truncate(plain), isImage: false };
+  }
+
   // Text-based files
   if (TEXT_TYPES.has(ext) || mimetype.startsWith("text/")) {
     return { textContent: truncate(buffer.toString("utf-8")), isImage: false };

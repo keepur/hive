@@ -1,6 +1,6 @@
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
-import type { ConversationsHistoryResponse, UsersInfoResponse } from "@slack/web-api";
+import type { UsersInfoResponse } from "@slack/web-api";
 import { createLogger } from "../logging/logger.js";
 import type { IncomingMessage } from "../types/agent-config.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
@@ -171,8 +171,27 @@ export class SlackGateway {
           count: event.files.length,
           names: event.files.map((f: any) => f.name),
         });
+        // Enrich file objects via files.info — Socket Mode events often carry
+        // partial file metadata (missing url_private_download / url_private).
+        // files.info returns the full object including the download URL.
+        const enrichedFiles = await Promise.all(
+          (event.files as any[]).map(async (f: any) => {
+            if (f.url_private_download || f.url_private) return f;
+            try {
+              const info = await this.web.files.info({ file: f.id as string });
+              return (info.file as any) ?? f;
+            } catch (err) {
+              log.warn("files.info failed, using partial file object", {
+                id: f.id,
+                name: f.name,
+                error: String(err),
+              });
+              return f;
+            }
+          }),
+        );
         const results = await Promise.all(
-          event.files.map((f: any) => downloadAndProcess(f as SlackFile, this.botToken)),
+          enrichedFiles.map((f: any) => downloadAndProcess(f as SlackFile, this.botToken)),
         );
         processedFiles = results.filter(Boolean) as ProcessedFile[];
       }
@@ -671,12 +690,57 @@ export class SlackGateway {
 
   /**
    * Read recent messages from a channel. Used by the Slack internal HTTP API.
-   * Returns the messages array from conversations.history, or undefined on error.
+   * Returns messages enriched with file content (hive_files field), or undefined on error.
+   * Messages that contain Slack files/snippets will have a `hive_files` array added,
+   * each entry containing the extracted text content so agents can read file contents.
    */
-  async readChannel(channel: string, limit = 50): Promise<ConversationsHistoryResponse["messages"] | undefined> {
+  async readChannel(channel: string, limit = 50): Promise<Array<Record<string, unknown>> | undefined> {
     try {
       const res = await this.web.conversations.history({ channel, limit });
-      return res.messages;
+      const messages = (res.messages ?? []) as Array<Record<string, unknown>>;
+
+      // Enrich messages that have files with extracted content
+      const enriched = await Promise.all(
+        messages.map(async (msg) => {
+          const files = msg.files as SlackFile[] | undefined;
+          if (!files?.length) return msg;
+
+          // Enrich via files.info — conversations.history often returns partial file objects
+          // (missing url_private_download / url_private), just like Socket Mode events.
+          const enrichedFiles = await Promise.all(
+            files.map(async (f) => {
+              if (f.url_private_download || f.url_private) return f;
+              try {
+                const info = await this.web.files.info({ file: f.id });
+                return (info.file as SlackFile) ?? f;
+              } catch (err) {
+                log.warn("files.info failed during readChannel, using partial file object", {
+                  id: f.id,
+                  name: f.name,
+                  error: String(err),
+                });
+                return f;
+              }
+            }),
+          );
+
+          const processed = await Promise.all(enrichedFiles.map((f) => downloadAndProcess(f, this.botToken)));
+
+          const hiveFiles = processed
+            .filter((f): f is ProcessedFile => f !== null)
+            .map(({ name, mimetype, size, textContent, isImage }) => ({
+              name,
+              mimetype,
+              size,
+              textContent,
+              isImage,
+            }));
+
+          return hiveFiles.length > 0 ? { ...msg, hive_files: hiveFiles } : msg;
+        }),
+      );
+
+      return enriched;
     } catch (err) {
       log.warn("readChannel failed", { channel, error: (err as Error).message });
       return undefined;
