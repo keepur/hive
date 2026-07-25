@@ -17,9 +17,7 @@ Slack / SMS / WebSocket / scheduler
             ↓
        Provider adapter (selected from the agent's model string)
             ↓
-       Claude lane: AgentRunner + direct SDK MCP wiring · Lane B: hive tool bridge (bridged MCP + hive builtins)
-            ↓
-       Agent runner (spawns Claude session + MCP servers as subprocesses, fresh per turn)
+       Claude + Lane A: Agent runner (Claude session + MCP servers, fresh per turn) · Lane B (openai/gemini/codex): provider adapter + hive tool bridge (no Claude session)
             ↓
        Response → channel adapter → delivery
 ```
