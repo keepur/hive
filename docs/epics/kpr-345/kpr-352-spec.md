@@ -182,6 +182,7 @@ Codex-identical rendering: `toolCalls`/`toolMs`/`toolSummary` from `bridge.stats
 - **Reflection turns:** provider-blind post-lock re-resolve carries the gemini handle; reflection accretes on the chain like any turn.
 - **Nested delegate turn:** fresh unpersisted chain, id discarded, budget slot held, faults = Task text (§D6).
 - **Missing API key:** pre-request throw → `auth` classification → breaker → honest outage; `hive credentials add GEMINI_API_KEY` recovers next spawn.
+  > **Corrected (2026-07-26, epic-PR integrated-head review):** `config.gemini.apiKey` resolves once at boot, so a seeded/rotated key takes effect after a **service restart**, not the next spawn — the adapter's remediation message and `docs/providers.md` both state the restart requirement.
 
 ## Testing contract sketch
 
