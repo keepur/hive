@@ -58,7 +58,7 @@ There are two lanes behind that routing:
 
 ## Out of scope (epic rulings)
 
-- **Voice is pinned to the Claude lane, by code.** A voice-enabled agent configured with a non-Claude model still runs its voice turns on the engine's default Claude model. This is a documented caveat on voice-enabled agents today, and a candidate for revisit once the matrix has been live for a while.
+- **Voice is not provider-pinned — keep voice-enabled agents on Claude-lane models.** A voice-enabled agent configured with a non-Claude model runs its voice turns on that configured provider, and that path is unsupported: latency, session semantics, and prompt-assembly behavior for live calls are validated only on the Claude lane. A code-enforced Claude-lane pin for voice was considered and deliberately deferred as a standalone piece of future work; until it (or a proper voice-on-other-lanes validation) ships, the supported configuration is a Claude-lane model on every voice-enabled agent.
 - **OpenAI-compatible "sidecar" providers** for non-agentic, one-shot LLM calls elsewhere in the engine are a separate concern from this matrix, which covers agent turns only.
 - **Gemini's managed-agent offering** (a preview capability at time of writing) is not a design target here.
 - **Cross-provider cost/pricing normalization** beyond what each column's existing telemetry already reports.
@@ -73,3 +73,5 @@ There are two lanes behind that routing:
 ## History
 
 This matrix was ruled and transcribed as part of the KPR-345 provider-agnostic-runtime epic; evidence baseline `kpr-345` @ `4d2a9de` (the epic branch at its final merged code child). Every future provider child inherits the duty of updating the affected rows here alongside its code change.
+
+2026-07-26 — voice ruling corrected: the original entry stated a code-enforced Claude-lane pin for voice; no such enforcement shipped. The entry now describes the real behavior (voice follows the configured route; non-Claude voice is unsupported) and the pin is deferred as standalone future work.

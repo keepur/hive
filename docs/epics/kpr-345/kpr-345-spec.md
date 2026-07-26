@@ -144,6 +144,7 @@ A doc (`docs/` public engine docs) with providers × capabilities (tools by tran
 - Translation-proxy passthrough (LiteLLM, claude-code-router) in production.
 - Gemini Managed Agents (preview-only) as a design target.
 - Voice-pipeline provider reassignment — **enforced, not assumed**: voice routes through the same `spawnTurn` → `createProviderAdapter` path as every channel (`voice-adapter.ts:202-205`), so reassigning a voice-enabled agent would otherwise send voice turns into Lane B with undefined parity. Ruling: the voice spawn path pins the Claude lane (explicit route override at the voice call site — code-enforced, matrix-listed as a caveat on voice-enabled agents) until a post-matrix revisit. When the agent's `model` is non-Claude-routed, voice turns resolve to the engine's default Claude model.
+  > **Superseded (May, 2026-07-26 — HUMAN_DIRECTIVE, epic decision register):** the code-enforced pin was never implemented (found at the epic's integrated-head review) and is descoped from this epic — this is the post-matrix revisit, early. Real behavior: voice turns follow the agent's configured route; non-Claude voice is documented in `docs/providers.md` as an unsupported path. The pin is re-filed as a standalone feature request outside the epic.
 - Cost/pricing normalization across providers beyond what telemetry already records.
 
 ## Candidate child decomposition (sequencing at Gate 1)
