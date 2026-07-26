@@ -702,7 +702,7 @@ describe("T10 missing key (adapter half)", () => {
     const result = await adapter.runTurn({ prompt: "hi" });
 
     expect(result.error).toBe(
-      "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY",
+      "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY, and restart the service",
     );
     expect(classifyTurnResult(result)).toMatchObject({ kind: "auth" });
     expect(calls).toHaveLength(0); // threw before any create

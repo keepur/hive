@@ -101,7 +101,14 @@ export interface ProviderTurnAssembly {
   instructions: string;
   /** Bridgeable subset for the route provider — already partitioned. */
   toolInventory: HiveToolInventoryEntry[];
-  /** R3 honesty record: what the partition removed, for logging/telemetry/matrix. */
+  /**
+   * R3 honesty record: what the partition removed. NOTE: nothing reads this
+   * field today — the actual per-spawn honesty surface is the
+   * `log.info("Lane B inventory partition", ...)` line in
+   * assembleProviderTurn, built from the same `omitted` local. This field is
+   * carried on the assembly for a future consumer (telemetry/parity-matrix
+   * automation); until one exists, treat the log line as the source of truth.
+   */
   omittedTools: OmittedToolRecord[];
   guardrailGate: GuardrailGate;
   memory: ProviderMemoryBundle; // {hotTierPrompt} when the agent's hot tier rendered, else {}

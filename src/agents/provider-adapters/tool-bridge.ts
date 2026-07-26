@@ -23,7 +23,7 @@ import type { WorkItemContext } from "../agent-runner.js";
 import type { GuardrailDecision, GuardrailGate } from "./types.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import type { ProviderSkillIndexEntry, DelegateTurnRunner } from "./turn-assembly.js";
-import { BuiltinExecutor, EXECUTOR_BACKED_BUILTIN_NAMES } from "./builtin-executor.js"; // Task 2 creates; Task 1 ships a stub (Step 1.2)
+import { BuiltinExecutor, EXECUTOR_BACKED_BUILTIN_NAMES } from "./builtin-executor.js"; // executor-backed builtin dispatch
 
 const log = createLogger("tool-bridge");
 
@@ -56,7 +56,7 @@ export interface ToolBridgeOptions {
   agentId: string;
   /** Resolved per-spawn session cwd (spec §D5-cwd) — builtin executor working dir. */
   sessionCwd: string;
-  /** load_skill source (spec §D6) — [] until KPR-349 populates it. */
+  /** load_skill source (spec §D6) — populated by KPR-349's skill index. */
   skillIndex: ProviderSkillIndexEntry[];
   /**
    * KPR-354 (§D3): manager-owned nested-turn executor. Present ⇒
@@ -94,6 +94,14 @@ export class ToolBridge {
   private executor: BuiltinExecutor | null = null;
   private closed = false;
   private readonly _stats: MutableStats = { toolCalls: 0, toolMs: 0, perTool: new Map() };
+  /**
+   * Fail-soft connect/tool-cap omission record, appended throughout connect().
+   * NOTE: nothing in production reads this array today — the actual honesty
+   * surface at each omission site is the adjacent `log.warn(...)` call built
+   * from local variables (agent id, error class, server name). Kept as a
+   * per-turn record for tests and a future consumer; until one exists, treat
+   * the log lines as the source of truth.
+   */
   readonly runtimeOmissions: { server: string; reason: string }[] = [];
 
   constructor(opts: ToolBridgeOptions) {
@@ -182,7 +190,7 @@ export class ToolBridge {
       }
     }
 
-    // load_skill (spec §D6): rendered whenever the index is non-empty — dark until KPR-349.
+    // load_skill (spec §D6): rendered whenever the index is non-empty (KPR-349 populates skillIndex).
     const loadSkill = this.buildLoadSkillTool();
     if (loadSkill) tools.push(loadSkill);
 

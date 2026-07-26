@@ -185,9 +185,11 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
     try {
       // §D7: API-key single path (Vertex OAuth deleted — Interactions is not
       // served on Vertex). Pre-request throw → classifyThrown "auth" (row
-      // alternate pinned) → breaker → honest outage; `hive credentials add
-      // GEMINI_API_KEY` recovers next spawn. The finally below still runs
-      // bridge.close() on this path (T9).
+      // alternate pinned) → breaker → honest outage; config.gemini.apiKey is
+      // resolved once at boot (config.ts `optional()`, env-first then
+      // Keychain), so `hive credentials add GEMINI_API_KEY` needs a service
+      // restart to take effect, not just the next spawn. The finally below
+      // still runs bridge.close() on this path (T9).
       const env = this.options.env ?? process.env;
       const apiKey =
         this.options.apiKey ||
@@ -196,7 +198,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
         envValue("GOOGLE_API_KEY", env);
       if (!apiKey) {
         throw new Error(
-          "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY",
+          "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY, and restart the service",
         );
       }
       const client = this.options.client ?? buildDefaultClient(apiKey);

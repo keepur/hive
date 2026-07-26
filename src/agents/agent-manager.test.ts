@@ -2410,7 +2410,7 @@ describe("AgentManager", () => {
         expect(prompt).toContain("session continuity was reset"); // keyed on the TAG, not the id
       });
 
-      it("claude→pilot handoff uses the pilot annotation variant (no conversation_search — pilots are tool-free)", async () => {
+      it("claude→pilot handoff uses the pilot annotation variant (no conversation_search — Lane B keeps the conservative pilot-era default)", async () => {
         registry._agents.set(
           "codex-pilot",
           makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
@@ -2462,7 +2462,7 @@ describe("AgentManager", () => {
           return id;
         }
 
-        it("claude→gemini: guard trips, fresh gemini turn, PILOT notice (tool-free), row rewritten with the interaction handle", async () => {
+        it("claude→gemini: guard trips, fresh gemini turn, PILOT notice (conservative default), row rewritten with the interaction handle", async () => {
           const id = geminiAgent();
           const threadId = "sms:line-1:kpr352-c2g";
           seed(threadId, "claude-uuid-1", "claude", id);

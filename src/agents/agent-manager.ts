@@ -256,11 +256,12 @@ interface SpawnShaping {
  * when spawnTurn's session-identity guard reset thread continuity. Binding
  * content requirements (spec): the engine changed, prior turns in this
  * thread are not in context, agent memory is intact. The conversation_search
- * recall clause is Claude-target only — pilot adapters advertise zero tools
- * until KPR-348 wires the bridge — KPR-347 deleted the assertToolFreePilot
- * guards, so the pilot variant must not suggest a tool the
- * agent cannot reach. Voice never sees either (carve-out returns first;
- * voice's handoff is its full-transcript re-send).
+ * recall clause is Claude-target only — the Lane B variant is the
+ * conservative pilot-era default (KPR-347 deleted the assertToolFreePilot
+ * guards), kept as-is pending a dedicated follow-up even though KPR-348
+ * gave all three Lane B adapters real tool execution, so the pilot variant
+ * must not suggest a tool the agent cannot reach. Voice never sees either
+ * (carve-out returns first; voice's handoff is its full-transcript re-send).
  */
 const SESSION_HANDOFF_NOTICE_CLAUDE =
   "[System notice: this thread's session continuity was reset because your underlying engine changed. Earlier turns in this thread are not in your context, but your agent memory is intact — use conversation_search if you need prior context from this thread.]\n";
@@ -1649,12 +1650,14 @@ export class AgentManager {
     // ONLY by spawnTurn's session-identity guard. Prepended ahead of the
     // sender prefix; memory carryover needs nothing here (every fresh spawn
     // already assembles the full system prompt incl. agent memory). Variant
-    // keyed on the static provider (≡ effective under the W3 clamp): pilots
-    // are tool-free, so only Claude targets get the conversation_search clause.
+    // keyed on the static provider (≡ effective under the W3 clamp): Lane B
+    // targets keep the conservative pilot-era default (no conversation_search
+    // clause) pending a dedicated follow-up, not because they lack tools —
+    // KPR-348 gave them real tool execution.
     if (ctx.sessionHandoff) {
       // KPR-346 (§D7): variant keys on CLAUDE-RUNTIME LANE MEMBERSHIP, not
       // === "claude" — Lane A agents run the full runtime and have
-      // conversation_search. Future ids fail toward the tool-free pilot
+      // conversation_search. Future ids fail toward the conservative Lane B
       // variant (safe default).
       prompt =
         (staticRoute.provider === "claude" || isLaneAProvider(staticRoute.provider)

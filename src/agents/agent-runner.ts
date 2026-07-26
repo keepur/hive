@@ -1315,8 +1315,8 @@ export class AgentRunner {
     for (const name of CLAUDE_SDK_BUILTIN_TOOL_NAMES) {
       // KPR-348 (canon 1): the six executor-backed builtins are the fleet's
       // only {kind:"static"} schema producer; the rest stay unavailable
-      // (WebFetch/WebSearch/NotebookEdit/TodoWrite claude-only by ruling,
-      // Task = child 9).
+      // (WebFetch/WebSearch/NotebookEdit/TodoWrite claude-only by ruling;
+      // Task is synthesized separately by the bridge — KPR-354).
       const staticDef = EXECUTOR_BACKED_BUILTIN_NAMES.has(name)
         ? BUILTIN_TOOL_DEFINITIONS.find((d) => d.name === name)
         : undefined;

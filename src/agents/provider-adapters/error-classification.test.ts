@@ -67,7 +67,7 @@ describe("classifyTurnResult (KPR-306)", () => {
     "OAuth session is not available",
     // KPR-352 §D7: the GeminiInteractionsAdapter missing-key throw — pinned
     // per the auth row's standing rule (alternates land with their sentinel).
-    "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY",
+    "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY, and restart the service",
     // KPR-351 R1: the OpenAIAgentsAdapter missing-key throw — pinned per the
     // auth row's standing rule (alternates land with their sentinel). No row
     // edit needed: the existing `api.?key is not available` alternate matches.

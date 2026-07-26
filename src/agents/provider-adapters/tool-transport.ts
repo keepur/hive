@@ -93,8 +93,8 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
     // KPR-348 (spec §D5, canon 2): the six executor-backed builtins are
     // bridgeable on every Lane B provider — ONE code path emits openai,
     // gemini, and codex identically (codex ≡ openai at the classify site;
-    // gemini upgraded for classification honesty — its adapter still
-    // advertises zero tools until KPR-352, only its omission record changes).
+    // gemini classification landed ahead of KPR-352, which later gave the
+    // gemini adapter its own tool-executing bridge).
     // KPR-354 (spec §D1): claude-subagent entries are Task-synthesis inputs —
     // requires-hive-bridge on all three Lane B columns, same one-code-path
     // rule. claude-builtin behavior unchanged: only executor-backed builtins
