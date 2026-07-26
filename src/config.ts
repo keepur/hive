@@ -277,6 +277,16 @@ export const config = {
   codex: {
     agentModel: optional("CODEX_AGENT_MODEL", "gpt-5.4-mini"),
   },
+  kimi: {
+    /** KPR-346: Lane A passthrough default-model override (non-secret).
+     *  The secret KIMI_API_KEY deliberately has NO boot-time entry — it
+     *  resolves per spawn (env → Keychain) in resolvePassthroughSpawn. */
+    agentModel: optional("KIMI_AGENT_MODEL", ""),
+  },
+  deepseek: {
+    /** KPR-346: as kimi above; DEEPSEEK_API_KEY resolves per spawn. */
+    agentModel: optional("DEEPSEEK_AGENT_MODEL", ""),
+  },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),
     teamId: optional("LINEAR_TEAM_ID", ""),

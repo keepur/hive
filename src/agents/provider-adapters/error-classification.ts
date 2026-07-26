@@ -60,11 +60,13 @@ const SDK_NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_exec
  * First match wins, in row order. The auth row MUST remain a superset of
  * every `isAuthRebuildResumeError` alternate (agent-manager.ts — currently:
  * resolve authentication | credentials\.json | not authenticated |
- * 401 Unauthorized | ANTHROPIC_API_KEY | authToken). A sentinel the auth row
- * misses would classify non-provider and RESET the hard-fault streak, so a
- * persistent auth outage would never trip. Any future addition to the
- * sentinel list must extend this row in the same change (regression-pinned
- * per-alternate in error-classification.test.ts).
+ * 401 Unauthorized | ANTHROPIC_API_KEY | authToken). It also carries the
+ * gemini missing-key sentinel (`api.?key is not available` — KPR-352 §D7: the
+ * GeminiInteractionsAdapter's pre-request throw when no Gemini/Google key
+ * resolves). A sentinel the auth row misses would classify non-provider and
+ * RESET the hard-fault streak, so a persistent auth outage would never trip.
+ * Any future addition to the sentinel list must extend this row in the same
+ * change (regression-pinned per-alternate in error-classification.test.ts).
  */
 const FAULT_PATTERNS: ReadonlyArray<
   readonly [Exclude<ProviderFaultKind, "non-provider" | "timeout">, RegExp]
@@ -76,7 +78,7 @@ const FAULT_PATTERNS: ReadonlyArray<
   ["rate-limit", /\b429\b|rate.?limit|too many requests/i],
   [
     "auth",
-    /\b401\b|\b403\b|authentication|unauthorized|invalid.?api.?key|OAuth session is not available|not.?authenticated|credentials\.json|ANTHROPIC_API_KEY|authToken|resolve authentication/i,
+    /\b401\b|\b403\b|authentication|unauthorized|invalid.?api.?key|OAuth session is not available|api.?key is not available|not.?authenticated|credentials\.json|ANTHROPIC_API_KEY|authToken|resolve authentication/i,
   ],
   ["server-error", /\b5\d\d\b|overloaded|internal server error|service unavailable|bad gateway|upstream/i],
   [
@@ -124,5 +126,24 @@ export function classifyTurnResult(input: TurnFaultInput): TurnClassification {
  * missing-OAuth throw pre-RunResult). Same tables, same fail-safe default.
  */
 export function classifyThrown(err: unknown): TurnClassification {
+  if (err instanceof TurnAssemblyError) {
+    return { outcome: "fault", kind: "non-provider", message: err.message };
+  }
   return classifyErrorString(String(err));
+}
+
+/**
+ * KPR-347: typed wrapper for any throw during Lane B turn assembly
+ * (inventory build, prompt assembly, gate construction — the pre-runTurn
+ * phase). Exists because assembly failure causes are hive-internal (Mongo,
+ * config, filesystem) but their MESSAGES can pattern-match provider-fault
+ * rows — a Mongo blip's "ECONNREFUSED" would classify connect-fail and
+ * count toward a healthy foreign provider's trip streak. The instanceof
+ * short-circuit in classifyThrown runs BEFORE the pattern tables.
+ */
+export class TurnAssemblyError extends Error {
+  override readonly name = "TurnAssemblyError";
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+  }
 }

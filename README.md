@@ -60,6 +60,7 @@ For deeper reading or when something breaks:
 - [Architecture](docs/architecture.md) — what's inside the engine.
 - [Managing your hive](docs/managing-your-hive.md) — plugins, skills, day-two ops.
 - [Troubleshooting](docs/troubleshooting.md) — when things break.
+- [Supported providers & parity matrix](docs/providers.md) — which model providers work, and where they differ from Claude.
 
 ## License
 

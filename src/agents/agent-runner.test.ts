@@ -1165,6 +1165,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       claude: "direct",
       openai: "mcp-bridge-candidate",
       gemini: "mcp-bridge-candidate",
+      codex: "mcp-bridge-candidate",
     });
   });
 
@@ -1339,7 +1340,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     expect(teamRosterDescriptor.compatibility.openai).toBe("requires-hive-bridge");
   });
 
-  it("classifies delegate servers as Claude sub-agents and Claude-only for non-Claude providers", () => {
+  it("classifies delegate servers as Claude sub-agents, bridgeable on Lane B, carrying serverConfig + description (KPR-354 §D1/§D2)", () => {
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: [],
@@ -1355,19 +1356,55 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       requiresTurnContext: false,
       requiresHiveRuntime: false,
     });
+    // KPR-354 §D1: delegate entries now bridge on every Lane B column.
     expect(google.compatibility).toEqual({
       claude: "direct",
-      openai: "claude-only",
-      gemini: "claude-only",
+      openai: "requires-hive-bridge",
+      gemini: "requires-hive-bridge",
+      codex: "requires-hive-bridge",
     });
+    // KPR-354 §D2: the entry carries the delegate's real external MCP config
+    // (the same object buildAllServerConfigs resolves) and the catalog text
+    // the Claude lane feeds AgentDefinition.description. google is catalog-known.
+    expect(google.serverConfig).toBeDefined();
+    expect(google.serverConfig!.type).toBe("stdio");
+    expect((google.serverConfig as any).env.GOG_ACCOUNTS).toBe("test@example.com");
+    expect(google.description).toBe("Email (Gmail), calendar, Google Drive files");
   });
 
-  it("includes representative Claude SDK built-ins as Claude-only descriptors", () => {
+  it("carries the delegate name as its own description when the server is not catalog-known (KPR-354 §D2)", () => {
+    const plugin: LoadedPlugin = {
+      name: "test-plugin",
+      dir: "/plugins/test-plugin",
+      manifest: {
+        name: "test-plugin",
+        description: "Test",
+        mcpServers: {
+          // No per-server description → getServerCatalogEntry falls back to the name.
+          "custom-server": { entry: "mcp-servers/custom/index.ts", env: [], envMap: {}, agentEnv: {} },
+        },
+        agentSeeds: [],
+      },
+      brokenServers: {},
+    };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [], delegateServers: ["custom-server"] }),
+      memoryManager as any,
+      [plugin],
+    );
+
+    const custom = inventoryByName(runner, "custom-server");
+    expect(custom.transport).toBe("claude-subagent");
+    expect(custom.serverConfig).toBeDefined();
+    expect(custom.description).toBe("custom-server");
+  });
+
+  it("includes non-executor Claude SDK built-ins as Claude-only descriptors", () => {
     const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
 
-    const bash = inventoryByName(runner, "Bash");
-    const task = inventoryByName(runner, "Task");
-    for (const descriptor of [bash, task]) {
+    // Task/WebFetch are claude-builtin NOT backed by the executor → claude-only.
+    for (const name of ["Task", "WebFetch"]) {
+      const descriptor = inventoryByName(runner, name);
       expect(descriptor).toMatchObject({
         transport: "claude-builtin",
         source: "sdk-builtin",
@@ -1379,7 +1416,45 @@ describe("AgentRunner.buildToolTransportInventory", () => {
         claude: "direct",
         openai: "claude-only",
         gemini: "claude-only",
+        codex: "claude-only",
       });
+    }
+  });
+
+  // KPR-348 (Step 2.9.2): per-tool builtin names + static schemas for the six.
+  it("emits per-tool builtin names (no compound display names)", () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const names = new Set(runner.buildToolTransportInventory().map((e) => e.name));
+    for (const n of ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]) {
+      expect(names).toContain(n);
+    }
+    expect(names).not.toContain("Read / Write / Edit");
+    expect(names).not.toContain("Glob / Grep");
+    expect(names).not.toContain("WebFetch / WebSearch");
+  });
+
+  it("sources the six executor-backed builtins as { kind: 'static' } with a matching single tool def", () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    for (const name of ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]) {
+      const entry = inventoryByName(runner, name);
+      expect(entry.compatibility).toEqual({
+        claude: "direct",
+        openai: "requires-hive-bridge",
+        gemini: "requires-hive-bridge",
+        codex: "requires-hive-bridge",
+      });
+      expect(entry.schemas.kind).toBe("static");
+      if (entry.schemas.kind === "static") {
+        expect(entry.schemas.tools).toHaveLength(1);
+        expect(entry.schemas.tools[0]!.name).toBe(name);
+      }
+    }
+  });
+
+  it("keeps WebFetch/WebSearch/NotebookEdit/TodoWrite/Task builtins unavailable", () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    for (const name of ["WebFetch", "WebSearch", "NotebookEdit", "TodoWrite", "Task"]) {
+      expect(inventoryByName(runner, name).schemas).toEqual({ kind: "unavailable" });
     }
   });
 
@@ -1423,6 +1498,156 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     const names = runner.buildToolTransportInventory().map((entry) => entry.name);
     expect(names).not.toContain("code-task");
     expect(names).not.toContain("code-search");
+  });
+
+  // ── KPR-347 (T7): per-entry schema sourcing + serverConfig carriage ──
+  it("sources external stdio entries as connect-time with a serverConfig deep-equal to the built config", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["keychain"] }),
+      memoryManager as any,
+    );
+
+    const keychain = inventoryByName(runner, "keychain");
+    expect(keychain.schemas).toEqual({ kind: "connect-time" });
+    expect(keychain.serverConfig).toBeDefined();
+    expect(keychain.serverConfig).toEqual(runner.buildServerConfig("keychain"));
+  });
+
+  it("sources external http entries as connect-time with an http serverConfig", async () => {
+    const { config } = await import("../config.js");
+    const origToken = config.slack.mcpToken;
+    const origLocal = (config.slack as any).localMcpServer;
+    (config.slack as any).mcpToken = "xoxp-test";
+    (config.slack as any).localMcpServer = false;
+    try {
+      const runner = new AgentRunner(
+        makeAgentConfig({ coreServers: ["slack"] }),
+        memoryManager as any,
+      );
+
+      const slack = inventoryByName(runner, "slack");
+      expect(slack.schemas).toEqual({ kind: "connect-time" });
+      expect(slack.serverConfig).toBeDefined();
+      expect(slack.serverConfig!.type).toBe("http");
+    } finally {
+      (config.slack as any).mcpToken = origToken;
+      (config.slack as any).localMcpServer = origLocal;
+    }
+  });
+
+  it("sources sdk-in-process entries (memory, schedule, team-roster) as connect-time WITHOUT a serverConfig", () => {
+    const teamRoster = { teamSummary: async () => "## Team\n- Alice" };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+      {} as any,
+    );
+
+    for (const name of ["memory", "schedule", "team-roster"]) {
+      const entry = inventoryByName(runner, name);
+      expect(entry.schemas).toEqual({ kind: "connect-time" });
+      expect("serverConfig" in entry).toBe(false);
+    }
+  });
+
+  it("sources non-executor claude-builtin entries as unavailable WITHOUT a serverConfig; claude-subagent entries as unavailable WITH serverConfig + description (KPR-354 §D2)", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [], delegateServers: ["google"] }),
+      memoryManager as any,
+    );
+
+    // WebFetch is a claude-builtin NOT backed by the executor → unavailable, no config.
+    const webFetch = inventoryByName(runner, "WebFetch");
+    expect(webFetch.schemas).toEqual({ kind: "unavailable" });
+    expect("serverConfig" in webFetch).toBe(false);
+
+    // KPR-348: executor-backed builtins are now static, WITH no serverConfig.
+    const bash = inventoryByName(runner, "Bash");
+    expect(bash.schemas.kind).toBe("static");
+    expect("serverConfig" in bash).toBe(false);
+
+    // KPR-354 §D2: the claude-subagent schema state stays "unavailable" (the Task
+    // schema is hive-authored, not discovered), but the entry now carries the
+    // delegate's serverConfig + catalog description for later Task synthesis.
+    const google = inventoryByName(runner, "google");
+    expect(google.schemas).toEqual({ kind: "unavailable" });
+    expect(google.serverConfig).toBeDefined();
+    expect(google.serverConfig!.type).toBe("stdio");
+    expect(google.description).toBe("Email (Gmail), calendar, Google Drive files");
+  });
+});
+
+// ── KPR-348 (Step 2.9.3): buildInProcessServers extraction equivalence ──
+// The block was cut VERBATIM out of send(); these pin that the extracted
+// method wires the same server keys the send() path used to assign inline.
+describe("AgentRunner.buildInProcessServers (KPR-348 extraction)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("no db + no roster → {}", () => {
+    const runner = new AgentRunner(makeAgentConfig({ coreServers: ["memory"] }), memoryManager as any);
+    expect(runner.buildInProcessServers()).toEqual({});
+  });
+
+  it("roster present (no db) → only team-roster", () => {
+    const teamRoster = { teamSummary: async () => "## Team\n- Alice" };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: [] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+    );
+    expect(Object.keys(runner.buildInProcessServers())).toEqual(["team-roster"]);
+  });
+
+  it("db present → db-gated in-process servers wired (memory/schedule)", () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory", "schedule"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
+    );
+    const keys = Object.keys(runner.buildInProcessServers());
+    expect(keys).toContain("memory");
+    expect(keys).toContain("schedule");
+  });
+
+  it("send() and buildInProcessServers wire the same in-process server keys (equivalence)", async () => {
+    const teamRoster = { teamSummary: async () => "## Team\n- Alice" };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory", "schedule"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      teamRoster as any,
+      makeFakeInProcessDb(),
+    );
+    const extracted = new Set(Object.keys(runner.buildInProcessServers()));
+    await runner.send("hello");
+    const runtimeServerNames = Object.keys(getCapturedServers());
+    // every extracted in-process key is present in the runtime-wired server map
+    for (const key of extracted) {
+      expect(runtimeServerNames).toContain(key);
+    }
   });
 });
 
@@ -2602,6 +2827,124 @@ describe("AgentRunner ENABLE_TOOL_SEARCH env pinning (via send) (KPR-329)", () =
   });
 });
 
+// ── KPR-346 §D5: Lane A passthrough env substitution ─────────────
+describe("AgentRunner Lane A passthrough env substitution (via send) (KPR-346)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+  let origBaseUrl: string | undefined;
+  let origAuthToken: string | undefined;
+
+  const PASSTHROUGH = {
+    provider: "kimi" as const,
+    model: "kimi-k3",
+    baseUrl: "https://api.moonshot.ai/anthropic",
+    authToken: "tok-test",
+  };
+
+  function makePassthroughRunner(overrides: Partial<AgentConfig> = {}) {
+    return new AgentRunner(
+      makeAgentConfig({ model: "kimi/kimi-k3", ...overrides }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { laneAPassthrough: PASSTHROUGH },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+    // Ambient-pollution guard: the `...process.env` spread would otherwise
+    // leak an ambient ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN into the vanilla
+    // regression case (exactly as with ANTHROPIC_API_KEY).
+    origBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    origAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    delete process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+  });
+
+  afterEach(() => {
+    if (origBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = origBaseUrl;
+    if (origAuthToken === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+    else process.env.ANTHROPIC_AUTH_TOKEN = origAuthToken;
+  });
+
+  it("passes the FOREIGN model id to options.model while agentConfig.model keeps the prefix", async () => {
+    const runner = makePassthroughRunner();
+    await runner.send("hello");
+    expect(getCapturedOptions().model).toBe("kimi-k3");
+    // The prefixed string survives on the config for provider attribution.
+    expect((runner as any).agentConfig.model).toBe("kimi/kimi-k3");
+  });
+
+  it("pins base URL, vendor token, all five model pins + subagent model, and scrubs the entrypoint", async () => {
+    // Present-as-key scrub of CLAUDE_CODE_ENTRYPOINT (spike finding): an
+    // inherited entrypoint would force OAuth over the injected carrier.
+    const origEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+    process.env.CLAUDE_CODE_ENTRYPOINT = "claude";
+    try {
+      const runner = makePassthroughRunner();
+      await runner.send("hello");
+      const env = getCapturedOptions().env;
+      expect(env.ANTHROPIC_BASE_URL).toBe("https://api.moonshot.ai/anthropic");
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe("tok-test");
+      expect(env.ANTHROPIC_MODEL).toBe("kimi-k3");
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBe("kimi-k3");
+      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("kimi-k3");
+      expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("kimi-k3");
+      expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("kimi-k3");
+      expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("kimi-k3");
+      // Scrubbed even though ambient set it to "claude".
+      expect(env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
+    } finally {
+      if (origEntrypoint === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+      else process.env.CLAUDE_CODE_ENTRYPOINT = origEntrypoint;
+    }
+  });
+
+  it("scrubs ANTHROPIC_API_KEY even with config apiKey AND an ambient value set", async () => {
+    process.env.ANTHROPIC_API_KEY = "ambient";
+    try {
+      const runner = makePassthroughRunner();
+      await runner.send("hello");
+      // config mock carries anthropic.apiKey: "test-key"; the passthrough
+      // spread (LAST) beats both the conditional injection and the ambient.
+      expect(getCapturedOptions().env.ANTHROPIC_API_KEY).toBeUndefined();
+    } finally {
+      delete process.env.ANTHROPIC_API_KEY;
+    }
+  });
+
+  it("forces ENABLE_TOOL_SEARCH to 'false' even when the agent config sets toolSearch 'on'", async () => {
+    const runner = makePassthroughRunner({ toolSearch: "on" });
+    await runner.send("hello");
+    expect(getCapturedOptions().env.ENABLE_TOOL_SEARCH).toBe("false");
+  });
+
+  it("preserves session resume on a passthrough spawn", async () => {
+    const runner = makePassthroughRunner();
+    await runner.send("hello", "sess-1");
+    expect(getCapturedOptions().resume).toBe("sess-1");
+  });
+
+  it("regression: a vanilla runner injects no passthrough keys and keeps KPR-329 tool-search behavior", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const env = getCapturedOptions().env;
+    expect("ANTHROPIC_BASE_URL" in env).toBe(false);
+    expect("ANTHROPIC_AUTH_TOKEN" in env).toBe(false);
+    // Default agent + default config → the KPR-329 "auto" pin, unchanged.
+    expect(env.ENABLE_TOOL_SEARCH).toBe("auto");
+  });
+});
+
 // ── Archetype card injection ─────────────────────────────────────
 describe("buildSystemPrompt — archetype card", () => {
   beforeEach(() => {
@@ -3268,5 +3611,95 @@ describe("AgentRunner is_error result guard (KPR-312, via send)", () => {
     const result = await runner.send("hello");
     expect(result.text).toBe("fine");
     expect(result.error).toBeUndefined();
+  });
+});
+
+describe("buildSystemPrompt datetime composition (KPR-349 §D2 pin)", () => {
+  it("output is <prefix> + joiner + Pacific datetime trailer, datetime last", async () => {
+    const memoryManager = makeMockMemoryManager();
+    const runner = new AgentRunner(
+      makeAgentConfig({ systemPrompt: "PIN-SYSTEM-PROMPT" }),
+      memoryManager as never,
+    );
+    const out = await (
+      runner as unknown as { buildSystemPrompt(c: string[], d?: string[]): Promise<string> }
+    ).buildSystemPrompt([]);
+    // Full-output shape: prefix, then the exact joiner, then the trailer — nothing after.
+    expect(out).toMatch(/^[\s\S]+\n\n---\n\n\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    expect(out).toContain("PIN-SYSTEM-PROMPT");
+    // Trailer text renders an en-US Pacific timestamp (weekday, month day, year, h:mm AM/PM).
+    const trailer = out.slice(out.lastIndexOf("**Current date/time**"));
+    expect(trailer).toMatch(
+      /^\*\*Current date\/time\*\*: (Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), [A-Z][a-z]+ \d{1,2}, \d{4} at \d{1,2}:\d{2} (AM|PM) \(Pacific Time\)$/,
+    );
+  });
+});
+
+describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
+  function makeSpyPrefixCache() {
+    return {
+      getOrBuild: vi.fn(<T>(_id: string, build: () => T) => build()),
+      invalidateAgent: vi.fn(),
+      invalidateAll: vi.fn(),
+    };
+  }
+
+  function makeRunnerWithCache(
+    cache: ReturnType<typeof makeSpyPrefixCache>,
+    memoryManager = makeMockMemoryManager(),
+    overrides: Partial<AgentConfig> = {},
+  ): AgentRunner {
+    // Constructor arg order: (config, memoryManager, plugins, skillIndex,
+    // eventSubscribersJson, prefetcher, teamRoster, db, prefixCache, ...).
+    return new AgentRunner(
+      makeAgentConfig(overrides),
+      memoryManager as never,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      undefined,
+      cache as never,
+    );
+  }
+
+  it("Lane B: buildProviderPrompt never touches the prefix cache (uncached by ruling)", async () => {
+    const cache = makeSpyPrefixCache();
+    const runner = makeRunnerWithCache(cache);
+    await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
+    expect(cache.getOrBuild).not.toHaveBeenCalled();
+    expect(cache.invalidateAgent).not.toHaveBeenCalled();
+    expect(cache.invalidateAll).not.toHaveBeenCalled();
+  });
+
+  it("Claude lane: buildSystemPrompt reads through the prefix cache exactly once (unchanged)", async () => {
+    const cache = makeSpyPrefixCache();
+    const runner = makeRunnerWithCache(cache);
+    await (
+      runner as unknown as { buildSystemPrompt(c: string[], d?: string[]): Promise<string> }
+    ).buildSystemPrompt([]);
+    expect(cache.getOrBuild).toHaveBeenCalledTimes(1);
+  });
+
+  it("Lane B: instructions end with the Pacific datetime trailer", async () => {
+    const cache = makeSpyPrefixCache();
+    const runner = makeRunnerWithCache(cache);
+    const { instructions } = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
+    expect(instructions).toMatch(/\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+  });
+
+  it("Lane B: a rendered hot-tier block is returned AND folded into instructions exactly once (single-injection)", async () => {
+    const HOT = "HOT-TIER-UNIQUE-MARKER-XYZ";
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(HOT);
+    const cache = makeSpyPrefixCache();
+    const runner = makeRunnerWithCache(cache, memoryManager);
+    const { instructions, hotTierPrompt } = await runner.buildProviderPrompt({
+      toolInventory: [],
+      toolsExecutable: false,
+    });
+    expect(hotTierPrompt).toBe(HOT);
+    expect(instructions.split(HOT).length - 1).toBe(1);
   });
 });

@@ -33,6 +33,7 @@ import { Scheduler } from "./scheduler/scheduler.js";
 import { HealthReporter } from "./health/health-reporter.js";
 import { LinearClient } from "./linear/linear-client.js";
 import { SessionStore } from "./agents/session-store.js";
+import { TurnHistoryStore } from "./agents/turn-history-store.js";
 import { TurnTelemetryStore } from "./agents/turn-telemetry.js";
 import { Dispatcher } from "./channels/dispatcher.js";
 import { SlackAdapter } from "./channels/slack-adapter.js";
@@ -318,6 +319,10 @@ async function main(): Promise<void> {
   const sessionStore = new SessionStore(db);
   await sessionStore.init();
 
+  // KPR-353 (§D3): stateless-replay turn history (codex) — provider_turn_history.
+  const turnHistoryStore = new TurnHistoryStore(db);
+  await turnHistoryStore.init();
+
   const turnTelemetryStore = new TurnTelemetryStore(db);
   await turnTelemetryStore.init();
 
@@ -384,6 +389,7 @@ async function main(): Promise<void> {
     prefixCache,
     undefined,
     memoryLifecycle,
+    turnHistoryStore,
   );
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(

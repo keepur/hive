@@ -70,8 +70,20 @@ describe("SessionStore — StoredSessionRef normalization + scrub (KPR-313)", ()
     expect(mocks.deleteOne).not.toHaveBeenCalled();
   });
 
-  it("belt-and-braces: non-resumable tag with a non-empty id yields NO handle (and no scrub)", async () => {
-    mocks.findOne.mockResolvedValueOnce(doc("resp_abc", "gemini"));
+  it("KPR-352: gemini-tagged interactions/ row IS resumable (previous_interaction_id chaining)", async () => {
+    // §D3: gemini exited stateless-replay — a tagged row with a real Interactions
+    // handle now returns that handle (was NO-handle pre-flip). Tagged rows are
+    // never scrubbed regardless.
+    mocks.findOne.mockResolvedValueOnce(doc("interactions/abc123", "gemini"));
+    await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+      sessionId: "interactions/abc123",
+      provider: "gemini",
+    });
+    expect(mocks.deleteOne).not.toHaveBeenCalled();
+  });
+
+  it('KPR-352: gemini-tagged sessionId:"" (pre-352 write) ⇒ NO handle — no poisoned resume on upgrade day', async () => {
+    mocks.findOne.mockResolvedValueOnce(doc("", "gemini"));
     await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
       sessionId: undefined,
       provider: "gemini",
@@ -85,6 +97,25 @@ describe("SessionStore — StoredSessionRef normalization + scrub (KPR-313)", ()
       sessionId: "resp_abc",
       provider: "openai",
     });
+  });
+
+  it("KPR-346: kimi-tagged row IS resumable (Lane A client-transcript ⇒ handle returned)", async () => {
+    mocks.findOne.mockResolvedValueOnce(doc("sess-kimi-1", "kimi"));
+    await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+      sessionId: "sess-kimi-1",
+      provider: "kimi",
+    });
+    expect(mocks.deleteOne).not.toHaveBeenCalled();
+  });
+
+  it("KPR-347 fail-closed: out-of-union provider tag on a row yields NO handle (old .has() scrub posture preserved)", async () => {
+    // KPR-346: kimi joined the union (Lane A), so this fail-closed pin now uses
+    // a genuinely out-of-union provider string — behavior of the source is
+    // unchanged (any unknown provider ⇒ stateless-replay ⇒ no handle).
+    mocks.findOne.mockResolvedValueOnce(doc("some-real-looking-id", "some-future-provider"));
+    const ref = await store.get("agent-a", "sms:line-1:t1");
+    expect(ref?.sessionId).toBeUndefined();
+    expect(ref?.provider).toBe("some-future-provider"); // provenance passes through; handle does not
   });
 
   it("legacy untagged plain uuid grandfathers as claude (fleet-upgrade no-op)", async () => {

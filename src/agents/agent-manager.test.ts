@@ -56,11 +56,21 @@ vi.mock("../config.js", () => ({
     plugins: [],
     openai: { agentModel: "" },
     codex: { agentModel: "gpt-5.4-mini" },
-    gemini: { agentModel: "" },
+    gemini: { agentModel: "", apiKey: "test-gemini-key" },
+    // KPR-346: Lane A passthrough model overrides + instance id consumed by
+    // createProviderAdapter's resolvePassthroughSpawn call.
+    kimi: { agentModel: "" },
+    deepseek: { agentModel: "" },
+    instance: { id: "test-instance" },
     modelRouter: { enabled: false },
     memory: { reflectionMinTurns: 3 },
   },
 }));
+
+// KPR-346: the Lane A credential chain is env → Keychain. Stub the Keychain
+// leg so no real `security` subprocess ever runs; env (KIMI_API_KEY /
+// DEEPSEEK_API_KEY, set per-test) is the only live source in the suite.
+vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: vi.fn(() => "") }));
 
 // Mock plugin loader
 vi.mock("../plugins/plugin-loader.js", () => ({
@@ -90,21 +100,38 @@ vi.mock("./agent-runner.js", () => ({
     abort: mockRunnerAbort,
     wasAborted: false,
     buildToolTransportInventory: mockRunnerToolInventory,
+    // KPR-348: assembleProviderTurn now carries in-process servers + session cwd.
+    buildInProcessServers: vi.fn().mockReturnValue({}),
+    resolveTurnCwd: vi.fn().mockReturnValue("/tmp/kpr348-test-cwd"),
+    // KPR-349: the seam now delegates instruction assembly to the runner.
+    // Content-agnostic stub — instruction CONTENT is pinned in
+    // agent-runner.test.ts / turn-assembly.test.ts; these manager tests pin
+    // ROUTING (adapter selection, inventory partition, memory/skillIndex shape).
+    buildProviderPrompt: vi.fn(async () => ({
+      instructions: "PILOT-ASSEMBLED-INSTRUCTIONS",
+      skillEntries: [],
+    })),
   })),
   // Re-exported from agent-runner for plugin-loader path resolution; the test
   // manager doesn't use it, so a sentinel path is fine.
   DIST_DIR: "/mock/dist",
 }));
 
-const { mockCodexConstructor, mockCodexRunTurn, mockOpenAIConstructor, mockOpenAIRunTurn, mockGeminiConstructor, mockGeminiRunTurn } =
-  vi.hoisted(() => ({
-    mockCodexConstructor: vi.fn(),
-    mockCodexRunTurn: vi.fn(),
-    mockOpenAIConstructor: vi.fn(),
-    mockOpenAIRunTurn: vi.fn(),
-    mockGeminiConstructor: vi.fn(),
-    mockGeminiRunTurn: vi.fn(),
-  }));
+const {
+  mockCodexConstructor, mockCodexRunTurn, mockCodexAbort,
+  mockOpenAIConstructor, mockOpenAIRunTurn, mockOpenAIAbort,
+  mockGeminiConstructor, mockGeminiRunTurn, mockGeminiAbort,
+} = vi.hoisted(() => ({
+  mockCodexConstructor: vi.fn(),
+  mockCodexRunTurn: vi.fn(),
+  mockCodexAbort: vi.fn(),
+  mockOpenAIConstructor: vi.fn(),
+  mockOpenAIRunTurn: vi.fn(),
+  mockOpenAIAbort: vi.fn(),
+  mockGeminiConstructor: vi.fn(),
+  mockGeminiRunTurn: vi.fn(),
+  mockGeminiAbort: vi.fn(),
+}));
 
 vi.mock("./provider-adapters/codex-subscription-adapter.js", () => ({
   CodexSubscriptionAdapter: vi.fn().mockImplementation((options) => {
@@ -112,7 +139,7 @@ vi.mock("./provider-adapters/codex-subscription-adapter.js", () => ({
     return {
       provider: "codex",
       runTurn: mockCodexRunTurn,
-      abort: vi.fn(),
+      abort: mockCodexAbort,
       wasAborted: false,
     };
   }),
@@ -124,19 +151,19 @@ vi.mock("./provider-adapters/openai-agents-adapter.js", () => ({
     return {
       provider: "openai",
       runTurn: mockOpenAIRunTurn,
-      abort: vi.fn(),
+      abort: mockOpenAIAbort,
       wasAborted: false,
     };
   }),
 }));
 
-vi.mock("./provider-adapters/gemini-adk-adapter.js", () => ({
-  GeminiAdkAdapter: vi.fn().mockImplementation((options) => {
+vi.mock("./provider-adapters/gemini-interactions-adapter.js", () => ({
+  GeminiInteractionsAdapter: vi.fn().mockImplementation((options) => {
     mockGeminiConstructor(options);
     return {
       provider: "gemini",
       runTurn: mockGeminiRunTurn,
-      abort: vi.fn(),
+      abort: mockGeminiAbort,
       wasAborted: false,
     };
   }),
@@ -152,15 +179,18 @@ vi.mock("../search/conversation-index.js", () => ({
   })),
 }));
 
-import { AgentManager, type TurnContext } from "./agent-manager.js";
+import { AgentManager, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
-import type { RunResult } from "./agent-runner.js";
+import { AgentRunner, type RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./provider-circuit-breaker.js";
 import type { WorkItem } from "../types/work-item.js";
 import { routeModel, RESOURCE_TIER_DEFAULTS } from "./model-router.js";
 import type { ModelRouterResult } from "./model-router.js";
 import type { AgentProviderId } from "./provider-adapters/types.js";
+import { buildGenericDelegatePrompt, type DelegateTurnRunner } from "./provider-adapters/turn-assembly.js";
+import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
+import { classifyTurnResult } from "./provider-adapters/error-classification.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -2158,6 +2188,81 @@ describe("AgentManager", () => {
         expect(result.finalMessage).toBe("back");
         expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
       });
+
+      it("KPR-347 T5: assembly throws with a provider-fault-shaped message — classifies non-provider, breaker closed after 3 repeats", async () => {
+        registry._agents.set(
+          "oai-pilot",
+          makeAgentConfig({ id: "oai-pilot", name: "OAI", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        mockRunnerToolInventory.mockImplementation(() => {
+          throw new Error("connect ECONNREFUSED 127.0.0.1:27017");
+        });
+        // try/finally: restore the mock even if an assertion below throws, so a
+        // failed run doesn't leak the throwing implementation into later tests
+        // (belt-and-braces — beforeEach already re-primes mockRunnerToolInventory).
+        try {
+          for (let i = 0; i < 3; i++) {
+            await expect(
+              manager.spawnTurn(smsCtx({ agentId: "oai-pilot", threadId: `sms:line-1:kpr347-asm-${i}` })),
+            ).rejects.toThrow(/Lane B turn assembly failed/);
+          }
+          // The killer assertion: three ECONNREFUSED-worded failures did NOT open
+          // the openai circuit — TurnAssemblyError short-circuited the pattern
+          // tables (§D6). A raw Error with this message would have tripped it.
+          const snap = manager.circuitBreakers.stateFor("openai");
+          expect(snap?.state).toBe("closed");
+          expect(snap?.consecutiveHardFaults).toBe(0);
+        } finally {
+          mockRunnerToolInventory.mockReturnValue([]);
+        }
+      });
+
+      it("KPR-347 T6: abort landing DURING async assembly skips runTurn — synthesized aborted result, breaker-neutral", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5", coreServers: [] }),
+        );
+        mockRunnerToolInventory.mockImplementationOnce(() => {
+          // Fires ticket.abort() while assembly is in flight — after the
+          // early-flag attach, before the adapter exists. §D5: the manager-owned
+          // skip must bypass runTurn() entirely (the pilot adapter would reset
+          // its aborted flag at runTurn entry, so a flag-only re-check is inert).
+          manager.stopAgent("codex-pilot");
+          return [];
+        });
+        // No runTurn stub: the real mechanism must NOT call it. If the skip
+        // regressed, mockCodexRunTurn would resolve undefined and the turn
+        // would blow up — a stronger signal than a fabricated aborted result.
+        const result = await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr347-abortwin" }));
+        expect(mockCodexRunTurn).not.toHaveBeenCalled(); // §D5 skip — no provider call
+        expect(mockCodexAbort).toHaveBeenCalled(); // the re-check still fired adapter.abort()
+        expect(result.finalMessage).toBe("");
+        expect(result.aborted).toBe(true); // synthesized aborted completion, not a throw
+        // Aborted turns are breaker-neutral (classifyTurnResult → aborted).
+        expect(manager.circuitBreakers.stateFor("codex")?.consecutiveHardFaults ?? 0).toBe(0);
+        manager.restartAgent("codex-pilot"); // don't leak stopped state into later tests
+      });
+
+      it("KPR-347: abort BEFORE runTurn yields an aborted result with zero provider calls (per-mechanism pin)", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5", coreServers: [] }),
+        );
+        // Abort mid-assembly. The synthesized aborted RunResult is the ONLY path
+        // that closes the §D5 window — the pilot adapters reset `aborted` at
+        // runTurn() entry, so any turn that reached runTurn would run to
+        // completion. Assert both halves of the mechanism explicitly.
+        mockRunnerToolInventory.mockImplementationOnce(() => {
+          manager.stopAgent("codex-pilot");
+          return [];
+        });
+        const result = await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr347-premech" }));
+        expect(result.aborted).toBe(true);
+        expect(result.finalMessage).toBe("");
+        expect(mockCodexRunTurn).not.toHaveBeenCalled();
+        expect(mockCodexConstructor).toHaveBeenCalledTimes(1); // adapter WAS constructed (abort races construction)
+        manager.restartAgent("codex-pilot");
+      });
     });
 
     describe("providerFor + TurnResult timedOut/aborted propagation (KPR-307)", () => {
@@ -2305,7 +2410,7 @@ describe("AgentManager", () => {
         expect(prompt).toContain("session continuity was reset"); // keyed on the TAG, not the id
       });
 
-      it("claude→pilot handoff uses the pilot annotation variant (no conversation_search — pilots are tool-free)", async () => {
+      it("claude→pilot handoff uses the pilot annotation variant (no conversation_search — Lane B keeps the conservative pilot-era default)", async () => {
         registry._agents.set(
           "codex-pilot",
           makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
@@ -2321,6 +2426,108 @@ describe("AgentManager", () => {
         expect(req.sessionId).toBeUndefined();
         expect(req.prompt).toContain("session continuity was reset");
         expect(req.prompt).not.toContain("conversation_search");
+      });
+
+      it("KPR-350 §D4: claude→openai handoff — fresh session, annotation, first turn persists the openai handle", async () => {
+        // openai→claude direction (:2371-2388) and the openai write-side persist
+        // pin (:2492-2500) already exist; this pins the missing claude→openai
+        // direction: guard strips the claude id, the annotation fires, and the
+        // first openai turn persists its lastResponseId under the openai tag.
+        registry._agents.set(
+          "openai-pilot",
+          makeAgentConfig({ id: "openai-pilot", name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        const threadId = "sms:line-1:kpr350-c2o";
+        seed(threadId, "claude-uuid-1", "claude", "openai-pilot");
+        await manager.spawnTurn(
+          smsCtx({ agentId: "openai-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+        );
+        const req = mockOpenAIRunTurn.mock.calls[0]![0];
+        expect(req.sessionId).toBeUndefined(); // guard stripped the claude id
+        expect(req.prompt).toContain("session continuity was reset"); // §3.4 annotation
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "openai-pilot", threadId, "openai-session", "openai", expect.anything(),
+        ); // first openai turn persists the first lastResponseId
+      });
+
+      // KPR-352 §D5/T4: gemini joins server-resumable, so provider transitions
+      // into and out of gemini exercise the same KPR-313 guard. The KPR-350
+      // obligation: pin every direction a gemini handle could wrongly cross.
+      describe("KPR-352 §D5/T4: gemini provider transitions", () => {
+        function geminiAgent(id = "gem") {
+          registry._agents.set(
+            id,
+            makeAgentConfig({ id, name: "Gem", model: "gemini/gemini-3.6-flash", coreServers: [] }),
+          );
+          return id;
+        }
+
+        it("claude→gemini: guard trips, fresh gemini turn, PILOT notice (conservative default), row rewritten with the interaction handle", async () => {
+          const id = geminiAgent();
+          const threadId = "sms:line-1:kpr352-c2g";
+          seed(threadId, "claude-uuid-1", "claude", id);
+          mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/new" }));
+          await manager.spawnTurn(
+            smsCtx({ agentId: id, threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.sessionId).toBeUndefined(); // guard stripped the claude id
+          expect(req.prompt).toContain("session continuity was reset");
+          expect(req.prompt).not.toContain("conversation_search"); // gemini gets the pilot variant
+          expect(sessionStore.set).toHaveBeenCalledWith(id, threadId, "interactions/new", "gemini", expect.anything());
+        });
+
+        it("gemini→claude: guard trips, fresh claude turn, CLAUDE notice variant (conversation_search)", async () => {
+          registry._agents.set("flipper", makeAgentConfig({ id: "flipper", name: "Flipper", model: "claude-sonnet-4-6" }));
+          const threadId = "sms:line-1:kpr352-g2c";
+          seed(threadId, "interactions/old", "gemini", "flipper");
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "c", sessionId: "s-new" }));
+          await manager.spawnTurn(
+            smsCtx({ agentId: "flipper", threadId, sessionId: "interactions/old", sessionProvider: "gemini" }),
+          );
+          const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+          expect(sessionArg).toBeUndefined(); // gemini handle never adopted by claude
+          expect(prompt).toContain("session continuity was reset");
+          expect(prompt).toContain("conversation_search"); // claude-target variant
+        });
+
+        it("openai→gemini: server-resumable→server-resumable STILL trips on provider mismatch — the openai handle never crosses", async () => {
+          const id = geminiAgent();
+          const threadId = "sms:line-1:kpr352-o2g";
+          seed(threadId, "resp_openai", "openai", id);
+          mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/new" }));
+          await manager.spawnTurn(
+            smsCtx({ agentId: id, threadId, sessionId: "resp_openai", sessionProvider: "openai" }),
+          );
+          expect(mockGeminiRunTurn.mock.calls[0]![0].sessionId).toBeUndefined();
+          expect(sessionStore.set).toHaveBeenCalledWith(id, threadId, "interactions/new", "gemini", expect.anything());
+        });
+
+        it("gemini→openai: the interaction handle never crosses into an openai turn", async () => {
+          registry._agents.set(
+            "oai",
+            makeAgentConfig({ id: "oai", name: "Oai", model: "openai/gpt-5.4-mini", coreServers: [] }),
+          );
+          const threadId = "sms:line-1:kpr352-g2o";
+          seed(threadId, "interactions/old", "gemini", "oai");
+          await manager.spawnTurn(
+            smsCtx({ agentId: "oai", threadId, sessionId: "interactions/old", sessionProvider: "gemini" }),
+          );
+          expect(mockOpenAIRunTurn.mock.calls[0]![0].sessionId).toBeUndefined();
+          expect(sessionStore.set).toHaveBeenCalledWith("oai", threadId, "openai-session", "openai", expect.anything());
+        });
+
+        it("adopt: a seeded gemini row matching a gemini turn resumes the handle with NO handoff notice", async () => {
+          const id = geminiAgent();
+          const threadId = "sms:line-1:kpr352-gem-adopt";
+          seed(threadId, "interactions/keep", "gemini", id);
+          await manager.spawnTurn(
+            smsCtx({ agentId: id, threadId, sessionId: "interactions/keep", sessionProvider: "gemini" }),
+          );
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.sessionId).toBe("interactions/keep"); // same-provider hot path resumes
+          expect(req.prompt).not.toContain("session continuity was reset");
+        });
       });
 
       it("⚠A9 re-resolve-on-trip: queued same-thread turn ADOPTS the predecessor's switched session instead of double-dropping", async () => {
@@ -2353,7 +2560,7 @@ describe("AgentManager", () => {
         expect(promptB).not.toContain("session continuity was reset");
       });
 
-      it("persist rule: claude id+tag; codex ''+tag with findAgentByThread intact; gemini ''+tag", async () => {
+      it("persist rule: claude id+tag; codex ''+tag with findAgentByThread intact; gemini id+tag (server-resumable)", async () => {
         // Claude
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-c" }));
         await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr313-p-claude" }));
@@ -2373,15 +2580,50 @@ describe("AgentManager", () => {
         // The ROW survives — thread→agent mapping intact (the ticket's rule, literally).
         await expect(sessionStore.findAgentByThread("sms:line-1:kpr313-p-codex")).resolves.toBe("codex-pilot");
 
-        // Gemini
+        // Gemini — KPR-352: server-resumable now, so the real Interactions
+        // handle is persisted under the gemini tag (was ""+tag pre-flip).
         registry._agents.set(
           "gemini-pilot",
           makeAgentConfig({ id: "gemini-pilot", name: "Gemini Pilot", model: "gemini/gemini-3-pro", coreServers: [] }),
         );
+        mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/xyz" }));
         await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr313-p-gem" }));
         expect(sessionStore.set).toHaveBeenLastCalledWith(
-          "gemini-pilot", "sms:line-1:kpr313-p-gem", "", "gemini", expect.anything(),
+          "gemini-pilot", "sms:line-1:kpr313-p-gem", "interactions/xyz", "gemini", expect.anything(),
         );
+      });
+
+      it("KPR-352 churn-mint: errored gemini turn that resumed and minted a DIFFERENT interaction id never overwrites the row", async () => {
+        registry._agents.set(
+          "gemini-pilot",
+          makeAgentConfig({ id: "gemini-pilot", name: "Gemini Pilot", model: "gemini/gemini-3-pro", coreServers: [] }),
+        );
+        mockGeminiRunTurn.mockResolvedValueOnce(
+          makeRunResult({ error: "some tool blew up mid-turn", sessionId: "interactions/new" }),
+        );
+        await manager.spawnTurn(
+          smsCtx({
+            agentId: "gemini-pilot",
+            threadId: "sms:line-1:kpr352-gem-mint",
+            sessionId: "interactions/old",
+            sessionProvider: "gemini",
+          }),
+        );
+        expect(sessionStore.set).not.toHaveBeenCalled();
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("different id"),
+          expect.objectContaining({ agentId: "gemini-pilot" }),
+        );
+      });
+
+      it("KPR-352: errored FRESH gemini turn returning sessionId:'' does not persist (falsy guard)", async () => {
+        registry._agents.set(
+          "gemini-pilot",
+          makeAgentConfig({ id: "gemini-pilot", name: "Gemini Pilot", model: "gemini/gemini-3-pro", coreServers: [] }),
+        );
+        mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "" }));
+        await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr352-gem-fresh-err" }));
+        expect(sessionStore.set).not.toHaveBeenCalled();
       });
 
       it("persist rule: openai persists its resp id with the openai tag (genuinely resumable)", async () => {
@@ -2490,6 +2732,703 @@ describe("AgentManager", () => {
         expect(sessionArg).toBeUndefined();
         expect(prompt).toContain("session continuity was reset"); // no special-casing for reflection (⚠A7)
         expect(sessionStore.get).toHaveBeenCalledTimes(2); // re-resolve + trip re-read (redundant-but-idempotent)
+      });
+
+      // KPR-353 (T4): TurnHistoryStore wiring — codex-branch options, the
+      // §D4 handoff-clear, and its AWAITED ordering guarantee.
+      describe("TurnHistoryStore wiring (KPR-353 §D3/§D4)", () => {
+        function makeFakeTurnHistoryStore() {
+          return {
+            load: vi.fn(async () => [] as unknown[]),
+            append: vi.fn(async () => {}),
+            clear: vi.fn(async () => {}),
+            init: vi.fn(async () => {}),
+          };
+        }
+
+        // Local manager with the store wired as the 12th ctor arg (positions
+        // 6–11 undefined, mirroring the 5-arg construction in beforeEach).
+        function makeManagerWithStore(fakeStore: ReturnType<typeof makeFakeTurnHistoryStore>) {
+          return new AgentManager(
+            registry as any,
+            memoryManager as any,
+            sessionStore as any,
+            undefined as any,
+            turnTelemetryStore as any,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            fakeStore as any,
+          );
+        }
+
+        function registerCodexPilot() {
+          registry._agents.set(
+            "codex-pilot",
+            makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+          );
+        }
+
+        it("codex-branch options: adapter constructed with historyStore + agentId (store key = config.id), name stays the display label", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+
+          await mgr.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr353-opts" }));
+
+          expect(mockCodexConstructor).toHaveBeenCalledWith(
+            expect.objectContaining({ historyStore: fakeStore, agentId: "codex-pilot", name: "Codex Pilot" }),
+          );
+        });
+
+        it("handoff (claude→codex) clears exactly once with (agentId, threadId)", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-handoff";
+          seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+
+          expect(fakeStore.clear).toHaveBeenCalledTimes(1);
+          expect(fakeStore.clear).toHaveBeenCalledWith("codex-pilot", threadId);
+        });
+
+        it("KPR-352: gemini→codex handoff clears the codex history exactly once (provider-agnostic — the KPR-350 obligation)", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr352-g2codex";
+          seed(threadId, "interactions/old", "gemini", "codex-pilot");
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "interactions/old", sessionProvider: "gemini" }),
+          );
+
+          expect(fakeStore.clear).toHaveBeenCalledTimes(1);
+          expect(fakeStore.clear).toHaveBeenCalledWith("codex-pilot", threadId);
+        });
+
+        it("KPR-352: codex→gemini handoff — guard trips, the gemini turn starts a fresh chain, no history flows in", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registry._agents.set(
+            "gem",
+            makeAgentConfig({ id: "gem", name: "Gem", model: "gemini/gemini-3.6-flash", coreServers: [] }),
+          );
+          const threadId = "sms:line-1:kpr352-codex2g";
+          seed(threadId, "", "codex", "gem");
+          mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/fresh" }));
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "gem", threadId, sessionId: undefined, sessionProvider: "codex" }),
+          );
+
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.sessionId).toBeUndefined(); // fresh gemini chain
+          expect(req.prompt).toContain("session continuity was reset");
+          expect(sessionStore.set).toHaveBeenCalledWith("gem", threadId, "interactions/fresh", "gemini", expect.anything());
+        });
+
+        it("ORDERING pin: the clear is AWAITED — the codex adapter (and its load) is unreachable until clear resolves", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-order";
+          seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+
+          // Manually-deferred clear: the guard's `await …clear()` parks here.
+          let resolveClear!: () => void;
+          const deferred = new Promise<void>((res) => {
+            resolveClear = res;
+          });
+          fakeStore.clear.mockReturnValueOnce(deferred as any);
+
+          // Start WITHOUT awaiting.
+          const spawnP = mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+
+          // Settle: wait until the guard has actually called clear, THEN flush a
+          // generous run of microtasks. A vacuous "clear was called" assertion
+          // passes under BOTH the awaited and the fire-and-forget variants — the
+          // microtask flush is what lets the mutant race past the parked clear
+          // and reach the adapter, so the pin below can catch it.
+          await vi.waitFor(() => expect(fakeStore.clear.mock.calls.length).toBeGreaterThan(0));
+          for (let i = 0; i < 10; i++) await Promise.resolve();
+
+          // The adapter — and therefore its load() — is unreachable while clear
+          // is pending. An awaited clear orders the Mongo delete ahead of the
+          // read; fire-and-forget would let this turn replay the stale doc.
+          expect(mockCodexConstructor).not.toHaveBeenCalled();
+          expect(mockCodexRunTurn).not.toHaveBeenCalled();
+
+          // Release the clear → the turn proceeds to the adapter and completes.
+          resolveClear();
+          await spawnP;
+          expect(mockCodexRunTurn).toHaveBeenCalled();
+        });
+
+        it("rejected clear is swallowed: the turn proceeds and completes normally", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-reject";
+          seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+          fakeStore.clear.mockRejectedValueOnce(new Error("mongo down"));
+
+          const result = await mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+
+          expect(result.errors).toEqual([]);
+          expect(mockCodexRunTurn).toHaveBeenCalled();
+        });
+
+        it("adopt branch does NOT clear (predecessor's own guard trip already cleared)", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-adopt";
+          // Post-lock re-read returns the TURN's provider (codex) — the ⚠A9
+          // adopt path — while the captured tag is a stale "claude".
+          seed(threadId, "", "codex", "codex-pilot");
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: undefined, sessionProvider: "claude" }),
+          );
+
+          expect(fakeStore.clear).not.toHaveBeenCalled();
+        });
+
+        it("no store ⇒ handoff hook no-ops: the turn completes exactly as before, nothing throws", async () => {
+          // `manager` (beforeEach) is constructed WITHOUT the 12th arg.
+          registerCodexPilot();
+          const threadId = "sms:line-1:kpr353-nostore";
+          seed(threadId, "claude-uuid-1", "claude", "codex-pilot");
+
+          const result = await manager.spawnTurn(
+            smsCtx({ agentId: "codex-pilot", threadId, sessionId: "claude-uuid-1", sessionProvider: "claude" }),
+          );
+
+          expect(result.errors).toEqual([]);
+          expect(mockCodexRunTurn).toHaveBeenCalled();
+        });
+      });
+    });
+
+    describe("stale-handle self-heal (KPR-350 §D3)", () => {
+      const STALE = "Previous response with id 'resp_stale' not found.";
+      function openaiAgent(id = "openai-pilot") {
+        registry._agents.set(
+          id,
+          makeAgentConfig({ id, name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        return id;
+      }
+      const octx = (threadId: string, sessionId = "resp_stale") =>
+        smsCtx({ agentId: openaiAgent(), threadId, sessionId, sessionProvider: "openai" });
+
+      it("retries exactly once with sessionId stripped; success persists the fresh handle", async () => {
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-fresh" }));
+        const ctx = octx("sms:line-1:kpr350-heal");
+        const result = await manager.spawnTurn(ctx);
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+        expect(mockOpenAIRunTurn.mock.calls[0]![0].sessionId).toBe("resp_stale");
+        expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBeUndefined(); // fresh retry
+        expect(result.finalMessage).toBe("healed");
+        expect(result.newSessionId).toBe("resp-fresh");
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "openai-pilot", ctx.threadId, "resp-fresh", "openai", expect.anything(),
+        ); // write path self-corrects — no explicit scrub
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("stale-server-handle"),
+          expect.not.objectContaining({ reason: expect.anything() }), // no handle value logged
+        );
+      });
+
+      it("failed retry: churn-mint blocks the minted id, error surfaces, stale handle survives for next-turn re-trip", async () => {
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "resp-minted" }));
+        const result = await manager.spawnTurn(octx("sms:line-1:kpr350-heal-fail"));
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+        expect(result.errors).toEqual(["boom"]);
+        expect(sessionStore.set).not.toHaveBeenCalled(); // ⚠A4 rider: error + different id than resumed
+      });
+
+      it("breaker record-once: exactly one record per spawnTurn, classification = finalized attempt's; streak 0 both ways", async () => {
+        // KPR-351 (R3): the streak-0 assertions alone were vacuous — stale
+        // AND "boom" both classify non-provider, so streak 0 held even if
+        // the first attempt were recorded. The spy makes the pin bite.
+        const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "resp-f2" }));
+        await manager.spawnTurn(octx("sms:line-1:kpr350-brk-1"));
+        expect(recordSpy).toHaveBeenCalledTimes(1); // first attempt's stale fault never recorded
+        expect(recordSpy.mock.calls[0]![1]).toEqual({ outcome: "success" });
+
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "resp_stale" }));
+        await manager.spawnTurn(octx("sms:line-1:kpr350-brk-2"));
+        expect(recordSpy).toHaveBeenCalledTimes(2);
+        expect(recordSpy.mock.calls[1]![1]).toEqual({ outcome: "fault", kind: "non-provider", message: "boom" });
+
+        const snap = manager.circuitBreakers.stateFor("openai")!; // non-null-assertion per stateFor("claude")! precedent
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0);
+      });
+
+      it("gating: dead on client-transcript (claude), stateless-replay (codex), missing sessionId, non-matching 404", async () => {
+        // claude route, same string, sessionId present → no retry
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "s1" }));
+        await manager.spawnTurn(smsCtx({ sessionId: "s1", sessionProvider: "claude", threadId: "sms:line-1:kpr350-g1" }));
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        // codex route → no retry (stateless-replay; semantics conjunct is the discriminating gate).
+        // Pass a sessionId so the sessionId conjunct is satisfied and the leg is non-vacuous —
+        // production codex rows never carry handles (belt-and-braces), but this makes the
+        // semantics gate itself bite (plan-review/1/fable advisory).
+        registry._agents.set("codex-pilot", makeAgentConfig({ id: "codex-pilot", name: "CP", model: "codex/gpt-5.5:medium", coreServers: [] }));
+        mockCodexRunTurn.mockResolvedValueOnce(makeRunResult({ error: STALE }));
+        await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr350-g2", sessionId: "resp_x", sessionProvider: "codex" }));
+        expect(mockCodexRunTurn).toHaveBeenCalledTimes(1);
+        // openai route, NO sessionId → no retry
+        mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: STALE }));
+        await manager.spawnTurn(smsCtx({ agentId: openaiAgent(), threadId: "sms:line-1:kpr350-g3", sessionId: undefined }));
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+        // openai route, generic 404 → no retry (matcher narrowness at the arm)
+        mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: "404 Not Found", sessionId: "resp_x" }));
+        await manager.spawnTurn(octx("sms:line-1:kpr350-g4", "resp_x"));
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2); // 1 (g3) + 1 (g4), no retries
+      });
+
+      describe("chain-orphan re-read (KPR-351 R2)", () => {
+        function seedRow(threadId: string, sessionId: string, provider = "openai") {
+          sessionStore._sessions.set(`openai-pilot:${threadId}`, { sessionId, provider });
+        }
+
+        it("contender-healed row is adopted: retry carries the contender's handle, success persists normally", async () => {
+          const ctx = octx("sms:line-1:kpr351-adopt");
+          seedRow(ctx.threadId, "resp-contender");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "adopted", sessionId: "resp-contender-2" }));
+          const result = await manager.spawnTurn(ctx);
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+          expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBe("resp-contender"); // adopt, NOT fresh
+          expect(result.finalMessage).toBe("adopted");
+          expect(sessionStore.set).toHaveBeenCalledWith(
+            "openai-pilot", ctx.threadId, "resp-contender-2", "openai", expect.anything(),
+          );
+          // Redaction: adoption is a boolean; no handle value in any warn meta.
+          expect(mockLogWarn).toHaveBeenCalledWith(
+            expect.stringContaining("stale-server-handle"),
+            expect.objectContaining({ adoptedContenderHandle: true }),
+          );
+          const leaked = mockLogWarn.mock.calls.some(([, meta]) =>
+            JSON.stringify(meta ?? "").includes("resp-contender"),
+          );
+          expect(leaked).toBe(false);
+        });
+
+        it("row holds the SAME stale handle (no contender heal) ⇒ fresh retry, as KPR-350 shipped", async () => {
+          const ctx = octx("sms:line-1:kpr351-same");
+          seedRow(ctx.threadId, "resp_stale");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-fresh" }));
+          await manager.spawnTurn(ctx);
+          expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBeUndefined();
+          expect(mockLogWarn).toHaveBeenCalledWith(
+            expect.stringContaining("stale-server-handle"),
+            expect.objectContaining({ adoptedContenderHandle: false }),
+          );
+        });
+
+        it("row absent, empty-handle row, or foreign-provider row ⇒ fresh retry (no cross-provider adoption)", async () => {
+          // absent
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-a" }));
+          await manager.spawnTurn(octx("sms:line-1:kpr351-absent"));
+          expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBeUndefined();
+          // empty handle ("" normalizes to undefined in the store's get())
+          const ctx2 = octx("sms:line-1:kpr351-empty");
+          seedRow(ctx2.threadId, "");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-b" }));
+          await manager.spawnTurn(ctx2);
+          expect(mockOpenAIRunTurn.mock.calls[3]![0].sessionId).toBeUndefined();
+          // foreign provider tag
+          const ctx3 = octx("sms:line-1:kpr351-xprov");
+          seedRow(ctx3.threadId, "claude-uuid-9", "claude");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-c" }));
+          await manager.spawnTurn(ctx3);
+          expect(mockOpenAIRunTurn.mock.calls[5]![0].sessionId).toBeUndefined();
+        });
+
+        it("adopted retry that errors stale AGAIN ⇒ no second retry (single-retry semantics intact)", async () => {
+          const ctx = octx("sms:line-1:kpr351-twice");
+          seedRow(ctx.threadId, "resp-contender");
+          mockOpenAIRunTurn
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+            .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp-contender" }));
+          const result = await manager.spawnTurn(ctx);
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+          expect(result.errors).toEqual([STALE]);
+        });
+      });
+    });
+
+    describe("stale-handle self-heal — gemini (KPR-352 §D3)", () => {
+      // Binding delta (Task-0/1 spike): the live Interactions API returns 400
+      // for fabricated AND malformed ids; the adapter tags only round-1
+      // status-400 failures (STALE_HANDLE_STATUSES = {400}) whose carried
+      // previous_interaction_id was the persisted handle with the
+      // "gemini interaction resume rejected" sentinel — 403/404 stay untagged
+      // (this file's own status-breadth test pins it).
+      const TAGGED =
+        "gemini interaction resume rejected (status 400): the referenced previous_interaction_id is invalid";
+      function geminiAgent(id = "gem") {
+        registry._agents.set(
+          id,
+          makeAgentConfig({ id, name: "Gem", model: "gemini/gemini-3.6-flash", coreServers: [] }),
+        );
+        return id;
+      }
+      function seed(threadId: string, sessionId: string, provider: string, agentId: string) {
+        sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      }
+      const gctx = (threadId: string, sessionId = "interactions/stale") =>
+        smsCtx({ agentId: geminiAgent(), threadId, sessionId, sessionProvider: "gemini" });
+
+      it("tagged stale-resume error retries exactly once with sessionId stripped; success persists the fresh handle", async () => {
+        mockGeminiRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "interactions/new" }));
+        const ctx = gctx("sms:line-1:kpr352-heal");
+        const result = await manager.spawnTurn(ctx);
+        expect(mockGeminiRunTurn).toHaveBeenCalledTimes(2);
+        expect(mockGeminiRunTurn.mock.calls[0]![0].sessionId).toBe("interactions/stale");
+        expect(mockGeminiRunTurn.mock.calls[1]![0].sessionId).toBeUndefined(); // fresh retry
+        expect(result.finalMessage).toBe("healed");
+        expect(result.newSessionId).toBe("interactions/new");
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          ctx.agentId, ctx.threadId, "interactions/new", "gemini", expect.anything(),
+        ); // write path self-corrects — the row is overwritten
+        // Redaction pin: the self-heal warn carries {agentId, threadId, provider}
+        // only — the provider message (which embeds the handle) is never logged.
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("stale-server-handle"),
+          expect.not.objectContaining({ reason: expect.anything() }),
+        );
+        const leaked = mockLogWarn.mock.calls.some(([, meta]) =>
+          JSON.stringify(meta ?? "").includes("resume rejected"),
+        );
+        expect(leaked).toBe(false);
+      });
+
+      it("failed retry: fresh attempt errors with '', error surfaces, no persist, seeded stale handle survives for next-turn re-trip", async () => {
+        const id = geminiAgent();
+        const threadId = "sms:line-1:kpr352-heal-fail";
+        seed(threadId, "interactions/stale", "gemini", id);
+        mockGeminiRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/stale" }))
+          .mockResolvedValueOnce(makeRunResult({ error: "still broken", sessionId: "" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ agentId: id, threadId, sessionId: "interactions/stale", sessionProvider: "gemini" }),
+        );
+        expect(mockGeminiRunTurn).toHaveBeenCalledTimes(2);
+        expect(result.errors).toEqual(["still broken"]);
+        expect(sessionStore.set).not.toHaveBeenCalled(); // falsy sessionId guard on the errored fresh retry
+        expect(sessionStore._sessions.get(`${id}:${threadId}`)).toEqual({
+          sessionId: "interactions/stale",
+          provider: "gemini",
+        }); // stale handle survives
+      });
+
+      it("breaker record-once: tagged→success and tagged→'boom' both leave the gemini streak at 0 (first attempts never reach the breaker)", async () => {
+        mockGeminiRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "interactions/f2" }));
+        await manager.spawnTurn(gctx("sms:line-1:kpr352-brk-1"));
+        mockGeminiRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/stale" }))
+          .mockResolvedValueOnce(makeRunResult({ error: "boom", sessionId: "interactions/stale" }));
+        await manager.spawnTurn(gctx("sms:line-1:kpr352-brk-2"));
+        const snap = manager.circuitBreakers.stateFor("gemini")!;
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0); // tagged first attempts + non-provider "boom" never trip
+      });
+
+      it("narrowness: the tagged string on a CLAUDE-routed agent → no retry (client-transcript gate)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "s1" }));
+        await manager.spawnTurn(
+          smsCtx({ sessionId: "s1", sessionProvider: "claude", threadId: "sms:line-1:kpr352-narrow-c" }),
+        );
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      });
+
+      it("narrowness: the tagged string on a CODEX-routed agent → no retry (stateless-replay gate)", async () => {
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "CP", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        mockCodexRunTurn.mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "interactions/x" }));
+        await manager.spawnTurn(
+          smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr352-narrow-x", sessionId: "interactions/x", sessionProvider: "codex" }),
+        );
+        expect(mockCodexRunTurn).toHaveBeenCalledTimes(1);
+      });
+
+      it("no-sessionId guard: the tagged string on a thread with no stored handle → no retry (arm requires effectiveCtx.sessionId)", async () => {
+        const id = geminiAgent();
+        mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "" }));
+        await manager.spawnTurn(smsCtx({ agentId: id, threadId: "sms:line-1:kpr352-nosess", sessionId: undefined }));
+        expect(mockGeminiRunTurn).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("Lane A passthrough (KPR-346)", () => {
+      function seed(threadId: string, sessionId: string, provider: string, agentId: string) {
+        sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      }
+
+      // The last AgentRunner construction's options bag (11th ctor arg).
+      function lastRunnerOptions() {
+        const call = vi.mocked(AgentRunner).mock.calls.at(-1)!;
+        return call[10];
+      }
+
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        // Env is the only live credential source (Keychain leg stubbed to "").
+        process.env.KIMI_API_KEY = "test-kimi-key";
+        process.env.DEEPSEEK_API_KEY = "test-dseek-key";
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3", coreServers: [] }),
+        );
+        registry._agents.set(
+          "agent-dseek",
+          makeAgentConfig({ id: "agent-dseek", name: "AgentDseek", model: "deepseek/deepseek-v4-pro", coreServers: [] }),
+        );
+      });
+
+      afterEach(() => {
+        delete process.env.KIMI_API_KEY;
+        delete process.env.DEEPSEEK_API_KEY;
+      });
+
+      // --- T1: routing ------------------------------------------------------
+      it("T1: providerFor maps kimi/deepseek prefixes; unknown prefix and slashless fall to claude", () => {
+        expect(manager.providerFor("agent-kimi")).toBe("kimi");
+        expect(manager.providerFor("agent-dseek")).toBe("deepseek");
+
+        registry._agents.set(
+          "agent-mystery",
+          makeAgentConfig({ id: "agent-mystery", name: "AgentMystery", model: "mystery/m" }),
+        );
+        expect(manager.providerFor("agent-mystery")).toBe("claude"); // unknown prefix → claude (KPR-231)
+
+        registry._agents.set(
+          "agent-slashless",
+          makeAgentConfig({ id: "agent-slashless", name: "AgentSlashless", model: "kimi" }),
+        );
+        expect(manager.providerFor("agent-slashless")).toBe("claude"); // no slash → claude (documented)
+      });
+
+      // --- T3: adapter selection -------------------------------------------
+      it("T3: kimi turn constructs AgentRunner with the laneAPassthrough bag and runs the Claude adapter — no Lane B", async () => {
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-adapter" }));
+
+        expect(lastRunnerOptions()).toEqual({
+          laneAPassthrough: expect.objectContaining({
+            provider: "kimi",
+            model: "kimi-k3",
+            baseUrl: "https://api.moonshot.ai/anthropic",
+            authToken: "test-kimi-key",
+          }),
+        });
+        expect(mockRunnerSend).toHaveBeenCalled();
+        // Lane B adapters + assembly never entered.
+        expect(mockCodexConstructor).not.toHaveBeenCalled();
+        expect(mockOpenAIConstructor).not.toHaveBeenCalled();
+        expect(mockGeminiConstructor).not.toHaveBeenCalled();
+        const kimiRunner = vi.mocked(AgentRunner).mock.results.at(-1)!.value as { buildProviderPrompt: ReturnType<typeof vi.fn> };
+        expect(kimiRunner.buildProviderPrompt).not.toHaveBeenCalled();
+      });
+
+      // --- T3: model chain -------------------------------------------------
+      it("T3: model chain — empty route model falls to the table default", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-default" }));
+        expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("kimi-k3");
+      });
+
+      // --- T1: routing — `:effort`-only suffix passes through as a bad model id
+      // `splitProviderModel(":high")` hits the `colon <= 0` guard: model stays
+      // `":high"` (NON-empty, so no default-chain fallback) and no effort is
+      // extracted. The foreign endpoint receives `":high"` as a model id → 4xx
+      // bad-model config fault (breaker-safe), identical to `codex/:high`.
+      it("T1: `:effort`-only suffix (kimi/:high) → model ':high', no effort", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/:high", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-only" }));
+        expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe(":high");
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBeUndefined();
+      });
+
+      it("T3: model chain — configured agentModel wins over the table default", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/", coreServers: [] }),
+        );
+        (appConfig as any).kimi.agentModel = "kimi-k2.6";
+        try {
+          await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-configmodel" }));
+          expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("kimi-k2.6");
+        } finally {
+          (appConfig as any).kimi.agentModel = "";
+        }
+      });
+
+      // --- T3: credential fault, breaker-invisible -------------------------
+      it("T3: missing credential throws a config fault that never trips the kimi breaker", async () => {
+        delete process.env.KIMI_API_KEY;
+        for (let i = 0; i < 3; i++) {
+          await expect(
+            manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: `sms:line-1:kpr346-cred-${i}` })),
+          ).rejects.toThrow(/Passthrough credential missing \(authentication\): KIMI_API_KEY/);
+        }
+        // Breaker never tripped — restore the key and the 4th spawn RUNS.
+        process.env.KIMI_API_KEY = "test-kimi-key";
+        const result = await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-cred-ok" }));
+        expect(result.errors).toEqual([]);
+        expect(mockRunnerSend).toHaveBeenCalled();
+        expect(manager.circuitBreakers.stateFor("kimi")?.state ?? "closed").toBe("closed");
+      });
+
+      // --- T6: breaker attribution -----------------------------------------
+      it("T6: three hard faults open the kimi breaker; a claude agent on the same manager is unaffected", async () => {
+        for (let i = 0; i < 3; i++) {
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "connect ECONNREFUSED 1.2.3.4:443" }));
+          await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: `sms:line-1:kpr346-trip-${i}` }));
+        }
+        expect(manager.circuitBreakers.stateFor("kimi")!.state).toBe("open");
+
+        await expect(
+          manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-fastfail" })),
+        ).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+
+        // A claude-model agent (agent-a) still completes — per-provider breaker.
+        const result = await manager.spawnTurn(smsCtx({ agentId: "agent-a", threadId: "sms:line-1:kpr346-claude-ok" }));
+        expect(result.finalMessage).toBe("response");
+      });
+
+      // --- T7: KPR-313 session-identity guard ------------------------------
+      it("T7: claude-tagged row + kimi turn trips handoff with the CLAUDE variant (conversation_search)", async () => {
+        const threadId = "sms:line-1:kpr346-t7-trip";
+        seed(threadId, "s-old", "claude", "agent-kimi");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "s-new" }));
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "agent-kimi", threadId, sessionId: "s-old", sessionProvider: "claude" }),
+        );
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined(); // resume stripped
+        expect(prompt.startsWith("[System notice:")).toBe(true);
+        expect(prompt).toContain("conversation_search"); // §D7 claude-variant pin
+      });
+
+      it("T7: same kimi tag resumes with no handoff", async () => {
+        const threadId = "sms:line-1:kpr346-t7-match";
+        seed(threadId, "s-1", "kimi", "agent-kimi");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1" }));
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "agent-kimi", threadId, sessionId: "s-1", sessionProvider: "kimi" }),
+        );
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBe("s-1");
+        expect(prompt).not.toContain("session continuity was reset");
+      });
+
+      it("T7: kimi tag + deepseek turn trips handoff (cross-Lane-A provider transition)", async () => {
+        const threadId = "sms:line-1:kpr346-t7-cross";
+        seed(threadId, "s-1", "kimi", "agent-dseek");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "s-d" }));
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "agent-dseek", threadId, sessionId: "s-1", sessionProvider: "kimi" }),
+        );
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined();
+        expect(prompt).toContain("session continuity was reset");
+      });
+
+      // --- T2: persist ------------------------------------------------------
+      it("T2: kimi turn persists the real handle under the kimi tag (client-transcript)", async () => {
+        const threadId = "sms:line-1:kpr346-persist";
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-kimi-new" }));
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId }));
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-kimi", threadId, "s-kimi-new", "kimi", expect.anything(),
+        );
+      });
+
+      // --- T5: effort + limits ---------------------------------------------
+      it("T5: deliverable :effort suffix flows to the runner; the router is never called", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:high", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-high" }));
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBe("high");
+        expect(vi.mocked(routeModel)).not.toHaveBeenCalled();
+      });
+
+      it("T5: out-of-set :effort suffix is clamped to undefined with exactly one warn per (agent,model)", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:xhigh", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-x1" }));
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBeUndefined();
+
+        // A second xhigh turn: still exactly one clamp warn (once-per key).
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-effort-x2" }));
+        const clampWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("outside the deliverable"));
+        expect(clampWarns).toHaveLength(1);
+      });
+
+      it("T5: Lane A resourceLimits stays undefined (runner legacy fallback)", async () => {
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-limits" }));
+        const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toBeUndefined();
       });
     });
   });
@@ -2618,10 +3557,21 @@ describe("AgentManager", () => {
       expect(mockRunnerSend).not.toHaveBeenCalled();
       expect(mockCodexConstructor).toHaveBeenCalledWith({
         name: "Codex Pilot",
-        instructions: "pilot soul\n\npilot system",
         model: "gpt-5.5",
         reasoningEffort: "medium",
-        toolInventory: [],
+        assembly: expect.objectContaining({
+          // KPR-349: instructions now come from the runner's buildProviderPrompt
+          // (mocked here); content is pinned in agent-runner/turn-assembly tests.
+          instructions: "PILOT-ASSEMBLED-INSTRUCTIONS",
+          toolInventory: [],
+          omittedTools: [],
+          memory: {},
+          skillIndex: [],
+        }),
+        // KPR-353 (§D3): store wiring. This `manager` (beforeEach) carries no
+        // TurnHistoryStore ⇒ historyStore is undefined; agentId is the store key.
+        historyStore: undefined,
+        agentId: "codex-pilot",
       });
       expect(mockCodexRunTurn).toHaveBeenCalledWith(expect.objectContaining({
         prompt: "hello codex",
@@ -2657,11 +3607,91 @@ describe("AgentManager", () => {
       expect(mockRunnerSend).not.toHaveBeenCalled();
       expect(constructorMock).toHaveBeenCalledWith(expect.objectContaining({
         name: "Pilot",
-        instructions: "pilot system",
+        assembly: expect.objectContaining({ instructions: "PILOT-ASSEMBLED-INSTRUCTIONS" }),
       }));
       expect(runTurnMock).toHaveBeenCalledWith(expect.objectContaining({ prompt: "ping" }));
       expect(result.finalMessage).toBe(text);
       expect(result.newSessionId).toBe(sessionId);
+    });
+
+    it("KPR-352 §D5/T7: gemini-branch options — :effort carried, apiKey from config, Interactions model", async () => {
+      registry._agents.set(
+        "gemini-effort-pilot",
+        makeAgentConfig({
+          id: "gemini-effort-pilot",
+          name: "Gemini Effort Pilot",
+          model: "gemini/gemini-3.6-flash:high",
+          coreServers: [],
+        }),
+      );
+
+      const item = makeWorkItem({ text: "ping", source: { kind: "sms", id: "line-1", label: "May" } });
+      await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "gemini-effort-pilot" });
+
+      expect(mockGeminiConstructor).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Gemini Effort Pilot",
+          model: "gemini-3.6-flash",
+          reasoningEffort: "high",
+          apiKey: "test-gemini-key",
+          assembly: expect.objectContaining({ instructions: "PILOT-ASSEMBLED-INSTRUCTIONS" }),
+        }),
+      );
+    });
+
+    it("KPR-352: bare gemini/ (empty agentModel config) falls back to the Interactions default model", async () => {
+      registry._agents.set(
+        "gemini-default-pilot",
+        makeAgentConfig({ id: "gemini-default-pilot", name: "Gemini Default Pilot", model: "gemini/", coreServers: [] }),
+      );
+
+      const item = makeWorkItem({ text: "ping", source: { kind: "sms", id: "line-1", label: "May" } });
+      await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "gemini-default-pilot" });
+
+      expect(mockGeminiConstructor).toHaveBeenCalledWith(
+        expect.objectContaining({ model: "gemini-3.6-flash" }),
+      );
+    });
+
+    it("KPR-347: pilots construct and run with a REAL non-empty inventory — guards are gone, partition feeds the assembly", async () => {
+      registry._agents.set(
+        "codex-pilot",
+        makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5:medium", coreServers: [] }),
+      );
+      mockRunnerToolInventory.mockReturnValueOnce([
+        {
+          name: "memory", transport: "sdk-in-process", source: "core",
+          requiresTurnContext: false, requiresHiveRuntime: true, inProcess: true,
+          compatibility: { claude: "direct", openai: "requires-hive-bridge", gemini: "requires-hive-bridge", codex: "requires-hive-bridge" },
+          schemas: { kind: "connect-time" },
+        },
+        {
+          name: "Bash", transport: "claude-builtin", source: "sdk-builtin",
+          requiresTurnContext: false, requiresHiveRuntime: false, inProcess: false,
+          compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only" },
+          schemas: { kind: "unavailable" },
+        },
+      ]);
+      const item = makeWorkItem({
+        text: "hello codex",
+        source: { kind: "sms", id: "line-1-seam", label: "May" },
+        threadId: "sms:line-1:seam-inv-ctx",
+      });
+      const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "codex-pilot" });
+      expect(result.finalMessage).toBe("codex response");
+      const options = mockCodexConstructor.mock.calls.at(-1)![0];
+      expect(options.assembly.toolInventory.map((e: { name: string }) => e.name)).toEqual(["memory"]);
+      expect(options.assembly.omittedTools).toEqual([
+        { name: "Bash", transport: "claude-builtin", compatibility: "claude-only" },
+      ]);
+      // KPR-347 NIT: the inventory is built with the turn's WorkItemContext
+      // (bgContext hoisted BEFORE createProviderAdapter). Pin the seam so
+      // reverting the hoist — passing undefined / stale ctx to Lane B
+      // assembly — fails here rather than silently degrading context-sensitive
+      // server configs.
+      expect(mockRunnerToolInventory).toHaveBeenCalledWith(
+        expect.objectContaining({ channelId: "line-1-seam", threadId: "sms:line-1:seam-inv-ctx" }),
+      );
     });
 
     it("records telemetry, conversation index, and activity audit on success", async () => {
@@ -3192,5 +4222,446 @@ describe("AgentManager", () => {
       expect(snap.perAgent["agent-b"]!.budgetSource).toBe("default");
       expect(snap.perAgent["agent-b"]!.budget).toBe(5);
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // KPR-354 §D5: the nested-turn runner (THE LIGHT-UP). Exercises the
+  // manager-built delegateTurnRunner carried on the Lane B assembly — captured
+  // off the real assembleProviderTurn output and invoked directly.
+  // ---------------------------------------------------------------------------
+  describe("KPR-354 nested delegate turns", () => {
+    const NESTED_NAME = "TestAgent:google";
+
+    function makeSubagentEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInventoryEntry {
+      return {
+        name: "google",
+        transport: "claude-subagent",
+        source: "core",
+        requiresTurnContext: false,
+        requiresHiveRuntime: false,
+        inProcess: false,
+        compatibility: {
+          claude: "direct",
+          openai: "requires-hive-bridge",
+          gemini: "requires-hive-bridge",
+          codex: "requires-hive-bridge",
+        },
+        schemas: { kind: "unavailable" },
+        description: "Gmail + Calendar",
+        serverConfig: { type: "stdio", command: "gog-mcp" } as never,
+        ...overrides,
+      };
+    }
+
+    const call = (
+      runner: DelegateTurnRunner,
+      signal: AbortSignal = new AbortController().signal,
+    ): Promise<string> => runner({ delegate: "google", prompt: "p", entry: makeSubagentEntry(), signal });
+
+    // Run one parent openai spawn (resolves immediately) and hand back the
+    // delegateTurnRunner off the FIRST openai construction's assembly.
+    async function setupOpenAIParent(cfg: Partial<AgentConfig> = {}): Promise<DelegateTurnRunner> {
+      registry._agents.set(
+        "np",
+        makeAgentConfig({
+          id: "np",
+          name: "TestAgent",
+          model: "openai/gpt-5.4-mini",
+          delegateServers: ["google"],
+          coreServers: [],
+          ...cfg,
+        }),
+      );
+      mockRunnerToolInventory.mockReturnValue([makeSubagentEntry()]);
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "np" }));
+      return mockOpenAIConstructor.mock.calls[0]![0].assembly.delegateTurnRunner as DelegateTurnRunner;
+    }
+
+    const nestedOpenAIConstructions = () =>
+      mockOpenAIConstructor.mock.calls.filter((c) => c[0].name === NESTED_NAME);
+
+    // The budget slot the nested runner holds is `activeSpawnCount` (the same
+    // map withSpawnTicket uses) — NOT `activeTickets`, which drives
+    // getSnapshot().activeSpawns and which the nested runner deliberately never
+    // touches (no ticket, no updateStatus, no lock). Observe the real slot.
+    const activeSlots = (id: string): number =>
+      ((manager as unknown as { activeSpawnCount: Map<string, number> }).activeSpawnCount.get(id) ?? 0);
+
+    it("(1) happy path: resolves delegate text; nested built with parent route + generic prompt + no runner", async () => {
+      const runner = await setupOpenAIParent();
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ text: "delegate output" }));
+
+      expect(await call(runner)).toBe("delegate output");
+
+      const nested = nestedOpenAIConstructions();
+      expect(nested.length).toBe(1);
+      const opts = nested[0]![0];
+      expect(opts.name).toBe(NESTED_NAME);
+      expect(opts.model).toBe("gpt-5.4-mini"); // parent route's model
+      expect(opts.assembly.instructions).toBe(buildGenericDelegatePrompt("google"));
+      // Structural depth-1: nested assembly carries no delegate runner.
+      expect(opts.assembly.delegateTurnRunner).toBeUndefined();
+      // Directive 2 pin: nested assembly omitted nothing (all-bridgeable).
+      expect(opts.assembly.omittedTools).toEqual([]);
+    });
+
+    it("(2) empty text / error / aborted results shape to the D5.7 strings", async () => {
+      const runner = await setupOpenAIParent();
+
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ text: "" }));
+      expect(await call(runner)).toBe("Delegate 'google' returned no output.");
+
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: "boom" }));
+      expect(await call(runner)).toBe("Delegate turn failed (google): boom");
+
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ aborted: true }));
+      expect(await call(runner)).toBe("Delegate turn aborted (google).");
+    });
+
+    it("(3) nested runTurn REJECTS → never-rejects string AND slot released", async () => {
+      const runner = await setupOpenAIParent();
+      mockOpenAIRunTurn.mockRejectedValueOnce(new Error("kaboom"));
+
+      expect(await call(runner)).toBe("Delegate turn failed (google): kaboom");
+      // Negative-verify leg 3: removing the finally decrement leaves this at 1.
+      expect(activeSlots("np")).toBe(0);
+    });
+
+    it("(4) directive 3 pin — synchronous stop+budget: 3 sync calls at budget 2 → exactly 2 nested, third denied", async () => {
+      const runner = await setupOpenAIParent({ spawnBudget: 2 });
+      let resolve1!: (v: unknown) => void;
+      let resolve2!: (v: unknown) => void;
+      mockOpenAIRunTurn
+        .mockImplementationOnce(() => new Promise((r) => { resolve1 = r; }))
+        .mockImplementationOnce(() => new Promise((r) => { resolve2 = r; }));
+
+      // No await between the three invocations — the sync stop/budget prefix of
+      // each runs to its first internal await before the next begins.
+      const p1 = call(runner);
+      const p2 = call(runner);
+      const p3 = call(runner);
+
+      expect(await p3).toBe(
+        "Task denied: spawn budget exhausted (2/2). Retry later or proceed without the delegate.",
+      );
+      expect(nestedOpenAIConstructions().length).toBe(2);
+      expect(manager.getSnapshot().perAgent["np"]!.saturationCount).toBe(1);
+
+      resolve1(makeRunResult({ text: "d1" }));
+      resolve2(makeRunResult({ text: "d2" }));
+      expect(await p1).toBe("d1");
+      expect(await p2).toBe("d2");
+      expect(activeSlots("np")).toBe(0);
+    });
+
+    it("(5) saturation denial does not leak a slot", async () => {
+      const runner = await setupOpenAIParent({ spawnBudget: 2 });
+      let resolve1!: (v: unknown) => void;
+      let resolve2!: (v: unknown) => void;
+      mockOpenAIRunTurn
+        .mockImplementationOnce(() => new Promise((r) => { resolve1 = r; }))
+        .mockImplementationOnce(() => new Promise((r) => { resolve2 = r; }));
+
+      const p1 = call(runner);
+      const p2 = call(runner);
+      const slotsBeforeDenial = activeSlots("np");
+      expect(slotsBeforeDenial).toBe(2);
+      await call(runner); // denial
+      expect(activeSlots("np")).toBe(slotsBeforeDenial);
+
+      resolve1(makeRunResult({ text: "d1" }));
+      resolve2(makeRunResult({ text: "d2" }));
+      await Promise.all([p1, p2]);
+    });
+
+    it("(6) stopped agent → denied, no nested construction", async () => {
+      const runner = await setupOpenAIParent();
+      manager.stopAgent("np");
+      const before = mockOpenAIConstructor.mock.calls.length;
+
+      expect(await call(runner)).toBe("Task denied: agent is stopped.");
+      expect(mockOpenAIConstructor.mock.calls.length).toBe(before);
+    });
+
+    it("(7) abort chain: mid-flight abort calls nested.abort() then resolves aborted; pre-aborted short-circuits the turn", async () => {
+      const runner = await setupOpenAIParent();
+
+      // Mid-flight: hang the nested turn, fire the parent signal.
+      let resolveNested!: (v: unknown) => void;
+      mockOpenAIRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+      const ac = new AbortController();
+      const p = call(runner, ac.signal);
+      await Promise.resolve();
+      ac.abort();
+      expect(mockOpenAIAbort).toHaveBeenCalled();
+      resolveNested(makeRunResult({ aborted: true }));
+      expect(await p).toBe("Delegate turn aborted (google).");
+
+      // Pre-aborted: §D5 constructs the adapter before the aborted short-circuit
+      // (verbatim order), but the nested TURN never runs — runTurn is not
+      // invoked for the delegate.
+      const preAbort = new AbortController();
+      preAbort.abort();
+      const runTurnCallsBefore = mockOpenAIRunTurn.mock.calls.length;
+      expect(await call(runner, preAbort.signal)).toBe("Delegate turn aborted (google).");
+      expect(mockOpenAIRunTurn.mock.calls.length).toBe(runTurnCallsBefore);
+    });
+
+    it("(8) directive 1 pin — abort() throw inside the listener is contained (never escapes)", async () => {
+      const runner = await setupOpenAIParent();
+      mockOpenAIAbort.mockImplementation(() => {
+        throw new Error("abort boom");
+      });
+      let resolveNested!: (v: unknown) => void;
+      mockOpenAIRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+
+      const ac = new AbortController();
+      const p = call(runner, ac.signal);
+      await Promise.resolve();
+      // Negative-verify leg 4: without the listener try/catch this throw escapes
+      // as a worker-level uncaught error and fails the test.
+      ac.abort();
+      resolveNested(makeRunResult({ aborted: true }));
+      await expect(p).resolves.toBe("Delegate turn aborted (google).");
+    });
+
+    it("(9) directive 2 pin — nested run leaves lastSpawnAt untouched and status idle", async () => {
+      const runner = await setupOpenAIParent();
+      const before = manager.getSnapshot().perAgent["np"]!.lastSpawnAt;
+      await call(runner); // full nested run (default openai resolve)
+      expect(manager.getSnapshot().perAgent["np"]!.lastSpawnAt).toBe(before);
+
+      // Mid-flight: no parent in flight → status stays idle through the nested turn.
+      let resolveNested!: (v: unknown) => void;
+      mockOpenAIRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+      const p = call(runner);
+      await Promise.resolve();
+      expect(manager.getState("np")!.status).toBe("idle");
+      resolveNested(makeRunResult({ text: "x" }));
+      await p;
+    });
+
+    it("(10) slot visibility — the budget slot is held (1) during a hanging nested turn", async () => {
+      const runner = await setupOpenAIParent();
+      let resolveNested!: (v: unknown) => void;
+      mockOpenAIRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+
+      const p = call(runner);
+      await Promise.resolve();
+      expect(activeSlots("np")).toBe(1);
+      // getSnapshot().activeSpawns stays 0 — nested turns hold a budget slot but
+      // register no activeTicket (no lock/status), by construction (§D5.2).
+      expect(manager.getSnapshot().perAgent["np"]!.activeSpawns).toBe(0);
+      resolveNested(makeRunResult({ text: "x" }));
+      await p;
+      expect(activeSlots("np")).toBe(0);
+    });
+
+    it("(11) codex parent — nested gets NO historyStore/agentId, route effort, and touches no session/history store", async () => {
+      const historyStore = {
+        load: vi.fn().mockResolvedValue([]),
+        append: vi.fn().mockResolvedValue(undefined),
+        clear: vi.fn().mockResolvedValue(undefined),
+      };
+      const localManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        historyStore as any,
+      );
+      registry._agents.set(
+        "cp",
+        makeAgentConfig({
+          id: "cp",
+          name: "TestAgent",
+          model: "codex/gpt-5.5:medium",
+          delegateServers: ["google"],
+          coreServers: [],
+        }),
+      );
+      mockRunnerToolInventory.mockReturnValue([makeSubagentEntry()]);
+      mockConversationIndex.mockResolvedValue(undefined);
+      await localManager.spawnTurn(makeSmsCtx({ agentId: "cp" }));
+      const runner = mockCodexConstructor.mock.calls[0]![0].assembly.delegateTurnRunner as DelegateTurnRunner;
+
+      // Baselines captured AFTER the parent spawn — the nested invocation must
+      // add nothing.
+      const loadBefore = historyStore.load.mock.calls.length;
+      const appendBefore = historyStore.append.mock.calls.length;
+      const clearBefore = historyStore.clear.mock.calls.length;
+      const setBefore = sessionStore.set.mock.calls.length;
+
+      await call(runner);
+
+      const nested = mockCodexConstructor.mock.calls.find((c) => c[0].name === NESTED_NAME)![0];
+      expect(nested.historyStore).toBeUndefined();
+      expect(nested.agentId).toBeUndefined();
+      expect(nested.reasoningEffort).toBe("medium"); // route's effort
+      expect(nested.model).toBe("gpt-5.5");
+      expect(historyStore.load.mock.calls.length).toBe(loadBefore);
+      expect(historyStore.append.mock.calls.length).toBe(appendBefore);
+      expect(historyStore.clear.mock.calls.length).toBe(clearBefore);
+      expect(sessionStore.set.mock.calls.length).toBe(setBefore);
+    });
+
+    it("(12) T8 breaker neutrality — a 5xx tool fault stays in tool text; no breaker record; classifies success", async () => {
+      const runner = await setupOpenAIParent();
+      const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: "500 Internal Server Error", text: "" }));
+
+      expect(await call(runner)).toBe("Delegate turn failed (google): 500 Internal Server Error");
+      expect(recordSpy).not.toHaveBeenCalled();
+      // The fault lives only in tool text — the parent turn's own result (a
+      // successful string return) classifies success.
+      expect(
+        classifyTurnResult(
+          makeRunResult({ text: "Delegate turn failed (google): 500 Internal Server Error" }),
+        ),
+      ).toEqual({ outcome: "success" });
+    });
+
+    it("KPR-350 §D5: nested delegate turn is session-less — no sessionId in, no persist out", async () => {
+      const runner = await setupOpenAIParent();
+      const setsBefore = sessionStore.set.mock.calls.length;
+      mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ text: "out", sessionId: "resp-nested-discard" }));
+      await call(runner);
+      const nestedReq = mockOpenAIRunTurn.mock.calls.at(-1)![0];
+      expect(nestedReq.sessionId).toBeUndefined(); // ⇒ previousResponseId undefined on the nested run
+      expect(sessionStore.set.mock.calls.length).toBe(setsBefore); // result id discarded, store untouched
+    });
+
+    // -------------------------------------------------------------------------
+    // KPR-352 §D6: nested delegate turns on a gemini-routed parent. The
+    // partition routes claude-subagent ⇒ requires-hive-bridge for gemini
+    // (Task 1), so the parent's bridge synthesizes Task and the manager's
+    // nested branch now constructs a session-less GeminiInteractionsAdapter —
+    // the pre-352 "provider does not execute tools" return is inverted.
+    // -------------------------------------------------------------------------
+    async function setupGeminiParent(cfg: Partial<AgentConfig> = {}): Promise<DelegateTurnRunner> {
+      registry._agents.set(
+        "gp",
+        makeAgentConfig({
+          id: "gp",
+          name: "TestAgent",
+          model: "gemini/gemini-3.6-flash:high",
+          delegateServers: ["google"],
+          coreServers: [],
+          ...cfg,
+        }),
+      );
+      mockRunnerToolInventory.mockReturnValue([makeSubagentEntry()]);
+      mockConversationIndex.mockResolvedValue(undefined);
+      await manager.spawnTurn(makeSmsCtx({ agentId: "gp" }));
+      return mockGeminiConstructor.mock.calls[0]![0].assembly.delegateTurnRunner as DelegateTurnRunner;
+    }
+
+    const nestedGeminiConstructions = () =>
+      mockGeminiConstructor.mock.calls.filter((c) => c[0].name === NESTED_NAME);
+
+    it("(KPR-352 nested-1) gemini parent: bridge invocation constructs a nested gemini adapter (inverts the pre-352 not-called path)", async () => {
+      const runner = await setupGeminiParent();
+      const constructionsBefore = mockGeminiConstructor.mock.calls.length;
+      mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "delegate output" }));
+
+      expect(await call(runner)).toBe("delegate output");
+
+      // Inversion pin: the gemini constructor fired a SECOND time (pre-352 this
+      // path returned "provider does not execute tools" without constructing).
+      expect(mockGeminiConstructor.mock.calls.length).toBe(constructionsBefore + 1);
+      const nested = nestedGeminiConstructions();
+      expect(nested.length).toBe(1);
+      const opts = nested[0]![0];
+      expect(opts.name).toBe(NESTED_NAME);
+      expect(opts.model).toBe("gemini-3.6-flash"); // parent route's model
+      expect(opts.apiKey).toBe("test-gemini-key"); // config apiKey threaded
+      expect(opts.reasoningEffort).toBe("high"); // parent route's effort
+      expect(opts.assembly.instructions).toBe(buildGenericDelegatePrompt("google"));
+      // Structural depth-1: nested assembly carries no delegate runner.
+      expect(opts.assembly.delegateTurnRunner).toBeUndefined();
+      expect(opts.assembly.omittedTools).toEqual([]);
+    });
+
+    it("(KPR-352 nested-2) gemini nested turn is session-less — no sessionId in, discarded out", async () => {
+      const runner = await setupGeminiParent();
+      const setsBefore = sessionStore.set.mock.calls.length;
+      mockGeminiRunTurn.mockResolvedValueOnce(
+        makeRunResult({ text: "out", sessionId: "interactions/discard-me" }),
+      );
+      await call(runner);
+      const nestedReq = mockGeminiRunTurn.mock.calls.at(-1)![0];
+      expect(nestedReq.sessionId).toBeUndefined(); // fresh chain — no previous_interaction_id
+      expect(sessionStore.set.mock.calls.length).toBe(setsBefore); // result id discarded, store untouched
+    });
+
+    it("(KPR-352 nested-3) gemini nested fault stays in tool text; breaker-invisible (parent records once)", async () => {
+      const runner = await setupGeminiParent();
+      // The parent turn recorded on the breaker before this spy is installed;
+      // the nested fault must add no record → breaker sees exactly the parent.
+      const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+      mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ error: "500 Internal Server Error", text: "" }));
+
+      expect(await call(runner)).toBe("Delegate turn failed (google): 500 Internal Server Error");
+      expect(recordSpy).not.toHaveBeenCalled();
+    });
+
+    it("(KPR-352 nested-4) gemini nested spawn holds a budget slot then releases in finally", async () => {
+      const runner = await setupGeminiParent();
+      let resolveNested!: (v: unknown) => void;
+      mockGeminiRunTurn.mockImplementationOnce(() => new Promise((r) => { resolveNested = r; }));
+
+      const p = call(runner);
+      await Promise.resolve();
+      expect(activeSlots("gp")).toBe(1); // slot held during the hanging nested turn
+      resolveNested(makeRunResult({ text: "x" }));
+      await p;
+      expect(activeSlots("gp")).toBe(0); // released in finally
+    });
+  });
+});
+
+describe("isStaleServerHandleError (KPR-350 §D3) — narrowness matrix", () => {
+  const MUST_MATCH = [
+    "Previous response with id 'resp_abc123' not found.",
+    "previous response not found",
+    "Previous response resp_9 has expired",
+    "400 invalid_request_error: previous_response_id 'resp_x' not found",
+    "previous_response_id is invalid",
+    "Previous response with id 'resp_x' no longer exists",
+    // KPR-352: the gemini adapter's hive-owned stale-resume sentinel (matched
+    // regardless of the embedded 400/403/404 status the live API returns).
+    "gemini interaction resume rejected (status 400): the referenced previous_interaction_id is invalid",
+    "gemini interaction resume rejected (status 403): You do not have permission to access the content",
+  ];
+  const MUST_NOT_MATCH = [
+    "404 Not Found",
+    "getaddrinfo ENOTFOUND api.openai.com",
+    "model not found",
+    "tool not found",
+    "conversation not found",
+    "error_during_execution",
+    "401 Unauthorized",
+    "No response received from previous request",
+    "",
+    // KPR-352: a genuine gemini fault WITHOUT the resume-rejected sentinel is an
+    // ordinary provider fault — never tagged (adapter's generic-400 guard).
+    "Gemini interaction request failed (403): You do not have permission to access the content",
+    "Gemini interaction request failed (400): invalid request payload",
+  ];
+  it.each(MUST_MATCH)("matches: %s", (s) => expect(isStaleServerHandleError(s)).toBe(true));
+  it.each(MUST_NOT_MATCH)("does NOT match: %s", (s) => expect(isStaleServerHandleError(s)).toBe(false));
+  it("is disjoint from the auth-rebuild sentinel on every stale string (arm independence)", () => {
+    // isAuthRebuildResumeError is module-private; assert via its published
+    // alternates: none of the stale strings contain an auth sentinel.
+    const AUTH = /resolve authentication|credentials\.json|not authenticated|401 Unauthorized|ANTHROPIC_API_KEY|authToken/i;
+    for (const s of MUST_MATCH) expect(AUTH.test(s)).toBe(false);
   });
 });

@@ -5,6 +5,7 @@ import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkIt
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
+import type { TurnHistoryStore } from "./turn-history-store.js";
 import type { TurnTelemetryStore } from "./turn-telemetry.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { Db } from "mongodb";
@@ -29,10 +30,21 @@ import {
   CodexSubscriptionAdapter,
   type CodexReasoningEffort,
 } from "./provider-adapters/codex-subscription-adapter.js";
-import { GeminiAdkAdapter } from "./provider-adapters/gemini-adk-adapter.js";
+import { GeminiInteractionsAdapter } from "./provider-adapters/gemini-interactions-adapter.js";
 import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
-import { RESUMABLE_SESSION_PROVIDERS } from "./provider-adapters/types.js";
+import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
+import {
+  assembleProviderTurn,
+  buildNestedDelegateAssembly,
+  type DelegateTurnRunner,
+  type ProviderTurnAssembly,
+} from "./provider-adapters/turn-assembly.js";
+import {
+  isLaneAProvider,
+  resolvePassthroughSpawn,
+  type PassthroughSpawnConfig,
+} from "./provider-adapters/passthrough-providers.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
 
@@ -164,8 +176,12 @@ const DEFAULT_PER_AGENT_SPAWN_BUDGET = 5;
 type ProviderModelRoute =
   | { provider: "claude"; model: string }
   | { provider: "openai"; model: string; reasoningEffort?: CodexReasoningEffort }
-  | { provider: "gemini"; model: string }
-  | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort };
+  | { provider: "gemini"; model: string; reasoningEffort?: CodexReasoningEffort }
+  | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort }
+  // KPR-346 (§D2): Lane A passthrough — Claude runtime, foreign endpoint.
+  // reasoningEffort survives splitProviderModel and delivers via the Claude
+  // adapter's existing effort channel (clamped in prepareSpawn, §D6).
+  | { provider: "kimi" | "deepseek"; model: string; reasoningEffort?: CodexReasoningEffort };
 
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
 
@@ -183,7 +199,13 @@ function resolveProviderModel(model: string): ProviderModelRoute {
     return { provider: "openai", model: providerModel, reasoningEffort };
   }
   if (provider === "gemini" || provider === "google-gemini") {
-    return { provider: "gemini", model: providerModel };
+    return { provider: "gemini", model: providerModel, reasoningEffort };
+  }
+  if (provider === "kimi") {
+    return { provider: "kimi", model: providerModel, reasoningEffort };
+  }
+  if (provider === "deepseek") {
+    return { provider: "deepseek", model: providerModel, reasoningEffort };
   }
 
   return { provider: "claude", model: normalized };
@@ -218,7 +240,8 @@ interface SpawnShaping {
    * meaning untouched). Set only by the router merge branch, which is only
    * reached when the static model is effort-capable (prepareSpawn's skip
    * guarantees deliverability); undefined on voice/skip/failure paths and
-   * for pilots.
+   * for pilots. KPR-346: ALSO set by prepareSpawn's Lane A branch (clamped
+   * static :effort suffix — §D6).
    */
   effortOverride: ReasoningEffort | undefined;
   /** Static-tier execution bounds — set ONLY on the router-on path (KPR-338
@@ -228,20 +251,17 @@ interface SpawnShaping {
   routerCostUsd: number;
 }
 
-function buildPilotInstructions(name: string, soul: string, systemPrompt: string): string {
-  const sections = [soul.trim(), systemPrompt.trim()].filter(Boolean);
-  return sections.length ? sections.join("\n\n") : `You are ${name}.`;
-}
-
 /**
  * KPR-313 §3.4: hive-owned handoff annotation, prepended by prepareSpawn
  * when spawnTurn's session-identity guard reset thread continuity. Binding
  * content requirements (spec): the engine changed, prior turns in this
  * thread are not in context, agent memory is intact. The conversation_search
- * recall clause is Claude-target only — pilot adapters run tool-free
- * (assertToolFreePilot in codex/gemini; openai gets the no-tool variant regardless), so the pilot variant must not suggest a tool the
- * agent cannot reach. Voice never sees either (carve-out returns first;
- * voice's handoff is its full-transcript re-send).
+ * recall clause is Claude-target only — the Lane B variant is the
+ * conservative pilot-era default (KPR-347 deleted the assertToolFreePilot
+ * guards), kept as-is pending a dedicated follow-up even though KPR-348
+ * gave all three Lane B adapters real tool execution, so the pilot variant
+ * must not suggest a tool the agent cannot reach. Voice never sees either
+ * (carve-out returns first; voice's handoff is its full-transcript re-send).
  */
 const SESSION_HANDOFF_NOTICE_CLAUDE =
   "[System notice: this thread's session continuity was reset because your underlying engine changed. Earlier turns in this thread are not in your context, but your agent memory is intact — use conversation_search if you need prior context from this thread.]\n";
@@ -257,6 +277,40 @@ const SESSION_HANDOFF_NOTICE_PILOT =
 function isAuthRebuildResumeError(reason: string): boolean {
   return /resolve authentication|credentials\.json|not authenticated|401 Unauthorized|ANTHROPIC_API_KEY|authToken/i.test(
     reason,
+  );
+}
+
+/**
+ * KPR-350 (§D3): stale server-handle sentinel for server-resumable routes.
+ * Matches the Responses previous-response-gone surface ("Previous response
+ * with id 'resp_…' not found", 404/400-shaped, incl. the previous_response_id
+ * param variant). Deliberately NARROW — bounded gaps, anchored on the
+ * "previous response(_id)" prefix — because a false positive silently drops
+ * one turn's context (the self-heal retries fresh). Docs/community-sourced;
+ * refined against KPR-351's live capture (L2) if the production string
+ * differs. Exported for the narrowness-matrix unit pins.
+ *
+ * KPR-352 (§D3): a third alternate matches the gemini adapter's hive-owned
+ * stale-resume sentinel ("gemini interaction resume rejected"). Unlike the
+ * openai alternates (which match the vendor's prose surface), the gemini
+ * sentinel is emitted deterministically by the adapter — only for a round-1
+ * 4xx whose carried previous_interaction_id was the persisted handle — so the
+ * matcher is a sentinel check, not a prose guess.
+ */
+export function isStaleServerHandleError(reason: string): boolean {
+  return (
+    /previous response[\s\S]{0,80}?(not found|expired|no longer (?:exists|available))/i.test(reason) ||
+    /previous_response_id[\s\S]{0,80}?(not found|invalid|expired)/i.test(reason) ||
+    // KPR-352 (§D3): the gemini adapter's hive-owned sentinel — emitted ONLY
+    // for round-1 status-400 failures (the live-probed set; T0 spike showed
+    // fabricated AND malformed ids both 400) whose carried
+    // previous_interaction_id was the persisted sessions-store handle, gated
+    // by a message discriminator so generic malformed-request 400s stay
+    // ordinary provider faults. If a genuinely aged-out handle is ever
+    // observed to 403 (55d/1d retention — unprobeable at spike time), fold
+    // that status + a permission-message discriminator into the adapter's
+    // STALE_HANDLE_STATUSES/STALE_HANDLE_MESSAGE, not here.
+    /gemini interaction resume rejected/i.test(reason)
   );
 }
 
@@ -375,6 +429,11 @@ export class AgentManager {
   private prefixCache?: PrefixCache;
   private db: Db;
   private memoryLifecycle?: MemoryLifecycle;
+  /** KPR-353 (§D3/§D4): stateless-replay turn history. Optional so bare test
+   *  constructions stay valid; production wiring (index.ts) always passes it.
+   *  Absent ⇒ codex turns run stateless (pre-353 floor) and the handoff hook
+   *  no-ops. */
+  private turnHistoryStore?: TurnHistoryStore;
   // Keyed by channelId → timestamps of new-session spawns (within 60s window).
   private spawnWindow = new Map<string, number[]>();
   // KPR-216: in-flight per-turn spawn count per agent. Bounded by
@@ -406,6 +465,9 @@ export class AgentManager {
    *  off-catalog (non-haiku-tier) static model — supportsEffort is
    *  conservative (unknown ⇒ false) and the operator deserves a signal. */
   private readonly effortIncapableWarned = new Set<string>();
+  /** KPR-346 (§D6): once-per-(agent,model) warn when a Lane A :effort suffix
+   *  is outside the SDK-deliverable {low,medium,high} set. */
+  private readonly laneAEffortClampWarned = new Set<string>();
   /**
    * KPR-306: per-provider circuit breakers. Read-only surface — KPR-307's
    * dispatcher-side consumer and the CircuitBreakerHeartbeat both reach it
@@ -425,6 +487,7 @@ export class AgentManager {
     prefixCache?: PrefixCache,
     options?: { reflectionDebounceMs?: number },
     memoryLifecycle?: MemoryLifecycle,
+    turnHistoryStore?: TurnHistoryStore,
   ) {
     this.registry = registry;
     this.memoryManager = memoryManager;
@@ -439,6 +502,7 @@ export class AgentManager {
     this.teamRoster = teamRoster;
     this.prefixCache = prefixCache;
     this.memoryLifecycle = memoryLifecycle;
+    this.turnHistoryStore = turnHistoryStore;
     // KPR-220 Phase 6: 30s default; tests inject a small value for speed.
     this.reflectionDebounceMs = options?.reflectionDebounceMs ?? 30_000;
     // KPR-306: registry defaults internally when appConfig.circuitBreaker is
@@ -484,44 +548,227 @@ export class AgentManager {
    * invariant, R-311.1) — the static agent.model prefix is no longer
    * re-resolved here, so the breaker permit and the adapter always key off
    * the same resolution (R7). Single call site (runOneSpawnAttempt);
-   * parameter required, no default.
+   * parameter required, no default. KPR-347: async — Lane B construction
+   * awaits turn assembly; Claude branch has no awaits and is unchanged in
+   * logic.
    */
-  private createProviderAdapter(agentId: string, route: ProviderModelRoute): AgentProviderAdapter {
+  private async createProviderAdapter(
+    agentId: string,
+    route: ProviderModelRoute,
+    workItemContext?: WorkItemContext,
+  ): Promise<AgentProviderAdapter> {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle);
+
+    // KPR-346 (§D3/§D4): Lane A passthrough — credential + model resolved
+    // per spawn, BEFORE runner construction. A missing credential throws
+    // TurnAssemblyError here, inside runOneSpawnAttempt's recorded try:
+    // classifyThrown short-circuits it to non-provider, so a config fault
+    // never counts toward the foreign breaker's trip streak and never
+    // engages the outage queue (epic §D2).
+    let laneAPassthrough: PassthroughSpawnConfig | undefined;
+    if (route.provider === "kimi" || route.provider === "deepseek") {
+      laneAPassthrough = resolvePassthroughSpawn(route.provider, route.model, {
+        configuredModel: appConfig[route.provider].agentModel,
+        instanceId: appConfig.instance.id,
+      });
+    }
+
+    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, laneAPassthrough ? { laneAPassthrough } : undefined);
     if (route.provider === "claude") {
       return new ClaudeAgentAdapter(runner);
     }
+    // KPR-346 (§D3): Lane A runs the FULL Claude runtime against the vendor
+    // endpoint — ClaudeAgentAdapter, never the Lane B assembly path below.
+    // The adapter's `readonly provider = "claude"` stays as-is per canon:
+    // the adapter class is an execution-path detail; every ops surface
+    // (breaker, outage gate, session tag, KPR-313 guard) keys on the ROUTE.
+    if (route.provider === "kimi" || route.provider === "deepseek") {
+      return new ClaudeAgentAdapter(runner);
+    }
 
-    const instructions = buildPilotInstructions(config.name, config.soul, config.systemPrompt);
-    const toolInventory: [] = [];
+    // KPR-347 (§D5): Lane B per-spawn assembly — real inventory through the
+    // compatibility partition; KPR-349: instructions are the real prompt from
+    // buildProviderInstructions (via the runner's buildProviderPrompt),
+    // assembled inside assembleProviderTurn. Assembly throws are
+    // TurnAssemblyError (classifies non-provider inside the caller's
+    // recorded try).
+    // KPR-354 (§D5): manager-owned nested-turn runner for delegate
+    // subagents. Built BEFORE assembly and carried on it as an opaque
+    // callback (provider-blindness canon — provider resolution and budget
+    // machinery stay here). The body runs only inside the parent adapter's
+    // runTurn, after `parentAssembly` is assigned below. NEVER throws —
+    // every path resolves model-visible text (D5.7); tool faults stay
+    // breaker-invisible (no breaker acquire/record anywhere in the body).
+    // Forward-referenced binding: the closure below reads parentAssembly at
+    // call-time, assigned after assembly is built — must be `let`.
+    // eslint-disable-next-line prefer-const
+    let parentAssembly: ProviderTurnAssembly | undefined;
+    const delegateTurnRunner: DelegateTurnRunner = async (call) => {
+      const startedAt = Date.now();
+      // D5.1 + D5.2 (spec-review directive 3): stop check and budget
+      // check-and-increment are SYNCHRONOUS with no await between them —
+      // atomic under parallel openai Task calls (no interleaving without an
+      // await point). Denials never increment.
+      if (this.stoppedAgents.has(agentId)) {
+        return "Task denied: agent is stopped.";
+      }
+      const active = this.activeSpawnCount.get(agentId) ?? 0;
+      const budget = this.spawnBudgetFor(agentId);
+      if (active >= budget) {
+        this.recordSaturation(agentId, active, budget);
+        return `Task denied: spawn budget exhausted (${active}/${budget}). Retry later or proceed without the delegate.`;
+      }
+      this.activeSpawnCount.set(agentId, active + 1);
+      // Slot held from here; released in the finally (withSpawnTicket's
+      // delete-at-zero idiom). Deliberately NOT touched (D5.2 + directive 2):
+      // the per-thread lock (the parent holds agentId:threadId for the whole
+      // outer turn — a nested wait would deadlock permanently; same-thread
+      // serialization is a message-level concern the parent already
+      // provides), lastSpawnAt, updateStatus, breaker acquire/record,
+      // sessionStore, reflection scheduling.
+      let removeAbortListener: (() => void) | undefined;
+      try {
+        const { assembly: nestedAssembly, maxTurns } = buildNestedDelegateAssembly({
+          config,
+          delegate: call.delegate,
+          entry: call.entry,
+          workItemContext: call.workItemContext,
+          // "" arm is dead by construction: the delegate callback can only run
+          // after the parent adapter is constructed, which requires assembly.
+          sessionCwd: parentAssembly?.sessionCwd ?? "",
+        });
+        let nested: AgentProviderAdapter;
+        if (route.provider === "openai") {
+          nested = new OpenAIAgentsAdapter({
+            name: `${config.name}:${call.delegate}`,
+            model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
+            assembly: nestedAssembly,
+          });
+        } else if (route.provider === "codex") {
+          nested = new CodexSubscriptionAdapter({
+            name: `${config.name}:${call.delegate}`,
+            model: route.model || appConfig.codex.agentModel,
+            reasoningEffort: route.reasoningEffort,
+            assembly: nestedAssembly,
+            // NO historyStore / agentId (G4): the KPR-353 wiring then skips
+            // replay and persist by construction — provider_turn_history is
+            // provably untouched by nested turns.
+          });
+        } else if (route.provider === "gemini") {
+          nested = new GeminiInteractionsAdapter({
+            name: `${config.name}:${call.delegate}`,
+            model: route.model || appConfig.gemini.agentModel || "gemini-3.6-flash",
+            apiKey: appConfig.gemini.apiKey || undefined,
+            reasoningEffort: route.reasoningEffort,
+            assembly: nestedAssembly,
+            // Session-less by construction (§D6): no sessionId flows into the
+            // nested runTurn below, the nested turn starts a fresh chain, and
+            // the D5.7 shaping discards the final id — nothing persists.
+            // Accepted residue: unreferenced store:true interactions self-
+            // expire at vendor retention (55d paid) — KPR-350's 30d shape.
+          });
+        } else {
+          // Unreachable while LaneBProviderId = {openai, codex, gemini} —
+          // kept as containment for a future provider that ships tool-less
+          // (KPR-354 belt-and-braces; §D6).
+          return `Delegate turn failed (${call.delegate}): provider ${String((route as { provider: string }).provider)} does not execute tools`;
+        }
+        if (call.signal.aborted) return `Delegate turn aborted (${call.delegate}).`;
+        // D5.5 (spec-review directive 1): the listener body is try/caught —
+        // an abort() throw inside EventTarget dispatch would NOT surface
+        // through this async frame and would escape all containment; the
+        // never-throws contract is structural, not assumed.
+        const onAbort = () => {
+          try {
+            nested.abort();
+          } catch (err) {
+            log.warn("Nested delegate abort threw — contained (KPR-354 D5.5)", {
+              agentId,
+              delegate: call.delegate,
+              error: String(err),
+            });
+          }
+        };
+        call.signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => call.signal.removeEventListener("abort", onAbort);
+        const result = await nested.runTurn({
+          prompt: call.prompt,
+          workItemContext: call.workItemContext,
+          // Only maxTurns is consumed on Lane B (openai run options + codex
+          // round budget); timeoutMs/budgetUsd are Claude-lane concepts —
+          // neutral values.
+          resourceLimits: { maxTurns, timeoutMs: 600_000, budgetUsd: 0 },
+        });
+        // D5.8: one info log keyed on the ROUTE provider (resolved-provider
+        // attribution canon). Nested usage is logged, not folded into the
+        // parent RunResult (⚠ spec Key Points; costUsd is 0 on both Lane B
+        // surfaces anyway).
+        log.info("Nested delegate turn complete", {
+          agentId,
+          provider: route.provider,
+          delegate: call.delegate,
+          durationMs: Date.now() - startedAt,
+          toolCalls: result.toolCalls,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          ...(result.error ? { error: result.error } : {}),
+        });
+        // D5.7 result shaping (never throws). Nested sessionId DISCARDED;
+        // sessionStore untouched (G4).
+        if (result.aborted) return `Delegate turn aborted (${call.delegate}).`;
+        if (result.error) return `Delegate turn failed (${call.delegate}): ${result.error}`;
+        return result.text || `Delegate '${call.delegate}' returned no output.`;
+      } catch (err) {
+        // Belt-and-suspenders (D5.7): the runner contract is never-throws.
+        return `Delegate turn failed (${call.delegate}): ${err instanceof Error ? err.message : String(err)}`;
+      } finally {
+        removeAbortListener?.();
+        const next = (this.activeSpawnCount.get(agentId) ?? 1) - 1;
+        if (next <= 0) this.activeSpawnCount.delete(agentId);
+        else this.activeSpawnCount.set(agentId, next);
+      }
+    };
+
+    const assembly = await assembleProviderTurn({
+      runner,
+      config,
+      provider: route.provider,
+      workItemContext,
+      delegateTurnRunner,
+    });
+    parentAssembly = assembly;
 
     if (route.provider === "codex") {
       return new CodexSubscriptionAdapter({
         name: config.name,
-        instructions,
         model: route.model || appConfig.codex.agentModel,
         reasoningEffort: route.reasoningEffort,
-        toolInventory,
+        assembly,
+        // KPR-353 (§D3): hive-persisted stateless-replay history. agentId is
+        // config.id (the store key); `name` above stays the display label.
+        historyStore: this.turnHistoryStore,
+        agentId: config.id,
       });
     }
 
     if (route.provider === "openai") {
       return new OpenAIAgentsAdapter({
         name: config.name,
-        instructions,
         model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
-        toolInventory,
+        assembly,
       });
     }
 
-    return new GeminiAdkAdapter({
+    return new GeminiInteractionsAdapter({
       name: config.name,
-      instructions,
-      model: route.model || appConfig.gemini.agentModel || "gemini-2.5-flash",
-      toolInventory,
+      // KPR-352 plan-time pin: Interactions-supported default (pre-352
+      // literal "gemini-2.5-flash" predates the surface).
+      model: route.model || appConfig.gemini.agentModel || "gemini-3.6-flash",
+      apiKey: appConfig.gemini.apiKey || undefined,
+      reasoningEffort: route.reasoningEffort,
+      assembly,
     });
   }
 
@@ -708,6 +955,22 @@ export class AgentManager {
             turn: route.provider,
             hadSessionId: !!effectiveCtx.sessionId,
           });
+          // KPR-353 (§D4): a provider handoff invalidates the thread's replay
+          // history (validity is contiguous-same-provider by construction).
+          // AWAITED — load-bearing: this very turn proceeds through
+          // prepareSpawn to the adapter's load(), so only a clear that
+          // resolves before the spawn continues orders the Mongo delete ahead
+          // of the read; fire-and-forget would let the post-handoff turn
+          // replay the stale doc. An awaited fail-soft Mongo op inside the R7
+          // window is established posture (the sessionStore.get above), and
+          // clear() never throws (§D3) — the catch is belt-and-braces for
+          // foreign store impls/mocks. Accepted residual (spec §D4): if the
+          // swallowed clear FAILS, the stale doc survives until TTL
+          // (same-provider turns never re-trip the guard) — warn-logged in
+          // the store, tolerated; a resulting 4xx lands in the §D7 self-heal.
+          if (this.turnHistoryStore) {
+            await this.turnHistoryStore.clear(ctx.agentId, ctx.threadId).catch(() => {});
+          }
           effectiveCtx = { ...effectiveCtx, sessionId: undefined, sessionHandoff: true };
         }
       }
@@ -744,6 +1007,62 @@ export class AgentManager {
           });
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: undefined },
+            shaping,
+            ticket,
+            onStream,
+          );
+        } else if (
+          // KPR-350 (§D3): stale server-handle self-heal. The store held a
+          // handle the server no longer honors (30d expiry edge, deletion,
+          // org rotation) — without this arm the thread errors identically
+          // every turn until the row TTLs out (up to 7 days). One fresh
+          // retry; a successful retry overwrites the row via the normal
+          // finalizeSpawnResult path (no explicit scrub — the write path
+          // self-corrects); a failed retry surfaces normally and the
+          // churn-mint rider keeps the stale handle for the next turn's
+          // re-trip (bounded waste: one extra attempt per turn, never a dead
+          // thread). SEMANTICS gate, not provider gate — the KPR-347 seam:
+          // dead for client-transcript (their resume errors mean other
+          // things) and stateless-replay (no handle exists to be stale).
+          // `else if` ⇒ at most one retry per turn, and record-once is
+          // untouched: only the finalized attempt reaches the breaker.
+          finalResult.error &&
+          isStaleServerHandleError(finalResult.error) &&
+          effectiveCtx.sessionId &&
+          sessionSemanticsFor(shaping.route.provider) === "server-resumable"
+        ) {
+          // KPR-351 (R2): chain-orphan closure. Two same-thread turns can
+          // both resolve the same stale handle PRE-lock; the first heals and
+          // persists a fresh chain head; the queued second then trips this
+          // arm and — without a re-read — would retry fresh, orphaning the
+          // healed chain (one exchange lost, healed handle overwritten). One
+          // post-lock sessionStore re-read (authoritative under the per-
+          // thread lock — the KPR-313 adopt-branch's own idiom above) adopts
+          // a contender's same-provider, non-empty, DIFFERENT handle; every
+          // other shape falls through to the fresh retry exactly as KPR-350
+          // shipped it. Single-retry semantics (`else if`), record-once,
+          // churn-mint, and the auth-rebuild arm are untouched; the store
+          // read is withRetry fail-soft — no new throw surface inside the
+          // recorded try.
+          const contender = await this.sessionStore.get(effectiveCtx.agentId, effectiveCtx.threadId);
+          const adoptedSessionId =
+            contender?.provider === shaping.route.provider &&
+            contender.sessionId &&
+            contender.sessionId !== effectiveCtx.sessionId
+              ? contender.sessionId
+              : undefined;
+          // Deliberately NOT logging the error string or any handle value:
+          // the provider's stale-handle message embeds the resp_ handle
+          // (log-redaction posture — KPR-350 §D3 "no handle value"); R2
+          // adoption is surfaced as a boolean only.
+          log.warn("spawnTurn stale-server-handle — self-heal retry (KPR-350, adopt-or-fresh KPR-351)", {
+            agentId: effectiveCtx.agentId,
+            threadId: effectiveCtx.threadId,
+            provider: shaping.route.provider,
+            adoptedContenderHandle: adoptedSessionId !== undefined,
+          });
+          finalResult = await this.runOneSpawnAttempt(
+            { ...effectiveCtx, sessionId: adoptedSessionId },
             shaping,
             ticket,
             onStream,
@@ -1146,12 +1465,8 @@ export class AgentManager {
     ticket: SpawnTicket,
     onStream?: SpawnTurnStreamCallback,
   ): Promise<RunResult> {
-    // Fresh provider adapter per spawn — its lazy-built in-process MCPs are therefore
-    // also fresh, with channel/thread ctx captured at construction. The
-    // long-lived path keeps reusing one runner per agent.
-    const adapter = this.createProviderAdapter(ctx.agentId, shaping.route);
-    ticket.attachAbort(() => adapter.abort());
-
+    // KPR-347: built BEFORE adapter construction so Lane B assembly receives
+    // the turn's WorkItemContext (context-sensitive server configs).
     const bgContext: WorkItemContext = {
       adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,
       channelId: ctx.channelId,
@@ -1161,6 +1476,37 @@ export class AgentManager {
       slackTs: (ctx.workItem.meta?.slackTs as string) ?? "",
       slackThreadTs: (ctx.workItem.meta?.slackThreadTs as string) ?? "",
     };
+
+    // Fresh provider adapter per spawn — its lazy-built in-process MCPs are therefore
+    // also fresh, with channel/thread ctx captured at construction. The
+    // long-lived path keeps reusing one runner per agent.
+    //
+    // KPR-347 abort-window closure (§D5): construction is now async; an
+    // abort landing while assembly is in flight must not become a lost
+    // no-op (abortHandle unset). Flag early, re-attach after construction,
+    // re-check. Aborted results stay breaker-neutral (classifyTurnResult).
+    let abortedEarly = false;
+    ticket.attachAbort(() => {
+      abortedEarly = true;
+    });
+    const adapter = await this.createProviderAdapter(ctx.agentId, shaping.route, bgContext);
+    ticket.attachAbort(() => adapter.abort());
+
+    // KPR-347 §D5: an abort that landed while the async assembly above was in
+    // flight must not run the full turn. A flag-only re-check on the adapter
+    // cannot close the window — all three pilot adapters reset `aborted` at
+    // runTurn() entry and ClaudeAgentAdapter's abort is a pre-send no-op — so
+    // the skip is manager-owned and provider-agnostic: bypass runTurn()
+    // entirely and synthesize a breaker-neutral aborted RunResult. adapter.abort()
+    // still fires to signal any adapter holding state (harmless). The result is
+    // a normal aborted completion (classifyTurnResult → "aborted"), NOT a thrown
+    // error, so the KPR-306 recorded-try classification stays neutral.
+    if (abortedEarly) {
+      adapter.abort();
+      const aborted = this.synthesizeAbortedResult(ctx.sessionId ?? "");
+      aborted.costUsd += shaping.routerCostUsd;
+      return aborted;
+    }
 
     const result = await adapter.runTurn({
       prompt: shaping.prompt,
@@ -1175,6 +1521,63 @@ export class AgentManager {
     // finalizeSpawnResult and recordSpawnObservability see the full cost.
     result.costUsd += shaping.routerCostUsd;
     return result;
+  }
+
+  /**
+   * KPR-347 §D5: minimal breaker-neutral aborted RunResult for the early-abort
+   * skip in runOneSpawnAttempt (no runTurn() call was made). Mirrors the pilot
+   * adapters' buildResult zero-shape (all counters 0, toolSummary "none") with
+   * `aborted: true` so classifyTurnResult resolves to "aborted" and the
+   * downstream finalize path (session persist skipped on aborted, telemetry
+   * skipped) behaves exactly as a real adapter-emitted abort. sessionId is the
+   * resumed handle (if any) so finalizeSpawnResult's newSessionId stays intact.
+   */
+  private synthesizeAbortedResult(sessionId: string): RunResult {
+    return {
+      text: "",
+      sessionId,
+      costUsd: 0,
+      durationMs: 0,
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: "none",
+      streamed: false,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      contextWindow: 0,
+      compactions: 0,
+      aborted: true,
+    };
+  }
+
+  /**
+   * KPR-346 (§D6): Lane A :effort delivery. The runner's existing narrowing
+   * (agent-runner.ts — only {low,medium,high} reach SDK Options.effort) is
+   * the deliverable set; clamping HERE (with a warn) makes the drop explicit
+   * at the shaping seam instead of silently swallowed by the runner.
+   * Whether the foreign endpoint honors, ignores, or rejects the param is
+   * validation item V4 (Task 5).
+   */
+  private clampLaneAEffort(
+    agentId: string,
+    model: string,
+    effort: CodexReasoningEffort | undefined,
+  ): ReasoningEffort | undefined {
+    if (!effort) return undefined;
+    if (effort === "low" || effort === "medium" || effort === "high") return effort;
+    const key = `${agentId}:${model}`;
+    if (!this.laneAEffortClampWarned.has(key)) {
+      this.laneAEffortClampWarned.add(key);
+      log.warn("Lane A :effort suffix outside the deliverable {low,medium,high} set — dropped", {
+        agentId,
+        model,
+        effort,
+      });
+    }
+    return undefined;
   }
 
   /**
@@ -1247,13 +1650,39 @@ export class AgentManager {
     // ONLY by spawnTurn's session-identity guard. Prepended ahead of the
     // sender prefix; memory carryover needs nothing here (every fresh spawn
     // already assembles the full system prompt incl. agent memory). Variant
-    // keyed on the static provider (≡ effective under the W3 clamp): pilots
-    // are tool-free, so only Claude targets get the conversation_search clause.
+    // keyed on the static provider (≡ effective under the W3 clamp): Lane B
+    // targets keep the conservative pilot-era default (no conversation_search
+    // clause) pending a dedicated follow-up, not because they lack tools —
+    // KPR-348 gave them real tool execution.
     if (ctx.sessionHandoff) {
+      // KPR-346 (§D7): variant keys on CLAUDE-RUNTIME LANE MEMBERSHIP, not
+      // === "claude" — Lane A agents run the full runtime and have
+      // conversation_search. Future ids fail toward the conservative Lane B
+      // variant (safe default).
       prompt =
-        (staticRoute.provider === "claude"
+        (staticRoute.provider === "claude" || isLaneAProvider(staticRoute.provider)
           ? SESSION_HANDOFF_NOTICE_CLAUDE
           : SESSION_HANDOFF_NOTICE_PILOT) + prompt;
+    }
+
+    // KPR-346 (§D6): Lane A — the router stays skipped (foreign ids are
+    // off-catalog, supportsEffort false, KPR-322 rule stands; zero classifier
+    // cost) but the static :effort suffix delivers through the Claude
+    // adapter's existing channel. resourceLimits stays undefined — the
+    // runner's per-agent legacy fallback applies; Claude static-tier limits
+    // are never computed for foreign models.
+    if (isLaneAProvider(staticRoute.provider)) {
+      return {
+        prompt,
+        route: staticRoute,
+        resourceLimits: undefined,
+        routerCostUsd: 0,
+        effortOverride: this.clampLaneAEffort(
+          ctx.agentId,
+          agentConfig?.model ?? "",
+          "reasoningEffort" in staticRoute ? staticRoute.reasoningEffort : undefined,
+        ),
+      };
     }
 
     // Router gate (KPR-311): skip when disabled, for system senders
@@ -1400,7 +1829,7 @@ export class AgentManager {
       // store doubles as the dispatcher's thread→agent map via
       // findAgentByThread) with an empty sessionId — the row persists, the
       // fake handle never does.
-      const resumable = RESUMABLE_SESSION_PROVIDERS.has(route.provider);
+      const resumable = persistsResumableHandle(sessionSemanticsFor(route.provider));
       // ⚠A4 churn-mint rider: an ERROR turn that attempted a resume and came
       // back with a DIFFERENT id is a failed-resume mint (the CLI's
       // error_during_execution result carries a freshly minted session_id) —
