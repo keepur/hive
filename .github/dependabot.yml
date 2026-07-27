@@ -1,0 +1,33 @@
+# Dependabot version updates (KPR-366 follow-through, enabled 2026-07-26).
+# Security alerts + security-fix PRs are enabled at the repo level; this file
+# adds a weekly scheduled pass for regular version drift.
+#
+# All Dependabot PRs target main and are human-merged (Gate 2 discipline —
+# automation never merges into main).
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    # One grouped PR for all semver-minor/patch drift; majors arrive as
+    # individual PRs so each 0.x runtime-SDK bump stays a considered,
+    # separately-reviewable change (see KPR-366).
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # npm's xlsx line is abandoned upstream; we pin the SheetJS vendor CDN
+      # tarball instead (PR #339). Dependabot must not "update" it back.
+      - dependency-name: "xlsx"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
