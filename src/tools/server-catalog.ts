@@ -143,9 +143,16 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
   },
   ollama: {
     description: "Local LLM inference and embeddings via Ollama — privacy-safe, no data leaves the machine",
-    usage: "Running prompts against local models for sensitive data (medical, financial, NDA). Vision support via llama3.2-vision",
+    usage:
+      "Running prompts against local models for sensitive data (medical, financial, NDA). Vision support via llama3.2-vision",
     notFor: "General-purpose reasoning — use your primary model. Ollama is for privacy-sensitive local inference only",
     toolkitBlurb: "Local LLM inference via Ollama (privacy-safe, on-device)",
+  },
+  "knowledge-base": {
+    description: "RAG pipeline — ingest documents (PDF, DOCX, TXT, etc.), chunk + embed via bge-large, semantic search",
+    usage: "Ingesting reference documents and retrieving relevant context via semantic search",
+    notFor: "Conversation history — use conversation-search. Agent memory — use structured-memory",
+    toolkitBlurb: "Document RAG pipeline (ingest, chunk, embed, search)",
   },
 };
 
