@@ -69,6 +69,7 @@ const INFRASTRUCTURE_SERVERS = new Set([
   "keychain",
   "admin",
   "skill-author",
+  "ollama",
 ]);
 
 /**

@@ -41,6 +41,11 @@ export const LLM_CATALOG: readonly CatalogModel[] = [
     capabilities: ["json", "structured-outputs", "vision", "effort"],
   },
   {
+    id: "claude-opus-5",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
     id: "claude-sonnet-5",
     provider: "anthropic",
     capabilities: ["json", "structured-outputs", "vision", "effort"],

@@ -255,6 +255,7 @@ const MCP_BUNDLE_MAP: Record<string, string> = {
   "search/conversation-search-mcp-server.js": "search-conversation.min.js",
   "slack/slack-mcp-server.js": "slack.min.js",
   "skill-author/skill-author-mcp-server.js": "skill-author.min.js",
+  "ollama/ollama-mcp-server.js": "ollama.min.js",
 };
 
 function mcpPath(devSubpath: string): string {
@@ -999,6 +1000,17 @@ export class AgentRunner {
       env: {
         AGENT_ID: this.agentConfig.id,
         HIVE_HOME: hiveHome,
+      },
+    };
+
+    // Ollama MCP server — local LLM inference (privacy-safe, on-device).
+    // Always available on localhost:11434; no credentials required.
+    servers["ollama"] = {
+      type: "stdio",
+      command: "node",
+      args: [mcpPath("ollama/ollama-mcp-server.js")],
+      env: {
+        OLLAMA_BASE_URL: process.env.OLLAMA_BASE_URL ?? "http://localhost:11434",
       },
     };
 

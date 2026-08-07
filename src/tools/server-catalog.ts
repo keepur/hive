@@ -141,6 +141,12 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     description: "Read secrets from macOS Keychain",
     usage: "Retrieving API keys or credentials stored in the system keychain",
   },
+  ollama: {
+    description: "Local LLM inference and embeddings via Ollama — privacy-safe, no data leaves the machine",
+    usage: "Running prompts against local models for sensitive data (medical, financial, NDA). Vision support via llama3.2-vision",
+    notFor: "General-purpose reasoning — use your primary model. Ollama is for privacy-sensitive local inference only",
+    toolkitBlurb: "Local LLM inference via Ollama (privacy-safe, on-device)",
+  },
 };
 
 /** Format a catalog entry as a prompt line: "- name: description\n  → usage / notFor" */
