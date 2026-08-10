@@ -18,10 +18,18 @@ export interface TeamToolDeps {
   agentId: string;
   /** Live agent-id lookup — invoked on every tool call so hot reloads apply. */
   getAgentIds: () => string[];
+  /**
+   * Live display-name lookup for an agent id. Agent `_id`s are immutable once
+   * created, so a renamed agent keeps its legacy key (e.g. id `may`, name
+   * `Bill`). Attribution must resolve through the display name and fall back to
+   * the raw id only when the agent is unknown — never the other way round.
+   */
+  getAgentName?: (id: string) => string | undefined;
 }
 
 export function buildTeamTools(deps: TeamToolDeps) {
-  const { db, agentId, getAgentIds } = deps;
+  const { db, agentId, getAgentIds, getAgentName } = deps;
+  const displayName = (id: string): string => getAgentName?.(id) ?? id;
   const messages = db.collection<TeamMessage>("team_messages");
   const pendingRequests = db.collection("team_pending_requests");
 
@@ -65,7 +73,7 @@ export function buildTeamTools(deps: TeamToolDeps) {
             threadId,
             senderId: agentId,
             senderType: "agent",
-            senderName: agentId,
+            senderName: displayName(agentId),
             text,
             createdAt: new Date(),
           } as TeamMessage);

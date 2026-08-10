@@ -424,16 +424,24 @@ export class Scheduler {
         .findOneAndUpdate({ _id: req._id, status: "pending" }, { $set: { status: "fired", firedAt: new Date() } });
       if (!updated) continue;
 
+      // Agent `_id`s are immutable, so a renamed agent keeps its legacy key
+      // (e.g. id `may`, display name `Bill`). Attribution resolves through the
+      // display name and falls back to the raw id only for unknown agents.
+      const fromId = req.fromAgentId as string;
+      const targetId = req.targetAgentId as string;
+      const fromName = this.registry.get(fromId)?.name ?? fromId;
+      const targetName = this.registry.get(targetId)?.name ?? targetId;
+
       const item: WorkItem = {
         id: `team-${String(req._id)}`,
         text: req.text as string,
         source: {
           kind: "internal" as ChannelKind,
           id: req.channelId as string,
-          label: `internal:${req.fromAgentId}→${req.targetAgentId}`,
+          label: `internal:${fromName}→${targetName}`,
         },
-        sender: req.fromAgentId as string,
-        senderName: req.fromAgentId as string,
+        sender: fromId,
+        senderName: fromName,
         threadId: `internal:${req.channelId}:${req.threadId}`,
         timestamp: new Date(),
         meta: {
@@ -466,7 +474,7 @@ export class Scheduler {
             threadId: req.threadId,
             senderId: req.targetAgentId,
             senderType: "agent",
-            senderName: req.targetAgentId,
+            senderName: targetName,
             text: result.finalMessage,
             createdAt: new Date(),
           });

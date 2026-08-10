@@ -1421,6 +1421,7 @@ export class AgentRunner {
           db: this.db,
           agentId: this.agentConfig.id,
           getAgentIds: () => AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
+          getAgentName: (id: string) => AgentRunner.registryRef?.get(id)?.name,
         });
       }
       servers["team"] = this.teamMcpServer;

@@ -101,4 +101,53 @@ describe("team-mcp-server (in-process)", () => {
     expect(res.content[0].text).toMatch(/- bob/);
     expect(res.content[0].text).toMatch(/- carol/);
   });
+
+  // Agent `_id`s are immutable, so a renamed agent keeps its legacy key
+  // (real case: id `may`, display name `Bill`). Attribution must resolve
+  // through the display name, with the raw id only as a fallback.
+  describe("sender attribution uses display name, not raw _id", () => {
+    it("stamps senderName with the display name for a renamed agent", async () => {
+      const { db, messageInserts } = makeFakeDb();
+      const tools = buildTeamTools({
+        db: db as any,
+        agentId: "may",
+        getAgentIds: () => ["may", "bob"],
+        getAgentName: (id: string) => ({ may: "Bill", bob: "Bob" })[id],
+      });
+
+      await getHandler(tools, "send_message")({ targetAgentId: "bob", text: "hi" });
+
+      expect(messageInserts).toHaveLength(1);
+      expect(messageInserts[0].senderName).toBe("Bill");
+      // senderId stays the immutable key — only the display field changes.
+      expect(messageInserts[0].senderId).toBe("may");
+    });
+
+    it("falls back to the raw id when the agent is unknown", async () => {
+      const { db, messageInserts } = makeFakeDb();
+      const tools = buildTeamTools({
+        db: db as any,
+        agentId: "ghost",
+        getAgentIds: () => ["ghost", "bob"],
+        getAgentName: () => undefined,
+      });
+
+      await getHandler(tools, "send_message")({ targetAgentId: "bob", text: "hi" });
+
+      expect(messageInserts[0].senderName).toBe("ghost");
+    });
+
+    it("falls back to the raw id when no resolver is supplied", async () => {
+      const { db, messageInserts } = makeFakeDb();
+      const tools = buildTeamTools({
+        db: db as any,
+        agentId: "may",
+        getAgentIds: () => ["may", "bob"],
+      });
+
+      await getHandler(tools, "send_message")({ targetAgentId: "bob", text: "hi" });
+
+      expect(messageInserts[0].senderName).toBe("may");
+    });
+  });
 });
