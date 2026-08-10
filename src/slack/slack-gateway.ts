@@ -42,6 +42,8 @@ export class SlackGateway {
   private outboundTsCache = new OutboundTsCache();
   private integrationChannels = new Set<string>(); // channel names that accept bot messages
   private botToken: string;
+  /** Slack error from the most recent readChannel failure, so callers can surface the real cause. */
+  lastReadError: string | undefined;
 
   constructor(appToken: string, botToken: string) {
     this.socket = new SocketModeClient({ appToken });
@@ -696,6 +698,7 @@ export class SlackGateway {
    */
   async readChannel(channel: string, limit = 50): Promise<Array<Record<string, unknown>> | undefined> {
     try {
+      this.lastReadError = undefined;
       const res = await this.web.conversations.history({ channel, limit });
       const messages = (res.messages ?? []) as Array<Record<string, unknown>>;
 
@@ -742,6 +745,7 @@ export class SlackGateway {
 
       return enriched;
     } catch (err) {
+      this.lastReadError = (err as Error).message;
       log.warn("readChannel failed", { channel, error: (err as Error).message });
       return undefined;
     }
