@@ -2201,7 +2201,15 @@ export class AgentRunner {
     const totalToolMs = toolCalls.reduce((sum, tc) => sum + ((tc.endMs ?? Date.now()) - tc.startMs), 0);
     const llmMs = durationMs - totalToolMs;
 
-    log.info("Agent response complete", {
+    // A deadline fire or an abort() unwinds the iterator by CLOSING it, not by
+    // throwing — so `error` stays undefined and the old `hasError: !!error`
+    // reported a killed run as clean. Every error-log-based health check was
+    // therefore blind to exactly the failures it existed to catch: a run that
+    // burned its whole timeout on tool calls and emitted nothing still looked
+    // identical to a successful one. `hasError` now means "this run did not
+    // complete", which is the question a health check is actually asking.
+    const failed = !!error || timedOut || this._aborted;
+    const completion = {
       agent: this.agentConfig.id,
       sessionId: resultSessionId,
       costUsd,
@@ -2220,8 +2228,28 @@ export class AgentRunner {
       compactions,
       preCompactTokens,
       streamed,
-      hasError: !!error,
-    });
+      hasError: failed,
+      // Surfaced so a consumer can tell WHY a run failed without correlating
+      // back to the separate "Agent query timed out" warn line.
+      aborted: this._aborted,
+      ...(timedOut ? { timedOut: true } : {}),
+      ...(error ? { error } : {}),
+      // "Did this run actually ship anything?" — previously only inferable by
+      // reading outputTokens off the final record.
+      producedOutput: resultText.length > 0,
+    };
+
+    // Only `error` level reaches stderr (and therefore hive.err). A timeout is
+    // a fault and belongs there. An operator abort is intentional, so it stays
+    // a warn — but it still carries hasError, so it can't masquerade as a
+    // clean run to anything reading the record rather than the log level.
+    if (error || timedOut) {
+      log.error("Agent response complete", completion);
+    } else if (this._aborted) {
+      log.warn("Agent response complete", completion);
+    } else {
+      log.info("Agent response complete", completion);
+    }
 
     return {
       text: resultText, sessionId: resultSessionId, costUsd, durationMs,
