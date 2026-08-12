@@ -65,7 +65,12 @@ describe("MemoryEmbedder.upsert truncation (KPR-241)", () => {
     expect(upsertCall.points[0].payload.truncated).toBeUndefined();
   });
 
-  it("truncates content over the embed cap and sets truncated:true", async () => {
+  // Supersedes the original KPR-241 truncation test. The 6000-char cap was
+  // removed: it never prevented the Ollama 400 (measured — pure-ASCII text
+  // embeds fine at 60k chars; the 400 is driven by non-ASCII density, not
+  // length) and it silently discarded content. embedOllama now chunks and
+  // mean-pools, so upsert must hand over the WHOLE record.
+  it("passes long content through untruncated and sets no truncated flag", async () => {
     const embedder = new MemoryEmbedder("http://qdrant.test", "http://ollama.test");
     const upsertSpy = vi.fn().mockResolvedValue({});
     const embedSpy = vi.fn().mockResolvedValue([0.1, 0.2]);
@@ -82,8 +87,8 @@ describe("MemoryEmbedder.upsert truncation (KPR-241)", () => {
       importance: "medium",
       createdAt: 1,
     });
-    expect(embedSpy.mock.calls[0][0].length).toBeLessThanOrEqual(6100);
-    expect(upsertSpy.mock.calls[0][1].points[0].payload.truncated).toBe(true);
+    expect(embedSpy.mock.calls[0][0]).toBe(longContent);
+    expect(upsertSpy.mock.calls[0][1].points[0].payload.truncated).toBeUndefined();
   });
 });
 

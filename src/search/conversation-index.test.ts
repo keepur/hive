@@ -124,7 +124,10 @@ describe("ConversationIndex", () => {
       );
       expect(indexCall).toBeDefined();
       const body = JSON.parse(indexCall![1].body as string);
-      expect(body.input).toBe("hello there\n\nhi back");
+      // embedOllama now always uses Ollama's batch form (`input` is an array of
+      // chunks) so that long inputs can be chunked and mean-pooled. Short input
+      // like this still goes out as a single-element batch.
+      expect(body.input).toEqual(["hello there\n\nhi back"]);
 
       // Verify upsert payload
       expect(mockUpsert).toHaveBeenCalledWith("conversations", {
