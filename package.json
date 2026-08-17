@@ -96,7 +96,7 @@
     "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",
     "esbuild": "^0.28.0",
-    "eslint": "^9.0.0",
+    "eslint": "^10.8.0",
     "eslint-config-prettier": "^10.0.0",
     "husky": "^9.0.0",
     "lint-staged": "^15.0.0",
