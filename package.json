@@ -76,7 +76,7 @@
     "@openai/agents": "^0.11.4",
     "@qdrant/js-client-rest": "^1.17.0",
     "@slack/socket-mode": "^2.0.5",
-    "@slack/web-api": "^7.14.1",
+    "@slack/web-api": "^8.0.0",
     "better-sqlite3": "^12.8.0",
     "brave-search-mcp": "^2.0.1",
     "csv-parse": "^6.1.0",
