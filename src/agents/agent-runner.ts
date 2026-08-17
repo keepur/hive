@@ -841,10 +841,18 @@ export class AgentRunner {
       for (const [name, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
         const isGooglePlugin = AgentRunner.isGooglePluginServer(plugin, name);
         if (isGooglePlugin && gogAccounts.length === 0) {
-          log.debug("Google plugin has no accounts for agent, skipping", {
+          // KPR-373: when the agent explicitly lists this server, skipping it
+          // makes the tool (or its delegate sub-agent) silently vanish — the
+          // agent then reports "no google tool" with nothing in the logs.
+          // Warn in that case; stay at debug for agents that never asked.
+          const referencesServer =
+            this.agentConfig.coreServers.includes(name) || this.agentConfig.delegateServers.includes(name);
+          const skipLog = referencesServer ? log.warn : log.debug;
+          skipLog("Google plugin has no accounts for agent, skipping", {
             plugin: plugin.name,
             server: name,
             agent: this.agentConfig.id,
+            referencedBy: referencesServer ? "agent definition (coreServers/delegateServers)" : "none",
           });
           continue;
         }
@@ -927,7 +935,19 @@ export class AgentRunner {
 
         for (const envVar of serverDef.secretEnv ?? []) {
           const value = process.env[envVar] || fromKeychain(config.instance.id, envVar);
-          if (value) env[envVar] = value;
+          if (value) {
+            env[envVar] = value;
+          } else {
+            // KPR-373: a declared secret that resolves empty means the server
+            // spawns without its credential and fails downstream with a
+            // confusing tool-level error. Make the gap visible at the source.
+            log.warn("Declared secret-env var resolved empty at spawn — server will run without it", {
+              plugin: plugin.name,
+              server: name,
+              agent: this.agentConfig.id,
+              envVar,
+            });
+          }
         }
 
         // env-map: rename base env vars (e.g. DODI_OPS_API_URL -> TASK_LEDGER_API_URL)
@@ -2201,7 +2221,15 @@ export class AgentRunner {
     const totalToolMs = toolCalls.reduce((sum, tc) => sum + ((tc.endMs ?? Date.now()) - tc.startMs), 0);
     const llmMs = durationMs - totalToolMs;
 
-    log.info("Agent response complete", {
+    // A deadline fire or an abort() unwinds the iterator by CLOSING it, not by
+    // throwing — so `error` stays undefined and the old `hasError: !!error`
+    // reported a killed run as clean. Every error-log-based health check was
+    // therefore blind to exactly the failures it existed to catch: a run that
+    // burned its whole timeout on tool calls and emitted nothing still looked
+    // identical to a successful one. `hasError` now means "this run did not
+    // complete", which is the question a health check is actually asking.
+    const failed = !!error || timedOut || this._aborted;
+    const completion = {
       agent: this.agentConfig.id,
       sessionId: resultSessionId,
       costUsd,
@@ -2220,8 +2248,28 @@ export class AgentRunner {
       compactions,
       preCompactTokens,
       streamed,
-      hasError: !!error,
-    });
+      hasError: failed,
+      // Surfaced so a consumer can tell WHY a run failed without correlating
+      // back to the separate "Agent query timed out" warn line.
+      aborted: this._aborted,
+      ...(timedOut ? { timedOut: true } : {}),
+      ...(error ? { error } : {}),
+      // "Did this run actually ship anything?" — previously only inferable by
+      // reading outputTokens off the final record.
+      producedOutput: resultText.length > 0,
+    };
+
+    // Only `error` level reaches stderr (and therefore hive.err). A timeout is
+    // a fault and belongs there. An operator abort is intentional, so it stays
+    // a warn — but it still carries hasError, so it can't masquerade as a
+    // clean run to anything reading the record rather than the log level.
+    if (error || timedOut) {
+      log.error("Agent response complete", completion);
+    } else if (this._aborted) {
+      log.warn("Agent response complete", completion);
+    } else {
+      log.info("Agent response complete", completion);
+    }
 
     return {
       text: resultText, sessionId: resultSessionId, costUsd, durationMs,
