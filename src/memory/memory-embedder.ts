@@ -10,12 +10,17 @@ const log = createLogger("memory-embedder");
 const COLLECTION = "agent_memory";
 
 /**
- * KPR-241: Ollama embed-context cap. The Catalyst diagnostic ("Ollama embed
- * 400: the input length exceeds the context length") motivates a hard cap
- * applied at the embedder boundary. 6000 chars ≈ 1500 tokens leaves headroom
- * vs typical 2048-token Ollama defaults. Configurable via env.
+ * KPR-241 follow-up: the 6000-char cap that used to live here has been removed.
+ * It assumed a ~2048-token Ollama default, but the embedding model's real
+ * window is 512 tokens (`bert.context_length`), so the cap was ~4x too large to
+ * ever prevent an "input length exceeds the context length" 400. It also only
+ * covered `upsert()`, leaving `search()` — which embeds full record content
+ * during the burst-similarity check — unguarded, and it silently discarded
+ * everything past the cut.
+ *
+ * `embedOllama` now chunks and mean-pools internally, so it accepts text of any
+ * length and no content is dropped. See src/search/embed-utils.ts.
  */
-const EMBED_MAX_CHARS = parseInt(process.env.MEMORY_EMBED_MAX_CHARS ?? "6000", 10);
 
 interface QdrantPayload {
   [key: string]: unknown;
@@ -54,17 +59,6 @@ export class MemoryEmbedder implements MemoryVectorIndex {
     return embedOllama(this.ollamaUrl, text);
   }
 
-  /**
-   * KPR-241: truncate content to the embed-context limit. Returns the
-   * possibly-truncated content and a flag for the payload. Truncating at
-   * the embedder boundary keeps the Mongo record intact while preventing
-   * Ollama 400s from leaving orphan Mongo records.
-   */
-  private truncateForEmbed(content: string): { content: string; truncated: boolean } {
-    if (content.length <= EMBED_MAX_CHARS) return { content, truncated: false };
-    return { content: content.slice(0, EMBED_MAX_CHARS) + "\n…[truncated]", truncated: true };
-  }
-
   async ensureCollection(): Promise<void> {
     if (this.collectionReady) return;
     const client = this.getClient();
@@ -83,11 +77,11 @@ export class MemoryEmbedder implements MemoryVectorIndex {
 
   async upsert(pointId: string, content: string, payload: QdrantPayload): Promise<void> {
     await this.ensureCollection();
-    const { content: embedContent, truncated } = this.truncateForEmbed(content);
-    const vector = await this.embed(embedContent);
-    const finalPayload: QdrantPayload = truncated ? { ...payload, truncated: true } : payload;
+    // No truncation: embedOllama chunks + mean-pools, so the whole record is
+    // represented in the vector regardless of length.
+    const vector = await this.embed(content);
     await this.getClient().upsert(COLLECTION, {
-      points: [{ id: pointId, vector, payload: finalPayload }],
+      points: [{ id: pointId, vector, payload }],
     });
   }
 
