@@ -104,14 +104,28 @@ vi.mock("../memory/memory-mcp-server.js", async (importOriginal) => {
 });
 
 // ── Logger mock ─────────────────────────────────────────────────────
-vi.mock("../logging/logger.js", () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
+// Hoisted so every createLogger() call shares ONE set of spies. agent-runner.ts
+// binds its logger at module load, so a factory returning a fresh object per
+// call would hand tests a different instance than the one under test and make
+// log assertions impossible.
+const mockLog = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
 }));
+vi.mock("../logging/logger.js", () => ({
+  createLogger: () => mockLog,
+}));
+
+/** The payload of the single "Agent response complete" record, at any level. */
+function completionRecord(): Record<string, any> | undefined {
+  for (const spy of [mockLog.error, mockLog.warn, mockLog.info]) {
+    const call = spy.mock.calls.find((c) => c[0] === "Agent response complete");
+    if (call) return { ...(call[1] as Record<string, any>), _level: spy };
+  }
+  return undefined;
+}
 
 // ── Keychain mock ───────────────────────────────────────────────────
 vi.mock("../keychain/from-keychain.js", () => ({
@@ -3564,6 +3578,83 @@ describe("RunResult.timedOut (KPR-306)", () => {
     const result = await resultP;
     expect(result.aborted).toBe(true);
     expect(result.timedOut).toBeUndefined();
+  });
+});
+
+describe("completion record reports killed runs as failures", () => {
+  beforeEach(() => {
+    mockQueryOverride = null;
+    mockLog.info.mockClear();
+    mockLog.warn.mockClear();
+    mockLog.error.mockClear();
+  });
+  afterEach(() => {
+    mockQueryOverride = null;
+    vi.useRealTimers();
+  });
+
+  /** A query that hangs until close() releases it — i.e. until abort() fires. */
+  function hangingQuery() {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started!: () => void;
+    const startedP = new Promise<void>((r) => (started = r));
+    mockQueryOverride = () => ({
+      close: () => release(),
+      // eslint-disable-next-line require-yield -- intentionally hangs until abort() calls close()
+      [Symbol.asyncIterator]: async function* () {
+        started();
+        await gate;
+      },
+    });
+    return startedP;
+  }
+
+  // The Aug 11 end-of-day-summary run: hit the 300s wall having spent it all on
+  // tool calls, produced zero output, and still logged hasError: false — so it
+  // never reached hive.err and no error-log health check could see it.
+  it("deadline fire logs hasError: true at error level (was: false at info)", async () => {
+    hangingQuery();
+    const runner = makeRunner({ timeoutMs: 25 });
+    const result = await runner.send("hi");
+
+    expect(result.timedOut).toBe(true);
+    const rec = completionRecord();
+    expect(rec).toBeDefined();
+    expect(rec!.hasError).toBe(true);
+    expect(rec!.timedOut).toBe(true);
+    expect(rec!.aborted).toBe(true);
+    expect(rec!.producedOutput).toBe(false);
+    // error level is what routes to stderr -> hive.err. This is the whole point.
+    expect(rec!._level).toBe(mockLog.error);
+    expect(mockLog.info).not.toHaveBeenCalledWith("Agent response complete", expect.anything());
+  });
+
+  it("operator abort logs hasError: true, but at warn — it is intentional, not a fault", async () => {
+    const startedP = hangingQuery();
+    const runner = makeRunner(); // 300s default deadline, never fires here
+    const resultP = runner.send("hi");
+    await startedP;
+    runner.abort();
+    await resultP;
+
+    const rec = completionRecord();
+    expect(rec!.hasError).toBe(true);
+    expect(rec!.aborted).toBe(true);
+    expect(rec!.timedOut).toBeUndefined();
+    expect(rec!._level).toBe(mockLog.warn);
+  });
+
+  it("a clean run still logs hasError: false at info — no false positives", async () => {
+    const runner = makeRunner();
+    const result = await runner.send("hi");
+
+    expect(result.aborted).toBe(false);
+    const rec = completionRecord();
+    expect(rec!.hasError).toBe(false);
+    expect(rec!.aborted).toBe(false);
+    expect(rec!.timedOut).toBeUndefined();
+    expect(rec!._level).toBe(mockLog.info);
   });
 });
 
