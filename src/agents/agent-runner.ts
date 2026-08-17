@@ -841,10 +841,18 @@ export class AgentRunner {
       for (const [name, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
         const isGooglePlugin = AgentRunner.isGooglePluginServer(plugin, name);
         if (isGooglePlugin && gogAccounts.length === 0) {
-          log.debug("Google plugin has no accounts for agent, skipping", {
+          // KPR-373: when the agent explicitly lists this server, skipping it
+          // makes the tool (or its delegate sub-agent) silently vanish — the
+          // agent then reports "no google tool" with nothing in the logs.
+          // Warn in that case; stay at debug for agents that never asked.
+          const referencesServer =
+            this.agentConfig.coreServers.includes(name) || this.agentConfig.delegateServers.includes(name);
+          const skipLog = referencesServer ? log.warn : log.debug;
+          skipLog("Google plugin has no accounts for agent, skipping", {
             plugin: plugin.name,
             server: name,
             agent: this.agentConfig.id,
+            referencedBy: referencesServer ? "agent definition (coreServers/delegateServers)" : "none",
           });
           continue;
         }
@@ -927,7 +935,19 @@ export class AgentRunner {
 
         for (const envVar of serverDef.secretEnv ?? []) {
           const value = process.env[envVar] || fromKeychain(config.instance.id, envVar);
-          if (value) env[envVar] = value;
+          if (value) {
+            env[envVar] = value;
+          } else {
+            // KPR-373: a declared secret that resolves empty means the server
+            // spawns without its credential and fails downstream with a
+            // confusing tool-level error. Make the gap visible at the source.
+            log.warn("Declared secret-env var resolved empty at spawn — server will run without it", {
+              plugin: plugin.name,
+              server: name,
+              agent: this.agentConfig.id,
+              envVar,
+            });
+          }
         }
 
         // env-map: rename base env vars (e.g. DODI_OPS_API_URL -> TASK_LEDGER_API_URL)
