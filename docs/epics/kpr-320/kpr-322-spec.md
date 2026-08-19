@@ -250,12 +250,26 @@ Everything else is net-new worker code (`src/voice-worker/`, `scripts/livekit-se
 
 ### 14.1 Matrix
 
-| | TTS-A: Cartesia Sonic (sonic-3) | TTS-B: ElevenLabs (eleven_flash_v2_5) |
+**(Amended 2026-08-19 — operator premium-quality ruling; see 14.1.1.)**
+
+| | TTS-A: Cartesia Sonic (current flagship: Sonic-3.6) | TTS-B: ElevenLabs (Eleven v3 Conversational) |
 |---|---|---|
 | **STT-1: Deepgram Flux** (`flux-general-en`, `STTv2`, turn detection `stt`) | cell F×S | cell F×E |
 | **STT-2: Deepgram Nova-3** (streaming + Silero VAD + turn-detector; §5.4 caveat) | cell N×S | cell N×E |
 
 Vendor state as researched 2026-07-14 (⚠ all vendor-claimed until measured): Flux is the purpose-built conversational STT — model-integrated end-of-turn detection (~260ms p50 EOU at defaults), turn-complete transcripts, materially fewer false interruptions than VAD-pipeline approaches; Nova-3 is the transcript-accuracy control cell requiring external turn logic. Sonic-3 (SSM architecture) claims ~40ms model TTFA / ~90ms p90 delivered, ~$0.02–0.03/min-class pricing; ElevenLabs Flash v2.5 claims ~75ms model inference / ~150ms observed TTFA, ~$0.04–0.06/min-class, with the stronger voice-cloning ecosystem (relevant to future agent voice identity — pilot uses stock catalog voices ⚠; cloning is out of scope until the 325 verdict).
+
+### 14.1.1 Vendor-state refresh (2026-08-19) — supersedes the TTS cells above where they conflict
+
+Landscape re-check run 2026-08-19 (operator-directed, one month after original research). Architecture verdict: **no change** — agents-js had only incremental releases (1.6.9 as of Aug 7, no breaking changes; all four plugins we lean on healthy; standalone turn-detector package deprecation does not affect `turnDetection: "stt"`), LiveKit Cloud SIP stable, LiveKit commercially strengthened ($100M Series C @ $1B, Jan 2026). TTS cells updated per the operator's premium-quality ruling (2026-08-19: "happy to pay a premium for voice quality on vendor/customer calls" — reinforces the §14.4 rule that cost is tie-break only):
+
+- **TTS-A → Cartesia Sonic-3.6** (shipped 2026-08-18): leads both Artificial Analysis speech leaderboards (1,283 / 1,123 Elo), beats Eleven v3 by 64 Elo in the controlled same-voices comparison, sub-90ms vendor-claimed TTFA. ⚠ exact API model id + real-world TTFA pinned/measured at Task-0/PoC.
+- **TTS-B → ElevenLabs Eleven v3 Conversational** (~280ms vendor-claimed TTFB, high emotional range, dedicated realtime WebSocket), replacing Flash v2.5, which is demoted to documented latency fallback. ⚠ v3 Conversational GA status, exact model id, pricing, and agents-js plugin support are UNVERIFIED — ElevenLabs' own docs are inconsistent (Flash v2.5 still tagged "recommended for agents"); confirm before wiring the cell; if it fails confirmation, cell B reverts to `eleven_flash_v2_5`.
+- **Optional wildcard cell (delivery discretion): Deepgram Flux TTS** (GA 2026-08-12, conversation-native, $0.045/1k chars from Sept 13; **free through 2026-09-12** — a zero-cost extra cell if the PoC runs inside that window; agents-js support landed in 1.6.9).
+- **STT axis unchanged** (Flux still the purpose-built conversational STT; Flux Multilingual GA'd Apr 2026). ⚠ NEW reliability flag: third-party monitoring showed 90.1% trailing-30-day Deepgram uptime with incidents 2026-08-04 and 2026-08-13 — verify against Deepgram's own SLA/status history before the pilot binds the call path to it; if corroborated, add a fallback STT cell (AssemblyAI Universal-3.5 Pro Realtime or OpenAI `gpt-live-transcribe`, $0.017/min) at delivery discretion.
+- **OpenAI duplex/S2S evaluated and disqualified** (operator question 2026-08-19): GPT-Live-1 (full-duplex, Jul 8) is consumer-ChatGPT-only; `gpt-realtime-2.1` (dev API, Jul 7) supports tool-calling but OpenAI's model authors every turn — no bring-your-own-LLM mechanism in either. Structurally incompatible with the W5 requirement that the hive agent authors every turn. Re-evaluation trigger: OpenAI ships duplex with third-party-LLM turn authorship.
+- **ElevenLabs Agents (hosted platform) noted as a 325-rubric comparator**: supports custom LLM via OpenAI-compatible SSE endpoint (hive stays the brain) + native Twilio/SIP — a build-vs-buy alternative to this ticket's worker, at the cost of platform lock-in and less barge-in/turn-detection control. Not adopted; recorded so the 325 pilot verdict can weigh it.
+- ⚠ Not re-checked in this refresh (research lane stopped): Twilio Elastic SIP/CNAM process changes and any new FCC AI-disclosure rules for outbound AI calls — verify in the KPR-321 ops lane before account/CNAM submission.
 
 ### 14.2 Method
 
