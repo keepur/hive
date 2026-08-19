@@ -237,7 +237,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
           .array(z.string())
           .optional()
           .describe('Optional short names / nicknames for name-based routing (e.g. ["Sam"] for "Samantha").'),
-        model: z.string().describe("Model to use (e.g. 'claude-sonnet-4-6', 'claude-haiku-4-5')"),
+        model: z.string().describe("Model to use (e.g. 'claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5')"),
         homeBase: z
           .string()
           .describe(
