@@ -90,7 +90,7 @@ server.registerTool(
       cwd: z.string().describe("Working directory (absolute path to worktree)"),
       maxTurns: z.number().optional().describe("Max agentic turns (default: 100)"),
       maxBudget: z.number().optional().describe("Max spend in USD (default: 5.00)"),
-      model: z.string().optional().describe("Model override (e.g. 'claude-sonnet-4-6')"),
+      model: z.string().optional().describe("Model override (e.g. 'claude-sonnet-5')"),
     },
   },
   async ({ prompt, cwd, maxTurns, maxBudget, model }) => {

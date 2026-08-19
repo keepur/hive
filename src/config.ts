@@ -394,7 +394,7 @@ export const config = {
     port: parseInt(optional("CODE_TASK_PORT", String(ports.codeTask ?? portBase + 2)), 10),
     authToken: optional("CODE_TASK_AUTH_TOKEN", "") || randomUUID(),
     pluginDirs: discoverPluginDirs((hive.codeTask as Record<string, unknown>)?.pluginDirs as string[] | undefined),
-    defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-4-6"),
+    defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-5"),
     defaultMaxTurns: parseInt(optional("CODE_TASK_MAX_TURNS", "100"), 10),
     defaultMaxBudget: parseFloat(optional("CODE_TASK_MAX_BUDGET", "5.00")),
     maxConcurrent: parseInt(optional("CODE_TASK_MAX_CONCURRENT", "2"), 10),
