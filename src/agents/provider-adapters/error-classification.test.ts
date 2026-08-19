@@ -3,6 +3,7 @@ import {
   classifyTurnResult,
   classifyThrown,
   HARD_FAULT_KINDS,
+  TurnAssemblyError,
   type ProviderFaultKind,
 } from "./error-classification.js";
 
@@ -64,6 +65,13 @@ describe("classifyTurnResult (KPR-306)", () => {
     "invalid api key",
     "invalid_api_key",
     "OAuth session is not available",
+    // KPR-352 §D7: the GeminiInteractionsAdapter missing-key throw — pinned
+    // per the auth row's standing rule (alternates land with their sentinel).
+    "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY, and restart the service",
+    // KPR-351 R1: the OpenAIAgentsAdapter missing-key throw — pinned per the
+    // auth row's standing rule (alternates land with their sentinel). No row
+    // edit needed: the existing `api.?key is not available` alternate matches.
+    "OpenAI API key is not available; set OPENAI_API_KEY in the instance .env and restart — hive credentials add does not carry this key yet",
   ])("auth: %s", (s) => expect(faultKind(s)).toBe("auth"));
 
   // The auth row MUST be a superset of every isAuthRebuildResumeError
@@ -112,10 +120,79 @@ describe("classifyThrown", () => {
 });
 
 describe("HARD_FAULT_KINDS", () => {
-  it("contains every kind except non-provider", () => {
+  it("contains every kind except non-provider and bad-model", () => {
     expect([...HARD_FAULT_KINDS].sort()).toEqual(
       ["auth", "connect-fail", "rate-limit", "server-error", "timeout"].sort(),
     );
     expect(HARD_FAULT_KINDS.has("non-provider")).toBe(false);
+  });
+});
+
+describe("bad-model (KPR-312 — KPR-310 verdict anomaly 1, M8)", () => {
+  // Pinned VERBATIM, character-for-character, so pattern drift against the
+  // observed SDK surface is caught (spec §6).
+  const M8_ERROR =
+    "There's an issue with the selected model (claude-nonexistent-9). It may not exist or you may not have access to it.";
+
+  it("classifies the verbatim M8 string via classifyTurnResult", () => {
+    expect(classifyTurnResult({ error: M8_ERROR })).toEqual({
+      outcome: "fault",
+      kind: "bad-model",
+      message: M8_ERROR,
+    });
+  });
+
+  it("classifies the verbatim M8 string via classifyThrown (the path M8 actually took)", () => {
+    expect(classifyThrown(new Error(M8_ERROR))).toMatchObject({ kind: "bad-model" });
+  });
+
+  it("classifies the FULL observed M8 throw shape (SDK wrapper prefix + M8 text)", () => {
+    // The observed throw wraps the M8 text — classifyThrown String()s it into
+    // "Error: Claude Code returned an error result: <M8 text>"; the row must
+    // match inside that envelope, not only the bare substring.
+    expect(
+      classifyThrown(new Error(`Claude Code returned an error result: ${M8_ERROR}`)),
+    ).toMatchObject({ kind: "bad-model" });
+  });
+
+  it("matches each alternate independently", () => {
+    expect(faultKind("issue with the selected model")).toBe("bad-model");
+    expect(faultKind("It may not exist or you may not have access to it")).toBe("bad-model");
+  });
+
+  it("is never breaker-eligible", () => {
+    expect(HARD_FAULT_KINDS.has("bad-model")).toBe(false);
+  });
+
+  it("is the LAST row — earlier rows keep precedence on overlapping strings", () => {
+    // A string matching both server-error and bad-model classifies server-error
+    // (first match wins), proving the appended row cannot re-bucket old inputs.
+    expect(faultKind("503 issue with the selected model")).toBe("server-error");
+  });
+});
+
+describe("TurnAssemblyError (KPR-347 §D6)", () => {
+  it("a wrapped Mongo ECONNREFUSED classifies non-provider — the instanceof pre-check beats the pattern tables", () => {
+    const msg = "connect ECONNREFUSED 127.0.0.1:27017";
+    expect(classifyThrown(new TurnAssemblyError(msg, { cause: new Error(msg) }))).toEqual({
+      outcome: "fault", kind: "non-provider", message: msg,
+    });
+    // Contrast case: the SAME message unwrapped pattern-matches connect-fail —
+    // proving the type, not string luck, carries the classification.
+    expect(classifyThrown(new Error(msg))).toMatchObject({ outcome: "fault", kind: "connect-fail" });
+  });
+});
+
+describe("KPR-350 §D3 — stale-resume strings stay non-provider (no 404 row, ever)", () => {
+  it.each([
+    "Previous response with id 'resp_abc123' not found.",
+    "400 invalid_request_error: previous_response_id 'resp_x' not found",
+    "Previous response resp_9 has expired",
+  ])("classifies non-provider: %s", (error) => {
+    expect(classifyTurnResult({ error })).toEqual({
+      outcome: "fault",
+      kind: "non-provider",
+      message: error,
+    });
   });
 });

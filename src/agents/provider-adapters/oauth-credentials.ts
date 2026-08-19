@@ -9,18 +9,6 @@ export interface CodexOAuthOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-export interface GoogleVertexOAuthConfig {
-  project: string;
-  location: string;
-}
-
-export interface GoogleOAuthOptions {
-  credentialsPath?: string;
-  project?: string;
-  location?: string;
-  env?: NodeJS.ProcessEnv;
-}
-
 interface CodexAuthFile {
   tokens?: {
     access_token?: string;
@@ -34,7 +22,6 @@ interface JwtPayload {
 
 const OPENAI_API_AUDIENCE = "https://api.openai.com/v1";
 const DEFAULT_MIN_TTL_SECONDS = 60;
-const DEFAULT_VERTEX_LOCATION = "us-central1";
 
 export function createCodexOpenAITokenProvider(
   options: CodexOAuthOptions = {},
@@ -53,31 +40,6 @@ export function createCodexOpenAITokenProvider(
     if (refreshed) return refreshed;
     throw new Error("Codex OAuth session is missing a usable OpenAI API access token");
   };
-}
-
-export function resolveGoogleVertexOAuthConfig(
-  options: GoogleOAuthOptions = {},
-): GoogleVertexOAuthConfig | null {
-  const env = options.env ?? process.env;
-  const credentialsPath = options.credentialsPath ?? env.GOOGLE_APPLICATION_CREDENTIALS ?? defaultGoogleAdcPath(env);
-  if (!credentialsPath || !existsSync(credentialsPath)) return null;
-
-  const project =
-    options.project ??
-    env.GOOGLE_CLOUD_PROJECT ??
-    env.GOOGLE_PROJECT_ID ??
-    env.GCLOUD_PROJECT ??
-    readGoogleAdcProject(credentialsPath);
-  if (!project) return null;
-
-  const location =
-    options.location ??
-    env.GOOGLE_CLOUD_LOCATION ??
-    env.GOOGLE_CLOUD_REGION ??
-    env.GOOGLE_REGION ??
-    DEFAULT_VERTEX_LOCATION;
-
-  return { project, location };
 }
 
 export function isProviderAuthError(error: unknown): boolean {
@@ -155,19 +117,6 @@ function defaultCodexCommand(): string {
 
 function defaultCodexAuthPath(env?: NodeJS.ProcessEnv): string {
   return join(env?.HOME ?? process.env.HOME ?? "", ".codex", "auth.json");
-}
-
-function defaultGoogleAdcPath(env: NodeJS.ProcessEnv): string {
-  return join(env.HOME ?? process.env.HOME ?? "", ".config", "gcloud", "application_default_credentials.json");
-}
-
-function readGoogleAdcProject(credentialsPath: string): string {
-  try {
-    const adc = JSON.parse(readFileSync(credentialsPath, "utf8")) as { quota_project_id?: string; project_id?: string };
-    return adc.quota_project_id ?? adc.project_id ?? "";
-  } catch {
-    return "";
-  }
 }
 
 function errorMessage(error: unknown): string {

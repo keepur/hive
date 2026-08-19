@@ -1,6 +1,6 @@
 import { ObjectId } from "mongodb";
-import { query, type SDKMessage, type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../logging/logger.js";
+import type { LLMProviderId, LLMResult, LLMTaskRequest } from "../llm/types.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { MemoryStore, AutoDreamAgentState } from "./memory-store.js";
 import type { MemoryEmbedder } from "./memory-embedder.js";
@@ -17,9 +17,42 @@ import { IMPORTANCE_WEIGHTS, TYPE_WEIGHTS } from "./memory-types.js";
 
 const log = createLogger("memory-lifecycle");
 
+/**
+ * KPR-314: every registry fact this module consults is a member of the
+ * injected interface — the site never reaches around the injection to the
+ * singleton (spec §3.4). LLMRegistry satisfies it structurally; tests
+ * inject mocks (makeMockLlm).
+ */
+export interface MemoryLlmClient {
+  generateForTask(task: "memory", request: LLMTaskRequest): Promise<LLMResult>;
+  hasProvider(id: LLMProviderId): boolean;
+  estimateCostUsd(task: "memory", request: LLMTaskRequest): number | undefined;
+}
+
+/** KPR-314: bounded call where none existed (the subprocess could hang a
+ *  sweep indefinitely — spec §1). Generous for a haiku summarization call. */
+const MEMORY_LLM_TIMEOUT_MS = 30_000;
+
+/**
+ * KPR-314 estimate-gate tolerance (spec §3.4, exported for the test pin).
+ * The pre-call estimate is deliberately conservative (chars/4 over-counts
+ * English input ~5-10%; the full maxOutputTokens allowance is charged while
+ * real outputs run ~50-100 tokens) — ×1.3 absorbs exactly those biases so
+ * the gate's skip set stays strictly inside today's abort set at defaults:
+ * one-sided parity — it never skips anything today's cap completed, and may
+ * complete shallow-over band pages today's cap aborted (strictly cheaper).
+ */
+export const GATE_TOLERANCE = 1.3;
+
+/** KPR-314 per-phase output pins (spec §3.4): contradiction verdicts are
+ *  one word; summaries and memory records are 2-5 sentences. */
+const VERDICT_MAX_OUTPUT_TOKENS = 32;
+const DREAM_MAX_OUTPUT_TOKENS = 256;
+
 class AutoDreamBudget {
   spentUsd = 0;
   llmCalls = 0;
+  gateSkips = 0;
 
   constructor(
     readonly maxRunUsd: number,
@@ -42,6 +75,10 @@ class AutoDreamBudget {
     this.spentUsd += costUsd;
     this.llmCalls++;
   }
+
+  recordGateSkip(): void {
+    this.gateSkips++;
+  }
 }
 
 export class MemoryLifecycle {
@@ -49,9 +86,22 @@ export class MemoryLifecycle {
     private store: MemoryStore,
     private embedder: MemoryEmbedder,
     private config: MemoryLifecycleConfig,
+    private llm: MemoryLlmClient, // KPR-314: injected registry (index.ts passes getLLMRegistry())
     private dreamConfig?: DreamConfig,
     private getActiveAgentIds?: () => Promise<Set<string>>,
   ) {}
+
+  private noKeyLogged = false;
+
+  /** KPR-314: no-key is a steady state, not an incident (312's distinction). */
+  private llmAvailable(): boolean {
+    if (this.llm.hasProvider("anthropic")) return true;
+    if (!this.noKeyLogged) {
+      this.noKeyLogged = true;
+      log.info("autoDream LLM phases skipped — no ANTHROPIC_API_KEY (scoring/tier/purge sweeps unaffected)");
+    }
+    return false;
+  }
 
   /**
    * Filter memory-derived agent IDs (includes orphans from retired agents)
@@ -84,34 +134,41 @@ export class MemoryLifecycle {
     return this.dreamConfig?.minNewMemories ?? 10;
   }
 
-  private async runDreamQuery(prompt: string, budget: AutoDreamBudget): Promise<string> {
+  private async runDreamQuery(
+    prompt: string,
+    budget: AutoDreamBudget,
+    maxOutputTokens: number = DREAM_MAX_OUTPUT_TOKENS,
+  ): Promise<string> {
     if (!budget.canSpend()) throw new Error("autoDream run budget exhausted");
 
-    const q = query({
+    const request: LLMTaskRequest = {
       prompt,
-      options: {
-        model: "claude-haiku-4-5-20251001",
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        maxTurns: 1,
-        maxBudgetUsd: budget.callBudgetUsd(),
-        persistSession: false,
-      },
-    });
+      maxOutputTokens,
+      temperature: 0,
+      timeoutMs: MEMORY_LLM_TIMEOUT_MS,
+    };
 
-    let text = "";
-    for await (const message of q) {
-      const msg = message as SDKMessage;
-      if (msg.type === "result") {
-        const result = msg as SDKResultMessage;
-        budget.record(result.total_cost_usd ?? 0);
-        if (result.subtype === "success" && result.result) {
-          text = result.result;
-        }
-      }
+    // KPR-314 estimate gate (spec §3.4): the subprocess's per-call hard cap
+    // is gone (a direct API call can't pre-cap spend); callBudgetUsd() is
+    // kept-and-repurposed as a caller-side estimate ceiling with tolerance.
+    // Worst-case estimate on the ACTUAL request as sent; skip = today's
+    // empty-text result ("" → every phase caller continues) — never a throw,
+    // never an abort, counted and surfaced in the autoDream-complete log.
+    // An undefined estimate never gates (moot: the memory task is
+    // catalog-pinned haiku, pricing always known).
+    const estimate = this.llm.estimateCostUsd("memory", request);
+    const gateUsd = budget.callBudgetUsd() * GATE_TOLERANCE;
+    if (estimate !== undefined && estimate > gateUsd) {
+      budget.recordGateSkip();
+      log.debug("autoDream: call skipped by estimate gate", { estimate, gateUsd, maxOutputTokens });
+      return "";
     }
 
-    return text;
+    // Post-hoc exceedance is by design (spec ⚠5): a gate-passed call may
+    // exceed callBudgetUsd() in actuals — recorded, consumes run budget.
+    const result = await this.llm.generateForTask("memory", request);
+    budget.record(result.costUsd ?? 0);
+    return result.text;
   }
 
   /**
@@ -293,6 +350,12 @@ export class MemoryLifecycle {
     if (!this.dreamConfig?.enabled) {
       return { merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] };
     }
+    // KPR-314: no provider ⇒ LLM phases can do no work — return zero-counts
+    // up front instead of an error-spam steady state (spec §3.4). Non-LLM
+    // sweep phases live in sweep(), untouched.
+    if (!this.llmAvailable()) {
+      return { merged: 0, contradictions: 0, promoted: 0, flaggedForReview: 0, errors: [] };
+    }
 
     const start = Date.now();
     let merged = 0;
@@ -368,7 +431,10 @@ export class MemoryLifecycle {
           errors.push(`${agentId}: ${err}`);
           log.error("autoDream failed for agent", { agentId, error: String(err) });
           if (String(err).includes("autoDream run budget exhausted")) break;
-          if (String(err).includes("hit your limit")) break;
+          // KPR-314: the CLI-subscription "hit your limit" break is gone —
+          // direct API errors never produce that string; a 429 is recorded
+          // per-agent by this catch and the run continues (damage bounded by
+          // canSpend() + per-phase loop caps).
         }
       }
     } catch (err) {
@@ -376,7 +442,10 @@ export class MemoryLifecycle {
     }
 
     const totalActions = merged + contradictions + promoted + flaggedForReview + summarized;
-    if (totalActions > 0) {
+    // KPR-314: an all-skipped run (totalActions 0, gateSkips > 0) must still
+    // emit the completion log — counted skips are the observability surface
+    // for a perpetually-gated backlog (spec §3.4).
+    if (totalActions > 0 || budget.gateSkips > 0) {
       log.info("autoDream complete", {
         durationMs: Date.now() - start,
         merged,
@@ -388,6 +457,7 @@ export class MemoryLifecycle {
         spentUsd: budget.spentUsd,
         budgetUsd: budget.maxRunUsd,
         llmCalls: budget.llmCalls,
+        gateSkips: budget.gateSkips,
         errors: errors.length,
       });
     }
@@ -403,6 +473,7 @@ export class MemoryLifecycle {
       spentUsd: budget.spentUsd,
       budgetUsd: budget.maxRunUsd,
       llmCalls: budget.llmCalls,
+      gateSkips: budget.gateSkips,
     };
   }
 
@@ -423,6 +494,7 @@ export class MemoryLifecycle {
     pagesProcessed: number;
     drained: boolean;
     spentUsd: number;
+    gateSkips: number;
     errors: string[];
   }> {
     if (!this.dreamConfig) {
@@ -434,7 +506,23 @@ export class MemoryLifecycle {
         pagesProcessed: 0,
         drained: true,
         spentUsd: 0,
+        gateSkips: 0,
         errors: ["autoDream not configured"],
+      };
+    }
+    // KPR-314: operator-invoked path — an explicit error beats silent
+    // zero-counts when the LLM provider is absent (spec §3.4 step 10).
+    if (!this.llmAvailable()) {
+      return {
+        summarized: 0,
+        merged: 0,
+        contradictions: 0,
+        promoted: 0,
+        pagesProcessed: 0,
+        drained: false,
+        spentUsd: 0,
+        gateSkips: 0,
+        errors: ["no ANTHROPIC_API_KEY — autoDream LLM phases unavailable"],
       };
     }
     const errors: string[] = [];
@@ -493,7 +581,17 @@ export class MemoryLifecycle {
         log.warn("runConsolidationForAgent markAutoDreamRun failed", { agentId, error: String(markErr) });
       }
     }
-    return { summarized, merged, contradictions, promoted, pagesProcessed, drained, spentUsd: budget.spentUsd, errors };
+    return {
+      summarized,
+      merged,
+      contradictions,
+      promoted,
+      pagesProcessed,
+      drained,
+      spentUsd: budget.spentUsd,
+      gateSkips: budget.gateSkips,
+      errors,
+    };
   }
 
   /**
@@ -658,7 +756,8 @@ export class MemoryLifecycle {
             continue;
           }
 
-          const verdict = (await this.runDreamQuery(prompt, budget)).trim().toUpperCase();
+          // KPR-314: verdicts are one word — 32-token pin (spec §3.4).
+          const verdict = (await this.runDreamQuery(prompt, budget, VERDICT_MAX_OUTPUT_TOKENS)).trim().toUpperCase();
 
           pairsChecked++;
 

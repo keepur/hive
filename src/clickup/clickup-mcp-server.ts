@@ -221,32 +221,149 @@ server.registerTool(
   },
 );
 
+/**
+ * Fetch tasks from the workspace-wide endpoint, following pagination.
+ *
+ * NOTE: `GET /team/{id}/task` ("Get Filtered Team Tasks") supports only
+ * STRUCTURED filters (list_ids, space_ids, statuses, assignees, tags, dates).
+ * It has NO free-text search parameter, and it silently ignores unknown query
+ * params rather than erroring. Passing `name=` or `search=` therefore returns
+ * the newest page of tasks completely unfiltered. Text matching MUST be done
+ * client-side — see clickup_search_tasks below.
+ *
+ * Returns the collected tasks plus a `truncated` flag so callers can tell the
+ * difference between "scanned everything, found nothing" and "gave up early".
+ */
+async function fetchWorkspaceTasks(
+  workspaceId: string,
+  opts: {
+    includeClosed?: boolean;
+    listIds?: string[];
+    spaceIds?: string[];
+    maxPages: number;
+  },
+): Promise<{ tasks: any[]; pagesFetched: number; truncated: boolean }> {
+  const seen = new Map<string, any>();
+  let page = 0;
+  let truncated = false;
+
+  for (; page < opts.maxPages; page++) {
+    const params = new URLSearchParams();
+    params.set("page", String(page));
+    params.set("subtasks", "true");
+    if (opts.includeClosed) params.set("include_closed", "true");
+    opts.listIds?.forEach((id) => params.append("list_ids[]", id));
+    opts.spaceIds?.forEach((id) => params.append("space_ids[]", id));
+
+    const data = await clickup(`/team/${workspaceId}/task?${params}`);
+    const batch = data.tasks ?? [];
+    if (batch.length === 0) break;
+    for (const t of batch) seen.set(t.id, t);
+    // ClickUp returns a `last_page` hint on some plans; fall back to a short page.
+    if (data.last_page === true) {
+      page++;
+      break;
+    }
+  }
+  if (page >= opts.maxPages) truncated = true;
+
+  return { tasks: [...seen.values()], pagesFetched: page, truncated };
+}
+
+/** Case-insensitive AND-match: every whitespace-separated term must appear. */
+function matchesQuery(task: any, query: string, searchDescriptions: boolean): boolean {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return false;
+  const haystack = [
+    task.name ?? "",
+    ...(searchDescriptions ? [task.description ?? "", task.text_content ?? ""] : []),
+    ...(task.custom_fields ?? [])
+      .filter((f: any) => f?.value != null)
+      .map((f: any) => (typeof f.value === "string" ? f.value : JSON.stringify(f.value))),
+  ]
+    .join("\n")
+    .toLowerCase();
+  return terms.every((t) => haystack.includes(t));
+}
+
 server.registerTool(
   "clickup_search_tasks",
   {
     title: "Search Tasks",
-    description: "Search for tasks across an entire workspace by name or custom field values.",
+    description:
+      "Search tasks across a workspace by name (and optionally description/custom fields). " +
+      "Matching is case-insensitive; every whitespace-separated term must appear. " +
+      "The ClickUp API has no server-side text search, so this pages the workspace and " +
+      "filters locally — the result always reports how many tasks were actually scanned. " +
+      "For duplicate-checking before creating a task, set include_closed=true.",
     inputSchema: {
       workspace_id: z.string().describe("Workspace (team) ID to search in"),
-      query: z.string().describe("Search query — matches task names"),
-      include_closed: z.boolean().optional().describe("Include closed/done tasks (default false)"),
+      query: z.string().describe("Search query — all terms must match (case-insensitive)"),
+      include_closed: z
+        .boolean()
+        .optional()
+        .describe("Include closed/done tasks (default false). Use true for duplicate checks."),
+      search_descriptions: z
+        .boolean()
+        .optional()
+        .describe("Also match against task descriptions and custom fields (default false)"),
+      list_ids: z
+        .array(z.string())
+        .optional()
+        .describe("Restrict to these list IDs — much faster than scanning the whole workspace"),
+      space_ids: z.array(z.string()).optional().describe("Restrict to these space IDs"),
+      max_pages: z.number().optional().describe("Max pages of 100 tasks to scan (default 25 = 2500 tasks)"),
     },
   },
-  async ({ workspace_id, query, include_closed }) => {
+  async ({ workspace_id, query, include_closed, search_descriptions, list_ids, space_ids, max_pages }) => {
     try {
-      const params = new URLSearchParams();
-      params.set("name", query);
-      if (include_closed) params.set("include_closed", "true");
-      params.set("subtasks", "true");
-
-      const data = await clickup(`/team/${workspace_id}/task?${params}`);
-      const tasks = data.tasks ?? [];
-      if (tasks.length === 0) {
-        return { content: [{ type: "text", text: `No tasks found matching "${query}".` }] };
+      if (!query.trim()) {
+        return {
+          content: [{ type: "text", text: "Query is empty — refusing to return unfiltered results." }],
+          isError: true,
+        };
       }
-      const lines = tasks.map(formatTask);
+
+      const { tasks, pagesFetched, truncated } = await fetchWorkspaceTasks(workspace_id, {
+        includeClosed: include_closed,
+        listIds: list_ids,
+        spaceIds: space_ids,
+        maxPages: max_pages ?? 25,
+      });
+
+      const hits = tasks.filter((t) => matchesQuery(t, query, search_descriptions ?? false));
+
+      const scope = [
+        `scanned ${tasks.length} tasks across ${pagesFetched} page(s)`,
+        include_closed ? "including closed" : "open only — closed tasks NOT scanned",
+        ...(list_ids?.length ? [`lists: ${list_ids.join(", ")}`] : []),
+        ...(space_ids?.length ? [`spaces: ${space_ids.join(", ")}`] : []),
+      ].join("; ");
+
+      const warning = truncated
+        ? `\n\n⚠️ SCAN TRUNCATED at ${pagesFetched} pages — there may be more matches. ` +
+          `Re-run with a higher max_pages or narrow with list_ids to get a complete answer.`
+        : "";
+
+      if (hits.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No tasks found matching "${query}" (${scope}).${warning}`,
+            },
+          ],
+        };
+      }
+
+      const lines = hits.map(formatTask);
       return {
-        content: [{ type: "text", text: `Search results for "${query}" (${tasks.length}):\n\n${lines.join("\n\n")}` }],
+        content: [
+          {
+            type: "text",
+            text: `Search results for "${query}" — ${hits.length} match(es) (${scope}):\n\n${lines.join("\n\n")}${warning}`,
+          },
+        ],
       };
     } catch (e: any) {
       return { content: [{ type: "text", text: e.message }], isError: true };

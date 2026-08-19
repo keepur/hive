@@ -11,6 +11,7 @@ import { z } from "zod";
 import { ObjectId, type Db } from "mongodb";
 import { MemoryStore } from "./memory-store.js";
 import { MemoryEmbedder } from "./memory-embedder.js";
+import { describeError } from "../logging/describe-error.js";
 import type { MemoryType, MemoryImportance, MemoryTier, PurgeFilters } from "./memory-types.js";
 
 export interface StructuredMemoryTurnContext {
@@ -167,7 +168,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
               }
             } catch (err) {
               // KPR-241: fail open — Qdrant outage skips burst check only, save proceeds.
-              process.stderr.write(`memory_save burst-guard skipped: ${String(err)}\n`);
+              process.stderr.write(`memory_save burst-guard skipped: ${describeError(err)}\n`);
             }
           }
 
@@ -204,7 +205,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
             ],
           };
         } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `memory_save error: ${String(err)}` }] };
+          return { isError: true, content: [{ type: "text", text: `memory_save error: ${describeError(err)}` }] };
         }
       },
     ),
@@ -268,7 +269,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
           }
           return { content: [{ type: "text", text: records.join("\n\n---\n\n") }] };
         } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `memory_recall error: ${String(err)}` }] };
+          return { isError: true, content: [{ type: "text", text: `memory_recall error: ${describeError(err)}` }] };
         }
       },
     ),
@@ -316,7 +317,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
 
           return { content: [{ type: "text", text: `Updated memory [${id}]` }] };
         } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `memory_update error: ${String(err)}` }] };
+          return { isError: true, content: [{ type: "text", text: `memory_update error: ${describeError(err)}` }] };
         }
       },
     ),
@@ -344,7 +345,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
           await store.pin(objectId);
           return { content: [{ type: "text", text: `Pinned memory [${id}] — will stay in your active context` }] };
         } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `memory_pin error: ${String(err)}` }] };
+          return { isError: true, content: [{ type: "text", text: `memory_pin error: ${describeError(err)}` }] };
         }
       },
     ),
@@ -372,7 +373,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
           await store.unpin(objectId);
           return { content: [{ type: "text", text: `Unpinned memory [${id}] — will be scored normally` }] };
         } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `memory_unpin error: ${String(err)}` }] };
+          return { isError: true, content: [{ type: "text", text: `memory_unpin error: ${describeError(err)}` }] };
         }
       },
     ),
@@ -405,7 +406,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
 
           return { content: [{ type: "text", text: `Forgotten memory [${id}]` }] };
         } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `memory_forget error: ${String(err)}` }] };
+          return { isError: true, content: [{ type: "text", text: `memory_forget error: ${describeError(err)}` }] };
         }
       },
     ),
@@ -476,7 +477,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
           const noun = count === 1 ? "memory" : "memories";
           return { content: [{ type: "text", text: `Purged ${count} ${noun} matching ${summary}` }] };
         } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `memory_purge error: ${String(err)}` }] };
+          return { isError: true, content: [{ type: "text", text: `memory_purge error: ${describeError(err)}` }] };
         }
       },
     ),
@@ -518,7 +519,7 @@ export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
 
           return { content: [{ type: "text", text: lines.join("\n") }] };
         } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `memory_review error: ${String(err)}` }] };
+          return { isError: true, content: [{ type: "text", text: `memory_review error: ${describeError(err)}` }] };
         }
       },
     ),

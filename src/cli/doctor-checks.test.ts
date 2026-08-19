@@ -3,7 +3,14 @@ import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { launchctlPrint, pidAlive, requiredEnvVarsFromConfig, resolveServicePath } from "./doctor-checks.js";
+import {
+  launchctlPrint,
+  pidAlive,
+  requiredEnvVarsFromConfig,
+  resolveServicePath,
+  modelRouterModeLine,
+  llmSidecarLine,
+} from "./doctor-checks.js";
 
 // execFileSync and fetch are mocked per-test via vi.mock for subprocess checks.
 vi.mock("node:child_process", async () => {
@@ -648,5 +655,44 @@ describe("mapRosterStatsDoc", () => {
   it("degraded missing -> false", () => {
     const result = mapRosterStatsDoc({ docCount: 1 });
     expect(result?.degraded).toBe(false);
+  });
+});
+
+describe("modelRouterModeLine (KPR-312)", () => {
+  it("reports LLM classification when a key resolves", () => {
+    expect(modelRouterModeLine(true)).toBe("model router: LLM classification");
+  });
+
+  it("reports heuristics-only when no key resolves", () => {
+    expect(modelRouterModeLine(false)).toBe("model router: heuristics-only (no ANTHROPIC_API_KEY)");
+  });
+
+  it("is informational by construction — both modes yield a printable line, no failure channel", () => {
+    // The doctor wiring only console.logs this string; it never touches
+    // allPassed (structural — the helper cannot return a failure signal).
+    for (const mode of [true, false]) {
+      expect(modelRouterModeLine(mode).length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("llmSidecarLine (KPR-314)", () => {
+  it("pins all four key permutations verbatim", () => {
+    expect(llmSidecarLine(true, true)).toBe("llm sidecar: anthropic ✓, gemini ✓");
+    expect(llmSidecarLine(false, true)).toBe(
+      "llm sidecar: anthropic ✗ (meeting classifier → all-roster, memory dream → skipped), gemini ✓",
+    );
+    expect(llmSidecarLine(true, false)).toBe("llm sidecar: anthropic ✓, gemini ✗ (image description → off)");
+    expect(llmSidecarLine(false, false)).toBe(
+      "llm sidecar: anthropic ✗ (meeting classifier → all-roster, memory dream → skipped), gemini ✗ (image description → off)",
+    );
+  });
+
+  it("is informational by construction — every mode yields a printable line, no failure channel", () => {
+    for (const a of [true, false]) {
+      for (const g of [true, false]) {
+        expect(llmSidecarLine(a, g).length).toBeGreaterThan(0);
+      }
+    }
   });
 });

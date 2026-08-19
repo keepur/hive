@@ -122,6 +122,11 @@ export interface DreamResult {
   budgetUsd?: number;
   llmCalls?: number;
   summarized?: number; // KPR-241
+  /** KPR-314: runDreamQuery calls skipped by the per-call estimate gate
+   *  (callBudgetUsd × GATE_TOLERANCE). A perpetually-skipped backlog is
+   *  observable here + in the autoDream-complete log instead of burning
+   *  budget invisibly (spec §3.4). */
+  gateSkips?: number;
 }
 
 export const IMPORTANCE_WEIGHTS: Record<MemoryImportance, number> = {

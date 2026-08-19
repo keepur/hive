@@ -1,6 +1,6 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
-import { existsSync, statSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
+import { existsSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
 import { createRequire } from "node:module";
 import { getArchetype, type ArchetypeDefinition } from "../archetypes/registry.js";
 import { readFile } from "node:fs/promises";
@@ -10,23 +10,36 @@ import type { MemoryManager } from "../memory/memory-manager.js";
 import type { ScopeDecl } from "../memory/memory-scope.js";
 import { config, resolveToolSearchMode } from "../config.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
-import { hiveHome, agentScratchDir, agentPlaywrightDir } from "../paths.js";
+import { hiveHome, agentPlaywrightDir } from "../paths.js";
 import type { LoadedPlugin, HttpPluginMcpServer } from "../plugins/types.js";
 import { isHttpServer } from "../plugins/types.js";
 import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildPrefix } from "./prefix-builder.js";
+import { buildPrefix, buildProviderInstructions, SECTION_JOINER, formatDateTimeTrailer } from "./prefix-builder.js";
+import { deriveProviderSkillIndex } from "./provider-adapters/skill-index.js";
+import {
+  buildGenericDelegatePrompt,
+  DELEGATE_MAX_TURNS_CUSTOM,
+  DELEGATE_MAX_TURNS_GENERIC,
+  type ProviderSkillIndexEntry,
+} from "./provider-adapters/turn-assembly.js";
+import { buildPassthroughEnv, type PassthroughSpawnConfig } from "./provider-adapters/passthrough-providers.js";
 import type { PrefixCache } from "./prefix-cache.js";
 import { invalidatePrefixCacheByMemoryPath } from "./prefix-invalidation.js";
 import {
   CLAUDE_SDK_BUILTIN_TOOL_NAMES,
   classifyToolTransport,
-  type HiveToolTransportDescriptor,
+  type HiveToolInventoryEntry,
   type HiveToolTransportKind,
   type HiveToolTransportSource,
 } from "./provider-adapters/tool-transport.js";
+import {
+  BUILTIN_TOOL_DEFINITIONS,
+  EXECUTOR_BACKED_BUILTIN_NAMES,
+} from "./provider-adapters/builtin-executor.js";
+import { resolveSessionCwd } from "./session-cwd.js";
 import {
   DELEGATE_UNSAFE_SERVERS as DELEGATE_UNSAFE_SERVER_NAMES,
   TURN_CONTEXT_DEPENDENT_SERVERS,
@@ -55,6 +68,7 @@ import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
+import type { ReasoningEffort } from "./provider-adapters/types.js";
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -291,6 +305,13 @@ function warnIfToolSearchForceDisabled(): void {
   );
 }
 
+/** KPR-346: optional per-spawn runner options (currently Lane A only). */
+export interface AgentRunnerOptions {
+  /** Set by AgentManager.createProviderAdapter for kimi/deepseek routes —
+   *  triggers §D5 env substitution in send(). Absent ⇒ vanilla Claude spawn. */
+  laneAPassthrough?: PassthroughSpawnConfig;
+}
+
 export class AgentRunner {
   static registryRef?: import("./agent-registry.js").AgentRegistry;
 
@@ -329,8 +350,9 @@ export class AgentRunner {
   // index.ts; tests that don't pass one fall through to a direct buildPrefix
   // call (no cache) so per-test isolation isn't a concern.
   private prefixCache?: PrefixCache;
+  private readonly laneAPassthrough?: PassthroughSpawnConfig;
 
-  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache, memoryLifecycle?: MemoryLifecycle) {
+  constructor(agentConfig: AgentConfig, memoryManager: MemoryManager, plugins: LoadedPlugin[] = [], skillIndex: SkillIndex = new Map(), eventSubscribersJson = "{}", prefetcher?: CodeIndexPrefetcher, teamRoster?: TeamRoster, db?: Db, prefixCache?: PrefixCache, memoryLifecycle?: MemoryLifecycle, runnerOptions?: AgentRunnerOptions) {
     this.agentConfig = agentConfig;
     this.memoryManager = memoryManager;
     this.plugins = plugins;
@@ -341,6 +363,7 @@ export class AgentRunner {
     this.db = db;
     this.prefixCache = prefixCache;
     this.memoryLifecycle = memoryLifecycle;
+    this.laneAPassthrough = runnerOptions?.laneAPassthrough;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
@@ -366,10 +389,9 @@ export class AgentRunner {
       : await buildPrefix(this.agentConfig, buildContext);
 
     // Date/time last — changes every minute, so placing it at the end
-    // preserves the static prefix for prompt caching.
-    const now = new Date();
-    const pacific = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
-    return `${prefix}\n\n---\n\n**Current date/time**: ${pacific} (Pacific Time)`;
+    // preserves the static prefix for prompt caching. Single definition
+    // shared with Lane B (KPR-349 §D1: the two lanes cannot drift).
+    return `${prefix}${SECTION_JOINER}${formatDateTimeTrailer()}`;
   }
 
 
@@ -819,10 +841,18 @@ export class AgentRunner {
       for (const [name, serverDef] of Object.entries(plugin.manifest.mcpServers)) {
         const isGooglePlugin = AgentRunner.isGooglePluginServer(plugin, name);
         if (isGooglePlugin && gogAccounts.length === 0) {
-          log.debug("Google plugin has no accounts for agent, skipping", {
+          // KPR-373: when the agent explicitly lists this server, skipping it
+          // makes the tool (or its delegate sub-agent) silently vanish — the
+          // agent then reports "no google tool" with nothing in the logs.
+          // Warn in that case; stay at debug for agents that never asked.
+          const referencesServer =
+            this.agentConfig.coreServers.includes(name) || this.agentConfig.delegateServers.includes(name);
+          const skipLog = referencesServer ? log.warn : log.debug;
+          skipLog("Google plugin has no accounts for agent, skipping", {
             plugin: plugin.name,
             server: name,
             agent: this.agentConfig.id,
+            referencedBy: referencesServer ? "agent definition (coreServers/delegateServers)" : "none",
           });
           continue;
         }
@@ -905,7 +935,19 @@ export class AgentRunner {
 
         for (const envVar of serverDef.secretEnv ?? []) {
           const value = process.env[envVar] || fromKeychain(config.instance.id, envVar);
-          if (value) env[envVar] = value;
+          if (value) {
+            env[envVar] = value;
+          } else {
+            // KPR-373: a declared secret that resolves empty means the server
+            // spawns without its credential and fails downstream with a
+            // confusing tool-level error. Make the gap visible at the source.
+            log.warn("Declared secret-env var resolved empty at spawn — server will run without it", {
+              plugin: plugin.name,
+              server: name,
+              agent: this.agentConfig.id,
+              envVar,
+            });
+          }
         }
 
         // env-map: rename base env vars (e.g. DODI_OPS_API_URL -> TASK_LEDGER_API_URL)
@@ -1205,12 +1247,12 @@ export class AgentRunner {
     return "stdio";
   }
 
-  buildToolTransportInventory(context?: WorkItemContext): HiveToolTransportDescriptor[] {
+  buildToolTransportInventory(context?: WorkItemContext): HiveToolInventoryEntry[] {
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
     const autoInjectedServers = AgentRunner.autoInjectedServerNames();
     const pluginServerNames = this.pluginServerNames();
-    const inventory: HiveToolTransportDescriptor[] = [];
+    const inventory: HiveToolInventoryEntry[] = [];
 
     for (const [name, serverConfig] of Object.entries(mcpServers)) {
       const inProcess = !!this.db && IN_PROCESS_PORTED_SERVERS.has(name) && this.shouldEnableInProcessServer(name);
@@ -1220,14 +1262,23 @@ export class AgentRunner {
           ? "plugin"
           : "core";
 
-      inventory.push(classifyToolTransport({
+      const descriptor = classifyToolTransport({
         name,
         transport: inProcess ? "sdk-in-process" : AgentRunner.transportKindForServerConfig(serverConfig),
         source,
         requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has(name),
         requiresHiveRuntime: inProcess,
         inProcess,
-      }));
+      });
+      // KPR-347 (§D1.2): schemas materialize at bridge time — both discovery
+      // mechanics declare connect-time. serverConfig rides ONLY on external
+      // MCP entries; an in-process entry's stdio placeholder is wrong by
+      // construction (send() overrides it with the factory).
+      inventory.push(
+        inProcess
+          ? { ...descriptor, schemas: { kind: "connect-time" } }
+          : { ...descriptor, schemas: { kind: "connect-time" }, serverConfig },
+      );
     }
 
     // KPR-327: "memory" has no stdio placeholder in buildAllServerConfigs
@@ -1235,44 +1286,316 @@ export class AgentRunner {
     // map — surface its in-process descriptor explicitly, mirroring the
     // runtime wiring in send().
     if (!!this.db && this.shouldEnableInProcessServer("memory") && !mcpServers["memory"]) {
-      inventory.push(classifyToolTransport({
-        name: "memory",
-        transport: "sdk-in-process",
-        source: "core",
-        requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("memory"),
-        requiresHiveRuntime: true,
-        inProcess: true,
-      }));
+      inventory.push({
+        ...classifyToolTransport({
+          name: "memory",
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("memory"),
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
     }
 
     if (this.teamRoster) {
-      inventory.push(classifyToolTransport({
-        name: "team-roster",
-        transport: "sdk-in-process",
-        source: "engine",
-        requiresTurnContext: false,
-        requiresHiveRuntime: true,
-        inProcess: true,
-      }));
+      inventory.push({
+        ...classifyToolTransport({
+          name: "team-roster",
+          transport: "sdk-in-process",
+          source: "engine",
+          requiresTurnContext: false,
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
     }
 
     for (const name of this.activeDelegateNames(allServerConfigs)) {
-      inventory.push(classifyToolTransport({
-        name,
-        transport: "claude-subagent",
-        source: "delegate",
-      }));
+      inventory.push({
+        ...classifyToolTransport({
+          name,
+          transport: "claude-subagent",
+          source: "delegate",
+        }),
+        schemas: { kind: "unavailable" },
+        // KPR-354 (§D2): Task-synthesis carriage. serverConfig is safe by
+        // construction — KPR-184 bars in-process servers from delegateServers
+        // and activeDelegateNames drops config-less names, so every surviving
+        // delegate is a real stdio/http/sse config. Secrecy rule unchanged:
+        // bridge-facing, never model-facing, never logged. description is the
+        // same catalog text the Claude lane feeds AgentDefinition.description.
+        serverConfig: allServerConfigs[name],
+        description: this.getServerCatalogEntry(name).description,
+      });
     }
 
     for (const name of CLAUDE_SDK_BUILTIN_TOOL_NAMES) {
-      inventory.push(classifyToolTransport({
-        name,
-        transport: "claude-builtin",
-        source: "sdk-builtin",
-      }));
+      // KPR-348 (canon 1): the six executor-backed builtins are the fleet's
+      // only {kind:"static"} schema producer; the rest stay unavailable
+      // (WebFetch/WebSearch/NotebookEdit/TodoWrite claude-only by ruling;
+      // Task is synthesized separately by the bridge — KPR-354).
+      const staticDef = EXECUTOR_BACKED_BUILTIN_NAMES.has(name)
+        ? BUILTIN_TOOL_DEFINITIONS.find((d) => d.name === name)
+        : undefined;
+      inventory.push({
+        ...classifyToolTransport({
+          name,
+          transport: "claude-builtin",
+          source: "sdk-builtin",
+        }),
+        schemas: staticDef ? { kind: "static", tools: [staticDef] } : { kind: "unavailable" },
+      });
     }
 
     return inventory;
+  }
+
+  /**
+   * KPR-348 (spec §D4): build the in-process SDK MCP servers for one turn —
+   * extracted VERBATIM from send() so the Lane B assembly can carry the same
+   * instances (same handlers, same *ContextRef closures) to the tool bridge.
+   * Behavior-preserving on the Claude lane: send() calls this and merges the
+   * result exactly where the inline block used to assign. Per-runner
+   * instance caching, shouldEnableInProcessServer gating, workflow flag,
+   * context-ref refreshes, and prefix-cache invalidation closures all
+   * unchanged.
+   */
+  buildInProcessServers(context?: WorkItemContext): Record<string, McpSdkServerConfigWithInstance> {
+    const servers: Record<string, McpSdkServerConfigWithInstance> = {};
+    // team-roster is the codebase's first in-process MCP server (createSdkMcpServer
+    // from the SDK). Unlike stdio entries, it isn't a process spawn — it's a
+    // long-lived object holding tool handlers that close over the shared
+    // teamRoster cache. Built once per AgentRunner and reused across send()
+    // invocations to avoid per-message allocation.
+    if (this.teamRoster) {
+      if (!this.teamRosterMcpServer) {
+        this.teamRosterMcpServer = createTeamRosterMcpServer(this.teamRoster);
+      }
+      servers["team-roster"] = this.teamRosterMcpServer;
+    }
+
+    // KPR-122/KPR-327: memory MCP — in-process. This is the ONLY wiring for the
+    // memory server post-KPR-327: buildAllServerConfigs no longer holds a stdio
+    // placeholder for it (KPR-183 removed the shim in memory-mcp-server.ts; the
+    // native-contract cutover dropped the placeholder key entirely). We register
+    // the in-process SDK server when (a) the runner has a shared `db` (runtime
+    // path; tests without `db` skip) and (b) the agent's coreServers includes
+    // "memory". The cached SDK server is safe to reuse across turns: the
+    // resolved scope list depends only on constructor-time agent + archetype
+    // config.
+    if (this.db && this.shouldEnableInProcessServer("memory")) {
+      if (!this.memoryMcpServer) {
+        this.memoryMcpServer = createMemoryMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          memoryScopes: this.resolveMemoryScopes(),
+          // KPR-213: write-through prefix cache invalidation. Path-aware:
+          // agents/<id>/... invalidates that agent; shared/* invalidates
+          // everyone; status/* is operational telemetry and does not affect prompts.
+          onWrite: this.prefixCache
+            ? (path, reason) => invalidatePrefixCacheByMemoryPath(this.prefixCache!, path, reason)
+            : undefined,
+        });
+      }
+      servers["memory"] = this.memoryMcpServer;
+    }
+
+    // KPR-122: event-bus MCP — in-process. Subscriber map is constructor-time
+    // stable on the runner so the cached server is safe to reuse across turns.
+    if (this.db && this.shouldEnableInProcessServer("event-bus")) {
+      if (!this.eventBusMcpServer) {
+        this.eventBusMcpServer = createEventBusMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          eventSubscribersJson: this.eventSubscribersJson,
+        });
+      }
+      servers["event-bus"] = this.eventBusMcpServer;
+    }
+
+    // KPR-122: contacts MCP — in-process. No per-turn context.
+    if (this.db && this.shouldEnableInProcessServer("contacts")) {
+      if (!this.contactsMcpServer) {
+        this.contactsMcpServer = createContactsMcpServer({ db: this.db });
+      }
+      servers["contacts"] = this.contactsMcpServer;
+    }
+
+    // KPR-122: schedule MCP — in-process. AgentId is constructor-stable.
+    if (this.db && this.shouldEnableInProcessServer("schedule")) {
+      if (!this.scheduleMcpServer) {
+        this.scheduleMcpServer = createScheduleMcpServer({ db: this.db, agentId: this.agentConfig.id });
+      }
+      servers["schedule"] = this.scheduleMcpServer;
+    }
+
+    // KPR-122: team MCP — in-process. `getAgentIds` reads the live registry on
+    // every call so a hot reload (SIGUSR1) is reflected without rebuilding the
+    // cached server.
+    if (this.db && this.shouldEnableInProcessServer("team")) {
+      if (!this.teamMcpServer) {
+        this.teamMcpServer = createTeamMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          getAgentIds: () => AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
+        });
+      }
+      servers["team"] = this.teamMcpServer;
+    }
+
+    // KPR-122: admin MCP — in-process. instanceCapabilities is plugin-derived
+    // and constructor-stable on the runner.
+    if (this.db && this.shouldEnableInProcessServer("admin")) {
+      if (!this.adminMcpServer) {
+        this.adminMcpServer = createAdminMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
+          memoryLifecycle: this.memoryLifecycle,
+        });
+      }
+      servers["admin"] = this.adminMcpServer;
+    }
+
+    // KPR-122: code-search MCP — in-process. Qdrant/Ollama URLs read from
+    // process.env at server-build time (same default values as the stdio path).
+    if (this.db && this.shouldEnableInProcessServer("code-search")) {
+      if (!this.codeSearchMcpServer) {
+        this.codeSearchMcpServer = createCodeSearchMcpServer({ db: this.db });
+      }
+      servers["code-search"] = this.codeSearchMcpServer;
+    }
+
+    // KPR-122: workflow MCP — in-process. Gated by config.workflow.enabled
+    // (mirrors `effectiveCoreServerSet` which only adds it when the feature
+    // flag is on).
+    if (this.db && config.workflow.enabled && this.shouldEnableInProcessServer("workflow")) {
+      if (!this.workflowMcpServer) {
+        this.workflowMcpServer = createWorkflowMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          eventSubscribersJson: this.eventSubscribersJson,
+        });
+      }
+      servers["workflow"] = this.workflowMcpServer;
+    }
+
+    // KPR-122: callback MCP — in-process. Per-turn source metadata flows
+    // through callbackContextRef.current, refreshed each turn so a callback
+    // scheduled mid-thread captures the right channel/thread.
+    if (this.db && this.shouldEnableInProcessServer("callback")) {
+      this.callbackContextRef.current = {
+        adapterId: context?.adapterId,
+        channelId: context?.channelId,
+        channelKind: context?.channelKind,
+        channelLabel: context?.channelLabel,
+        threadId: context?.threadId,
+        slackTs: context?.slackTs,
+        slackThreadTs: context?.slackThreadTs,
+      };
+      if (!this.callbackMcpServer) {
+        this.callbackMcpServer = createCallbackMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          context: this.callbackContextRef,
+        });
+      }
+      servers["callback"] = this.callbackMcpServer;
+    }
+
+    // KPR-122: structured-memory MCP — in-process, paired with memory.
+    // channel/thread come from the per-turn `context` (mutable ref so the
+    // cached SDK server sees the active values without rebuilding).
+    if (this.db && this.shouldEnableInProcessServer("structured-memory")) {
+      this.structuredMemoryContextRef.current = {
+        channelId: context?.channelId,
+        threadId: context?.threadId,
+      };
+      if (!this.structuredMemoryMcpServer) {
+        this.structuredMemoryMcpServer = createStructuredMemoryMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          context: this.structuredMemoryContextRef,
+          qdrantUrl: process.env.QDRANT_URL,
+          ollamaUrl: process.env.OLLAMA_URL,
+          // KPR-213: structured-memory mutations affect the agent's hot-tier
+          // and therefore its prefix. Bulk paths pass null → invalidateAll.
+          onMutate: this.prefixCache
+            ? (mutAgentId, reason) => {
+                if (mutAgentId === null) this.prefixCache!.invalidateAll(reason);
+                else this.prefixCache!.invalidateAgent(mutAgentId, reason);
+              }
+            : undefined,
+        });
+      }
+      servers["structured-memory"] = this.structuredMemoryMcpServer;
+    }
+
+    return servers;
+  }
+
+  /**
+   * KPR-348 (spec §D5-cwd): resolve the session cwd for a Lane B spawn —
+   * exactly the Claude-lane rule. Archetype sessionOptions().cwd wins (with
+   * the shared fail-loud stat check → the assembly's TurnAssemblyError try
+   * classifies it non-provider); otherwise the agent scratch dir.
+   */
+  resolveTurnCwd(context?: WorkItemContext): string {
+    let archetypeCwd: unknown;
+    const archetypeDef = this.getArchetypeDef();
+    if (archetypeDef && this.agentConfig.archetypeConfig) {
+      try {
+        archetypeCwd = archetypeDef.sessionOptions({
+          agentConfig: this.agentConfig,
+          archetypeConfig: this.agentConfig.archetypeConfig,
+          workItemContext: context,
+        }).cwd;
+      } catch (err) {
+        log.error("Archetype sessionOptions threw — ignoring", {
+          agent: this.agentConfig.id,
+          archetype: this.agentConfig.archetype,
+          error: String(err),
+        });
+      }
+    }
+    return resolveSessionCwd({ archetypeCwd, agentId: this.agentConfig.id });
+  }
+
+  /**
+   * KPR-349 (spec §D1): assemble the Lane B instruction prompt — public
+   * method following the KPR-348 precedent (buildInProcessServers /
+   * resolveTurnCwd) so the runner's private memoryManager / teamRoster /
+   * plugins / skillIndex stay private. Thin: derives the skill entries
+   * (§D6) from the SAME agent-scoped SDK plugin list the Claude lane passes
+   * to query() (buildNativeSkills), then delegates to the shared builder.
+   *
+   * toolsExecutable arrives as a plain boolean — the gating decision lives
+   * at the assembly seam (§D3). Post-KPR-352 (§D4) every Lane B provider
+   * executes tools, so the old provider allowlist dissolved and assembly
+   * passes `true` unconditionally; prefix-builder carries no per-provider
+   * branches by design and the boolean seam survives for a future
+   * non-executing provider.
+   *
+   * UNCACHED by ruling (spec §D2): never touches PrefixCache — Lane B
+   * rebuilds per spawn (per-spawn adapters, construction-time ≡ turn-time).
+   */
+  async buildProviderPrompt(opts: {
+    toolInventory: HiveToolInventoryEntry[];
+    toolsExecutable: boolean;
+  }): Promise<{ instructions: string; hotTierPrompt?: string; skillEntries: ProviderSkillIndexEntry[] }> {
+    const skillEntries = deriveProviderSkillIndex(this.buildNativeSkills());
+    const result = await buildProviderInstructions(this.agentConfig, {
+      toolInventory: opts.toolInventory,
+      skillIndex: skillEntries,
+      toolsExecutable: opts.toolsExecutable,
+      memoryManager: this.memoryManager,
+      teamRoster: this.teamRoster,
+      plugins: this.plugins,
+    });
+    return { instructions: result.instructions, hotTierPrompt: result.hotTierPrompt, skillEntries };
   }
 
   /**
@@ -1337,17 +1660,18 @@ export class AgentRunner {
       // Get description from server catalog or plugin manifest
       const description = this.getServerCatalogEntry(serverName).description;
 
-      // Use custom delegate prompt if available, otherwise generic
+      // Use custom delegate prompt if available, otherwise generic.
+      // KPR-354 (§D5.3): prompt + maxTurns constants shared with the Lane B
+      // nested assembly (turn-assembly.ts) — extraction, output-identical.
       const customPrompt = this.agentConfig.delegatePrompts?.[serverName];
-      const prompt = customPrompt
-        || `You are a tool specialist for ${serverName}. Execute the requested task using your available tools. Return results concisely. Do not add commentary or explanation beyond what was asked.`;
+      const prompt = customPrompt || buildGenericDelegatePrompt(serverName);
 
       agents[serverName] = {
         description,
         prompt,
         mcpServers: [{ [serverName]: serverConfig }], // Record form — NOT string reference
         model: "inherit",
-        maxTurns: customPrompt ? 7 : 10, // Intent-aware delegates need fewer turns
+        maxTurns: customPrompt ? DELEGATE_MAX_TURNS_CUSTOM : DELEGATE_MAX_TURNS_GENERIC,
         disallowedTools: ["Agent"], // subagents cannot spawn sub-subagents
       };
 
@@ -1522,188 +1846,25 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, modelOverride?: string, resourceLimits?: ResourceLimits, systemPromptOverride?: string): Promise<RunResult> {
-    const effectiveModel = modelOverride ?? this.agentConfig.model;
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: ReasoningEffort): Promise<RunResult> {
+    // KPR-346 (§D5): Lane A passthrough — the CLI model is the FOREIGN id;
+    // agentConfig.model keeps the prefixed string (kimi/…) so telemetry and
+    // the activity log attribute the provider via the model string untouched.
+    const passthrough = this.laneAPassthrough;
+    const effectiveModel = passthrough?.model ?? this.agentConfig.model;
 
     log.info("Sending prompt to agent", {
       agent: this.agentConfig.id,
       model: effectiveModel,
-      modelOverride: modelOverride ? true : false,
       resumeSession: sessionId ?? "new",
       promptLength: prompt.length,
       streaming: !!onStream,
+      ...(passthrough ? { passthroughProvider: passthrough.provider } : {}),
     });
 
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
-    // team-roster is the codebase's first in-process MCP server (createSdkMcpServer
-    // from the SDK). Unlike stdio entries, it isn't a process spawn — it's a
-    // long-lived object holding tool handlers that close over the shared
-    // teamRoster cache. Built once per AgentRunner and reused across send()
-    // invocations to avoid per-message allocation.
-    if (this.teamRoster) {
-      if (!this.teamRosterMcpServer) {
-        this.teamRosterMcpServer = createTeamRosterMcpServer(this.teamRoster);
-      }
-      mcpServers["team-roster"] = this.teamRosterMcpServer;
-    }
-
-    // KPR-122/KPR-327: memory MCP — in-process. This is the ONLY wiring for the
-    // memory server post-KPR-327: buildAllServerConfigs no longer holds a stdio
-    // placeholder for it (KPR-183 removed the shim in memory-mcp-server.ts; the
-    // native-contract cutover dropped the placeholder key entirely). We register
-    // the in-process SDK server when (a) the runner has a shared `db` (runtime
-    // path; tests without `db` skip) and (b) the agent's coreServers includes
-    // "memory". The cached SDK server is safe to reuse across turns: the
-    // resolved scope list depends only on constructor-time agent + archetype
-    // config.
-    if (this.db && this.shouldEnableInProcessServer("memory")) {
-      if (!this.memoryMcpServer) {
-        this.memoryMcpServer = createMemoryMcpServer({
-          db: this.db,
-          agentId: this.agentConfig.id,
-          memoryScopes: this.resolveMemoryScopes(),
-          // KPR-213: write-through prefix cache invalidation. Path-aware:
-          // agents/<id>/... invalidates that agent; shared/* invalidates
-          // everyone; status/* is operational telemetry and does not affect prompts.
-          onWrite: this.prefixCache
-            ? (path, reason) => invalidatePrefixCacheByMemoryPath(this.prefixCache!, path, reason)
-            : undefined,
-        });
-      }
-      mcpServers["memory"] = this.memoryMcpServer;
-    }
-
-    // KPR-122: event-bus MCP — in-process. Subscriber map is constructor-time
-    // stable on the runner so the cached server is safe to reuse across turns.
-    if (this.db && this.shouldEnableInProcessServer("event-bus")) {
-      if (!this.eventBusMcpServer) {
-        this.eventBusMcpServer = createEventBusMcpServer({
-          db: this.db,
-          agentId: this.agentConfig.id,
-          eventSubscribersJson: this.eventSubscribersJson,
-        });
-      }
-      mcpServers["event-bus"] = this.eventBusMcpServer;
-    }
-
-    // KPR-122: contacts MCP — in-process. No per-turn context.
-    if (this.db && this.shouldEnableInProcessServer("contacts")) {
-      if (!this.contactsMcpServer) {
-        this.contactsMcpServer = createContactsMcpServer({ db: this.db });
-      }
-      mcpServers["contacts"] = this.contactsMcpServer;
-    }
-
-    // KPR-122: schedule MCP — in-process. AgentId is constructor-stable.
-    if (this.db && this.shouldEnableInProcessServer("schedule")) {
-      if (!this.scheduleMcpServer) {
-        this.scheduleMcpServer = createScheduleMcpServer({ db: this.db, agentId: this.agentConfig.id });
-      }
-      mcpServers["schedule"] = this.scheduleMcpServer;
-    }
-
-    // KPR-122: team MCP — in-process. `getAgentIds` reads the live registry on
-    // every call so a hot reload (SIGUSR1) is reflected without rebuilding the
-    // cached server.
-    if (this.db && this.shouldEnableInProcessServer("team")) {
-      if (!this.teamMcpServer) {
-        this.teamMcpServer = createTeamMcpServer({
-          db: this.db,
-          agentId: this.agentConfig.id,
-          getAgentIds: () => AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
-        });
-      }
-      mcpServers["team"] = this.teamMcpServer;
-    }
-
-    // KPR-122: admin MCP — in-process. instanceCapabilities is plugin-derived
-    // and constructor-stable on the runner.
-    if (this.db && this.shouldEnableInProcessServer("admin")) {
-      if (!this.adminMcpServer) {
-        this.adminMcpServer = createAdminMcpServer({
-          db: this.db,
-          agentId: this.agentConfig.id,
-          instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
-          memoryLifecycle: this.memoryLifecycle,
-        });
-      }
-      mcpServers["admin"] = this.adminMcpServer;
-    }
-
-    // KPR-122: code-search MCP — in-process. Qdrant/Ollama URLs read from
-    // process.env at server-build time (same default values as the stdio path).
-    if (this.db && this.shouldEnableInProcessServer("code-search")) {
-      if (!this.codeSearchMcpServer) {
-        this.codeSearchMcpServer = createCodeSearchMcpServer({ db: this.db });
-      }
-      mcpServers["code-search"] = this.codeSearchMcpServer;
-    }
-
-    // KPR-122: workflow MCP — in-process. Gated by config.workflow.enabled
-    // (mirrors `effectiveCoreServerSet` which only adds it when the feature
-    // flag is on).
-    if (this.db && config.workflow.enabled && this.shouldEnableInProcessServer("workflow")) {
-      if (!this.workflowMcpServer) {
-        this.workflowMcpServer = createWorkflowMcpServer({
-          db: this.db,
-          agentId: this.agentConfig.id,
-          eventSubscribersJson: this.eventSubscribersJson,
-        });
-      }
-      mcpServers["workflow"] = this.workflowMcpServer;
-    }
-
-    // KPR-122: callback MCP — in-process. Per-turn source metadata flows
-    // through callbackContextRef.current, refreshed each turn so a callback
-    // scheduled mid-thread captures the right channel/thread.
-    if (this.db && this.shouldEnableInProcessServer("callback")) {
-      this.callbackContextRef.current = {
-        adapterId: context?.adapterId,
-        channelId: context?.channelId,
-        channelKind: context?.channelKind,
-        channelLabel: context?.channelLabel,
-        threadId: context?.threadId,
-        slackTs: context?.slackTs,
-        slackThreadTs: context?.slackThreadTs,
-      };
-      if (!this.callbackMcpServer) {
-        this.callbackMcpServer = createCallbackMcpServer({
-          db: this.db,
-          agentId: this.agentConfig.id,
-          context: this.callbackContextRef,
-        });
-      }
-      mcpServers["callback"] = this.callbackMcpServer;
-    }
-
-    // KPR-122: structured-memory MCP — in-process, paired with memory.
-    // channel/thread come from the per-turn `context` (mutable ref so the
-    // cached SDK server sees the active values without rebuilding).
-    if (this.db && this.shouldEnableInProcessServer("structured-memory")) {
-      this.structuredMemoryContextRef.current = {
-        channelId: context?.channelId,
-        threadId: context?.threadId,
-      };
-      if (!this.structuredMemoryMcpServer) {
-        this.structuredMemoryMcpServer = createStructuredMemoryMcpServer({
-          db: this.db,
-          agentId: this.agentConfig.id,
-          context: this.structuredMemoryContextRef,
-          qdrantUrl: process.env.QDRANT_URL,
-          ollamaUrl: process.env.OLLAMA_URL,
-          // KPR-213: structured-memory mutations affect the agent's hot-tier
-          // and therefore its prefix. Bulk paths pass null → invalidateAll.
-          onMutate: this.prefixCache
-            ? (mutAgentId, reason) => {
-                if (mutAgentId === null) this.prefixCache!.invalidateAll(reason);
-                else this.prefixCache!.invalidateAgent(mutAgentId, reason);
-              }
-            : undefined,
-        });
-      }
-      mcpServers["structured-memory"] = this.structuredMemoryMcpServer;
-    }
+    Object.assign(mcpServers, this.buildInProcessServers(context));
 
     const serverSubAgents = this.buildServerSubAgents(allServerConfigs);
     // KPR-219: voice (and any future channel) can supply a fully-built system
@@ -1743,49 +1904,41 @@ export class AgentRunner {
     // Resolve the session cwd. Archetype-provided wins; otherwise every agent
     // gets a per-agent scratch dir so Bash/Write with relative paths lands in
     // the agent's namespace instead of HIVE_HOME. See KPR-51 design spec.
-    const cwdSource: "archetype" | "default" =
-      typeof archetypeExtra.cwd === "string" ? "archetype" : "default";
-    const effectiveCwd =
-      cwdSource === "archetype"
-        ? (archetypeExtra.cwd as string)
-        : agentScratchDir(this.agentConfig.id, hiveHome);
-
-    if (cwdSource === "default") {
-      // Lazy create — fail loud on mkdir errors (permissions, read-only fs).
-      mkdirSync(effectiveCwd, { recursive: true });
-    } else {
-      // Archetype path must already exist: Jasper's workshop is operator-configured
-      // and a missing dir there is a misconfig we want to surface at session start,
-      // not silently recreate.
-      let st: ReturnType<typeof statSync>;
-      try {
-        st = statSync(effectiveCwd);
-      } catch (err) {
-        const msg = `Archetype cwd unavailable at session start — refusing to run: ${effectiveCwd} (${String(err)})`;
-        log.error(msg, { agent: this.agentConfig.id });
-        throw new Error(msg);
-      }
-      if (!st.isDirectory()) {
-        const msg = `Archetype cwd is not a directory: ${effectiveCwd}`;
-        log.error(msg, { agent: this.agentConfig.id });
-        throw new Error(msg);
-      }
-    }
+    // KPR-348: shared with the Lane B builtin executor via resolveSessionCwd.
+    const effectiveCwd = resolveSessionCwd({
+      archetypeCwd: archetypeExtra.cwd,
+      agentId: this.agentConfig.id,
+    });
 
     // KPR-329: resolve tool-search mode for this spawn. The env value is
     // always pinned (see env block below) so hive owns the policy — the CLI's
     // implicit default is never in play.
-    const toolSearch = resolveToolSearchMode(
-      this.agentConfig.toolSearch,
-      config.toolSearch.mode,
-      config.toolSearch.source,
-    );
-    log.debug("Tool search mode resolved", {
-      agent: this.agentConfig.id,
-      mode: toolSearch.mode,
-      source: toolSearch.source,
-    });
-    warnIfToolSearchForceDisabled();
+    // KPR-346 (§D5): passthrough spawns BYPASS resolveToolSearchMode — tool
+    // search is forced off (tool_reference blocks are unsupported on vendor
+    // Anthropic-compat endpoints; same failure mode as the KPR-329 proxy
+    // note). No ToolSearchSource union change — the forced mode is logged,
+    // not sourced.
+    let toolSearchEnvValue: string;
+    if (passthrough) {
+      toolSearchEnvValue = "false";
+      log.debug("Tool search forced off for Lane A passthrough spawn", {
+        agent: this.agentConfig.id,
+        provider: passthrough.provider,
+      });
+    } else {
+      const toolSearch = resolveToolSearchMode(
+        this.agentConfig.toolSearch,
+        config.toolSearch.mode,
+        config.toolSearch.source,
+      );
+      log.debug("Tool search mode resolved", {
+        agent: this.agentConfig.id,
+        mode: toolSearch.mode,
+        source: toolSearch.source,
+      });
+      warnIfToolSearchForceDisabled();
+      toolSearchEnvValue = toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto";
+    }
 
     const q = query({
       prompt,
@@ -1797,6 +1950,15 @@ export class AgentRunner {
 
         maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
         maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
+        // KPR-312: per-turn reasoning effort from the complexity classifier.
+        // ReasoningEffort and the SDK's EffortLevel overlap but neither is a
+        // superset (ReasoningEffort has minimal/none/xhigh; EffortLevel has
+        // max) — only the shared {low, medium, high} subset is deliverable
+        // (routeModel emits nothing else; the narrowing also satisfies the
+        // SDK's EffortLevel type). Deliberately NO `thinking` key: toggling
+        // thinking config turn-to-turn invalidates the messages-tier prompt
+        // cache — the exact cost class KPR-312 avoids.
+        ...(effort === "low" || effort === "medium" || effort === "high" ? { effort } : {}),
         // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
         // may return arbitrary SDK options, but we explicitly pick only the safe ones
         // so a rogue archetype can't override security invariants (permissionMode,
@@ -1819,8 +1981,10 @@ export class AgentRunner {
           CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
           CLAUDECODE: undefined,
           // KPR-329: always pinned — overrides any ambient ENABLE_TOOL_SEARCH.
-          ENABLE_TOOL_SEARCH:
-            toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto",
+          ENABLE_TOOL_SEARCH: toolSearchEnvValue,
+          // KPR-346 (§D5): Lane A pins — base URL, vendor token, foreign-model
+          // pins (incl. subagents), ANTHROPIC_API_KEY scrub, tool search off.
+          ...(passthrough ? buildPassthroughEnv(passthrough) : {}),
         },
         // Pass --strict-mcp-config to the spawned claude CLI so it ignores all
         // MCP sources except the engine-supplied `mcpServers` above (which the
@@ -1989,7 +2153,17 @@ export class AgentRunner {
           }
 
           if (result.subtype === "success") {
-            resultText = result.result || resultText;
+            if (result.is_error === true) {
+              // KPR-312 (KPR-310 M8): the SDK can emit subtype "success" with
+              // is_error: true and the error text in `result` (observed for a
+              // rejected model id). Adopting that text as the reply mis-reads
+              // the turn — classify it as an error. In M8 a subsequent SDK
+              // throw rescued the turn anyway; this guard keeps classification
+              // correct even if a future SDK version stops throwing.
+              error = result.result || "unknown error (is_error result)";
+            } else {
+              resultText = result.result || resultText;
+            }
           } else {
             error = result.subtype;
             if ("errors" in result && Array.isArray(result.errors)) {
@@ -2047,7 +2221,15 @@ export class AgentRunner {
     const totalToolMs = toolCalls.reduce((sum, tc) => sum + ((tc.endMs ?? Date.now()) - tc.startMs), 0);
     const llmMs = durationMs - totalToolMs;
 
-    log.info("Agent response complete", {
+    // A deadline fire or an abort() unwinds the iterator by CLOSING it, not by
+    // throwing — so `error` stays undefined and the old `hasError: !!error`
+    // reported a killed run as clean. Every error-log-based health check was
+    // therefore blind to exactly the failures it existed to catch: a run that
+    // burned its whole timeout on tool calls and emitted nothing still looked
+    // identical to a successful one. `hasError` now means "this run did not
+    // complete", which is the question a health check is actually asking.
+    const failed = !!error || timedOut || this._aborted;
+    const completion = {
       agent: this.agentConfig.id,
       sessionId: resultSessionId,
       costUsd,
@@ -2066,8 +2248,28 @@ export class AgentRunner {
       compactions,
       preCompactTokens,
       streamed,
-      hasError: !!error,
-    });
+      hasError: failed,
+      // Surfaced so a consumer can tell WHY a run failed without correlating
+      // back to the separate "Agent query timed out" warn line.
+      aborted: this._aborted,
+      ...(timedOut ? { timedOut: true } : {}),
+      ...(error ? { error } : {}),
+      // "Did this run actually ship anything?" — previously only inferable by
+      // reading outputTokens off the final record.
+      producedOutput: resultText.length > 0,
+    };
+
+    // Only `error` level reaches stderr (and therefore hive.err). A timeout is
+    // a fault and belongs there. An operator abort is intentional, so it stays
+    // a warn — but it still carries hasError, so it can't masquerade as a
+    // clean run to anything reading the record rather than the log level.
+    if (error || timedOut) {
+      log.error("Agent response complete", completion);
+    } else if (this._aborted) {
+      log.warn("Agent response complete", completion);
+    } else {
+      log.info("Agent response complete", completion);
+    }
 
     return {
       text: resultText, sessionId: resultSessionId, costUsd, durationMs,

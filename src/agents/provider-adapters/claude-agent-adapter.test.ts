@@ -28,9 +28,9 @@ describe("ClaudeAgentAdapter", () => {
         sessionId: "s0",
         onStream,
         workItemContext,
-        modelOverride: "claude-haiku-4-5",
         resourceLimits,
         systemPromptOverride: "voice prompt",
+        effort: "low",
       }),
     ).resolves.toBe(result);
 
@@ -39,9 +39,9 @@ describe("ClaudeAgentAdapter", () => {
       "s0",
       onStream,
       workItemContext,
-      "claude-haiku-4-5",
       resourceLimits,
       "voice prompt",
+      "low",
     );
   });
 

@@ -14,6 +14,8 @@ import { createLogger } from "../logging/logger.js";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { join, extname } from "node:path";
 import { tmpdir } from "node:os";
+import type { LLMTaskRequest, LLMResult } from "../llm/types.js";
+import { LLMProviderUnavailableError } from "../llm/errors.js";
 
 const log = createLogger("file-processor");
 const DOWNLOAD_DIR = join(tmpdir(), "hive-slack-files");
@@ -42,53 +44,58 @@ export interface ProcessedFile {
 
 export const IMAGE_TYPES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic"]);
 
-let geminiApiKey = "";
-const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
+const IMAGE_DESCRIPTION_PROMPT =
+  "Describe this image in detail. If it contains text, extract all of it. If it's a diagram, architecture drawing, or technical image, describe all labels, relationships, and structure. If it's a screenshot of messages or a conversation, transcribe everything. Be thorough.";
 
-/** Set the Gemini API key for image processing */
-export function setGeminiApiKey(key: string): void {
-  geminiApiKey = key;
+/** KPR-314: generous single-image bound (was: none on the raw fetch). */
+const VISION_TIMEOUT_MS = 30_000;
+
+/**
+ * KPR-314 (PR #194's injection shape): the registry is injected rather than
+ * imported — keeps this module unit-testable and import-cycle-free. The
+ * vision task's model/provider knowledge lives in the registry catalog;
+ * this module no longer knows Gemini exists.
+ */
+interface VisionLlmClient {
+  generateForTask(task: "vision", request: LLMTaskRequest): Promise<LLMResult>;
 }
 
-export async function describeImageWithGemini(buffer: Buffer, mimetype: string): Promise<string | null> {
-  if (!geminiApiKey) return null;
+let visionLlmClient: VisionLlmClient | undefined;
+
+export function setVisionLlmClient(client: VisionLlmClient): void {
+  visionLlmClient = client;
+}
+
+/** Test-only seam. */
+export function resetVisionLlmClientForTests(): void {
+  visionLlmClient = undefined;
+}
+
+export async function describeImage(buffer: Buffer, mimetype: string): Promise<string | null> {
+  if (!visionLlmClient) return null;
 
   try {
-    const base64 = buffer.toString("base64");
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { inline_data: { mime_type: mimetype, data: base64 } },
-                {
-                  text: "Describe this image in detail. If it contains text, extract all of it. If it's a diagram, architecture drawing, or technical image, describe all labels, relationships, and structure. If it's a screenshot of messages or a conversation, transcribe everything. Be thorough.",
-                },
-              ],
-            },
-          ],
-        }),
-      },
-    );
-
-    if (!res.ok) {
-      const err = await res.text();
-      log.warn("Gemini vision error", { status: res.status, error: err.slice(0, 200) });
-      return null;
-    }
-
-    const data = (await res.json()) as any;
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (text) {
-      log.info("Image described via Gemini", { model: GEMINI_MODEL, chars: text.length });
-    }
-    return text || null;
-  } catch (e: any) {
-    log.warn("Gemini vision failed", { error: e.message });
+    const result = await visionLlmClient.generateForTask("vision", {
+      prompt: IMAGE_DESCRIPTION_PROMPT,
+      images: [{ mimeType: mimetype, dataBase64: buffer.toString("base64") }],
+      maxOutputTokens: 2048,
+      temperature: 0,
+      timeoutMs: VISION_TIMEOUT_MS,
+    });
+    if (!result.text) return null;
+    log.info("Image described", {
+      provider: result.provider,
+      model: result.model,
+      chars: result.text.length,
+    });
+    return result.text;
+  } catch (e: unknown) {
+    // Missing GEMINI_API_KEY ⇒ silent null — byte-identical to today's
+    // key-less behavior (steady state ≠ incident). Everything else
+    // (timeout / 429 / 5xx / capability misbinding) warns and degrades to
+    // the metadata-only entry callers already handle.
+    if (e instanceof LLMProviderUnavailableError) return null;
+    log.warn("Image description failed", { error: e instanceof Error ? e.message : String(e) });
     return null;
   }
 }
@@ -118,6 +125,29 @@ export async function extractContent(
   mimetype: string,
 ): Promise<{ textContent: string | null; isImage: false } | null> {
   const ext = extname(filename).slice(1).toLowerCase();
+
+  // HTML — strip tags to get readable plain text (Slack posts / rich-text snippets)
+  if (ext === "html" || mimetype === "text/html") {
+    const raw = buffer.toString("utf-8");
+    const plain = raw
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<\/div>/gi, "\n")
+      .replace(/<\/li>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, " ")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return { textContent: truncate(plain), isImage: false };
+  }
 
   // Text-based files
   if (TEXT_TYPES.has(ext) || mimetype.startsWith("text/")) {
@@ -224,7 +254,7 @@ export async function downloadAndProcess(file: SlackFile, botToken: string): Pro
 
     // Images — describe via Gemini vision, fall back to metadata only
     if (isImage) {
-      const description = await describeImageWithGemini(buffer, file.mimetype);
+      const description = await describeImage(buffer, file.mimetype);
       return {
         name: file.name,
         mimetype: file.mimetype,
@@ -256,7 +286,7 @@ export async function processImageBuffer(buffer: Buffer, filename: string, mimet
   const localPath = join(DOWNLOAD_DIR, `ws-${Date.now()}-${safeName}`);
   writeFileSync(localPath, buffer);
 
-  const description = await describeImageWithGemini(buffer, mimetype);
+  const description = await describeImage(buffer, mimetype);
   return {
     name: filename,
     mimetype,

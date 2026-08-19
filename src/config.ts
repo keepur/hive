@@ -277,6 +277,16 @@ export const config = {
   codex: {
     agentModel: optional("CODEX_AGENT_MODEL", "gpt-5.4-mini"),
   },
+  kimi: {
+    /** KPR-346: Lane A passthrough default-model override (non-secret).
+     *  The secret KIMI_API_KEY deliberately has NO boot-time entry — it
+     *  resolves per spawn (env → Keychain) in resolvePassthroughSpawn. */
+    agentModel: optional("KIMI_AGENT_MODEL", ""),
+  },
+  deepseek: {
+    /** KPR-346: as kimi above; DEEPSEEK_API_KEY resolves per spawn. */
+    agentModel: optional("DEEPSEEK_AGENT_MODEL", ""),
+  },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),
     teamId: optional("LINEAR_TEAM_ID", ""),
@@ -384,7 +394,7 @@ export const config = {
     port: parseInt(optional("CODE_TASK_PORT", String(ports.codeTask ?? portBase + 2)), 10),
     authToken: optional("CODE_TASK_AUTH_TOKEN", "") || randomUUID(),
     pluginDirs: discoverPluginDirs((hive.codeTask as Record<string, unknown>)?.pluginDirs as string[] | undefined),
-    defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-4-6"),
+    defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-5"),
     defaultMaxTurns: parseInt(optional("CODE_TASK_MAX_TURNS", "100"), 10),
     defaultMaxBudget: parseFloat(optional("CODE_TASK_MAX_BUDGET", "5.00")),
     maxConcurrent: parseInt(optional("CODE_TASK_MAX_CONCURRENT", "2"), 10),
@@ -423,7 +433,9 @@ export const config = {
   modelRouter: {
     enabled: optional("MODEL_ROUTER_ENABLED", "true") === "true",
     model: optional("MODEL_ROUTER_MODEL", "claude-haiku-4-5-20251001"),
-    timeoutMs: parseInt(optional("MODEL_ROUTER_TIMEOUT_MS", "8000"), 10),
+    // KPR-312: 8000 → 4000 — the CLI-startup headroom is gone; a direct haiku
+    // call at p50 ~0.5s doesn't need 8s before falling back.
+    timeoutMs: parseInt(optional("MODEL_ROUTER_TIMEOUT_MS", "4000"), 10),
   },
   // KPR-306: provider circuit breaker (hive.yaml `circuitBreaker`, all keys
   // optional; enabled:false = shadow mode — observe + telemetry, never fast-fail).

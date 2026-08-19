@@ -11,8 +11,9 @@
  */
 
 import { createLogger } from "./logging/logger.js";
+import { describeError } from "./logging/describe-error.js";
 import { getLoopbackDispatcher } from "./http/loopback-dispatcher.js";
-import type { Dispatcher } from "undici";
+import { fetch as undiciFetch, type Dispatcher } from "undici";
 
 const log = createLogger("beekeeper-client");
 
@@ -56,17 +57,16 @@ export function startBeekeeperRegistration(opts: BeekeeperRegistrationOptions): 
 
   const register = async (): Promise<void> => {
     try {
-      // The global `RequestInit` resolves to the DOM lib variant in this
-      // project (a transitive dep pulls in lib.dom), which lacks undici's
-      // `dispatcher` field. Pass it via a typed intersection rather than
-      // weakening to `any` — the runtime fetch is undici's and honors it.
-      const init: RequestInit & { dispatcher: Dispatcher } = {
+      // undici's own fetch pairs with our undici Agent at the same major —
+      // per-request dispatchers have no cross-major compat with the runtime's
+      // built-in fetch (KPR-344), and undici's RequestInit natively carries
+      // `dispatcher` (retires the KPR-252 typed-intersection workaround).
+      const res = await undiciFetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
         dispatcher,
-      };
-      const res = await fetch(url, init);
+      });
       if (res.ok) {
         log.debug("Registered with beekeeper", { beekeeperPort, wsPort });
       } else {
@@ -74,7 +74,7 @@ export function startBeekeeperRegistration(opts: BeekeeperRegistrationOptions): 
         log.warn("Beekeeper registration failed", { status: res.status, body: text });
       }
     } catch (err) {
-      log.warn("Beekeeper registration error", { error: String(err) });
+      log.warn("Beekeeper registration error", { error: describeError(err) });
     }
   };
 

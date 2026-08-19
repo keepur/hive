@@ -32,6 +32,8 @@ import {
   slackAuthOk,
   spawnCoordinatorStatsForDoctor,
   memoryLifecycleStatsForDoctor,
+  modelRouterModeLine,
+  llmSidecarLine,
 } from "./doctor-checks.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -497,11 +499,17 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
   const checks: Check[] = [
     // ── Prereqs (preserved from existing doctor) ─────────────────────────
     {
-      name: "Node.js >= 22",
+      name: "Node.js >= 22.19",
       group: "prereq",
       required: true,
-      test: () => parseInt(process.versions.node.split(".")[0]) >= 22,
-      remedy: "Install Node 22+: brew install node@22 && brew link --overwrite node@22",
+      // Floor is 22.19.0, not just major 22: undici 8 (a transitive dep) requires
+      // >=22.19.0, and package.json `engines` was bumped to match. Compare
+      // major.minor so 22.0–22.18 correctly fails here instead of slipping through.
+      test: () => {
+        const [major, minor] = process.versions.node.split(".").map((n) => parseInt(n, 10));
+        return major > 22 || (major === 22 && minor >= 19);
+      },
+      remedy: "Install Node >= 22.19 (undici 8 floor): brew install node@22 && brew link --overwrite node@22",
     },
     {
       name: "Homebrew",
@@ -710,6 +718,13 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // KPR-241: memory lifecycle per-agent stats.
     const memoryRows = await memoryLifecycleStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderMemoryLifecycleSection(memoryRows, console.log, config.memory.spendWarnThresholdUsd ?? 5);
+    // KPR-312: model-router classifier mode — informational only, never
+    // contributes to allPassed. ANTHROPIC_API_KEY resolves env→Keychain via
+    // config.ts optional(); presence ⇔ LLM classification path.
+    console.log(`\n${modelRouterModeLine(Boolean(config.anthropic.apiKey))}`);
+    // KPR-314: sidecar LLM registry presence — informational only, never
+    // touches allPassed. Both keys resolve env→Keychain via config optional().
+    console.log(`\n${llmSidecarLine(Boolean(config.anthropic.apiKey), Boolean(config.gemini.apiKey))}`);
   } else {
     console.log("\nDatastore identity");
     console.log("  ○ skipped: config not loaded");
@@ -724,6 +739,8 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     console.log("\nOutage queue (honest outage behavior)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nMemory lifecycle: skipped (config not loaded)");
+    console.log("\nmodel router: skipped (config not loaded)");
+    console.log("\nllm sidecar: skipped (config not loaded)");
   }
 
   if (!allPassed) {

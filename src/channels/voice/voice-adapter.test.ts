@@ -63,6 +63,7 @@ interface AgentManagerStub {
   spawnTurn: ReturnType<typeof vi.fn>;
   sessionStoreGet: ReturnType<typeof vi.fn>;
   sessionStoreSet: ReturnType<typeof vi.fn>;
+  providerFor: ReturnType<typeof vi.fn>;
   calls: Array<{ ctx: TurnContext; onStream?: (chunk: string) => void }>;
 }
 
@@ -70,6 +71,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
   const calls: AgentManagerStub["calls"] = [];
   const sessionStoreGet = vi.fn().mockResolvedValue(undefined as string | undefined);
   const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
+  const providerFor = vi.fn().mockReturnValue("claude");
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
     calls.push({ ctx, onStream });
@@ -91,7 +93,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
     } satisfies TurnResult;
   });
 
-  return { spawnTurn, sessionStoreGet, sessionStoreSet, calls };
+  return { spawnTurn, sessionStoreGet, sessionStoreSet, providerFor, calls };
 }
 
 function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: ReturnType<typeof vi.fn> }) {
@@ -111,6 +113,7 @@ function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: 
           get: am.sessionStoreGet,
           set: am.sessionStoreSet,
         }),
+        providerFor: am.providerFor,
       }
     : undefined;
   return new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager, dispatcher as any);
@@ -283,7 +286,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
   it("uses extractLatestUserMessage prompt + resume id when session-store has a sessionId", async () => {
     const am = makeAgentManager();
-    am.sessionStoreGet.mockResolvedValueOnce("resume-sid-xyz");
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "resume-sid-xyz", provider: "claude" });
     const adapter = makeVoiceAdapter(am);
     const res = new MockServerResponse();
     const req = makeRequest({
@@ -387,7 +390,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
   it("outer retry: when first spawnTurn errors with sessionId set and no bytes sent, retries with full transcript and stripped sessionId", async () => {
     const am = makeAgentManager();
-    am.sessionStoreGet.mockResolvedValueOnce("stale-sid");
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "stale-sid", provider: "claude" });
     // First call errors (in errors[]), second succeeds.
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
@@ -430,7 +433,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
   it("outer retry double-failure: stale sessionId is not pre-emptively cleared; next call resumes against it cleanly", async () => {
     const am = makeAgentManager();
-    am.sessionStoreGet.mockResolvedValue("persistent-stale-sid");
+    am.sessionStoreGet.mockResolvedValue({ sessionId: "persistent-stale-sid", provider: "claude" });
 
     const failingTurn = async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
@@ -513,6 +516,78 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     const body = JSON.parse(res.written.join(""));
     expect(body.error).toBe("Voice unavailable");
   });
+
+  it("KPR-313: provider mismatch at the read ⇒ no resume, no tag, FULL-transcript prompt (voice's native handoff), no annotation", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "resp_openai_123", provider: "openai" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "first user line" },
+        { role: "assistant", content: "first agent line" },
+        { role: "user", content: "latest user line" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    const ctx = am.calls[0]!.ctx;
+    expect(ctx.sessionId).toBeUndefined(); // mismatched handle never attempted
+    expect(ctx.sessionProvider).toBeUndefined(); // spawnTurn guard has nothing to trip on
+    // FULL transcript, not latest-message-only — pre-313 the doomed resume
+    // failed HARD and the outer retry re-sent the transcript; a naive
+    // guard-strip downstream would have silently sent only the last line.
+    expect(ctx.workItem.text).toContain("Caller: first user line");
+    expect(ctx.workItem.text).toContain("You: first agent line");
+    expect(ctx.workItem.text).toContain("Caller: latest user line");
+    // Voice carve-out: annotation-free (the transcript IS the handoff).
+    expect(ctx.workItem.text).not.toContain("session continuity was reset");
+  });
+
+  it("KPR-313: codex-tagged mapping-only row (no handle) ⇒ full transcript, no resume", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: undefined, provider: "codex" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "user", content: "still here" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    const ctx = am.calls[0]!.ctx;
+    expect(ctx.sessionId).toBeUndefined();
+    expect(ctx.workItem.text).toContain("Caller: hi");
+    expect(ctx.workItem.text).toContain("Caller: still here");
+  });
+
+  it("KPR-313: matching provider keeps today's behavior — latest-message prompt, resume, tag set", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "resume-sid-match", provider: "claude" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "earlier line" },
+        { role: "user", content: "latest user line" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    const ctx = am.calls[0]!.ctx;
+    expect(ctx.sessionId).toBe("resume-sid-match");
+    expect(ctx.sessionProvider).toBe("claude");
+    expect(ctx.workItem.text).toBe("latest user line");
+    expect(am.providerFor).toHaveBeenCalledWith("mokie");
+  });
 });
 
 describe("VoiceAdapter — provider circuit open (KPR-307)", () => {
@@ -558,7 +633,7 @@ describe("VoiceAdapter — provider circuit open (KPR-307)", () => {
 
   it("does NOT fire the outer resume-retry for circuit-open fast-fails", async () => {
     const am = makeAgentManager();
-    am.sessionStoreGet.mockResolvedValue("session-abc"); // resume present
+    am.sessionStoreGet.mockResolvedValue({ sessionId: "session-abc", provider: "claude" }); // resume present
     am.spawnTurn.mockRejectedValue(circuitOpenError());
     const adapter = makeVoiceAdapter(am);
     const res = new MockServerResponse();

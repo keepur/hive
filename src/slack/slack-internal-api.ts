@@ -169,11 +169,28 @@ export class SlackInternalApi {
       return;
     }
 
-    const messages = await this.gateway.readChannel(channel, typeof limit === "number" ? limit : undefined);
+    // The tool schema advertises "channel ID or bare name", and handleSend resolves names.
+    // conversations.history only accepts IDs, so resolve here too — otherwise every
+    // name-based read fails with an opaque channel_not_found.
+    const resolvedChannelId = await this.gateway.resolveChannelId(channel);
+    if (!resolvedChannelId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: `unknown channel: ${channel}` }));
+      return;
+    }
+
+    const messages = await this.gateway.readChannel(resolvedChannelId, typeof limit === "number" ? limit : undefined);
 
     if (messages === undefined) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "failed to read channel history" }));
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: `failed to read channel history for ${channel} (${resolvedChannelId}): ${
+            this.gateway.lastReadError ?? "unknown error"
+          }`,
+        }),
+      );
       return;
     }
 

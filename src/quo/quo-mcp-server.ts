@@ -151,7 +151,7 @@ server.registerTool(
     try {
       const params: Record<string, string> = {
         phoneNumberId: resolveLine(line),
-        "participants[]": participant,
+        participants: participant,
         maxResults: String(maxResults),
       };
       if (createdAfter) params.createdAfter = createdAfter;
@@ -185,7 +185,7 @@ server.registerTool(
       const params: Record<string, string> = {
         maxResults: String(maxResults),
       };
-      if (line) params["phoneNumbers[]"] = resolveLine(line);
+      if (line) params.phoneNumbers = resolveLine(line);
       if (updatedAfter) params.updatedAfter = updatedAfter;
       const result = await api("GET", "/conversations", undefined, params);
       return { content: [{ type: "text", text: result }] };
@@ -218,7 +218,7 @@ server.registerTool(
     try {
       const params: Record<string, string> = {
         phoneNumberId: resolveLine(line),
-        "participants[]": participant,
+        participants: participant,
         maxResults: String(maxResults),
       };
       if (createdAfter) params.createdAfter = createdAfter;

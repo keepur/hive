@@ -306,6 +306,54 @@ describe("SlackInternalApi — /internal/slack/read", () => {
     expect(res.status).toBe(400);
     expect(res.body).toMatchObject({ ok: false });
   });
+
+  // --- regression: name -> ID resolution on the read path ----------------------
+  // conversations.history only accepts channel IDs. handleSend resolved names but
+  // handleRead passed the raw string straight through, so every name-based read
+  // failed with channel_not_found. The original read test only ever passed "C123",
+  // so the gap survived a release.
+  it("resolves a bare channel name to an ID before reading", async () => {
+    (gateway.resolveChannelId as ReturnType<typeof vi.fn>).mockResolvedValue("C0AK579G9DL");
+
+    const res = await post(port, "/internal/slack/read", { channel: "general", limit: 10 }, token);
+
+    expect(res.status).toBe(200);
+    expect(gateway.resolveChannelId).toHaveBeenCalledWith("general");
+    // The ID must reach the gateway — never the raw name.
+    expect(gateway.readChannel).toHaveBeenCalledWith("C0AK579G9DL", 10);
+  });
+
+  it("passes channel IDs through untouched", async () => {
+    const res = await post(port, "/internal/slack/read", { channel: "C123", limit: 5 }, token);
+
+    expect(res.status).toBe(200);
+    expect(gateway.readChannel).toHaveBeenCalledWith("C123", 5);
+  });
+
+  it("returns 400 with the channel name when it cannot be resolved", async () => {
+    (gateway.resolveChannelId as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+    const res = await post(port, "/internal/slack/read", { channel: "no-such-channel" }, token);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ ok: false, error: "unknown channel: no-such-channel" });
+    expect(gateway.readChannel).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the underlying Slack error instead of a generic message", async () => {
+    const failing = makeGateway({
+      readChannel: vi.fn().mockResolvedValue(undefined),
+      lastReadError: "An API error occurred: not_in_channel",
+    });
+    const ctx = await startApi(failing, makeAgentManager());
+
+    const res = await post(ctx.port, "/internal/slack/read", { channel: "general" }, ctx.token);
+
+    expect(res.status).toBe(500);
+    expect(String(res.body.error)).toContain("not_in_channel");
+    expect(String(res.body.error)).toContain("general");
+    await ctx.stop();
+  });
 });
 
 describe("SlackInternalApi — /internal/slack/channels", () => {

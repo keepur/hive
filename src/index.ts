@@ -33,6 +33,7 @@ import { Scheduler } from "./scheduler/scheduler.js";
 import { HealthReporter } from "./health/health-reporter.js";
 import { LinearClient } from "./linear/linear-client.js";
 import { SessionStore } from "./agents/session-store.js";
+import { TurnHistoryStore } from "./agents/turn-history-store.js";
 import { TurnTelemetryStore } from "./agents/turn-telemetry.js";
 import { Dispatcher } from "./channels/dispatcher.js";
 import { SlackAdapter } from "./channels/slack-adapter.js";
@@ -46,11 +47,12 @@ import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
 import { RetentionSweeper } from "./retention/retention-sweeper.js";
-import { setGeminiApiKey } from "./files/file-processor.js";
+import { setVisionLlmClient } from "./files/file-processor.js";
 import { MemoryStore } from "./memory/memory-store.js";
 import { MemoryEmbedder } from "./memory/memory-embedder.js";
 import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
 import { MemoryLifecycleHeartbeat } from "./memory/memory-lifecycle-heartbeat.js";
+import { getLLMRegistry } from "./llm/registry.js";
 import { AdminApi } from "./admin/admin-api.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
@@ -101,11 +103,11 @@ async function main(): Promise<void> {
   initInstanceGit(hiveHome);
   checkUpgradeNotice(hiveStateDir, skillsDir);
 
-  // Initialize Gemini vision for image processing
-  if (config.gemini.apiKey) {
-    setGeminiApiKey(config.gemini.apiKey);
-    log.info("Gemini vision enabled", { model: config.gemini.visionModel });
-  }
+  // KPR-314: image description rides the LLM registry's vision task —
+  // provider/model/key knowledge lives in the catalog, not here. Key-less
+  // instances degrade to null descriptions inside describeImage (unchanged
+  // behavior); the registry's construction log reports provider presence.
+  setVisionLlmClient(getLLMRegistry());
 
   // Shared MongoDB client — KPR-121: single pool for the whole hive process.
   // All in-process Mongo consumers (MemoryManager, MemoryStore, SessionStore,
@@ -306,6 +308,9 @@ async function main(): Promise<void> {
       coldRetentionDays: config.memory.coldRetentionDays,
       purgeRetentionDays: config.memory.purgeRetentionDays,
     },
+    // KPR-314: injected sidecar-LLM client — autoDream's runDreamQuery rides
+    // the registry's anthropic provider (no more per-call CLI subprocess).
+    getLLMRegistry(),
     config.autoDream,
     async () => new Set(registry!.listIds()),
   );
@@ -313,6 +318,10 @@ async function main(): Promise<void> {
 
   const sessionStore = new SessionStore(db);
   await sessionStore.init();
+
+  // KPR-353 (§D3): stateless-replay turn history (codex) — provider_turn_history.
+  const turnHistoryStore = new TurnHistoryStore(db);
+  await turnHistoryStore.init();
 
   const turnTelemetryStore = new TurnTelemetryStore(db);
   await turnTelemetryStore.init();
@@ -380,6 +389,7 @@ async function main(): Promise<void> {
     prefixCache,
     undefined,
     memoryLifecycle,
+    turnHistoryStore,
   );
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(

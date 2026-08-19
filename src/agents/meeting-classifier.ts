@@ -1,11 +1,6 @@
-import {
-  query,
-  type Query,
-  type SDKMessage,
-  type SDKResultMessage,
-} from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
+import { getLLMRegistry } from "../llm/registry.js";
 
 const log = createLogger("meeting-classifier");
 
@@ -22,6 +17,8 @@ export interface ClassifyResult {
   durationMs: number;
 }
 
+// KPR-314: the "Respond with ONLY a JSON object" plea is gone — structured
+// outputs enforce the shape (same evolution 312 made for the router prompt).
 const CLASSIFIER_PROMPT = `You are a meeting facilitator. Given a message and a list of meeting participants, decide which participants should respond.
 
 Rules:
@@ -30,9 +27,17 @@ Rules:
 - Fewer is better — don't trigger everyone for a question only one person can answer.
 - If the message is clearly directed at one person, return only that person.
 - If the message is a general question to the room, pick 2-3 most relevant.
-- For "what does everyone think?" style questions, include all participants.
+- For "what does everyone think?" style questions, include all participants.`;
 
-Respond with ONLY a JSON object: { "respond": ["agent-id-1", "agent-id-2"] }`;
+/** { respond: string[] } — kills the brace-scan on the happy path (spec §3.3). */
+const RESPOND_SCHEMA = {
+  type: "object",
+  properties: {
+    respond: { type: "array", items: { type: "string" } },
+  },
+  required: ["respond"],
+  additionalProperties: false,
+} as const;
 
 export function parseClassifierOutput(
   text: string,
@@ -83,6 +88,15 @@ function buildRosterContext(
   return prompt;
 }
 
+// KPR-314: no-key is a steady state, not an incident (312's distinction) —
+// warn once per process, not once per meeting message.
+let noKeyWarned = false;
+
+/** Test-only seam. */
+export function __resetMeetingClassifierStateForTests(): void {
+  noKeyWarned = false;
+}
+
 export async function classifyMeetingMessage(
   messageText: string,
   roster: RosterMember[],
@@ -99,83 +113,47 @@ export async function classifyMeetingMessage(
     return { respondAgentIds: [roster[0].agentId], costUsd: 0, durationMs: 0 };
   }
 
-  const routerModel = config.modelRouter.model;
-  let q: Query | null = null;
+  // KPR-314: no-key pre-check — all-roster directly, never a thrown-and-caught
+  // error per message (spec §3.3). Doctor + boot log carry the standing notice.
+  const registry = getLLMRegistry();
+  if (!registry.hasProvider("anthropic")) {
+    if (!noKeyWarned) {
+      noKeyWarned = true;
+      log.warn(
+        "Meeting classifier has no ANTHROPIC_API_KEY — selecting all roster members for every meeting message",
+      );
+    }
+    return { respondAgentIds: [...validIds], costUsd: 0, durationMs: 0 };
+  }
+
   let resultText = "";
+  let parsedOutput: unknown;
   let costUsd = 0;
   let durationMs = 0;
-
-  const deadline = setTimeout(() => {
-    if (q) {
-      log.warn("Meeting classifier timed out", {
-        timeoutMs: config.modelRouter.timeoutMs,
-      });
-      q.close();
-    }
-  }, config.modelRouter.timeoutMs);
 
   try {
     const userPrompt = `${buildRosterContext(roster, recentMessages)}\n\nMessage:\n${messageText}`;
 
-    q = query({
+    // KPR-314: one registry call replaces the per-message Claude Code CLI
+    // subprocess (query(), $0.01 cap, setTimeout→q.close() deadline, env
+    // surgery). Model: the same classifier-grade entry the router uses
+    // (preserves today's config.modelRouter.model coupling); timeout keeps
+    // the borrowed knob — no new config (spec §3.3).
+    const result = await registry.generateForTask("meetingClassifier", {
       prompt: userPrompt,
-      options: {
-        model: routerModel,
-        systemPrompt: CLASSIFIER_PROMPT,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        maxTurns: 1,
-        maxBudgetUsd: 0.01,
-        persistSession: false,
-        disallowedTools: [
-          "Bash",
-          "Read",
-          "Write",
-          "Edit",
-          "Glob",
-          "Grep",
-          "Agent",
-          "WebFetch",
-          "WebSearch",
-          "NotebookEdit",
-        ],
-        env: {
-          ...process.env,
-          ...(config.anthropic.apiKey
-            ? { ANTHROPIC_API_KEY: config.anthropic.apiKey }
-            : {}),
-          CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
-          CLAUDECODE: undefined as unknown as string,
-        },
-      },
+      systemPrompt: CLASSIFIER_PROMPT,
+      jsonSchema: RESPOND_SCHEMA,
+      maxOutputTokens: 256,
+      temperature: 0,
+      timeoutMs: config.modelRouter.timeoutMs,
     });
-
-    for await (const message of q) {
-      const msg = message as SDKMessage;
-
-      if (msg.type === "assistant") {
-        // SDK SDKMessage union doesn't expose .message.content after type narrowing — runtime shape is correct
-        const content = (msg as any).message?.content; // eslint-disable-line @typescript-eslint/no-explicit-any
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === "text") {
-              resultText = block.text;
-            }
-          }
-        }
-      }
-
-      if (msg.type === "result") {
-        const result = msg as SDKResultMessage;
-        costUsd = result.total_cost_usd;
-        durationMs = result.duration_ms;
-        if (result.subtype === "success" && result.result) {
-          resultText = result.result;
-        }
-      }
-    }
+    resultText = result.text;
+    parsedOutput = result.parsed;
+    costUsd = result.costUsd ?? 0;
+    durationMs = result.durationMs;
   } catch (err) {
-    log.warn("Meeting classifier query failed, selecting all roster members", {
+    // Timeout / 429 / 5xx / capability error — today's catch → all-roster path.
+    log.warn("Meeting classifier call failed, selecting all roster members", {
       error: String(err),
     });
     return {
@@ -183,12 +161,13 @@ export async function classifyMeetingMessage(
       costUsd: 0,
       durationMs: 0,
     };
-  } finally {
-    clearTimeout(deadline);
-    q = null;
   }
 
-  const parsed = parseClassifierOutput(resultText, validIds);
+  // Belt-and-braces (spec §3.3): parseClassifierOutput over parsed ?? text —
+  // the valid-id allowlist filter is business logic, not parse scaffolding.
+  const candidate =
+    parsedOutput !== undefined ? JSON.stringify(parsedOutput) : resultText;
+  const parsed = parseClassifierOutput(candidate, validIds);
   if (!parsed) {
     log.warn("Meeting classifier parse failed, selecting all roster members", {
       rawText: resultText.slice(0, 200),

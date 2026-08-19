@@ -21,6 +21,7 @@ export type ProviderFaultKind =
   | "rate-limit" // 429 / rate limit / too many requests
   | "auth" // 401/403/authentication/invalid key
   | "server-error" // 5xx / overloaded / service unavailable
+  | "bad-model" // rejected/unknown model id (KPR-312, M8) — config fault, NEVER trips the breaker
   | "non-provider"; // everything else — NEVER trips the breaker
 
 export interface TurnFaultInput {
@@ -34,7 +35,10 @@ export type TurnClassification =
   | { outcome: "aborted" } // operator abort — breaker-neutral
   | { outcome: "fault"; kind: ProviderFaultKind; message: string };
 
-/** Every kind that counts toward the trip streak — all except non-provider. */
+/** Every kind that counts toward the trip streak — all except non-provider
+ * and bad-model (a rejected model id is operator config error, not provider
+ * unhealth — KPR-312, same reasoning as the non-provider bucketing, now
+ * countable instead of invisible). */
 export const HARD_FAULT_KINDS: ReadonlySet<ProviderFaultKind> = new Set([
   "connect-fail",
   "timeout",
@@ -56,11 +60,13 @@ const SDK_NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_exec
  * First match wins, in row order. The auth row MUST remain a superset of
  * every `isAuthRebuildResumeError` alternate (agent-manager.ts — currently:
  * resolve authentication | credentials\.json | not authenticated |
- * 401 Unauthorized | ANTHROPIC_API_KEY | authToken). A sentinel the auth row
- * misses would classify non-provider and RESET the hard-fault streak, so a
- * persistent auth outage would never trip. Any future addition to the
- * sentinel list must extend this row in the same change (regression-pinned
- * per-alternate in error-classification.test.ts).
+ * 401 Unauthorized | ANTHROPIC_API_KEY | authToken). It also carries the
+ * gemini missing-key sentinel (`api.?key is not available` — KPR-352 §D7: the
+ * GeminiInteractionsAdapter's pre-request throw when no Gemini/Google key
+ * resolves). A sentinel the auth row misses would classify non-provider and
+ * RESET the hard-fault streak, so a persistent auth outage would never trip.
+ * Any future addition to the sentinel list must extend this row in the same
+ * change (regression-pinned per-alternate in error-classification.test.ts).
  */
 const FAULT_PATTERNS: ReadonlyArray<
   readonly [Exclude<ProviderFaultKind, "non-provider" | "timeout">, RegExp]
@@ -72,9 +78,17 @@ const FAULT_PATTERNS: ReadonlyArray<
   ["rate-limit", /\b429\b|rate.?limit|too many requests/i],
   [
     "auth",
-    /\b401\b|\b403\b|authentication|unauthorized|invalid.?api.?key|OAuth session is not available|not.?authenticated|credentials\.json|ANTHROPIC_API_KEY|authToken|resolve authentication/i,
+    /\b401\b|\b403\b|authentication|unauthorized|invalid.?api.?key|OAuth session is not available|api.?key is not available|not.?authenticated|credentials\.json|ANTHROPIC_API_KEY|authToken|resolve authentication/i,
   ],
   ["server-error", /\b5\d\d\b|overloaded|internal server error|service unavailable|bad gateway|upstream/i],
+  [
+    // KPR-312 (KPR-310 M8): "There's an issue with the selected model
+    // (claude-nonexistent-9). It may not exist or you may not have access to
+    // it." — the SDK's rejected-model surface. LAST row by design; the M8
+    // string matches no earlier row (verified at delivery, Task 0).
+    "bad-model",
+    /issue with the selected model|may not exist or you may not have access/i,
+  ],
 ];
 
 function classifyErrorString(error: string): TurnClassification {
@@ -112,5 +126,24 @@ export function classifyTurnResult(input: TurnFaultInput): TurnClassification {
  * missing-OAuth throw pre-RunResult). Same tables, same fail-safe default.
  */
 export function classifyThrown(err: unknown): TurnClassification {
+  if (err instanceof TurnAssemblyError) {
+    return { outcome: "fault", kind: "non-provider", message: err.message };
+  }
   return classifyErrorString(String(err));
+}
+
+/**
+ * KPR-347: typed wrapper for any throw during Lane B turn assembly
+ * (inventory build, prompt assembly, gate construction — the pre-runTurn
+ * phase). Exists because assembly failure causes are hive-internal (Mongo,
+ * config, filesystem) but their MESSAGES can pattern-match provider-fault
+ * rows — a Mongo blip's "ECONNREFUSED" would classify connect-fail and
+ * count toward a healthy foreign provider's trip streak. The instanceof
+ * short-circuit in classifyThrown runs BEFORE the pattern tables.
+ */
+export class TurnAssemblyError extends Error {
+  override readonly name = "TurnAssemblyError";
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+  }
 }
