@@ -23,14 +23,14 @@ describe("PASSTHROUGH_PROVIDERS table (KPR-346 §D1)", () => {
       id: "kimi",
       displayName: "Kimi (Moonshot AI)",
       baseUrl: "https://api.moonshot.ai/anthropic",
-      authTokenKey: "KIMI_API_KEY",
+      credential: { kind: "env-key", key: "KIMI_API_KEY" },
       defaultModel: "kimi-k3",
     });
     expect(PASSTHROUGH_PROVIDERS.deepseek).toEqual({
       id: "deepseek",
       displayName: "DeepSeek",
       baseUrl: "https://api.deepseek.com/anthropic",
-      authTokenKey: "DEEPSEEK_API_KEY",
+      credential: { kind: "env-key", key: "DEEPSEEK_API_KEY" },
       defaultModel: "deepseek-v4-pro",
     });
   });
@@ -64,8 +64,8 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
   });
 
   describe("model chain: route.model || configuredModel || table default", () => {
-    it("route model wins over both configured and default", () => {
-      const cfg = resolvePassthroughSpawn("kimi", "kimi/route-model", {
+    it("route model wins over both configured and default", async () => {
+      const cfg = await resolvePassthroughSpawn("kimi", "kimi/route-model", {
         configuredModel: "cfg-model",
         instanceId: "inst",
         resolveSecret: () => "tok",
@@ -73,8 +73,8 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
       expect(cfg.model).toBe("kimi/route-model");
     });
 
-    it("empty route falls back to configured model", () => {
-      const cfg = resolvePassthroughSpawn("kimi", "", {
+    it("empty route falls back to configured model", async () => {
+      const cfg = await resolvePassthroughSpawn("kimi", "", {
         configuredModel: "cfg-model",
         instanceId: "inst",
         resolveSecret: () => "tok",
@@ -82,8 +82,8 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
       expect(cfg.model).toBe("cfg-model");
     });
 
-    it("empty route + empty config falls back to the table default", () => {
-      const cfg = resolvePassthroughSpawn("kimi", "", {
+    it("empty route + empty config falls back to the table default", async () => {
+      const cfg = await resolvePassthroughSpawn("kimi", "", {
         configuredModel: "",
         instanceId: "inst",
         resolveSecret: () => "tok",
@@ -93,38 +93,33 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
   });
 
   describe("credential chain: process.env first, then Keychain (per spawn)", () => {
-    it("process.env.KIMI_API_KEY wins; Keychain is not consulted", () => {
+    it("process.env.KIMI_API_KEY wins; Keychain is not consulted", async () => {
       process.env.KIMI_API_KEY = "env-tok";
-      const cfg = resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" });
+      const cfg = await resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" });
       expect(cfg.authToken).toBe("env-tok");
       expect(mockFromKeychain).not.toHaveBeenCalled();
     });
 
-    it("empty env → fromKeychain(instanceId, KIMI_API_KEY) is consulted", () => {
+    it("empty env → fromKeychain(instanceId, KIMI_API_KEY) is consulted", async () => {
       mockFromKeychain.mockReturnValue("kc-tok");
-      const cfg = resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst-7" });
+      const cfg = await resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst-7" });
       expect(cfg.authToken).toBe("kc-tok");
       expect(mockFromKeychain).toHaveBeenCalledWith("inst-7", "KIMI_API_KEY");
     });
 
-    it("both empty → throws TurnAssemblyError naming the key and the remediation", () => {
+    it("both empty → rejects with TurnAssemblyError naming the key and the remediation", async () => {
       mockFromKeychain.mockReturnValue("");
-      expect(() =>
-        resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" }),
-      ).toThrow(TurnAssemblyError);
-      expect(() =>
-        resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" }),
-      ).toThrow(/Passthrough credential missing \(authentication\): KIMI_API_KEY/);
-      expect(() =>
-        resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" }),
-      ).toThrow(/hive credentials add/);
+      const call = () => resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" });
+      await expect(call()).rejects.toThrow(TurnAssemblyError);
+      await expect(call()).rejects.toThrow(/Passthrough credential missing \(authentication\): KIMI_API_KEY/);
+      await expect(call()).rejects.toThrow(/hive credentials add/);
     });
   });
 
-  it("breaker-invisibility: the missing-credential throw classifies non-provider, while the same message as a plain Error classifies auth", () => {
+  it("breaker-invisibility: the missing-credential throw classifies non-provider, while the same message as a plain Error classifies auth", async () => {
     let thrown: unknown;
     try {
-      resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst", resolveSecret: () => "" });
+      await resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst", resolveSecret: () => "" });
     } catch (err) {
       thrown = err;
     }
@@ -137,8 +132,8 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
     expect(classifyThrown(new Error(message))).toMatchObject({ outcome: "fault", kind: "auth" });
   });
 
-  it("the credential never leaks into any spawn-config field other than authToken", () => {
-    const cfg = resolvePassthroughSpawn("kimi", "", {
+  it("the credential never leaks into any spawn-config field other than authToken", async () => {
+    const cfg = await resolvePassthroughSpawn("kimi", "", {
       configuredModel: "",
       instanceId: "inst",
       resolveSecret: () => "SECRET-TOK",

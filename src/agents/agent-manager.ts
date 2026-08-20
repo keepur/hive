@@ -569,7 +569,7 @@ export class AgentManager {
     // engages the outage queue (epic §D2).
     let laneAPassthrough: PassthroughSpawnConfig | undefined;
     if (route.provider === "kimi" || route.provider === "deepseek") {
-      laneAPassthrough = resolvePassthroughSpawn(route.provider, route.model, {
+      laneAPassthrough = await resolvePassthroughSpawn(route.provider, route.model, {
         configuredModel: appConfig[route.provider].agentModel,
         instanceId: appConfig.instance.id,
       });
