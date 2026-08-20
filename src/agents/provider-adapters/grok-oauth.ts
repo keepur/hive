@@ -1,4 +1,4 @@
-import { chmodSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createLogger } from "../../logging/logger.js";
@@ -112,28 +112,46 @@ async function refreshCredential(path: string, opts: OAuthFileTokenOptions): Pro
 
   let grant: TokenGrant;
   try {
-    const tokenEndpoint = await discoverTokenEndpoint(issuer, opts);
+    const tokenEndpoint = await discoverTokenEndpoint(issuer, path, opts);
     grant = await requestRefreshGrant(tokenEndpoint, clientId, refreshToken, opts);
   } catch (err) {
+    // review r1 (item 3): a discovery-validation failure is a distinct,
+    // already-classified failure (breaker-invisible TurnAssemblyError with
+    // its own message) — let it propagate as-is rather than falling into
+    // either the rejected-grant or transient-network arms below.
+    if (err instanceof TurnAssemblyError) throw err;
     if (err instanceof GrantRejectedError) {
       // §D3: a rejected grant most often means someone else legitimately
       // refreshed first and rotated the token out from under us. Re-read once
       // before declaring the credential dead.
-      const fresh = rereadUsableToken(path, now());
+      const fresh = rereadUsableToken(path, now(), entry);
       if (fresh) {
-        log.warn("Grok OAuth grant rejected, but a fresh token was found on disk — another process refreshed first", {
-          path,
-          status: err.status,
-        });
-        return fresh;
+        if (fresh.changedFromPreGrant) {
+          log.warn("Grok OAuth grant rejected, but a fresh token was found on disk — another process refreshed first", {
+            path,
+            status: err.status,
+          });
+        } else {
+          // review r1 (item 4): the re-read token is byte-for-byte the SAME
+          // one we failed to refresh — no other process won a race, the
+          // grant was just rejected while the on-disk token remains usable.
+          log.warn("Grok OAuth grant rejected, but the on-disk token is still valid — proceeding with its remaining lifetime", {
+            path,
+            status: err.status,
+          });
+        }
+        return fresh.token;
       }
       throw new TurnAssemblyError(
         `Grok OAuth refresh was rejected (authentication) [${err.status}] — the refresh token is spent or revoked; run \`grok login\` to sign in again`,
       );
     }
-    // Transport/timeout. If the on-disk token is inside the threshold but not
-    // yet dead, it still works — grounding every turn during an auth.x.ai blip
-    // while holding a usable credential would be strictly worse (§D3).
+    // Transport/timeout, OR a 5xx/429 from the token endpoint (review r1,
+    // item 1) — neither means the refresh token is spent, so both take the
+    // same transient handling. If the on-disk token is inside the threshold
+    // but not yet dead, it still works — grounding every turn during an
+    // auth.x.ai blip while holding a usable credential would be strictly
+    // worse (§D3).
     const onDiskToken = stringField(entry, "key");
     if (expiresAtMs !== null && expiresAtMs > now() && onDiskToken) {
       log.warn("Grok OAuth refresh failed transiently — proceeding with the still-valid on-disk token", {
@@ -143,6 +161,10 @@ async function refreshCredential(path: string, opts: OAuthFileTokenOptions): Pro
       });
       return onDiskToken;
     }
+    // Message deliberately unchanged by review r1 item 1 — a 5xx/429 status
+    // is folded into `errorMessage(err)` above (`Error("token endpoint
+    // returned 503: ...")`), so this stays accurate for both a genuine
+    // network fault and an auth-server error response.
     throw new TurnAssemblyError(
       `Grok OAuth refresh could not reach the xAI auth server (${errorMessage(err)}) and the on-disk token has expired — this is an auth.x.ai connectivity failure, not a sign-in problem; retry shortly`,
     );
@@ -167,8 +189,26 @@ interface TokenGrant {
   expiresInSec?: number;
 }
 
-async function discoverTokenEndpoint(issuer: string, opts: OAuthFileTokenOptions): Promise<string> {
+/**
+ * review r1 (item 3, defense-in-depth): `oidc_issuer` comes from the
+ * credential file and `token_endpoint` from whatever that issuer's discovery
+ * document says — both are used verbatim to POST a refresh grant carrying
+ * the refresh token. A downgraded (http) or redirected (cross-origin)
+ * endpoint would leak the grant. Pin both to https and same-origin before
+ * ever fetching or trusting the discovery document.
+ */
+async function discoverTokenEndpoint(issuer: string, path: string, opts: OAuthFileTokenOptions): Promise<string> {
   const normalizedIssuer = issuer.replace(/\/+$/, "");
+  let issuerUrl: URL;
+  try {
+    issuerUrl = new URL(normalizedIssuer);
+  } catch {
+    throw new TurnAssemblyError(discoveryValidationMessage(path, `the issuer "${issuer}" is not a valid URL`));
+  }
+  if (issuerUrl.protocol !== "https:") {
+    throw new TurnAssemblyError(discoveryValidationMessage(path, `the issuer "${issuer}" is not https`));
+  }
+
   const cached = discoveryCache.get(normalizedIssuer);
   if (cached) return cached;
   const res = await fetchWithTimeout(`${normalizedIssuer}/.well-known/openid-configuration`, { method: "GET" }, opts);
@@ -176,6 +216,22 @@ async function discoverTokenEndpoint(issuer: string, opts: OAuthFileTokenOptions
   const doc = (await res.json()) as { token_endpoint?: unknown };
   if (typeof doc.token_endpoint !== "string" || !doc.token_endpoint) {
     throw new Error("OIDC discovery document carries no token_endpoint");
+  }
+  let tokenEndpointUrl: URL;
+  try {
+    tokenEndpointUrl = new URL(doc.token_endpoint);
+  } catch {
+    throw new TurnAssemblyError(
+      discoveryValidationMessage(path, `the discovered token_endpoint "${doc.token_endpoint}" is not a valid URL`),
+    );
+  }
+  if (tokenEndpointUrl.protocol !== "https:" || tokenEndpointUrl.origin !== issuerUrl.origin) {
+    throw new TurnAssemblyError(
+      discoveryValidationMessage(
+        path,
+        `the discovered token_endpoint "${doc.token_endpoint}" is not https or does not share the issuer's origin (${issuerUrl.origin})`,
+      ),
+    );
   }
   discoveryCache.set(normalizedIssuer, doc.token_endpoint);
   return doc.token_endpoint;
@@ -204,7 +260,17 @@ async function requestRefreshGrant(
     opts,
   );
   const text = await res.text();
-  if (!res.ok) throw new GrantRejectedError(res.status, text.slice(0, 200));
+  if (!res.ok) {
+    // Only a genuine client-side rejection (400-499, excluding 429) means the
+    // refresh token itself is spent or revoked. 5xx and 429 are the auth
+    // server having a bad moment — route those through the SAME transient
+    // handling as a network fault (review r1: a 503 must never surface the
+    // `grok login` misdirection).
+    if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+      throw new GrantRejectedError(res.status, text.slice(0, 200));
+    }
+    throw new Error(`token endpoint returned ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
+  }
   let parsed: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown };
   try {
     parsed = JSON.parse(text) as typeof parsed;
@@ -241,11 +307,27 @@ function writeBack(
   };
   const next: Record<string, OAuthFileEntry> = { ...file, [entryKey]: updated };
   const tmp = join(dirname(path), `.auth.json.hive-${process.pid}-${nowMs}.tmp`);
+  // review r1 (item 2): renameSync alone is atomic but NOT durable — on
+  // crash/power-loss the directory-entry rename can land on disk ahead of
+  // the temp file's data, leaving a truncated/zero-length auth.json. fsync
+  // the fd before the rename so the data is durable first.
+  let fd: number | undefined;
   try {
-    writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    fd = openSync(tmp, "w", 0o600);
+    writeSync(fd, `${JSON.stringify(next, null, 2)}\n`);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
     chmodSync(tmp, 0o600);
     renameSync(tmp, path); // atomic replace within the same directory
   } catch (err) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* best effort */
+      }
+    }
     try {
       unlinkSync(tmp);
     } catch {
@@ -286,15 +368,31 @@ function readCredentialFile(path: string): {
   return { file, entryKey, entry };
 }
 
-function rereadUsableToken(path: string, nowMs: number): string {
+interface RereadResult {
+  token: string;
+  /** review r1 (item 4): true only when the re-read key/refresh_token differ
+   *  from what we held before the grant — i.e. someone else genuinely won a
+   *  race. False means it's the SAME token we just failed to refresh, still
+   *  valid, and nobody else did anything. */
+  changedFromPreGrant: boolean;
+}
+
+function rereadUsableToken(path: string, nowMs: number, preGrantEntry: OAuthFileEntry): RereadResult | null {
   try {
     const { entry } = readCredentialFile(path);
     const expiresAtMs = parseExpiry(entry.expires_at);
-    if (expiresAtMs !== null && expiresAtMs > nowMs) return stringField(entry, "key");
+    if (expiresAtMs !== null && expiresAtMs > nowMs) {
+      const token = stringField(entry, "key");
+      if (!token) return null;
+      const changedFromPreGrant =
+        token !== stringField(preGrantEntry, "key") ||
+        stringField(entry, "refresh_token") !== stringField(preGrantEntry, "refresh_token");
+      return { token, changedFromPreGrant };
+    }
   } catch {
     /* fall through to the caller's hard failure */
   }
-  return "";
+  return null;
 }
 
 function requireAccessToken(entry: OAuthFileEntry, path: string): string {
@@ -319,12 +417,23 @@ function missingCredentialMessage(path: string, reason: string): string {
   return `Grok OAuth credential unavailable (authentication) at ${path} — ${reason}; run \`grok login\` to sign in`;
 }
 
+/** review r1 (item 3): deliberately does NOT say `grok login` — a bad or
+ *  spoofed discovery document is a malformed/suspicious-credential problem,
+ *  not an expired-session one, and telling the operator to sign in again
+ *  would misdirect them exactly like the taxonomy already guards against for
+ *  transient network faults. */
+function discoveryValidationMessage(path: string, reason: string): string {
+  return `Grok OAuth discovery for the credential at ${path} failed validation (${reason}) — refusing to send the refresh grant; this looks like a misconfigured or compromised credential file`;
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, opts: OAuthFileTokenOptions): Promise<Response> {
   const doFetch = opts.fetchImpl ?? fetch;
   return doFetch(url, { ...init, signal: AbortSignal.timeout(opts.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS) });
 }
 
-function expandHome(p: string): string {
+/** Exported for direct unit coverage (review r1, item 5a) — a `~/…` path
+ *  must resolve against the operator's home dir, not the process cwd. */
+export function expandHome(p: string): string {
   if (p === "~") return homedir();
   if (p.startsWith("~/")) return join(homedir(), p.slice(2));
   return p;
