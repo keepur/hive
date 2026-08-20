@@ -140,7 +140,8 @@ npm run lint           # ESLint
 npm run format         # Prettier
 npm run test           # Vitest
 npm run check          # All checks (typecheck + lint + format + test)
-npm run bundle         # Stage 2: esbuild → pkg/ (publish-ready); runs check:bundle gates
+npm run bundle         # Stage 2: esbuild → pkg/ (publish-ready) — build only, no gates
+npm run check:bundle   # bundle + the 4 guards (strings, pack, runtime, qdrant-stub)
 
 # Late-binding credentials (Honeypot, post-bootstrap)
 hive credentials list           # Show curated keys + which are set
