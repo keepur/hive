@@ -4,8 +4,13 @@ vi.mock("../../keychain/from-keychain.js", () => ({
   fromKeychain: vi.fn(() => ""),
 }));
 
+vi.mock("./grok-oauth.js", () => ({
+  resolveOAuthFileToken: vi.fn(async () => "grok-oauth-token"),
+}));
+
 import { fromKeychain } from "../../keychain/from-keychain.js";
 import { classifyThrown, TurnAssemblyError } from "./error-classification.js";
+import { resolveOAuthFileToken } from "./grok-oauth.js";
 import {
   PASSTHROUGH_PROVIDERS,
   buildPassthroughEnv,
@@ -16,6 +21,7 @@ import {
 import type { AgentProviderId } from "./types.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
+const mockResolveOAuthFileToken = vi.mocked(resolveOAuthFileToken);
 
 describe("PASSTHROUGH_PROVIDERS table (KPR-346 §D1)", () => {
   it("carries the exact vendor endpoints, key names, and default models", () => {
@@ -34,12 +40,25 @@ describe("PASSTHROUGH_PROVIDERS table (KPR-346 §D1)", () => {
       defaultModel: "deepseek-v4-pro",
     });
   });
+
+  it("KPR-371: grok carries the xAI endpoint, the OAuth-file credential, and grok-4.6", () => {
+    expect(PASSTHROUGH_PROVIDERS.grok).toEqual({
+      id: "grok",
+      displayName: "Grok (xAI)",
+      baseUrl: "https://api.x.ai",
+      credential: { kind: "oauth-file", path: "~/.grok/auth.json" },
+      defaultModel: "grok-4.6",
+    });
+  });
 });
 
 describe("isLaneAProvider (KPR-346 §D1)", () => {
   it.each([
     ["kimi", true],
     ["deepseek", true],
+    // KPR-371: NOT compile-forced. A missed id here silently degrades the
+    // session-handoff notice and silently drops :effort instead of clamping.
+    ["grok", true],
     ["claude", false],
     ["openai", false],
     ["gemini", false],
@@ -148,6 +167,57 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
   });
 });
 
+describe("resolvePassthroughSpawn — oauth-file credential (KPR-371 §D2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockResolveOAuthFileToken.mockResolvedValue("grok-oauth-token");
+  });
+
+  it("resolves the credential from the OAuth file, never from env/Keychain", async () => {
+    const cfg = await resolvePassthroughSpawn("grok", "", {
+      configuredModel: "",
+      instanceId: "inst",
+      resolveSecret: () => "SHOULD-NOT-BE-USED",
+    });
+    expect(cfg.authToken).toBe("grok-oauth-token");
+    expect(mockResolveOAuthFileToken).toHaveBeenCalledWith("~/.grok/auth.json", {
+      fetchImpl: undefined,
+      now: undefined,
+    });
+    expect(mockFromKeychain).not.toHaveBeenCalled();
+  });
+
+  it("model chain: route → configured → grok-4.6", async () => {
+    const base = { instanceId: "inst" };
+    expect((await resolvePassthroughSpawn("grok", "grok-4.5", { ...base, configuredModel: "cfg" })).model).toBe(
+      "grok-4.5",
+    );
+    expect((await resolvePassthroughSpawn("grok", "", { ...base, configuredModel: "cfg" })).model).toBe("cfg");
+    expect((await resolvePassthroughSpawn("grok", "", { ...base, configuredModel: "" })).model).toBe("grok-4.6");
+  });
+
+  it("carries the xAI base URL into the spawn config", async () => {
+    const cfg = await resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst" });
+    expect(cfg.baseUrl).toBe("https://api.x.ai");
+    expect(cfg.provider).toBe("grok");
+  });
+
+  it("propagates an OAuth failure unwrapped — the branch adds no wrapping", async () => {
+    const failure = new TurnAssemblyError("Grok OAuth credential unavailable (authentication) at /x — run `grok login`");
+    mockResolveOAuthFileToken.mockRejectedValue(failure);
+    await expect(
+      resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst" }),
+    ).rejects.toBe(failure);
+  });
+
+  it("threads the fetch/now test seams through to the OAuth resolver", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const now = () => 42;
+    await resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst", fetchImpl, now });
+    expect(mockResolveOAuthFileToken).toHaveBeenCalledWith("~/.grok/auth.json", { fetchImpl, now });
+  });
+});
+
 describe("buildPassthroughEnv (KPR-346 §D5)", () => {
   const sample: PassthroughSpawnConfig = {
     provider: "kimi",
@@ -189,6 +259,28 @@ describe("buildPassthroughEnv (KPR-346 §D5)", () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL: "kimi-k3",
       ANTHROPIC_DEFAULT_HAIKU_MODEL: "kimi-k3",
       CLAUDE_CODE_SUBAGENT_MODEL: "kimi-k3",
+      ENABLE_TOOL_SEARCH: "false",
+      CLAUDE_CODE_ENTRYPOINT: undefined,
+    });
+  });
+
+  it("KPR-371: grok pins the xAI endpoint and grok-4.6 across every model var", () => {
+    const env = buildPassthroughEnv({
+      provider: "grok",
+      model: "grok-4.6",
+      baseUrl: "https://api.x.ai",
+      authToken: "grok-oauth-token",
+    });
+    expect(env).toStrictEqual({
+      ANTHROPIC_BASE_URL: "https://api.x.ai",
+      ANTHROPIC_AUTH_TOKEN: "grok-oauth-token",
+      ANTHROPIC_API_KEY: undefined,
+      ANTHROPIC_MODEL: "grok-4.6",
+      ANTHROPIC_SMALL_FAST_MODEL: "grok-4.6",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "grok-4.6",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "grok-4.6",
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "grok-4.6",
+      CLAUDE_CODE_SUBAGENT_MODEL: "grok-4.6",
       ENABLE_TOOL_SEARCH: "false",
       CLAUDE_CODE_ENTRYPOINT: undefined,
     });

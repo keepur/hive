@@ -21,16 +21,18 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
     ["codex", false],
     ["kimi", true],
     ["deepseek", true],
+    ["grok", true],
   ] as const)("%s → persistsResumableHandle=%s", (provider, expected) => {
     expect(persistsResumableHandle(sessionSemanticsFor(provider as AgentProviderId))).toBe(expected);
   });
 
-  it("declares exactly the six current provider ids (Record exhaustiveness is compile-time)", () => {
+  it("declares exactly the seven current provider ids (Record exhaustiveness is compile-time)", () => {
     expect(Object.keys(SESSION_SEMANTICS).sort()).toEqual([
       "claude",
       "codex",
       "deepseek",
       "gemini",
+      "grok",
       "kimi",
       "openai",
     ]);

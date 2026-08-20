@@ -1,13 +1,14 @@
 import type { ResourceLimits } from "../model-router.js";
 import type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner.js";
 
-export type AgentProviderId = "claude" | "openai" | "gemini" | "codex" | "kimi" | "deepseek";
+export type AgentProviderId = "claude" | "openai" | "gemini" | "codex" | "kimi" | "deepseek" | "grok";
 
 /**
  * KPR-347: the native-lane (Lane B) adapter providers — the set whose
  * adapters run a provider SDK/API directly and need the hive bridge.
  * DELIBERATELY a literal union, NOT Exclude<AgentProviderId, "claude">:
- * Lane A providers (kimi/deepseek — child 1) join AgentProviderId but run
+ * Lane A providers (kimi/deepseek — child 1; grok — KPR-371) join
+ * AgentProviderId but run
  * the Claude-lane runtime and must NEVER gain a compatibility column or a
  * bridge path. Growing this union is a Lane B replication child's explicit
  * one-line concern.
@@ -80,6 +81,8 @@ export const SESSION_SEMANTICS: Readonly<Record<AgentProviderId, SessionSemantic
   // documented parity-matrix caveat).
   kimi: "client-transcript",
   deepseek: "client-transcript",
+  // KPR-371 (§D1): Lane A — same client-transcript semantics as kimi/deepseek.
+  grok: "client-transcript",
 };
 
 export function sessionSemanticsFor(provider: AgentProviderId): SessionSemantics {

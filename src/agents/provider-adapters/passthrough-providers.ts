@@ -11,13 +11,14 @@ import type { AgentProviderId } from "./types.js";
  * Translation proxies are ruled out (epic canon); only vendor-operated
  * endpoints qualify. Adding the next compat vendor is: one table row + one
  * AgentProviderId union member + one SESSION_SEMANTICS entry (compile-forced)
- * + two resolveProviderModel-style prefix arms — no new code path.
+ * + two resolveProviderModel-style prefix arms + the isLaneAProvider body
+ * (NOT compile-forced) + a `credential` entry (KPR-371) — no new code path.
  *
  * Lane A ids join AgentProviderId only. LaneBProviderId is NEVER touched:
  * these providers must never gain a tool-transport compatibility column or a
  * bridge path (decision-register canon).
  */
-export type LaneAProviderId = "kimi" | "deepseek";
+export type LaneAProviderId = "kimi" | "deepseek" | "grok";
 
 /**
  * KPR-371 (§D2): Lane A credential source. `authTokenKey: string` hardwired
@@ -69,10 +70,27 @@ export const PASSTHROUGH_PROVIDERS: Readonly<Record<LaneAProviderId, Passthrough
     credential: { kind: "env-key", key: "DEEPSEEK_API_KEY" },
     defaultModel: "deepseek-v4-pro",
   },
+  grok: {
+    id: "grok",
+    displayName: "Grok (xAI)",
+    baseUrl: "https://api.x.ai",
+    // KPR-371 (§D2/R5): subscription OAuth, shared with the `grok` CLI. Hive
+    // reads AND writes this file — the refresh token rotates on use.
+    credential: { kind: "oauth-file", path: "~/.grok/auth.json" },
+    // §3.5: the subscription session exposes only grok-4.6 / grok-4.5; the
+    // API's wider catalogue is not reachable under this auth.
+    defaultModel: "grok-4.6",
+  },
 };
 
+/**
+ * NOT compile-forced — a missed id here produces no compile error and no
+ * runtime error, it just takes the wrong branch at agent-manager.ts's
+ * session-handoff notice (degrades to the Lane B variant) and its :effort
+ * clamp (silently dropped instead of clamped). Every Lane A id must appear.
+ */
 export function isLaneAProvider(p: AgentProviderId): p is LaneAProviderId {
-  return p === "kimi" || p === "deepseek";
+  return p === "kimi" || p === "deepseek" || p === "grok";
 }
 
 /** Per-spawn resolved shape handed to the runner (§D1). The credential lives
