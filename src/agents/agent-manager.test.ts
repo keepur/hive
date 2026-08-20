@@ -61,6 +61,9 @@ vi.mock("../config.js", () => ({
     // createProviderAdapter's resolvePassthroughSpawn call.
     kimi: { agentModel: "" },
     deepseek: { agentModel: "" },
+    // KPR-371: grok's default-model override. No credential entry — the
+    // credential is an OAuth file, mocked below.
+    grok: { agentModel: "" },
     instance: { id: "test-instance" },
     modelRouter: { enabled: false },
     memory: { reflectionMinTurns: 3 },
@@ -71,6 +74,13 @@ vi.mock("../config.js", () => ({
 // leg so no real `security` subprocess ever runs; env (KIMI_API_KEY /
 // DEEPSEEK_API_KEY, set per-test) is the only live source in the suite.
 vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: vi.fn(() => "") }));
+
+// KPR-371: grok's credential is a vendor-CLI-owned OAuth file. Mock the
+// resolver so the suite never reads the operator's real ~/.grok/auth.json
+// and never issues a refresh grant.
+vi.mock("./provider-adapters/grok-oauth.js", () => ({
+  resolveOAuthFileToken: vi.fn(async () => "test-grok-oauth-token"),
+}));
 
 // Mock plugin loader
 vi.mock("../plugins/plugin-loader.js", () => ({
@@ -194,7 +204,10 @@ import type { ModelRouterResult } from "./model-router.js";
 import type { AgentProviderId } from "./provider-adapters/types.js";
 import { buildGenericDelegatePrompt, type DelegateTurnRunner } from "./provider-adapters/turn-assembly.js";
 import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
-import { classifyTurnResult } from "./provider-adapters/error-classification.js";
+import { classifyTurnResult, TurnAssemblyError } from "./provider-adapters/error-classification.js";
+import { resolveOAuthFileToken } from "./provider-adapters/grok-oauth.js";
+
+const mockResolveOAuthFileToken = vi.mocked(resolveOAuthFileToken);
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -3433,6 +3446,200 @@ describe("AgentManager", () => {
         await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-limits" }));
         const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
         expect(resourceLimits).toBeUndefined();
+      });
+    });
+
+    describe("Lane A passthrough — Grok (KPR-371)", () => {
+      function seed(threadId: string, sessionId: string, provider: string, agentId: string) {
+        sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      }
+
+      function lastRunnerOptions() {
+        const call = vi.mocked(AgentRunner).mock.calls.at(-1)!;
+        return call[10];
+      }
+
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        mockResolveOAuthFileToken.mockResolvedValue("test-grok-oauth-token");
+        process.env.KIMI_API_KEY = "test-kimi-key";
+        registry._agents.set(
+          "agent-grok",
+          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6", coreServers: [] }),
+        );
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3", coreServers: [] }),
+        );
+      });
+
+      afterEach(() => {
+        delete process.env.KIMI_API_KEY;
+      });
+
+      // --- routing ----------------------------------------------------------
+      it("providerFor maps the grok/ prefix; a typo'd prefix still falls back to claude", () => {
+        expect(manager.providerFor("agent-grok")).toBe("grok");
+
+        // Pre-existing behaviour, pinned as the baseline for the fail-closed
+        // follow-up: an unknown prefix becomes a Claude call with a garbage
+        // model id rather than an error.
+        registry._agents.set(
+          "agent-typo",
+          makeAgentConfig({ id: "agent-typo", name: "AgentTypo", model: "grock/grok-5" }),
+        );
+        expect(manager.providerFor("agent-typo")).toBe("claude");
+      });
+
+      // --- adapter selection ------------------------------------------------
+      it("grok turn constructs AgentRunner with the laneAPassthrough bag and runs the Claude adapter — no Lane B", async () => {
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-adapter" }));
+
+        expect(lastRunnerOptions()).toEqual({
+          laneAPassthrough: expect.objectContaining({
+            provider: "grok",
+            model: "grok-4.6",
+            baseUrl: "https://api.x.ai",
+            authToken: "test-grok-oauth-token",
+          }),
+        });
+        expect(mockRunnerSend).toHaveBeenCalled();
+        expect(mockCodexConstructor).not.toHaveBeenCalled();
+        expect(mockOpenAIConstructor).not.toHaveBeenCalled();
+        expect(mockGeminiConstructor).not.toHaveBeenCalled();
+        const grokRunner = vi.mocked(AgentRunner).mock.results.at(-1)!.value as {
+          buildProviderPrompt: ReturnType<typeof vi.fn>;
+        };
+        expect(grokRunner.buildProviderPrompt).not.toHaveBeenCalled();
+      });
+
+      // --- model chain ------------------------------------------------------
+      it("model chain — empty route model falls to the grok-4.6 table default", async () => {
+        registry._agents.set(
+          "agent-grok",
+          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-default" }));
+        expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("grok-4.6");
+      });
+
+      it("model chain — GROK_AGENT_MODEL wins over the table default, and an explicit route wins over both", async () => {
+        registry._agents.set(
+          "agent-grok",
+          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/", coreServers: [] }),
+        );
+        (appConfig as any).grok.agentModel = "grok-4.5";
+        try {
+          await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-cfgmodel" }));
+          expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("grok-4.5");
+
+          registry._agents.set(
+            "agent-grok",
+            makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6", coreServers: [] }),
+          );
+          await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-routewins" }));
+          expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("grok-4.6");
+        } finally {
+          (appConfig as any).grok.agentModel = "";
+        }
+      });
+
+      // --- credential fault, breaker-invisible ------------------------------
+      it("an unavailable OAuth credential is a config fault that never trips the grok breaker", async () => {
+        mockResolveOAuthFileToken.mockRejectedValue(
+          new TurnAssemblyError(
+            "Grok OAuth credential unavailable (authentication) at ~/.grok/auth.json — the file is absent or unreadable; run `grok login` to sign in",
+          ),
+        );
+        for (let i = 0; i < 3; i++) {
+          await expect(
+            manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr371-cred-${i}` })),
+          ).rejects.toThrow(/Grok OAuth credential unavailable \(authentication\)/);
+        }
+        // Breaker never tripped — restore the credential and the 4th spawn RUNS.
+        mockResolveOAuthFileToken.mockResolvedValue("test-grok-oauth-token");
+        const result = await manager.spawnTurn(
+          smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-cred-ok" }),
+        );
+        expect(result.errors).toEqual([]);
+        expect(manager.circuitBreakers.stateFor("grok")?.state ?? "closed").toBe("closed");
+      });
+
+      // --- breaker attribution ---------------------------------------------
+      it("three hard faults open the grok breaker only — claude and kimi stay closed", async () => {
+        for (let i = 0; i < 3; i++) {
+          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "connect ECONNREFUSED 1.2.3.4:443" }));
+          await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr371-trip-${i}` }));
+        }
+        expect(manager.circuitBreakers.stateFor("grok")!.state).toBe("open");
+
+        await expect(
+          manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-fastfail" })),
+        ).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+
+        // Sibling providers are untouched — the breaker keys on the route.
+        expect(manager.circuitBreakers.stateFor("kimi")?.state ?? "closed").toBe("closed");
+        const kimiResult = await manager.spawnTurn(
+          smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr371-kimi-ok" }),
+        );
+        expect(kimiResult.finalMessage).toBe("response");
+        const claudeResult = await manager.spawnTurn(
+          smsCtx({ agentId: "agent-a", threadId: "sms:line-1:kpr371-claude-ok" }),
+        );
+        expect(claudeResult.finalMessage).toBe("response");
+      });
+
+      // --- KPR-313 session-identity guard ----------------------------------
+      // This is the assertion that catches a missed isLaneAProvider edit: with
+      // grok absent from that predicate the notice silently degrades to the
+      // Lane B variant, with no compile or runtime error anywhere.
+      it("claude-tagged row + grok turn trips handoff with the CLAUDE variant (conversation_search)", async () => {
+        const threadId = "sms:line-1:kpr371-handoff";
+        seed(threadId, "s-old", "claude", "agent-grok");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "s-new" }));
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "agent-grok", threadId, sessionId: "s-old", sessionProvider: "claude" }),
+        );
+
+        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
+        expect(sessionArg).toBeUndefined();
+        expect(prompt.startsWith("[System notice:")).toBe(true);
+        expect(prompt).toContain("conversation_search");
+      });
+
+      it("persists the real handle under the grok tag (client-transcript)", async () => {
+        const threadId = "sms:line-1:kpr371-persist";
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-grok-new" }));
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId }));
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-grok", threadId, "s-grok-new", "grok", expect.anything(),
+        );
+      });
+
+      // --- effort ------------------------------------------------------------
+      it(":effort inside the deliverable set flows to the runner; the router is never called", async () => {
+        registry._agents.set(
+          "agent-grok",
+          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6:high", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-effort-high" }));
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBe("high");
+        expect(vi.mocked(routeModel)).not.toHaveBeenCalled();
+      });
+
+      it("grok's native :xhigh is clamped to undefined with a warn — not silently dropped", async () => {
+        registry._agents.set(
+          "agent-grok",
+          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6:xhigh", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-effort-xhigh" }));
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBeUndefined();
+        // The warn is the Lane A clamp — proof the turn took the Lane A branch.
+        const clampWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("outside the deliverable"));
+        expect(clampWarns).toHaveLength(1);
       });
     });
   });

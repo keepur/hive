@@ -1,5 +1,6 @@
 import { fromKeychain } from "../../keychain/from-keychain.js";
 import { TurnAssemblyError } from "./error-classification.js";
+import { resolveOAuthFileToken } from "./grok-oauth.js";
 import type { AgentProviderId } from "./types.js";
 
 /**
@@ -10,21 +11,37 @@ import type { AgentProviderId } from "./types.js";
  * Translation proxies are ruled out (epic canon); only vendor-operated
  * endpoints qualify. Adding the next compat vendor is: one table row + one
  * AgentProviderId union member + one SESSION_SEMANTICS entry (compile-forced)
- * + two resolveProviderModel-style prefix arms — no new code path.
+ * + two resolveProviderModel-style prefix arms + the isLaneAProvider body
+ * (NOT compile-forced) + a `credential` entry (KPR-371) — no new code path.
  *
  * Lane A ids join AgentProviderId only. LaneBProviderId is NEVER touched:
  * these providers must never gain a tool-transport compatibility column or a
  * bridge path (decision-register canon).
  */
-export type LaneAProviderId = "kimi" | "deepseek";
+export type LaneAProviderId = "kimi" | "deepseek" | "grok";
+
+/**
+ * KPR-371 (§D2): Lane A credential source. `authTokenKey: string` hardwired
+ * "static key from env or Honeypot"; Grok authenticates with a subscription
+ * OAuth token in a vendor-CLI-owned file that expires every 6h and whose
+ * refresh token rotates on use. The discriminant keeps the kimi/deepseek
+ * branch byte-for-byte unchanged while giving grok its own resolution path.
+ */
+export type PassthroughCredential =
+  | { kind: "env-key"; key: string }
+  | { kind: "oauth-file"; path: string };
 
 export interface PassthroughProviderDef {
   id: LaneAProviderId;
   displayName: string;
   /** Vendor-operated Anthropic-compat endpoint (never a translation proxy). */
   baseUrl: string;
-  /** Honeypot/env credential name — resolved PER SPAWN (env → Keychain). */
-  authTokenKey: string;
+  /**
+   * Credential source — resolved PER SPAWN, never boot-time.
+   *  - env-key:    env → Keychain (Honeypot `hive/<instanceId>/<KEY>`).
+   *  - oauth-file: vendor-CLI-owned OAuth file, refreshed + written back.
+   */
+  credential: PassthroughCredential;
   /**
    * Fallback model when neither the route (`kimi/<model>`) nor config
    * (`KIMI_AGENT_MODEL` / `DEEPSEEK_AGENT_MODEL`) names one. Pinned at plan
@@ -43,20 +60,37 @@ export const PASSTHROUGH_PROVIDERS: Readonly<Record<LaneAProviderId, Passthrough
     id: "kimi",
     displayName: "Kimi (Moonshot AI)",
     baseUrl: "https://api.moonshot.ai/anthropic",
-    authTokenKey: "KIMI_API_KEY",
+    credential: { kind: "env-key", key: "KIMI_API_KEY" },
     defaultModel: "kimi-k3",
   },
   deepseek: {
     id: "deepseek",
     displayName: "DeepSeek",
     baseUrl: "https://api.deepseek.com/anthropic",
-    authTokenKey: "DEEPSEEK_API_KEY",
+    credential: { kind: "env-key", key: "DEEPSEEK_API_KEY" },
     defaultModel: "deepseek-v4-pro",
+  },
+  grok: {
+    id: "grok",
+    displayName: "Grok (xAI)",
+    baseUrl: "https://api.x.ai",
+    // KPR-371 (§D2/R5): subscription OAuth, shared with the `grok` CLI. Hive
+    // reads AND writes this file — the refresh token rotates on use.
+    credential: { kind: "oauth-file", path: "~/.grok/auth.json" },
+    // §3.5: the subscription session exposes only grok-4.6 / grok-4.5; the
+    // API's wider catalogue is not reachable under this auth.
+    defaultModel: "grok-4.6",
   },
 };
 
+/**
+ * NOT compile-forced — a missed id here produces no compile error and no
+ * runtime error, it just takes the wrong branch at agent-manager.ts's
+ * session-handoff notice (degrades to the Lane B variant) and its :effort
+ * clamp (silently dropped instead of clamped). Every Lane A id must appear.
+ */
 export function isLaneAProvider(p: AgentProviderId): p is LaneAProviderId {
-  return p === "kimi" || p === "deepseek";
+  return p === "kimi" || p === "deepseek" || p === "grok";
 }
 
 /** Per-spawn resolved shape handed to the runner (§D1). The credential lives
@@ -70,12 +104,18 @@ export interface PassthroughSpawnConfig {
 }
 
 /**
- * KPR-346 (§D4): per-spawn credential + model resolution. Credential chain is
- * the standard secret-env pattern (agent-runner.ts plugin stdio servers):
- * process.env first, then Honeypot Keychain (hive/<instanceId>/<KEY>) — per
- * spawn, not boot-time, so `hive credentials add` takes effect on the next
- * spawn without a restart. Model chain mirrors codex/openai/gemini:
- * route.model || configured agentModel || table default.
+ * KPR-346 (§D4): per-spawn credential + model resolution. Model chain mirrors
+ * codex/openai/gemini: route.model || configured agentModel || table default.
+ *
+ * KPR-371 (§D2): the credential branches on the table's discriminant.
+ *  - env-key    — the standard secret-env pattern (agent-runner.ts plugin
+ *                 stdio servers): process.env first, then Honeypot Keychain
+ *                 (hive/<instanceId>/<KEY>) — per spawn, not boot-time, so
+ *                 `hive credentials add` takes effect on the next spawn
+ *                 without a restart.
+ *  - oauth-file — a vendor-CLI-owned OAuth file (grok-oauth.ts), which may
+ *                 perform a refresh grant and write the rotated pair back.
+ *                 This is why the function is async.
  *
  * Missing/empty credential throws TurnAssemblyError — classifyThrown
  * short-circuits it to non-provider BEFORE the pattern tables
@@ -87,7 +127,7 @@ export interface PassthroughSpawnConfig {
  * exploits to prove the typed wrapper is load-bearing. Config fault, not
  * provider fault (epic §D2).
  */
-export function resolvePassthroughSpawn(
+export async function resolvePassthroughSpawn(
   provider: LaneAProviderId,
   routeModel: string,
   opts: {
@@ -96,23 +136,39 @@ export function resolvePassthroughSpawn(
     instanceId: string;
     /** Test seam only; defaults to env → Keychain. */
     resolveSecret?: (instanceId: string, key: string) => string;
+    /** Test seam only (oauth-file providers); defaults to global fetch. */
+    fetchImpl?: typeof fetch;
+    /** Test seam only (oauth-file providers); defaults to Date.now. */
+    now?: () => number;
   },
-): PassthroughSpawnConfig {
+): Promise<PassthroughSpawnConfig> {
   const def = PASSTHROUGH_PROVIDERS[provider];
-  const resolve =
-    opts.resolveSecret ?? ((instanceId: string, key: string) => process.env[key] || fromKeychain(instanceId, key));
-  const authToken = resolve(opts.instanceId, def.authTokenKey);
-  if (!authToken) {
-    throw new TurnAssemblyError(
-      `Passthrough credential missing (authentication): ${def.authTokenKey} — seed it via \`hive credentials add ${def.authTokenKey}\``,
-    );
-  }
+  const authToken =
+    def.credential.kind === "env-key"
+      ? resolveEnvKeyCredential(def.credential.key, opts)
+      : await resolveOAuthFileToken(def.credential.path, { fetchImpl: opts.fetchImpl, now: opts.now });
   return {
     provider,
     model: routeModel || opts.configuredModel || def.defaultModel,
     baseUrl: def.baseUrl,
     authToken,
   };
+}
+
+/** The `env-key` branch — byte-for-byte the pre-KPR-371 behaviour. */
+function resolveEnvKeyCredential(
+  key: string,
+  opts: { instanceId: string; resolveSecret?: (instanceId: string, key: string) => string },
+): string {
+  const resolve =
+    opts.resolveSecret ?? ((instanceId: string, k: string) => process.env[k] || fromKeychain(instanceId, k));
+  const authToken = resolve(opts.instanceId, key);
+  if (!authToken) {
+    throw new TurnAssemblyError(
+      `Passthrough credential missing (authentication): ${key} — seed it via \`hive credentials add ${key}\``,
+    );
+  }
+  return authToken;
 }
 
 /**
