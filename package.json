@@ -79,7 +79,7 @@
     "@slack/web-api": "^8.0.0",
     "better-sqlite3": "^12.8.0",
     "brave-search-mcp": "^2.0.1",
-    "csv-parse": "^6.1.0",
+    "csv-parse": "^7.0.2",
     "dotenv": "^17.3.1",
     "mammoth": "^1.12.1",
     "mongodb": "^7.5.0",
