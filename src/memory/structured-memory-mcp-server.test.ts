@@ -23,28 +23,32 @@ const mockGetByIds = vi.fn().mockResolvedValue([]);
 const mockMarkSummarized = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("./memory-store.js", () => ({
-  MemoryStore: vi.fn().mockImplementation(() => ({
-    init: vi.fn().mockResolvedValue(undefined),
-    save: mockSave,
-    getById: mockGetById,
-    getByIds: mockGetByIds,
-    touchAccess: vi.fn().mockResolvedValue(undefined),
-    update: vi.fn(),
-    pin: vi.fn(),
-    unpin: vi.fn(),
-    delete: vi.fn(),
-    purge: vi.fn().mockResolvedValue(0),
-    getHotTierWithStats: vi.fn().mockResolvedValue([]),
-    markSummarized: mockMarkSummarized,
-  })),
+  MemoryStore: vi.fn().mockImplementation(function () {
+    return {
+      init: vi.fn().mockResolvedValue(undefined),
+      save: mockSave,
+      getById: mockGetById,
+      getByIds: mockGetByIds,
+      touchAccess: vi.fn().mockResolvedValue(undefined),
+      update: vi.fn(),
+      pin: vi.fn(),
+      unpin: vi.fn(),
+      delete: vi.fn(),
+      purge: vi.fn().mockResolvedValue(0),
+      getHotTierWithStats: vi.fn().mockResolvedValue([]),
+      markSummarized: mockMarkSummarized,
+    };
+  }),
 }));
 
 vi.mock("./memory-embedder.js", () => ({
-  MemoryEmbedder: vi.fn().mockImplementation(() => ({
-    upsert: mockUpsert,
-    search: mockSearch,
-    remove: vi.fn().mockResolvedValue(undefined),
-  })),
+  MemoryEmbedder: vi.fn().mockImplementation(function () {
+    return {
+      upsert: mockUpsert,
+      search: mockSearch,
+      remove: vi.fn().mockResolvedValue(undefined),
+    };
+  }),
 }));
 
 import { buildStructuredMemoryTools } from "./structured-memory-mcp-server.js";

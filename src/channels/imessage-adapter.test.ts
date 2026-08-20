@@ -26,31 +26,39 @@ const mockGetMaxRowId = vi.fn().mockReturnValue(100);
 const mockDbClose = vi.fn();
 
 vi.mock("./imessage-db.js", () => ({
-  IMessageDb: vi.fn(() => ({
-    getNewMessages: mockGetNewMessages,
-    getMaxRowId: mockGetMaxRowId,
-    close: mockDbClose,
-  })),
+  IMessageDb: vi.fn(function () {
+    return {
+      getNewMessages: mockGetNewMessages,
+      getMaxRowId: mockGetMaxRowId,
+      close: mockDbClose,
+    };
+  }),
 }));
 
 const mockConnect = vi.fn().mockResolvedValue(undefined);
 const mockMongoClose = vi.fn().mockResolvedValue(undefined);
 const mockFindOne = vi.fn().mockResolvedValue(null);
 const mockInsertOne = vi.fn().mockResolvedValue(undefined);
-const mockCollection = vi.fn(() => ({
-  findOne: mockFindOne,
-  insertOne: mockInsertOne,
-}));
-const mockMongoDb = vi.fn(() => ({
-  collection: mockCollection,
-}));
+const mockCollection = vi.fn(function () {
+  return {
+    findOne: mockFindOne,
+    insertOne: mockInsertOne,
+  };
+});
+const mockMongoDb = vi.fn(function () {
+  return {
+    collection: mockCollection,
+  };
+});
 
 vi.mock("mongodb", () => ({
-  MongoClient: vi.fn(() => ({
-    connect: mockConnect,
-    db: mockMongoDb,
-    close: mockMongoClose,
-  })),
+  MongoClient: vi.fn(function () {
+    return {
+      connect: mockConnect,
+      db: mockMongoDb,
+      close: mockMongoClose,
+    };
+  }),
 }));
 
 // ---------------------------------------------------------------------------

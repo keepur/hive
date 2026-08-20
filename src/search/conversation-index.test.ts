@@ -8,12 +8,14 @@ const mockUpsert = vi.fn();
 const mockSearch = vi.fn();
 
 vi.mock("@qdrant/js-client-rest", () => ({
-  QdrantClient: vi.fn().mockImplementation(() => ({
-    getCollections: mockGetCollections,
-    createCollection: mockCreateCollection,
-    upsert: mockUpsert,
-    search: mockSearch,
-  })),
+  QdrantClient: vi.fn().mockImplementation(function () {
+    return {
+      getCollections: mockGetCollections,
+      createCollection: mockCreateCollection,
+      upsert: mockUpsert,
+      search: mockSearch,
+    };
+  }),
 }));
 
 // ── Mock fetch (Ollama embedding) ───────────────────────────────────────────

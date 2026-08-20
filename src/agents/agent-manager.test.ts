@@ -95,7 +95,8 @@ const mockRunnerSend = vi.fn();
 const mockRunnerAbort = vi.fn();
 const mockRunnerToolInventory = vi.fn().mockReturnValue([]);
 vi.mock("./agent-runner.js", () => ({
-  AgentRunner: vi.fn().mockImplementation(() => ({
+  AgentRunner: vi.fn().mockImplementation(function () {
+    return {
     send: mockRunnerSend,
     abort: mockRunnerAbort,
     wasAborted: false,
@@ -111,7 +112,8 @@ vi.mock("./agent-runner.js", () => ({
       instructions: "PILOT-ASSEMBLED-INSTRUCTIONS",
       skillEntries: [],
     })),
-  })),
+  };
+  }),
   // Re-exported from agent-runner for plugin-loader path resolution; the test
   // manager doesn't use it, so a sentinel path is fine.
   DIST_DIR: "/mock/dist",
@@ -134,7 +136,7 @@ const {
 }));
 
 vi.mock("./provider-adapters/codex-subscription-adapter.js", () => ({
-  CodexSubscriptionAdapter: vi.fn().mockImplementation((options) => {
+  CodexSubscriptionAdapter: vi.fn().mockImplementation(function (options) {
     mockCodexConstructor(options);
     return {
       provider: "codex",
@@ -146,7 +148,7 @@ vi.mock("./provider-adapters/codex-subscription-adapter.js", () => ({
 }));
 
 vi.mock("./provider-adapters/openai-agents-adapter.js", () => ({
-  OpenAIAgentsAdapter: vi.fn().mockImplementation((options) => {
+  OpenAIAgentsAdapter: vi.fn().mockImplementation(function (options) {
     mockOpenAIConstructor(options);
     return {
       provider: "openai",
@@ -158,7 +160,7 @@ vi.mock("./provider-adapters/openai-agents-adapter.js", () => ({
 }));
 
 vi.mock("./provider-adapters/gemini-interactions-adapter.js", () => ({
-  GeminiInteractionsAdapter: vi.fn().mockImplementation((options) => {
+  GeminiInteractionsAdapter: vi.fn().mockImplementation(function (options) {
     mockGeminiConstructor(options);
     return {
       provider: "gemini",
@@ -174,9 +176,11 @@ const { mockConversationIndex } = vi.hoisted(() => ({
   mockConversationIndex: vi.fn(),
 }));
 vi.mock("../search/conversation-index.js", () => ({
-  ConversationIndex: vi.fn().mockImplementation(() => ({
+  ConversationIndex: vi.fn().mockImplementation(function () {
+    return {
     index: mockConversationIndex,
-  })),
+  };
+  }),
 }));
 
 import { AgentManager, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";

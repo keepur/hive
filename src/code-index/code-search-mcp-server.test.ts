@@ -12,9 +12,11 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 const mockSearch = vi.fn(async () => []);
 
 vi.mock("@qdrant/js-client-rest", () => ({
-  QdrantClient: vi.fn().mockImplementation(() => ({
-    search: mockSearch,
-  })),
+  QdrantClient: vi.fn().mockImplementation(function () {
+    return {
+      search: mockSearch,
+    };
+  }),
 }));
 
 vi.mock("../search/embed-utils.js", () => ({
@@ -33,7 +35,9 @@ function makeFakeDb(): any {
   return {
     collection: () => ({
       findOne: vi.fn(async () => null),
-      find: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
+      find: vi.fn(function () {
+        return { toArray: vi.fn(async () => []) };
+      }),
     }),
   };
 }

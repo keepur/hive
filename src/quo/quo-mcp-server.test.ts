@@ -6,12 +6,14 @@ type ToolHandler = (...args: any[]) => any;
 const registeredTools = new Map<string, { handler: ToolHandler }>();
 
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
-  McpServer: vi.fn().mockImplementation(() => ({
-    registerTool: vi.fn((name: string, _opts: unknown, handler: ToolHandler) => {
-      registeredTools.set(name, { handler });
-    }),
-    connect: vi.fn(),
-  })),
+  McpServer: vi.fn().mockImplementation(function () {
+    return {
+      registerTool: vi.fn((name: string, _opts: unknown, handler: ToolHandler) => {
+        registeredTools.set(name, { handler });
+      }),
+      connect: vi.fn(),
+    };
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
