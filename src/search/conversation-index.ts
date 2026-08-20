@@ -130,8 +130,8 @@ export class ConversationIndex {
       });
     }
 
-    const results = await client.search(COLLECTION, {
-      vector: queryVector,
+    const { points: results } = await client.query(COLLECTION, {
+      query: queryVector,
       limit,
       with_payload: true,
       filter: { must },

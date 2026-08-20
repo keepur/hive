@@ -21,6 +21,14 @@ updates:
       minor-and-patch:
         update-types: ["minor", "patch"]
     ignore:
+      # @qdrant/js-client-rest 1.19 removed QdrantClient.search() (migrated to
+      # query() in this repo) AND warns as incompatible against our deployed
+      # Qdrant *server* 1.17 — the client tolerates at most a 1-minor gap.
+      # Hold at 1.18 until the fleet's Qdrant servers are upgraded, then drop
+      # this entry; the code is already off the removed API, so the bump is
+      # then a one-line version change.
+      - dependency-name: "@qdrant/js-client-rest"
+        versions: [">=1.19.0"]
       # npm's xlsx line is abandoned upstream; we pin the SheetJS vendor CDN
       # tarball instead (PR #339). Dependabot must not "update" it back.
       - dependency-name: "xlsx"
