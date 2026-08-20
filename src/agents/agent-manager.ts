@@ -181,7 +181,7 @@ type ProviderModelRoute =
   // KPR-346 (§D2): Lane A passthrough — Claude runtime, foreign endpoint.
   // reasoningEffort survives splitProviderModel and delivers via the Claude
   // adapter's existing effort channel (clamped in prepareSpawn, §D6).
-  | { provider: "kimi" | "deepseek"; model: string; reasoningEffort?: CodexReasoningEffort };
+  | { provider: "kimi" | "deepseek" | "grok"; model: string; reasoningEffort?: CodexReasoningEffort };
 
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
 
@@ -206,6 +206,9 @@ function resolveProviderModel(model: string): ProviderModelRoute {
   }
   if (provider === "deepseek") {
     return { provider: "deepseek", model: providerModel, reasoningEffort };
+  }
+  if (provider === "grok") {
+    return { provider: "grok", model: providerModel, reasoningEffort };
   }
 
   return { provider: "claude", model: normalized };
@@ -568,7 +571,7 @@ export class AgentManager {
     // never counts toward the foreign breaker's trip streak and never
     // engages the outage queue (epic §D2).
     let laneAPassthrough: PassthroughSpawnConfig | undefined;
-    if (route.provider === "kimi" || route.provider === "deepseek") {
+    if (route.provider === "kimi" || route.provider === "deepseek" || route.provider === "grok") {
       laneAPassthrough = await resolvePassthroughSpawn(route.provider, route.model, {
         configuredModel: appConfig[route.provider].agentModel,
         instanceId: appConfig.instance.id,
@@ -584,7 +587,7 @@ export class AgentManager {
     // The adapter's `readonly provider = "claude"` stays as-is per canon:
     // the adapter class is an execution-path detail; every ops surface
     // (breaker, outage gate, session tag, KPR-313 guard) keys on the ROUTE.
-    if (route.provider === "kimi" || route.provider === "deepseek") {
+    if (route.provider === "kimi" || route.provider === "deepseek" || route.provider === "grok") {
       return new ClaudeAgentAdapter(runner);
     }
 

@@ -287,6 +287,14 @@ export const config = {
     /** KPR-346: as kimi above; DEEPSEEK_API_KEY resolves per spawn. */
     agentModel: optional("DEEPSEEK_AGENT_MODEL", ""),
   },
+  grok: {
+    /** KPR-371: Lane A passthrough default-model override (non-secret).
+     *  There is deliberately NO secret entry — the credential is a
+     *  subscription OAuth file (~/.grok/auth.json) resolved per spawn (§D6),
+     *  never a paste-able key, which is also why grok is absent from the
+     *  credential registry. */
+    agentModel: optional("GROK_AGENT_MODEL", ""),
+  },
   linear: {
     apiKey: optional("LINEAR_API_KEY", ""),
     teamId: optional("LINEAR_TEAM_ID", ""),

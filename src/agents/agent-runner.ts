@@ -307,7 +307,8 @@ function warnIfToolSearchForceDisabled(): void {
 
 /** KPR-346: optional per-spawn runner options (currently Lane A only). */
 export interface AgentRunnerOptions {
-  /** Set by AgentManager.createProviderAdapter for kimi/deepseek routes —
+  /** Set by AgentManager.createProviderAdapter for Lane A routes
+   *  (kimi/deepseek/grok) —
    *  triggers §D5 env substitution in send(). Absent ⇒ vanilla Claude spawn. */
   laneAPassthrough?: PassthroughSpawnConfig;
 }
