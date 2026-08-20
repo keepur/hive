@@ -12,14 +12,18 @@ vi.mock("../logging/logger.js", () => ({
 
 const mockAll = vi.fn();
 const mockGet = vi.fn();
-const mockPrepare = vi.fn(() => ({ all: mockAll, get: mockGet }));
+const mockPrepare = vi.fn(function () {
+  return { all: mockAll, get: mockGet };
+});
 const mockClose = vi.fn();
 
 vi.mock("better-sqlite3", () => ({
-  default: vi.fn(() => ({
-    prepare: mockPrepare,
-    close: mockClose,
-  })),
+  default: vi.fn(function () {
+    return {
+      prepare: mockPrepare,
+      close: mockClose,
+    };
+  }),
 }));
 
 // ---------------------------------------------------------------------------

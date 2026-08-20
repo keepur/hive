@@ -143,12 +143,18 @@ vi.mock("mongodb", () => {
   const aggregate = vi.fn();
   const find = vi.fn();
   const countDocuments = vi.fn();
-  const collection = vi.fn(() => ({ estimatedDocumentCount, findOne, aggregate, find, countDocuments }));
+  const collection = vi.fn(function () {
+    return { estimatedDocumentCount, findOne, aggregate, find, countDocuments };
+  });
   const command = vi.fn((cmd: unknown) => ping(cmd));
-  const db = vi.fn(() => ({ command, collection }));
+  const db = vi.fn(function () {
+    return { command, collection };
+  });
   const connect = vi.fn();
   const close = vi.fn();
-  const MongoClient = vi.fn(() => ({ connect, db, close }));
+  const MongoClient = vi.fn(function () {
+    return { connect, db, close };
+  });
   return {
     MongoClient,
     __mocks: { connect, close, ping, estimatedDocumentCount, findOne, aggregate, find, countDocuments },
@@ -214,7 +220,9 @@ describe("hasAnyAgent / defaultAgentExists", () => {
 
 vi.mock("@slack/web-api", () => {
   const test = vi.fn();
-  const WebClient = vi.fn(() => ({ auth: { test } }));
+  const WebClient = vi.fn(function () {
+    return { auth: { test } };
+  });
   return { WebClient, __test: test };
 });
 import * as slack from "@slack/web-api";

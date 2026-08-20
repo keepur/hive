@@ -16,19 +16,23 @@ const uploadV2Mock = vi.fn().mockResolvedValue({ ok: true });
 const conversationsListMock = vi.fn().mockResolvedValue({ channels: [], response_metadata: { next_cursor: "" } });
 
 vi.mock("@slack/web-api", () => ({
-  WebClient: vi.fn().mockImplementation(() => ({
-    chat: { postMessage: postMessageMock },
-    files: { uploadV2: uploadV2Mock },
-    conversations: { list: conversationsListMock },
-  })),
+  WebClient: vi.fn().mockImplementation(function () {
+    return {
+      chat: { postMessage: postMessageMock },
+      files: { uploadV2: uploadV2Mock },
+      conversations: { list: conversationsListMock },
+    };
+  }),
 }));
 
 vi.mock("@slack/socket-mode", () => ({
-  SocketModeClient: vi.fn().mockImplementation(() => ({
-    on: vi.fn(),
-    start: vi.fn(),
-    disconnect: vi.fn(),
-  })),
+  SocketModeClient: vi.fn().mockImplementation(function () {
+    return {
+      on: vi.fn(),
+      start: vi.fn(),
+      disconnect: vi.fn(),
+    };
+  }),
 }));
 
 describe("SlackGateway.postMessage — message length handling", () => {
