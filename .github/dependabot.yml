@@ -21,6 +21,27 @@ updates:
       minor-and-patch:
         update-types: ["minor", "patch"]
     ignore:
+      # 0.x-major runtime SDK bumps. For 0.x, `0.2 → 0.3` is semver-MINOR, so
+      # the minor-and-patch group sweeps them in and they land on a green CI
+      # check that says nothing about SDK runtime behavior — defeating the
+      # KPR-366 intent stated above. Hold them out of the group; drop these
+      # two entries to take each bump as its own considered PR.
+      - dependency-name: "@anthropic-ai/claude-agent-sdk"
+        versions: [">=0.3.0"]
+      - dependency-name: "@openai/agents"
+        versions: [">=0.12.0"]
+      # typescript 7 cannot install: typescript-eslint@8 declares
+      # peer typescript@">=4.8.4 <6.1.0", so `npm ci` fails ERESOLVE (#379).
+      # Drop this once typescript-eslint ships TS 7 support.
+      - dependency-name: "typescript"
+        versions: [">=7.0.0"]
+      # @slack/socket-mode 3 declares peer undici@^7, but hive runs undici 8
+      # deliberately — KPR-344 relies on v8's dual-symbol setGlobalDispatcher
+      # for connection pooling across Node 22/24/26. Taking it would force an
+      # undici downgrade and silently break that (#382). Drop once socket-mode
+      # supports undici 8.
+      - dependency-name: "@slack/socket-mode"
+        versions: [">=3.0.0"]
       # @qdrant/js-client-rest 1.19 removed QdrantClient.search() (migrated to
       # query() in this repo) AND warns as incompatible against our deployed
       # Qdrant *server* 1.17 — the client tolerates at most a 1-minor gap.
