@@ -85,7 +85,7 @@
     "mongodb": "^7.1.0",
     "pdf-parse": "^2.4.5",
     "tinyglobby": "^0.2.17",
-    "undici": "^8.0.0",
+    "undici": "^8.10.0",
     "ws": "^8.19.0",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "yaml": "^2.8.2"
