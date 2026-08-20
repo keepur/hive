@@ -42,12 +42,13 @@ export interface OAuthFileTokenOptions {
   timeoutMs?: number;
 }
 
-/** Non-2xx from the token endpoint — distinct from a transport failure,
- *  because only this case means the refresh token itself is spent. */
+/** A rejection that means the refresh token itself is spent — distinct from a
+ *  transport failure. `reason` is always safe to surface to the operator
+ *  (an HTTP status or a shape description, never a response body). */
 class GrantRejectedError extends Error {
   constructor(
     readonly status: number,
-    readonly detail: string,
+    readonly reason: string,
   ) {
     super(`token endpoint returned ${status}`);
     this.name = "GrantRejectedError";
@@ -142,8 +143,10 @@ async function refreshCredential(path: string, opts: OAuthFileTokenOptions): Pro
         }
         return fresh.token;
       }
+      // review r2: `reason` rather than a bare status — a malformed 2xx grant
+      // response takes this arm too, and "[200]" alone would read as nonsense.
       throw new TurnAssemblyError(
-        `Grok OAuth refresh was rejected (authentication) [${err.status}] — the refresh token is spent or revoked; run \`grok login\` to sign in again`,
+        `Grok OAuth refresh was rejected (authentication) [${err.reason}] — the refresh token is spent or revoked; run \`grok login\` to sign in again`,
       );
     }
     // Transport/timeout, OR a 5xx/429 from the token endpoint (review r1,
@@ -161,12 +164,12 @@ async function refreshCredential(path: string, opts: OAuthFileTokenOptions): Pro
       });
       return onDiskToken;
     }
-    // Message deliberately unchanged by review r1 item 1 — a 5xx/429 status
-    // is folded into `errorMessage(err)` above (`Error("token endpoint
-    // returned 503: ...")`), so this stays accurate for both a genuine
-    // network fault and an auth-server error response.
+    // A 5xx/429 status is folded into `errorMessage(err)` above
+    // (`Error("token endpoint returned 503")`), so this stays accurate for
+    // both a genuine network fault and an auth-server error response.
+    const onDiskState = expiresAtMs === null ? "carries no parseable expiry" : "has expired";
     throw new TurnAssemblyError(
-      `Grok OAuth refresh could not reach the xAI auth server (${errorMessage(err)}) and the on-disk token has expired — this is an auth.x.ai connectivity failure, not a sign-in problem; retry shortly`,
+      `Grok OAuth refresh could not reach the xAI auth server (${errorMessage(err)}) and the on-disk token ${onDiskState} — this is an auth.x.ai connectivity failure, not a sign-in problem; retry shortly`,
     );
   }
 
@@ -256,6 +259,9 @@ async function requestRefreshGrant(
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
       body: body.toString(),
+      // review r2: the discovered endpoint's origin is pinned, but a 307/308
+      // from it would re-POST the refresh token wherever it pointed. Refuse.
+      redirect: "error",
     },
     opts,
   );
@@ -265,11 +271,12 @@ async function requestRefreshGrant(
     // refresh token itself is spent or revoked. 5xx and 429 are the auth
     // server having a bad moment — route those through the SAME transient
     // handling as a network fault (review r1: a 503 must never surface the
-    // `grok login` misdirection).
+    // `grok login` misdirection). Status only — response bodies stay out of
+    // errors and logs per the repo's redaction convention.
     if (res.status >= 400 && res.status < 500 && res.status !== 429) {
-      throw new GrantRejectedError(res.status, text.slice(0, 200));
+      throw new GrantRejectedError(res.status, `HTTP ${res.status}`);
     }
-    throw new Error(`token endpoint returned ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
+    throw new Error(`token endpoint returned ${res.status}`);
   }
   let parsed: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown };
   try {

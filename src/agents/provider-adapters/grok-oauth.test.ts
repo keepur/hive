@@ -260,7 +260,7 @@ describe("failure modes (§D3) — all breaker-invisible, each with its own reme
     const path = writeAuthFile({ expires_at: new Date(NOW - 1000).toISOString() });
     const { impl } = makeFetch({ status: 400, body: { error: "invalid_grant" } });
     const call = () => resolveOAuthFileToken(path, { fetchImpl: impl, now });
-    await expect(call()).rejects.toThrow(/refresh was rejected \(authentication\) \[400\]/);
+    await expect(call()).rejects.toThrow(/refresh was rejected \(authentication\) \[HTTP 400\]/);
     await expect(call()).rejects.toThrow(/run `grok login`/);
   });
 
@@ -408,8 +408,24 @@ describe("token-endpoint 4xx-only grant rejection (review r1, item 1)", () => {
     const path = writeAuthFile({ expires_at: new Date(NOW - 1000).toISOString() });
     const { impl } = makeFetch({ status: 400, body: { error: "invalid_grant" } });
     const call = () => resolveOAuthFileToken(path, { fetchImpl: impl, now });
-    await expect(call()).rejects.toThrow(/refresh was rejected \(authentication\) \[400\]/);
+    await expect(call()).rejects.toThrow(/refresh was rejected \(authentication\) \[HTTP 400\]/);
     await expect(call()).rejects.toThrow(/run `grok login`/);
+  });
+
+  it("a malformed 2xx grant response names the shape problem, not a bare status (review r2)", async () => {
+    const path = writeAuthFile({ expires_at: new Date(NOW - 1000).toISOString() });
+    const { impl } = makeFetch({ status: 200, body: "not json at all" });
+    const call = () => resolveOAuthFileToken(path, { fetchImpl: impl, now });
+    await expect(call()).rejects.toThrow(/\[grant response was not JSON\]/);
+    await expect(call()).rejects.not.toThrow(/\[200\]/);
+  });
+
+  it("the grant POST pins redirect: 'error' so a 307/308 cannot re-POST the refresh token elsewhere (review r2)", async () => {
+    const path = writeAuthFile({ expires_at: new Date(NOW - 1000).toISOString() });
+    const { impl, mock } = makeFetch();
+    await resolveOAuthFileToken(path, { fetchImpl: impl, now });
+    const tokenCall = mock.mock.calls.find(([url]) => String(url) === TOKEN_URL);
+    expect(tokenCall?.[1]).toMatchObject({ method: "POST", redirect: "error" });
   });
 });
 
