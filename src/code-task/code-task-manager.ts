@@ -624,7 +624,7 @@ export class CodeTaskManager {
       }
 
       // Failed or orphaned
-      let logTail = "";
+      let logTail: string;
       try {
         const stderr = await readFile(task.stderrPath, "utf-8");
         const lines = stderr.split("\n");

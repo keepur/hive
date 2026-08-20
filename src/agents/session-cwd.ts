@@ -25,7 +25,7 @@ export function resolveSessionCwd(opts: { archetypeCwd: unknown; agentId: string
     } catch (err) {
       const msg = `Archetype cwd unavailable at session start — refusing to run: ${effectiveCwd} (${String(err)})`;
       log.error(msg, { agent: opts.agentId });
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
     if (!st.isDirectory()) {
       const msg = `Archetype cwd is not a directory: ${effectiveCwd}`;

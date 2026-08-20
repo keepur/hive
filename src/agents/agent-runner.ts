@@ -2018,7 +2018,6 @@ export class AgentRunner {
 
     // Instrumentation
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
-    let activeToolStart: number | null = null;
     let activeToolName: string | null = null;
 
     const timeoutMs = resourceLimits?.timeoutMs ?? this.agentConfig.timeoutMs ?? 300_000; // 5 min default
@@ -2103,7 +2102,7 @@ export class AgentRunner {
                   toolCalls[toolCalls.length - 1]!.endMs = Date.now();
                 }
                 activeToolName = block.name;
-                activeToolStart = Date.now();
+                const activeToolStart = Date.now();
                 toolCalls.push({ tool: block.name, startMs: activeToolStart });
                 log.info("Tool call started", {
                   agent: this.agentConfig.id,
