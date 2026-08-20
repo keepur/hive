@@ -35,7 +35,7 @@ There are two lanes behind that routing:
 | 14. Streaming | `full` | `full` — unchanged | `full` — unchanged | `full` | `full` | `full` |
 | 15. Ops integration (breaker/outage/telemetry/usage) | `full` | `caveat(costUsd nominal — Claude pricing math)` [^15] | `caveat(costUsd nominal — Claude pricing math)` [^15] | `caveat(token counts report 0)` [^15] | `caveat(costUsd 0; real token counts)` [^15] | `caveat(costUsd 0; real token counts)` [^15] |
 | 16. Auth & credentials | `full` — subscription OAuth [^16] | `full` — per-provider API key via Honeypot [^16] | `full` — subscription OAuth, refreshed in place [^16] | `caveat(.env only)` [^16] | `caveat(paid-tier key for production)` [^16] | `full` — subscription OAuth [^16] |
-| 17. Validation status | `production (baseline)` | `live-unvalidated; production reassignment gated on funded-key validation` | `live-unvalidated` — pending the KPR-371 validation matrix | `unit + 401-boundary; live legs key-conditioned, open` | `live-validated (dev key); production gated on paid tier` | `production-validated` |
+| 17. Validation status | `production (baseline)` | `live-unvalidated; production reassignment gated on funded-key validation` | `credential layer live-validated (subscription OAuth: hot path, real refresh + rotation write-back, CLI round trip, live 200 on the compat endpoint)`; agent-layer parity gated on post-merge rollout | `unit + 401-boundary; live legs key-conditioned, open` | `live-validated (dev key); production gated on paid tier` | `production-validated` |
 
 ## Footnotes
 
