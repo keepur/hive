@@ -159,6 +159,21 @@ export interface TurnResult {
   timedOut?: boolean;
   /** KPR-307: propagated from RunResult.aborted (operator abort or deadline abort). */
   aborted?: boolean;
+  /**
+   * KPR-323 C1: cold-turn stage decomposition, populated only for
+   * ctx.channel === "voice" (always-on, log-only — the adapter merges these
+   * into the "Voice turn complete" line). Durations in ms.
+   */
+  stageTimings?: {
+    lockWaitMs: number;
+    spawnPrepMs: number;
+    bootToInitMs?: number;
+    initToFirstTokenMs?: number;
+  };
+  /** KPR-323 C2: true when the turn ran on a warm voice lease. */
+  warmPath?: boolean;
+  /** KPR-323 C2: 1-based turn sequence within the warm lease. */
+  warmTurnSeq?: number;
 }
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
@@ -890,7 +905,10 @@ export class AgentManager {
       throw new Error(`Unknown agent: ${ctx.agentId}`);
     }
 
+    const enteredAt = Date.now(); // KPR-323 C1: T1 anchor (admission start)
+
     return this.withSpawnTicket(ctx, async (ticket) => {
+      const lambdaStartedAt = Date.now(); // KPR-323 C1: T2 anchor (lock+budget held)
       // KPR-306: circuit-breaker admission — FIRST thing in the lambda, so a
       // fast-fail spends no session I/O and no model-router call. Throws
       // ProviderCircuitOpenError while the provider's circuit is open;
@@ -989,6 +1007,11 @@ export class AgentManager {
       // regression prevention.
       const shaping = await this.prepareSpawn(effectiveCtx);
 
+      let dispatchAt: number | undefined; // KPR-323 C1: T3 anchor (adapter.runTurn)
+      const markDispatch = () => {
+        dispatchAt = dispatchAt ?? Date.now();
+      };
+
       // KPR-306: exactly one breaker record per spawnTurn, on the FINALIZED
       // attempt. The auth-rebuild first attempt is locally recoverable —
       // when the retry fires, only the retry's result reaches the breaker
@@ -1001,7 +1024,7 @@ export class AgentManager {
       // belt-and-braces for future refactors.
       let finalResult: RunResult;
       try {
-        finalResult = await this.runOneSpawnAttempt(effectiveCtx, shaping, ticket, onStream);
+        finalResult = await this.runOneSpawnAttempt(effectiveCtx, shaping, ticket, onStream, markDispatch);
         if (finalResult.error && isAuthRebuildResumeError(finalResult.error) && effectiveCtx.sessionId) {
           log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
             agentId: effectiveCtx.agentId,
@@ -1013,6 +1036,7 @@ export class AgentManager {
             shaping,
             ticket,
             onStream,
+            markDispatch,
           );
         } else if (
           // KPR-350 (§D3): stale server-handle self-heal. The store held a
@@ -1069,6 +1093,7 @@ export class AgentManager {
             shaping,
             ticket,
             onStream,
+            markDispatch,
           );
         }
       } catch (err) {
@@ -1080,6 +1105,15 @@ export class AgentManager {
       this.circuitBreakers.record(permit, classifyTurnResult(finalResult), finalResult.llmMs);
 
       const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult, shaping.route);
+      // KPR-323 C1: voice-only stage decomposition for the adapter's log line.
+      if (effectiveCtx.channel === "voice") {
+        turnResult.stageTimings = {
+          lockWaitMs: lambdaStartedAt - enteredAt,
+          spawnPrepMs: (dispatchAt ?? lambdaStartedAt) - lambdaStartedAt,
+          bootToInitMs: finalResult.bootToInitMs,
+          initToFirstTokenMs: finalResult.initToFirstTokenMs,
+        };
+      }
       this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
@@ -1467,6 +1501,7 @@ export class AgentManager {
     shaping: SpawnShaping,
     ticket: SpawnTicket,
     onStream?: SpawnTurnStreamCallback,
+    onDispatch?: () => void, // KPR-323 C1: T3 anchor callback
   ): Promise<RunResult> {
     // KPR-347: built BEFORE adapter construction so Lane B assembly receives
     // the turn's WorkItemContext (context-sensitive server configs).
@@ -1511,6 +1546,7 @@ export class AgentManager {
       return aborted;
     }
 
+    onDispatch?.(); // KPR-323 C1 — immediately before adapter.runTurn
     const result = await adapter.runTurn({
       prompt: shaping.prompt,
       sessionId: ctx.sessionId,

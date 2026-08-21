@@ -153,6 +153,10 @@ export interface RunResult {
   error?: string;
   aborted?: boolean;
   timedOut?: boolean; // KPR-306: deadline fired; distinguishes timeout-abort from operator abort
+  /** KPR-323 C1: query()-call → system/init (CLI boot + session load + MCP handshake). Voice decomposition; log-only. */
+  bootToInitMs?: number;
+  /** KPR-323 C1: system/init → first streamed text_delta (≈ model TTFT). On warm turns (KPR-323 C2): push → first delta. */
+  initToFirstTokenMs?: number;
 }
 
 /**
@@ -1965,6 +1969,12 @@ export class AgentRunner {
       toolSearchEnvValue = toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto";
     }
 
+    // KPR-323 C1: cold-turn stage anchors (spec §2 T3→T5, T5→T6). Log-only.
+    const queryStartedAt = Date.now();
+    let initAt: number | undefined;
+    let bootToInitMs: number | undefined;
+    let initToFirstTokenMs: number | undefined;
+
     const q = query({
       prompt,
       options: {
@@ -2072,6 +2082,8 @@ export class AgentRunner {
 
         if (msg.type === "system" && msg.subtype === "init") {
           resultSessionId = msg.session_id;
+          initAt = Date.now();
+          bootToInitMs = initAt - queryStartedAt; // KPR-323 C1
           log.debug("Session initialized", { sessionId: resultSessionId });
         }
 
@@ -2100,6 +2112,9 @@ export class AgentRunner {
         if (msg.type === "stream_event" && onStream) {
           const event = (msg as any).event;
           if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
+            if (initToFirstTokenMs === undefined) {
+              initToFirstTokenMs = Date.now() - (initAt ?? queryStartedAt); // KPR-323 C1
+            }
             onStream(event.delta.text);
             streamed = true;
           }
@@ -2304,6 +2319,7 @@ export class AgentRunner {
       contextWindow, compactions, preCompactTokens,
       error, aborted: this._aborted,
       ...(timedOut ? { timedOut: true } : {}),
+      bootToInitMs, initToFirstTokenMs,
     };
   }
 

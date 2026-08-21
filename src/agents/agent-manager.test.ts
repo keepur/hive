@@ -662,6 +662,22 @@ describe("AgentManager", () => {
     });
   });
 
+  describe("spawnTurn C1 stageTimings (KPR-323)", () => {
+    it("populates stageTimings for a voice ctx", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const result = await manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      expect(result.stageTimings).toBeDefined();
+      expect(result.stageTimings!.lockWaitMs).toBeGreaterThanOrEqual(0);
+      expect(result.stageTimings!.spawnPrepMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it("leaves stageTimings undefined for an SMS ctx", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const result = await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+      expect(result.stageTimings).toBeUndefined();
+    });
+  });
+
   describe("getAllStates", () => {
     it("returns all agent states", async () => {
       mockConversationIndex.mockResolvedValue(undefined);

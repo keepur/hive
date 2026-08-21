@@ -3859,3 +3859,50 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
     expect(instructions.split(HOT).length - 1).toBe(1);
   });
 });
+
+describe("AgentRunner C1 stage stamps (KPR-323)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("stamps bootToInitMs and initToFirstTokenMs on init then text_delta then result", async () => {
+    mockMessages = [
+      { type: "system", subtype: "init", session_id: "s-c1" },
+      {
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "hi" },
+        },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        result: "hi",
+        total_cost_usd: 0.001,
+        duration_ms: 100,
+        session_id: "s-c1",
+      },
+    ];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello", undefined, () => {});
+
+    expect(typeof result.bootToInitMs).toBe("number");
+    expect(result.bootToInitMs).toBeGreaterThanOrEqual(0);
+    expect(typeof result.initToFirstTokenMs).toBe("number");
+    expect(result.initToFirstTokenMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("leaves bootToInitMs and initToFirstTokenMs undefined when neither init nor text_delta is emitted", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.bootToInitMs).toBeUndefined();
+    expect(result.initToFirstTokenMs).toBeUndefined();
+  });
+});
