@@ -282,6 +282,29 @@ export class VoiceAdapter {
     const callMeta = request.call?.metadata as Record<string, string> | undefined;
     const model = agentConfig.model;
 
+    // KPR-322 E2: abort the in-flight spawn when the client disconnects
+    // pre-completion (LiveKit barge-in cancels the bridge's HTTP request;
+    // a Vapi hang-up benefits identically). Registered BEFORE any await —
+    // `close` is not replayed for late listeners, and the prompt-build /
+    // session-store lookups below are real suspension points. `close` also
+    // fires after a normal `end()` — `writableEnded` distinguishes premature
+    // closes. All later response writes are suppressed via `clientGone`.
+    let clientGone = res.destroyed === true;
+    res.on("close", () => {
+      if (res.writableEnded) return;
+      clientGone = true;
+      try {
+        const abortedInFlight = agentManager.abortThread(agentId, threadId);
+        log.info("Voice client disconnected mid-turn", { callId, agentId, abortedInFlight });
+      } catch (err) {
+        // Throw-safety (review round 1 B2): a synchronous throw in an HTTP
+        // event listener is an uncaughtException — index.ts registers only
+        // an unhandledRejection handler (:878) — and would crash the engine
+        // mid-Vapi-coexistence. Log and swallow; the socket is gone anyway.
+        log.error("abort-on-disconnect failed", { callId, agentId, error: String(err) });
+      }
+    });
+
     // Voice-specific system prompt — omits tool summaries / delegate
     // descriptions, adds call goal/context. AgentRunner consumes via
     // TurnContext.systemPromptOverride.
@@ -333,7 +356,7 @@ export class VoiceAdapter {
           // chunk is the pre-extracted text-delta string (StreamCallback shape
           // = `(chunk: string) => void`). Defensive empty-skip mirrors the
           // legacy inline loop's behavior.
-          if (!chunk) return;
+          if (!chunk || clientGone) return;
           if (!headersSent) {
             res.writeHead(200, {
               "Content-Type": "text/event-stream",
@@ -391,6 +414,11 @@ export class VoiceAdapter {
       }
     };
 
+    if (clientGone) {
+      log.info("Voice turn skipped — client disconnected before spawn", { callId, agentId });
+      return;
+    }
+
     let outcome = await runOnce(ctx);
     let outerRetryFired = false;
 
@@ -398,7 +426,7 @@ export class VoiceAdapter {
     // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
     // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
     // cover (stale id without auth-error pattern, etc.).
-    if (!outcome.ok && !outcome.circuitOpen && effectiveResume && !outcome.bytesSent) {
+    if (!outcome.ok && !outcome.circuitOpen && effectiveResume && !outcome.bytesSent && !clientGone) {
       log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
         callId,
         reason: outcome.reason,
@@ -412,6 +440,19 @@ export class VoiceAdapter {
         workItem: retryWorkItem,
       };
       outcome = await runOnce(retryCtx);
+    }
+
+    // E2: never write into a dead socket — the turn (aborted or completed)
+    // ends silently; next turn's resume either works or trips the outer
+    // full-transcript retry (recoverable by construction, spec §7).
+    if (clientGone) {
+      log.info("Voice turn ended after client disconnect — response suppressed", {
+        callId,
+        agentId,
+        ok: outcome.ok,
+        aborted: outcome.ok ? (outcome.result.aborted ?? false) : undefined,
+      });
+      return;
     }
 
     if (!outcome.ok) {

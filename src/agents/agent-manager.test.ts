@@ -309,6 +309,38 @@ function makeSmsCtx(
   };
 }
 
+/** KPR-322 E2: voice TurnContext helper — same threadId on ctx and WorkItem. */
+function makeVoiceCtx(
+  overrides: Partial<{
+    agentId: string;
+    sessionId: string | undefined;
+    threadId: string;
+    channelId: string;
+    text: string;
+    workItem: WorkItem;
+  }> = {},
+): TurnContext {
+  const agentId = overrides.agentId ?? "agent-a";
+  const threadId = overrides.threadId ?? "voice:call-1";
+  const channelId = overrides.channelId ?? "call-1";
+  const workItem =
+    overrides.workItem ??
+    makeWorkItem({
+      text: overrides.text ?? "hello over voice",
+      threadId,
+      source: { kind: "voice" as const, id: channelId, label: `voice:${channelId}` },
+      sender: channelId,
+    });
+  return {
+    agentId,
+    sessionId: overrides.sessionId,
+    channelId,
+    threadId,
+    workItem,
+    channel: "voice" as const,
+  };
+}
+
 function makeMockRegistry() {
   const agents = new Map<string, AgentConfig>();
   agents.set("agent-a", makeAgentConfig({ id: "agent-a", name: "AgentA", maxConcurrent: 2 }));
@@ -562,6 +594,71 @@ describe("AgentManager", () => {
       // Cleanup
       resolver!();
       await p.catch(() => {});
+    });
+  });
+
+  describe("abortThread (KPR-322 E2)", () => {
+    it("aborts the ticket-holding spawn so the queued same-thread turn proceeds", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      let releaseFirst!: (r: ReturnType<typeof makeRunResult>) => void;
+      mockRunnerSend.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseFirst = resolve;
+        }),
+      );
+      mockRunnerAbort.mockImplementationOnce(() => releaseFirst(makeRunResult({ aborted: true })));
+
+      const first = manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(1));
+
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "post-interruption reply" }));
+      const second = manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      await new Promise((r) => setTimeout(r, 80)); // > 3 lock-wait cycles
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1); // still queued
+
+      expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+      const [turn1, turn2] = await Promise.all([first, second]);
+      expect(turn1.aborted).toBe(true);
+      expect(turn2.finalMessage).toBe("post-interruption reply");
+    });
+
+    it("returns false when nothing is in flight for the thread", () => {
+      expect(manager.abortThread("agent-a", "voice:none")).toBe(false);
+    });
+
+    it("does not abort a different thread of the same agent", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      let release!: (r: ReturnType<typeof makeRunResult>) => void;
+      mockRunnerSend.mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      );
+      const inflight = manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" })); // voice:call-1
+      await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(1));
+      expect(manager.abortThread("agent-a", "voice:call-2")).toBe(false);
+      expect(mockRunnerAbort).not.toHaveBeenCalled();
+      release(makeRunResult());
+      await inflight;
+    });
+
+    it("is throw-safe: a throwing ticket.abort() never escapes abortThread (KPR-322 review B2)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      let release!: (r: ReturnType<typeof makeRunResult>) => void;
+      mockRunnerSend.mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      );
+      mockRunnerAbort.mockImplementationOnce(() => {
+        throw new Error("boom");
+      });
+      const inflight = manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(1));
+      expect(() => manager.abortThread("agent-a", "voice:call-1")).not.toThrow();
+      expect(mockRunnerAbort).toHaveBeenCalledTimes(1);
+      release(makeRunResult());
+      await inflight;
     });
   });
 
