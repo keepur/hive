@@ -167,7 +167,7 @@ describe("VoiceWorkerHeartbeat (KPR-322 Task 8)", () => {
     vi.useRealTimers();
   });
 
-  it("writeOnce $sets cellDefaults/updatedAt/lastError only — not local counters", async () => {
+  it("writeOnce $sets cellDefaults/updatedAt only — not lastError or local counters", async () => {
     const coll = makeFakeCollection();
     const hb = new VoiceWorkerHeartbeat(coll as never, cellDefaults);
     hb.activeCalls = 2;
@@ -182,10 +182,15 @@ describe("VoiceWorkerHeartbeat (KPR-322 Task 8)", () => {
     expect(update.$set).not.toHaveProperty("activeCalls");
     expect(update.$set).not.toHaveProperty("callsStarted");
     expect(update.$set).not.toHaveProperty("callsCompleted");
-    expect(update.$set.lastError).toBe("budget_saturated");
+    expect(update.$set).not.toHaveProperty("lastError");
     expect(update.$set.cellDefaults).toEqual(cellDefaults);
     expect(update.$set.updatedAt).toBeInstanceOf(Date);
-    expect(update.$setOnInsert).toEqual({ activeCalls: 0, callsStarted: 0, callsCompleted: 0 });
+    expect(update.$setOnInsert).toEqual({
+      lastError: null,
+      activeCalls: 0,
+      callsStarted: 0,
+      callsCompleted: 0,
+    });
     expect(options).toEqual({ upsert: true });
     assertNoPii(update.$set as Record<string, unknown>);
     assertNoPii(update.$setOnInsert as Record<string, unknown>);

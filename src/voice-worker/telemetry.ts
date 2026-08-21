@@ -155,18 +155,21 @@ export class VoiceWorkerHeartbeat {
   ) {}
 
   /**
-   * Supervisor liveness tick. Sets cellDefaults / updatedAt / lastError only.
-   * Never $set the call counters — those are owned by forked-job $inc via
-   * noteCallStarted / noteCallEnded. $setOnInsert seeds zeros on first upsert.
+   * Supervisor liveness tick. Sets cellDefaults / updatedAt only.
+   * Never $set lastError — forked jobs persist that via noteError; the
+   * supervisor never calls noteError, so a tick $set would wipe a job error
+   * with null. Never $set the call counters — those are owned by forked-job
+   * $inc via noteCallStarted / noteCallEnded. $setOnInsert seeds lastError
+   * null plus counter zeros on first upsert.
    */
   async writeOnce(): Promise<void> {
     await this.persist({
       $set: {
-        lastError: this.lastError,
         cellDefaults: this.cellDefaults,
         updatedAt: new Date(),
       },
       $setOnInsert: {
+        lastError: null,
         activeCalls: 0,
         callsStarted: 0,
         callsCompleted: 0,
