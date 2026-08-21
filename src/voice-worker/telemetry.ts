@@ -177,6 +177,30 @@ export class VoiceWorkerHeartbeat {
     });
   }
 
+  /**
+   * Process boot: zero ghost in-flight calls left by a previous process that
+   * $inc'd activeCalls and died without noteCallEnded. $set activeCalls: 0
+   * plus cellDefaults/updatedAt. Does not $set lastError or lifetime
+   * callsStarted/callsCompleted. $setOnInsert seeds first-ever upsert;
+   * activeCalls is omitted there because it is already in $set (Mongo
+   * rejects the same path in both).
+   */
+  async writeBoot(): Promise<void> {
+    this.activeCalls = 0;
+    await this.persist({
+      $set: {
+        cellDefaults: this.cellDefaults,
+        updatedAt: new Date(),
+        activeCalls: 0,
+      },
+      $setOnInsert: {
+        lastError: null,
+        callsStarted: 0,
+        callsCompleted: 0,
+      },
+    });
+  }
+
   async noteCallStarted(): Promise<void> {
     this.activeCalls += 1;
     this.callsStarted += 1;

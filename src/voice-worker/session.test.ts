@@ -1,9 +1,34 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { VendorCell } from "./cells.js";
 import { resolveFailureAction, type BridgeFailureClass } from "./error-map.js";
-import { resolveInboundAgent } from "./session.js";
-import { CallStats } from "./telemetry.js";
 import type { WorkerConfig } from "./worker-config.js";
+
+const { mongoMocks } = vi.hoisted(() => ({
+  mongoMocks: {
+    insertOne: vi.fn(),
+    connect: vi.fn(),
+    close: vi.fn(),
+    db: vi.fn(),
+    collection: vi.fn(),
+    MongoClient: vi.fn(),
+  },
+}));
+
+vi.mock("mongodb", () => {
+  mongoMocks.collection.mockImplementation(() => ({ insertOne: mongoMocks.insertOne }));
+  mongoMocks.db.mockImplementation(() => ({ collection: mongoMocks.collection }));
+  mongoMocks.MongoClient.mockImplementation(function MongoClient() {
+    return {
+      connect: mongoMocks.connect,
+      db: mongoMocks.db,
+      close: mongoMocks.close,
+    };
+  });
+  return { MongoClient: mongoMocks.MongoClient };
+});
+
+import { recordSetupFailure, resolveInboundAgent } from "./session.js";
+import { CallStats, VoiceWorkerHeartbeat } from "./telemetry.js";
 
 const INBOUND_COPY = {
   goal: "Answer this inbound vendor callback professionally and help the caller.",
@@ -102,5 +127,54 @@ describe("CallStats.retryConsumed (KPR-322 Task 7 stand-in)", () => {
     expect(stats.retryConsumed("budget_saturated")).toBe(true);
     expect(stats.retryConsumed("spawn_failed")).toBe(false);
     expect(stats.retryConsumed("spawn_failed")).toBe(true);
+  });
+});
+
+describe("recordSetupFailure (KPR-322 setup telemetry)", () => {
+  const cell: VendorCell = { stt: "deepgram/flux-general-en", tts: "cartesia/sonic-3" };
+  const wc = {
+    livekitUrl: "wss://example.livekit.cloud",
+    livekitApiKey: "k",
+    livekitApiSecret: "s",
+    sipTrunkId: "ST_x",
+    inboundAgents: {},
+    defaultStt: "deepgram/flux-general-en",
+    defaultTts: "cartesia/sonic-3",
+    deepgramApiKey: "dg",
+    cartesiaApiKey: "c",
+    elevenlabsApiKey: "e",
+    bridgeToken: "t",
+    bridgeUrl: "http://127.0.0.1:9/v1/chat/completions",
+    mongoUri: "mongodb://localhost",
+    mongoDbName: "hive",
+  } satisfies WorkerConfig;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mongoMocks.insertOne.mockResolvedValue({ acknowledged: true });
+    mongoMocks.connect.mockResolvedValue(undefined);
+    mongoMocks.close.mockResolvedValue(undefined);
+  });
+
+  it("first-wins: subsequent flush(completed) keeps outcome setup_failed", async () => {
+    const stats = new CallStats(wc, { callId: "call-1", agentId: "luna", cell, direction: "outbound" });
+    const coll = { updateOne: vi.fn().mockResolvedValue({ acknowledged: true }) };
+    const heartbeat = new VoiceWorkerHeartbeat(coll as never, {
+      defaultStt: wc.defaultStt,
+      defaultTts: wc.defaultTts,
+    });
+
+    await recordSetupFailure(stats, heartbeat);
+    await stats.flush("completed");
+
+    expect(mongoMocks.insertOne).toHaveBeenCalledTimes(1);
+    const doc = mongoMocks.insertOne.mock.calls[0]![0] as Record<string, unknown>;
+    expect(doc.outcome).toBe("setup_failed");
+    expect(doc).not.toHaveProperty("to");
+    expect(doc).not.toHaveProperty("phone");
+
+    expect(coll.updateOne).toHaveBeenCalledTimes(1);
+    const update = coll.updateOne.mock.calls[0]![1] as { $set: Record<string, unknown> };
+    expect(update.$set.lastError).toBe("setup_failed");
   });
 });

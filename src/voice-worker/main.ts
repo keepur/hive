@@ -50,7 +50,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       defaultStt: wc.defaultStt,
       defaultTts: wc.defaultTts,
     });
-    await workerHeartbeat.writeOnce();
+    await workerHeartbeat.writeBoot();
     workerHeartbeat.start();
     cli.runApp(
       new WorkerOptions({

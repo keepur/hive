@@ -196,6 +196,33 @@ describe("VoiceWorkerHeartbeat (KPR-322 Task 8)", () => {
     assertNoPii(update.$setOnInsert as Record<string, unknown>);
   });
 
+  it("writeBoot $sets activeCalls 0 plus cellDefaults/updatedAt — not lastError or lifetime counters", async () => {
+    const coll = makeFakeCollection();
+    const hb = new VoiceWorkerHeartbeat(coll as never, cellDefaults);
+    hb.activeCalls = 2;
+    hb.callsStarted = 5;
+    hb.callsCompleted = 3;
+    hb.lastError = "budget_saturated";
+    await hb.writeBoot();
+
+    expect(hb.activeCalls).toBe(0);
+    expect(hb.callsStarted).toBe(5);
+    expect(hb.callsCompleted).toBe(3);
+    expect(hb.lastError).toBe("budget_saturated");
+    expect(coll.updateOne).toHaveBeenCalledTimes(1);
+    const [filter, update, options] = coll.updateOne.mock.calls[0]!;
+    expect(filter).toEqual({ kind: "voice_worker_stats" });
+    expect(update.$set.activeCalls).toBe(0);
+    expect(update.$set.cellDefaults).toEqual(cellDefaults);
+    expect(update.$set.updatedAt).toBeInstanceOf(Date);
+    expect(update.$set).not.toHaveProperty("lastError");
+    expect(update.$set).not.toHaveProperty("callsStarted");
+    expect(update.$set).not.toHaveProperty("callsCompleted");
+    expect(options).toEqual({ upsert: true });
+    assertNoPii(update.$set as Record<string, unknown>);
+    assertNoPii(update.$setOnInsert as Record<string, unknown>);
+  });
+
   it("noteCallStarted $incs counters, updates in-memory, and does not include PII", async () => {
     const coll = makeFakeCollection();
     const hb = new VoiceWorkerHeartbeat(coll as never, cellDefaults);

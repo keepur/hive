@@ -188,16 +188,33 @@ export async function runCallSession(
     // "fix" agent behavior here.
     instructions: "Placeholder — hive owns the prompt server-side.",
   });
-  await session.start({ agent, room: ctx.room });
+  try {
+    await session.start({ agent, room: ctx.room });
 
-  if (dest) {
-    const sip = new SipClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
-    await sip.createSipParticipant(wc.sipTrunkId, dest, callId, {
-      participantIdentity: `sip-${callId}`,
-      waitUntilAnswered: true,
-    });
-    session.generateReply();
+    if (dest) {
+      const sip = new SipClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
+      await sip.createSipParticipant(wc.sipTrunkId, dest, callId, {
+        participantIdentity: `sip-${callId}`,
+        waitUntilAnswered: true,
+      });
+      session.generateReply();
+    }
+  } catch (err) {
+    // callId only — LiveKit/SIP errors can embed the destination.
+    log.error("Call setup failed", { callId });
+    await recordSetupFailure(stats, heartbeat);
+    throw err;
   }
+}
+
+/** First-wins setup failure so shutdown flush("completed") cannot win. */
+export async function recordSetupFailure(
+  stats: Pick<CallStats, "recordFailure" | "flush">,
+  heartbeat?: Pick<VoiceWorkerHeartbeat, "noteError">,
+): Promise<void> {
+  stats.recordFailure("setup_failed");
+  if (heartbeat) await heartbeat.noteError("setup_failed");
+  await stats.flush("failed");
 }
 
 async function handleSessionError(
