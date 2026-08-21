@@ -111,6 +111,9 @@ export class HiveLLMStream extends llm.LLMStream {
   }
 
   protected async run(): Promise<void> {
+    // Abort-before-first-token must not leak the previous turn's object into
+    // TurnMetrics (EOU can join cancelled TTS before this turn's finally).
+    this.parent.lastTurnTiming = null;
     const controller = new AbortController();
     // §7: framework cancels the stream (barge-in) → abort the HTTP request.
     const onAbort = () => controller.abort();
@@ -158,7 +161,15 @@ export class HiveLLMStream extends llm.LLMStream {
           if (ev.kind === "content") {
             if (this.abortController.signal.aborted) return;
             const now = Date.now();
-            if (!firstTokenAt) firstTokenAt = now;
+            if (!firstTokenAt) {
+              firstTokenAt = now;
+              // New object so TurnMetrics can tell this-turn TTFT from a
+              // leftover prior-turn lastTurnTiming snapshotted at EOU.
+              this.parent.lastTurnTiming = {
+                llmTtftMs: firstTokenAt - startedAt,
+                maxInterChunkGapMs: maxGapMs,
+              };
+            }
             if (lastChunkAt) maxGapMs = Math.max(maxGapMs, now - lastChunkAt);
             lastChunkAt = now;
             yielded = true;

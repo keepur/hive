@@ -225,6 +225,68 @@ describe("HiveLLM (KPR-322)", () => {
     expect(sawTeardown).toBe(true);
   });
 
+  it("publishes lastTurnTiming at the first yielded token before the stream ends", async () => {
+    const stub = await listen((_req, res) => {
+      _req.resume();
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(formatSSETextChunk(STREAM_ID, "one", MODEL));
+    });
+    openServers.push(stub.server);
+
+    const hive = makeHive(stub.url);
+    hive.on("error", () => {
+      /* swallow EventEmitter errors */
+    });
+    const stream = hive.chat({ chatCtx: userCtx("hello") });
+    const first = await stream.next();
+    expect(first.done).toBe(false);
+    expect(first.value?.delta?.content).toBe("one");
+    expect(hive.lastTurnTiming).not.toBeNull();
+    expect(hive.lastTurnTiming!.llmTtftMs).toBeGreaterThanOrEqual(0);
+    stream.close();
+    const leftover: llm.ChatChunk[] = [];
+    try {
+      for await (const chunk of stream) leftover.push(chunk);
+    } catch {
+      /* close may reject the iterator */
+    }
+    expect(leftover).toEqual([]);
+  });
+
+  it("clears lastTurnTiming at run start so abort-before-token does not leak the prior turn", async () => {
+    const stub = await listen((req, res) => {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+    });
+    openServers.push(stub.server);
+
+    const hive = makeHive(stub.url);
+    const prior = { llmTtftMs: 999, maxInterChunkGapMs: 50 };
+    hive.lastTurnTiming = prior;
+    hive.on("error", () => {
+      /* swallow EventEmitter errors */
+    });
+    const stream = hive.chat({ chatCtx: userCtx("hello") });
+    const started = Date.now();
+    while (hive.lastTurnTiming === prior) {
+      if (Date.now() - started > 2000) break;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(hive.lastTurnTiming).toBeNull();
+    expect(hive.lastTurnTiming).not.toBe(prior);
+    stream.close();
+    const leftover: llm.ChatChunk[] = [];
+    let thrown: unknown;
+    try {
+      for await (const chunk of stream) leftover.push(chunk);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeUndefined();
+    expect(leftover).toEqual([]);
+    expect(hive.lastTurnTiming).not.toBe(prior);
+  });
+
   it("prefixes the latest user message with the interruption marker only", async () => {
     let parsedBody: {
       stream?: boolean;
