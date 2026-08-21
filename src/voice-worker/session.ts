@@ -48,7 +48,7 @@ import type { VendorCell } from "./cells.js";
 import type { DispatchMetadata } from "./dispatch-meta.js";
 import { FAILURE_BEHAVIOR, FALLBACK_LINES, resolveFailureAction } from "./error-map.js";
 import { BridgeError, HiveLLM } from "./hive-llm.js";
-import { CallStats, TurnMetrics } from "./telemetry.js";
+import { CallStats, TurnMetrics, type VoiceWorkerHeartbeat } from "./telemetry.js";
 import { normalizeForTTS } from "./tts-normalize.js";
 import type { WorkerConfig } from "./worker-config.js";
 
@@ -100,6 +100,7 @@ export async function runCallSession(
   wc: WorkerConfig,
   meta: DispatchMetadata,
   cell: VendorCell,
+  heartbeat?: VoiceWorkerHeartbeat,
 ): Promise<void> {
   await ctx.connect();
   const callId = ctx.room.name;
@@ -153,6 +154,19 @@ export async function runCallSession(
   const metrics = new TurnMetrics(callId, cell, hiveLLM, outbound ? "outbound" : "inbound");
   metrics.attach(session);
 
+  if (heartbeat) {
+    heartbeat.activeCalls += 1;
+    heartbeat.callsStarted += 1;
+  }
+  let callReleased = false;
+  const releaseCall = () => {
+    if (callReleased) return;
+    callReleased = true;
+    if (!heartbeat) return;
+    heartbeat.activeCalls = Math.max(0, heartbeat.activeCalls - 1);
+    heartbeat.callsCompleted += 1;
+  };
+
   session.on(voice.AgentSessionEventTypes.ConversationItemAdded, (ev) => {
     const item = ev.item;
     if (item.type === "message" && item.role === "assistant" && item.interrupted) {
@@ -162,7 +176,12 @@ export async function runCallSession(
   });
 
   session.on(voice.AgentSessionEventTypes.Error, (ev) => {
-    void handleSessionError(ev, { session, stats, ctx, callId });
+    void handleSessionError(ev, { session, stats, ctx, callId, heartbeat, releaseCall });
+  });
+
+  ctx.addShutdownCallback(() => {
+    releaseCall();
+    return stats.flush("completed");
   });
 
   const agent = new voice.Agent({
@@ -181,8 +200,6 @@ export async function runCallSession(
     });
     session.generateReply();
   }
-
-  ctx.addShutdownCallback(() => stats.flush("completed"));
 }
 
 async function handleSessionError(
@@ -192,9 +209,11 @@ async function handleSessionError(
     stats: CallStats;
     ctx: JobContext;
     callId: string;
+    heartbeat?: VoiceWorkerHeartbeat;
+    releaseCall: () => void;
   },
 ): Promise<void> {
-  const { session, stats, ctx, callId } = args;
+  const { session, stats, ctx, callId, heartbeat, releaseCall } = args;
   const inner = ev.error;
   const failure = inner.type === "llm_error" && inner.error instanceof BridgeError ? inner.error : null;
   if (!failure) {
@@ -213,7 +232,9 @@ async function handleSessionError(
   }
   if (action.kind === "continue") return;
   await speakAndWait(session, FALLBACK_LINES[action.say]);
+  if (heartbeat) heartbeat.lastError = behavior.telemetryOutcome;
   await stats.flush("failed");
+  releaseCall();
   ctx.shutdown();
 }
 
