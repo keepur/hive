@@ -151,20 +151,18 @@ export async function runCallSession(
     cell,
     direction: outbound ? "outbound" : "inbound",
   });
-  const metrics = new TurnMetrics(callId, cell, hiveLLM, outbound ? "outbound" : "inbound");
+  const metrics = new TurnMetrics(callId, cell, hiveLLM, outbound ? "outbound" : "inbound", (line) => {
+    if (line.totalToFirstAudioMs >= 0) stats.recordTurnLatency(line.totalToFirstAudioMs);
+  });
   metrics.attach(session);
 
-  if (heartbeat) {
-    heartbeat.activeCalls += 1;
-    heartbeat.callsStarted += 1;
-  }
+  if (heartbeat) void heartbeat.noteCallStarted();
   let callReleased = false;
   const releaseCall = () => {
     if (callReleased) return;
     callReleased = true;
     if (!heartbeat) return;
-    heartbeat.activeCalls = Math.max(0, heartbeat.activeCalls - 1);
-    heartbeat.callsCompleted += 1;
+    void heartbeat.noteCallEnded();
   };
 
   session.on(voice.AgentSessionEventTypes.ConversationItemAdded, (ev) => {
@@ -232,7 +230,7 @@ async function handleSessionError(
   }
   if (action.kind === "continue") return;
   await speakAndWait(session, FALLBACK_LINES[action.say]);
-  if (heartbeat) heartbeat.lastError = behavior.telemetryOutcome;
+  if (heartbeat) void heartbeat.noteError(behavior.telemetryOutcome);
   await stats.flush("failed");
   releaseCall();
   ctx.shutdown();

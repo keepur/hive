@@ -26,6 +26,15 @@ export interface WorkerConfig {
   mongoDbName: string;
 }
 
+/** Map hive worker config onto @livekit/agents WorkerOptions / ServerOptions auth fields. */
+export function livekitServerAuth(wc: Pick<WorkerConfig, "livekitUrl" | "livekitApiKey" | "livekitApiSecret">): {
+  wsURL: string;
+  apiKey: string;
+  apiSecret: string;
+} {
+  return { wsURL: wc.livekitUrl, apiKey: wc.livekitApiKey, apiSecret: wc.livekitApiSecret };
+}
+
 export function loadWorkerConfig(): WorkerConfig {
   const lk = config.voice.livekit;
   if (!lk.enabled) throw new Error("voice.livekit.enabled is false — voice worker refusing to start");

@@ -167,7 +167,7 @@ describe("VoiceWorkerHeartbeat (KPR-322 Task 8)", () => {
     vi.useRealTimers();
   });
 
-  it("writeOnce upserts {kind: voice_worker_stats} with counters + updatedAt", async () => {
+  it("writeOnce $sets cellDefaults/updatedAt/lastError only — not local counters", async () => {
     const coll = makeFakeCollection();
     const hb = new VoiceWorkerHeartbeat(coll as never, cellDefaults);
     hb.activeCalls = 2;
@@ -179,14 +179,65 @@ describe("VoiceWorkerHeartbeat (KPR-322 Task 8)", () => {
     expect(coll.updateOne).toHaveBeenCalledTimes(1);
     const [filter, update, options] = coll.updateOne.mock.calls[0]!;
     expect(filter).toEqual({ kind: "voice_worker_stats" });
-    expect(update.$set.activeCalls).toBe(2);
-    expect(update.$set.callsStarted).toBe(5);
-    expect(update.$set.callsCompleted).toBe(3);
+    expect(update.$set).not.toHaveProperty("activeCalls");
+    expect(update.$set).not.toHaveProperty("callsStarted");
+    expect(update.$set).not.toHaveProperty("callsCompleted");
     expect(update.$set.lastError).toBe("budget_saturated");
     expect(update.$set.cellDefaults).toEqual(cellDefaults);
     expect(update.$set.updatedAt).toBeInstanceOf(Date);
+    expect(update.$setOnInsert).toEqual({ activeCalls: 0, callsStarted: 0, callsCompleted: 0 });
     expect(options).toEqual({ upsert: true });
     assertNoPii(update.$set as Record<string, unknown>);
+    assertNoPii(update.$setOnInsert as Record<string, unknown>);
+  });
+
+  it("noteCallStarted $incs counters, updates in-memory, and does not include PII", async () => {
+    const coll = makeFakeCollection();
+    const hb = new VoiceWorkerHeartbeat(coll as never, cellDefaults);
+    await hb.noteCallStarted();
+
+    expect(hb.activeCalls).toBe(1);
+    expect(hb.callsStarted).toBe(1);
+    expect(coll.updateOne).toHaveBeenCalledTimes(1);
+    const [filter, update, options] = coll.updateOne.mock.calls[0]!;
+    expect(filter).toEqual({ kind: "voice_worker_stats" });
+    expect(update.$inc).toEqual({ activeCalls: 1, callsStarted: 1 });
+    expect(update.$set.updatedAt).toBeInstanceOf(Date);
+    expect(update.$set).not.toHaveProperty("activeCalls");
+    expect(options).toEqual({ upsert: true });
+    assertNoPii(update as Record<string, unknown>);
+    assertNoPii(update.$inc as Record<string, unknown>);
+    assertNoPii(update.$set as Record<string, unknown>);
+  });
+
+  it("noteCallEnded $incs completed and decrements activeCalls", async () => {
+    const coll = makeFakeCollection();
+    const hb = new VoiceWorkerHeartbeat(coll as never, cellDefaults);
+    await hb.noteCallStarted();
+    await hb.noteCallEnded();
+
+    expect(hb.activeCalls).toBe(0);
+    expect(hb.callsCompleted).toBe(1);
+    const update = coll.updateOne.mock.calls[1]![1] as {
+      $inc: Record<string, number>;
+      $set: Record<string, unknown>;
+    };
+    expect(update.$inc).toEqual({ activeCalls: -1, callsCompleted: 1 });
+    expect(update.$set.updatedAt).toBeInstanceOf(Date);
+    assertNoPii(update.$inc);
+    assertNoPii(update.$set);
+  });
+
+  it("noteError $sets lastError without PII", async () => {
+    const coll = makeFakeCollection();
+    const hb = new VoiceWorkerHeartbeat(coll as never, cellDefaults);
+    await hb.noteError("budget_saturated");
+
+    expect(hb.lastError).toBe("budget_saturated");
+    const update = coll.updateOne.mock.calls[0]![1] as { $set: Record<string, unknown> };
+    expect(update.$set.lastError).toBe("budget_saturated");
+    expect(update.$set.updatedAt).toBeInstanceOf(Date);
+    assertNoPii(update.$set);
   });
 
   it("write failure logs and does not throw", async () => {
@@ -297,6 +348,29 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
     session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(9));
     session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(9));
     expect(mockLog.info).not.toHaveBeenCalled();
+  });
+
+  it("invokes onTurn with the emitted line", () => {
+    const onTurn = vi.fn();
+    const hiveLLM = { lastTurnTiming: { llmTtftMs: 200, maxInterChunkGapMs: 15 } };
+    const metrics = new TurnMetrics("call-abc", CELL, hiveLLM, "outbound", onTurn);
+    const session = makeFakeSession();
+    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
+
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110));
+
+    expect(onTurn).toHaveBeenCalledTimes(1);
+    const line = onTurn.mock.calls[0]![0] as Record<string, unknown>;
+    expect(line.callId).toBe("call-abc");
+    expect(line.turnSeq).toBe(0);
+    expect(line.direction).toBe("outbound");
+    expect(line.cell).toEqual(CELL);
+    expect(line.eouDelayMs).toBe(110);
+    expect(line.llmTtftMs).toBe(200);
+    expect(line.ttsTtfbMs).toBe(80);
+    expect(line.totalToFirstAudioMs).toBe(110 + 200 + 80);
+    assertNoPii(line);
   });
 });
 

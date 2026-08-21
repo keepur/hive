@@ -75,6 +75,7 @@ export class TurnMetrics {
     private readonly cell: VendorCell,
     private readonly hiveLLM: Pick<HiveLLM, "lastTurnTiming">,
     private readonly direction: CallDirection = "outbound",
+    private readonly onTurn?: (line: TurnMetricsLine) => void,
   ) {}
 
   attach(session: Pick<voice.AgentSession, "on">): void {
@@ -133,6 +134,7 @@ export class TurnMetrics {
     this.pendingFalseInterruption = false;
     // Flatten cell so the log object has no nested vendor dump.
     log.info("voice turn metrics", { ...line, cell: `${this.cell.stt}+${this.cell.tts}` });
+    this.onTurn?.(line);
   }
 }
 
@@ -153,26 +155,53 @@ export class VoiceWorkerHeartbeat {
   ) {}
 
   /**
-   * Writes one heartbeat snapshot. Exposed for tests + initial-write at
-   * CLI boot so the doctor sees real data on the first poll rather than
-   * "no heartbeat yet".
+   * Supervisor liveness tick. Sets cellDefaults / updatedAt / lastError only.
+   * Never $set the call counters — those are owned by forked-job $inc via
+   * noteCallStarted / noteCallEnded. $setOnInsert seeds zeros on first upsert.
    */
   async writeOnce(): Promise<void> {
+    await this.persist({
+      $set: {
+        lastError: this.lastError,
+        cellDefaults: this.cellDefaults,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: {
+        activeCalls: 0,
+        callsStarted: 0,
+        callsCompleted: 0,
+      },
+    });
+  }
+
+  async noteCallStarted(): Promise<void> {
+    this.activeCalls += 1;
+    this.callsStarted += 1;
+    await this.persist({
+      $inc: { activeCalls: 1, callsStarted: 1 },
+      $set: { updatedAt: new Date() },
+    });
+  }
+
+  async noteCallEnded(): Promise<void> {
+    this.activeCalls = Math.max(0, this.activeCalls - 1);
+    this.callsCompleted += 1;
+    await this.persist({
+      $inc: { activeCalls: -1, callsCompleted: 1 },
+      $set: { updatedAt: new Date() },
+    });
+  }
+
+  async noteError(msg: string): Promise<void> {
+    this.lastError = msg;
+    await this.persist({
+      $set: { lastError: msg, updatedAt: new Date() },
+    });
+  }
+
+  private async persist(update: object): Promise<void> {
     await this.telemetry
-      .updateOne(
-        { kind: VoiceWorkerHeartbeat.TELEMETRY_KIND },
-        {
-          $set: {
-            activeCalls: this.activeCalls,
-            callsStarted: this.callsStarted,
-            callsCompleted: this.callsCompleted,
-            lastError: this.lastError,
-            cellDefaults: this.cellDefaults,
-            updatedAt: new Date(),
-          },
-        },
-        { upsert: true },
-      )
+      .updateOne({ kind: VoiceWorkerHeartbeat.TELEMETRY_KIND }, update, { upsert: true })
       .catch((err) => log.warn("voice-worker heartbeat write failed", { error: String(err) }));
   }
 
