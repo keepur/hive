@@ -5,6 +5,7 @@ import {
   resolveCircuitBreakerConfig,
   resolveOutageQueueConfig,
   resolveToolSearchConfig,
+  resolveVoiceLivekitConfig,
   DEFAULT_TOOL_SEARCH_CONFIG,
 } from "./config.js";
 import { DEFAULT_CIRCUIT_BREAKER_CONFIG } from "./agents/provider-circuit-breaker.js";
@@ -198,5 +199,37 @@ describe("resolveToolSearchConfig (KPR-329)", () => {
       mode: "on",
       source: "hive.yaml",
     });
+  });
+});
+
+describe("resolveVoiceLivekitConfig (KPR-322 E3)", () => {
+  it("defaults on absent/garbage input", () => {
+    for (const input of [undefined, null, 42, "x", []]) {
+      const c = resolveVoiceLivekitConfig(input);
+      expect(c.enabled).toBe(false);
+      expect(c.url).toBe("");
+      expect(c.sipTrunkId).toBe("");
+      expect(c.inboundAgents).toEqual({});
+      expect(c.defaultStt).toBe("deepgram/flux-general-en");
+      expect(c.defaultTts).toBe("cartesia/sonic-3");
+    }
+  });
+  it("parses a full section and filters junk inboundAgents entries", () => {
+    const c = resolveVoiceLivekitConfig({
+      enabled: true,
+      url: " wss://p.livekit.cloud ",
+      sipTrunkId: "ST_1",
+      inboundAgents: { "+15551230000": "nora", "+15551231111": 7, "+15551232222": " " },
+      defaultStt: "deepgram/nova-3",
+      defaultTts: "elevenlabs/eleven_flash_v2_5",
+      unknownKey: "ignored",
+    });
+    expect(c.enabled).toBe(true);
+    expect(c.url).toBe("wss://p.livekit.cloud");
+    expect(c.inboundAgents).toEqual({ "+15551230000": "nora" });
+    expect(c.defaultStt).toBe("deepgram/nova-3");
+  });
+  it("enabled must be literal true", () => {
+    expect(resolveVoiceLivekitConfig({ enabled: "true" }).enabled).toBe(false);
   });
 });

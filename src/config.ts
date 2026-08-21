@@ -165,6 +165,53 @@ export function resolveToolSearchEnv(agentToolSearch: string | undefined, hiveMo
 }
 
 /**
+ * KPR-322 E3: resolve the optional hive.yaml `voice.livekit` section.
+ * Liberal-loader style (KPR-225 F3): all keys optional, unknown keys ignored,
+ * non-object input → defaults. Exported pure for unit tests.
+ */
+export interface VoiceLivekitConfig {
+  enabled: boolean;
+  /** wss://<project>.livekit.cloud — non-secret. */
+  url: string;
+  /** SIPOutboundTrunk id from SIP-1 (ST_...). */
+  sipTrunkId: string;
+  /** E.164 → hive agent id map for inbound dispatch (S5). */
+  inboundAgents: Record<string, string>;
+  /** A/B cell defaults (S7); per-dispatch metadata overrides. */
+  defaultStt: string;
+  defaultTts: string;
+}
+
+export function resolveVoiceLivekitConfig(raw: unknown): VoiceLivekitConfig {
+  const src = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  const str = (v: unknown, fallback: string): string => (typeof v === "string" && v.trim() ? v.trim() : fallback);
+  const inboundAgents: Record<string, string> = {};
+  if (src.inboundAgents && typeof src.inboundAgents === "object" && !Array.isArray(src.inboundAgents)) {
+    for (const [num, agent] of Object.entries(src.inboundAgents as Record<string, unknown>)) {
+      if (typeof agent === "string" && agent.trim()) inboundAgents[num] = agent.trim();
+    }
+  }
+  return {
+    enabled: src.enabled === true,
+    url: str(src.url, ""),
+    sipTrunkId: str(src.sipTrunkId, ""),
+    inboundAgents,
+    defaultStt: str(src.defaultStt, "deepgram/flux-general-en"),
+    defaultTts: str(src.defaultTts, "cartesia/sonic-3"),
+  };
+}
+
+/**
+ * KPR-322: env-first / Honeypot-second secret resolution for out-of-engine
+ * processes (the voice worker reuses the engine loader). Delegates to the
+ * loader's own `optional()` so the semantics can never drift from the
+ * engine's resolution order.
+ */
+export function resolveSecretEnv(key: string): string {
+  return optional(key, "");
+}
+
+/**
  * KPR-242: warn once at config load if hive.yaml still carries the deprecated
  * `google.account` field. Exported so unit tests can exercise it directly.
  */
@@ -432,6 +479,28 @@ export const config = {
     apiKey: optional("VAPI_API_KEY", ""),
     serverSecret: optional("VAPI_SERVER_SECRET", ""),
     port: parseInt(optional("VOICE_PORT", String(ports.voice ?? portBase + 5)), 10),
+    // KPR-322 E1/E3: shared bridge secret (worker → adapter) + bind host.
+    // Loopback default — both callers are local (worker directly; Vapi via
+    // the cloudflared tunnel, which connects from localhost ⚠ verify tunnel
+    // topology at delivery; escape hatch: voice.bindHost: "0.0.0.0").
+    bridgeToken: optional("HIVE_VOICE_BRIDGE_TOKEN", ""),
+    bindHost: ((hive.voice as Record<string, unknown> | undefined)?.bindHost as string) || "127.0.0.1",
+    // KPR-322 E3: LiveKit worker section + worker/server API pair.
+    livekit: resolveVoiceLivekitConfig((hive.voice as Record<string, unknown> | undefined)?.livekit),
+    livekitApiKey: optional("LIVEKIT_API_KEY", ""),
+    livekitApiSecret: optional("LIVEKIT_API_SECRET", ""),
+  },
+  // KPR-322 E3: names reserved by 321 §9, wired here. Consumed by
+  // scripts/livekit-setup.ts (SIP-1) — never by cloud-model-facing code.
+  telephony: {
+    twilio: {
+      number:
+        ((hive.telephony as Record<string, { number?: string; trunkDomain?: string }> | undefined)?.twilio
+          ?.number as string) ?? "",
+      trunkDomain:
+        ((hive.telephony as Record<string, { number?: string; trunkDomain?: string }> | undefined)?.twilio
+          ?.trunkDomain as string) ?? "",
+    },
   },
   autonomy: {
     externalComms: (hive.autonomy?.externalComms ?? AUTONOMY_DEFAULTS.externalComms) as boolean,
