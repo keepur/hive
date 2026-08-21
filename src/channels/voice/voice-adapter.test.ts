@@ -64,6 +64,7 @@ interface AgentManagerStub {
   sessionStoreGet: ReturnType<typeof vi.fn>;
   sessionStoreSet: ReturnType<typeof vi.fn>;
   providerFor: ReturnType<typeof vi.fn>;
+  abortThread: ReturnType<typeof vi.fn>;
   calls: Array<{ ctx: TurnContext; onStream?: (chunk: string) => void }>;
 }
 
@@ -72,6 +73,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
   const sessionStoreGet = vi.fn().mockResolvedValue(undefined as string | undefined);
   const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
   const providerFor = vi.fn().mockReturnValue("claude");
+  const abortThread = vi.fn().mockReturnValue(false);
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
     calls.push({ ctx, onStream });
@@ -93,7 +95,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
     } satisfies TurnResult;
   });
 
-  return { spawnTurn, sessionStoreGet, sessionStoreSet, providerFor, calls };
+  return { spawnTurn, sessionStoreGet, sessionStoreSet, providerFor, abortThread, calls };
 }
 
 function makeVoiceAdapter(
@@ -118,6 +120,7 @@ function makeVoiceAdapter(
           set: am.sessionStoreSet,
         }),
         providerFor: am.providerFor,
+        abortThread: am.abortThread,
       }
     : undefined;
   return new VoiceAdapter(
@@ -134,6 +137,7 @@ function makeVoiceAdapter(
 class MockServerResponse extends EventEmitter {
   headersSent = false;
   writableEnded = false;
+  destroyed = false;
   statusCode = 0;
   headers: Record<string, string> = {};
   written: string[] = [];
@@ -883,5 +887,89 @@ describe("E1 bridge auth (KPR-322)", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("E2 abort-on-disconnect (KPR-322)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("suppresses outer retry when the client is gone", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "stale-sid", provider: "claude" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      res.emit("close");
+      return {
+        finalMessage: "",
+        newSessionId: "",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 0,
+          costUsd: 0,
+          durationMs: 0,
+        },
+        errors: ["resume failed: bad session id"],
+      };
+    });
+
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "ack" },
+        { role: "user", content: "now retry me" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    expect(am.abortThread).toHaveBeenCalledWith("mokie", "voice:call-abc-123");
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+    expect(res.written).toEqual([]);
+    expect(res.writableEnded).toBe(false);
+  });
+
+  it("does not write after premature close (no throw, no write after end)", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: true });
+
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      onStream!("before ");
+      res.emit("close");
+      onStream!("after ");
+      return {
+        finalMessage: "before after",
+        newSessionId: "s1",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 0,
+          costUsd: 0,
+          durationMs: 0,
+        },
+        errors: [],
+      };
+    });
+
+    await expect(callHandle(adapter, req, res)).resolves.toBeUndefined();
+
+    expect(am.abortThread).toHaveBeenCalledWith("mokie", "voice:call-abc-123");
+    const joined = res.written.join("");
+    expect(joined).toContain('"content":"before "');
+    expect(joined).not.toContain("after");
+    expect(joined).not.toContain("[DONE]");
+    expect(res.writableEnded).toBe(false);
   });
 });

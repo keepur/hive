@@ -602,9 +602,11 @@ describe("VoiceAdapter integration (KPR-219)", () => {
 
     const req = beginStreamingChat(p, workerShapedBody("call-e2"));
     await req.firstChunk();
+    const disconnectAt = Date.now();
     req.destroySocket();
 
     await abortSignal;
+    expect(Date.now() - disconnectAt).toBeLessThanOrEqual(100);
     expect(abortThread).toHaveBeenCalledWith("mokie", "voice:call-e2");
     await spawnFinished;
   });

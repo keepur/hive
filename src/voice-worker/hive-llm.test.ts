@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { formatSSEDone, formatSSETextChunk } from "../channels/voice/openai-translator.js";
+import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../outage/outage-notices.js";
 import type { BridgeFailureClass } from "./error-map.js";
 import { BridgeError, HiveLLM } from "./hive-llm.js";
 import { applyInterruptionMarker } from "./interruption-marker.js";
@@ -106,6 +107,21 @@ describe("HiveLLM (KPR-322)", () => {
     expect(chunks.map((c) => c.delta?.content)).toEqual(["one", "two", "three"]);
     expect(hive.lastTurnTiming).not.toBeNull();
     expect(hive.lastTurnTiming!.llmTtftMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("passthrough: 200 spoken outage notice streams as content (not a BridgeError)", async () => {
+    const stub = await listen((_req, res) => {
+      _req.resume();
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(formatSSETextChunk(STREAM_ID, VOICE_OUTAGE_SPOKEN_NOTICE, MODEL));
+      res.end(formatSSEDone(STREAM_ID, MODEL));
+    });
+    openServers.push(stub.server);
+
+    const hive = makeHive(stub.url);
+    const { chunks, bridge } = await consumeTurn(hive, userCtx("hello"));
+    expect(bridge).toBeUndefined();
+    expect(chunks.map((c) => c.delta?.content)).toEqual([VOICE_OUTAGE_SPOKEN_NOTICE]);
   });
 
   it("records maxInterChunkGapMs when the engine pauses between deltas", async () => {
