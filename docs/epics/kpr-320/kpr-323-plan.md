@@ -5,7 +5,7 @@
 **Ticket:** KPR-323 (W5.3), child of epic KPR-320 (W5 Voice v2). **Consumes:** KPR-322 bridge contract (thread keying `voice:<callId>`, full-transcript-every-turn, E2 abort-on-disconnect). **Feeds:** KPR-322 §15 P2 (its latency gate binds to this ticket's blessed baseline artifact), KPR-325 (pilot rides the warm path).
 **Spec:** [`kpr-323-spec.md`](./kpr-323-spec.md) (clean through 2 Frontier review rounds; §n refs below are spec sections; C1–C6 are the spec §10 engine-change inventory; W0/W1/W2/W-leak are the spec §7 empiricism gates). The spec is binding — this plan renders it, it does not redesign it.
 **Plan type:** CODE plan (engine diff, all behind `voice.warmPath.enabled`) + read-only baseline tooling (C6) + D3-gated empirical tasks (W0–W-leak — designed, NOT run).
-**Anchors:** every code anchor below verified 2026-07-14 against lane worktree `/Users/mokie/github/lane-kpr-323` @ `aedef74` (epic branch kpr-320; code content = base main @ W6 — only docs commits differ from `d074d5c`). W3 (epic kpr-309) is matured but NOT merged and reshapes the same spawn seam; Task 0 re-confirms before any delivery work. KPR-322's engine tasks (T1–T3) land first on the epic branch; Task 6 (C3) layers inside 322's `abortThread` with zero 322-artifact delta.
+**Anchors:** Task 0 re-pinned 2026-08-21 against lane worktree `/Users/mokie/github/lane-kpr-323-deliver` @ `bbd9581` (epic `kpr-320` with KPR-322 squash-merged; W3/kpr-309 content is on this HEAD). Original plan-time pin was 2026-07-14 `/Users/mokie/github/lane-kpr-323` @ `aedef74`. Line refs below are delivery-HEAD. Task 6 (C3) layers inside 322's landed `abortThread` with zero 322-artifact delta.
 **Status:** DRAFT — dispatcher runs the plan-review loop; not self-approved.
 
 **Goal:** Remove the per-turn cold-spawn tax from voice turns via a per-call warm session lease behind `AgentManager.spawnTurn`, and deliver the blessed read-only first-audio baseline (`firstTokenMs` p50/p95 from production "Voice turn complete" logs) that every W5 latency gate compares against.
@@ -184,28 +184,30 @@ No new processes, no new HTTP surfaces, no schema changes, no new secrets (spec 
 
 ### Task 0 — Anchor re-confirmation gate (mandatory; demote-to-spec escape hatch)
 
-**Files:** none modified. Output: a pass/fail table in the implement-lane notes.
+**Files:** none modified except cosmetic line-ref updates in this plan + spec §9/§12. Output: a pass/fail table in the implement-lane notes.
 
 Rule: for each anchor, re-locate it at delivery HEAD (grep by symbol, not line). **Cosmetic drift** (line shifts, renames with same semantics) → update the plan's refs inline and proceed. **Material drift** (signature/semantics/keying/error-shape changes) → STOP, demote the ticket to the spec lane; do not adapt on the fly.
 
-- [ ] **W3 surface 1 — `spawnTurn` / `withSpawnTicket` internals** (today `agent-manager.ts:563-655` / `:673-771`): the plan adds a branch at the top of `spawnTurn` (after the registry check, before `withSpawnTicket`) and a lease that occupies a ticket via a lambda resolving at release. Confirm: HOF signature `withSpawnTicket<T>(ctx, fn: (ticket) => Promise<T>)`; `SpawnTicket` shape (`agentId`/`threadKey`/`workItem`/`attachAbort`/`abort`, `:223-229`); three stop-checkpoints; budget accounting inside the critical section; breaker-acquire placement as the lambda's first act (`:577-581`); saturation recording + `"Spawn budget exceeded for ..."` throw (`:693-700`). **Material if:** the HOF, ticket shape, or breaker placement was reshaped by W3 (KPR-338 alone rewrites ~160 lines of this file).
-- [ ] **W3 surface 2 — `TurnContext` / session keying / resume semantics**: `TurnContext` fields incl. `systemPromptOverride` + `kind` (`agent-manager.ts:71-92`); Mongo `sessions` `_id "{agentId}:{threadId}"` + 7-day TTL (`session-store.ts:6-40`); `finalizeSpawnResult`'s rotation-persist gate `if (result.sessionId && !result.aborted)` (`:1218-1232`); KPR-313's session-identity guards may alter keying or rotation handling the lease's per-turn persistence rides on. **Material if** resume semantics or thread keying changed.
-- [ ] **W3 surface 3 — adapter error taxonomy**: `"Spawn budget exceeded"` string-match (`voice-adapter.ts:375`), `isAuthError` (`:24-29`), `instanceof ProviderCircuitOpenError` (`:324`), outer-retry condition (`:337`). If W3 landed typed errors, re-bind the lease-open saturation row and the §6 precedence-rule tests to the typed forms (cosmetic if 1:1; material otherwise).
-- [ ] **W3 surface 4 — `AgentRunner.send` / abort surfaces + factoring pin**: `send()` signature (`agent-runner.ts:1525`), in-process MCP wiring block (`:1537-1706`), `systemPromptOverride` consumption (`:1714`), options literal (`:1790-1834`), message loop anchors (init `:1885-1888`, text_delta `:1912-1917`, result `:1956-1999`), `abort()` (`:2090-2097`), `activeQuery` (`:301`). Task 3's `buildQueryEnvelope` boundaries are pinned against THESE lines — re-derive the exact cut points at delivery HEAD before cutting. **Material if** prompt assembly moved out of `send()` or a provider-adapter layer now owns `query()` construction.
-- [ ] **SDK pin (the load-bearing one)** — record the exact installed `@anthropic-ai/claude-agent-sdk` version (package.json pins `^0.2.63`; the main checkout resolved `0.2.104` at plan time, where all five claims below verify against `sdk.d.ts`). Verify against the installed typings at delivery:
-  1. `query({ prompt: string | AsyncIterable<SDKUserMessage>, options })` (`sdk.d.ts` — the union is the streaming-input mode).
-  2. `Query.interrupt(): Promise<void>` with the interface comment stating control requests are "only supported when streaming input/output is used" — positive evidence for §4.4: a cold string-prompt turn has no interrupt surface, so `abortThread`'s no-lease fall-through to spawn-abort is the only option there.
-  3. `Query.close(): void` ("forcefully ends the query ... cleaning up ... the CLI subprocess").
-  4. `SDKUserMessage` shape: `{ type: "user", message: MessageParam, parent_tool_use_id: string | null, ... }` (all other fields optional).
-  5. `Query.streamInput(stream)` exists (not used by this design — the input iterable is passed as `prompt` — but its presence pins the streaming-input mode's stability; `SDKSession` remains `@alpha`, not designed on).
-  Also pin at Task 0 (typings-level; W2 verifies live): per-exchange `result` emission in streaming-input mode (⚠ registry #1 — typings show `SDKResultMessage` in the `SDKMessage` union with per-result `session_id`/`usage`; the per-exchange cadence itself is a runtime property), and the scope of `maxTurns`/`maxBudgetUsd` under streaming input (⚠ #5 — if cumulative across the session, decide and record: warm envelope omits `maxTurns` or scales it; a one-line change in `buildQueryEnvelope`'s warm branch).
-  **Extension-point disappearance = material → demote.**
-- [ ] **322 E2 landing shape** — read the MERGED `abortThread` body + the adapter close-listener wiring + the mock surfaces (`abortThread: vi.fn()` and the `("test-agent", "voice:call-e2")` assertion) as actually landed. Task 6 inserts the warm dispatch as the method's FIRST act — confirm the merged body still matches 322 plan Task 3 Step 1's ticket-walk shape before inserting. **Material if** the method was renamed/resignatured.
-- [ ] **Reflection method shape**: `scheduleReflectionIfEligible` increments by exactly 1 (`agent-manager.ts:891` — `(prior ?? 0) + 1`) and `runReflectionTurn`'s quiescence check reads `processing` (`:944-947`). Task 5's `turns` parameter extension is pinned against this exact shape.
-- [ ] **Observability surfaces**: `getSnapshot()` (`:815-851`), `CoordinatorSnapshotPerAgent` (`:239-258`), heartbeat spread-write (`spawn-coordinator-heartbeat.ts:46-67`), doctor reader/renderer (`doctor-checks.ts:311-377`, `doctor.ts:124-148`), `config.voice` block shape post-322-T1 (`config.ts:408-417` pre-322).
-- [ ] **Adapter C1 anchors**: `buildVoiceSystemPrompt` call (`voice-adapter.ts:243-246`), `sessionStore.get` (`:249`), "Voice turn complete" log (`:423-432`), zero-chunk close (`:397-409`).
-- [ ] Re-confirm **no KPR-208 artifacts** (`git log --all --grep=KPR-208` → empty) and no W3 warm-path rails on the merged kpr-309 content (spec §9.7).
-- [ ] Record the full table (anchor → found-at → cosmetic/material/UNCHANGED) in lane notes. Any material row → demote-to-spec, stop.
+- [x] **W3 surface 1 — `spawnTurn` / `withSpawnTicket` internals** (delivery `agent-manager.ts:886-1092` / `:1110-1208`): the plan adds a branch at the top of `spawnTurn` (after the registry check, before `withSpawnTicket`) and a lease that occupies a ticket via a lambda resolving at release. Confirm: HOF signature `withSpawnTicket<T>(ctx, fn: (ticket) => Promise<T>)` (`:1110-1113`); `SpawnTicket` shape (`agentId`/`threadKey`/`workItem`/`attachAbort`/`abort`, `:341-347`); three stop-checkpoints (`:1114`, `:1121`, `:1168`); budget accounting inside the critical section (`:1125-1138`); breaker-acquire placement as the lambda's first act (`:893-904`); saturation recording + `"Spawn budget exceeded for ..."` throw (`:1130-1136`). **Material if:** the HOF, ticket shape, or breaker placement was reshaped by W3 (KPR-338 alone rewrites ~160 lines of this file). **Result: COSMETIC** — HOF/ticket/breaker intact; lambda body grew (KPR-313/350/351) without reshaping those three.
+- [x] **W3 surface 2 — `TurnContext` / session keying / resume semantics**: `TurnContext` fields incl. `systemPromptOverride` + `kind` (`agent-manager.ts:85-120`; additive optional `sessionProvider`/`sessionHandoff` from KPR-313); Mongo `sessions` `_id "{agentId}:{threadId}"` (`session-store.ts:13`, `get` `:94`) + 7-day TTL (`:56`); `finalizeSpawnResult`'s rotation-persist gate `if (result.sessionId && !result.aborted)` (`:1829`) still the outer gate (inner `persistsResumableHandle` + churn-mint riders are additive). `get()` now returns `StoredSessionRef`. **Material if** resume semantics or thread keying changed. **Result: COSMETIC** — keying unchanged; persist outer-gate unchanged; KPR-313 riders are additive.
+- [x] **W3 surface 3 — adapter error taxonomy**: `"Spawn budget exceeded"` string-match (`voice-adapter.ts:480`), `isAuthError` (`:24-29`, UNCHANGED), `instanceof ProviderCircuitOpenError` (`:411`), outer-retry condition (`:429`). If W3 landed typed errors, re-bind the lease-open saturation row and the §6 precedence-rule tests to the typed forms (cosmetic if 1:1; material otherwise). **Result: UNCHANGED taxonomy** (line shifts only) — still string-match, no typed budget error.
+- [x] **W3 surface 4 — `AgentRunner.send` / abort surfaces + factoring pin**: `send()` signature (`agent-runner.ts:1874`; additive 7th param `effort?: ReasoningEffort`; KPR-338 deleted `modelOverride`); in-process MCP wiring is `buildInProcessServers()` (`:1391`) merged at `:1892`; `systemPromptOverride` consumption (`:1900`); options literal inlined in `query()` (`:1968-2023`); message loop anchors (init `:2073-2076`, text_delta `:2100-2105`, result `:2144-2197`); `abort()` (`:2316-2323`); `activeQuery` (`:324`). Task 3's `buildQueryEnvelope` boundaries are pinned against THESE lines — re-derive the exact cut points at delivery HEAD before cutting. **Material if** prompt assembly moved out of `send()` or a provider-adapter layer now owns `query()` construction. **Result: COSMETIC** — `query()` still constructed only in `send()` (`src/` production); Lane B adapters do not own the Claude `query()`.
+- [x] **SDK pin (the load-bearing one)** — package.json pins `^0.2.141`; lockfile resolved `0.2.141` (`package-lock.json` `node_modules/@anthropic-ai/claude-agent-sdk`). Typings verified against that version's `sdk.d.ts`:
+  1. `query({ prompt: string | AsyncIterable<SDKUserMessage>, options })` (`sdk.d.ts:2252-2255` — the union is the streaming-input mode).
+  2. `Query.interrupt(): Promise<void>` (`:2033`) with the interface comment stating control requests are "only supported when streaming input/output is used" (`:2024-2028`) — positive evidence for §4.4: a cold string-prompt turn has no interrupt surface, so `abortThread`'s no-lease fall-through to spawn-abort is the only option there.
+  3. `Query.close(): void` (`:2249`) ("forcefully ends the query ... cleaning up ... the CLI subprocess").
+  4. `SDKUserMessage` shape (`:3657-3676`): `{ type: "user", message: MessageParam, parent_tool_use_id: string | null, ... }` (all other fields optional).
+  5. `Query.streamInput(stream)` exists (`:2222`) (not used by this design — the input iterable is passed as `prompt` — but its presence pins the streaming-input mode's stability; `SDKSession` remains `@alpha` at `:3344`, not designed on).
+  Also pin at Task 0 (typings-level; W2 verifies live): per-exchange `result` emission in streaming-input mode (⚠ registry #1 — typings show `SDKResultMessage` in the `SDKMessage` union at `:3133` with per-result `session_id`/`usage`; the per-exchange cadence itself is a runtime property), and the scope of `maxTurns`/`maxBudgetUsd` under streaming input (⚠ #5 — **DECIDED: omit both on the warm envelope**). Typings describe both as limits on **the query** (`maxTurns` "before the query stops"; `maxBudgetUsd` "for the query" — `sdk.d.ts:1436-1443`). A warm lease is one long-lived `query()`, so both are cumulative across the call. Task 3's `openVoiceStreamingSession` deletes `options.maxTurns` and `options.maxBudgetUsd` after `buildQueryEnvelope` (cold `send()` keeps them). W2 verifies live.
+  **Extension-point disappearance = material → demote.** **Result: all five claims hold on 0.2.141.**
+- [x] **322 E2 landing shape** — MERGED `abortThread` (`agent-manager.ts:1944-1966`) is byte-identical to 322 plan Task 3 Step 1 (still directly above `stopAgent`). Adapter close-listener (`voice-adapter.ts:293-306`) still registers before the first `await`. Mocks: `abortThread: vi.fn()`; assertion is `("mokie", "voice:call-e2")` (`voice-adapter.integration.test.ts:610`) — fixture agent id, not a resignature. Task 6 inserts the warm dispatch as the method's FIRST act. **Material if** the method was renamed/resignatured. **Result: UNCHANGED signature/body** (cosmetic fixture id + line shift).
+- [x] **Reflection method shape**: `scheduleReflectionIfEligible` increments by exactly 1 (`agent-manager.ts:1328` — `(prior?.pendingReflectionTurns ?? 0) + 1`) and `runReflectionTurn`'s quiescence check reads `processing` (`:1381-1384`). Task 5's `turns` parameter extension is pinned against this exact shape. **Result: UNCHANGED shape** (line shift).
+- [x] **Observability surfaces**: `getSnapshot()` (`:1252-1288`), `CoordinatorSnapshotPerAgent` (`:357-376`), heartbeat spread-write (`spawn-coordinator-heartbeat.ts:46-67`, UNCHANGED), doctor reader/renderer (`doctor-checks.ts:372-439`, `doctor.ts:128-152`), `config.voice` block post-322-T1 (`config.ts:473-492` — carries `bridgeToken`/`bindHost`/`livekit` as designed). **Result: COSMETIC** line shifts; 322-T1 keys present as expected.
+- [x] **Adapter C1 anchors**: `buildVoiceSystemPrompt` call (`voice-adapter.ts:311-314`), `sessionStore.get` (`:317`, returns `StoredSessionRef`), "Voice turn complete" log (`:528-537`), zero-chunk close (`:502-514`). **Result: COSMETIC**.
+- [x] Re-confirm **no KPR-208 artifacts** (`git log --all --grep=KPR-208` → empty) and no W3 warm-path rails on the merged kpr-309 content (spec §9.7) — `src/` has no `warmPath` / `WarmVoiceSession` / `openVoiceStreamingSession` / `buildQueryEnvelope`.
+- [x] Record the full table (anchor → found-at → cosmetic/material/UNCHANGED) in lane notes. Any material row → demote-to-spec, stop. **No material rows. Proceed to Task 1.**
+
+**Task 0 `send()` / `query()` cut points (Task 3):** envelope starts at `const allServerConfigs = this.buildAllServerConfigs(context);` (`agent-runner.ts:1890`) through toolSearch/Lane A env (`:1966`) plus the options literal currently inlined at `:1969-2022` (reify as a local). `send()` keeps the signature + "Sending prompt to agent" log (`:1874-1888`) and `const q = query({ prompt, options })` (`:1968`). Substitutions: `onStream`→`params.streaming`, `sessionId`→`params.sessionId`, `systemPromptOverride`→`params.systemPromptOverride`, `context`/`resourceLimits`/`effort`→`params.*`. **No `modelOverride`** (KPR-338 deleted it; `effectiveModel = this.laneAPassthrough?.model ?? this.agentConfig.model`). In-process wiring is already `this.buildInProcessServers(context)` at `:1892` — do not re-inline. Production `query()` lives only in `send()`.
 
 ### Task 1 — C4: `voice.warmPath.enabled` config key
 
@@ -234,7 +236,7 @@ export function resolveVoiceWarmPathConfig(raw: unknown): VoiceWarmPathConfig {
 }
 ```
 
-- [ ] **Step 2:** Add one line inside the `voice` block (`config.ts:408-417` pre-322; place after `port`, beside 322's additions if already landed):
+- [ ] **Step 2:** Add one line inside the `voice` block (`config.ts:473-492`; place after `port` at `:481`, beside 322's `bridgeToken`/`bindHost`/`livekit` keys):
 
 ```typescript
     // KPR-323 C4: per-call warm session lease master switch. Default false
@@ -275,7 +277,7 @@ Spec §2: six additive numeric fields — `promptBuildMs`, `sessionLookupMs` (ad
 - Modify: `src/channels/voice/voice-adapter.ts` (two stamps + log fields)
 - Test: `src/agents/agent-runner.test.ts`, `src/agents/agent-manager.test.ts`, `src/channels/voice/voice-adapter.test.ts` (all additive)
 
-- [ ] **Step 1:** `agent-runner.ts` — extend `RunResult` (`:120-142`), after `timedOut`:
+- [ ] **Step 1:** `agent-runner.ts` — extend `RunResult` (`:134-156`), after `timedOut`:
 
 ```typescript
   /** KPR-323 C1: query()-call → system/init (CLI boot + session load + MCP handshake). Voice decomposition; log-only. */
@@ -284,7 +286,7 @@ Spec §2: six additive numeric fields — `promptBuildMs`, `sessionLookupMs` (ad
   initToFirstTokenMs?: number;
 ```
 
-- [ ] **Step 2:** `agent-runner.ts` `send()` — immediately before `const q = query({` (`:1790`):
+- [ ] **Step 2:** `agent-runner.ts` `send()` — immediately before `const q = query({` (`:1968`):
 
 ```typescript
     // KPR-323 C1: cold-turn stage anchors (spec §2 T3→T5, T5→T6). Log-only.
@@ -294,7 +296,7 @@ Spec §2: six additive numeric fields — `promptBuildMs`, `sessionLookupMs` (ad
     let initToFirstTokenMs: number | undefined;
 ```
 
-In the message loop, extend the init branch (`:1885-1888`):
+In the message loop, extend the init branch (`:2073-2076`):
 
 ```typescript
         if (msg.type === "system" && msg.subtype === "init") {
@@ -305,7 +307,7 @@ In the message loop, extend the init branch (`:1885-1888`):
         }
 ```
 
-and the text_delta branch (`:1912-1918`):
+and the text_delta branch (`:2100-2106`):
 
 ```typescript
         if (msg.type === "stream_event" && onStream) {
@@ -320,9 +322,9 @@ and the text_delta branch (`:1912-1918`):
         }
 ```
 
-Add `bootToInitMs, initToFirstTokenMs,` to the returned object (`:2072-2081`).
+Add `bootToInitMs, initToFirstTokenMs,` to the returned object (`:2298-2307`).
 
-- [ ] **Step 3:** `agent-manager.ts` — extend `TurnResult` (`:104-134`), after `aborted`:
+- [ ] **Step 3:** `agent-manager.ts` — extend `TurnResult` (`:132-162`), after `aborted`:
 
 ```typescript
   /**
@@ -342,7 +344,7 @@ Add `bootToInitMs, initToFirstTokenMs,` to the returned object (`:2072-2081`).
   warmTurnSeq?: number;
 ```
 
-- [ ] **Step 4:** `agent-manager.ts` `spawnTurn` (`:563`) — stamp `enteredAt` before the HOF, `lambdaStartedAt` + `dispatchAt` inside:
+- [ ] **Step 4:** `agent-manager.ts` `spawnTurn` (`:886`) — stamp `enteredAt` before the HOF, `lambdaStartedAt` + `dispatchAt` inside:
 
 ```typescript
   async spawnTurn(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
@@ -358,7 +360,7 @@ Add `bootToInitMs, initToFirstTokenMs,` to the returned object (`:2072-2081`).
       const lambdaStartedAt = Date.now(); // KPR-323 C1: T2 anchor (lock+budget held)
 ```
 
-then thread the dispatch stamp through the existing attempt calls (both the happy path and the auth-rebuild retry at `:623-635` — the `??` keeps the FIRST dispatch stamp, so a retried turn's `spawnPrepMs` spans to the first dispatch, matching §3.1's retry-inflated-latency honesty):
+then thread the dispatch stamp through the existing attempt calls (the happy path, the auth-rebuild retry at `:1005-1016`, **and** the KPR-350/351 stale-handle arm at `:1017-1073` — the `??` keeps the FIRST dispatch stamp, so a retried turn's `spawnPrepMs` spans to the first dispatch, matching §3.1's retry-inflated-latency honesty):
 
 ```typescript
       let dispatchAt: number | undefined; // KPR-323 C1: T3 anchor (adapter.runTurn)
@@ -385,7 +387,7 @@ then thread the dispatch stamp through the existing attempt calls (both the happ
       } catch (err) {
 ```
 
-and after `const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult);` (`:645`):
+and after `const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult, shaping.route);` (`:1082`):
 
 ```typescript
       // KPR-323 C1: voice-only stage decomposition for the adapter's log line.
@@ -399,7 +401,7 @@ and after `const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult
       }
 ```
 
-- [ ] **Step 5:** `runOneSpawnAttempt` (`:1027`) — additive trailing parameter, invoked immediately before the adapter dispatch:
+- [ ] **Step 5:** `runOneSpawnAttempt` (`:1465`) — additive trailing parameter, invoked immediately before the adapter dispatch:
 
 ```typescript
   private async runOneSpawnAttempt(
@@ -414,7 +416,7 @@ and after `const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult
     const result = await adapter.runTurn({ ... unchanged ... });
 ```
 
-- [ ] **Step 6:** `voice-adapter.ts` — stamp the two pre-spawn reads (`:243-249`):
+- [ ] **Step 6:** `voice-adapter.ts` — stamp the two pre-spawn reads (`:311-317`):
 
 ```typescript
     const promptBuildStartedAt = Date.now(); // KPR-323 C1: T0→T1
@@ -426,11 +428,11 @@ and after `const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult
 
     const sessionStore = agentManager.getSessionStore();
     const sessionLookupStartedAt = Date.now(); // KPR-323 C1: T0→T1
-    const storedSessionId = await sessionStore.get(agentId, threadId);
+    const storedRef = await sessionStore.get(agentId, threadId);
     const sessionLookupMs = Date.now() - sessionLookupStartedAt;
 ```
 
-and extend the "Voice turn complete" log (`:423-432`) — full replacement of the call:
+and extend the "Voice turn complete" log (`:528-537`) — full replacement of the call:
 
 ```typescript
     log.info("Voice turn complete", {
@@ -477,7 +479,7 @@ Spec §9.4: the lease needs a session-opening sibling to `send()` reusing the sa
 import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUserMessage, type McpServerConfig, ... } from "@anthropic-ai/claude-agent-sdk";
 ```
 
-- [ ] **Step 2:** Extract `send()`'s pre-query assembly into a private method. **Cut boundaries (re-pin at Task 0):** the assembly `:1537-1788` plus the options literal `:1791-1833` (reified as a local instead of inlined into `query()`) move verbatim into the new method — starting at `const allServerConfigs = this.buildAllServerConfigs(context);` — with exactly four parameter substitutions — `onStream`→`params.streaming`, `sessionId`→`params.sessionId`, `systemPromptOverride`→`params.systemPromptOverride`, `context`/`modelOverride`/`resourceLimits`→`params.*`:
+- [ ] **Step 2:** Extract `send()`'s pre-query assembly into a private method. **Cut boundaries (Task 0 re-pin @ `bbd9581`):** the assembly `:1890-1966` plus the options literal `:1969-2022` (reified as a local instead of inlined into `query()`) move verbatim into the new method — starting at `const allServerConfigs = this.buildAllServerConfigs(context);` — with substitutions `onStream`→`params.streaming`, `sessionId`→`params.sessionId`, `systemPromptOverride`→`params.systemPromptOverride`, `context`/`resourceLimits`/`effort`→`params.*`. **No `modelOverride`** (deleted by KPR-338); `effectiveModel = this.laneAPassthrough?.model ?? this.agentConfig.model`. In-process MCP wiring is already `Object.assign(mcpServers, this.buildInProcessServers(context))` at `:1892`.
 
 ```typescript
   /**
@@ -491,15 +493,16 @@ import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUser
   private async buildQueryEnvelope(params: {
     sessionId?: string;
     context?: WorkItemContext;
-    modelOverride?: string;
     resourceLimits?: ResourceLimits;
     systemPromptOverride?: string;
     streaming: boolean;
+    effort?: ReasoningEffort;
   }): Promise<SdkQueryOptions> {
-    const effectiveModel = params.modelOverride ?? this.agentConfig.model;
-    // ... [moved: same cut as stated above — assembly :1537-1788 verbatim,
-    //      then the :1791-1833 options literal reified as the local below;
-    //      four parameter substitutions, no logic edits] ...
+    const passthrough = this.laneAPassthrough;
+    const effectiveModel = passthrough?.model ?? this.agentConfig.model;
+    // ... [moved: assembly :1890-1966 verbatim, then the :1969-2022 options
+    //      literal reified as the local below; substitutions as Task 0 cut
+    //      points; no logic edits] ...
     const options: SdkQueryOptions = {
       model: effectiveModel,
       systemPrompt,
@@ -507,6 +510,7 @@ import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUser
       allowDangerouslySkipPermissions: true,
       maxTurns: params.resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
       maxBudgetUsd: params.resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
+      ...(params.effort === "low" || params.effort === "medium" || params.effort === "high" ? { effort: params.effort } : {}),
       cwd: effectiveCwd,
       settingSources: archetypeExtra.settingSources ?? [],
       includePartialMessages: params.streaming,
@@ -529,10 +533,10 @@ import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUser
     const options = await this.buildQueryEnvelope({
       sessionId,
       context,
-      modelOverride,
       resourceLimits,
       systemPromptOverride,
       streaming: !!onStream,
+      effort,
     });
     const queryStartedAt = Date.now(); // KPR-323 C1 (Task 2)
     // ... C1 locals ...
@@ -579,6 +583,11 @@ import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUser
       systemPromptOverride: params.systemPromptOverride,
       streaming: true,
     });
+    // Task 0 ⚠#5: maxTurns/maxBudgetUsd are query-scoped (cumulative across
+    // the streaming-input session). Omit them on the warm path so a long
+    // call is not killed by the per-turn bound. Cold send() keeps them.
+    delete options.maxTurns;
+    delete options.maxBudgetUsd;
     const q = query({ prompt: params.input, options });
     // Belt-and-braces: runner.abort() (and wasAborted) keep working for a
     // lease-held runner; the lease's close() calls Query.close() directly.
@@ -615,7 +624,7 @@ const log = createLogger("warm-voice-session");
  * KPR-323 §4.2/§4.7: release constants. Deliberately NOT config — the
  * enabled flag is the rollback lever; these are pilot-tunable by code
  * change only (spec §11 ⚠). Lifetime cap aligns with the voice adapter's
- * CallSession TTL (voice-adapter.ts:38).
+ * CallSession TTL (voice-adapter.ts:49).
  */
 export const WARM_IDLE_TIMEOUT_MS = 120_000;
 export const WARM_LIFETIME_CAP_MS = 2 * 60 * 60 * 1000;
@@ -695,10 +704,10 @@ export interface WarmVoiceSessionDeps {
  * Throw-safety contract (spec §4.2, load-bearing):
  *  - Timer callbacks are try/catch-wrapped — they run on bare setTimeout,
  *    where a synchronous throw is an uncaughtException (the engine
- *    registers only an unhandledRejection handler, index.ts:878).
+ *    registers only an unhandledRejection handler, index.ts:890).
  *  - close() is no-throw and idempotent. It is invoked from at least four
  *    contexts: the timers; ticket.abort() via stopAgent's ticket walk —
- *    which has NO per-ticket try/catch (agent-manager.ts:1318-1323), so a
+ *    which has NO per-ticket try/catch (agent-manager.ts:1983-1987), so a
  *    throwing close() would skip the agent's remaining tickets; the
  *    turn-failure path; and engine shutdown.
  *  - interrupt()'s Promise is always given a .catch (requestInterrupt).
@@ -1219,26 +1228,18 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
   private warmLeases = new Map<string, WarmVoiceSession>();
 ```
 
-- [ ] **Step 2:** Extract runner construction (used by both `createProviderAdapter` and the lease — spec §4.2 "same constructor args"):
+- [ ] **Step 2:** Extract runner construction (used by both `createProviderAdapter` and the lease — spec §4.2 "same constructor args"). **Do not** change `createProviderAdapter`'s landed signature:
 
 ```typescript
-  private createRunner(agentId: string): AgentRunner {
+  private createRunner(agentId: string, laneAPassthrough?: PassthroughSpawnConfig): AgentRunner {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
-    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle);
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, laneAPassthrough ? { laneAPassthrough } : undefined);
   }
-
-  private createProviderAdapter(agentId: string): AgentProviderAdapter {
-    const config = this.registry.get(agentId);
-    if (!config) throw new Error(`Unknown agent: ${agentId}`);
-    const runner = this.createRunner(agentId);
-    const route = resolveProviderModel(config.model);
-    if (route.provider === "claude") {
-      return new ClaudeAgentAdapter(runner);
-    }
-    // ... remainder of the method unchanged (pilot adapters) ...
 ```
+
+`createProviderAdapter` keeps its landed signature (`agent-manager.ts:558-562` — async, `route` + optional `workItemContext`). Replace only the `new AgentRunner(...)` line at `:581` with `this.createRunner(agentId, laneAPassthrough)`. Lease open (Claude-only) calls `this.createRunner(ctx.agentId)` with no passthrough.
 
 - [ ] **Step 3:** Scope-guard gate (spec §4.7):
 
@@ -1699,14 +1700,14 @@ describe("abortThread warm dispatch (KPR-323 C3)", () => {
 - Modify: `src/cli/doctor-checks.ts` (`SpawnCoordinatorRow` + reader), `src/cli/doctor.ts` (render)
 - Test: `src/agents/agent-manager.test.ts`, `src/agents/spawn-coordinator-heartbeat.test.ts`, `src/cli/doctor-checks.test.ts`, `src/cli/doctor.test.ts` (all additive)
 
-- [ ] **Step 1:** `CoordinatorSnapshotPerAgent` (`agent-manager.ts:239-258`) — add after `stopped`:
+- [ ] **Step 1:** `CoordinatorSnapshotPerAgent` (`agent-manager.ts:357-376`) — add after `stopped`:
 
 ```typescript
   /** KPR-323 C5: live warm voice leases for this agent (each holds one budget slot for its call's duration). */
   warmVoiceSessions: number;
 ```
 
-`getSnapshot()` (`:828-848`) — compute beside `activeThreadKeys`:
+`getSnapshot()` (`:1252-1288`) — compute beside `activeThreadKeys`:
 
 ```typescript
       let warmVoiceSessions = 0;
@@ -1717,8 +1718,8 @@ describe("abortThread warm dispatch (KPR-323 C3)", () => {
 
 and add `warmVoiceSessions,` to the per-agent literal. The heartbeat (`spawn-coordinator-heartbeat.ts:50-56`) spreads `perAgent` into the telemetry doc — the field flows through with **zero heartbeat code change**.
 
-- [ ] **Step 2:** Doctor reader (`doctor-checks.ts:311-377`): add `warmVoiceSessions: number;` to `SpawnCoordinatorRow`, `warmVoiceSessions?: number;` to the find projection type, and `warmVoiceSessions: d.warmVoiceSessions ?? 0,` to the mapper (defaults keep pre-323 heartbeat docs readable).
-- [ ] **Step 3:** Doctor render (`doctor.ts:133-144`) — extend the per-agent row (informational; **never flips the exit code** — KPR-296 rule; the section already never contributes to `allPassed`):
+- [ ] **Step 2:** Doctor reader (`doctor-checks.ts:372-439`): add `warmVoiceSessions: number;` to `SpawnCoordinatorRow`, `warmVoiceSessions?: number;` to the find projection type, and `warmVoiceSessions: d.warmVoiceSessions ?? 0,` to the mapper (defaults keep pre-323 heartbeat docs readable).
+- [ ] **Step 3:** Doctor render (`doctor.ts:128-152`) — extend the per-agent row (informational; **never flips the exit code** — KPR-296 rule; the section already never contributes to `allPassed`):
 
 ```typescript
     emit(
@@ -1784,7 +1785,7 @@ export interface VoiceTurnSample {
  * Parse one log line. Returns a sample for matching "Voice turn complete"
  * rows (streaming mode, given agent), null otherwise. Tolerates non-JSON
  * lines (multi-writer logs). Success-only by construction: the engine emits
- * this line only on successful turns (voice-adapter.ts:423-432).
+ * this line only on successful turns (voice-adapter.ts:528-537).
  */
 export function parseVoiceTurnLine(line: string, agentId: string): VoiceTurnSample | null {
   if (!line.includes("Voice turn complete")) return null; // cheap pre-filter
@@ -2065,17 +2066,17 @@ npx tsx scripts/voice-latency-baseline.ts \
 | 2 | **`interrupt()` leaves the session usable** for the next queued turn (§4.4). Live at W2; fallback if false: interrupt degrades to lease-close + cold next turn (correct, loses the barge-in win). Both failure shapes escalate to close in code: rejection → immediate `interrupt-failed` close; resolve-but-no-`result` → `interrupt-noop` grace close (Task 4 backstop, unit assertion 12) | Tasks 4, 12 |
 | 3 | Session-id rotation visibility per turn in streaming mode (KPR-211 semantics under streaming input) — full-transcript retry covers the gap regardless | Task 0 → Task 12 |
 | 4 | Per-turn usage/cost attribution in streaming mode (per-exchange, not cumulative) — telemetry/activity-log accuracy only | Task 12 |
-| 5 | `maxTurns` / `maxBudgetUsd` scope under streaming input (per-exchange vs whole-session). If cumulative: warm envelope omits/raises them — one-line decision recorded at Task 0 | Task 0 → Task 3 |
+| 5 | `maxTurns` / `maxBudgetUsd` scope under streaming input — **Task 0 DECIDED: omit both on the warm envelope** (typings: limits on *the query*; a warm lease is one query). Cold `send()` keeps them. W2 verifies live | Task 0 → Task 3 |
 | 6 | `system/init` emission timing in streaming-input mode (first turn only; `bootToInitMs` anchor validity on the cold path is unaffected) | Task 12 |
 | 7 | W2 pass thresholds are placeholders until W1 measures the TTFT floor; W0's artifact binds 322 P2 regardless | Task 11 → Task 12 |
 | 8 | Idle 120s / lifetime 2h constants — pilot-tunable by code change only, deliberately not config | Tasks 4, 12, 13 |
 | 9 | Baseline sample minimums (50/20 in ≤30 days) — operator may bless small-n with the shortfall recorded | Task 10 |
-| 10 | `"Spawn budget exceeded"` string contract with the adapter survives until W3's typed errors re-bind it (§9.3) | Task 0 → Task 5 tests |
+| 10 | `"Spawn budget exceeded"` string contract with the adapter — **Task 0 confirmed: still string-match** (`voice-adapter.ts:480`); no W3 typed budget error | Task 0 → Task 5 tests |
 | 11 | Explicit end-of-call release (worker `DELETE /v1/calls/<id>`) — seam note only; idle timeout is the designed mechanism | — (recorded for 322/325 delivery) |
-| 12 | `scheduleReflectionIfEligible` turns-credit extension — shape pinned in Task 5 against the `(prior ?? 0) + 1` body; re-check for W3 drift | Task 0 → Task 5 |
+| 12 | `scheduleReflectionIfEligible` turns-credit extension — shape pinned in Task 5 against the `(prior?.pendingReflectionTurns ?? 0) + 1` body (`agent-manager.ts:1328`); re-checked at Task 0, UNCHANGED | Task 0 → Task 5 |
 | 13 | Interrupt-on-idle-session behavior (disconnect during pre-spawn awaits; §4.4 edge) | Task 12 |
 | 14 | Manual `q.next()` consumption keeps the generator open across turns (a for-await `break` would `return()` it) — pinned by unit assertion 3; live at W2 | Task 4 → Task 12 |
-| 15 | Installed SDK version at delivery (package pins `^0.2.63`; main resolved `0.2.104` at plan time, where all Task-0 typing claims verify) — pin the exact delivery version + re-check the five claims | Task 0 |
+| 15 | Installed SDK version at delivery — **pinned `^0.2.141` / resolved `0.2.141`**. All five Task-0 typing claims hold against that `sdk.d.ts` | Task 0 |
 | 16 | `voice.warmPath.enabled` is instance-global — production calls ride warm during any warm-on test window (disclosed in the W2/W-leak GO blocks) | Tasks 12, 13 |
 | 17 | Instance log-dir location + rotation shape for the harvest (launchd stdout destination; plain JSON-lines assumed) | Task 10 |
 
