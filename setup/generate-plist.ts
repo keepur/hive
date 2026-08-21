@@ -6,6 +6,8 @@
  *   service/com.hive.<id>.agent.plist        — main Hive service
  *   service/com.hive.<id>.rotate-logs.plist  — daily log rotation
  *   service/com.hive.<id>.deploy-check.plist — periodic deploy checker
+ *   service/com.hive.<id>.voice-worker.plist — LiveKit voice worker (only when
+ *                                             voice.livekit.enabled is true)
  *
  * Usage:
  *   npx tsx setup/generate-plist.ts
@@ -21,6 +23,11 @@ const ROOT = resolve(import.meta.dirname, "..");
 type HiveYamlShape = {
   instance?: {
     id?: string;
+  };
+  voice?: {
+    livekit?: {
+      enabled?: boolean;
+    };
   };
 };
 
@@ -185,3 +192,64 @@ const deployCheckPlistPath = join(SERVICE_DIR, `${LABEL_DEPLOY}.plist`);
 writeFileSync(deployCheckPlistPath, deployCheckPlist);
 console.log(`Generated: ${deployCheckPlistPath}`);
 console.log(`  Label: ${LABEL_DEPLOY}`);
+
+// ── Voice worker plist (KPR-322 S4) — only when voice.livekit.enabled ──
+// Pilot deploy runs from a built checkout (`npm run build` → dist/ + node_modules
+// present). The npm-published tarball does NOT carry dist/ — packaging the worker
+// into `hive update` artifacts is out of scope for the pilot.
+// Restart: launchctl kickstart -k gui/$(id -u)/com.hive.<id>.voice-worker
+// Dev: npx tsx src/voice-worker/main.ts dev
+const voiceLivekitEnabled = (hiveConfig.voice?.livekit?.enabled ?? false) === true;
+if (voiceLivekitEnabled) {
+  const LABEL_VOICE = `com.hive.${instanceId}.voice-worker`;
+  const voiceWorkerPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL_VOICE}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>${nodePath}</string>
+    <string>dist/voice-worker/main.js</string>
+    <string>start</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>${DEPLOY_DIR}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${pathEnv}</string>
+    <key>HOME</key>
+    <string>${home}</string>
+    <key>DEPLOY_DIR</key>
+    <string>${DEPLOY_DIR}</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>${LOGS_DIR}/voice-worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOGS_DIR}/voice-worker.err</string>
+</dict>
+</plist>
+`;
+  const voicePlistPath = join(SERVICE_DIR, `${LABEL_VOICE}.plist`);
+  writeFileSync(voicePlistPath, voiceWorkerPlist);
+  console.log(`Generated: ${voicePlistPath}`);
+  console.log(`  Label: ${LABEL_VOICE}`);
+}
