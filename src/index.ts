@@ -707,19 +707,21 @@ async function main(): Promise<void> {
 
   // Voice adapter — Vapi phone integration (custom LLM endpoint)
   let voiceAdapter: import("./channels/voice/voice-adapter.js").VoiceAdapter | undefined;
-  if (config.voice.enabled && config.voice.serverSecret) {
+  const livekitBridgeWanted = config.voice.livekit.enabled && !!config.voice.bridgeToken;
+  if ((config.voice.enabled && config.voice.serverSecret) || livekitBridgeWanted) {
     const { VoiceAdapter } = await import("./channels/voice/voice-adapter.js");
-
     voiceAdapter = new VoiceAdapter(
       config.voice.port,
       config.voice.serverSecret,
+      config.voice.bridgeToken,
       registry,
       memoryManager,
-      agentManager, // KPR-219: needed for the per-turn flag-on path
-      dispatcher, // KPR-223: routes voice turns through the dispatcher (taskLedger + audit; dedup skipped)
+      agentManager,
+      dispatcher, // KPR-223
+      config.voice.bindHost,
     );
     await voiceAdapter.start();
-    log.info("Voice adapter started", { port: config.voice.port });
+    log.info("Voice adapter started", { port: config.voice.port, livekitBridge: livekitBridgeWanted });
   }
 
   // Start scheduler (with callback support via MongoDB)

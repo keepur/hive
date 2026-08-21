@@ -1932,6 +1932,39 @@ export class AgentManager {
     return Array.from(this.states.values());
   }
 
+  /**
+   * KPR-322 E2: abort the in-flight spawn for one thread. Voice barge-in —
+   * the adapter calls this when the bridge's/Vapi's HTTP socket closes
+   * before the turn completes; without it the per-thread lock
+   * (`agentId:threadId`) keeps the caller's post-interruption turn queued
+   * behind the abandoned one (25ms wait loop, withSpawnTicket). Only the
+   * ticket-holding (running) spawn is aborted — lock-waiters hold no ticket.
+   * Returns true if a matching in-flight ticket was aborted.
+   */
+  abortThread(agentId: string, threadId: string): boolean {
+    const threadKey = `${agentId}:${threadId}`;
+    const tickets = this.activeTickets.get(agentId);
+    if (!tickets) return false;
+    let aborted = false;
+    for (const ticket of tickets) {
+      if (ticket.threadKey === threadKey) {
+        try {
+          ticket.abort();
+          aborted = true;
+        } catch (err) {
+          // Throw-safety (review round 1 B2): one bad ticket must not skip
+          // the rest — and callers include an HTTP `close` listener where a
+          // synchronous throw would be an uncaughtException.
+          log.warn("ticket.abort() threw during abortThread", { agentId, threadId, error: String(err) });
+        }
+      }
+    }
+    if (aborted) {
+      log.info("Aborted in-flight spawn for thread", { agentId, threadId });
+    }
+    return aborted;
+  }
+
   stopAgent(agentId: string): void {
     // KPR-220 Phase 5/10: mark stopped first so any concurrent
     // withSpawnTicket call sees it at the post-lock check. Then walk

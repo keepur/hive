@@ -46,15 +46,12 @@ const external = [
 const qdrantDispatcherStub: Plugin = {
   name: "qdrant-dispatcher-stub",
   setup(b) {
-    b.onLoad(
-      { filter: /[\\/]@qdrant[\\/]js-client-rest[\\/]dist[\\/][^\\/]+[\\/]dispatcher\.js$/ },
-      () => ({
-        contents:
-          "export const createDispatcher = () => undefined;\n" +
-          'createDispatcher.hiveStub = "hive-qdrant-dispatcher-stub";\n',
-        loader: "js",
-      }),
-    );
+    b.onLoad({ filter: /[\\/]@qdrant[\\/]js-client-rest[\\/]dist[\\/][^\\/]+[\\/]dispatcher\.js$/ }, () => ({
+      contents:
+        "export const createDispatcher = () => undefined;\n" +
+        'createDispatcher.hiveStub = "hive-qdrant-dispatcher-stub";\n',
+      loader: "js",
+    }));
   },
 };
 
@@ -111,6 +108,7 @@ await build({
     "mcp/task": "dist/tasks/task-mcp-server.js",
     "mcp/code-task": "dist/code-task/code-task-mcp-server.js",
     "mcp/voice": "dist/voice/voice-mcp-server.js",
+    "mcp/voice-livekit": "dist/voice/livekit-voice-mcp-server.js",
     "mcp/slack": "dist/slack/slack-mcp-server.js",
     "mcp/skill-author": "dist/skill-author/skill-author-mcp-server.js",
   },
@@ -136,10 +134,7 @@ for (const m of configSrc.matchAll(/\brequired\(\s*"([A-Z0-9_]+)"\s*\)/g)) {
   requiredEnv.add(m[1]);
 }
 const requiredEnvList = [...requiredEnv].sort();
-writeFileSync(
-  resolve(PKG_DIR, "required-env.json"),
-  JSON.stringify({ requiredEnv: requiredEnvList }, null, 2) + "\n",
-);
+writeFileSync(resolve(PKG_DIR, "required-env.json"), JSON.stringify({ requiredEnv: requiredEnvList }, null, 2) + "\n");
 console.log(`  pkg/required-env.json (${requiredEnvList.length} keys: ${requiredEnvList.join(", ")})`);
 
 console.log("\n✓ Bundle complete → pkg/");

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
-import { VoiceAdapter, isAuthError } from "./voice-adapter.js";
+import { VoiceAdapter, isAuthError, timingSafeTokenEqual } from "./voice-adapter.js";
 import type { OpenAIChatRequest } from "./openai-translator.js";
 import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
 import { ProviderCircuitOpenError } from "../../agents/provider-circuit-breaker.js";
@@ -64,6 +64,7 @@ interface AgentManagerStub {
   sessionStoreGet: ReturnType<typeof vi.fn>;
   sessionStoreSet: ReturnType<typeof vi.fn>;
   providerFor: ReturnType<typeof vi.fn>;
+  abortThread: ReturnType<typeof vi.fn>;
   calls: Array<{ ctx: TurnContext; onStream?: (chunk: string) => void }>;
 }
 
@@ -72,6 +73,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
   const sessionStoreGet = vi.fn().mockResolvedValue(undefined as string | undefined);
   const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
   const providerFor = vi.fn().mockReturnValue("claude");
+  const abortThread = vi.fn().mockReturnValue(false);
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
     calls.push({ ctx, onStream });
@@ -93,10 +95,14 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
     } satisfies TurnResult;
   });
 
-  return { spawnTurn, sessionStoreGet, sessionStoreSet, providerFor, calls };
+  return { spawnTurn, sessionStoreGet, sessionStoreSet, providerFor, abortThread, calls };
 }
 
-function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: ReturnType<typeof vi.fn> }) {
+function makeVoiceAdapter(
+  am?: AgentManagerStub,
+  dispatcher?: { routeVoiceTurn: ReturnType<typeof vi.fn> },
+  opts: { serverSecret?: string; bridgeToken?: string } = {},
+) {
   const registry: any = {
     get: vi.fn((id: string) =>
       id === "mokie" ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-6" } : undefined,
@@ -114,14 +120,24 @@ function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: 
           set: am.sessionStoreSet,
         }),
         providerFor: am.providerFor,
+        abortThread: am.abortThread,
       }
     : undefined;
-  return new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager, dispatcher as any);
+  return new VoiceAdapter(
+    0,
+    opts.serverSecret ?? "shared-secret",
+    opts.bridgeToken ?? "",
+    registry,
+    memoryManager,
+    agentManager,
+    dispatcher as any,
+  );
 }
 
 class MockServerResponse extends EventEmitter {
   headersSent = false;
   writableEnded = false;
+  destroyed = false;
   statusCode = 0;
   headers: Record<string, string> = {};
   written: string[] = [];
@@ -162,6 +178,39 @@ async function callHandle(adapter: VoiceAdapter, req: OpenAIChatRequest, res: Mo
   );
 }
 
+async function invokeHandleRequest(
+  adapter: VoiceAdapter,
+  opts: { headers?: Record<string, string>; body: unknown },
+): Promise<MockServerResponse> {
+  const res = new MockServerResponse();
+  const req: any = new EventEmitter();
+  req.method = "POST";
+  req.url = "/v1/chat/completions";
+  req.headers = opts.headers ?? {};
+  const handlePromise = (adapter as any).handleRequest(req, res);
+  req.emit("data", Buffer.from(typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)));
+  req.emit("end");
+  await handlePromise;
+  return res;
+}
+
+function workerBody(agentId = "mokie"): Record<string, unknown> {
+  return {
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+    call: { id: "call-abc", metadata: { hive_agent_id: agentId } },
+  };
+}
+
+function vapiBody(): Record<string, unknown> {
+  return {
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+    assistant: { metadata: { hive_agent_id: "mokie" } },
+    call: { id: "call-abc" },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // isAuthError (unchanged from baseline) — keep guarding the regex.
 // ---------------------------------------------------------------------------
@@ -190,6 +239,19 @@ describe("isAuthError", () => {
   });
 });
 
+describe("timingSafeTokenEqual", () => {
+  it("returns false for empty strings", () => {
+    expect(timingSafeTokenEqual("", "")).toBe(false);
+    expect(timingSafeTokenEqual("", "tok")).toBe(false);
+    expect(timingSafeTokenEqual("tok", "")).toBe(false);
+  });
+
+  it("returns true for equal tokens and false for unequal", () => {
+    expect(timingSafeTokenEqual("tok-1", "tok-1")).toBe(true);
+    expect(timingSafeTokenEqual("tok-1", "tok-2")).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // KPR-219: per-turn-via-AgentManager path tests
 // ---------------------------------------------------------------------------
@@ -212,7 +274,7 @@ describe("VoiceAdapter — KPR-220 Phase 8 retirement", () => {
     expect(
       () =>
         // Test wiring: pass undefined (typed-undefined coercion mirrors prod misconfig).
-        new VoiceAdapter(0, "shared-secret", {} as any, {} as any, undefined as unknown as any),
+        new VoiceAdapter(0, "shared-secret", "", {} as any, {} as any, undefined as unknown as any),
     ).toThrow(/AgentManager/);
   });
 
@@ -705,5 +767,209 @@ describe("VoiceAdapter.handleRequest agent resolution", () => {
 
     expect(res.statusCode).toBe(401);
     expect(am.spawnTurn).not.toHaveBeenCalled();
+  });
+});
+
+describe("E1 bridge auth (KPR-322)", () => {
+  const BRIDGE = "tok-bridge-1";
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("1. valid bearer + worker-shaped body → 200, spawn runs", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: `Bearer ${BRIDGE}` },
+      body: workerBody(),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("2. non-matching bearer + Vapi-shaped body → falls through and succeeds", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: "Bearer no-credentials-provided" },
+      body: vapiBody(),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("3. neither token nor Vapi shape → 401", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: "Bearer wrong" },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+        call: { id: "call-abc" },
+      },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(res.written.join("")).toBe(JSON.stringify({ error: "Unauthorized" }));
+    expect(am.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("4. serverSecret unset + valid bridge → 200; unset + Vapi-shaped, no token → 403", async () => {
+    const amOk = makeAgentManager();
+    const adapterOk = makeVoiceAdapter(amOk, undefined, { serverSecret: "", bridgeToken: BRIDGE });
+    const resOk = await invokeHandleRequest(adapterOk, {
+      headers: { authorization: `Bearer ${BRIDGE}` },
+      body: workerBody(),
+    });
+    expect(resOk.statusCode).toBe(200);
+    expect(amOk.spawnTurn).toHaveBeenCalledTimes(1);
+
+    const amDeny = makeAgentManager();
+    const adapterDeny = makeVoiceAdapter(amDeny, undefined, { serverSecret: "", bridgeToken: BRIDGE });
+    const resDeny = await invokeHandleRequest(adapterDeny, {
+      headers: { authorization: "Bearer no-credentials-provided" },
+      body: vapiBody(),
+    });
+    expect(resDeny.statusCode).toBe(403);
+    expect(resDeny.written.join("")).toBe(JSON.stringify({ error: "Server secret not configured" }));
+    expect(amDeny.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("5. bridge token configured but no resolvable hive_agent_id → 400", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: `Bearer ${BRIDGE}` },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+        call: { id: "call-abc" },
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.written.join("")).toBe(JSON.stringify({ error: "call.metadata.hive_agent_id required" }));
+    expect(am.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("6. empty bridgeToken → Vapi requests match pre-E1 behavior", async () => {
+    const amOk = makeAgentManager();
+    const adapterOk = makeVoiceAdapter(amOk); // bridgeToken defaults to ""
+    const resOk = await invokeHandleRequest(adapterOk, {
+      headers: { authorization: "Bearer no-credentials-provided" },
+      body: vapiBody(),
+    });
+    expect(resOk.statusCode).toBe(200);
+    expect(amOk.spawnTurn).toHaveBeenCalledTimes(1);
+
+    const amDeny = makeAgentManager();
+    const adapterDeny = makeVoiceAdapter(amDeny);
+    const resDeny = await invokeHandleRequest(adapterDeny, {
+      headers: { authorization: "Bearer no-credentials-provided" },
+      body: {
+        model: "x",
+        messages: [{ role: "user", content: "hi" }],
+        assistant: {},
+        call: {},
+      },
+    });
+    expect(resDeny.statusCode).toBe(401);
+    expect(resDeny.written.join("")).toBe(JSON.stringify({ error: "Unauthorized" }));
+    expect(amDeny.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("8. valid bridge token + Vapi-shaped body → 200 via the token path", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: `Bearer ${BRIDGE}` },
+      body: vapiBody(),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("E2 abort-on-disconnect (KPR-322)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("suppresses outer retry when the client is gone", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "stale-sid", provider: "claude" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      res.emit("close");
+      return {
+        finalMessage: "",
+        newSessionId: "",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 0,
+          costUsd: 0,
+          durationMs: 0,
+        },
+        errors: ["resume failed: bad session id"],
+      };
+    });
+
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "ack" },
+        { role: "user", content: "now retry me" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    expect(am.abortThread).toHaveBeenCalledWith("mokie", "voice:call-abc-123");
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+    expect(res.written).toEqual([]);
+    expect(res.writableEnded).toBe(false);
+  });
+
+  it("does not write after premature close (no throw, no write after end)", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: true });
+
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      onStream!("before ");
+      res.emit("close");
+      onStream!("after ");
+      return {
+        finalMessage: "before after",
+        newSessionId: "s1",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 0,
+          costUsd: 0,
+          durationMs: 0,
+        },
+        errors: [],
+      };
+    });
+
+    await expect(callHandle(adapter, req, res)).resolves.toBeUndefined();
+
+    expect(am.abortThread).toHaveBeenCalledWith("mokie", "voice:call-abc-123");
+    const joined = res.written.join("");
+    expect(joined).toContain('"content":"before "');
+    expect(joined).not.toContain("after");
+    expect(joined).not.toContain("[DONE]");
+    expect(res.writableEnded).toBe(false);
   });
 });

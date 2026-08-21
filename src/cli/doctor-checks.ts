@@ -328,6 +328,47 @@ export async function prefixCacheStatsForDoctor(uri: string, dbName: string): Pr
   }
 }
 
+/** KPR-322: voice-worker heartbeat row (kind="voice_worker_stats"). */
+export interface VoiceWorkerStatsRow {
+  activeCalls: number;
+  callsStarted: number;
+  callsCompleted: number;
+  lastError: string | null;
+  cellDefaults: { defaultStt?: string; defaultTts?: string } | null;
+  /** Seconds since the worker last wrote this doc; null if no doc yet. */
+  staleSeconds: number | null;
+}
+
+export async function voiceWorkerStatsForDoctor(uri: string, dbName: string): Promise<VoiceWorkerStatsRow | null> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const doc = await client.db(dbName).collection("telemetry").findOne<{
+      activeCalls?: number;
+      callsStarted?: number;
+      callsCompleted?: number;
+      lastError?: string | null;
+      cellDefaults?: { defaultStt?: string; defaultTts?: string };
+      updatedAt?: Date;
+    }>({ kind: "voice_worker_stats" });
+    if (!doc) return null;
+    const updatedAt = doc.updatedAt instanceof Date ? doc.updatedAt : null;
+    return {
+      activeCalls: doc.activeCalls ?? 0,
+      callsStarted: doc.callsStarted ?? 0,
+      callsCompleted: doc.callsCompleted ?? 0,
+      lastError: doc.lastError ?? null,
+      cellDefaults: doc.cellDefaults ?? null,
+      staleSeconds: updatedAt ? Math.round((Date.now() - updatedAt.getTime()) / 1000) : null,
+    };
+  } catch {
+    return null;
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 /**
  * KPR-220 Phase 11 / spec S6+S8: per-agent spawn-coordinator snapshot row,
  * read from the `telemetry` collection where the engine heartbeats it every
