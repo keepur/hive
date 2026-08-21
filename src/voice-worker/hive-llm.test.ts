@@ -331,4 +331,48 @@ describe("HiveLLM (KPR-322)", () => {
     expect(msgs[2]!.content).toBe(applyInterruptionMarker("latest user", spoken));
     expect(hive.interruptedSpokenText).toBeNull();
   });
+
+  it("keeps the interruption marker on a 503 retry until the bridge POST succeeds", async () => {
+    const bodies: Array<Array<{ role: string; content: string }>> = [];
+    let requestCount = 0;
+
+    const stub = await listen((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+          messages?: Array<{ role: string; content: string }>;
+        };
+        bodies.push(parsed.messages ?? []);
+        requestCount += 1;
+        if (requestCount === 1) {
+          res.writeHead(503, { "Content-Type": "text/plain" });
+          res.end("Voice temporarily unavailable");
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(formatSSETextChunk(STREAM_ID, "ok", MODEL));
+        res.end(formatSSEDone(STREAM_ID, MODEL));
+      });
+    });
+    openServers.push(stub.server);
+
+    const hive = makeHive(stub.url);
+    const spoken = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron";
+    hive.interruptedSpokenText = spoken;
+    const chatCtx = userCtx("latest user");
+    const marked = applyInterruptionMarker("latest user", spoken);
+
+    const first = await consumeTurn(hive, chatCtx);
+    expectBridge(first.bridge, "budget_saturated", false);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]![0]!.content).toBe(marked);
+    expect(hive.interruptedSpokenText).toBe(spoken);
+
+    const second = await consumeTurn(hive, chatCtx);
+    expect(second.bridge).toBeUndefined();
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]![0]!.content).toBe(marked);
+    expect(hive.interruptedSpokenText).toBeNull();
+  });
 });

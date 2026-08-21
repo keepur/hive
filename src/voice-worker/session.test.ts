@@ -27,7 +27,7 @@ vi.mock("mongodb", () => {
   return { MongoClient: mongoMocks.MongoClient };
 });
 
-import { recordSetupFailure, resolveInboundAgent } from "./session.js";
+import { recordSetupFailure, resolveInboundAgent, runJobShutdown } from "./session.js";
 import { CallStats, VoiceWorkerHeartbeat } from "./telemetry.js";
 
 const INBOUND_COPY = {
@@ -176,5 +176,34 @@ describe("recordSetupFailure (KPR-322 setup telemetry)", () => {
     expect(coll.updateOne).toHaveBeenCalledTimes(1);
     const update = coll.updateOne.mock.calls[0]![1] as { $set: Record<string, unknown> };
     expect(update.$set.lastError).toBe("setup_failed");
+  });
+});
+
+describe("runJobShutdown (KPR-322 call-end heartbeat)", () => {
+  it("invokes closeMongo only after releaseCall resolves, even if close is faster", async () => {
+    const order: string[] = [];
+    let finishRelease!: () => void;
+    const releaseCall = () =>
+      new Promise<void>((resolve) => {
+        order.push("release-started");
+        finishRelease = () => {
+          order.push("release-finished");
+          resolve();
+        };
+      });
+    const flush = async () => {
+      order.push("flush");
+    };
+    const closeMongo = () => {
+      order.push("close");
+      return Promise.resolve();
+    };
+
+    const running = runJobShutdown({ releaseCall, flush, closeMongo });
+    await Promise.resolve();
+    expect(order).toEqual(["release-started"]);
+    finishRelease();
+    await running;
+    expect(order).toEqual(["release-started", "release-finished", "flush", "close"]);
   });
 });

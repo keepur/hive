@@ -24,15 +24,10 @@ export default defineAgent({
       defaultStt: wc.defaultStt,
       defaultTts: wc.defaultTts,
     });
-    try {
-      await runCallSession(ctx, wc, meta, cell, heartbeat);
-    } finally {
-      // entry() returns while the LiveKit job is still running; close on
-      // shutdown so noteCall* writes during the call still have a client.
-      ctx.addShutdownCallback(async () => {
-        await mongo.close().catch(() => {});
-      });
-    }
+    // entry() returns while the LiveKit job is still running. Close Mongo
+    // from the session's ordered shutdown callback (after noteCallEnded),
+    // not as a sibling Promise.all callback — close must not race persist().
+    await runCallSession(ctx, wc, meta, cell, heartbeat, () => mongo.close().catch(() => {}));
   },
 });
 

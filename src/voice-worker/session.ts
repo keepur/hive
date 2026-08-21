@@ -95,13 +95,32 @@ export function resolveInboundAgent(
   };
 }
 
+/** Ordered job teardown so noteCallEnded hits a live Mongo client (KPR-322). */
+export async function runJobShutdown(hooks: {
+  releaseCall: () => Promise<void>;
+  flush: () => Promise<void>;
+  closeMongo: () => Promise<void>;
+}): Promise<void> {
+  await hooks.releaseCall();
+  await hooks.flush();
+  await hooks.closeMongo();
+}
+
 export async function runCallSession(
   ctx: JobContext,
   wc: WorkerConfig,
   meta: DispatchMetadata,
   cell: VendorCell,
   heartbeat?: VoiceWorkerHeartbeat,
+  closeMongo?: () => Promise<void>,
 ): Promise<void> {
+  const shutdownHooks = {
+    releaseCall: async () => {},
+    flush: async () => {},
+    closeMongo: closeMongo ?? (async () => {}),
+  };
+  ctx.addShutdownCallback(() => runJobShutdown(shutdownHooks));
+
   await ctx.connect();
   const callId = ctx.room.name;
   if (!callId) {
@@ -158,12 +177,14 @@ export async function runCallSession(
 
   if (heartbeat) void heartbeat.noteCallStarted();
   let callReleased = false;
-  const releaseCall = () => {
+  const releaseCall = async () => {
     if (callReleased) return;
     callReleased = true;
     if (!heartbeat) return;
-    void heartbeat.noteCallEnded();
+    await heartbeat.noteCallEnded();
   };
+  shutdownHooks.releaseCall = releaseCall;
+  shutdownHooks.flush = () => stats.flush("completed");
 
   session.on(voice.AgentSessionEventTypes.ConversationItemAdded, (ev) => {
     const item = ev.item;
@@ -175,11 +196,6 @@ export async function runCallSession(
 
   session.on(voice.AgentSessionEventTypes.Error, (ev) => {
     void handleSessionError(ev, { session, stats, ctx, callId, heartbeat, releaseCall });
-  });
-
-  ctx.addShutdownCallback(() => {
-    releaseCall();
-    return stats.flush("completed");
   });
 
   const agent = new voice.Agent({
@@ -225,7 +241,7 @@ async function handleSessionError(
     ctx: JobContext;
     callId: string;
     heartbeat?: VoiceWorkerHeartbeat;
-    releaseCall: () => void;
+    releaseCall: () => Promise<void>;
   },
 ): Promise<void> {
   const { session, stats, ctx, callId, heartbeat, releaseCall } = args;
@@ -249,7 +265,7 @@ async function handleSessionError(
   await speakAndWait(session, FALLBACK_LINES[action.say]);
   if (heartbeat) void heartbeat.noteError(behavior.telemetryOutcome);
   await stats.flush("failed");
-  releaseCall();
+  await releaseCall();
   ctx.shutdown();
 }
 

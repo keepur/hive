@@ -88,7 +88,7 @@ export class HiveLLMStream extends llm.LLMStream {
     super(parent, args);
   }
 
-  private toBridgeMessages(): BridgeMessage[] {
+  private toBridgeMessages(interruptedSpokenText: string | null): BridgeMessage[] {
     // ChatContext → full transcript (§5.2). Item/text accessors pinned at 1.6.4.
     const turns = this.chatCtx.items
       .filter(
@@ -98,14 +98,17 @@ export class HiveLLMStream extends llm.LLMStream {
       .map((i) => ({ role: i.role, text: i.textContent ?? "" }));
     const msgs = serializeTranscript(turns);
     // §7: interruption marker prefixes the LATEST user message only.
-    if (this.parent.interruptedSpokenText && msgs.length > 0) {
+    // Apply from a local copy — do not mutate parent.interruptedSpokenText here
+    // so a §8 retry stream (budget_saturated / spawn_failed) still prefixes,
+    // and a second toBridgeMessages() in this run() cannot double-prefix via
+    // a cleared-then-re-read flag.
+    if (interruptedSpokenText && msgs.length > 0) {
       for (let k = msgs.length - 1; k >= 0; k--) {
         if (msgs[k]!.role === "user") {
-          msgs[k]!.content = applyInterruptionMarker(msgs[k]!.content, this.parent.interruptedSpokenText);
+          msgs[k]!.content = applyInterruptionMarker(msgs[k]!.content, interruptedSpokenText);
           break;
         }
       }
-      this.parent.interruptedSpokenText = null; // consumed
     }
     return msgs;
   }
@@ -126,6 +129,10 @@ export class HiveLLMStream extends llm.LLMStream {
     let maxGapMs = 0;
     let yielded = false;
     try {
+      // Snapshot once so a second toBridgeMessages() in this run cannot
+      // re-read a mutated flag; clear the parent field only after POST ok.
+      const spokenText = this.parent.interruptedSpokenText;
+      const messages = this.toBridgeMessages(spokenText);
       const res = await fetch(this.opts.bridgeUrl, {
         method: "POST",
         signal: controller.signal,
@@ -135,7 +142,7 @@ export class HiveLLMStream extends llm.LLMStream {
         },
         body: JSON.stringify({
           stream: true,
-          messages: this.toBridgeMessages(),
+          messages,
           call: {
             id: this.opts.callId,
             metadata: {
@@ -150,6 +157,10 @@ export class HiveLLMStream extends llm.LLMStream {
         const snippet = (await res.text().catch(() => "")).slice(0, 200);
         throw new BridgeError(classifyHttpFailure(res.status, snippet), `bridge HTTP ${res.status}: ${snippet}`, false);
       }
+      // Engine accepted the marked user message. Leave the flag cleared on a
+      // later barge-in abort — do not restore. BridgeError (503/500) above
+      // leaves the flag set so §8's generateReply() retry still prefixes.
+      this.parent.interruptedSpokenText = null;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       const parser = new SSEParser();
