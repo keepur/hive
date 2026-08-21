@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, timingSafeEqual, randomUUID } from "node:crypto";
 import { createLogger } from "../../logging/logger.js";
 import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
 import { renderConversationPrompt, extractLatestUserMessage } from "./conversation-prompt.js";
@@ -28,6 +28,17 @@ export function isAuthError(err: unknown): boolean {
   );
 }
 
+/**
+ * KPR-322 E1: constant-time bearer comparison. sha256 normalizes lengths so
+ * timingSafeEqual never throws on length mismatch. Exported for unit tests.
+ */
+export function timingSafeTokenEqual(provided: string, expected: string): boolean {
+  if (!provided || !expected) return false;
+  const a = createHash("sha256").update(provided).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
 interface CallSession {
   callId: string;
   agentId: string;
@@ -45,6 +56,8 @@ export class VoiceAdapter {
   constructor(
     private port: number,
     private serverSecret: string,
+    /** KPR-322 E1: shared bridge secret (HIVE_VOICE_BRIDGE_TOKEN). "" = LiveKit bridge disabled. */
+    private bridgeToken: string,
     private registry: AgentRegistry,
     private memoryManager: MemoryManager,
     /**
@@ -61,6 +74,8 @@ export class VoiceAdapter {
      * that doesn't need the full dispatcher.
      */
     private dispatcher?: Dispatcher,
+    /** KPR-322 E1: loopback default — both callers are local. */
+    private bindHost: string = "127.0.0.1",
   ) {
     if (!agentManager) {
       throw new Error("VoiceAdapter requires AgentManager (KPR-220 Phase 8 retired the direct-query fallback)");
@@ -79,13 +94,13 @@ export class VoiceAdapter {
     });
 
     await new Promise<void>((resolve) => {
-      this.httpServer!.listen(this.port, () => resolve());
+      this.httpServer!.listen(this.port, this.bindHost, () => resolve());
     });
 
     // Sweep stale sessions every 30 minutes
     this.sweepTimer = setInterval(() => this.sweepStaleSessions(), 30 * 60 * 1000);
 
-    log.info("Voice adapter started", { port: this.port });
+    log.info("Voice adapter started", { port: this.port, bindHost: this.bindHost });
   }
 
   stop(): void {
@@ -109,23 +124,37 @@ export class VoiceAdapter {
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!this.serverSecret) {
+    const authHeader = (req.headers["authorization"] as string) ?? "";
+    const bearerSecret = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7) : "";
+    // KPR-322 E1: a matching bridge bearer authenticates the request as the
+    // LiveKit worker, regardless of body shape. A present-but-NON-matching
+    // bearer is NOT an immediate 401 — Vapi sends `Authorization: Bearer
+    // no-credentials-provided` by default, so non-matching bearers fall
+    // through to the Vapi shape check below.
+    const isBridgeAuthed = this.bridgeToken !== "" && timingSafeTokenEqual(bearerSecret, this.bridgeToken);
+
+    // Pre-E1 dead-endpoint gate, with the bridge carved out: a LiveKit-only
+    // instance (no VAPI_SERVER_SECRET) must still serve bridge-authed turns.
+    if (!this.serverSecret && !isBridgeAuthed) {
       log.error("Voice endpoint called but VAPI_SERVER_SECRET not configured — rejecting");
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Server secret not configured" }));
       return;
     }
 
-    const authHeader = (req.headers["authorization"] as string) ?? "";
-    const bearerSecret = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7) : "";
     const providedSecret =
       (req.headers["x-vapi-secret"] as string) ?? (req.headers["server-secret"] as string) ?? bearerSecret ?? "";
     const hasValidSecret = providedSecret === this.serverSecret;
 
-    // Custom LLM endpoint: Vapi sends `Authorization: Bearer no-credentials-provided`
-    // by default; their schema has no per-assistant API-key field. Auth this path by
-    // verifying the body's assistant.id maps to a configured agent — the UUID is
-    // the bearer token. Other paths still require the shared secret.
+    // Custom LLM endpoint. Two authenticated shapes:
+    //  (a) bridge: `Authorization: Bearer <HIVE_VOICE_BRIDGE_TOKEN>` — no
+    //      `assistant` object; agent resolves via call.metadata.hive_agent_id.
+    //  (b) Vapi: no/non-matching bearer, but Vapi-shaped — an `assistant`
+    //      object present, resolving through the existing three-priority
+    //      chain (assistant.metadata → voice.assistants map → call.metadata;
+    //      the MCP-initiated flow legitimately uses call.metadata).
+    // Anything neither token-bearing nor Vapi-shaped → 401. The worker sends
+    // no `assistant`, so a wrong/missing token gets 401, never a spawn.
     if (req.method === "POST" && req.url === "/v1/chat/completions") {
       const body = await readBody(req);
       let request: OpenAIChatRequest;
@@ -137,8 +166,24 @@ export class VoiceAdapter {
         return;
       }
 
+      if (!isBridgeAuthed && !request.assistant) {
+        log.warn("Voice request rejected — no bridge token and not Vapi-shaped", {
+          hasBearer: !!bearerSecret,
+        });
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
       const agentId = this.resolveAgentId(request);
       if (!agentId) {
+        if (isBridgeAuthed) {
+          // Authenticated bridge but malformed body — a request error, not auth.
+          log.warn("Bridge request missing resolvable agent", { hasCallMeta: !!request.call?.metadata });
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "call.metadata.hive_agent_id required" }));
+          return;
+        }
         log.warn("Voice request rejected — could not resolve agent from request body", {
           assistantId: request.assistant?.id,
           hasMetadata: !!request.assistant?.metadata,
@@ -159,7 +204,7 @@ export class VoiceAdapter {
       return this.handleChatCompletion(req, res, request, agentId, agentConfig);
     }
 
-    // All other paths require the shared secret.
+    // All other paths require the shared secret (unchanged).
     if (!hasValidSecret) {
       log.warn("Voice request rejected — invalid server secret", {
         url: req.url,

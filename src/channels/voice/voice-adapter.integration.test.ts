@@ -55,6 +55,26 @@ interface CapturedSpawn {
   onStream?: (chunk: string) => void;
 }
 
+function echoSpawn(): (ctx: TurnContext, onStream?: (chunk: string) => void) => Promise<TurnResult> {
+  return async (_ctx, onStream) => {
+    onStream?.("hi");
+    return {
+      finalMessage: "hi",
+      newSessionId: "echo-session",
+      usage: {
+        inputTokens: 1,
+        outputTokens: 1,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        contextWindow: 200000,
+        costUsd: 0,
+        durationMs: 10,
+      },
+      errors: [],
+    };
+  };
+}
+
 function makeAdapter(opts: {
   /** Resolved by spawnTurn; behavior may include onStream chunks. */
   spawn: (ctx: TurnContext, onStream?: (chunk: string) => void) => Promise<TurnResult>;
@@ -62,11 +82,15 @@ function makeAdapter(opts: {
   storedSessionId?: string;
   /**
    * KPR-223: optional dispatcher mock. When provided, the adapter is
-   * constructed with the 6-arg form so voice turns route through
+   * constructed with the dispatcher so voice turns route through
    * `dispatcher.routeVoiceTurn` instead of directly through
    * `agentManager.spawnTurn`. Omit to keep the legacy fallback wiring.
    */
   dispatcher?: Dispatcher;
+  /** KPR-322 E1: override VAPI_SERVER_SECRET (default "shared-secret"). */
+  serverSecret?: string;
+  /** KPR-322 E1: HIVE_VOICE_BRIDGE_TOKEN (default "" = LiveKit disabled). */
+  bridgeToken?: string;
 }) {
   const captured: CapturedSpawn[] = [];
   const sessionStoreGet = vi
@@ -94,18 +118,20 @@ function makeAdapter(opts: {
     providerFor: vi.fn().mockReturnValue("claude"),
   };
 
+  const serverSecret = opts.serverSecret ?? "shared-secret";
+  const bridgeToken = opts.bridgeToken ?? "";
   const adapter = opts.dispatcher
-    ? new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager, opts.dispatcher)
-    : new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager);
+    ? new VoiceAdapter(0, serverSecret, bridgeToken, registry, memoryManager, agentManager, opts.dispatcher)
+    : new VoiceAdapter(0, serverSecret, bridgeToken, registry, memoryManager, agentManager);
   return { adapter, captured, sessionStoreGet, sessionStoreSet, spawnTurn };
 }
 
 function postChatCompletion(
   port: number,
-  body: Record<string, unknown>,
+  opts: { headers?: Record<string, string>; body: Record<string, unknown> },
 ): Promise<{ status: number; headers: IncomingMessage["headers"]; chunks: string[] }> {
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
+    const payload = JSON.stringify(opts.body);
     const req: ClientRequest = httpRequest(
       {
         host: "127.0.0.1",
@@ -117,6 +143,7 @@ function postChatCompletion(
           "Content-Length": Buffer.byteLength(payload),
           // Vapi default — auth comes from assistant.metadata.hive_agent_id.
           authorization: "Bearer no-credentials-provided",
+          ...opts.headers,
         },
       },
       (res) => {
@@ -144,13 +171,15 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     vi.clearAllMocks();
   });
 
-  async function startAdapter(setup: ReturnType<typeof makeAdapter>): Promise<number> {
+  async function startAdapter(
+    setup: ReturnType<typeof makeAdapter>,
+  ): Promise<{ server: { address: () => AddressInfo | string | null }; port: number }> {
     adapter = setup.adapter;
     await adapter.start();
-    const httpServer = (adapter as any).httpServer as { address: () => AddressInfo };
-    const addr = httpServer.address();
+    const server = (adapter as any).httpServer as { address: () => AddressInfo };
+    const addr = server.address();
     port = addr.port;
-    return port;
+    return { server, port };
   }
 
   it("first turn (no stored sessionId) — full transcript prompt + streaming SSE chunks", async () => {
@@ -176,17 +205,19 @@ describe("VoiceAdapter integration (KPR-219)", () => {
       },
     });
 
-    const p = await startAdapter(setup);
+    const { port: p } = await startAdapter(setup);
 
     const res = await postChatCompletion(p, {
-      model: "voice-mock",
-      stream: true,
-      messages: [
-        { role: "system", content: "you are mokie" },
-        { role: "user", content: "Hello?" },
-      ],
-      assistant: { metadata: { hive_agent_id: "mokie" } },
-      call: { id: "call-int-1", metadata: { goal: "say hi" } },
+      body: {
+        model: "voice-mock",
+        stream: true,
+        messages: [
+          { role: "system", content: "you are mokie" },
+          { role: "user", content: "Hello?" },
+        ],
+        assistant: { metadata: { hive_agent_id: "mokie" } },
+        call: { id: "call-int-1", metadata: { goal: "say hi" } },
+      },
     });
 
     expect(res.status).toBe(200);
@@ -228,18 +259,20 @@ describe("VoiceAdapter integration (KPR-219)", () => {
       },
     });
 
-    const p = await startAdapter(setup);
+    const { port: p } = await startAdapter(setup);
 
     const res = await postChatCompletion(p, {
-      model: "voice-mock",
-      stream: true,
-      messages: [
-        { role: "user", content: "first turn user message" },
-        { role: "assistant", content: "first turn agent reply" },
-        { role: "user", content: "follow-up question" },
-      ],
-      assistant: { metadata: { hive_agent_id: "mokie" } },
-      call: { id: "call-int-2" },
+      body: {
+        model: "voice-mock",
+        stream: true,
+        messages: [
+          { role: "user", content: "first turn user message" },
+          { role: "assistant", content: "first turn agent reply" },
+          { role: "user", content: "follow-up question" },
+        ],
+        assistant: { metadata: { hive_agent_id: "mokie" } },
+        call: { id: "call-int-2" },
+      },
     });
 
     expect(res.status).toBe(200);
@@ -296,17 +329,19 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     });
     setupBox.current = setup;
 
-    const p = await startAdapter(setup);
+    const { port: p } = await startAdapter(setup);
 
     const res = await postChatCompletion(p, {
-      model: "voice-mock",
-      stream: true,
-      messages: [
-        { role: "system", content: "you are mokie" },
-        { role: "user", content: "Test dispatcher routing" },
-      ],
-      assistant: { metadata: { hive_agent_id: "mokie" } },
-      call: { id: "call-int-3", metadata: { goal: "verify dispatcher" } },
+      body: {
+        model: "voice-mock",
+        stream: true,
+        messages: [
+          { role: "system", content: "you are mokie" },
+          { role: "user", content: "Test dispatcher routing" },
+        ],
+        assistant: { metadata: { hive_agent_id: "mokie" } },
+        call: { id: "call-int-3", metadata: { goal: "verify dispatcher" } },
+      },
     });
 
     expect(res.status).toBe(200);
@@ -328,5 +363,64 @@ describe("VoiceAdapter integration (KPR-219)", () => {
 
     // Inner spawnTurn was reached via the dispatcher delegation.
     expect(setup.spawnTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("binds loopback by default and accepts bridge-token requests without VAPI secret (KPR-322 E1)", async () => {
+    const setup = makeAdapter({ spawn: echoSpawn(), serverSecret: "", bridgeToken: "tok-1" });
+    const { server, port: p } = await startAdapter(setup);
+    expect((server.address() as AddressInfo).address).toBe("127.0.0.1");
+    const res = await postChatCompletion(p, {
+      headers: { authorization: "Bearer tok-1" },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+        call: { id: "call-abc", metadata: { hive_agent_id: "mokie" } },
+      },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects a non-matching bearer on the worker-shaped path (KPR-322 E1)", async () => {
+    const setup = makeAdapter({ spawn: echoSpawn(), serverSecret: "", bridgeToken: "tok-1" });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      headers: { authorization: "Bearer wrong" },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+        call: { id: "call-abc", metadata: { hive_agent_id: "mokie" } },
+      },
+    });
+    // No VAPI secret and not bridge-authed: the pre-E1 dead-endpoint 403-gate
+    // fires before the worker-shape 401 (Testing-Contract assertion 4).
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a non-matching bearer with 401 when VAPI secret is configured (KPR-322 E1)", async () => {
+    const setup = makeAdapter({ spawn: echoSpawn(), serverSecret: "vapi-secret", bridgeToken: "tok-1" });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      headers: { authorization: "Bearer wrong" },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+        call: { id: "call-abc", metadata: { hive_agent_id: "mokie" } },
+      },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("preserves Vapi fall-through with Bearer no-credentials-provided (KPR-322 E1)", async () => {
+    const setup = makeAdapter({ spawn: echoSpawn(), serverSecret: "vapi-secret" });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+        assistant: { metadata: { hive_agent_id: "mokie" } },
+        call: { id: "call-vapi" },
+      },
+    });
+    expect(res.status).toBe(200);
   });
 });
