@@ -597,10 +597,10 @@ export class AgentRunner {
     // hive-voice worker. Gated on the livekit section + API pair; server
     // key name "voice-livekit" so agents can carry either/both.
     if (
-      config.voice.livekit.enabled &&
+      config.voice.livekit?.enabled &&
       config.voice.livekitApiKey &&
       config.voice.livekitApiSecret &&
-      config.voice.livekit.url
+      config.voice.livekit?.url
     ) {
       servers["voice-livekit"] = {
         type: "stdio",

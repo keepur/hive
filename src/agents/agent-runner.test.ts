@@ -180,7 +180,14 @@ vi.mock("../config.js", async (importOriginal) => {
       browser: { cdpEndpoint: "" },
       memory: { hotBudgetTokens: 3000 },
       workflow: { enabled: false },
-      voice: { apiKey: "", phoneNumberId: "", assistants: {} },
+      voice: {
+        apiKey: "",
+        phoneNumberId: "",
+        assistants: {},
+        livekit: { enabled: false, url: "", sipTrunkId: "", inboundAgents: {}, defaultStt: "", defaultTts: "" },
+        livekitApiKey: "",
+        livekitApiSecret: "",
+      },
       // KPR-329: engine-default tool-search config for the mocked module.
       toolSearch: { mode: "auto", source: "default" },
     },
@@ -236,6 +243,7 @@ function getCapturedOptions(): Record<string, any> {
 import { AgentRunner, resolveToolSearchEnv, resolveToolSearchMode } from "./agent-runner.js";
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
+import { config } from "../config.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
 
@@ -320,6 +328,63 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers).toHaveProperty("background");
     expect(servers).toHaveProperty("callback");
     expect(servers).toHaveProperty("admin");
+    expect(servers).not.toHaveProperty("voice-livekit");
+  });
+
+  it("registers voice-livekit when livekit is enabled with credentials", async () => {
+    const origVoice = config.voice;
+    (config as any).voice = {
+      ...origVoice,
+      livekit: {
+        enabled: true,
+        url: "wss://example.livekit.cloud",
+        sipTrunkId: "",
+        inboundAgents: {},
+        defaultStt: "",
+        defaultTts: "",
+      },
+      livekitApiKey: "lk-key",
+      livekitApiSecret: "lk-secret",
+    };
+    try {
+      runner = new AgentRunner(
+        makeAgentConfig({ coreServers: ["voice-livekit"] }),
+        memoryManager as any,
+        [],
+        new Map(),
+        "{}",
+        undefined,
+        undefined,
+        makeFakeInProcessDb(),
+      );
+      await runner.send("hello");
+      const servers = getCapturedServers();
+      expect(servers).toHaveProperty("voice-livekit");
+      expect(servers["voice-livekit"].env).toMatchObject({
+        LIVEKIT_URL: "wss://example.livekit.cloud",
+        LIVEKIT_API_KEY: "lk-key",
+        LIVEKIT_API_SECRET: "lk-secret",
+        AGENT_ID: "test-agent",
+        AGENT_NAME: "TestAgent",
+      });
+    } finally {
+      (config as any).voice = origVoice;
+    }
+  });
+
+  it("does not register voice-livekit when livekit is disabled", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["voice-livekit"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
+    );
+    await runner.send("hello");
+    expect(getCapturedServers()).not.toHaveProperty("voice-livekit");
   });
 
   it("filters servers by agent coreServers allowlist", async () => {
