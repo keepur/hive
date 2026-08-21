@@ -54,18 +54,25 @@ export function percentile(samples: number[], p: number): number {
  * `tts_metrics.ttfbMs`, `llm_metrics.ttftMs`; `interruption_metrics` has
  * counts (not a boolean `falseInterruption`); there is no `totalToFirstAudioMs`.
  *
- * One TurnMetricsLine is emitted on `eou_metrics` (turn boundary), combining
- * that EOU delay with last-seen TTS TTFB + `hiveLLM.lastTurnTiming` for
- * `llmTtftMs` / `maxInterChunkGapMs` (LiveKit `llm_metrics.ttftMs` is a
- * fallback only). `totalToFirstAudioMs` is the sum of those three when all
- * are >= 0, else -1. `interrupted` is true when `numInterruptions` increased
- * since the last line; `falseInterruption` latches `agent_false_interruption`
- * until the next emitted line. Missing numbers stay -1.
+ * agents-js 1.6.4 emits `eou_metrics` immediately after `generateReply()` is
+ * scheduled — before this turn's LLM stream or TTS TTFB exist. Production
+ * order is EOU (with `speechId` = the new SpeechHandle) → this turn's LLM →
+ * this turn's TTS TTFB. Hold the pending EOU; emit one TurnMetricsLine when
+ * matching TTS TTFB arrives (join on `speechId`). `llmTtftMs` /
+ * `maxInterChunkGapMs` come from `hiveLLM.lastTurnTiming` if set (HiveLLM
+ * TTFT is this turn's by TTS TTFB), else matching `llm_metrics.ttftMs` for
+ * that `speechId`, else -1. `ttsTtfbMs` is the matching TTS event.
+ * `totalToFirstAudioMs` is the sum of EOU + LLM TTFT + TTS TTFB when all
+ * are >= 0, else -1. Incomplete turns are dropped, not cross-wired with
+ * another speech's TTS. `interrupted` is true when `numInterruptions`
+ * increased since the last line; `falseInterruption` latches
+ * `agent_false_interruption` until the next emitted line (the TTS-joined
+ * line, not EOU). `speechId` is internal join key only — omit from JSONL.
  */
 export class TurnMetrics {
   private turnSeq = 0;
-  private lastTtsTtfbMs = -1;
-  private lastLlmTtftMs = -1;
+  private pendingEou: { speechId: string; endOfUtteranceDelayMs: number } | null = null;
+  private llmTtftBySpeechId = new Map<string, number>();
   private lastInterruptionCount = 0;
   private pendingInterrupted = false;
   private pendingFalseInterruption = false;
@@ -91,28 +98,35 @@ export class TurnMetrics {
     const m = ev.metrics;
     switch (m.type) {
       case "tts_metrics":
-        this.lastTtsTtfbMs = m.ttfbMs;
+        if (m.speechId !== undefined && this.pendingEou?.speechId === m.speechId) {
+          const eou = this.pendingEou;
+          this.pendingEou = null;
+          this.emitTurn(eou.endOfUtteranceDelayMs, m.ttfbMs, m.speechId);
+        }
         return;
       case "llm_metrics":
-        this.lastLlmTtftMs = m.ttftMs;
+        if (m.speechId !== undefined) this.llmTtftBySpeechId.set(m.speechId, m.ttftMs);
         return;
       case "interruption_metrics":
         if (m.numInterruptions > this.lastInterruptionCount) this.pendingInterrupted = true;
         this.lastInterruptionCount = m.numInterruptions;
         return;
       case "eou_metrics":
-        this.emitTurn(m.endOfUtteranceDelayMs);
+        // Hold until matching TTS TTFB. A new EOU replaces an unmatched one
+        // (incomplete turns are dropped, never flushed with another speech's TTS).
+        this.pendingEou =
+          m.speechId !== undefined ? { speechId: m.speechId, endOfUtteranceDelayMs: m.endOfUtteranceDelayMs } : null;
         return;
       default:
         return;
     }
   }
 
-  private emitTurn(eouDelayMs: number): void {
+  private emitTurn(eouDelayMs: number, ttsTtfbMs: number, speechId: string): void {
     const bridge = this.hiveLLM.lastTurnTiming;
-    const llmTtftMs = bridge?.llmTtftMs ?? this.lastLlmTtftMs;
+    const llmTtftMs = bridge?.llmTtftMs ?? this.llmTtftBySpeechId.get(speechId) ?? -1;
     const maxInterChunkGapMs = bridge?.maxInterChunkGapMs ?? -1;
-    const ttsTtfbMs = this.lastTtsTtfbMs;
+    this.llmTtftBySpeechId.delete(speechId);
     const totalToFirstAudioMs =
       eouDelayMs >= 0 && llmTtftMs >= 0 && ttsTtfbMs >= 0 ? eouDelayMs + llmTtftMs + ttsTtfbMs : -1;
     const line: TurnMetricsLine = {

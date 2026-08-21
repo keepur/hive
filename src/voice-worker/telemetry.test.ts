@@ -83,7 +83,7 @@ function makeFakeSession() {
   };
 }
 
-function eouEvent(endOfUtteranceDelayMs: number): MetricsCollectedEvent {
+function eouEvent(endOfUtteranceDelayMs: number, speechId?: string): MetricsCollectedEvent {
   return {
     type: "metrics_collected",
     createdAt: Date.now(),
@@ -94,11 +94,12 @@ function eouEvent(endOfUtteranceDelayMs: number): MetricsCollectedEvent {
       transcriptionDelayMs: 0,
       onUserTurnCompletedDelayMs: 0,
       lastSpeakingTimeMs: 0,
+      ...(speechId !== undefined ? { speechId } : {}),
     },
   };
 }
 
-function ttsEvent(ttfbMs: number): MetricsCollectedEvent {
+function ttsEvent(ttfbMs: number, speechId?: string): MetricsCollectedEvent {
   return {
     type: "metrics_collected",
     createdAt: Date.now(),
@@ -113,11 +114,12 @@ function ttsEvent(ttfbMs: number): MetricsCollectedEvent {
       cancelled: false,
       charactersCount: 0,
       streamed: true,
+      ...(speechId !== undefined ? { speechId } : {}),
     },
   };
 }
 
-function llmEvent(ttftMs: number): MetricsCollectedEvent {
+function llmEvent(ttftMs: number, speechId?: string): MetricsCollectedEvent {
   return {
     type: "metrics_collected",
     createdAt: Date.now(),
@@ -134,6 +136,7 @@ function llmEvent(ttftMs: number): MetricsCollectedEvent {
       promptCachedTokens: 0,
       totalTokens: 0,
       tokensPerSecond: 0,
+      ...(speechId !== undefined ? { speechId } : {}),
     },
   };
 }
@@ -289,14 +292,17 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
     vi.clearAllMocks();
   });
 
-  it("emits one JSONL line on eou_metrics with callId only — no to / number / text fields", () => {
-    const hiveLLM = { lastTurnTiming: { llmTtftMs: 200, maxInterChunkGapMs: 15 } };
+  it("emits one JSONL line on matching TTS after production-order EOU/LLM — callId only, no to / number / text / speechId", () => {
+    const hiveLLM = { lastTurnTiming: null };
     const metrics = new TurnMetrics("call-abc", CELL, hiveLLM, "outbound");
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
+    expect(mockLog.info).not.toHaveBeenCalled();
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(200, "s1"));
+    expect(mockLog.info).not.toHaveBeenCalled();
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
 
     expect(mockLog.info).toHaveBeenCalledTimes(1);
     const [msg, logged] = mockLog.info.mock.calls[0] as [string, Record<string, unknown>];
@@ -308,47 +314,76 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
     expect(typeof logged.cell).toBe("string");
     expect(logged.eouDelayMs).toBe(110);
     expect(logged.llmTtftMs).toBe(200);
-    expect(logged.maxInterChunkGapMs).toBe(15);
+    expect(logged.maxInterChunkGapMs).toBe(-1);
     expect(logged.ttsTtfbMs).toBe(80);
     expect(logged.totalToFirstAudioMs).toBe(110 + 200 + 80);
     expect(logged.interrupted).toBe(false);
     expect(logged.falseInterruption).toBe(false);
+    expect(logged).not.toHaveProperty("speechId");
     assertNoPii(logged);
   });
 
-  it("missing numbers stay -1 when TTS/LLM have not been seen", () => {
-    const hiveLLM = { lastTurnTiming: null };
+  it("joins EOU to this-turn TTS on speechId — previous-turn TTS does not complete the next EOU", () => {
+    const hiveLLM = { lastTurnTiming: { llmTtftMs: 10, maxInterChunkGapMs: 0 } };
+    const metrics = new TurnMetrics("call-x", CELL, hiveLLM);
+    const session = makeFakeSession();
+    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
+
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
+    expect(mockLog.info).toHaveBeenCalledTimes(1);
+    expect((mockLog.info.mock.calls[0]![1] as Record<string, unknown>).ttsTtfbMs).toBe(80);
+
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(90, "s2"));
+    expect(mockLog.info).toHaveBeenCalledTimes(1);
+
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(50, "s2"));
+    expect(mockLog.info).toHaveBeenCalledTimes(2);
+    const lineB = mockLog.info.mock.calls[1]![1] as Record<string, unknown>;
+    expect(lineB.eouDelayMs).toBe(90);
+    expect(lineB.ttsTtfbMs).toBe(50);
+    expect(lineB.turnSeq).toBe(1);
+    expect(lineB).not.toHaveProperty("speechId");
+    assertNoPii(lineB);
+  });
+
+  it("uses hiveLLM.lastTurnTiming when EOU then matching TTS fire", () => {
+    const hiveLLM = { lastTurnTiming: { llmTtftMs: 200, maxInterChunkGapMs: 15 } };
+    const metrics = new TurnMetrics("call-bridge", CELL, hiveLLM);
+    const session = makeFakeSession();
+    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
+
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
+
+    const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
+    expect(logged.llmTtftMs).toBe(200);
+    expect(logged.maxInterChunkGapMs).toBe(15);
+    expect(logged.ttsTtfbMs).toBe(80);
+    expect(logged.totalToFirstAudioMs).toBe(110 + 200 + 80);
+    assertNoPii(logged);
+  });
+
+  it("does not emit on EOU alone — incomplete turns are dropped", () => {
+    const hiveLLM = { lastTurnTiming: { llmTtftMs: 200, maxInterChunkGapMs: 15 } };
     const metrics = new TurnMetrics("call-xyz", CELL, hiveLLM, "inbound");
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(50));
-
-    const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
-    expect(logged.eouDelayMs).toBe(50);
-    expect(logged.llmTtftMs).toBe(-1);
-    expect(logged.maxInterChunkGapMs).toBe(-1);
-    expect(logged.ttsTtfbMs).toBe(-1);
-    expect(logged.totalToFirstAudioMs).toBe(-1);
-    expect(logged.direction).toBe("inbound");
-    assertNoPii(logged);
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(50, "s1"));
+    expect(mockLog.info).not.toHaveBeenCalled();
   });
 
-  it("falls back to last-seen llm_metrics.ttftMs when hiveLLM.lastTurnTiming is null", () => {
-    const hiveLLM = { lastTurnTiming: null };
-    const metrics = new TurnMetrics("call-fb", CELL, hiveLLM);
+  it("does not emit a turn line on tts/llm metrics alone", () => {
+    const metrics = new TurnMetrics("call-none", CELL, { lastTurnTiming: null });
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(333));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(10));
-
-    const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
-    expect(logged.llmTtftMs).toBe(333);
-    assertNoPii(logged);
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(9, "s1"));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(9, "s1"));
+    expect(mockLog.info).not.toHaveBeenCalled();
   });
 
-  it("maps interruption_metrics counts and agent_false_interruption onto the next eou line", () => {
+  it("maps interruption_metrics and agent_false_interruption onto the next TTS-joined line", () => {
     const hiveLLM = { lastTurnTiming: { llmTtftMs: 1, maxInterChunkGapMs: 0 } };
     const metrics = new TurnMetrics("call-int", CELL, hiveLLM);
     const session = makeFakeSession();
@@ -360,37 +395,32 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
       resumed: true,
       createdAt: Date.now(),
     });
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(20));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(20, "s1"));
+    expect(mockLog.info).not.toHaveBeenCalled();
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
 
     const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
     expect(logged.interrupted).toBe(true);
     expect(logged.falseInterruption).toBe(true);
     assertNoPii(logged);
 
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(20));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(20, "s2"));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(50, "s2"));
     const next = mockLog.info.mock.calls[1]![1] as Record<string, unknown>;
     expect(next.interrupted).toBe(false);
     expect(next.falseInterruption).toBe(false);
   });
 
-  it("does not emit a turn line on tts/llm metrics alone", () => {
-    const metrics = new TurnMetrics("call-none", CELL, { lastTurnTiming: null });
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(9));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(9));
-    expect(mockLog.info).not.toHaveBeenCalled();
-  });
-
-  it("invokes onTurn with the emitted line", () => {
+  it("invokes onTurn with the emitted line when matching TTS arrives", () => {
     const onTurn = vi.fn();
     const hiveLLM = { lastTurnTiming: { llmTtftMs: 200, maxInterChunkGapMs: 15 } };
     const metrics = new TurnMetrics("call-abc", CELL, hiveLLM, "outbound", onTurn);
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110));
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
+    expect(onTurn).not.toHaveBeenCalled();
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
 
     expect(onTurn).toHaveBeenCalledTimes(1);
     const line = onTurn.mock.calls[0]![0] as Record<string, unknown>;
@@ -402,6 +432,7 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
     expect(line.llmTtftMs).toBe(200);
     expect(line.ttsTtfbMs).toBe(80);
     expect(line.totalToFirstAudioMs).toBe(110 + 200 + 80);
+    expect(line).not.toHaveProperty("speechId");
     assertNoPii(line);
   });
 });
