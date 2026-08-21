@@ -6,6 +6,7 @@ import {
   resolveOutageQueueConfig,
   resolveToolSearchConfig,
   resolveVoiceLivekitConfig,
+  resolveVoiceWarmPathConfig,
   DEFAULT_TOOL_SEARCH_CONFIG,
 } from "./config.js";
 import { DEFAULT_CIRCUIT_BREAKER_CONFIG } from "./agents/provider-circuit-breaker.js";
@@ -231,5 +232,19 @@ describe("resolveVoiceLivekitConfig (KPR-322 E3)", () => {
   });
   it("enabled must be literal true", () => {
     expect(resolveVoiceLivekitConfig({ enabled: "true" }).enabled).toBe(false);
+  });
+});
+
+describe("resolveVoiceWarmPathConfig (KPR-323 C4)", () => {
+  it("defaults to disabled on absent/garbage input", () => {
+    for (const input of [undefined, null, 42, "x", [], { enabled: "true" }, { enabled: 1 }]) {
+      expect(resolveVoiceWarmPathConfig(input).enabled).toBe(false);
+    }
+  });
+  it("enables on literal true only", () => {
+    expect(resolveVoiceWarmPathConfig({ enabled: true }).enabled).toBe(true);
+  });
+  it("ignores unknown keys", () => {
+    expect(resolveVoiceWarmPathConfig({ enabled: true, idleMs: 5 }).enabled).toBe(true);
   });
 });

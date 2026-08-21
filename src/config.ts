@@ -202,6 +202,23 @@ export function resolveVoiceLivekitConfig(raw: unknown): VoiceLivekitConfig {
 }
 
 /**
+ * KPR-323 C4: resolve the optional hive.yaml `voice.warmPath` section.
+ * Liberal-loader style (KPR-225 F3): literal `true` only; absent/garbage →
+ * disabled. `false` = the warm branch is never taken — byte-identical
+ * today-path (the rollback lever, spec §4.7). Idle timeout (120s) and
+ * lifetime cap (2h) are named constants in warm-voice-session.ts —
+ * deliberately NOT config. Exported pure for unit tests.
+ */
+export interface VoiceWarmPathConfig {
+  enabled: boolean;
+}
+
+export function resolveVoiceWarmPathConfig(raw: unknown): VoiceWarmPathConfig {
+  const src = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  return { enabled: src.enabled === true };
+}
+
+/**
  * KPR-322: env-first / Honeypot-second secret resolution for out-of-engine
  * processes (the voice worker reuses the engine loader). Delegates to the
  * loader's own `optional()` so the semantics can never drift from the
@@ -489,6 +506,9 @@ export const config = {
     livekit: resolveVoiceLivekitConfig((hive.voice as Record<string, unknown> | undefined)?.livekit),
     livekitApiKey: optional("LIVEKIT_API_KEY", ""),
     livekitApiSecret: optional("LIVEKIT_API_SECRET", ""),
+    // KPR-323 C4: per-call warm session lease master switch. Default false
+    // on merge; flipped per-instance after W2 passes.
+    warmPath: resolveVoiceWarmPathConfig((hive.voice as Record<string, unknown> | undefined)?.warmPath),
   },
   // KPR-322 E3: names reserved by 321 §9, wired here. Consumed by
   // scripts/livekit-setup.ts (SIP-1) — never by cloud-model-facing code.
