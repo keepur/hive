@@ -257,6 +257,7 @@ const MCP_BUNDLE_MAP: Record<string, string> = {
   "google/google-mcp-server.js": "google.min.js",
   "quo/quo-mcp-server.js": "quo.min.js",
   "voice/voice-mcp-server.js": "voice.min.js",
+  "voice/livekit-voice-mcp-server.js": "voice-livekit.min.js",
   "tasks/task-mcp-server.js": "task.min.js",
   "resend/resend-mcp-server.js": "resend.min.js",
   "linear/linear-mcp-server.js": "linear.min.js",
@@ -586,6 +587,29 @@ export class AgentRunner {
           VAPI_API_KEY: config.voice.apiKey,
           VAPI_PHONE_NUMBER_ID: config.voice.phoneNumberId,
           VAPI_ASSISTANT_ID: vapiAssistantId,
+          AGENT_ID: this.agentConfig.id,
+          AGENT_NAME: this.agentConfig.name,
+        },
+      };
+    }
+
+    // LiveKit voice MCP server (KPR-322 E4) — outbound calls via the
+    // hive-voice worker. Gated on the livekit section + API pair; server
+    // key name "voice-livekit" so agents can carry either/both.
+    if (
+      config.voice.livekit.enabled &&
+      config.voice.livekitApiKey &&
+      config.voice.livekitApiSecret &&
+      config.voice.livekit.url
+    ) {
+      servers["voice-livekit"] = {
+        type: "stdio",
+        command: "node",
+        args: [mcpPath("voice/livekit-voice-mcp-server.js")],
+        env: {
+          LIVEKIT_URL: config.voice.livekit.url,
+          LIVEKIT_API_KEY: config.voice.livekitApiKey,
+          LIVEKIT_API_SECRET: config.voice.livekitApiSecret,
           AGENT_ID: this.agentConfig.id,
           AGENT_NAME: this.agentConfig.name,
         },

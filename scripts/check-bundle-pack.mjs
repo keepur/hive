@@ -39,10 +39,22 @@ const required = [
 // pkg/server.min.js's entry-point check), so per-server bundles for them
 // would be empty/no-op.
 const expectedMcp = [
-  "github-issues", "linear", "clickup", "google",
-  "keychain", "quo", "resend", "search-conversation",
-  "background-task", "recall", "task",
-  "code-task", "voice", "slack", "skill-author",
+  "github-issues",
+  "linear",
+  "clickup",
+  "google",
+  "keychain",
+  "quo",
+  "resend",
+  "search-conversation",
+  "background-task",
+  "recall",
+  "task",
+  "code-task",
+  "voice",
+  "voice-livekit",
+  "slack",
+  "skill-author",
 ];
 for (const mcp of expectedMcp) {
   required.push(`pkg/mcp/${mcp}.min.js`);
