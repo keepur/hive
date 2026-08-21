@@ -111,8 +111,8 @@ export class MemoryEmbedder implements MemoryVectorIndex {
     const searchFilter: any = { must };
     if (extraMustNot.length > 0) searchFilter.must_not = extraMustNot;
 
-    const results = await this.getClient().search(COLLECTION, {
-      vector: queryVector,
+    const { points: results } = await this.getClient().query(COLLECTION, {
+      query: queryVector,
       limit,
       with_payload: true,
       filter: searchFilter,

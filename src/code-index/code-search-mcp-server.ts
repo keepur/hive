@@ -49,8 +49,8 @@ export function buildCodeSearchTools(deps: CodeSearchToolDeps) {
           if (repo) must.push({ key: "repo", match: { value: repo } });
           if (role) must.push({ key: "role", match: { value: role } });
 
-          const results = await qdrant.search(CODE_INDEX_COLLECTION, {
-            vector: queryVector,
+          const { points: results } = await qdrant.query(CODE_INDEX_COLLECTION, {
+            query: queryVector,
             limit: searchLimit,
             with_payload: true,
             filter: must.length > 0 ? { must } : undefined,

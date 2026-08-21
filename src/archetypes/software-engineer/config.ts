@@ -4,9 +4,7 @@ import { normalize, resolve } from "node:path";
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export type TrackerConfig =
-  | { type: "linear"; project: string }
-  | { type: "github"; repo: string }
-  | { type: "clickup"; list: string };
+  { type: "linear"; project: string } | { type: "github"; repo: string } | { type: "clickup"; list: string };
 
 export interface Workspace {
   name: string;

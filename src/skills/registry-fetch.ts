@@ -45,7 +45,7 @@ export function shallowClone(url: string): CloneResult {
     return { dir: tmpDir, headSha, cleanup };
   } catch (err) {
     cleanup();
-    throw new Error(`registry fetch failed: ${String(err)}`);
+    throw new Error(`registry fetch failed: ${String(err)}`, { cause: err });
   }
 }
 
@@ -86,7 +86,7 @@ export function partialClone(url: string): CloneResult {
     return { dir: tmpDir, headSha, cleanup };
   } catch (err) {
     cleanup();
-    throw new Error(`registry fetch failed: ${String(err)}`);
+    throw new Error(`registry fetch failed: ${String(err)}`, { cause: err });
   }
 }
 

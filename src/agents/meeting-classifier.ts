@@ -126,10 +126,10 @@ export async function classifyMeetingMessage(
     return { respondAgentIds: [...validIds], costUsd: 0, durationMs: 0 };
   }
 
-  let resultText = "";
+  let resultText: string;
   let parsedOutput: unknown;
-  let costUsd = 0;
-  let durationMs = 0;
+  let costUsd: number;
+  let durationMs: number;
 
   try {
     const userPrompt = `${buildRosterContext(roster, recentMessages)}\n\nMessage:\n${messageText}`;

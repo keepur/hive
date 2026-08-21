@@ -5,15 +5,17 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const mockGetCollections = vi.fn();
 const mockCreateCollection = vi.fn();
 const mockUpsert = vi.fn();
-const mockSearch = vi.fn();
+const mockQuery = vi.fn();
 
 vi.mock("@qdrant/js-client-rest", () => ({
-  QdrantClient: vi.fn().mockImplementation(() => ({
-    getCollections: mockGetCollections,
-    createCollection: mockCreateCollection,
-    upsert: mockUpsert,
-    search: mockSearch,
-  })),
+  QdrantClient: vi.fn().mockImplementation(function () {
+    return {
+      getCollections: mockGetCollections,
+      createCollection: mockCreateCollection,
+      upsert: mockUpsert,
+      query: mockQuery,
+    };
+  }),
 }));
 
 // ── Mock fetch (Ollama embedding) ───────────────────────────────────────────
@@ -67,7 +69,7 @@ describe("ConversationIndex", () => {
     mockGetCollections.mockResolvedValue({ collections: [] });
     mockCreateCollection.mockResolvedValue(undefined);
     mockUpsert.mockResolvedValue(undefined);
-    mockSearch.mockResolvedValue([]);
+    mockQuery.mockResolvedValue({ points: [] });
 
     // Create a fresh instance each test so collectionReady resets
     index = new ConversationIndex("http://localhost:6333", "http://localhost:11434");
@@ -168,12 +170,12 @@ describe("ConversationIndex", () => {
 
   describe("search", () => {
     it("builds correct filter with agentId match", async () => {
-      mockSearch.mockResolvedValue([]);
+      mockQuery.mockResolvedValue({ points: [] });
 
       await index.search("query text", "agent-a", 5);
 
-      expect(mockSearch).toHaveBeenCalledWith("conversations", {
-        vector: FAKE_VECTOR,
+      expect(mockQuery).toHaveBeenCalledWith("conversations", {
+        query: FAKE_VECTOR,
         limit: 5,
         with_payload: true,
         filter: {
@@ -183,12 +185,12 @@ describe("ConversationIndex", () => {
     });
 
     it("adds timestampUnix range filter when sinceUnix is provided", async () => {
-      mockSearch.mockResolvedValue([]);
+      mockQuery.mockResolvedValue({ points: [] });
 
       await index.search("query text", "agent-a", 10, 1700000000);
 
-      expect(mockSearch).toHaveBeenCalledWith("conversations", {
-        vector: FAKE_VECTOR,
+      expect(mockQuery).toHaveBeenCalledWith("conversations", {
+        query: FAKE_VECTOR,
         limit: 10,
         with_payload: true,
         filter: {
@@ -201,36 +203,38 @@ describe("ConversationIndex", () => {
     });
 
     it("returns correctly typed ConversationResult array", async () => {
-      mockSearch.mockResolvedValue([
-        {
-          score: 0.95,
-          payload: {
-            agentId: "agent-a",
-            threadId: "thread-1",
-            channelId: "C123",
-            source: "slack",
-            senderName: "Alice",
-            timestampUnix: 1700000000,
-            timestamp: "2024-01-01T00:00:00.000Z",
-            inbound: "hello",
-            response: "world",
+      mockQuery.mockResolvedValue({
+        points: [
+          {
+            score: 0.95,
+            payload: {
+              agentId: "agent-a",
+              threadId: "thread-1",
+              channelId: "C123",
+              source: "slack",
+              senderName: "Alice",
+              timestampUnix: 1700000000,
+              timestamp: "2024-01-01T00:00:00.000Z",
+              inbound: "hello",
+              response: "world",
+            },
           },
-        },
-        {
-          score: 0.82,
-          payload: {
-            agentId: "agent-a",
-            threadId: "thread-2",
-            channelId: "C456",
-            source: "sms",
-            senderName: "Bob",
-            timestampUnix: 1700001000,
-            timestamp: "2024-01-01T00:16:40.000Z",
-            inbound: "question",
-            response: "answer",
+          {
+            score: 0.82,
+            payload: {
+              agentId: "agent-a",
+              threadId: "thread-2",
+              channelId: "C456",
+              source: "sms",
+              senderName: "Bob",
+              timestampUnix: 1700001000,
+              timestamp: "2024-01-01T00:16:40.000Z",
+              inbound: "question",
+              response: "answer",
+            },
           },
-        },
-      ]);
+        ],
+      });
 
       const results = await index.search("test query", "agent-a", 10);
 

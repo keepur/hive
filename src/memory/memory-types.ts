@@ -5,11 +5,7 @@ export type MemoryImportance = "critical" | "high" | "medium" | "low";
 export type MemoryTier = "hot" | "warm" | "cold";
 
 export type ConsolidationPhase =
-  | "idle"
-  | "summarizeCold"
-  | "mergeDuplicates"
-  | "detectContradictions"
-  | "promotePatterns";
+  "idle" | "summarizeCold" | "mergeDuplicates" | "detectContradictions" | "promotePatterns";
 
 export interface ConsolidationCursor {
   createdAt: Date;

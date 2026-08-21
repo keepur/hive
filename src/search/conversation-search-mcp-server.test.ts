@@ -6,12 +6,14 @@ let registeredTools: Record<string, (...args: any[]) => any> = {};
 
 const mockConnect = vi.fn();
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
-  McpServer: vi.fn().mockImplementation(() => ({
-    registerTool: (name: string, _schema: any, handler: (...args: any[]) => any) => {
-      registeredTools[name] = handler;
-    },
-    connect: mockConnect,
-  })),
+  McpServer: vi.fn().mockImplementation(function () {
+    return {
+      registerTool: (name: string, _schema: any, handler: (...args: any[]) => any) => {
+        registeredTools[name] = handler;
+      },
+      connect: mockConnect,
+    };
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
@@ -22,9 +24,11 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 
 const mockSearch = vi.fn();
 vi.mock("./conversation-index.js", () => ({
-  ConversationIndex: vi.fn().mockImplementation(() => ({
-    search: mockSearch,
-  })),
+  ConversationIndex: vi.fn().mockImplementation(function () {
+    return {
+      search: mockSearch,
+    };
+  }),
 }));
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -64,20 +68,24 @@ async function loadWithEnv(agentId: string, defaultAgent?: string) {
 
   // Re-apply mocks after resetModules (they are hoisted but registry is cleared)
   vi.doMock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
-    McpServer: vi.fn().mockImplementation(() => ({
-      registerTool: (name: string, _schema: any, handler: (...args: any[]) => any) => {
-        registeredTools[name] = handler;
-      },
-      connect: mockConnect,
-    })),
+    McpServer: vi.fn().mockImplementation(function () {
+      return {
+        registerTool: (name: string, _schema: any, handler: (...args: any[]) => any) => {
+          registeredTools[name] = handler;
+        },
+        connect: mockConnect,
+      };
+    }),
   }));
   vi.doMock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
     StdioServerTransport: vi.fn(),
   }));
   vi.doMock("./conversation-index.js", () => ({
-    ConversationIndex: vi.fn().mockImplementation(() => ({
-      search: mockSearch,
-    })),
+    ConversationIndex: vi.fn().mockImplementation(function () {
+      return {
+        search: mockSearch,
+      };
+    }),
   }));
 
   await import("./conversation-search-mcp-server.js");

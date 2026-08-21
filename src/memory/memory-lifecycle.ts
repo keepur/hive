@@ -261,7 +261,6 @@ export class MemoryLifecycle {
 
     // 1. Score all non-pinned records
     const records = await this.store.getAllNonPinned(agentId);
-    let cleanedCount = 0;
 
     if (records.length > 0) {
       const accessCounts = records.map((r) => r.accessCount).sort((a, b) => a - b);
@@ -319,7 +318,7 @@ export class MemoryLifecycle {
     // 4. Clean up old summarized records
     // Runs unconditionally — agents with no active memories still have old summaries to clean.
     const retentionDate = new Date(Date.now() - this.config.coldRetentionDays * 24 * 60 * 60 * 1000);
-    cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
+    const cleanedCount = await this.store.deleteSummarizedOlderThan(agentId, retentionDate);
 
     // 5. Hard-delete purged records older than retention period
     // Runs unconditionally — agents that purged all memories still need cleanup.

@@ -307,7 +307,8 @@ function warnIfToolSearchForceDisabled(): void {
 
 /** KPR-346: optional per-spawn runner options (currently Lane A only). */
 export interface AgentRunnerOptions {
-  /** Set by AgentManager.createProviderAdapter for kimi/deepseek routes —
+  /** Set by AgentManager.createProviderAdapter for Lane A routes
+   *  (kimi/deepseek/grok) —
    *  triggers §D5 env substitution in send(). Absent ⇒ vanilla Claude spawn. */
   laneAPassthrough?: PassthroughSpawnConfig;
 }
@@ -2018,7 +2019,6 @@ export class AgentRunner {
 
     // Instrumentation
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
-    let activeToolStart: number | null = null;
     let activeToolName: string | null = null;
 
     const timeoutMs = resourceLimits?.timeoutMs ?? this.agentConfig.timeoutMs ?? 300_000; // 5 min default
@@ -2103,7 +2103,7 @@ export class AgentRunner {
                   toolCalls[toolCalls.length - 1]!.endMs = Date.now();
                 }
                 activeToolName = block.name;
-                activeToolStart = Date.now();
+                const activeToolStart = Date.now();
                 toolCalls.push({ tool: block.name, startMs: activeToolStart });
                 log.info("Tool call started", {
                   agent: this.agentConfig.id,

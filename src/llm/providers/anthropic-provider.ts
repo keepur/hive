@@ -28,18 +28,16 @@ export class AnthropicProvider implements LLMProvider {
   async generate(request: LLMRequest): Promise<LLMResult> {
     const started = Date.now();
     const content: Anthropic.ContentBlockParam[] = [
-      ...(request.images ?? []).map(
-        (img): Anthropic.ImageBlockParam => ({
-          type: "image",
-          source: {
-            type: "base64",
-            // Callers pass real image mimetypes; the API rejects others — a
-            // caller error surfaced as a thrown 400, per the throw contract.
-            media_type: img.mimeType as Anthropic.Base64ImageSource["media_type"],
-            data: img.dataBase64,
-          },
-        }),
-      ),
+      ...(request.images ?? []).map((img): Anthropic.ImageBlockParam => ({
+        type: "image",
+        source: {
+          type: "base64",
+          // Callers pass real image mimetypes; the API rejects others — a
+          // caller error surfaced as a thrown 400, per the throw contract.
+          media_type: img.mimeType as Anthropic.Base64ImageSource["media_type"],
+          data: img.dataBase64,
+        },
+      })),
       { type: "text", text: request.prompt },
     ];
     const params = {

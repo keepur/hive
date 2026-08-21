@@ -9,12 +9,14 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   })),
 }));
 
-const mockSearch = vi.fn(async () => []);
+const mockQuery = vi.fn(async () => ({ points: [] }));
 
 vi.mock("@qdrant/js-client-rest", () => ({
-  QdrantClient: vi.fn().mockImplementation(() => ({
-    search: mockSearch,
-  })),
+  QdrantClient: vi.fn().mockImplementation(function () {
+    return {
+      query: mockQuery,
+    };
+  }),
 }));
 
 vi.mock("../search/embed-utils.js", () => ({
@@ -33,14 +35,16 @@ function makeFakeDb(): any {
   return {
     collection: () => ({
       findOne: vi.fn(async () => null),
-      find: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
+      find: vi.fn(function () {
+        return { toArray: vi.fn(async () => []) };
+      }),
     }),
   };
 }
 
 describe("code-search-mcp-server (in-process)", () => {
   it("code_search returns the empty-state message when Qdrant returns nothing", async () => {
-    mockSearch.mockResolvedValueOnce([]);
+    mockQuery.mockResolvedValueOnce({ points: [] });
     const tools = buildCodeSearchTools({ db: makeFakeDb() });
     const handler = getHandler(tools, "code_search");
 

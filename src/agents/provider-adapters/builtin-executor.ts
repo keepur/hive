@@ -348,7 +348,6 @@ export class BuiltinExecutor {
     }
 
     const out: string[] = [];
-    let totalChars = 0;
     for (const file of files) {
       const fst = await stat(file).catch(() => null);
       if (!fst?.isFile() || fst.size > GREP_MAX_FILE_BYTES) continue;
@@ -375,7 +374,7 @@ export class BuiltinExecutor {
           }
         }
       }
-      totalChars = out.reduce((n, s) => n + s.length + 1, 0);
+      const totalChars = out.reduce((n, s) => n + s.length + 1, 0);
       if (totalChars > OUTPUT_TRUNCATE_CHARS) {
         out.push("[grep output truncated at 30000 characters]");
         break;

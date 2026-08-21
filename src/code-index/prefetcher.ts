@@ -52,8 +52,8 @@ export class CodeIndexPrefetcher {
 
     // 1. Query code index
     try {
-      const codeResults = await this.qdrant.search(CODE_INDEX_COLLECTION, {
-        vector: queryVector,
+      const { points: codeResults } = await this.qdrant.query(CODE_INDEX_COLLECTION, {
+        query: queryVector,
         limit: this.prefetchLimit,
         with_payload: true,
       });
@@ -75,8 +75,8 @@ export class CodeIndexPrefetcher {
     // We filter by agentId in Qdrant and post-filter by topic prefix in application code.
     if (agentId) {
       try {
-        const memResults = await this.qdrant.search("agent_memory", {
-          vector: queryVector,
+        const { points: memResults } = await this.qdrant.query("agent_memory", {
+          query: queryVector,
           limit: 15, // fetch extra to account for post-filter
           with_payload: true,
           filter: {
@@ -178,8 +178,8 @@ export class CodeIndexPrefetcher {
       const queryVector = await embedOllama(this.options.ollamaUrl, tail);
 
       // 2a. Search code index for relevant files
-      const codeResults = await this.qdrant.search(CODE_INDEX_COLLECTION, {
-        vector: queryVector,
+      const { points: codeResults } = await this.qdrant.query(CODE_INDEX_COLLECTION, {
+        query: queryVector,
         limit: this.prefetchLimit,
         with_payload: true,
       });
@@ -196,8 +196,8 @@ export class CodeIndexPrefetcher {
 
       // 2b. Search agent memory for code insights
       if (agentId) {
-        const memResults = await this.qdrant.search("agent_memory", {
-          vector: queryVector,
+        const { points: memResults } = await this.qdrant.query("agent_memory", {
+          query: queryVector,
           limit: 10,
           with_payload: true,
           filter: {
