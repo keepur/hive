@@ -10,9 +10,10 @@ import {
   renderPrefixCacheSection,
   renderPromptCacheSection,
   renderSpawnCoordinatorSection,
+  renderVoiceWorkerSection,
   resolveRequiredEnvVars,
 } from "./doctor.js";
-import type { DatastoreIdentityReport } from "./doctor-checks.js";
+import type { DatastoreIdentityReport, VoiceWorkerStatsRow } from "./doctor-checks.js";
 
 describe("resolveRequiredEnvVars", () => {
   let dir: string;
@@ -336,6 +337,58 @@ describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
     );
     const out = lines.join("\n");
     expect(out).toContain("last error: something broke");
+  });
+});
+
+describe("renderVoiceWorkerSection (KPR-322)", () => {
+  const fullRow: VoiceWorkerStatsRow = {
+    activeCalls: 1,
+    callsStarted: 4,
+    callsCompleted: 3,
+    lastError: null,
+    cellDefaults: { defaultStt: "deepgram/flux-general-en", defaultTts: "cartesia/sonic-3" },
+    staleSeconds: 12,
+  };
+
+  it("renders 'no heartbeat yet' when no row is available", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection(null, (l) => lines.push(l), "keepur");
+    const out = lines.join("\n");
+    expect(out).toContain("Voice worker (LiveKit)");
+    expect(out).toContain("no heartbeat yet — worker never started?");
+  });
+
+  it("renders counters and cell defaults", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection(fullRow, (l) => lines.push(l), "keepur");
+    const out = lines.join("\n");
+    expect(out).toContain("active=1");
+    expect(out).toContain("started=4");
+    expect(out).toContain("completed=3");
+    expect(out).toContain("deepgram/flux-general-en");
+    expect(out).toContain("cartesia/sonic-3");
+    expect(out).toContain("heartbeat 12s ago");
+    expect(out).not.toMatch(/heartbeat stale/);
+  });
+
+  it("renders last error when present", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection({ ...fullRow, lastError: "sip trunk down" }, (l) => lines.push(l), "keepur");
+    expect(lines.join("\n")).toContain("last error: sip trunk down");
+  });
+
+  it("flags stale heartbeat when staleSeconds > 90 and includes kickstart hint", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection({ ...fullRow, staleSeconds: 91 }, (l) => lines.push(l), "keepur");
+    const out = lines.join("\n");
+    expect(out).toContain("heartbeat stale");
+    expect(out).toContain("launchctl kickstart -k gui/$(id -u)/com.hive.keepur.voice-worker");
+  });
+
+  it("does not flag stale heartbeat at the 90s boundary", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection({ ...fullRow, staleSeconds: 90 }, (l) => lines.push(l), "keepur");
+    expect(lines.join("\n")).not.toMatch(/heartbeat stale/);
   });
 });
 

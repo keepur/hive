@@ -346,6 +346,74 @@ describe("circuitBreakerStatsForDoctor (KPR-306)", () => {
   });
 });
 
+import { voiceWorkerStatsForDoctor } from "./doctor-checks.js";
+
+describe("voiceWorkerStatsForDoctor (KPR-322)", () => {
+  beforeEach(() => {
+    mongoMocks.connect.mockReset().mockResolvedValue(undefined);
+    mongoMocks.close.mockReset().mockResolvedValue(undefined);
+    mongoMocks.findOne.mockReset();
+  });
+
+  it("maps a present doc including staleSeconds from updatedAt", async () => {
+    const updatedAt = new Date(Date.now() - 10_000);
+    mongoMocks.findOne.mockResolvedValue({
+      kind: "voice_worker_stats",
+      activeCalls: 2,
+      callsStarted: 10,
+      callsCompleted: 8,
+      lastError: null,
+      cellDefaults: { defaultStt: "deepgram/flux-general-en", defaultTts: "cartesia/sonic-3" },
+      updatedAt,
+    });
+    const row = await voiceWorkerStatsForDoctor("mongodb://x", "hive_test");
+    expect(row).toMatchObject({
+      activeCalls: 2,
+      callsStarted: 10,
+      callsCompleted: 8,
+      lastError: null,
+      cellDefaults: { defaultStt: "deepgram/flux-general-en", defaultTts: "cartesia/sonic-3" },
+    });
+    expect(row!.staleSeconds).toBeGreaterThanOrEqual(9);
+    expect(mongoMocks.findOne).toHaveBeenCalledWith({ kind: "voice_worker_stats" });
+  });
+
+  it("defaults missing fields to 0 / null", async () => {
+    mongoMocks.findOne.mockResolvedValue({ kind: "voice_worker_stats" });
+    const row = await voiceWorkerStatsForDoctor("mongodb://x", "hive_test");
+    expect(row).toEqual({
+      activeCalls: 0,
+      callsStarted: 0,
+      callsCompleted: 0,
+      lastError: null,
+      cellDefaults: null,
+      staleSeconds: null,
+    });
+  });
+
+  it("returns null when the doc is absent", async () => {
+    mongoMocks.findOne.mockResolvedValue(null);
+    await expect(voiceWorkerStatsForDoctor("mongodb://x", "hive_test")).resolves.toBeNull();
+  });
+
+  it("returns null when the connection throws", async () => {
+    mongoMocks.connect.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    await expect(voiceWorkerStatsForDoctor("mongodb://x", "hive_test")).resolves.toBeNull();
+  });
+
+  it("returns staleSeconds null when updatedAt is not a Date", async () => {
+    mongoMocks.findOne.mockResolvedValue({
+      kind: "voice_worker_stats",
+      activeCalls: 1,
+      updatedAt: "not-a-date",
+    });
+    const row = await voiceWorkerStatsForDoctor("mongodb://x", "hive_test");
+    expect(row).not.toBeNull();
+    expect(row!.staleSeconds).toBeNull();
+    expect(row!.activeCalls).toBe(1);
+  });
+});
+
 // ── outage queue (KPR-307) ───────────────────────────────────────────────
 
 import { outageQueueStatsForDoctor } from "./doctor-checks.js";

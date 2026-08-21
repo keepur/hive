@@ -7,6 +7,7 @@ import {
   type PromptCacheRow,
   type PrefixCacheStatsRow,
   type SpawnCoordinatorRow,
+  type VoiceWorkerStatsRow,
   type CircuitBreakerRow,
   type OutageQueueStats,
   type MemoryLifecycleRow,
@@ -31,6 +32,7 @@ import {
   resolveServicePath,
   slackAuthOk,
   spawnCoordinatorStatsForDoctor,
+  voiceWorkerStatsForDoctor,
   memoryLifecycleStatsForDoctor,
   modelRouterModeLine,
   llmSidecarLine,
@@ -146,6 +148,41 @@ export function renderSpawnCoordinatorSection(
     if (r.lastError) {
       emit(`    last error: ${r.lastError}`);
     }
+  }
+}
+
+/**
+ * KPR-322: render the LiveKit voice-worker heartbeat section. Reads the
+ * engine's `telemetry.voice_worker_stats` doc (written every 30s).
+ * Informational — does not affect exit code. Staleness threshold is 90s
+ * (tighter than the 120s engine-heartbeat siblings: the worker is a
+ * separate launchd process).
+ */
+export function renderVoiceWorkerSection(
+  row: VoiceWorkerStatsRow | null,
+  emit: (line: string) => void = console.log,
+  instanceId = "<id>",
+): void {
+  emit("\nVoice worker (LiveKit)");
+  if (!row) {
+    emit("  ○ no heartbeat yet — worker never started?");
+    return;
+  }
+  const stale = row.staleSeconds === null ? "?" : `${row.staleSeconds}s ago`;
+  const defaults =
+    row.cellDefaults === null
+      ? "none"
+      : `stt=${row.cellDefaults.defaultStt ?? "?"} tts=${row.cellDefaults.defaultTts ?? "?"}`;
+  emit(
+    `  active=${row.activeCalls} started=${row.callsStarted} completed=${row.callsCompleted} cell-defaults=${defaults} (heartbeat ${stale})`,
+  );
+  if (row.lastError) {
+    emit(`    last error: ${row.lastError}`);
+  }
+  if (row.staleSeconds !== null && row.staleSeconds > 90) {
+    emit(
+      `  ⚠ heartbeat stale — worker down or wedged (launchctl kickstart -k gui/$(id -u)/com.hive.${instanceId}.voice-worker)`,
+    );
   }
 }
 
@@ -704,6 +741,13 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // KPR-220 Phase 11: spawn-coordinator per-agent stats.
     const coordinatorRows = await spawnCoordinatorStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderSpawnCoordinatorSection(coordinatorRows);
+    // KPR-322: LiveKit voice-worker heartbeat. Informational — NEVER
+    // contributes to allPassed. Omitted entirely when livekit is disabled
+    // (the worker isn't expected to run).
+    if (config.voice.livekit.enabled) {
+      const voiceWorkerStats = await voiceWorkerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+      renderVoiceWorkerSection(voiceWorkerStats, console.log, config.instance.id);
+    }
     // KPR-306: provider circuit-breaker per-provider stats. Informational —
     // NEVER contributes to allPassed (D4).
     const breakerRows = await circuitBreakerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
