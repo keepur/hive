@@ -1125,10 +1125,14 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     const result = await handler({ provider: "gemini" });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, { headers: Record<string, string> }];
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      { headers: Record<string, string>; signal?: AbortSignal },
+    ];
     expect(init.headers["x-goog-api-key"]).toBe("test-gemini-key");
     expect(url).not.toContain("test-gemini-key");
     expect(url).not.toContain("key=");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
 
     const parsed = JSON.parse(result.content[0].text);
     // Filtered: embedding (no generateContent), image + veo (family regex).
@@ -1235,7 +1239,10 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
   };
 
   it("gemini-only: 200 with zero usable chat models → empty array + note, NOT isError (mirrors unseeded-curated shape)", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => geminiZeroUsableResponse));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => geminiZeroUsableResponse),
+    );
     const handler = getHandler(makeTools(), "agent_model_catalog_list");
     const result = await handler({ provider: "gemini" });
     expect(result.isError).toBeUndefined();
@@ -1245,7 +1252,10 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
 
   it("all-4 listing: gemini 200 with zero usable chat models → note present alongside curated results", async () => {
     seedGrok();
-    vi.stubGlobal("fetch", vi.fn(async () => geminiZeroUsableResponse));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => geminiZeroUsableResponse),
+    );
     const handler = getHandler(makeTools(), "agent_model_catalog_list");
     const result = await handler({});
     expect(result.isError).toBeUndefined();
