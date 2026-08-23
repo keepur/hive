@@ -1220,3 +1220,22 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     expect(noteTexts).toMatch(/gemini: Gemini API key not configured/);
   });
 });
+
+describe("admin-mcp-server — model field discoverability (KPR-381)", () => {
+  it("agent_create's model describe teaches provider-prefix syntax and points at the lookup tool", () => {
+    const tools = makeTools();
+    const t = tools.find((x: any) => x.name === "agent_create")!;
+    const desc = (t.inputSchema as any).model.description as string;
+    expect(desc).toContain("<provider>/<model>[:effort]");
+    expect(desc).toContain("agent_model_catalog_list");
+    expect(desc).toContain("claude-haiku-4-5");
+  });
+
+  it("agent_update's fields describe covers the model syntax and the lookup tool", () => {
+    const tools = makeTools();
+    const t = tools.find((x: any) => x.name === "agent_update")!;
+    const desc = (t.inputSchema as any).fields.description as string;
+    expect(desc).toContain("<provider>/<model>[:effort]");
+    expect(desc).toContain("agent_model_catalog_list");
+  });
+});

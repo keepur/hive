@@ -359,7 +359,14 @@ export function buildAdminTools(deps: AdminToolDeps) {
           .array(z.string())
           .optional()
           .describe('Optional short names / nicknames for name-based routing (e.g. ["Sam"] for "Samantha").'),
-        model: z.string().describe("Model to use (e.g. 'claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5')"),
+        model: z
+          .string()
+          .describe(
+            "Model to use. Bare id (e.g. 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5') routes to Claude. " +
+              "Prefix <provider>/<model>[:effort] routes elsewhere — e.g. 'codex/gpt-5.5:medium', " +
+              "'gemini/gemini-3.1-pro-preview', 'grok/grok-4.6'. Call agent_model_catalog_list first to check " +
+              "what's currently valid per provider; see docs/providers.md for full capability parity.",
+          ),
         homeBase: z
           .string()
           .describe(
@@ -534,7 +541,11 @@ export function buildAdminTools(deps: AdminToolDeps) {
         fields: z
           .record(z.string(), z.any())
           .optional()
-          .describe("Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.)"),
+          .describe(
+            "Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.). " +
+              "For `model`: bare id routes to Claude; <provider>/<model>[:effort] routes elsewhere " +
+              "(e.g. 'codex/gpt-5.5:medium', 'grok/grok-4.6') — call agent_model_catalog_list to check valid ids per provider.",
+          ),
       },
       async ({ agent_id, homeBase, soul, systemPrompt, archetype, title, roles, aliases, fields }) => {
         try {
