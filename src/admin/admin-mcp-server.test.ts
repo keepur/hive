@@ -18,8 +18,15 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   })),
 }));
 
+// KPR-381: admin-mcp-server now imports the config singleton for the gemini
+// key. Mock it — the real config.ts throws on missing SLACK_* env at import.
+const mockConfig = vi.hoisted(() => ({ gemini: { apiKey: "test-gemini-key" } }));
+vi.mock("../config.js", () => ({ config: mockConfig }));
+
 let agentDocsStore = new Map<string, any>();
 let agentVersionsStore: any[] = [];
+let catalogDocsStore = new Map<string, any>();
+let catalogVersionsStore: any[] = [];
 
 function makeAgentDefsCollection(): any {
   return {
@@ -66,12 +73,40 @@ function makeAgentVersionsCollection(): any {
   };
 }
 
+function makeCatalogDocsCollection(): any {
+  return {
+    findOne: vi.fn(async (filter: any) => catalogDocsStore.get(filter?._id) ?? null),
+    updateOne: vi.fn(async (filter: any, update: any, opts: any) => {
+      const id = filter?._id;
+      const existing = catalogDocsStore.get(id);
+      if (existing && update.$set) Object.assign(existing, update.$set);
+      else if (opts?.upsert) catalogDocsStore.set(id, { _id: id, ...update.$set });
+      return { modifiedCount: existing ? 1 : 0 };
+    }),
+    createIndex: vi.fn().mockResolvedValue("ok"),
+  };
+}
+
+function makeCatalogVersionsCollection(): any {
+  return {
+    insertOne: vi.fn(async (doc: any) => {
+      catalogVersionsStore.push({ ...doc });
+      return { insertedId: "cv" };
+    }),
+    createIndex: vi.fn().mockResolvedValue("ok"),
+  };
+}
+
 function makeFakeDb(): any {
   const defs = makeAgentDefsCollection();
   const versions = makeAgentVersionsCollection();
+  const catalogDocs = makeCatalogDocsCollection();
+  const catalogVersions = makeCatalogVersionsCollection();
   return {
     collection: (name: string) => {
       if (name === "agent_definitions") return defs;
+      if (name === "agent_model_catalog") return catalogDocs;
+      if (name === "agent_model_catalog_versions") return catalogVersions;
       return versions;
     },
   };
@@ -896,5 +931,99 @@ describe("KPR-308 — floorCritical write boundary", () => {
     const handler = getHandler(makeTools(), "agent_update");
     await handler({ agent_id: "existing-agent", fields: { floorCritical: "yes" } });
     expect(agentDocsStore.get("existing-agent").floorCritical).toBe(false);
+  });
+});
+
+describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+    catalogDocsStore = new Map();
+    catalogVersionsStore = [];
+    mockConfig.gemini.apiKey = "test-gemini-key";
+  });
+
+  it("upserts the catalog doc and appends a version row", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const result = await handler({
+      provider: "grok",
+      models: [
+        { id: "grok-4.6", displayName: "Grok 4.6", notes: "subscription default" },
+        { id: "grok-4.5", displayName: "Grok 4.5" },
+      ],
+    });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toMatch(/grok catalog updated: \+2 \(grok-4\.6, grok-4\.5\), -0\. 2 models total\./);
+
+    const doc = catalogDocsStore.get("grok");
+    expect(doc.provider).toBe("grok");
+    expect(doc.models).toHaveLength(2);
+    expect(doc.models[0].addedAt).toBeInstanceOf(Date);
+    expect(doc.updatedBy).toBe("admin");
+    expect(doc.updatedAt).toBeInstanceOf(Date);
+
+    expect(catalogVersionsStore).toHaveLength(1);
+    expect(catalogVersionsStore[0].provider).toBe("grok");
+    expect(catalogVersionsStore[0].snapshot).toHaveLength(2);
+    expect(catalogVersionsStore[0].changeSummary).toMatch(/\+2/);
+    expect(catalogVersionsStore[0].updatedBy).toBe("admin");
+  });
+
+  it("diffs against the current doc and preserves addedAt for retained ids", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const oldDate = new Date("2026-01-01T00:00:00Z");
+    catalogDocsStore.set("claude", {
+      _id: "claude",
+      provider: "claude",
+      models: [
+        { id: "claude-opus-5", displayName: "Opus 5", addedAt: oldDate },
+        { id: "claude-opus-4-7", displayName: "Opus 4.7", addedAt: oldDate },
+      ],
+      updatedAt: oldDate,
+      updatedBy: "seed",
+    });
+
+    const result = await handler({
+      provider: "claude",
+      models: [
+        { id: "claude-opus-5", displayName: "Opus 5" },
+        { id: "claude-opus-6", displayName: "Opus 6" },
+      ],
+      changeSummary: "Opus 6 shipped; 4.7 deprecated",
+    });
+    expect(result.content[0].text).toMatch(/\+1 \(claude-opus-6\), -1 \(claude-opus-4-7\)\. 2 models total/);
+    expect(result.content[0].text).toMatch(/Opus 6 shipped/);
+
+    const doc = catalogDocsStore.get("claude");
+    const retained = doc.models.find((m: any) => m.id === "claude-opus-5");
+    const fresh = doc.models.find((m: any) => m.id === "claude-opus-6");
+    expect(retained.addedAt).toEqual(oldDate);
+    expect(fresh.addedAt.getTime()).toBeGreaterThan(oldDate.getTime());
+    expect(catalogVersionsStore[0].changeSummary).toBe("Opus 6 shipped; 4.7 deprecated");
+  });
+
+  it("rejects duplicate model ids", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const result = await handler({
+      provider: "codex",
+      models: [
+        { id: "gpt-5.5", displayName: "GPT-5.5" },
+        { id: "gpt-5.5", displayName: "GPT-5.5 again" },
+      ],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/Duplicate model ids/);
+    expect(catalogDocsStore.size).toBe(0);
+    expect(catalogVersionsStore).toHaveLength(0);
+  });
+
+  it("excludes gemini at the Zod schema level — no handler rejection needed", () => {
+    const tools = makeTools();
+    const t = tools.find((x: any) => x.name === "agent_model_catalog_refresh")!;
+    const providerSchema = (t.inputSchema as any).provider;
+    expect(providerSchema.safeParse("gemini").success).toBe(false);
+    expect(providerSchema.safeParse("claude").success).toBe(true);
+    expect(providerSchema.safeParse("grok").success).toBe(true);
+    expect(providerSchema.safeParse("codex").success).toBe(true);
   });
 });

@@ -18,6 +18,11 @@ import type { AutonomyFlags } from "../agents/autonomy.js";
 import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
 import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
 import { IN_PROCESS_PORTED_SERVERS } from "../agents/in-process-servers.js";
+import { createLogger } from "../logging/logger.js";
+import { config as appConfig } from "../config.js";
+import { getCachedGeminiModels, setCachedGeminiModels } from "./model-catalog-cache.js";
+
+const log = createLogger("admin-mcp");
 
 /**
  * KPR-184: returns an error message if `delegateServers` references any
@@ -79,6 +84,52 @@ function checkToolSearch(value: unknown): string | null {
   return `Invalid toolSearch: "${String(value)}". Must be one of: auto, on, off — or omit the field to inherit the hive.yaml toolSearch.mode (engine default: auto).`;
 }
 
+// ---------------------------------------------------------------------------
+// KPR-381: agent model catalog — curated model ids for claude/grok/codex
+// (subscription-auth providers with no live model-list endpoint) + a live
+// Gemini lookup. Types are inline on purpose: no second consumer exists.
+// NOT related to src/llm/catalog.ts (LLM_CATALOG) — that is the sidecar
+// catalog for 4 fixed internal engine tasks and is untouched here.
+// ---------------------------------------------------------------------------
+
+type CuratedCatalogProvider = "claude" | "grok" | "codex";
+
+interface AgentModelCatalogEntry {
+  id: string; // e.g. "grok-4.6"
+  displayName: string; // e.g. "Grok 4.6"
+  notes?: string; // free text, e.g. "subscription default"
+  addedAt: Date;
+}
+
+interface AgentModelCatalogDoc {
+  _id: CuratedCatalogProvider;
+  provider: CuratedCatalogProvider;
+  models: AgentModelCatalogEntry[];
+  updatedAt: Date;
+  updatedBy: string; // agentId that called the refresh tool
+}
+
+/** Append-only audit trail — mirrors AgentDefinitionVersion's shape. */
+interface AgentModelCatalogVersion {
+  provider: CuratedCatalogProvider;
+  snapshot: AgentModelCatalogEntry[];
+  changeSummary: string;
+  createdAt: Date;
+  updatedBy: string;
+}
+
+/** One row in agent_model_catalog_list's entries JSON. */
+interface CatalogListEntry {
+  provider: CuratedCatalogProvider | "gemini";
+  id: string;
+  displayName: string;
+  notes?: string;
+  source: "live" | "curated";
+  asOf: string; // ISO — fetch time for gemini, updatedAt for curated
+}
+
+const CURATED_CATALOG_PROVIDERS: readonly CuratedCatalogProvider[] = ["claude", "grok", "codex"];
+
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
   servers: { configured: [], unconfigured: [], broken: [] },
@@ -100,14 +151,18 @@ export function buildAdminTools(deps: AdminToolDeps) {
   const { db, agentId, instanceCapabilitiesJson } = deps;
   const agentDefs = db.collection<AgentDefinition>("agent_definitions");
   const agentVersions = db.collection<AgentDefinitionVersion>("agent_definition_versions");
+  const catalogDocs = db.collection<AgentModelCatalogDoc>("agent_model_catalog");
+  const catalogVersions = db.collection<AgentModelCatalogVersion>("agent_model_catalog_versions");
 
   // Lazy index creation — first call to a handler triggers it. Avoids hard
   // requirements on Mongo at module import (test harnesses, dry runs).
   let indexInit: Promise<void> | null = null;
   function ensureIndexes(): Promise<void> {
     if (!indexInit) {
-      indexInit = agentVersions
-        .createIndex({ agentId: 1, createdAt: -1 })
+      indexInit = Promise.all([
+        agentVersions.createIndex({ agentId: 1, createdAt: -1 }),
+        catalogVersions.createIndex({ provider: 1, createdAt: -1 }),
+      ])
         .then(() => undefined)
         .catch(() => undefined);
     }
@@ -777,6 +832,93 @@ export function buildAdminTools(deps: AdminToolDeps) {
           return { content: [{ type: "text", text: JSON.stringify(catalog, null, 2) }] };
         } catch (err) {
           return { isError: true, content: [{ type: "text", text: `list_archetypes error: ${String(err)}` }] };
+        }
+      },
+    ),
+    tool(
+      "agent_model_catalog_refresh",
+      "Replace the curated model list for one provider (claude/grok/codex) after researching current vendor reality with your own WebSearch/WebFetch. Pass the FULL replacement list, not a delta. Upserts agent_model_catalog, appends a version-history row, returns a diff summary. Performs no vendor calls itself. Gemini is always resolved live and cannot be refreshed.",
+      {
+        provider: z.enum(["claude", "grok", "codex"]).describe("Gemini is always live — nothing to refresh."),
+        models: z
+          .array(
+            z.object({
+              id: z
+                .string()
+                .min(1)
+                .describe("Model id as the provider route accepts it (e.g. 'grok-4.6', 'gpt-5.5', 'claude-opus-5')."),
+              displayName: z.string().min(1),
+              notes: z.string().optional().describe("Free text, e.g. 'subscription default', 'reasoning tier'."),
+            }),
+          )
+          .min(1)
+          .describe("The full replacement list for this provider."),
+        changeSummary: z
+          .string()
+          .optional()
+          .describe(
+            "What changed and why, e.g. 'Anthropic shipped Opus 6, added; removed Opus 4.7 (deprecated per vendor changelog)'.",
+          ),
+      },
+      async ({ provider, models, changeSummary }) => {
+        try {
+          await ensureIndexes();
+
+          const ids = models.map((m) => m.id);
+          if (new Set(ids).size !== ids.length) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `Duplicate model ids in input: ${ids.join(", ")}.` }],
+            };
+          }
+
+          const now = new Date();
+          const current = await catalogDocs.findOne({ _id: provider as never });
+          const prevById = new Map((current?.models ?? []).map((m) => [m.id, m]));
+          const newIds = new Set(ids);
+          const added = ids.filter((id) => !prevById.has(id));
+          const removed = [...prevById.keys()].filter((id) => !newIds.has(id));
+
+          const nextModels: AgentModelCatalogEntry[] = models.map((m) => ({
+            id: m.id,
+            displayName: m.displayName,
+            ...(m.notes ? { notes: m.notes } : {}),
+            // Preserve addedAt for retained ids; stamp now for new ones.
+            addedAt: prevById.get(m.id)?.addedAt ?? now,
+          }));
+
+          await catalogDocs.updateOne(
+            { _id: provider as never },
+            { $set: { provider, models: nextModels, updatedAt: now, updatedBy: agentId } },
+            { upsert: true },
+          );
+
+          const fmt = (xs: string[]) => (xs.length > 0 ? ` (${xs.join(", ")})` : "");
+          const diffText = `+${added.length}${fmt(added)}, -${removed.length}${fmt(removed)}`;
+
+          await catalogVersions.insertOne({
+            provider,
+            snapshot: nextModels,
+            changeSummary: changeSummary ?? diffText,
+            createdAt: now,
+            updatedBy: agentId,
+          });
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${provider} catalog updated: ${diffText}. ${nextModels.length} models total.${
+                  changeSummary ? ` — ${changeSummary}` : ""
+                }`,
+              },
+            ],
+          };
+        } catch (err) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `agent_model_catalog_refresh error: ${String(err)}` }],
+          };
         }
       },
     ),
