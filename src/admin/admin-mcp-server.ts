@@ -162,7 +162,10 @@ async function fetchGeminiModels(apiKey: string): Promise<CatalogListEntry[]> {
 
   let res: Response;
   try {
-    res = await fetch(GEMINI_MODELS_URL, { headers: { "x-goog-api-key": apiKey } });
+    res = await fetch(GEMINI_MODELS_URL, {
+      headers: { "x-goog-api-key": apiKey },
+      signal: AbortSignal.timeout(10_000),
+    });
   } catch {
     // Deliberately NOT String(err): transport errors can embed request detail.
     throw new GeminiLookupError(
@@ -931,7 +934,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
           const notes: string[] = [];
 
           for (const p of wantCurated) {
-            const doc = await catalogDocs.findOne({ _id: p as never });
+            const doc = await catalogDocs.findOne({ _id: p });
             if (!doc || (doc.models ?? []).length === 0) {
               notes.push(`${p}: not yet seeded — call agent_model_catalog_refresh first.`);
               continue;
@@ -960,7 +963,17 @@ export function buildAdminTools(deps: AdminToolDeps) {
               notes.push(`gemini: ${GEMINI_KEY_MISSING_MSG}`);
             } else {
               try {
-                entries.push(...(await fetchGeminiModels(key)));
+                const geminiEntries = await fetchGeminiModels(key);
+                entries.push(...geminiEntries);
+                if (geminiEntries.length === 0) {
+                  // A 200 with zero usable models (vendor returned nothing,
+                  // or the best-effort chat-family filter excluded
+                  // everything) is not a hard error — mirrors the "not yet
+                  // seeded" curated-provider case: empty array + a prose
+                  // note, for both the all-4 and gemini-only calls, so it
+                  // doesn't silently read as "gemini has no models."
+                  notes.push("gemini: vendor returned no usable chat models.");
+                }
               } catch (err) {
                 // Sanitized by construction — GeminiLookupError messages
                 // carry status + fixed text only. No stale-cache fallback:
@@ -1028,7 +1041,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
           }
 
           const now = new Date();
-          const current = await catalogDocs.findOne({ _id: provider as never });
+          const current = await catalogDocs.findOne({ _id: provider });
           const prevById = new Map((current?.models ?? []).map((m) => [m.id, m]));
           const newIds = new Set(ids);
           const added = ids.filter((id) => !prevById.has(id));
@@ -1043,7 +1056,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
           }));
 
           await catalogDocs.updateOne(
-            { _id: provider as never },
+            { _id: provider },
             { $set: { provider, models: nextModels, updatedAt: now, updatedBy: agentId } },
             { upsert: true },
           );

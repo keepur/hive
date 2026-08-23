@@ -1219,6 +1219,45 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
       .join("\n");
     expect(noteTexts).toMatch(/gemini: Gemini API key not configured/);
   });
+
+  const geminiZeroUsableResponse = {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      models: [
+        {
+          name: "models/text-embedding-005",
+          displayName: "Text Embedding 005",
+          supportedGenerationMethods: ["embedContent"],
+        },
+      ],
+    }),
+  };
+
+  it("gemini-only: 200 with zero usable chat models → empty array + note, NOT isError (mirrors unseeded-curated shape)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => geminiZeroUsableResponse));
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    expect(result.content[1].text).toBe("gemini: vendor returned no usable chat models.");
+  });
+
+  it("all-4 listing: gemini 200 with zero usable chat models → note present alongside curated results", async () => {
+    seedGrok();
+    vi.stubGlobal("fetch", vi.fn(async () => geminiZeroUsableResponse));
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({});
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.every((e: any) => e.provider !== "gemini")).toBe(true);
+    expect(parsed.filter((e: any) => e.provider === "grok")).toHaveLength(2);
+    const noteTexts = result.content
+      .slice(1)
+      .map((c: any) => c.text)
+      .join("\n");
+    expect(noteTexts).toMatch(/gemini: vendor returned no usable chat models\./);
+  });
 });
 
 describe("admin-mcp-server — model field discoverability (KPR-381)", () => {
