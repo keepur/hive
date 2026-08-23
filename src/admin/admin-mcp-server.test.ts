@@ -1080,10 +1080,16 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     catalogVersionsStore = [];
     invalidateGeminiModelCache();
     mockConfig.gemini.apiKey = "test-gemini-key";
+    // KPR-382: the gemini leg now reads the adapter's env fallbacks — clear
+    // any ambient dev-machine keys so missing-key tests stay deterministic.
+    vi.stubEnv("GOOGLE_GENAI_API_KEY", "");
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("GOOGLE_API_KEY", "");
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   function seedGrok() {
@@ -1281,6 +1287,95 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
       .map((c: any) => c.text)
       .join("\n");
     expect(noteTexts).toMatch(/gemini: vendor returned no usable chat models\./);
+  });
+
+  // ------------------------------------------------------------------
+  // KPR-382: gemini key fallback chain — mirror of the adapter's
+  // resolution (gemini-interactions-adapter.ts:194-198).
+  // ------------------------------------------------------------------
+
+  function headerKeyOf(fetchMock: ReturnType<typeof vi.fn>): string {
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, { headers: Record<string, string> }];
+    return init.headers["x-goog-api-key"];
+  }
+
+  it("falls back to GOOGLE_GENAI_API_KEY when the config key is empty (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_GENAI_API_KEY", "genai-fallback-key");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBeUndefined();
+    expect(headerKeyOf(fetchMock)).toBe("genai-fallback-key");
+    expect(JSON.parse(result.content[0].text)).toHaveLength(1);
+  });
+
+  it("falls back to GOOGLE_API_KEY as the last resort (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_API_KEY", "google-fallback-key");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBeUndefined();
+    expect(headerKeyOf(fetchMock)).toBe("google-fallback-key");
+  });
+
+  it("config.gemini.apiKey wins over env fallbacks (KPR-382)", async () => {
+    vi.stubEnv("GOOGLE_GENAI_API_KEY", "genai-fallback-key");
+    vi.stubEnv("GOOGLE_API_KEY", "google-fallback-key");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    await handler({ provider: "gemini" });
+    expect(headerKeyOf(fetchMock)).toBe("test-gemini-key");
+  });
+
+  it("GOOGLE_GENAI_API_KEY beats GOOGLE_API_KEY — adapter order (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_GENAI_API_KEY", "genai-fallback-key");
+    vi.stubEnv("GOOGLE_API_KEY", "google-fallback-key");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    await handler({ provider: "gemini" });
+    expect(headerKeyOf(fetchMock)).toBe("genai-fallback-key");
+  });
+
+  it("whitespace-only fallback values are treated as missing (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_API_KEY", "   ");
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+  });
+
+  it("missing-key message names the full chain and keeps the credentials-add remediation (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/GOOGLE_GENAI_API_KEY/);
+    expect(result.content[0].text).toMatch(/GOOGLE_API_KEY/);
+    expect(result.content[0].text).toMatch(/hive credentials add GEMINI_API_KEY/);
+  });
+
+  it("all-4 call with only a fallback key → gemini leg succeeds, no gemini note (KPR-382)", async () => {
+    seedGrok();
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_API_KEY", "google-fallback-key");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => geminiOkResponse),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({});
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.some((e: any) => e.provider === "gemini")).toBe(true);
+    const noteTexts = result.content.slice(1).map((c: any) => c.text);
+    expect(noteTexts.some((n: string) => n.startsWith("gemini:"))).toBe(false);
   });
 });
 

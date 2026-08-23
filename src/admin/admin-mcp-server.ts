@@ -20,6 +20,7 @@ import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
 import { IN_PROCESS_PORTED_SERVERS } from "../agents/in-process-servers.js";
 import { createLogger } from "../logging/logger.js";
 import { config as appConfig } from "../config.js";
+import { envValue } from "../agents/provider-adapters/oauth-credentials.js";
 import { getCachedGeminiModels, setCachedGeminiModels } from "./model-catalog-cache.js";
 
 const log = createLogger("admin-mcp");
@@ -197,8 +198,9 @@ async function fetchGeminiModels(apiKey: string): Promise<CatalogListEntry[]> {
 }
 
 const GEMINI_KEY_MISSING_MSG =
-  "Gemini API key not configured on this instance (GEMINI_API_KEY) — run `hive credentials add GEMINI_API_KEY`, " +
-  "then restart the hive service (gemini key resolution happens once at boot; see docs/providers.md).";
+  "Gemini API key not configured on this instance — checked GEMINI_API_KEY (env→Keychain) and the adapter's " +
+  "env-only fallbacks GOOGLE_GENAI_API_KEY / GOOGLE_API_KEY (KPR-382). Run `hive credentials add GEMINI_API_KEY`, " +
+  "then restart the hive service (GEMINI_API_KEY keychain resolution happens once at boot; see docs/providers.md).";
 
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
@@ -953,7 +955,20 @@ export function buildAdminTools(deps: AdminToolDeps) {
           }
 
           if (wantGemini) {
-            const key = appConfig.gemini.apiKey;
+            // KPR-382: byte-for-byte mirror of the adapter's key chain
+            // (gemini-interactions-adapter.ts:194-198, where options.apiKey
+            // is config.gemini.apiKey per agent-manager.ts) so this tool's
+            // availability judgment matches actual turn behavior. The env
+            // fallbacks are adapter-local by ruling — read from process.env
+            // here, deliberately NOT pushed into config.ts (docs/providers.md
+            // fn 16: env-only, never Keychain-resolved). The raw
+            // GEMINI_API_KEY leg is redundant behind the config read but
+            // kept so the chain is textually identical to the adapter's.
+            const key =
+              appConfig.gemini.apiKey ||
+              envValue("GOOGLE_GENAI_API_KEY") ||
+              envValue("GEMINI_API_KEY") ||
+              envValue("GOOGLE_API_KEY");
             if (!key) {
               // Only the gemini-only call hard-errors; the all-4 call
               // degrades to partial results + a prose note (spec).
