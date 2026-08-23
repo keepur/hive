@@ -78,7 +78,7 @@ Each agent gets a subset of MCP servers — listed in its `coreServers` and `del
 - `code-index/code-search-mcp-server.ts` — semantic code search over indexed files.
 - `code-task/code-task-mcp-server.ts` — delegate coding to Claude Code CLI sessions.
 - `search/conversation-search-mcp-server.ts` — semantic search over past conversations.
-- `admin/admin-mcp-server.ts` — agent CRUD + version history (admin-scoped).
+- `admin/admin-mcp-server.ts` — agent CRUD + version history, agent model catalog (model-id discovery/lookup, KPR-381) (admin-scoped).
 
 Plugins (e.g. CRM integrations, business-specific tools) are separately-published packages; install with `hive plugin add <pkg>`.
 
