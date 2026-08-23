@@ -197,9 +197,10 @@ async function fetchGeminiModels(apiKey: string): Promise<CatalogListEntry[]> {
   return entries;
 }
 
+// KPR-382: message mirrors the adapter's Gemini key fallback chain (GEMINI_API_KEY → GOOGLE_GENAI_API_KEY → GOOGLE_API_KEY).
 const GEMINI_KEY_MISSING_MSG =
   "Gemini API key not configured on this instance — checked GEMINI_API_KEY (env→Keychain) and the adapter's " +
-  "env-only fallbacks GOOGLE_GENAI_API_KEY / GOOGLE_API_KEY (KPR-382). Run `hive credentials add GEMINI_API_KEY`, " +
+  "env-only fallbacks GOOGLE_GENAI_API_KEY / GOOGLE_API_KEY. Run `hive credentials add GEMINI_API_KEY`, " +
   "then restart the hive service (GEMINI_API_KEY keychain resolution happens once at boot; see docs/providers.md).";
 
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {

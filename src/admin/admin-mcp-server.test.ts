@@ -1346,9 +1346,12 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
   it("whitespace-only fallback values are treated as missing (KPR-382)", async () => {
     mockConfig.gemini.apiKey = "";
     vi.stubEnv("GOOGLE_API_KEY", "   ");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
     const handler = getHandler(makeTools(), "agent_model_catalog_list");
     const result = await handler({ provider: "gemini" });
     expect(result.isError).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("missing-key message names the full chain and keeps the credentials-add remediation (KPR-382)", async () => {
