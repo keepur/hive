@@ -97,7 +97,7 @@ All in `src/` — each agent only gets servers listed in its `coreServers`/`dele
 - `quo-mcp-server.ts` — SMS via Quo/OpenPhone
 - `resend/resend-mcp-server.ts` — outbound email via Resend
 - `callback-mcp-server.ts` — timer callbacks for delayed responses [in-process]
-- `admin-mcp-server.ts` — agent CRUD + version history, model overrides [in-process]
+- `admin-mcp-server.ts` — agent CRUD + version history, model overrides, agent model catalog (KPR-381) [in-process]
 - `clickup/clickup-mcp-server.ts` — ClickUp task management
 - `events/event-bus-mcp-server.ts` — cross-agent event bus (publish events, subscriber delivery) [in-process]
 - `team/team-mcp-server.ts` — direct agent-to-agent messaging (auto-injected core server, no flag) [in-process]
@@ -242,6 +242,8 @@ Per-turn `query()` with `options.resume = sessionId` is the **only** execution p
 ## Provider adapters
 
 Agents can run on providers other than Claude. The agent's `model` field selects the provider via `resolveProviderModel` (`src/agents/agent-manager.ts`): a bare model id (no `/`) routes to **Claude** (the default); a `<provider>/<model>[:<reasoningEffort>]` prefix routes elsewhere — `openai`, `gemini`/`google-gemini`, `codex`/`openai-codex`, or the Lane A passthrough providers kimi/deepseek (KPR-346) and grok (KPR-371). Unknown prefixes fall back to Claude. The optional `:effort` suffix (`minimal`|`none`|`low`|`medium`|`high`|`xhigh`) is consumed by codex (`reasoning.effort` — also gates encrypted-reasoning replay) and gemini (`thinking_level`, `none→minimal`/`xhigh→high` coerced), delivered clamped to `{low,medium,high}` on Lane A, and currently parsed-but-not-delivered on openai.
+
+**Which model ids are valid (KPR-381):** the admin MCP's `agent_model_catalog_list` is the agent-facing answer — gemini resolved live from the vendor (`x-goog-api-key` header auth, ~10 min process-wide TTL cache in `src/admin/model-catalog-cache.ts`, no stale-cache fallback on failure), claude/grok/codex read from the curated `agent_model_catalog` collection. That catalog is operator/agent-maintained via `agent_model_catalog_refresh` (full replacement list per provider, no vendor calls of its own, appends to `agent_model_catalog_versions`) — an unseeded provider returns a prose "not yet seeded" note, not an error. Both tools live in `src/admin/admin-mcp-server.ts` and are unrelated to `src/llm/catalog.ts` (`LLM_CATALOG`), which serves the engine's own internal sidecar tasks.
 
 `AgentManager.createProviderAdapter()` builds the adapter per spawn:
 
