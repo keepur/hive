@@ -130,6 +130,73 @@ interface CatalogListEntry {
 
 const CURATED_CATALOG_PROVIDERS: readonly CuratedCatalogProvider[] = ["claude", "grok", "codex"];
 
+/**
+ * KPR-381: live Gemini model lookup. Header auth ONLY (x-goog-api-key) — a
+ * query-param key would leak into agent-visible tool output via any error
+ * message that echoes the request URL. Every failure path throws a
+ * GeminiLookupError whose message is sanitized by construction (HTTP status
+ * + fixed text; never the raw error object, never the URL). pageSize=1000
+ * avoids nextPageToken pagination (vendor max; full list fits one page).
+ */
+const GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
+
+/**
+ * Best-effort exclusion of non-chat model families (image/video/audio/TTS/
+ * embedding). The vendor field doesn't cleanly distinguish "works on the
+ * Interactions adapter" — same caveat KPR-352 flagged — so this filter is
+ * documented best-effort, not a hard guarantee.
+ */
+const GEMINI_NON_CHAT_RE = /(embed|imagen|image|veo|video|lyria|audio|tts)/i;
+
+interface GeminiApiModel {
+  name?: string;
+  displayName?: string;
+  supportedGenerationMethods?: string[];
+}
+
+class GeminiLookupError extends Error {}
+
+async function fetchGeminiModels(apiKey: string): Promise<CatalogListEntry[]> {
+  const cached = getCachedGeminiModels<CatalogListEntry>();
+  if (cached) return cached;
+
+  let res: Response;
+  try {
+    res = await fetch(GEMINI_MODELS_URL, { headers: { "x-goog-api-key": apiKey } });
+  } catch {
+    // Deliberately NOT String(err): transport errors can embed request detail.
+    throw new GeminiLookupError(
+      "Gemini model lookup failed: network error reaching generativelanguage.googleapis.com.",
+    );
+  }
+  if (!res.ok) {
+    throw new GeminiLookupError(`Gemini model lookup failed: vendor returned HTTP ${res.status}.`);
+  }
+  let body: { models?: GeminiApiModel[] };
+  try {
+    body = (await res.json()) as { models?: GeminiApiModel[] };
+  } catch {
+    throw new GeminiLookupError("Gemini model lookup failed: unparseable vendor response.");
+  }
+
+  const asOf = new Date().toISOString();
+  const entries: CatalogListEntry[] = (body.models ?? [])
+    .filter((m) => (m.supportedGenerationMethods ?? []).includes("generateContent"))
+    .filter((m) => !GEMINI_NON_CHAT_RE.test(`${m.name ?? ""} ${m.displayName ?? ""}`))
+    .map((m) => {
+      const id = (m.name ?? "").replace(/^models\//, "");
+      return { provider: "gemini" as const, id, displayName: m.displayName ?? id, source: "live" as const, asOf };
+    })
+    .filter((e) => e.id.length > 0);
+
+  setCachedGeminiModels(entries);
+  return entries;
+}
+
+const GEMINI_KEY_MISSING_MSG =
+  "Gemini API key not configured on this instance (GEMINI_API_KEY) — run `hive credentials add GEMINI_API_KEY`, " +
+  "then restart the hive service (gemini key resolution happens once at boot; see docs/providers.md).";
+
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
   servers: { configured: [], unconfigured: [], broken: [] },
@@ -832,6 +899,83 @@ export function buildAdminTools(deps: AdminToolDeps) {
           return { content: [{ type: "text", text: JSON.stringify(catalog, null, 2) }] };
         } catch (err) {
           return { isError: true, content: [{ type: "text", text: `list_archetypes error: ${String(err)}` }] };
+        }
+      },
+    ),
+    tool(
+      "agent_model_catalog_list",
+      "List valid LLM model ids per provider for agent `model` assignment. Gemini is resolved live from the vendor (cached ~10 min); claude/grok/codex come from the curated catalog (maintained via agent_model_catalog_refresh). Use before setting `model` on agent_create/agent_update. Returns a JSON entries array plus prose notes for any provider leg that is unseeded or unavailable.",
+      {
+        provider: z.enum(["claude", "grok", "codex", "gemini"]).optional().describe("Omit to list all 4 providers."),
+      },
+      async ({ provider }) => {
+        try {
+          await ensureIndexes();
+          const wantCurated = provider
+            ? CURATED_CATALOG_PROVIDERS.filter((p) => p === provider)
+            : [...CURATED_CATALOG_PROVIDERS];
+          const wantGemini = provider === undefined || provider === "gemini";
+
+          const entries: CatalogListEntry[] = [];
+          const notes: string[] = [];
+
+          for (const p of wantCurated) {
+            const doc = await catalogDocs.findOne({ _id: p as never });
+            if (!doc || (doc.models ?? []).length === 0) {
+              notes.push(`${p}: not yet seeded — call agent_model_catalog_refresh first.`);
+              continue;
+            }
+            const asOf = doc.updatedAt instanceof Date ? doc.updatedAt.toISOString() : String(doc.updatedAt);
+            for (const m of doc.models) {
+              entries.push({
+                provider: p,
+                id: m.id,
+                displayName: m.displayName,
+                ...(m.notes ? { notes: m.notes } : {}),
+                source: "curated",
+                asOf,
+              });
+            }
+          }
+
+          if (wantGemini) {
+            const key = appConfig.gemini.apiKey;
+            if (!key) {
+              // Only the gemini-only call hard-errors; the all-4 call
+              // degrades to partial results + a prose note (spec).
+              if (provider === "gemini") {
+                return { isError: true, content: [{ type: "text", text: GEMINI_KEY_MISSING_MSG }] };
+              }
+              notes.push(`gemini: ${GEMINI_KEY_MISSING_MSG}`);
+            } else {
+              try {
+                entries.push(...(await fetchGeminiModels(key)));
+              } catch (err) {
+                // Sanitized by construction — GeminiLookupError messages
+                // carry status + fixed text only. No stale-cache fallback:
+                // masking a vendor failure as fresh data is worse than an
+                // honest error (spec; matches breaker fast-fail posture).
+                const msg = err instanceof GeminiLookupError ? err.message : "Gemini model lookup failed.";
+                log.warn(`agent_model_catalog_list gemini leg failed: ${msg}`);
+                if (provider === "gemini") {
+                  return { isError: true, content: [{ type: "text", text: msg }] };
+                }
+                notes.push(`gemini: ${msg}`);
+              }
+            }
+          }
+
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(entries, null, 2) },
+              ...notes.map((n) => ({ type: "text" as const, text: n })),
+            ],
+          };
+        } catch (err) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `agent_model_catalog_list error: ${String(err)}` }],
+          };
         }
       },
     ),

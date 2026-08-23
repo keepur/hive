@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // ---------------------------------------------------------------------------
 // KPR-122 in-process port: the admin MCP server is now a pure builder
@@ -113,6 +113,7 @@ function makeFakeDb(): any {
 }
 
 import { buildAdminTools } from "./admin-mcp-server.js";
+import { invalidateGeminiModelCache } from "./model-catalog-cache.js";
 // Ensure the software-engineer archetype is registered in the registry.
 await import("../archetypes/software-engineer/index.js");
 
@@ -1025,5 +1026,197 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(providerSchema.safeParse("claude").success).toBe(true);
     expect(providerSchema.safeParse("grok").success).toBe(true);
     expect(providerSchema.safeParse("codex").success).toBe(true);
+  });
+});
+
+describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
+  const geminiOkResponse = {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      models: [
+        {
+          name: "models/gemini-3.1-pro-preview",
+          displayName: "Gemini 3.1 Pro Preview",
+          supportedGenerationMethods: ["generateContent", "countTokens"],
+        },
+        {
+          name: "models/gemini-3.1-flash-image-preview",
+          displayName: "Nano Banana 2",
+          supportedGenerationMethods: ["generateContent"],
+        },
+        {
+          name: "models/text-embedding-005",
+          displayName: "Text Embedding 005",
+          supportedGenerationMethods: ["embedContent"],
+        },
+        {
+          name: "models/veo-3.1-generate-preview",
+          displayName: "Veo 3.1",
+          supportedGenerationMethods: ["generateContent"],
+        },
+      ],
+    }),
+  };
+
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+    catalogDocsStore = new Map();
+    catalogVersionsStore = [];
+    invalidateGeminiModelCache();
+    mockConfig.gemini.apiKey = "test-gemini-key";
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function seedGrok() {
+    catalogDocsStore.set("grok", {
+      _id: "grok",
+      provider: "grok",
+      models: [
+        { id: "grok-4.6", displayName: "Grok 4.6", notes: "subscription default", addedAt: new Date() },
+        { id: "grok-4.5", displayName: "Grok 4.5", addedAt: new Date() },
+      ],
+      updatedAt: new Date("2026-08-23T00:00:00Z"),
+      updatedBy: "hermi",
+    });
+  }
+
+  it("returns curated entries with source/asOf for a seeded provider", async () => {
+    seedGrok();
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "grok" });
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toEqual([
+      {
+        provider: "grok",
+        id: "grok-4.6",
+        displayName: "Grok 4.6",
+        notes: "subscription default",
+        source: "curated",
+        asOf: "2026-08-23T00:00:00.000Z",
+      },
+      {
+        provider: "grok",
+        id: "grok-4.5",
+        displayName: "Grok 4.5",
+        source: "curated",
+        asOf: "2026-08-23T00:00:00.000Z",
+      },
+    ]);
+  });
+
+  it("unseeded curated provider → empty entries array + prose note, not an error", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "codex" });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    expect(result.content[1].text).toMatch(/codex: not yet seeded — call agent_model_catalog_refresh first/);
+  });
+
+  it("gemini live lookup uses x-goog-api-key HEADER auth — key never in the URL", async () => {
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, { headers: Record<string, string> }];
+    expect(init.headers["x-goog-api-key"]).toBe("test-gemini-key");
+    expect(url).not.toContain("test-gemini-key");
+    expect(url).not.toContain("key=");
+
+    const parsed = JSON.parse(result.content[0].text);
+    // Filtered: embedding (no generateContent), image + veo (family regex).
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toMatchObject({
+      provider: "gemini",
+      id: "gemini-3.1-pro-preview",
+      displayName: "Gemini 3.1 Pro Preview",
+      source: "live",
+    });
+    expect(typeof parsed[0].asOf).toBe("string");
+  });
+
+  it("second call within TTL serves the cache — zero extra fetches", async () => {
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    await handler({ provider: "gemini" });
+    await handler({ provider: "gemini" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("missing gemini key + provider=gemini → isError with credentials-add remediation", async () => {
+    mockConfig.gemini.apiKey = "";
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/hive credentials add GEMINI_API_KEY/);
+  });
+
+  it("vendor 500 + provider=gemini → sanitized status-only error, no key, no URL", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) })),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("Gemini model lookup failed: vendor returned HTTP 500.");
+    expect(result.content[0].text).not.toContain("test-gemini-key");
+    expect(result.content[0].text).not.toContain("generativelanguage");
+  });
+
+  it("network-level rejection → fixed sanitized message, never String(err)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("connect ECONNREFUSED https://generativelanguage.googleapis.com/v1beta/models?leak=1");
+      }),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/network error/);
+    expect(result.content[0].text).not.toContain("leak=1");
+  });
+
+  it("all-4 listing with a failed gemini leg → partial results + prose note, NOT isError", async () => {
+    seedGrok();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 429, json: async () => ({}) })),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({});
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.every((e: any) => e.provider !== "gemini")).toBe(true);
+    expect(parsed.filter((e: any) => e.provider === "grok")).toHaveLength(2);
+    const noteTexts = result.content
+      .slice(1)
+      .map((c: any) => c.text)
+      .join("\n");
+    expect(noteTexts).toMatch(/claude: not yet seeded/);
+    expect(noteTexts).toMatch(/codex: not yet seeded/);
+    expect(noteTexts).toMatch(/gemini: Gemini model lookup failed: vendor returned HTTP 429\./);
+  });
+
+  it("all-4 listing with a missing gemini key → partial results + prose note, NOT isError", async () => {
+    seedGrok();
+    mockConfig.gemini.apiKey = "";
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({});
+    expect(result.isError).toBeUndefined();
+    const noteTexts = result.content
+      .slice(1)
+      .map((c: any) => c.text)
+      .join("\n");
+    expect(noteTexts).toMatch(/gemini: Gemini API key not configured/);
   });
 });
