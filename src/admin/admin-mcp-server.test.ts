@@ -1018,6 +1018,19 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(catalogVersionsStore).toHaveLength(0);
   });
 
+  it("an explicit empty changeSummary falls back to the diff text — no blank audit row", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const result = await handler({
+      provider: "codex",
+      models: [{ id: "gpt-5.5", displayName: "GPT-5.5" }],
+      changeSummary: "",
+    });
+    expect(result.isError).toBeUndefined();
+    // Response text omits the empty summary; the version row must not be blank.
+    expect(result.content[0].text).toBe("codex catalog updated: +1 (gpt-5.5), -0. 1 models total.");
+    expect(catalogVersionsStore[0].changeSummary).toBe("+1 (gpt-5.5), -0");
+  });
+
   it("excludes gemini at the Zod schema level — no handler rejection needed", () => {
     const tools = makeTools();
     const t = tools.find((x: any) => x.name === "agent_model_catalog_refresh")!;

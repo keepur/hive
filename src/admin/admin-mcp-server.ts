@@ -1067,7 +1067,10 @@ export function buildAdminTools(deps: AdminToolDeps) {
           await catalogVersions.insertOne({
             provider,
             snapshot: nextModels,
-            changeSummary: changeSummary ?? diffText,
+            // `||` not `??`: an explicit empty string is treated the same way
+            // the response text below treats it (falsy → omitted), so a blank
+            // summary never lands in the audit trail in place of the diff.
+            changeSummary: changeSummary || diffText,
             createdAt: now,
             updatedBy: agentId,
           });
