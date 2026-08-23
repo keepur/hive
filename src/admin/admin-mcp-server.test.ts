@@ -967,6 +967,7 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(catalogVersionsStore[0].provider).toBe("grok");
     expect(catalogVersionsStore[0].snapshot).toHaveLength(2);
     expect(catalogVersionsStore[0].changeSummary).toMatch(/\+2/);
+    expect(catalogVersionsStore[0].createdAt).toBeInstanceOf(Date);
     expect(catalogVersionsStore[0].updatedBy).toBe("admin");
   });
 

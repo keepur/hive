@@ -97,7 +97,7 @@ All in `src/` — each agent only gets servers listed in its `coreServers`/`dele
 - `quo-mcp-server.ts` — SMS via Quo/OpenPhone
 - `resend/resend-mcp-server.ts` — outbound email via Resend
 - `callback-mcp-server.ts` — timer callbacks for delayed responses [in-process]
-- `admin-mcp-server.ts` — agent CRUD + version history, model overrides, agent model catalog (KPR-381) [in-process]
+- `admin-mcp-server.ts` — agent CRUD + version history, agent model catalog (KPR-381) [in-process]
 - `clickup/clickup-mcp-server.ts` — ClickUp task management
 - `events/event-bus-mcp-server.ts` — cross-agent event bus (publish events, subscriber delivery) [in-process]
 - `team/team-mcp-server.ts` — direct agent-to-agent messaging (auto-injected core server, no flag) [in-process]
