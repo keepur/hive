@@ -177,7 +177,7 @@ export class WarmVoiceSession {
    */
   async runTurn(req: WarmTurnRequest): Promise<RunResult> {
     if (this.closed || !this.query) {
-      throw new Error(`Warm voice lease closed (${this.closeReason ?? "unknown"})`);
+      throw this.notRunnableError();
     }
     const run = this.turnChain.then(() => this.consumeOneTurn(req));
     // Keep the chain alive across a failed turn; the failure itself
@@ -301,6 +301,27 @@ export class WarmVoiceSession {
     }
   }
 
+  /**
+   * Why a lease cannot run a turn right now. Two distinct states share the
+   * `!this.query` test (review round 1, issue 4):
+   *  - CLOSED — released for a named reason.
+   *  - NOT YET STARTED — the manager publishes the lease into `warmLeases`
+   *    BEFORE `start(q)` (it must: the registry entry is what makes the
+   *    second turn of a call reuse this lease instead of queueing forever
+   *    behind the lease's own per-thread lock). A second turn arriving in
+   *    the narrow async window between publish and start therefore lands
+   *    here. It degrades safely — the throw is the adapter's cold-fallback
+   *    trigger — but reporting it as "closed" mis-describes a session that
+   *    is merely still opening.
+   */
+  private notRunnableError(): Error {
+    return new Error(
+      this.closed
+        ? `Warm voice lease closed (${this.closeReason ?? "unknown"})`
+        : "Warm voice lease not started yet (session still opening)",
+    );
+  }
+
   private logCtx(): Record<string, unknown> {
     return { agentId: this.deps.agentId, threadKey: this.deps.threadKey };
   }
@@ -337,7 +358,7 @@ export class WarmVoiceSession {
    */
   private async consumeOneTurn(req: WarmTurnRequest): Promise<RunResult> {
     if (this.closed || !this.query) {
-      throw new Error(`Warm voice lease closed (${this.closeReason ?? "unknown"})`);
+      throw this.notRunnableError();
     }
     const q = this.query;
     this.clearIdleTimer(); // no idle reclaim while a turn runs
@@ -480,6 +501,25 @@ export class WarmVoiceSession {
             }
             if (result.subtype === "success") {
               text = (result as { result?: string }).result || text;
+            } else if (this.interruptRequested || timedOut) {
+              // Spec §6 failure-close precedence: a barge-in-interrupted or
+              // timed-out turn is ABORTED-BUT-SPOKEN (KPR-307 semantics), not
+              // a turn-level failure — the lease must stay open. The SDK is
+              // free to encode a severed generation as a non-success subtype
+              // (e.g. error_during_execution); adopting that as `error` would
+              // classify the turn as a failure, fire an outcome-failure, feed
+              // the provider breaker, and close the lease — defeating the two
+              // behaviors §6 singles out as lease-stays-open. The turn is
+              // already marked via `aborted`/`timedOut` below; log only.
+              // (The stream-ended branch above is NOT exempted: an output
+              // stream that died before the result is a genuine session
+              // failure and must still fall back cold.)
+              safeLog("info", "Non-success result subtype on an interrupted/timed-out warm turn — not a turn failure", {
+                ...this.logCtx(),
+                subtype: result.subtype,
+                turnSeq: this.turnCount,
+                timedOut,
+              });
             } else {
               error =
                 "errors" in result && Array.isArray(result.errors) ? result.errors.join("; ") : result.subtype;

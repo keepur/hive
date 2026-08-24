@@ -3960,4 +3960,31 @@ describe("AgentRunner.openVoiceStreamingSession (KPR-323 C2)", () => {
     const options = getCapturedOptions();
     expect("resume" in options).toBe(false);
   });
+
+  it("strips maxTurns and maxBudgetUsd from the warm envelope (per-turn bounds must not apply per-call)", async () => {
+    // Fixture carries maxTurns: 25 / budgetUsd: 10 — both would otherwise
+    // flow into the envelope via buildQueryEnvelope's agentConfig fallback
+    // and be enforced CUMULATIVELY across every turn of the warm call.
+    const agentConfig = makeAgentConfig({ maxTurns: 200, budgetUsd: 5 });
+    const runner = new AgentRunner(agentConfig, memoryManager as any);
+
+    await runner.openVoiceStreamingSession({
+      input: (async function* () {})(),
+      sessionId: "s-1",
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const options = getCapturedOptions();
+    expect(options.maxTurns).toBeUndefined();
+    expect(options.maxBudgetUsd).toBeUndefined();
+    expect("maxTurns" in options).toBe(false);
+    expect("maxBudgetUsd" in options).toBe(false);
+
+    // Control: the cold per-turn path still carries both.
+    await runner.send("hello");
+    const coldOptions = getCapturedOptions();
+    expect(coldOptions.maxTurns).toBe(200);
+    expect(coldOptions.maxBudgetUsd).toBe(5);
+  });
 });

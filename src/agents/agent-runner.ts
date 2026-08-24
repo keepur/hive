@@ -2395,6 +2395,18 @@ export class AgentRunner {
       streaming: true,
     });
 
+    // KPR-323 Task 0 ⚠#5 (DECIDED): strip maxTurns / maxBudgetUsd from the
+    // warm envelope. Both are PER-TURN bounds on the cold path — one query()
+    // per turn — but a lease is ONE query() for the WHOLE call, so the SDK
+    // would apply them CUMULATIVELY across every turn of the conversation.
+    // With the shipped defaults a long call would trip the cumulative limit
+    // mid-conversation, error the turn out, close the lease, and silently
+    // degrade to cold for the rest of the call. Per-turn shaping is not
+    // available on the streaming-input path; the lease's per-turn watchdog
+    // (WarmVoiceSession) is what bounds an individual warm turn.
+    delete options.maxTurns;
+    delete options.maxBudgetUsd;
+
     const q = query({ prompt: params.input, options });
     // Belt-and-braces: runner.abort() (and wasAborted) keep working for a
     // lease-held runner; the lease's close() calls Query.close() directly.

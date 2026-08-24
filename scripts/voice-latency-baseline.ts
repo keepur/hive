@@ -148,6 +148,53 @@ export function buildArtifact(
   };
 }
 
+export type WindowResolution =
+  | { ok: true; from: Date; to: Date }
+  | { ok: false; error: string };
+
+/**
+ * Resolve + VALIDATE the harvest window from the CLI args (review round 1,
+ * issue 5). Unvalidated args used to fail silently and late: `--days abc`
+ * made `from` an Invalid Date, the ≤30-day guard's comparison was `false`
+ * for NaN operands so it passed, zero samples matched the NaN-bounded
+ * window, and the run finally died on `from.toISOString()` with a bare
+ * RangeError. Every malformed input now produces a usage error instead.
+ * Pure + exported so the failure modes are unit-testable.
+ */
+export function resolveWindow(
+  args: { from?: string; to?: string; days?: string },
+  now: Date = new Date(),
+): WindowResolution {
+  const to = args.to !== undefined ? new Date(args.to) : now;
+  if (Number.isNaN(to.getTime())) {
+    return { ok: false, error: `--to is not a valid ISO 8601 timestamp: ${args.to}` };
+  }
+
+  let days = 30;
+  if (args.days !== undefined) {
+    const parsed = parseInt(args.days, 10);
+    if (!Number.isFinite(parsed)) {
+      return { ok: false, error: `--days is not a number: ${args.days}` };
+    }
+    if (parsed < 1) {
+      return { ok: false, error: `--days must be at least 1: ${args.days}` };
+    }
+    days = parsed;
+  }
+
+  const from = args.from !== undefined ? new Date(args.from) : new Date(to.getTime() - days * 86_400_000);
+  if (Number.isNaN(from.getTime())) {
+    return { ok: false, error: `--from is not a valid ISO 8601 timestamp: ${args.from}` };
+  }
+  if (from.getTime() > to.getTime()) {
+    return { ok: false, error: "--from must not be after --to" };
+  }
+  if (to.getTime() - from.getTime() > 30 * 86_400_000) {
+    return { ok: false, error: "window exceeds the spec §3.2 maximum of 30 days" };
+  }
+  return { ok: true, from, to };
+}
+
 async function harvestDir(logDir: string, agentId: string, fromMs: number, toMs: number): Promise<VoiceTurnSample[]> {
   const samples: VoiceTurnSample[] = [];
   const names = readdirSync(logDir).filter((n) => {
@@ -186,13 +233,12 @@ async function main(): Promise<void> {
     process.stderr.write("required: --log-dir <dir> --agent <agentId> --out <file>\n");
     process.exit(1);
   }
-  const to = values.to ? new Date(values.to) : new Date();
-  const days = values.days ? parseInt(values.days, 10) : 30;
-  const from = values.from ? new Date(values.from) : new Date(to.getTime() - days * 86_400_000);
-  if (to.getTime() - from.getTime() > 30 * 86_400_000) {
-    process.stderr.write("window exceeds the spec §3.2 maximum of 30 days\n");
+  const window = resolveWindow({ from: values.from, to: values.to, days: values.days });
+  if (!window.ok) {
+    process.stderr.write(window.error + "\n");
     process.exit(1);
   }
+  const { from, to } = window;
 
   const engineVersion = (
     JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as { version: string }

@@ -608,4 +608,106 @@ describe("WarmVoiceSession", () => {
 
     lease.close("test-cleanup");
   });
+
+  // ------------------------------------- §6 precedence: non-success subtype
+  // on an interrupted / timed-out turn. The SDK is free to encode a severed
+  // generation as e.g. error_during_execution; that must NOT become a
+  // turn-level failure (which would close the lease at the manager).
+  it("does not set `error` when a BARGE-IN-interrupted turn's result carries a non-success subtype", async () => {
+    vi.useFakeTimers();
+    const { q, emit, interrupt } = makeFakeQuery();
+    const { lease, onClosed } = makeLease();
+    lease.start(q);
+
+    const p = lease.runTurn({ text: "u1", onStream: () => {}, timeoutMs: 60_000 });
+    emit(delta("hello "));
+    emit(assistantMsg("hello there"));
+    await vi.advanceTimersByTimeAsync(0);
+
+    lease.requestInterrupt("barge-in");
+    expect(interrupt).toHaveBeenCalledTimes(1);
+
+    // Non-success encoding of the severed generation.
+    emit(resultMsg({ result: "", session_id: "s1", subtype: "error_during_execution", errors: ["severed"] }));
+    const r = await p;
+    expect(r.aborted).toBe(true);
+    expect(r.error).toBeUndefined(); // §6: aborted-but-spoken, not a failure
+    expect(r.text).toBe("hello there"); // already-streamed text preserved
+    expect(lease.isClosed).toBe(false);
+    expect(onClosed).not.toHaveBeenCalled();
+
+    // Not poisoned: the next turn runs clean and unmarked in the same session.
+    emit(delta("second "));
+    emit(resultMsg({ result: "second", session_id: "s2" }));
+    const r2 = await lease.runTurn({ text: "u2", timeoutMs: 60_000 });
+    expect(r2.text).toBe("second");
+    expect(r2.error).toBeUndefined();
+    expect(r2.aborted).toBeUndefined();
+    expect(lease.turns).toBe(2);
+    expect(lease.isClosed).toBe(false);
+
+    lease.close("test-cleanup");
+  });
+
+  it("does not set `error` when a TIMED-OUT turn's result carries a non-success subtype", async () => {
+    vi.useFakeTimers();
+    const { q, emit, interrupt } = makeFakeQuery();
+    const { lease, onClosed } = makeLease();
+    lease.start(q);
+
+    const p = lease.runTurn({ text: "u1", timeoutMs: 1_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    emit(delta("partial "));
+    await vi.advanceTimersByTimeAsync(1_000); // watchdog fires
+    expect(interrupt).toHaveBeenCalledTimes(1);
+
+    emit(resultMsg({ result: "", session_id: "s1", subtype: "error_during_execution", errors: ["severed"] }));
+    const r = await p;
+    expect(r.timedOut).toBe(true);
+    expect(r.aborted).toBe(true);
+    expect(r.error).toBeUndefined();
+    expect(lease.isClosed).toBe(false);
+    expect(onClosed).not.toHaveBeenCalled();
+
+    // Session still usable.
+    emit(resultMsg({ result: "next", session_id: "s2" }));
+    const r2 = await lease.runTurn({ text: "u2", timeoutMs: 5_000 });
+    expect(r2.text).toBe("next");
+    expect(r2.error).toBeUndefined();
+    expect(lease.turns).toBe(2);
+
+    lease.close("test-cleanup");
+  });
+
+  // ------------------------------- review round 1, issue 4: started vs closed
+  it("reports an unstarted lease as 'not started yet', and a closed one as closed", async () => {
+    const { lease } = makeLease();
+    // Published-but-unstarted (the manager's narrow open window).
+    await expect(lease.runTurn({ text: "u1", timeoutMs: 1_000 })).rejects.toThrow(/not started yet/);
+    expect(lease.isClosed).toBe(false);
+
+    // Once genuinely closed, the message names the close reason.
+    lease.close("idle-timeout");
+    await expect(lease.runTurn({ text: "u1", timeoutMs: 1_000 })).rejects.toThrow(
+      /Warm voice lease closed \(idle-timeout\)/,
+    );
+  });
+
+  it("STILL sets `error` when a non-interrupted turn's result carries a non-success subtype", async () => {
+    // Control for the two cases above: the exemption is scoped to
+    // interrupted/timed-out turns; a genuine turn failure is unchanged.
+    vi.useFakeTimers();
+    const { q, emit } = makeFakeQuery();
+    const { lease } = makeLease();
+    lease.start(q);
+
+    const p = lease.runTurn({ text: "u1", timeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    emit(resultMsg({ result: "", session_id: "s1", subtype: "error_during_execution", errors: ["boom"] }));
+    const r = await p;
+    expect(r.error).toBe("boom");
+    expect(r.aborted).toBeUndefined();
+
+    lease.close("test-cleanup");
+  });
 });

@@ -1,8 +1,11 @@
 import { describe, it, expect } from "vitest";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   buildArtifact,
   nearestRank,
   parseVoiceTurnLine,
+  resolveWindow,
   type VoiceTurnSample,
 } from "./voice-latency-baseline.js";
 
@@ -406,4 +409,89 @@ describe("artifact schema", () => {
     // No arrays anywhere — per-call rows cannot be present.
     expect(json).not.toContain("[");
   });
+});
+
+// ---------------------------------------------------------------------------
+// resolveWindow — CLI arg validation (review round 1, issue 5)
+// ---------------------------------------------------------------------------
+
+describe("resolveWindow", () => {
+  const NOW = new Date("2026-08-23T00:00:00.000Z");
+
+  it("defaults to the trailing 30 days ending now", () => {
+    const w = resolveWindow({}, NOW);
+    expect(w.ok).toBe(true);
+    if (!w.ok) return;
+    expect(w.to.toISOString()).toBe("2026-08-23T00:00:00.000Z");
+    expect(w.from.toISOString()).toBe("2026-07-24T00:00:00.000Z");
+  });
+
+  it("honours --days", () => {
+    const w = resolveWindow({ days: "7" }, NOW);
+    expect(w.ok).toBe(true);
+    if (!w.ok) return;
+    expect(w.from.toISOString()).toBe("2026-08-16T00:00:00.000Z");
+  });
+
+  it("honours explicit --from/--to", () => {
+    const w = resolveWindow({ from: "2026-08-01T00:00:00.000Z", to: "2026-08-10T00:00:00.000Z" }, NOW);
+    expect(w.ok).toBe(true);
+    if (!w.ok) return;
+    expect(w.from.toISOString()).toBe("2026-08-01T00:00:00.000Z");
+    expect(w.to.toISOString()).toBe("2026-08-10T00:00:00.000Z");
+  });
+
+  // The regression: NaN made every downstream guard vacuously pass and the
+  // run died later on from.toISOString() with a bare RangeError.
+  it("rejects a non-numeric --days instead of producing an Invalid Date", () => {
+    const w = resolveWindow({ days: "abc" }, NOW);
+    expect(w.ok).toBe(false);
+    if (w.ok) return;
+    expect(w.error).toContain("--days is not a number");
+  });
+
+  it("rejects a non-positive --days", () => {
+    expect(resolveWindow({ days: "0" }, NOW).ok).toBe(false);
+    expect(resolveWindow({ days: "-5" }, NOW).ok).toBe(false);
+  });
+
+  it("rejects a malformed --from", () => {
+    const w = resolveWindow({ from: "not-a-date" }, NOW);
+    expect(w.ok).toBe(false);
+    if (w.ok) return;
+    expect(w.error).toContain("--from is not a valid ISO 8601 timestamp");
+  });
+
+  it("rejects a malformed --to", () => {
+    const w = resolveWindow({ to: "2026-13-45" }, NOW);
+    expect(w.ok).toBe(false);
+    if (w.ok) return;
+    expect(w.error).toContain("--to is not a valid ISO 8601 timestamp");
+  });
+
+  it("rejects an inverted window", () => {
+    const w = resolveWindow({ from: "2026-08-10T00:00:00.000Z", to: "2026-08-01T00:00:00.000Z" }, NOW);
+    expect(w.ok).toBe(false);
+    if (w.ok) return;
+    expect(w.error).toContain("--from must not be after --to");
+  });
+
+  it("still enforces the spec §3.2 30-day maximum", () => {
+    const w = resolveWindow({ from: "2026-06-01T00:00:00.000Z", to: "2026-08-01T00:00:00.000Z" }, NOW);
+    expect(w.ok).toBe(false);
+    if (w.ok) return;
+    expect(w.error).toContain("30 days");
+  });
+
+  it("(smoke) the CLI exits 1 with a usage error — not a RangeError stack", () => {
+    const script = fileURLToPath(new URL("./voice-latency-baseline.ts", import.meta.url));
+    const r = spawnSync(
+      "npx",
+      ["tsx", script, "--log-dir", "/tmp", "--agent", "nobody", "--out", "/tmp/kpr323-baseline-smoke.json", "--days", "abc"],
+      { encoding: "utf-8" },
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("--days is not a number");
+    expect(r.stderr).not.toContain("RangeError");
+  }, 30_000);
 });

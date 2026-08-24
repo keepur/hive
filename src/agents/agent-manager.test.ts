@@ -4983,7 +4983,9 @@ describe("AgentManager", () => {
      * releaseHang() or interrupt() fires — gives the circuit-open and
      * timed-out cases a real in-flight turn without ad-hoc harness invention.
      */
-    function installEchoStreamingRunner(opts: { failOnTurn?: number; hangOnTurn?: number } = {}) {
+    function installEchoStreamingRunner(
+      opts: { failOnTurn?: number; hangOnTurn?: number; hangResultSubtype?: string } = {},
+    ) {
       let releaseHang: () => void = () => {};
       const hangReleased = new Promise<void>((r) => {
         releaseHang = r;
@@ -5012,6 +5014,12 @@ describe("AgentManager", () => {
             out.push({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: `reply-${n} ` } } });
             if (opts.hangOnTurn === n) {
               await hangReleased;
+              if (opts.hangResultSubtype) {
+                // The severed generation encoded as a NON-success subtype —
+                // the SDK encoding the §6 precedence rule has to survive.
+                out.push({ type: "result", subtype: opts.hangResultSubtype, errors: ["severed"], session_id: `sess-warm-${n}`, total_cost_usd: 0, duration_ms: 1 });
+                continue;
+              }
             }
             out.push({ type: "result", subtype: "success", result: `reply-${n}`, session_id: `sess-warm-${n}`, total_cost_usd: 0.01, duration_ms: 10, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
           }
@@ -5270,6 +5278,68 @@ describe("AgentManager", () => {
       expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
     });
 
+    // ---- assertion 14b (review round 1, issue 2) -------------------------
+    // The §6 precedence rule has to hold for the SDK encoding a severed
+    // generation as a NON-success result subtype — otherwise EVERY timed-out
+    // turn would close the lease and permanently degrade the call to cold.
+    it("(14b) a timed-out turn whose result carries a NON-SUCCESS subtype still does NOT close the lease", async () => {
+      registry._agents.get("agent-a")!.timeoutMs = 25;
+      const { interrupt, pushed } = installEchoStreamingRunner({
+        hangOnTurn: 2,
+        hangResultSubtype: "error_during_execution",
+      });
+
+      await manager.spawnTurn(makeVoiceCtx());
+      const r2 = await manager.spawnTurn(makeVoiceCtx()); // watchdog → interrupt → error-subtype result
+      expect(interrupt).toHaveBeenCalled();
+      // Headline regression: the lease must survive. (Asserted BEFORE the
+      // errors check so a revert of the fix fails on lease-close, not on the
+      // error string it is caused by.)
+      const lease = warmLeases(manager).get(WARM_KEY);
+      expect(lease).toBeDefined();
+      expect(lease!.isClosed).toBe(false);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // ticket still held
+      expect(r2.timedOut).toBe(true);
+      expect(r2.errors).toEqual([]); // §6: aborted-but-spoken, not a turn failure
+
+      // Next turn is still WARM on the same session — no re-open, no cold fallback.
+      const r3 = await manager.spawnTurn(makeVoiceCtx());
+      expect(r3.finalMessage).toBe("reply-3");
+      expect(r3.warmPath).toBe(true);
+      expect(r3.warmTurnSeq).toBe(3);
+      expect(pushed.length).toBe(3);
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+    });
+
+    // ---- assertion 14c (review round 1, issue 2) -------------------------
+    it("(14c) a barge-in-interrupted turn whose result carries a NON-SUCCESS subtype still does NOT close the lease", async () => {
+      const { interrupt, close, pushed } = installEchoStreamingRunner({
+        hangOnTurn: 2,
+        hangResultSubtype: "error_during_execution",
+      });
+
+      await manager.spawnTurn(makeVoiceCtx());
+      const turn2 = manager.spawnTurn(makeVoiceCtx()); // hangs until interrupted
+      await vi.waitFor(() => expect(pushed.length).toBe(2));
+
+      expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+      expect(interrupt).toHaveBeenCalledTimes(1);
+      expect(close).not.toHaveBeenCalled(); // turn-level severing, not session-level
+
+      const r2 = await turn2;
+      // Headline regression first (see 14b).
+      const lease = warmLeases(manager).get(WARM_KEY);
+      expect(lease).toBeDefined();
+      expect(lease!.isClosed).toBe(false);
+      expect(r2.aborted).toBe(true);
+      expect(r2.errors).toEqual([]); // §6: no turn-level failure
+
+      const r3 = await manager.spawnTurn(makeVoiceCtx());
+      expect(r3.warmPath).toBe(true);
+      expect(r3.warmTurnSeq).toBe(3);
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // never re-opened
+    });
+
     // ---- assertions 15, 16 ----------------------------------------------
     it("(15,16) exactly ONE reflection per call, credited with the call's turn count; none scheduled between warm turns", async () => {
       const fastManager = new AgentManager(
@@ -5419,6 +5489,25 @@ describe("AgentManager", () => {
           process.off("unhandledRejection", onRej);
         }
         expect(floated).toEqual([]);
+      });
+
+      it("(11c) a SYNCHRONOUSLY throwing interrupt() does not propagate out of abortThread", async () => {
+        // abortThread is called from an HTTP `close` listener — a synchronous
+        // throw there is an uncaughtException (review round 1, issue 3).
+        mockConversationIndex.mockResolvedValue(undefined);
+        const { interrupt, close } = installEchoStreamingRunner();
+        interrupt.mockImplementationOnce(() => {
+          throw new Error("sync interrupt boom");
+        });
+        await manager.spawnTurn(makeVoiceCtx());
+
+        expect(() => manager.abortThread("agent-a", "voice:call-1")).not.toThrow();
+        expect(interrupt).toHaveBeenCalledTimes(1);
+        // Escalated exactly like a REJECTED interrupt: lease closed → cold fallback.
+        expect(close).toHaveBeenCalled();
+        expect(warmLeases(manager).get(WARM_KEY)).toBeUndefined();
+        await new Promise((r) => setTimeout(r, 10));
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0); // lock + budget freed
       });
 
       it("(11b) falls through to the 322 ticket-walk when no lease exists (cold voice spawn)", async () => {

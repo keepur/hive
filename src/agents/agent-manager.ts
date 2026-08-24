@@ -1269,6 +1269,15 @@ export class AgentManager {
     // "Lease ready" gate: acquisition errors propagate synchronously.
     await Promise.race([ready, coordinator]);
 
+    // Published BEFORE start() deliberately (review round 1, issue 4): the
+    // registry entry is what makes a second turn arriving mid-open reuse this
+    // lease. Deferring the publish until after start() would send that turn
+    // into openWarmLease → withSpawnTicket, where it would block on the
+    // per-thread lock THIS lease holds for the whole call — a hang, not a
+    // fallback. The cost is a narrow window in which runTurn is called on a
+    // published-but-unstarted lease; it throws (accurately labelled "not
+    // started yet", see WarmVoiceSession.notRunnableError) and the adapter's
+    // outer retry lands cold. Safe degradation, not a wedge.
     this.warmLeases.set(threadKey, lease);
 
     try {
@@ -1329,9 +1338,16 @@ export class AgentManager {
    * message is never pushed; the session is healthy; half-open probes are
    * real turns and recovery is seamless mid-call). EVERY OTHER turn-level
    * failure closes the lease BEFORE the error propagates, so the adapter's
-   * outer full-transcript retry always lands cold. Timed-out turns return
-   * ok under KPR-307 semantics (empty errors) — not a turn-level failure —
-   * so the lease stays open.
+   * outer full-transcript retry always lands cold. Timed-out AND
+   * barge-in-interrupted turns return ok under KPR-307 semantics (empty
+   * errors) — not a turn-level failure — so the lease stays open. That
+   * exemption is enforced at the source, in WarmVoiceSession.consumeOneTurn:
+   * a non-success result subtype on an aborted/timed-out turn never becomes
+   * an `error` string, so it also never trips the breaker or fires an
+   * outcome-failure (both of which run BEFORE the close check below). The
+   * two remaining error sources — the output stream ending before the turn's
+   * result, and a throw out of the demux — are genuine session deaths and DO
+   * close the lease even on an interrupted turn.
    *
    * No per-turn reflection scheduling here (§4.5): a timer firing mid-call
    * would hit the quiescence check, skip without rescheduling, and lose the
@@ -2280,8 +2296,26 @@ export class AgentManager {
     // interrupt-on-idle is SDK-unspecified — W2 in-run check (§7).
     const lease = this.warmLeases.get(threadKey);
     if (lease && !lease.isClosed) {
-      lease.requestInterrupt("abort-thread");
-      log.info("Warm voice lease interrupted for thread", { agentId, threadId });
+      try {
+        lease.requestInterrupt("abort-thread");
+        log.info("Warm voice lease interrupted for thread", { agentId, threadId });
+      } catch (err) {
+        // Same throw-safety contract as the ticket walk below (review round 1
+        // B2): abortThread is called from an HTTP `close` listener, where a
+        // SYNCHRONOUS throw is an uncaughtException. requestInterrupt guards
+        // the interrupt() PROMISE, but a synchronous throw out of
+        // Query.interrupt() itself (or out of the log line) would escape.
+        log.warn("lease.requestInterrupt() threw during abortThread — closing lease (cold fallback)", {
+          agentId,
+          threadId,
+          error: String(err),
+        });
+        // Same failure class as a REJECTED interrupt (warm-voice-session.ts):
+        // the interrupt did not happen, so the session may be wedged; closing
+        // converts it into the standard cold-fallback path (§6). close() is
+        // no-throw by contract, so the guard above still holds.
+        lease.close("interrupt-threw:abort-thread");
+      }
       return true;
     }
     // --- 322 Task 3 body from here, unchanged ---
