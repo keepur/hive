@@ -3906,3 +3906,58 @@ describe("AgentRunner C1 stage stamps (KPR-323)", () => {
     expect(result.initToFirstTokenMs).toBeUndefined();
   });
 });
+
+describe("AgentRunner.openVoiceStreamingSession (KPR-323 C2)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  const fakeCtx = {
+    adapterId: "voice",
+    channelId: "call-1",
+    channelKind: "voice",
+    channelLabel: "Voice",
+    threadId: "call-1",
+    slackTs: "",
+    slackThreadTs: "",
+  } as any;
+
+  it("opens a streaming-input query with resume, partial messages, and the override prompt", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const input = (async function* () {})();
+
+    await runner.openVoiceStreamingSession({
+      input,
+      sessionId: "s-1",
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const call = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
+    expect(typeof call[0].prompt).not.toBe("string");
+    expect(call[0].prompt).toBe(input);
+
+    const options = getCapturedOptions();
+    expect(options.resume).toBe("s-1");
+    expect(options.includePartialMessages).toBe(true);
+    expect(options.systemPrompt).toBe("vp");
+  });
+
+  it("omits resume entirely when sessionId is undefined", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+
+    await runner.openVoiceStreamingSession({
+      input: (async function* () {})(),
+      sessionId: undefined,
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const options = getCapturedOptions();
+    expect("resume" in options).toBe(false);
+  });
+});
