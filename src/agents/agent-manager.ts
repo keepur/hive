@@ -389,6 +389,8 @@ export interface CoordinatorSnapshotPerAgent {
   lastError: string | null;
   /** Whether the agent is in `stoppedAgents` (spec S8). */
   stopped: boolean;
+  /** KPR-323 C5: live warm voice leases for this agent (each holds one budget slot for its call's duration). */
+  warmVoiceSessions: number;
 }
 
 export interface CoordinatorSnapshot {
@@ -1574,6 +1576,13 @@ export class AgentManager {
       for (const key of this.activeSpawnKeys) {
         if (key.startsWith(prefix)) activeThreadKeys.push(key);
       }
+      // KPR-323 C5: warm voice leases are keyed `${agentId}:${threadId}` —
+      // same prefix-scan shape as activeSpawnKeys above, so the count is
+      // per-agent, never global.
+      let warmVoiceSessions = 0;
+      for (const key of this.warmLeases.keys()) {
+        if (key.startsWith(prefix)) warmVoiceSessions++;
+      }
       const sat = this.saturationEvents.get(agentId);
       perAgent[agentId] = {
         activeSpawns,
@@ -1585,6 +1594,7 @@ export class AgentManager {
         lastSpawnAt: this.lastSpawnAt.get(agentId) ?? null,
         lastError: this.lastSpawnError.get(agentId) ?? null,
         stopped: this.stoppedAgents.has(agentId),
+        warmVoiceSessions,
       };
     }
 

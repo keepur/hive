@@ -384,6 +384,8 @@ export interface SpawnCoordinatorRow {
   lastSpawnAt: number | null;
   lastError: string | null;
   stopped: boolean;
+  /** KPR-323 C5: live warm voice leases for this agent (informational). */
+  warmVoiceSessions: number;
   /** Seconds since the engine last wrote this doc; null if no doc found yet. */
   staleSeconds: number | null;
 }
@@ -412,6 +414,7 @@ export async function spawnCoordinatorStatsForDoctor(uri: string, dbName: string
         lastSpawnAt?: number | null;
         lastError?: string | null;
         stopped?: boolean;
+        warmVoiceSessions?: number;
         updatedAt?: Date;
       }>({ kind: "spawn_coordinator_stats" })
       .toArray();
@@ -429,6 +432,8 @@ export async function spawnCoordinatorStatsForDoctor(uri: string, dbName: string
           lastSpawnAt: d.lastSpawnAt ?? null,
           lastError: d.lastError ?? null,
           stopped: d.stopped ?? false,
+          // KPR-323 C5: pre-323 heartbeat docs have no such field — default to 0.
+          warmVoiceSessions: d.warmVoiceSessions ?? 0,
           staleSeconds: updatedAt ? Math.round((Date.now() - updatedAt.getTime()) / 1000) : null,
         };
       })

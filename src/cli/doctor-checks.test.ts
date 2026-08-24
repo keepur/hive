@@ -414,6 +414,35 @@ describe("voiceWorkerStatsForDoctor (KPR-322)", () => {
   });
 });
 
+// ── spawn coordinator warmVoiceSessions (KPR-323 C5) ─────────────────────
+
+import { spawnCoordinatorStatsForDoctor } from "./doctor-checks.js";
+
+describe("spawnCoordinatorStatsForDoctor — warmVoiceSessions (KPR-323 C5)", () => {
+  beforeEach(() => {
+    mongoMocks.connect.mockReset().mockResolvedValue(undefined);
+    mongoMocks.close.mockReset().mockResolvedValue(undefined);
+    mongoMocks.find.mockReset();
+  });
+
+  it("reads warmVoiceSessions when present and defaults pre-323 docs to 0", async () => {
+    const updatedAt = new Date(Date.now() - 5_000);
+    mongoMocks.find.mockReturnValue({
+      toArray: async () => [
+        // Post-323 heartbeat doc.
+        { agentId: "agent-warm", activeSpawns: 1, budget: 5, warmVoiceSessions: 2, updatedAt },
+        // Pre-323 heartbeat doc — field absent entirely.
+        { agentId: "agent-legacy", activeSpawns: 0, budget: 5, updatedAt },
+      ],
+    });
+    const rows = await spawnCoordinatorStatsForDoctor("mongodb://x", "hive_test");
+    expect(rows.map((r) => r.agentId)).toEqual(["agent-legacy", "agent-warm"]);
+    expect(rows.find((r) => r.agentId === "agent-warm")!.warmVoiceSessions).toBe(2);
+    // The default is what keeps an old telemetry doc readable (never undefined).
+    expect(rows.find((r) => r.agentId === "agent-legacy")!.warmVoiceSessions).toBe(0);
+  });
+});
+
 // ── outage queue (KPR-307) ───────────────────────────────────────────────
 
 import { outageQueueStatsForDoctor } from "./doctor-checks.js";

@@ -143,7 +143,7 @@ export function renderSpawnCoordinatorSection(
     const lastSat =
       r.lastSaturationAt === null ? "never" : `${Math.round((Date.now() - r.lastSaturationAt) / 1000)}s ago`;
     emit(
-      `  ${r.agentId}: active=${r.activeSpawns} budget=${r.budget} (source=${r.budgetSource}) saturations=${r.saturationCount} (last ${lastSat})${flagStr} (heartbeat ${stale})`,
+      `  ${r.agentId}: active=${r.activeSpawns} warm-voice=${r.warmVoiceSessions} budget=${r.budget} (source=${r.budgetSource}) saturations=${r.saturationCount} (last ${lastSat})${flagStr} (heartbeat ${stale})`,
     );
     if (r.lastError) {
       emit(`    last error: ${r.lastError}`);

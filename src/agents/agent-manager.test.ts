@@ -4965,8 +4965,8 @@ describe("AgentManager", () => {
   // KPR-323 C2 — warm voice lease integration against the REAL spawn
   // coordinator. Additive block: every assertion below exercises the new
   // branch in spawnTurn; the flag-off case pins that the cold path is
-  // untouched. Testing-Contract integration assertions 1–9, 12–16, 18
-  // (10–11 land with Task 6 / abortThread; 17 with Task 7 / observability).
+  // untouched. Testing-Contract integration assertions 1–9, 12–16, 18, plus
+  // 10–11 (Task 6 / abortThread) and 17 (Task 7 / observability).
   // ==========================================================================
   describe("warm voice lease (KPR-323)", () => {
     const WARM_KEY = "agent-a:voice:call-1";
@@ -5340,6 +5340,32 @@ describe("AgentManager", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    // ---- assertion 17 (KPR-323 C5, observability) ------------------------
+    it("(17) getSnapshot surfaces warmVoiceSessions per agent — 1 while leased, 0 after close, 0 for lease-free agents", async () => {
+      installEchoStreamingRunner();
+
+      // Baseline: nobody holds a lease.
+      const cold = manager.getSnapshot().perAgent;
+      expect(cold["agent-a"]!.warmVoiceSessions).toBe(0);
+      expect(cold["agent-b"]!.warmVoiceSessions).toBe(0);
+
+      await manager.spawnTurn(makeVoiceCtx());
+      const open = manager.getSnapshot().perAgent;
+      expect(open["agent-a"]!.warmVoiceSessions).toBe(1);
+      // Per-agent, not global: agent-b holds no lease of its own.
+      expect(open["agent-b"]!.warmVoiceSessions).toBe(0);
+
+      // A second concurrent call on the same agent counts separately.
+      await manager.spawnTurn(makeVoiceCtx({ threadId: "voice:call-2" }));
+      expect(manager.getSnapshot().perAgent["agent-a"]!.warmVoiceSessions).toBe(2);
+      expect(manager.getSnapshot().perAgent["agent-b"]!.warmVoiceSessions).toBe(0);
+
+      for (const lease of [...warmLeases(manager).values()]) lease.close("test-close");
+      await new Promise((r) => setTimeout(r, 10));
+      expect(warmLeases(manager).size).toBe(0);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.warmVoiceSessions).toBe(0);
     });
 
     // ---- assertions 10, 11 (KPR-323 C3, spec §4.4) -----------------------

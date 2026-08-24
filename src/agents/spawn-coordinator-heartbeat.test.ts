@@ -45,6 +45,7 @@ describe("SpawnCoordinatorHeartbeat (KPR-220 Phase 11)", () => {
           lastSpawnAt: 1234,
           lastError: null,
           stopped: false,
+          warmVoiceSessions: 1,
         },
         "agent-b": {
           activeSpawns: 0,
@@ -56,6 +57,7 @@ describe("SpawnCoordinatorHeartbeat (KPR-220 Phase 11)", () => {
           lastSpawnAt: null,
           lastError: "boom",
           stopped: true,
+          warmVoiceSessions: 0,
         },
       },
     };
@@ -79,6 +81,12 @@ describe("SpawnCoordinatorHeartbeat (KPR-220 Phase 11)", () => {
     expect(bCall[1].$set.stopped).toBe(true);
     expect(bCall[1].$set.lastError).toBe("boom");
     expect(bCall[1].$set.saturationCount).toBe(2);
+
+    // KPR-323 C5: the snapshot spread carries warmVoiceSessions through with
+    // no heartbeat-specific code — pin that so a future field-listing
+    // refactor of writeOnce can't silently drop it.
+    expect(aCall[1].$set.warmVoiceSessions).toBe(1);
+    expect(bCall[1].$set.warmVoiceSessions).toBe(0);
   });
 
   it("writeOnce with empty perAgent does not call updateOne", async () => {
