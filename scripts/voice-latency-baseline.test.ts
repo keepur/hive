@@ -210,32 +210,63 @@ describe("parseVoiceTurnLine", () => {
 });
 
 // ---------------------------------------------------------------------------
-// window filtering — the harvest boundary predicate (harvestDir applies
-// `tsMs >= fromMs && tsMs <= toMs` to parser output before buildArtifact)
+// window filtering — the harvest boundary (C6). These exercise the REAL
+// predicate inside `harvestDir` against real log files on disk; asserting
+// against a locally re-declared copy of `tsMs >= fromMs && tsMs <= toMs` would
+// stay green even if the shipped filter were flipped to exclusive or deleted.
 // ---------------------------------------------------------------------------
 
 describe("window filtering (harvest boundary)", () => {
   const fromMs = Date.parse("2026-08-01T00:00:00.000Z");
   const toMs = Date.parse("2026-08-08T00:00:00.000Z");
-  const inWindow = (s: VoiceTurnSample) => s.tsMs >= fromMs && s.tsMs <= toMs;
+  const midMs = (fromMs + toMs) / 2;
+  const dirs: string[] = [];
 
-  it("includes both boundaries and excludes outside", () => {
-    const all = [
-      sample({ tsMs: fromMs - 1 }),
-      sample({ tsMs: fromMs }),
-      sample({ tsMs: (fromMs + toMs) / 2 }),
-      sample({ tsMs: toMs }),
-      sample({ tsMs: toMs + 1 }),
-    ];
-    const kept = all.filter(inWindow);
-    expect(kept).toHaveLength(3);
+  /** Write one log file whose lines carry the given timestamps. */
+  function logDirWith(rows: Array<{ tsMs: number } & Record<string, unknown>>): string {
+    const dir = mkdtempSync(join(tmpdir(), "kpr323-window-"));
+    dirs.push(dir);
+    const body = rows
+      .map(({ tsMs, ...rest }) => line({ ts: new Date(tsMs).toISOString(), ...rest }))
+      .join("\n");
+    writeFileSync(join(dir, "voice.log"), body + "\n");
+    return dir;
+  }
+
+  afterEach(() => {
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  it("includes both boundaries and excludes outside", async () => {
+    // firstTokenMs doubles as a per-row tag so the kept set is identifiable.
+    const dir = logDirWith([
+      { tsMs: fromMs - 1, firstTokenMs: 1 },
+      { tsMs: fromMs, firstTokenMs: 2 },
+      { tsMs: midMs, firstTokenMs: 3 },
+      { tsMs: toMs, firstTokenMs: 4 },
+      { tsMs: toMs + 1, firstTokenMs: 5 },
+    ]);
+
+    const kept = await harvestDir(dir, ["voice.log"], AGENT, fromMs, toMs);
+
+    // Inclusive on BOTH ends: the `from` and `to` rows survive, the ±1ms
+    // rows do not.
+    expect(kept.map((s) => s.firstTokenMs)).toEqual([2, 3, 4]);
+    expect(kept.map((s) => s.tsMs)).toEqual([fromMs, midMs, toMs]);
 
     const { artifact } = buildArtifact(kept, OPTS);
     expect(artifact.samples.resumed).toBe(3);
   });
 
-  it("buildArtifact counts exactly what the window predicate passed in", () => {
-    const kept = [sample({ tsMs: fromMs }), sample({ tsMs: toMs, resumed: false })].filter(inWindow);
+  it("buildArtifact counts exactly what harvestDir's window returned", async () => {
+    const dir = logDirWith([
+      { tsMs: fromMs - 1, sdkSessionResumed: true },
+      { tsMs: fromMs, sdkSessionResumed: true },
+      { tsMs: toMs, sdkSessionResumeAttempted: false, sdkSessionResumed: false },
+      { tsMs: toMs + 1, sdkSessionResumeAttempted: false, sdkSessionResumed: false },
+    ]);
+
+    const kept = await harvestDir(dir, ["voice.log"], AGENT, fromMs, toMs);
     const { artifact } = buildArtifact(kept, OPTS);
     expect(artifact.samples).toEqual({
       resumed: 1,
@@ -243,6 +274,14 @@ describe("window filtering (harvest boundary)", () => {
       excludedMissingFirstToken: 0,
       excludedWarmPath: 0,
     });
+  });
+
+  it("returns nothing when the whole file falls outside the window", async () => {
+    const dir = logDirWith([
+      { tsMs: fromMs - 60_000 },
+      { tsMs: toMs + 60_000 },
+    ]);
+    expect(await harvestDir(dir, ["voice.log"], AGENT, fromMs, toMs)).toEqual([]);
   });
 });
 
