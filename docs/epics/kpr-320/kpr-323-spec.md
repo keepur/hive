@@ -64,7 +64,7 @@ Source: the existing **"Voice turn complete"** log lines (`voice-adapter.ts:423-
 
 Deliverable at delivery time: `scripts/voice-latency-baseline.ts` (C6) — reads the instance log dir, filters the window, computes the stats, emits the artifact JSON. The methodology (this section) is canon now; the script is a mechanical rendering of it, and an operator could equally produce the artifact with grep+jq.
 
-**Sample requirements:** ≥50 resumed turns and ≥20 non-resumed turns within a ≤30-day window ending at capture time, all from the production agent's line, streaming mode only. Log lines **without a `firstTokenMs` value are excluded** from the metrics (degenerate zero-chunk streaming turns never set it — the adapter emits headers + `[DONE]` at completion, `voice-adapter.ts:397-408`) and the exclusion count is recorded in the artifact. If the window can't supply the minimums, the shortfall is recorded in the artifact and the operator decides whether to bless anyway (small-n flagged) or wait for traffic. Failed turns are structurally excluded (the log line fires only on success) — the baseline measures the latency of turns that worked, which is the correct comparand for P2.
+**Sample requirements:** ≥50 resumed turns and ≥20 non-resumed turns within a ≤30-day window ending at capture time, all from the production agent's line, streaming mode only. Log lines **without a `firstTokenMs` value are excluded** from the metrics (degenerate zero-chunk streaming turns never set it — the adapter emits headers + `[DONE]` at completion, `voice-adapter.ts:397-408`) and the exclusion count is recorded in the artifact. **Warm turns are structurally excluded**: this artifact is the PRE-WARM comparand, so any row carrying `warmPath: true` (the C1/C2 stamp on the same log line) is dropped from all metrics before the resumed/non-resumed split, and the drop count is recorded as `samples.excludedWarmPath` plus a `notes` caveat. Without this, a re-harvest taken after KPR-325's pilot flips `voice.warmPath.enabled` on would silently blend warm turns into the cold baseline and move an immutable number that 322 P2 binds to. If the window can't supply the minimums, the shortfall is recorded in the artifact and the operator decides whether to bless anyway (small-n flagged) or wait for traffic. Failed turns are structurally excluded (the log line fires only on success) — the baseline measures the latency of turns that worked, which is the correct comparand for P2.
 
 ### 3.3 Artifact format (what the PoC gates consume)
 
@@ -79,7 +79,7 @@ One JSON document, aggregate-only (no per-call rows, no callIds, no text):
   "source": "vapi-production-logs",
   "window": { "from": "<ISO8601>", "to": "<ISO8601>" },
   "agentId": "<agent>", "mode": "streaming",
-  "samples": { "resumed": 0, "nonResumed": 0, "excludedMissingFirstToken": 0 },
+  "samples": { "resumed": 0, "nonResumed": 0, "excludedMissingFirstToken": 0, "excludedWarmPath": 0 },
   "metrics": {
     "resumed":    { "firstTokenMs": { "p50": 0, "p95": 0 }, "totalMs": { "p50": 0, "p95": 0 } },
     "nonResumed": { "firstTokenMs": { "p50": 0, "p95": 0 }, "totalMs": { "p50": 0, "p95": 0 } }

@@ -1207,6 +1207,16 @@ export class AgentManager {
     // Optional chaining keeps test config mocks without a `voice` key working
     // — the gate simply stays cold.
     if (appConfig.voice?.warmPath?.enabled !== true) return false;
+    // Positive guard (review final round, issue 1): the warm lease pins the
+    // system prompt for the WHOLE call from ctx.systemPromptOverride, and
+    // buildQueryEnvelope treats any non-nullish override as authoritative —
+    // an empty string would open the lease with NO soul, role, constitution,
+    // or toolkit and never fall back to buildSystemPrompt. Today the voice
+    // adapter always supplies one, so this is unreachable; guarding here
+    // makes a future regression degrade HONESTLY to the cold path (which
+    // passes systemPromptOverride: undefined and builds the real prompt)
+    // instead of silently running a whole call without identity/guardrails.
+    if (!ctx.systemPromptOverride) return false;
     const def = this.registry.get(ctx.agentId);
     if (!def) return false;
     return resolveProviderModel(def.model).provider === "claude";
@@ -1307,15 +1317,35 @@ export class AgentManager {
     // lease. Deferring the publish until after start() would send that turn
     // into openWarmLease → withSpawnTicket, where it would block on the
     // per-thread lock THIS lease holds for the whole call — a hang, not a
-    // fallback. The cost is a narrow window in which runTurn is called on a
+    // fallback. The cost is a window in which runTurn is called on a
     // published-but-unstarted lease; it throws (accurately labelled "not
     // started yet", see WarmVoiceSession.notRunnableError) and the adapter's
-    // outer retry lands cold. That degradation is only safe because
-    // WarmVoiceSession.start() carries a closed-guard (review round 2, issue
-    // 1): the throw here reaches runWarmTurn, which closes the lease, and the
-    // Query this open is still awaiting therefore arrives at start() on an
-    // already-closed lease — where the guard closes it instead of orphaning
-    // the CLI subprocess. Same for ticket-abort/shutdown closing mid-open.
+    // outer retry lands cold.
+    //
+    // How wide is that window, precisely (final round, issue 3)? Effectively
+    // ONE MICROTASK, not the CLI boot. `query()` itself is synchronous and
+    // openVoiceStreamingSession does not await the CLI boot or the MCP
+    // handshake — those are observed later, inside turn 1's consumeOneTurn
+    // (which is exactly why initToFirstTokenMs on the FIRST warm turn carries
+    // them). And for voice specifically buildQueryEnvelope has no await at
+    // all: systemPromptOverride short-circuits buildSystemPrompt. So no
+    // macrotask — a second HTTP request, a timer — can realistically land in
+    // it; the guarding below is for the abort/shutdown paths that CAN close
+    // the lease from an already-scheduled callback, not for a 1.5-2s gap.
+    //
+    // The degradation is safe because WarmVoiceSession.start() carries a
+    // closed-guard (review round 2, issue 1): a throw here reaches
+    // runWarmTurn, which closes the lease, and the Query this open is still
+    // awaiting therefore arrives at start() on an already-closed lease —
+    // where the guard closes it instead of orphaning the CLI subprocess.
+    // Same for ticket-abort/shutdown closing mid-open.
+    //
+    // Known edge case, documented not fixed: if a turn DID land in this
+    // window and got closed as collateral, turn 1 specifically has no
+    // effectiveResume, so the adapter's outer retry (which requires a resume
+    // attempt) would NOT fire — the caller would get a hard failure on the
+    // very first exchange of the call rather than a graceful cold retry.
+    // Acceptable given the window is a microtask.
     this.warmLeases.set(threadKey, lease);
 
     try {
@@ -1348,6 +1378,9 @@ export class AgentManager {
           slackTs: "",
           slackThreadTs: "",
         },
+        // Non-empty by construction: isWarmPathEligible refuses the warm path
+        // when ctx.systemPromptOverride is falsy (final round, issue 1), so
+        // the `?? ""` here is a type narrowing, not a silent-empty fallback.
         systemPromptOverride: ctx.systemPromptOverride ?? "",
       });
       lease.start(q);

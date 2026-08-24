@@ -41,6 +41,7 @@ function sample(over: Partial<VoiceTurnSample> = {}): VoiceTurnSample {
     firstTokenMs: 1000,
     totalMs: 3000,
     resumed: true,
+    warmPath: false,
     ...over,
   };
 }
@@ -112,7 +113,18 @@ describe("parseVoiceTurnLine", () => {
       firstTokenMs: 1500,
       totalMs: 4200,
       resumed: true,
+      warmPath: false,
     });
+  });
+
+  // Final round, issue 2: the warm-lease stamp on the same log line.
+  it("carries warmPath from the log row (absent/false/true)", () => {
+    // Pre-KPR-323 rows have no such field at all — must parse as cold.
+    expect(parseVoiceTurnLine(line(), AGENT)?.warmPath).toBe(false);
+    expect(parseVoiceTurnLine(line({ warmPath: false }), AGENT)?.warmPath).toBe(false);
+    expect(parseVoiceTurnLine(line({ warmPath: true }), AGENT)?.warmPath).toBe(true);
+    // Only a literal `true` counts — a truthy non-boolean is not a warm stamp.
+    expect(parseVoiceTurnLine(line({ warmPath: "true" }), AGENT)?.warmPath).toBe(false);
   });
 
   it("marks resumed=false when sdkSessionResumeAttempted is false", () => {
@@ -212,7 +224,12 @@ describe("window filtering (harvest boundary)", () => {
   it("buildArtifact counts exactly what the window predicate passed in", () => {
     const kept = [sample({ tsMs: fromMs }), sample({ tsMs: toMs, resumed: false })].filter(inWindow);
     const { artifact } = buildArtifact(kept, OPTS);
-    expect(artifact.samples).toEqual({ resumed: 1, nonResumed: 1, excludedMissingFirstToken: 0 });
+    expect(artifact.samples).toEqual({
+      resumed: 1,
+      nonResumed: 1,
+      excludedMissingFirstToken: 0,
+      excludedWarmPath: 0,
+    });
   });
 });
 
@@ -234,6 +251,7 @@ describe("buildArtifact", () => {
       resumed: 1,
       nonResumed: 1,
       excludedMissingFirstToken: 2,
+      excludedWarmPath: 0,
     });
     // The excluded rows' totalMs (9999) must not reach any metric.
     expect(artifact.metrics.resumed.totalMs.p95).toBe(3000);
@@ -255,6 +273,64 @@ describe("buildArtifact", () => {
     expect(artifact.metrics.resumed.firstTokenMs).toEqual({ p50: 1100, p95: 1200 });
     // Two-value distribution [3000, 3100] — NOT [0, 3000, 3100].
     expect(artifact.metrics.resumed.totalMs).toEqual({ p50: 3000, p95: 3100 });
+  });
+
+  // Final round, issue 2: the blessed artifact is the PRE-WARM comparand
+  // KPR-322 P2 binds to. A re-harvest over a window that overlaps KPR-325's
+  // pilot must not blend fast warm turns into the cold baseline.
+  it("excludes warmPath rows from ALL metrics and counts them separately", () => {
+    const samples = [
+      sample({ resumed: true, firstTokenMs: 3000, totalMs: 6000, warmPath: false }),
+      sample({ resumed: true, firstTokenMs: 200, totalMs: 400, warmPath: true }),
+      sample({ resumed: false, firstTokenMs: 3200, totalMs: 6400, warmPath: false }),
+      sample({ resumed: false, firstTokenMs: 250, totalMs: 500, warmPath: true }),
+    ];
+    const { artifact } = buildArtifact(samples, OPTS);
+
+    expect(artifact.samples).toEqual({
+      resumed: 1,
+      nonResumed: 1,
+      excludedMissingFirstToken: 0,
+      excludedWarmPath: 2,
+    });
+    // The fast warm numbers (200/250/400/500) must not appear anywhere.
+    expect(artifact.metrics.resumed.firstTokenMs).toEqual({ p50: 3000, p95: 3000 });
+    expect(artifact.metrics.resumed.totalMs).toEqual({ p50: 6000, p95: 6000 });
+    expect(artifact.metrics.nonResumed.firstTokenMs).toEqual({ p50: 3200, p95: 3200 });
+    expect(artifact.metrics.nonResumed.totalMs).toEqual({ p50: 6400, p95: 6400 });
+  });
+
+  it("records the warm-path contamination caveat in notes", () => {
+    const clean = buildArtifact([...bulk(50, true), ...bulk(20, false)], OPTS);
+    expect(clean.artifact.samples.excludedWarmPath).toBe(0);
+    expect(clean.artifact.notes).toBe("");
+
+    const contaminated = buildArtifact(
+      [...bulk(50, true), ...bulk(20, false), sample({ warmPath: true })],
+      OPTS,
+    );
+    // No sample shortfall (warm rows never counted toward the minimums), but
+    // the caveat still rides in notes.
+    expect(contaminated.shortfall).toBeNull();
+    expect(contaminated.artifact.notes).toContain("WARM-PATH TURNS EXCLUDED: 1");
+  });
+
+  it("counts a warm row missing firstTokenMs as warm, not as missing-firstToken", () => {
+    const { artifact } = buildArtifact(
+      [sample({ resumed: true }), sample({ warmPath: true, firstTokenMs: undefined })],
+      OPTS,
+    );
+    expect(artifact.samples.excludedWarmPath).toBe(1);
+    expect(artifact.samples.excludedMissingFirstToken).toBe(0);
+  });
+
+  it("is unchanged for a pre-KPR-323 cold-only sample set (backward compatible)", () => {
+    const samples = [...bulk(3, true, 1000), sample({ resumed: false, firstTokenMs: 2000 })];
+    const { artifact } = buildArtifact(samples, OPTS);
+    expect(artifact.samples.resumed).toBe(3);
+    expect(artifact.samples.nonResumed).toBe(1);
+    expect(artifact.samples.excludedWarmPath).toBe(0);
+    expect(artifact.metrics.resumed.firstTokenMs.p50).toBe(1000);
   });
 
   it("splits resumed vs nonResumed on the resumed flag", () => {
@@ -287,7 +363,12 @@ describe("buildArtifact", () => {
 
   it("yields zeroed metrics for an empty sample set", () => {
     const { artifact } = buildArtifact([], OPTS);
-    expect(artifact.samples).toEqual({ resumed: 0, nonResumed: 0, excludedMissingFirstToken: 0 });
+    expect(artifact.samples).toEqual({
+      resumed: 0,
+      nonResumed: 0,
+      excludedMissingFirstToken: 0,
+      excludedWarmPath: 0,
+    });
     expect(artifact.metrics.resumed).toEqual({
       firstTokenMs: { p50: 0, p95: 0 },
       totalMs: { p50: 0, p95: 0 },
@@ -396,6 +477,7 @@ describe("artifact schema", () => {
       "resumed",
       "nonResumed",
       "excludedMissingFirstToken",
+      "excludedWarmPath",
     ]);
     expect(Object.keys(artifact.metrics)).toEqual(["resumed", "nonResumed"]);
     expect(Object.keys(artifact.metrics.resumed)).toEqual(["firstTokenMs", "totalMs"]);
@@ -475,6 +557,20 @@ describe("resolveWindow", () => {
     expect(resolveWindow({ days: "-5" }, NOW).ok).toBe(false);
   });
 
+  // Final round, issue 5: parseInt("30abc") === 30, so trailing garbage used
+  // to be silently accepted while a fully non-numeric value errored.
+  it("rejects --days with trailing garbage (no parseInt prefix leniency)", () => {
+    for (const bad of ["30abc", "30.5", "3e2", " 30", "30 ", "+30", "0x1e"]) {
+      const w = resolveWindow({ days: bad }, NOW);
+      expect(w.ok, `expected --days ${JSON.stringify(bad)} to be rejected`).toBe(false);
+      if (w.ok) continue;
+      expect(w.error).toContain("--days is not a number");
+    }
+    // …and a clean integer still works.
+    const good = resolveWindow({ days: "30" }, NOW);
+    expect(good.ok).toBe(true);
+  });
+
   it("rejects a malformed --from", () => {
     const w = resolveWindow({ from: "not-a-date" }, NOW);
     expect(w.ok).toBe(false);
@@ -513,6 +609,18 @@ describe("resolveWindow", () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("--days is not a number");
     expect(r.stderr).not.toContain("RangeError");
+  }, 30_000);
+
+  it("(smoke) the CLI exits 1 on --days 30abc rather than silently harvesting 30", () => {
+    const script = fileURLToPath(new URL("./voice-latency-baseline.ts", import.meta.url));
+    const r = spawnSync(
+      "npx",
+      ["tsx", script, "--log-dir", "/tmp", "--agent", "nobody", "--out", "/tmp/kpr323-baseline-smoke.json", "--days", "30abc"],
+      { encoding: "utf-8" },
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("--days is not a number: 30abc");
+    expect(r.stdout).toBe("");
   }, 30_000);
 });
 

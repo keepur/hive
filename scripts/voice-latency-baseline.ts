@@ -3,9 +3,10 @@
  * KPR-323 C6 / spec §3: blessed read-only first-audio baseline harvester.
  *
  * Reads the instance's engine log files (JSON lines), filters successful
- * "Voice turn complete" rows for one agent within a ≤30-day window, splits
- * by sdkSessionResumeAttempted, and emits the aggregate-only artifact JSON
- * (spec §3.3). Zero behavior change to the engine; no traffic generated;
+ * "Voice turn complete" rows for one agent within a ≤30-day window, DROPS
+ * warm-lease rows (`warmPath: true` — this artifact is the cold comparand),
+ * splits the rest by sdkSessionResumeAttempted, and emits the
+ * aggregate-only artifact JSON (spec §3.3). Zero behavior change to the engine; no traffic generated;
  * no message content or phone numbers read or written — only numeric
  * latency fields, counts, and ISO timestamps.
  *
@@ -41,6 +42,13 @@ export interface VoiceTurnSample {
    */
   totalMs: number | undefined;
   resumed: boolean;
+  /**
+   * KPR-323 C1/C2 stamp on the same log line (`warmPath`). `true` = the turn
+   * ran on a warm lease, i.e. it is NOT a cold-path turn and must never enter
+   * this baseline (final round, issue 2). Absent/false on every pre-KPR-323
+   * row, so old logs parse unchanged.
+   */
+  warmPath: boolean;
 }
 
 /**
@@ -68,6 +76,7 @@ export function parseVoiceTurnLine(line: string, agentId: string): VoiceTurnSamp
     firstTokenMs: typeof entry.firstTokenMs === "number" ? entry.firstTokenMs : undefined,
     totalMs: typeof entry.totalMs === "number" ? entry.totalMs : undefined,
     resumed: entry.sdkSessionResumeAttempted === true,
+    warmPath: entry.warmPath === true,
   };
 }
 
@@ -93,7 +102,19 @@ export interface BaselineArtifact {
   window: { from: string; to: string };
   agentId: string;
   mode: "streaming";
-  samples: { resumed: number; nonResumed: number; excludedMissingFirstToken: number };
+  samples: {
+    resumed: number;
+    nonResumed: number;
+    excludedMissingFirstToken: number;
+    /**
+     * Warm-lease turns seen in the window and excluded from every metric
+     * (final round, issue 2). Recorded in the artifact so a blessed baseline
+     * can never hide the fact that warm traffic was present while it was
+     * harvested — the number KPR-322 P2's latency gate binds to is the
+     * COLD comparand by definition.
+     */
+    excludedWarmPath: number;
+  };
   metrics: {
     resumed: { firstTokenMs: PercentilePair; totalMs: PercentilePair };
     nonResumed: { firstTokenMs: PercentilePair; totalMs: PercentilePair };
@@ -106,11 +127,23 @@ export function buildArtifact(
   windowSamples: VoiceTurnSample[],
   opts: { capturedAt: string; engineVersion: string; gitSha: string; agentId: string; from: string; to: string },
 ): { artifact: BaselineArtifact; shortfall: string | null } {
+  // Warm-lease turns are excluded FIRST (final round, issue 2): spec §3
+  // defines this artifact as the PRE-WARM comparand that KPR-322 P2's
+  // latency gate binds to, and §3.4 contemplates re-baselining later. Once
+  // KPR-325's pilot flips `voice.warmPath.enabled` on for some window, a
+  // re-harvest would otherwise blend fast warm turns into the "cold"
+  // baseline and move an immutable number artificially favorable with
+  // nothing recording the contamination. Excluding first also keeps
+  // `excludedMissingFirstToken` meaning what it says: COLD rows that were
+  // unusable.
+  const excludedWarmPath = windowSamples.filter((s) => s.warmPath).length;
+  const coldSamples = windowSamples.filter((s) => !s.warmPath);
+
   // Spec §3.2: rows without firstTokenMs (degenerate zero-chunk streaming
   // turns — the adapter emits headers + [DONE] only) are excluded from ALL
   // metrics and counted.
-  const excludedMissingFirstToken = windowSamples.filter((s) => s.firstTokenMs === undefined).length;
-  const usable = windowSamples.filter((s) => s.firstTokenMs !== undefined);
+  const excludedMissingFirstToken = coldSamples.filter((s) => s.firstTokenMs === undefined).length;
+  const usable = coldSamples.filter((s) => s.firstTokenMs !== undefined);
   const resumed = usable.filter((s) => s.resumed);
   const nonResumed = usable.filter((s) => !s.resumed);
 
@@ -134,6 +167,17 @@ export function buildArtifact(
       ? `SAMPLE SHORTFALL: ${shortfallParts.join(", ")} — operator decides: bless small-n (recorded) or wait for traffic (spec §3.2)`
       : null;
 
+  // Contamination provenance rides in `notes` too, not just the counter — a
+  // blessed artifact is read by humans, and "some of this window ran warm"
+  // is exactly the caveat a re-baselining operator must see (final round,
+  // issue 2). `shortfall` (the stderr/return channel) stays purely the
+  // sample-minimum signal.
+  const warmNote =
+    excludedWarmPath > 0
+      ? `WARM-PATH TURNS EXCLUDED: ${excludedWarmPath} turn(s) in this window ran on a warm lease and were dropped from all metrics — this window overlaps warm-path traffic, so the remaining cold sample may be unrepresentative (spec §3.4 re-baselining)`
+      : null;
+  const notes = [shortfall, warmNote].filter((n): n is string => n !== null).join(" | ");
+
   return {
     artifact: {
       kind: "voice_latency_baseline",
@@ -149,10 +193,11 @@ export function buildArtifact(
         resumed: resumed.length,
         nonResumed: nonResumed.length,
         excludedMissingFirstToken,
+        excludedWarmPath,
       },
       metrics: { resumed: bucket(resumed), nonResumed: bucket(nonResumed) },
       blessing: { blessedBy: "", blessedAt: "", linearRef: "" },
-      notes: shortfall ?? "",
+      notes,
     },
     shortfall,
   };
@@ -182,10 +227,14 @@ export function resolveWindow(
 
   let days = 30;
   if (args.days !== undefined) {
-    const parsed = parseInt(args.days, 10);
-    if (!Number.isFinite(parsed)) {
+    // Full-string match, not parseInt's prefix parsing (final round, issue
+    // 5): `parseInt("30abc", 10)` returns 30, so `--days 30abc` used to be
+    // silently accepted as 30 while `--days abc` errored — the same
+    // malformed-input class round 1 set out to close.
+    if (!/^\d+$/.test(args.days) || !Number.isSafeInteger(Number(args.days))) {
       return { ok: false, error: `--days is not a number: ${args.days}` };
     }
+    const parsed = Number(args.days);
     if (parsed < 1) {
       return { ok: false, error: `--days must be at least 1: ${args.days}` };
     }
@@ -323,6 +372,13 @@ async function main(): Promise<void> {
     JSON.stringify({ out, samples: artifact.samples, metrics: artifact.metrics }, null, 2) + "\n",
   );
   if (shortfall) process.stderr.write(shortfall + "\n");
+  // Loud on stderr too: a harvest that swallowed warm turns is a re-baseline
+  // caveat the operator must see before blessing (final round, issue 2).
+  if (artifact.samples.excludedWarmPath > 0) {
+    process.stderr.write(
+      `WARM-PATH TURNS EXCLUDED: ${artifact.samples.excludedWarmPath} — window overlaps warm-path traffic (spec §3.4)\n`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

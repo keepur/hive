@@ -2428,8 +2428,14 @@ export class AgentRunner {
     delete options.maxBudgetUsd;
 
     const q = query({ prompt: params.input, options });
-    // Belt-and-braces: runner.abort() (and wasAborted) keep working for a
-    // lease-held runner; the lease's close() calls Query.close() directly.
+    // Bookkeeping parity with send(), NOT a safety net (final round, issue
+    // 4). What actually terminates a warm session is the lease's own close()
+    // → Query.close(). runner.abort() is unreachable on this path: the
+    // manager's openWarmLease builds this runner as a local binding, hands
+    // the Query to the WarmVoiceSession, and never retains the runner — so
+    // nothing external can call .abort()/read .wasAborted on it. The
+    // assignment is kept only so this instance's own state stays consistent
+    // with the cold path's invariants.
     this.activeQuery = q;
     return q;
   }

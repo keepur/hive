@@ -319,7 +319,14 @@ function makeSmsCtx(
   };
 }
 
-/** KPR-322 E2: voice TurnContext helper — same threadId on ctx and WorkItem. */
+/**
+ * KPR-322 E2: voice TurnContext helper — same threadId on ctx and WorkItem.
+ *
+ * `systemPromptOverride` defaults to a non-empty string because the real
+ * voice adapter ALWAYS supplies one (buildVoiceSystemPrompt), and KPR-323's
+ * warm-path gate requires it (final round, issue 1). Pass it explicitly
+ * (including `undefined`) to exercise the eligibility guard.
+ */
 function makeVoiceCtx(
   overrides: Partial<{
     agentId: string;
@@ -328,6 +335,7 @@ function makeVoiceCtx(
     channelId: string;
     text: string;
     workItem: WorkItem;
+    systemPromptOverride: string | undefined;
   }> = {},
 ): TurnContext {
   const agentId = overrides.agentId ?? "agent-a";
@@ -348,6 +356,8 @@ function makeVoiceCtx(
     threadId,
     workItem,
     channel: "voice" as const,
+    systemPromptOverride:
+      "systemPromptOverride" in overrides ? overrides.systemPromptOverride : "voice-system-prompt",
   };
 }
 
@@ -5193,6 +5203,34 @@ describe("AgentManager", () => {
         });
       } finally {
         delete process.env.KIMI_API_KEY;
+      }
+    });
+
+    // Final round, issue 1: the warm lease pins ONE system prompt for the
+    // whole call, and buildQueryEnvelope treats any non-nullish override as
+    // authoritative — so an absent/empty override would open a lease running
+    // with no soul, role, constitution, or toolkit for the entire call
+    // instead of falling back to the real built prompt. Unreachable today
+    // (the voice adapter always sets it), guarded positively so a future
+    // regression degrades to cold rather than silently losing identity.
+    // (For `undefined` the cold path then BUILDS the real prompt; for `""` it
+    // reproduces the pre-KPR-323 behavior unchanged — either way the warm
+    // path never pins an empty prompt for a whole call.)
+    it("(6c) a voice ctx with no systemPromptOverride takes the cold path — never a lease with an empty prompt", async () => {
+      installEchoStreamingRunner();
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "cold no-prompt reply" }));
+
+      for (const override of [undefined, ""]) {
+        mockRunnerOpenStream.mockClear();
+        mockRunnerSend.mockClear();
+        const r = await manager.spawnTurn(
+          makeVoiceCtx({ systemPromptOverride: override, threadId: `voice:call-noprompt-${String(override)}` }),
+        );
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        expect(r.finalMessage).toBe("cold no-prompt reply");
+        expect(r.warmPath).toBeUndefined();
+        expect(warmLeases(manager).size).toBe(0);
       }
     });
 

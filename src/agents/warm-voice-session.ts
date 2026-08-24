@@ -158,11 +158,24 @@ export class WarmVoiceSession {
    * Bind the opened SDK query; arm lifetime + idle timers.
    *
    * Closed-guard (review round 2, issue 1): the manager publishes the lease
-   * into `warmLeases` BEFORE awaiting the session open (CLI boot + MCP
-   * handshake, ~1.5-2s), so anything that closes the lease during that
-   * window — ticket.abort() via stopAgent/stopAll/restartAgent, engine
-   * shutdown, or a second turn hitting notRunnableError() → runWarmTurn's
-   * `lease.close("turn-failure")` — lands while `this.query` is still null.
+   * into `warmLeases` BEFORE awaiting the session open, so anything that
+   * closes the lease during that window — ticket.abort() via
+   * stopAgent/stopAll/restartAgent, engine shutdown, or a second turn hitting
+   * notRunnableError() → runWarmTurn's `lease.close("turn-failure")` — lands
+   * while `this.query` is still null.
+   *
+   * That window is effectively ONE MICROTASK, not the CLI boot (final round,
+   * issue 3): `query()` is synchronous, openVoiceStreamingSession never
+   * awaits the CLI boot or MCP handshake (those surface later, inside turn
+   * 1's consumeOneTurn — hence initToFirstTokenMs carrying them on the first
+   * warm turn), and voice's buildQueryEnvelope has no await at all because
+   * systemPromptOverride short-circuits buildSystemPrompt. So the realistic
+   * closers here are callbacks already scheduled (abort/shutdown), not a
+   * newly-arriving request. Note too that a turn closed as collateral in this
+   * window would, on turn 1 specifically, have no effectiveResume — so the
+   * adapter's outer retry (which requires a resume attempt) would not fire
+   * and the caller sees a hard failure rather than a cold retry. Documented
+   * rather than engineered around, given the width of the window.
    * Without this guard, start() would bind the late-arriving Query to an
    * already-closed lease: close() early-returns on the idempotency guard,
    * armIdleTimer() early-returns on `closed`, the registry entry is already
