@@ -77,7 +77,7 @@
     "@qdrant/js-client-rest": "~1.18.0",
     "@slack/socket-mode": "^2.0.5",
     "@slack/web-api": "^8.0.0",
-    "better-sqlite3": "^12.8.0",
+    "better-sqlite3": "^13.0.3",
     "brave-search-mcp": "^2.0.1",
     "csv-parse": "^7.0.2",
     "dotenv": "^17.3.1",
