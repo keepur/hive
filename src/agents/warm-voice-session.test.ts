@@ -361,6 +361,35 @@ describe("WarmVoiceSession", () => {
     },
   );
 
+  // Review round 2, issue 1: the manager publishes the lease into warmLeases
+  // BEFORE awaiting the session open, so ticket-abort / shutdown / an early
+  // second turn's turn-failure close can all land while `query` is still null.
+  // start() must not bind the late Query to an already-closed lease — nothing
+  // would ever close it (close() and armIdleTimer() both early-return on
+  // `closed`, the registry entry and ticket are already gone), leaving an
+  // orphan CLI subprocess.
+  it("start() on an already-closed lease closes the late Query instead of orphaning it", async () => {
+    vi.useFakeTimers();
+    const { q, close } = makeFakeQuery();
+    const { lease, onClosed } = makeLease();
+
+    lease.close("ticket-abort");
+    expect(onClosed).toHaveBeenCalledTimes(1);
+    expect(close).not.toHaveBeenCalled(); // nothing bound yet
+
+    lease.start(q);
+
+    // The late Query is cleaned up immediately.
+    expect(close).toHaveBeenCalledTimes(1);
+    // No idle/lifetime timer armed, no second close: time passing changes nothing.
+    expect(await advanceCatching(WARM_LIFETIME_CAP_MS + WARM_IDLE_TIMEOUT_MS)).toBeNull();
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(onClosed).toHaveBeenCalledTimes(1);
+    expect(lease.isClosed).toBe(true);
+    // closeReason preserved — start() must not overwrite the real close reason.
+    await expect(lease.runTurn({ text: "late", timeoutMs: 5_000 })).rejects.toThrow(/ticket-abort/);
+  });
+
   it("close() swallows a throwing onClosed and still marks the lease closed", () => {
     const { q } = makeFakeQuery({ closeThrows: true });
     const lease = new WarmVoiceSession({

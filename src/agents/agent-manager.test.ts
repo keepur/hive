@@ -5491,9 +5491,12 @@ describe("AgentManager", () => {
         expect(floated).toEqual([]);
       });
 
-      it("(11c) a SYNCHRONOUSLY throwing interrupt() does not propagate out of abortThread", async () => {
+      it("(11c) a SYNCHRONOUSLY throwing interrupt() does not propagate out of abortThread, and does NOT close the lease", async () => {
         // abortThread is called from an HTTP `close` listener — a synchronous
-        // throw there is an uncaughtException (review round 1, issue 3).
+        // throw there is an uncaughtException (review round 1, issue 3). The
+        // guard is LOG-ONLY (review round 2, issue 2): unlike a REJECTED
+        // interrupt promise (case 11), a synchronous throw is not evidence of a
+        // wedged session, and escalating would end a healthy warm call.
         mockConversationIndex.mockResolvedValue(undefined);
         const { interrupt, close } = installEchoStreamingRunner();
         interrupt.mockImplementationOnce(() => {
@@ -5501,13 +5504,24 @@ describe("AgentManager", () => {
         });
         await manager.spawnTurn(makeVoiceCtx());
 
-        expect(() => manager.abortThread("agent-a", "voice:call-1")).not.toThrow();
+        let dispatched: boolean | undefined;
+        expect(() => {
+          dispatched = manager.abortThread("agent-a", "voice:call-1");
+        }).not.toThrow();
+        expect(dispatched).toBe(true); // it DID dispatch; the throw was downstream
         expect(interrupt).toHaveBeenCalledTimes(1);
-        // Escalated exactly like a REJECTED interrupt: lease closed → cold fallback.
-        expect(close).toHaveBeenCalled();
-        expect(warmLeases(manager).get(WARM_KEY)).toBeUndefined();
+        // Lease survives: no session close, registry entry intact, ticket held.
+        expect(close).not.toHaveBeenCalled();
+        const lease = warmLeases(manager).get(WARM_KEY);
+        expect(lease).toBeDefined();
+        expect(lease!.isClosed).toBe(false);
         await new Promise((r) => setTimeout(r, 10));
-        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0); // lock + budget freed
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1);
+
+        // And the call keeps going warm on the same session.
+        const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: "sess-warm-1" }));
+        expect(r.warmPath).toBe(true);
+        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // no re-open
       });
 
       it("(11b) falls through to the 322 ticket-walk when no lease exists (cold voice spawn)", async () => {

@@ -1277,7 +1277,12 @@ export class AgentManager {
     // fallback. The cost is a narrow window in which runTurn is called on a
     // published-but-unstarted lease; it throws (accurately labelled "not
     // started yet", see WarmVoiceSession.notRunnableError) and the adapter's
-    // outer retry lands cold. Safe degradation, not a wedge.
+    // outer retry lands cold. That degradation is only safe because
+    // WarmVoiceSession.start() carries a closed-guard (review round 2, issue
+    // 1): the throw here reaches runWarmTurn, which closes the lease, and the
+    // Query this open is still awaiting therefore arrives at start() on an
+    // already-closed lease — where the guard closes it instead of orphaning
+    // the CLI subprocess. Same for ticket-abort/shutdown closing mid-open.
     this.warmLeases.set(threadKey, lease);
 
     try {
@@ -1343,8 +1348,14 @@ export class AgentManager {
    * errors) — not a turn-level failure — so the lease stays open. That
    * exemption is enforced at the source, in WarmVoiceSession.consumeOneTurn:
    * a non-success result subtype on an aborted/timed-out turn never becomes
-   * an `error` string, so it also never trips the breaker or fires an
-   * outcome-failure (both of which run BEFORE the close check below). The
+   * an `error` string. Scope of that exemption (review round 2, issue 3 — do
+   * not widen it in either direction): it governs the LEASE-CLOSE decision
+   * below, plus `TurnResult.errors` and the outcome-failure path in
+   * finalizeSpawnResult. It does NOT govern breaker classification —
+   * classifyTurnResult keys on `aborted`/`timedOut` BEFORE it looks at
+   * `error`, so a barge-in is classified `aborted` and a timeout is
+   * classified `fault:timeout` either way. That is correct per spec §6 (the
+   * breaker must still see a timeout as failure-class); leave it alone. The
    * two remaining error sources — the output stream ending before the turn's
    * result, and a throw out of the demux — are genuine session deaths and DO
    * close the lease even on an interrupted turn.
@@ -2296,26 +2307,29 @@ export class AgentManager {
     // interrupt-on-idle is SDK-unspecified — W2 in-run check (§7).
     const lease = this.warmLeases.get(threadKey);
     if (lease && !lease.isClosed) {
+      // Throw-safety only (review round 1 B2, narrowed in round 2): abortThread
+      // is called from an HTTP `close` listener, where a SYNCHRONOUS throw is an
+      // uncaughtException. `Query.interrupt()` is declared `async` in the SDK, so
+      // it cannot throw synchronously; this guard is defense-in-depth against a
+      // future non-async surface or a throw inside requestInterrupt's own
+      // bookkeeping. It is deliberately LOG-ONLY — it does NOT escalate to
+      // lease.close(). A REJECTED interrupt promise is evidence of a wedged
+      // session and is escalated where that evidence exists (inside
+      // WarmVoiceSession.requestInterrupt); a synchronous throw here is not, and
+      // closing on it would end a healthy warm call. The success log lives
+      // OUTSIDE the try for the same reason — a dead-fd logger fault is not a
+      // session fault.
       try {
         lease.requestInterrupt("abort-thread");
-        log.info("Warm voice lease interrupted for thread", { agentId, threadId });
       } catch (err) {
-        // Same throw-safety contract as the ticket walk below (review round 1
-        // B2): abortThread is called from an HTTP `close` listener, where a
-        // SYNCHRONOUS throw is an uncaughtException. requestInterrupt guards
-        // the interrupt() PROMISE, but a synchronous throw out of
-        // Query.interrupt() itself (or out of the log line) would escape.
-        log.warn("lease.requestInterrupt() threw during abortThread — closing lease (cold fallback)", {
+        log.warn("lease.requestInterrupt() threw during abortThread — lease left open", {
           agentId,
           threadId,
           error: String(err),
         });
-        // Same failure class as a REJECTED interrupt (warm-voice-session.ts):
-        // the interrupt did not happen, so the session may be wedged; closing
-        // converts it into the standard cold-fallback path (§6). close() is
-        // no-throw by contract, so the guard above still holds.
-        lease.close("interrupt-threw:abort-thread");
+        return true;
       }
+      log.info("Warm voice lease interrupted for thread", { agentId, threadId });
       return true;
     }
     // --- 322 Task 3 body from here, unchanged ---

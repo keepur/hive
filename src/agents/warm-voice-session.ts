@@ -152,8 +152,39 @@ export class WarmVoiceSession {
     return this.turnInFlight;
   }
 
-  /** Bind the opened SDK query; arm lifetime + idle timers. */
+  /**
+   * Bind the opened SDK query; arm lifetime + idle timers.
+   *
+   * Closed-guard (review round 2, issue 1): the manager publishes the lease
+   * into `warmLeases` BEFORE awaiting the session open (CLI boot + MCP
+   * handshake, ~1.5-2s), so anything that closes the lease during that
+   * window — ticket.abort() via stopAgent/stopAll/restartAgent, engine
+   * shutdown, or a second turn hitting notRunnableError() → runWarmTurn's
+   * `lease.close("turn-failure")` — lands while `this.query` is still null.
+   * Without this guard, start() would bind the late-arriving Query to an
+   * already-closed lease: close() early-returns on the idempotency guard,
+   * armIdleTimer() early-returns on `closed`, the registry entry is already
+   * deleted and the ticket already released — the CLI subprocess would run
+   * forever with no reachable close path (W-leak drill: orphan `claude`
+   * processes). Instead, close the Query immediately and leave the lease's
+   * state — including closeReason — exactly as the real close left it.
+   */
   start(query: Query): void {
+    if (this.closed) {
+      safeLog("warn", "Warm voice lease closed during session open — closing the late Query", {
+        ...this.logCtx(),
+        reason: this.closeReason ?? "unknown",
+      });
+      try {
+        query.close();
+      } catch (err) {
+        safeLog("warn", "late query close threw during start() on a closed lease", {
+          ...this.logCtx(),
+          error: String(err),
+        });
+      }
+      return;
+    }
     this.query = query;
     this.lifetimeTimer = setTimeout(() => {
       // Bare-timer throw-safety (spec §4.2).
