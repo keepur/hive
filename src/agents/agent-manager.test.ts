@@ -67,6 +67,10 @@ vi.mock("../config.js", () => ({
     instance: { id: "test-instance" },
     modelRouter: { enabled: false },
     memory: { reflectionMinTurns: 3 },
+    // KPR-323 C2: warm voice lease master switch. Default OFF here so every
+    // pre-existing voice case keeps running the cold path unchanged; the warm
+    // describe flips it per-block.
+    voice: { warmPath: { enabled: false } },
   },
 }));
 
@@ -104,10 +108,15 @@ vi.mock("../files/file-processor.js", () => ({
 const mockRunnerSend = vi.fn();
 const mockRunnerAbort = vi.fn();
 const mockRunnerToolInventory = vi.fn().mockReturnValue([]);
+// KPR-323: streaming-session mock on the AgentRunner mock object. Installed
+// per-test by installEchoStreamingRunner(); untouched by cold-path cases.
+const mockRunnerOpenStream = vi.fn();
 vi.mock("./agent-runner.js", () => ({
   AgentRunner: vi.fn().mockImplementation(function () {
     return {
     send: mockRunnerSend,
+    // KPR-323 C2: the warm lease's session opener.
+    openVoiceStreamingSession: mockRunnerOpenStream,
     abort: mockRunnerAbort,
     wasAborted: false,
     buildToolTransportInventory: mockRunnerToolInventory,
@@ -206,6 +215,7 @@ import { buildGenericDelegatePrompt, type DelegateTurnRunner } from "./provider-
 import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
 import { classifyTurnResult, TurnAssemblyError } from "./provider-adapters/error-classification.js";
 import { resolveOAuthFileToken } from "./provider-adapters/grok-oauth.js";
+import { AsyncPushQueue, WARM_IDLE_TIMEOUT_MS, type WarmVoiceSession } from "./warm-voice-session.js";
 
 const mockResolveOAuthFileToken = vi.mocked(resolveOAuthFileToken);
 
@@ -309,7 +319,14 @@ function makeSmsCtx(
   };
 }
 
-/** KPR-322 E2: voice TurnContext helper — same threadId on ctx and WorkItem. */
+/**
+ * KPR-322 E2: voice TurnContext helper — same threadId on ctx and WorkItem.
+ *
+ * `systemPromptOverride` defaults to a non-empty string because the real
+ * voice adapter ALWAYS supplies one (buildVoiceSystemPrompt), and KPR-323's
+ * warm-path gate requires it (final round, issue 1). Pass it explicitly
+ * (including `undefined`) to exercise the eligibility guard.
+ */
 function makeVoiceCtx(
   overrides: Partial<{
     agentId: string;
@@ -318,6 +335,7 @@ function makeVoiceCtx(
     channelId: string;
     text: string;
     workItem: WorkItem;
+    systemPromptOverride: string | undefined;
   }> = {},
 ): TurnContext {
   const agentId = overrides.agentId ?? "agent-a";
@@ -338,6 +356,8 @@ function makeVoiceCtx(
     threadId,
     workItem,
     channel: "voice" as const,
+    systemPromptOverride:
+      "systemPromptOverride" in overrides ? overrides.systemPromptOverride : "voice-system-prompt",
   };
 }
 
@@ -659,6 +679,48 @@ describe("AgentManager", () => {
       expect(mockRunnerAbort).toHaveBeenCalledTimes(1);
       release(makeRunResult());
       await inflight;
+    });
+  });
+
+  describe("spawnTurn C1 stageTimings (KPR-323)", () => {
+    it("populates stageTimings for a voice ctx", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const result = await manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      expect(result.stageTimings).toBeDefined();
+      expect(result.stageTimings!.lockWaitMs).toBeGreaterThanOrEqual(0);
+      expect(result.stageTimings!.spawnPrepMs).toBeGreaterThanOrEqual(0);
+    });
+
+    // The two runner-produced halves of C1 are the numbers Task 11's
+    // falsification gate reads. `>= 0` on an elapsed-time field passes for
+    // ANY value, so assert the EXACT values the runner reported survive the
+    // RunResult → TurnResult.stageTimings mapping — deleting either line in
+    // agent-manager's mapping must fail here.
+    it("carries the runner's bootToInitMs / initToFirstTokenMs through verbatim", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({ bootToInitMs: 741, initToFirstTokenMs: 1263 }),
+      );
+      const result = await manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      expect(result.stageTimings).toMatchObject({
+        bootToInitMs: 741,
+        initToFirstTokenMs: 1263,
+      });
+    });
+
+    // The inverse: a runner that reports neither (non-streaming turn) must
+    // not synthesize zeros — an absent measurement stays absent.
+    it("leaves the runner-produced halves undefined when the runner reported none", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const result = await manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      expect(result.stageTimings!.bootToInitMs).toBeUndefined();
+      expect(result.stageTimings!.initToFirstTokenMs).toBeUndefined();
+    });
+
+    it("leaves stageTimings undefined for an SMS ctx", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      const result = await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
+      expect(result.stageTimings).toBeUndefined();
     });
   });
 
@@ -4932,6 +4994,749 @@ describe("AgentManager", () => {
       resolveNested(makeRunResult({ text: "x" }));
       await p;
       expect(activeSlots("gp")).toBe(0); // released in finally
+    });
+  });
+
+  // ==========================================================================
+  // KPR-323 C2 — warm voice lease integration against the REAL spawn
+  // coordinator. Additive block: every assertion below exercises the new
+  // branch in spawnTurn; the flag-off case pins that the cold path is
+  // untouched. Testing-Contract integration assertions 1–9, 12–16, 18, plus
+  // 10–11 (Task 6 / abortThread) and 17 (Task 7 / observability).
+  // ==========================================================================
+  describe("warm voice lease (KPR-323)", () => {
+    const WARM_KEY = "agent-a:voice:call-1";
+
+    function warmLeases(m: AgentManager): Map<string, WarmVoiceSession> {
+      return (m as unknown as { warmLeases: Map<string, WarmVoiceSession> }).warmLeases;
+    }
+
+    /**
+     * Fake streaming Query driven by an AsyncPushQueue: answers each pushed
+     * message with `deltas + result` (init emitted once, before turn 1).
+     *
+     * hangOnTurn (plan review r1 adv. 2): withhold that turn's `result` until
+     * releaseHang() or interrupt() fires — gives the circuit-open and
+     * timed-out cases a real in-flight turn without ad-hoc harness invention.
+     */
+    function installEchoStreamingRunner(
+      opts: { failOnTurn?: number; hangOnTurn?: number; hangResultSubtype?: string } = {},
+    ) {
+      let releaseHang: () => void = () => {};
+      const hangReleased = new Promise<void>((r) => {
+        releaseHang = r;
+      });
+      const interrupt = vi.fn(() => {
+        releaseHang(); // an interrupt releases the withheld result
+        return Promise.resolve();
+      });
+      const close = vi.fn();
+      const pushed: string[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockRunnerOpenStream.mockImplementation(async ({ input }: { input: AsyncIterable<any> }) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const out = new AsyncPushQueue<any>();
+        const it = out[Symbol.asyncIterator]();
+        void (async () => {
+          out.push({ type: "system", subtype: "init", session_id: "sess-warm-0" });
+          let n = 0;
+          for await (const m of input) {
+            n++;
+            pushed.push(String(m.message?.content ?? ""));
+            if (opts.failOnTurn === n) {
+              out.push({ type: "result", subtype: "error_during_execution", errors: ["boom"], session_id: `sess-warm-${n}`, total_cost_usd: 0, duration_ms: 1 });
+              continue;
+            }
+            out.push({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: `reply-${n} ` } } });
+            if (opts.hangOnTurn === n) {
+              await hangReleased;
+              if (opts.hangResultSubtype) {
+                // The severed generation encoded as a NON-success subtype —
+                // the SDK encoding the §6 precedence rule has to survive.
+                out.push({ type: "result", subtype: opts.hangResultSubtype, errors: ["severed"], session_id: `sess-warm-${n}`, total_cost_usd: 0, duration_ms: 1 });
+                continue;
+              }
+            }
+            out.push({ type: "result", subtype: "success", result: `reply-${n}`, session_id: `sess-warm-${n}`, total_cost_usd: 0.01, duration_ms: 10, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
+          }
+          out.end();
+        })();
+        return {
+          next: () => it.next(),
+          interrupt,
+          close: close.mockImplementation(() => out.end()),
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        };
+      });
+      return { interrupt, close, pushed, releaseHang };
+    }
+
+    beforeEach(() => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appConfig as any).voice = { warmPath: { enabled: true } };
+    });
+
+    afterEach(() => {
+      // Release any lease still open so a test never leaves a pending
+      // coordinator lambda (and its lock/budget) behind for the next one.
+      for (const lease of [...warmLeases(manager).values()]) lease.close("test-cleanup");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appConfig as any).voice = { warmPath: { enabled: false } };
+    });
+
+    // ---- assertion 1 -----------------------------------------------------
+    it("(1) flag OFF: voice ctx takes the cold path exactly — no stream open, no lease, no ticket held", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appConfig as any).voice = { warmPath: { enabled: false } };
+      installEchoStreamingRunner();
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "cold reply", sessionId: "cold-1" }));
+
+      const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: "stored-abc" }));
+
+      expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      expect(r.finalMessage).toBe("cold reply");
+      expect(r.warmPath).toBeUndefined();
+      expect(r.warmTurnSeq).toBeUndefined();
+      // Cold C1 decomposition still present (pre-323 voice shape, Task 2).
+      expect(r.stageTimings).toBeDefined();
+      expect(r.stageTimings!.lockWaitMs).toBeGreaterThanOrEqual(0);
+      expect(warmLeases(manager).size).toBe(0);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+    });
+
+    // ---- assertions 2, 3, 4 ---------------------------------------------
+    it("(2,3,4) opens a lease on turn 1, holds the ticket across turns, resumes exactly ctx.sessionId, persists per turn", async () => {
+      const { pushed } = installEchoStreamingRunner();
+      const runnersBefore = vi.mocked(AgentRunner).mock.calls.length;
+
+      const r1 = await manager.spawnTurn(makeVoiceCtx({ sessionId: "stored-abc" }));
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+      expect(mockRunnerOpenStream.mock.calls[0]![0].sessionId).toBe("stored-abc"); // §4.2: exactly as passed
+      expect(r1.finalMessage).toBe("reply-1");
+      expect(r1.warmPath).toBe(true);
+      expect(r1.warmTurnSeq).toBe(1);
+      expect(r1.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, initToFirstTokenMs: expect.any(Number) });
+      // Ticket outlives the turn — the lease holds lock + one budget slot.
+      const snap1 = manager.getSnapshot().perAgent["agent-a"]!;
+      expect(snap1.activeSpawns).toBe(1);
+      expect(snap1.activeThreadKeys).toEqual([WARM_KEY]);
+
+      const r2 = await manager.spawnTurn(makeVoiceCtx({ sessionId: "sess-warm-1" }));
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // no re-open
+      expect(mockRunnerSend).not.toHaveBeenCalled(); // never the cold path
+      expect(vi.mocked(AgentRunner).mock.calls.length).toBe(runnersBefore + 1); // runner built once
+      expect(r2.finalMessage).toBe("reply-2");
+      expect(r2.warmPath).toBe(true);
+      expect(r2.warmTurnSeq).toBe(2);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // still ONE ticket
+      expect(pushed).toEqual(["hello over voice", "hello over voice"]); // one push per turn, in order
+
+      // Per-turn session persistence (rotation-safe cold fallback). The
+      // COUNT is load-bearing (review round 4, issue 8): two turns must
+      // produce exactly two writes — a lease that persisted only at open,
+      // or persisted twice per turn, would still satisfy the two
+      // toHaveBeenCalledWith assertions below.
+      expect(sessionStore.set).toHaveBeenCalledTimes(2);
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", "voice:call-1", "sess-warm-1", "claude", expect.anything());
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", "voice:call-1", "sess-warm-2", "claude", expect.anything());
+    });
+
+    it("(2b) a first-turn ctx with no stored session opens with resume undefined — never a store re-read", async () => {
+      installEchoStreamingRunner();
+      // Seed the store with a row the lease must NOT pick up: the resume
+      // source is ctx.sessionId alone (§4.2 resume-source rule).
+      sessionStore._sessions.set("agent-a:voice:call-1", { sessionId: "store-only", provider: "claude" });
+
+      await manager.spawnTurn(makeVoiceCtx({ sessionId: undefined }));
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+      expect(mockRunnerOpenStream.mock.calls[0]![0].sessionId).toBeUndefined();
+    });
+
+    // ---- assertion 5 -----------------------------------------------------
+    it("(5) a reflection-kind voice ctx never opens or reuses a lease", async () => {
+      installEchoStreamingRunner();
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "reflected" }));
+
+      // No lease at all.
+      const cold = await manager.spawnTurn({ ...makeVoiceCtx(), kind: "reflection" });
+      expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+      expect(cold.warmPath).toBeUndefined();
+
+      // A lease is OPEN (on the call thread) — a reflection ctx still runs
+      // cold and does not open or reuse a lease of its own.
+      //
+      // Scope note (review round 4, issue 8): the reflection ctx below is
+      // routed to a DIFFERENT thread than the open lease, so what this pins
+      // is "reflection never opens a lease while a lease exists", not
+      // "reflection reuses nothing on the leased thread". The same-thread
+      // variant is not constructible here by design: reflection is gated OFF
+      // the warm path, so it falls to withSpawnTicket and would block on the
+      // per-thread lock the lease holds for the call's duration — the test
+      // would hang rather than assert. The same-thread guarantee is the
+      // lock's, not the gate's.
+      await manager.spawnTurn(makeVoiceCtx());
+      expect(warmLeases(manager).get(WARM_KEY)).toBeDefined();
+      const sendsBefore = mockRunnerSend.mock.calls.length;
+      const cold2 = await manager.spawnTurn({ ...makeVoiceCtx({ threadId: "voice:call-other" }), kind: "reflection" });
+      expect(cold2.warmPath).toBeUndefined();
+      expect(mockRunnerSend.mock.calls.length).toBe(sendsBefore + 1);
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // only the real turn's lease
+    });
+
+    // ---- assertion 6 -----------------------------------------------------
+    it("(6) a non-claude agent takes the cold path (pilot adapters have no lease machinery)", async () => {
+      registry._agents.set(
+        "voice-oai",
+        makeAgentConfig({ id: "voice-oai", name: "VoiceOAI", model: "openai/gpt-5.4-mini", coreServers: [] }),
+      );
+      installEchoStreamingRunner();
+
+      const r = await manager.spawnTurn(makeVoiceCtx({ agentId: "voice-oai", threadId: "voice:call-oai" }));
+      expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+      expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+      expect(r.warmPath).toBeUndefined();
+      expect(warmLeases(manager).size).toBe(0);
+    });
+
+    it("(6b) a Lane A agent takes the cold path too — the gate is claude-ROUTE, not claude-adapter", async () => {
+      // Review round 4, issue 6: Lane A (kimi/deepseek/grok) runs the FULL
+      // ClaudeAgentAdapter/AgentRunner, so unlike Lane B it *has* the stream
+      // machinery. It is excluded because openWarmLease's runner is built
+      // without the passthrough options resolved below — a warm Lane A turn
+      // would silently hit Anthropic with the wrong model. Pin the exclusion
+      // so wiring it later is a deliberate act, not an accident.
+      process.env.KIMI_API_KEY = "test-kimi-key";
+      registry._agents.set(
+        "voice-kimi",
+        makeAgentConfig({ id: "voice-kimi", name: "VoiceKimi", model: "kimi/kimi-k3", coreServers: [] }),
+      );
+      installEchoStreamingRunner();
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "cold kimi reply" }));
+      try {
+        const r = await manager.spawnTurn(makeVoiceCtx({ agentId: "voice-kimi", threadId: "voice:call-kimi" }));
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        expect(r.finalMessage).toBe("cold kimi reply");
+        expect(r.warmPath).toBeUndefined();
+        expect(warmLeases(manager).size).toBe(0);
+        // The very thing the warm path does not thread through.
+        expect(vi.mocked(AgentRunner).mock.calls.at(-1)![10]).toEqual({
+          laneAPassthrough: expect.objectContaining({ provider: "kimi", model: "kimi-k3" }),
+        });
+      } finally {
+        delete process.env.KIMI_API_KEY;
+      }
+    });
+
+    // Final round, issue 1: the warm lease pins ONE system prompt for the
+    // whole call, and buildQueryEnvelope treats any non-nullish override as
+    // authoritative — so an absent/empty override would open a lease running
+    // with no soul, role, constitution, or toolkit for the entire call
+    // instead of falling back to the real built prompt. Unreachable today
+    // (the voice adapter always sets it), guarded positively so a future
+    // regression degrades to cold rather than silently losing identity.
+    // (For `undefined` the cold path then BUILDS the real prompt; for `""` it
+    // reproduces the pre-KPR-323 behavior unchanged — either way the warm
+    // path never pins an empty prompt for a whole call.)
+    it("(6c) a voice ctx with no systemPromptOverride takes the cold path — never a lease with an empty prompt", async () => {
+      installEchoStreamingRunner();
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "cold no-prompt reply" }));
+
+      for (const override of [undefined, ""]) {
+        mockRunnerOpenStream.mockClear();
+        mockRunnerSend.mockClear();
+        const r = await manager.spawnTurn(
+          makeVoiceCtx({ systemPromptOverride: override, threadId: `voice:call-noprompt-${String(override)}` }),
+        );
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        expect(r.finalMessage).toBe("cold no-prompt reply");
+        expect(r.warmPath).toBeUndefined();
+        expect(warmLeases(manager).size).toBe(0);
+      }
+    });
+
+    // ---- assertion 7 -----------------------------------------------------
+    it("(7) budget saturation at open rejects with the existing message; no lease registered, no stream opened", async () => {
+      installEchoStreamingRunner();
+      // agent-a's fixture budget is maxConcurrent: 2 — park both slots on
+      // OTHER threads so the voice open loses on budget, not on the lock.
+      const releasers: Array<() => void> = [];
+      mockRunnerSend.mockImplementation(
+        () => new Promise((resolve) => { releasers.push(() => resolve(makeRunResult())); }),
+      );
+      const inflight = [0, 1].map((i) => manager.spawnTurn(makeSmsCtx({ threadId: `sms:line-1:warm-budget-${i}` })));
+      await new Promise((r) => setTimeout(r, 30));
+
+      // No-unhandled-rejection guard (review round 4, issue 8 — mirrors case
+      // 11): the denied open must not leave the lease's own coordinator
+      // promise floating.
+      const floated: unknown[] = [];
+      const onRej = (r: unknown) => floated.push(r);
+      process.on("unhandledRejection", onRej);
+      try {
+        await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toThrow(/Spawn budget exceeded for agent-a \(2\/2\)/);
+        expect(warmLeases(manager).size).toBe(0);
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+
+        releasers.forEach((r) => r());
+        await Promise.all(inflight);
+        await new Promise((r) => setTimeout(r, 10));
+      } finally {
+        process.off("unhandledRejection", onRej);
+      }
+      expect(floated).toEqual([]);
+    });
+
+    // ---- assertion 8 -----------------------------------------------------
+    it("(8) a stopped agent surfaces AgentStoppedError at open; no lease registered", async () => {
+      installEchoStreamingRunner();
+      manager.stopAgent("agent-a");
+
+      await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toThrow(/stopped/i);
+      expect(warmLeases(manager).size).toBe(0);
+      expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+      manager.restartAgent("agent-a");
+    });
+
+    // ---- assertion 9 -----------------------------------------------------
+    it("(9) stopAgent mid-call closes the lease through the ticket walk and frees lock + budget", async () => {
+      const { close } = installEchoStreamingRunner({ hangOnTurn: 2 });
+      await manager.spawnTurn(makeVoiceCtx());
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1);
+
+      const turn2 = manager.spawnTurn(makeVoiceCtx()); // hangs mid-generation
+      await new Promise((r) => setTimeout(r, 10));
+
+      manager.stopAgent("agent-a"); // ticket.abort() → lease.close("ticket-abort")
+      expect(close).toHaveBeenCalled();
+      expect(warmLeases(manager).size).toBe(0);
+
+      // Stop means stop: the in-flight turn does not come back healthy.
+      const r2 = await turn2;
+      expect(r2.errors.length).toBeGreaterThan(0);
+
+      await new Promise((r) => setTimeout(r, 10));
+      const snap = manager.getSnapshot().perAgent["agent-a"]!;
+      expect(snap.activeSpawns).toBe(0);
+      expect(snap.activeThreadKeys).toEqual([]);
+      manager.restartAgent("agent-a");
+    });
+
+    // ---- assertion 12 ----------------------------------------------------
+    it("(12) a turn-level failure closes the lease BEFORE returning; the retry-shaped ctx opens a FRESH lease", async () => {
+      installEchoStreamingRunner({ failOnTurn: 1 });
+
+      const r1 = await manager.spawnTurn(makeVoiceCtx({ sessionId: "stored-abc" }));
+      expect(r1.errors).toEqual(["boom"]);
+      expect(r1.warmPath).toBe(true);
+      // Already closed at the moment spawnTurn resolves (registry entry gone).
+      expect(warmLeases(manager).get(WARM_KEY)).toBeUndefined();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0); // lock + budget freed
+
+      // The adapter's outer retry: sessionId stripped, full transcript text.
+      await manager.spawnTurn(makeVoiceCtx({ sessionId: undefined, text: "full transcript" }));
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(2);
+      expect(mockRunnerOpenStream.mock.calls[1]![0].sessionId).toBeUndefined(); // never the escaped session
+    });
+
+    // ---- the open-failure path (spec §5) ---------------------------------
+    // The one failure mode in this ticket with NO timer backstop:
+    // `lease.start()` is never reached, so neither the idle timer nor the
+    // lifetime timer is armed. The explicit `lease.close("open-failed")` in
+    // openWarmLease's catch is the ONLY thing that frees the per-thread
+    // lock, the budget slot, and the registry entry at THIS turn. Losing it
+    // does not deadlock forever — a subsequent WARM-eligible turn on the
+    // same thread finds the published-but-unstarted lease, `runTurn` throws
+    // `notRunnableError`, and `runWarmTurn`'s catch closes it as
+    // "turn-failure" (a one-extra-failed-exchange self-heal). A cold-shaped
+    // or reflection turn, which acquires the lock via `withSpawnTicket`
+    // directly rather than through the lease, has no such self-heal and
+    // would hang on the still-held lock — that is the real permanent-leak
+    // exposure this test guards.
+    it("(12b) a failed session open closes the published lease — no lock/budget/registry leak; the error propagates", async () => {
+      installEchoStreamingRunner();
+      let atThrow: Record<string, boolean> | undefined;
+      mockRunnerOpenStream.mockImplementationOnce(() => {
+        // Snapshot the lease at the instant the open fails. It is already
+        // published (openWarmLease sets the registry entry BEFORE the try)
+        // and carries no timers — i.e. genuinely unreclaimable by anything
+        // other than the catch below it.
+        const l = warmLeases(manager).get(WARM_KEY);
+        const priv = l as unknown as { idleTimer: unknown; lifetimeTimer: unknown } | undefined;
+        atThrow = {
+          published: l !== undefined,
+          closed: l?.isClosed ?? true,
+          idleArmed: priv?.idleTimer != null,
+          lifetimeArmed: priv?.lifetimeTimer != null,
+        };
+        return Promise.reject(new Error("CLI boot failed"));
+      });
+
+      await expect(manager.spawnTurn(makeVoiceCtx({ sessionId: "stored-abc" }))).rejects.toThrow(
+        "CLI boot failed",
+      );
+
+      // Precondition of everything below: the lease really was live and
+      // timer-less at throw time, so no backstop could have reclaimed it.
+      expect(atThrow).toEqual({
+        published: true,
+        closed: false,
+        idleArmed: false,
+        lifetimeArmed: false,
+      });
+
+      // Registry entry gone the moment spawnTurn rejects.
+      expect(warmLeases(manager).size).toBe(0);
+      await new Promise((r) => setTimeout(r, 10));
+      const snap = manager.getSnapshot().perAgent["agent-a"]!;
+      expect(snap.activeSpawns).toBe(0); // budget slot released
+      expect(snap.activeThreadKeys).toEqual([]); // per-thread lock released
+      expect(snap.warmVoiceSessions).toBe(0);
+
+      // The thread is not poisoned: the adapter's outer retry (cold-shaped
+      // ctx) acquires the lock, opens a FRESH lease, and runs.
+      const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: undefined, text: "full transcript" }));
+      expect(r.warmPath).toBe(true);
+      expect(r.warmTurnSeq).toBe(1);
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(2);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1);
+    });
+
+    // ---- assertion 13 ----------------------------------------------------
+    it("(13) circuit-open on a warm turn fast-fails pre-push and LEAVES THE LEASE OPEN; recovery is warm", async () => {
+      let t = 0;
+      (manager as unknown as { circuitBreakers: ProviderCircuitBreakerRegistry }).circuitBreakers =
+        new ProviderCircuitBreakerRegistry(undefined, () => t);
+      const { pushed } = installEchoStreamingRunner();
+
+      await manager.spawnTurn(makeVoiceCtx()); // turn 1 establishes the lease
+      expect(pushed.length).toBe(1);
+
+      // Trip the shared claude breaker from a cold thread on ANOTHER agent.
+      const CONNECT_FAIL = "TypeError: fetch failed: connect ECONNREFUSED 127.0.0.1:443";
+      for (let i = 0; i < 3; i++) {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: CONNECT_FAIL }));
+        await manager.spawnTurn(makeSmsCtx({ agentId: "agent-b", threadId: `sms:line-1:warm-trip-${i}` }));
+      }
+      expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("open");
+
+      await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+      expect(pushed.length).toBe(1); // nothing pushed — the message never reached the session
+      const lease = warmLeases(manager).get(WARM_KEY);
+      expect(lease).toBeDefined();
+      expect(lease!.isClosed).toBe(false); // §6: circuit-open does NOT close the lease
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // ticket still held
+
+      // Past cooldown: the next real turn is the half-open probe — and it runs WARM.
+      t += 15_000;
+      const r = await manager.spawnTurn(makeVoiceCtx());
+      expect(r.finalMessage).toBe("reply-2");
+      expect(r.warmTurnSeq).toBe(2);
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // no re-open — same session
+      expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
+    });
+
+    // ---- assertion 14 ----------------------------------------------------
+    it("(14) a timed-out turn is NOT a turn-level failure — the lease stays open and the next turn runs warm", async () => {
+      registry._agents.get("agent-a")!.timeoutMs = 25;
+      const { interrupt, pushed } = installEchoStreamingRunner({ hangOnTurn: 2 });
+
+      await manager.spawnTurn(makeVoiceCtx());
+      const r2 = await manager.spawnTurn(makeVoiceCtx()); // watchdog fires → interrupt → result
+      expect(interrupt).toHaveBeenCalled();
+      expect(r2.timedOut).toBe(true);
+      expect(r2.errors).toEqual([]); // KPR-307 semantics: no error string
+      const lease = warmLeases(manager).get(WARM_KEY);
+      expect(lease).toBeDefined();
+      expect(lease!.isClosed).toBe(false);
+
+      const r3 = await manager.spawnTurn(makeVoiceCtx());
+      expect(r3.finalMessage).toBe("reply-3");
+      expect(r3.warmTurnSeq).toBe(3);
+      expect(pushed.length).toBe(3);
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+    });
+
+    // ---- assertion 14b (review round 1, issue 2) -------------------------
+    // The §6 precedence rule has to hold for the SDK encoding a severed
+    // generation as a NON-success result subtype — otherwise EVERY timed-out
+    // turn would close the lease and permanently degrade the call to cold.
+    it("(14b) a timed-out turn whose result carries a NON-SUCCESS subtype still does NOT close the lease", async () => {
+      registry._agents.get("agent-a")!.timeoutMs = 25;
+      const { interrupt, pushed } = installEchoStreamingRunner({
+        hangOnTurn: 2,
+        hangResultSubtype: "error_during_execution",
+      });
+
+      await manager.spawnTurn(makeVoiceCtx());
+      const r2 = await manager.spawnTurn(makeVoiceCtx()); // watchdog → interrupt → error-subtype result
+      expect(interrupt).toHaveBeenCalled();
+      // Headline regression: the lease must survive. (Asserted BEFORE the
+      // errors check so a revert of the fix fails on lease-close, not on the
+      // error string it is caused by.)
+      const lease = warmLeases(manager).get(WARM_KEY);
+      expect(lease).toBeDefined();
+      expect(lease!.isClosed).toBe(false);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // ticket still held
+      expect(r2.timedOut).toBe(true);
+      expect(r2.errors).toEqual([]); // §6: aborted-but-spoken, not a turn failure
+
+      // Next turn is still WARM on the same session — no re-open, no cold fallback.
+      const r3 = await manager.spawnTurn(makeVoiceCtx());
+      expect(r3.finalMessage).toBe("reply-3");
+      expect(r3.warmPath).toBe(true);
+      expect(r3.warmTurnSeq).toBe(3);
+      expect(pushed.length).toBe(3);
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+    });
+
+    // ---- assertion 14c (review round 1, issue 2) -------------------------
+    it("(14c) a barge-in-interrupted turn whose result carries a NON-SUCCESS subtype still does NOT close the lease", async () => {
+      const { interrupt, close, pushed } = installEchoStreamingRunner({
+        hangOnTurn: 2,
+        hangResultSubtype: "error_during_execution",
+      });
+
+      await manager.spawnTurn(makeVoiceCtx());
+      const turn2 = manager.spawnTurn(makeVoiceCtx()); // hangs until interrupted
+      await vi.waitFor(() => expect(pushed.length).toBe(2));
+
+      expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+      expect(interrupt).toHaveBeenCalledTimes(1);
+      expect(close).not.toHaveBeenCalled(); // turn-level severing, not session-level
+
+      const r2 = await turn2;
+      // Headline regression first (see 14b).
+      const lease = warmLeases(manager).get(WARM_KEY);
+      expect(lease).toBeDefined();
+      expect(lease!.isClosed).toBe(false);
+      expect(r2.aborted).toBe(true);
+      expect(r2.errors).toEqual([]); // §6: no turn-level failure
+
+      const r3 = await manager.spawnTurn(makeVoiceCtx());
+      expect(r3.warmPath).toBe(true);
+      expect(r3.warmTurnSeq).toBe(3);
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // never re-opened
+    });
+
+    // ---- assertions 15, 16 ----------------------------------------------
+    it("(15,16) exactly ONE reflection per call, credited with the call's turn count; none scheduled between warm turns", async () => {
+      const fastManager = new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { reflectionDebounceMs: 25 },
+      );
+      installEchoStreamingRunner();
+      mockRunnerSend.mockResolvedValue(makeRunResult({ text: "reflected" }));
+      const isReflection = () =>
+        mockRunnerSend.mock.calls.filter(
+          ([prompt]) => typeof prompt === "string" && prompt.startsWith("[System — end of conversation reflection]"),
+        ).length;
+
+      // --- A 1-turn call: credit 1 < reflectionMinTurns (3) → no reflection.
+      await fastManager.spawnTurn(makeVoiceCtx({ threadId: "voice:call-short" }));
+      warmLeases(fastManager).get("agent-a:voice:call-short")!.close("idle-timeout");
+      await new Promise((r) => setTimeout(r, 60));
+      expect(isReflection()).toBe(0);
+
+      // --- A 3-turn call on a fresh thread.
+      await fastManager.spawnTurn(makeVoiceCtx({ threadId: "voice:call-long" }));
+      await fastManager.spawnTurn(makeVoiceCtx({ threadId: "voice:call-long" }));
+      await fastManager.spawnTurn(makeVoiceCtx({ threadId: "voice:call-long" }));
+      // (16) no per-turn reflection scheduling mid-call: past the debounce
+      // window, nothing has been scheduled and no reflection state exists.
+      await new Promise((r) => setTimeout(r, 60));
+      expect(isReflection()).toBe(0);
+      const states = (fastManager as unknown as { reflectionStates: Map<string, unknown> }).reflectionStates;
+      expect(states.has("agent-a:voice:call-long")).toBe(false);
+
+      // (15) release credits the whole call at once → minTurns satisfied by
+      // ONE call, and exactly one reflection fires.
+      warmLeases(fastManager).get("agent-a:voice:call-long")!.close("idle-timeout");
+      const credited = (
+        fastManager as unknown as { reflectionStates: Map<string, { pendingReflectionTurns: number }> }
+      ).reflectionStates.get("agent-a:voice:call-long");
+      expect(credited!.pendingReflectionTurns).toBe(3);
+      await new Promise((r) => setTimeout(r, 80));
+      expect(isReflection()).toBe(1);
+
+      fastManager.stopAgent("agent-a");
+      fastManager.stopReflections();
+    });
+
+    // ---- assertion 18 ----------------------------------------------------
+    it("(18) a lease with no further turns is reclaimed by the idle timer — lock + budget freed", async () => {
+      vi.useFakeTimers();
+      try {
+        installEchoStreamingRunner();
+        const r1 = await manager.spawnTurn(makeVoiceCtx());
+        expect(r1.warmTurnSeq).toBe(1);
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1);
+
+        await vi.advanceTimersByTimeAsync(WARM_IDLE_TIMEOUT_MS + 100);
+
+        expect(warmLeases(manager).size).toBe(0);
+        const snap = manager.getSnapshot().perAgent["agent-a"]!;
+        expect(snap.activeSpawns).toBe(0);
+        expect(snap.activeThreadKeys).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // ---- assertion 17 (KPR-323 C5, observability) ------------------------
+    it("(17) getSnapshot surfaces warmVoiceSessions per agent — 1 while leased, 0 after close, 0 for lease-free agents", async () => {
+      installEchoStreamingRunner();
+
+      // Baseline: nobody holds a lease.
+      const cold = manager.getSnapshot().perAgent;
+      expect(cold["agent-a"]!.warmVoiceSessions).toBe(0);
+      expect(cold["agent-b"]!.warmVoiceSessions).toBe(0);
+
+      await manager.spawnTurn(makeVoiceCtx());
+      const open = manager.getSnapshot().perAgent;
+      expect(open["agent-a"]!.warmVoiceSessions).toBe(1);
+      // Per-agent, not global: agent-b holds no lease of its own.
+      expect(open["agent-b"]!.warmVoiceSessions).toBe(0);
+
+      // A second concurrent call on the same agent counts separately.
+      await manager.spawnTurn(makeVoiceCtx({ threadId: "voice:call-2" }));
+      expect(manager.getSnapshot().perAgent["agent-a"]!.warmVoiceSessions).toBe(2);
+      expect(manager.getSnapshot().perAgent["agent-b"]!.warmVoiceSessions).toBe(0);
+
+      for (const lease of [...warmLeases(manager).values()]) lease.close("test-close");
+      await new Promise((r) => setTimeout(r, 10));
+      expect(warmLeases(manager).size).toBe(0);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.warmVoiceSessions).toBe(0);
+    });
+
+    // ---- assertions 10, 11 (KPR-323 C3, spec §4.4) -----------------------
+    // Nested so the C3 cases reuse installEchoStreamingRunner / warmLeases /
+    // the flag beforeEach+afterEach above verbatim. 322's own abortThread
+    // describe (KPR-322 E2, flag OFF) is untouched.
+    describe("abortThread warm dispatch (KPR-323 C3)", () => {
+      // NOTE (naming accuracy): turn 1 is awaited to completion here, so
+      // NOTHING is in flight when abortThread fires — this is the IDLE-lease
+      // arm of assertion 10 (requestInterrupt's `!hadTurnInFlight` early
+      // return), not a barge-in. The mid-generation severing arm is case
+      // (14c) above, which interrupts a genuinely in-flight turn.
+      it("(10) dispatches an interrupt on an IDLE lease and keeps it open (no turn in flight)", async () => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        const { interrupt, close } = installEchoStreamingRunner();
+        await manager.spawnTurn(makeVoiceCtx());
+
+        expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+        expect(interrupt).toHaveBeenCalledTimes(1);
+        // Dispatch is turn-level, NOT session-level: the call stays up.
+        expect(close).not.toHaveBeenCalled();
+        const lease = warmLeases(manager).get(WARM_KEY);
+        expect(lease).toBeDefined();
+        expect(lease!.isClosed).toBe(false);
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // ticket still held
+
+        // Session survives: the next turn runs warm on the same lease.
+        const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: "sess-warm-1" }));
+        expect(r.warmPath).toBe(true);
+        expect(r.warmTurnSeq).toBe(2);
+        expect(r.finalMessage).toBe("reply-2");
+        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // no re-open
+      });
+
+      it("(11) escalates a rejected interrupt to lease close (cold fallback), with no unhandled rejection", async () => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        const { interrupt, close } = installEchoStreamingRunner();
+        interrupt.mockRejectedValueOnce(new Error("wedged"));
+        await manager.spawnTurn(makeVoiceCtx());
+
+        const floated: unknown[] = [];
+        const onRej = (r: unknown) => floated.push(r);
+        process.on("unhandledRejection", onRej);
+        try {
+          expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+          // Discriminates the C3 dispatch from 322's ticket walk: the walk
+          // would also close the lease (ticket.abort → close) but would never
+          // reach interrupt(). Close here must be the ESCALATION.
+          expect(interrupt).toHaveBeenCalledTimes(1);
+          await vi.waitFor(() => expect(close).toHaveBeenCalled());
+          expect(warmLeases(manager).get(WARM_KEY)).toBeUndefined();
+          // Coordinator lambda unblocks a tick after onClosed → lock+budget freed.
+          await new Promise((r) => setTimeout(r, 10));
+          expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+        } finally {
+          process.off("unhandledRejection", onRej);
+        }
+        expect(floated).toEqual([]);
+      });
+
+      it("(11c) a SYNCHRONOUSLY throwing interrupt() does not propagate out of abortThread, and does NOT close the lease", async () => {
+        // abortThread is called from an HTTP `close` listener — a synchronous
+        // throw there is an uncaughtException (review round 1, issue 3). The
+        // guard is LOG-ONLY (review round 2, issue 2): unlike a REJECTED
+        // interrupt promise (case 11), a synchronous throw is not evidence of a
+        // wedged session, and escalating would end a healthy warm call.
+        mockConversationIndex.mockResolvedValue(undefined);
+        const { interrupt, close } = installEchoStreamingRunner();
+        interrupt.mockImplementationOnce(() => {
+          throw new Error("sync interrupt boom");
+        });
+        await manager.spawnTurn(makeVoiceCtx());
+
+        let dispatched: boolean | undefined;
+        expect(() => {
+          dispatched = manager.abortThread("agent-a", "voice:call-1");
+        }).not.toThrow();
+        expect(dispatched).toBe(true); // it DID dispatch; the throw was downstream
+        expect(interrupt).toHaveBeenCalledTimes(1);
+        // Lease survives: no session close, registry entry intact, ticket held.
+        expect(close).not.toHaveBeenCalled();
+        const lease = warmLeases(manager).get(WARM_KEY);
+        expect(lease).toBeDefined();
+        expect(lease!.isClosed).toBe(false);
+        await new Promise((r) => setTimeout(r, 10));
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1);
+
+        // And the call keeps going warm on the same session.
+        const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: "sess-warm-1" }));
+        expect(r.warmPath).toBe(true);
+        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // no re-open
+      });
+
+      it("(11b) falls through to the 322 ticket-walk when no lease exists (cold voice spawn)", async () => {
+        // Flag OFF for this case — cold spawn holds the ticket.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (appConfig as any).voice = { warmPath: { enabled: false } };
+        mockConversationIndex.mockResolvedValue(undefined);
+        // 322's zombie-spawn pattern: send hangs, runner.abort releases it.
+        let releaseSend!: (r: ReturnType<typeof makeRunResult>) => void;
+        mockRunnerSend.mockReturnValueOnce(
+          new Promise((resolve) => {
+            releaseSend = resolve;
+          }),
+        );
+        mockRunnerAbort.mockImplementationOnce(() => releaseSend(makeRunResult({ aborted: true })));
+
+        const inflight = manager.spawnTurn(makeVoiceCtx());
+        await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(1));
+        expect(warmLeases(manager).size).toBe(0); // nothing for the dispatch to shadow
+
+        expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+        expect(mockRunnerAbort).toHaveBeenCalledTimes(1);
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+        expect((await inflight).aborted).toBe(true);
+      });
     });
   });
 });

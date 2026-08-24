@@ -11,13 +11,14 @@ import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../../outage/outage-notices.js";
 // Mocks shared across the file
 // ---------------------------------------------------------------------------
 
+const mockLog = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
 vi.mock("../../logging/logger.js", () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
+  createLogger: () => mockLog,
 }));
 
 // Stub out the SDK `query` so the legacy direct-query path in
@@ -327,6 +328,63 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
     const ctx = am.calls[0]!.ctx;
     expect(ctx.systemPromptOverride).toBe("voice-prompt:qualify lead:warm inbound");
+  });
+
+  it("KPR-323 C1: Voice turn complete carries promptBuildMs, sessionLookupMs, and warmPath false", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    const completeCall = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete");
+    expect(completeCall).toBeDefined();
+    const fields = completeCall![1] as Record<string, unknown>;
+    expect(typeof fields.promptBuildMs).toBe("number");
+    expect(fields.promptBuildMs as number).toBeGreaterThanOrEqual(0);
+    expect(typeof fields.sessionLookupMs).toBe("number");
+    expect(fields.sessionLookupMs as number).toBeGreaterThanOrEqual(0);
+    expect(fields.warmPath).toBe(false);
+    // Absent-coordinator-stamps branch: the `...(result.stageTimings ?? {})`
+    // and `warmTurnSeq` spreads degrade to nothing rather than logging
+    // undefined-valued keys.
+    expect(fields).not.toHaveProperty("bootToInitMs");
+    expect(fields).not.toHaveProperty("warmTurnSeq");
+  });
+
+  // The populated branch of the same two spreads. Without this, every
+  // assertion above runs against a TurnResult carrying NO stageTimings and no
+  // warmTurnSeq, so nothing proves the coordinator's C1 numbers — the exact
+  // inputs Task 11's falsification gate reads — actually reach the log line.
+  it("KPR-323 C1/C2: a populated stageTimings + warmTurnSeq from the coordinator reach the log line verbatim", async () => {
+    const am = makeAgentManager({
+      stageTimings: {
+        lockWaitMs: 3,
+        spawnPrepMs: 17,
+        bootToInitMs: 741,
+        initToFirstTokenMs: 1263,
+      },
+      warmPath: true,
+      warmTurnSeq: 4,
+    });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    const completeCall = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete");
+    expect(completeCall).toBeDefined();
+    const fields = completeCall![1] as Record<string, unknown>;
+    expect(fields).toMatchObject({
+      lockWaitMs: 3,
+      spawnPrepMs: 17,
+      bootToInitMs: 741,
+      initToFirstTokenMs: 1263,
+      warmPath: true,
+      warmTurnSeq: 4,
+    });
   });
 
   it("populates the in-adapter callId→agentId map on first turn (used as fast in-flight cache)", async () => {

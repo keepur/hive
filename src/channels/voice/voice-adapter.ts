@@ -308,13 +308,17 @@ export class VoiceAdapter {
     // Voice-specific system prompt — omits tool summaries / delegate
     // descriptions, adds call goal/context. AgentRunner consumes via
     // TurnContext.systemPromptOverride.
+    const promptBuildStartedAt = Date.now(); // KPR-323 C1: T0→T1
     const systemPrompt = await buildVoiceSystemPrompt(agentConfig, this.memoryManager, {
       goal: callMeta?.goal,
       context: callMeta?.context,
     });
+    const promptBuildMs = Date.now() - promptBuildStartedAt;
 
     const sessionStore = agentManager.getSessionStore();
+    const sessionLookupStartedAt = Date.now(); // KPR-323 C1: T0→T1
     const storedRef = await sessionStore.get(agentId, threadId);
+    const sessionLookupMs = Date.now() - sessionLookupStartedAt;
 
     // KPR-313 §3.5: provider eligibility applied at voice's OWN read — not
     // left to the spawnTurn guard. Voice chooses its prompt SHAPE from
@@ -534,6 +538,15 @@ export class VoiceAdapter {
       sdkSessionResumeAttempted: !!effectiveResume,
       sdkSessionResumed: !!effectiveResume && outcome.ok && !outerRetryFired,
       routedVia: "agentManager",
+      // KPR-323 C1: stage decomposition (adapter-side stamps + coordinator/
+      // runner stamps carried on TurnResult). Log-only; all durations —
+      // no content, no numbers-of-humans (repo redaction posture).
+      promptBuildMs,
+      sessionLookupMs,
+      ...(result.stageTimings ?? {}),
+      // KPR-323 C2: warm-lease markers (false/absent until Task 5 lands).
+      warmPath: result.warmPath ?? false,
+      ...(result.warmTurnSeq !== undefined ? { warmTurnSeq: result.warmTurnSeq } : {}),
     });
   }
 

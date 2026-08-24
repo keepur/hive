@@ -1,7 +1,8 @@
 import { createLogger } from "../logging/logger.js";
-import type { AgentState, AgentStatus } from "../types/agent-config.js";
+import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
-import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import { AgentRunner, DIST_DIR, type AgentRunnerOptions, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import { WarmVoiceSession } from "./warm-voice-session.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
@@ -159,6 +160,21 @@ export interface TurnResult {
   timedOut?: boolean;
   /** KPR-307: propagated from RunResult.aborted (operator abort or deadline abort). */
   aborted?: boolean;
+  /**
+   * KPR-323 C1: cold-turn stage decomposition, populated only for
+   * ctx.channel === "voice" (always-on, log-only — the adapter merges these
+   * into the "Voice turn complete" line). Durations in ms.
+   */
+  stageTimings?: {
+    lockWaitMs: number;
+    spawnPrepMs: number;
+    bootToInitMs?: number;
+    initToFirstTokenMs?: number;
+  };
+  /** KPR-323 C2: true when the turn ran on a warm voice lease. */
+  warmPath?: boolean;
+  /** KPR-323 C2: 1-based turn sequence within the warm lease. */
+  warmTurnSeq?: number;
 }
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
@@ -373,6 +389,8 @@ export interface CoordinatorSnapshotPerAgent {
   lastError: string | null;
   /** Whether the agent is in `stoppedAgents` (spec S8). */
   stopped: boolean;
+  /** KPR-323 C5: live warm voice leases for this agent (each holds one budget slot for its call's duration). */
+  warmVoiceSessions: number;
 }
 
 export interface CoordinatorSnapshot {
@@ -454,6 +472,12 @@ export class AgentManager {
   // AgentStoppedError if the agent is in this set at any of three
   // checkpoints (pre-wait, mid-wait, post-lock).
   private stoppedAgents = new Set<string>();
+  // KPR-323 C2: per-call warm voice leases, keyed by threadKey
+  // (`agentId:threadId`, threadId = voice:<callId>). Registered only after
+  // ticket acquisition; removed by lease.close() via onClosed (identity-
+  // checked). The lease's ticket lives in activeTickets like any spawn, so
+  // stopAgent/stopAll/sweep and the snapshot see it without special-casing.
+  private warmLeases = new Map<string, WarmVoiceSession>();
   // KPR-220 Phase 6: per-(agentId,threadId) reflection coordinator state.
   private reflectionStates = new Map<string, ReflectionState>();
   private reflectionDebounceMs: number;
@@ -546,6 +570,33 @@ export class AgentManager {
   }
 
   /**
+   * KPR-323 C2 (spec §4.2 "same constructor args"): the single place an
+   * AgentRunner is constructed. Both the per-spawn adapter path
+   * (createProviderAdapter) and the warm voice lease (openWarmLease) go
+   * through it, so a lease-backed runner is byte-identical to a cold one
+   * apart from the Lane A options the cold path resolves per spawn (never
+   * set on the warm path — the gate is claude-only).
+   *
+   * `preRead` (review round 4, issue 5): callers that have an await between
+   * their own registry read and this call pass the definition + subscriber
+   * snapshot they read BEFORE that await, so a SIGUSR1 reload landing inside
+   * the await window cannot swap the runner's config out from under them —
+   * this restores the pre-extraction read ordering in `createProviderAdapter`
+   * and removes its double registry read. Callers with no such gap
+   * (`openWarmLease`) omit it and let this method read.
+   */
+  private createRunner(
+    agentId: string,
+    runnerOptions?: AgentRunnerOptions,
+    preRead?: { config: AgentConfig; eventSubscribersJson: string },
+  ): AgentRunner {
+    const config = preRead?.config ?? this.registry.get(agentId);
+    if (!config) throw new Error(`Unknown agent: ${agentId}`);
+    const eventSubscribersJson = preRead?.eventSubscribersJson ?? JSON.stringify(this.registry.getSubscriberMap());
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, runnerOptions);
+  }
+
+  /**
    * KPR-311 → KPR-338: the route is the agent's static per-turn route
    * derived by prepareSpawn (static by construction post-KPR-338 — clamp
    * invariant, R-311.1) — the static agent.model prefix is no longer
@@ -562,6 +613,10 @@ export class AgentManager {
   ): Promise<AgentProviderAdapter> {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
+    // Read the subscriber snapshot HERE, beside the definition read and
+    // before the Lane A await below (review round 4, issue 5): both are
+    // handed to createRunner so a SIGUSR1 reload landing inside the
+    // credential-resolve window cannot half-swap the runner's inputs.
     const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
 
     // KPR-346 (§D3/§D4): Lane A passthrough — credential + model resolved
@@ -578,7 +633,10 @@ export class AgentManager {
       });
     }
 
-    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, laneAPassthrough ? { laneAPassthrough } : undefined);
+    const runner = this.createRunner(agentId, laneAPassthrough ? { laneAPassthrough } : undefined, {
+      config,
+      eventSubscribersJson,
+    });
     if (route.provider === "claude") {
       return new ClaudeAgentAdapter(runner);
     }
@@ -890,7 +948,24 @@ export class AgentManager {
       throw new Error(`Unknown agent: ${ctx.agentId}`);
     }
 
+    const enteredAt = Date.now(); // KPR-323 C1: T1 anchor (admission start)
+
+    // KPR-323 C2: warm voice path. The branch lives HERE — behind
+    // dispatcher.routeVoiceTurn and the adapter seam — so taskLedger/audit,
+    // the outer retry, all error rows, and the 322 bridge contract are
+    // untouched (spec §5). Flag off / non-eligible → the code below this
+    // block is byte-identical to pre-323.
+    if (this.isWarmPathEligible(ctx)) {
+      const threadKey = `${ctx.agentId}:${ctx.threadId}`;
+      const lease = this.warmLeases.get(threadKey);
+      if (lease && !lease.isClosed) {
+        return this.runWarmTurn(lease, ctx, onStream);
+      }
+      return this.openWarmLease(ctx, onStream);
+    }
+
     return this.withSpawnTicket(ctx, async (ticket) => {
+      const lambdaStartedAt = Date.now(); // KPR-323 C1: T2 anchor (lock+budget held)
       // KPR-306: circuit-breaker admission — FIRST thing in the lambda, so a
       // fast-fail spends no session I/O and no model-router call. Throws
       // ProviderCircuitOpenError while the provider's circuit is open;
@@ -989,6 +1064,11 @@ export class AgentManager {
       // regression prevention.
       const shaping = await this.prepareSpawn(effectiveCtx);
 
+      let dispatchAt: number | undefined; // KPR-323 C1: T3 anchor (adapter.runTurn)
+      const markDispatch = () => {
+        dispatchAt = dispatchAt ?? Date.now();
+      };
+
       // KPR-306: exactly one breaker record per spawnTurn, on the FINALIZED
       // attempt. The auth-rebuild first attempt is locally recoverable —
       // when the retry fires, only the retry's result reaches the breaker
@@ -1001,7 +1081,7 @@ export class AgentManager {
       // belt-and-braces for future refactors.
       let finalResult: RunResult;
       try {
-        finalResult = await this.runOneSpawnAttempt(effectiveCtx, shaping, ticket, onStream);
+        finalResult = await this.runOneSpawnAttempt(effectiveCtx, shaping, ticket, onStream, markDispatch);
         if (finalResult.error && isAuthRebuildResumeError(finalResult.error) && effectiveCtx.sessionId) {
           log.warn("spawnTurn auth-rebuild-resume — retrying without resume", {
             agentId: effectiveCtx.agentId,
@@ -1013,6 +1093,7 @@ export class AgentManager {
             shaping,
             ticket,
             onStream,
+            markDispatch,
           );
         } else if (
           // KPR-350 (§D3): stale server-handle self-heal. The store held a
@@ -1069,6 +1150,7 @@ export class AgentManager {
             shaping,
             ticket,
             onStream,
+            markDispatch,
           );
         }
       } catch (err) {
@@ -1080,6 +1162,15 @@ export class AgentManager {
       this.circuitBreakers.record(permit, classifyTurnResult(finalResult), finalResult.llmMs);
 
       const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult, shaping.route);
+      // KPR-323 C1: voice-only stage decomposition for the adapter's log line.
+      if (effectiveCtx.channel === "voice") {
+        turnResult.stageTimings = {
+          lockWaitMs: lambdaStartedAt - enteredAt,
+          spawnPrepMs: (dispatchAt ?? lambdaStartedAt) - lambdaStartedAt,
+          bootToInitMs: finalResult.bootToInitMs,
+          initToFirstTokenMs: finalResult.initToFirstTokenMs,
+        };
+      }
       this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
@@ -1089,6 +1180,314 @@ export class AgentManager {
       }
       return turnResult;
     });
+  }
+
+  /**
+   * KPR-323 §4.7 scope guards: voice channel, real turns only (a post-call
+   * reflection turn on a voice thread carries channel "voice" via the
+   * captured lastChannelKind and must NEVER open a lease — reflection always
+   * runs cold), claude provider only, config-gated (false = branch never
+   * taken).
+   *
+   * Why claude-only, precisely (review round 4, issue 6 — the two excluded
+   * families are excluded for DIFFERENT reasons):
+   *  - Lane B (openai/gemini/codex) has no session/stream machinery at all —
+   *    those adapters own their own dispatch loops and expose nothing like
+   *    `openVoiceStreamingSession`. Nothing to warm.
+   *  - Lane A (kimi/deepseek/grok) DOES run the full ClaudeAgentAdapter /
+   *    AgentRunner, so the capability exists — it is excluded because
+   *    `openWarmLease` builds its runner with `createRunner(ctx.agentId)`
+   *    and threads NO `laneAPassthrough` options through, so a Lane A agent
+   *    on the warm path would silently run against Anthropic with the wrong
+   *    model. An unwired gap, deliberately gated closed rather than
+   *    half-wired; wiring it is a follow-up, not a hidden limitation.
+   */
+  private isWarmPathEligible(ctx: TurnContext): boolean {
+    if (ctx.channel !== "voice" || ctx.kind === "reflection") return false;
+    // Optional chaining keeps test config mocks without a `voice` key working
+    // — the gate simply stays cold.
+    if (appConfig.voice?.warmPath?.enabled !== true) return false;
+    // Positive guard (review final round, issue 1): the warm lease pins the
+    // system prompt for the WHOLE call from ctx.systemPromptOverride, and
+    // buildQueryEnvelope treats any non-nullish override as authoritative —
+    // an empty string would open the lease with NO soul, role, constitution,
+    // or toolkit and never fall back to buildSystemPrompt. Today the voice
+    // adapter always supplies one, so this is unreachable; guarding here
+    // makes a future regression degrade HONESTLY to the cold path (which
+    // passes systemPromptOverride: undefined and builds the real prompt)
+    // instead of silently running a whole call without identity/guardrails.
+    if (!ctx.systemPromptOverride) return false;
+    const def = this.registry.get(ctx.agentId);
+    if (!def) return false;
+    return resolveProviderModel(def.model).provider === "claude";
+  }
+
+  /**
+   * KPR-323 §4.2 lease open (turn 1 of a call). The lease is a REAL spawn
+   * ticket: withSpawnTicket runs with a lambda that resolves only at lease
+   * release, so the per-thread lock and one budget slot are held for the
+   * call's duration — all three stop-checkpoints, saturation recording, and
+   * the finally-cleanup fire exactly as for any spawn (§4.3: preserved, not
+   * carved out).
+   *
+   * Promise ownership (§4.2): open AWAITS ticket acquisition (the "lease
+   * ready" gate) so budget-exceeded / AgentStoppedError propagate
+   * synchronously to turn 1's caller and the adapter's existing 503 rows.
+   * Post-acquisition, the pending coordinator promise is owned by the
+   * lease: a .catch() attached at creation (before any await can float it)
+   * logs and force-removes the registry entry — post-acquisition rejection
+   * is a should-never state (release resolves the lambda; close() never
+   * rejects); the handler is belt-and-braces above the process-level
+   * unhandledRejection logger.
+   */
+  private async openWarmLease(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
+    const threadKey = `${ctx.agentId}:${ctx.threadId}`;
+
+    let releaseLease!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseLease = resolve;
+    });
+    let markAcquired!: () => void;
+    let acquired = false;
+    const ready = new Promise<void>((resolve) => {
+      markAcquired = () => {
+        acquired = true;
+        resolve();
+      };
+    });
+
+    const lease = new WarmVoiceSession({
+      agentId: ctx.agentId,
+      threadKey,
+      onClosed: ({ reason, turns }) => {
+        // Registry cleanup — identity-checked (a re-open may have replaced
+        // the entry; mirrors the activeTickets identity-check rationale).
+        if (this.warmLeases.get(threadKey) === lease) {
+          this.warmLeases.delete(threadKey);
+        }
+        // Resolve the coordinator lambda → withSpawnTicket's finally frees
+        // lock + budget + ticket set on the way out (no new cleanup path).
+        releaseLease();
+        // §4.5: one reflection per call, credited with the call's turn
+        // count, scheduled at release with the final turn's ctx/result.
+        // reflectionMinTurns <= 0 still disables (inside the method).
+        try {
+          if (lease.lastTurn && turns > 0) {
+            this.scheduleReflectionIfEligible(lease.lastTurn.ctx, lease.lastTurn.result, turns);
+          }
+        } catch (err) {
+          log.warn("Release-time reflection scheduling failed", {
+            agentId: ctx.agentId,
+            threadKey,
+            reason,
+            error: String(err),
+          });
+        }
+      },
+    });
+
+    const coordinator = this.withSpawnTicket(ctx, async (ticket) => {
+      // Abort keeps KILL semantics — stopAgent's ticket walk must actually
+      // stop the call (§4.2); barge-in severing goes through abortThread's
+      // warm dispatch (Task 6), never through ticket.abort().
+      ticket.attachAbort(() => lease.close("ticket-abort"));
+      markAcquired();
+      await released;
+    });
+    // Declared owner of the detached promise — attached synchronously, so
+    // it can never float. Pre-acquisition rejections (budget/stopped) are
+    // surfaced to the caller by the ready-race below; this handler only
+    // acts on the post-acquisition should-never case.
+    coordinator.catch((err) => {
+      if (acquired) {
+        log.error("Warm lease coordinator promise rejected post-acquisition — force-releasing", {
+          agentId: ctx.agentId,
+          threadKey,
+          error: String(err),
+        });
+        lease.close("coordinator-rejected");
+      }
+    });
+
+    // "Lease ready" gate: acquisition errors propagate synchronously.
+    await Promise.race([ready, coordinator]);
+
+    // Published BEFORE start() deliberately (review round 1, issue 4): the
+    // registry entry is what makes a second turn arriving mid-open reuse this
+    // lease. Deferring the publish until after start() would send that turn
+    // into openWarmLease → withSpawnTicket, where it would block on the
+    // per-thread lock THIS lease holds for the whole call — a hang, not a
+    // fallback. The cost is a window in which runTurn is called on a
+    // published-but-unstarted lease; it throws (accurately labelled "not
+    // started yet", see WarmVoiceSession.notRunnableError) and the adapter's
+    // outer retry lands cold.
+    //
+    // How wide is that window, precisely (final round, issue 3)? Effectively
+    // ONE MICROTASK, not the CLI boot. `query()` itself is synchronous and
+    // openVoiceStreamingSession does not await the CLI boot or the MCP
+    // handshake — those are observed later, inside turn 1's consumeOneTurn
+    // (which is exactly why initToFirstTokenMs on the FIRST warm turn carries
+    // them). And for voice specifically buildQueryEnvelope has no await at
+    // all: systemPromptOverride short-circuits buildSystemPrompt. So no
+    // macrotask — a second HTTP request, a timer — can realistically land in
+    // it; the guarding below is for the abort/shutdown paths that CAN close
+    // the lease from an already-scheduled callback, not for a 1.5-2s gap.
+    //
+    // The degradation is safe because WarmVoiceSession.start() carries a
+    // closed-guard (review round 2, issue 1): a throw here reaches
+    // runWarmTurn, which closes the lease, and the Query this open is still
+    // awaiting therefore arrives at start() on an already-closed lease —
+    // where the guard closes it instead of orphaning the CLI subprocess.
+    // Same for ticket-abort/shutdown closing mid-open.
+    //
+    // Known edge case, documented not fixed: if a turn DID land in this
+    // window and got closed as collateral, turn 1 specifically has no
+    // effectiveResume, so the adapter's outer retry (which requires a resume
+    // attempt) would NOT fire — the caller would get a hard failure on the
+    // very first exchange of the call rather than a graceful cold retry.
+    // Acceptable given the window is a microtask.
+    this.warmLeases.set(threadKey, lease);
+
+    try {
+      if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
+
+      // Accepted trade-off (plan review r1 adv. 4): a circuit-open at call
+      // START pays one CLI boot + MCP handshake here before turn 1's
+      // per-turn breaker acquire fast-fails — unlike the cold path, which
+      // fast-fails before any I/O. Deliberate, not an oversight: a pre-open
+      // acquire probe would either leak a permit or double-record against
+      // KPR-306's record-once-per-turn discipline, and the waste is bounded
+      // (one subprocess boot + a budget slot held ≤120s idle) in an
+      // already-degraded state — while the opened lease keeps half-open
+      // probes warm mid-call (spec §5 breaker row).
+      // Build the runner once; open the streaming session with resume =
+      // ctx.sessionId EXACTLY as passed (§4.2 resume-source rule — the
+      // adapter stays the single authority on resume-vs-full-prompt; the
+      // retry-shaped ctx {sessionId: undefined, full transcript} therefore
+      // opens a FRESH session and never resumes the one a retry escaped).
+      const runner = this.createRunner(ctx.agentId);
+      const q = await runner.openVoiceStreamingSession({
+        input: lease.inputQueue,
+        sessionId: ctx.sessionId,
+        context: {
+          adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,
+          channelId: ctx.channelId,
+          channelKind: ctx.workItem.source.kind,
+          channelLabel: ctx.workItem.source.label,
+          threadId: ctx.threadId,
+          slackTs: "",
+          slackThreadTs: "",
+        },
+        // Non-empty by construction: isWarmPathEligible refuses the warm path
+        // when ctx.systemPromptOverride is falsy (final round, issue 1), so
+        // the `?? ""` here is a type narrowing, not a silent-empty fallback.
+        systemPromptOverride: ctx.systemPromptOverride ?? "",
+      });
+      lease.start(q);
+    } catch (err) {
+      // Session open failed — release lock/budget/registry before
+      // propagating; the adapter's outer retry lands cold (§5).
+      lease.close("open-failed");
+      throw err;
+    }
+
+    // Turn 1 runs through the same per-turn path as turns 2..N. Turn 1's
+    // text is the adapter's full-transcript or greet-branch render,
+    // unchanged from conversation-prompt.ts (§4.2).
+    return this.runWarmTurn(lease, ctx, onStream);
+  }
+
+  /**
+   * KPR-323 §4.2 turn N: per-turn breaker acquire → push + demux via the
+   * lease → per-turn finalize/observability reused VERBATIM (this is what
+   * keeps session-id rotation persisted to Mongo per turn and cold fallback
+   * lossless). Never re-enters withSpawnTicket — the lease's ticket already
+   * covers the thread; re-entering would deadlock on the held lock.
+   *
+   * Failure-close precedence (spec §6 — the one place it is stated; do not
+   * generalize): a circuit-open fast-fail does NOT close the lease (the
+   * message is never pushed; the session is healthy; half-open probes are
+   * real turns and recovery is seamless mid-call). EVERY OTHER turn-level
+   * failure closes the lease BEFORE the error propagates, so the adapter's
+   * outer full-transcript retry always lands cold. Timed-out AND
+   * barge-in-interrupted turns return ok under KPR-307 semantics (empty
+   * errors) — not a turn-level failure — so the lease stays open. That
+   * exemption is enforced at the source, in WarmVoiceSession.consumeOneTurn:
+   * a non-success result subtype on an aborted/timed-out turn never becomes
+   * an `error` string. Scope of that exemption (review round 2, issue 3 — do
+   * not widen it in either direction): it governs the LEASE-CLOSE decision
+   * below, plus `TurnResult.errors` and the outcome-failure path in
+   * finalizeSpawnResult. It does NOT govern breaker classification —
+   * classifyTurnResult keys on `aborted`/`timedOut` BEFORE it looks at
+   * `error`, so a barge-in is classified `aborted` and a timeout is
+   * classified `fault:timeout` either way. That is correct per spec §6 (the
+   * breaker must still see a timeout as failure-class); leave it alone. The
+   * two remaining error sources — the output stream ending before the turn's
+   * result, and a throw out of the demux — are genuine session deaths and DO
+   * close the lease even on an interrupted turn.
+   *
+   * No per-turn reflection scheduling here (§4.5): a timer firing mid-call
+   * would hit the quiescence check, skip without rescheduling, and lose the
+   * reflection. One reflection per call is credited at release.
+   */
+  private async runWarmTurn(
+    lease: WarmVoiceSession,
+    ctx: TurnContext,
+    onStream?: SpawnTurnStreamCallback,
+  ): Promise<TurnResult> {
+    const route = resolveProviderModel(this.registry.get(ctx.agentId)?.model ?? "");
+    const permit = this.circuitBreakers.acquire(route.provider, {
+      agentId: ctx.agentId,
+      threadId: ctx.threadId,
+    });
+
+    const timeoutMs = this.registry.get(ctx.agentId)?.timeoutMs ?? 300_000;
+
+    let runResult: RunResult;
+    try {
+      runResult = await lease.runTurn({ text: ctx.workItem.text, onStream, timeoutMs });
+    } catch (err) {
+      this.circuitBreakers.record(permit, classifyThrown(err), 0);
+      lease.close("turn-failure");
+      throw err;
+    }
+    this.circuitBreakers.record(permit, classifyTurnResult(runResult), runResult.llmMs);
+
+    const turnResult = this.finalizeSpawnResult(ctx, runResult, route);
+    turnResult.warmPath = true;
+    turnResult.warmTurnSeq = lease.turns;
+    // C1 on warm turns (plan review r1 adv. 3): admission/spawn stages do
+    // not exist on a warm turn — zeros by definition — and
+    // initToFirstTokenMs is the lease's push → first-delta measurement
+    // (RunResult field comment, Task 2). Populated so the adapter's log
+    // spread carries it instead of computing-and-dropping it.
+    turnResult.stageTimings = {
+      lockWaitMs: 0,
+      spawnPrepMs: 0,
+      initToFirstTokenMs: runResult.initToFirstTokenMs,
+    };
+    // The warm lane's shaping is exactly what prepareSpawn's voice carve-out
+    // returns (raw text + the static route, no router, no resource limits) —
+    // constructed inline because prepareSpawn is not re-entered on a warm
+    // turn. Same `route` object the breaker permit was keyed on.
+    this.recordSpawnObservability(ctx, {
+      prompt: ctx.workItem.text,
+      route,
+      resourceLimits: undefined,
+      routerCostUsd: 0,
+      effortOverride: undefined,
+    }, runResult);
+    lease.lastTurn = { ctx, result: turnResult };
+
+    if (runResult.error) {
+      // Turn-level failure: close BEFORE returning (spec §5 outer-retry
+      // row). The adapter's retry ctx {sessionId: undefined, full
+      // transcript} then opens a FRESH lease — cold-equivalent turn 1,
+      // warm for subsequent turns (spec §6 crash row).
+      lease.close("turn-failure");
+    }
+
+    return turnResult;
   }
 
   /**
@@ -1270,6 +1669,13 @@ export class AgentManager {
       for (const key of this.activeSpawnKeys) {
         if (key.startsWith(prefix)) activeThreadKeys.push(key);
       }
+      // KPR-323 C5: warm voice leases are keyed `${agentId}:${threadId}` —
+      // same prefix-scan shape as activeSpawnKeys above, so the count is
+      // per-agent, never global.
+      let warmVoiceSessions = 0;
+      for (const key of this.warmLeases.keys()) {
+        if (key.startsWith(prefix)) warmVoiceSessions++;
+      }
       const sat = this.saturationEvents.get(agentId);
       perAgent[agentId] = {
         activeSpawns,
@@ -1281,6 +1687,7 @@ export class AgentManager {
         lastSpawnAt: this.lastSpawnAt.get(agentId) ?? null,
         lastError: this.lastSpawnError.get(agentId) ?? null,
         stopped: this.stoppedAgents.has(agentId),
+        warmVoiceSessions,
       };
     }
 
@@ -1315,7 +1722,7 @@ export class AgentManager {
    * turn. Legacy code shared the predicate but queue-drain semantics masked
    * the consequence.
    */
-  private scheduleReflectionIfEligible(ctx: TurnContext, turnResult: TurnResult): void {
+  private scheduleReflectionIfEligible(ctx: TurnContext, turnResult: TurnResult, turns: number = 1): void {
     const minTurns = appConfig.memory.reflectionMinTurns;
     if (minTurns <= 0) return;
 
@@ -1325,7 +1732,9 @@ export class AgentManager {
 
     const ok = turnResult.errors.length === 0;
     const state: ReflectionState = {
-      pendingReflectionTurns: (prior?.pendingReflectionTurns ?? 0) + 1,
+      // KPR-323 §4.5: `turns` defaults to 1 (every cold caller); the warm
+      // voice lease credits the whole call's turn count once, at release.
+      pendingReflectionTurns: (prior?.pendingReflectionTurns ?? 0) + turns,
       lastTurnAt: Date.now(),
       lastSender: ctx.workItem.sender,
       lastResultOk: ok,
@@ -1467,6 +1876,7 @@ export class AgentManager {
     shaping: SpawnShaping,
     ticket: SpawnTicket,
     onStream?: SpawnTurnStreamCallback,
+    onDispatch?: () => void, // KPR-323 C1: T3 anchor callback
   ): Promise<RunResult> {
     // KPR-347: built BEFORE adapter construction so Lane B assembly receives
     // the turn's WorkItemContext (context-sensitive server configs).
@@ -1511,6 +1921,7 @@ export class AgentManager {
       return aborted;
     }
 
+    onDispatch?.(); // KPR-323 C1 — immediately before adapter.runTurn
     const result = await adapter.runTurn({
       prompt: shaping.prompt,
       sessionId: ctx.sessionId,
@@ -1943,6 +2354,58 @@ export class AgentManager {
    */
   abortThread(agentId: string, threadId: string): boolean {
     const threadKey = `${agentId}:${threadId}`;
+    // KPR-323 C3 (spec §4.4): the method's contract is "sever the in-flight
+    // turn for this thread". Under a warm lease the correct severing is a
+    // turn-level interrupt — the caller is still on the line; killing the
+    // session on every barge-in would end the call. Barge-in vs hang-up is
+    // indistinguishable at the socket and interrupt-and-keep-warm is
+    // correct for both: barge-in → next turn hits a hot session; hang-up →
+    // idle timeout reclaims in ≤120s. No lease → 322's ticket-walk abort,
+    // verbatim (a cold string-prompt query has no interrupt surface —
+    // control requests exist only in streaming mode — so spawn-abort is the
+    // only option there). ticket.abort() keeps KILL semantics for stopAgent.
+    //
+    // interrupt() returns a Promise; this method stays synchronous-boolean —
+    // requestInterrupt dispatches fire-and-forget with a .catch that logs
+    // and escalates to lease.close() (a failed interrupt means the session
+    // may be wedged; closing converts to standard cold fallback, §6).
+    // Idle-lease edge (disconnect during the adapter's pre-spawn awaits):
+    // interrupt-on-idle is SDK-unspecified — W2 in-run check (§7).
+    const lease = this.warmLeases.get(threadKey);
+    if (lease && !lease.isClosed) {
+      // Throw-safety only (review round 1 B2, narrowed in round 2): abortThread
+      // is called from an HTTP `close` listener, where a SYNCHRONOUS throw is an
+      // uncaughtException. `Query.interrupt()` is declared `async` in the SDK, so
+      // it cannot throw synchronously; this guard is defense-in-depth against a
+      // future non-async surface or a throw inside requestInterrupt's own
+      // bookkeeping. It is deliberately LOG-ONLY — it does NOT escalate to
+      // lease.close(). A REJECTED interrupt promise is evidence of a wedged
+      // session and is escalated where that evidence exists (inside
+      // WarmVoiceSession.requestInterrupt); a synchronous throw here is not, and
+      // closing on it would end a healthy warm call. The success log lives
+      // OUTSIDE the try for the same reason — a dead-fd logger fault is not a
+      // session fault.
+      try {
+        lease.requestInterrupt("abort-thread");
+      } catch (err) {
+        log.warn("lease.requestInterrupt() threw during abortThread — lease left open", {
+          agentId,
+          threadId,
+          error: String(err),
+        });
+        return true;
+      }
+      // "dispatched", not "interrupted" (review round 4, issue 10):
+      // requestInterrupt silently no-ops when the lease is published but not
+      // yet started (the documented publish-before-start() window), so
+      // claiming the generation was severed would be inaccurate in that
+      // window. Behaviorally harmless either way — the idle timer reclaims
+      // an unstarted lease in ≤120s — so the wording is the fix, not a new
+      // "is it started" state probe.
+      log.info("Warm voice lease interrupt dispatched for thread", { agentId, threadId });
+      return true;
+    }
+    // --- 322 Task 3 body from here, unchanged ---
     const tickets = this.activeTickets.get(agentId);
     if (!tickets) return false;
     let aborted = false;

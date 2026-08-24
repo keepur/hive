@@ -3859,3 +3859,164 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
     expect(instructions.split(HOT).length - 1).toBe(1);
   });
 });
+
+describe("AgentRunner C1 stage stamps (KPR-323)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("stamps bootToInitMs and initToFirstTokenMs on init then text_delta then result", async () => {
+    mockMessages = [
+      { type: "system", subtype: "init", session_id: "s-c1" },
+      {
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "hi" },
+        },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        result: "hi",
+        total_cost_usd: 0.001,
+        duration_ms: 100,
+        session_id: "s-c1",
+      },
+    ];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello", undefined, () => {});
+
+    expect(typeof result.bootToInitMs).toBe("number");
+    expect(result.bootToInitMs).toBeGreaterThanOrEqual(0);
+    expect(typeof result.initToFirstTokenMs).toBe("number");
+    expect(result.initToFirstTokenMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("leaves bootToInitMs and initToFirstTokenMs undefined when neither init nor text_delta is emitted", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.bootToInitMs).toBeUndefined();
+    expect(result.initToFirstTokenMs).toBeUndefined();
+  });
+
+  // Round-3 review fix: the T3 anchor must be stamped BEFORE query-envelope
+  // assembly, otherwise envelope cost (server configs, in-process MCP
+  // construction, skill projections, cwd mkdir) lands between spawnPrepMs and
+  // bootToInitMs and is attributed to neither. Negative-verify: with the
+  // pre-fix placement (queryStartedAt after buildQueryEnvelope) bootToInitMs
+  // is ~0 here and this assertion fails.
+  it("bootToInitMs includes query-envelope assembly time (no unattributed T2→T5 gap)", async () => {
+    const ENVELOPE_MS = 60;
+    mockMessages = [
+      { type: "system", subtype: "init", session_id: "s-c1-gap" },
+      {
+        type: "result",
+        subtype: "success",
+        result: "hi",
+        total_cost_usd: 0.001,
+        duration_ms: 100,
+        session_id: "s-c1-gap",
+      },
+    ];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const realBuild = (runner as any).buildQueryEnvelope.bind(runner);
+    vi.spyOn(runner as any, "buildQueryEnvelope").mockImplementation(async (params: any) => {
+      await new Promise((r) => setTimeout(r, ENVELOPE_MS));
+      return realBuild(params);
+    });
+
+    const result = await runner.send("hello");
+
+    expect(result.bootToInitMs).toBeGreaterThanOrEqual(ENVELOPE_MS - 5);
+  });
+});
+
+describe("AgentRunner.openVoiceStreamingSession (KPR-323 C2)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  const fakeCtx = {
+    adapterId: "voice",
+    channelId: "call-1",
+    channelKind: "voice",
+    channelLabel: "Voice",
+    threadId: "call-1",
+    slackTs: "",
+    slackThreadTs: "",
+  } as any;
+
+  it("opens a streaming-input query with resume, partial messages, and the override prompt", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const input = (async function* () {})();
+
+    await runner.openVoiceStreamingSession({
+      input,
+      sessionId: "s-1",
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const call = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
+    expect(typeof call[0].prompt).not.toBe("string");
+    expect(call[0].prompt).toBe(input);
+
+    const options = getCapturedOptions();
+    expect(options.resume).toBe("s-1");
+    expect(options.includePartialMessages).toBe(true);
+    expect(options.systemPrompt).toBe("vp");
+  });
+
+  it("omits resume entirely when sessionId is undefined", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+
+    await runner.openVoiceStreamingSession({
+      input: (async function* () {})(),
+      sessionId: undefined,
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const options = getCapturedOptions();
+    expect("resume" in options).toBe(false);
+  });
+
+  it("strips maxTurns and maxBudgetUsd from the warm envelope (per-turn bounds must not apply per-call)", async () => {
+    // Fixture carries maxTurns: 25 / budgetUsd: 10 — both would otherwise
+    // flow into the envelope via buildQueryEnvelope's agentConfig fallback
+    // and be enforced CUMULATIVELY across every turn of the warm call.
+    const agentConfig = makeAgentConfig({ maxTurns: 200, budgetUsd: 5 });
+    const runner = new AgentRunner(agentConfig, memoryManager as any);
+
+    await runner.openVoiceStreamingSession({
+      input: (async function* () {})(),
+      sessionId: "s-1",
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const options = getCapturedOptions();
+    expect(options.maxTurns).toBeUndefined();
+    expect(options.maxBudgetUsd).toBeUndefined();
+    expect("maxTurns" in options).toBe(false);
+    expect("maxBudgetUsd" in options).toBe(false);
+
+    // Control: the cold per-turn path still carries both.
+    await runner.send("hello");
+    const coldOptions = getCapturedOptions();
+    expect(coldOptions.maxTurns).toBe(200);
+    expect(coldOptions.maxBudgetUsd).toBe(5);
+  });
+});

@@ -258,6 +258,7 @@ describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
           lastSpawnAt: Date.now() - 1_000,
           lastError: null,
           stopped: false,
+          warmVoiceSessions: 1,
           staleSeconds: 5,
         },
       ],
@@ -270,6 +271,31 @@ describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
     expect(out).toContain("source=spawnBudget");
     expect(out).toContain("saturations=3");
     expect(out).toContain("heartbeat 5s ago");
+    // KPR-323 C5: informational warm-voice lease count on the same row.
+    expect(out).toContain("warm-voice=1");
+  });
+
+  it("renders warm-voice=0 for an agent holding no warm voice lease (KPR-323 C5)", () => {
+    const lines: string[] = [];
+    renderSpawnCoordinatorSection(
+      [
+        {
+          agentId: "agent-idle",
+          activeSpawns: 0,
+          budget: 5,
+          budgetSource: "default",
+          saturationCount: 0,
+          lastSaturationAt: null,
+          lastSpawnAt: null,
+          lastError: null,
+          stopped: false,
+          warmVoiceSessions: 0,
+          staleSeconds: 2,
+        },
+      ],
+      (l) => lines.push(l),
+    );
+    expect(lines.join("\n")).toContain("warm-voice=0");
   });
 
   it("flags stopped agents distinctly (spec S8)", () => {
@@ -286,6 +312,7 @@ describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
           lastSpawnAt: null,
           lastError: null,
           stopped: true,
+          warmVoiceSessions: 0,
           staleSeconds: 1,
         },
       ],
@@ -308,6 +335,7 @@ describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
           lastSpawnAt: null,
           lastError: null,
           stopped: false,
+          warmVoiceSessions: 0,
           staleSeconds: 300,
         },
       ],
@@ -330,6 +358,7 @@ describe("renderSpawnCoordinatorSection (KPR-220 Phase 11)", () => {
           lastSpawnAt: Date.now(),
           lastError: "something broke",
           stopped: false,
+          warmVoiceSessions: 0,
           staleSeconds: 1,
         },
       ],
