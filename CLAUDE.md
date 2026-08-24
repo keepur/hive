@@ -64,8 +64,9 @@ Message (Slack/SMS/WebSocket/Scheduler)
 ### Key Files
 - `src/index.ts` — entry point, wires all subsystems
 - `src/config.ts` — loads env + hive.yaml into typed config
-- `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles system prompts, configures MCP servers, builds per-spawn hooks with current `WorkItemContext`
-- `src/agents/agent-manager.ts` — spawn coordinator: per-thread lock + per-agent budget, ticket lifecycle, reflection scheduler, snapshot surface
+- `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn — except a KPR-323 warm voice lease, where one runner backs a whole call via `openVoiceStreamingSession`); assembles system prompts, configures MCP servers, builds per-spawn hooks with current `WorkItemContext`
+- `src/agents/agent-manager.ts` — spawn coordinator: per-thread lock + per-agent budget, ticket lifecycle, reflection scheduler, snapshot surface, warm voice lease registry
+- `src/agents/warm-voice-session.ts` — KPR-323 per-call warm streaming-input session lease for voice (default off; see "Warm voice path")
 - `src/agents/spawn-coordinator-heartbeat.ts` — 30s heartbeat that writes `getSnapshot()` to `db.telemetry` (`kind=spawn_coordinator_stats`) per agent
 - `src/agents/provider-circuit-breaker.ts` — per-provider circuit breaker + Open-Circuit Contract (`ProviderCircuitOpenError`, snapshot API); heartbeated by `src/agents/circuit-breaker-heartbeat.ts` (`kind=circuit_breaker_stats`)
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB
@@ -224,15 +225,23 @@ Where `<root>` is one of: a seed directory (e.g. `seeds/chief-of-staff/`), a plu
 
 ## Spawn coordinator (KPR-220)
 
-Per-turn `query()` with `options.resume = sessionId` is the **only** execution path post-KPR-220. The long-lived per-agent `query()` loop (`AgentRunner.send()` driven by `AgentManager.sendMessage`) is gone; every channel (Slack, SMS, WS, voice, scheduler) routes through `AgentManager.runWorkItemTurn(agentId, item)` which builds a `TurnContext` and calls `spawnTurn(ctx)`. Voice keeps a direct `spawnTurn` call so it can pass its own `systemPromptOverride`.
+Per-turn `query()` with `options.resume = sessionId` is the **only** execution path post-KPR-220 — with one opt-in exception since KPR-323, the warm voice lease (below), which holds a single streaming-input `query()` open across one call. The long-lived per-agent `query()` loop (`AgentRunner.send()` driven by `AgentManager.sendMessage`) is gone; every channel (Slack, SMS, WS, voice, scheduler) routes through `AgentManager.runWorkItemTurn(agentId, item)` which builds a `TurnContext` and calls `spawnTurn(ctx)`. Voice keeps a direct `spawnTurn` call so it can pass its own `systemPromptOverride`.
 
-`AgentManager` is a thin spawn coordinator: per-thread lock (`agentId:threadId`), per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface. There is no longer any per-channel opt-in flag, no per-agent queue, no `AgentRunner` reuse.
+`AgentManager` is a thin spawn coordinator: per-thread lock (`agentId:threadId`), per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface. There is no per-agent queue, and no `AgentRunner` reuse across turns — except within a single warm voice lease (KPR-323), the one remaining per-channel opt-in flag.
 
 **Budget:** per-agent `spawnBudget` field on the agent definition; falls back to legacy `maxConcurrent`, then the engine default (5). `maxConcurrent` is **deprecated** for spawn-coordinator purposes — set `spawnBudget` on new agents. Source of the resolved budget is surfaced in `hive doctor` ("Spawn coordinator" section) as `source=spawnBudget|maxConcurrent|default`.
 
 **Reflection:** triggered by post-quiescence debounce (30s after the last non-reflection turn) instead of the legacy queue-drain trigger. `memory.reflectionMinTurns <= 0` disables reflection entirely (queue-drain semantics treated zero as "fire every turn" which was a bug under the new debounce model).
 
-**Observability:** `getSnapshot()` returns per-agent `{ activeSpawns, activeThreadKeys, budget, budgetSource, saturationCount, lastSaturationAt, lastSpawnAt, lastError, stopped }`. `SpawnCoordinatorHeartbeat` upserts per-agent docs to `db.telemetry` (`kind=spawn_coordinator_stats`) every 30s; the doctor reads them.
+**Observability:** `getSnapshot()` returns per-agent `{ activeSpawns, activeThreadKeys, budget, budgetSource, saturationCount, lastSaturationAt, lastSpawnAt, lastError, stopped, warmVoiceSessions }`. `SpawnCoordinatorHeartbeat` upserts per-agent docs to `db.telemetry` (`kind=spawn_coordinator_stats`) every 30s; the doctor reads them and renders `warm-voice=<n>` in the Spawn coordinator row (pre-KPR-323 heartbeat docs lack the field and read as 0).
+
+**Warm voice path (KPR-323, default off):** `voice.warmPath.enabled: true` in hive.yaml opts voice into a per-call **warm session lease** (`src/agents/warm-voice-session.ts`) that amortizes the cold-spawn tax — turn 1 opens one streaming-input `query()` via `AgentRunner.openVoiceStreamingSession`, subsequent turns of the same call run on it. Anything but a literal `true` (absent/garbage) leaves the branch untaken and the cold path byte-identical; the flag is the rollback lever.
+
+- **Eligibility** (`isWarmPathEligible`, all must hold): `channel === "voice"`, not a `reflection` turn, flag on, a non-empty `systemPromptOverride` present (an empty override would pin a call-long prompt with no soul/constitution — degrade to cold instead), and the agent resolves to the **claude** provider. Lane B adapters have no such surface; Lane A (kimi/deepseek/grok) is deliberately gated closed rather than half-wired — the lease builds its runner without passthrough options, so it would silently run against Anthropic on the wrong model.
+- **Coordinator semantics are preserved, not carved out:** the lease is a real spawn ticket — it holds the per-thread lock and **one budget slot for the call's duration**, so stop-checkpoints, saturation recording, and cleanup fire as for any spawn. Reflection is deferred to lease release and scheduled once with the final turn's context.
+- **`abortThread` dispatches to the lease** when one is live: it `interrupt()`s the current generation and **keeps the lease warm** (barge-in and hang-up are indistinguishable at the socket; hang-up is reclaimed by the idle timeout). With no lease it falls back to the KPR-322 ticket-walk abort verbatim.
+- **Lifetimes are constants, not config** — `WARM_IDLE_TIMEOUT_MS` (120s), `WARM_LIFETIME_CAP_MS` (2h), `WARM_INTERRUPT_GRACE_MS` (10s) in `warm-voice-session.ts`. Any lease failure closes the lease and degrades to the cold path.
+- **Telemetry:** the voice adapter's "Voice turn complete" row carries always-on cold-turn stage timings (`promptBuildMs`, `sessionLookupMs`, plus coordinator/runner `stageTimings`) and warm markers (`warmPath`, `warmTurnSeq`). `npx tsx scripts/voice-latency-baseline.ts` is a read-only harvester over instance log files that aggregates cold first-audio latency from those rows into a baseline artifact (it drops `warmPath: true` rows — the cold comparand).
 
 **Migration notes:**
 - `agentManager.perTurnSpawn.{sms,slack,ws,voice}` config keys are removed. Hive.yaml loader silently ignores them (KPR-225 F3 liberal-loader pattern), but they have no effect.
