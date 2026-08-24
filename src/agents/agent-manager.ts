@@ -1,7 +1,8 @@
 import { createLogger } from "../logging/logger.js";
 import type { AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
-import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import { AgentRunner, DIST_DIR, type AgentRunnerOptions, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import { WarmVoiceSession } from "./warm-voice-session.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
@@ -469,6 +470,12 @@ export class AgentManager {
   // AgentStoppedError if the agent is in this set at any of three
   // checkpoints (pre-wait, mid-wait, post-lock).
   private stoppedAgents = new Set<string>();
+  // KPR-323 C2: per-call warm voice leases, keyed by threadKey
+  // (`agentId:threadId`, threadId = voice:<callId>). Registered only after
+  // ticket acquisition; removed by lease.close() via onClosed (identity-
+  // checked). The lease's ticket lives in activeTickets like any spawn, so
+  // stopAgent/stopAll/sweep and the snapshot see it without special-casing.
+  private warmLeases = new Map<string, WarmVoiceSession>();
   // KPR-220 Phase 6: per-(agentId,threadId) reflection coordinator state.
   private reflectionStates = new Map<string, ReflectionState>();
   private reflectionDebounceMs: number;
@@ -561,6 +568,21 @@ export class AgentManager {
   }
 
   /**
+   * KPR-323 C2 (spec §4.2 "same constructor args"): the single place an
+   * AgentRunner is constructed. Both the per-spawn adapter path
+   * (createProviderAdapter) and the warm voice lease (openWarmLease) go
+   * through it, so a lease-backed runner is byte-identical to a cold one
+   * apart from the Lane A options the cold path resolves per spawn (never
+   * set on the warm path — the gate is claude-only).
+   */
+  private createRunner(agentId: string, runnerOptions?: AgentRunnerOptions): AgentRunner {
+    const config = this.registry.get(agentId);
+    if (!config) throw new Error(`Unknown agent: ${agentId}`);
+    const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
+    return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, runnerOptions);
+  }
+
+  /**
    * KPR-311 → KPR-338: the route is the agent's static per-turn route
    * derived by prepareSpawn (static by construction post-KPR-338 — clamp
    * invariant, R-311.1) — the static agent.model prefix is no longer
@@ -577,7 +599,6 @@ export class AgentManager {
   ): Promise<AgentProviderAdapter> {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
-    const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
 
     // KPR-346 (§D3/§D4): Lane A passthrough — credential + model resolved
     // per spawn, BEFORE runner construction. A missing credential throws
@@ -593,7 +614,7 @@ export class AgentManager {
       });
     }
 
-    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, laneAPassthrough ? { laneAPassthrough } : undefined);
+    const runner = this.createRunner(agentId, laneAPassthrough ? { laneAPassthrough } : undefined);
     if (route.provider === "claude") {
       return new ClaudeAgentAdapter(runner);
     }
@@ -907,6 +928,20 @@ export class AgentManager {
 
     const enteredAt = Date.now(); // KPR-323 C1: T1 anchor (admission start)
 
+    // KPR-323 C2: warm voice path. The branch lives HERE — behind
+    // dispatcher.routeVoiceTurn and the adapter seam — so taskLedger/audit,
+    // the outer retry, all error rows, and the 322 bridge contract are
+    // untouched (spec §5). Flag off / non-eligible → the code below this
+    // block is byte-identical to pre-323.
+    if (this.isWarmPathEligible(ctx)) {
+      const threadKey = `${ctx.agentId}:${ctx.threadId}`;
+      const lease = this.warmLeases.get(threadKey);
+      if (lease && !lease.isClosed) {
+        return this.runWarmTurn(lease, ctx, onStream);
+      }
+      return this.openWarmLease(ctx, onStream);
+    }
+
     return this.withSpawnTicket(ctx, async (ticket) => {
       const lambdaStartedAt = Date.now(); // KPR-323 C1: T2 anchor (lock+budget held)
       // KPR-306: circuit-breaker admission — FIRST thing in the lambda, so a
@@ -1123,6 +1158,241 @@ export class AgentManager {
       }
       return turnResult;
     });
+  }
+
+  /**
+   * KPR-323 §4.7 scope guards: voice channel, real turns only (a post-call
+   * reflection turn on a voice thread carries channel "voice" via the
+   * captured lastChannelKind and must NEVER open a lease — reflection always
+   * runs cold), claude provider only (pilot adapters have no session/stream
+   * machinery), config-gated (false = branch never taken).
+   */
+  private isWarmPathEligible(ctx: TurnContext): boolean {
+    if (ctx.channel !== "voice" || ctx.kind === "reflection") return false;
+    // Optional chaining keeps test config mocks without a `voice` key working
+    // — the gate simply stays cold.
+    if (appConfig.voice?.warmPath?.enabled !== true) return false;
+    const def = this.registry.get(ctx.agentId);
+    if (!def) return false;
+    return resolveProviderModel(def.model).provider === "claude";
+  }
+
+  /**
+   * KPR-323 §4.2 lease open (turn 1 of a call). The lease is a REAL spawn
+   * ticket: withSpawnTicket runs with a lambda that resolves only at lease
+   * release, so the per-thread lock and one budget slot are held for the
+   * call's duration — all three stop-checkpoints, saturation recording, and
+   * the finally-cleanup fire exactly as for any spawn (§4.3: preserved, not
+   * carved out).
+   *
+   * Promise ownership (§4.2): open AWAITS ticket acquisition (the "lease
+   * ready" gate) so budget-exceeded / AgentStoppedError propagate
+   * synchronously to turn 1's caller and the adapter's existing 503 rows.
+   * Post-acquisition, the pending coordinator promise is owned by the
+   * lease: a .catch() attached at creation (before any await can float it)
+   * logs and force-removes the registry entry — post-acquisition rejection
+   * is a should-never state (release resolves the lambda; close() never
+   * rejects); the handler is belt-and-braces above the process-level
+   * unhandledRejection logger.
+   */
+  private async openWarmLease(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
+    const threadKey = `${ctx.agentId}:${ctx.threadId}`;
+
+    let releaseLease!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseLease = resolve;
+    });
+    let markAcquired!: () => void;
+    let acquired = false;
+    const ready = new Promise<void>((resolve) => {
+      markAcquired = () => {
+        acquired = true;
+        resolve();
+      };
+    });
+
+    const lease = new WarmVoiceSession({
+      agentId: ctx.agentId,
+      threadKey,
+      onClosed: ({ reason, turns }) => {
+        // Registry cleanup — identity-checked (a re-open may have replaced
+        // the entry; mirrors the activeTickets identity-check rationale).
+        if (this.warmLeases.get(threadKey) === lease) {
+          this.warmLeases.delete(threadKey);
+        }
+        // Resolve the coordinator lambda → withSpawnTicket's finally frees
+        // lock + budget + ticket set on the way out (no new cleanup path).
+        releaseLease();
+        // §4.5: one reflection per call, credited with the call's turn
+        // count, scheduled at release with the final turn's ctx/result.
+        // reflectionMinTurns <= 0 still disables (inside the method).
+        try {
+          if (lease.lastTurn && turns > 0) {
+            this.scheduleReflectionIfEligible(lease.lastTurn.ctx, lease.lastTurn.result, turns);
+          }
+        } catch (err) {
+          log.warn("Release-time reflection scheduling failed", {
+            agentId: ctx.agentId,
+            threadKey,
+            reason,
+            error: String(err),
+          });
+        }
+      },
+    });
+
+    const coordinator = this.withSpawnTicket(ctx, async (ticket) => {
+      // Abort keeps KILL semantics — stopAgent's ticket walk must actually
+      // stop the call (§4.2); barge-in severing goes through abortThread's
+      // warm dispatch (Task 6), never through ticket.abort().
+      ticket.attachAbort(() => lease.close("ticket-abort"));
+      markAcquired();
+      await released;
+    });
+    // Declared owner of the detached promise — attached synchronously, so
+    // it can never float. Pre-acquisition rejections (budget/stopped) are
+    // surfaced to the caller by the ready-race below; this handler only
+    // acts on the post-acquisition should-never case.
+    coordinator.catch((err) => {
+      if (acquired) {
+        log.error("Warm lease coordinator promise rejected post-acquisition — force-releasing", {
+          agentId: ctx.agentId,
+          threadKey,
+          error: String(err),
+        });
+        lease.close("coordinator-rejected");
+      }
+    });
+
+    // "Lease ready" gate: acquisition errors propagate synchronously.
+    await Promise.race([ready, coordinator]);
+
+    this.warmLeases.set(threadKey, lease);
+
+    try {
+      if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
+
+      // Accepted trade-off (plan review r1 adv. 4): a circuit-open at call
+      // START pays one CLI boot + MCP handshake here before turn 1's
+      // per-turn breaker acquire fast-fails — unlike the cold path, which
+      // fast-fails before any I/O. Deliberate, not an oversight: a pre-open
+      // acquire probe would either leak a permit or double-record against
+      // KPR-306's record-once-per-turn discipline, and the waste is bounded
+      // (one subprocess boot + a budget slot held ≤120s idle) in an
+      // already-degraded state — while the opened lease keeps half-open
+      // probes warm mid-call (spec §5 breaker row).
+      // Build the runner once; open the streaming session with resume =
+      // ctx.sessionId EXACTLY as passed (§4.2 resume-source rule — the
+      // adapter stays the single authority on resume-vs-full-prompt; the
+      // retry-shaped ctx {sessionId: undefined, full transcript} therefore
+      // opens a FRESH session and never resumes the one a retry escaped).
+      const runner = this.createRunner(ctx.agentId);
+      const q = await runner.openVoiceStreamingSession({
+        input: lease.inputQueue,
+        sessionId: ctx.sessionId,
+        context: {
+          adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,
+          channelId: ctx.channelId,
+          channelKind: ctx.workItem.source.kind,
+          channelLabel: ctx.workItem.source.label,
+          threadId: ctx.threadId,
+          slackTs: "",
+          slackThreadTs: "",
+        },
+        systemPromptOverride: ctx.systemPromptOverride ?? "",
+      });
+      lease.start(q);
+    } catch (err) {
+      // Session open failed — release lock/budget/registry before
+      // propagating; the adapter's outer retry lands cold (§5).
+      lease.close("open-failed");
+      throw err;
+    }
+
+    // Turn 1 runs through the same per-turn path as turns 2..N. Turn 1's
+    // text is the adapter's full-transcript or greet-branch render,
+    // unchanged from conversation-prompt.ts (§4.2).
+    return this.runWarmTurn(lease, ctx, onStream);
+  }
+
+  /**
+   * KPR-323 §4.2 turn N: per-turn breaker acquire → push + demux via the
+   * lease → per-turn finalize/observability reused VERBATIM (this is what
+   * keeps session-id rotation persisted to Mongo per turn and cold fallback
+   * lossless). Never re-enters withSpawnTicket — the lease's ticket already
+   * covers the thread; re-entering would deadlock on the held lock.
+   *
+   * Failure-close precedence (spec §6 — the one place it is stated; do not
+   * generalize): a circuit-open fast-fail does NOT close the lease (the
+   * message is never pushed; the session is healthy; half-open probes are
+   * real turns and recovery is seamless mid-call). EVERY OTHER turn-level
+   * failure closes the lease BEFORE the error propagates, so the adapter's
+   * outer full-transcript retry always lands cold. Timed-out turns return
+   * ok under KPR-307 semantics (empty errors) — not a turn-level failure —
+   * so the lease stays open.
+   *
+   * No per-turn reflection scheduling here (§4.5): a timer firing mid-call
+   * would hit the quiescence check, skip without rescheduling, and lose the
+   * reflection. One reflection per call is credited at release.
+   */
+  private async runWarmTurn(
+    lease: WarmVoiceSession,
+    ctx: TurnContext,
+    onStream?: SpawnTurnStreamCallback,
+  ): Promise<TurnResult> {
+    const route = resolveProviderModel(this.registry.get(ctx.agentId)?.model ?? "");
+    const permit = this.circuitBreakers.acquire(route.provider, {
+      agentId: ctx.agentId,
+      threadId: ctx.threadId,
+    });
+
+    const timeoutMs = this.registry.get(ctx.agentId)?.timeoutMs ?? 300_000;
+
+    let runResult: RunResult;
+    try {
+      runResult = await lease.runTurn({ text: ctx.workItem.text, onStream, timeoutMs });
+    } catch (err) {
+      this.circuitBreakers.record(permit, classifyThrown(err), 0);
+      lease.close("turn-failure");
+      throw err;
+    }
+    this.circuitBreakers.record(permit, classifyTurnResult(runResult), runResult.llmMs);
+
+    const turnResult = this.finalizeSpawnResult(ctx, runResult, route);
+    turnResult.warmPath = true;
+    turnResult.warmTurnSeq = lease.turns;
+    // C1 on warm turns (plan review r1 adv. 3): admission/spawn stages do
+    // not exist on a warm turn — zeros by definition — and
+    // initToFirstTokenMs is the lease's push → first-delta measurement
+    // (RunResult field comment, Task 2). Populated so the adapter's log
+    // spread carries it instead of computing-and-dropping it.
+    turnResult.stageTimings = {
+      lockWaitMs: 0,
+      spawnPrepMs: 0,
+      initToFirstTokenMs: runResult.initToFirstTokenMs,
+    };
+    // The warm lane's shaping is exactly what prepareSpawn's voice carve-out
+    // returns (raw text + the static route, no router, no resource limits) —
+    // constructed inline because prepareSpawn is not re-entered on a warm
+    // turn. Same `route` object the breaker permit was keyed on.
+    this.recordSpawnObservability(ctx, {
+      prompt: ctx.workItem.text,
+      route,
+      resourceLimits: undefined,
+      routerCostUsd: 0,
+      effortOverride: undefined,
+    }, runResult);
+    lease.lastTurn = { ctx, result: turnResult };
+
+    if (runResult.error) {
+      // Turn-level failure: close BEFORE returning (spec §5 outer-retry
+      // row). The adapter's retry ctx {sessionId: undefined, full
+      // transcript} then opens a FRESH lease — cold-equivalent turn 1,
+      // warm for subsequent turns (spec §6 crash row).
+      lease.close("turn-failure");
+    }
+
+    return turnResult;
   }
 
   /**
@@ -1349,7 +1619,7 @@ export class AgentManager {
    * turn. Legacy code shared the predicate but queue-drain semantics masked
    * the consequence.
    */
-  private scheduleReflectionIfEligible(ctx: TurnContext, turnResult: TurnResult): void {
+  private scheduleReflectionIfEligible(ctx: TurnContext, turnResult: TurnResult, turns: number = 1): void {
     const minTurns = appConfig.memory.reflectionMinTurns;
     if (minTurns <= 0) return;
 
@@ -1359,7 +1629,9 @@ export class AgentManager {
 
     const ok = turnResult.errors.length === 0;
     const state: ReflectionState = {
-      pendingReflectionTurns: (prior?.pendingReflectionTurns ?? 0) + 1,
+      // KPR-323 §4.5: `turns` defaults to 1 (every cold caller); the warm
+      // voice lease credits the whole call's turn count once, at release.
+      pendingReflectionTurns: (prior?.pendingReflectionTurns ?? 0) + turns,
       lastTurnAt: Date.now(),
       lastSender: ctx.workItem.sender,
       lastResultOk: ok,
