@@ -61,8 +61,8 @@ vi.mock("../config.js", () => ({
     // createProviderAdapter's resolvePassthroughSpawn call.
     kimi: { agentModel: "" },
     deepseek: { agentModel: "" },
-    // KPR-371: grok's default-model override. No credential entry — the
-    // credential is an OAuth file, mocked below.
+    // KPR-371/KPR-384: grok's default-model override; the credential
+    // (GROK_GATEWAY_KEY) rides the same env → Keychain chain as kimi/deepseek.
     grok: { agentModel: "" },
     instance: { id: "test-instance" },
     modelRouter: { enabled: false },
@@ -72,15 +72,9 @@ vi.mock("../config.js", () => ({
 
 // KPR-346: the Lane A credential chain is env → Keychain. Stub the Keychain
 // leg so no real `security` subprocess ever runs; env (KIMI_API_KEY /
-// DEEPSEEK_API_KEY, set per-test) is the only live source in the suite.
+// DEEPSEEK_API_KEY / GROK_GATEWAY_KEY, set per-test) is the only live source
+// in the suite.
 vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: vi.fn(() => "") }));
-
-// KPR-371: grok's credential is a vendor-CLI-owned OAuth file. Mock the
-// resolver so the suite never reads the operator's real ~/.grok/auth.json
-// and never issues a refresh grant.
-vi.mock("./provider-adapters/grok-oauth.js", () => ({
-  resolveOAuthFileToken: vi.fn(async () => "test-grok-oauth-token"),
-}));
 
 // Mock plugin loader
 vi.mock("../plugins/plugin-loader.js", () => ({
@@ -205,9 +199,6 @@ import type { AgentProviderId } from "./provider-adapters/types.js";
 import { buildGenericDelegatePrompt, type DelegateTurnRunner } from "./provider-adapters/turn-assembly.js";
 import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
 import { classifyTurnResult, TurnAssemblyError } from "./provider-adapters/error-classification.js";
-import { resolveOAuthFileToken } from "./provider-adapters/grok-oauth.js";
-
-const mockResolveOAuthFileToken = vi.mocked(resolveOAuthFileToken);
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -3461,7 +3452,7 @@ describe("AgentManager", () => {
 
       beforeEach(() => {
         mockConversationIndex.mockResolvedValue(undefined);
-        mockResolveOAuthFileToken.mockResolvedValue("test-grok-oauth-token");
+        process.env.GROK_GATEWAY_KEY = "test-grok-gateway-key";
         process.env.KIMI_API_KEY = "test-kimi-key";
         registry._agents.set(
           "agent-grok",
@@ -3475,6 +3466,7 @@ describe("AgentManager", () => {
 
       afterEach(() => {
         delete process.env.KIMI_API_KEY;
+        delete process.env.GROK_GATEWAY_KEY;
       });
 
       // --- routing ----------------------------------------------------------
@@ -3499,8 +3491,10 @@ describe("AgentManager", () => {
           laneAPassthrough: expect.objectContaining({
             provider: "grok",
             model: "grok-4.6",
-            baseUrl: "https://api.x.ai",
-            authToken: "test-grok-oauth-token",
+            // KPR-384: the loopback CLIProxyAPI gateway, never api.x.ai —
+            // xAI's own compat endpoint 400s on schemas lacking `required`.
+            baseUrl: "http://127.0.0.1:8317",
+            authToken: "test-grok-gateway-key",
           }),
         });
         expect(mockRunnerSend).toHaveBeenCalled();
@@ -3545,19 +3539,17 @@ describe("AgentManager", () => {
       });
 
       // --- credential fault, breaker-invisible ------------------------------
-      it("an unavailable OAuth credential is a config fault that never trips the grok breaker", async () => {
-        mockResolveOAuthFileToken.mockRejectedValue(
-          new TurnAssemblyError(
-            "Grok OAuth credential unavailable (authentication) at ~/.grok/auth.json — the file is absent or unreadable; run `grok login` to sign in",
-          ),
-        );
+      it("a missing gateway key is a config fault that never trips the grok breaker", async () => {
+        // KPR-384: no env value and the Keychain stub returns "" — the
+        // standard Lane A missing-credential path, same as kimi/deepseek.
+        delete process.env.GROK_GATEWAY_KEY;
         for (let i = 0; i < 3; i++) {
           await expect(
             manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr371-cred-${i}` })),
-          ).rejects.toThrow(/Grok OAuth credential unavailable \(authentication\)/);
+          ).rejects.toThrow(/Passthrough credential missing \(authentication\): GROK_GATEWAY_KEY/);
         }
         // Breaker never tripped — restore the credential and the 4th spawn RUNS.
-        mockResolveOAuthFileToken.mockResolvedValue("test-grok-oauth-token");
+        process.env.GROK_GATEWAY_KEY = "test-grok-gateway-key";
         const result = await manager.spawnTurn(
           smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-cred-ok" }),
         );

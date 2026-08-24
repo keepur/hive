@@ -4,13 +4,8 @@ vi.mock("../../keychain/from-keychain.js", () => ({
   fromKeychain: vi.fn(() => ""),
 }));
 
-vi.mock("./grok-oauth.js", () => ({
-  resolveOAuthFileToken: vi.fn(async () => "grok-oauth-token"),
-}));
-
 import { fromKeychain } from "../../keychain/from-keychain.js";
 import { classifyThrown, TurnAssemblyError } from "./error-classification.js";
-import { resolveOAuthFileToken } from "./grok-oauth.js";
 import {
   PASSTHROUGH_PROVIDERS,
   buildPassthroughEnv,
@@ -21,7 +16,6 @@ import {
 import type { AgentProviderId } from "./types.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
-const mockResolveOAuthFileToken = vi.mocked(resolveOAuthFileToken);
 
 describe("PASSTHROUGH_PROVIDERS table (KPR-346 §D1)", () => {
   it("carries the exact vendor endpoints, key names, and default models", () => {
@@ -41,12 +35,13 @@ describe("PASSTHROUGH_PROVIDERS table (KPR-346 §D1)", () => {
     });
   });
 
-  it("KPR-371: grok carries the xAI endpoint, the OAuth-file credential, and grok-4.6", () => {
+  it("KPR-384: grok carries the loopback gateway endpoint (env-overridable), the gateway-key credential, and grok-4.6", () => {
     expect(PASSTHROUGH_PROVIDERS.grok).toEqual({
       id: "grok",
       displayName: "Grok (xAI)",
-      baseUrl: "https://api.x.ai",
-      credential: { kind: "oauth-file", path: "~/.grok/auth.json" },
+      baseUrl: "http://127.0.0.1:8317",
+      baseUrlEnv: "GROK_GATEWAY_URL",
+      credential: { kind: "env-key", key: "GROK_GATEWAY_KEY" },
       defaultModel: "grok-4.6",
     });
   });
@@ -83,8 +78,8 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
   });
 
   describe("model chain: route.model || configuredModel || table default", () => {
-    it("route model wins over both configured and default", async () => {
-      const cfg = await resolvePassthroughSpawn("kimi", "kimi/route-model", {
+    it("route model wins over both configured and default", () => {
+      const cfg = resolvePassthroughSpawn("kimi", "kimi/route-model", {
         configuredModel: "cfg-model",
         instanceId: "inst",
         resolveSecret: () => "tok",
@@ -92,8 +87,8 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
       expect(cfg.model).toBe("kimi/route-model");
     });
 
-    it("empty route falls back to configured model", async () => {
-      const cfg = await resolvePassthroughSpawn("kimi", "", {
+    it("empty route falls back to configured model", () => {
+      const cfg = resolvePassthroughSpawn("kimi", "", {
         configuredModel: "cfg-model",
         instanceId: "inst",
         resolveSecret: () => "tok",
@@ -101,8 +96,8 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
       expect(cfg.model).toBe("cfg-model");
     });
 
-    it("empty route + empty config falls back to the table default", async () => {
-      const cfg = await resolvePassthroughSpawn("kimi", "", {
+    it("empty route + empty config falls back to the table default", () => {
+      const cfg = resolvePassthroughSpawn("kimi", "", {
         configuredModel: "",
         instanceId: "inst",
         resolveSecret: () => "tok",
@@ -112,33 +107,33 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
   });
 
   describe("credential chain: process.env first, then Keychain (per spawn)", () => {
-    it("process.env.KIMI_API_KEY wins; Keychain is not consulted", async () => {
+    it("process.env.KIMI_API_KEY wins; Keychain is not consulted", () => {
       process.env.KIMI_API_KEY = "env-tok";
-      const cfg = await resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" });
+      const cfg = resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" });
       expect(cfg.authToken).toBe("env-tok");
       expect(mockFromKeychain).not.toHaveBeenCalled();
     });
 
-    it("empty env → fromKeychain(instanceId, KIMI_API_KEY) is consulted", async () => {
+    it("empty env → fromKeychain(instanceId, KIMI_API_KEY) is consulted", () => {
       mockFromKeychain.mockReturnValue("kc-tok");
-      const cfg = await resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst-7" });
+      const cfg = resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst-7" });
       expect(cfg.authToken).toBe("kc-tok");
       expect(mockFromKeychain).toHaveBeenCalledWith("inst-7", "KIMI_API_KEY");
     });
 
-    it("both empty → rejects with TurnAssemblyError naming the key and the remediation", async () => {
+    it("both empty → throws TurnAssemblyError naming the key and the remediation", () => {
       mockFromKeychain.mockReturnValue("");
       const call = () => resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst" });
-      await expect(call()).rejects.toThrow(TurnAssemblyError);
-      await expect(call()).rejects.toThrow(/Passthrough credential missing \(authentication\): KIMI_API_KEY/);
-      await expect(call()).rejects.toThrow(/hive credentials add/);
+      expect(call).toThrow(TurnAssemblyError);
+      expect(call).toThrow(/Passthrough credential missing \(authentication\): KIMI_API_KEY/);
+      expect(call).toThrow(/hive credentials add/);
     });
   });
 
-  it("breaker-invisibility: the missing-credential throw classifies non-provider, while the same message as a plain Error classifies auth", async () => {
+  it("breaker-invisibility: the missing-credential throw classifies non-provider, while the same message as a plain Error classifies auth", () => {
     let thrown: unknown;
     try {
-      await resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst", resolveSecret: () => "" });
+      resolvePassthroughSpawn("kimi", "", { configuredModel: "", instanceId: "inst", resolveSecret: () => "" });
     } catch (err) {
       thrown = err;
     }
@@ -151,8 +146,8 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
     expect(classifyThrown(new Error(message))).toMatchObject({ outcome: "fault", kind: "auth" });
   });
 
-  it("the credential never leaks into any spawn-config field other than authToken", async () => {
-    const cfg = await resolvePassthroughSpawn("kimi", "", {
+  it("the credential never leaks into any spawn-config field other than authToken", () => {
+    const cfg = resolvePassthroughSpawn("kimi", "", {
       configuredModel: "",
       instanceId: "inst",
       resolveSecret: () => "SECRET-TOK",
@@ -167,54 +162,117 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
   });
 });
 
-describe("resolvePassthroughSpawn — oauth-file credential (KPR-371 §D2)", () => {
+describe("resolvePassthroughSpawn — grok gateway (KPR-384)", () => {
+  const ORIG_KEY = process.env.GROK_GATEWAY_KEY;
+  const ORIG_URL = process.env.GROK_GATEWAY_URL;
+
   beforeEach(() => {
     vi.clearAllMocks();
-    mockResolveOAuthFileToken.mockResolvedValue("grok-oauth-token");
+    mockFromKeychain.mockReturnValue("");
+    delete process.env.GROK_GATEWAY_KEY;
+    delete process.env.GROK_GATEWAY_URL;
   });
 
-  it("resolves the credential from the OAuth file, never from env/Keychain", async () => {
-    const cfg = await resolvePassthroughSpawn("grok", "", {
+  afterEach(() => {
+    if (ORIG_KEY === undefined) delete process.env.GROK_GATEWAY_KEY;
+    else process.env.GROK_GATEWAY_KEY = ORIG_KEY;
+    if (ORIG_URL === undefined) delete process.env.GROK_GATEWAY_URL;
+    else process.env.GROK_GATEWAY_URL = ORIG_URL;
+  });
+
+  it("resolves GROK_GATEWAY_KEY on the standard env → Keychain chain — no OAuth-file path remains", () => {
+    process.env.GROK_GATEWAY_KEY = "gw-env-tok";
+    const cfg = resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst" });
+    expect(cfg.authToken).toBe("gw-env-tok");
+    expect(mockFromKeychain).not.toHaveBeenCalled();
+
+    delete process.env.GROK_GATEWAY_KEY;
+    mockFromKeychain.mockReturnValue("gw-kc-tok");
+    const kc = resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst-9" });
+    expect(kc.authToken).toBe("gw-kc-tok");
+    expect(mockFromKeychain).toHaveBeenCalledWith("inst-9", "GROK_GATEWAY_KEY");
+  });
+
+  it("missing gateway key throws the standard breaker-invisible config fault naming GROK_GATEWAY_KEY", () => {
+    const call = () => resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst" });
+    expect(call).toThrow(TurnAssemblyError);
+    expect(call).toThrow(/Passthrough credential missing \(authentication\): GROK_GATEWAY_KEY/);
+    let thrown: unknown;
+    try {
+      call();
+    } catch (err) {
+      thrown = err;
+    }
+    expect(classifyThrown(thrown)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+  });
+
+  it("model chain: route → configured → grok-4.6", () => {
+    const base = { instanceId: "inst", resolveSecret: () => "tok" };
+    expect(resolvePassthroughSpawn("grok", "grok-4.5", { ...base, configuredModel: "cfg" }).model).toBe("grok-4.5");
+    expect(resolvePassthroughSpawn("grok", "", { ...base, configuredModel: "cfg" }).model).toBe("cfg");
+    expect(resolvePassthroughSpawn("grok", "", { ...base, configuredModel: "" }).model).toBe("grok-4.6");
+  });
+
+  it("carries the loopback gateway base URL by default", () => {
+    const cfg = resolvePassthroughSpawn("grok", "", {
       configuredModel: "",
       instanceId: "inst",
-      resolveSecret: () => "SHOULD-NOT-BE-USED",
+      resolveSecret: () => "tok",
     });
-    expect(cfg.authToken).toBe("grok-oauth-token");
-    expect(mockResolveOAuthFileToken).toHaveBeenCalledWith("~/.grok/auth.json", {
-      fetchImpl: undefined,
-      now: undefined,
-    });
-    expect(mockFromKeychain).not.toHaveBeenCalled();
-  });
-
-  it("model chain: route → configured → grok-4.6", async () => {
-    const base = { instanceId: "inst" };
-    expect((await resolvePassthroughSpawn("grok", "grok-4.5", { ...base, configuredModel: "cfg" })).model).toBe(
-      "grok-4.5",
-    );
-    expect((await resolvePassthroughSpawn("grok", "", { ...base, configuredModel: "cfg" })).model).toBe("cfg");
-    expect((await resolvePassthroughSpawn("grok", "", { ...base, configuredModel: "" })).model).toBe("grok-4.6");
-  });
-
-  it("carries the xAI base URL into the spawn config", async () => {
-    const cfg = await resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst" });
-    expect(cfg.baseUrl).toBe("https://api.x.ai");
+    expect(cfg.baseUrl).toBe("http://127.0.0.1:8317");
     expect(cfg.provider).toBe("grok");
   });
 
-  it("propagates an OAuth failure unwrapped — the branch adds no wrapping", async () => {
-    const failure = new TurnAssemblyError("Grok OAuth credential unavailable (authentication) at /x — run `grok login`");
-    mockResolveOAuthFileToken.mockRejectedValue(failure);
-    await expect(
-      resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst" }),
-    ).rejects.toBe(failure);
+  it("GROK_GATEWAY_URL overrides the gateway address per spawn", () => {
+    process.env.GROK_GATEWAY_URL = "http://127.0.0.1:9999";
+    const cfg = resolvePassthroughSpawn("grok", "", {
+      configuredModel: "",
+      instanceId: "inst",
+      resolveSecret: () => "tok",
+    });
+    expect(cfg.baseUrl).toBe("http://127.0.0.1:9999");
+
+    // Per-spawn, not module-load: clearing the override restores the default
+    // on the very next resolution.
+    delete process.env.GROK_GATEWAY_URL;
+    const next = resolvePassthroughSpawn("grok", "", {
+      configuredModel: "",
+      instanceId: "inst",
+      resolveSecret: () => "tok",
+    });
+    expect(next.baseUrl).toBe("http://127.0.0.1:8317");
   });
 
-  it("threads the fetch/now test seams through to the OAuth resolver", async () => {
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
-    const now = () => 42;
-    await resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst", fetchImpl, now });
-    expect(mockResolveOAuthFileToken).toHaveBeenCalledWith("~/.grok/auth.json", { fetchImpl, now });
+  describe("override validation: https, or http to loopback only (review r1)", () => {
+    const base = { configuredModel: "", instanceId: "inst", resolveSecret: () => "tok" };
+    const call = () => resolvePassthroughSpawn("grok", "", base);
+
+    it.each(["http://localhost:9999", "http://127.0.0.1:8317", "http://127.5.5.5:80", "http://[::1]:8317", "https://gw.internal.example:8317"])(
+      "accepts %s",
+      (url) => {
+        process.env.GROK_GATEWAY_URL = url;
+        expect(call().baseUrl).toBe(url);
+      },
+    );
+
+    it("rejects cleartext http to a non-loopback host as a breaker-invisible config fault", () => {
+      process.env.GROK_GATEWAY_URL = "http://gw.internal.example:8317";
+      expect(call).toThrow(TurnAssemblyError);
+      expect(call).toThrow(/cleartext to a non-loopback host/);
+      let thrown: unknown;
+      try {
+        call();
+      } catch (err) {
+        thrown = err;
+      }
+      expect(classifyThrown(thrown)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+    });
+
+    it("rejects a malformed override URL", () => {
+      process.env.GROK_GATEWAY_URL = "not a url";
+      expect(call).toThrow(TurnAssemblyError);
+      expect(call).toThrow(/GROK_GATEWAY_URL is not a valid URL/);
+    });
   });
 });
 
@@ -264,16 +322,16 @@ describe("buildPassthroughEnv (KPR-346 §D5)", () => {
     });
   });
 
-  it("KPR-371: grok pins the xAI endpoint and grok-4.6 across every model var", () => {
+  it("KPR-384: grok pins the gateway endpoint and grok-4.6 across every model var", () => {
     const env = buildPassthroughEnv({
       provider: "grok",
       model: "grok-4.6",
-      baseUrl: "https://api.x.ai",
-      authToken: "grok-oauth-token",
+      baseUrl: "http://127.0.0.1:8317",
+      authToken: "grok-gateway-key",
     });
     expect(env).toStrictEqual({
-      ANTHROPIC_BASE_URL: "https://api.x.ai",
-      ANTHROPIC_AUTH_TOKEN: "grok-oauth-token",
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:8317",
+      ANTHROPIC_AUTH_TOKEN: "grok-gateway-key",
       ANTHROPIC_API_KEY: undefined,
       ANTHROPIC_MODEL: "grok-4.6",
       ANTHROPIC_SMALL_FAST_MODEL: "grok-4.6",

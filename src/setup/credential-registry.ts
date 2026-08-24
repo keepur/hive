@@ -153,6 +153,16 @@ export const CREDENTIAL_REGISTRY: CredentialEntry[] = [
     kind: "secret",
     fields: [{ key: "DEEPSEEK_API_KEY", label: "DeepSeek API Key" }],
   },
+  {
+    server: "grok",
+    title: "Grok (xAI) gateway",
+    description:
+      "Lane A passthrough provider (KPR-384) — agents with model: grok/… run the Claude runtime against a " +
+      "self-hosted CLIProxyAPI gateway. The key is an `api-keys` entry from your gateway's config.yaml.",
+    helpUrl: "https://github.com/keepur/hive/blob/main/docs/providers.md",
+    kind: "secret",
+    fields: [{ key: "GROK_GATEWAY_KEY", label: "Grok gateway API key" }],
+  },
 ];
 
 export function findCredentialEntry(server: string): CredentialEntry | undefined {
