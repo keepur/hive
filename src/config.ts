@@ -289,10 +289,10 @@ export const config = {
   },
   grok: {
     /** KPR-371: Lane A passthrough default-model override (non-secret).
-     *  There is deliberately NO secret entry — the credential is a
-     *  subscription OAuth file (~/.grok/auth.json) resolved per spawn (§D6),
-     *  never a paste-able key, which is also why grok is absent from the
-     *  credential registry. */
+     *  The secret GROK_GATEWAY_KEY (KPR-384 — gateway API key for the
+     *  self-hosted CLIProxyAPI shim) deliberately has NO boot-time entry —
+     *  it resolves per spawn (env → Keychain) in resolvePassthroughSpawn,
+     *  as does the non-secret GROK_GATEWAY_URL endpoint override. */
     agentModel: optional("GROK_AGENT_MODEL", ""),
   },
   linear: {

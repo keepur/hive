@@ -1,6 +1,5 @@
 import { fromKeychain } from "../../keychain/from-keychain.js";
 import { TurnAssemblyError } from "./error-classification.js";
-import { resolveOAuthFileToken } from "./grok-oauth.js";
 import type { AgentProviderId } from "./types.js";
 
 /**
@@ -21,26 +20,34 @@ import type { AgentProviderId } from "./types.js";
 export type LaneAProviderId = "kimi" | "deepseek" | "grok";
 
 /**
- * KPR-371 (§D2): Lane A credential source. `authTokenKey: string` hardwired
- * "static key from env or Honeypot"; Grok authenticates with a subscription
- * OAuth token in a vendor-CLI-owned file that expires every 6h and whose
- * refresh token rotates on use. The discriminant keeps the kimi/deepseek
- * branch byte-for-byte unchanged while giving grok its own resolution path.
+ * Lane A credential source: a static key resolved env → Honeypot Keychain per
+ * spawn. KPR-371 briefly widened this to a discriminated union with an
+ * `oauth-file` variant for grok's vendor-CLI-owned subscription OAuth file;
+ * KPR-384 retired that variant when grok moved behind the self-hosted
+ * CLIProxyAPI gateway (see the grok row below) and its credential became an
+ * ordinary gateway API key. The `kind` discriminant stays so a future
+ * non-key vendor re-widens the union without touching existing rows.
  */
-export type PassthroughCredential =
-  | { kind: "env-key"; key: string }
-  | { kind: "oauth-file"; path: string };
+export type PassthroughCredential = { kind: "env-key"; key: string };
 
 export interface PassthroughProviderDef {
   id: LaneAProviderId;
   displayName: string;
-  /** Vendor-operated Anthropic-compat endpoint (never a translation proxy). */
-  baseUrl: string;
   /**
-   * Credential source — resolved PER SPAWN, never boot-time.
-   *  - env-key:    env → Keychain (Honeypot `hive/<instanceId>/<KEY>`).
-   *  - oauth-file: vendor-CLI-owned OAuth file, refreshed + written back.
+   * The endpoint the spawn's ANTHROPIC_BASE_URL is pinned to. For kimi and
+   * deepseek this is the vendor-operated Anthropic-compat endpoint (never a
+   * translation proxy — epic KPR-345 canon). Grok is the one sanctioned
+   * exception (KPR-384): an OPERATOR-hosted loopback CLIProxyAPI gateway,
+   * because xAI's own compat endpoint rejects the CLI's tool schemas (see
+   * the grok row). The canon rules out third-party-operated translation
+   * services, not infrastructure the operator runs on their own machine.
    */
+  baseUrl: string;
+  /** Env var that overrides `baseUrl` per spawn, for endpoints that are
+   *  deployment infrastructure rather than a universal vendor address. */
+  baseUrlEnv?: string;
+  /** Credential source — resolved PER SPAWN (env → Honeypot Keychain
+   *  `hive/<instanceId>/<KEY>`), never boot-time. */
   credential: PassthroughCredential;
   /**
    * Fallback model when neither the route (`kimi/<model>`) nor config
@@ -73,12 +80,22 @@ export const PASSTHROUGH_PROVIDERS: Readonly<Record<LaneAProviderId, Passthrough
   grok: {
     id: "grok",
     displayName: "Grok (xAI)",
-    baseUrl: "https://api.x.ai",
-    // KPR-371 (§D2/R5): subscription OAuth, shared with the `grok` CLI. Hive
-    // reads AND writes this file — the refresh token rotates on use.
-    credential: { kind: "oauth-file", path: "~/.grok/auth.json" },
-    // §3.5: the subscription session exposes only grok-4.6 / grok-4.5; the
-    // API's wider catalogue is not reachable under this auth.
+    // KPR-384: xAI's /v1/messages validator rejects any tool input_schema
+    // that omits the `required` array (valid JSON Schema, accepted by
+    // Anthropic) — 13 of the CLI's builtin/plugin tool schemas omit it, so a
+    // direct api.x.ai spawn 400s on every realistic toolkit. Lane A grok
+    // therefore fronts the operator's self-hosted CLIProxyAPI gateway
+    // (io.keepur.grok-gateway pattern, loopback-only), which translates to
+    // the vendor's OpenAI-format backend and drops the quirk. The gateway
+    // owns the `grok login` subscription OAuth session (the KPR-371
+    // oauth-file machinery lived in hive until KPR-384 removed it); hive
+    // holds only a gateway API key from the gateway config's `api-keys`
+    // allowlist.
+    baseUrl: "http://127.0.0.1:8317",
+    baseUrlEnv: "GROK_GATEWAY_URL",
+    credential: { kind: "env-key", key: "GROK_GATEWAY_KEY" },
+    // KPR-371 §3.5: the subscription session exposes only grok-4.6 /
+    // grok-4.5; the API's wider catalogue is not reachable under this auth.
     defaultModel: "grok-4.6",
   },
 };
@@ -107,15 +124,13 @@ export interface PassthroughSpawnConfig {
  * KPR-346 (§D4): per-spawn credential + model resolution. Model chain mirrors
  * codex/openai/gemini: route.model || configured agentModel || table default.
  *
- * KPR-371 (§D2): the credential branches on the table's discriminant.
- *  - env-key    — the standard secret-env pattern (agent-runner.ts plugin
- *                 stdio servers): process.env first, then Honeypot Keychain
- *                 (hive/<instanceId>/<KEY>) — per spawn, not boot-time, so
- *                 `hive credentials add` takes effect on the next spawn
- *                 without a restart.
- *  - oauth-file — a vendor-CLI-owned OAuth file (grok-oauth.ts), which may
- *                 perform a refresh grant and write the rotated pair back.
- *                 This is why the function is async.
+ * The credential is the standard secret-env pattern (agent-runner.ts plugin
+ * stdio servers): process.env first, then Honeypot Keychain
+ * (hive/<instanceId>/<KEY>) — per spawn, not boot-time, so `hive credentials
+ * add` takes effect on the next spawn without a restart. The base URL is
+ * likewise re-read per spawn when the row declares a `baseUrlEnv` override.
+ * (KPR-371's async oauth-file arm lived here until KPR-384 removed it —
+ * resolution is synchronous again.)
  *
  * Missing/empty credential throws TurnAssemblyError — classifyThrown
  * short-circuits it to non-provider BEFORE the pattern tables
@@ -127,7 +142,7 @@ export interface PassthroughSpawnConfig {
  * exploits to prove the typed wrapper is load-bearing. Config fault, not
  * provider fault (epic §D2).
  */
-export async function resolvePassthroughSpawn(
+export function resolvePassthroughSpawn(
   provider: LaneAProviderId,
   routeModel: string,
   opts: {
@@ -136,22 +151,14 @@ export async function resolvePassthroughSpawn(
     instanceId: string;
     /** Test seam only; defaults to env → Keychain. */
     resolveSecret?: (instanceId: string, key: string) => string;
-    /** Test seam only (oauth-file providers); defaults to global fetch. */
-    fetchImpl?: typeof fetch;
-    /** Test seam only (oauth-file providers); defaults to Date.now. */
-    now?: () => number;
   },
-): Promise<PassthroughSpawnConfig> {
+): PassthroughSpawnConfig {
   const def = PASSTHROUGH_PROVIDERS[provider];
-  const authToken =
-    def.credential.kind === "env-key"
-      ? resolveEnvKeyCredential(def.credential.key, opts)
-      : await resolveOAuthFileToken(def.credential.path, { fetchImpl: opts.fetchImpl, now: opts.now });
   return {
     provider,
     model: routeModel || opts.configuredModel || def.defaultModel,
-    baseUrl: def.baseUrl,
-    authToken,
+    baseUrl: (def.baseUrlEnv && process.env[def.baseUrlEnv]) || def.baseUrl,
+    authToken: resolveEnvKeyCredential(def.credential.key, opts),
   };
 }
 

@@ -153,6 +153,19 @@ export const CREDENTIAL_REGISTRY: CredentialEntry[] = [
     kind: "secret",
     fields: [{ key: "DEEPSEEK_API_KEY", label: "DeepSeek API Key" }],
   },
+  {
+    server: "grok",
+    title: "Grok (xAI) gateway",
+    description:
+      "Lane A passthrough provider (KPR-371/KPR-384) — agents with model: grok/… run the Claude runtime against " +
+      "a self-hosted CLIProxyAPI gateway that fronts the operator's `grok login` subscription session " +
+      "(xAI's own Anthropic-compatible endpoint rejects the CLI's tool schemas). The key is one of the " +
+      "gateway config's `api-keys` entries; the gateway address defaults to http://127.0.0.1:8317 " +
+      "(non-secret override: GROK_GATEWAY_URL).",
+    helpUrl: "https://github.com/router-for-me/CLIProxyAPI",
+    kind: "secret",
+    fields: [{ key: "GROK_GATEWAY_KEY", label: "Grok gateway API key" }],
+  },
 ];
 
 export function findCredentialEntry(server: string): CredentialEntry | undefined {

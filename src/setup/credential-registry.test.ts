@@ -15,6 +15,7 @@ const NON_CATALOG_SERVERS = new Set([
   "model-router", // pseudo-server: LLM complexity classifier (KPR-312), not an MCP server
   "kimi", // Lane A passthrough provider (KPR-346), not an MCP server
   "deepseek", // Lane A passthrough provider (KPR-346), not an MCP server
+  "grok", // Lane A passthrough provider (KPR-371/KPR-384 gateway key), not an MCP server
 ]);
 
 describe("CREDENTIAL_REGISTRY", () => {
