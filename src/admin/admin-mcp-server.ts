@@ -18,6 +18,12 @@ import type { AutonomyFlags } from "../agents/autonomy.js";
 import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
 import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
 import { IN_PROCESS_PORTED_SERVERS } from "../agents/in-process-servers.js";
+import { createLogger } from "../logging/logger.js";
+import { config as appConfig } from "../config.js";
+import { envValue } from "../agents/provider-adapters/oauth-credentials.js";
+import { getCachedGeminiModels, setCachedGeminiModels } from "./model-catalog-cache.js";
+
+const log = createLogger("admin-mcp");
 
 /**
  * KPR-184: returns an error message if `delegateServers` references any
@@ -79,6 +85,126 @@ function checkToolSearch(value: unknown): string | null {
   return `Invalid toolSearch: "${String(value)}". Must be one of: auto, on, off — or omit the field to inherit the hive.yaml toolSearch.mode (engine default: auto).`;
 }
 
+// ---------------------------------------------------------------------------
+// KPR-381: agent model catalog — curated model ids for claude/grok/codex
+// (subscription-auth providers with no live model-list endpoint) + a live
+// Gemini lookup. Types are inline on purpose: no second consumer exists.
+// NOT related to src/llm/catalog.ts (LLM_CATALOG) — that is the sidecar
+// catalog for 4 fixed internal engine tasks and is untouched here.
+// ---------------------------------------------------------------------------
+
+type CuratedCatalogProvider = "claude" | "grok" | "codex";
+
+interface AgentModelCatalogEntry {
+  id: string; // e.g. "grok-4.6"
+  displayName: string; // e.g. "Grok 4.6"
+  notes?: string; // free text, e.g. "subscription default"
+  addedAt: Date;
+}
+
+interface AgentModelCatalogDoc {
+  _id: CuratedCatalogProvider;
+  provider: CuratedCatalogProvider;
+  models: AgentModelCatalogEntry[];
+  updatedAt: Date;
+  updatedBy: string; // agentId that called the refresh tool
+}
+
+/** Append-only audit trail — mirrors AgentDefinitionVersion's shape. */
+interface AgentModelCatalogVersion {
+  provider: CuratedCatalogProvider;
+  snapshot: AgentModelCatalogEntry[];
+  changeSummary: string;
+  createdAt: Date;
+  updatedBy: string;
+}
+
+/** One row in agent_model_catalog_list's entries JSON. */
+interface CatalogListEntry {
+  provider: CuratedCatalogProvider | "gemini";
+  id: string;
+  displayName: string;
+  notes?: string;
+  source: "live" | "curated";
+  asOf: string; // ISO — fetch time for gemini, updatedAt for curated
+}
+
+const CURATED_CATALOG_PROVIDERS: readonly CuratedCatalogProvider[] = ["claude", "grok", "codex"];
+
+/**
+ * KPR-381: live Gemini model lookup. Header auth ONLY (x-goog-api-key) — a
+ * query-param key would leak into agent-visible tool output via any error
+ * message that echoes the request URL. Every failure path throws a
+ * GeminiLookupError whose message is sanitized by construction (HTTP status
+ * + fixed text; never the raw error object, never the URL). pageSize=1000
+ * avoids nextPageToken pagination (vendor max; full list fits one page).
+ */
+const GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
+
+/**
+ * Best-effort exclusion of non-chat model families (image/video/audio/TTS/
+ * embedding). The vendor field doesn't cleanly distinguish "works on the
+ * Interactions adapter" — same caveat KPR-352 flagged — so this filter is
+ * documented best-effort, not a hard guarantee.
+ */
+const GEMINI_NON_CHAT_RE = /(embed|imagen|image|veo|video|lyria|audio|tts)/i;
+
+interface GeminiApiModel {
+  name?: string;
+  displayName?: string;
+  supportedGenerationMethods?: string[];
+}
+
+class GeminiLookupError extends Error {}
+
+async function fetchGeminiModels(apiKey: string): Promise<CatalogListEntry[]> {
+  const cached = getCachedGeminiModels<CatalogListEntry>();
+  if (cached) return cached;
+
+  let res: Response;
+  try {
+    res = await fetch(GEMINI_MODELS_URL, {
+      headers: { "x-goog-api-key": apiKey },
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    // Deliberately NOT String(err): transport errors can embed request detail.
+    throw new GeminiLookupError(
+      "Gemini model lookup failed: network error reaching generativelanguage.googleapis.com.",
+    );
+  }
+  if (!res.ok) {
+    throw new GeminiLookupError(`Gemini model lookup failed: vendor returned HTTP ${res.status}.`);
+  }
+  let body: { models?: GeminiApiModel[] };
+  try {
+    body = (await res.json()) as { models?: GeminiApiModel[] };
+  } catch {
+    throw new GeminiLookupError("Gemini model lookup failed: unparseable vendor response.");
+  }
+
+  const asOf = new Date().toISOString();
+  const entries: CatalogListEntry[] = (body.models ?? [])
+    .filter((m) => (m.supportedGenerationMethods ?? []).includes("generateContent"))
+    .filter((m) => !GEMINI_NON_CHAT_RE.test(`${m.name ?? ""} ${m.displayName ?? ""}`))
+    .map((m) => {
+      const id = (m.name ?? "").replace(/^models\//, "");
+      return { provider: "gemini" as const, id, displayName: m.displayName ?? id, source: "live" as const, asOf };
+    })
+    .filter((e) => e.id.length > 0);
+
+  setCachedGeminiModels(entries);
+  return entries;
+}
+
+// KPR-382: message mirrors the adapter's Gemini key fallback chain, EFFECTIVE order
+// (GEMINI_API_KEY → GOOGLE_GENAI_API_KEY → GOOGLE_API_KEY) — see the actual chain's
+// literal code order + rationale at the `key` assignment below.
+const GEMINI_KEY_MISSING_MSG =
+  "Gemini API key not configured on this instance — checked GEMINI_API_KEY (env→Keychain) and the adapter's " +
+  "env-only fallbacks GOOGLE_GENAI_API_KEY / GOOGLE_API_KEY. Run `hive credentials add GEMINI_API_KEY`, " +
+  "then restart the hive service (GEMINI_API_KEY keychain resolution happens once at boot; see docs/providers.md).";
+
 const FALLBACK_CAPABILITIES: InstanceCapabilities = {
   instanceId: "unknown",
   servers: { configured: [], unconfigured: [], broken: [] },
@@ -100,14 +226,18 @@ export function buildAdminTools(deps: AdminToolDeps) {
   const { db, agentId, instanceCapabilitiesJson } = deps;
   const agentDefs = db.collection<AgentDefinition>("agent_definitions");
   const agentVersions = db.collection<AgentDefinitionVersion>("agent_definition_versions");
+  const catalogDocs = db.collection<AgentModelCatalogDoc>("agent_model_catalog");
+  const catalogVersions = db.collection<AgentModelCatalogVersion>("agent_model_catalog_versions");
 
   // Lazy index creation — first call to a handler triggers it. Avoids hard
   // requirements on Mongo at module import (test harnesses, dry runs).
   let indexInit: Promise<void> | null = null;
   function ensureIndexes(): Promise<void> {
     if (!indexInit) {
-      indexInit = agentVersions
-        .createIndex({ agentId: 1, createdAt: -1 })
+      indexInit = Promise.all([
+        agentVersions.createIndex({ agentId: 1, createdAt: -1 }),
+        catalogVersions.createIndex({ provider: 1, createdAt: -1 }),
+      ])
         .then(() => undefined)
         .catch(() => undefined);
     }
@@ -237,7 +367,14 @@ export function buildAdminTools(deps: AdminToolDeps) {
           .array(z.string())
           .optional()
           .describe('Optional short names / nicknames for name-based routing (e.g. ["Sam"] for "Samantha").'),
-        model: z.string().describe("Model to use (e.g. 'claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5')"),
+        model: z
+          .string()
+          .describe(
+            "Model to use. Bare id (e.g. 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5') routes to Claude. " +
+              "Prefix <provider>/<model>[:effort] routes elsewhere — e.g. 'codex/gpt-5.5:medium', " +
+              "'gemini/gemini-3.1-pro-preview', 'grok/grok-4.6'. Call agent_model_catalog_list first to check " +
+              "what's currently valid per provider; see docs/providers.md for full capability parity.",
+          ),
         homeBase: z
           .string()
           .describe(
@@ -412,7 +549,11 @@ export function buildAdminTools(deps: AdminToolDeps) {
         fields: z
           .record(z.string(), z.any())
           .optional()
-          .describe("Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.)"),
+          .describe(
+            "Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.). " +
+              "For `model`: bare id routes to Claude; <provider>/<model>[:effort] routes elsewhere " +
+              "(e.g. 'codex/gpt-5.5:medium', 'grok/grok-4.6') — call agent_model_catalog_list to check valid ids per provider.",
+          ),
       },
       async ({ agent_id, homeBase, soul, systemPrompt, archetype, title, roles, aliases, fields }) => {
         try {
@@ -777,6 +918,196 @@ export function buildAdminTools(deps: AdminToolDeps) {
           return { content: [{ type: "text", text: JSON.stringify(catalog, null, 2) }] };
         } catch (err) {
           return { isError: true, content: [{ type: "text", text: `list_archetypes error: ${String(err)}` }] };
+        }
+      },
+    ),
+    tool(
+      "agent_model_catalog_list",
+      "List valid LLM model ids per provider for agent `model` assignment. Gemini is resolved live from the vendor (cached ~10 min); claude/grok/codex come from the curated catalog (maintained via agent_model_catalog_refresh). Use before setting `model` on agent_create/agent_update. Returns a JSON entries array plus prose notes for any provider leg that is unseeded or unavailable.",
+      {
+        provider: z.enum(["claude", "grok", "codex", "gemini"]).optional().describe("Omit to list all 4 providers."),
+      },
+      async ({ provider }) => {
+        try {
+          await ensureIndexes();
+          const wantCurated = provider
+            ? CURATED_CATALOG_PROVIDERS.filter((p) => p === provider)
+            : [...CURATED_CATALOG_PROVIDERS];
+          const wantGemini = provider === undefined || provider === "gemini";
+
+          const entries: CatalogListEntry[] = [];
+          const notes: string[] = [];
+
+          for (const p of wantCurated) {
+            const doc = await catalogDocs.findOne({ _id: p });
+            if (!doc || (doc.models ?? []).length === 0) {
+              notes.push(`${p}: not yet seeded — call agent_model_catalog_refresh first.`);
+              continue;
+            }
+            const asOf = doc.updatedAt instanceof Date ? doc.updatedAt.toISOString() : String(doc.updatedAt);
+            for (const m of doc.models) {
+              entries.push({
+                provider: p,
+                id: m.id,
+                displayName: m.displayName,
+                ...(m.notes ? { notes: m.notes } : {}),
+                source: "curated",
+                asOf,
+              });
+            }
+          }
+
+          if (wantGemini) {
+            // KPR-382: byte-for-byte mirror of the adapter's key chain
+            // (gemini-interactions-adapter.ts:194-198, where options.apiKey
+            // is config.gemini.apiKey per agent-manager.ts) so this tool's
+            // availability judgment matches actual turn behavior. The env
+            // fallbacks are adapter-local by ruling — read from process.env
+            // here, deliberately NOT pushed into config.ts (docs/providers.md
+            // fn 16: env-only, never Keychain-resolved). The raw
+            // GEMINI_API_KEY leg is redundant behind the config read but
+            // kept so the chain is textually identical to the adapter's.
+            const key =
+              appConfig.gemini.apiKey ||
+              envValue("GOOGLE_GENAI_API_KEY") ||
+              envValue("GEMINI_API_KEY") ||
+              envValue("GOOGLE_API_KEY");
+            if (!key) {
+              // Only the gemini-only call hard-errors; the all-4 call
+              // degrades to partial results + a prose note (spec).
+              if (provider === "gemini") {
+                return { isError: true, content: [{ type: "text", text: GEMINI_KEY_MISSING_MSG }] };
+              }
+              notes.push(`gemini: ${GEMINI_KEY_MISSING_MSG}`);
+            } else {
+              try {
+                const geminiEntries = await fetchGeminiModels(key);
+                entries.push(...geminiEntries);
+                if (geminiEntries.length === 0) {
+                  // A 200 with zero usable models (vendor returned nothing,
+                  // or the best-effort chat-family filter excluded
+                  // everything) is not a hard error — mirrors the "not yet
+                  // seeded" curated-provider case: empty array + a prose
+                  // note, for both the all-4 and gemini-only calls, so it
+                  // doesn't silently read as "gemini has no models."
+                  notes.push("gemini: vendor returned no usable chat models.");
+                }
+              } catch (err) {
+                // Sanitized by construction — GeminiLookupError messages
+                // carry status + fixed text only. No stale-cache fallback:
+                // masking a vendor failure as fresh data is worse than an
+                // honest error (spec; matches breaker fast-fail posture).
+                const msg = err instanceof GeminiLookupError ? err.message : "Gemini model lookup failed.";
+                log.warn(`agent_model_catalog_list gemini leg failed: ${msg}`);
+                if (provider === "gemini") {
+                  return { isError: true, content: [{ type: "text", text: msg }] };
+                }
+                notes.push(`gemini: ${msg}`);
+              }
+            }
+          }
+
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(entries, null, 2) },
+              ...notes.map((n) => ({ type: "text" as const, text: n })),
+            ],
+          };
+        } catch (err) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `agent_model_catalog_list error: ${String(err)}` }],
+          };
+        }
+      },
+    ),
+    tool(
+      "agent_model_catalog_refresh",
+      "Replace the curated model list for one provider (claude/grok/codex) after researching current vendor reality with your own WebSearch/WebFetch. Pass the FULL replacement list, not a delta. Upserts agent_model_catalog, appends a version-history row, returns a diff summary. Performs no vendor calls itself. Gemini is always resolved live and cannot be refreshed.",
+      {
+        provider: z.enum(["claude", "grok", "codex"]).describe("Gemini is always live — nothing to refresh."),
+        models: z
+          .array(
+            z.object({
+              id: z
+                .string()
+                .min(1)
+                .describe("Model id as the provider route accepts it (e.g. 'grok-4.6', 'gpt-5.5', 'claude-opus-5')."),
+              displayName: z.string().min(1),
+              notes: z.string().optional().describe("Free text, e.g. 'subscription default', 'reasoning tier'."),
+            }),
+          )
+          .min(1)
+          .describe("The full replacement list for this provider."),
+        changeSummary: z
+          .string()
+          .optional()
+          .describe(
+            "What changed and why, e.g. 'Anthropic shipped Opus 6, added; removed Opus 4.7 (deprecated per vendor changelog)'.",
+          ),
+      },
+      async ({ provider, models, changeSummary }) => {
+        try {
+          await ensureIndexes();
+
+          const ids = models.map((m) => m.id);
+          if (new Set(ids).size !== ids.length) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `Duplicate model ids in input: ${ids.join(", ")}.` }],
+            };
+          }
+
+          const now = new Date();
+          const current = await catalogDocs.findOne({ _id: provider });
+          const prevById = new Map((current?.models ?? []).map((m) => [m.id, m]));
+          const newIds = new Set(ids);
+          const added = ids.filter((id) => !prevById.has(id));
+          const removed = [...prevById.keys()].filter((id) => !newIds.has(id));
+
+          const nextModels: AgentModelCatalogEntry[] = models.map((m) => ({
+            id: m.id,
+            displayName: m.displayName,
+            ...(m.notes ? { notes: m.notes } : {}),
+            // Preserve addedAt for retained ids; stamp now for new ones.
+            addedAt: prevById.get(m.id)?.addedAt ?? now,
+          }));
+
+          await catalogDocs.updateOne(
+            { _id: provider },
+            { $set: { provider, models: nextModels, updatedAt: now, updatedBy: agentId } },
+            { upsert: true },
+          );
+
+          const fmt = (xs: string[]) => (xs.length > 0 ? ` (${xs.join(", ")})` : "");
+          const diffText = `+${added.length}${fmt(added)}, -${removed.length}${fmt(removed)}`;
+
+          await catalogVersions.insertOne({
+            provider,
+            snapshot: nextModels,
+            // `||` not `??`: an explicit empty string is treated the same way
+            // the response text below treats it (falsy → omitted), so a blank
+            // summary never lands in the audit trail in place of the diff.
+            changeSummary: changeSummary || diffText,
+            createdAt: now,
+            updatedBy: agentId,
+          });
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${provider} catalog updated: ${diffText}. ${nextModels.length} models total.${
+                  changeSummary ? ` — ${changeSummary}` : ""
+                }`,
+              },
+            ],
+          };
+        } catch (err) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `agent_model_catalog_refresh error: ${String(err)}` }],
+          };
         }
       },
     ),

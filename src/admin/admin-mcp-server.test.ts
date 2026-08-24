@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // ---------------------------------------------------------------------------
 // KPR-122 in-process port: the admin MCP server is now a pure builder
@@ -18,8 +18,15 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   })),
 }));
 
+// KPR-381: admin-mcp-server now imports the config singleton for the gemini
+// key. Mock it — the real config.ts throws on missing SLACK_* env at import.
+const mockConfig = vi.hoisted(() => ({ gemini: { apiKey: "test-gemini-key" } }));
+vi.mock("../config.js", () => ({ config: mockConfig }));
+
 let agentDocsStore = new Map<string, any>();
 let agentVersionsStore: any[] = [];
+let catalogDocsStore = new Map<string, any>();
+let catalogVersionsStore: any[] = [];
 
 function makeAgentDefsCollection(): any {
   return {
@@ -66,18 +73,47 @@ function makeAgentVersionsCollection(): any {
   };
 }
 
+function makeCatalogDocsCollection(): any {
+  return {
+    findOne: vi.fn(async (filter: any) => catalogDocsStore.get(filter?._id) ?? null),
+    updateOne: vi.fn(async (filter: any, update: any, opts: any) => {
+      const id = filter?._id;
+      const existing = catalogDocsStore.get(id);
+      if (existing && update.$set) Object.assign(existing, update.$set);
+      else if (opts?.upsert) catalogDocsStore.set(id, { _id: id, ...update.$set });
+      return { modifiedCount: existing ? 1 : 0 };
+    }),
+    createIndex: vi.fn().mockResolvedValue("ok"),
+  };
+}
+
+function makeCatalogVersionsCollection(): any {
+  return {
+    insertOne: vi.fn(async (doc: any) => {
+      catalogVersionsStore.push({ ...doc });
+      return { insertedId: "cv" };
+    }),
+    createIndex: vi.fn().mockResolvedValue("ok"),
+  };
+}
+
 function makeFakeDb(): any {
   const defs = makeAgentDefsCollection();
   const versions = makeAgentVersionsCollection();
+  const catalogDocs = makeCatalogDocsCollection();
+  const catalogVersions = makeCatalogVersionsCollection();
   return {
     collection: (name: string) => {
       if (name === "agent_definitions") return defs;
+      if (name === "agent_model_catalog") return catalogDocs;
+      if (name === "agent_model_catalog_versions") return catalogVersions;
       return versions;
     },
   };
 }
 
 import { buildAdminTools } from "./admin-mcp-server.js";
+import { invalidateGeminiModelCache } from "./model-catalog-cache.js";
 // Ensure the software-engineer archetype is registered in the registry.
 await import("../archetypes/software-engineer/index.js");
 
@@ -896,5 +932,471 @@ describe("KPR-308 — floorCritical write boundary", () => {
     const handler = getHandler(makeTools(), "agent_update");
     await handler({ agent_id: "existing-agent", fields: { floorCritical: "yes" } });
     expect(agentDocsStore.get("existing-agent").floorCritical).toBe(false);
+  });
+});
+
+describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+    catalogDocsStore = new Map();
+    catalogVersionsStore = [];
+    mockConfig.gemini.apiKey = "test-gemini-key";
+  });
+
+  it("upserts the catalog doc and appends a version row", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const result = await handler({
+      provider: "grok",
+      models: [
+        { id: "grok-4.6", displayName: "Grok 4.6", notes: "subscription default" },
+        { id: "grok-4.5", displayName: "Grok 4.5" },
+      ],
+    });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toMatch(/grok catalog updated: \+2 \(grok-4\.6, grok-4\.5\), -0\. 2 models total\./);
+
+    const doc = catalogDocsStore.get("grok");
+    expect(doc.provider).toBe("grok");
+    expect(doc.models).toHaveLength(2);
+    expect(doc.models[0].addedAt).toBeInstanceOf(Date);
+    expect(doc.updatedBy).toBe("admin");
+    expect(doc.updatedAt).toBeInstanceOf(Date);
+
+    expect(catalogVersionsStore).toHaveLength(1);
+    expect(catalogVersionsStore[0].provider).toBe("grok");
+    expect(catalogVersionsStore[0].snapshot).toHaveLength(2);
+    expect(catalogVersionsStore[0].changeSummary).toMatch(/\+2/);
+    expect(catalogVersionsStore[0].createdAt).toBeInstanceOf(Date);
+    expect(catalogVersionsStore[0].updatedBy).toBe("admin");
+  });
+
+  it("diffs against the current doc and preserves addedAt for retained ids", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const oldDate = new Date("2026-01-01T00:00:00Z");
+    catalogDocsStore.set("claude", {
+      _id: "claude",
+      provider: "claude",
+      models: [
+        { id: "claude-opus-5", displayName: "Opus 5", addedAt: oldDate },
+        { id: "claude-opus-4-7", displayName: "Opus 4.7", addedAt: oldDate },
+      ],
+      updatedAt: oldDate,
+      updatedBy: "seed",
+    });
+
+    const result = await handler({
+      provider: "claude",
+      models: [
+        { id: "claude-opus-5", displayName: "Opus 5" },
+        { id: "claude-opus-6", displayName: "Opus 6" },
+      ],
+      changeSummary: "Opus 6 shipped; 4.7 deprecated",
+    });
+    expect(result.content[0].text).toMatch(/\+1 \(claude-opus-6\), -1 \(claude-opus-4-7\)\. 2 models total/);
+    expect(result.content[0].text).toMatch(/Opus 6 shipped/);
+
+    const doc = catalogDocsStore.get("claude");
+    const retained = doc.models.find((m: any) => m.id === "claude-opus-5");
+    const fresh = doc.models.find((m: any) => m.id === "claude-opus-6");
+    expect(retained.addedAt).toEqual(oldDate);
+    expect(fresh.addedAt.getTime()).toBeGreaterThan(oldDate.getTime());
+    expect(catalogVersionsStore[0].changeSummary).toBe("Opus 6 shipped; 4.7 deprecated");
+  });
+
+  it("rejects duplicate model ids", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const result = await handler({
+      provider: "codex",
+      models: [
+        { id: "gpt-5.5", displayName: "GPT-5.5" },
+        { id: "gpt-5.5", displayName: "GPT-5.5 again" },
+      ],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/Duplicate model ids/);
+    expect(catalogDocsStore.size).toBe(0);
+    expect(catalogVersionsStore).toHaveLength(0);
+  });
+
+  it("an explicit empty changeSummary falls back to the diff text — no blank audit row", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const result = await handler({
+      provider: "codex",
+      models: [{ id: "gpt-5.5", displayName: "GPT-5.5" }],
+      changeSummary: "",
+    });
+    expect(result.isError).toBeUndefined();
+    // Response text omits the empty summary; the version row must not be blank.
+    expect(result.content[0].text).toBe("codex catalog updated: +1 (gpt-5.5), -0. 1 models total.");
+    expect(catalogVersionsStore[0].changeSummary).toBe("+1 (gpt-5.5), -0");
+  });
+
+  it("excludes gemini at the Zod schema level — no handler rejection needed", () => {
+    const tools = makeTools();
+    const t = tools.find((x: any) => x.name === "agent_model_catalog_refresh")!;
+    const providerSchema = (t.inputSchema as any).provider;
+    expect(providerSchema.safeParse("gemini").success).toBe(false);
+    expect(providerSchema.safeParse("claude").success).toBe(true);
+    expect(providerSchema.safeParse("grok").success).toBe(true);
+    expect(providerSchema.safeParse("codex").success).toBe(true);
+  });
+});
+
+describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
+  const geminiOkResponse = {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      models: [
+        {
+          name: "models/gemini-3.1-pro-preview",
+          displayName: "Gemini 3.1 Pro Preview",
+          supportedGenerationMethods: ["generateContent", "countTokens"],
+        },
+        {
+          name: "models/gemini-3.1-flash-image-preview",
+          displayName: "Nano Banana 2",
+          supportedGenerationMethods: ["generateContent"],
+        },
+        {
+          name: "models/text-embedding-005",
+          displayName: "Text Embedding 005",
+          supportedGenerationMethods: ["embedContent"],
+        },
+        {
+          name: "models/veo-3.1-generate-preview",
+          displayName: "Veo 3.1",
+          supportedGenerationMethods: ["generateContent"],
+        },
+      ],
+    }),
+  };
+
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+    catalogDocsStore = new Map();
+    catalogVersionsStore = [];
+    invalidateGeminiModelCache();
+    mockConfig.gemini.apiKey = "test-gemini-key";
+    // KPR-382: the gemini leg now reads the adapter's env fallbacks — clear
+    // any ambient dev-machine keys so missing-key tests stay deterministic.
+    vi.stubEnv("GOOGLE_GENAI_API_KEY", "");
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("GOOGLE_API_KEY", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  function seedGrok() {
+    catalogDocsStore.set("grok", {
+      _id: "grok",
+      provider: "grok",
+      models: [
+        { id: "grok-4.6", displayName: "Grok 4.6", notes: "subscription default", addedAt: new Date() },
+        { id: "grok-4.5", displayName: "Grok 4.5", addedAt: new Date() },
+      ],
+      updatedAt: new Date("2026-08-23T00:00:00Z"),
+      updatedBy: "hermi",
+    });
+  }
+
+  it("returns curated entries with source/asOf for a seeded provider", async () => {
+    seedGrok();
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "grok" });
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toEqual([
+      {
+        provider: "grok",
+        id: "grok-4.6",
+        displayName: "Grok 4.6",
+        notes: "subscription default",
+        source: "curated",
+        asOf: "2026-08-23T00:00:00.000Z",
+      },
+      {
+        provider: "grok",
+        id: "grok-4.5",
+        displayName: "Grok 4.5",
+        source: "curated",
+        asOf: "2026-08-23T00:00:00.000Z",
+      },
+    ]);
+  });
+
+  it("unseeded curated provider → empty entries array + prose note, not an error", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "codex" });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    expect(result.content[1].text).toMatch(/codex: not yet seeded — call agent_model_catalog_refresh first/);
+  });
+
+  it("gemini live lookup uses x-goog-api-key HEADER auth — key never in the URL", async () => {
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      { headers: Record<string, string>; signal?: AbortSignal },
+    ];
+    expect(init.headers["x-goog-api-key"]).toBe("test-gemini-key");
+    expect(url).not.toContain("test-gemini-key");
+    expect(url).not.toContain("key=");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+
+    const parsed = JSON.parse(result.content[0].text);
+    // Filtered: embedding (no generateContent), image + veo (family regex).
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toMatchObject({
+      provider: "gemini",
+      id: "gemini-3.1-pro-preview",
+      displayName: "Gemini 3.1 Pro Preview",
+      source: "live",
+    });
+    expect(typeof parsed[0].asOf).toBe("string");
+  });
+
+  it("second call within TTL serves the cache — zero extra fetches", async () => {
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    await handler({ provider: "gemini" });
+    await handler({ provider: "gemini" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("missing gemini key + provider=gemini → isError with credentials-add remediation", async () => {
+    mockConfig.gemini.apiKey = "";
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/hive credentials add GEMINI_API_KEY/);
+  });
+
+  it("vendor 500 + provider=gemini → sanitized status-only error, no key, no URL", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) })),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("Gemini model lookup failed: vendor returned HTTP 500.");
+    expect(result.content[0].text).not.toContain("test-gemini-key");
+    expect(result.content[0].text).not.toContain("generativelanguage");
+  });
+
+  it("network-level rejection → fixed sanitized message, never String(err)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("connect ECONNREFUSED https://generativelanguage.googleapis.com/v1beta/models?leak=1");
+      }),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/network error/);
+    expect(result.content[0].text).not.toContain("leak=1");
+  });
+
+  it("all-4 listing with a failed gemini leg → partial results + prose note, NOT isError", async () => {
+    seedGrok();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 429, json: async () => ({}) })),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({});
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.every((e: any) => e.provider !== "gemini")).toBe(true);
+    expect(parsed.filter((e: any) => e.provider === "grok")).toHaveLength(2);
+    const noteTexts = result.content
+      .slice(1)
+      .map((c: any) => c.text)
+      .join("\n");
+    expect(noteTexts).toMatch(/claude: not yet seeded/);
+    expect(noteTexts).toMatch(/codex: not yet seeded/);
+    expect(noteTexts).toMatch(/gemini: Gemini model lookup failed: vendor returned HTTP 429\./);
+  });
+
+  it("all-4 listing with a missing gemini key → partial results + prose note, NOT isError", async () => {
+    seedGrok();
+    mockConfig.gemini.apiKey = "";
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({});
+    expect(result.isError).toBeUndefined();
+    const noteTexts = result.content
+      .slice(1)
+      .map((c: any) => c.text)
+      .join("\n");
+    expect(noteTexts).toMatch(/gemini: Gemini API key not configured/);
+  });
+
+  const geminiZeroUsableResponse = {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      models: [
+        {
+          name: "models/text-embedding-005",
+          displayName: "Text Embedding 005",
+          supportedGenerationMethods: ["embedContent"],
+        },
+      ],
+    }),
+  };
+
+  it("gemini-only: 200 with zero usable chat models → empty array + note, NOT isError (mirrors unseeded-curated shape)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => geminiZeroUsableResponse),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    expect(result.content[1].text).toBe("gemini: vendor returned no usable chat models.");
+  });
+
+  it("all-4 listing: gemini 200 with zero usable chat models → note present alongside curated results", async () => {
+    seedGrok();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => geminiZeroUsableResponse),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({});
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.every((e: any) => e.provider !== "gemini")).toBe(true);
+    expect(parsed.filter((e: any) => e.provider === "grok")).toHaveLength(2);
+    const noteTexts = result.content
+      .slice(1)
+      .map((c: any) => c.text)
+      .join("\n");
+    expect(noteTexts).toMatch(/gemini: vendor returned no usable chat models\./);
+  });
+
+  // ------------------------------------------------------------------
+  // KPR-382: gemini key fallback chain — mirror of the adapter's
+  // resolution (gemini-interactions-adapter.ts:194-198).
+  // ------------------------------------------------------------------
+
+  function headerKeyOf(fetchMock: ReturnType<typeof vi.fn>): string {
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, { headers: Record<string, string> }];
+    return init.headers["x-goog-api-key"];
+  }
+
+  it("falls back to GOOGLE_GENAI_API_KEY when the config key is empty (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_GENAI_API_KEY", "genai-fallback-key");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBeUndefined();
+    expect(headerKeyOf(fetchMock)).toBe("genai-fallback-key");
+    expect(JSON.parse(result.content[0].text)).toHaveLength(1);
+  });
+
+  it("falls back to GOOGLE_API_KEY as the last resort (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_API_KEY", "google-fallback-key");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBeUndefined();
+    expect(headerKeyOf(fetchMock)).toBe("google-fallback-key");
+  });
+
+  it("config.gemini.apiKey wins over env fallbacks (KPR-382)", async () => {
+    vi.stubEnv("GOOGLE_GENAI_API_KEY", "genai-fallback-key");
+    vi.stubEnv("GOOGLE_API_KEY", "google-fallback-key");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    await handler({ provider: "gemini" });
+    expect(headerKeyOf(fetchMock)).toBe("test-gemini-key");
+  });
+
+  it("GOOGLE_GENAI_API_KEY beats GOOGLE_API_KEY — adapter order (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_GENAI_API_KEY", "genai-fallback-key");
+    vi.stubEnv("GOOGLE_API_KEY", "google-fallback-key");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    await handler({ provider: "gemini" });
+    expect(headerKeyOf(fetchMock)).toBe("genai-fallback-key");
+  });
+
+  it("whitespace-only fallback values are treated as missing (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_API_KEY", "   ");
+    const fetchMock = vi.fn(async () => geminiOkResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("missing-key message names the full chain and keeps the credentials-add remediation (KPR-382)", async () => {
+    mockConfig.gemini.apiKey = "";
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({ provider: "gemini" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/GOOGLE_GENAI_API_KEY/);
+    expect(result.content[0].text).toMatch(/GOOGLE_API_KEY/);
+    expect(result.content[0].text).toMatch(/hive credentials add GEMINI_API_KEY/);
+  });
+
+  it("all-4 call with only a fallback key → gemini leg succeeds, no gemini note (KPR-382)", async () => {
+    seedGrok();
+    mockConfig.gemini.apiKey = "";
+    vi.stubEnv("GOOGLE_API_KEY", "google-fallback-key");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => geminiOkResponse),
+    );
+    const handler = getHandler(makeTools(), "agent_model_catalog_list");
+    const result = await handler({});
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.some((e: any) => e.provider === "gemini")).toBe(true);
+    const noteTexts = result.content.slice(1).map((c: any) => c.text);
+    expect(noteTexts.some((n: string) => n.startsWith("gemini:"))).toBe(false);
+  });
+});
+
+describe("admin-mcp-server — model field discoverability (KPR-381)", () => {
+  it("agent_create's model describe teaches provider-prefix syntax and points at the lookup tool", () => {
+    const tools = makeTools();
+    const t = tools.find((x: any) => x.name === "agent_create")!;
+    const desc = (t.inputSchema as any).model.description as string;
+    expect(desc).toContain("<provider>/<model>[:effort]");
+    expect(desc).toContain("agent_model_catalog_list");
+    expect(desc).toContain("claude-haiku-4-5");
+  });
+
+  it("agent_update's fields describe covers the model syntax and the lookup tool", () => {
+    const tools = makeTools();
+    const t = tools.find((x: any) => x.name === "agent_update")!;
+    const desc = (t.inputSchema as any).fields.description as string;
+    expect(desc).toContain("<provider>/<model>[:effort]");
+    expect(desc).toContain("agent_model_catalog_list");
   });
 });
