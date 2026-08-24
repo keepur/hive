@@ -5346,14 +5346,19 @@ describe("AgentManager", () => {
     });
 
     // ---- the open-failure path (spec §5) ---------------------------------
-    // The one failure mode in this ticket with NO backstop: `lease.start()`
-    // is never reached, so neither the idle timer nor the lifetime timer is
-    // armed, and the ticket-abort walk only reaches leases someone can still
-    // find. The explicit `lease.close("open-failed")` in openWarmLease's
-    // catch is therefore the ONLY thing that frees the per-thread lock, the
-    // budget slot, and the registry entry — losing it leaks all three
-    // PERMANENTLY, and every later turn on that thread deadlocks on the lock
-    // the orphaned lease still holds.
+    // The one failure mode in this ticket with NO timer backstop:
+    // `lease.start()` is never reached, so neither the idle timer nor the
+    // lifetime timer is armed. The explicit `lease.close("open-failed")` in
+    // openWarmLease's catch is the ONLY thing that frees the per-thread
+    // lock, the budget slot, and the registry entry at THIS turn. Losing it
+    // does not deadlock forever — a subsequent WARM-eligible turn on the
+    // same thread finds the published-but-unstarted lease, `runTurn` throws
+    // `notRunnableError`, and `runWarmTurn`'s catch closes it as
+    // "turn-failure" (a one-extra-failed-exchange self-heal). A cold-shaped
+    // or reflection turn, which acquires the lock via `withSpawnTicket`
+    // directly rather than through the lease, has no such self-heal and
+    // would hang on the still-held lock — that is the real permanent-leak
+    // exposure this test guards.
     it("(12b) a failed session open closes the published lease — no lock/budget/registry leak; the error propagates", async () => {
       installEchoStreamingRunner();
       let atThrow: Record<string, boolean> | undefined;
