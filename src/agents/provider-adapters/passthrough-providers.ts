@@ -7,8 +7,10 @@ import type { AgentProviderId } from "./types.js";
  * operate an official Anthropic-compatible endpoint, run through the FULL
  * Claude-lane runtime (ClaudeAgentAdapter/AgentRunner: MCP tools, skills,
  * hooks, memory, subagents, resume) with per-spawn env substitution only.
- * Translation proxies are ruled out (epic canon); only vendor-operated
- * endpoints qualify. Adding the next compat vendor is: one table row + one
+ * Translation proxies are ruled out (epic canon); vendor-operated endpoints
+ * are the rule — grok is the one sanctioned exception (KPR-384, see its
+ * row: an OPERATOR-hosted gateway, because the vendor endpoint itself is
+ * broken for real toolkits). Adding the next compat vendor is: one table row + one
  * AgentProviderId union member + one SESSION_SEMANTICS entry (compile-forced)
  * + two resolveProviderModel-style prefix arms + the isLaneAProvider body
  * (NOT compile-forced) + a `credential` entry (KPR-371) — no new code path.
@@ -44,7 +46,9 @@ export interface PassthroughProviderDef {
    */
   baseUrl: string;
   /** Env var that overrides `baseUrl` per spawn, for endpoints that are
-   *  deployment infrastructure rather than a universal vendor address. */
+   *  deployment infrastructure rather than a universal vendor address. The
+   *  override is validated (https, or http to loopback only) — see
+   *  assertSafeBaseUrlOverride. */
   baseUrlEnv?: string;
   /** Credential source — resolved PER SPAWN (env → Honeypot Keychain
    *  `hive/<instanceId>/<KEY>`), never boot-time. */
@@ -154,15 +158,40 @@ export function resolvePassthroughSpawn(
   },
 ): PassthroughSpawnConfig {
   const def = PASSTHROUGH_PROVIDERS[provider];
+  const override = def.baseUrlEnv ? process.env[def.baseUrlEnv] : undefined;
   return {
     provider,
     model: routeModel || opts.configuredModel || def.defaultModel,
-    baseUrl: (def.baseUrlEnv && process.env[def.baseUrlEnv]) || def.baseUrl,
+    baseUrl: override ? assertSafeBaseUrlOverride(override, def.baseUrlEnv!) : def.baseUrl,
     authToken: resolveEnvKeyCredential(def.credential.key, opts),
   };
 }
 
-/** The `env-key` branch — byte-for-byte the pre-KPR-371 behaviour. */
+/**
+ * KPR-384 (review r1): a base-URL override redirects the auth token AND the
+ * full prompt/tool-result stream, so refuse a cleartext off-box target:
+ * `http:` is allowed only toward loopback hosts; anything else must be
+ * `https:`. Thrown as TurnAssemblyError — a config fault, breaker-invisible
+ * like every other Lane A assembly fault.
+ */
+function assertSafeBaseUrlOverride(raw: string, envKey: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new TurnAssemblyError(`${envKey} is not a valid URL ("${raw}") — fix or unset the override`);
+  }
+  const host = url.hostname;
+  const loopback = host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new TurnAssemblyError(
+      `${envKey} ("${raw}") would send the credential and conversation over cleartext to a non-loopback host — use https:// for off-box gateways, or an http://127.0.0.1/localhost address`,
+    );
+  }
+  return raw;
+}
+
+/** The env-key credential resolution — byte-for-byte the pre-KPR-371 behaviour. */
 function resolveEnvKeyCredential(
   key: string,
   opts: { instanceId: string; resolveSecret?: (instanceId: string, key: string) => string },

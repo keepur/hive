@@ -242,6 +242,38 @@ describe("resolvePassthroughSpawn — grok gateway (KPR-384)", () => {
     });
     expect(next.baseUrl).toBe("http://127.0.0.1:8317");
   });
+
+  describe("override validation: https, or http to loopback only (review r1)", () => {
+    const base = { configuredModel: "", instanceId: "inst", resolveSecret: () => "tok" };
+    const call = () => resolvePassthroughSpawn("grok", "", base);
+
+    it.each(["http://localhost:9999", "http://127.0.0.1:8317", "http://127.5.5.5:80", "http://[::1]:8317", "https://gw.internal.example:8317"])(
+      "accepts %s",
+      (url) => {
+        process.env.GROK_GATEWAY_URL = url;
+        expect(call().baseUrl).toBe(url);
+      },
+    );
+
+    it("rejects cleartext http to a non-loopback host as a breaker-invisible config fault", () => {
+      process.env.GROK_GATEWAY_URL = "http://gw.internal.example:8317";
+      expect(call).toThrow(TurnAssemblyError);
+      expect(call).toThrow(/cleartext to a non-loopback host/);
+      let thrown: unknown;
+      try {
+        call();
+      } catch (err) {
+        thrown = err;
+      }
+      expect(classifyThrown(thrown)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+    });
+
+    it("rejects a malformed override URL", () => {
+      process.env.GROK_GATEWAY_URL = "not a url";
+      expect(call).toThrow(TurnAssemblyError);
+      expect(call).toThrow(/GROK_GATEWAY_URL is not a valid URL/);
+    });
+  });
 });
 
 describe("buildPassthroughEnv (KPR-346 §D5)", () => {
