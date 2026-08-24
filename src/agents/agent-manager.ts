@@ -2251,6 +2251,30 @@ export class AgentManager {
    */
   abortThread(agentId: string, threadId: string): boolean {
     const threadKey = `${agentId}:${threadId}`;
+    // KPR-323 C3 (spec §4.4): the method's contract is "sever the in-flight
+    // turn for this thread". Under a warm lease the correct severing is a
+    // turn-level interrupt — the caller is still on the line; killing the
+    // session on every barge-in would end the call. Barge-in vs hang-up is
+    // indistinguishable at the socket and interrupt-and-keep-warm is
+    // correct for both: barge-in → next turn hits a hot session; hang-up →
+    // idle timeout reclaims in ≤120s. No lease → 322's ticket-walk abort,
+    // verbatim (a cold string-prompt query has no interrupt surface —
+    // control requests exist only in streaming mode — so spawn-abort is the
+    // only option there). ticket.abort() keeps KILL semantics for stopAgent.
+    //
+    // interrupt() returns a Promise; this method stays synchronous-boolean —
+    // requestInterrupt dispatches fire-and-forget with a .catch that logs
+    // and escalates to lease.close() (a failed interrupt means the session
+    // may be wedged; closing converts to standard cold fallback, §6).
+    // Idle-lease edge (disconnect during the adapter's pre-spawn awaits):
+    // interrupt-on-idle is SDK-unspecified — W2 in-run check (§7).
+    const lease = this.warmLeases.get(threadKey);
+    if (lease && !lease.isClosed) {
+      lease.requestInterrupt("abort-thread");
+      log.info("Warm voice lease interrupted for thread", { agentId, threadId });
+      return true;
+    }
+    // --- 322 Task 3 body from here, unchanged ---
     const tickets = this.activeTickets.get(agentId);
     if (!tickets) return false;
     let aborted = false;

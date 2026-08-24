@@ -5341,6 +5341,84 @@ describe("AgentManager", () => {
         vi.useRealTimers();
       }
     });
+
+    // ---- assertions 10, 11 (KPR-323 C3, spec §4.4) -----------------------
+    // Nested so the C3 cases reuse installEchoStreamingRunner / warmLeases /
+    // the flag beforeEach+afterEach above verbatim. 322's own abortThread
+    // describe (KPR-322 E2, flag OFF) is untouched.
+    describe("abortThread warm dispatch (KPR-323 C3)", () => {
+      it("(10) interrupts the in-flight generation and keeps the lease open (barge-in)", async () => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        const { interrupt, close } = installEchoStreamingRunner();
+        await manager.spawnTurn(makeVoiceCtx());
+
+        expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+        expect(interrupt).toHaveBeenCalledTimes(1);
+        // Severing is turn-level, NOT session-level: the call stays up.
+        expect(close).not.toHaveBeenCalled();
+        const lease = warmLeases(manager).get(WARM_KEY);
+        expect(lease).toBeDefined();
+        expect(lease!.isClosed).toBe(false);
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // ticket still held
+
+        // Session survives: the next turn runs warm on the same lease.
+        const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: "sess-warm-1" }));
+        expect(r.warmPath).toBe(true);
+        expect(r.warmTurnSeq).toBe(2);
+        expect(r.finalMessage).toBe("reply-2");
+        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // no re-open
+      });
+
+      it("(11) escalates a rejected interrupt to lease close (cold fallback), with no unhandled rejection", async () => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        const { interrupt, close } = installEchoStreamingRunner();
+        interrupt.mockRejectedValueOnce(new Error("wedged"));
+        await manager.spawnTurn(makeVoiceCtx());
+
+        const floated: unknown[] = [];
+        const onRej = (r: unknown) => floated.push(r);
+        process.on("unhandledRejection", onRej);
+        try {
+          expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+          // Discriminates the C3 dispatch from 322's ticket walk: the walk
+          // would also close the lease (ticket.abort → close) but would never
+          // reach interrupt(). Close here must be the ESCALATION.
+          expect(interrupt).toHaveBeenCalledTimes(1);
+          await vi.waitFor(() => expect(close).toHaveBeenCalled());
+          expect(warmLeases(manager).get(WARM_KEY)).toBeUndefined();
+          // Coordinator lambda unblocks a tick after onClosed → lock+budget freed.
+          await new Promise((r) => setTimeout(r, 10));
+          expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+        } finally {
+          process.off("unhandledRejection", onRej);
+        }
+        expect(floated).toEqual([]);
+      });
+
+      it("(11b) falls through to the 322 ticket-walk when no lease exists (cold voice spawn)", async () => {
+        // Flag OFF for this case — cold spawn holds the ticket.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (appConfig as any).voice = { warmPath: { enabled: false } };
+        mockConversationIndex.mockResolvedValue(undefined);
+        // 322's zombie-spawn pattern: send hangs, runner.abort releases it.
+        let releaseSend!: (r: ReturnType<typeof makeRunResult>) => void;
+        mockRunnerSend.mockReturnValueOnce(
+          new Promise((resolve) => {
+            releaseSend = resolve;
+          }),
+        );
+        mockRunnerAbort.mockImplementationOnce(() => releaseSend(makeRunResult({ aborted: true })));
+
+        const inflight = manager.spawnTurn(makeVoiceCtx());
+        await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(1));
+        expect(warmLeases(manager).size).toBe(0); // nothing for the dispatch to shadow
+
+        expect(manager.abortThread("agent-a", "voice:call-1")).toBe(true);
+        expect(mockRunnerAbort).toHaveBeenCalledTimes(1);
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+        expect((await inflight).aborted).toBe(true);
+      });
+    });
   });
 });
 
