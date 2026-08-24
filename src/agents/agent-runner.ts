@@ -153,7 +153,15 @@ export interface RunResult {
   error?: string;
   aborted?: boolean;
   timedOut?: boolean; // KPR-306: deadline fired; distinguishes timeout-abort from operator abort
-  /** KPR-323 C1: query()-call → system/init (CLI boot + session load + MCP handshake). Voice decomposition; log-only. */
+  /**
+   * KPR-323 C1: turn dispatch → system/init. Spans query-envelope assembly
+   * (server configs, in-process MCP construction, sub-agent + skill-projection
+   * build, session cwd mkdir) PLUS the CLI boot, session load and MCP
+   * handshake — i.e. everything between the manager's T3 dispatch anchor and
+   * the SDK's init message, not just the raw query() boot. Stamped before
+   * buildQueryEnvelope so no time falls between spawnPrepMs and this field.
+   * Voice decomposition; log-only.
+   */
   bootToInitMs?: number;
   /** KPR-323 C1: system/init → first streamed text_delta (≈ model TTFT). On warm turns (KPR-323 C2): push → first delta. */
   initToFirstTokenMs?: number;
@@ -2048,6 +2056,20 @@ export class AgentRunner {
       ...(passthrough ? { passthroughProvider: passthrough.provider } : {}),
     });
 
+    // KPR-323 C1: cold-turn stage anchors (spec §2 T3→T5, T5→T6). Log-only.
+    // The T3 anchor is stamped BEFORE envelope assembly, not after: the
+    // manager fires its onDispatch T3 callback immediately before
+    // adapter.runTurn (agent-manager.ts), and ClaudeAgentAdapter.runTurn is a
+    // bare passthrough to send(). Anchoring after buildQueryEnvelope would
+    // leave envelope assembly (server configs, in-process MCP construction,
+    // sub-agents, skill projections, session cwd mkdir) attributed to NEITHER
+    // spawnPrepMs nor bootToInitMs — an unattributed gap that understates the
+    // decomposition against firstTokenMs and biases Task 11's W1 falsification
+    // rule toward a false demotion. Spec §2 assigns in-process MCP server
+    // construction to the T2→T3 span; stamping here folds it into bootToInitMs
+    // so the stages reconcile.
+    const queryStartedAt = Date.now();
+
     const options = await this.buildQueryEnvelope({
       sessionId,
       context,
@@ -2057,8 +2079,6 @@ export class AgentRunner {
       streaming: !!onStream,
     });
 
-    // KPR-323 C1: cold-turn stage anchors (spec §2 T3→T5, T5→T6). Log-only.
-    const queryStartedAt = Date.now();
     let initAt: number | undefined;
     let bootToInitMs: number | undefined;
     let initToFirstTokenMs: number | undefined;

@@ -3905,6 +3905,38 @@ describe("AgentRunner C1 stage stamps (KPR-323)", () => {
     expect(result.bootToInitMs).toBeUndefined();
     expect(result.initToFirstTokenMs).toBeUndefined();
   });
+
+  // Round-3 review fix: the T3 anchor must be stamped BEFORE query-envelope
+  // assembly, otherwise envelope cost (server configs, in-process MCP
+  // construction, skill projections, cwd mkdir) lands between spawnPrepMs and
+  // bootToInitMs and is attributed to neither. Negative-verify: with the
+  // pre-fix placement (queryStartedAt after buildQueryEnvelope) bootToInitMs
+  // is ~0 here and this assertion fails.
+  it("bootToInitMs includes query-envelope assembly time (no unattributed T2→T5 gap)", async () => {
+    const ENVELOPE_MS = 60;
+    mockMessages = [
+      { type: "system", subtype: "init", session_id: "s-c1-gap" },
+      {
+        type: "result",
+        subtype: "success",
+        result: "hi",
+        total_cost_usd: 0.001,
+        duration_ms: 100,
+        session_id: "s-c1-gap",
+      },
+    ];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const realBuild = (runner as any).buildQueryEnvelope.bind(runner);
+    vi.spyOn(runner as any, "buildQueryEnvelope").mockImplementation(async (params: any) => {
+      await new Promise((r) => setTimeout(r, ENVELOPE_MS));
+      return realBuild(params);
+    });
+
+    const result = await runner.send("hello");
+
+    expect(result.bootToInitMs).toBeGreaterThanOrEqual(ENVELOPE_MS - 5);
+  });
 });
 
 describe("AgentRunner.openVoiceStreamingSession (KPR-323 C2)", () => {
