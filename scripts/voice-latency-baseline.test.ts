@@ -1,8 +1,21 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildArtifact,
+  harvestDir,
   nearestRank,
   parseVoiceTurnLine,
   resolveLogFiles,
@@ -664,5 +677,257 @@ describe("resolveLogFiles", () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("log-dir not found or unreadable");
     expect(r.stderr).not.toContain("at Object.readdirSync");
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// CLI argument validation (child-PR round 1, issue 2)
+// ---------------------------------------------------------------------------
+
+describe("CLI argument validation", () => {
+  const script = () => fileURLToPath(new URL("./voice-latency-baseline.ts", import.meta.url));
+
+  // parseArgs runs strict; unguarded it threw ERR_PARSE_ARGS_UNKNOWN_OPTION as
+  // a raw stack instead of the clean exit-1 usage line the header comment and
+  // every other malformed-input path promise.
+  it("(smoke) the CLI exits 1 with a usage error on an unknown flag", () => {
+    const r = spawnSync(
+      "npx",
+      [
+        "tsx",
+        script(),
+        "--log-dir",
+        "/tmp",
+        "--agent",
+        "nobody",
+        "--out",
+        "/tmp/kpr323-baseline-smoke.json",
+        "--bogus",
+      ],
+      { encoding: "utf-8" },
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("invalid arguments");
+    expect(r.stderr).toContain("required: --log-dir <dir> --agent <agentId> --out <file>");
+    // The raw throw shape must not leak.
+    expect(r.stderr).not.toContain("ERR_PARSE_ARGS_UNKNOWN_OPTION");
+    expect(r.stderr).not.toContain("at parseArgs");
+    expect(r.stdout).toBe("");
+  }, 30_000);
+
+  it("(smoke) the CLI exits 1 with a usage error on a stray positional", () => {
+    const r = spawnSync(
+      "npx",
+      [
+        "tsx",
+        script(),
+        "--log-dir",
+        "/tmp",
+        "--agent",
+        "nobody",
+        "--out",
+        "/tmp/kpr323-baseline-smoke.json",
+        "stray-positional",
+      ],
+      { encoding: "utf-8" },
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("invalid arguments");
+    expect(r.stderr).not.toMatch(/^\s+at /m);
+    expect(r.stdout).toBe("");
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// harvestDir — per-file read errors (child-PR round 1, issue 3)
+// ---------------------------------------------------------------------------
+
+describe("harvestDir per-file error handling", () => {
+  const FROM = Date.parse("2026-08-01T00:00:00.000Z");
+  const TO = Date.parse("2026-08-08T00:00:00.000Z");
+  const dirs: string[] = [];
+
+  function tempLogDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "kpr323-logs-"));
+    dirs.push(dir);
+    return dir;
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    while (dirs.length > 0) {
+      const dir = dirs.pop()!;
+      // Restore any chmod-000 file so the recursive remove can proceed.
+      try {
+        chmodSync(join(dir, "locked.log"), 0o600);
+      } catch {
+        /* not every dir has one */
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The reviewer's production scenario: log rotation truncates/replaces a file
+  // between `resolveLogFiles`' listing and the read. Pre-fix this aborted the
+  // WHOLE harvest with an uncaught error and wrote no artifact at all.
+  it("skips a file that vanished after listing, reports it, and harvests the rest", async () => {
+    const dir = tempLogDir();
+    writeFileSync(join(dir, "a.log"), line({ firstTokenMs: 1000 }) + "\n");
+    writeFileSync(join(dir, "c.log"), line({ firstTokenMs: 2000 }) + "\n");
+    const errs: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      errs.push(String(chunk));
+      return true;
+    });
+
+    // "b.log" was listed by readdir but is gone by read time.
+    const samples = await harvestDir(dir, ["a.log", "b.log", "c.log"], AGENT, FROM, TO);
+
+    expect(samples.map((s) => s.firstTokenMs)).toEqual([1000, 2000]);
+    expect(errs.join("")).toContain("skipping unreadable log file: b.log");
+  });
+
+  it("drops the partial rows of a file that fails mid-read (no torn half-file)", async () => {
+    const dir = tempLogDir();
+    writeFileSync(join(dir, "a.log"), line({ firstTokenMs: 1000 }) + "\n");
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    // The missing file contributes nothing at all — not even rows that would
+    // have been read before the failure.
+    const samples = await harvestDir(dir, ["missing.log", "a.log"], AGENT, FROM, TO);
+    expect(samples).toHaveLength(1);
+  });
+
+  it.skipIf(process.getuid?.() === 0)(
+    "(smoke) the CLI completes the harvest around a permissions-locked log file",
+    () => {
+      const dir = tempLogDir();
+      writeFileSync(join(dir, "a.log"), line({ sdkSessionResumeAttempted: true }) + "\n");
+      writeFileSync(join(dir, "b.log"), line({ sdkSessionResumeAttempted: false }) + "\n");
+      // Five rows that must NOT reach the artifact — the file is unreadable.
+      writeFileSync(
+        join(dir, "locked.log"),
+        Array.from({ length: 5 }, () => line({ firstTokenMs: 99 })).join("\n") + "\n",
+      );
+      chmodSync(join(dir, "locked.log"), 0o000);
+      const out = join(dir, "artifact.json");
+
+      const r = spawnSync(
+        "npx",
+        [
+          "tsx",
+          fileURLToPath(new URL("./voice-latency-baseline.ts", import.meta.url)),
+          "--log-dir",
+          dir,
+          "--agent",
+          AGENT,
+          "--out",
+          out,
+          "--from",
+          "2026-08-01T00:00:00.000Z",
+          "--to",
+          "2026-08-08T00:00:00.000Z",
+        ],
+        { encoding: "utf-8" },
+      );
+
+      // The harvest completed: exit 0, artifact written.
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain("skipping unreadable log file: locked.log");
+      const artifact = JSON.parse(readFileSync(out, "utf-8")) as {
+        samples: { resumed: number; nonResumed: number };
+        metrics: { resumed: { firstTokenMs: { p50: number } } };
+      };
+      // Only the two readable rows — none of locked.log's five.
+      expect(artifact.samples.resumed).toBe(1);
+      expect(artifact.samples.nonResumed).toBe(1);
+      expect(artifact.metrics.resumed.firstTokenMs.p50).toBe(1500);
+    },
+    30_000,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// main-guard path encoding (child-PR round 1, issue 1)
+// ---------------------------------------------------------------------------
+
+describe("CLI main-guard", () => {
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  /**
+   * Stage a runnable copy of the harvester plus one log row under `dir`, run
+   * it, and assert it ACTUALLY harvested — the pre-fix bug's whole tell is a
+   * clean exit that did nothing (no stdout, no stderr, no artifact), so exit
+   * status alone proves nothing here.
+   */
+  function runHarvestFrom(dir: string): void {
+    const script = join(dir, "voice-latency-baseline.ts");
+    writeFileSync(
+      script,
+      readFileSync(fileURLToPath(new URL("./voice-latency-baseline.ts", import.meta.url)), "utf-8"),
+    );
+    // tsx picks the module format from the nearest package.json; the copy needs
+    // its own or the top-level await at the entry point fails to transform.
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module", version: "0.0.0-test" }));
+    const logDir = join(dir, "logs");
+    mkdirSync(logDir);
+    writeFileSync(join(logDir, "a.log"), line() + "\n");
+    const out = join(dir, "artifact.json");
+
+    const r = spawnSync(
+      "npx",
+      [
+        "tsx",
+        script,
+        "--log-dir",
+        logDir,
+        "--agent",
+        AGENT,
+        "--out",
+        out,
+        "--from",
+        "2026-08-01T00:00:00.000Z",
+        "--to",
+        "2026-08-08T00:00:00.000Z",
+        // Keeps the copied script from resolving ../package.json / git.
+        "--engine-version",
+        "0.0.0-test",
+        "--git-sha",
+        "deadbeef",
+      ],
+      { encoding: "utf-8" },
+    );
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).not.toBe("");
+    const artifact = JSON.parse(readFileSync(out, "utf-8")) as { samples: { resumed: number } };
+    expect(artifact.samples.resumed).toBe(1);
+  }
+
+  // Pre-fix the guard compared `import.meta.url` against a raw
+  // `file://${process.argv[1]}`, so a path component needing percent-encoding
+  // (a space here) made the guard false and the harvest a SILENT no-op.
+  // The dir is realpath'd so this case isolates the ENCODING bug.
+  it("(smoke) runs the harvest when invoked from a path containing a space", () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "kpr323 space-")));
+    dirs.push(dir);
+    runHarvestFrom(dir);
+  }, 30_000);
+
+  // Same silent-no-op shape by a different route: node resolves
+  // `import.meta.url` through symlinks while argv[1] stays as typed, so an
+  // invocation via a symlinked path (macOS /tmp → /private/tmp, or a symlinked
+  // checkout) needs the guard's realpath fallback.
+  it("(smoke) runs the harvest when invoked through a symlinked path", () => {
+    const real = realpathSync(mkdtempSync(join(tmpdir(), "kpr323-real-")));
+    dirs.push(real);
+    const linked = join(realpathSync(tmpdir()), `kpr323-link-${process.pid}`);
+    symlinkSync(real, linked, "dir");
+    dirs.push(linked);
+    runHarvestFrom(linked);
   }, 30_000);
 });

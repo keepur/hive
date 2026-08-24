@@ -25,11 +25,19 @@
  * numbers + sample sizes, blesses in Linear (date + words), the blessing is
  * stamped, and the file is committed — immutable thereafter (spec §3.4).
  */
-import { createReadStream, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  createReadStream,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createInterface } from "node:readline";
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 export interface VoiceTurnSample {
@@ -279,7 +287,21 @@ export function resolveLogFiles(logDir: string): LogDirResolution {
   return { ok: true, names };
 }
 
-async function harvestDir(
+/**
+ * Read every listed log file, skipping — but REPORTING — any file that fails
+ * mid-harvest (child-PR round 1, issue 3). `resolveLogFiles` guards the
+ * directory listing only; the per-file I/O has its own failure modes that a
+ * clean `readdir` cannot rule out: a permissions-locked file, or (the real
+ * production shape) a log-rotation script truncating/replacing a file between
+ * the listing and the read. Without this guard one such file aborted the whole
+ * harvest with an uncaught error and produced no artifact at all.
+ *
+ * A failed file contributes ZERO samples — the partial rows read before the
+ * error are dropped with it, so the artifact never carries a torn half-file.
+ * The skip is announced on stderr per file: a silently skipped log would
+ * undercount a blessed, immutable baseline with nobody the wiser.
+ */
+export async function harvestDir(
   logDir: string,
   names: string[],
   agentId: string,
@@ -288,33 +310,54 @@ async function harvestDir(
 ): Promise<VoiceTurnSample[]> {
   const samples: VoiceTurnSample[] = [];
   for (const name of names) {
-    const rl = createInterface({ input: createReadStream(join(logDir, name)), crlfDelay: Infinity });
-    for await (const line of rl) {
-      const s = parseVoiceTurnLine(line, agentId);
-      if (s && s.tsMs >= fromMs && s.tsMs <= toMs) samples.push(s);
+    const fileSamples: VoiceTurnSample[] = [];
+    try {
+      const rl = createInterface({ input: createReadStream(join(logDir, name)), crlfDelay: Infinity });
+      for await (const line of rl) {
+        const s = parseVoiceTurnLine(line, agentId);
+        if (s && s.tsMs >= fromMs && s.tsMs <= toMs) fileSamples.push(s);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`skipping unreadable log file: ${name} (${msg})\n`);
+      continue;
     }
+    samples.push(...fileSamples);
   }
   return samples;
 }
 
+const USAGE = "required: --log-dir <dir> --agent <agentId> --out <file>";
+
 async function main(): Promise<void> {
-  const { values } = parseArgs({
-    options: {
-      "log-dir": { type: "string" },
-      agent: { type: "string" },
-      from: { type: "string" },
-      to: { type: "string" },
-      days: { type: "string" },
-      "git-sha": { type: "string" },
-      "engine-version": { type: "string" },
-      out: { type: "string" },
-    },
-  });
+  // parseArgs runs strict (no unknown options, no positionals) and THROWS on
+  // violation (child-PR round 1, issue 2). Unguarded, `--bogus` or a stray
+  // positional surfaced a raw ERR_PARSE_ARGS_UNKNOWN_OPTION stack instead of
+  // the clean exit-1 usage line every other malformed-input path emits.
+  let values: Record<string, string | undefined>;
+  try {
+    ({ values } = parseArgs({
+      options: {
+        "log-dir": { type: "string" },
+        agent: { type: "string" },
+        from: { type: "string" },
+        to: { type: "string" },
+        days: { type: "string" },
+        "git-sha": { type: "string" },
+        "engine-version": { type: "string" },
+        out: { type: "string" },
+      },
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`invalid arguments: ${msg} — ${USAGE}\n`);
+    process.exit(1);
+  }
   const logDir = values["log-dir"];
   const agent = values.agent;
   const out = values.out;
   if (!logDir || !agent || !out) {
-    process.stderr.write("required: --log-dir <dir> --agent <agentId> --out <file>\n");
+    process.stderr.write(USAGE + "\n");
     process.exit(1);
   }
   const window = resolveWindow({ from: values.from, to: values.to, days: values.days });
@@ -389,8 +432,26 @@ async function main(): Promise<void> {
 // pure functions never runs the harvest. The esbuild shim-guard hazard does
 // not apply: scripts/ is not bundled.
 function isMain(): boolean {
-  // tsx-compatible main detection.
-  return import.meta.url === `file://${process.argv[1]}`;
+  // tsx-compatible main detection. `pathToFileURL`, not a raw `file://${...}`
+  // template (child-PR round 1, issue 1): argv[1] is a filesystem path, and any
+  // path component needing percent-encoding (a space, `#`, `?`, non-ASCII —
+  // e.g. a checkout under "~/My Repos/") makes the raw string differ from the
+  // percent-encoded `import.meta.url`. The guard then silently no-ops: exit 0,
+  // no stdout, no stderr, no artifact — the worst possible failure shape for a
+  // harvest whose output KPR-322 P2 binds to.
+  //
+  // The realpath fallback closes the same hole for a symlinked invocation
+  // path: node resolves `import.meta.url` through symlinks but leaves argv[1]
+  // as typed, so `npx tsx "/tmp/x/harvest.ts"` on macOS (/tmp → /private/tmp)
+  // no-ops just as silently. Compare resolved paths before giving up.
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  if (import.meta.url === pathToFileURL(entry).href) return true;
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(entry);
+  } catch {
+    return false;
+  }
 }
 
 if (isMain()) {
