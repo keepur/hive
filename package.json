@@ -75,7 +75,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@openai/agents": "^0.11.4",
     "@qdrant/js-client-rest": "~1.18.0",
-    "@slack/socket-mode": "^2.0.5",
+    "@slack/socket-mode": "^2.0.7",
     "@slack/web-api": "^8.0.0",
     "better-sqlite3": "^13.0.3",
     "brave-search-mcp": "^2.0.1",
