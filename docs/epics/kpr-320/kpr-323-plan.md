@@ -215,7 +215,7 @@ Rule: for each anchor, re-locate it at delivery HEAD (grep by symbol, not line).
 - Modify: `src/config.ts` (voice block — post-322-T1 it also carries `bridgeToken`/`bindHost`/`livekit`; C4 adds one key beside them)
 - Test: `src/config.test.ts` (add cases)
 
-- [ ] **Step 1:** Add the pure resolver above the `config` export (mirrors 322's `resolveVoiceLivekitConfig` pattern):
+- [x] **Step 1:** Add the pure resolver above the `config` export (mirrors 322's `resolveVoiceLivekitConfig` pattern):
 
 ```typescript
 /**
@@ -236,7 +236,7 @@ export function resolveVoiceWarmPathConfig(raw: unknown): VoiceWarmPathConfig {
 }
 ```
 
-- [ ] **Step 2:** Add one line inside the `voice` block (`config.ts:473-492`; place after `port` at `:481`, beside 322's `bridgeToken`/`bindHost`/`livekit` keys):
+- [x] **Step 2:** Add one line inside the `voice` block (`config.ts:473-492`; place after `port` at `:481`, beside 322's `bridgeToken`/`bindHost`/`livekit` keys):
 
 ```typescript
     // KPR-323 C4: per-call warm session lease master switch. Default false
@@ -244,7 +244,7 @@ export function resolveVoiceWarmPathConfig(raw: unknown): VoiceWarmPathConfig {
     warmPath: resolveVoiceWarmPathConfig((hive.voice as Record<string, unknown> | undefined)?.warmPath),
 ```
 
-- [ ] **Step 3:** Tests in `src/config.test.ts`:
+- [x] **Step 3:** Tests in `src/config.test.ts`:
 
 ```typescript
 import { resolveVoiceWarmPathConfig } from "./config.js";
@@ -264,8 +264,8 @@ describe("resolveVoiceWarmPathConfig (KPR-323 C4)", () => {
 });
 ```
 
-- [ ] **Step 4:** Verify — `npx vitest run src/config.test.ts` green; `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run typecheck` green.
-- [ ] **Step 5:** Commit — `git add src/config.ts src/config.test.ts && git commit -m "feat(kpr-323): C4 voice.warmPath.enabled config key (default off)"`
+- [x] **Step 4:** Verify — `npx vitest run src/config.test.ts` green; `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run typecheck` green.
+- [x] **Step 5:** Commit — `git add src/config.ts src/config.test.ts && git commit -m "feat(kpr-323): C4 voice.warmPath.enabled config key (default off)"`
 
 ### Task 2 — C1: cold-turn stage decomposition on "Voice turn complete" (log-only, always-on)
 
@@ -277,7 +277,7 @@ Spec §2: six additive numeric fields — `promptBuildMs`, `sessionLookupMs` (ad
 - Modify: `src/channels/voice/voice-adapter.ts` (two stamps + log fields)
 - Test: `src/agents/agent-runner.test.ts`, `src/agents/agent-manager.test.ts`, `src/channels/voice/voice-adapter.test.ts` (all additive)
 
-- [ ] **Step 1:** `agent-runner.ts` — extend `RunResult` (`:134-156`), after `timedOut`:
+- [x] **Step 1:** `agent-runner.ts` — extend `RunResult` (`:134-156`), after `timedOut`:
 
 ```typescript
   /** KPR-323 C1: query()-call → system/init (CLI boot + session load + MCP handshake). Voice decomposition; log-only. */
@@ -286,7 +286,7 @@ Spec §2: six additive numeric fields — `promptBuildMs`, `sessionLookupMs` (ad
   initToFirstTokenMs?: number;
 ```
 
-- [ ] **Step 2:** `agent-runner.ts` `send()` — immediately before `const q = query({` (`:1968`):
+- [x] **Step 2:** `agent-runner.ts` `send()` — immediately before `const q = query({` (`:1968`):
 
 ```typescript
     // KPR-323 C1: cold-turn stage anchors (spec §2 T3→T5, T5→T6). Log-only.
@@ -324,7 +324,7 @@ and the text_delta branch (`:2100-2106`):
 
 Add `bootToInitMs, initToFirstTokenMs,` to the returned object (`:2298-2307`).
 
-- [ ] **Step 3:** `agent-manager.ts` — extend `TurnResult` (`:132-162`), after `aborted`:
+- [x] **Step 3:** `agent-manager.ts` — extend `TurnResult` (`:132-162`), after `aborted`:
 
 ```typescript
   /**
@@ -344,7 +344,7 @@ Add `bootToInitMs, initToFirstTokenMs,` to the returned object (`:2298-2307`).
   warmTurnSeq?: number;
 ```
 
-- [ ] **Step 4:** `agent-manager.ts` `spawnTurn` (`:886`) — stamp `enteredAt` before the HOF, `lambdaStartedAt` + `dispatchAt` inside:
+- [x] **Step 4:** `agent-manager.ts` `spawnTurn` (`:886`) — stamp `enteredAt` before the HOF, `lambdaStartedAt` + `dispatchAt` inside:
 
 ```typescript
   async spawnTurn(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
@@ -401,7 +401,7 @@ and after `const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult
       }
 ```
 
-- [ ] **Step 5:** `runOneSpawnAttempt` (`:1465`) — additive trailing parameter, invoked immediately before the adapter dispatch:
+- [x] **Step 5:** `runOneSpawnAttempt` (`:1465`) — additive trailing parameter, invoked immediately before the adapter dispatch:
 
 ```typescript
   private async runOneSpawnAttempt(
@@ -416,7 +416,7 @@ and after `const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult
     const result = await adapter.runTurn({ ... unchanged ... });
 ```
 
-- [ ] **Step 6:** `voice-adapter.ts` — stamp the two pre-spawn reads (`:311-317`):
+- [x] **Step 6:** `voice-adapter.ts` — stamp the two pre-spawn reads (`:311-317`):
 
 ```typescript
     const promptBuildStartedAt = Date.now(); // KPR-323 C1: T0→T1
@@ -458,12 +458,12 @@ and extend the "Voice turn complete" log (`:528-537`) — full replacement of th
 
 `firstTokenMs` semantics unchanged (request-arrival → first SSE byte) so warm/cold/baseline numbers stay directly comparable (spec §4.6).
 
-- [ ] **Step 7:** Tests (additive):
+- [x] **Step 7:** Tests (additive):
   - `agent-manager.test.ts`: reuse 322's landed `makeVoiceCtx` (322-plan Task 3 Step 4 adds it; extend via its overrides parameter only — e.g. workItem `text: "hello"` where a case pins the turn text — so the Task 9 additions-only audit stays clean; add the helper only if absent at delivery HEAD, shaped: `channel: "voice"`, `threadId: "voice:call-1"`, workItem `text: "hello"`, `source: { kind: "voice", id: "call-1", label: "voice:call-1" }`, `systemPromptOverride: "voice prompt"`). Cases: voice ctx → `result.stageTimings` defined, `lockWaitMs >= 0`, `spawnPrepMs >= 0`; SMS ctx → `stageTimings` undefined.
   - `agent-runner.test.ts`: using the file's existing query-mock idiom, emit `system/init` then a `stream_event` text_delta then `result` → returned `RunResult.bootToInitMs` and `initToFirstTokenMs` are numbers ≥ 0; a run with neither → both undefined.
   - `voice-adapter.test.ts`: capture the mocked logger (extend the file's logger mock to spies via `vi.hoisted`, matching the `agent-manager.test.ts` idiom, if it does not already expose them) and assert the "Voice turn complete" entry carries numeric `promptBuildMs`/`sessionLookupMs` and `warmPath: false`. All pre-existing cases untouched and green.
-- [ ] **Step 8:** Verify — `npx vitest run src/agents src/channels/voice` green; typecheck green.
-- [ ] **Step 9:** Commit — `git commit -m "feat(kpr-323): C1 cold-turn stage decomposition on Voice turn complete (log-only)"`
+- [x] **Step 8:** Verify — `npx vitest run src/agents src/channels/voice` green; typecheck green.
+- [x] **Step 9:** Commit — `git commit -m "feat(kpr-323): C1 cold-turn stage decomposition on Voice turn complete (log-only)"`
 
 ### Task 3 — Runner: `buildQueryEnvelope` extraction + `openVoiceStreamingSession`
 
@@ -473,13 +473,13 @@ Spec §9.4: the lease needs a session-opening sibling to `send()` reusing the sa
 - Modify: `src/agents/agent-runner.ts`
 - Test: `src/agents/agent-runner.test.ts` (existing suite is the regression harness; one additive case)
 
-- [ ] **Step 1:** Extend the SDK type import (`agent-runner.ts:1`) with `type SDKUserMessage`:
+- [x] **Step 1:** Extend the SDK type import (`agent-runner.ts:1`) with `type SDKUserMessage`:
 
 ```typescript
 import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUserMessage, type McpServerConfig, ... } from "@anthropic-ai/claude-agent-sdk";
 ```
 
-- [ ] **Step 2:** Extract `send()`'s pre-query assembly into a private method. **Cut boundaries (Task 0 re-pin @ `bbd9581`):** the assembly `:1890-1966` plus the options literal `:1969-2022` (reified as a local instead of inlined into `query()`) move verbatim into the new method — starting at `const allServerConfigs = this.buildAllServerConfigs(context);` — with substitutions `onStream`→`params.streaming`, `sessionId`→`params.sessionId`, `systemPromptOverride`→`params.systemPromptOverride`, `context`/`resourceLimits`/`effort`→`params.*`. **No `modelOverride`** (deleted by KPR-338); `effectiveModel = this.laneAPassthrough?.model ?? this.agentConfig.model`. In-process MCP wiring is already `Object.assign(mcpServers, this.buildInProcessServers(context))` at `:1892`.
+- [x] **Step 2:** Extract `send()`'s pre-query assembly into a private method. **Cut boundaries (Task 0 re-pin @ `bbd9581`):** the assembly `:1890-1966` plus the options literal `:1969-2022` (reified as a local instead of inlined into `query()`) move verbatim into the new method — starting at `const allServerConfigs = this.buildAllServerConfigs(context);` — with substitutions `onStream`→`params.streaming`, `sessionId`→`params.sessionId`, `systemPromptOverride`→`params.systemPromptOverride`, `context`/`resourceLimits`/`effort`→`params.*`. **No `modelOverride`** (deleted by KPR-338); `effectiveModel = this.laneAPassthrough?.model ?? this.agentConfig.model`. In-process MCP wiring is already `Object.assign(mcpServers, this.buildInProcessServers(context))` at `:1892`.
 
 ```typescript
   /**
@@ -543,7 +543,7 @@ import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUser
     const q = query({ prompt, options });
 ```
 
-- [ ] **Step 3:** Add the streaming-session opener below `send()`:
+- [x] **Step 3:** Add the streaming-session opener below `send()`:
 
 ```typescript
   /**
@@ -596,9 +596,9 @@ import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUser
   }
 ```
 
-- [ ] **Step 4:** Additive test in `agent-runner.test.ts`: with the file's query mock capturing its arguments, `openVoiceStreamingSession({ input: (async function* () {})(), sessionId: "s-1", context: fakeCtx, systemPromptOverride: "vp" })` → the mock received a non-string `prompt` (the iterable), `options.resume === "s-1"`, `options.includePartialMessages === true`, `options.systemPrompt === "vp"`; with `sessionId: undefined` → no `resume` key.
-- [ ] **Step 5:** Verify — `npx vitest run src/agents` green (the FULL existing runner + manager suites are the extraction's regression proof); `npx vitest run src/channels` green; typecheck green.
-- [ ] **Step 6:** Commit — `git commit -m "refactor(kpr-323): extract buildQueryEnvelope; add openVoiceStreamingSession (streaming-input sibling of send)"`
+- [x] **Step 4:** Additive test in `agent-runner.test.ts`: with the file's query mock capturing its arguments, `openVoiceStreamingSession({ input: (async function* () {})(), sessionId: "s-1", context: fakeCtx, systemPromptOverride: "vp" })` → the mock received a non-string `prompt` (the iterable), `options.resume === "s-1"`, `options.includePartialMessages === true`, `options.systemPrompt === "vp"`; with `sessionId: undefined` → no `resume` key.
+- [x] **Step 5:** Verify — `npx vitest run src/agents` green (the FULL existing runner + manager suites are the extraction's regression proof); `npx vitest run src/channels` green; typecheck green.
+- [x] **Step 6:** Commit — `git commit -m "refactor(kpr-323): extract buildQueryEnvelope; add openVoiceStreamingSession (streaming-input sibling of send)"`
 
 ### Task 4 — C2: `src/agents/warm-voice-session.ts` (the lease module)
 
@@ -608,7 +608,7 @@ The ticket's core. One class per active call: owns the input queue, per-turn out
 - Create: `src/agents/warm-voice-session.ts`
 - Create: `src/agents/warm-voice-session.test.ts`
 
-- [ ] **Step 1:** Create `src/agents/warm-voice-session.ts` (complete file):
+- [x] **Step 1:** Create `src/agents/warm-voice-session.ts` (complete file):
 
 ```typescript
 import type { Query, SDKMessage, SDKResultMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -1114,7 +1114,7 @@ export class WarmVoiceSession {
 }
 ```
 
-- [ ] **Step 2:** Create `src/agents/warm-voice-session.test.ts` implementing Testing-Contract warm-voice-session assertions 1–12 exactly. Harness core (no SDK runtime import — types only):
+- [x] **Step 2:** Create `src/agents/warm-voice-session.test.ts` implementing Testing-Contract warm-voice-session assertions 1–12 exactly. Harness core (no SDK runtime import — types only):
 
 ```typescript
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -1204,8 +1204,8 @@ Representative cases (write all 12 from the contract; demux + no-generator-close
 
 Timer cases use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync(WARM_IDLE_TIMEOUT_MS)`; the interrupt-escalation case asserts via a scoped `process.on("unhandledRejection")` listener that no rejection floats.
 
-- [ ] **Step 3:** Verify — `npx vitest run src/agents/warm-voice-session.test.ts` green (all 12 contract assertions present and passing); typecheck green.
-- [ ] **Step 4:** Commit — `git commit -m "feat(kpr-323): C2 warm voice session lease module (input queue, demux, watchdog, no-throw close)"`
+- [x] **Step 3:** Verify — `npx vitest run src/agents/warm-voice-session.test.ts` green (all 12 contract assertions present and passing); typecheck green.
+- [x] **Step 4:** Commit — `git commit -m "feat(kpr-323): C2 warm voice session lease module (input queue, demux, watchdog, no-throw close)"`
 
 ### Task 5 — C2: manager integration (registry, gate, open, warm turn, release-time reflection)
 
@@ -1213,7 +1213,7 @@ Timer cases use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync(WARM_IDLE_TI
 - Modify: `src/agents/agent-manager.ts`
 - Test: `src/agents/agent-manager.test.ts` (ADDITIVE describe blocks only)
 
-- [ ] **Step 1:** Imports + registry field:
+- [x] **Step 1:** Imports + registry field:
 
 ```typescript
 import { WarmVoiceSession } from "./warm-voice-session.js";
@@ -1228,7 +1228,7 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
   private warmLeases = new Map<string, WarmVoiceSession>();
 ```
 
-- [ ] **Step 2:** Extract runner construction (used by both `createProviderAdapter` and the lease — spec §4.2 "same constructor args"). **Do not** change `createProviderAdapter`'s landed signature:
+- [x] **Step 2:** Extract runner construction (used by both `createProviderAdapter` and the lease — spec §4.2 "same constructor args"). **Do not** change `createProviderAdapter`'s landed signature:
 
 ```typescript
   private createRunner(agentId: string, laneAPassthrough?: PassthroughSpawnConfig): AgentRunner {
@@ -1241,7 +1241,7 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
 
 `createProviderAdapter` keeps its landed signature (`agent-manager.ts:558-562` — async, `route` + optional `workItemContext`). Replace only the `new AgentRunner(...)` line at `:581` with `this.createRunner(agentId, laneAPassthrough)`. Lease open (Claude-only) calls `this.createRunner(ctx.agentId)` with no passthrough.
 
-- [ ] **Step 3:** Scope-guard gate (spec §4.7):
+- [x] **Step 3:** Scope-guard gate (spec §4.7):
 
 ```typescript
   /**
@@ -1262,7 +1262,7 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
 
 (Optional chaining keeps test config mocks without a `voice` key working — the gate simply stays cold.)
 
-- [ ] **Step 4:** The branch in `spawnTurn`, inserted after the registry check + `enteredAt` stamp, BEFORE `withSpawnTicket`:
+- [x] **Step 4:** The branch in `spawnTurn`, inserted after the registry check + `enteredAt` stamp, BEFORE `withSpawnTicket`:
 
 ```typescript
     // KPR-323 C2: warm voice path. The branch lives HERE — behind
@@ -1280,7 +1280,7 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
     }
 ```
 
-- [ ] **Step 5:** `openWarmLease` (place after `spawnTurn`; complete code — the promise-ownership block implements spec §4.2 verbatim):
+- [x] **Step 5:** `openWarmLease` (place after `spawnTurn`; complete code — the promise-ownership block implements spec §4.2 verbatim):
 
 ```typescript
   /**
@@ -1422,7 +1422,7 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
   }
 ```
 
-- [ ] **Step 6:** `runWarmTurn` (complete code):
+- [x] **Step 6:** `runWarmTurn` (complete code):
 
 ```typescript
   /**
@@ -1496,7 +1496,7 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
   }
 ```
 
-- [ ] **Step 7:** Reflection turns-credit extension (spec §4.5 / §11 — additive; cold callers unchanged). Change the signature and one line:
+- [x] **Step 7:** Reflection turns-credit extension (spec §4.5 / §11 — additive; cold callers unchanged). Change the signature and one line:
 
 ```typescript
   private scheduleReflectionIfEligible(ctx: TurnContext, turnResult: TurnResult, turns: number = 1): void {
@@ -1506,7 +1506,7 @@ import { WarmVoiceSession } from "./warm-voice-session.js";
       pendingReflectionTurns: (prior?.pendingReflectionTurns ?? 0) + turns,
 ```
 
-- [ ] **Step 8:** Tests — new `describe("warm voice lease (KPR-323)")` blocks in `agent-manager.test.ts`, ADDITIVE only, implementing Testing-Contract integration assertions 1–9, 12–16, and 18 (10–11 land with Task 6; 17 with Task 7). Harness extensions (top of file, beside the existing mocks):
+- [x] **Step 8:** Tests — new `describe("warm voice lease (KPR-323)")` blocks in `agent-manager.test.ts`, ADDITIVE only, implementing Testing-Contract integration assertions 1–9, 12–16, and 18 (10–11 land with Task 6; 17 with Task 7). Harness extensions (top of file, beside the existing mocks):
 
 ```typescript
 // KPR-323: streaming-session mock on the AgentRunner mock object.
@@ -1602,8 +1602,8 @@ function installEchoStreamingRunner(opts: { failOnTurn?: number; hangOnTurn?: nu
 
 (Adapt `mockSessionStoreSet` to the file's existing SessionStore mock idiom; if the suite passes a real in-memory store stub, assert on it instead — cosmetic.) The remaining cases follow the contract list mechanically: budget saturation (fill the budget with hanging SMS spawns on OTHER threads, then expect the voice open to reject with `"Spawn budget exceeded"`); stop-mid-call (stopAgent → close spy called → snapshot 0); failure-closes-lease-first + fresh-lease-on-retry-ctx (`failOnTurn: 1`, then a second spawnTurn with `sessionId: undefined` → `mockRunnerOpenStream` called a second time with `sessionId: undefined`); circuit-open (establish the lease with a normal turn 1, force the breaker open via its test surface or a registry stub → turn 2 throws pre-push, `pushed.length === 1`, lease open); timeout-keeps-open (`hangOnTurn: 2` + fake timers advancing the per-turn watchdog — the watchdog's interrupt releases the hang, the turn returns `timedOut: true` with empty errors, lease open); reflection credit (fake timers: 3 turns → idle-close → advance debounce → exactly one reflection spawn with `kind: "reflection"`, and with `reflectionMinTurns: 3` it fires after ONE 3-turn call); no per-turn reflection timers between warm turns.
 
-- [ ] **Step 9:** Verify — `npx vitest run src/agents/agent-manager.test.ts` green INCLUDING every pre-existing case untouched; full `npx vitest run src/agents src/channels/voice` green; flag-off equivalence spot-check (assertion 1) present.
-- [ ] **Step 10:** Commit — `git commit -m "feat(kpr-323): C2 warm lease coordinator integration (gate, open, warm turns, release-time reflection credit)"`
+- [x] **Step 9:** Verify — `npx vitest run src/agents/agent-manager.test.ts` green INCLUDING every pre-existing case untouched; full `npx vitest run src/agents src/channels/voice` green; flag-off equivalence spot-check (assertion 1) present.
+- [x] **Step 10:** Commit — `git commit -m "feat(kpr-323): C2 warm lease coordinator integration (gate, open, warm turns, release-time reflection credit)"`
 
 ### Task 6 — C3: warm-lease dispatch inside `abortThread` (zero 322-artifact delta)
 
@@ -1613,7 +1613,7 @@ function installEchoStreamingRunner(opts: { failOnTurn?: number; hangOnTurn?: nu
 - Modify: `src/agents/agent-manager.ts` (`abortThread`, as landed by 322)
 - Test: `src/agents/agent-manager.test.ts` (additive cases)
 
-- [ ] **Step 1:** Insert the dispatch as the method's first act (322's ticket-walk body stays verbatim below it):
+- [x] **Step 1:** Insert the dispatch as the method's first act (322's ticket-walk body stays verbatim below it):
 
 ```typescript
   abortThread(agentId: string, threadId: string): boolean {
@@ -1646,7 +1646,7 @@ function installEchoStreamingRunner(opts: { failOnTurn?: number; hangOnTurn?: nu
     ...
 ```
 
-- [ ] **Step 2:** Additive tests (Testing-Contract integration assertions 10–11):
+- [x] **Step 2:** Additive tests (Testing-Contract integration assertions 10–11):
 
 ```typescript
 describe("abortThread warm dispatch (KPR-323 C3)", () => {
@@ -1690,8 +1690,8 @@ describe("abortThread warm dispatch (KPR-323 C3)", () => {
 });
 ```
 
-- [ ] **Step 3:** Verify — `npx vitest run src/agents/agent-manager.test.ts` green, and **explicitly confirm 322's E2 describe blocks pass with zero diff** (`git diff <322-merge-sha> -- src/agents/agent-manager.test.ts` shows only additions; `git diff <322-merge-sha> -- src/channels/voice/` shows only Task 2's C1 additions).
-- [ ] **Step 4:** Commit — `git commit -m "feat(kpr-323): C3 abortThread warm-lease dispatch (turn interrupt under lease; 322 ticket-walk otherwise)"`
+- [x] **Step 3:** Verify — `npx vitest run src/agents/agent-manager.test.ts` green, and **explicitly confirm 322's E2 describe blocks pass with zero diff** (`git diff <322-merge-sha> -- src/agents/agent-manager.test.ts` shows only additions; `git diff <322-merge-sha> -- src/channels/voice/` shows only Task 2's C1 additions).
+- [x] **Step 4:** Commit — `git commit -m "feat(kpr-323): C3 abortThread warm-lease dispatch (turn interrupt under lease; 322 ticket-walk otherwise)"`
 
 ### Task 7 — C5: `warmVoiceSessions` on snapshot + heartbeat + doctor (informational)
 
@@ -1700,7 +1700,7 @@ describe("abortThread warm dispatch (KPR-323 C3)", () => {
 - Modify: `src/cli/doctor-checks.ts` (`SpawnCoordinatorRow` + reader), `src/cli/doctor.ts` (render)
 - Test: `src/agents/agent-manager.test.ts`, `src/agents/spawn-coordinator-heartbeat.test.ts`, `src/cli/doctor-checks.test.ts`, `src/cli/doctor.test.ts` (all additive)
 
-- [ ] **Step 1:** `CoordinatorSnapshotPerAgent` (`agent-manager.ts:357-376`) — add after `stopped`:
+- [x] **Step 1:** `CoordinatorSnapshotPerAgent` (`agent-manager.ts:357-376`) — add after `stopped`:
 
 ```typescript
   /** KPR-323 C5: live warm voice leases for this agent (each holds one budget slot for its call's duration). */
@@ -1718,8 +1718,8 @@ describe("abortThread warm dispatch (KPR-323 C3)", () => {
 
 and add `warmVoiceSessions,` to the per-agent literal. The heartbeat (`spawn-coordinator-heartbeat.ts:50-56`) spreads `perAgent` into the telemetry doc — the field flows through with **zero heartbeat code change**.
 
-- [ ] **Step 2:** Doctor reader (`doctor-checks.ts:372-439`): add `warmVoiceSessions: number;` to `SpawnCoordinatorRow`, `warmVoiceSessions?: number;` to the find projection type, and `warmVoiceSessions: d.warmVoiceSessions ?? 0,` to the mapper (defaults keep pre-323 heartbeat docs readable).
-- [ ] **Step 3:** Doctor render (`doctor.ts:128-152`) — extend the per-agent row (informational; **never flips the exit code** — KPR-296 rule; the section already never contributes to `allPassed`):
+- [x] **Step 2:** Doctor reader (`doctor-checks.ts:372-439`): add `warmVoiceSessions: number;` to `SpawnCoordinatorRow`, `warmVoiceSessions?: number;` to the find projection type, and `warmVoiceSessions: d.warmVoiceSessions ?? 0,` to the mapper (defaults keep pre-323 heartbeat docs readable).
+- [x] **Step 3:** Doctor render (`doctor.ts:128-152`) — extend the per-agent row (informational; **never flips the exit code** — KPR-296 rule; the section already never contributes to `allPassed`):
 
 ```typescript
     emit(
@@ -1727,9 +1727,9 @@ and add `warmVoiceSessions,` to the per-agent literal. The heartbeat (`spawn-coo
     );
 ```
 
-- [ ] **Step 4:** Tests (additive): snapshot case (contract assertion 17) — lease open → `warmVoiceSessions: 1`, after close → `0`; agents with no leases → `0`. Heartbeat: extend the existing `writeOnce` case to assert the upserted doc `$set` carries `warmVoiceSessions`. Doctor: reader defaults missing field to 0; render line contains `warm-voice=1` for a row with one lease.
-- [ ] **Step 5:** Verify — `npx vitest run src/agents src/cli/doctor.test.ts src/cli/doctor-checks.test.ts` green.
-- [ ] **Step 6:** Commit — `git commit -m "feat(kpr-323): C5 warmVoiceSessions on snapshot/heartbeat/doctor (informational)"`
+- [x] **Step 4:** Tests (additive): snapshot case (contract assertion 17) — lease open → `warmVoiceSessions: 1`, after close → `0`; agents with no leases → `0`. Heartbeat: extend the existing `writeOnce` case to assert the upserted doc `$set` carries `warmVoiceSessions`. Doctor: reader defaults missing field to 0; render line contains `warm-voice=1` for a row with one lease.
+- [x] **Step 5:** Verify — `npx vitest run src/agents src/cli/doctor.test.ts src/cli/doctor-checks.test.ts` green.
+- [x] **Step 6:** Commit — `git commit -m "feat(kpr-323): C5 warmVoiceSessions on snapshot/heartbeat/doctor (informational)"`
 
 ### Task 8 — C6: `scripts/voice-latency-baseline.ts` (read-only harvester + artifact emitter)
 
@@ -1739,7 +1739,7 @@ Spec §3 is canon for methodology; this script is its mechanical rendering (an o
 - Create: `scripts/voice-latency-baseline.ts`
 - Create: `scripts/voice-latency-baseline.test.ts` (the `scripts/flatten-skills.test.ts` precedent)
 
-- [ ] **Step 1:** Create the script (complete file):
+- [x] **Step 1:** Create the script (complete file):
 
 ```typescript
 #!/usr/bin/env npx tsx
@@ -1971,17 +1971,17 @@ if (process.argv[1]?.endsWith("voice-latency-baseline.ts")) {
 
 (Adjust the main-guard idiom to match `scripts/flatten-skills.ts`'s exact pattern at delivery — cosmetic. The esbuild shim-guard hazard does not apply: `scripts/` is not bundled.)
 
-- [ ] **Step 2:** `scripts/voice-latency-baseline.test.ts` — implement the Testing-Contract C6 assertion list exactly: `nearestRank` on known vectors (`[1..10]` → p50=5, p95=10; `[7]` → p50=p95=7; empty → 0); parser accept/reject matrix (wrong msg, wrong component, wrong agent, non-streaming, non-JSON, bad ts); window filtering at the harvest boundary (test via `buildArtifact` input pre-filtering — pass samples straight in); exclusion counting + bucket split; schema-shape assertion (`Object.keys` exact match against the §3.3 schema, `blessing` empty); shortfall note for small-n; a full artifact stringified contains no `callId` key and no `text` key.
-- [ ] **Step 3:** Verify — `npx vitest run scripts/voice-latency-baseline.test.ts` green; typecheck green; `npm run check:bundle` green (script not pulled into any bundle entry).
-- [ ] **Step 4:** Commit — `git commit -m "feat(kpr-323): C6 read-only voice latency baseline harvester + artifact schema"`
+- [x] **Step 2:** `scripts/voice-latency-baseline.test.ts` — implement the Testing-Contract C6 assertion list exactly: `nearestRank` on known vectors (`[1..10]` → p50=5, p95=10; `[7]` → p50=p95=7; empty → 0); parser accept/reject matrix (wrong msg, wrong component, wrong agent, non-streaming, non-JSON, bad ts); window filtering at the harvest boundary (test via `buildArtifact` input pre-filtering — pass samples straight in); exclusion counting + bucket split; schema-shape assertion (`Object.keys` exact match against the §3.3 schema, `blessing` empty); shortfall note for small-n; a full artifact stringified contains no `callId` key and no `text` key.
+- [x] **Step 3:** Verify — `npx vitest run scripts/voice-latency-baseline.test.ts` green; typecheck green; `npm run check:bundle` green (script not pulled into any bundle entry).
+- [x] **Step 4:** Commit — `git commit -m "feat(kpr-323): C6 read-only voice latency baseline harvester + artifact schema"`
 
 ### Task 9 — CI close-out (full gates before any deploy/gated work)
 
-- [ ] `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` green at delivery HEAD.
-- [ ] `npm run check:bundle` green (warm-voice-session enters the engine bundle via agent-manager import; baseline script stays out).
-- [ ] Flag-off equivalence audit: `git diff <pre-323-sha> -- src/channels/voice/voice-adapter.ts` shows ONLY C1 stamps + log fields; grep confirms the warm branch is reachable only through `isWarmPathEligible` and that `voice.warmPath.enabled` defaults `false` (config resolver test is the proof).
-- [ ] Zero-322-delta audit: `git diff <322-merge-sha> -- src/agents/agent-manager.test.ts src/channels/voice/` shows additions only, no modified/deleted lines in 322's committed cases.
-- [ ] Commit any stragglers; this is the last ungated task.
+- [x] `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` green at delivery HEAD.
+- [x] `npm run check:bundle` green (warm-voice-session enters the engine bundle via agent-manager import; baseline script stays out).
+- [x] Flag-off equivalence audit: `git diff <pre-323-sha> -- src/channels/voice/voice-adapter.ts` shows ONLY C1 stamps + log fields; grep confirms the warm branch is reachable only through `isWarmPathEligible` and that `voice.warmPath.enabled` defaults `false` (config resolver test is the proof).
+- [x] Zero-322-delta audit: `git diff <322-merge-sha> -- src/agents/agent-manager.test.ts src/channels/voice/` shows additions only, no modified/deleted lines in 322's committed cases.
+- [x] Commit any stragglers; this is the last ungated task.
 
 ### Task 10 — [GATE: operator go, D3] W0: baseline harvest + blessing (unblocks 322 P2)
 
@@ -2026,7 +2026,8 @@ npx tsx scripts/voice-latency-baseline.ts \
   - Interrupt-then-continue: barge-in mid-answer → generation stops, next turn answers in-session (`warmTurnSeq` increments, no lease re-open in logs). **Failure = material → demote.** (If the `interrupt-noop` grace backstop fires here instead — interrupt resolved but no `result` — record it: barge-in degrades to lease-close + cold next turn, the ⚠ #2 fallback; not a demote by itself.)
   - Interrupt-on-idle: hang up / disconnect during the adapter's pre-spawn awaits on turn N → verify the session either survives or degrades cleanly to a closed lease + cold next turn (spec §4.4 edge; either outcome passes, a wedged call fails).
   - Fallback drill: `kill` the lease's claude subprocess mid-call (identify via `ps` + the call's start time) → the in-flight turn errors, lease closes, next utterance recovers via the cold outer retry within ONE turn (caller hears one slower turn, none lost).
-  - Session-id rotation + per-turn usage attribution (⚠ registry #3/#4): confirm per-turn `sessionStore` writes and sane per-turn (non-cumulative) usage numbers in the logs; anomalies are recorded (telemetry-accuracy impact only) — not gate failures unless rotation loss breaks the fallback drill.
+  - Session-id rotation + per-turn usage attribution (⚠ registry #3/#4): confirm per-turn `sessionStore` writes and sane per-turn (non-cumulative) usage numbers in the logs; anomalies are recorded — not gate failures unless rotation loss breaks the fallback drill.
+  - **Per-turn `llmMs`/duration sanity (⚠ registry #4, breaker arm — review round 4, issue 2):** spot-check that each warm turn's derived `llmMs` is *non-cumulative* and roughly consistent with that turn's observed wall-clock time, and that late-call turns do not show a monotonically growing duration. This one is NOT telemetry-only: `llmMs` feeds KPR-306's p95 latency trip arm, so a cumulative `duration_ms` would drift the **claude** breaker toward opening engine-wide. A confirmed cumulative reading is a **gate failure** — fix the derivation before pilot rollout.
 - [ ] Record per-cell tables + verdicts in lane notes + epic decision register. All pass → recommend flipping the default for the pilot cohort in KPR-325's lane (not here; default stays `false` on this ticket).
 
 ### Task 13 — [GATE: operator go, D3] W-leak: soak / reclaim drills

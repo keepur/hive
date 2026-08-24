@@ -5,6 +5,7 @@ import {
   buildArtifact,
   nearestRank,
   parseVoiceTurnLine,
+  resolveLogFiles,
   resolveWindow,
   type VoiceTurnSample,
 } from "./voice-latency-baseline.js";
@@ -134,11 +135,13 @@ describe("parseVoiceTurnLine", () => {
     expect(s?.firstTokenMs).toBeUndefined();
   });
 
-  it("defaults totalMs to 0 when the field is missing or non-numeric", () => {
+  // Review round 4, issue 9: this used to default to 0, which then entered
+  // the totalMs percentile distribution as a real (bogus) sample.
+  it("carries totalMs undefined when the field is missing or non-numeric", () => {
     const raw = JSON.parse(line()) as Record<string, unknown>;
     delete raw.totalMs;
-    expect(parseVoiceTurnLine(JSON.stringify(raw), AGENT)?.totalMs).toBe(0);
-    expect(parseVoiceTurnLine(line({ totalMs: "4200" }), AGENT)?.totalMs).toBe(0);
+    expect(parseVoiceTurnLine(JSON.stringify(raw), AGENT)?.totalMs).toBeUndefined();
+    expect(parseVoiceTurnLine(line({ totalMs: "4200" }), AGENT)?.totalMs).toBeUndefined();
   });
 
   it("rejects a different msg", () => {
@@ -235,6 +238,23 @@ describe("buildArtifact", () => {
     // The excluded rows' totalMs (9999) must not reach any metric.
     expect(artifact.metrics.resumed.totalMs.p95).toBe(3000);
     expect(artifact.metrics.nonResumed.totalMs.p95).toBe(3000);
+  });
+
+  // Review round 4, issue 9: a malformed row missing totalMs must not enter
+  // the totalMs distribution (a 0 sample would drag p50 to the floor); its
+  // firstTokenMs is still a valid sample and stays counted.
+  it("drops a missing-totalMs row from the totalMs bucket only", () => {
+    const samples = [
+      sample({ resumed: true, firstTokenMs: 1000, totalMs: 3000 }),
+      sample({ resumed: true, firstTokenMs: 1100, totalMs: 3100 }),
+      sample({ resumed: true, firstTokenMs: 1200, totalMs: undefined }),
+    ];
+    const { artifact } = buildArtifact(samples, OPTS);
+
+    expect(artifact.samples.resumed).toBe(3); // still a usable firstTokenMs row
+    expect(artifact.metrics.resumed.firstTokenMs).toEqual({ p50: 1100, p95: 1200 });
+    // Two-value distribution [3000, 3100] — NOT [0, 3000, 3100].
+    expect(artifact.metrics.resumed.totalMs).toEqual({ p50: 3000, p95: 3100 });
   });
 
   it("splits resumed vs nonResumed on the resumed flag", () => {
@@ -493,5 +513,48 @@ describe("resolveWindow", () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("--days is not a number");
     expect(r.stderr).not.toContain("RangeError");
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// resolveLogFiles — log-dir validation (review round 4, issue 9)
+// ---------------------------------------------------------------------------
+
+describe("resolveLogFiles", () => {
+  it("lists the regular files in an existing dir", () => {
+    const dir = fileURLToPath(new URL(".", import.meta.url));
+    const r = resolveLogFiles(dir);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.names).toContain("voice-latency-baseline.ts");
+  });
+
+  it("reports a clean usage error for a nonexistent dir instead of throwing ENOENT", () => {
+    const r = resolveLogFiles("/tmp/kpr323-definitely-not-a-log-dir");
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toContain("log-dir not found or unreadable");
+    expect(r.error).toContain("/tmp/kpr323-definitely-not-a-log-dir");
+  });
+
+  it("(smoke) the CLI exits 1 on a mistyped --log-dir — no uncaught ENOENT stack", () => {
+    const script = fileURLToPath(new URL("./voice-latency-baseline.ts", import.meta.url));
+    const r = spawnSync(
+      "npx",
+      [
+        "tsx",
+        script,
+        "--log-dir",
+        "/tmp/kpr323-definitely-not-a-log-dir",
+        "--agent",
+        "nobody",
+        "--out",
+        "/tmp/kpr323-baseline-smoke.json",
+      ],
+      { encoding: "utf-8" },
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("log-dir not found or unreadable");
+    expect(r.stderr).not.toContain("at Object.readdirSync");
   }, 30_000);
 });

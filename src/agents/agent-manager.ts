@@ -1,5 +1,5 @@
 import { createLogger } from "../logging/logger.js";
-import type { AgentState, AgentStatus } from "../types/agent-config.js";
+import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import { AgentRunner, DIST_DIR, type AgentRunnerOptions, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { WarmVoiceSession } from "./warm-voice-session.js";
@@ -576,11 +576,23 @@ export class AgentManager {
    * through it, so a lease-backed runner is byte-identical to a cold one
    * apart from the Lane A options the cold path resolves per spawn (never
    * set on the warm path — the gate is claude-only).
+   *
+   * `preRead` (review round 4, issue 5): callers that have an await between
+   * their own registry read and this call pass the definition + subscriber
+   * snapshot they read BEFORE that await, so a SIGUSR1 reload landing inside
+   * the await window cannot swap the runner's config out from under them —
+   * this restores the pre-extraction read ordering in `createProviderAdapter`
+   * and removes its double registry read. Callers with no such gap
+   * (`openWarmLease`) omit it and let this method read.
    */
-  private createRunner(agentId: string, runnerOptions?: AgentRunnerOptions): AgentRunner {
-    const config = this.registry.get(agentId);
+  private createRunner(
+    agentId: string,
+    runnerOptions?: AgentRunnerOptions,
+    preRead?: { config: AgentConfig; eventSubscribersJson: string },
+  ): AgentRunner {
+    const config = preRead?.config ?? this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
-    const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
+    const eventSubscribersJson = preRead?.eventSubscribersJson ?? JSON.stringify(this.registry.getSubscriberMap());
     return new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, runnerOptions);
   }
 
@@ -601,6 +613,11 @@ export class AgentManager {
   ): Promise<AgentProviderAdapter> {
     const config = this.registry.get(agentId);
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
+    // Read the subscriber snapshot HERE, beside the definition read and
+    // before the Lane A await below (review round 4, issue 5): both are
+    // handed to createRunner so a SIGUSR1 reload landing inside the
+    // credential-resolve window cannot half-swap the runner's inputs.
+    const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
 
     // KPR-346 (§D3/§D4): Lane A passthrough — credential + model resolved
     // per spawn, BEFORE runner construction. A missing credential throws
@@ -616,7 +633,10 @@ export class AgentManager {
       });
     }
 
-    const runner = this.createRunner(agentId, laneAPassthrough ? { laneAPassthrough } : undefined);
+    const runner = this.createRunner(agentId, laneAPassthrough ? { laneAPassthrough } : undefined, {
+      config,
+      eventSubscribersJson,
+    });
     if (route.provider === "claude") {
       return new ClaudeAgentAdapter(runner);
     }
@@ -1166,8 +1186,21 @@ export class AgentManager {
    * KPR-323 §4.7 scope guards: voice channel, real turns only (a post-call
    * reflection turn on a voice thread carries channel "voice" via the
    * captured lastChannelKind and must NEVER open a lease — reflection always
-   * runs cold), claude provider only (pilot adapters have no session/stream
-   * machinery), config-gated (false = branch never taken).
+   * runs cold), claude provider only, config-gated (false = branch never
+   * taken).
+   *
+   * Why claude-only, precisely (review round 4, issue 6 — the two excluded
+   * families are excluded for DIFFERENT reasons):
+   *  - Lane B (openai/gemini/codex) has no session/stream machinery at all —
+   *    those adapters own their own dispatch loops and expose nothing like
+   *    `openVoiceStreamingSession`. Nothing to warm.
+   *  - Lane A (kimi/deepseek/grok) DOES run the full ClaudeAgentAdapter /
+   *    AgentRunner, so the capability exists — it is excluded because
+   *    `openWarmLease` builds its runner with `createRunner(ctx.agentId)`
+   *    and threads NO `laneAPassthrough` options through, so a Lane A agent
+   *    on the warm path would silently run against Anthropic with the wrong
+   *    model. An unwired gap, deliberately gated closed rather than
+   *    half-wired; wiring it is a follow-up, not a hidden limitation.
    */
   private isWarmPathEligible(ctx: TurnContext): boolean {
     if (ctx.channel !== "voice" || ctx.kind === "reflection") return false;
@@ -2329,7 +2362,14 @@ export class AgentManager {
         });
         return true;
       }
-      log.info("Warm voice lease interrupted for thread", { agentId, threadId });
+      // "dispatched", not "interrupted" (review round 4, issue 10):
+      // requestInterrupt silently no-ops when the lease is published but not
+      // yet started (the documented publish-before-start() window), so
+      // claiming the generation was severed would be inaccurate in that
+      // window. Behaviorally harmless either way — the idle timer reclaims
+      // an unstarted lease in ≤120s — so the wording is the fix, not a new
+      // "is it started" state probe.
+      log.info("Warm voice lease interrupt dispatched for thread", { agentId, threadId });
       return true;
     }
     // --- 322 Task 3 body from here, unchanged ---

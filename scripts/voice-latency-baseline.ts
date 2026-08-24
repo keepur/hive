@@ -17,7 +17,7 @@
  *     --log-dir ~/services/hive/<instance>/logs \
  *     --agent <agentId> \
  *     [--to <ISO8601>] [--days 30 | --from <ISO8601>] \
- *     [--git-sha <engine sha>] \
+ *     [--git-sha <engine sha>] [--engine-version <x.y.z>] \
  *     --out docs/epics/kpr-320/baselines/voice-baseline-<YYYY-MM-DD>.json
  *
  * The artifact is emitted with `blessing` EMPTY; the operator reviews the
@@ -28,12 +28,18 @@ import { createReadStream, mkdirSync, readdirSync, readFileSync, statSync, write
 import { createInterface } from "node:readline";
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
+import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 export interface VoiceTurnSample {
   tsMs: number;
   firstTokenMs: number | undefined;
-  totalMs: number;
+  /**
+   * `undefined` for a malformed row missing the field (review round 4,
+   * issue 9): mapping it to 0 injected a bogus zero into the totalMs
+   * percentile distribution. Same treatment as `firstTokenMs`.
+   */
+  totalMs: number | undefined;
   resumed: boolean;
 }
 
@@ -41,7 +47,8 @@ export interface VoiceTurnSample {
  * Parse one log line. Returns a sample for matching "Voice turn complete"
  * rows (streaming mode, given agent), null otherwise. Tolerates non-JSON
  * lines (multi-writer logs). Success-only by construction: the engine emits
- * this line only on successful turns (voice-adapter.ts:423-432).
+ * this line only on successful turns — see the "Voice turn complete" log
+ * site at the end of `spawnTurnViaAgentManager` in voice-adapter.ts.
  */
 export function parseVoiceTurnLine(line: string, agentId: string): VoiceTurnSample | null {
   if (!line.includes("Voice turn complete")) return null; // cheap pre-filter
@@ -59,7 +66,7 @@ export function parseVoiceTurnLine(line: string, agentId: string): VoiceTurnSamp
   return {
     tsMs,
     firstTokenMs: typeof entry.firstTokenMs === "number" ? entry.firstTokenMs : undefined,
-    totalMs: typeof entry.totalMs === "number" ? entry.totalMs : 0,
+    totalMs: typeof entry.totalMs === "number" ? entry.totalMs : undefined,
     resumed: entry.sdkSessionResumeAttempted === true,
   };
 }
@@ -113,7 +120,10 @@ export function buildArtifact(
   };
   const bucket = (xs: VoiceTurnSample[]) => ({
     firstTokenMs: pair(xs.map((s) => s.firstTokenMs!)),
-    totalMs: pair(xs.map((s) => s.totalMs)),
+    // A row missing `totalMs` (malformed — the engine always emits it) is
+    // dropped from THIS bucket only; its firstTokenMs is still a valid
+    // sample (review round 4, issue 9).
+    totalMs: pair(xs.map((s) => s.totalMs).filter((v): v is number => v !== undefined)),
   });
 
   const shortfallParts: string[] = [];
@@ -195,15 +205,39 @@ export function resolveWindow(
   return { ok: true, from, to };
 }
 
-async function harvestDir(logDir: string, agentId: string, fromMs: number, toMs: number): Promise<VoiceTurnSample[]> {
-  const samples: VoiceTurnSample[] = [];
-  const names = readdirSync(logDir).filter((n) => {
+export type LogDirResolution = { ok: true; names: string[] } | { ok: false; error: string };
+
+/**
+ * List the regular files in the log dir, or report a usage error (review
+ * round 4, issue 9). A mistyped `--log-dir` used to surface as a raw ENOENT
+ * stack out of `readdirSync`; every other malformed-input path exits 1 with
+ * a clean line. Pure + exported for the same reason as `resolveWindow`.
+ */
+export function resolveLogFiles(logDir: string): LogDirResolution {
+  let entries: string[];
+  try {
+    entries = readdirSync(logDir);
+  } catch (err) {
+    return { ok: false, error: `log-dir not found or unreadable: ${logDir} (${String(err)})` };
+  }
+  const names = entries.filter((n) => {
     try {
       return statSync(join(logDir, n)).isFile();
     } catch {
       return false;
     }
   });
+  return { ok: true, names };
+}
+
+async function harvestDir(
+  logDir: string,
+  names: string[],
+  agentId: string,
+  fromMs: number,
+  toMs: number,
+): Promise<VoiceTurnSample[]> {
+  const samples: VoiceTurnSample[] = [];
   for (const name of names) {
     const rl = createInterface({ input: createReadStream(join(logDir, name)), crlfDelay: Infinity });
     for await (const line of rl) {
@@ -223,6 +257,7 @@ async function main(): Promise<void> {
       to: { type: "string" },
       days: { type: "string" },
       "git-sha": { type: "string" },
+      "engine-version": { type: "string" },
       out: { type: "string" },
     },
   });
@@ -240,19 +275,38 @@ async function main(): Promise<void> {
   }
   const { from, to } = window;
 
-  const engineVersion = (
-    JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as { version: string }
-  ).version;
+  // Provenance (review round 4, issue 1): the artifact is immutable once
+  // blessed (spec §3.4) and 322 P2 binds to it, so both provenance fields
+  // must describe the ENGINE, never the harvesting shell's cwd. Defaults
+  // resolve against this script's own location; `--engine-version` /
+  // `--git-sha` override when the harvested logs came from a different
+  // engine build than the checkout running the harvest.
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const engineVersion =
+    values["engine-version"] ??
+    (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as { version: string }).version;
   let gitSha = values["git-sha"] ?? "";
   if (!gitSha) {
     try {
-      gitSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+      // cwd = the engine repo (via scriptDir), not process.cwd(); stderr
+      // suppressed so a "fatal: not a git repository" line can never
+      // interleave with the load-bearing SAMPLE SHORTFALL message.
+      gitSha = execFileSync("git", ["rev-parse", "HEAD"], {
+        encoding: "utf-8",
+        cwd: scriptDir,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
     } catch {
       gitSha = "unknown";
     }
   }
 
-  const samples = await harvestDir(logDir, agent, from.getTime(), to.getTime());
+  const logFiles = resolveLogFiles(logDir);
+  if (!logFiles.ok) {
+    process.stderr.write(logFiles.error + "\n");
+    process.exit(1);
+  }
+  const samples = await harvestDir(logDir, logFiles.names, agent, from.getTime(), to.getTime());
   const { artifact, shortfall } = buildArtifact(samples, {
     capturedAt: new Date().toISOString(),
     engineVersion,

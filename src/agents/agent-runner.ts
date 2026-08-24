@@ -2065,9 +2065,9 @@ export class AgentRunner {
     // sub-agents, skill projections, session cwd mkdir) attributed to NEITHER
     // spawnPrepMs nor bootToInitMs — an unattributed gap that understates the
     // decomposition against firstTokenMs and biases Task 11's W1 falsification
-    // rule toward a false demotion. Spec §2 assigns in-process MCP server
-    // construction to the T2→T3 span; stamping here folds it into bootToInitMs
-    // so the stages reconcile.
+    // rule toward a false demotion. Spec §2's stage table is annotated to
+    // match: in-process MCP server construction and the rest of envelope
+    // assembly are measured inside bootToInitMs, not spawnPrepMs.
     const queryStartedAt = Date.now();
 
     const options = await this.buildQueryEnvelope({

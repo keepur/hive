@@ -5099,7 +5099,12 @@ describe("AgentManager", () => {
       expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // still ONE ticket
       expect(pushed).toEqual(["hello over voice", "hello over voice"]); // one push per turn, in order
 
-      // Per-turn session persistence (rotation-safe cold fallback).
+      // Per-turn session persistence (rotation-safe cold fallback). The
+      // COUNT is load-bearing (review round 4, issue 8): two turns must
+      // produce exactly two writes — a lease that persisted only at open,
+      // or persisted twice per turn, would still satisfy the two
+      // toHaveBeenCalledWith assertions below.
+      expect(sessionStore.set).toHaveBeenCalledTimes(2);
       expect(sessionStore.set).toHaveBeenCalledWith("agent-a", "voice:call-1", "sess-warm-1", "claude", expect.anything());
       expect(sessionStore.set).toHaveBeenCalledWith("agent-a", "voice:call-1", "sess-warm-2", "claude", expect.anything());
     });
@@ -5125,7 +5130,18 @@ describe("AgentManager", () => {
       expect(mockRunnerOpenStream).not.toHaveBeenCalled();
       expect(cold.warmPath).toBeUndefined();
 
-      // Lease OPEN on the same thread — reflection still runs cold.
+      // A lease is OPEN (on the call thread) — a reflection ctx still runs
+      // cold and does not open or reuse a lease of its own.
+      //
+      // Scope note (review round 4, issue 8): the reflection ctx below is
+      // routed to a DIFFERENT thread than the open lease, so what this pins
+      // is "reflection never opens a lease while a lease exists", not
+      // "reflection reuses nothing on the leased thread". The same-thread
+      // variant is not constructible here by design: reflection is gated OFF
+      // the warm path, so it falls to withSpawnTicket and would block on the
+      // per-thread lock the lease holds for the call's duration — the test
+      // would hang rather than assert. The same-thread guarantee is the
+      // lock's, not the gate's.
       await manager.spawnTurn(makeVoiceCtx());
       expect(warmLeases(manager).get(WARM_KEY)).toBeDefined();
       const sendsBefore = mockRunnerSend.mock.calls.length;
@@ -5150,6 +5166,36 @@ describe("AgentManager", () => {
       expect(warmLeases(manager).size).toBe(0);
     });
 
+    it("(6b) a Lane A agent takes the cold path too — the gate is claude-ROUTE, not claude-adapter", async () => {
+      // Review round 4, issue 6: Lane A (kimi/deepseek/grok) runs the FULL
+      // ClaudeAgentAdapter/AgentRunner, so unlike Lane B it *has* the stream
+      // machinery. It is excluded because openWarmLease's runner is built
+      // without the passthrough options resolved below — a warm Lane A turn
+      // would silently hit Anthropic with the wrong model. Pin the exclusion
+      // so wiring it later is a deliberate act, not an accident.
+      process.env.KIMI_API_KEY = "test-kimi-key";
+      registry._agents.set(
+        "voice-kimi",
+        makeAgentConfig({ id: "voice-kimi", name: "VoiceKimi", model: "kimi/kimi-k3", coreServers: [] }),
+      );
+      installEchoStreamingRunner();
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "cold kimi reply" }));
+      try {
+        const r = await manager.spawnTurn(makeVoiceCtx({ agentId: "voice-kimi", threadId: "voice:call-kimi" }));
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        expect(r.finalMessage).toBe("cold kimi reply");
+        expect(r.warmPath).toBeUndefined();
+        expect(warmLeases(manager).size).toBe(0);
+        // The very thing the warm path does not thread through.
+        expect(vi.mocked(AgentRunner).mock.calls.at(-1)![10]).toEqual({
+          laneAPassthrough: expect.objectContaining({ provider: "kimi", model: "kimi-k3" }),
+        });
+      } finally {
+        delete process.env.KIMI_API_KEY;
+      }
+    });
+
     // ---- assertion 7 -----------------------------------------------------
     it("(7) budget saturation at open rejects with the existing message; no lease registered, no stream opened", async () => {
       installEchoStreamingRunner();
@@ -5162,12 +5208,24 @@ describe("AgentManager", () => {
       const inflight = [0, 1].map((i) => manager.spawnTurn(makeSmsCtx({ threadId: `sms:line-1:warm-budget-${i}` })));
       await new Promise((r) => setTimeout(r, 30));
 
-      await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toThrow(/Spawn budget exceeded for agent-a \(2\/2\)/);
-      expect(warmLeases(manager).size).toBe(0);
-      expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+      // No-unhandled-rejection guard (review round 4, issue 8 — mirrors case
+      // 11): the denied open must not leave the lease's own coordinator
+      // promise floating.
+      const floated: unknown[] = [];
+      const onRej = (r: unknown) => floated.push(r);
+      process.on("unhandledRejection", onRej);
+      try {
+        await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toThrow(/Spawn budget exceeded for agent-a \(2\/2\)/);
+        expect(warmLeases(manager).size).toBe(0);
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
 
-      releasers.forEach((r) => r());
-      await Promise.all(inflight);
+        releasers.forEach((r) => r());
+        await Promise.all(inflight);
+        await new Promise((r) => setTimeout(r, 10));
+      } finally {
+        process.off("unhandledRejection", onRej);
+      }
+      expect(floated).toEqual([]);
     });
 
     // ---- assertion 8 -----------------------------------------------------

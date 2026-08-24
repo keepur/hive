@@ -11,7 +11,7 @@ const log = createLogger("warm-voice-session");
  * KPR-323 §4.2/§4.7: release constants. Deliberately NOT config — the
  * enabled flag is the rollback lever; these are pilot-tunable by code
  * change only (spec §11 ⚠). Lifetime cap aligns with the voice adapter's
- * CallSession TTL (voice-adapter.ts:38).
+ * CallSession TTL (`SESSION_TTL_MS` in voice-adapter.ts).
  */
 export const WARM_IDLE_TIMEOUT_MS = 120_000;
 export const WARM_LIFETIME_CAP_MS = 2 * 60 * 60 * 1000;
@@ -109,10 +109,12 @@ export interface WarmVoiceSessionDeps {
  * Throw-safety contract (spec §4.2, load-bearing):
  *  - Timer callbacks are try/catch-wrapped — they run on bare setTimeout,
  *    where a synchronous throw is an uncaughtException (the engine
- *    registers only an unhandledRejection handler, index.ts:878).
+ *    registers only an unhandledRejection handler — see index.ts's
+ *    `process.on("unhandledRejection", ...)`).
  *  - close() is no-throw and idempotent. It is invoked from at least four
  *    contexts: the timers; ticket.abort() via stopAgent's ticket walk —
- *    which has NO per-ticket try/catch (agent-manager.ts:1318-1323), so a
+ *    which has NO per-ticket try/catch (see the `for (const ticket of
+ *    tickets) ticket.abort()` loop in agent-manager.ts's `stopAgent`), so a
  *    throwing close() would skip the agent's remaining tickets; the
  *    turn-failure path; and engine shutdown.
  *  - interrupt()'s Promise is always given a .catch (requestInterrupt).
