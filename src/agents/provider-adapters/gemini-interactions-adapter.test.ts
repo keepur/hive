@@ -818,7 +818,7 @@ describe("Lane B wall-clock deadline (timeoutMs)", () => {
     expect(result.timedOut).toBe(true);
     expect(result.aborted).toBe(false);
     expect(adapter.wasAborted).toBe(false);
-    expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+    expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "turn-deadline" });
     expect(create).toHaveBeenCalledTimes(1);
     expect(logMock.warn).toHaveBeenCalledWith(
       "Gemini turn deadline exceeded — aborting turn",
@@ -839,7 +839,7 @@ describe("Lane B wall-clock deadline (timeoutMs)", () => {
       [created("i1"), fnCallStart(0, "c1", ECHO), argsDelta(0, '{"text":"a"}'), completed("i1", { status: "requires_action" })],
       [created("i2"), textDelta("done"), completed("i2")],
     ]);
-    const adapter = makeAdapter({ client, assembly: echoAssembly({ delayMs: 300 }) });
+    const adapter = makeAdapter({ client, assembly: echoAssembly({ delayMs: 1000 }) });
     const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(100) });
     expect(result.error).toBe("error_turn_deadline");
     expect(result.aborted).toBe(false);

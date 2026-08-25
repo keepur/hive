@@ -282,6 +282,15 @@ export class ProviderCircuitBreaker {
           if (this.consecutiveHardFaults >= this.config.consecutiveFaultThreshold) {
             this.open(now, classification.kind);
           }
+        } else if (classification.kind === "turn-deadline") {
+          // Lane B wall-clock deadline expiry: inconclusive, like "aborted".
+          // Never trips (a slow-but-healthy tool can consume the whole wall
+          // clock) but ALSO never resets the streak — unlike every other
+          // non-hard fault it is NOT proof the provider responded: a
+          // genuinely hung provider yields exactly this result every turn
+          // (the hive deadline preempts undici's own timeouts), and a reset
+          // here would blind hang-type outage detection permanently.
+          return;
         } else {
           // non-provider: the turn traversed the provider path and got a
           // response — proves the provider is up. Resets the streak (same
@@ -415,7 +424,11 @@ export class ProviderCircuitBreaker {
   private settleProbe(classification: TurnClassification, now: number, llmMs: number): void {
     if (
       classification.outcome === "success" ||
-      (classification.outcome === "fault" && !HARD_FAULT_KINDS.has(classification.kind))
+      (classification.outcome === "fault" &&
+        !HARD_FAULT_KINDS.has(classification.kind) &&
+        // A deadline-expired probe proves nothing (the provider may still be
+        // hung) — inconclusive like "aborted" below, NOT a recovery close.
+        classification.kind !== "turn-deadline")
     ) {
       // A turn that reached the provider and failed on something else still
       // proves the provider is reachable — closes.
@@ -428,7 +441,10 @@ export class ProviderCircuitBreaker {
       }
       return;
     }
-    if (classification.outcome === "aborted") {
+    if (
+      classification.outcome === "aborted" ||
+      (classification.outcome === "fault" && classification.kind === "turn-deadline")
+    ) {
       this.reopen(now, false); // inconclusive: exponent unchanged
       return;
     }

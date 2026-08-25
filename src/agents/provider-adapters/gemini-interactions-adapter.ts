@@ -161,20 +161,13 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
     // delegates abort-chain off it); a non-cancellable in-flight tool call is
     // caught at the next loop checkpoint via interruptedResult. undefined ⇒
     // no deadline (bare/test constructions — prepareSpawn always supplies one
-    // on Lane B); 0 is an immediate deadline (honest-zero, maxTurns-0 twin).
+    // on Lane B); 0 fires immediately, though the first round may still
+    // dispatch and be aborted mid-flight (a timer is a macrotask — unlike
+    // maxTurns 0's zero-call short-circuit). Armed inside the try (below) so
+    // a throw between here and the finally can never leak the timer.
     const timeoutMs = request.resourceLimits?.timeoutMs;
     let deadlineFired = false;
-    const deadline =
-      timeoutMs !== undefined
-        ? setTimeout(() => {
-            deadlineFired = true;
-            log.warn("Gemini turn deadline exceeded — aborting turn", {
-              agent: this.options.name,
-              timeoutMs,
-            });
-            abortController.abort();
-          }, timeoutMs)
-        : undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
 
     // KPR-352 (§D1): per-spawn tool bridge — the codex adapter's exact
     // construction (codex-subscription-adapter.ts:126-136), including the
@@ -210,8 +203,10 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
     /** Deadline expiry is a turn-shape ERROR, not an abort: `aborted` stays
      *  false so classifyTurnResult's `timedOut && aborted` hang rule (the
      *  Claude-lane breaker-tripping timeout) can never match, and
-     *  TURN_DEADLINE_SUBTYPE short-circuits to non-provider — Lane B wall
-     *  clock folds bridged tool time in, and a slow-but-healthy tool must not
+     *  TURN_DEADLINE_SUBTYPE classifies as the breaker-INCONCLUSIVE
+     *  turn-deadline kind (never trips, never resets a streak, never closes
+     *  a half-open probe: an expiry proves nothing about provider health
+     *  either way) — Lane B wall clock folds bridged tool time in, and a slow-but-healthy tool must not
      *  trip a healthy provider. `timedOut: true` still flows to telemetry.
      *  sessionId is the §D1 error-path shape (resumed handle, never a
      *  mid-turn mint) so pre-deadline chain state resumes next turn. */
@@ -237,6 +232,17 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
       deadlineFired && !this.aborted ? deadlineResult() : abortedResult();
 
     try {
+      if (timeoutMs !== undefined) {
+        deadline = setTimeout(() => {
+          deadlineFired = true;
+          log.warn("Gemini turn deadline exceeded — aborting turn", {
+            agent: this.options.name,
+            timeoutMs,
+          });
+          abortController.abort();
+        }, timeoutMs);
+      }
+
       // §D7: API-key single path (Vertex OAuth deleted — Interactions is not
       // served on Vertex). Pre-request throw → classifyThrown "auth" (row
       // alternate pinned) → breaker → honest outage; config.gemini.apiKey is
@@ -334,8 +340,17 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
         // final-reply semantics, 353 parity).
         let state: Awaited<ReturnType<typeof consumeInteractionStream>>;
         try {
-          state = await consumeInteractionStream(stream, request.onStream, () => this.aborted);
+          state = await consumeInteractionStream(
+            stream,
+            request.onStream,
+            // Deadline-aware: the signal-abort leg makes the consumer stop on
+            // its own even if the transport's reject-on-abort were ever absent.
+            () => this.aborted || abortController.signal.aborted,
+          );
         } catch (error) {
+          // A deadline/operator abort passes through untouched (no HTTP
+          // status ⇒ describeStreamError returns the original error), so the
+          // outer catch's isAbortError/interruptedResult still resolve it.
           throw this.describeStreamError(error);
         }
         totals.inputTokens += state.inputTokens;

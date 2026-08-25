@@ -847,7 +847,7 @@ describe("OpenAIAgentsAdapter — Lane B wall-clock deadline (timeoutMs)", () =>
     expect(result.aborted).toBe(false);
     expect(adapter.wasAborted).toBe(false);
     expect(result.sessionId).toBe("resp-prev");
-    expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+    expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "turn-deadline" });
     expect(logMock.warn).toHaveBeenCalledWith(
       "OpenAI turn deadline exceeded — aborting turn",
       expect.objectContaining({ timeoutMs: 25 }),

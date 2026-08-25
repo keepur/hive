@@ -51,26 +51,21 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     // its HTTP requests, and the ToolBridge (nested KPR-354 delegates
     // abort-chain off it) all hang off abortController.signal. undefined ⇒
     // no deadline (bare/test constructions — prepareSpawn always supplies
-    // one on Lane B); 0 is an immediate deadline (honest-zero).
+    // one on Lane B); 0 fires immediately, though the run may still start
+    // and be aborted mid-flight (a timer is a macrotask). Armed inside the
+    // try (below) so a throw between here and the finally can never leak
+    // the timer.
     const timeoutMs = request.resourceLimits?.timeoutMs;
     let deadlineFired = false;
-    const deadline =
-      timeoutMs !== undefined
-        ? setTimeout(() => {
-            deadlineFired = true;
-            log.warn("OpenAI turn deadline exceeded — aborting turn", {
-              agent: this.options.name,
-              timeoutMs,
-            });
-            abortController.abort();
-          }, timeoutMs)
-        : undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
 
     /** Deadline expiry is a turn-shape ERROR, not an abort: `aborted` stays
      *  false so classifyTurnResult's `timedOut && aborted` hang rule (the
      *  Claude-lane breaker-tripping timeout) can never match, and
-     *  TURN_DEADLINE_SUBTYPE short-circuits to non-provider — Lane B wall
-     *  clock folds bridged tool time in, and a slow-but-healthy tool must
+     *  TURN_DEADLINE_SUBTYPE classifies as the breaker-INCONCLUSIVE
+     *  turn-deadline kind (never trips, never resets a streak, never closes
+     *  a half-open probe: an expiry proves nothing about provider health
+     *  either way) — Lane B wall clock folds bridged tool time in, and a slow-but-healthy tool must
      *  not trip a healthy provider. Operator abort() outranks a deadline
      *  that also fired (checked at every use site via !this.aborted). */
     const deadlineResult = (bridge: ToolBridge): RunResult =>
@@ -101,6 +96,17 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     });
 
     try {
+      if (timeoutMs !== undefined) {
+        deadline = setTimeout(() => {
+          deadlineFired = true;
+          log.warn("OpenAI turn deadline exceeded — aborting turn", {
+            agent: this.options.name,
+            timeoutMs,
+          });
+          abortController.abort();
+        }, timeoutMs);
+      }
+
       // KPR-351 (R1): API-key single path — resolve the client BEFORE
       // connecting tool servers, so persistent misconfig fails in
       // microseconds. The throw is caught by this method's own catch and

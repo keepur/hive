@@ -22,6 +22,7 @@ export type ProviderFaultKind =
   | "auth" // 401/403/authentication/invalid key
   | "server-error" // 5xx / overloaded / service unavailable
   | "bad-model" // rejected/unknown model id (KPR-312, M8) — config fault, NEVER trips the breaker
+  | "turn-deadline" // Lane B wall-clock deadline expiry — breaker-INCONCLUSIVE (see TURN_DEADLINE_SUBTYPE)
   | "non-provider"; // everything else — NEVER trips the breaker
 
 export interface TurnFaultInput {
@@ -52,23 +53,28 @@ export const HARD_FAULT_KINDS: ReadonlySet<ProviderFaultKind> = new Set([
  * as RunResult.error when the turn's `resourceLimits.timeoutMs` deadline
  * fires (with `timedOut: true` but `aborted: false` — so the Claude-lane
  * `timedOut && aborted` hang rule in classifyTurnResult can never match).
- * Pinned non-provider like error_max_turns: a Lane B turn's wall clock folds
- * bridged tool execution time in, so a deadline expiry is a turn-shape
- * condition — a slow-but-healthy tool must never trip a healthy provider's
- * breaker (same asymmetry that keeps toolMs out of the p95 llmMs window).
+ *
+ * Classifies as the dedicated `turn-deadline` kind, which the breaker treats
+ * as INCONCLUSIVE — never trips (a Lane B turn's wall clock folds bridged
+ * tool execution time in, and a slow-but-healthy tool must never trip a
+ * healthy provider — the same asymmetry that keeps toolMs out of the p95
+ * llmMs window), but ALSO never resets a hard-fault streak and never closes
+ * a half-open probe: unlike every other non-hard fault, a deadline expiry is
+ * NOT proof the provider responded (a genuinely hung provider produces
+ * exactly this result every turn, since the hive deadline deterministically
+ * preempts undici's own timeouts). Short-circuits before the pattern tables.
  */
 export const TURN_DEADLINE_SUBTYPE = "error_turn_deadline";
 
 /**
- * Turn-shape sentinels flattened into RunResult.error verbatim: the SDK
- * result subtypes (agent-runner.ts `msg.type === "result"` non-success
- * branch) plus the Lane B adapters' own sentinels (error_max_turns is shared;
- * TURN_DEADLINE_SUBTYPE is Lane-B-only). These are turn-shape conditions
- * (budget/turn caps, wall-clock deadline, in-execution tool failures), not
- * provider faults — short-circuit them before the pattern tables so e.g.
+ * SDK result subtypes flattened into RunResult.error verbatim
+ * (agent-runner.ts `msg.type === "result"` non-success branch; the Lane B
+ * dispatch loops share error_max_turns). These are turn-shape conditions
+ * (budget/turn caps, in-execution tool failures), not provider faults —
+ * short-circuit them before the pattern tables so e.g.
  * "error_during_execution" can never match a fault row.
  */
-const NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_execution", TURN_DEADLINE_SUBTYPE]);
+const SDK_NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_execution"]);
 
 /**
  * First match wins, in row order. The auth row MUST remain a superset of
@@ -83,7 +89,7 @@ const NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_executio
  * change (regression-pinned per-alternate in error-classification.test.ts).
  */
 const FAULT_PATTERNS: ReadonlyArray<
-  readonly [Exclude<ProviderFaultKind, "non-provider" | "timeout">, RegExp]
+  readonly [Exclude<ProviderFaultKind, "non-provider" | "timeout" | "turn-deadline">, RegExp]
 > = [
   [
     "connect-fail",
@@ -114,7 +120,10 @@ const FAULT_PATTERNS: ReadonlyArray<
 ];
 
 function classifyErrorString(error: string): TurnClassification {
-  if (NON_PROVIDER_SUBTYPES.has(error.trim())) {
+  if (error.trim() === TURN_DEADLINE_SUBTYPE) {
+    return { outcome: "fault", kind: "turn-deadline", message: error };
+  }
+  if (SDK_NON_PROVIDER_SUBTYPES.has(error.trim())) {
     return { outcome: "fault", kind: "non-provider", message: error };
   }
   for (const [kind, pattern] of FAULT_PATTERNS) {

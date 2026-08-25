@@ -1359,7 +1359,7 @@ describe("CodexSubscriptionAdapter — Lane B wall-clock deadline (timeoutMs)", 
       expect(result.timedOut).toBe(true);
       expect(result.aborted).toBe(false);
       expect(adapter.wasAborted).toBe(false);
-      expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+      expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "turn-deadline" });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(store.append).not.toHaveBeenCalled();
       expect(logMock.warn).toHaveBeenCalledWith(
@@ -1376,7 +1376,7 @@ describe("CodexSubscriptionAdapter — Lane B wall-clock deadline (timeoutMs)", 
       [completed([callItem("mcp__fixture__echo", '{"text":"hi"}')])],
       [completed([{ type: "message", role: "assistant", content: [] }])],
     );
-    const { adapter, cleanup } = makeAdapter({ assembly: makeAssembly(echoAssembly({}, 300)) }, fetchMock);
+    const { adapter, cleanup } = makeAdapter({ assembly: makeAssembly(echoAssembly({}, 1000)) }, fetchMock);
     try {
       const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(100) });
       expect(result.error).toBe("error_turn_deadline");
@@ -1387,7 +1387,7 @@ describe("CodexSubscriptionAdapter — Lane B wall-clock deadline (timeoutMs)", 
     }
   });
 
-  it("timeoutMs 0 is an immediate deadline (honest-zero — the maxTurns-0 pin's twin)", async () => {
+  it("timeoutMs 0 fires immediately — at most one round dispatches before the abort", async () => {
     const { adapter, cleanup, fetchMock } = makeAdapter({}, hangingFetch());
     try {
       const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(0) });
@@ -1421,6 +1421,23 @@ describe("CodexSubscriptionAdapter — Lane B wall-clock deadline (timeoutMs)", 
       expect(result.error).toBeUndefined();
       expect(result.timedOut).toBeUndefined();
       expect(result.aborted).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("timer is cleared on normal completion — no late deadline warn ever fires", async () => {
+    const okFetch = sseScript([completed([{ type: "message", role: "assistant", content: [] }])]);
+    const { adapter, cleanup } = makeAdapter({}, okFetch);
+    try {
+      const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(200) });
+      expect(result.error).toBeUndefined();
+      // Wait past the would-be deadline: a leaked timer would warn + abort.
+      await new Promise((r) => setTimeout(r, 250));
+      expect(logMock.warn).not.toHaveBeenCalledWith(
+        "Codex turn deadline exceeded — aborting turn",
+        expect.anything(),
+      );
     } finally {
       cleanup();
     }

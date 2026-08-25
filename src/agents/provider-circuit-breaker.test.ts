@@ -425,3 +425,52 @@ describe("ProviderCircuitBreakerRegistry — isolation, shadow mode, defaults", 
     expect(registry.stateFor("claude")!.enabled).toBe(true);
   });
 });
+
+describe("ProviderCircuitBreaker — turn-deadline is breaker-INCONCLUSIVE (Lane B wall-clock deadline)", () => {
+  const deadlineFault = (): TurnClassification => ({
+    outcome: "fault",
+    kind: "turn-deadline",
+    message: "error_turn_deadline",
+  });
+
+  it("record: never trips on its own — many consecutive deadline expiries keep the circuit closed", () => {
+    const { registry, turn } = makeRegistry();
+    for (let i = 0; i < 10; i++) turn(deadlineFault(), 0);
+    expect(registry.stateFor("claude")!.state).toBe("closed");
+  });
+
+  it("record: preserves the hard-fault streak (unlike non-provider, which resets) — a hung provider still trips", () => {
+    // hard, hard, deadline, hard → trips: the deadline neither counts nor
+    // resets. A reset here would blind hang-type outage detection, since the
+    // hive deadline preempts undici's own timeouts on a hung provider.
+    const { registry, turn } = makeRegistry();
+    turn(hardFault(), 0);
+    turn(hardFault(), 0);
+    turn(deadlineFault(), 0);
+    expect(registry.stateFor("claude")!.state).toBe("closed");
+    turn(hardFault(), 0);
+    expect(registry.stateFor("claude")!.state).toBe("open");
+    // Contrast pin: same sequence with non-provider DOES reset (guards
+    // against someone later folding turn-deadline into the reset branch).
+    const other = makeRegistry();
+    other.turn(hardFault(), 0);
+    other.turn(hardFault(), 0);
+    other.turn(nonProviderFault(), 0);
+    other.turn(hardFault(), 0);
+    expect(other.registry.stateFor("claude")!.state).toBe("closed");
+  });
+
+  it("settleProbe: a deadline-expired probe does NOT close (no reachability proof) and reopens without backoff escalation", () => {
+    const { registry, advance, turn } = makeRegistry();
+    turn(hardFault());
+    turn(hardFault());
+    turn(hardFault());
+    advance(15_000);
+    const probe = registry.acquire("claude");
+    expect(probe.isProbe).toBe(true);
+    registry.record(probe, deadlineFault(), 0);
+    expect(registry.stateFor("claude")!.state).toBe("open");
+    // Inconclusive like "aborted": exponent unchanged → base cooldown again.
+    expect(expectOpenThrow(() => registry.acquire("claude")).retryAfterMs).toBe(15_000);
+  });
+});
