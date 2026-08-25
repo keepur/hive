@@ -60,6 +60,13 @@ describe("classifyTurnResult (KPR-306)", () => {
     "Quota exceeded for quota metric 'Generate requests'", // quota-phrased 429
   ])("rate-limit: %s", (s) => expect(faultKind(s)).toBe("rate-limit"));
 
+  // Negative pins for the Google-429 alternates (false-positive bias — a
+  // hive-internal budget message must never take breaker weight).
+  it.each([
+    "Task denied: spawn budget exhausted (2/2) — try again shortly",
+    "autoDream run budget exhausted",
+  ])("non-provider (not a vendor 429): %s", (s) => expect(faultKind(s)).toBe("non-provider"));
+
   it.each([
     "401 unauthorized-ish", // \b401\b
     "403 Forbidden",
