@@ -278,7 +278,12 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
         // Text deltas from EVERY round reach onStream (intermediate
         // think-aloud); RunResult.text is the final round's text only (§D1
         // final-reply semantics, 353 parity).
-        const state = await consumeInteractionStream(stream, request.onStream, () => this.aborted);
+        let state: Awaited<ReturnType<typeof consumeInteractionStream>>;
+        try {
+          state = await consumeInteractionStream(stream, request.onStream, () => this.aborted);
+        } catch (error) {
+          throw this.describeStreamError(error);
+        }
         totals.inputTokens += state.inputTokens;
         totals.outputTokens += state.outputTokens;
         totals.cacheReadTokens += state.cacheReadTokens;
@@ -409,6 +414,23 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
       return new Error(`Gemini interaction request failed (${status}): ${message}`);
     }
     return error instanceof Error ? error : new Error(message);
+  }
+
+  /** Stream-phase sibling of describeCreateError: an SDK throw during
+   *  stream ITERATION bypasses the create try/catch and lands in the outer
+   *  catch, which stringifies with errorMessage() — message only, status
+   *  dropped. A 429/5xx arriving mid-stream therefore reached the
+   *  classifier bare and could rate-limit-misclassify as non-provider
+   *  (observed on dodi 2026-08-24: "Resource has been exhausted (e.g.
+   *  check quota)." → non-provider → breaker never counted it). Preserve
+   *  the status for FAULT_PATTERNS. No stale-handle tagging here: a stale
+   *  PERSISTED handle fails at create time, never mid-stream (§D3). */
+  private describeStreamError(error: unknown): Error {
+    const status = extractStatus(error);
+    if (status !== undefined) {
+      return new Error(`Gemini interaction stream failed (${status}): ${errorMessage(error)}`);
+    }
+    return error instanceof Error ? error : new Error(errorMessage(error));
   }
 
   /** §D5: no suffix ⇒ no generation_config sent (model-default thinking —
