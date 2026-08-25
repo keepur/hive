@@ -178,7 +178,6 @@ export class OpenAIAgentsAdapter extends LaneBTurnScaffold {
   private extractSessionId(result: OpenAIResultLike, fallback: string): string {
     return result.lastResponseId ?? fallback;
   }
-
 }
 
 /**
