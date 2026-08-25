@@ -502,6 +502,38 @@ describe("T5 stale-handle tag (adapter half)", () => {
     expect(result.error).toBe("connect ECONNREFUSED 10.0.0.1:443");
     expect(classifyTurnResult(result)).toMatchObject({ kind: "connect-fail" });
   });
+
+  it("mid-stream throw preserves status — a stream-phase 429 classifies rate-limit (dodi 2026-08-24)", async () => {
+    const client: GeminiInteractionsClient = {
+      create: vi.fn(async () =>
+        (async function* () {
+          yield created("interactions/rl");
+          throw statusError(429, "Resource has been exhausted (e.g. check quota).");
+        })(),
+      ),
+    };
+    const adapter = makeAdapter({ client });
+    const result = await adapter.runTurn({ prompt: "hi" });
+    expect(result.error).toBe(
+      "Gemini interaction stream failed (429): Resource has been exhausted (e.g. check quota).",
+    );
+    expect(classifyTurnResult(result)).toMatchObject({ kind: "rate-limit" });
+  });
+
+  it("mid-stream statusless throw passes through verbatim (connect-fail stays reachable)", async () => {
+    const client: GeminiInteractionsClient = {
+      create: vi.fn(async () =>
+        (async function* () {
+          yield created("interactions/rl");
+          throw new Error("connect ECONNRESET 10.0.0.1:443");
+        })(),
+      ),
+    };
+    const adapter = makeAdapter({ client });
+    const result = await adapter.runTurn({ prompt: "hi" });
+    expect(result.error).toBe("connect ECONNRESET 10.0.0.1:443");
+    expect(classifyTurnResult(result)).toMatchObject({ kind: "connect-fail" });
+  });
 });
 
 // ---------------------------------------------------------------------------

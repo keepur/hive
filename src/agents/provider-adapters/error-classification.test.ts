@@ -55,6 +55,9 @@ describe("classifyTurnResult (KPR-306)", () => {
     "rate limit exceeded",
     "rate-limited, retry later",
     "too many requests",
+    "Resource has been exhausted (e.g. check quota).", // Gemini prose 429 (dodi 2026-08-24)
+    "Status RESOURCE_EXHAUSTED on generateContent", // gRPC-style status token
+    "Quota exceeded for quota metric 'Generate requests'", // quota-phrased 429
   ])("rate-limit: %s", (s) => expect(faultKind(s)).toBe("rate-limit"));
 
   it.each([

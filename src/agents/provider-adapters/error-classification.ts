@@ -75,7 +75,15 @@ const FAULT_PATTERNS: ReadonlyArray<
     "connect-fail",
     /ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EPIPE|socket hang up|fetch failed|network error|terminated/i,
   ],
-  ["rate-limit", /\b429\b|rate.?limit|too many requests/i],
+  [
+    // The Google alternates cover Gemini's canonical 429 surfaces — the
+    // prose message ("Resource has been exhausted (e.g. check quota).",
+    // observed classifying non-provider on dodi 2026-08-24), the gRPC-style
+    // status token, and the quota-phrased variant. At Google a quota breach
+    // IS a 429, so quota-exceeded belongs on this row, not a new kind.
+    "rate-limit",
+    /\b429\b|rate.?limit|too many requests|resource has been exhausted|RESOURCE_EXHAUSTED|quota exceeded/i,
+  ],
   [
     "auth",
     /\b401\b|\b403\b|authentication|unauthorized|invalid.?api.?key|OAuth session is not available|api.?key is not available|not.?authenticated|credentials\.json|ANTHROPIC_API_KEY|authToken|resolve authentication/i,
