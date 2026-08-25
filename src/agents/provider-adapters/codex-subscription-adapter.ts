@@ -273,6 +273,11 @@ export class CodexSubscriptionAdapter extends LaneBTurnScaffold {
     // §D3 persist policy: success only — interrupted/max-turns/deadline
     // outcomes return above without persisting (deadline resolves to
     // "interrupted" at a loop checkpoint or in the scaffold catch).
+    // Timing note (KPR-391 §Task 5, plan-accepted delta — NOT a bug): the
+    // scaffold's finish() snapshots durationMs after executeTurn returns, so
+    // this await now folds history-persist latency into codex durationMs/llmMs
+    // (pre-migration the snapshot was taken before it). Acknowledged rather
+    // than special-cased — ~ms-scale, and no test observes it.
     if (historyKey) {
       await historyKey.store
         .append(historyKey.agentId, historyKey.threadId, "codex", thisTurnItems)
