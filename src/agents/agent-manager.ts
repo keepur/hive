@@ -247,9 +247,13 @@ interface SpawnShaping {
    * static :effort suffix — §D6).
    */
   effortOverride: ReasoningEffort | undefined;
-  /** Static-tier execution bounds — set ONLY on the router-on path (KPR-338
-   *  path-preserving rule); undefined elsewhere so the runner's per-agent
-   *  legacy fallback (timeoutMs/maxTurns/budgetUsd) stays live config. */
+  /** Execution bounds. Claude lane: static-tier bounds, set ONLY on the
+   *  router-on path (KPR-338 path-preserving rule) — undefined elsewhere so
+   *  the runner's per-agent legacy fallback (timeoutMs/maxTurns/budgetUsd)
+   *  stays live config. ALSO set by prepareSpawn's Lane B branch
+   *  (openai/gemini/codex), from the agent definition — those adapters have
+   *  no runner-side fallback and only consume maxTurns. Voice and Lane A
+   *  stay undefined. */
   resourceLimits: ResourceLimits | undefined;
   routerCostUsd: number;
 }
