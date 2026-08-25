@@ -26,12 +26,12 @@ import type { TeamRoster } from "../team-roster/team-roster.js";
 import type { PrefixCache } from "./prefix-cache.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import { ClaudeAgentAdapter } from "./provider-adapters/claude-agent-adapter.js";
-import {
-  CodexSubscriptionAdapter,
-  type CodexReasoningEffort,
-} from "./provider-adapters/codex-subscription-adapter.js";
-import { GeminiInteractionsAdapter } from "./provider-adapters/gemini-interactions-adapter.js";
-import { OpenAIAgentsAdapter } from "./provider-adapters/openai-agents-adapter.js";
+import type { CodexReasoningEffort } from "./provider-adapters/codex-subscription-adapter.js";
+// KPR-391 (§4.3): both Lane B construction sites (top-level tail + the
+// KPR-354 nested delegate runner) resolve through this one table — the twin
+// construction switches they replace could drift; a table lookup cannot.
+import { LANE_B_PROVIDER_MODULES } from "./provider-adapters/provider-modules.js";
+import type { LaneBModuleDeps, LaneBProviderModule } from "./provider-adapters/provider-module.js";
 import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
 import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
 import {
@@ -596,6 +596,19 @@ export class AgentManager {
       return new ClaudeAgentAdapter(runner);
     }
 
+    // KPR-391 (§4.3): named-handle deps for the provider modules — built
+    // once, shared by the top-level tail and the nested delegate runner so
+    // the two construction sites cannot drift.
+    const moduleDeps: LaneBModuleDeps = {
+      providerConfig: {
+        codex: { agentModel: appConfig.codex.agentModel },
+        openai: { agentModel: appConfig.openai.agentModel },
+        gemini: { agentModel: appConfig.gemini.agentModel, apiKey: appConfig.gemini.apiKey || undefined },
+      },
+      turnHistoryStore: this.turnHistoryStore,
+      agentId: config.id,
+    };
+
     // KPR-347 (§D5): Lane B per-spawn assembly — real inventory through the
     // compatibility partition; KPR-349: instructions are the real prompt from
     // buildProviderInstructions (via the runner's buildProviderPrompt),
@@ -647,42 +660,29 @@ export class AgentManager {
           // after the parent adapter is constructed, which requires assembly.
           sessionCwd: parentAssembly?.sessionCwd ?? "",
         });
-        let nested: AgentProviderAdapter;
-        if (route.provider === "openai") {
-          nested = new OpenAIAgentsAdapter({
-            name: `${config.name}:${call.delegate}`,
-            model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
-            assembly: nestedAssembly,
-          });
-        } else if (route.provider === "codex") {
-          nested = new CodexSubscriptionAdapter({
-            name: `${config.name}:${call.delegate}`,
-            model: route.model || appConfig.codex.agentModel,
-            reasoningEffort: route.reasoningEffort,
-            assembly: nestedAssembly,
-            // NO historyStore / agentId (G4): the KPR-353 wiring then skips
-            // replay and persist by construction — provider_turn_history is
-            // provably untouched by nested turns.
-          });
-        } else if (route.provider === "gemini") {
-          nested = new GeminiInteractionsAdapter({
-            name: `${config.name}:${call.delegate}`,
-            model: route.model || appConfig.gemini.agentModel || "gemini-3.6-flash",
-            apiKey: appConfig.gemini.apiKey || undefined,
-            reasoningEffort: route.reasoningEffort,
-            assembly: nestedAssembly,
-            // Session-less by construction (§D6): no sessionId flows into the
-            // nested runTurn below, the nested turn starts a fresh chain, and
-            // the D5.7 shaping discards the final id — nothing persists.
-            // Accepted residue: unreferenced store:true interactions self-
-            // expire at vendor retention (55d paid) — KPR-350's 30d shape.
-          });
-        } else {
+        const module = (LANE_B_PROVIDER_MODULES as Partial<Record<string, LaneBProviderModule>>)[
+          route.provider
+        ];
+        if (!module) {
           // Unreachable while LaneBProviderId = {openai, codex, gemini} —
           // kept as containment for a future provider that ships tool-less
-          // (KPR-354 belt-and-braces; §D6).
+          // (KPR-354 belt-and-braces; §D6). Registry-miss path.
           return `Delegate turn failed (${call.delegate}): provider ${String((route as { provider: string }).provider)} does not execute tools`;
         }
+        const nested: AgentProviderAdapter = module.createAdapter({
+          name: `${config.name}:${call.delegate}`,
+          route: { model: route.model, reasoningEffort: route.reasoningEffort },
+          assembly: nestedAssembly,
+          // G4: the codex module omits historyStore/agentId in nested context —
+          // provider_turn_history is provably untouched by nested turns.
+          // Gemini stays session-less by construction (§D6): no sessionId
+          // flows into the nested runTurn below, the nested turn starts a
+          // fresh chain, and the D5.7 shaping discards the final id — nothing
+          // persists. Accepted residue: unreferenced store:true interactions
+          // self-expire at vendor retention (55d paid) — KPR-350's 30d shape.
+          context: "nested",
+          deps: moduleDeps,
+        });
         if (call.signal.aborted) return `Delegate turn aborted (${call.delegate}).`;
         // D5.5 (spec-review directive 1): the listener body is try/caught —
         // an abort() throw inside EventTarget dispatch would NOT surface
@@ -758,35 +758,16 @@ export class AgentManager {
     });
     parentAssembly = assembly;
 
-    if (route.provider === "codex") {
-      return new CodexSubscriptionAdapter({
-        name: config.name,
-        model: route.model || appConfig.codex.agentModel,
-        reasoningEffort: route.reasoningEffort,
-        assembly,
-        // KPR-353 (§D3): hive-persisted stateless-replay history. agentId is
-        // config.id (the store key); `name` above stays the display label.
-        historyStore: this.turnHistoryStore,
-        agentId: config.id,
-      });
-    }
-
-    if (route.provider === "openai") {
-      return new OpenAIAgentsAdapter({
-        name: config.name,
-        model: route.model || appConfig.openai.agentModel || "gpt-5.4-mini",
-        assembly,
-      });
-    }
-
-    return new GeminiInteractionsAdapter({
+    // KPR-391 (§4.3/§5.5): the top-level construction is the same table
+    // lookup the nested runner above uses — model default chains, the
+    // KPR-353 history wiring (primary-only) and the gemini key threading all
+    // live in the module entries now.
+    return LANE_B_PROVIDER_MODULES[route.provider].createAdapter({
       name: config.name,
-      // KPR-352 plan-time pin: Interactions-supported default (pre-352
-      // literal "gemini-2.5-flash" predates the surface).
-      model: route.model || appConfig.gemini.agentModel || "gemini-3.6-flash",
-      apiKey: appConfig.gemini.apiKey || undefined,
-      reasoningEffort: route.reasoningEffort,
+      route: { model: route.model, reasoningEffort: route.reasoningEffort },
       assembly,
+      context: "primary",
+      deps: moduleDeps,
     });
   }
 
