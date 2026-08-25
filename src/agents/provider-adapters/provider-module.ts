@@ -30,9 +30,16 @@ export interface ProviderModuleRoute {
 
 /** Named engine handles a module may consume. */
 export interface LaneBModuleDeps {
-  /** Resolved per-provider config slices (appConfig.<provider>.agentModel /
-   *  .apiKey) keyed by provider id — a module reads its own key only. */
-  providerConfig: Partial<Record<LaneBProviderId, { agentModel?: string; apiKey?: string }>>;
+  /** THIS module's own resolved config slice (appConfig.<provider>.agentModel
+   *  / .apiKey) — singular, never the whole per-provider map. Least-privilege
+   *  by construction: the CALLER resolves the slice for the provider it is
+   *  constructing, so a module is never handed another provider's
+   *  credential. Load-bearing once KPR-394 makes modules loadable through
+   *  this ABI via `hive plugin add` — a third-party module that received the
+   *  full map would receive every other provider's apiKey with it
+   *  (CLAUDE.md § Security (DOD-212): a malicious plugin can exfil secrets
+   *  directly). */
+  providerConfig?: { agentModel?: string; apiKey?: string };
   /** KPR-353 stateless-replay history store — consumed only by modules whose
    *  session strategy persists replay history, and only in primary context:
    *  the KPR-354 G4 guarantee (nested turns provably never touch

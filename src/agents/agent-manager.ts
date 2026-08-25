@@ -599,12 +599,20 @@ export class AgentManager {
     // KPR-391 (§4.3): named-handle deps for the provider modules — built
     // once, shared by the top-level tail and the nested delegate runner so
     // the two construction sites cannot drift.
+    //
+    // `providerConfig` is the ROUTE's own slice, resolved here — least
+    // privilege at the construction seam. Both sites construct for
+    // `route.provider` (the nested runner is a same-provider delegate turn),
+    // so one slice serves both. Handing a module the full per-provider map
+    // would hand every module every other provider's apiKey — harmless while
+    // all three entries are in-tree, a real credential-exposure hazard once
+    // KPR-394 makes this contract the ABI for `hive plugin add`-loaded
+    // third-party modules (CLAUDE.md § Security (DOD-212)).
     const moduleDeps: LaneBModuleDeps = {
-      providerConfig: {
-        codex: { agentModel: appConfig.codex.agentModel },
-        openai: { agentModel: appConfig.openai.agentModel },
-        gemini: { agentModel: appConfig.gemini.agentModel, apiKey: appConfig.gemini.apiKey || undefined },
-      },
+      providerConfig:
+        route.provider === "gemini"
+          ? { agentModel: appConfig.gemini.agentModel, apiKey: appConfig.gemini.apiKey || undefined }
+          : { agentModel: appConfig[route.provider].agentModel },
       turnHistoryStore: this.turnHistoryStore,
       agentId: config.id,
     };

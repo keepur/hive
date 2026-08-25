@@ -18,7 +18,7 @@ const codexModule: LaneBProviderModule = {
   createAdapter: (args) =>
     new CodexSubscriptionAdapter({
       name: args.name,
-      model: args.route.model || args.deps.providerConfig.codex?.agentModel,
+      model: args.route.model || args.deps.providerConfig?.agentModel,
       reasoningEffort: args.route.reasoningEffort,
       assembly: args.assembly,
       // KPR-353 §D3 wiring in PRIMARY context only. The KPR-354 G4
@@ -35,7 +35,7 @@ const openaiModule: LaneBProviderModule = {
   createAdapter: (args) =>
     new OpenAIAgentsAdapter({
       name: args.name,
-      model: args.route.model || args.deps.providerConfig.openai?.agentModel || "gpt-5.4-mini",
+      model: args.route.model || args.deps.providerConfig?.agentModel || "gpt-5.4-mini",
       assembly: args.assembly,
       // reasoningEffort deliberately not passed: parsed-but-not-delivered
       // (docs/providers.md row — the options type has no such field).
@@ -48,8 +48,8 @@ const geminiModule: LaneBProviderModule = {
     new GeminiInteractionsAdapter({
       name: args.name,
       // KPR-352 plan-time pin: Interactions-supported default.
-      model: args.route.model || args.deps.providerConfig.gemini?.agentModel || "gemini-3.6-flash",
-      apiKey: args.deps.providerConfig.gemini?.apiKey,
+      model: args.route.model || args.deps.providerConfig?.agentModel || "gemini-3.6-flash",
+      apiKey: args.deps.providerConfig?.apiKey,
       reasoningEffort: args.route.reasoningEffort,
       assembly: args.assembly,
       // Nested turns are session-less by construction (§D6): no sessionId

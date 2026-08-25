@@ -14,6 +14,7 @@ import { GeminiInteractionsAdapter } from "./gemini-interactions-adapter.js";
 import { OpenAIAgentsAdapter } from "./openai-agents-adapter.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { LaneBModuleDeps } from "./provider-module.js";
+import type { LaneBProviderId } from "./types.js";
 import type { TurnHistoryStore } from "../turn-history-store.js";
 
 function makeAssembly(overrides: Partial<ProviderTurnAssembly> = {}): ProviderTurnAssembly {
@@ -34,15 +35,26 @@ const fakeStore = { load: async () => [], save: async () => {}, clear: async () 
 
 function makeDeps(overrides: Partial<LaneBModuleDeps> = {}): LaneBModuleDeps {
   return {
-    providerConfig: {
-      codex: { agentModel: "cfg-codex" },
-      openai: { agentModel: "cfg-openai" },
-      gemini: { agentModel: "cfg-gemini", apiKey: "k" },
-    },
+    providerConfig: { agentModel: "cfg-model" },
     turnHistoryStore: fakeStore,
     agentId: "a1",
     ...overrides,
   };
+}
+
+/**
+ * Deps carrying ONE provider's own config slice — the shape the manager now
+ * resolves per construction. `providerConfig` is deliberately singular: a
+ * module is never handed another provider's agentModel or apiKey.
+ */
+const OWN_SLICE: Record<LaneBProviderId, { agentModel?: string; apiKey?: string }> = {
+  codex: { agentModel: "cfg-codex" },
+  openai: { agentModel: "cfg-openai" },
+  gemini: { agentModel: "cfg-gemini", apiKey: "k" },
+};
+
+function depsFor(provider: LaneBProviderId, overrides: Partial<LaneBModuleDeps> = {}): LaneBModuleDeps {
+  return makeDeps({ providerConfig: { ...OWN_SLICE[provider] }, ...overrides });
 }
 
 /** Adapters keep their construction options as a private instance field. */
@@ -118,33 +130,31 @@ describe("LANE_B_PROVIDER_MODULES", () => {
 
   describe("model default chains", () => {
     it("route model wins over the providerConfig slice", () => {
-      const deps = makeDeps();
       expect(
         optionsOf(
-          LANE_B_PROVIDER_MODULES.codex.createAdapter({ name: "A", route: { model: "route-codex" }, assembly, context: "primary", deps }),
+          LANE_B_PROVIDER_MODULES.codex.createAdapter({ name: "A", route: { model: "route-codex" }, assembly, context: "primary", deps: depsFor("codex") }),
         ).model,
       ).toBe("route-codex");
       expect(
         optionsOf(
-          LANE_B_PROVIDER_MODULES.openai.createAdapter({ name: "A", route: { model: "route-openai" }, assembly, context: "primary", deps }),
+          LANE_B_PROVIDER_MODULES.openai.createAdapter({ name: "A", route: { model: "route-openai" }, assembly, context: "primary", deps: depsFor("openai") }),
         ).model,
       ).toBe("route-openai");
       expect(
         optionsOf(
-          LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", route: { model: "route-gemini" }, assembly, context: "primary", deps }),
+          LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", route: { model: "route-gemini" }, assembly, context: "primary", deps: depsFor("gemini") }),
         ).model,
       ).toBe("route-gemini");
     });
 
     it("an empty route model falls back to the providerConfig slice", () => {
-      const deps = makeDeps();
-      expect(optionsOf(LANE_B_PROVIDER_MODULES.codex.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps })).model).toBe("cfg-codex");
-      expect(optionsOf(LANE_B_PROVIDER_MODULES.openai.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps })).model).toBe("cfg-openai");
-      expect(optionsOf(LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps })).model).toBe("cfg-gemini");
+      expect(optionsOf(LANE_B_PROVIDER_MODULES.codex.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps: depsFor("codex") })).model).toBe("cfg-codex");
+      expect(optionsOf(LANE_B_PROVIDER_MODULES.openai.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps: depsFor("openai") })).model).toBe("cfg-openai");
+      expect(optionsOf(LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps: depsFor("gemini") })).model).toBe("cfg-gemini");
     });
 
     it("both absent → openai/gemini pin their literal defaults; codex stays undefined-tolerant", () => {
-      const deps = makeDeps({ providerConfig: { codex: {}, openai: {}, gemini: {} } });
+      const deps = makeDeps({ providerConfig: {} });
       expect(optionsOf(LANE_B_PROVIDER_MODULES.openai.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps })).model).toBe("gpt-5.4-mini");
       expect(optionsOf(LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps })).model).toBe("gemini-3.6-flash");
       // Mirrors the pre-migration call-site expression (`"" || undefined`):
@@ -154,9 +164,9 @@ describe("LANE_B_PROVIDER_MODULES", () => {
   });
 
   describe("per-provider option threading", () => {
-    it("gemini threads apiKey from its deps slice (undefined when absent)", () => {
+    it("gemini threads apiKey from its OWN deps slice (undefined when absent)", () => {
       const withKey = optionsOf(
-        LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", route: { model: "m" }, assembly, context: "primary", deps: makeDeps() }),
+        LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", route: { model: "m" }, assembly, context: "primary", deps: depsFor("gemini") }),
       );
       expect(withKey.apiKey).toBe("k");
 
@@ -166,10 +176,20 @@ describe("LANE_B_PROVIDER_MODULES", () => {
           route: { model: "m" },
           assembly,
           context: "primary",
-          deps: makeDeps({ providerConfig: { gemini: { agentModel: "cfg-gemini" } } }),
+          deps: makeDeps({ providerConfig: { agentModel: "cfg-gemini" } }),
         }),
       );
       expect(withoutKey.apiKey).toBeUndefined();
+    });
+
+    it("an omitted providerConfig is tolerated — no slice, no credential", () => {
+      const deps = makeDeps({ providerConfig: undefined });
+      expect(optionsOf(LANE_B_PROVIDER_MODULES.codex.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps })).model).toBeUndefined();
+      const gemini = optionsOf(
+        LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps }),
+      );
+      expect(gemini.model).toBe("gemini-3.6-flash");
+      expect(gemini.apiKey).toBeUndefined();
     });
 
     it("codex + gemini pass the route's reasoningEffort through; openai never carries one", () => {
