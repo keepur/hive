@@ -1688,6 +1688,29 @@ export class AgentManager {
       };
     }
 
+    // Lane B (non-Claude, non-Lane-A) providers: the router stays skipped
+    // (R-311.2 pilot gate), but resourceLimits must be supplied here — the
+    // Lane B adapters have no runner-side legacy fallback, so an undefined
+    // limit silently fell through to each adapter's DEFAULT_MAX_ROUNDS (10)
+    // and the agent definition's maxTurns was dead config. That default was
+    // unreachable in the tool-free pilot era; post-KPR-348 tool execution it
+    // truncated real turns (error_max_turns). Mirror the Claude runner's
+    // legacy fallback (agent-def maxTurns/timeoutMs/budgetUsd) — only
+    // maxTurns is consumed on Lane B today.
+    if (agentConfig && staticRoute.provider !== "claude") {
+      return {
+        prompt,
+        route: staticRoute,
+        resourceLimits: {
+          maxTurns: agentConfig.maxTurns,
+          timeoutMs: agentConfig.timeoutMs ?? 300_000, // 5 min default (agent-config contract)
+          budgetUsd: agentConfig.budgetUsd,
+        },
+        routerCostUsd: 0,
+        effortOverride: undefined,
+      };
+    }
+
     // Router gate (KPR-311): skip when disabled, for system senders
     // (scheduler/cron), when the agent vanished mid-turn (guard above), or
     // when the agent's static provider isn't Claude (pilot gate — calling
