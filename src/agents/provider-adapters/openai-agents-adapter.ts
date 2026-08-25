@@ -4,7 +4,11 @@ import type { RunResult } from "../agent-runner.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import { ToolBridge, type BridgedTool } from "./tool-bridge.js";
+import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
 import { envValue } from "./oauth-credentials.js";
+import { createLogger } from "../../logging/logger.js";
+
+const log = createLogger("openai-adapter");
 
 export interface OpenAIAgentsAdapterOptions {
   name: string;
@@ -39,6 +43,47 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
 
     const streamed = !!request.onStream;
     const sessionId = request.sessionId ?? "";
+
+    // Wall-clock turn deadline (resourceLimits.timeoutMs — Claude-lane
+    // parity, agent-runner.ts:2024; codex/gemini-identical shape). The
+    // Agents SDK owns this adapter's dispatch loop, so mid-round abort via
+    // the shared signal is the ONLY viable mechanism here — the SDK run,
+    // its HTTP requests, and the ToolBridge (nested KPR-354 delegates
+    // abort-chain off it) all hang off abortController.signal. undefined ⇒
+    // no deadline (bare/test constructions — prepareSpawn always supplies
+    // one on Lane B); 0 is an immediate deadline (honest-zero).
+    const timeoutMs = request.resourceLimits?.timeoutMs;
+    let deadlineFired = false;
+    const deadline =
+      timeoutMs !== undefined
+        ? setTimeout(() => {
+            deadlineFired = true;
+            log.warn("OpenAI turn deadline exceeded — aborting turn", {
+              agent: this.options.name,
+              timeoutMs,
+            });
+            abortController.abort();
+          }, timeoutMs)
+        : undefined;
+
+    /** Deadline expiry is a turn-shape ERROR, not an abort: `aborted` stays
+     *  false so classifyTurnResult's `timedOut && aborted` hang rule (the
+     *  Claude-lane breaker-tripping timeout) can never match, and
+     *  TURN_DEADLINE_SUBTYPE short-circuits to non-provider — Lane B wall
+     *  clock folds bridged tool time in, and a slow-but-healthy tool must
+     *  not trip a healthy provider. Operator abort() outranks a deadline
+     *  that also fired (checked at every use site via !this.aborted). */
+    const deadlineResult = (bridge: ToolBridge): RunResult =>
+      this.buildResult({
+        text: "",
+        sessionId,
+        durationMs: Date.now() - startedAt,
+        streamed,
+        aborted: false,
+        timedOut: true,
+        error: TURN_DEADLINE_SUBTYPE,
+        toolStats: bridge.stats,
+      });
 
     // KPR-348 (§D8): per-spawn tool bridge — construction-time ≡ turn-time
     // (per-spawn adapter). It gets the abort signal now (canon 5: mid-bridge
@@ -96,6 +141,10 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
           stream: true,
         });
         const text = await this.consumeTextStream(result, request.onStream);
+        // The SDK can resolve an aborted stream quietly instead of throwing —
+        // a deadline that landed mid-stream must not surface partial text as
+        // a clean success.
+        if (deadlineFired && !this.aborted) return deadlineResult(bridge);
         const durationMs = Date.now() - startedAt;
         return this.buildResult({
           text,
@@ -111,6 +160,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
         ...runOptions,
         stream: false,
       });
+      if (deadlineFired && !this.aborted) return deadlineResult(bridge);
       const durationMs = Date.now() - startedAt;
       return this.buildResult({
         text: coerceFinalOutput(result.finalOutput),
@@ -123,6 +173,9 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     } catch (error) {
       const durationMs = Date.now() - startedAt;
       if (this.isAbortError(error, abortController)) {
+        // A deadline abort usually surfaces here as the SDK's abort throw —
+        // resolve it to the deadline error, not an operator abort.
+        if (deadlineFired && !this.aborted) return deadlineResult(bridge);
         return this.buildResult({
           text: "",
           sessionId,
@@ -143,6 +196,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
         toolStats: bridge.stats,
       });
     } finally {
+      if (deadline !== undefined) clearTimeout(deadline);
       await bridge.close(); // never throws/rejects (advisory 1)
       if (this.currentAbortController === abortController) {
         this.currentAbortController = null;
@@ -244,6 +298,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     durationMs,
     streamed,
     aborted,
+    timedOut,
     error,
     toolStats,
   }: {
@@ -252,6 +307,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
     durationMs: number;
     streamed: boolean;
     aborted: boolean;
+    timedOut?: boolean;
     error?: string;
     toolStats?: { toolCalls: number; toolMs: number; perTool: Map<string, number> };
   }): RunResult {
@@ -282,6 +338,7 @@ export class OpenAIAgentsAdapter implements AgentProviderAdapter {
       contextWindow: 0,
       compactions: 0,
       aborted,
+      ...(timedOut ? { timedOut: true } : {}),
       ...(error ? { error } : {}),
     };
   }

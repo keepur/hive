@@ -703,9 +703,12 @@ export class AgentManager {
         const result = await nested.runTurn({
           prompt: call.prompt,
           workItemContext: call.workItemContext,
-          // Only maxTurns is consumed on Lane B (openai run options + codex
-          // round budget); timeoutMs/budgetUsd are Claude-lane concepts —
-          // neutral values.
+          // maxTurns bounds the nested round budget; timeoutMs is a live
+          // 10-minute wall-clock backstop on all three Lane B surfaces —
+          // under default limits the PARENT's own deadline fires first and
+          // abort-chains in via call.signal (nested deadline expiry surfaces
+          // as Task tool text, breaker-invisible by construction). budgetUsd
+          // stays inert on Lane B.
           resourceLimits: { maxTurns, timeoutMs: 600_000, budgetUsd: 0 },
         });
         // D5.8: one info log keyed on the ROUTE provider (resolved-provider
@@ -1699,8 +1702,11 @@ export class AgentManager {
     // and the agent definition's maxTurns was dead config. That default was
     // unreachable in the tool-free pilot era; post-KPR-348 tool execution it
     // truncated real turns (error_max_turns). Mirror the Claude runner's
-    // legacy fallback (agent-def maxTurns/timeoutMs/budgetUsd) — only
-    // maxTurns is consumed on Lane B today.
+    // legacy fallback (agent-def maxTurns/timeoutMs/budgetUsd). maxTurns
+    // bounds the round budget and timeoutMs the wall clock (all three
+    // adapters arm an abort-signal deadline; expiry surfaces as the pinned
+    // non-provider TURN_DEADLINE_SUBTYPE, never a breaker trip); budgetUsd
+    // is still inert on Lane B.
     if (agentConfig && staticRoute.provider !== "claude") {
       return {
         prompt,

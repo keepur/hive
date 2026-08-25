@@ -5,6 +5,7 @@ import type { AgentProviderAdapter, AgentProviderTurnRequest, ReasoningEffort } 
 import { envValue } from "./oauth-credentials.js";
 import { createLogger } from "../../logging/logger.js";
 import { ToolBridge, type BridgedTool } from "./tool-bridge.js";
+import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
 
 const log = createLogger("gemini-adapter");
 
@@ -151,6 +152,30 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
      *  state resumes next turn (deliberately NOT the mid-turn minted id). */
     const fallbackSessionId = request.sessionId ?? "";
 
+    // Wall-clock turn deadline (resourceLimits.timeoutMs — Claude-lane
+    // parity, agent-runner.ts:2024; codex-adapter-identical shape). Mid-round
+    // abort by design: the round budget bounds round COUNT, not round
+    // DURATION — a between-round check alone would leave one stalled
+    // Interactions stream unbounded. The shared abortController threads
+    // through the SDK's fetchOptions AND the ToolBridge (nested KPR-354
+    // delegates abort-chain off it); a non-cancellable in-flight tool call is
+    // caught at the next loop checkpoint via interruptedResult. undefined ⇒
+    // no deadline (bare/test constructions — prepareSpawn always supplies one
+    // on Lane B); 0 is an immediate deadline (honest-zero, maxTurns-0 twin).
+    const timeoutMs = request.resourceLimits?.timeoutMs;
+    let deadlineFired = false;
+    const deadline =
+      timeoutMs !== undefined
+        ? setTimeout(() => {
+            deadlineFired = true;
+            log.warn("Gemini turn deadline exceeded — aborting turn", {
+              agent: this.options.name,
+              timeoutMs,
+            });
+            abortController.abort();
+          }, timeoutMs)
+        : undefined;
+
     // KPR-352 (§D1): per-spawn tool bridge — the codex adapter's exact
     // construction (codex-subscription-adapter.ts:126-136), including the
     // KPR-354 §D6 delegateRunner one-liner. connect() inside the try
@@ -181,6 +206,35 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
         cacheReadTokens: totals.cacheReadTokens,
         toolStats: bridge.stats,
       });
+
+    /** Deadline expiry is a turn-shape ERROR, not an abort: `aborted` stays
+     *  false so classifyTurnResult's `timedOut && aborted` hang rule (the
+     *  Claude-lane breaker-tripping timeout) can never match, and
+     *  TURN_DEADLINE_SUBTYPE short-circuits to non-provider — Lane B wall
+     *  clock folds bridged tool time in, and a slow-but-healthy tool must not
+     *  trip a healthy provider. `timedOut: true` still flows to telemetry.
+     *  sessionId is the §D1 error-path shape (resumed handle, never a
+     *  mid-turn mint) so pre-deadline chain state resumes next turn. */
+    const deadlineResult = (): RunResult =>
+      this.buildResult({
+        text: "",
+        sessionId: fallbackSessionId,
+        durationMs: Date.now() - startedAt,
+        streamed,
+        aborted: false,
+        timedOut: true,
+        error: TURN_DEADLINE_SUBTYPE,
+        inputTokens: totals.inputTokens,
+        outputTokens: totals.outputTokens,
+        cacheReadTokens: totals.cacheReadTokens,
+        toolStats: bridge.stats,
+      });
+
+    /** Single interruption resolver for every abort checkpoint: an operator
+     *  abort() outranks a deadline that also fired (the operator asked for
+     *  breaker-neutral silence, not an error surface). */
+    const interruptedResult = (): RunResult =>
+      deadlineFired && !this.aborted ? deadlineResult() : abortedResult();
 
     try {
       // §D7: API-key single path (Vertex OAuth deleted — Interactions is not
@@ -246,7 +300,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
             toolStats: bridge.stats,
           });
         }
-        if (this.aborted || abortController.signal.aborted) return abortedResult();
+        if (this.aborted || abortController.signal.aborted) return interruptedResult();
 
         let stream: AsyncIterable<Record<string, unknown>>;
         try {
@@ -290,7 +344,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
         if (state.interactionId) lastInteractionId = state.interactionId;
         finalText = state.text;
 
-        if (this.aborted || abortController.signal.aborted) return abortedResult();
+        if (this.aborted || abortController.signal.aborted) return interruptedResult();
 
         // T0 spike Delta 2: interaction.completed.status === "requires_action"
         // signals pending function_calls; harvestFunctionCalls returns them
@@ -309,7 +363,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
         // follow-up round.
         const resultItems: unknown[] = [];
         for (const call of calls) {
-          if (this.aborted || abortController.signal.aborted) return abortedResult();
+          if (this.aborted || abortController.signal.aborted) return interruptedResult();
           const output = await executeFunctionCall(call, bridgedByName);
           // T0 spike leg (b2): function_result input shape accepted verbatim.
           resultItems.push({
@@ -324,7 +378,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
       }
 
       const durationMs = Date.now() - startedAt;
-      if (this.aborted || abortController.signal.aborted) return abortedResult();
+      if (this.aborted || abortController.signal.aborted) return interruptedResult();
 
       return this.buildResult({
         // §D1: the FINAL round's interaction id — it transitively contains
@@ -342,19 +396,10 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
       });
     } catch (error) {
       const durationMs = Date.now() - startedAt;
-      if (this.isAbortError(error, abortController)) {
-        return this.buildResult({
-          text: "",
-          sessionId: fallbackSessionId,
-          durationMs,
-          streamed,
-          aborted: true,
-          inputTokens: totals.inputTokens,
-          outputTokens: totals.outputTokens,
-          cacheReadTokens: totals.cacheReadTokens,
-          toolStats: bridge.stats,
-        });
-      }
+      // A deadline abort usually surfaces here as the aborted create/stream
+      // throw — interruptedResult resolves it to the deadline error, not an
+      // abort.
+      if (this.isAbortError(error, abortController)) return interruptedResult();
       return this.buildResult({
         text: "",
         sessionId: fallbackSessionId,
@@ -368,6 +413,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
         toolStats: bridge.stats,
       });
     } finally {
+      if (deadline !== undefined) clearTimeout(deadline);
       await bridge.close(); // never throws/rejects (KPR-348 advisory 1)
       if (this.currentAbortController === abortController) {
         this.currentAbortController = null;
@@ -469,6 +515,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
     inputTokens,
     outputTokens,
     cacheReadTokens,
+    timedOut,
     error,
     toolStats,
   }: {
@@ -480,6 +527,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens: number;
+    timedOut?: boolean;
     error?: string;
     toolStats?: Readonly<{ toolCalls: number; toolMs: number; perTool: Map<string, number> }>;
   }): RunResult {
@@ -509,6 +557,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
       contextWindow: 0,
       compactions: 0,
       aborted,
+      ...(timedOut ? { timedOut: true } : {}),
       ...(error ? { error } : {}),
     };
   }

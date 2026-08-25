@@ -1327,3 +1327,102 @@ function makeJwt(payload: Record<string, unknown>): string {
   ).toString("base64url");
   return `header.${encoded}.signature`;
 }
+
+describe("CodexSubscriptionAdapter — Lane B wall-clock deadline (timeoutMs)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const limits = (timeoutMs: number) => ({ maxTurns: 10, timeoutMs, budgetUsd: 0 });
+
+  /** A fetch that never settles until its abort signal fires (models a stalled POST/SSE round). */
+  function hangingFetch(): ReturnType<typeof vi.fn<typeof fetch>> {
+    return vi.fn<typeof fetch>(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = (init as RequestInit).signal as AbortSignal;
+          const abortErr = () => reject(new DOMException("The operation was aborted.", "AbortError"));
+          if (signal.aborted) return abortErr();
+          signal.addEventListener("abort", abortErr, { once: true });
+        }),
+    );
+  }
+
+  it("mid-round: stalled POST past timeoutMs → error_turn_deadline, timedOut, NOT aborted, non-provider, no persist, warn logged", async () => {
+    const store = makeFakeStore();
+    const { adapter, cleanup, fetchMock } = makeAdapter({ historyStore: store, agentId: "agent-x" }, hangingFetch());
+    try {
+      const result = await adapter.runTurn({
+        prompt: "go",
+        workItemContext: threadContext("sms:t1"),
+        resourceLimits: limits(25),
+      });
+      expect(result.error).toBe("error_turn_deadline");
+      expect(result.timedOut).toBe(true);
+      expect(result.aborted).toBe(false);
+      expect(adapter.wasAborted).toBe(false);
+      expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(store.append).not.toHaveBeenCalled();
+      expect(logMock.warn).toHaveBeenCalledWith(
+        "Codex turn deadline exceeded — aborting turn",
+        expect.objectContaining({ timeoutMs: 25 }),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("between-checkpoint: deadline elapses inside a slow tool call → caught at the next loop checkpoint, no round-2 POST", async () => {
+    const fetchMock = sseScript(
+      [completed([callItem("mcp__fixture__echo", '{"text":"hi"}')])],
+      [completed([{ type: "message", role: "assistant", content: [] }])],
+    );
+    const { adapter, cleanup } = makeAdapter({ assembly: makeAssembly(echoAssembly({}, 300)) }, fetchMock);
+    try {
+      const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(100) });
+      expect(result.error).toBe("error_turn_deadline");
+      expect(result.aborted).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1); // round 2 never posted
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("timeoutMs 0 is an immediate deadline (honest-zero — the maxTurns-0 pin's twin)", async () => {
+    const { adapter, cleanup, fetchMock } = makeAdapter({}, hangingFetch());
+    try {
+      const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(0) });
+      expect(result.error).toBe("error_turn_deadline");
+      expect(result.timedOut).toBe(true);
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("operator abort() outranks the deadline: abort well before timeoutMs → breaker-neutral aborted, no error", async () => {
+    const { adapter, cleanup } = makeAdapter({}, hangingFetch());
+    try {
+      const pending = adapter.runTurn({ prompt: "go", resourceLimits: limits(5000) });
+      setTimeout(() => adapter.abort(), 10);
+      const result = await pending;
+      expect(result.aborted).toBe(true);
+      expect(result.error).toBeUndefined();
+      expect(result.timedOut).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("no timeoutMs (bare construction) arms no deadline — turn completes normally", async () => {
+    const okFetch = sseScript([completed([{ type: "message", role: "assistant", content: [] }])]);
+    const { adapter, cleanup } = makeAdapter({}, okFetch);
+    try {
+      const result = await adapter.runTurn({ prompt: "go" });
+      expect(result.error).toBeUndefined();
+      expect(result.timedOut).toBeUndefined();
+      expect(result.aborted).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+});

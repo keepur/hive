@@ -48,13 +48,27 @@ export const HARD_FAULT_KINDS: ReadonlySet<ProviderFaultKind> = new Set([
 ]);
 
 /**
- * SDK result subtypes flattened into RunResult.error verbatim
- * (agent-runner.ts `msg.type === "result"` non-success branch). These are
- * turn-shape conditions (budget/turn caps, in-execution tool failures), not
+ * Lane B wall-clock deadline sentinel. The three native adapters emit this
+ * as RunResult.error when the turn's `resourceLimits.timeoutMs` deadline
+ * fires (with `timedOut: true` but `aborted: false` — so the Claude-lane
+ * `timedOut && aborted` hang rule in classifyTurnResult can never match).
+ * Pinned non-provider like error_max_turns: a Lane B turn's wall clock folds
+ * bridged tool execution time in, so a deadline expiry is a turn-shape
+ * condition — a slow-but-healthy tool must never trip a healthy provider's
+ * breaker (same asymmetry that keeps toolMs out of the p95 llmMs window).
+ */
+export const TURN_DEADLINE_SUBTYPE = "error_turn_deadline";
+
+/**
+ * Turn-shape sentinels flattened into RunResult.error verbatim: the SDK
+ * result subtypes (agent-runner.ts `msg.type === "result"` non-success
+ * branch) plus the Lane B adapters' own sentinels (error_max_turns is shared;
+ * TURN_DEADLINE_SUBTYPE is Lane-B-only). These are turn-shape conditions
+ * (budget/turn caps, wall-clock deadline, in-execution tool failures), not
  * provider faults — short-circuit them before the pattern tables so e.g.
  * "error_during_execution" can never match a fault row.
  */
-const SDK_NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_execution"]);
+const NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_execution", TURN_DEADLINE_SUBTYPE]);
 
 /**
  * First match wins, in row order. The auth row MUST remain a superset of
@@ -100,7 +114,7 @@ const FAULT_PATTERNS: ReadonlyArray<
 ];
 
 function classifyErrorString(error: string): TurnClassification {
-  if (SDK_NON_PROVIDER_SUBTYPES.has(error.trim())) {
+  if (NON_PROVIDER_SUBTYPES.has(error.trim())) {
     return { outcome: "fault", kind: "non-provider", message: error };
   }
   for (const [kind, pattern] of FAULT_PATTERNS) {
