@@ -1,11 +1,11 @@
 import { ApiError, GoogleGenAI } from "@google/genai";
-import type { RunResult } from "../agent-runner.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
-import type { AgentProviderAdapter, AgentProviderTurnRequest, ReasoningEffort } from "./types.js";
+import type { ReasoningEffort } from "./types.js";
 import { envValue } from "./oauth-credentials.js";
 import { createLogger } from "../../logging/logger.js";
-import { ToolBridge, type BridgedTool } from "./tool-bridge.js";
-import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
+import type { BridgedTool } from "./tool-bridge.js";
+import { LaneBTurnScaffold, type LaneBTurnHarness, type LaneBTurnOutcome } from "./turn-scaffold.js";
+import { runBoundedDispatchLoop } from "./dispatch-loop.js";
 
 const log = createLogger("gemini-adapter");
 
@@ -13,8 +13,6 @@ const log = createLogger("gemini-adapter");
  *  live model list 2026-07-23, T0 spike). GEMINI_AGENT_MODEL / agent model
  *  override. */
 export const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
-/** §D1: mirrors the codex adapter's round bound when resourceLimits is absent. */
-const DEFAULT_MAX_ROUNDS = 10;
 
 /**
  * §D3: statuses that mark a ROUND-1 resume-carrying create failure as a stale
@@ -129,185 +127,78 @@ export interface GeminiRoundState {
   sawCompleted: boolean;
 }
 
-export class GeminiInteractionsAdapter implements AgentProviderAdapter {
+export class GeminiInteractionsAdapter extends LaneBTurnScaffold {
   readonly provider = "gemini" as const;
 
-  private currentAbortController: AbortController | null = null;
-  private aborted = false;
+  constructor(private readonly options: GeminiInteractionsAdapterOptions) {
+    super({ name: options.name, assembly: options.assembly });
+  }
 
-  constructor(private readonly options: GeminiInteractionsAdapterOptions) {}
+  // §D1 no-fabrication pin: the scaffold default (request.sessionId ?? "") IS
+  // gemini's policy on every non-success path — NEVER a fabricated id. Under
+  // server-resumable semantics a fabricated id would be persisted and later
+  // resumed as garbage; the gemini-pilot- fabrication died with the KPR-352
+  // rewrite. "" persists nothing (finalize's falsy guard); an unchanged
+  // resumed id is a harmless same-id TTL refresh, and the pre-error chain
+  // state resumes next turn (deliberately NOT the mid-turn minted id). So no
+  // fallbackSessionId / interruptionSessionId overrides here.
 
-  async runTurn(request: AgentProviderTurnRequest): Promise<RunResult> {
-    const startedAt = Date.now();
-    const abortController = new AbortController();
-    this.currentAbortController = abortController;
-    this.aborted = false;
-
-    const streamed = !!request.onStream;
-    /** §D1: error/abort fallback — NEVER a fabricated id. Under
-     *  server-resumable semantics a fabricated id would be persisted and later
-     *  resumed as garbage; the gemini-pilot- fabrication died with this
-     *  rewrite. "" persists nothing (finalize's falsy guard); an unchanged
-     *  resumed id is a harmless same-id TTL refresh, and the pre-error chain
-     *  state resumes next turn (deliberately NOT the mid-turn minted id). */
-    const fallbackSessionId = request.sessionId ?? "";
-
-    // Wall-clock turn deadline (resourceLimits.timeoutMs — Claude-lane
-    // parity, agent-runner.ts:2024; codex-adapter-identical shape). Mid-round
-    // abort by design: the round budget bounds round COUNT, not round
-    // DURATION — a between-round check alone would leave one stalled
-    // Interactions stream unbounded. The shared abortController threads
-    // through the SDK's fetchOptions AND the ToolBridge (nested KPR-354
-    // delegates abort-chain off it); a non-cancellable in-flight tool call is
-    // caught at the next loop checkpoint via interruptedResult. undefined ⇒
-    // no deadline (bare/test constructions — prepareSpawn always supplies one
-    // on Lane B); 0 fires immediately, though the first round may still
-    // dispatch and be aborted mid-flight (a timer is a macrotask — unlike
-    // maxTurns 0's zero-call short-circuit). Armed inside the try (below) so
-    // a throw between here and the finally can never leak the timer.
-    const timeoutMs = request.resourceLimits?.timeoutMs;
-    let deadlineFired = false;
-    let deadline: ReturnType<typeof setTimeout> | undefined;
-
-    // KPR-352 (§D1): per-spawn tool bridge — the codex adapter's exact
-    // construction (codex-subscription-adapter.ts:126-136), including the
-    // KPR-354 §D6 delegateRunner one-liner. connect() inside the try
-    // (fail-soft per server); close() in the finally.
-    const bridge = new ToolBridge({
-      inventory: this.options.assembly.toolInventory,
-      inProcessServers: this.options.assembly.inProcessServers,
-      gate: this.options.assembly.guardrailGate,
-      workItemContext: request.workItemContext,
-      signal: abortController.signal,
-      agentId: this.options.name,
-      sessionCwd: this.options.assembly.sessionCwd,
-      skillIndex: this.options.assembly.skillIndex,
-      delegateRunner: this.options.assembly.delegateTurnRunner, // KPR-354 (§D6)
+  protected override warnDeadlineExpired(timeoutMs: number): void {
+    log.warn("Gemini turn deadline exceeded — aborting turn", {
+      agent: this.options.name,
+      timeoutMs,
     });
+  }
 
-    const totals = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
+  protected async executeTurn(harness: LaneBTurnHarness): Promise<LaneBTurnOutcome> {
+    const { request, bridge } = harness;
 
-    const abortedResult = (): RunResult =>
-      this.buildResult({
-        text: "",
-        sessionId: fallbackSessionId,
-        durationMs: Date.now() - startedAt,
-        streamed,
-        aborted: true,
-        inputTokens: totals.inputTokens,
-        outputTokens: totals.outputTokens,
-        cacheReadTokens: totals.cacheReadTokens,
-        toolStats: bridge.stats,
-      });
+    // §D7: API-key single path (Vertex OAuth deleted — Interactions is not
+    // served on Vertex). Pre-request throw → scaffold catch → classifyThrown
+    // "auth" (row alternate pinned) → breaker → honest outage;
+    // config.gemini.apiKey is resolved once at boot (config.ts `optional()`,
+    // env-first then Keychain), so `hive credentials add GEMINI_API_KEY`
+    // needs a service restart to take effect, not just the next spawn. The
+    // scaffold's finally still runs bridge.close() on this path (T10).
+    const env = this.options.env ?? process.env;
+    const apiKey =
+      this.options.apiKey ||
+      envValue("GOOGLE_GENAI_API_KEY", env) ||
+      envValue("GEMINI_API_KEY", env) ||
+      envValue("GOOGLE_API_KEY", env);
+    if (!apiKey) {
+      throw new Error(
+        "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY, and restart the service",
+      );
+    }
+    const client = this.options.client ?? buildDefaultClient(apiKey);
 
-    /** Deadline expiry is a turn-shape ERROR, not an abort: `aborted` stays
-     *  false so classifyTurnResult's `timedOut && aborted` hang rule (the
-     *  Claude-lane breaker-tripping timeout) can never match, and
-     *  TURN_DEADLINE_SUBTYPE classifies as the breaker-INCONCLUSIVE
-     *  turn-deadline kind (never trips, never resets a streak, never closes
-     *  a half-open probe: an expiry proves nothing about provider health
-     *  either way) — Lane B wall clock folds bridged tool time in, and a slow-but-healthy tool must not
-     *  trip a healthy provider. `timedOut: true` still flows to telemetry.
-     *  sessionId is the §D1 error-path shape (resumed handle, never a
-     *  mid-turn mint) so pre-deadline chain state resumes next turn. */
-    const deadlineResult = (): RunResult =>
-      this.buildResult({
-        text: "",
-        sessionId: fallbackSessionId,
-        durationMs: Date.now() - startedAt,
-        streamed,
-        aborted: false,
-        timedOut: true,
-        error: TURN_DEADLINE_SUBTYPE,
-        inputTokens: totals.inputTokens,
-        outputTokens: totals.outputTokens,
-        cacheReadTokens: totals.cacheReadTokens,
-        toolStats: bridge.stats,
-      });
+    const bridged = await bridge.connect();
+    const bridgedByName = new Map(bridged.map((bt) => [bt.name, bt]));
+    // §D1: BridgedTool[] → Interactions function tools (T0 spike leg (b):
+    // {type:"function", name, description, parameters} accepted). Name/cap
+    // edges are bridge-owned (KPR-348/349).
+    const toolPayloads = bridged.map((bt) => ({
+      type: "function" as const,
+      name: bt.name,
+      description: bt.description,
+      parameters: bt.inputSchema,
+    }));
 
-    /** Single interruption resolver for every abort checkpoint: an operator
-     *  abort() outranks a deadline that also fired (the operator asked for
-     *  breaker-neutral silence, not an error surface). */
-    const interruptedResult = (): RunResult =>
-      deadlineFired && !this.aborted ? deadlineResult() : abortedResult();
+    const thinkingLevel = this.resolveThinkingLevel();
 
-    try {
-      if (timeoutMs !== undefined) {
-        deadline = setTimeout(() => {
-          deadlineFired = true;
-          log.warn("Gemini turn deadline exceeded — aborting turn", {
-            agent: this.options.name,
-            timeoutMs,
-          });
-          abortController.abort();
-        }, timeoutMs);
-      }
+    /** §D1: previous_interaction_id does double duty — round 1 resumes the
+     *  persisted handle (undefined ⇒ fresh thread); rounds N+1 chain the
+     *  prior round's just-minted id and send ONLY the function_result items
+     *  (the server holds the rest — T0 spike: no client replay). */
+    let chainHead: string | undefined = request.sessionId || undefined;
+    let input: unknown = request.prompt;
+    let roundResultItems: unknown[] = [];
 
-      // §D7: API-key single path (Vertex OAuth deleted — Interactions is not
-      // served on Vertex). Pre-request throw → classifyThrown "auth" (row
-      // alternate pinned) → breaker → honest outage; config.gemini.apiKey is
-      // resolved once at boot (config.ts `optional()`, env-first then
-      // Keychain), so `hive credentials add GEMINI_API_KEY` needs a service
-      // restart to take effect, not just the next spawn. The finally below
-      // still runs bridge.close() on this path (T9).
-      const env = this.options.env ?? process.env;
-      const apiKey =
-        this.options.apiKey ||
-        envValue("GOOGLE_GENAI_API_KEY", env) ||
-        envValue("GEMINI_API_KEY", env) ||
-        envValue("GOOGLE_API_KEY", env);
-      if (!apiKey) {
-        throw new Error(
-          "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY, and restart the service",
-        );
-      }
-      const client = this.options.client ?? buildDefaultClient(apiKey);
-
-      const bridged = await bridge.connect();
-      const bridgedByName = new Map(bridged.map((bt) => [bt.name, bt]));
-      // §D1: BridgedTool[] → Interactions function tools (T0 spike leg (b):
-      // {type:"function", name, description, parameters} accepted). Name/cap
-      // edges are bridge-owned (KPR-348/349).
-      const toolPayloads = bridged.map((bt) => ({
-        type: "function" as const,
-        name: bt.name,
-        description: bt.description,
-        parameters: bt.inputSchema,
-      }));
-
-      const thinkingLevel = this.resolveThinkingLevel();
-
-      /** §D1: previous_interaction_id does double duty — round 1 resumes the
-       *  persisted handle (undefined ⇒ fresh thread); rounds N+1 chain the
-       *  prior round's just-minted id and send ONLY the function_result
-       *  items (the server holds the rest — T0 spike: no client replay). */
-      let chainHead: string | undefined = request.sessionId || undefined;
-      let input: unknown = request.prompt;
-      let finalText = "";
-      let lastInteractionId: string | undefined;
-
-      // maxTurns 0 ⇒ zero create calls ⇒ error_max_turns (codex-identical
-      // divergence pin: a zero budget honestly means "no model rounds").
-      const maxRounds = request.resourceLimits?.maxTurns ?? DEFAULT_MAX_ROUNDS;
-      let round = 0;
-      for (;;) {
-        round += 1;
-        if (round > maxRounds) {
-          return this.buildResult({
-            text: "",
-            sessionId: fallbackSessionId,
-            durationMs: Date.now() - startedAt,
-            streamed,
-            aborted: false,
-            error: "error_max_turns",
-            inputTokens: totals.inputTokens,
-            outputTokens: totals.outputTokens,
-            cacheReadTokens: totals.cacheReadTokens,
-            toolStats: bridge.stats,
-          });
-        }
-        if (this.aborted || abortController.signal.aborted) return interruptedResult();
-
+    return runBoundedDispatchLoop<GeminiRoundState, GeminiFunctionCall>({
+      request,
+      harness,
+      executeRound: async (round) => {
         let stream: AsyncIterable<Record<string, unknown>>;
         try {
           stream = await client.create(
@@ -329,7 +220,7 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
             // maxRetries 0: single-attempt by design — retry policy belongs
             // to the breaker/outage layer; SDK-internal retries would mask
             // rate-limit/5xx faults from classification.
-            { fetchOptions: { signal: abortController.signal }, maxRetries: 0 },
+            { fetchOptions: { signal: harness.signal }, maxRetries: 0 },
           );
         } catch (error) {
           throw this.describeCreateError(error, round, request.sessionId || undefined);
@@ -337,112 +228,60 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
 
         // Text deltas from EVERY round reach onStream (intermediate
         // think-aloud); RunResult.text is the final round's text only (§D1
-        // final-reply semantics, 353 parity).
-        let state: Awaited<ReturnType<typeof consumeInteractionStream>>;
+        // final-reply semantics, 353 parity — the loop owns that formula).
+        let state: GeminiRoundState;
         try {
-          state = await consumeInteractionStream(
-            stream,
-            request.onStream,
-            // Deadline-aware: the signal-abort leg makes the consumer stop on
-            // its own even if the transport's reject-on-abort were ever absent.
-            () => this.aborted || abortController.signal.aborted,
-          );
+          // Deadline-aware: harness.isAborted makes the consumer stop on its
+          // own even if the transport's reject-on-abort were ever absent.
+          state = await consumeInteractionStream(stream, request.onStream, harness.isAborted);
         } catch (error) {
           // A deadline/operator abort passes through untouched (no HTTP
           // status ⇒ describeStreamError returns the original error), so the
-          // outer catch's isAbortError/interruptedResult still resolve it.
+          // scaffold catch's isAbortError/interruptedResult still resolve it.
           throw this.describeStreamError(error);
         }
-        totals.inputTokens += state.inputTokens;
-        totals.outputTokens += state.outputTokens;
-        totals.cacheReadTokens += state.cacheReadTokens;
-        if (state.interactionId) lastInteractionId = state.interactionId;
-        finalText = state.text;
-
-        if (this.aborted || abortController.signal.aborted) return interruptedResult();
-
-        // T0 spike Delta 2: interaction.completed.status === "requires_action"
-        // signals pending function_calls; harvestFunctionCalls returns them
-        // (from the step.start events that carry that same pending call), so
-        // the harvest-driven loop control IS the requires_action drive — a
-        // non-empty harvest ⟺ a requires_action turn.
-        const calls = harvestFunctionCalls(state);
-        if (calls.length === 0) break;
+        return {
+          state,
+          usage: {
+            inputTokens: state.inputTokens,
+            outputTokens: state.outputTokens,
+            cacheReadTokens: state.cacheReadTokens,
+          },
+          providerRoundId: state.interactionId,
+          text: state.text,
+        };
+      },
+      // T0 spike Delta 2: interaction.completed.status === "requires_action"
+      // signals pending function_calls; harvestFunctionCalls returns them
+      // (from the step.start events that carry that same pending call), so
+      // the harvest-driven loop control IS the requires_action drive — a
+      // non-empty harvest ⟺ a requires_action turn. Harvest dedups internally
+      // (dual-source contract) — no callId hook.
+      harvest: (state) => harvestFunctionCalls(state),
+      beforeExecuteCalls: (state) => {
         if (!state.interactionId) {
           // Can't chain the function_result round without the parent id.
           throw new Error("Gemini interaction stream ended without an interaction id");
         }
-
-        // Sequential by design (KPR-353 pin: in-process handlers are not
-        // concurrency-audited under one turn). All results ship in ONE
-        // follow-up round.
-        const resultItems: unknown[] = [];
-        for (const call of calls) {
-          if (this.aborted || abortController.signal.aborted) return interruptedResult();
-          const output = await executeFunctionCall(call, bridgedByName);
-          // T0 spike leg (b2): function_result input shape accepted verbatim.
-          resultItems.push({
-            type: "function_result",
-            name: call.name,
-            call_id: call.id,
-            result: [{ type: "text", text: output }],
-          });
-        }
+        // All results ship in ONE follow-up round (the loop executes them
+        // sequentially — KPR-353 pin).
+        roundResultItems = [];
+      },
+      executeCall: async (call) => {
+        const output = await executeFunctionCall(call, bridgedByName);
+        // T0 spike leg (b2): function_result input shape accepted verbatim.
+        roundResultItems.push({
+          type: "function_result",
+          name: call.name,
+          call_id: call.id,
+          result: [{ type: "text", text: output }],
+        });
+      },
+      afterCalls: (state) => {
         chainHead = state.interactionId;
-        input = resultItems;
-      }
-
-      const durationMs = Date.now() - startedAt;
-      if (this.aborted || abortController.signal.aborted) return interruptedResult();
-
-      return this.buildResult({
-        // §D1: the FINAL round's interaction id — it transitively contains
-        // the whole turn. A success without an id persists nothing (the
-        // finalize path's falsy guard) rather than persisting a lie.
-        text: finalText,
-        sessionId: lastInteractionId ?? fallbackSessionId,
-        durationMs,
-        streamed,
-        aborted: false,
-        inputTokens: totals.inputTokens,
-        outputTokens: totals.outputTokens,
-        cacheReadTokens: totals.cacheReadTokens,
-        toolStats: bridge.stats,
-      });
-    } catch (error) {
-      const durationMs = Date.now() - startedAt;
-      // A deadline abort usually surfaces here as the aborted create/stream
-      // throw — interruptedResult resolves it to the deadline error, not an
-      // abort.
-      if (this.isAbortError(error, abortController)) return interruptedResult();
-      return this.buildResult({
-        text: "",
-        sessionId: fallbackSessionId,
-        durationMs,
-        streamed,
-        aborted: false,
-        error: errorMessage(error),
-        inputTokens: totals.inputTokens,
-        outputTokens: totals.outputTokens,
-        cacheReadTokens: totals.cacheReadTokens,
-        toolStats: bridge.stats,
-      });
-    } finally {
-      if (deadline !== undefined) clearTimeout(deadline);
-      await bridge.close(); // never throws/rejects (KPR-348 advisory 1)
-      if (this.currentAbortController === abortController) {
-        this.currentAbortController = null;
-      }
-    }
-  }
-
-  abort(): void {
-    this.aborted = true;
-    this.currentAbortController?.abort();
-  }
-
-  get wasAborted(): boolean {
-    return this.aborted;
+        input = roundResultItems;
+      },
+    });
   }
 
   /**
@@ -512,69 +351,6 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
       }
     }
     return level;
-  }
-
-  private isAbortError(error: unknown, abortController: AbortController): boolean {
-    if (this.aborted || abortController.signal.aborted) return true;
-    if (!error || typeof error !== "object") return false;
-    const maybeAbort = error as { name?: unknown; code?: unknown };
-    return maybeAbort.name === "AbortError" || maybeAbort.code === "ABORT_ERR";
-  }
-
-  private buildResult({
-    text,
-    sessionId,
-    durationMs,
-    streamed,
-    aborted,
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    timedOut,
-    error,
-    toolStats,
-  }: {
-    text: string;
-    sessionId: string;
-    durationMs: number;
-    streamed: boolean;
-    aborted: boolean;
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-    timedOut?: boolean;
-    error?: string;
-    toolStats?: Readonly<{ toolCalls: number; toolMs: number; perTool: Map<string, number> }>;
-  }): RunResult {
-    const toolMs = toolStats?.toolMs ?? 0;
-    const toolCalls = toolStats?.toolCalls ?? 0;
-    const toolSummary =
-      toolStats && toolStats.perTool.size > 0
-        ? [...toolStats.perTool.entries()].map(([n, c]) => `${n}×${c}`).join(", ")
-        : "none";
-    return {
-      text,
-      sessionId,
-      costUsd: 0, // no per-token billing wired — KPR-355 matrix caveat (Lane A precedent)
-      durationMs,
-      // §D8 (KPR-348 §D8 rule): the breaker's p95 window samples llmMs —
-      // folding tool time in would let slow-but-healthy tools trip a healthy
-      // gemini endpoint. Clamped for degenerate/mocked timing.
-      llmMs: Math.max(0, durationMs - toolMs),
-      toolMs,
-      toolCalls,
-      toolSummary,
-      streamed,
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheCreationTokens: 0,
-      contextWindow: 0,
-      compactions: 0,
-      aborted,
-      ...(timedOut ? { timedOut: true } : {}),
-      ...(error ? { error } : {}),
-    };
   }
 }
 
