@@ -4291,7 +4291,59 @@ describe("AgentManager", () => {
           expect(routeModel).not.toHaveBeenCalled();
           const req = mockCodexRunTurn.mock.calls[0]![0];
           expect(req.effort).toBeUndefined();
-          expect(req.resourceLimits).toBeUndefined();
+          // Lane B limits come from the agent definition (fixture defaults),
+          // not the adapters' DEFAULT_MAX_ROUNDS — see the dedicated tests.
+          expect(req.resourceLimits).toEqual({ maxTurns: 25, timeoutMs: 300_000, budgetUsd: 10 });
+        });
+
+        it("Lane B resourceLimits mirror the agent definition (maxTurns is not dead config)", async () => {
+          registry._agents.set(
+            "gemini-b",
+            makeAgentConfig({
+              id: "gemini-b",
+              name: "GeminiB",
+              model: "gemini/gemini-3.1-pro-preview",
+              maxTurns: 40,
+              budgetUsd: 7,
+              timeoutMs: 120_000,
+              coreServers: [],
+              soul: "",
+              systemPrompt: "gemini system",
+            }),
+          );
+
+          const item = makeWorkItem({ text: "hello gemini", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "gemini-b" });
+
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.resourceLimits).toEqual({ maxTurns: 40, timeoutMs: 120_000, budgetUsd: 7 });
+        });
+
+        it("Lane B system-sender turns carry agent-def limits too (router still skipped)", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          registry._agents.set(
+            "gemini-b",
+            makeAgentConfig({
+              id: "gemini-b",
+              name: "GeminiB",
+              model: "gemini/gemini-3.1-pro-preview",
+              maxTurns: 40,
+              coreServers: [],
+              soul: "",
+              systemPrompt: "gemini system",
+            }),
+          );
+
+          const sys = makeWorkItem({
+            text: "execute your scheduled digest task",
+            sender: "system",
+            source: { kind: "sms", id: "line-1", label: "May" },
+          });
+          await manager.spawnTurn({ ...makeCtx(sys, "sms"), agentId: "gemini-b", threadId: "sms:line-1:gsys" });
+
+          expect(routeModel).not.toHaveBeenCalled();
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.resourceLimits?.maxTurns).toBe(40);
         });
       });
     });
