@@ -188,15 +188,20 @@ describe("runBoundedDispatchLoop — abort checkpoints", () => {
     expect(rounds).toEqual([]);
   });
 
-  it("interrupts at the post-stream checkpoint", async () => {
+  it("interrupts at the post-stream checkpoint, before the harvest runs", async () => {
     const { harness, setAborted } = makeHarness();
     const executed: string[] = [];
+    let harvested = 0;
     const outcome = await runBoundedDispatchLoop(
       makeDriver(harness, {
         request: req(5),
         executeRound: async () => {
           setAborted(); // fired while the stream was being consumed
           return { state: { calls: ["c"] }, usage: {}, text: "partial" };
+        },
+        harvest: (state) => {
+          harvested += 1;
+          return state.calls;
         },
         executeCall: async (call) => {
           executed.push(call);
@@ -205,6 +210,13 @@ describe("runBoundedDispatchLoop — abort checkpoints", () => {
     );
 
     expect(outcome).toEqual({ kind: "interrupted" });
+    // Mutation pin: `harvested === 0` is the ONLY observation this checkpoint
+    // owns. Delete the post-stream `isAborted` return from dispatch-loop.ts
+    // and the abort is still caught one checkpoint later (pre-tool) with an
+    // identical `{kind:"interrupted"}` and an identical empty `executed` —
+    // but the harvest will have run. Assert both, and the counter is what
+    // fails.
+    expect(harvested).toBe(0);
     expect(executed).toEqual([]);
   });
 
