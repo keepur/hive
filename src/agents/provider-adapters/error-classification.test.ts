@@ -3,6 +3,7 @@ import {
   classifyTurnResult,
   classifyThrown,
   HARD_FAULT_KINDS,
+  TURN_DEADLINE_SUBTYPE,
   TurnAssemblyError,
   type ProviderFaultKind,
 } from "./error-classification.js";
@@ -109,6 +110,20 @@ describe("classifyTurnResult (KPR-306)", () => {
   it("classifies SDK result subtypes as non-provider (short-circuit)", () => {
     expect(faultKind("error_max_turns")).toBe("non-provider");
     expect(faultKind("error_during_execution")).toBe("non-provider");
+  });
+
+  it("classifies the Lane B deadline sentinel as the dedicated turn-deadline kind (short-circuit)", () => {
+    expect(TURN_DEADLINE_SUBTYPE).toBe("error_turn_deadline");
+    expect(faultKind(TURN_DEADLINE_SUBTYPE)).toBe("turn-deadline");
+  });
+
+  it("Lane B deadline result shape (timedOut without aborted) classifies turn-deadline — never the breaker-tripping timeout kind", () => {
+    // The adapters pin aborted:false on deadline results precisely so the
+    // timedOut && aborted hang rule (Claude-lane) can never match; the
+    // turn-deadline kind is outside HARD_FAULT_KINDS, so it can never trip.
+    const c = classifyTurnResult({ error: TURN_DEADLINE_SUBTYPE, timedOut: true, aborted: false });
+    expect(c).toEqual({ outcome: "fault", kind: "turn-deadline", message: TURN_DEADLINE_SUBTYPE });
+    expect(c.outcome === "fault" && HARD_FAULT_KINDS.has(c.kind)).toBe(false);
   });
 
   it("classifies unknown strings as non-provider (fail-safe default)", () => {

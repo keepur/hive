@@ -46,7 +46,7 @@ import {
   type PassthroughSpawnConfig,
 } from "./provider-adapters/passthrough-providers.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
-import { classifyThrown, classifyTurnResult } from "./provider-adapters/error-classification.js";
+import { classifyThrown, classifyTurnResult, TURN_DEADLINE_SUBTYPE } from "./provider-adapters/error-classification.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -252,8 +252,9 @@ interface SpawnShaping {
    *  the runner's per-agent legacy fallback (timeoutMs/maxTurns/budgetUsd)
    *  stays live config. ALSO set by prepareSpawn's Lane B branch
    *  (openai/gemini/codex), from the agent definition — those adapters have
-   *  no runner-side fallback and only consume maxTurns. Voice and Lane A
-   *  stay undefined. */
+   *  no runner-side fallback and consume maxTurns (round budget) and
+   *  timeoutMs (wall-clock deadline); budgetUsd stays inert there. Voice and
+   *  Lane A stay undefined. */
   resourceLimits: ResourceLimits | undefined;
   routerCostUsd: number;
 }
@@ -703,9 +704,12 @@ export class AgentManager {
         const result = await nested.runTurn({
           prompt: call.prompt,
           workItemContext: call.workItemContext,
-          // Only maxTurns is consumed on Lane B (openai run options + codex
-          // round budget); timeoutMs/budgetUsd are Claude-lane concepts —
-          // neutral values.
+          // maxTurns bounds the nested round budget; timeoutMs is a live
+          // 10-minute wall-clock backstop on all three Lane B surfaces —
+          // under default limits the PARENT's own deadline fires first and
+          // abort-chains in via call.signal (nested deadline expiry surfaces
+          // as Task tool text, breaker-invisible by construction). budgetUsd
+          // stays inert on Lane B.
           resourceLimits: { maxTurns, timeoutMs: 600_000, budgetUsd: 0 },
         });
         // D5.8: one info log keyed on the ROUTE provider (resolved-provider
@@ -725,6 +729,13 @@ export class AgentManager {
         // D5.7 result shaping (never throws). Nested sessionId DISCARDED;
         // sessionStore untouched (G4).
         if (result.aborted) return `Delegate turn aborted (${call.delegate}).`;
+        // Map the deadline sentinel to prose — the raw subtype string would
+        // be opaque to the parent model (reachable when an agent-def
+        // timeoutMs above the nested 600s backstop lets the nested deadline
+        // fire before the parent's).
+        if (result.error === TURN_DEADLINE_SUBTYPE) {
+          return `Delegate turn failed (${call.delegate}): the delegate exceeded its wall-clock deadline.`;
+        }
         if (result.error) return `Delegate turn failed (${call.delegate}): ${result.error}`;
         return result.text || `Delegate '${call.delegate}' returned no output.`;
       } catch (err) {
@@ -1699,8 +1710,12 @@ export class AgentManager {
     // and the agent definition's maxTurns was dead config. That default was
     // unreachable in the tool-free pilot era; post-KPR-348 tool execution it
     // truncated real turns (error_max_turns). Mirror the Claude runner's
-    // legacy fallback (agent-def maxTurns/timeoutMs/budgetUsd) — only
-    // maxTurns is consumed on Lane B today.
+    // legacy fallback (agent-def maxTurns/timeoutMs/budgetUsd). maxTurns
+    // bounds the round budget and timeoutMs the wall clock (all three
+    // adapters arm an abort-signal deadline; expiry surfaces as
+    // TURN_DEADLINE_SUBTYPE — the breaker-inconclusive turn-deadline kind:
+    // never a trip, never a streak reset, never a probe close); budgetUsd
+    // is still inert on Lane B.
     if (agentConfig && staticRoute.provider !== "claude") {
       return {
         prompt,

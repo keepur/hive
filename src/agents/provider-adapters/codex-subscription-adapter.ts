@@ -5,6 +5,7 @@ import type { AgentProviderAdapter, AgentProviderTurnRequest, ReasoningEffort } 
 import { createCodexOpenAITokenProvider } from "./oauth-credentials.js";
 import { createLogger } from "../../logging/logger.js";
 import { ToolBridge, type BridgedTool } from "./tool-bridge.js";
+import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
 import type { TurnHistoryStore } from "../turn-history-store.js";
 
 const DEFAULT_CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
@@ -119,6 +120,24 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
     const streamed = !!request.onStream;
     const sessionId = request.sessionId ?? `codex-pilot-${randomUUID()}`;
 
+    // Wall-clock turn deadline (resourceLimits.timeoutMs — Claude-lane parity,
+    // agent-runner.ts:2024): without it a spawn attempt holds the per-thread
+    // lock for up to maxTurns full-history POSTs. Mid-round abort by design —
+    // the round budget bounds round COUNT, not round DURATION, so a
+    // between-round check alone would leave one stalled SSE stream unbounded.
+    // Firing the shared abortController cancels the in-flight fetch AND
+    // signals the ToolBridge (nested KPR-354 delegates abort-chain off it); a
+    // non-cancellable in-flight tool call is caught at the next loop
+    // checkpoint via interruptedResult. undefined ⇒ no deadline (bare/test
+    // constructions — prepareSpawn always supplies one on Lane B); 0 fires
+    // immediately, though the first round may still dispatch and be aborted
+    // mid-flight (a timer is a macrotask — unlike maxTurns 0's zero-POST
+    // short-circuit). Armed inside the try (below) so a throw between here
+    // and the finally can never leak the timer.
+    const timeoutMs = request.resourceLimits?.timeoutMs;
+    let deadlineFired = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+
     // KPR-353 (§D1): per-spawn tool bridge — the openai adapter's exact
     // construction (openai-agents-adapter.ts:54-63). connect() inside the
     // try (fail-soft per server; an all-failed bridge yields [] and the turn
@@ -159,7 +178,50 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
         toolStats: bridge.stats,
       });
 
+    /** Deadline expiry is a turn-shape ERROR, not an abort: `aborted` stays
+     *  false so classifyTurnResult's `timedOut && aborted` hang rule (the
+     *  Claude-lane breaker-tripping timeout) can never match, and
+     *  TURN_DEADLINE_SUBTYPE classifies as the breaker-INCONCLUSIVE
+     *  turn-deadline kind (never trips, never resets a streak, never closes
+     *  a half-open probe: an expiry proves nothing about provider health
+     *  either way) — Lane B wall clock folds bridged tool time in, and a slow-but-healthy tool must not
+     *  trip a healthy provider. `timedOut: true` still flows to telemetry.
+     *  sessionId mirrors the error path (resumed handle, never a mid-turn
+     *  mint), so the churn-mint guard / TTL-refresh persist semantics apply
+     *  unchanged. */
+    const deadlineResult = (): RunResult =>
+      this.buildResult({
+        text: "",
+        sessionId,
+        durationMs: Date.now() - startedAt,
+        streamed,
+        aborted: false,
+        timedOut: true,
+        error: TURN_DEADLINE_SUBTYPE,
+        inputTokens: totals.inputTokens,
+        outputTokens: totals.outputTokens,
+        cacheReadTokens: totals.cacheReadTokens,
+        toolStats: bridge.stats,
+      });
+
+    /** Single interruption resolver for every abort checkpoint: an operator
+     *  abort() outranks a deadline that also fired (the operator asked for
+     *  breaker-neutral silence, not an error surface). */
+    const interruptedResult = (): RunResult =>
+      deadlineFired && !this.aborted ? deadlineResult() : abortedResult();
+
     try {
+      if (timeoutMs !== undefined) {
+        deadline = setTimeout(() => {
+          deadlineFired = true;
+          log.warn("Codex turn deadline exceeded — aborting turn", {
+            agent: this.options.name,
+            timeoutMs,
+          });
+          abortController.abort();
+        }, timeoutMs);
+      }
+
       // §D3: load NEVER throws and NEVER returns Mongo error text (breaker
       // safety — store-owned contract; the .catch is belt-and-braces against
       // a future non-conforming store impl leaking Mongo text into
@@ -225,7 +287,7 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
             toolStats: bridge.stats,
           });
         }
-        if (this.aborted || abortController.signal.aborted) return abortedResult();
+        if (this.aborted || abortController.signal.aborted) return interruptedResult();
 
         const response = await this.fetchImpl()(this.options.endpoint ?? DEFAULT_CODEX_RESPONSES_URL, {
           method: "POST",
@@ -286,7 +348,13 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
         // Fresh per-round state; text deltas stream to onStream across ALL
         // rounds (intermediate think-aloud), but RunResult.text is the FINAL
         // round's assistant text only (§D2 final-reply semantics).
-        const state = await consumeCodexSse(response.body, request.onStream, () => this.aborted);
+        const state = await consumeCodexSse(
+          response.body,
+          request.onStream,
+          // Deadline-aware: the signal-abort leg makes the consumer stop on
+          // its own even if the transport's reject-on-abort were ever absent.
+          () => this.aborted || abortController.signal.aborted,
+        );
         totals.inputTokens += state.inputTokens;
         totals.outputTokens += state.outputTokens;
         totals.cacheReadTokens += state.cacheReadTokens;
@@ -296,7 +364,7 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
         inputItems.push(...state.outputItems);
         thisTurnItems.push(...state.outputItems);
 
-        if (this.aborted || abortController.signal.aborted) return abortedResult();
+        if (this.aborted || abortController.signal.aborted) return interruptedResult();
 
         // Dedupe by call_id: closes the degenerate double-`response.completed`
         // case (both payloads captured into outputItems) that would otherwise
@@ -312,7 +380,7 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
         // concurrency-audited under one turn; parallelizing is a follow-up
         // lever, deliberately not pre-built).
         for (const call of calls) {
-          if (this.aborted || abortController.signal.aborted) return abortedResult();
+          if (this.aborted || abortController.signal.aborted) return interruptedResult();
           const output = await executeFunctionCall(call, bridgedByName);
           const outputItem = { type: "function_call_output", call_id: call.call_id, output };
           inputItems.push(outputItem);
@@ -321,7 +389,7 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
       }
 
       const durationMs = Date.now() - startedAt;
-      if (this.aborted || abortController.signal.aborted) return abortedResult();
+      if (this.aborted || abortController.signal.aborted) return interruptedResult();
 
       // §D3 persist policy: success only — error/aborted turns never persist
       // (an errored turn's item may be re-delivered by the retry/outage path;
@@ -346,19 +414,9 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
       });
     } catch (error) {
       const durationMs = Date.now() - startedAt;
-      if (this.isAbortError(error, abortController)) {
-        return this.buildResult({
-          text: "",
-          sessionId: lastResponseId ?? sessionId,
-          durationMs,
-          streamed,
-          aborted: true,
-          inputTokens: totals.inputTokens,
-          outputTokens: totals.outputTokens,
-          cacheReadTokens: totals.cacheReadTokens,
-          toolStats: bridge.stats,
-        });
-      }
+      // A deadline abort usually surfaces here as the aborted fetch's throw —
+      // interruptedResult resolves it to the deadline error, not an abort.
+      if (this.isAbortError(error, abortController)) return interruptedResult();
 
       return this.buildResult({
         text: "",
@@ -373,6 +431,7 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
         toolStats: bridge.stats,
       });
     } finally {
+      if (deadline !== undefined) clearTimeout(deadline);
       await bridge.close(); // never throws/rejects (KPR-348 advisory 1)
       if (this.currentAbortController === abortController) {
         this.currentAbortController = null;
@@ -406,6 +465,7 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
     durationMs,
     streamed,
     aborted,
+    timedOut,
     inputTokens,
     outputTokens,
     cacheReadTokens,
@@ -417,6 +477,7 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
     durationMs: number;
     streamed: boolean;
     aborted: boolean;
+    timedOut?: boolean;
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens: number;
@@ -449,6 +510,7 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
       contextWindow: 0,
       compactions: 0,
       aborted,
+      ...(timedOut ? { timedOut: true } : {}),
       ...(error ? { error } : {}),
     };
   }
