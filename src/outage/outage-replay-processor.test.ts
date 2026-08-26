@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { OutageReplayProcessor } from "./outage-replay-processor.js";
-import type { OutageQueueDoc } from "./outage-queue-store.js";
+import { OutageQueueStore, type OutageQueueDoc } from "./outage-queue-store.js";
 import type { WorkItem } from "../types/work-item.js";
 
 vi.mock("../logging/logger.js", () => ({
@@ -177,11 +177,177 @@ describe("OutageReplayProcessor (KPR-307 §7.4)", () => {
   it("start() recovers stale replaying docs and ticks on the configured interval; stop() halts it", async () => {
     vi.useFakeTimers();
     processor.start();
-    expect(store.recoverStaleReplaying).toHaveBeenCalledTimes(1);
+    expect(store.recoverStaleReplaying).toHaveBeenCalledTimes(1); // boot call fires BEFORE the first interval
     await vi.advanceTimersByTimeAsync(15_000);
+    expect(store.recoverStaleReplaying).toHaveBeenCalledTimes(2); // KPR-403: the sweep also rides every tick
     expect(store.expireOlderThan).toHaveBeenCalledTimes(1);
     processor.stop();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(store.expireOlderThan).toHaveBeenCalledTimes(1); // no further ticks
   });
 });
+
+// ---------------------------------------------------------------------------
+// KPR-403: deadline-aware periodic re-sweep of replaying orphans
+// ---------------------------------------------------------------------------
+
+describe("OutageReplayProcessor — periodic stale-replaying re-sweep (KPR-403)", () => {
+  it("KPR-403: tick order is sweep → expire → drain; same-tick recovery feeds the same tick's drain by construction", async () => {
+    // NEGATIVE-VERIFY prediction (Step 4): pre-fix tick() has no sweep step —
+    // the "recover" label never appears and this row fails.
+    const store = makeStore();
+    const dispatcher = makeDispatcher();
+    const processor = new OutageReplayProcessor(store as never, dispatcher as never, CONFIG);
+    const order: string[] = [];
+    store.recoverStaleReplaying.mockImplementation(async () => {
+      order.push("recover");
+      return 0;
+    });
+    store.expireOlderThan.mockImplementation(async () => {
+      order.push("expire");
+      return [];
+    });
+    store.claimNext.mockImplementation(async () => {
+      order.push("drain");
+      return null;
+    });
+    await processor.tick();
+    expect(order).toEqual(["recover", "expire", "drain"]);
+  });
+
+  it("KPR-403: a sweep rejection is caught — expire and drain still run", async () => {
+    // Pin, passes both ways by design pre-/post-fix (pre-fix the sweep is
+    // simply absent): the point is that a Mongo hiccup in the sweep must
+    // never starve expiry or the drain (spec §Edge-5).
+    const store = makeStore();
+    const dispatcher = makeDispatcher();
+    const processor = new OutageReplayProcessor(store as never, dispatcher as never, CONFIG);
+    store.recoverStaleReplaying.mockRejectedValueOnce(new Error("mongo hiccup"));
+    await processor.tick(); // must not throw
+    expect(store.expireOlderThan).toHaveBeenCalledTimes(1);
+    expect(store.claimNext).toHaveBeenCalledTimes(1);
+  });
+
+  it("★ KPR-403 Q2: a crash-orphan younger than its bound at boot is recovered by a later tick and replayed", async () => {
+    // The Q2 headline pin, on the REAL store + REAL processor tick: mock
+    // choreography here would only test the mocks. The mini driver fake
+    // below covers exactly the surface this flow touches; query-shape
+    // fidelity (ordering, upserts, CAS) is the store suite's job.
+    let clock = Date.parse("2026-07-07T12:00:00Z");
+    const coll = new MiniOutageCollection();
+    const realStore = new OutageQueueStore(coll as never, () => new Date(clock));
+    const workItem: WorkItem = {
+      id: "m1",
+      text: "original question",
+      source: { kind: "slack", id: "C1", label: "general" },
+      sender: "user1",
+      threadId: "t1",
+      timestamp: new Date("2026-07-07T10:00:00Z"),
+    };
+    // Fresh-claimed orphan: the process crashed 10s after claimNext stamped it.
+    coll.docs.push({
+      _id: "d1",
+      itemId: "m1",
+      agentId: "agent-a",
+      provider: "claude",
+      workItem,
+      policy: "notify",
+      enqueueOrigin: "fast-fail",
+      deadlineMs: 300_000,
+      status: "replaying",
+      attempts: 0,
+      enqueuedAt: new Date(clock - 10_000),
+      lastAttemptAt: new Date(clock - 10_000),
+      lastError: null,
+      noticeSent: true,
+      doneAt: null,
+    });
+    const dispatcher = {
+      // Dispatcher-authored outcome (§5-2g): a successful replay releases done.
+      dispatch: vi.fn().mockImplementation(async (item: WorkItem) => {
+        await realStore.release(item.id, "agent-a", "done");
+      }),
+      deliverOutageNotice: vi.fn().mockResolvedValue(undefined),
+    };
+    const processor = new OutageReplayProcessor(realStore as never, dispatcher as never, CONFIG, () => new Date(clock));
+
+    // Boot-time sweep (start()'s call, 10s after the crash): orphan is far
+    // under its 360s bound — correctly untouched. Pre-fix, nothing would
+    // EVER look at it again (expiry is pending-only; TTL needs a Date doneAt).
+    expect(await realStore.recoverStaleReplaying()).toBe(0);
+    expect(coll.docs[0].status).toBe("replaying");
+
+    clock += 400_000; // past deadlineMs 300s + 60s grace
+    await processor.tick(); // sweep → expire → drain in ONE tick
+
+    expect(dispatcher.dispatch).toHaveBeenCalledTimes(1);
+    const replayed = dispatcher.dispatch.mock.calls[0][0] as WorkItem;
+    expect(replayed.meta).toMatchObject({ targetAgentId: "agent-a", outageReplay: true });
+    expect(coll.docs[0].status).toBe("done"); // recovered → claimed → replayed → released
+  });
+});
+
+// KPR-403 T6 harness: minimal driver fake for the REAL OutageQueueStore —
+// equality + $lt + Date-equality matching, $set/$setOnInsert application.
+// Deliberately tiny and test-local (repo convention: harness beside its
+// subject); the store suite's FakeOutageCollection remains the authority on
+// full query-shape fidelity.
+function miniMatches(doc: Record<string, unknown>, filter: Record<string, unknown>): boolean {
+  for (const [key, cond] of Object.entries(filter)) {
+    const val = doc[key];
+    if (cond !== null && typeof cond === "object" && !(cond instanceof Date)) {
+      const c = cond as { $lt?: unknown };
+      if ("$lt" in c && !(val !== null && (val as never) < (c.$lt as never))) return false;
+    } else if (val instanceof Date && cond instanceof Date) {
+      if (val.getTime() !== cond.getTime()) return false;
+    } else if (val !== cond) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function miniApply(doc: Record<string, unknown>, update: Record<string, unknown>): void {
+  for (const [k, v] of Object.entries((update.$set as Record<string, unknown>) ?? {})) doc[k] = v;
+}
+
+class MiniOutageCollection {
+  docs: Record<string, unknown>[] = [];
+
+  async updateOne(filter: Record<string, unknown>, update: Record<string, unknown>) {
+    const doc = this.docs.find((d) => miniMatches(d, filter));
+    if (!doc) return { matchedCount: 0, modifiedCount: 0 };
+    miniApply(doc, update);
+    return { matchedCount: 1, modifiedCount: 1 };
+  }
+
+  async updateMany(filter: Record<string, unknown>, update: Record<string, unknown>) {
+    let modifiedCount = 0;
+    for (const doc of this.docs) {
+      if (miniMatches(doc, filter)) {
+        miniApply(doc, update);
+        modifiedCount++;
+      }
+    }
+    return { modifiedCount };
+  }
+
+  async findOneAndUpdate(filter: Record<string, unknown>, update: Record<string, unknown>) {
+    // Sort ignored: T6 stages at most one candidate; ordering fidelity is
+    // the store suite's job (KPR-400 F2 rows).
+    const doc = this.docs.find((d) => miniMatches(d, filter));
+    if (!doc) return null;
+    miniApply(doc, update);
+    return { ...doc };
+  }
+
+  async findOne(filter: Record<string, unknown>) {
+    const doc = this.docs.find((d) => miniMatches(d, filter));
+    return doc ? { ...doc } : null;
+  }
+
+  find(filter: Record<string, unknown>) {
+    const results = this.docs.filter((d) => miniMatches(d, filter)).map((d) => ({ ...d }));
+    return { toArray: async () => results };
+  }
+}
