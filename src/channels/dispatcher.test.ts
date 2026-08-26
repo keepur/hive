@@ -1315,6 +1315,40 @@ describe("outage interception (KPR-307)", () => {
     expect(adapter.deliver.mock.calls[0][0].text).not.toBe(OUTAGE_NOTICE_DEFAULT);
   });
 
+  it("KPR-400 F2: ProviderCircuitOpenError fast-fail enqueues enqueueOrigin 'fast-fail'", async () => {
+    // NEGATIVE-VERIFY prediction (Step 3): pre-fix handleOutageTurn has no
+    // origin param and enqueue carries no enqueueOrigin — objectContaining
+    // fails.
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(store.enqueue).toHaveBeenCalledWith(expect.objectContaining({ itemId: "m1", enqueueOrigin: "fast-fail" }));
+  });
+
+  it("KPR-400 F2: post-turn zero-progress deadline gate enqueues enqueueOrigin 'post-turn-fault'", async () => {
+    // Same fixture shape as the '★ timeout gate: timedOut && aborted with
+    // breaker open' row above (cited by name — KPR-398 zero-progress hang
+    // signature: empty finalMessage, toolCalls 0, streamed false).
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(
+      makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true }),
+    );
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(store.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ itemId: "m1", enqueueOrigin: "post-turn-fault" }),
+    );
+  });
+
+  it("KPR-400 F2: a replay fast-failing again releases pending and never re-enqueues (origin stays untouched)", async () => {
+    // Pin, passes both ways by design: the release-before-depth branch
+    // predates KPR-400; origin immutability itself is store-level
+    // ($setOnInsert — pinned in outage-queue-store.test.ts). This row pins
+    // that the dispatcher's replay path cannot even REACH enqueue.
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(replayItem({ id: "m1" }));
+    expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "pending");
+    expect(store.enqueue).not.toHaveBeenCalled();
+  });
+
   it("sched: turns skip with a log — never queued, never noticed", async () => {
     agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
     await dispatcher.dispatch(
