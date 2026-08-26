@@ -1118,7 +1118,7 @@ export class AgentManager {
         effectiveCtx,
         finalResult,
         shaping.route,
-        finalAttemptSessionId !== undefined,
+        !!finalAttemptSessionId,
       );
       this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
 
