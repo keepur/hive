@@ -398,6 +398,15 @@ describe("OpenAIAgentsAdapter", () => {
     expect(typeof client._options.apiKey).toBe("string");
   });
 
+  it("KPR-306: client pins maxRetries 0 — no openai-node internal retries ahead of breaker classification", async () => {
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+    await makeAdapter().runTurn({ prompt: "hello" });
+    const client = (OpenAIProviderMock.mock.calls[0]![0] as any).openAIClient;
+    // openai-node defaults to 2; anything nonzero silently absorbs 429/5xx
+    // with backoff before the fault reaches error classification.
+    expect(client.maxRetries).toBe(0);
+  });
+
   it("KPR-351 R1: OPENAI_API_KEY env resolves when options.apiKey is absent", async () => {
     process.env.OPENAI_API_KEY = "sk-env";
     runMock.mockResolvedValueOnce(makeSdkResult() as never);
