@@ -2018,10 +2018,13 @@ export class AgentManager {
         threadId: ctx.threadId,
         timedOut: result.timedOut === true,
       });
-      // NO tokenData: aborted turns carry all-zero usage (the SDK result
-      // message never arrived) — set() without tokenData updates only
-      // sessionId/provider/updatedAt, preserving the prior turn's stats
-      // (session-store.ts set(): defaults land $setOnInsert-only).
+      // NO tokenData: deliberate. Post-KPR-401 an aborted turn CAN carry real
+      // partial usage (streamed-usage accumulator), but back-filling the
+      // session row's tokenData from a partial snapshot is a recorded
+      // follow-up (epic canon D15), not this write's job — set() without
+      // tokenData updates only sessionId/provider/updatedAt, preserving the
+      // prior turn's stats (session-store.ts set(): defaults land
+      // $setOnInsert-only).
       this.sessionStore.set(ctx.agentId, ctx.threadId, result.sessionId, route.provider);
     }
 
