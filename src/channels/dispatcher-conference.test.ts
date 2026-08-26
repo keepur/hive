@@ -444,8 +444,10 @@ describe("Conference channel routing", () => {
     const [reactorId, round1Item] = round1Call()!;
     expect(reactorId).toBe("jessica");
     // Peer reply framed in the terminal slot: responder display name + full reply text.
+    // The reply label must carry reactionTo.authorName (display name, not the bare
+    // agent id) — a plain toContain("Jasper") would also pass on the preamble alone.
     expect(round1Item.text).toContain("Agent response");
-    expect(round1Item.text).toContain("Jasper");
+    expect(round1Item.text).toContain("[Jasper just replied]:");
     // Human message absent (fetchThreadHistory is mocked to [], so it cannot leak
     // in via the transcript either) and the [New message] human-slot is gone.
     expect(round1Item.text).not.toContain("please weigh in on the Q3 roadmap");
@@ -476,6 +478,8 @@ describe("Conference channel routing", () => {
     // Derived deterministically from Dispatcher.buildMeetingPreamble's literal template,
     // with threadContext empty (fetchThreadHistory is mocked to [], so formatThreadContext
     // returns "" and .filter(Boolean) drops that segment from the join entirely).
+    // Pins the full preamble wording too, not just the join — KPR-389's preamble
+    // hardening will need to update this expectation deliberately.
     const expectedPreamble = `You are in a meeting in #conf-pin with Jasper.
 
 Meeting rules:
