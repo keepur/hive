@@ -219,6 +219,17 @@ describe("Conference channel routing", () => {
     dispatcher.setSlackAdapter(mockSlackAdapter as any);
   });
 
+  // Hoisted out of the delta describe (KPR-389 T8 needs it too — it only
+  // touches the classifier mock).
+  function soloClassifier() {
+    // Round-0 selects jasper; any reaction pass selects nobody.
+    return import("../agents/meeting-classifier.js").then(({ classifyMeetingMessage }) => {
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+    });
+  }
+
   it("routes conference channel message through classifier", async () => {
     const item = makeWorkItem({
       text: "Jasper, what's the engineering status?",
@@ -536,6 +547,92 @@ Meeting rules:
     expect(quoted.some((p) => NON_RESPONSE_PATTERNS.some((rx) => rx.test(p!.trim())))).toBe(true);
   });
 
+  describe("round-1 kill suppression (KPR-389 D5)", () => {
+    const zeroUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      contextWindow: 0,
+      costUsd: 0,
+      durationMs: 100,
+    };
+    function turn(overrides: Record<string, unknown> = {}) {
+      return {
+        finalMessage: "Agent response",
+        newSessionId: "s2",
+        usage: zeroUsage,
+        errors: [] as string[],
+        llmMs: 0,
+        toolMs: 0,
+        toolCalls: 0,
+        toolSummary: null,
+        streamed: false,
+        compactions: 0,
+        ...overrides,
+      };
+    }
+    async function twoAgentClassifier() {
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+    }
+    function confItem(threadId: string) {
+      return makeWorkItem({
+        text: "Jasper, and Jessica, please weigh in",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kill" },
+        threadId,
+        meta: { slackTs: "1700.0001" },
+      });
+    }
+
+    it.each([
+      ["aborted", { aborted: true }],
+      ["timedOut", { timedOut: true, aborted: true }],
+    ])("killed round-1 reaction (%s) never delivers; mark untouched for the reactor", async (_label, flags) => {
+      await twoAgentClassifier();
+      agentManager.runWorkItemTurn
+        .mockResolvedValueOnce(turn()) // jasper round-0: real reply
+        .mockResolvedValueOnce(turn({ finalMessage: "", ...flags })); // jessica round-1: killed
+      await dispatcher.dispatch(confItem(`conf-kill-${_label}`));
+      await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
+      expect(adapter.deliver).toHaveBeenCalledTimes(1); // only jasper's round-0 reply
+      expect(adapter.deliver.mock.calls[0][0].agentId).toBe("jasper");
+      expect(agentManager._sessionStore.setMeetingMark).not.toHaveBeenCalledWith(
+        "jessica",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it("errored round-1 reaction WITH text still delivers (exit-code-1 convention)", async () => {
+      await twoAgentClassifier();
+      agentManager.runWorkItemTurn
+        .mockResolvedValueOnce(turn())
+        .mockResolvedValueOnce(turn({ finalMessage: "Real answer with a warning", errors: ["exit 1"] }));
+      await dispatcher.dispatch(confItem("conf-kill-errtext"));
+      await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(adapter.deliver).toHaveBeenCalledTimes(2));
+      expect(adapter.deliver.mock.calls[1][0].text).toBe("Real answer with a warning");
+    });
+
+    it("control: a killed ROUND-0 turn keeps today's delivery behavior (filler delivered)", async () => {
+      await soloClassifier(); // round-0 jasper only, reaction pass selects nobody
+      agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ finalMessage: "", aborted: true }));
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, next steps?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-kill-r0" },
+          threadId: "conf-kill-r0",
+          meta: { slackTs: "1700.0002" },
+        }),
+      );
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe("_No response._");
+    });
+  });
+
   describe("delta context injection (KPR-388)", () => {
     // NOTE: continuation lines are deliberately flush-left inside the
     // backticks — the preamble byte pin breaks on any leading whitespace.
@@ -570,15 +667,6 @@ Meeting rules:
         timestamp: new Date(Date.now() - (e.minAgo ?? 5) * 60_000),
         isBot: e.isBot ?? false,
       }));
-
-    function soloClassifier() {
-      // Round-0 selects jasper; any reaction pass selects nobody.
-      return import("../agents/meeting-classifier.js").then(({ classifyMeetingMessage }) => {
-        (classifyMeetingMessage as any)
-          .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
-          .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
-      });
-    }
 
     const THREE_MSG_HISTORY = () =>
       makeHistory([

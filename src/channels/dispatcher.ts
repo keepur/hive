@@ -2,7 +2,13 @@ import { createLogger } from "../logging/logger.js";
 import type { WorkItem, WorkResult } from "../types/work-item.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
 import { isBroadcastCapable } from "./channel-adapter.js";
-import type { AgentManager, TurnContext, TurnResult, SpawnTurnStreamCallback } from "../agents/agent-manager.js";
+import {
+  conferenceRoundOf,
+  type AgentManager,
+  type TurnContext,
+  type TurnResult,
+  type SpawnTurnStreamCallback,
+} from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
@@ -323,6 +329,16 @@ export class Dispatcher {
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
+      // KPR-389 D5b: single-dispatch leg of the round-1 kill suppression —
+      // reachable only by replayed reactions (live conference turns always
+      // route via dispatchToAgent). Discriminator is the meta (replay
+      // `resolved` carries no conference fields). Delivery-only suppression:
+      // recordTurnSuccess below still runs, so replay → done resolution is
+      // unharmed. Text-bearing kills DELIVER here, unlike the fan-out leg —
+      // replay is the last delivery chance. No error arm: an errored replay
+      // already resolved via resolveReplayRealFailure above.
+      const killedReaction = conferenceRoundOf(item) === 1 && (runResult.aborted || runResult.timedOut) && !trimmedText;
+
       if (isNonResponse) {
         log.info("Non-response suppressed", {
           agentId,
@@ -330,6 +346,13 @@ export class Dispatcher {
           text: trimmedText,
           costUsd: runResult.costUsd,
           durationMs: runResult.durationMs,
+          conferenceRound: conferenceRoundOf(item),
+        });
+      } else if (killedReaction) {
+        log.info("Round-1 reaction suppressed on replay (killed)", {
+          agentId,
+          aborted: runResult.aborted,
+          timedOut: runResult.timedOut,
         });
       } else {
         const workResult: WorkResult = {
@@ -1085,11 +1108,31 @@ export class Dispatcher {
         }
       }
 
+      // KPR-389 D5: a killed reaction is silent — never post filler into the
+      // meeting. Keys on the in-memory ResolvedAgent (replay items never carry
+      // conference fields here — they take the single-dispatch leg, D5b). The
+      // early return deliberately skips recordTurnSuccess: a killed turn is
+      // not evidence of provider recovery (the KPR-307 episode ends on the
+      // next genuinely successful turn). An errored reaction WITH text still
+      // delivers (exit-code-1 convention — may be a real answer + warning).
+      if (
+        resolved.conferenceRound === 1 &&
+        (runResult.aborted || runResult.timedOut || (runResult.error && !runResult.text.trim()))
+      ) {
+        log.info("Round-1 reaction suppressed (killed/errored)", {
+          agentId,
+          aborted: runResult.aborted,
+          timedOut: runResult.timedOut,
+          error: runResult.error?.slice(0, 120),
+        });
+        return;
+      }
+
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
       if (isNonResponse) {
-        log.info("Non-response suppressed (fan-out)", { agentId });
+        log.info("Non-response suppressed (fan-out)", { agentId, conferenceRound: resolved.conferenceRound });
       } else {
         const workResult: WorkResult = {
           text: runResult.text || "_No response._",
