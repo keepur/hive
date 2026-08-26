@@ -54,6 +54,7 @@
 | T6 | `dispatcher-conference.test.ts` | C4 structural guard | Every double-quoted phrase extracted from real `buildMeetingPreamble` output; ≥1 matches a local mirror of `NON_RESPONSE_PATTERNS` |
 | T7/T7b/T7c | `agent-manager.test.ts` | D6 telemetry | round-1 turn: `record()` receives `conferenceRound: 1, injectionMode, resumedSession: true, durationMs/llmMs/toolMs/toolCalls, effort: "low"`; activity record carries `conferenceRound: 1`; DM turn: perf fields present, conference keys **absent**; aborted reaction: telemetry skipped, activity still round-tagged |
 | T8 | `dispatcher-conference.test.ts` | D5 fan-out kill suppression (aborted + timedOut variants) + errored-with-text delivers + round-0 control | killed round-1 ⇒ zero `deliver` for the reactor, mark untouched; killed round-0 still delivers `"_No response._"` (today's behavior) |
+<!-- reviewer note (plan-review r1): the kill tests' deliver-count assert runs synchronously after waitFor(runWorkItemTurn × 2); with the all-mock harness this is safe, but waiting additionally on a post-turn signal (e.g. jasper's setMeetingMark call, as the existing :991 pin does) makes the negative airtight — implementer may add it. -->
 | T8b | `dispatcher.test.ts` (outage describe) | D5b replay leg | killed replayed reaction ⇒ no `deliver`, `store.release(id, agent, "done")` **still called** (`recordTurnSuccess` intact); text-bearing kill delivers; real-text control delivers |
 | T9 | `dispatcher.test.ts` | Replay shaping continuity | item reaching `runWorkItemTurn` retains `meta.conferenceRound === 1` through the pinned path; fan-out guard did not fire (delivery still happens for a good replay) |
 | T10 | `agent-manager.test.ts` | `conferenceRoundOf` table | `0→0`, `1→1`, `"1"→undefined`, `2→undefined`, `undefined→undefined`, missing meta→undefined |
@@ -485,7 +486,7 @@ Meeting rules:
   }
 ```
 
-- [ ] **3.2 T5a — C6 pin update (deliberate)** — dispatcher-conference.test.ts:501–510: replace `expectedPreamble` with the same 8-line body (channel `conf-pin`, name `Jasper`), commented:
+- [ ] **3.2 T5a — C6 pin update (deliberate)** — dispatcher-conference.test.ts:501–510: replace `expectedPreamble` with the same body (header + blank + rules header + 7 bullets; channel `conf-pin`, name `Jasper`) — the literal below is authoritative, commented:
 
 ```ts
     // KPR-389 D4: deliberate C6 pin update — this is the only ticket licensed
@@ -508,7 +509,8 @@ Meeting rules:
 - [ ] **3.4 Stale-literal grep** — confirm no other embedding of the old preamble text:
 
 ```bash
-grep -rn "If you have nothing meaningful to add, respond with" src/ docs/ seeds/ || echo CLEAN
+grep -rn "If you have nothing meaningful to add, respond with" src/ seeds/ || echo CLEAN
+# scoped to src/ + seeds/ — docs/ keeps two permanent historical hits (kpr-388-plan.md quoting the old preamble, and this plan itself); CLEAN is expected only for the scoped form
 ```
 
   Expected: `CLEAN` after the edits (the old preamble line is the only user of that exact wording). Note the C3 terminal slot at dispatcher.ts:1020–1023 uses the DIFFERENT phrase `If you have nothing to add, respond with "No response needed."` ("nothing to add", not "nothing meaningful to add") — it will not match this grep, is C3-byte-intact, and must NOT be touched.
@@ -907,7 +909,7 @@ Behavior-preserving expected-PASS set (must stay green on every revert EXCEPT it
 - [ ] **7.1** `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` — expect exit 0 (typecheck + lint + format + full vitest). If Prettier rewrites the new template literals, re-run the byte-pin suites afterward (flush-left continuation lines must survive formatting — template-literal interiors are not reformatted by Prettier, but verify).
 - [ ] **7.2** `npm run check:bundle` — expect bundle + all 4 guards green (no new externals were introduced; this is belt-and-braces).
 - [ ] **7.3 `docs/providers.md` check** — read row 12 + footnote 12. **Conclusion (state in PR body for reviewer confirmation, per spec):** no edit required. Row 12's claude cell ("full — per-turn classifier, catalog-driven") describes provider *capability*; KPR-389 skips the classifier only for round-1 conference reaction turns as a hive turn-shaping policy, and the Lane B "effort unchanged on reactions" is the pre-existing constructor-time-suffix contract, not a new behavioral divergence. `maxTurns`/`timeoutMs` clamping uses the existing per-turn resource-limits channel footnote 10 already documents. If the reviewer disagrees, the fix is a one-line footnote-12 addendum — file it as a review fix, not a scope change.
-- [ ] **7.4** Confirm the diff touches ONLY: `src/channels/dispatcher.ts`, `src/agents/agent-manager.ts`, `src/agents/turn-telemetry.ts`, `src/activity/types.ts`, `src/channels/dispatcher-conference.test.ts`, `src/channels/dispatcher.test.ts`, `src/agents/agent-manager.test.ts` (`git diff --stat 5029b07`). Anything else = scope leak — stop and re-check.
+- [ ] **7.4** Confirm the diff touches ONLY: `src/channels/dispatcher.ts`, `src/agents/agent-manager.ts`, `src/agents/turn-telemetry.ts`, `src/activity/types.ts`, `src/channels/dispatcher-conference.test.ts`, `src/channels/dispatcher.test.ts`, `src/agents/agent-manager.test.ts` (`git diff --stat 5029b07 -- src/`). Anything else under src/ = scope leak — stop and re-check. (Unscoped diff also shows the plan/manifest docs commits — expected, not a leak.)
 
 ---
 
