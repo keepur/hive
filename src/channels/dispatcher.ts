@@ -1010,8 +1010,13 @@ export class Dispatcher {
     let effectiveItem = item;
     if (resolved.conferenceMode) {
       // KPR-387: round-1 reaction turns are framed against the peer reply — the
-      // original human message is never re-presented in the terminal slot (it
-      // remains available via the re-fetched transcript in threadContext).
+      // original human message is never re-presented in the terminal slot. It
+      // remains reachable via session ∪ injected context (KPR-388 generalizes
+      // the old re-fetched-transcript guarantee): a round-1 reactor was never a
+      // round-0 responder for this trigger (C1/C2), so its mark predates the
+      // triggering message — the message is in its delta, or already in its
+      // session by the covering invariant. A reactor with no session/mark gets
+      // the full transcript directly.
       const newMessageSegment = resolved.reactionTo
         ? `[${resolved.reactionTo.authorName} just replied]:\n${resolved.reactionTo.text}\n\n` +
           `React to ${resolved.reactionTo.authorName}'s reply if you have something to add. ` +
@@ -1054,6 +1059,27 @@ export class Dispatcher {
       if (this.outage && effectiveItem.meta?.outageReplay && runResult.error) {
         await this.resolveReplayRealFailure(effectiveItem, agentId, adapter, runResult.error);
         return;
+      }
+
+      // KPR-388: meeting-continuity mark bookkeeping. Sits AFTER the outage
+      // gates (a queued/fast-failed turn must not touch the mark) and OUTSIDE
+      // the isNonResponse branch below — a suppressed turn consumed its
+      // injection all the same (C2's "responded or selected" spirit).
+      // Error/aborted turns leave the mark untouched: session absorption is
+      // unknown, and a stale-low mark only over-includes next turn
+      // (duplication, never a gap — covering invariant, spec §5). Both store
+      // methods are withRetry fail-soft and never throw.
+      if (resolved.conferenceMode && !runResult.error && !runResult.aborted) {
+        const sessionStore = this.agentManager.getSessionStore();
+        if (resolved.injectionMode === "delta" && runResult.resumedSession === false) {
+          // Delta went into a fresh session — continuity broke after
+          // injection was baked. Clear the mark: the NEXT turn injects the
+          // full transcript and heals (same-turn re-injection is impossible
+          // by construction — retries reuse the already-shaped prompt).
+          await sessionStore.clearMeetingMark(agentId, threadId);
+        } else if (resolved.injectionHighWaterTs) {
+          await sessionStore.setMeetingMark(agentId, threadId, resolved.injectionHighWaterTs);
+        }
       }
 
       const trimmedText = runResult.text.trim();
