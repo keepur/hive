@@ -2761,6 +2761,10 @@ Two temporary reverts of load-bearing new behavior; paste the observed failing t
 
 ---
 
+## Final-round advisory (caught-by: plan-review/2/fable — apply during implementation, no re-review needed)
+
+In `auditInstalledProviderDecls` (doctor static audit), also `seen.set(decl.id, plugin)` for **invalid** decls, so audit collision detection keys on declaration order regardless of validity — mirroring the runtime's `pluginOwnerOf`. Without this, the doubly-degenerate corner (first registrant invalid → `broken`; second plugin declares the same id validly) renders an **ok** doctor row for the second plugin while turns fail with the first plugin's reason. One line + adjust the audit's collision assertion if the corner is added as a test case (optional).
+
 ## Execution Handoff
 
 Execute tasks in order (0→11); each of Tasks 1–9 is one commit; the walking session owns the plan-file commit and the PR. Inner-loop suites per task are listed in each verify block; the full gate runs once at Task 11 (and any time a task's verify surprises).
