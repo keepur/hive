@@ -2217,7 +2217,7 @@ describe("AgentManager", () => {
       it("KPR-400 F1: acquire meta deadlineMs ≥ the opus tier limit when the agent has no explicit timeoutMs", async () => {
         registry._agents.set(
           "agent-opus",
-          makeAgentConfig({ id: "agent-opus", name: "OpusAgent", model: "claude-opus-4-5" }),
+          makeAgentConfig({ id: "agent-opus", name: "OpusAgent", model: "claude-opus-4-7" }),
         );
         const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
         mockRunnerSend.mockResolvedValueOnce(makeRunResult());
