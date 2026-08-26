@@ -1,7 +1,7 @@
 # KPR-387 — Conference reaction dispatch: exclude round-0 responders; frame reactions against the peer reply
 
 **Epic:** KPR-386 (meeting mode) — first child.
-**Status:** DRAFT (spec-drafter output, pre-plan).
+**Status:** spec-ready (spec review clean round 1, fable; advisory notes folded in).
 **Decision-register canon:** none exists yet — KPR-386 is a pre-register epic and this is its first child. Noted per contract; not a blocker.
 
 ## TL;DR
@@ -80,6 +80,8 @@ Why this is sufficient with **no change** to the exclusion logic:
 
 The existing `respondingAgentId` skip (line 1241) becomes redundant for the triggering agent but stays — harmless, and it protects the (theoretical) `humanTs`-undefined path where nothing was recorded.
 
+Note the classifier's all-roster fallback paths (no API key, call failure, parse failure all return every roster member as round-0 responders): under this fix those paths record the whole roster and therefore suppress all reactions for that trigger. That is coherent — everyone already answered — but it is a deliberate consequence the tests should not trip over.
+
 **Timing semantics (decision):** recording happens at *selection* time, not completion time. Consequence: a round-0 primary whose turn errors or is suppressed remains excluded from reacting on that `humanTs`. This is intentional — it is exactly the suppressed-burn case from the incident (the agent already had its shot at this trigger), and it matches the Gate 1 delegated assumption.
 
 ### 2. Reframe the round-1 dispatch against the peer reply
@@ -150,10 +152,12 @@ The human message is not lost: round-1 `threadContext` is re-fetched *after* the
 
 Extend `src/channels/dispatcher-conference.test.ts` (tests live beside source per repo convention). The existing harness (mock registry with jasper/river/jessica, mocked `classifyMeetingMessage`, mock slack adapter) already supports both tests.
 
+**Async-drain hazard (both new tests):** `triggerConferenceReactions` is fire-and-forget at its call site (dispatcher.ts:1050 — `.catch`, not awaited), so `await dispatcher.dispatch(item)` returns before any reaction-pass classifier call or round-1 `runWorkItemTurn` happens. Both tests must drain the in-flight pass (e.g. `vi.waitFor` on the asserted mock call / microtask flush) or they pass vacuously; the negative-verify step is the backstop that would expose a vacuous test.
+
 1. **Round-0 responders excluded from the reaction roster.** Mention Jasper, River, and Jessica in a `conf-*` item; round-0 classifier returns `["jasper", "river"]`; reaction-classifier calls return `[]` (or capture-only). Assert every reaction-pass `classifyMeetingMessage` call receives a roster containing **only** `jessica` — neither `jasper` nor `river` — and that `runWorkItemTurn` is invoked at most once per agent for the trigger. (Pre-fix: River appears in the roster of the reaction pass triggered by Jasper's reply, and vice versa.)
-2. **Round-1 prompt frames the peer reply.** Round-0 returns `["jasper"]`; the reaction classifier (second call) returns `["jessica"]`. With `fetchThreadHistory` mocked to `[]`, assert the round-1 `runWorkItemTurn` item (`meta.conferenceRound === 1`) has text that (a) contains the mocked round-0 response text (`"Agent response"`) and the responder's display name (`"Jasper"`), and (b) does **not** contain the original human message text and does not end with the `[New message]:\n<human text>` pattern. (Pre-fix: the text ends with the human message and never contains the peer reply.)
+2. **Round-1 prompt frames the peer reply.** The trigger message must mention both Jasper and Jessica (if only Jasper is mentioned, `peerMembers` is empty and `triggerConferenceReactions` returns at line 1254 before the reaction classifier is ever called). Round-0 returns `["jasper"]`; the reaction classifier (second call) returns `["jessica"]`. With `fetchThreadHistory` mocked to `[]`, assert the round-1 `runWorkItemTurn` item (`meta.conferenceRound === 1`) has text that (a) contains the mocked round-0 response text (`"Agent response"`) and the responder's display name (`"Jasper"`), and (b) does **not** contain the original human message text and does not end with the `[New message]:\n<human text>` pattern. (Pre-fix: the text ends with the human message and never contains the peer reply.)
 3. **Negative verify** (per `feedback_negative_verify_regression_tests`): with both fixes reverted (stash/`git checkout` of the dispatcher hunks), run the two new tests and confirm both fail; restore and confirm green. Record the evidence in the PR.
-4. **Regression sweep:** full `npm run check` — in particular the five existing conference tests must stay green (none asserts the pre-fix defective behavior: the fan-out test suppresses reactions via empty classifier results, and the round-0 `[New message]` framing tests only cover `conferenceRound: 0` items, which are untouched).
+4. **Regression sweep:** full `npm run check` — in particular the six existing tests in the file (five conference-path + one negative-routing) must stay green (none asserts the pre-fix defective behavior: the fan-out test suppresses reactions via empty classifier results, and the round-0 `[New message]` framing tests only cover `conferenceRound: 0` items, which are untouched).
 
 ## Open questions
 
