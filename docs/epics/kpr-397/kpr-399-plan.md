@@ -800,6 +800,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
         // openai route + same string + sessionId → no retry: server-resumable
         // is not this arm's semantics, and the string does not match the
         // KPR-350 arm's matcher either (mutual exclusivity, both directions).
+        // NOTE: the pre-existing KPR-313 churn-mint warn ("Skipping session
+        // persist — errored turn returned a different id…") also fires here
+        // (errored result id "resp-x" ≠ resumed "resp-old") — expected and
+        // harmless to these assertions.
         registry._agents.set(
           "openai-pilot",
           makeAgentConfig({ id: "openai-pilot", name: "OP", model: "openai/gpt-5.4-mini", coreServers: [] }),
@@ -841,7 +845,7 @@ git diff HEAD~1 HEAD -- src/agents/agent-manager.ts | git apply -R
 SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/agent-manager.test.ts
 ```
 
-Expected: **failures confined to the two new KPR-399 describes** — at minimum: the new-direction persist row, all three D1-signal rows, the operator-abort row, the same-id TTL-refresh row, the Lane A inheritance row, the re-entry-preference row (all persist nothing on pre-fix code), and every self-heal row (no retry fires: single runner call / errors surface / no "resume rejected" warn). Rows that pass both ways — deliberately: the fail-closed row, the empty-sessionId row, the mint-belt different-id row, the C3 pins, the re-scoped zero-progress legacy row (Task 3's test-file change, not reverted). Every pre-existing test still passes. If the new-direction rows do NOT fail here, stop — the tests are not pinning the behavior change; fix the tests.
+Expected: **failures confined to the two new KPR-399 describes** — at minimum: the new-direction persist row, all three D1-signal rows, the operator-abort row, the same-id TTL-refresh row, the Lane A inheritance row, the re-entry-preference row (all persist nothing on pre-fix code), and these self-heal rows: both "retries exactly once" variants (single runner call on pre-fix code), "breaker record-once" (pre-fix records the rejection's `non-provider` fault, not `success`), and "single retry" (only one runner call, not two). Rows that pass both ways — deliberately: the fail-closed row, the empty-sessionId row, the mint-belt different-id row, the C3 pins, the re-scoped zero-progress legacy row (Task 3's test-file change, not reverted), **and the self-heal "gating" row** — it pins the arm's ABSENCE conditions (no retry without a sessionId / on openai semantics / on an auth sentinel), all of which hold on pre-fix code too (no arm ⇒ no retry, and no "resume rejected" warn exists either way). Every pre-existing test still passes. If the new-direction rows do NOT fail here, stop — the tests are not pinning the behavior change; fix the tests.
 
 Restore and confirm:
 
@@ -866,9 +870,11 @@ git commit -m "test(agent-manager): KPR-399 pins — persist-on-abort both direc
 
 Negative-verified: with Task 3's agent-manager.ts diff reverse-applied, the
 new-direction persist rows, D1-signal rows, operator-abort row, Lane A
-inheritance row, re-entry-preference row, and every self-heal row fail on
-pre-fix code; fail-closed / C3 / mint-belt rows pass either way, and every
-pre-existing row passes both ways.
+inheritance row, re-entry-preference row, and the retry-firing self-heal
+rows (both retries-exactly-once variants, breaker record-once, single
+retry) fail on pre-fix code; fail-closed / C3 / mint-belt rows and the
+self-heal gating row (absence conditions hold pre-fix too) pass either
+way, and every pre-existing row passes both ways.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
@@ -902,4 +908,4 @@ Expected: exactly `src/agents/provider-adapters/error-classification.ts`, `src/a
 - **[Task 3, Step 3]:** the second Edit anchor (`preCompactTokens: result.preCompactTokens,` + `});` + two closing braces) is unique as a four-line block — the other `preCompactTokens: result.preCompactTokens,` occurrence in the file (the TurnResult return literal, ~L1937) has different surrounding lines. If an exact-match edit tool complains, widen the anchor upward to include `contextWindow: result.contextWindow,`.
 - **[Task 4, Step 1]:** several new `it(...)` lines and `makeRunResult({...})` literals exceed typical print width; the Step 2 `prettier --write` will rewrap them before commit — do not treat the reflow as a deviation.
 - **[Task 4]:** the `it.each` callbacks destructure `_label` unused — the repo's existing suites use the same pattern (KPR-398 block in `error-classification.test.ts`), so ESLint accepts it; if `npm run check` flags it anyway, fix at Task 5.
-- **[Matcher strings]:** `UNKNOWN_SESSION` / `DANGLING_TOOL_USE` are docs-sourced stand-ins (⚠A3). If the deliver lane's V4 captures a different production string, refine `isClaudeResumeLoadError` + its pins in the same change — that refinement is in-contract (KPR-350 precedent), not scope creep.
+- **[Matcher strings]:** `UNKNOWN_SESSION` / `DANGLING_TOOL_USE` are docs-sourced stand-ins (⚠A3), deliberately duplicated at **two sites in different files**: `src/agents/provider-adapters/error-classification.test.ts` (Task 2 describe) and `src/agents/agent-manager.test.ts` (Task 4 self-heal describe). If the deliver lane's V4 captures a different production string, refine `isClaudeResumeLoadError` + the literals at **both** sites in the same change — that refinement is in-contract (KPR-350 precedent), not scope creep.
