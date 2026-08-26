@@ -1,7 +1,7 @@
 # KPR-388 — Delta context injection keyed to meeting continuity
 
 **Epic:** KPR-386 (meeting mode) — second child, follows merged KPR-387 (@ 3896a24).
-**Status:** DRAFT (spec-drafter output; pending spec review).
+**Status:** spec-ready (spec review clean r1, fable; advisory notes folded in).
 **Decision-register canon:** C1–C6 (from KPR-387) bind this spec; interactions resolved in §Design/6 and §Canon.
 
 ## TL;DR
@@ -91,7 +91,7 @@ Decision (all three must hold for delta; else full):
 2. `ref.provider === agentManager.providerFor(agentId)` (else spawnTurn's KPR-313 guard will run the turn fresh with a handoff notice — full injection is the correct pairing);
 3. `ref.meetingLastSeenTs` present.
 
-- **Full mode:** `formatThreadContext(history, …)` unchanged, byte-for-byte (first-5 + last-100 pinning intact; C6 pin test green untouched). `injectionHighWaterTs` = max ts over the *included* (post-truncation) messages.
+- **Full mode:** `formatThreadContext(history, …)` unchanged, byte-for-byte (first-5 + last-100 pinning intact; C6 pin test green untouched). `injectionHighWaterTs` = max ts over the *included* (post-truncation) messages — additionally maxed with the trigger's `meta.slackTs` on round-0, same as delta mode (uniform rule, both modes: the terminal slot showed the trigger, so the session absorbed it; covers a fetch that raced the trigger message).
 - **Delta mode:** `delta = history.filter(m => parseFloat(m.ts) > parseFloat(mark))`, capped at the last 100 (same cap constant as full; no first-5 pin — the session has the opening by the covering invariant). Formatted with the same `author (ago): text` body but a delta header, e.g.:
 
   ```
@@ -103,7 +103,7 @@ Decision (all three must hold for delta; else full):
 
 `ResolvedAgent` carries `injectionMode` and `injectionHighWaterTs` alongside the now-per-agent `threadContext`. `dispatchToAgent`'s prompt assembly (the `contextPrefix` join and both terminal-slot branches) is **unchanged**.
 
-Slack ts comparison: raw `ts` strings compared via `parseFloat` (microsecond-precision decimal seconds, server-assigned, monotonic per channel), strictly-greater semantics. This requires `ThreadMessage` (slack-adapter.ts:19) to gain `ts: string` (from `msg.ts`), keeping the existing derived `timestamp: Date` for display — the Date's millisecond truncation is not collision-safe for the mark.
+Slack ts comparison: raw `ts` strings compared via `parseFloat` (microsecond-precision decimal seconds, server-assigned, monotonic per channel), strictly-greater semantics. This requires `ThreadMessage` (slack-adapter.ts:19) to gain `ts: string` (from `msg.ts`), keeping the existing derived `timestamp: Date` for display — the Date's millisecond truncation is not collision-safe for the mark. Carry the existing `msg.ts ?? "0"` posture into the new field knowingly: a hypothetical ts-less message gets `ts: "0"` and sorts permanently below any mark (delta-excluded). Slack always assigns ts, so this is a typing artifact, accepted.
 
 ### 3. Fresh-vs-resumed signal — `TurnResult.resumedSession`
 
@@ -147,6 +147,8 @@ Consequences checked against real timelines:
 - **Pre-lock staleness:** a second trigger reads the mark while the first turn is in flight; its delta over-includes the first turn's window. Duplication of one window, never a gap; the per-thread lock serializes the actual sessions.
 - **Concurrent fetch races:** a message that slips into a fetch mid-flight is either injected (and covered by the mark advance) or not fetched (ts > everything injected ⇒ > mark ⇒ next delta). No gap.
 - **Truncation gap:** a >100-message delta (or today's >105 full truncation) drops the middle; the mark still advances over the gap. This is exactly today's information loss, accepted identically.
+- **Mark regression is benign, not prevented:** "only advances" is the invariant's argument, not a write-side enforcement — a plain `$set` permits a late-ordered write to regress the mark. Any written value was covered by its turn's session, so regression errs toward duplication, never gaps. The plan may substitute numeric `$max` enforcement if preferred (note: ts is a decimal *string*; `$max` needs numeric handling).
+- **Compaction interaction (named deliberately):** today's full re-injection incidentally masks compaction's loss of old thread history; post-delta, a compacted session's older thread content survives only via the compaction summary. That is the design intent — trust session continuity — not an oversight.
 
 ### 6. Degradation paths — exhaustive
 
@@ -194,7 +196,7 @@ Unit tests beside source (repo convention). New pins get the negative-verify tre
 **`src/channels/dispatcher-conference.test.ts`** (mock `agentManager` gains `getSessionStore().get`, `providerFor`; `fetchThreadHistory` mock gains `ts` values):
 1. Delta injection: session ref with handle + matching provider + mark ⇒ prompt contains only `ts > mark` messages; **byte-exact delta-shape pin** (sibling of the C6 pin).
 2. Full injection on each read-side miss: no doc; empty-handle (codex-shaped) ref; provider mismatch (`providerFor` ≠ `ref.provider`); missing mark. Existing round-0 byte pin passes **unmodified** (C6 regression guard).
-3. Mark advance: `setMeetingMark` called with max injected ts (incl. trigger `slackTs` max-in on round-0) on success; also on a suppressed non-response turn; **not** called on error, aborted, or outage-queued turns.
+3. Mark advance: `setMeetingMark` called with max injected ts (incl. trigger `slackTs` max-in on round-0 — both injection modes) on success; also on a suppressed non-response turn; **not** called on error, aborted, or outage-queued turns.
 4. Mark clear: delta-injected turn with `resumedSession: false` ⇒ `clearMeetingMark`, no set.
 5. C3 interaction: round-1 reactor with mark predating the human message ⇒ delta contains the human message; reactor with no session ⇒ full transcript. Existing round-1 framing test passes unmodified (delta header must not match `[New message]:\n`).
 6. Empty delta ⇒ context segment dropped (join degenerates to the pinned empty-history shape).
