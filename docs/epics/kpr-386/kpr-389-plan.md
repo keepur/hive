@@ -54,10 +54,11 @@
 | T6 | `dispatcher-conference.test.ts` | C4 structural guard | Every double-quoted phrase extracted from real `buildMeetingPreamble` output; ≥1 matches a local mirror of `NON_RESPONSE_PATTERNS` |
 | T7/T7b/T7c | `agent-manager.test.ts` | D6 telemetry | round-1 turn: `record()` receives `conferenceRound: 1, injectionMode, resumedSession: true, durationMs/llmMs/toolMs/toolCalls, effort: "low"`; activity record carries `conferenceRound: 1`; DM turn: perf fields present, conference keys **absent**; aborted reaction: telemetry skipped, activity still round-tagged |
 | T8 | `dispatcher-conference.test.ts` | D5 fan-out kill suppression (aborted + timedOut variants) + errored-with-text delivers + round-0 control | killed round-1 ⇒ zero `deliver` for the reactor, mark untouched; killed round-0 still delivers `"_No response._"` (today's behavior) |
-<!-- reviewer note (plan-review r1): the kill tests' deliver-count assert runs synchronously after waitFor(runWorkItemTurn × 2); with the all-mock harness this is safe, but waiting additionally on a post-turn signal (e.g. jasper's setMeetingMark call, as the existing :991 pin does) makes the negative airtight — implementer may add it. -->
 | T8b | `dispatcher.test.ts` (outage describe) | D5b replay leg | killed replayed reaction ⇒ no `deliver`, `store.release(id, agent, "done")` **still called** (`recordTurnSuccess` intact); text-bearing kill delivers; real-text control delivers |
 | T9 | `dispatcher.test.ts` | Replay shaping continuity | item reaching `runWorkItemTurn` retains `meta.conferenceRound === 1` through the pinned path; fan-out guard did not fire (delivery still happens for a good replay) |
 | T10 | `agent-manager.test.ts` | `conferenceRoundOf` table | `0→0`, `1→1`, `"1"→undefined`, `2→undefined`, `undefined→undefined`, missing meta→undefined |
+
+<!-- reviewer note (plan-review r1): the kill tests' deliver-count assert runs synchronously after waitFor(runWorkItemTurn × 2); with the all-mock harness this is safe, but waiting additionally on a post-turn signal (e.g. jasper's setMeetingMark call, as the existing :991 pin does) makes the negative airtight — implementer may add it. -->
 
 ### Integration
 None new. The conference suites ARE the integration harness (dispatcher + mocked manager end-to-end through `dispatch()`); spawn shaping runs through real `spawnTurn`/`prepareSpawn` against mocked adapters. No live-Slack or live-provider tests (see Non-Required Rationale).
