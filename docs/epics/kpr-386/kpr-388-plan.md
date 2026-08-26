@@ -39,7 +39,7 @@
 ### Regression Surface
 
 - The **9 existing tests** in `dispatcher-conference.test.ts` must stay green with **zero edits** — in particular the round-0 byte-exact pin (C6) and the round-1 framing test (its `/\[New message\]:\n/` negative must not match the new delta header).
-- The **16 existing tests** in `session-store.test.ts` (normalization/scrub) — `normalizeRef` changes are additive; `toEqual` ignores `undefined`-valued keys, so existing shape assertions hold.
+- The **17 existing tests** in `session-store.test.ts` (14 plain `it` + one 3-case `it.each`) (normalization/scrub) — `normalizeRef` changes are additive; `toEqual` ignores `undefined`-valued keys, so existing shape assertions hold.
 - The full `agent-manager.test.ts` suite (spawnTurn, KPR-313 guard, KPR-350/351 self-heal, breaker) — `finalizeSpawnResult` gains a parameter at its single call site; no behavior change.
 - `dispatcher.test.ts` (outage/routing) — non-conference paths never reach the new code (gated on `conferenceMode`/`conf-` label).
 - `slack-adapter.test.ts` — `ThreadMessage.ts` is additive.
@@ -55,7 +55,7 @@ SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest r
 # expected after Task 6: Test Files 1 passed, Tests 23 passed (9 existing + 14 new)
 
 SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/session-store.test.ts
-# expected after Task 1: Tests 21 passed (16 existing + 5 new)
+# expected after Task 1: Tests 22 passed (17 existing + 5 new)
 
 SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/agent-manager.test.ts
 # expected after Task 3: all existing + 6 new pass
@@ -245,7 +245,7 @@ File: `src/agents/session-store.ts`
   cd /Users/mokie/github/hive-KPR-386
   npm run typecheck   # expected: exit 0
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/session-store.test.ts
-  # expected: Tests 21 passed (16 existing + 5 new)
+  # expected: Tests 22 passed (17 existing + 5 new)
   ```
 
 - [ ] **1g.** Commit:
@@ -966,7 +966,7 @@ Files: `src/channels/dispatcher.ts`, `src/channels/dispatcher-conference.test.ts
   }
   ```
 
-  No other test edits in this task — the 9 existing tests must pass **unmodified** (all agents unseeded ⇒ full mode ⇒ byte-identical output; the default `runWorkItemTurn` success now triggers `setMeetingMark` spy calls that nothing asserts on).
+  No other test edits in this task — the 9 existing tests must pass **unmodified** (all agents unseeded ⇒ full mode ⇒ byte-identical output). Note for Task 5: once the write side lands there, the default `runWorkItemTurn` success triggers `setMeetingMark` spy calls that nothing asserts on — expected.
 
 - [ ] **4i.** Verify:
 
@@ -1529,10 +1529,10 @@ Per `feedback_negative_verify_regression_tests`: prove the new regression tests 
 
   Expected FAILURES (record the list):
   - dispatcher: the delta byte pin; both mark-advance tests; the suppressed-non-response advance; the clear test; the C3-delta test; the empty-delta pin (old code injects the full transcript and never calls the mark spies).
-  - session-store: all 5 new tests (`setMeetingMark`/`clearMeetingMark` don't exist ⇒ TypeError; mark-surfacing `toEqual`s miss the key).
+  - session-store: 4 of the 5 new tests (`setMeetingMark`/`clearMeetingMark` don't exist ⇒ TypeError; the two mark-surfacing `toEqual`s miss the key). The scrub test is NOT among them — see expected passes.
   - agent-manager: all 6 `resumedSession` tests (`undefined` is neither `true` nor `false`).
 
-  Expected PASSES among the new tests (behavior-preserving pins — not vacuous; their bite pairs with the delta pin and the C6 sibling): the 4 miss-matrix cases, error/aborted-untouched, outage-untouched, round-1 no-session full. All 9+16 pre-existing tests must also pass. If any test expected to fail PASSES, it is vacuous — fix the test, do not proceed.
+  Expected PASSES among the new tests (behavior-preserving pins — not vacuous; their bite pairs with the delta pin and the C6 sibling): the 4 miss-matrix cases, error/aborted-untouched, outage-untouched, round-1 no-session full, and the session-store scrub test (pre-fix `normalizeRef`'s scrub branch already returns `{ sessionId: undefined, provider: undefined }`, satisfying its `toEqual` — it is a guard pin, not a regression test). All 9+17 pre-existing tests must also pass. If any test expected to fail PASSES, it is vacuous — fix the test, do not proceed.
 
 - [ ] **7c.** Restore and confirm green:
 
