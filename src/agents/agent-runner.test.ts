@@ -1180,6 +1180,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       openai: "mcp-bridge-candidate",
       gemini: "mcp-bridge-candidate",
       codex: "mcp-bridge-candidate",
+      grok: "mcp-bridge-candidate",
     });
   });
 
@@ -1376,6 +1377,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       openai: "requires-hive-bridge",
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
+      grok: "requires-hive-bridge",
     });
     // KPR-354 §D2: the entry carries the delegate's real external MCP config
     // (the same object buildAllServerConfigs resolves) and the catalog text
@@ -1431,6 +1433,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
         openai: "claude-only",
         gemini: "claude-only",
         codex: "claude-only",
+        grok: "claude-only",
       });
     }
   });
@@ -1456,6 +1459,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
         openai: "requires-hive-bridge",
         gemini: "requires-hive-bridge",
         codex: "requires-hive-bridge",
+        grok: "requires-hive-bridge",
       });
       expect(entry.schemas.kind).toBe("static");
       if (entry.schemas.kind === "static") {

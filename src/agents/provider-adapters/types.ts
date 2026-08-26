@@ -7,13 +7,13 @@ export type AgentProviderId = "claude" | "openai" | "gemini" | "codex" | "kimi" 
  * KPR-347: the native-lane (Lane B) adapter providers — the set whose
  * adapters run a provider SDK/API directly and need the hive bridge.
  * DELIBERATELY a literal union, NOT Exclude<AgentProviderId, "claude">:
- * Lane A providers (kimi/deepseek — child 1; grok — KPR-371) join
- * AgentProviderId but run
+ * Lane A providers (kimi/deepseek — child 1) join AgentProviderId but run
  * the Claude-lane runtime and must NEVER gain a compatibility column or a
  * bridge path. Growing this union is a Lane B replication child's explicit
- * one-line concern.
+ * one-line concern. Grok promoted from Lane A passthrough to Lane B native
+ * in KPR-392 — it was the KPR-371 Lane A row, now joins this union instead.
  */
-export type LaneBProviderId = "openai" | "gemini" | "codex";
+export type LaneBProviderId = "openai" | "gemini" | "codex" | "grok";
 
 /**
  * KPR-347 (epic §D3): per-provider session continuity semantics. Drives
