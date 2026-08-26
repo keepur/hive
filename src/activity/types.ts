@@ -31,4 +31,8 @@ export interface ActivityRecord {
   // Outcome
   streamed: boolean;
   error?: string;
+  /** KPR-401: sparse — set only when true, so aborted turns stop
+   * masquerading as free, instant, clean turns in the audit trail. */
+  aborted?: boolean;
+  timedOut?: boolean;
 }
