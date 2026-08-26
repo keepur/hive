@@ -586,6 +586,17 @@ Meeting rules:
         meta: { slackTs: "1700.0001" },
       });
     }
+    /**
+     * Deterministic barrier for the fire-and-forget reaction pass (plan-review
+     * r1 note). `waitFor(runWorkItemTurn × 2)` alone is NOT enough: everything
+     * downstream of the reactor's turn resolution — the D5 guard and the
+     * delivery it suppresses — is a pure microtask chain (all harness mocks
+     * resolve immediately, no timers), so the deliver-count assert can run
+     * before it. One macrotask boundary drains the whole chain, because the
+     * microtask queue is fully emptied before the next macrotask. Negative-
+     * verified: with the D5 guard disabled these tests fail in ~3ms.
+     */
+    const settleReactions = () => new Promise((r) => setTimeout(r, 0));
 
     it.each([
       ["aborted", { aborted: true }],
@@ -597,6 +608,7 @@ Meeting rules:
         .mockResolvedValueOnce(turn({ finalMessage: "", ...flags })); // jessica round-1: killed
       await dispatcher.dispatch(confItem(`conf-kill-${_label}`));
       await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
+      await settleReactions();
       expect(adapter.deliver).toHaveBeenCalledTimes(1); // only jasper's round-0 reply
       expect(adapter.deliver.mock.calls[0][0].agentId).toBe("jasper");
       expect(agentManager._sessionStore.setMeetingMark).not.toHaveBeenCalledWith(
