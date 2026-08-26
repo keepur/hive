@@ -1646,8 +1646,9 @@ export class AgentManager {
     // acquire site (KPR-306): SIGUSR1 hot-reload can remove the agent
     // between spawnTurn's registry pre-check and this point, and an
     // unguarded dereference would throw OUTSIDE the recorded try — skipping
-    // the breaker's record() and wedging a half-open probe permit for up to
-    // PROBE_STALE_MS. The degenerate route ({provider:"claude", model:""})
+    // the breaker's record() and wedging a half-open probe permit until the
+    // probe's own stale bound (deadlineMs + grace; 360s meta-less fallback —
+    // KPR-400). The degenerate route ({provider:"claude", model:""})
     // flows on instead; the turn then fails INSIDE the recorded try via
     // createProviderAdapter's `Unknown agent` throw (classifyThrown →
     // non-provider → never trips).
