@@ -1575,3 +1575,10 @@ Per `feedback_negative_verify_regression_tests`: prove the new regression tests 
 - **No** provider-adapter, `SESSION_SEMANTICS`, breaker, or outage-queue changes; no new collections, config keys, or indexes; no `$max` mark enforcement (plan-fixed: plain `$set`, regression benign per spec §5).
 - **No** changes to `sessions` TTL/`updatedAt` handling — the mark methods deliberately do not touch `updatedAt`.
 - Session-store `set()`/`delete()`/`clearAgent()`/scrub logic unchanged beyond the additive mark surfacing.
+
+---
+
+## Reviewer notes (plan-review r2, fable — advisory)
+
+- Task 7b: the C3-delta expected-FAIL manifests as a `vi.waitFor` **timeout**, not an assertion mismatch — don't mistake the slow failure for a harness problem when recording evidence.
+- C3-delta test: `setMeetingMark` also fires for jasper (round-0, same highwater); `toHaveBeenCalledWith("jessica", …)` tolerates this — never tighten to `toHaveBeenCalledTimes(1)`.
