@@ -84,7 +84,10 @@ export class OutageReplayProcessor {
   }
 
   /**
-   * Serial oldest-first drain (§5-2b). Outcomes are DISPATCHER-authored
+   * Serial class-ordered drain (§5-2b; KPR-400 F2: claimNext encapsulates
+   * the ordering — fast-fail-class docs before post-turn-fault-class docs,
+   * oldest-first within class, so the post-cooldown probe slot goes to the
+   * cheapest available real turn). Outcomes are DISPATCHER-authored
    * (§5-2g) — dispatch() returns void and never rethrows from turn failures,
    * so drain control re-reads the claimed doc's status (Finding 7 r2):
    * `pending` (fast-fail-again) stops the drain; done/expired/failed continue.

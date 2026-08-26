@@ -71,8 +71,22 @@ class FakeOutageCollection {
   async findOneAndUpdate(filter: any, update: any, options?: { sort?: Record<string, 1 | -1> }) {
     let candidates = this.docs.filter((d) => matches(d, filter));
     if (options?.sort) {
-      const [[key, dir]] = Object.entries(options.sort);
-      candidates = [...candidates].sort((a, b) => (a[key] < b[key] ? -dir : a[key] > b[key] ? dir : 0));
+      // KPR-400 (F2): multi-key sort, mirroring the ONE BSON type-ordering
+      // fact claimNext relies on — a missing/null field sorts BEFORE any
+      // string (documented Mongo behavior: null/missing < string), so
+      // legacy docs without enqueueOrigin claim with top priority (⚠A5).
+      const entries = Object.entries(options.sort);
+      candidates = [...candidates].sort((a, b) => {
+        for (const [key, dir] of entries) {
+          const aMissing = a[key] === undefined || a[key] === null;
+          const bMissing = b[key] === undefined || b[key] === null;
+          if (aMissing !== bMissing) return (aMissing ? -1 : 1) * dir;
+          if (aMissing && bMissing) continue;
+          if (a[key] < b[key]) return -dir;
+          if (a[key] > b[key]) return dir;
+        }
+        return 0;
+      });
     }
     const doc = candidates[0];
     if (!doc) return null;
@@ -114,6 +128,7 @@ function makeInput(overrides: Partial<OutageEnqueueInput> = {}): OutageEnqueueIn
     provider: "claude",
     workItem: makeWorkItem(),
     policy: "notify",
+    enqueueOrigin: "fast-fail", // KPR-400 (F2): required input field; harness default
     ...overrides,
   };
 }
@@ -244,5 +259,52 @@ describe("OutageQueueStore (KPR-307)", () => {
     expect(await store.statusOf("msg-1", "agent-a")).toBe("pending");
     expect(await store.statusOf("msg-1", "agent-b")).toBe("done");
     expect(await store.statusOf("nope", "agent-a")).toBeNull();
+  });
+});
+
+describe("OutageQueueStore — enqueue-origin replay ordering (KPR-400 F2)", () => {
+  it("claimNext prefers fast-fail-class docs, oldest-first within class", async () => {
+    // NEGATIVE-VERIFY prediction (Step 4): pre-fix claimNext sorts on
+    // enqueuedAt alone (and enqueue writes no origin) — the burner (oldest)
+    // claims first and this row fails.
+    const { store, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "burner", enqueueOrigin: "post-turn-fault" })); // T0 — trip-crosser
+    advance(60_000);
+    await store.enqueue(makeInput({ itemId: "ff-old", enqueueOrigin: "fast-fail" })); // T1
+    advance(60_000);
+    await store.enqueue(makeInput({ itemId: "ff-new", enqueueOrigin: "fast-fail" })); // T2
+    expect((await store.claimNext())?.itemId).toBe("ff-old"); // class first, then age
+    expect((await store.claimNext())?.itemId).toBe("ff-new");
+    expect((await store.claimNext())?.itemId).toBe("burner"); // deadline burner replays last
+    expect(await store.claimNext()).toBeNull();
+  });
+
+  it("legacy doc (field absent) claims first — BSON missing < string (deploy-mid-outage window, ⚠A5)", async () => {
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "ff", enqueueOrigin: "fast-fail" })); // T0
+    advance(60_000);
+    await store.enqueue(makeInput({ itemId: "legacy" })); // T1 — then strip the field to simulate pre-KPR-400
+    delete fake.docs.find((d) => d.itemId === "legacy")!.enqueueOrigin;
+    expect((await store.claimNext())?.itemId).toBe("legacy"); // missing sorts before "fast-fail" despite being newer
+    expect((await store.claimNext())?.itemId).toBe("ff");
+  });
+
+  it("constant-ordering pin: 'fast-fail' < 'post-turn-fault' as strings (load-bearing sort, ⚠A2)", () => {
+    // The ascending index/sort on the origin string IS the class
+    // preference. Renaming either literal breaks replay ordering silently —
+    // this row makes it loud. (A numeric weight field is the sanctioned
+    // substitution if a reviewer prefers it.)
+    expect("fast-fail" < "post-turn-fault").toBe(true);
+  });
+
+  it("origin is $setOnInsert-immutable: double-enqueue and back-to-pending release never touch it", async () => {
+    const { store, fake } = makeStore();
+    await store.enqueue(makeInput({ enqueueOrigin: "fast-fail" }));
+    await store.enqueue(makeInput({ enqueueOrigin: "post-turn-fault" })); // same (itemId, agentId) — no-op
+    expect(fake.docs).toHaveLength(1);
+    expect(fake.docs[0].enqueueOrigin).toBe("fast-fail");
+    await store.claimNext();
+    await store.release("msg-1", "agent-a", "pending", "circuit still open"); // fast-failed replay path
+    expect(fake.docs[0].enqueueOrigin).toBe("fast-fail"); // spec §Edge-7: class survives release
   });
 });

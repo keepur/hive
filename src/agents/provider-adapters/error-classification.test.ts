@@ -291,3 +291,16 @@ describe("KPR-398 — deadline abort with observed progress", () => {
     ).toEqual({ outcome: "fault", kind: "turn-deadline", message: TURN_DEADLINE_SUBTYPE });
   });
 });
+
+describe("KPR-400 D9 — error-string attenuation on the with-progress deadline arm (pin)", () => {
+  it("a real error string coexisting with deadline+progress becomes the message verbatim (error wins over synthesized evidence)", () => {
+    // Unreachable on the Claude deadline path today (error stays undefined;
+    // iterator closed, not thrown) — this pins the deliberate error-wins
+    // choice for any future caller that supplies both. Comment-only source
+    // change behind this row: negative-verify is degenerate by construction
+    // (no pre-fix state to fail against — KPR-401 Task 7 precedent).
+    expect(
+      classifyTurnResult({ error: "boom", timedOut: true, aborted: true, toolCalls: 1 }),
+    ).toEqual({ outcome: "fault", kind: "turn-deadline", message: "boom" });
+  });
+});
