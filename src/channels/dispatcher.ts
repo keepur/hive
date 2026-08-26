@@ -93,7 +93,9 @@ export class Dispatcher {
   private teamStore?: import("../team/team-store.js").TeamStore;
   private slackAdapter?: SlackAdapter;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
-  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — tracks which agents reacted in round 1
+  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents that responded or were
+  // selected to respond on this human message, either round (KPR-387): round-0
+  // primaries recorded at selection time, round-1 reactors at claim time.
   private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
@@ -1157,12 +1159,29 @@ export class Dispatcher {
       costUsd: classification.costUsd,
     });
 
+    // KPR-387: record round-0 responders so the reaction pass never re-selects a
+    // primary for the same triggering human message. Recorded at selection time —
+    // a primary whose turn errors or is suppressed stays excluded for this trigger
+    // (deliberate: kills the suppressed-turn burn; Gate 1 delegated assumption).
+    // Runs synchronously before any round-0 dispatch starts, so there is no race
+    // with a fast round-0 completion triggering the reaction pass.
+    const humanTs = item.meta?.slackTs as string | undefined;
+    if (humanTs && classification.respondAgentIds.length > 0) {
+      if (!this.meetingReactionTracker.has(threadId)) {
+        this.meetingReactionTracker.set(threadId, new Map());
+      }
+      const threadTracker = this.meetingReactionTracker.get(threadId)!;
+      const responded = threadTracker.get(humanTs) ?? new Set<string>();
+      for (const id of classification.respondAgentIds) responded.add(id);
+      threadTracker.set(humanTs, responded);
+    }
+
     const preamble = this.buildMeetingPreamble(item.source.label, rosterMembers);
 
     return classification.respondAgentIds.map((agentId) => ({
       agentId,
       conferenceMode: true,
-      conferenceHumanTs: item.meta?.slackTs as string,
+      conferenceHumanTs: humanTs,
       conferenceRound: 0,
       threadContext,
       meetingPreamble: preamble,
