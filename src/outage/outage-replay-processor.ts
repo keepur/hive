@@ -28,7 +28,13 @@ export class OutageReplayProcessor {
   ) {}
 
   start(): void {
-    // Boot recovery: crash between claim and release leaves `replaying` orphans (§7.1).
+    // Boot sweep (KPR-403): immediate pass — the first interval tick is 15s
+    // out. The recovery sweep also rides every tick() as its first step now;
+    // boot-only recovery (§7.1's original shape) stranded orphans younger
+    // than the bound at boot forever. This void call runs outside the tick
+    // guard and can pathologically overlap the first tick's drain on a slow
+    // boot query — the per-doc deadline bound (fresh claim ⇒ young ⇒
+    // skipped) plus the store's CAS write cover that window.
     void this.store
       .recoverStaleReplaying()
       .catch((err) => log.warn("Stale-replaying recovery failed", { error: String(err) }));
@@ -46,11 +52,22 @@ export class OutageReplayProcessor {
     }
   }
 
-  /** One poll cycle. Public for tests. Re-entrancy-guarded — a slow drain can outlive the interval. */
+  /** One poll cycle. Public for tests. Re-entrancy-guarded — a slow drain can
+   *  outlive the interval. Ordering is deliberate (KPR-403): sweep → expire →
+   *  drain, so a recovered over-age orphan is expired (with its batched
+   *  notice) in the same tick rather than replayed, and a recovered fresh
+   *  orphan is claimable by the same tick's drain. The guard also means the
+   *  folded sweep can never run while this process's own replay dispatch is
+   *  in flight — it structurally cannot see its own live claim. */
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      // KPR-403: periodic re-sweep — boot-only recovery stranded orphans
+      // younger than the bound at boot. Failure must not starve expire/drain.
+      await this.store
+        .recoverStaleReplaying()
+        .catch((err) => log.warn("Stale-replaying recovery failed", { error: String(err) }));
       await this.expireStale();
       await this.drain();
     } finally {
