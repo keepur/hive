@@ -2,7 +2,7 @@
 
 > **For agentic workers:** Use dodi-dev:implement to execute this plan.
 
-**Spec:** [kpr-393-spec.md](./kpr-393-spec.md) (approved, Gate 1 signed off) — the contract. Epic: KPR-385 (Decision Register canon C1–C17 binds). **Every anchor below verified against this worktree's HEAD `b51c496`.** All baselines in this plan were recorded by actually running the suites at that HEAD (Node 24 — see Commands).
+**Spec:** [kpr-393-spec.md](./kpr-393-spec.md) (approved, Gate 1 signed off) — the contract. Epic: KPR-385 (Decision Register canon C1–C17 binds). **Every anchor below verified against this worktree's HEAD `b51c496`.** All baselines in this plan were recorded by actually running the suites at that HEAD (reviewer re-verified identical counts on default Node 26 — no Node pinning needed; see Commands).
 
 **Delivery-tier input (plan author's view, reviewer classifies authoritatively): standard.** Two small additive surfaces — a static prompt section composed only by `buildProviderInstructions`, and a pure regex detector wired as one boolean at an existing record call — with every line of production and test code transcribed in this plan, zero shared-layer edits (no loop, no scaffold, no adapters), and the two pre-existing test-file deltas fully enumerated.
 
@@ -28,7 +28,7 @@
 - Unit: **required**
   - Scope: `src/agents/intent-trailer.test.ts` (new — detector positives/negatives/tail-window, fixtures seeded from the spec's transcript shapes); `src/agents/prefix-builder.provider.test.ts` (delta — section presence, order, joiner count, gate, three-clause content pin).
   - Reason: the detector and the prompt section are the ticket's two load-bearing surfaces; both are pure and fully deterministic.
-  - Harness: **existing** (plain vitest; the provider prefix suite's `makeInput`/`richInput` fixtures already cover every composition path).
+  - Harness: **existing** (plain vitest; the provider prefix suite's `richInputs()` fixture helper already covers every composition path).
   - Minimum assertions: the per-task lists in Tasks 1–2.
 
 - Integration: **required**
@@ -51,7 +51,7 @@
 
 ### Regression Surface
 
-- **Zero-expectation-edit suites (C10) — real baselines recorded at `b51c496` (Node 24, env stubs):**
+- **Zero-expectation-edit suites (C10) — real baselines recorded at `b51c496` (env stubs; counts identical on Node 24 and 26):**
   | Suite | Baseline |
   |---|---|
   | `src/agents/prefix-builder.golden.test.ts` | 12 passed |
@@ -68,7 +68,7 @@
 
 ### Commands
 
-- Node: run everything on Node 24 (dev mode on Node 26 is broken per CLAUDE.md; the default `node` on this Mac is v26): `export PATH="$HOME/.nvm/versions/node/v24.13.1/bin:$PATH"` first in each shell. `npm ci` already run in this worktree.
+- Node: default Node (v26) is fine for every command in this plan — CLAUDE.md's Node-26 breakage is tsx dev mode only, which no plan command uses; the plan reviewer reproduced all baselines on v26. `npm ci` already run in this worktree.
 - Full gate: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check`
 - Targeted inner loop: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/intent-trailer.test.ts src/agents/prefix-builder.provider.test.ts src/agents/prefix-builder.golden.test.ts src/agents/agent-manager.test.ts src/agents/provider-adapters/ src/activity/activity-logger.test.ts`
 - Per-file count verification: `... npx vitest run <file>` and read the `Tests  N passed` line — vitest runtime output, never grep (`it.each` expansion).
@@ -97,7 +97,6 @@ src/agents/agent-manager.test.ts               MODIFIED  (enumerated delta #2)
 
 ### Task 0: Baseline pin
 
-- [ ] `export PATH="$HOME/.nvm/versions/node/v24.13.1/bin:$PATH"` and confirm `node --version` prints `v24.13.1`.
 - [ ] Confirm worktree HEAD: `git -C /Users/mokie/github/lane-kpr-393-mature rev-parse --short HEAD` → `b51c496` (or a later commit of this lane containing it).
 - [ ] Re-run the zero-edit baselines and confirm they match the table above:
   ```bash
@@ -496,7 +495,7 @@ Two temporary reverts of the load-bearing new behavior; paste the observed faili
 
 ### Task 5: Final gate, count verification, zero-diff audits
 
-- [ ] Full gate: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` → all green (Node 24 shell).
+- [ ] Full gate: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check` → all green.
 - [ ] Zero-edit suite counts match baselines exactly:
   ```bash
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run \
@@ -517,7 +516,7 @@ Two temporary reverts of the load-bearing new behavior; paste the observed faili
   #   src/agents/prefix-builder.ts
   # (docs/providers.md absent = no parity-row change, per spec §Integration points)
   ```
-- [ ] Docs confirmation (spec §Integration points): `docs/providers.md` untouched; direct the PR body to note: "Prompt guidance (KPR-393 follow-through section) applies uniformly to all four Lane B providers; not a parity-matrix behavior row — no caveat row added." If the implementer judges a caveat row IS warranted, stop and surface to the walking session rather than editing unilaterally.
+- [ ] Docs confirmation (spec §Integration points): `docs/providers.md` untouched; direct the PR body to note: "Prompt guidance (KPR-393 follow-through section) applies uniformly to all four Lane B providers; not a parity-matrix behavior row — no caveat row added." If the implementer judges a caveat row IS warranted, stop and surface to the walking session rather than editing unilaterally. While making the no-caveat call, glance at the Lane B intro line (`docs/providers.md` ~line 9, "they get the same prompt assembly … as Claude") — already imprecise pre-existing phrasing the new section brushes against; no row change is forced by it (reviewer-confirmed), just don't let it flip your judgment silently.
 - [ ] D3 confirmation: no loop/scaffold/adapter diffs exist (covered by the diff audit above); the phase-2 criteria live in the spec §D3 and are referenced from `intent-trailer.ts`'s docstring — nothing further to build (C1).
 - [ ] No commit unless fixes were needed (any fix commits use the same trailer).
 
