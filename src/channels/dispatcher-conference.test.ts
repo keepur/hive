@@ -498,27 +498,56 @@ describe("Conference channel routing", () => {
     // returns "" and .filter(Boolean) drops that segment from the join entirely).
     // Pins the full preamble wording too, not just the join — KPR-389's preamble
     // hardening will need to update this expectation deliberately.
+    // KPR-389 D4: deliberate C6 pin update — this is the only ticket licensed
+    // to edit this literal (epic canon C6). Full-join byte identity retained.
     const expectedPreamble = `You are in a meeting in #conf-pin with Jasper.
 
 Meeting rules:
+- The discussion so far is already in this prompt and your session context — do NOT re-read the channel, search the workspace, or re-orient with tools before speaking.
+- If you have nothing meaningful to add, reply "No response needed." immediately — as your first output, with no tool calls first.
+- Only use a tool if your reply genuinely needs information that is not already in this thread — never to re-read the meeting itself.
 - Be concise — others are also responding.
 - Build on what's been said. Don't repeat points already made.
-- If you have nothing meaningful to add, respond with "No response needed."
 - Stay in your lane — don't cover someone else's domain unless asked.
 - Address others by name when responding to their points.`;
 
     expect(round0Item.text).toBe(`${expectedPreamble}\n---\n[New message]:\n${item.text}`);
   });
 
+  it("T6 (C4 guard): a double-quoted escape phrase in the preamble matches NON_RESPONSE_PATTERNS", () => {
+    // Local mirror of dispatcher.ts NON_RESPONSE_PATTERNS — same deliberate-copy
+    // convention as dispatcher.test.ts:273 (the pin IS the point: widen-or-match
+    // is enforced by this test failing on any preamble rewording).
+    const NON_RESPONSE_PATTERNS = [
+      /^no response (requested|needed|required|necessary)\.?$/i,
+      /^\(no response\)$/i,
+      /^n\/a\.?$/i,
+    ];
+    const preamble = (
+      dispatcher as unknown as {
+        buildMeetingPreamble(
+          c: string,
+          r: Array<{ agentId: string; name: string; title?: string; role: string }>,
+        ): string;
+      }
+    ).buildMeetingPreamble("x", [{ agentId: "jasper", name: "Jasper", role: "VP Engineering" }]);
+    const quoted = [...preamble.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect(quoted.length).toBeGreaterThan(0);
+    expect(quoted.some((p) => NON_RESPONSE_PATTERNS.some((rx) => rx.test(p!.trim())))).toBe(true);
+  });
+
   describe("delta context injection (KPR-388)", () => {
     // NOTE: continuation lines are deliberately flush-left inside the
     // backticks — the preamble byte pin breaks on any leading whitespace.
+    // KPR-389 D4: deliberate C10 pin update (see C6 note above).
     const PREAMBLE = (channel: string, names: string) => `You are in a meeting in #${channel} with ${names}.
 
 Meeting rules:
+- The discussion so far is already in this prompt and your session context — do NOT re-read the channel, search the workspace, or re-orient with tools before speaking.
+- If you have nothing meaningful to add, reply "No response needed." immediately — as your first output, with no tool calls first.
+- Only use a tool if your reply genuinely needs information that is not already in this thread — never to re-read the meeting itself.
 - Be concise — others are also responding.
 - Build on what's been said. Don't repeat points already made.
-- If you have nothing meaningful to add, respond with "No response needed."
 - Stay in your lane — don't cover someone else's domain unless asked.
 - Address others by name when responding to their points.`;
 

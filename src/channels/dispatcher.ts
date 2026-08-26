@@ -1350,14 +1350,21 @@ export class Dispatcher {
     return `${hours}h ago`;
   }
 
+  /** KPR-389 D4: hardened — the transcript is already in prompt ∪ session
+   *  (C10 covering-invariant phrasing, true in full AND delta modes); decline
+   *  immediately with the C4-safe escape phrase. Escape phrase must stay
+   *  "No response needed." verbatim (C4 + C3 terminal-slot coherence) — any
+   *  rewording must re-run the C4 guard test. */
   private buildMeetingPreamble(channelName: string, roster: RosterMember[]): string {
     const names = roster.map((r) => r.name).join(", ");
     return `You are in a meeting in #${channelName} with ${names}.
 
 Meeting rules:
+- The discussion so far is already in this prompt and your session context — do NOT re-read the channel, search the workspace, or re-orient with tools before speaking.
+- If you have nothing meaningful to add, reply "No response needed." immediately — as your first output, with no tool calls first.
+- Only use a tool if your reply genuinely needs information that is not already in this thread — never to re-read the meeting itself.
 - Be concise — others are also responding.
 - Build on what's been said. Don't repeat points already made.
-- If you have nothing meaningful to add, respond with "No response needed."
 - Stay in your lane — don't cover someone else's domain unless asked.
 - Address others by name when responding to their points.`;
   }
