@@ -160,9 +160,12 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
     const bridged = await bridge.connect();
     const bridgedByName = new Map(bridged.map((bt) => [bt.name, bt]));
     // Chat-completions function tools. Edge 2 (§6.2): NO schema
-    // normalization pre-built — the `required`-array quirk is believed
+    // normalization pre-built here — the `required`-array quirk is believed
     // Anthropic-validator-specific; `parameters.required ??= []` is the
-    // one-line mitigation IF live validation bites, not before.
+    // one-line mitigation IF live validation bites, not before. (In
+    // practice ToolBridge's normalizeSchema at tool-bridge.ts:538 already
+    // fills `required: []` on every bridged schema, so the quirk is
+    // structurally impossible on this path today.)
     const toolPayloads = bridged.map((bt) => ({
       type: "function" as const,
       function: { name: bt.name, description: bt.description, parameters: bt.inputSchema },
@@ -214,7 +217,17 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
         // never emitted; anomalies throw (decorated) instead of silently
         // harvesting empty. Skipped when the turn aborted mid-stream (the
         // loop's post-stream checkpoint resolves the interruption).
-        if (!harness.isAborted()) state.assembled = assembleToolCalls(state);
+        if (!harness.isAborted()) {
+          state.assembled = assembleToolCalls(state);
+          // Edge 3 spirit guard: finish_reason=tool_calls with zero
+          // assembled calls is a gateway stream-shape fault, never a
+          // silent empty harvest.
+          if (state.finishReason === "tool_calls" && state.assembled.length === 0) {
+            throw new Error(
+              "Grok gateway stream signaled tool_calls with no tool calls assembled — malformed stream",
+            );
+          }
+        }
         const assistantMessage = {
           role: "assistant",
           content: state.text || null,

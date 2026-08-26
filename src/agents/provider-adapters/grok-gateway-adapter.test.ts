@@ -75,6 +75,7 @@ function makeInProcEntry(name = "fixture"): HiveToolInventoryEntry {
       openai: "requires-hive-bridge",
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
+      grok: "requires-hive-bridge",
     },
     schemas: { kind: "connect-time" },
   };
@@ -546,6 +547,18 @@ describe("GrokGatewayAdapter — C5 error decoration (§4.4)", () => {
     const result = await adapter.runTurn({ prompt: "go" });
 
     expect(result.error).toContain("terminated");
+    expect(result.text).toBe("");
+  });
+
+  it("finish_reason:tool_calls with zero assembled tool calls → error containing 'malformed stream', never a silent empty harvest", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(sse([finishChunk("cmpl-1", "tool_calls")])));
+    const { adapter } = makeAdapter({}, fetchMock);
+
+    const result = await adapter.runTurn({ prompt: "go" });
+
+    expect(result.error).toContain("malformed stream");
     expect(result.text).toBe("");
   });
 });

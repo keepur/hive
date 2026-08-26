@@ -681,7 +681,7 @@ export class AgentManager {
           route.provider
         ];
         if (!module) {
-          // Unreachable while LaneBProviderId = {openai, codex, gemini} —
+          // Unreachable while LaneBProviderId = {openai, codex, gemini, grok} —
           // kept as containment for a future provider that ships tool-less
           // (KPR-354 belt-and-braces; §D6). Registry-miss path.
           return `Delegate turn failed (${call.delegate}): provider ${String((route as { provider: string }).provider)} does not execute tools`;
