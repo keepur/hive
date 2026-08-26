@@ -11,7 +11,9 @@ Child of hotfix epic **KPR-397**. Status: **spec draft** (Gate 1 delegated).
 > below), D13/D6 (untouched — stated as non-goals; no breaker or classifier file
 > is edited), D22(ii) (KPR-399 reads kpr-400-spec §Design.3/§Edge-10 —
 > this design does not move `claimNext`'s ordering or the replay classes;
-> `enqueueOrigin` immutability is preserved by recovery).
+> `enqueueOrigin` immutability is preserved by recovery), D26 (KPR-399 live
+> gate: deadline aborts leave zero dangling `tool_use`; replays resume the
+> persisted aborted session — consumed by §Design.4, §Edge-10, ⚠A3).
 > **Origin:** kpr-400-spec §Edge-9 / ⚠A6 — the flagged adjacent observation,
 > now folded in by operator scope amendment.
 
@@ -55,7 +57,7 @@ changes. Fully unit-verifiable; no live-instance items.
   (constructor takes a bare `Collection`, `outage-queue-store.ts:100`); the
   processor has store + dispatcher + config only (`outage-replay-processor.ts:23`);
   neither can reach the agent registry. The two places that *can* know an
-  agent's deadline are the manager (`acquireDeadlineMs`, `agent-manager.ts:901`
+  agent's deadline are the manager (`acquireDeadlineMs`, `agent-manager.ts:907`
   — private, D20) and the dispatcher (holds `agentManager`,
   `dispatcher.ts:79`, and is already the sole enqueue author at
   `dispatcher.ts:660`). That seam decides the ruling: stamp the bound where
@@ -65,10 +67,14 @@ changes. Fully unit-verifiable; no live-instance items.
   exactly one `claimNext` caller (the drain), the drain awaits each dispatch,
   and `tick()` is re-entrancy-guarded (`ticking` flag,
   `outage-replay-processor.ts:50-59`). So within one process **at most one doc
-  is legitimately `replaying` at a time, and a sweep can never run while this
-  process's own replay dispatch is in flight** — the sweep-in-tick literally
-  cannot see (let alone steal) its own live claim. The deadline-aware bound is
-  therefore the guard for the *cross-process* window (restart overlap: a
+  is legitimately `replaying` at a time, and the tick-folded sweep can never
+  run while this process's own replay dispatch is in flight** — it literally
+  cannot see (let alone steal) its own live claim. The one in-process
+  exception: the **boot sweep fires `void` in `start()` outside the tick
+  guard** and can pathologically overlap the first tick's drain (slow boot
+  query) — there the per-doc deadline bound (fresh claim ⇒ young ⇒ skipped)
+  plus the fresh-`lastAttemptAt` CAS cover it. The deadline-aware bound is
+  otherwise the guard for the *cross-process* window (restart overlap: a
   predecessor process still finishing a turn while the new boot sweeps) and the
   honest lease semantics for any future concurrency change.
 - **The ticket's literal (d) ("claimNext stamps claimDeadlineMs") doesn't
@@ -99,7 +105,7 @@ changes. Fully unit-verifiable; no live-instance items.
 ## Problem
 
 `src/outage/outage-queue-store.ts` + `src/outage/outage-replay-processor.ts`,
-verified on branch @ 88f4e5c:
+verified on branch @ b2f4745:
 
 - **Q1 — wrong bound.** `recoverStaleReplaying(staleMs = STALE_REPLAYING_MS)`
   reverts `replaying` docs with `lastAttemptAt < now − 360s` to `pending`.
@@ -131,7 +137,8 @@ flagged them, this ticket fixes them.
    pending → replay/expire lifecycle.
 3. **G3 — never steal a live claim:** the sweep must not revert a doc whose
    turn is genuinely in flight — guaranteed within-process by the tick guard +
-   serial drain, and cross-process by the deadline-aware bound; recovery writes
+   serial drain (tick-folded sweep; the boot sweep is covered by the bound +
+   CAS, §Key Points), and cross-process by the deadline-aware bound; recovery writes
    are CAS-shaped so a doc that moved under the sweep is left alone.
 4. **G4 — canon intact:** `claimNext` filter/sort untouched (D19 ordering,
    D22(ii)); `enqueueOrigin` immutability preserved by recovery; no breaker,
@@ -236,8 +243,17 @@ flagged them, this ticket fixes them.
     const docs = await this.collection.find({ status: "replaying" }).toArray();
     let recovered = 0;
     for (const doc of docs) {
+      if (!doc.lastAttemptAt) {
+        // Unreachable via claimNext (it always stamps lastAttemptAt) — skip,
+        // but loudly: malformed data should be conspicuous, not recycled.
+        log.warn("Replaying doc with no lastAttemptAt — skipped by recovery", {
+          itemId: doc.itemId,
+          agentId: doc.agentId,
+        });
+        continue;
+      }
       const boundMs = (doc.deadlineMs ?? STALE_REPLAYING_FALLBACK_MS) + STALE_REPLAYING_GRACE_MS;
-      if (!doc.lastAttemptAt || nowMs - doc.lastAttemptAt.getTime() <= boundMs) continue;
+      if (nowMs - doc.lastAttemptAt.getTime() <= boundMs) continue;
       const result = await this.collection.updateOne(
         { _id: doc._id, status: "replaying", lastAttemptAt: doc.lastAttemptAt },
         { $set: { status: "pending" } },
@@ -253,8 +269,8 @@ flagged them, this ticket fixes them.
 
   (The fake already models `find`, Date-equality matching, and `updateOne` —
   no fake extension needed. A `lastAttemptAt: null` `replaying` doc is
-  unreachable via `claimNext` but deliberately skipped rather than reverted —
-  malformed data should be conspicuous in logs/doctor, not silently recycled.)
+  unreachable via `claimNext` but deliberately skipped-with-warn rather than
+  reverted — malformed data stays conspicuous, never silently recycled.)
 - **Processor:** the sweep becomes the tick's first step; the boot call stays
   (immediacy — first tick is 15s out — and the existing processor pin at
   `outage-replay-processor.test.ts:180` expects it):
@@ -284,8 +300,10 @@ flagged them, this ticket fixes them.
   CAS) makes boot-pass/tick-pass/repeat-pass all no-ops after first success.
 - **Live-turn interplay (constraint 3, explicit):** primary protection is
   structural — one `claimNext` caller, serial drain, tick re-entrancy guard ⇒
-  a sweep never executes while this process's replay dispatch is in flight, so
-  it cannot observe its own live claim. Secondary protection is the per-doc
+  the *tick-folded* sweep never executes while this process's replay dispatch
+  is in flight, so it cannot observe its own live claim (the boot sweep runs
+  `void` outside the guard and falls back to the next two protections —
+  §Key Points). Secondary protection is the per-doc
   bound ⇒ a predecessor process's live claim (restart overlap) is not swept
   until its turn's deadline + grace has provably passed. Tertiary is the CAS ⇒
   a doc released-and-re-claimed between the sweep's read and write (fresh
@@ -309,7 +327,13 @@ precedent, kept.** Justification against the alternative (expire):
   only *completed-with-delivery* shapes to `done`. A crash orphan gives zero
   progress evidence — `pending` is the conservative reading consistent with
   that canon, and `replayWrap`'s note (`outage-notices.ts:82`) flags the
-  replay to the agent.
+  replay to the agent. Post-KPR-399 (D26, §Edge-10) the argument is stronger
+  for one subcase: on client-transcript lanes (claude + Lane A — C3 scope),
+  a doc whose turn abort-finalized (session persisted) before the process died
+  re-replays as a *resume* of the partial work. Plain mid-turn crashes — Q2's
+  own headline scenario and the dominant orphan source — never reach the
+  persist point, and Lane B docs persist nothing on abort, so both keep the
+  pre-existing accepted posture.
 - Attempts stay untouched: `attempts` means *real (breaker-closed) replay
   attempts* (§5-2g contract, written only by `recordFailedAttempt`); a crash
   is not a turn outcome. The poison case (a doc whose replay reliably crashes
@@ -343,8 +367,10 @@ precedent, kept.** Justification against the alternative (expire):
    Deadline *lowered* later → over-estimate → orphan waits longer (harmless).
    Deadline *raised* mid-outage above the stamp → theoretical under-estimate,
    material only in the restart-overlap window (within-process the tick guard
-   already prevents any steal); consequence is one bounded duplicate replay.
-   Accepted (⚠A3) — same over/under asymmetry argument as kpr-400 ⚠A3.
+   already prevents any steal); consequence is one bounded duplicate replay
+   (D26 does not reach this steal — the still-running twin's session persist
+   post-dates the duplicate's dispatch, §Edge-10). Accepted (⚠A3) — same
+   over/under asymmetry argument as kpr-400 ⚠A3.
 4. **Agent deleted between enqueue and recovery:** the doc still recovers by
    its stamped bound — no registry lookup needed (a virtue of (d)); the
    pinned-agent pre-check in `dispatch()` then expires it before any spawn
@@ -363,11 +389,24 @@ precedent, kept.** Justification against the alternative (expire):
    doc eventually recovers and replays — the immortality fix also unblocks
    this key. No code change needed; falls out of Q2's fix.
 9. **`enqueueOrigin` under recovery:** never written by the sweep — a
-   recovered doc keeps its class and re-claims per D19 ordering. Pinned (T9).
-10. **KPR-399 interplay (parked PR #414, not on this branch):** none —
-    recovery touches neither `claimNext` ordering nor replay classes; the new
-    field is additive and invisible to kpr-400-spec §Design.3/§Edge-10, so
-    KPR-399's D22(ii) rebase contract is undisturbed.
+   recovered doc keeps its class and re-claims per D19 ordering. Pinned (T3).
+10. **KPR-399 interplay (merged at b2f4745, on this branch):** benign and
+    reinforcing. KPR-399's live gate produced canon **D26**: deadline aborts
+    leave zero dangling `tool_use` (SDK SIGTERM-grace flush), mid-tool resume
+    is clean (behavior (i)), and replays re-enter via `runWorkItemTurn` →
+    `sessionStore.get` and **resume** the persisted aborted session. A swept
+    orphan's re-replay is therefore resume-first: the with-progress aborted
+    turn persisted its session, so the re-replay resumes that transcript and
+    the agent sees its own partial work rather than blindly redoing it —
+    directly strengthening §Design.4's duplicate-partial-side-effect argument.
+    (D26 does NOT reach the ⚠A3 steal: there the twin's turn is still running
+    when the sweep re-dispatches, so its abort-finalize persist lies in the
+    future — that duplicate resumes pre-turn context and ⚠A3's bounded-
+    duplicate acceptance stands on its own.) The ordering/class
+    contract claims stand as written (verified true): recovery touches neither
+    `claimNext` ordering nor replay classes; the new field is additive and
+    invisible to kpr-400-spec §Design.3/§Edge-10, so KPR-399's D22(ii)
+    contract is undisturbed.
 
 ## Testing (all unit; no live-instance items)
 
@@ -384,7 +423,7 @@ added), so a live-instance checklist would verify nothing a unit row doesn't.
 | T1 | store | Legacy `replaying` doc (no `deadlineMs`), `lastAttemptAt` 7 min old → recovered; 5 min old → not. Pins fallback+grace = old 360s. | Existing recovery rows migrate to this shape; the 360s boundary itself is the pin. |
 | T2 | store | Doc `deadlineMs: 900_000`, `lastAttemptAt` 8 min old → **not** recovered (young under 960s bound). | Revert per-doc bound to the flat 360s const → doc is (wrongly) recovered → row fails on pre-fix code. |
 | T3 | store | Same doc at 17 min → recovered to `pending`; `attempts` and `enqueueOrigin` byte-unchanged. | — (paired with T2). |
-| T4 | store | CAS: doc's `lastAttemptAt` mutated between the sweep's read and write (harness mutates after `find` resolves) → not reverted, count excludes it. | Drop `lastAttemptAt` from the CAS filter → row fails. |
+| T4 | store | CAS: doc's `lastAttemptAt` mutated between the sweep's read and write (harness mutates after `find` resolves) → not reverted, count excludes it. Harness note: the fake's `find()` snapshots eagerly at call time, so this row needs a monkey-patched `find`/`updateOne` interposer to inject the mutation into the gap — build that harness step in the plan. | Drop `lastAttemptAt` from the CAS filter → row fails. |
 | T5 | store | `enqueue` stamps `deadlineMs` via `$setOnInsert`; second enqueue of the same key with a different value does not rewrite (D19 immutability). | — |
 | T6 | processor | Young-orphan re-sweep (the Q2 pin): store seeded with a fresh-claimed orphan; `start()`'s boot sweep recovers nothing; advance injected clock past bound; next `tick()` recovers it and the same tick's drain claims it. | Remove the sweep from `tick()` (pre-fix shape) → doc stays `replaying` forever → row fails on pre-fix code. |
 | T7 | processor | Tick ordering: recover → expireStale → drain (spy call order); sweep rejection is caught and expire/drain still run. | — |
@@ -401,7 +440,9 @@ added), so a live-instance checklist would verify nothing a unit row doesn't.
   backfill migration. D19-analog posture, accepted.
 - ⚠ **A3 — enqueue-time stamp is immutable**; config drift during queue
   residence accepted (over-estimate harmless; under-estimate window is
-  restart-overlap-only and bounded). Mirrors kpr-400 ⚠A3's asymmetry argument.
+  restart-overlap-only and bounded; D26 does not reach this steal —
+  the twin's persist post-dates the duplicate's dispatch, §Edge-10). Mirrors
+  kpr-400 ⚠A3's asymmetry argument.
 - ⚠ **A4 — recovered docs revert to `pending`** (attempts unchanged); the
   crash-loop poison case is bounded by maxAgeHours expiry, accepted residual.
   §Design.4.
