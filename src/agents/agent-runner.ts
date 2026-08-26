@@ -153,6 +153,8 @@ export interface RunResult {
   error?: string;
   aborted?: boolean;
   timedOut?: boolean; // KPR-306: deadline fired; distinguishes timeout-abort from operator abort
+  /** KPR-388: populated ONLY by the dispatcher's convertTurnResult mapping (TurnResult passthrough); runner/adapters never set it. */
+  resumedSession?: boolean;
 }
 
 /**

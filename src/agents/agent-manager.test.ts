@@ -3100,6 +3100,77 @@ describe("AgentManager", () => {
       });
     });
 
+    describe("TurnResult.resumedSession (KPR-388)", () => {
+      const STALE = "Previous response with id 'resp_stale' not found.";
+      function openai388(id = "openai-pilot") {
+        registry._agents.set(
+          id,
+          makeAgentConfig({ id, name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        return id;
+      }
+
+      it("true on a happy-path resume", async () => {
+        const result = await manager.spawnTurn(
+          smsCtx({ sessionId: "s1", threadId: "sms:line-1:kpr388-r1" }),
+        );
+        expect(result.resumedSession).toBe(true);
+      });
+
+      it("false on a first turn (no stored session)", async () => {
+        const result = await manager.spawnTurn(
+          smsCtx({ sessionId: undefined, threadId: "sms:line-1:kpr388-r2" }),
+        );
+        expect(result.resumedSession).toBe(false);
+      });
+
+      it("false after the auth-rebuild retry (finalized attempt ran fresh)", async () => {
+        mockRunnerSend
+          .mockResolvedValueOnce(
+            makeRunResult({ error: "Could not resolve authentication method", sessionId: "" }),
+          )
+          .mockResolvedValueOnce(makeRunResult({ text: "ok after retry", sessionId: "session-retry" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ sessionId: "stale-session", threadId: "sms:line-1:kpr388-r3" }),
+        );
+        expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+        expect(result.resumedSession).toBe(false);
+      });
+
+      it("false after the stale-handle self-heal fresh retry", async () => {
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-fresh" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ agentId: openai388(), sessionId: "resp_stale", sessionProvider: "openai", threadId: "sms:line-1:kpr388-r4" }),
+        );
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+        expect(result.resumedSession).toBe(false);
+      });
+
+      it("true after self-heal contender adoption (adopted handle counts as resumed)", async () => {
+        const threadId = "sms:line-1:kpr388-r5";
+        sessionStore._sessions.set(`openai-pilot:${threadId}`, { sessionId: "resp-contender", provider: "openai" });
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "adopted", sessionId: "resp-contender-2" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ agentId: openai388(), sessionId: "resp_stale", sessionProvider: "openai", threadId }),
+        );
+        expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBe("resp-contender");
+        expect(result.resumedSession).toBe(true);
+      });
+
+      it("false on a KPR-313 provider-handoff turn (guard strips the session pre-attempt)", async () => {
+        // Stored codex tag, claude turn: guard trips, turn runs fresh with the
+        // handoff annotation — resumedSession must report the fresh reality.
+        const result = await manager.spawnTurn(
+          smsCtx({ sessionId: "s-codex-row", sessionProvider: "codex", threadId: "sms:line-1:kpr388-r6" }),
+        );
+        expect(result.resumedSession).toBe(false);
+      });
+    });
+
     describe("stale-handle self-heal — gemini (KPR-352 §D3)", () => {
       // Binding delta (Task-0/1 spike): the live Interactions API returns 400
       // for fabricated AND malformed ids; the adapter tags only round-1

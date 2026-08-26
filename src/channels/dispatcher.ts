@@ -412,6 +412,9 @@ export class Dispatcher {
       // downstream"; that stopped being true here).
       aborted: turn.aborted ?? false,
       timedOut: turn.timedOut,
+      // KPR-388: fresh-vs-resumed signal consumed by the conference
+      // meeting-mark bookkeeping in dispatchToAgent.
+      resumedSession: turn.resumedSession,
     };
   }
 
