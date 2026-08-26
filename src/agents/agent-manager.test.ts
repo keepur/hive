@@ -2015,9 +2015,16 @@ describe("AgentManager", () => {
       expect(sessionStore.set).toHaveBeenCalledTimes(3);
     });
 
-    it("does NOT update session-store when the result is aborted", async () => {
+    it("does NOT update session-store when the result is aborted with ZERO progress (KPR-399 re-scope)", async () => {
+      // Pre-KPR-399 this row pinned "aborted never persists" using the
+      // fixture's default progress fields (toolCalls: 1, text: "response") —
+      // a shape that now DELIBERATELY persists (§D2 persist-on-abort). It is
+      // re-scoped to the zero-progress shape (also synthesizeAbortedResult's
+      // shape): the fail-closed direction, which survives unchanged. The
+      // with-progress direction is pinned in the KPR-399 persist-on-abort
+      // describe below.
       mockRunnerSend.mockResolvedValueOnce(
-        makeRunResult({ aborted: true, sessionId: "session-aborted" }),
+        makeRunResult({ aborted: true, sessionId: "session-aborted", toolCalls: 0, streamed: false, text: "" }),
       );
       await manager.spawnTurn(smsCtx());
       expect(sessionStore.set).not.toHaveBeenCalled();
@@ -2678,8 +2685,19 @@ describe("AgentManager", () => {
       });
 
       it("⚠A4 churn-mint rider: errored turn that resumed and returned a DIFFERENT id never overwrites the row", async () => {
+        // KPR-399 fixture re-scope (error string only — the pinned direction
+        // is unchanged): this row previously used the CLI's unknown-session
+        // text ("No conversation found with session ID: s-old"), which is now
+        // an `isClaudeResumeLoadError` alternate — the §D3 self-heal arm
+        // intercepts it BEFORE finalize, retries fresh, and the healed retry
+        // legitimately persists (the arm's headline purpose: no more dead
+        // thread until the 7d TTL). `error_during_execution` is the other
+        // real failed-resume-mint surface (the source comment's own example:
+        // the CLI's error_during_execution result carries a freshly minted
+        // session_id) and matches no self-heal alternate, so the churn-mint
+        // rider is exercised exactly as before.
         mockRunnerSend.mockResolvedValueOnce(
-          makeRunResult({ error: "No conversation found with session ID: s-old", sessionId: "s-minted" }),
+          makeRunResult({ error: "error_during_execution", sessionId: "s-minted" }),
         );
         await manager.spawnTurn(
           smsCtx({ threadId: "sms:line-1:kpr313-mint", sessionId: "s-old", sessionProvider: "claude" }),
@@ -3238,6 +3256,254 @@ describe("AgentManager", () => {
         mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "" }));
         await manager.spawnTurn(smsCtx({ agentId: id, threadId: "sms:line-1:kpr352-nosess", sessionId: undefined }));
         expect(mockGeminiRunTurn).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("persist-on-abort (KPR-399 §D2)", () => {
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+      });
+
+      // Incident shape (KPR-397 epic, 2026-08-26): deadline abort mid-tool
+      // turn with a valid transcript id — must persist so replay/follow-up
+      // resumes instead of restarting ("think / hit-wall / restart" loop).
+      it("aborted claude turn WITH progress persists sessionId — no tokenData (new direction)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "s1", toolCalls: 46, streamed: true, text: "" }),
+        );
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-p1" });
+        await manager.spawnTurn(ctx);
+        expect(sessionStore.set).toHaveBeenCalledTimes(1);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude");
+        // No 5th arg: tokenData omitted — aborted turns carry all-zero usage;
+        // set() without tokenData preserves the prior turn's stats.
+        expect(sessionStore.set.mock.calls[0]!.length).toBe(4);
+      });
+
+      it.each([
+        ["toolCalls alone", { toolCalls: 1, streamed: false, text: "" }],
+        ["streamed alone", { toolCalls: 0, streamed: true, text: "" }],
+        ["text alone", { toolCalls: 0, streamed: false, text: "partial reply" }],
+      ] as const)("each D1 signal independently sufficient: %s", async (_label, progress) => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "s1", ...progress }),
+        );
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-sig" });
+        await manager.spawnTurn(ctx);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude");
+      });
+
+      it("fail-closed: aborted with ZERO progress persists nothing (also synthesizeAbortedResult's shape)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "s1", toolCalls: 0, streamed: false, text: "" }),
+        );
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr399-zero" }));
+        expect(sessionStore.set).not.toHaveBeenCalled();
+      });
+
+      it("empty sessionId on an aborted result persists nothing (abort before system/init)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "", toolCalls: 3, streamed: true, text: "" }),
+        );
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr399-noid" }));
+        expect(sessionStore.set).not.toHaveBeenCalled();
+      });
+
+      it("operator abort (aborted without timedOut) with progress persists too — uniform handling (⚠A4)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, sessionId: "s-stop", toolCalls: 3, streamed: true, text: "" }),
+        );
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-stop" });
+        await manager.spawnTurn(ctx);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-stop", "claude");
+      });
+
+      it("mint-safety belt: aborted + errored + resumed + DIFFERENT id never overwrites the row", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, error: "boom", sessionId: "s-minted", toolCalls: 3, streamed: true, text: "" }),
+        );
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr399-mint", sessionId: "s-old", sessionProvider: "claude" }),
+        );
+        expect(sessionStore.set).not.toHaveBeenCalled();
+      });
+
+      it("mint-safety belt scope: aborted + errored turn re-persisting the SAME id it resumed is allowed (TTL refresh)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, error: "boom", sessionId: "s-same", toolCalls: 3, streamed: true, text: "" }),
+        );
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-same", sessionId: "s-same", sessionProvider: "claude" });
+        await manager.spawnTurn(ctx);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-same", "claude");
+      });
+
+      it("C3 pins: aborted-with-progress on openai / gemini / codex routes persists NOTHING (Lane B byte-for-byte)", async () => {
+        registry._agents.set(
+          "openai-pilot",
+          makeAgentConfig({ id: "openai-pilot", name: "OP", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        registry._agents.set(
+          "gemini-pilot",
+          makeAgentConfig({ id: "gemini-pilot", name: "GP", model: "gemini/gemini-2.5-pro", coreServers: [] }),
+        );
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "CP", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        const shape = { aborted: true, timedOut: true, toolCalls: 5, streamed: true, text: "" };
+        mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ ...shape, sessionId: "resp-abort" }));
+        await manager.spawnTurn(smsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr399-c3-o" }));
+        mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ ...shape, sessionId: "int-abort" }));
+        await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr399-c3-g" }));
+        mockCodexRunTurn.mockResolvedValueOnce(makeRunResult({ ...shape, sessionId: "codex-abort" }));
+        await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr399-c3-c" }));
+        expect(sessionStore.set).not.toHaveBeenCalled();
+      });
+
+      // All three client-transcript passthrough providers, one row each — the
+      // arm gates on SEMANTICS, so every Lane A column must inherit it.
+      it.each([
+        ["kimi", "KIMI_API_KEY", "agent-kimi", "kimi/kimi-k3", "kimi-s1"],
+        ["deepseek", "DEEPSEEK_API_KEY", "agent-dseek", "deepseek/deepseek-v4-pro", "dseek-s1"],
+        ["grok", "GROK_GATEWAY_KEY", "agent-grok", "grok/grok-4.6", "grok-s1"],
+      ] as const)(
+        "Lane A inheritance pin: an aborted-with-progress %s turn persists under its own tag (client-transcript)",
+        async (provider, envKey, agentId, model, sessionId) => {
+          process.env[envKey] = `test-${provider}-key`;
+          try {
+            registry._agents.set(agentId, makeAgentConfig({ id: agentId, name: agentId, model, coreServers: [] }));
+            mockRunnerSend.mockResolvedValueOnce(
+              makeRunResult({ aborted: true, timedOut: true, sessionId, toolCalls: 2, streamed: true, text: "" }),
+            );
+            const ctx = smsCtx({ agentId, threadId: `sms:line-1:kpr399-${provider}` });
+            await manager.spawnTurn(ctx);
+            expect(sessionStore.set).toHaveBeenCalledWith(agentId, ctx.threadId, sessionId, provider);
+          } finally {
+            delete process.env[envKey];
+          }
+        },
+      );
+
+      it("re-entry prefers resume: after an aborted-turn persist, the next runWorkItemTurn on the thread resumes the persisted id", async () => {
+        // Pins spec Testing Contract 11 — "replay prefers resume" — via the
+        // real store-backed path (runWorkItemTurn → sessionStore.get →
+        // ctx.sessionId → runner resume), without touching dispatcher code.
+        mockRunnerSend
+          .mockResolvedValueOnce(
+            makeRunResult({ aborted: true, timedOut: true, sessionId: "s-abort", toolCalls: 7, streamed: true, text: "" }),
+          )
+          .mockResolvedValueOnce(makeRunResult({ text: "resumed", sessionId: "s-abort" }));
+        const threadId = "sms:line-1:kpr399-replay";
+        const src = { kind: "sms" as const, id: "line-1", label: "May (CEO)" };
+        await manager.runWorkItemTurn("agent-a", makeWorkItem({ threadId, source: src, sender: "+15551234567" }));
+        const second = await manager.runWorkItemTurn(
+          "agent-a",
+          makeWorkItem({ threadId, source: src, sender: "+15551234567" }),
+        );
+        expect(mockRunnerSend.mock.calls[1]![1]).toBe("s-abort"); // resumed, not "new"
+        expect(second.newSessionId).toBe("s-abort");
+      });
+    });
+
+    describe("resume-rejection self-heal (KPR-399 §D3)", () => {
+      const UNKNOWN_SESSION = "No conversation found with session ID: 0198c3f2-abcd-7890-b1c2-d3e4f5a6b7c8";
+      const DANGLING_TOOL_USE =
+        "400 invalid_request_error: messages.57: the following `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01AbCdEfGh";
+
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        // Hermetic queue: the outer beforeEach's clearAllMocks() clears call
+        // history but NOT the mockResolvedValueOnce queue. Rows here queue two
+        // responses expecting a retry; if the retry does not fire (pre-fix
+        // source under negative-verify) the second value would bleed into the
+        // next row. Reset the queue, then restore the suite-wide default.
+        mockRunnerSend.mockReset();
+        mockRunnerSend.mockResolvedValue(makeRunResult());
+      });
+
+      it.each([
+        ["unknown-session", UNKNOWN_SESSION],
+        ["dangling tool_use 400", DANGLING_TOOL_USE],
+      ])("retries exactly once with sessionId stripped on %s; retry result is the turn result", async (_label, reason) => {
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ error: reason, sessionId: "" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "s-fresh" }));
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-heal", sessionId: "s-dead", sessionProvider: "claude" });
+        const result = await manager.spawnTurn(ctx);
+        expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+        expect(mockRunnerSend.mock.calls[0]![1]).toBe("s-dead"); // first attempt resumed
+        expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined(); // fresh retry
+        expect(result.finalMessage).toBe("healed");
+        expect(result.newSessionId).toBe("s-fresh");
+        // Write path self-corrects: fresh handle persisted normally (no scrub).
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-fresh", "claude", expect.anything());
+        // Redaction posture: the warn carries no error string / handle value.
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("resume rejected"),
+          expect.not.objectContaining({ reason: expect.anything() }),
+        );
+        const leaked = mockLogWarn.mock.calls.some(([, meta]) => JSON.stringify(meta ?? "").includes("s-dead"));
+        expect(leaked).toBe(false);
+      });
+
+      it("breaker record-once: only the finalized attempt is recorded; streak stays 0 (breaker-invisible)", async () => {
+        const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "s-2" }));
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr399-brk", sessionId: "s-dead", sessionProvider: "claude" }),
+        );
+        expect(recordSpy).toHaveBeenCalledTimes(1); // first attempt's rejection never recorded
+        expect(recordSpy.mock.calls[0]![1]).toEqual({ outcome: "success" });
+        const snap = manager.circuitBreakers.stateFor("claude")!;
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0);
+      });
+
+      it("single retry: a retry that fails with the matcher string again is NOT retried a second time", async () => {
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }))
+          .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr399-once", sessionId: "s-dead", sessionProvider: "claude" }),
+        );
+        expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+        expect(result.errors).toEqual([UNKNOWN_SESSION]);
+      });
+
+      it("gating: dead without a stored sessionId; dead on openai (semantics gate); auth sentinel routes to the auth arm", async () => {
+        // No sessionId → no retry (arm requires effectiveCtx.sessionId).
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }));
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr399-g1", sessionId: undefined }));
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        // openai route + same string + sessionId → no retry: server-resumable
+        // is not this arm's semantics, and the string does not match the
+        // KPR-350 arm's matcher either (mutual exclusivity, both directions).
+        // NOTE: the pre-existing KPR-313 churn-mint warn ("Skipping session
+        // persist — errored turn returned a different id…") also fires here
+        // (errored result id "resp-x" ≠ resumed "resp-old") — expected and
+        // harmless to these assertions.
+        registry._agents.set(
+          "openai-pilot",
+          makeAgentConfig({ id: "openai-pilot", name: "OP", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "resp-x" }));
+        await manager.spawnTurn(
+          smsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr399-g2", sessionId: "resp-old", sessionProvider: "openai" }),
+        );
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+        // Auth sentinel on claude + sessionId → the FIRST arm fires (else-if
+        // chain order), never this one: its warn appears, ours does not.
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ error: "Could not resolve authentication method", sessionId: "" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "s-a" }));
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr399-g3", sessionId: "s-x", sessionProvider: "claude" }),
+        );
+        expect(mockLogWarn).toHaveBeenCalledWith(expect.stringContaining("auth-rebuild"), expect.anything());
+        const resumeWarn = mockLogWarn.mock.calls.some(([msg]) => String(msg).includes("resume rejected"));
+        expect(resumeWarn).toBe(false);
       });
     });
 

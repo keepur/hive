@@ -3,6 +3,8 @@ import {
   classifyTurnResult,
   classifyThrown,
   HARD_FAULT_KINDS,
+  hasObservedProgress,
+  isClaudeResumeLoadError,
   TURN_DEADLINE_SUBTYPE,
   TurnAssemblyError,
   type ProviderFaultKind,
@@ -289,6 +291,79 @@ describe("KPR-398 — deadline abort with observed progress", () => {
     expect(
       classifyTurnResult({ error: TURN_DEADLINE_SUBTYPE, timedOut: true, aborted: false, toolCalls: 0 }),
     ).toEqual({ outcome: "fault", kind: "turn-deadline", message: TURN_DEADLINE_SUBTYPE });
+  });
+});
+
+describe("KPR-399 — claude resume-rejection matcher + persist-predicate export", () => {
+  // Realistic surface strings (docs/community-sourced — matcher wording is
+  // ⚠A3, REFINED against the live V4 capture at delivery, KPR-350 posture).
+  const UNKNOWN_SESSION = "No conversation found with session ID: 0198c3f2-abcd-7890-b1c2-d3e4f5a6b7c8";
+  const DANGLING_TOOL_USE =
+    "400 invalid_request_error: messages.57: the following `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01AbCdEfGh";
+
+  it.each([UNKNOWN_SESSION, DANGLING_TOOL_USE])("positive pin — matches: %s", (s) =>
+    expect(isClaudeResumeLoadError(s)).toBe(true),
+  );
+
+  // Breaker-invisibility pin: both surfaces classify non-provider (no
+  // FAULT_PATTERNS row matches), so the self-heal arm is breaker-invisible
+  // whether or not it fires. classifyErrorString is module-private — route
+  // the pin through classifyTurnResult({ error }) (spec Testing Contract 9).
+  it.each([UNKNOWN_SESSION, DANGLING_TOOL_USE])("breaker-invisible — classifies non-provider: %s", (s) => {
+    expect(classifyTurnResult({ error: s })).toEqual({
+      outcome: "fault",
+      kind: "non-provider",
+      message: s,
+    });
+  });
+
+  // Narrowness matrix, auth direction: every isAuthRebuildResumeError
+  // alternate (agent-manager.ts — strings mirrored per the auth-superset-pin
+  // precedent above) must NOT match the new matcher (no cross-arm capture;
+  // the auth-row superset rule is untouched by this ticket).
+  it.each([
+    "could not resolve authentication",
+    "missing credentials.json",
+    "not authenticated",
+    "401 Unauthorized",
+    "ANTHROPIC_API_KEY is not set",
+    "invalid authToken",
+  ])("auth-rebuild alternate does NOT match isClaudeResumeLoadError: %s", (s) =>
+    expect(isClaudeResumeLoadError(s)).toBe(false),
+  );
+
+  // Narrowness matrix, stale-server direction: the isStaleServerHandleError
+  // alternates (agent-manager.ts — openai prose surfaces + the gemini
+  // adapter sentinel) must not cross-match either.
+  it.each([
+    "Previous response with id 'resp_abc123' not found.",
+    "400 invalid_request_error: previous_response_id 'resp_x' not found",
+    "Previous response resp_9 has expired",
+    "gemini interaction resume rejected (status 400): previous_interaction_id invalid",
+  ])("stale-server alternate does NOT match isClaudeResumeLoadError: %s", (s) =>
+    expect(isClaudeResumeLoadError(s)).toBe(false),
+  );
+
+  it("generic 400s / unrelated strings / bare SDK subtypes do not match (deliberate narrowness)", () => {
+    expect(isClaudeResumeLoadError("400 Bad Request")).toBe(false);
+    expect(isClaudeResumeLoadError("session not found")).toBe(false); // no "conversation" anchor
+    expect(isClaudeResumeLoadError("tool_use block streamed mid-turn")).toBe(false); // no without…tool_result tail
+    // The V4 watch item: the runner may flatten a mid-continuation API
+    // failure to the bare subtype — the matcher deliberately does NOT match
+    // it today (refinement is in-contract if V4 observes it).
+    expect(isClaudeResumeLoadError("error_during_execution")).toBe(false);
+  });
+
+  // Spec Testing Contract 10: the exported symbol IS the D1 predicate both
+  // sites consume (single source of truth). The KPR-398 classifier rows
+  // above re-run unedited; the persist-gate tests (agent-manager.test.ts)
+  // exercise the import at the second site.
+  it("hasObservedProgress export: each signal independently sufficient; zero/absent shapes false", () => {
+    expect(hasObservedProgress({ toolCalls: 1 })).toBe(true);
+    expect(hasObservedProgress({ streamed: true })).toBe(true);
+    expect(hasObservedProgress({ text: "x" })).toBe(true);
+    expect(hasObservedProgress({ toolCalls: 0, streamed: false, text: "" })).toBe(false);
+    expect(hasObservedProgress({})).toBe(false);
   });
 });
 

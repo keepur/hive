@@ -141,9 +141,32 @@ function classifyErrorString(error: string): TurnClassification {
 }
 
 /** KPR-398: proof the provider responded THIS turn. Any one signal suffices;
- * all three absent is indistinguishable from a hung provider. */
-function hasObservedProgress(input: TurnFaultInput): boolean {
+ * all three absent is indistinguishable from a hung provider.
+ * KPR-399: exported — finalizeSpawnResult's persist-on-abort gate
+ * (agent-manager.ts) reuses this exact predicate as its D1 progress check, so
+ * the classifier and the persist gate can never silently diverge. A body
+ * change here is a Decision-Register event: it moves both surfaces at once. */
+export function hasObservedProgress(input: TurnFaultInput): boolean {
   return (input.toolCalls ?? 0) > 0 || input.streamed === true || (input.text?.length ?? 0) > 0;
+}
+
+/**
+ * KPR-399: Claude-lane resume-rejection surfaces. (1) the CLI's
+ * unknown-session error — the persisted id's transcript never flushed
+ * (abort before first write) or was removed; (2) the Messages API 400 when a
+ * resumed transcript ends with a dangling tool_use the CLI did not repair.
+ * Docs/community-sourced — REFINE against the live capture at delivery
+ * (KPR-350 posture; its matcher was refined in KPR-351 L2). Deliberately
+ * narrow: a false positive costs one thread's context (fresh retry), a miss
+ * costs a dead thread until the 7d TTL. Neither alternate may overlap the
+ * auth row (superset rule) — both classify non-provider today, keeping the
+ * arm breaker-invisible (pinned in error-classification.test.ts).
+ */
+export function isClaudeResumeLoadError(reason: string): boolean {
+  return (
+    /no conversation found with session/i.test(reason) ||
+    /tool_use[\s\S]{0,120}?without[\s\S]{0,40}?tool_result/i.test(reason)
+  );
 }
 
 /**
