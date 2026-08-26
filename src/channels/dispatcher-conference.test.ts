@@ -745,7 +745,7 @@ Meeting rules:
       expect(agentManager._sessionStore.clearMeetingMark).not.toHaveBeenCalled();
     });
 
-    it("outage-queued turn never touches the mark (bookkeeping sits after the KPR-307 gates)", async () => {
+    it("outage-queued turn never touches the mark", async () => {
       await soloClassifier();
       const threadId = "conf-thread-mark-outage";
       mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());

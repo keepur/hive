@@ -52,7 +52,7 @@ All test/check commands need the Slack env stubs (config load trips on `SLACK_BO
 ```bash
 cd /Users/mokie/github/hive-KPR-386
 SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/dispatcher-conference.test.ts
-# expected after Task 6: Test Files 1 passed, Tests 23 passed (9 existing + 14 new)
+# expected after Task 6: Test Files 1 passed, Tests 28 passed (9 existing + 14 new + 5 reviewer pins added at create-tests)
 
 SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/session-store.test.ts
 # expected after Task 1: Tests 22 passed (17 existing + 5 new)
@@ -1491,7 +1491,7 @@ Meeting rules:
 
   ```bash
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/dispatcher-conference.test.ts
-  # expected: Tests 23 passed (9 existing UNMODIFIED + 14 new)
+  # expected: Tests 28 passed (9 existing UNMODIFIED + 14 new + 5 reviewer pins)
   ```
 
 - [ ] **6d.** Commit:
