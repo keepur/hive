@@ -1219,6 +1219,9 @@ describe("outage interception (KPR-307)", () => {
   });
 
   it("★ timeout gate: timedOut && aborted with breaker open → outage path even with empty errors", async () => {
+    // KPR-398 zero-progress pin: fixture defaults toolCalls: 0 / streamed:
+    // false plus finalMessage "" = the hang signature — classifies hard
+    // timeout and still queues.
     agentManager.runWorkItemTurn.mockResolvedValueOnce(
       makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true }),
     );
@@ -1232,6 +1235,7 @@ describe("outage interception (KPR-307)", () => {
   });
 
   it("★ timedOut with breaker closed → legacy path, unqueued", async () => {
+    // KPR-398 zero-progress pin (see the open-breaker row above).
     agentManager.runWorkItemTurn.mockResolvedValueOnce(
       makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true }),
     );
@@ -1240,6 +1244,22 @@ describe("outage interception (KPR-307)", () => {
     await dispatcher.dispatch(slackItem());
     expect(store.enqueue).not.toHaveBeenCalled();
     expect(adapter.deliver).toHaveBeenCalledTimes(1); // "_No response._" as today
+  });
+
+  it("★ KPR-398: with-progress deadline turn with breaker open → legacy path, never queued", async () => {
+    // A turn-deadline-with-progress by definition executed tools or streamed;
+    // queuing it into outage_queue would silently re-run those side effects
+    // on replay (the gate's Finding 4 r1 rationale). Mirror of the zero-
+    // progress open-breaker row above, flipped by progress evidence alone.
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(
+      makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true, toolCalls: 46, streamed: true }),
+    );
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(store.enqueue).not.toHaveBeenCalled();
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // legacy "_No response._" delivery, not the notice
+    expect(adapter.deliver.mock.calls[0][0].text).not.toBe(OUTAGE_NOTICE_DEFAULT);
   });
 
   it("sched: turns skip with a log — never queued, never noticed", async () => {

@@ -539,14 +539,22 @@ export class Dispatcher {
 
   /**
    * §7.2 second classification leg (post-turn gate): the turn COMPLETED but
-   * the provider's breaker is open. Fires when the result classifies into
-   * HARD_FAULT_KINDS OR `timedOut && aborted` (Finding 3 r2 — a runner-
-   * deadline timeout typically leaves `error` unset, so `errors` alone never
-   * fires for hang-type outages). Gated on snapshot.enabled so shadow mode
-   * stays fully observational. A `non-provider` classification with the
-   * breaker coincidentally open follows the LEGACY path — a partially-
-   * executed tool turn's side effects must not be silently re-run
-   * (Finding 4 r1).
+   * the provider's breaker is open. Fires only when the FULL RunResult
+   * classifies into HARD_FAULT_KINDS (KPR-398: the classifier consults
+   * toolCalls/streamed/text inside its timedOut && aborted rule — a
+   * zero-progress hang classifies hard `timeout` and queues here; a
+   * with-progress deadline abort classifies breaker-inconclusive
+   * `turn-deadline` and follows the LEGACY path, because it by definition
+   * executed tools or streamed and a partially-executed tool turn's side
+   * effects must not be silently re-run — the same Finding 4 r1 rationale
+   * that keeps `non-provider` classifications out of the queue). The former
+   * redundant `timedOut && aborted` hangTimeout arm is deleted: rule 1
+   * classifies that shape as a fault irrespective of `error`, so hardFault
+   * alone covers exactly what it caught; the Finding 3 r2 concern (runner-
+   * deadline timeouts leave `error` unset, so `errors` alone never fires)
+   * lives in the cheap-exit condition below, which still admits error-less
+   * timedOut turns. Gated on snapshot.enabled so shadow mode stays fully
+   * observational.
    */
   private async maybeHandlePostTurnOutage(
     item: WorkItem,
@@ -563,14 +571,10 @@ export class Dispatcher {
     const snapshot = this.agentManager.circuitBreakers.stateFor(provider);
     if (!snapshot || snapshot.state !== "open" || snapshot.enabled !== true) return false;
 
-    const classification = classifyTurnResult({
-      error: runResult.error,
-      timedOut: runResult.timedOut,
-      aborted: runResult.aborted,
-    });
+    // KPR-398: full RunResult — structurally carries toolCalls/streamed/text.
+    const classification = classifyTurnResult(runResult);
     const hardFault = classification.outcome === "fault" && HARD_FAULT_KINDS.has(classification.kind);
-    const hangTimeout = runResult.timedOut === true && runResult.aborted === true;
-    if (!hardFault && !hangTimeout) return false;
+    if (!hardFault) return false;
 
     return this.handleOutageTurn(item, agentId, adapter, provider);
   }
