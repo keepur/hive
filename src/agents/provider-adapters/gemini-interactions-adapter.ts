@@ -328,7 +328,14 @@ export class GeminiInteractionsAdapter implements AgentProviderAdapter {
             },
             // maxRetries 0: single-attempt by design — retry policy belongs
             // to the breaker/outage layer; SDK-internal retries would mask
-            // rate-limit/5xx faults from classification.
+            // rate-limit/5xx faults from classification. These camelCase keys
+            // are the interactions bridge's documented option surface
+            // (GoogleGenAIRequestOptions): toGoogleGenAIRequestOptions maps
+            // fetchOptions→fetch_options (signal reaches the Request init) and
+            // maxRetries→retries {attempt-count-backoff, maxRetries: 0}, which
+            // short-circuits the retry loop at attempt 0 (verified against
+            // @google/genai 2.18.0 — don't re-flag from the low-level
+            // snake_case layer, it sits BELOW this converter).
             { fetchOptions: { signal: abortController.signal }, maxRetries: 0 },
           );
         } catch (error) {
