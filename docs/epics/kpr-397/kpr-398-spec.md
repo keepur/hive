@@ -51,7 +51,7 @@ Child of hotfix epic **KPR-397**. Status: **spec draft** (Gate 1 delegated).
 
 ### 1. Input type extension (`error-classification.ts`)
 
-Extend `TurnFaultInput` with three optional progress fields, names matching `RunResult` verbatim so both existing full-`RunResult` call sites are structurally assignable with **no call-site edits**:
+Extend `TurnFaultInput` with three optional progress fields, names matching `RunResult` verbatim so full-`RunResult` callers are structurally assignable with **no call-site edits** (today that is `agent-manager.ts:1095`; the dispatcher's narrowed call site is edited by A3 to become one):
 
 ```ts
 export interface TurnFaultInput {
@@ -82,7 +82,7 @@ function hasObservedProgress(input: TurnFaultInput): boolean {
 
 Signal soundness, per `agent-runner.ts`:
 
-- **`toolCalls > 0`** — incremented only when a complete `tool_use` block arrives in an assistant message (L2100-2107). The provider streamed an entire assistant message to emit it: the provider is up. This is the incident's signal (`toolCalls=46`). Note it also subsumes `toolMs` (`toolMs > 0 ⟺ toolCalls > 0` — the last open tool's `endMs` is closed at abort time, L2202-2204, which is why the incident telemetry showed `toolMs≈294s`).
+- **`toolCalls > 0`** — incremented only when a complete `tool_use` block arrives in an assistant message (L2100-2107). The provider streamed an entire assistant message to emit it: the provider is up. This is the incident's signal (`toolCalls=46`). Note it also subsumes `toolMs` as a progress signal (`toolCalls > 0` whenever `toolMs > 0` — the last open tool's `endMs` is closed at abort time, L2202-2204, which is why the incident telemetry showed `toolMs≈294s`).
 - **`streamed === true`** — set only when a `content_block_delta` text delta reached the stream callback (L2076-2082): provider bytes arrived this turn. Covers the deadline-mid-first-message case where no assistant message ever completes.
 - **`text.length > 0`** — `resultText` is captured from completed assistant text blocks (L2098-2099) independently of the stream callback. Covers non-streaming spawns (no `onStream` — e.g. cron/reflection turns, where `streamed` can never become true) that completed at least one assistant message before the deadline.
 
@@ -136,6 +136,7 @@ Every deadline/abort shape, exhaustively — **KPR-400's spec is written against
 | Claude (+Lane A passthrough) | `aborted` only (operator abort/stop) | **`aborted`** | neutral (streak unchanged, probe inconclusive) — unchanged |
 | Lane B (codex/openai/gemini) | `error === "error_turn_deadline"`, `timedOut: true, aborted: false` | fault / **`turn-deadline`** (progress-blind) | inconclusive — unchanged |
 | Any | narrowed input, `timedOut && aborted`, progress fields absent | fault / **`timeout`** | fail-closed pre-398 behavior |
+| (quirk, pre-existing) | `timedOut: true, aborted: false`, `error: undefined` | **`success`** (rules 1-2 miss; rule 3's no-error arm fires) | unreachable in practice: Claude-lane `timedOut ⇒ aborted` (deadline guard and `abort()` run in one synchronous block, agent-runner.ts:2034-2043); Lane B deadlines always carry the sentinel error. Recorded so KPR-400's spec doesn't rediscover it — not changed by this ticket |
 
 Lane A passthrough providers (kimi/deepseek/grok) ride the Claude rows automatically — they run `ClaudeAgentAdapter`/`AgentRunner` (`claude-agent-adapter.ts:9-10` returns `runner.send(...)` verbatim), so their per-provider breakers gain the same fix with zero extra work. (The epic notes Grok had the identical episode.)
 
