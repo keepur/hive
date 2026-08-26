@@ -1,7 +1,7 @@
 # KPR-389 — Meeting turn-kind awareness: conferenceRound into spawn shaping + preamble hardening
 
 **Epic:** KPR-386 (meeting mode) — third child, follows merged KPR-387 + KPR-388 (epic branch @ 7f6d92f).
-**Status:** draft (spec review pending).
+**Status:** spec-ready (spec review clean r3, fable; r1–r3 findings resolved, advisories folded).
 **Decision-register canon:** C1–C13 bind this spec; C3/C4/C5/C6/C7/C10/C12 are directly load-bearing — interactions resolved in §Design and §Canon compliance.
 
 ## TL;DR
@@ -252,6 +252,7 @@ Goal 5 has a second reachable path: outage mid-meeting → reaction queued → r
 // still runs, so replay → done resolution is unharmed.
 const killedReaction =
   conferenceRoundOf(item) === 1 && (runResult.aborted || runResult.timedOut) && !runResult.text.trim();
+// Text-bearing kills deliver here, unlike the fan-out leg (D5) — replay is the last delivery chance.
 
 if (isNonResponse) {
   … existing branch, log gains conferenceRound: conferenceRoundOf(item) …
@@ -326,7 +327,7 @@ this.turnTelemetryStore.record({
 ## Edge cases
 
 - **E1 Round-0 / non-conference:** untouched by construction (D3); negatively pinned (T2).
-- **E2 Delegate Task subagents inside a reaction:** claude lane — a Task call is one tool use in the parent loop; the SDK sub-session runs within the parent's 120s wall clock. Lane B — the KPR-354 nested runner keeps its own `{7|10, 600s}` limits, but the parent's clamped deadline abort-chains into the nested turn via `call.signal` (verified agent-manager.ts:718–724), so the 120s wall clock effectively bounds delegates too. A reaction that truly needs a delegate will likely be killed — accepted: reactions should not delegate, the preamble discourages tool use, and the kill is silent (D5).
+- **E2 Delegate Task subagents inside a reaction:** claude lane — a Task call is one tool use in the parent loop; the SDK sub-session runs within the parent's 120s wall clock. Lane B — the KPR-354 nested runner keeps its own `{7|10, 600s}` limits, but the parent's clamped deadline abort-chains into the nested turn via `call.signal` (verified agent-manager.ts:718–724), so the 120s wall clock effectively bounds delegates too. A reaction that truly needs a delegate will likely be killed — accepted: reactions should not delegate, the preamble discourages tool use, and the kill is silent (D5/D5b).
 - **E3 Voice / scheduler / cron / reflection / team / event one-shots:** none carry conference meta ⇒ `conferenceRound` undefined ⇒ zero change. Voice additionally returns at the carve-out before the branch.
 - **E4 Outage replay (C12 — verified):** queued doc holds the shaped `effectiveItem` (conference meta + baked prompt). Replay pins `targetAgentId` ⇒ resolveAgents step 0 ⇒ bare `ResolvedAgent` ⇒ single-dispatch path: no re-injection, no tracker writes, no mark bookkeeping (C12 placement intact). `prepareSpawn` still sees `meta.conferenceRound = 1` ⇒ reaction caps apply on replay — deliberate (same prompt, same kind). D5's fan-out guard does NOT fire for replays (`resolved.conferenceRound` is undefined there); a replayed reaction killed *again* by the caps is suppressed by the single-dispatch leg (D5b, meta-discriminated) with `recordTurnSuccess` intact — errored replay failures keep KPR-307 semantics via `resolveReplayRealFailure`. Nit for future pins: the replayed item's `text` is `replayWrap`'d (outage-replay-processor.ts:102–103 — prompt-note wrapper; the queued doc keeps the original shaped text), so a test pinning replayed conference text must expect the wrapper, not the bare shaped prompt.
 - **E5 C1 all-roster fallback interaction:** the *meeting* classifier's failure fallback selects all roster members. Round-0: all recorded at selection time ⇒ zero reactions (C1 stands, unaffected). Reaction pass: a fallback selects ALL unclaimed peers ⇒ a reaction storm — previously N full work turns, now N capped low-effort turns; this ticket bounds C1's worst case rather than changing it. The *effort* classifier (`routeModel`) is a different classifier: round-1 never calls it at all, so no interaction exists; its own fallback paths remain reachable only from round-0/non-conference turns.
