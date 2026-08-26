@@ -17,18 +17,26 @@
 
 export type ProviderFaultKind =
   | "connect-fail" // network-level: refused/reset/DNS/fetch failed
-  | "timeout" // runner deadline fired (RunResult.timedOut)
+  | "timeout" // runner deadline fired with ZERO observed progress — the hang signature (KPR-398)
   | "rate-limit" // 429 / rate limit / too many requests
   | "auth" // 401/403/authentication/invalid key
   | "server-error" // 5xx / overloaded / service unavailable
   | "bad-model" // rejected/unknown model id (KPR-312, M8) — config fault, NEVER trips the breaker
-  | "turn-deadline" // Lane B wall-clock deadline expiry — breaker-INCONCLUSIVE (see TURN_DEADLINE_SUBTYPE)
+  | "turn-deadline" // deadline expiry with proof the provider responded — breaker-INCONCLUSIVE. Lane B sentinel (see TURN_DEADLINE_SUBTYPE, progress-blind) + Claude-lane deadline abort with observed progress (KPR-398)
   | "non-provider"; // everything else — NEVER trips the breaker
 
 export interface TurnFaultInput {
   error?: string; // RunResult.error
   timedOut?: boolean; // RunResult.timedOut (KPR-306)
   aborted?: boolean; // RunResult.aborted
+  // KPR-398: per-turn progress evidence (RunResult field names, verbatim, so
+  // full-RunResult callers are structurally assignable with no call-site
+  // edits). Consulted ONLY inside the timedOut && aborted rule; absent fields
+  // are fail-closed (no progress ⇒ hard timeout — a narrowed caller keeps
+  // pre-KPR-398 behavior).
+  toolCalls?: number;
+  streamed?: boolean;
+  text?: string;
 }
 
 export type TurnClassification =
@@ -132,19 +140,47 @@ function classifyErrorString(error: string): TurnClassification {
   return { outcome: "fault", kind: "non-provider", message: error };
 }
 
+/** KPR-398: proof the provider responded THIS turn. Any one signal suffices;
+ * all three absent is indistinguishable from a hung provider. */
+function hasObservedProgress(input: TurnFaultInput): boolean {
+  return (input.toolCalls ?? 0) > 0 || input.streamed === true || (input.text?.length ?? 0) > 0;
+}
+
 /**
  * Classify a finished turn's RunResult. Order (first match wins):
- *  1. timedOut && aborted  → timeout fault (the deadline path sets both;
+ *  1. timedOut && aborted  → deadline abort (the deadline path sets both;
  *     requiring both is belt-and-suspenders on top of the runner-side
- *     activeQuery guard, which is the primary fix).
+ *     activeQuery guard, which is the primary fix). KPR-398 splits this rule
+ *     on observed progress: with progress (toolCalls > 0 | streamed | text
+ *     nonempty) → the breaker-INCONCLUSIVE turn-deadline kind; zero or
+ *     absent progress → the hard timeout kind (the hang signature —
+ *     fail-closed, so a caller passing a narrowed input keeps pre-KPR-398
+ *     behavior).
  *  2. aborted (alone)      → aborted (neutral — never reached a
- *     provider-attributable outcome).
+ *     provider-attributable outcome; progress fields are never consulted).
  *  3. no error             → success.
  *  4. pattern tables       → fault kind.
  *  5. default              → non-provider (fail-safe).
  */
 export function classifyTurnResult(input: TurnFaultInput): TurnClassification {
   if (input.timedOut === true && input.aborted === true) {
+    // KPR-398: the Claude runner's own deadline sets BOTH flags
+    // (agent-runner.ts deadline timer → abort()), so this shape covers two
+    // very different turns. Observed progress = the provider responded this
+    // turn ⇒ the same breaker-INCONCLUSIVE turn-deadline kind Lane B's
+    // sentinel gets (never trips, never resets a streak, never closes a
+    // probe). Zero progress = the hang signature ⇒ hard timeout, so a
+    // genuinely hung provider still trips the breaker. Fail-closed on
+    // absent fields.
+    if (hasObservedProgress(input)) {
+      return {
+        outcome: "fault",
+        kind: "turn-deadline",
+        message:
+          input.error ??
+          `turn deadline exceeded with progress (toolCalls=${input.toolCalls ?? 0}, streamed=${input.streamed === true}, textLen=${input.text?.length ?? 0})`,
+      };
+    }
     return { outcome: "fault", kind: "timeout", message: input.error ?? "turn deadline exceeded" };
   }
   if (input.aborted === true) return { outcome: "aborted" };
