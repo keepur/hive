@@ -125,16 +125,31 @@ private shapeReactionTurn(
   if (!agentConfig) {
     return { prompt, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
   }
-  // Base limits — the same values each lane would otherwise resolve:
-  //   claude:      static-tier limits (resolveResourceLimits(staticTier, resourceTiers))
-  //   Lane A + B:  agent-def legacy triple (byte-identical to the Lane B
-  //                branch construction at prepareSpawn:1748–1752; for Lane A
-  //                this newly *materializes* the same values the runner's
-  //                per-field fallback would have applied — no behavior change
-  //                beyond the clamp).
-  const base = staticRoute.provider === "claude"
+  // Base limits — config-accurate: exactly the values today's turn would
+  // otherwise receive, so the min() invariant ("tighter operator config
+  // always wins") holds on every reachable path:
+  //   claude, router ON:  static-tier limits (resolveResourceLimits) — the
+  //               router-on path's resourceLimits; the legacy triple is dead
+  //               config there and is deliberately NOT folded in (folding it
+  //               would newly activate config that has no effect today).
+  //   claude, router OFF: agent-def legacy triple — today the router gate
+  //               returns resourceLimits: undefined and the runner's
+  //               per-field fallback applies agentConfig values; an
+  //               operator's tightness may live there (e.g. maxTurns: 3) and
+  //               must win the min(). The other two undefined-resolving
+  //               claude paths are unreachable for round-1: reactions always
+  //               carry a human sender (never "system"), and the router-catch
+  //               belt-and-braces cannot fire because routeModel is never
+  //               called here.
+  //   Lane A + B: agent-def legacy triple (byte-identical to the Lane B
+  //               branch construction at prepareSpawn:1748–1752; for Lane A
+  //               this newly *materializes* the same values the runner's
+  //               per-field fallback would have applied — no behavior change
+  //               beyond the clamp).
+  const legacy = { maxTurns: agentConfig.maxTurns, timeoutMs: agentConfig.timeoutMs ?? 300_000, budgetUsd: agentConfig.budgetUsd };
+  const base = staticRoute.provider === "claude" && appConfig.modelRouter.enabled
     ? resolveResourceLimits(staticTier, agentConfig.resourceTiers)
-    : { maxTurns: agentConfig.maxTurns, timeoutMs: agentConfig.timeoutMs ?? 300_000, budgetUsd: agentConfig.budgetUsd };
+    : legacy;
   const limits: ResourceLimits = {
     maxTurns: Math.min(base.maxTurns, REACTION_MAX_TURNS),
     timeoutMs: Math.min(base.timeoutMs, REACTION_TIMEOUT_MS),
@@ -157,10 +172,12 @@ What each lane actually receives (delivery mechanics verified):
 
 | Lane | Effort | maxTurns | timeoutMs |
 |---|---|---|---|
-| claude (effort-capable) | `Options.effort = "low"` (runner:1964); **`routeModel` never called** — saves the sidecar call + its cost/latency on the shaped multi-KB prompt | `Options.maxTurns = min(tier, 6)` (runner:1954) | runner deadline `min(tier, 120s)` (runner:2026) |
+| claude (effort-capable) | `Options.effort = "low"` (runner:1964); **`routeModel` never called** — saves the sidecar call + its cost/latency on the shaped multi-KB prompt | `Options.maxTurns = min(base, 6)` (runner:1954) | runner deadline `min(base, 120s)` (runner:2026) |
 | claude (haiku / off-catalog) | none (undeliverable — same as today) | `min(base, 6)` (haiku tier base is already 20/120s ⇒ 6/120s) | `min(base, 120s)` |
 | Lane A (kimi/deepseek/grok) | `Options.effort = "low"` — overrides the clamped static `:effort` suffix for this turn only | `min(agent-def, 6)` — newly materialized limits object, values ≡ runner fallback | `min(agent-def ?? 300s, 120s)` |
 | Lane B (openai/codex/gemini) | unchanged (constructor-time `:effort`; `request.effort` ignored) | dispatch-loop round budget `min(agent-def, 6)` (e.g. codex:270) | abort-signal deadline `min(agent-def ?? 300s, 120s)`; expiry = `TURN_DEADLINE_SUBTYPE`, breaker-inconclusive |
+
+Claude-row `base` follows the D2 base rule: static-tier limits on router-enabled instances, the agent-def legacy triple when `modelRouter.enabled` is false — always the limits today's turn would actually have received.
 
 **Cap calibration (⚠ spec-chosen):** `maxTurns 6` sits below KPR-354's delegate budgets (7 custom / 10 generic) because a reaction is strictly lighter than a delegated task — engage-or-decline over already-present context, with at most a couple of genuine lookups. `timeoutMs 120s` reuses the haiku-tier precedent for light turns (`RESOURCE_TIER_DEFAULTS.haiku.timeoutMs`), kills the observed 156s stragglers, and leaves honest sub-30s reactions untouched. Both are plain constants — trivially tunable when the new telemetry says otherwise.
 
@@ -218,6 +235,10 @@ if (resolved.conferenceRound === 1 && (runResult.aborted || runResult.timedOut |
 
 Scope-guarded: keys on `resolved.conferenceRound === 1` (in-memory `ResolvedAgent`, never replay items — a replayed reaction resolves without conference fields and keeps KPR-307's replay failure handling untouched, §E4). Round-0 and normal turns keep today's delivery behavior. An errored reaction *with* text still delivers (it may be a real answer with a trailing warning — exit-code-1 convention).
 
+**Placement / `recordTurnSuccess`:** the guard sits after the outage gates and mark bookkeeping and before the `isNonResponse` branch — its early return therefore also skips `recordTurnSuccess` (dispatcher.ts:1126) for an aborted-without-error reaction. **Intended:** a killed turn is not evidence of provider recovery; the KPR-307 outage episode ends on the next genuinely successful turn. Replay `done` resolution is unaffected — replays never reach this guard.
+
+**Suppression outcome made queryable by round:** the existing `Non-response suppressed (fan-out)` log line (dispatcher.ts:1089) — which today logs only `{ agentId }` and fires for round-0 declines too — gains `conferenceRound: resolved.conferenceRound` (a number, redaction-safe: no message text). This is the discriminator the §C5 trigger counts against.
+
 ### D6. Telemetry stamping
 
 **`recordSpawnObservability`** gains a fourth parameter, threaded from `spawnTurn` (the same value `finalizeSpawnResult` receives — C7):
@@ -256,7 +277,7 @@ this.turnTelemetryStore.record({
 
 **`ActivityRecord`** (activity/types.ts) gains `conferenceRound?: number`, stamped at the existing `activityLogger.record` site. Rationale: turn telemetry skips aborted turns (`!result.aborted` gate), so clamp-killed reactions would be invisible there; the activity log records every finalized turn, keeping kill counts and error rates measurable. No other activity fields added (it already carries `durationMs`/`toolCalls`/`toolSummary`/`error`).
 
-**Measurement plan (what before/after looks like):** with KPR-387's fix already deployed (before-data exists in logs), one TTL window of post-deploy data answers: p50/p95 `durationMs` and `toolMs/durationMs` ratio for `conferenceRound: 1` vs `0`; suppression outcome via dispatcher logs; kill counts via activity log; `injectionMode`/`resumedSession` segmentation for KPR-388 efficacy; round-1 volume vs round-0 volume (feeds C5, below).
+**Measurement plan (what before/after looks like):** with KPR-387's fix already deployed (before-data exists in logs), one TTL window of post-deploy data answers: p50/p95 `durationMs` and `toolMs/durationMs` ratio for `conferenceRound: 1` vs `0`; suppression outcome via the round-tagged suppression log (D5); kill counts via the activity log; `injectionMode`/`resumedSession` segmentation for KPR-388 efficacy; round-1 vs round-0 volume via the activity log's `conferenceRound` — turn telemetry undercounts round-1 because the `!aborted` gate drops killed reactions (feeds C5, below).
 
 ## C5 disposition — lone-peer force-select
 
@@ -264,11 +285,11 @@ this.turnTelemetryStore.record({
 
 **Decision: keep the shortcut; measure; tune in a follow-up on trigger.** Rationale: (a) this ticket makes the forced reaction cheap — low effort, ≤6 turns, ≤120s, preamble-driven immediate decline — collapsing the marginal cost of a wrong force-select from ~1–2.5 min of tool churn to seconds; (b) replacing the shortcut with a classifier call adds a sidecar call per round-0 response in exactly the small-meeting case where it's most frequent, and the right damper (classifier-always vs suppression-history vs round-1-only removal) is a judgment call that deserves data; (c) the KPR-387 pre-PR note dispositioned this to KPR-389 *as tuning input*, not as a mandated change.
 
-**Explicit trigger for the follow-up ticket:** after ≥7 days of post-deploy telemetry, file a follow-up to route the *reaction pass only* through the classifier (dropping the `length === 1` shortcut for that call site, keeping round-0/DM semantics) if EITHER: round-1 turn volume exceeds round-0 volume for any instance (reaction inflation — query `agent_turn_telemetry` grouped by `conferenceRound`), OR >50% of round-1 turns end suppressed (dispatcher `Non-response suppressed (fan-out)` log rate against round-1 telemetry counts). If neither fires, the shortcut stands and C5 closes with this spec as its record.
+**Explicit trigger for the follow-up ticket:** after ≥7 days of post-deploy telemetry, file a follow-up to route the *reaction pass only* through the classifier (dropping the `length === 1` shortcut for that call site, keeping round-0/DM semantics) if EITHER: round-1 turn volume exceeds round-0 volume for any instance (reaction inflation — query `activity_log` grouped by its new `conferenceRound` field; turn telemetry is not the volume counter because its `!aborted` gate drops killed reactions), OR >50% of round-1 turns end suppressed (count `Non-response suppressed (fan-out)` log lines carrying `conferenceRound: 1` — the field D5 adds to that line — against round-1 volume from `activity_log`). If neither fires, the shortcut stands and C5 closes with this spec as its record.
 
 ## Integration points
 
-- `src/channels/dispatcher.ts` — `dispatchToAgent`: meta stamp gains `conferenceInjectionMode`; new round-1 kill-suppression guard (D5). `buildMeetingPreamble`: new literal (D4). Nothing else — `resolveConferenceAgents` / `triggerConferenceReactions` / `buildConferenceContext` / tracker / mark bookkeeping untouched (C1/C2/C12/C13).
+- `src/channels/dispatcher.ts` — `dispatchToAgent`: meta stamp gains `conferenceInjectionMode`; new round-1 kill-suppression guard + `conferenceRound` on the `Non-response suppressed (fan-out)` log line (D5). `buildMeetingPreamble`: new literal (D4). Nothing else — `resolveConferenceAgents` / `triggerConferenceReactions` / `buildConferenceContext` / tracker / mark bookkeeping untouched (C1/C2/C12/C13).
 - `src/agents/agent-manager.ts` — `conferenceRoundOf` / `conferenceInjectionModeOf` helpers; `TurnContext.conferenceRound`; `runWorkItemTurn` sets it; `prepareSpawn` round-1 branch + `shapeReactionTurn` + the two constants; `recordSpawnObservability` signature + stamping; `spawnTurn` call-site arg.
 - `src/agents/turn-telemetry.ts` — additive optional fields on `TurnTelemetryDoc`/`TurnTelemetryInput`.
 - `src/activity/types.ts` — `ActivityRecord.conferenceRound?`.
@@ -281,7 +302,7 @@ this.turnTelemetryStore.record({
 - **E1 Round-0 / non-conference:** untouched by construction (D3); negatively pinned (T2).
 - **E2 Delegate Task subagents inside a reaction:** claude lane — a Task call is one tool use in the parent loop; the SDK sub-session runs within the parent's 120s wall clock. Lane B — the KPR-354 nested runner keeps its own `{7|10, 600s}` limits, but the parent's clamped deadline abort-chains into the nested turn via `call.signal` (verified agent-manager.ts:718–724), so the 120s wall clock effectively bounds delegates too. A reaction that truly needs a delegate will likely be killed — accepted: reactions should not delegate, the preamble discourages tool use, and the kill is silent (D5).
 - **E3 Voice / scheduler / cron / reflection / team / event one-shots:** none carry conference meta ⇒ `conferenceRound` undefined ⇒ zero change. Voice additionally returns at the carve-out before the branch.
-- **E4 Outage replay (C12 — verified):** queued doc holds the shaped `effectiveItem` (conference meta + baked prompt). Replay pins `targetAgentId` ⇒ resolveAgents step 0 ⇒ bare `ResolvedAgent` ⇒ single-dispatch path: no re-injection, no tracker writes, no mark bookkeeping (C12 placement intact). `prepareSpawn` still sees `meta.conferenceRound = 1` ⇒ reaction caps apply on replay — deliberate (same prompt, same kind). D5's suppression guard does NOT fire for replays (`resolved.conferenceRound` is undefined there); replay failures keep KPR-307 semantics.
+- **E4 Outage replay (C12 — verified):** queued doc holds the shaped `effectiveItem` (conference meta + baked prompt). Replay pins `targetAgentId` ⇒ resolveAgents step 0 ⇒ bare `ResolvedAgent` ⇒ single-dispatch path: no re-injection, no tracker writes, no mark bookkeeping (C12 placement intact). `prepareSpawn` still sees `meta.conferenceRound = 1` ⇒ reaction caps apply on replay — deliberate (same prompt, same kind). D5's suppression guard does NOT fire for replays (`resolved.conferenceRound` is undefined there); replay failures keep KPR-307 semantics. Nit for future pins: the replayed item's `text` is `replayWrap`'d (outage-replay-processor.ts:102–103 — prompt-note wrapper; the queued doc keeps the original shaped text), so a test pinning replayed conference text must expect the wrapper, not the bare shaped prompt.
 - **E5 C1 all-roster fallback interaction:** the *meeting* classifier's failure fallback selects all roster members. Round-0: all recorded at selection time ⇒ zero reactions (C1 stands, unaffected). Reaction pass: a fallback selects ALL unclaimed peers ⇒ a reaction storm — previously N full work turns, now N capped low-effort turns; this ticket bounds C1's worst case rather than changing it. The *effort* classifier (`routeModel`) is a different classifier: round-1 never calls it at all, so no interaction exists; its own fallback paths remain reachable only from round-0/non-conference turns.
 - **E6 Per-thread lock:** reactions still serialize behind same-agent turns on `agentId:threadId`; the caps shrink the hold from minutes to ≤120s. Residual self-blocking is the staleness-culling trigger (Non-goals).
 - **E7 Haiku / effort-incapable claude agents:** no effort pin (undeliverable, same as today); caps still clamp (haiku base 20/120s ⇒ 6/120s).
