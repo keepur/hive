@@ -51,6 +51,8 @@ interface ResolvedAgent {
   conferenceRound?: number; // 0 = human-triggered, 1 = peer reaction
   threadContext?: string;
   meetingPreamble?: string;
+  /** Round-1 only: the peer reply this reaction turn should engage with (KPR-387). */
+  reactionTo?: { authorName: string; text: string };
 }
 
 /**
@@ -990,12 +992,18 @@ export class Dispatcher {
     // Conference mode: inject thread context + preamble into the WorkItem
     let effectiveItem = item;
     if (resolved.conferenceMode) {
-      const contextPrefix = [resolved.meetingPreamble, "", resolved.threadContext, "", "---", `[New message]:`]
-        .filter(Boolean)
-        .join("\n");
+      // KPR-387: round-1 reaction turns are framed against the peer reply — the
+      // original human message is never re-presented in the terminal slot (it
+      // remains available via the re-fetched transcript in threadContext).
+      const newMessageSegment = resolved.reactionTo
+        ? `[${resolved.reactionTo.authorName} just replied]:\n${resolved.reactionTo.text}\n\n` +
+          `React to ${resolved.reactionTo.authorName}'s reply if you have something to add. ` +
+          `Do not re-answer the original question. If you have nothing to add, respond with "No response needed."`
+        : `[New message]:\n${item.text}`;
+      const contextPrefix = [resolved.meetingPreamble, resolved.threadContext, "---"].filter(Boolean).join("\n");
       effectiveItem = {
         ...item,
-        text: `${contextPrefix}\n${item.text}`,
+        text: `${contextPrefix}\n${newMessageSegment}`,
         meta: {
           ...item.meta,
           conferenceMode: true,
@@ -1315,6 +1323,7 @@ Meeting rules:
     }
 
     // Dispatch reactions concurrently (peers already claimed in reacted set above)
+    const responderName = this.registry.get(respondingAgentId)?.name ?? respondingAgentId;
     const reactionDispatches = classification.respondAgentIds.map((agentId) => {
       const resolved: ResolvedAgent = {
         agentId,
@@ -1323,6 +1332,7 @@ Meeting rules:
         conferenceRound: 1,
         threadContext,
         meetingPreamble: preamble,
+        reactionTo: { authorName: responderName, text: responseText },
       };
       return this.dispatchToAgent(originalItem, resolved);
     });
