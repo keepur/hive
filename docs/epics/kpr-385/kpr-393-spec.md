@@ -133,7 +133,7 @@ Pre-agreed shape for that ticket (so it plans fast; all of it is future work):
 Deliberate deltas — enumerated:
 1. `src/agents/intent-trailer.test.ts` — new; fixtures include the three real Sol positives and ≥4 real negatives from the transcripts (paraphrased, no PII beyond what activity requires — use text shapes, not verbatim thread content).
 2. `src/agents/prefix-builder.provider.test.ts` — Lane B instruction expectations gain the Follow-through section (deliberate delta, enumerated; the Claude-lane golden suite `prefix-builder.golden.test.ts` must show **zero diff**).
-3. `src/agents/agent-manager.test.ts` — recordActivity includes/omits `intentTrailer` correctly (one positive, one negative).
+3. `src/agents/agent-manager.test.ts` — the activity record includes/omits `intentTrailer` correctly (one positive, one negative, plus one error-turn-with-text negative).
 
 Zero-diff surfaces (no expectation edits permitted): `dispatch-loop.ts`/`.test.ts`, `turn-scaffold.ts`/`.test.ts`, all four adapters + tests, `tool-bridge`, `turn-assembly`, `toolkit-section` (D1 lives in prefix-builder, not the toolkit renderer). Tests are not typechecked — no "compile-forced" claims for test-file deltas; sweep record literals.
 
