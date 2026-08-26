@@ -41,6 +41,9 @@ describe("detectIntentTrailer — negatives", () => {
     // empty / whitespace (reflection or aborted turns)
     "",
     "   \n  ",
+    // discourse markers, not commitments (review r1)
+    "Let me be clear: the deadline semantics are unchanged.",
+    "Let me now summarize the three findings.",
   ])("does not flag %j", (text) => {
     expect(detectIntentTrailer(text)).toBe(false);
   });
@@ -59,5 +62,28 @@ describe("detectIntentTrailer — tail window", () => {
   it("a promise inside the final 300 chars flags even with long preceding text", () => {
     const text = "Analysis complete. ".repeat(30) + "Next, I'll draft the migration plan.";
     expect(detectIntentTrailer(text)).toBe(true);
+  });
+
+  it("a mid-sentence 'on it' landing exactly at the slice boundary does not flag (review r1)", () => {
+    // Build a 300-char suffix that starts with "on it" (no leading
+    // punctuation) so slice(-300) lands exactly on its first char.
+    const head = "on it right up until the freeze. ";
+    const filler = "Details follow. ";
+    let suffix = head;
+    while (suffix.length < 300) {
+      suffix += filler;
+    }
+    suffix = suffix.slice(0, 300);
+    expect(suffix.length).toBe(300); // sanity: suffix is exactly one tail window
+    expect(suffix.startsWith("on it")).toBe(true); // sanity: boundary lands on "on it"
+
+    // Prefix ends mid-sentence ("...working on it...") so the phrase is a
+    // genuine continuation, not a real clause start, in the full text.
+    const prefix = "Preamble sentence. ".repeat(20) + "The team has been working ";
+    const full = prefix + suffix;
+    expect(full.length).toBeGreaterThan(300);
+    expect(full.slice(-300)).toBe(suffix); // sanity: the 300-char tail is exactly `suffix`
+
+    expect(detectIntentTrailer(full)).toBe(false);
   });
 });

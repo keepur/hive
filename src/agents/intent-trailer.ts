@@ -28,8 +28,8 @@ const PATTERNS: readonly RegExp[] = [
   /\bI['’]ll\s+\p{L}+/iu, // "I'll check…"
   /\bI\s+will\s+\p{L}+/iu, // "I will draft…"
   /\bI['’]m\s+going\s+to\s+\p{L}+/iu, // "I'm going to pull…"
-  /\blet\s+me\s+(?!know\b)\p{L}+/iu, // "Let me inspect…" (never "let me know")
-  /(?:^|[.!?…\n—–]\s*)(?:I['’]m\s+)?on\s+it\b/iu, // clause-start "on it" / "I'm on it"
+  /\blet\s+me\s+(?!know\b|be\b|now\b)\p{L}+/iu, // "Let me inspect…" (never "let me know/be/now" — reader-directed or discourse markers)
+  /(?:^|[.!?…\n—–]\s*)(?:I['’]m\s+)?on\s+it\b/iu, // clause-start "on it" / "I'm on it" — ^ = true message start (tail is sentinel-prefixed when sliced)
   /\bfirst\s+step\s+is\b/iu, // "First step is to inspect…"
 ];
 
@@ -38,6 +38,12 @@ const PATTERNS: readonly RegExp[] = [
 export function detectIntentTrailer(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
-  const tail = trimmed.slice(-TAIL_CHARS);
+  let tail = trimmed.slice(-TAIL_CHARS);
+  if (tail.length < trimmed.length) {
+    // The slice cut mid-text: prefix a space so the ^ clause-anchor cannot
+    // bind to a synthetic start created by the cut. (^ remains valid for
+    // short messages where the tail IS the whole text, e.g. "On it.")
+    tail = " " + tail;
+  }
   return PATTERNS.some((re) => re.test(tail));
 }
