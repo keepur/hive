@@ -17,7 +17,7 @@
 - **C10 honesty:** the hardened preamble says the thread is available "in this prompt and your session context" — true in full mode (prompt carries it) and delta mode (prompt ∪ session covers it, KPR-388's covering invariant). It never claims "the full transcript is in this prompt".
 - **Telemetry surface (verified):** `agent_turn_telemetry` (turn-telemetry.ts) is token/cache-only today — no durations. Before/after measurement needs the perf split, so `TurnTelemetryDoc` gains optional `conferenceRound`/`injectionMode`/`resumedSession`/`durationMs`/`llmMs`/`toolMs`/`toolCalls`/`effort`; `ActivityRecord` gains optional `conferenceRound` (killed/errored turns never reach turn telemetry — the `result.sessionId && !aborted` gate — but always reach the activity log, so kill counts stay measurable). `resumedSession` (C7) is threaded into `recordSpawnObservability` from the same `!!finalAttemptSessionId` that feeds `finalizeSpawnResult`.
 - **Outage replay (C12, verified):** a queued conference turn persists the *shaped* `effectiveItem` including `meta.conferenceRound`; replay resolves via `targetAgentId` (dispatcher.ts:816–819) with no conference fields — no re-injection, no mark bookkeeping — but the meta spread (outage-replay-processor.ts:107) preserves the round, so a replayed reaction keeps reaction shaping. Deliberate: same prompt, same turn kind, same caps.
-- **⚠ Delegated assumptions** (flagged per contract): (1) cap values `REACTION_MAX_TURNS = 6` / `REACTION_TIMEOUT_MS = 120_000` are spec-chosen calibration (rationale §D3), not ticket-given; (2) round-1 kill suppression (§D5 — a clamp-killed reaction must not post `_No response._` into the meeting) is a small dispatcher addition implied but not named by the ticket; (3) the ticket's literal `"(no response)"` decline phrase is deliberately NOT adopted (§D4 rationale — C3/C4 coherence); (4) C5 lone-peer force-select is dispositioned measure-first with an explicit trigger (§C5), not code-changed here.
+- **⚠ Delegated assumptions** (flagged per contract): (1) cap values `REACTION_MAX_TURNS = 6` / `REACTION_TIMEOUT_MS = 120_000` are spec-chosen calibration (rationale §D3), not ticket-given; (2) round-1 kill suppression (§D5 fan-out leg + §D5b single-dispatch leg for replayed reactions — a clamp-killed reaction must not post `_No response._` into the meeting) is a small dispatcher addition implied but not named by the ticket; (3) the ticket's literal `"(no response)"` decline phrase is deliberately NOT adopted (§D4 rationale — C3/C4 coherence); (4) C5 lone-peer force-select is dispositioned measure-first with an explicit trigger (§C5), not code-changed here.
 - **Risk: low.** One optional `TurnContext` field + one meta field + one shaping branch + one preamble string + additive optional telemetry fields. No new collections, no config keys, no provider-adapter changes, no session-store changes. Round-0 and non-conference turns are untouched by construction (branch keys strictly on `conferenceRound === 1`).
 
 ## Problem
@@ -68,8 +68,9 @@ meta: {
 ```ts
 /** KPR-389: typed read of the dispatcher's conference discriminator (C3 —
  *  meta.conferenceRound is the round-1 discriminator). Returns undefined for
- *  non-conference items and malformed values. */
-function conferenceRoundOf(item: WorkItem): 0 | 1 | undefined {
+ *  non-conference items and malformed values. Exported — the dispatcher's
+ *  D5b single-dispatch suppression leg reads it too. */
+export function conferenceRoundOf(item: WorkItem): 0 | 1 | undefined {
   const v = item.meta?.conferenceRound;
   return v === 0 || v === 1 ? v : undefined;
 }
@@ -235,9 +236,34 @@ if (resolved.conferenceRound === 1 && (runResult.aborted || runResult.timedOut |
 
 Scope-guarded: keys on `resolved.conferenceRound === 1` (in-memory `ResolvedAgent`, never replay items — a replayed reaction resolves without conference fields and keeps KPR-307's replay failure handling untouched, §E4). Round-0 and normal turns keep today's delivery behavior. An errored reaction *with* text still delivers (it may be a real answer with a trailing warning — exit-code-1 convention).
 
-**Placement / `recordTurnSuccess`:** the guard sits after the outage gates and mark bookkeeping and before the `isNonResponse` branch — its early return therefore also skips `recordTurnSuccess` (dispatcher.ts:1126) for an aborted-without-error reaction. **Intended:** a killed turn is not evidence of provider recovery; the KPR-307 outage episode ends on the next genuinely successful turn. Replay `done` resolution is unaffected — replays never reach this guard.
+**Placement / `recordTurnSuccess`:** the guard sits after the outage gates and mark bookkeeping and before the `isNonResponse` branch — its early return therefore also skips `recordTurnSuccess` (dispatcher.ts:1127) for an aborted-without-error reaction. **Intended:** a killed turn is not evidence of provider recovery; the KPR-307 outage episode ends on the next genuinely successful turn. Replay `done` resolution is unaffected — replays never reach this guard (they take the single-dispatch path, covered by D5b).
 
 **Suppression outcome made queryable by round:** the existing `Non-response suppressed (fan-out)` log line (dispatcher.ts:1089) — which today logs only `{ agentId }` and fires for round-0 declines too — gains `conferenceRound: resolved.conferenceRound` (a number, redaction-safe: no message text). This is the discriminator the §C5 trigger counts against.
+
+### D5b. Single-dispatch leg — replayed killed reactions
+
+Goal 5 has a second reachable path: outage mid-meeting → reaction queued → replayed with caps intact (§E4) → killed again. The replayed item flows down `dispatch()`'s single-dispatch branch (never `dispatchToAgent`'s conference branch), where a timedOut+aborted, no-error, empty-text result with the breaker closed falls into the else-branch and delivers the `"_No response._"` filler (dispatcher.ts:336) before `recordTurnSuccess` resolves the doc `done` (:374). Fix: suppress **delivery only** on that leg — deliberately NOT an early return, because `recordTurnSuccess` is precisely what resolves the replayed doc `done` there (skipping it would burn replay attempts re-killing the same reaction until the attempt cap):
+
+```ts
+// KPR-389 D5b: single-dispatch leg of the round-1 kill suppression —
+// reachable only by replayed reactions (live conference turns always route
+// via dispatchToAgent). Discriminator is the meta (replay `resolved` carries
+// no conference fields). Delivery-only suppression: recordTurnSuccess below
+// still runs, so replay → done resolution is unharmed.
+const killedReaction =
+  conferenceRoundOf(item) === 1 && (runResult.aborted || runResult.timedOut) && !runResult.text.trim();
+
+if (isNonResponse) {
+  … existing branch, log gains conferenceRound: conferenceRoundOf(item) …
+} else if (killedReaction) {
+  log.info("Round-1 reaction suppressed on replay (killed)", { agentId, aborted: runResult.aborted, timedOut: runResult.timedOut });
+} else {
+  … existing delivery block, unchanged …
+}
+// recordTurnSuccess (:374) unchanged — runs for !error turns, resolving replay → done.
+```
+
+No error-arm here (unlike D5's fan-out guard): an errored replay already resolved via `resolveReplayRealFailure` (:318–321) before this point. The single-dispatch `Non-response suppressed` log line (:327) gains the same `conferenceRound: conferenceRoundOf(item)` field so the C5 suppression numerator doesn't read low across outage windows (advisory fold-in).
 
 ### D6. Telemetry stamping
 
@@ -277,7 +303,7 @@ this.turnTelemetryStore.record({
 
 **`ActivityRecord`** (activity/types.ts) gains `conferenceRound?: number`, stamped at the existing `activityLogger.record` site. Rationale: turn telemetry skips aborted turns (`!result.aborted` gate), so clamp-killed reactions would be invisible there; the activity log records every finalized turn, keeping kill counts and error rates measurable. No other activity fields added (it already carries `durationMs`/`toolCalls`/`toolSummary`/`error`).
 
-**Measurement plan (what before/after looks like):** with KPR-387's fix already deployed (before-data exists in logs), one TTL window of post-deploy data answers: p50/p95 `durationMs` and `toolMs/durationMs` ratio for `conferenceRound: 1` vs `0`; suppression outcome via the round-tagged suppression log (D5); kill counts via the activity log; `injectionMode`/`resumedSession` segmentation for KPR-388 efficacy; round-1 vs round-0 volume via the activity log's `conferenceRound` — turn telemetry undercounts round-1 because the `!aborted` gate drops killed reactions (feeds C5, below).
+**Measurement plan (what before/after looks like):** with KPR-387's fix already deployed (before-data exists in logs), one TTL window of post-deploy data answers: p50/p95 `durationMs` and `toolMs/durationMs` ratio for `conferenceRound: 1` vs `0`; suppression outcome via the round-tagged suppression logs (D5 fan-out + D5b single-dispatch — both legs carry `conferenceRound`, so the numerator doesn't read low across outage windows); kill counts via the activity log; `injectionMode`/`resumedSession` segmentation for KPR-388 efficacy; round-1 vs round-0 volume via the activity log's `conferenceRound` — turn telemetry undercounts round-1 because the `!aborted` gate drops killed reactions (feeds C5, below).
 
 ## C5 disposition — lone-peer force-select
 
@@ -285,11 +311,11 @@ this.turnTelemetryStore.record({
 
 **Decision: keep the shortcut; measure; tune in a follow-up on trigger.** Rationale: (a) this ticket makes the forced reaction cheap — low effort, ≤6 turns, ≤120s, preamble-driven immediate decline — collapsing the marginal cost of a wrong force-select from ~1–2.5 min of tool churn to seconds; (b) replacing the shortcut with a classifier call adds a sidecar call per round-0 response in exactly the small-meeting case where it's most frequent, and the right damper (classifier-always vs suppression-history vs round-1-only removal) is a judgment call that deserves data; (c) the KPR-387 pre-PR note dispositioned this to KPR-389 *as tuning input*, not as a mandated change.
 
-**Explicit trigger for the follow-up ticket:** after ≥7 days of post-deploy telemetry, file a follow-up to route the *reaction pass only* through the classifier (dropping the `length === 1` shortcut for that call site, keeping round-0/DM semantics) if EITHER: round-1 turn volume exceeds round-0 volume for any instance (reaction inflation — query `activity_log` grouped by its new `conferenceRound` field; turn telemetry is not the volume counter because its `!aborted` gate drops killed reactions), OR >50% of round-1 turns end suppressed (count `Non-response suppressed (fan-out)` log lines carrying `conferenceRound: 1` — the field D5 adds to that line — against round-1 volume from `activity_log`). If neither fires, the shortcut stands and C5 closes with this spec as its record.
+**Explicit trigger for the follow-up ticket:** after ≥7 days of post-deploy telemetry, file a follow-up to route the *reaction pass only* through the classifier (dropping the `length === 1` shortcut for that call site, keeping round-0/DM semantics) if EITHER: round-1 turn volume exceeds round-0 volume for any instance (reaction inflation — query `activity_log` grouped by its new `conferenceRound` field; turn telemetry is not the volume counter because its `!aborted` gate drops killed reactions), OR >50% of round-1 turns end suppressed (count suppression log lines carrying `conferenceRound: 1` — the field D5 adds to the fan-out line and D5b adds to the single-dispatch line, so replayed declines across outage windows count too — against round-1 volume from `activity_log`). If neither fires, the shortcut stands and C5 closes with this spec as its record.
 
 ## Integration points
 
-- `src/channels/dispatcher.ts` — `dispatchToAgent`: meta stamp gains `conferenceInjectionMode`; new round-1 kill-suppression guard + `conferenceRound` on the `Non-response suppressed (fan-out)` log line (D5). `buildMeetingPreamble`: new literal (D4). Nothing else — `resolveConferenceAgents` / `triggerConferenceReactions` / `buildConferenceContext` / tracker / mark bookkeeping untouched (C1/C2/C12/C13).
+- `src/channels/dispatcher.ts` — `dispatchToAgent`: meta stamp gains `conferenceInjectionMode`; new round-1 kill-suppression guard + `conferenceRound` on the `Non-response suppressed (fan-out)` log line (D5). `dispatch()` single-dispatch branch: delivery-only kill suppression for replayed reactions + `conferenceRound` on the `Non-response suppressed` log line (D5b). `buildMeetingPreamble`: new literal (D4). Nothing else — `resolveConferenceAgents` / `triggerConferenceReactions` / `buildConferenceContext` / tracker / mark bookkeeping untouched (C1/C2/C12/C13).
 - `src/agents/agent-manager.ts` — `conferenceRoundOf` / `conferenceInjectionModeOf` helpers; `TurnContext.conferenceRound`; `runWorkItemTurn` sets it; `prepareSpawn` round-1 branch + `shapeReactionTurn` + the two constants; `recordSpawnObservability` signature + stamping; `spawnTurn` call-site arg.
 - `src/agents/turn-telemetry.ts` — additive optional fields on `TurnTelemetryDoc`/`TurnTelemetryInput`.
 - `src/activity/types.ts` — `ActivityRecord.conferenceRound?`.
@@ -302,7 +328,7 @@ this.turnTelemetryStore.record({
 - **E1 Round-0 / non-conference:** untouched by construction (D3); negatively pinned (T2).
 - **E2 Delegate Task subagents inside a reaction:** claude lane — a Task call is one tool use in the parent loop; the SDK sub-session runs within the parent's 120s wall clock. Lane B — the KPR-354 nested runner keeps its own `{7|10, 600s}` limits, but the parent's clamped deadline abort-chains into the nested turn via `call.signal` (verified agent-manager.ts:718–724), so the 120s wall clock effectively bounds delegates too. A reaction that truly needs a delegate will likely be killed — accepted: reactions should not delegate, the preamble discourages tool use, and the kill is silent (D5).
 - **E3 Voice / scheduler / cron / reflection / team / event one-shots:** none carry conference meta ⇒ `conferenceRound` undefined ⇒ zero change. Voice additionally returns at the carve-out before the branch.
-- **E4 Outage replay (C12 — verified):** queued doc holds the shaped `effectiveItem` (conference meta + baked prompt). Replay pins `targetAgentId` ⇒ resolveAgents step 0 ⇒ bare `ResolvedAgent` ⇒ single-dispatch path: no re-injection, no tracker writes, no mark bookkeeping (C12 placement intact). `prepareSpawn` still sees `meta.conferenceRound = 1` ⇒ reaction caps apply on replay — deliberate (same prompt, same kind). D5's suppression guard does NOT fire for replays (`resolved.conferenceRound` is undefined there); replay failures keep KPR-307 semantics. Nit for future pins: the replayed item's `text` is `replayWrap`'d (outage-replay-processor.ts:102–103 — prompt-note wrapper; the queued doc keeps the original shaped text), so a test pinning replayed conference text must expect the wrapper, not the bare shaped prompt.
+- **E4 Outage replay (C12 — verified):** queued doc holds the shaped `effectiveItem` (conference meta + baked prompt). Replay pins `targetAgentId` ⇒ resolveAgents step 0 ⇒ bare `ResolvedAgent` ⇒ single-dispatch path: no re-injection, no tracker writes, no mark bookkeeping (C12 placement intact). `prepareSpawn` still sees `meta.conferenceRound = 1` ⇒ reaction caps apply on replay — deliberate (same prompt, same kind). D5's fan-out guard does NOT fire for replays (`resolved.conferenceRound` is undefined there); a replayed reaction killed *again* by the caps is suppressed by the single-dispatch leg (D5b, meta-discriminated) with `recordTurnSuccess` intact — errored replay failures keep KPR-307 semantics via `resolveReplayRealFailure`. Nit for future pins: the replayed item's `text` is `replayWrap`'d (outage-replay-processor.ts:102–103 — prompt-note wrapper; the queued doc keeps the original shaped text), so a test pinning replayed conference text must expect the wrapper, not the bare shaped prompt.
 - **E5 C1 all-roster fallback interaction:** the *meeting* classifier's failure fallback selects all roster members. Round-0: all recorded at selection time ⇒ zero reactions (C1 stands, unaffected). Reaction pass: a fallback selects ALL unclaimed peers ⇒ a reaction storm — previously N full work turns, now N capped low-effort turns; this ticket bounds C1's worst case rather than changing it. The *effort* classifier (`routeModel`) is a different classifier: round-1 never calls it at all, so no interaction exists; its own fallback paths remain reachable only from round-0/non-conference turns.
 - **E6 Per-thread lock:** reactions still serialize behind same-agent turns on `agentId:threadId`; the caps shrink the hold from minutes to ≤120s. Residual self-blocking is the staleness-culling trigger (Non-goals).
 - **E7 Haiku / effort-incapable claude agents:** no effort pin (undeliverable, same as today); caps still clamp (haiku base 20/120s ⇒ 6/120s).
@@ -321,8 +347,9 @@ Conventions: negative-verify per repo rule (revert the source change → confirm
 - **T5 (pins, deliberate):** update the C6 round-0 byte pin and the C10 `PREAMBLE` helper to the D4 literal; both suites green. The delta-mode pin (:585) and empty-delta pin (:941) update transitively via the helper — assert they still pin the full join shape.
 - **T6 (C4 guard):** extract every double-quoted phrase from `buildMeetingPreamble("x", [jasper])` output and assert at least one matches `NON_RESPONSE_PATTERNS` — makes the C4 check structural against future rewording (widen-or-match enforced by test failure).
 - **T7 (telemetry):** conference round-1 turn ⇒ `turnTelemetryStore.record` receives `conferenceRound: 1`, `injectionMode`, `resumedSession`, `durationMs`/`llmMs`/`toolMs`/`toolCalls`, `effort: "low"`; plain DM turn ⇒ conference fields absent, perf fields present. Activity record carries `conferenceRound`.
-- **T8 (kill suppression):** round-1 resolved agent whose turn returns `aborted: true` (and a `timedOut: true` variant) ⇒ no `deliver` call, mark untouched; round-0 aborted turn keeps today's delivery behavior (control).
-- **T9 (replay shaping):** item with `meta: { conferenceRound: 1, targetAgentId, outageReplay: true }` dispatches via the pinned-agent path and still receives reaction shaping (unit via `conferenceRoundOf` + a `runWorkItemTurn`-level assertion); D5 guard does not fire (replay `resolved` has no conference fields).
+- **T8 (kill suppression, fan-out leg):** round-1 resolved agent whose turn returns `aborted: true` (and a `timedOut: true` variant) ⇒ no `deliver` call, mark untouched; round-0 aborted turn keeps today's delivery behavior (control).
+- **T8b (kill suppression, single-dispatch leg):** item with `meta: { conferenceRound: 1, targetAgentId, outageReplay: true }` whose turn returns timedOut+aborted, no error, empty text ⇒ no `deliver` call (no `"_No response._"` filler) AND `recordTurnSuccess` still runs (replay doc resolves `done` — assert the release/`done` path). Control: same item returning real text delivers normally.
+- **T9 (replay shaping):** item with `meta: { conferenceRound: 1, targetAgentId, outageReplay: true }` dispatches via the pinned-agent path and still receives reaction shaping (unit via `conferenceRoundOf` + a `runWorkItemTurn`-level assertion); the fan-out guard (D5) does not fire (replay `resolved` has no conference fields) — killed replays are covered by D5b/T8b.
 - **T10 (helper):** `conferenceRoundOf` table test — `0`/`1`/`"1"`/`2`/`undefined`/missing meta.
 
 ## Canon compliance
