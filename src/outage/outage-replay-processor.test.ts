@@ -297,6 +297,13 @@ function miniMatches(doc: Record<string, unknown>, filter: Record<string, unknow
     const val = doc[key];
     if (cond !== null && typeof cond === "object" && !(cond instanceof Date)) {
       const c = cond as { $lt?: unknown };
+      // Loud-fail on anything this mini-fake does not model: a silent
+      // fall-through would match-all and quietly turn a filter into a
+      // no-op, so a future store query would pass here for the wrong reason.
+      const unmodelled = Object.keys(c).filter((op) => op !== "$lt");
+      if (unmodelled.length > 0) {
+        throw new Error("MiniOutageCollection: unmodelled operator in " + JSON.stringify(cond));
+      }
       if ("$lt" in c && !(val !== null && (val as never) < (c.$lt as never))) return false;
     } else if (val instanceof Date && cond instanceof Date) {
       if (val.getTime() !== cond.getTime()) return false;

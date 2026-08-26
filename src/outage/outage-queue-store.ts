@@ -110,6 +110,15 @@ export const STALE_REPLAYING_FALLBACK_MS = 300_000;
 export const STALE_REPLAYING_GRACE_MS = 60_000;
 
 export class OutageQueueStore {
+  /** KPR-403: `${itemId}:${agentId}` keys already warned about by
+   *  recoverStaleReplaying's malformed-doc skip. Sustained-condition
+   *  discipline per dispatcher §7.6 — one warn per episode: the
+   *  lastAttemptAt-null state is unreachable via engine code and permanent
+   *  until manual repair, so warning on every 15s tick forever would be a
+   *  4/min log storm. Per-process first sight keeps it conspicuous without
+   *  the storm. */
+  private warnedMalformedRecoveryKeys = new Set<string>();
+
   constructor(
     private collection: Collection<OutageQueueDoc>,
     private now: () => Date = () => new Date(),
@@ -263,10 +272,16 @@ export class OutageQueueStore {
       if (!doc.lastAttemptAt) {
         // Unreachable via claimNext (it always stamps lastAttemptAt) — skip,
         // but loudly: malformed data should be conspicuous, not recycled.
-        log.warn("Replaying doc with no lastAttemptAt — skipped by recovery", {
-          itemId: doc.itemId,
-          agentId: doc.agentId,
-        });
+        // Latched to first sight per doc per process (see
+        // warnedMalformedRecoveryKeys): the skip itself is unconditional.
+        const key = `${doc.itemId}:${doc.agentId}`;
+        if (!this.warnedMalformedRecoveryKeys.has(key)) {
+          this.warnedMalformedRecoveryKeys.add(key);
+          log.warn("Replaying doc with no lastAttemptAt — skipped by recovery", {
+            itemId: doc.itemId,
+            agentId: doc.agentId,
+          });
+        }
         continue;
       }
       const boundMs = (doc.deadlineMs ?? STALE_REPLAYING_FALLBACK_MS) + STALE_REPLAYING_GRACE_MS;

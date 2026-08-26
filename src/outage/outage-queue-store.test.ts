@@ -1,4 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+const { mockLog } = vi.hoisted(() => ({
+  mockLog: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
+
 import { OutageQueueStore, type OutageQueueDoc, type OutageEnqueueInput } from "./outage-queue-store.js";
 import type { Collection } from "mongodb";
 import type { WorkItem } from "../types/work-item.js";
@@ -394,5 +400,26 @@ describe("OutageQueueStore — deadline-aware stale-replaying recovery (KPR-403)
     advance(10_000_000);
     expect(await store.recoverStaleReplaying()).toBe(0);
     expect(fake.docs[0].status).toBe("replaying");
+  });
+
+  it("the malformed-doc skip warns once per doc per store, not once per 15s tick (sustained-condition latch)", async () => {
+    // The null-lastAttemptAt state is permanent until manual repair, and the
+    // sweep now runs every tick — an unlatched warn would be a 4/min storm.
+    // Skip behavior is unchanged across both sweeps; only the warn is latched.
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "malformed-latch" }));
+    fake.docs[0].status = "replaying";
+    fake.docs[0].lastAttemptAt = null;
+    advance(10_000_000);
+    mockLog.warn.mockClear();
+
+    expect(await store.recoverStaleReplaying()).toBe(0);
+    expect(await store.recoverStaleReplaying()).toBe(0); // second tick, same permanent state
+    expect(fake.docs[0].status).toBe("replaying"); // skip identical on both sweeps
+    expect(mockLog.warn).toHaveBeenCalledTimes(1);
+    expect(mockLog.warn).toHaveBeenCalledWith(expect.stringContaining("no lastAttemptAt"), {
+      itemId: "malformed-latch",
+      agentId: "agent-a",
+    });
   });
 });
