@@ -209,6 +209,8 @@ function makeMockAgentManager() {
       get: vi.fn().mockResolvedValue(undefined),
     }),
     providerFor: vi.fn().mockReturnValue("claude"),
+    // KPR-403: distinctive non-default value so stamp assertions are unambiguous.
+    turnDeadlineUpperBoundMs: vi.fn().mockReturnValue(900_000),
     circuitBreakers: { stateFor: vi.fn().mockReturnValue(null) },
   };
 }

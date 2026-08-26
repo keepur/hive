@@ -129,6 +129,7 @@ function makeInput(overrides: Partial<OutageEnqueueInput> = {}): OutageEnqueueIn
     workItem: makeWorkItem(),
     policy: "notify",
     enqueueOrigin: "fast-fail", // KPR-400 (F2): required input field; harness default
+    deadlineMs: 300_000, // KPR-403: required input field; 300s keeps old rows' 360s arithmetic identical
     ...overrides,
   };
 }
