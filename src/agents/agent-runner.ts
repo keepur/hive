@@ -2011,6 +2011,19 @@ export class AgentRunner {
     let outputTokens = 0;
     let cacheReadTokens = 0;
     let cacheCreationTokens = 0;
+    // KPR-401: streamed-usage accumulation for result-less turns (deadline
+    // abort, operator abort, mid-iteration throw). The SDK emits one
+    // `assistant` message per CONTENT BLOCK, repeating the same message.id
+    // with identical usage — countedUsageIds counts each API call's usage
+    // exactly once. The Set (not a last-seen-id comparison) is prescribed:
+    // its once-per-id guarantee holds unconditionally, including under any
+    // future interleaving of parallel-subagent bursts (spec-review ruling —
+    // a silent double-count under an SDK ordering change is the exact bug
+    // class this ticket exists to fix). When a result message arrives, its
+    // cumulative totals authoritatively OVERWRITE the accumulator (sawResult
+    // gates the durationMs fallback below).
+    let sawResult = false;
+    const countedUsageIds = new Set<string>();
     let ephemeral5mTokens: number | undefined;
     let ephemeral1hTokens: number | undefined;
     let contextWindow = 0;
@@ -2031,6 +2044,9 @@ export class AgentRunner {
     // activeQuery = null run back-to-back, synchronously, in send()'s
     // finally.)
     let timedOut = false;
+    // KPR-401: wall-clock anchor — durationMs comes from the result message
+    // when one arrives; result-less exits fall back to Date.now() − this.
+    const turnStartedAt = Date.now();
     const deadline = setTimeout(() => {
       if (this.activeQuery) {
         timedOut = true;
@@ -2092,7 +2108,25 @@ export class AgentRunner {
         }
 
         if (msg.type === "assistant") {
-          const content = (msg as any).message?.content;
+          const assistantMessage = (msg as any).message;
+          // KPR-401: per-API-call usage snapshot — ADDED once per distinct
+          // message.id (repetitions carry identical usage; first emission
+          // suffices). Subagent messages (parent_tool_use_id != null) are
+          // deliberately included: subagent spawns are paid spend. The four
+          // counters coalesce uniformly — cache_read/cache_creation are
+          // typed number | null; input/output are plain number (harmless
+          // belt). The result branch below overwrites all four when a
+          // result message arrives, so success turns are byte-identical.
+          const usageMessageId: string | undefined = assistantMessage?.id;
+          const messageUsage = assistantMessage?.usage;
+          if (usageMessageId && messageUsage && !countedUsageIds.has(usageMessageId)) {
+            countedUsageIds.add(usageMessageId);
+            inputTokens += messageUsage.input_tokens ?? 0;
+            outputTokens += messageUsage.output_tokens ?? 0;
+            cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
+            cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
+          }
+          const content = assistantMessage?.content;
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === "text") {
@@ -2119,6 +2153,12 @@ export class AgentRunner {
 
         if (msg.type === "result") {
           const result = msg as SDKResultMessage;
+          // KPR-401: the result message is the SDK's own cumulative turn
+          // total — authoritative. The usage ASSIGNMENTS below (not
+          // additions) overwrite the streamed accumulator, keeping the
+          // success path and the error_during_execution / error_max_turns
+          // paths byte-identical to pre-401 behavior.
+          sawResult = true;
           costUsd = result.total_cost_usd;
           durationMs = result.duration_ms;
           resultSessionId = result.session_id;
@@ -2219,7 +2259,19 @@ export class AgentRunner {
       .join(", ");
 
     const totalToolMs = toolCalls.reduce((sum, tc) => sum + ((tc.endMs ?? Date.now()) - tc.startMs), 0);
-    const llmMs = durationMs - totalToolMs;
+    // KPR-401 (c): result-less exits (deadline abort, operator abort, mid-
+    // iteration throw) never assigned durationMs — real wall clock instead
+    // of 0. Cosmetic residual, deliberate: the two catch-block log lines
+    // above print durationMs BEFORE this fallback runs, so they still show
+    // 0 on result-less crashes; the completion log and RunResult carry the
+    // corrected value (spec Edge cases — noted so review doesn't re-flag).
+    if (!sawResult) durationMs = Date.now() - turnStartedAt;
+    // KPR-401 (d): unconditional clamp — Lane B parity (all three adapters
+    // clamp verbatim). Pre-401 this computed 0 − toolMs on aborted turns
+    // (the llmMs=-294391 incident shape); on success turns it only alters
+    // clock-skew negatives, which pushSample dropped anyway (they now enter
+    // the window as 0-samples, matching Lane B — accepted, spec Edge cases).
+    const llmMs = Math.max(0, durationMs - totalToolMs);
 
     // A deadline fire or an abort() unwinds the iterator by CLOSING it, not by
     // throwing — so `error` stays undefined and the old `hasError: !!error`
