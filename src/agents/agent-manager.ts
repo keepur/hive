@@ -911,6 +911,19 @@ export class AgentManager {
     return Math.max(configuredMs, tierLimitMs);
   }
 
+  /** KPR-403: D20 acquire-time upper bound, exposed for outage-doc stamping.
+   *  The dispatcher stamps each outage-queue doc with this bound at enqueue
+   *  (the seam that has registry access), so the store's recovery sweep can
+   *  read a doc's replay-turn wall-clock ceiling from the doc itself — no
+   *  registry dependency at recovery time. Unknown agents fall back to the
+   *  300s default (the doc still recovers by its stamped bound even if the
+   *  agent is later deleted — kpr-403-spec §Edge-4). */
+  turnDeadlineUpperBoundMs(agentId: string): number {
+    const agentConfig = this.registry.get(agentId);
+    const provider = agentConfig ? resolveProviderModel(agentConfig.model).provider : "claude";
+    return this.acquireDeadlineMs(provider, agentConfig);
+  }
+
   /**
    * KPR-216: per-turn spawn API (Phase A). Spawns a fresh `query()` per
    * turn with `options.resume = ctx.sessionId`. Replaces the long-lived

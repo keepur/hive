@@ -657,7 +657,20 @@ export class Dispatcher {
         return true;
       }
 
-      await outage.store.enqueue({ itemId: item.id, agentId, provider, workItem: item, policy, enqueueOrigin: origin });
+      await outage.store.enqueue({
+        itemId: item.id,
+        agentId,
+        provider,
+        workItem: item,
+        policy,
+        enqueueOrigin: origin,
+        // KPR-403: enqueue-time deadline stamp — the doc carries its own
+        // replay-turn wall-clock upper bound (D20 semantics) so the store's
+        // recovery sweep needs no registry access. Both origin callers flow
+        // through this single site; the replayed-fast-fail release branch
+        // above never writes the field ($setOnInsert-immutable, spec ⚠A3).
+        deadlineMs: this.agentManager.turnDeadlineUpperBoundMs(agentId),
+      });
     } catch (storeErr) {
       log.error("Outage enqueue failed — falling back to legacy error path", { error: String(storeErr) });
       return false;

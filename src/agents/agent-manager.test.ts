@@ -2236,6 +2236,30 @@ describe("AgentManager", () => {
         );
       });
 
+      it("KPR-403: turnDeadlineUpperBoundMs — per-agent timeoutMs override wins (900s architect shape)", () => {
+        // NEGATIVE-VERIFY prediction (Step 3): pre-fix the wrapper does not
+        // exist — all three KPR-403 rows fail with a TypeError.
+        registry._agents.set(
+          "agent-arch-403",
+          makeAgentConfig({ id: "agent-arch-403", name: "Architect", model: "claude-sonnet-4-6", timeoutMs: 900_000 }),
+        );
+        // sonnet tier limit (300s) < explicit timeoutMs → max picks 900s.
+        expect(manager.turnDeadlineUpperBoundMs("agent-arch-403")).toBe(900_000);
+      });
+
+      it("KPR-403: turnDeadlineUpperBoundMs — router-path agent with no override gets the long tier limit", () => {
+        registry._agents.set(
+          "agent-opus-403",
+          makeAgentConfig({ id: "agent-opus-403", name: "OpusAgent", model: "claude-opus-4-7" }),
+        );
+        // No explicit timeoutMs (default 300s) < opus tier limit → max picks the tier.
+        expect(manager.turnDeadlineUpperBoundMs("agent-opus-403")).toBe(RESOURCE_TIER_DEFAULTS.opus.timeoutMs);
+      });
+
+      it("KPR-403: turnDeadlineUpperBoundMs — unknown agentId falls back to the 300s default", () => {
+        expect(manager.turnDeadlineUpperBoundMs("no-such-agent")).toBe(300_000);
+      });
+
       it("KPR-347 T5: assembly throws with a provider-fault-shaped message — classifies non-provider, breaker closed after 3 repeats", async () => {
         registry._agents.set(
           "oai-pilot",

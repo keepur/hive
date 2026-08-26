@@ -209,6 +209,8 @@ function makeMockAgentManager() {
       get: vi.fn().mockResolvedValue(undefined),
     }),
     providerFor: vi.fn().mockReturnValue("claude"),
+    // KPR-403: distinctive non-default value so stamp assertions are unambiguous.
+    turnDeadlineUpperBoundMs: vi.fn().mockReturnValue(900_000),
     circuitBreakers: { stateFor: vi.fn().mockReturnValue(null) },
   };
 }
@@ -1346,6 +1348,42 @@ describe("outage interception (KPR-307)", () => {
     agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
     await dispatcher.dispatch(replayItem({ id: "m1" }));
     expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "pending");
+    expect(store.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("KPR-403: fast-fail enqueue stamps deadlineMs from the manager wrapper", async () => {
+    // NEGATIVE-VERIFY prediction (Step 3): pre-fix the enqueue site never
+    // calls the wrapper and carries no deadlineMs — objectContaining fails.
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(agentManager.turnDeadlineUpperBoundMs).toHaveBeenCalledWith("executive-assistant");
+    expect(store.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ itemId: "m1", enqueueOrigin: "fast-fail", deadlineMs: 900_000 }),
+    );
+  });
+
+  it("KPR-403: post-turn-fault enqueue stamps deadlineMs from the manager wrapper", async () => {
+    // Same fixture shape as the '★ timeout gate' row above (KPR-398
+    // zero-progress hang signature) — both origin classes flow through the
+    // single enqueue site, so one stamp covers both callers.
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(
+      makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true }),
+    );
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+    await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
+    expect(store.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ itemId: "m1", enqueueOrigin: "post-turn-fault", deadlineMs: 900_000 }),
+    );
+  });
+
+  it("KPR-403: the replayed-fast-fail release branch never consults the wrapper and never reaches enqueue", async () => {
+    // Pin, passes both ways by design: the release-before-depth branch
+    // predates KPR-403 and release() has no deadline parameter — the stamp
+    // stays $setOnInsert-immutable at the store (pinned there, T5).
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(makeCircuitOpenError());
+    await dispatcher.dispatch(replayItem({ id: "m1" }));
+    expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "pending");
+    expect(agentManager.turnDeadlineUpperBoundMs).not.toHaveBeenCalled();
     expect(store.enqueue).not.toHaveBeenCalled();
   });
 
