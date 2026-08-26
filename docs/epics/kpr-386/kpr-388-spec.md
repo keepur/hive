@@ -162,7 +162,7 @@ Consequences checked against real timelines:
 | handoff race (stored tag stale pre-lock, KPR-313 ⚠A9 adopt branch) | injection was full (rule 2 saw mismatch); turn adopts predecessor's switched session → full-into-resumed: one duplication, mark set correctly | benign |
 | engine restart | in-memory rosters/trackers reset (existing behavior); `sessions` + mark persist in Mongo; Claude/Lane A resume across restarts | delta stays valid — **no restart special-casing needed**, verified against store schema |
 | mark ahead of fetched history (deleted messages, 200-cap horizon) | delta empty → context segment dropped; terminal slot still carries the trigger/reply | safe |
-| outage replay (KPR-307) | replay re-enters `dispatch()` → fresh classify/fetch/decide; failed turns never advanced the mark | over-inclusion only |
+| outage replay (KPR-307) | replay stamps `meta.targetAgentId`, so `resolveAgents` step 0 pins the agent and skips `resolveConferenceAgents` — no re-injection, no mark bookkeeping; the replayed turn resumes the session and absorbs the enqueue-time injected text; failed turns never advanced the mark, so the next live conference turn over-includes | over-inclusion only |
 | reflection turns | never conference-injected; mark untouched | correct — reflection shows the session nothing new |
 | codex | rule 1 always fails (empty handle) | today's behavior, by design (non-goal) |
 
