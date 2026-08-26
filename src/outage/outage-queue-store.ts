@@ -35,6 +35,19 @@ export const DEFAULT_OUTAGE_QUEUE_CONFIG: OutageQueueConfig = {
 export type OutagePolicy = "notify" | "silent";
 export type OutageQueueStatus = "pending" | "replaying" | "done" | "expired" | "failed";
 
+/**
+ * KPR-400 (F2): why the doc was enqueued — drives claimNext's class
+ * ordering. "fast-fail" = the turn never ran (ProviderCircuitOpenError,
+ * rejected pre-router — zero evidence of being expensive, typically live
+ * interactive traffic). "post-turn-fault" = the turn RAN and classified
+ * into HARD_FAULT_KINDS with the breaker open (trip-crossing turns, incl.
+ * zero-progress deadline burns). The string values are load-bearing:
+ * "fast-fail" < "post-turn-fault" lexicographically, so a plain ascending
+ * sort yields the class preference (pinned in outage-queue-store.test.ts,
+ * spec ⚠A2 — a numeric weight field is an acceptable substitution).
+ */
+export type OutageEnqueueOrigin = "fast-fail" | "post-turn-fault";
+
 export interface OutageQueueDoc {
   _id?: ObjectId;
   /** Original WorkItem.id — composite-unique with agentId: a fan-out dispatch
@@ -47,6 +60,13 @@ export interface OutageQueueDoc {
   /** Serialized verbatim — Date + meta survive the BSON round-trip. */
   workItem: WorkItem;
   policy: OutagePolicy;
+  /** KPR-400 (F2): immutable after first enqueue ($setOnInsert; back-to-
+   *  pending releases never touch it — a replay that fast-fails again keeps
+   *  its original class, spec §Edge-7). Optional: absent on pre-KPR-400
+   *  docs — BSON type ordering sorts missing before string, so legacy docs
+   *  claim with top (fast-fail-class) priority for the one
+   *  deploy-mid-outage window (spec ⚠A5, accepted). */
+  enqueueOrigin?: OutageEnqueueOrigin;
   status: OutageQueueStatus;
   /** Real (non-fast-fail) replay attempts. Breaker-open retries are free and never counted. */
   attempts: number;
@@ -65,6 +85,8 @@ export interface OutageEnqueueInput {
   provider: string;
   workItem: WorkItem;
   policy: OutagePolicy;
+  /** KPR-400 (F2): required from callers — see OutageEnqueueOrigin. */
+  enqueueOrigin: OutageEnqueueOrigin;
 }
 
 /** Terminal-doc hygiene TTL (⚠ spec §10): 7 days. */
@@ -86,6 +108,10 @@ export class OutageQueueStore {
     // of the fanned agents' replies (spec §7.1).
     await this.collection.createIndex({ itemId: 1, agentId: 1 }, { unique: true });
     await this.collection.createIndex({ status: 1, enqueuedAt: 1 });
+    // KPR-400 (F2): claimNext's class-ordered sort. The plain
+    // { status, enqueuedAt } index above stays — expireOlderThan and
+    // recoverStaleReplaying still read by it (harmless, other readers).
+    await this.collection.createIndex({ status: 1, enqueueOrigin: 1, enqueuedAt: 1 });
     // TTL applies only to docs where doneAt is a Date (terminal states);
     // pending/replaying docs carry doneAt: null and Mongo TTL skips non-Date values.
     await this.collection.createIndex({ doneAt: 1 }, { expireAfterSeconds: TERMINAL_TTL_SECONDS });
@@ -101,6 +127,8 @@ export class OutageQueueStore {
           provider: input.provider,
           workItem: input.workItem,
           policy: input.policy,
+          // KPR-400 (F2): $setOnInsert = immutable after first enqueue.
+          enqueueOrigin: input.enqueueOrigin,
           status: "pending",
           attempts: 0,
           enqueuedAt: this.now(),
@@ -114,13 +142,22 @@ export class OutageQueueStore {
     );
   }
 
-  /** Atomic pending→replaying claim, oldest enqueuedAt first — copies the
-   *  callback poller's mark-before-dispatch pattern (scheduler.ts). */
+  /** Atomic pending→replaying claim — copies the callback poller's
+   *  mark-before-dispatch pattern (scheduler.ts). KPR-400 (F2):
+   *  class-ordered — fast-fail-class docs (turns that never ran) before
+   *  post-turn-fault-class docs (turns that demonstrably ran into a hard
+   *  fault, incl. full-deadline burns), oldest enqueuedAt first WITHIN each
+   *  class — so after cooldown the drain's next claim (with high
+   *  probability the half-open probe) is the cheapest available real turn.
+   *  Ascending sort on the origin string IS the class preference
+   *  ("fast-fail" < "post-turn-fault"); missing/legacy docs sort first
+   *  under BSON type order (null/missing < string — documented Mongo
+   *  behavior, mirrored in the test fake; spec ⚠A5). */
   async claimNext(): Promise<OutageQueueDoc | null> {
     return this.collection.findOneAndUpdate(
       { status: "pending" },
       { $set: { status: "replaying", lastAttemptAt: this.now() } },
-      { sort: { enqueuedAt: 1 }, returnDocument: "after" },
+      { sort: { enqueueOrigin: 1, enqueuedAt: 1 }, returnDocument: "after" },
     );
   }
 

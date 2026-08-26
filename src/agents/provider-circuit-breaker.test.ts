@@ -474,3 +474,115 @@ describe("ProviderCircuitBreaker — turn-deadline is breaker-INCONCLUSIVE (Lane
     expect(expectOpenThrow(() => registry.acquire("claude")).retryAfterMs).toBe(15_000);
   });
 });
+
+describe("KPR-401 pins — aborted/deadline turns never pollute the p95 window (zero breaker code change)", () => {
+  // These rows pin EXISTING behavior that becomes load-bearing with KPR-401:
+  // aborted turns now carry large real llmMs values (wall-clock durationMs −
+  // toolMs) instead of negatives the pushSample guard happened to drop.
+  // Ticket constraint: "keep it that way" — success-only sampling at BOTH
+  // pushSample sites, plus the negative guard as belt. No source change
+  // backs this describe, so negative-verify is degenerate by construction
+  // (there is no pre-fix state to fail against) — these are pins, not
+  // regression proofs.
+  const deadlineFault = (): TurnClassification => ({
+    outcome: "fault",
+    kind: "turn-deadline",
+    message: "turn wall-clock deadline expired",
+  });
+
+  it("closed-state record(): aborted / turn-deadline with LARGE positive llmMs leave the window empty", () => {
+    const { registry, turn } = makeRegistry();
+    turn(aborted(), 294_391);
+    turn(deadlineFault(), 294_391);
+    const snap = registry.stateFor("claude")!;
+    expect(snap.state).toBe("closed");
+    expect(snap.sampleCount).toBe(0); // only `case "success"` samples
+    expect(snap.p95Ms).toBeNull();
+  });
+
+  it("probe settle: aborted / turn-deadline probes with LARGE llmMs reopen inconclusive, window stays empty", () => {
+    for (const classification of [aborted(), deadlineFault()]) {
+      const { registry, turn, advance } = makeRegistry();
+      turn(hardFault());
+      turn(hardFault());
+      turn(hardFault()); // open
+      advance(15_000);
+      const probe = registry.acquire("claude");
+      expect(probe.isProbe).toBe(true); // half-open probe admitted
+      registry.record(probe, classification, 294_391);
+      const snap = registry.stateFor("claude")!;
+      expect(snap.state).toBe("open"); // reopened inconclusive, not closed
+      expect(snap.sampleCount).toBe(0); // settleProbe's success gate did not sample
+      expect(snap.p95Ms).toBeNull();
+    }
+  });
+
+  it("pushSample negative guard: success with llmMs −1 never samples (belt for any future non-clamped caller)", () => {
+    const { registry, turn } = makeRegistry();
+    turn(success(), -1);
+    const snap = registry.stateFor("claude")!;
+    expect(snap.state).toBe("closed");
+    expect(snap.sampleCount).toBe(0);
+  });
+});
+
+describe("KPR-400 F1 — probe staleness follows the probe's own deadline", () => {
+  function tripped() {
+    const h = makeRegistry();
+    h.turn(hardFault());
+    h.turn(hardFault());
+    h.turn(hardFault());
+    return h;
+  }
+
+  it("T1: a 900s-deadline probe is NOT stale-killed at +400s and its +420s success closes the circuit", () => {
+    // NEGATIVE-VERIFY prediction (Step 3): on pre-fix code the +400s acquire
+    // stale-reconciles the probe (flat 360s bound) — retryAfterMs comes back
+    // 15_000 (fresh cooldown window) instead of the contract's 0, and the
+    // probe's eventual success is telemetry-only, leaving the circuit open.
+    const { registry, advance } = tripped();
+    advance(15_000);
+    const probe = registry.acquire("claude", { deadlineMs: 900_000 });
+    expect(probe.isProbe).toBe(true);
+
+    advance(400_000); // probe legitimately mid-flight (< 900s + 60s grace)
+    const err = expectOpenThrow(() => registry.acquire("claude"));
+    expect(err.retryAfterMs).toBe(0); // contract reject — probe kept, NOT reconciled
+    expect(registry.stateFor("claude")!.probeInFlight).toBe(true);
+
+    advance(20_000); // probe records success at +420s total
+    registry.record(probe, success(), 420_000);
+    expect(registry.stateFor("claude")!.state).toBe("closed");
+  });
+
+  it("T2: acquire meta WITHOUT deadlineMs keeps the exact 360s fallback bound", () => {
+    // Pin, passes both pre- and post-fix by design: (undefined ?? 300s) +
+    // 60s = the old PROBE_STALE_MS. The meta-LESS variant is pinned by the
+    // pre-existing row "stale probe permit is reconciled as inconclusive on
+    // next acquire" (advance(360_001)), which this plan leaves byte-
+    // unmodified — together they are the fallback contract.
+    const { registry, advance } = tripped();
+    advance(15_000);
+    const probe = registry.acquire("claude", { agentId: "agent-x" }); // no deadlineMs
+    expect(probe.isProbe).toBe(true);
+    advance(360_001);
+    const err = expectOpenThrow(() => registry.acquire("claude"));
+    expect(err.retryAfterMs).toBe(15_000); // reconciled → reopened (no escalation) → fresh cooldown
+    expect(registry.stateFor("claude")!.probeInFlight).toBe(false);
+  });
+
+  it("T3: the per-probe bound still fires past deadlineMs + grace — lost-permit belt preserved", () => {
+    // Pin, passes both ways (pre-fix the flat 360s bound fires even earlier).
+    const { registry, advance } = tripped();
+    advance(15_000);
+    const probe = registry.acquire("claude", { deadlineMs: 900_000 });
+    expect(probe.isProbe).toBe(true);
+    advance(960_001); // > 900_000 + 60_000 grace
+    const err = expectOpenThrow(() => registry.acquire("claude"));
+    expect(err.retryAfterMs).toBe(15_000); // reconciled inconclusive: exponent unchanged, base cooldown
+    expect(registry.stateFor("claude")!.probeInFlight).toBe(false);
+    // The lost probe's late record is telemetry-only — never closes.
+    registry.record(probe, success(), 100);
+    expect(registry.stateFor("claude")!.state).toBe("open");
+  });
+});

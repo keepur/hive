@@ -1,5 +1,5 @@
 import { createLogger } from "../logging/logger.js";
-import type { AgentState, AgentStatus } from "../types/agent-config.js";
+import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
@@ -892,6 +892,26 @@ export class AgentManager {
   }
 
   /**
+   * KPR-400 (F1): acquire-time UPPER BOUND on the turn's effective wall
+   * clock, threaded into the breaker as probe-staleness meta. The runner's
+   * effective deadline is `resourceLimits?.timeoutMs ?? agentConfig.timeoutMs
+   * ?? 300_000` (agent-runner.ts), and resourceLimits presence depends on
+   * the router gate — unknowable exactly before prepareSpawn runs. So:
+   * max(agent timeoutMs, claude static-tier limit). Over-estimating only
+   * delays reconciliation of a structurally-prevented lost-permit case;
+   * under-estimating is the live bug (a legitimate long probe stale-killed
+   * mid-flight — kpr-400-spec R2, ⚠A3). Non-claude routes never get Claude
+   * tier limits: Lane B pins `agentConfig.timeoutMs ?? 300_000` exactly at
+   * prepareSpawn, Lane A uses the runner's identical fallback.
+   */
+  private acquireDeadlineMs(provider: AgentProviderId, agentConfig: AgentConfig | undefined): number {
+    const configuredMs = agentConfig?.timeoutMs ?? 300_000;
+    if (!agentConfig || provider !== "claude") return configuredMs;
+    const tierLimitMs = resolveResourceLimits(modelToTier(agentConfig.model), agentConfig.resourceTiers).timeoutMs;
+    return Math.max(configuredMs, tierLimitMs);
+  }
+
+  /**
    * KPR-216: per-turn spawn API (Phase A). Spawns a fresh `query()` per
    * turn with `options.resume = ctx.sessionId`. Replaces the long-lived
    * AgentRunner.send() path for opt-in channels.
@@ -918,10 +938,14 @@ export class AgentManager {
       // withSpawnTicket's finally releases the per-thread lock, budget slot,
       // and ticket set on the way out (no new cleanup path). The lock is
       // held for microseconds during a fast-fail — no I/O precedes the throw.
-      const route = resolveProviderModel(this.registry.get(ctx.agentId)?.model ?? "");
+      const acquireAgentConfig = this.registry.get(ctx.agentId);
+      const route = resolveProviderModel(acquireAgentConfig?.model ?? "");
       const permit = this.circuitBreakers.acquire(route.provider, {
         agentId: ctx.agentId,
         threadId: ctx.threadId,
+        // KPR-400 (F1): the probe turn's own deadline (upper bound) drives
+        // the breaker's probe-staleness bound — see acquireDeadlineMs.
+        deadlineMs: this.acquireDeadlineMs(route.provider, acquireAgentConfig),
       });
 
       // KPR-220 Phase 15: re-resolve sessionId post-lock for reflection
@@ -1666,8 +1690,9 @@ export class AgentManager {
     // acquire site (KPR-306): SIGUSR1 hot-reload can remove the agent
     // between spawnTurn's registry pre-check and this point, and an
     // unguarded dereference would throw OUTSIDE the recorded try — skipping
-    // the breaker's record() and wedging a half-open probe permit for up to
-    // PROBE_STALE_MS. The degenerate route ({provider:"claude", model:""})
+    // the breaker's record() and wedging a half-open probe permit until the
+    // probe's own stale bound (deadlineMs + grace; 360s meta-less fallback —
+    // KPR-400). The degenerate route ({provider:"claude", model:""})
     // flows on instead; the turn then fails INSIDE the recorded try via
     // createProviderAdapter's `Unknown agent` throw (classifyThrown →
     // non-provider → never trips).
@@ -1844,7 +1869,16 @@ export class AgentManager {
 
     // Per-turn telemetry — independent of sessionStore (no history in
     // sessionStore.set). Aggregator in `hive doctor` reads this collection.
-    if (result.sessionId && !result.aborted) {
+    // KPR-401: aborted turns with real spend are recorded (sparse aborted
+    // flag on the doc); zero-usage aborted turns — operator abort before the
+    // first API call, and the manager's synthesizeAbortedResult early-abort
+    // shape (resumed sessionId, never spawned) — stay out: nothing to
+    // account, no noise docs. Deliberately provider-AGNOSTIC: Lane B
+    // adapters already return real partial totals on operator-aborted
+    // turns, and that spend is just as real — do not provider-gate this.
+    const hadUsage =
+      result.inputTokens + result.outputTokens + result.cacheReadTokens + result.cacheCreationTokens > 0;
+    if (result.sessionId && (!result.aborted || hadUsage)) {
       this.turnTelemetryStore
         .record({
           agentId: ctx.agentId,
@@ -1857,6 +1891,8 @@ export class AgentManager {
           cacheCreationTokens: result.cacheCreationTokens,
           ephemeral5mTokens: result.ephemeral5mTokens,
           ephemeral1hTokens: result.ephemeral1hTokens,
+          // KPR-401: sparse — only aborted:true is ever written.
+          ...(result.aborted ? { aborted: true as const } : {}),
         })
         .catch(() => {
           // Already logged inside the store via withRetry. Swallow here.
@@ -1907,6 +1943,11 @@ export class AgentManager {
       compactions: result.compactions,
       streamed: result.streamed,
       error: result.error,
+      // KPR-401: sparse abort flags — the audit row's costUsd:0/durationMs
+      // zeros on aborted turns are now segmentable instead of masquerading
+      // as free, instant, clean turns.
+      ...(result.aborted ? { aborted: true } : {}),
+      ...(result.timedOut ? { timedOut: true } : {}),
     });
   }
 

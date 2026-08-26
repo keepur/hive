@@ -2204,6 +2204,38 @@ describe("AgentManager", () => {
         expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
       });
 
+      it("KPR-400 F1: acquire meta deadlineMs ≥ the agent's own timeoutMs (900s architect shape)", async () => {
+        // NEGATIVE-VERIFY prediction (Task 4 Step 3): pre-fix the acquire
+        // meta carries agentId/threadId only — objectContaining fails.
+        registry._agents.set(
+          "agent-arch",
+          makeAgentConfig({ id: "agent-arch", name: "Architect", model: "claude-sonnet-4-6", timeoutMs: 900_000 }),
+        );
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult());
+        await manager.spawnTurn(smsCtx({ agentId: "agent-arch", threadId: "sms:line-1:kpr400-arch" }));
+        // sonnet tier limit (300s) < explicit timeoutMs → max picks 900s.
+        expect(acquireSpy).toHaveBeenCalledWith(
+          "claude",
+          expect.objectContaining({ agentId: "agent-arch", deadlineMs: 900_000 }),
+        );
+      });
+
+      it("KPR-400 F1: acquire meta deadlineMs ≥ the opus tier limit when the agent has no explicit timeoutMs", async () => {
+        registry._agents.set(
+          "agent-opus",
+          makeAgentConfig({ id: "agent-opus", name: "OpusAgent", model: "claude-opus-4-7" }),
+        );
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult());
+        await manager.spawnTurn(smsCtx({ agentId: "agent-opus", threadId: "sms:line-1:kpr400-opus" }));
+        // No explicit timeoutMs (default 300s) < opus tier limit → max picks 600s.
+        expect(acquireSpy).toHaveBeenCalledWith(
+          "claude",
+          expect.objectContaining({ agentId: "agent-opus", deadlineMs: RESOURCE_TIER_DEFAULTS.opus.timeoutMs }),
+        );
+      });
+
       it("KPR-347 T5: assembly throws with a provider-fault-shaped message — classifies non-provider, breaker closed after 3 repeats", async () => {
         registry._agents.set(
           "oai-pilot",
@@ -4209,6 +4241,101 @@ describe("AgentManager", () => {
       expect(auditArg.costUsd).toBe(0.02);
       expect(auditArg.durationMs).toBe(250);
       expect(auditArg.channelKind).toBe("sms");
+    });
+
+    describe("aborted-turn observability (KPR-401)", () => {
+      function makeObsManager() {
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+        return { localManager, activityLogger };
+      }
+
+      it("aborted turn WITH usage + sessionId records telemetry with aborted: true (relaxed gate)", async () => {
+        // NEGATIVE-VERIFY prediction (Step 3): pre-fix the gate is
+        // `sessionId && !aborted` — record() is never called; this row fails.
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "s-kpr401-tel", text: "" }),
+        );
+        const item = makeWorkItem({ text: "tel aborted", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+        const telArg = turnTelemetryStore.record.mock.calls[0]![0];
+        expect(telArg.aborted).toBe(true);
+        expect(telArg.sessionId).toBe("s-kpr401-tel");
+        expect(telArg.inputTokens).toBe(100); // real spend from the runner accumulator, not zeros
+        expect("timedOut" in telArg).toBe(false); // telemetry doc carries aborted only (spec §Design 2)
+      });
+
+      it("aborted turn with ZERO usage stays out of telemetry (synthesizeAbortedResult noise guard)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({
+            aborted: true,
+            timedOut: true,
+            sessionId: "s-kpr401-zero",
+            text: "",
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+          }),
+        );
+        const item = makeWorkItem({ text: "tel zero", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(turnTelemetryStore.record).not.toHaveBeenCalled();
+      });
+
+      it("success turns record WITHOUT the aborted field — doc shape unchanged", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-kpr401-ok" }));
+        const item = makeWorkItem({ text: "tel clean", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+        const telArg = turnTelemetryStore.record.mock.calls[0]![0];
+        expect("aborted" in telArg).toBe(false);
+      });
+
+      it("activity audit passes aborted/timedOut through sparsely — set on aborted turns, absent on success", async () => {
+        // NEGATIVE-VERIFY prediction (Step 3): pre-fix the audit payload has
+        // neither key — the aborted-turn assertions fail.
+        const { localManager, activityLogger } = makeObsManager();
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({
+            aborted: true,
+            timedOut: true,
+            sessionId: "s-kpr401-act",
+            text: "",
+            costUsd: 0,
+            durationMs: 294_391,
+          }),
+        );
+        const item1 = makeWorkItem({ text: "audit aborted", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item1, "sms"));
+        expect(activityLogger.record).toHaveBeenCalledTimes(1);
+        const abortedArg = activityLogger.record.mock.calls[0]![0];
+        expect(abortedArg.aborted).toBe(true);
+        expect(abortedArg.timedOut).toBe(true);
+        expect(abortedArg.costUsd).toBe(0); // honest zero, now flagged
+        expect(abortedArg.durationMs).toBe(294_391); // real wall clock from the runner
+
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-kpr401-ok2" }));
+        const item2 = makeWorkItem({ text: "audit clean", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item2, "sms"));
+        const successArg = activityLogger.record.mock.calls.at(-1)![0];
+        expect("aborted" in successArg).toBe(false); // sparse: absent, not false
+        expect("timedOut" in successArg).toBe(false);
+      });
     });
 
     it("voice carve-out: passes raw text to runner.send and skips model router", async () => {
