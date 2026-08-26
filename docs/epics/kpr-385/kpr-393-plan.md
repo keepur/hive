@@ -62,7 +62,7 @@
 - **Enumerated pre-existing test-file deltas (the complete list — C10/C16; nothing else may change):**
   1. `src/agents/prefix-builder.provider.test.ts` — baseline **15**, expected **16**. Assertion additions inside 3 existing tests ("full assembly renders every layer in spec order" order array; "sections are joined by …" count 9→10 + comment; gate "false → …" gains a not-contains) plus 1 new content-pin test. (Task 1.)
   2. `src/agents/agent-manager.test.ts` — baseline **227**, expected **230**. Three additive tests in a new describe; **zero edits to existing tests** — safe because every existing activity assertion is `objectContaining`/property-style and no existing `makeRunResult` fixture text matches the detector (swept explicitly in Task 3). (Task 3.)
-- New test file: `src/agents/intent-trailer.test.ts` (18 tests).
+- New test file: `src/agents/intent-trailer.test.ts` (18 tests; 21 after the pre-PR r1 hardening added 2 discourse-marker negatives + 1 slice-boundary test).
 - Untouched modules (empty diff verified in Task 5): `dispatch-loop.ts`, `turn-scaffold.ts`, `sse.ts`, `tool-bridge.ts`, `turn-assembly.ts`, `toolkit-section.ts`, all four adapters, `types.ts` (provider-adapters), `session-store.ts`, `activity-logger.ts`, `docs/providers.md`.
 - C16 note: the `classification-crosscheck.test.ts` literal fixture tables are decoupled from source — this plan makes **no** claim that any source mutation here would fail them (nothing in this ticket touches classification).
 
