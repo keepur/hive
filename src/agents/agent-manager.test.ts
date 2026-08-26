@@ -2197,6 +2197,38 @@ describe("AgentManager", () => {
         expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
       });
 
+      it("KPR-400 F1: acquire meta deadlineMs ≥ the agent's own timeoutMs (900s architect shape)", async () => {
+        // NEGATIVE-VERIFY prediction (Task 4 Step 3): pre-fix the acquire
+        // meta carries agentId/threadId only — objectContaining fails.
+        registry._agents.set(
+          "agent-arch",
+          makeAgentConfig({ id: "agent-arch", name: "Architect", model: "claude-sonnet-4-6", timeoutMs: 900_000 }),
+        );
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult());
+        await manager.spawnTurn(smsCtx({ agentId: "agent-arch", threadId: "sms:line-1:kpr400-arch" }));
+        // sonnet tier limit (300s) < explicit timeoutMs → max picks 900s.
+        expect(acquireSpy).toHaveBeenCalledWith(
+          "claude",
+          expect.objectContaining({ agentId: "agent-arch", deadlineMs: 900_000 }),
+        );
+      });
+
+      it("KPR-400 F1: acquire meta deadlineMs ≥ the opus tier limit when the agent has no explicit timeoutMs", async () => {
+        registry._agents.set(
+          "agent-opus",
+          makeAgentConfig({ id: "agent-opus", name: "OpusAgent", model: "claude-opus-4-5" }),
+        );
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult());
+        await manager.spawnTurn(smsCtx({ agentId: "agent-opus", threadId: "sms:line-1:kpr400-opus" }));
+        // No explicit timeoutMs (default 300s) < opus tier limit → max picks 600s.
+        expect(acquireSpy).toHaveBeenCalledWith(
+          "claude",
+          expect.objectContaining({ agentId: "agent-opus", deadlineMs: RESOURCE_TIER_DEFAULTS.opus.timeoutMs }),
+        );
+      });
+
       it("KPR-347 T5: assembly throws with a provider-fault-shaped message — classifies non-provider, breaker closed after 3 repeats", async () => {
         registry._agents.set(
           "oai-pilot",
