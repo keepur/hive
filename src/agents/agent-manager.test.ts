@@ -187,7 +187,7 @@ vi.mock("../search/conversation-index.js", () => ({
   }),
 }));
 
-import { AgentManager, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
+import { AgentManager, conferenceRoundOf, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
 import { AgentRunner, type RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -297,6 +297,32 @@ function makeSmsCtx(
     threadId,
     workItem,
     channel: "sms" as const,
+  };
+}
+
+/** KPR-389: conference-shaped TurnContext + item, meta stamped like the dispatcher does. */
+function makeConfCtx(
+  round: 0 | 1,
+  agentId = "agent-s",
+  extraMeta: Record<string, unknown> = {},
+): TurnContext & { workItem: WorkItem } {
+  const threadId = `conf:${agentId}:${Math.random()}`;
+  const workItem = makeWorkItem({
+    text: "shaped preamble + transcript + peer reply",
+    threadId,
+    source: { kind: "slack", id: "C-CONF", label: "conf-tahoe" },
+    sender: "U-MAY",
+    senderName: "May",
+    meta: { conferenceMode: true, conferenceRound: round, ...extraMeta },
+  });
+  return {
+    agentId,
+    sessionId: undefined,
+    channelId: "C-CONF",
+    threadId,
+    workItem,
+    channel: "slack" as const,
+    conferenceRound: round,
   };
 }
 
@@ -4950,6 +4976,22 @@ describe("AgentManager", () => {
       resolveNested(makeRunResult({ text: "x" }));
       await p;
       expect(activeSlots("gp")).toBe(0); // released in finally
+    });
+  });
+
+  describe("conferenceRoundOf (KPR-389 D1)", () => {
+    it.each([
+      ["round 0", { conferenceRound: 0 }, 0],
+      ["round 1", { conferenceRound: 1 }, 1],
+      ['malformed string "1"', { conferenceRound: "1" }, undefined],
+      ["out-of-range 2", { conferenceRound: 2 }, undefined],
+      ["explicit undefined", { conferenceRound: undefined }, undefined],
+    ])("%s ⇒ %s", (_label, meta, expected) => {
+      expect(conferenceRoundOf(makeWorkItem({ meta: meta as Record<string, unknown> }))).toBe(expected);
+    });
+
+    it("missing meta ⇒ undefined (fail-open to full-resource turn, E10)", () => {
+      expect(conferenceRoundOf(makeWorkItem())).toBeUndefined();
     });
   });
 });

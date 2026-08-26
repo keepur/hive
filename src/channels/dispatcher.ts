@@ -1031,6 +1031,9 @@ export class Dispatcher {
           conferenceMode: true,
           conferenceHumanTs: resolved.conferenceHumanTs,
           conferenceRound: resolved.conferenceRound,
+          // KPR-389 D1: injection mode rides along so telemetry can segment
+          // full vs delta turns (KPR-388 efficacy measurement).
+          conferenceInjectionMode: resolved.injectionMode,
         },
       };
     }

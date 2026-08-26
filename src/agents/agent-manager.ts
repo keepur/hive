@@ -104,6 +104,10 @@ export interface TurnContext {
   threadId: string;
   workItem: WorkItem;
   channel: ChannelKind;
+  /** KPR-389: conference turn kind — 0 primary, 1 peer reaction. Set by
+   *  runWorkItemTurn from WorkItem meta; undefined for every non-conference
+   *  turn and for voice/reflection contexts (which never carry the meta). */
+  conferenceRound?: 0 | 1;
   /**
    * KPR-219: bypass `AgentRunner.buildSystemPrompt` entirely when set. Voice
    * uses this to inject `buildVoiceSystemPrompt` output (omits tool summaries,
@@ -174,6 +178,21 @@ export interface TurnResult {
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
 export type SpawnTurnStreamCallback = StreamCallback;
+
+/** KPR-389: typed read of the dispatcher's conference discriminator (C3 —
+ *  meta.conferenceRound is the round-1 discriminator). Returns undefined for
+ *  non-conference items and malformed values. Exported — the dispatcher's
+ *  D5b single-dispatch suppression leg reads it too. */
+export function conferenceRoundOf(item: WorkItem): 0 | 1 | undefined {
+  const v = item.meta?.conferenceRound;
+  return v === 0 || v === 1 ? v : undefined;
+}
+
+/** KPR-389: typed read of the KPR-388 injection mode stamped beside the round. */
+function conferenceInjectionModeOf(item: WorkItem): "full" | "delta" | undefined {
+  const v = item.meta?.conferenceInjectionMode;
+  return v === "full" || v === "delta" ? v : undefined;
+}
 
 /**
  * Default per-agent in-flight spawn budget. Long-lived `maxConcurrent`
@@ -879,6 +898,7 @@ export class AgentManager {
       threadId,
       workItem: item,
       channel: item.source.kind,
+      conferenceRound: conferenceRoundOf(item),
     };
 
     return this.spawnTurn(ctx, onStream);
