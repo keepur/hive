@@ -81,8 +81,14 @@ export const SESSION_SEMANTICS: Readonly<Record<AgentProviderId, SessionSemantic
   // documented parity-matrix caveat).
   kimi: "client-transcript",
   deepseek: "client-transcript",
-  // KPR-371 (§D1): Lane A — same client-transcript semantics as kimi/deepseek.
-  grok: "client-transcript",
+  // KPR-392 (§4.2): grok promoted from Lane A passthrough to a native Lane B
+  // stateless-replay adapter — the operator-hosted gateway is a stateless
+  // translation proxy with no provider-side handle to chain (no
+  // persistence tier of its own, undocumented vendor retention). Continuity
+  // is hive-persisted `provider_turn_history` replayed client-side, same as
+  // codex; the write side (never persist a handle) is automatic via
+  // `persistsResumableHandle`. Was "client-transcript" under KPR-371 Lane A.
+  grok: "stateless-replay",
 };
 
 export function sessionSemanticsFor(provider: AgentProviderId): SessionSemantics {

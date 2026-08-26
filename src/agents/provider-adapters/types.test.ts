@@ -21,7 +21,7 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
     ["codex", false],
     ["kimi", true],
     ["deepseek", true],
-    ["grok", true],
+    ["grok", false], // KPR-392: stateless-replay, was client-transcript under Lane A
   ] as const)("%s → persistsResumableHandle=%s", (provider, expected) => {
     expect(persistsResumableHandle(sessionSemanticsFor(provider as AgentProviderId))).toBe(expected);
   });

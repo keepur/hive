@@ -43,8 +43,11 @@ import {
 import {
   isLaneAProvider,
   resolvePassthroughSpawn,
+  assertSafeBaseUrlOverride,
+  resolveEnvKeyCredential,
   type PassthroughSpawnConfig,
 } from "./provider-adapters/passthrough-providers.js";
+import { DEFAULT_GROK_GATEWAY_URL } from "./provider-adapters/grok-gateway-adapter.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import { classifyThrown, classifyTurnResult, TURN_DEADLINE_SUBTYPE } from "./provider-adapters/error-classification.js";
 
@@ -178,10 +181,14 @@ type ProviderModelRoute =
   | { provider: "openai"; model: string; reasoningEffort?: CodexReasoningEffort }
   | { provider: "gemini"; model: string; reasoningEffort?: CodexReasoningEffort }
   | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort }
+  // KPR-392 (§4.7): grok promoted off Lane A to a native Lane B module —
+  // same shape as the other Lane B members above; the full suffix set
+  // (incl. minimal/none) now flows to the route unclamped (§4.5).
+  | { provider: "grok"; model: string; reasoningEffort?: CodexReasoningEffort }
   // KPR-346 (§D2): Lane A passthrough — Claude runtime, foreign endpoint.
   // reasoningEffort survives splitProviderModel and delivers via the Claude
   // adapter's existing effort channel (clamped in prepareSpawn, §D6).
-  | { provider: "kimi" | "deepseek" | "grok"; model: string; reasoningEffort?: CodexReasoningEffort };
+  | { provider: "kimi" | "deepseek"; model: string; reasoningEffort?: CodexReasoningEffort };
 
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
 
@@ -576,7 +583,7 @@ export class AgentManager {
     // never counts toward the foreign breaker's trip streak and never
     // engages the outage queue (epic §D2).
     let laneAPassthrough: PassthroughSpawnConfig | undefined;
-    if (route.provider === "kimi" || route.provider === "deepseek" || route.provider === "grok") {
+    if (route.provider === "kimi" || route.provider === "deepseek") {
       laneAPassthrough = resolvePassthroughSpawn(route.provider, route.model, {
         configuredModel: appConfig[route.provider].agentModel,
         instanceId: appConfig.instance.id,
@@ -592,7 +599,7 @@ export class AgentManager {
     // The adapter's `readonly provider = "claude"` stays as-is per canon:
     // the adapter class is an execution-path detail; every ops surface
     // (breaker, outage gate, session tag, KPR-313 guard) keys on the ROUTE.
-    if (route.provider === "kimi" || route.provider === "deepseek" || route.provider === "grok") {
+    if (route.provider === "kimi" || route.provider === "deepseek") {
       return new ClaudeAgentAdapter(runner);
     }
 
@@ -612,7 +619,9 @@ export class AgentManager {
       providerConfig:
         route.provider === "gemini"
           ? { agentModel: appConfig.gemini.agentModel, apiKey: appConfig.gemini.apiKey || undefined }
-          : { agentModel: appConfig[route.provider].agentModel },
+          : route.provider === "grok"
+            ? this.resolveGrokModuleSlice()
+            : { agentModel: appConfig[route.provider].agentModel },
       turnHistoryStore: this.turnHistoryStore,
       agentId: config.id,
     };
@@ -777,6 +786,26 @@ export class AgentManager {
       context: "primary",
       deps: moduleDeps,
     });
+  }
+
+  /**
+   * KPR-392 (§4.3): grok's caller-resolved module slice — the engine
+   * resolves, the module consumes (DOD-212; load-bearing for KPR-394).
+   * GROK_GATEWAY_KEY: env→Honeypot PER SPAWN via the exported Lane A helper
+   * so the "authentication"-bearing TurnAssemblyError message and chain stay
+   * byte-identical to KPR-384 (spec-review advisory 1). GROK_GATEWAY_URL:
+   * re-read per spawn, validated (https, or http to loopback only) —
+   * verbatim KPR-384 semantics.
+   */
+  private resolveGrokModuleSlice(): { agentModel?: string; apiKey?: string; baseUrl?: string } {
+    const override = process.env.GROK_GATEWAY_URL;
+    return {
+      agentModel: appConfig.grok.agentModel,
+      apiKey: resolveEnvKeyCredential("GROK_GATEWAY_KEY", { instanceId: appConfig.instance.id }),
+      baseUrl: override
+        ? assertSafeBaseUrlOverride(override, "GROK_GATEWAY_URL")
+        : DEFAULT_GROK_GATEWAY_URL,
+    };
   }
 
   reloadSkills(): void {
