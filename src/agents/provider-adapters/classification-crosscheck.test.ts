@@ -38,6 +38,12 @@ describe("Lane B adapter error strings → ProviderFaultKind (KPR-391 §8 cross-
     "OpenAI API key is not available; set OPENAI_API_KEY in the instance .env and restart — hive credentials add does not carry this key yet",
     // gemini-interactions-adapter.ts — KPR-352 §D7 missing-key throw.
     "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY, and restart the service",
+    // grok-gateway-adapter.ts — gatewayErrorMessage C5 decoration at a 401 status.
+    "Grok gateway request failed (401): key not in allowlist",
+    // grok-gateway-adapter.ts — bare-construction guard (manager resolves
+    // GROK_GATEWAY_KEY before construction; this throw only surfaces if the
+    // adapter is ever constructed without it, e.g. a future call-site bug).
+    "Grok gateway API key is not available; seed GROK_GATEWAY_KEY via `hive credentials add GROK_GATEWAY_KEY`",
   ])("auth: %s", (s) => expect(faultKind(s)).toBe("auth"));
 
   it.each([
@@ -45,7 +51,39 @@ describe("Lane B adapter error strings → ProviderFaultKind (KPR-391 §8 cross-
     "Codex subscription request failed (429): slow down",
     // gemini stream-phase failure carrying Google's prose 429.
     "Gemini interaction stream failed (429): Resource has been exhausted (e.g. check quota).",
+    // grok-gateway-adapter.ts — gatewayErrorMessage C5 decoration at a 429 status.
+    "Grok gateway request failed (429): too many requests",
   ])("rate-limit: %s", (s) => expect(faultKind(s)).toBe("rate-limit"));
+
+  it.each([
+    // grok-gateway-adapter.ts — gatewayErrorMessage C5 decoration at a 503 status.
+    "Grok gateway request failed (503): upstream unavailable",
+  ])("server-error: %s", (s) => expect(faultKind(s)).toBe("server-error"));
+
+  it.each([
+    // grok-gateway-adapter.ts — consumeGrokSse edge-3 drop decoration: a
+    // stream that ended without finish_reason (not aborted by hive) is a
+    // gateway drop, phrased to land on the connect-fail row via "terminated".
+    // Deliberate attribution: the loopback gateway is grok route
+    // infrastructure — its death classifies as a grok provider fault by
+    // design (KPR-306/307 key on the route, not on the vendor endpoint).
+    // assembleToolCalls' own incomplete-fragment message is a different
+    // string that also carries "terminated" and is pinned separately below.
+    // Raw `fetch failed`/`ECONNREFUSED` throws from the gateway fetch call
+    // are already row-pinned by the shared FAULT_PATTERNS connect-fail
+    // regex and need no adapter-specific row here.
+    "Grok gateway stream ended without finish_reason — connection terminated mid-stream",
+    // grok-gateway-adapter.ts — Edge 3 spirit guard: finish_reason=tool_calls
+    // with zero assembled tool calls is a gateway stream-shape fault, phrased
+    // onto the same connect-fail row via "terminated" (r1 fix — was
+    // previously worded "malformed stream", which matched no FAULT_PATTERNS
+    // row and misclassified non-provider).
+    "Grok gateway stream signaled tool_calls but no tool calls were assembled — connection terminated mid-stream",
+    // grok-gateway-adapter.ts — assembleToolCalls incomplete-fragment guard
+    // (id/name never arrived for an indexed fragment): same connect-fail
+    // routing via "terminated".
+    "Grok gateway stream delivered an incomplete tool_call at index 0 (missing id or name) — connection terminated mid-stream",
+  ])("connect-fail: %s", (s) => expect(faultKind(s)).toBe("connect-fail"));
 
   it("round-budget exhaustion stays non-provider (shared dispatch loop emits error_max_turns)", () => {
     expect(faultKind("error_max_turns")).toBe("non-provider");

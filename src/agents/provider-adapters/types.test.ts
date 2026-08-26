@@ -21,7 +21,7 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
     ["codex", false],
     ["kimi", true],
     ["deepseek", true],
-    ["grok", true],
+    ["grok", false], // KPR-392: stateless-replay, was client-transcript under Lane A
   ] as const)("%s → persistsResumableHandle=%s", (provider, expected) => {
     expect(persistsResumableHandle(sessionSemanticsFor(provider as AgentProviderId))).toBe(expected);
   });
@@ -39,8 +39,7 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
   });
 });
 
-it("LaneBProviderId stays exactly {openai, gemini, codex} — Lane A never joins (KPR-346 canon pin)", () => {
-  // Compile-time exhaustiveness in both directions; runtime assert is a formality.
-  const laneB: Record<LaneBProviderId, true> = { openai: true, gemini: true, codex: true };
-  expect(Object.keys(laneB)).toHaveLength(3);
+it("LaneBProviderId is exactly {openai, gemini, codex, grok} — kimi/deepseek Lane A never joins (KPR-346 canon; grok promoted KPR-392)", () => {
+  const laneB: Record<LaneBProviderId, true> = { openai: true, gemini: true, codex: true, grok: true };
+  expect(Object.keys(laneB)).toHaveLength(4);
 });

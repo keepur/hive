@@ -38,8 +38,12 @@ export interface LaneBModuleDeps {
    *  this ABI via `hive plugin add` — a third-party module that received the
    *  full map would receive every other provider's apiKey with it
    *  (CLAUDE.md § Security (DOD-212): a malicious plugin can exfil secrets
-   *  directly). */
-  providerConfig?: { agentModel?: string; apiKey?: string };
+   *  directly). `baseUrl` (KPR-392) is the caller-validated provider
+   *  endpoint for providers whose endpoint is deployment infrastructure
+   *  (grok's operator-hosted gateway) rather than a universal vendor
+   *  address — resolved and validated by the engine, consumed opaquely by
+   *  the module. */
+  providerConfig?: { agentModel?: string; apiKey?: string; baseUrl?: string };
   /** KPR-353 stateless-replay history store — consumed only by modules whose
    *  session strategy persists replay history, and only in primary context:
    *  the KPR-354 G4 guarantee (nested turns provably never touch

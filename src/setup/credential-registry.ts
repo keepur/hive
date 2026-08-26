@@ -157,7 +157,7 @@ export const CREDENTIAL_REGISTRY: CredentialEntry[] = [
     server: "grok",
     title: "Grok (xAI) gateway",
     description:
-      "Lane A passthrough provider (KPR-384) — agents with model: grok/… run the Claude runtime against a " +
+      "Native Lane B adapter (KPR-392) — agents with model: grok/… speak chat-completions to a " +
       "self-hosted CLIProxyAPI gateway. The key is an `api-keys` entry from your gateway's config.yaml.",
     helpUrl: "https://github.com/keepur/hive/blob/main/docs/providers.md",
     kind: "secret",

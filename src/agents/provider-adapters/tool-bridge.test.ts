@@ -84,6 +84,7 @@ function makeEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInv
       openai: "mcp-bridge-candidate",
       gemini: "mcp-bridge-candidate",
       codex: "mcp-bridge-candidate",
+      grok: "mcp-bridge-candidate",
     },
     schemas: { kind: "connect-time" },
     serverConfig: { command: "node", args: [], env: {} } as never,

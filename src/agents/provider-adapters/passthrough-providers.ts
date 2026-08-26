@@ -8,27 +8,32 @@ import type { AgentProviderId } from "./types.js";
  * Claude-lane runtime (ClaudeAgentAdapter/AgentRunner: MCP tools, skills,
  * hooks, memory, subagents, resume) with per-spawn env substitution only.
  * Translation proxies are ruled out (epic canon); vendor-operated endpoints
- * are the rule — grok is the one sanctioned exception (KPR-384, see its
- * row: an OPERATOR-hosted gateway, because the vendor endpoint itself is
- * broken for real toolkits). Adding the next compat vendor is: one table row + one
- * AgentProviderId union member + one SESSION_SEMANTICS entry (compile-forced)
- * + two resolveProviderModel-style prefix arms + the isLaneAProvider body
- * (NOT compile-forced) + a `credential` entry (KPR-371) — no new code path.
+ * are the rule. Grok was the one sanctioned exception (KPR-384: an
+ * OPERATOR-hosted gateway, because the vendor endpoint itself is broken for
+ * real toolkits) until KPR-392 promoted it to a native Lane B adapter
+ * (`grok-gateway-adapter.ts`) — the gateway-exception canon note now lives
+ * there; this table has no exceptions left. Adding the next compat vendor is:
+ * one table row + one AgentProviderId union member + one SESSION_SEMANTICS
+ * entry (compile-forced) + two resolveProviderModel-style prefix arms + the
+ * isLaneAProvider body (NOT compile-forced) + a `credential` entry
+ * (KPR-371) — no new code path.
  *
  * Lane A ids join AgentProviderId only. LaneBProviderId is NEVER touched:
  * these providers must never gain a tool-transport compatibility column or a
  * bridge path (decision-register canon).
  */
-export type LaneAProviderId = "kimi" | "deepseek" | "grok";
+export type LaneAProviderId = "kimi" | "deepseek";
 
 /**
  * Lane A credential source: a static key resolved env → Honeypot Keychain per
  * spawn. KPR-371 briefly widened this to a discriminated union with an
  * `oauth-file` variant for grok's vendor-CLI-owned subscription OAuth file;
  * KPR-384 retired that variant when grok moved behind the self-hosted
- * CLIProxyAPI gateway (see the grok row below) and its credential became an
- * ordinary gateway API key. The `kind` discriminant stays so a future
- * non-key vendor re-widens the union without touching existing rows.
+ * CLIProxyAPI gateway and its credential became an ordinary gateway API key.
+ * KPR-392 then promoted grok off this table entirely — Lane B now resolves
+ * its own gateway key via `resolveEnvKeyCredential` below (exported for
+ * that purpose). The `kind` discriminant stays so a future non-key vendor
+ * re-widens the union without touching existing rows.
  */
 export type PassthroughCredential = { kind: "env-key"; key: string };
 
@@ -36,13 +41,13 @@ export interface PassthroughProviderDef {
   id: LaneAProviderId;
   displayName: string;
   /**
-   * The endpoint the spawn's ANTHROPIC_BASE_URL is pinned to. For kimi and
-   * deepseek this is the vendor-operated Anthropic-compat endpoint (never a
-   * translation proxy — epic KPR-345 canon). Grok is the one sanctioned
-   * exception (KPR-384): an OPERATOR-hosted loopback CLIProxyAPI gateway,
-   * because xAI's own compat endpoint rejects the CLI's tool schemas (see
-   * the grok row). The canon rules out third-party-operated translation
-   * services, not infrastructure the operator runs on their own machine.
+   * The endpoint the spawn's ANTHROPIC_BASE_URL is pinned to — the
+   * vendor-operated Anthropic-compat endpoint (never a translation proxy —
+   * epic KPR-345 canon). Grok was the one sanctioned exception (KPR-384: an
+   * OPERATOR-hosted loopback CLIProxyAPI gateway, because xAI's own compat
+   * endpoint rejects the CLI's tool schemas) until KPR-392 moved it to a
+   * native Lane B adapter, taking the exception with it — this table's
+   * remaining rows are all vendor-operated endpoints.
    */
   baseUrl: string;
   /** Env var that overrides `baseUrl` per spawn, for endpoints that are
@@ -81,27 +86,6 @@ export const PASSTHROUGH_PROVIDERS: Readonly<Record<LaneAProviderId, Passthrough
     credential: { kind: "env-key", key: "DEEPSEEK_API_KEY" },
     defaultModel: "deepseek-v4-pro",
   },
-  grok: {
-    id: "grok",
-    displayName: "Grok (xAI)",
-    // KPR-384: xAI's /v1/messages validator rejects any tool input_schema
-    // that omits the `required` array (valid JSON Schema, accepted by
-    // Anthropic) — 13 of the CLI's builtin/plugin tool schemas omit it, so a
-    // direct api.x.ai spawn 400s on every realistic toolkit. Lane A grok
-    // therefore fronts the operator's self-hosted CLIProxyAPI gateway
-    // (io.keepur.grok-gateway pattern, loopback-only), which translates to
-    // the vendor's OpenAI-format backend and drops the quirk. The gateway
-    // owns the `grok login` subscription OAuth session (the KPR-371
-    // oauth-file machinery lived in hive until KPR-384 removed it); hive
-    // holds only a gateway API key from the gateway config's `api-keys`
-    // allowlist.
-    baseUrl: "http://127.0.0.1:8317",
-    baseUrlEnv: "GROK_GATEWAY_URL",
-    credential: { kind: "env-key", key: "GROK_GATEWAY_KEY" },
-    // KPR-371 §3.5: the subscription session exposes only grok-4.6 /
-    // grok-4.5; the API's wider catalogue is not reachable under this auth.
-    defaultModel: "grok-4.6",
-  },
 };
 
 /**
@@ -111,7 +95,7 @@ export const PASSTHROUGH_PROVIDERS: Readonly<Record<LaneAProviderId, Passthrough
  * clamp (silently dropped instead of clamped). Every Lane A id must appear.
  */
 export function isLaneAProvider(p: AgentProviderId): p is LaneAProviderId {
-  return p === "kimi" || p === "deepseek" || p === "grok";
+  return p === "kimi" || p === "deepseek";
 }
 
 /** Per-spawn resolved shape handed to the runner (§D1). The credential lives
@@ -174,7 +158,7 @@ export function resolvePassthroughSpawn(
  * `https:`. Thrown as TurnAssemblyError — a config fault, breaker-invisible
  * like every other Lane A assembly fault.
  */
-function assertSafeBaseUrlOverride(raw: string, envKey: string): string {
+export function assertSafeBaseUrlOverride(raw: string, envKey: string): string {
   let url: URL;
   try {
     url = new URL(raw);
@@ -192,7 +176,7 @@ function assertSafeBaseUrlOverride(raw: string, envKey: string): string {
 }
 
 /** The env-key credential resolution — byte-for-byte the pre-KPR-371 behaviour. */
-function resolveEnvKeyCredential(
+export function resolveEnvKeyCredential(
   key: string,
   opts: { instanceId: string; resolveSecret?: (instanceId: string, key: string) => string },
 ): string {

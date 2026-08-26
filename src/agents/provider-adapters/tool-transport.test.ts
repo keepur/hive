@@ -22,6 +22,7 @@ describe("classifyToolTransport", () => {
         openai: "mcp-bridge-candidate",
         gemini: "mcp-bridge-candidate",
         codex: "mcp-bridge-candidate",
+        grok: "mcp-bridge-candidate",
       });
       expect(descriptor.requiresTurnContext).toBe(false);
       expect(descriptor.requiresHiveRuntime).toBe(false);
@@ -72,6 +73,7 @@ describe("classifyToolTransport", () => {
       openai: "requires-hive-bridge",
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
+      grok: "requires-hive-bridge",
     });
   });
 
@@ -88,6 +90,7 @@ describe("classifyToolTransport", () => {
       openai: "claude-only",
       gemini: "claude-only",
       codex: "claude-only",
+      grok: "claude-only",
     });
   });
 
@@ -105,6 +108,7 @@ describe("classifyToolTransport", () => {
       openai: "requires-hive-bridge",
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
+      grok: "requires-hive-bridge",
     });
   });
 
@@ -119,6 +123,7 @@ describe("classifyToolTransport", () => {
         openai: "requires-hive-bridge",
         gemini: "requires-hive-bridge",
         codex: "requires-hive-bridge",
+        grok: "requires-hive-bridge",
       });
       expect(d.compatibility.codex).toEqual(d.compatibility.openai);
     },
@@ -156,6 +161,7 @@ describe("classifyToolTransport", () => {
       openai: "unsupported",
       gemini: "unsupported",
       codex: "unsupported",
+      grok: "unsupported",
     });
   });
 
@@ -192,6 +198,7 @@ function makeEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInv
       openai: "mcp-bridge-candidate",
       gemini: "mcp-bridge-candidate",
       codex: "mcp-bridge-candidate",
+      grok: "mcp-bridge-candidate",
     },
     schemas: { kind: "connect-time" },
     ...overrides,
@@ -202,13 +209,13 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
   // 1. Each compatibility class × each LaneBProviderId.
   const bridgeableClasses = ["direct", "mcp-bridge-candidate", "requires-hive-bridge"] as const;
   const omittedClasses = ["claude-only", "unsupported"] as const;
-  const providers = ["openai", "gemini", "codex"] as const;
+  const providers = ["openai", "gemini", "codex", "grok"] as const;
 
   it.each(
     bridgeableClasses.flatMap((cls) => providers.map((provider) => ({ cls, provider }))),
   )("$cls lands in bridgeable for $provider", ({ cls, provider }) => {
     const entry = makeEntry({
-      compatibility: { claude: "direct", openai: cls, gemini: cls, codex: cls },
+      compatibility: { claude: "direct", openai: cls, gemini: cls, codex: cls, grok: cls },
     });
     const { bridgeable, omitted } = partitionInventoryForProvider([entry], provider);
     expect(bridgeable).toEqual([entry]);
@@ -221,7 +228,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     const entry = makeEntry({
       name: "gated",
       transport: "claude-builtin",
-      compatibility: { claude: "direct", openai: cls, gemini: cls, codex: cls },
+      compatibility: { claude: "direct", openai: cls, gemini: cls, codex: cls, grok: cls },
     });
     const { bridgeable, omitted } = partitionInventoryForProvider([entry], provider);
     expect(bridgeable).toEqual([]);
@@ -242,6 +249,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
         openai: "requires-hive-bridge",
         gemini: "requires-hive-bridge",
         codex: "requires-hive-bridge",
+        grok: "requires-hive-bridge",
       },
       schemas: { kind: "unavailable" },
     });
@@ -258,6 +266,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
         openai: "mcp-bridge-candidate",
         gemini: "mcp-bridge-candidate",
         codex: "claude-only",
+        grok: "mcp-bridge-candidate",
       },
     });
     expect(partitionInventoryForProvider([entry], "openai").bridgeable).toEqual([entry]);
@@ -274,7 +283,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     const b = makeEntry({
       name: "b",
       transport: "claude-builtin",
-      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only" },
+      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only", grok: "claude-only" },
     });
     const c = makeEntry({ name: "c" });
     const { bridgeable, omitted } = partitionInventoryForProvider([a, b, c], "openai");
@@ -292,7 +301,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     const entry = makeEntry({
       name: "quo",
       transport: "stdio",
-      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only" },
+      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only", grok: "claude-only" },
       serverConfig: {
         type: "stdio",
         command: "x",

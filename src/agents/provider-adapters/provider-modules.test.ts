@@ -12,6 +12,7 @@ import { LANE_B_PROVIDER_MODULES } from "./provider-modules.js";
 import { CodexSubscriptionAdapter } from "./codex-subscription-adapter.js";
 import { GeminiInteractionsAdapter } from "./gemini-interactions-adapter.js";
 import { OpenAIAgentsAdapter } from "./openai-agents-adapter.js";
+import { GrokGatewayAdapter } from "./grok-gateway-adapter.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { LaneBModuleDeps } from "./provider-module.js";
 import type { LaneBProviderId } from "./types.js";
@@ -47,10 +48,11 @@ function makeDeps(overrides: Partial<LaneBModuleDeps> = {}): LaneBModuleDeps {
  * resolves per construction. `providerConfig` is deliberately singular: a
  * module is never handed another provider's agentModel or apiKey.
  */
-const OWN_SLICE: Record<LaneBProviderId, { agentModel?: string; apiKey?: string }> = {
+const OWN_SLICE: Record<LaneBProviderId, { agentModel?: string; apiKey?: string; baseUrl?: string }> = {
   codex: { agentModel: "cfg-codex" },
   openai: { agentModel: "cfg-openai" },
   gemini: { agentModel: "cfg-gemini", apiKey: "k" },
+  grok: { agentModel: "cfg-grok", apiKey: "gk", baseUrl: "http://gateway:9" },
 };
 
 function depsFor(provider: LaneBProviderId, overrides: Partial<LaneBModuleDeps> = {}): LaneBModuleDeps {
@@ -66,7 +68,7 @@ describe("LANE_B_PROVIDER_MODULES", () => {
   const assembly = makeAssembly();
 
   it("is complete and self-consistent: one entry per Lane B provider, key matches module.provider", () => {
-    expect(Object.keys(LANE_B_PROVIDER_MODULES).sort()).toEqual(["codex", "gemini", "openai"]);
+    expect(Object.keys(LANE_B_PROVIDER_MODULES).sort()).toEqual(["codex", "gemini", "grok", "openai"]);
     for (const [key, module] of Object.entries(LANE_B_PROVIDER_MODULES)) {
       expect(module.provider).toBe(key);
     }
@@ -77,6 +79,7 @@ describe("LANE_B_PROVIDER_MODULES", () => {
     const codex = LANE_B_PROVIDER_MODULES.codex.createAdapter({ name: "A", ...args });
     const openai = LANE_B_PROVIDER_MODULES.openai.createAdapter({ name: "A", ...args });
     const gemini = LANE_B_PROVIDER_MODULES.gemini.createAdapter({ name: "A", ...args });
+    const grok = LANE_B_PROVIDER_MODULES.grok.createAdapter({ name: "A", ...args });
 
     expect(codex).toBeInstanceOf(CodexSubscriptionAdapter);
     expect(codex.provider).toBe("codex");
@@ -84,6 +87,8 @@ describe("LANE_B_PROVIDER_MODULES", () => {
     expect(openai.provider).toBe("openai");
     expect(gemini).toBeInstanceOf(GeminiInteractionsAdapter);
     expect(gemini.provider).toBe("gemini");
+    expect(grok).toBeInstanceOf(GrokGatewayAdapter);
+    expect(grok.provider).toBe("grok");
   });
 
   describe("codex context gate (KPR-354 G4)", () => {
@@ -125,6 +130,93 @@ describe("LANE_B_PROVIDER_MODULES", () => {
       const options = optionsOf(adapter);
       expect("historyStore" in options).toBe(false);
       expect("agentId" in options).toBe(false);
+    });
+  });
+
+  describe("grok context gate (KPR-392, mirrors codex KPR-354 G4)", () => {
+    it("primary carries historyStore + agentId from the deps slice", () => {
+      const adapter = LANE_B_PROVIDER_MODULES.grok.createAdapter({
+        name: "A",
+        route: { model: "m" },
+        assembly,
+        context: "primary",
+        deps: makeDeps(),
+      });
+      const options = optionsOf(adapter);
+      expect(options.historyStore).toBe(fakeStore);
+      expect(options.agentId).toBe("a1");
+    });
+
+    it("primary keeps the keys present even when the manager carries no store (historyStore: undefined)", () => {
+      const adapter = LANE_B_PROVIDER_MODULES.grok.createAdapter({
+        name: "A",
+        route: { model: "m" },
+        assembly,
+        context: "primary",
+        deps: makeDeps({ turnHistoryStore: undefined }),
+      });
+      const options = optionsOf(adapter);
+      expect("historyStore" in options).toBe(true);
+      expect(options.historyStore).toBeUndefined();
+      expect(options.agentId).toBe("a1");
+    });
+
+    it("nested OMITS both keys entirely — provider_turn_history is untouchable by construction", () => {
+      const adapter = LANE_B_PROVIDER_MODULES.grok.createAdapter({
+        name: "A:delegate",
+        route: { model: "m" },
+        assembly,
+        context: "nested",
+        deps: makeDeps(),
+      });
+      const options = optionsOf(adapter);
+      expect("historyStore" in options).toBe(false);
+      expect("agentId" in options).toBe(false);
+    });
+  });
+
+  describe("grok model + option threading (KPR-392, mirrors codex/gemini model + option threading)", () => {
+    it("route model wins over the providerConfig slice", () => {
+      expect(
+        optionsOf(
+          LANE_B_PROVIDER_MODULES.grok.createAdapter({ name: "A", route: { model: "route-grok" }, assembly, context: "primary", deps: depsFor("grok") }),
+        ).model,
+      ).toBe("route-grok");
+    });
+
+    it("an empty route model falls back to the providerConfig slice", () => {
+      expect(optionsOf(LANE_B_PROVIDER_MODULES.grok.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps: depsFor("grok") })).model).toBe("cfg-grok");
+    });
+
+    it("both absent → pins the literal default grok-4.6", () => {
+      const deps = makeDeps({ providerConfig: {} });
+      expect(optionsOf(LANE_B_PROVIDER_MODULES.grok.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps })).model).toBe("grok-4.6");
+    });
+
+    it("threads apiKey (GROK_GATEWAY_KEY) and baseUrl from its OWN deps slice", () => {
+      const withBoth = optionsOf(
+        LANE_B_PROVIDER_MODULES.grok.createAdapter({ name: "A", route: { model: "m" }, assembly, context: "primary", deps: depsFor("grok") }),
+      );
+      expect(withBoth.apiKey).toBe("gk");
+      expect(withBoth.baseUrl).toBe("http://gateway:9");
+
+      const withoutEither = optionsOf(
+        LANE_B_PROVIDER_MODULES.grok.createAdapter({
+          name: "A",
+          route: { model: "m" },
+          assembly,
+          context: "primary",
+          deps: makeDeps({ providerConfig: { agentModel: "cfg-grok" } }),
+        }),
+      );
+      expect(withoutEither.apiKey).toBeUndefined();
+      expect(withoutEither.baseUrl).toBeUndefined();
+    });
+
+    it("passes the route's reasoningEffort through", () => {
+      const deps = makeDeps();
+      const route = { model: "m", reasoningEffort: "high" as const };
+      expect(optionsOf(LANE_B_PROVIDER_MODULES.grok.createAdapter({ name: "A", route, assembly, context: "primary", deps })).reasoningEffort).toBe("high");
     });
   });
 
@@ -208,7 +300,7 @@ describe("LANE_B_PROVIDER_MODULES", () => {
     it("name + assembly pass through verbatim in both contexts", () => {
       const deps = makeDeps();
       for (const context of ["primary", "nested"] as const) {
-        for (const provider of ["codex", "openai", "gemini"] as const) {
+        for (const provider of ["codex", "openai", "gemini", "grok"] as const) {
           const options = optionsOf(
             LANE_B_PROVIDER_MODULES[provider].createAdapter({
               name: `Parent:${context}`,
@@ -228,7 +320,7 @@ describe("LANE_B_PROVIDER_MODULES", () => {
   it("registry miss is containment, not a construction: a non-Lane-B key indexes to undefined", () => {
     // Documents that agent-manager's `provider … does not execute tools`
     // branch is the miss path. Type-unreachable while
-    // LaneBProviderId = {openai, codex, gemini}.
+    // LaneBProviderId = {openai, codex, gemini, grok}.
     expect((LANE_B_PROVIDER_MODULES as Record<string, unknown>)["claude"]).toBeUndefined();
     expect((LANE_B_PROVIDER_MODULES as Record<string, unknown>)["not-a-provider"]).toBeUndefined();
   });

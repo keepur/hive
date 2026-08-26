@@ -85,6 +85,7 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
         openai: "unsupported",
         gemini: "unsupported",
         codex: "unsupported",
+        grok: "unsupported",
       },
     };
   }
@@ -116,6 +117,7 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
         openai: nonClaude,
         gemini: nonClaude,
         codex: nonClaude,
+        grok: nonClaude,
       },
     };
   }
@@ -137,6 +139,7 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
       openai: nonClaudeCompatibility,
       gemini: nonClaudeCompatibility,
       codex: nonClaudeCompatibility,
+      grok: nonClaudeCompatibility,
     },
   };
 }

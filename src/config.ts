@@ -291,7 +291,7 @@ export const config = {
     /** KPR-371: Lane A passthrough default-model override (non-secret).
      *  The secret GROK_GATEWAY_KEY (KPR-384 — gateway API key for the
      *  self-hosted CLIProxyAPI shim) deliberately has NO boot-time entry —
-     *  it resolves per spawn (env → Keychain) in resolvePassthroughSpawn,
+     *  it resolves per spawn (env → Keychain) in AgentManager.resolveGrokModuleSlice,
      *  as does the non-secret GROK_GATEWAY_URL endpoint override. */
     agentModel: optional("GROK_AGENT_MODEL", ""),
   },
