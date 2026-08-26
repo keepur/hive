@@ -11,7 +11,16 @@
 
 import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
-import { CREDENTIAL_REGISTRY, findCredentialEntryByKey, type CredentialField } from "../setup/credential-registry.js";
+import {
+  CREDENTIAL_REGISTRY,
+  findCredentialEntryByKey,
+  pluginProviderCredentialEntries,
+  type CredentialEntry,
+  type CredentialField,
+} from "../setup/credential-registry.js";
+import { readInstalledProviderDecls } from "../plugins/provider-decl.js";
+import { readConfig, configPath } from "./hive-config.js";
+import { hiveHome } from "../paths.js";
 
 export interface CredentialsCliIO {
   ask: (q: string) => Promise<string>;
@@ -43,19 +52,32 @@ export function defaultCliIO(): CredentialsCliIO {
   };
 }
 
+/** KPR-394: provider-plugin credential entries from installed manifests.
+ *  Fail-soft: a missing hive.yaml (pre-init box) yields the static
+ *  registry only. */
+function defaultDynamicEntries(): CredentialEntry[] {
+  try {
+    const cfg = readConfig(configPath());
+    return pluginProviderCredentialEntries(readInstalledProviderDecls(cfg.plugins ?? [], hiveHome));
+  } catch {
+    return [];
+  }
+}
+
 export async function runCredentialsCommand(
   subcommand: string | undefined,
   args: string[],
   io: CredentialsCliIO = defaultCliIO(),
+  dynamicEntries: CredentialEntry[] = defaultDynamicEntries(),
 ): Promise<number> {
   try {
     switch (subcommand) {
       case undefined:
       case "list":
       case "ls":
-        return listCredentials(io);
+        return listCredentials(io, dynamicEntries);
       case "add":
-        return await addCredential(args[0], io);
+        return await addCredential(args[0], io, dynamicEntries);
       case "remove":
       case "rm":
       case "delete":
@@ -83,7 +105,7 @@ function printHelp(io: CredentialsCliIO): number {
   return 0;
 }
 
-function listCredentials(io: CredentialsCliIO): number {
+function listCredentials(io: CredentialsCliIO, dynamicEntries: CredentialEntry[]): number {
   io.log("Third-party credentials (curated registry):");
   io.log("");
   for (const entry of CREDENTIAL_REGISTRY) {
@@ -97,18 +119,32 @@ function listCredentials(io: CredentialsCliIO): number {
       io.log(`  ${mark}  ${field.key.padEnd(24)} (${entry.server})`);
     }
   }
+  if (dynamicEntries.length > 0) {
+    io.log("");
+    io.log("Provider plugin credentials (from installed plugin manifests):");
+    for (const entry of dynamicEntries) {
+      for (const field of entry.fields) {
+        const mark = io.hasSecret(field.key) ? "ok" : "--";
+        io.log(`  ${mark}  ${field.key.padEnd(24)} (${entry.server})`);
+      }
+    }
+  }
   io.log("");
   io.log("Add or rotate: hive credentials add <KEY>");
   io.log("Remove:        hive credentials remove <KEY>");
   return 0;
 }
 
-async function addCredential(key: string | undefined, io: CredentialsCliIO): Promise<number> {
+async function addCredential(
+  key: string | undefined,
+  io: CredentialsCliIO,
+  dynamicEntries: CredentialEntry[],
+): Promise<number> {
   if (!key) {
     io.log("Usage: hive credentials add <KEY>");
     return 1;
   }
-  const entry = findCredentialEntryByKey(key);
+  const entry = findCredentialEntryByKey(key) ?? dynamicEntries.find((e) => e.fields.some((f) => f.key === key));
   if (!entry) {
     io.log(`Unknown key: ${key}.`);
     io.log("Run `hive credentials list` to see known keys.");

@@ -161,3 +161,42 @@ describe("runCredentialsCommand misc", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 });
+
+describe("plugin provider credentials (KPR-394)", () => {
+  const solEntry = {
+    server: "sol",
+    title: "Provider 'sol' (plugin hive-plugin-sol)",
+    description: "API key for the 'sol' provider plugin.",
+    helpUrl: "See the hive-plugin-sol plugin README.",
+    kind: "secret" as const,
+    fields: [{ key: "SOL_API_KEY", label: "SOL_API_KEY" }],
+  };
+
+  it("list shows dynamic provider keys in their own block", async () => {
+    const io = makeIO();
+    await runCredentialsCommand("list", [], io, [solEntry]);
+    const out = io.logs.join("\n");
+    expect(out).toContain("Provider plugin credentials");
+    expect(out).toContain("SOL_API_KEY");
+  });
+
+  it("add accepts a manifest-declared provider key", async () => {
+    const io = makeIO(["sol-secret-value"]);
+    const code = await runCredentialsCommand("add", ["SOL_API_KEY"], io, [solEntry]);
+    expect(code).toBe(0);
+    expect(io.stored.SOL_API_KEY).toBe("sol-secret-value");
+  });
+
+  it("add still rejects a genuinely unknown key", async () => {
+    const io = makeIO();
+    const code = await runCredentialsCommand("add", ["NOPE_KEY"], io, [solEntry]);
+    expect(code).toBe(1);
+    expect(io.logs.join("\n")).toContain("Unknown key: NOPE_KEY");
+  });
+
+  it("static registry entries are unaffected when no plugins declare providers", async () => {
+    const io = makeIO();
+    await runCredentialsCommand("list", [], io, []);
+    expect(io.logs.join("\n")).not.toContain("Provider plugin credentials");
+  });
+});
