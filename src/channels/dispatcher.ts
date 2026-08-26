@@ -13,7 +13,7 @@ import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
 import { classifyTurnResult, HARD_FAULT_KINDS } from "../agents/provider-adapters/error-classification.js";
-import type { OutageQueueStore, OutageQueueConfig } from "../outage/outage-queue-store.js";
+import type { OutageQueueStore, OutageQueueConfig, OutageEnqueueOrigin } from "../outage/outage-queue-store.js";
 import {
   OutageEpisodeTracker,
   adapterKeyFor,
@@ -514,7 +514,8 @@ export class Dispatcher {
   ): Promise<void> {
     if (this.outage) {
       if (err instanceof ProviderCircuitOpenError) {
-        const handled = await this.handleOutageTurn(item, agentId, adapter, err.provider);
+        // KPR-400 (F2): the turn never ran — fast-fail class (replays first).
+        const handled = await this.handleOutageTurn(item, agentId, adapter, err.provider, "fast-fail");
         if (handled) return;
       } else if (item.meta?.outageReplay) {
         await this.outage.store
@@ -581,7 +582,9 @@ export class Dispatcher {
     const hardFault = classification.outcome === "fault" && HARD_FAULT_KINDS.has(classification.kind);
     if (!hardFault) return false;
 
-    return this.handleOutageTurn(item, agentId, adapter, provider);
+    // KPR-400 (F2): the turn RAN and hard-faulted with the breaker open —
+    // post-turn-fault class (deadline burners live here; replays last).
+    return this.handleOutageTurn(item, agentId, adapter, provider, "post-turn-fault");
   }
 
   /**
@@ -595,6 +598,10 @@ export class Dispatcher {
     agentId: string,
     adapter: ChannelAdapter | undefined,
     provider: string,
+    /** KPR-400 (F2): enqueue class — threaded from the exactly two callers;
+     *  $setOnInsert-immutable, so a replayed doc's re-visit here (the
+     *  release-before-depth branch) never rewrites it. */
+    origin: OutageEnqueueOrigin,
   ): Promise<boolean> {
     const outage = this.outage;
     if (!outage) return false;
@@ -650,7 +657,7 @@ export class Dispatcher {
         return true;
       }
 
-      await outage.store.enqueue({ itemId: item.id, agentId, provider, workItem: item, policy });
+      await outage.store.enqueue({ itemId: item.id, agentId, provider, workItem: item, policy, enqueueOrigin: origin });
     } catch (storeErr) {
       log.error("Outage enqueue failed — falling back to legacy error path", { error: String(storeErr) });
       return false;

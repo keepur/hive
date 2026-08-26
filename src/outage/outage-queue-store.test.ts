@@ -114,6 +114,7 @@ function makeInput(overrides: Partial<OutageEnqueueInput> = {}): OutageEnqueueIn
     provider: "claude",
     workItem: makeWorkItem(),
     policy: "notify",
+    enqueueOrigin: "fast-fail", // KPR-400 (F2): required input field; harness default
     ...overrides,
   };
 }
