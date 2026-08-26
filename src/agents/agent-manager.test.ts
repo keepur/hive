@@ -187,7 +187,7 @@ vi.mock("../search/conversation-index.js", () => ({
   }),
 }));
 
-import { AgentManager, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
+import { AgentManager, conferenceRoundOf, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
 import { AgentRunner, type RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -297,6 +297,32 @@ function makeSmsCtx(
     threadId,
     workItem,
     channel: "sms" as const,
+  };
+}
+
+/** KPR-389: conference-shaped TurnContext + item, meta stamped like the dispatcher does. */
+function makeConfCtx(
+  round: 0 | 1,
+  agentId = "agent-s",
+  extraMeta: Record<string, unknown> = {},
+): TurnContext & { workItem: WorkItem } {
+  const threadId = `conf:${agentId}:${Math.random()}`;
+  const workItem = makeWorkItem({
+    text: "shaped preamble + transcript + peer reply",
+    threadId,
+    source: { kind: "slack", id: "C-CONF", label: "conf-tahoe" },
+    sender: "U-MAY",
+    senderName: "May",
+    meta: { conferenceMode: true, conferenceRound: round, ...extraMeta },
+  });
+  return {
+    agentId,
+    sessionId: undefined,
+    channelId: "C-CONF",
+    threadId,
+    workItem,
+    channel: "slack" as const,
+    conferenceRound: round,
   };
 }
 
@@ -3704,6 +3730,22 @@ describe("AgentManager", () => {
         const clampWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("outside the deliverable"));
         expect(clampWarns).toHaveLength(1);
       });
+
+      it("T4 (KPR-389): grok round-1 — 'low' pin overrides the :high suffix, limits materialized+clamped; round-0 keeps suffix + undefined limits", async () => {
+        registry._agents.set(
+          "agent-grok-high",
+          makeAgentConfig({ id: "agent-grok-high", name: "GrokHigh", model: "grok/grok-4.6:high", coreServers: [] }),
+        );
+        await manager.spawnTurn(makeConfCtx(1, "agent-grok-high"));
+        const [, , , , limits1, , effort1] = mockRunnerSend.mock.calls.at(-1)!;
+        expect(limits1).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 10 });
+        expect(effort1).toBe("low");
+
+        await manager.spawnTurn(makeConfCtx(0, "agent-grok-high"));
+        const [, , , , limits0, , effort0] = mockRunnerSend.mock.calls.at(-1)!;
+        expect(limits0).toBeUndefined(); // today's Lane A path — runner legacy fallback
+        expect(effort0).toBe("high"); // clamped static suffix, today's path
+      });
     });
   });
 
@@ -4950,6 +4992,172 @@ describe("AgentManager", () => {
       resolveNested(makeRunResult({ text: "x" }));
       await p;
       expect(activeSlots("gp")).toBe(0); // released in finally
+    });
+  });
+
+  describe("round-1 reaction shaping (KPR-389 D2/D3)", () => {
+    beforeEach(() => {
+      mockConversationIndex.mockResolvedValue(undefined);
+    });
+
+    it("T1: round-1 claude effort-capable — classifier skipped, effort low, static-tier base clamped (router on)", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        await manager.spawnTurn(makeConfCtx(1));
+        expect(routeModel).not.toHaveBeenCalled();
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        // sonnet base {300s, 50, 5} → min() clamp
+        expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 5 });
+        expect(effort).toBe("low");
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+
+    it("T1b: round-1 claude router OFF — legacy triple is the base; tighter operator maxTurns wins the min()", async () => {
+      registry._agents.set(
+        "agent-tight",
+        makeAgentConfig({ id: "agent-tight", name: "Tight", model: "claude-sonnet-4-6", maxTurns: 3 }),
+      );
+      await manager.spawnTurn(makeConfCtx(1, "agent-tight"));
+      expect(routeModel).not.toHaveBeenCalled();
+      const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+      // base = { maxTurns: 3, timeoutMs: 300_000 (undefined ?? default), budgetUsd: 10 }
+      expect(resourceLimits).toEqual({ maxTurns: 3, timeoutMs: 120_000, budgetUsd: 10 });
+      expect(effort).toBe("low");
+    });
+
+    it("E7: round-1 haiku agent — caps clamp, no effort pin (undeliverable, same as today)", async () => {
+      await manager.spawnTurn(makeConfCtx(1, "agent-a")); // agent-a = haiku default fixture
+      expect(routeModel).not.toHaveBeenCalled();
+      const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 10 });
+      expect(effort).toBeUndefined();
+    });
+
+    it("T2: round-0 conference turn untouched — classifier runs, static-tier limits, classifier effort (negative pin, D3)", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "high" }));
+        await manager.spawnTurn(makeConfCtx(0));
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(effort).toBe("high");
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+
+    it("T2b: non-conference control — no meta key ⇒ branch not taken ⇒ today's path byte-unchanged", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "medium" }));
+        await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(effort).toBe("medium");
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+
+    it("T3: Lane B (codex) round-1 — clamped agent-def limits, request.effort undefined; round-0 byte-identical to the Lane B branch", async () => {
+      registry._agents.set(
+        "codex-conf",
+        makeAgentConfig({ id: "codex-conf", name: "CodexConf", model: "codex/gpt-5.5:medium", coreServers: [] }),
+      );
+      await manager.spawnTurn(makeConfCtx(1, "codex-conf"));
+      const req1 = mockCodexRunTurn.mock.calls[0]![0];
+      expect(req1.resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 10 });
+      expect(req1.effort).toBeUndefined();
+
+      await manager.spawnTurn(makeConfCtx(0, "codex-conf"));
+      const req0 = mockCodexRunTurn.mock.calls[1]![0];
+      expect(req0.resourceLimits).toEqual({ maxTurns: 25, timeoutMs: 300_000, budgetUsd: 10 });
+    });
+  });
+
+  describe("turn-kind telemetry (KPR-389 D6)", () => {
+    function makeActivityLogger() {
+      return { record: vi.fn() };
+    }
+    function buildManager(activityLogger: { record: ReturnType<typeof vi.fn> }) {
+      return new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        activityLogger as any,
+      );
+    }
+
+    beforeEach(() => {
+      mockConversationIndex.mockResolvedValue(undefined);
+    });
+
+    it("T7: round-1 conference turn stamps round, injectionMode, resumedSession, perf split, effort — telemetry AND activity", async () => {
+      const activityLogger = makeActivityLogger();
+      const mgr = buildManager(activityLogger);
+      const { workItem, threadId } = makeConfCtx(1, "agent-s", { conferenceInjectionMode: "delta" });
+      // Seed a resumable same-provider session so runWorkItemTurn resolves it
+      // (C7: resumedSession = the finalized attempt launched with a handle).
+      sessionStore._sessions.set(`agent-s:${threadId}`, { sessionId: "sess-live", provider: "claude" });
+
+      await mgr.runWorkItemTurn("agent-s", workItem);
+
+      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc).toMatchObject({
+        conferenceRound: 1,
+        injectionMode: "delta",
+        resumedSession: true,
+        durationMs: 1000, // makeRunResult defaults
+        llmMs: 800,
+        toolMs: 200,
+        toolCalls: 1,
+        effort: "low", // the D2 pin, visible in telemetry
+      });
+      expect(activityLogger.record.mock.calls[0]![0].conferenceRound).toBe(1);
+    });
+
+    it("T7b: plain DM turn — perf fields present, conference keys ABSENT", async () => {
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc.durationMs).toBe(1000);
+      expect(doc.resumedSession).toBe(false);
+      expect(doc).not.toHaveProperty("conferenceRound");
+      expect(doc).not.toHaveProperty("injectionMode");
+      expect(doc).not.toHaveProperty("effort"); // router off ⇒ no override on a DM turn
+    });
+
+    it("T7c: an aborted (clamp-killed) reaction skips turn telemetry but lands round-tagged in the activity log", async () => {
+      const activityLogger = makeActivityLogger();
+      const mgr = buildManager(activityLogger);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ aborted: true, text: "", timedOut: true }));
+
+      await mgr.runWorkItemTurn("agent-s", makeConfCtx(1, "agent-s").workItem);
+
+      expect(turnTelemetryStore.record).not.toHaveBeenCalled(); // !aborted gate
+      expect(activityLogger.record.mock.calls[0]![0].conferenceRound).toBe(1); // kills stay measurable (C5 volume counter)
+    });
+  });
+
+  describe("conferenceRoundOf (KPR-389 D1)", () => {
+    it.each([
+      ["round 0", { conferenceRound: 0 }, 0],
+      ["round 1", { conferenceRound: 1 }, 1],
+      ['malformed string "1"', { conferenceRound: "1" }, undefined],
+      ["out-of-range 2", { conferenceRound: 2 }, undefined],
+      ["explicit undefined", { conferenceRound: undefined }, undefined],
+    ])("%s ⇒ %s", (_label, meta, expected) => {
+      expect(conferenceRoundOf(makeWorkItem({ meta: meta as Record<string, unknown> }))).toBe(expected);
+    });
+
+    it("missing meta ⇒ undefined (fail-open to full-resource turn, E10)", () => {
+      expect(conferenceRoundOf(makeWorkItem())).toBeUndefined();
     });
   });
 });

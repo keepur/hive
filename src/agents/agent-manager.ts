@@ -1,5 +1,5 @@
 import { createLogger } from "../logging/logger.js";
-import type { AgentState, AgentStatus } from "../types/agent-config.js";
+import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
@@ -10,7 +10,13 @@ import type { TurnTelemetryStore } from "./turn-telemetry.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { Db } from "mongodb";
 import { formatFilesForPrompt } from "../files/file-processor.js";
-import { routeModel, modelToTier, resolveResourceLimits, type ResourceLimits } from "./model-router.js";
+import {
+  routeModel,
+  modelToTier,
+  resolveResourceLimits,
+  type ResourceLimits,
+  type ModelTier,
+} from "./model-router.js";
 import { getLLMRegistry } from "../llm/registry.js";
 import { config as appConfig } from "../config.js";
 import { loadPlugins, rescanPluginBrokenServers } from "../plugins/plugin-loader.js";
@@ -104,6 +110,10 @@ export interface TurnContext {
   threadId: string;
   workItem: WorkItem;
   channel: ChannelKind;
+  /** KPR-389: conference turn kind — 0 primary, 1 peer reaction. Set by
+   *  runWorkItemTurn from WorkItem meta; undefined for every non-conference
+   *  turn and for voice/reflection contexts (which never carry the meta). */
+  conferenceRound?: 0 | 1;
   /**
    * KPR-219: bypass `AgentRunner.buildSystemPrompt` entirely when set. Voice
    * uses this to inject `buildVoiceSystemPrompt` output (omits tool summaries,
@@ -174,6 +184,21 @@ export interface TurnResult {
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
 export type SpawnTurnStreamCallback = StreamCallback;
+
+/** KPR-389: typed read of the dispatcher's conference discriminator (C3 —
+ *  meta.conferenceRound is the round-1 discriminator). Returns undefined for
+ *  non-conference items and malformed values. Exported — the dispatcher's
+ *  D5b single-dispatch suppression leg reads it too. */
+export function conferenceRoundOf(item: WorkItem): 0 | 1 | undefined {
+  const v = item.meta?.conferenceRound;
+  return v === 0 || v === 1 ? v : undefined;
+}
+
+/** KPR-389: typed read of the KPR-388 injection mode stamped beside the round. */
+function conferenceInjectionModeOf(item: WorkItem): "full" | "delta" | undefined {
+  const v = item.meta?.conferenceInjectionMode;
+  return v === "full" || v === "delta" ? v : undefined;
+}
 
 /**
  * Default per-agent in-flight spawn budget. Long-lived `maxConcurrent`
@@ -429,6 +454,15 @@ const REFLECTION_PROMPT = [
   "If yes, use memory_save, memory_update, or memory_forget now.",
   "If nothing worth saving, do nothing.",
 ].join("\n");
+
+/** KPR-389: turn-scoped reaction caps. Template: KPR-354's nested-delegate
+ *  literal override (resourceLimits: { maxTurns, timeoutMs: 600_000,
+ *  budgetUsd: 0 }); here we clamp with min() instead of replacing so tighter
+ *  operator config always wins. maxTurns 6 < KPR-354's 7/10 delegate budgets
+ *  (a reaction is strictly lighter); 120s reuses the haiku-tier light-turn
+ *  precedent. Plain constants — tune when the D6 telemetry says otherwise. */
+const REACTION_MAX_TURNS = 6;
+const REACTION_TIMEOUT_MS = 120_000;
 
 export class AgentManager {
   private states = new Map<string, AgentState>();
@@ -879,6 +913,7 @@ export class AgentManager {
       threadId,
       workItem: item,
       channel: item.source.kind,
+      conferenceRound: conferenceRoundOf(item),
     };
 
     return this.spawnTurn(ctx, onStream);
@@ -1120,7 +1155,7 @@ export class AgentManager {
         shaping.route,
         !!finalAttemptSessionId,
       );
-      this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
+      this.recordSpawnObservability(effectiveCtx, shaping, finalResult, !!finalAttemptSessionId);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
       // turns themselves don't reschedule (kind="reflection" guard).
@@ -1623,6 +1658,77 @@ export class AgentManager {
     return undefined;
   }
 
+  /** KPR-389 D2: round-1 conference reactions spawn cheap — classifier
+   *  skipped, effort pinned low where deliverable, limits clamped against the
+   *  config-accurate base (exactly what today's turn would have received). */
+  private shapeReactionTurn(
+    prompt: string,
+    staticRoute: ProviderModelRoute,
+    staticTier: ModelTier,
+    agentConfig: AgentConfig | undefined,
+    agentId: string,
+  ): SpawnShaping {
+    // Degenerate guard (mirrors staticRoute's `?? ""` idiom, E9): agent
+    // vanished mid-turn ⇒ flow on; the turn fails inside the recorded try as
+    // today (KPR-306 wedged-permit hazard respected).
+    if (!agentConfig) {
+      return { prompt, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+    }
+    // Base limits — config-accurate: exactly the values today's turn would
+    // otherwise receive, so the min() invariant ("tighter operator config
+    // always wins") holds on every reachable path:
+    //   claude, router ON:  static-tier limits (resolveResourceLimits). The
+    //               legacy triple is dead config there and is deliberately
+    //               NOT folded in (folding it would newly activate config
+    //               that has no effect today).
+    //   claude, router OFF: agent-def legacy triple — today the router gate
+    //               returns resourceLimits: undefined and the runner's
+    //               per-field fallback applies agentConfig values; operator
+    //               tightness may live there (e.g. maxTurns: 3) and must win
+    //               the min(). The other undefined-resolving claude paths are
+    //               unreachable for round-1: reactions always carry a human
+    //               sender (never "system"), and the router-catch cannot fire
+    //               because routeModel is never called here.
+    //   Lane A + B: agent-def legacy triple (byte-identical to the Lane B
+    //               branch construction; for Lane A this newly MATERIALIZES
+    //               the same values the runner's per-field fallback would
+    //               have applied — no behavior change beyond the clamp).
+    const legacy = {
+      maxTurns: agentConfig.maxTurns,
+      timeoutMs: agentConfig.timeoutMs ?? 300_000,
+      budgetUsd: agentConfig.budgetUsd,
+    };
+    const base =
+      staticRoute.provider === "claude" && appConfig.modelRouter.enabled
+        ? resolveResourceLimits(staticTier, agentConfig.resourceTiers)
+        : legacy;
+    const limits: ResourceLimits = {
+      maxTurns: Math.min(base.maxTurns, REACTION_MAX_TURNS),
+      timeoutMs: Math.min(base.timeoutMs, REACTION_TIMEOUT_MS),
+      budgetUsd: base.budgetUsd, // untouched — budget is not the reaction pathology
+    };
+    // Effort: claude-runtime lanes deliver via Options.effort ("low" is inside
+    // the runner's {low,medium,high} narrowing). The claude arm keeps the
+    // KPR-338 deliverability gate (haiku / off-catalog ⇒ undefined — pinning
+    // an undeliverable hint is a no-op at best). Lane B ignores request.effort
+    // by contract (types.ts) ⇒ undefined.
+    const effortOverride: ReasoningEffort | undefined =
+      staticRoute.provider === "claude"
+        ? staticTier !== "haiku" && getLLMRegistry().supportsEffort(agentConfig.model)
+          ? "low"
+          : undefined
+        : isLaneAProvider(staticRoute.provider)
+          ? "low"
+          : undefined;
+    log.debug("Round-1 reaction shaping applied (KPR-389)", {
+      agentId,
+      maxTurns: limits.maxTurns,
+      timeoutMs: limits.timeoutMs,
+      effort: effortOverride,
+    });
+    return { prompt, route: staticRoute, resourceLimits: limits, routerCostUsd: 0, effortOverride };
+  }
+
   /**
    * KPR-224 + KPR-311: per-turn shaping for `spawnTurn` (its single caller
    * post-KPR-220). Centralizes:
@@ -1706,6 +1812,14 @@ export class AgentManager {
         (staticRoute.provider === "claude" || isLaneAProvider(staticRoute.provider)
           ? SESSION_HANDOFF_NOTICE_CLAUDE
           : SESSION_HANDOFF_NOTICE_PILOT) + prompt;
+    }
+
+    // KPR-389: round-1 conference reactions spawn cheap — classifier skipped,
+    // effort pinned low where deliverable, limits clamped. Round 0 falls
+    // through to every existing path untouched (D3). Voice is structurally
+    // unreachable here (carve-out returned above; voice never carries the meta).
+    if (ctx.conferenceRound === 1) {
+      return this.shapeReactionTurn(prompt, staticRoute, staticTier, agentConfig, ctx.agentId);
     }
 
     // KPR-346 (§D6): Lane A — the router stays skipped (foreign ids are
@@ -1820,8 +1934,12 @@ export class AgentManager {
     ctx: TurnContext,
     shaping: SpawnShaping,
     result: RunResult,
+    resumedSession: boolean,
   ): void {
     const item = ctx.workItem;
+    // KPR-389 D6: turn-kind discriminators from the dispatcher's conference meta.
+    const confRound = conferenceRoundOf(item);
+    const injectionMode = conferenceInjectionModeOf(item);
 
     // Per-turn telemetry — independent of sessionStore (no history in
     // sessionStore.set). Aggregator in `hive doctor` reads this collection.
@@ -1838,6 +1956,16 @@ export class AgentManager {
           cacheCreationTokens: result.cacheCreationTokens,
           ephemeral5mTokens: result.ephemeral5mTokens,
           ephemeral1hTokens: result.ephemeral1hTokens,
+          // KPR-389: perf split + turn kind (conditional spreads keep absent
+          // keys absent — no BSON nulls on non-conference turns).
+          durationMs: result.durationMs,
+          llmMs: result.llmMs,
+          toolMs: result.toolMs,
+          toolCalls: result.toolCalls,
+          resumedSession,
+          ...(shaping.effortOverride ? { effort: shaping.effortOverride } : {}),
+          ...(confRound !== undefined ? { conferenceRound: confRound } : {}),
+          ...(injectionMode ? { injectionMode } : {}),
         })
         .catch(() => {
           // Already logged inside the store via withRetry. Swallow here.
@@ -1888,6 +2016,7 @@ export class AgentManager {
       compactions: result.compactions,
       streamed: result.streamed,
       error: result.error,
+      ...(confRound !== undefined ? { conferenceRound: confRound } : {}),
     });
   }
 

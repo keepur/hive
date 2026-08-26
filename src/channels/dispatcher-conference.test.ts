@@ -3,9 +3,15 @@ import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { OutageEpisodeTracker } from "../outage/outage-notices.js";
 
+// KPR-389 C5: the suppression log lines carry the `conferenceRound` tag that is
+// the measurement numerator, so tests must be able to read what dispatcher logs
+// to `info`. vi.hoisted is required: vi.mock factories run before top-level
+// statements. (Same shape as dispatcher.test.ts.) `vi.clearAllMocks()` in the
+// suite beforeEach resets it between tests.
+const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
-    info: vi.fn(),
+    info: mockLogInfo,
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
@@ -218,6 +224,17 @@ describe("Conference channel routing", () => {
     dispatcher.registerAdapter(adapter as any);
     dispatcher.setSlackAdapter(mockSlackAdapter as any);
   });
+
+  // Hoisted out of the delta describe (KPR-389 T8 needs it too — it only
+  // touches the classifier mock).
+  function soloClassifier() {
+    // Round-0 selects jasper; any reaction pass selects nobody.
+    return import("../agents/meeting-classifier.js").then(({ classifyMeetingMessage }) => {
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+    });
+  }
 
   it("routes conference channel message through classifier", async () => {
     const item = makeWorkItem({
@@ -498,27 +515,173 @@ describe("Conference channel routing", () => {
     // returns "" and .filter(Boolean) drops that segment from the join entirely).
     // Pins the full preamble wording too, not just the join — KPR-389's preamble
     // hardening will need to update this expectation deliberately.
+    // KPR-389 D4: deliberate C6 pin update — this is the only ticket licensed
+    // to edit this literal (epic canon C6). Full-join byte identity retained.
     const expectedPreamble = `You are in a meeting in #conf-pin with Jasper.
 
 Meeting rules:
+- The discussion so far is already in this prompt and your session context — do NOT re-read the channel, search the workspace, or re-orient with tools before speaking.
+- If you have nothing meaningful to add, reply "No response needed." immediately — as your first output, with no tool calls first.
+- Only use a tool if your reply genuinely needs information that is not already in this thread — never to re-read the meeting itself.
 - Be concise — others are also responding.
 - Build on what's been said. Don't repeat points already made.
-- If you have nothing meaningful to add, respond with "No response needed."
 - Stay in your lane — don't cover someone else's domain unless asked.
 - Address others by name when responding to their points.`;
 
     expect(round0Item.text).toBe(`${expectedPreamble}\n---\n[New message]:\n${item.text}`);
   });
 
+  it("T6 (C4 guard): a double-quoted escape phrase in the preamble matches NON_RESPONSE_PATTERNS", () => {
+    // Local mirror of dispatcher.ts NON_RESPONSE_PATTERNS — same deliberate-copy
+    // convention as dispatcher.test.ts:273 (the pin IS the point: widen-or-match
+    // is enforced by this test failing on any preamble rewording).
+    const NON_RESPONSE_PATTERNS = [
+      /^no response (requested|needed|required|necessary)\.?$/i,
+      /^\(no response\)$/i,
+      /^n\/a\.?$/i,
+    ];
+    const preamble = (
+      dispatcher as unknown as {
+        buildMeetingPreamble(
+          c: string,
+          r: Array<{ agentId: string; name: string; title?: string; role: string }>,
+        ): string;
+      }
+    ).buildMeetingPreamble("x", [{ agentId: "jasper", name: "Jasper", role: "VP Engineering" }]);
+    const quoted = [...preamble.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect(quoted.length).toBeGreaterThan(0);
+    expect(quoted.some((p) => NON_RESPONSE_PATTERNS.some((rx) => rx.test(p!.trim())))).toBe(true);
+  });
+
+  describe("round-1 kill suppression (KPR-389 D5)", () => {
+    const zeroUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      contextWindow: 0,
+      costUsd: 0,
+      durationMs: 100,
+    };
+    function turn(overrides: Record<string, unknown> = {}) {
+      return {
+        finalMessage: "Agent response",
+        newSessionId: "s2",
+        usage: zeroUsage,
+        errors: [] as string[],
+        llmMs: 0,
+        toolMs: 0,
+        toolCalls: 0,
+        toolSummary: null,
+        streamed: false,
+        compactions: 0,
+        ...overrides,
+      };
+    }
+    async function twoAgentClassifier() {
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+    }
+    function confItem(threadId: string) {
+      return makeWorkItem({
+        text: "Jasper, and Jessica, please weigh in",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kill" },
+        threadId,
+        meta: { slackTs: "1700.0001" },
+      });
+    }
+    /**
+     * Deterministic barrier for the fire-and-forget reaction pass (plan-review
+     * r1 note). `waitFor(runWorkItemTurn × 2)` alone is NOT enough: everything
+     * downstream of the reactor's turn resolution — the D5 guard and the
+     * delivery it suppresses — is a pure microtask chain (all harness mocks
+     * resolve immediately, no timers), so the deliver-count assert can run
+     * before it. One macrotask boundary drains the whole chain, because the
+     * microtask queue is fully emptied before the next macrotask. Negative-
+     * verified: with the D5 guard disabled these tests fail in ~3ms.
+     */
+    const settleReactions = () => new Promise((r) => setTimeout(r, 0));
+
+    it.each([
+      ["aborted", { aborted: true }],
+      ["timedOut", { timedOut: true, aborted: true }],
+    ])("killed round-1 reaction (%s) never delivers; mark untouched for the reactor", async (_label, flags) => {
+      await twoAgentClassifier();
+      agentManager.runWorkItemTurn
+        .mockResolvedValueOnce(turn()) // jasper round-0: real reply
+        .mockResolvedValueOnce(turn({ finalMessage: "", ...flags })); // jessica round-1: killed
+      await dispatcher.dispatch(confItem(`conf-kill-${_label}`));
+      await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
+      await settleReactions();
+      expect(adapter.deliver).toHaveBeenCalledTimes(1); // only jasper's round-0 reply
+      expect(adapter.deliver.mock.calls[0][0].agentId).toBe("jasper");
+      expect(agentManager._sessionStore.setMeetingMark).not.toHaveBeenCalledWith(
+        "jessica",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    // KPR-389 C5 numerator pin (round-1 arm). The kill tests above take the D5
+    // early return, which logs a different line — no existing test drove the
+    // tagged fan-out suppression log at round 1, so this one does: a reactor
+    // that answers with a non-response phrase.
+    it("C5 pin: a round-1 non-response suppression logs conferenceRound: 1", async () => {
+      await twoAgentClassifier();
+      agentManager.runWorkItemTurn
+        .mockResolvedValueOnce(turn()) // jasper round-0: real reply
+        .mockResolvedValueOnce(turn({ finalMessage: "No response needed." })); // jessica round-1
+      await dispatcher.dispatch(confItem("conf-kill-nonresponse"));
+      await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
+      await settleReactions();
+      expect(adapter.deliver).toHaveBeenCalledTimes(1); // only jasper's round-0 reply
+      expect(mockLogInfo).toHaveBeenCalledWith(
+        "Non-response suppressed (fan-out)",
+        expect.objectContaining({ agentId: "jessica", conferenceRound: 1 }),
+      );
+    });
+
+    it("errored round-1 reaction WITH text still delivers (exit-code-1 convention)", async () => {
+      await twoAgentClassifier();
+      agentManager.runWorkItemTurn
+        .mockResolvedValueOnce(turn())
+        .mockResolvedValueOnce(turn({ finalMessage: "Real answer with a warning", errors: ["exit 1"] }));
+      await dispatcher.dispatch(confItem("conf-kill-errtext"));
+      await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(adapter.deliver).toHaveBeenCalledTimes(2));
+      expect(adapter.deliver.mock.calls[1][0].text).toBe("Real answer with a warning");
+    });
+
+    it("control: a killed ROUND-0 turn keeps today's delivery behavior (filler delivered)", async () => {
+      await soloClassifier(); // round-0 jasper only, reaction pass selects nobody
+      agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ finalMessage: "", aborted: true }));
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, next steps?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-kill-r0" },
+          threadId: "conf-kill-r0",
+          meta: { slackTs: "1700.0002" },
+        }),
+      );
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe("_No response._");
+    });
+  });
+
   describe("delta context injection (KPR-388)", () => {
     // NOTE: continuation lines are deliberately flush-left inside the
     // backticks — the preamble byte pin breaks on any leading whitespace.
+    // KPR-389 D4: deliberate C10 pin update (see C6 note above).
     const PREAMBLE = (channel: string, names: string) => `You are in a meeting in #${channel} with ${names}.
 
 Meeting rules:
+- The discussion so far is already in this prompt and your session context — do NOT re-read the channel, search the workspace, or re-orient with tools before speaking.
+- If you have nothing meaningful to add, reply "No response needed." immediately — as your first output, with no tool calls first.
+- Only use a tool if your reply genuinely needs information that is not already in this thread — never to re-read the meeting itself.
 - Be concise — others are also responding.
 - Build on what's been said. Don't repeat points already made.
-- If you have nothing meaningful to add, respond with "No response needed."
 - Stay in your lane — don't cover someone else's domain unless asked.
 - Address others by name when responding to their points.`;
 
@@ -541,15 +704,6 @@ Meeting rules:
         timestamp: new Date(Date.now() - (e.minAgo ?? 5) * 60_000),
         isBot: e.isBot ?? false,
       }));
-
-    function soloClassifier() {
-      // Round-0 selects jasper; any reaction pass selects nobody.
-      return import("../agents/meeting-classifier.js").then(({ classifyMeetingMessage }) => {
-        (classifyMeetingMessage as any)
-          .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
-          .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
-      });
-    }
 
     const THREE_MSG_HISTORY = () =>
       makeHistory([
@@ -691,6 +845,12 @@ Meeting rules:
 
       expect(adapter.deliver).not.toHaveBeenCalled(); // suppression semantics intact
       expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
+      // KPR-389 C5 numerator pin (round-0 arm): the fan-out suppression log must
+      // carry the conferenceRound tag — dropping it silently breaks C5.
+      expect(mockLogInfo).toHaveBeenCalledWith(
+        "Non-response suppressed (fan-out)",
+        expect.objectContaining({ agentId: "jasper", conferenceRound: 0 }),
+      );
     });
 
     it("error and aborted turns leave the mark untouched", async () => {
