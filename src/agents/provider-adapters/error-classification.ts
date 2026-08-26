@@ -176,6 +176,16 @@ export function classifyTurnResult(input: TurnFaultInput): TurnClassification {
       return {
         outcome: "fault",
         kind: "turn-deadline",
+        // Attenuation shape (D9 truth-up, KPR-400 — deliberate, pinned in
+        // error-classification.test.ts): a real error string coexisting
+        // with deadline+progress becomes the turn-deadline message
+        // VERBATIM, suppressing the synthesized evidence string below.
+        // Unreachable on the Claude deadline path today (`error` stays
+        // undefined — the runner's deadline closes the iterator, nothing
+        // throws), but if a future caller supplies both, the error string
+        // wins: it carries strictly more debugging signal than the
+        // synthesized counters, and the KIND (not the message) is what the
+        // breaker keys on.
         message:
           input.error ??
           `turn deadline exceeded with progress (toolCalls=${input.toolCalls ?? 0}, streamed=${input.streamed === true}, textLen=${input.text?.length ?? 0})`,
