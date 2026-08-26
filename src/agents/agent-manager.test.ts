@@ -3726,6 +3726,209 @@ describe("AgentManager", () => {
         });
       });
     });
+
+    describe("provider plugins (KPR-394)", () => {
+      let fixture: ReturnType<typeof makeFixtureProviderModule>;
+
+      function makeFixtureProviderModule(id = "sol") {
+        const constructions: any[] = [];
+        const runTurn = vi.fn(async () => makeRunResult({ text: `${id} says hi` }));
+        const abort = vi.fn();
+        const module = {
+          provider: id,
+          createAdapter: vi.fn((args: any) => {
+            constructions.push(args);
+            return { provider: id, runTurn, abort, wasAborted: false };
+          }),
+        };
+        return { module, constructions, runTurn, abort };
+      }
+
+      // Replicated from the KPR-354 describe's makeSubagentEntry (scoped
+      // there, deliberately not hoisted). `laneB` is the R3 generic column a
+      // PLUGIN provider id reads through partitionInventoryForProvider's
+      // fallback — the KPR-354 literal only carries built-in columns, so a
+      // verbatim copy would be honestly `unsupported` for "sol".
+      function makeSolSubagentEntry(): any {
+        return {
+          name: "google",
+          transport: "claude-subagent",
+          source: "core",
+          requiresTurnContext: false,
+          requiresHiveRuntime: false,
+          inProcess: false,
+          compatibility: {
+            claude: "direct",
+            openai: "requires-hive-bridge",
+            gemini: "requires-hive-bridge",
+            codex: "requires-hive-bridge",
+            grok: "requires-hive-bridge",
+            laneB: "requires-hive-bridge",
+          },
+          schemas: { kind: "unavailable" },
+          description: "Gmail + Calendar",
+          serverConfig: { type: "stdio", command: "gog-mcp" },
+        };
+      }
+
+      async function registerSol(slice: Record<string, unknown> | undefined = {
+        defaultModel: "sol-large-2",
+        apiKeyEnv: "SOL_API_KEY",
+        baseUrlEnv: "SOL_BASE_URL",
+      }) {
+        const reg = await import("./provider-adapters/provider-registry.js");
+        fixture = makeFixtureProviderModule();
+        reg.__registerActivePluginProviderForTests({
+          id: "sol",
+          module: fixture.module as any,
+          semantics: "stateless-replay",
+          source: { plugin: "hive-plugin-sol" },
+          slice: slice as any,
+        });
+        registry._agents.set(
+          "agent-sol",
+          makeAgentConfig({ id: "agent-sol", name: "AgentSol", model: "sol/sol-large-2:high", coreServers: [] }),
+        );
+      }
+
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        process.env.SOL_API_KEY = "test-sol-key";
+      });
+
+      afterEach(async () => {
+        delete process.env.SOL_API_KEY;
+        delete process.env.SOL_BASE_URL;
+        const reg = await import("./provider-adapters/provider-registry.js");
+        reg.__resetPluginProvidersForTests();
+      });
+
+      it("routing: registered plugin id maps via providerFor; declared-broken routes to itself; undeclared falls back to claude", async () => {
+        await registerSol();
+        const reg = await import("./provider-adapters/provider-registry.js");
+        reg.__markBrokenPluginProviderForTests("bad", { plugin: "hive-plugin-bad", reason: "abi mismatch" });
+        registry._agents.set(
+          "agent-bad",
+          makeAgentConfig({ id: "agent-bad", name: "AgentBad", model: "bad/bad-1", coreServers: [] }),
+        );
+        expect(manager.providerFor("agent-sol")).toBe("sol");
+        expect(manager.providerFor("agent-bad")).toBe("bad"); // declared-broken: routes, then fails honestly
+        registry._agents.set(
+          "agent-typo2",
+          makeAgentConfig({ id: "agent-typo2", name: "AgentTypo2", model: "zeta/z-1" }),
+        );
+        expect(manager.providerFor("agent-typo2")).toBe("claude"); // never-declared canon unchanged
+      });
+
+      it("primary construction: fixture module builds the adapter with context primary, route model+effort, agentId deps", async () => {
+        await registerSol();
+        const result = await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-primary" }));
+        expect(result.errors).toEqual([]);
+        expect(fixture.runTurn).toHaveBeenCalled();
+        const args = fixture.constructions[0]!;
+        expect(args.context).toBe("primary");
+        expect(args.name).toBe("AgentSol");
+        expect(args.route).toEqual({ model: "sol-large-2", reasoningEffort: "high" });
+        expect(args.deps.agentId).toBe("agent-sol");
+        // No builtin adapter and no Claude runner ran.
+        expect(mockRunnerSend).not.toHaveBeenCalled();
+        expect(mockCodexConstructor).not.toHaveBeenCalled();
+      });
+
+      it("slice resolution: agentModel default + env-resolved apiKey; baseUrl undefined when override unset", async () => {
+        await registerSol();
+        await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-slice" }));
+        expect(fixture.constructions[0]!.deps.providerConfig).toEqual({
+          agentModel: "sol-large-2",
+          apiKey: "test-sol-key",
+          baseUrl: undefined,
+        });
+      });
+
+      it("missing SOL_API_KEY is a config fault that never trips the sol breaker (byte-identical grok contract)", async () => {
+        await registerSol();
+        delete process.env.SOL_API_KEY;
+        for (let i = 0; i < 3; i++) {
+          await expect(
+            manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: `sms:line-1:kpr394-cred-${i}` })),
+          ).rejects.toThrow(/Passthrough credential missing \(authentication\): SOL_API_KEY/);
+        }
+        process.env.SOL_API_KEY = "test-sol-key";
+        const result = await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-cred-ok" }));
+        expect(result.errors).toEqual([]);
+        expect(manager.circuitBreakers.stateFor("sol")?.state ?? "closed").toBe("closed");
+      });
+
+      it("a loopback SOL_BASE_URL override flows to the slice", async () => {
+        await registerSol();
+        process.env.SOL_BASE_URL = "http://127.0.0.1:4141";
+        await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-baseurl-ok" }));
+        expect(fixture.constructions[0]!.deps.providerConfig.baseUrl).toBe("http://127.0.0.1:4141");
+      });
+
+      it("a cleartext off-box SOL_BASE_URL override is a breaker-invisible config fault", async () => {
+        await registerSol();
+        process.env.SOL_BASE_URL = "http://evil.example:8317";
+        await expect(
+          manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-baseurl-bad" })),
+        ).rejects.toThrow(/cleartext to a non-loopback host/);
+        expect(manager.circuitBreakers.stateFor("sol")?.state ?? "closed").toBe("closed");
+      });
+
+      it("declared-broken provider: honest TurnAssemblyError naming plugin + reason; breaker closed; never Claude", async () => {
+        const reg = await import("./provider-adapters/provider-registry.js");
+        reg.__markBrokenPluginProviderForTests("bad", { plugin: "hive-plugin-bad", reason: "plugin requires provider ABI 2; engine provides 1" });
+        registry._agents.set(
+          "agent-bad",
+          makeAgentConfig({ id: "agent-bad", name: "AgentBad", model: "bad/bad-1", coreServers: [] }),
+        );
+        await expect(
+          manager.spawnTurn(smsCtx({ agentId: "agent-bad", threadId: "sms:line-1:kpr394-broken" })),
+        ).rejects.toThrow(/provider 'bad' from plugin 'hive-plugin-bad' failed to load: plugin requires provider ABI 2/);
+        expect(manager.circuitBreakers.stateFor("bad")?.state ?? "closed").toBe("closed");
+        expect(mockRunnerSend).not.toHaveBeenCalled(); // no silent Claude fallback
+      });
+
+      it("nested delegate turn constructs the SAME plugin module with context nested (KPR-354 parity)", async () => {
+        await registerSol();
+        registry._agents.set(
+          "agent-sol",
+          makeAgentConfig({
+            id: "agent-sol",
+            name: "AgentSol",
+            model: "sol/sol-large-2",
+            delegateServers: ["google"],
+            coreServers: [],
+          }),
+        );
+        mockRunnerToolInventory.mockReturnValue([makeSolSubagentEntry()]);
+        await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-nested" }));
+        const delegateRunner = fixture.constructions[0]!.assembly.delegateTurnRunner;
+        const text = await delegateRunner({
+          delegate: "google",
+          entry: makeSolSubagentEntry(),
+          prompt: "do the thing",
+          workItemContext: undefined,
+          signal: new AbortController().signal,
+        });
+        expect(text).toBe("sol says hi");
+        const nested = fixture.constructions.find((c) => c.context === "nested")!;
+        expect(nested.name).toBe("AgentSol:google");
+        expect(nested.deps).toBe(fixture.constructions[0]!.deps); // one shared deps object, both sites
+      });
+
+      it("three hard faults trip ONLY the sol breaker — sibling breakers untouched", async () => {
+        await registerSol();
+        fixture.runTurn.mockResolvedValue(
+          makeRunResult({ error: "connect ECONNREFUSED 127.0.0.1:4141", text: "" }),
+        );
+        for (let i = 0; i < 3; i++) {
+          await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: `sms:line-1:kpr394-fault-${i}` }));
+        }
+        expect(manager.circuitBreakers.stateFor("sol")?.state).toBe("open");
+        expect(manager.circuitBreakers.stateFor("codex")).toBeNull(); // never used this process
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------
