@@ -101,8 +101,8 @@
   7. `src/cli/doctor-checks.test.ts` — baseline **64**, expected **68**. Four additive render tests. (Task 6.)
   8. `src/cli/credentials.test.ts` — baseline **17**, expected **21**. Four additive tests via the new `dynamicEntries` parameter. (Task 5.)
   9. `src/setup/credential-registry.test.ts` — baseline **8**, expected **10**. Two additive tests for `pluginProviderCredentialEntries`. (Task 5.)
-- New test files: `src/plugins/provider-decl.test.ts` (29 tests), `src/agents/provider-adapters/provider-registry.test.ts` (21 tests).
-- Post-change provider-adapters directory total: 540 + 4 (tool-transport) + 21 (provider-registry) = **565**.
+- New test files: `src/plugins/provider-decl.test.ts` (30 tests), `src/agents/provider-adapters/provider-registry.test.ts` (18 tests).
+- Post-change provider-adapters directory total: 540 + 4 (tool-transport) + 18 (provider-registry) = **562**.
 - Untouched modules (empty diff verified in Task 11): `provider-modules.ts` (the table stays as the builtin seed — only its file-top comment's "until then" clause is now stale prose, deliberately left), `dispatch-loop.ts`, `sse.ts`, `tool-bridge.ts`, all four adapters, `passthrough-providers.ts` beyond the one `isLaneAProvider` line, `prefix-builder.ts`, `intent-trailer.ts`, `activity/types.ts`, `outage/` (all three files — `OutageQueueStore.provider` is already `string`, verified `outage-queue-store.ts:46`), `error-classification.ts`, `oauth-credentials.ts`.
 - C16 note: the `classification-crosscheck.test.ts` fixture tables are decoupled from source; nothing here touches classification and no claim is made that any mutation in this plan would fail them.
 
@@ -134,9 +134,9 @@
 ```
 src/agents/provider-adapters/provider-abi.ts          NEW   R1: ABI constant + kit type + type re-exports
 src/agents/provider-adapters/provider-registry.ts     NEW   §4.3 runtime registry + kit value + two-phase load
-src/agents/provider-adapters/provider-registry.test.ts NEW  21 tests
+src/agents/provider-adapters/provider-registry.test.ts NEW  18 tests
 src/plugins/provider-decl.ts                          NEW   §4.1 manifest layer (light, CLI-safe)
-src/plugins/provider-decl.test.ts                     NEW   29 tests
+src/plugins/provider-decl.test.ts                     NEW   30 tests
 src/plugins/types.ts                                  MOD   PluginProviderDecl + manifest field
 src/plugins/plugin-loader.ts                          MOD   normalizeManifest provider arm
 src/plugins/plugin-loader.test.ts                     MOD   delta #3 (+3)
@@ -570,7 +570,7 @@ and in `normalizeManifest` (line 239), add the field after `registerCommands`:
     provider: raw.provider !== undefined ? normalizeProviderDecl(raw.provider) : undefined,
 ```
 
-**1e. Create `/Users/mokie/github/lane-kpr-394-mature/src/plugins/provider-decl.test.ts`** — 29 tests:
+**1e. Create `/Users/mokie/github/lane-kpr-394-mature/src/plugins/provider-decl.test.ts`** — 30 tests:
 
 ```ts
 import { describe, expect, it } from "vitest";
@@ -829,7 +829,7 @@ describe("normalizeManifest — provider block (KPR-394)", () => {
   ```bash
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run \
     src/plugins/provider-decl.test.ts src/plugins/plugin-loader.test.ts
-  # expect: Test Files 2 passed; provider-decl 29 passed, plugin-loader 50 passed
+  # expect: Test Files 2 passed; provider-decl 30 passed, plugin-loader 50 passed
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run typecheck   # clean
   ```
 - [ ] Commit:
@@ -1070,6 +1070,14 @@ function clearPluginState(id: string): void {
  * of an id is rejected with both plugin names logged, and the id's routing
  * state stays with the first (never last-wins shadowing; edge 1). Re-declare
  * from the SAME plugin is idempotent (test/manager re-construction).
+ *
+ * Ordering note (plan-review r1 fix): the cross-plugin collision check runs
+ * BEFORE validation-driven `broken.set`. Checking collision first means an
+ * invalid second declaration for an id another plugin already owns never
+ * touches `broken`/`declared` for that id — it is rejected outright. Doing
+ * validation first would let the second plugin's (possibly invalid) verdict
+ * overwrite/shadow the first registrant's row during the phase a→b window
+ * and leave a stale broken entry behind once the first registrant activates.
  */
 export function declarePluginProviders(
   plugins: readonly LoadedPlugin[],
@@ -1080,7 +1088,22 @@ export function declarePluginProviders(
     if (!decl) continue;
     const id = decl.id;
     const owner = pluginOwnerOf(id);
-    if (owner === plugin.name) clearPluginState(id); // idempotent re-declare
+    if (owner === plugin.name) {
+      clearPluginState(id); // idempotent re-declare
+    } else if (owner !== undefined) {
+      // Cross-plugin collision — checked BEFORE validation (see the note
+      // above) so an invalid second declaration can never clobber or
+      // shadow the id it doesn't own. First registration wins
+      // deterministically; the second is rejected with both plugin names
+      // logged, and the id's routing state stays with the first — never
+      // last-wins shadowing.
+      log.error("Provider id collision — first registration wins, second rejected (KPR-394 edge 1)", {
+        provider: id,
+        first: owner,
+        second: plugin.name,
+      });
+      continue;
+    }
     const verdict = validateProviderDecl(decl, LANE_B_PROVIDER_ABI_VERSION);
     if (!verdict.ok) {
       broken.set(id, { plugin: plugin.name, reason: verdict.reason });
@@ -1088,16 +1111,6 @@ export function declarePluginProviders(
         provider: id,
         plugin: plugin.name,
         reason: verdict.reason,
-      });
-      continue;
-    }
-    if (active.has(id) || declared.has(id) || broken.has(id)) {
-      // Built-in (unreachable past the reserved-id check) or another
-      // plugin's id — first registration wins; this one is rejected.
-      log.error("Provider id collision — first registration wins, second rejected (KPR-394 edge 1)", {
-        provider: id,
-        first: pluginOwnerOf(id) ?? "builtin",
-        second: plugin.name,
       });
       continue;
     }
@@ -1422,7 +1435,7 @@ export function createProviderModule(kit) {
 
 (If this suite's logger mock interferes with the registry import, follow the file's existing `vi.mock` hoisting — the registry only needs `createLogger` to return an object with `info`/`warn`/`error`, which the existing mock provides.)
 
-**3e. Create `src/agents/provider-adapters/provider-registry.test.ts`** — 21 tests:
+**3e. Create `src/agents/provider-adapters/provider-registry.test.ts`** — 18 tests:
 
 ```ts
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -1530,10 +1543,14 @@ describe("declare (phase a)", () => {
     expect(describeUnroutableProvider("sol")).toMatch(/entry not resolvable/);
   });
 
-  it("collision: first wins, second rejected with both names logged; first stays routable", () => {
+  it("collision: first wins, second rejected with both names logged — even when the second decl is itself invalid (order fix)", () => {
     declareFixture();
-    declarePluginProviders([makePlugin("hive-plugin-sol2", makeDecl())], { hiveHome: FIXTURE_HOME });
+    declarePluginProviders([makePlugin("hive-plugin-sol2", makeDecl({ abi: 2 }))], { hiveHome: FIXTURE_HOME });
+    // First registrant's state is untouched: the collision check runs
+    // BEFORE validation, so the second plugin's invalid (abi-mismatch)
+    // decl never overwrites or shadows the id it doesn't own.
     expect(describeUnroutableProvider("sol")).toMatch(/declared but not yet activated/); // first's state intact
+    expect(describeUnroutableProvider("sol")).not.toMatch(/ABI/); // no stray broken row from the second decl
     const collisionLog = mockLog.error.mock.calls.find(([msg]) => String(msg).includes("collision"));
     expect(collisionLog![1]).toMatchObject({ provider: "sol", first: "hive-plugin-sol", second: "hive-plugin-sol2" });
   });
@@ -1652,8 +1669,8 @@ describe("semantics overlay + orphans + fixture e2e", () => {
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run \
     src/agents/provider-adapters/provider-registry.test.ts src/agents/session-store.test.ts \
     src/agents/provider-adapters/
-  # expect: provider-registry 21 passed, session-store 19 passed,
-  #         provider-adapters directory 565 passed
+  # expect: provider-registry 18 passed, session-store 19 passed,
+  #         provider-adapters directory 562 passed
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run typecheck   # clean
   ```
 - [ ] Commit:
@@ -2067,7 +2084,7 @@ Implementer notes for 4j (anchors, not design): `makeSubagentEntry` and `mockRun
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run \
     src/agents/agent-manager.test.ts src/channels/dispatcher.test.ts src/agents/provider-adapters/
   # expect: agent-manager 239 passed, dispatcher 91 passed (zero edits),
-  #         provider-adapters 565 passed
+  #         provider-adapters 562 passed
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run typecheck   # clean
   ```
 - [ ] Commit:
@@ -2707,7 +2724,7 @@ Two temporary reverts of load-bearing new behavior; paste the observed failing t
   perl -pi -e 's/const compatibility = columns\[provider\] \?\? columns\.laneB \?\? "unsupported";/const compatibility = columns[provider] ?? "unsupported"; \/\/ NEGVERIFY/' src/agents/provider-adapters/tool-transport.ts
   SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/provider-adapters/tool-transport.test.ts
   ```
-  Expected: **1 failed** — "R3: a plugin provider id reads the laneB fallback column (bridgeable)" (the claude-only, neither-column, and precedence tests pass by design without the fallback — that is expected, not a gap). Built-in tests all still pass — proof the fallback is reachable only off the built-in path.
+  Expected: **2 failed** — "R3: a plugin provider id reads the laneB fallback column (bridgeable)" and "R3: claude-only stays omitted for a plugin id, with the truthful reason" (this second test pins `compatibility: "claude-only"` for a plugin id, only producible via the fallback — the revert yields `"unsupported"` instead, so its `toEqual` mismatches). The neither-column and precedence tests pass by design without the fallback — that is expected, not a gap. Built-in tests all still pass — proof the fallback is reachable only off the built-in path.
   ```bash
   git checkout -- src/agents/provider-adapters/tool-transport.ts
   ```
@@ -2729,14 +2746,14 @@ Two temporary reverts of load-bearing new behavior; paste the observed failing t
     src/agents/toolkit-section.test.ts
   # expect: 21, 9, 23, 91, 29, 52, 6, 12, 16, 12, 26 — all passed, zero edits
   ```
-- [ ] Changed-suite counts: tool-transport 60, agent-runner 179, plugin-loader 50, agent-manager 239, session-store 19, admin 91, doctor-checks 68, credentials 21, credential-registry 10, provider-decl 29, provider-registry 21; provider-adapters directory total 565.
+- [ ] Changed-suite counts: tool-transport 60, agent-runner 179, plugin-loader 50, agent-manager 239, session-store 19, admin 91, doctor-checks 68, credentials 21, credential-registry 10, provider-decl 30, provider-registry 18; provider-adapters directory total 562.
 - [ ] Diff audit — exactly the enumerated file set changed since `1d138c5`:
   ```bash
   git diff --name-only 1d138c5 -- src/ docs/ package.json build/ scripts/ test-fixtures/
-  # expect exactly the 40 paths in the File Structure table (36 src/docs/config
-  # files + 2 fixture files + this plan file's sibling docs entry set; the
-  # plan file itself is committed by the walking session). Any file outside
-  # the table = stop and reconcile before proceeding.
+  # expect exactly the 40 paths in the File Structure table (37 src/docs/config
+  # files + 2 fixture files + 1 — this plan file itself, committed by the
+  # walking session). Any file outside the table = stop and reconcile before
+  # proceeding.
   ```
 - [ ] C19/C20 confirmation (covered by the diff audit): `prefix-builder.ts`, `intent-trailer.ts`, `activity/types.ts`, `dispatch-loop.ts`, `sse.ts`, `tool-bridge.ts`, all four adapters, `passthrough-providers.ts` (beyond the one isLaneAProvider line), `provider-modules.ts`, `outage/` — absent from the diff (or single-line where enumerated).
 - [ ] PR-body obligations to note for the walking session: (1) the enumerated nine pre-existing test-file deltas with per-file baselines (C10/C16, listed in the PR body per spec §7); (2) the edge-1 collision refinement (first-wins + log + doctor row, not id-keyed broken state); (3) the sse kit-member naming resolution; (4) `plugin.ts` CLI glue untested-by-convention note; (5) pack-size number after the d.ts tree.
