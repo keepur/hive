@@ -3,9 +3,15 @@ import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { OutageEpisodeTracker } from "../outage/outage-notices.js";
 
+// KPR-389 C5: the suppression log lines carry the `conferenceRound` tag that is
+// the measurement numerator, so tests must be able to read what dispatcher logs
+// to `info`. vi.hoisted is required: vi.mock factories run before top-level
+// statements. (Same shape as dispatcher.test.ts.) `vi.clearAllMocks()` in the
+// suite beforeEach resets it between tests.
+const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
-    info: vi.fn(),
+    info: mockLogInfo,
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
@@ -618,6 +624,25 @@ Meeting rules:
       );
     });
 
+    // KPR-389 C5 numerator pin (round-1 arm). The kill tests above take the D5
+    // early return, which logs a different line — no existing test drove the
+    // tagged fan-out suppression log at round 1, so this one does: a reactor
+    // that answers with a non-response phrase.
+    it("C5 pin: a round-1 non-response suppression logs conferenceRound: 1", async () => {
+      await twoAgentClassifier();
+      agentManager.runWorkItemTurn
+        .mockResolvedValueOnce(turn()) // jasper round-0: real reply
+        .mockResolvedValueOnce(turn({ finalMessage: "No response needed." })); // jessica round-1
+      await dispatcher.dispatch(confItem("conf-kill-nonresponse"));
+      await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
+      await settleReactions();
+      expect(adapter.deliver).toHaveBeenCalledTimes(1); // only jasper's round-0 reply
+      expect(mockLogInfo).toHaveBeenCalledWith(
+        "Non-response suppressed (fan-out)",
+        expect.objectContaining({ agentId: "jessica", conferenceRound: 1 }),
+      );
+    });
+
     it("errored round-1 reaction WITH text still delivers (exit-code-1 convention)", async () => {
       await twoAgentClassifier();
       agentManager.runWorkItemTurn
@@ -820,6 +845,12 @@ Meeting rules:
 
       expect(adapter.deliver).not.toHaveBeenCalled(); // suppression semantics intact
       expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
+      // KPR-389 C5 numerator pin (round-0 arm): the fan-out suppression log must
+      // carry the conferenceRound tag — dropping it silently breaks C5.
+      expect(mockLogInfo).toHaveBeenCalledWith(
+        "Non-response suppressed (fan-out)",
+        expect.objectContaining({ agentId: "jasper", conferenceRound: 0 }),
+      );
     });
 
     it("error and aborted turns leave the mark untouched", async () => {

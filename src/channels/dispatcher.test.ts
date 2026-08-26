@@ -1478,6 +1478,26 @@ describe("outage interception (KPR-307)", () => {
     expect(adapter.deliver).not.toHaveBeenCalled();
   });
 
+  // KPR-389 C5 numerator pin. The T8b kill test above takes the D5b branch,
+  // which logs a different line — nothing exercised the tagged single-dispatch
+  // suppression log at round 1, so this does: a replayed round-1 reaction whose
+  // answer is a non-response phrase.
+  it("C5 pin: a replayed round-1 non-response suppression logs conferenceRound: 1", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ finalMessage: "No response needed." }));
+    mockLogInfo.mockClear(); // this suite's beforeEach does not clear it
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        meta: { outageReplay: true, targetAgentId: "executive-assistant", conferenceRound: 1 },
+      }),
+    );
+    expect(adapter.deliver).not.toHaveBeenCalled();
+    expect(mockLogInfo).toHaveBeenCalledWith(
+      "Non-response suppressed",
+      expect.objectContaining({ agentId: "executive-assistant", conferenceRound: 1 }),
+    );
+  });
+
   it("outage wiring absent (setOutageHandling never called) → behavior identical to today", async () => {
     const bare = new Dispatcher(
       makeMockRegistry() as never,
