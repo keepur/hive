@@ -1155,7 +1155,7 @@ export class AgentManager {
         shaping.route,
         !!finalAttemptSessionId,
       );
-      this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
+      this.recordSpawnObservability(effectiveCtx, shaping, finalResult, !!finalAttemptSessionId);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
       // turns themselves don't reschedule (kind="reflection" guard).
@@ -1934,8 +1934,12 @@ export class AgentManager {
     ctx: TurnContext,
     shaping: SpawnShaping,
     result: RunResult,
+    resumedSession: boolean,
   ): void {
     const item = ctx.workItem;
+    // KPR-389 D6: turn-kind discriminators from the dispatcher's conference meta.
+    const confRound = conferenceRoundOf(item);
+    const injectionMode = conferenceInjectionModeOf(item);
 
     // Per-turn telemetry — independent of sessionStore (no history in
     // sessionStore.set). Aggregator in `hive doctor` reads this collection.
@@ -1952,6 +1956,16 @@ export class AgentManager {
           cacheCreationTokens: result.cacheCreationTokens,
           ephemeral5mTokens: result.ephemeral5mTokens,
           ephemeral1hTokens: result.ephemeral1hTokens,
+          // KPR-389: perf split + turn kind (conditional spreads keep absent
+          // keys absent — no BSON nulls on non-conference turns).
+          durationMs: result.durationMs,
+          llmMs: result.llmMs,
+          toolMs: result.toolMs,
+          toolCalls: result.toolCalls,
+          resumedSession,
+          ...(shaping.effortOverride ? { effort: shaping.effortOverride } : {}),
+          ...(confRound !== undefined ? { conferenceRound: confRound } : {}),
+          ...(injectionMode ? { injectionMode } : {}),
         })
         .catch(() => {
           // Already logged inside the store via withRetry. Swallow here.
@@ -2002,6 +2016,7 @@ export class AgentManager {
       compactions: result.compactions,
       streamed: result.streamed,
       error: result.error,
+      ...(confRound !== undefined ? { conferenceRound: confRound } : {}),
     });
   }
 

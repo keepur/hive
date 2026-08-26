@@ -14,6 +14,15 @@ export interface TurnTelemetryDoc {
   cacheCreationTokens: number;
   ephemeral5mTokens?: number;
   ephemeral1hTokens?: number;
+  // KPR-389: turn-kind + perf split for conference before/after measurement.
+  conferenceRound?: number; // 0 | 1; absent on non-conference turns
+  injectionMode?: "full" | "delta"; // KPR-388 injection mode, from meta
+  resumedSession?: boolean; // C7 — finalized attempt launched with a handle
+  durationMs?: number;
+  llmMs?: number;
+  toolMs?: number;
+  toolCalls?: number;
+  effort?: string; // delivered effortOverride ("low" pin visible)
   createdAt: Date;
 }
 
@@ -28,6 +37,15 @@ export interface TurnTelemetryInput {
   cacheCreationTokens: number;
   ephemeral5mTokens?: number;
   ephemeral1hTokens?: number;
+  // KPR-389: turn-kind + perf split for conference before/after measurement.
+  conferenceRound?: number; // 0 | 1; absent on non-conference turns
+  injectionMode?: "full" | "delta"; // KPR-388 injection mode, from meta
+  resumedSession?: boolean; // C7 — finalized attempt launched with a handle
+  durationMs?: number;
+  llmMs?: number;
+  toolMs?: number;
+  toolCalls?: number;
+  effort?: string; // delivered effortOverride ("low" pin visible)
 }
 
 export interface CacheHitRateRow {

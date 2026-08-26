@@ -5079,6 +5079,72 @@ describe("AgentManager", () => {
     });
   });
 
+  describe("turn-kind telemetry (KPR-389 D6)", () => {
+    function makeActivityLogger() {
+      return { record: vi.fn() };
+    }
+    function buildManager(activityLogger: { record: ReturnType<typeof vi.fn> }) {
+      return new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        activityLogger as any,
+      );
+    }
+
+    beforeEach(() => {
+      mockConversationIndex.mockResolvedValue(undefined);
+    });
+
+    it("T7: round-1 conference turn stamps round, injectionMode, resumedSession, perf split, effort — telemetry AND activity", async () => {
+      const activityLogger = makeActivityLogger();
+      const mgr = buildManager(activityLogger);
+      const { workItem, threadId } = makeConfCtx(1, "agent-s", { conferenceInjectionMode: "delta" });
+      // Seed a resumable same-provider session so runWorkItemTurn resolves it
+      // (C7: resumedSession = the finalized attempt launched with a handle).
+      sessionStore._sessions.set(`agent-s:${threadId}`, { sessionId: "sess-live", provider: "claude" });
+
+      await mgr.runWorkItemTurn("agent-s", workItem);
+
+      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc).toMatchObject({
+        conferenceRound: 1,
+        injectionMode: "delta",
+        resumedSession: true,
+        durationMs: 1000, // makeRunResult defaults
+        llmMs: 800,
+        toolMs: 200,
+        toolCalls: 1,
+        effort: "low", // the D2 pin, visible in telemetry
+      });
+      expect(activityLogger.record.mock.calls[0]![0].conferenceRound).toBe(1);
+    });
+
+    it("T7b: plain DM turn — perf fields present, conference keys ABSENT", async () => {
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc.durationMs).toBe(1000);
+      expect(doc.resumedSession).toBe(false);
+      expect(doc).not.toHaveProperty("conferenceRound");
+      expect(doc).not.toHaveProperty("injectionMode");
+      expect(doc).not.toHaveProperty("effort"); // router off ⇒ no override on a DM turn
+    });
+
+    it("T7c: an aborted (clamp-killed) reaction skips turn telemetry but lands round-tagged in the activity log", async () => {
+      const activityLogger = makeActivityLogger();
+      const mgr = buildManager(activityLogger);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ aborted: true, text: "", timedOut: true }));
+
+      await mgr.runWorkItemTurn("agent-s", makeConfCtx(1, "agent-s").workItem);
+
+      expect(turnTelemetryStore.record).not.toHaveBeenCalled(); // !aborted gate
+      expect(activityLogger.record.mock.calls[0]![0].conferenceRound).toBe(1); // kills stay measurable (C5 volume counter)
+    });
+  });
+
   describe("conferenceRoundOf (KPR-389 D1)", () => {
     it.each([
       ["round 0", { conferenceRound: 0 }, 0],
