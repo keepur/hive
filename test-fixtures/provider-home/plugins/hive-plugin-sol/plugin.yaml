@@ -1,0 +1,13 @@
+# KPR-394 in-repo test fixture (spec §7) — NOT a published example plugin.
+# Lives outside src/ so tsc/eslint/prettier/npm-pack never see it.
+name: hive-plugin-sol
+description: In-repo test fixture for KPR-394 provider-plugin loading
+provider:
+  id: sol
+  entry: provider.ts
+  abi: 1
+  session-semantics: stateless-replay
+  default-model: sol-large-2
+  api-key-env: SOL_API_KEY
+  base-url-env: SOL_BASE_URL
+  description: Sol test provider (fixture)

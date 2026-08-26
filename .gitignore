@@ -49,3 +49,9 @@ test-results/
 .mcp.json
 .claude/worktrees/
 .hive-state/
+
+# KPR-394: the in-repo provider-plugin test fixture ships a "compiled" entry
+# under dist/ (resolvePluginServerPath only looks there), which the global
+# `dist/` rule above would swallow. Re-include that tree — the negation
+# targets the directory itself, since git never descends into an excluded one.
+!test-fixtures/**/dist/

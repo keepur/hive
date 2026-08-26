@@ -97,7 +97,9 @@ export interface TurnContext {
    * session-identity guard. undefined ⇒ nothing known about the row's
    * producer (first turn, or a caller that resolved no session).
    */
-  sessionProvider?: AgentProviderId;
+  // R2 (KPR-394): widened from AgentProviderId — StoredSessionRef.provider is
+  // now a string (plugin provider ids are arbitrary registered strings).
+  sessionProvider?: string;
   /**
    * KPR-313: set ONLY by spawnTurn's session-identity guard when this turn
    * starts fresh due to a provider change; prepareSpawn prepends the handoff

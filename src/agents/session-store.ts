@@ -1,11 +1,10 @@
 import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import {
-  SESSION_SEMANTICS,
   persistsResumableHandle,
-  type AgentProviderId,
   type SessionSemantics,
 } from "./provider-adapters/types.js";
+import { sessionSemanticsIfKnown } from "./provider-adapters/provider-registry.js";
 
 const log = createLogger("session-store");
 
@@ -14,7 +13,7 @@ interface SessionDoc {
   agentId: string;
   threadId: string;
   sessionId: string; // "" ⇒ row exists for thread-mapping only; nothing resumable (KPR-313)
-  provider?: AgentProviderId; // KPR-313: producer tag; absent ⇒ legacy (pre-313) row
+  provider?: string; // KPR-313: producer tag; absent ⇒ legacy (pre-313) row
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -35,7 +34,7 @@ interface SessionDoc {
  */
 export interface StoredSessionRef {
   sessionId: string | undefined; // undefined ⇒ nothing to resume
-  provider: AgentProviderId | undefined;
+  provider: string | undefined;
 }
 
 /** KPR-313: legacy fabricated pilot ids (and unprovenanced resp_ chain ids) — scrub on read. */
@@ -113,7 +112,10 @@ export class SessionStore {
       // a provider this build doesn't know. The old Set's .has() scrubbed
       // unknowns implicitly; the ?? preserves exactly that posture (unknown
       // ⇒ stateless-replay ⇒ no handle).
-      const semantics: SessionSemantics | undefined = SESSION_SEMANTICS[doc.provider];
+      // KPR-394 (§4.3): registry-aware — a REGISTERED plugin provider's row
+      // is honored per its declared semantics; genuinely unknown provider
+      // strings keep the KPR-347 fail-closed posture (no handle).
+      const semantics: SessionSemantics | undefined = sessionSemanticsIfKnown(doc.provider);
       return {
         sessionId: persistsResumableHandle(semantics ?? "stateless-replay")
           ? doc.sessionId || undefined
@@ -153,7 +155,7 @@ export class SessionStore {
     return { sessionId: doc.sessionId || undefined, provider: "claude" };
   }
 
-  async set(agentId: string, threadId: string, sessionId: string, provider: AgentProviderId, tokenData?: {
+  async set(agentId: string, threadId: string, sessionId: string, provider: string, tokenData?: {
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens: number;
