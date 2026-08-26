@@ -580,3 +580,10 @@ git diff --stat HEAD~3 HEAD -- ':!docs'
 Expected: exactly `src/agents/provider-adapters/error-classification.ts`, `src/agents/provider-adapters/error-classification.test.ts`, `src/channels/dispatcher.ts`, `src/channels/dispatcher.test.ts`.
 
 - [ ] **Step 3:** No commit (verification-only task). Do not push, do not open a PR — that is the submit lane's job.
+
+---
+
+## Plan-review advisories (r1, verbatim — implementer notes, not deviations)
+
+- [Task 2, Step 2]: the `it.each` destructures `_label` unused — if the repo's ESLint config lacks `argsIgnorePattern: "^_"`, `npm run check` (Task 4) flags it; trivially fixable at that gate.
+- [Task 3, Step 3]: the new row's `makeTurn({...})` line exceeds typical print width; the Step 4 `prettier --write` will rewrap it before commit — implementer should not treat the reflow as a deviation.
