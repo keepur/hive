@@ -26,7 +26,7 @@ probe burns up to its full `timeoutMs` (900s on dodi's architects) before the
 circuit can even *fail to close*, when a 3-second turn would have closed it;
 **(R2)** `PROBE_STALE_MS = 360_000` mid-flight stale-reconciles any probe that
 legitimately runs past 360s — deterministically wrong for the 900s architects
-and *already* wrong for every opus-tier agent (tier default 600s) — discarding
+and *already* wrong for opus-tier agents on the router path (tier default 600s; router-off/system-sender turns still run the 300s fallback) — discarding
 a genuine probe success as telemetry-only and leaving the circuit open.
 
 Fix (hybrid of ticket options **(b)** + the stale-bound follow-on; **(a)** and
@@ -141,7 +141,7 @@ defects remain:
    slot goes to a fast-fail-class item (turn that never ran) before any
    post-turn-fault-class item; healing latency tracks the cheapest queued turn,
    not the most expensive.
-2. **G2 — probes get their full deadline:** a probe is never stale-reconciled
+2. **G2 — probes get their full deadline** (per-attempt: one permit can legitimately span two runner attempts via the auth-rebuild or stale-handle single retries — both fast-error shapes, never full-deadline burns — so G2 holds per attempt, not per permit; marginal, pre-existing under the 360s bound): a probe is never stale-reconciled
    while still inside its own turn's wall clock (+grace); a legitimate 400–900s
    probe success closes the circuit.
 3. **G3 — canon intact:** zero classification changes (D6 table byte-intact),
@@ -259,7 +259,7 @@ would be both looser and stale-prone.
    becomes the `turn-deadline` message verbatim, suppressing the synthesized
    evidence string. Unreachable on the Claude deadline path today (`error`
    stays `undefined`; iterator closed, not thrown); comment records that the
-   error-string-wins choice is deliberate (debuggability) and pinned (T10).
+   error-string-wins choice is deliberate (debuggability) and pinned (T9).
 
 ## Integration points
 
@@ -346,14 +346,14 @@ session state).
   `"fast-fail" < "post-turn-fault"` as strings.
 - **T6 (F2 dispatcher):** `ProviderCircuitOpenError` path enqueues
   `origin: "fast-fail"`; post-turn-gate path (zero-progress deadline shape from
-  the existing L1221-style fixture) enqueues `"post-turn-fault"`; a replay
+  the existing "★ timeout gate: timedOut && aborted with breaker open" fixture — cite by test name; its line has drifted since kpr-398) enqueues `"post-turn-fault"`; a replay
   fast-failing again releases `pending` without touching origin.
 - **T7 (manager):** acquire meta carries `deadlineMs` ≥ agent `timeoutMs`
   (900_000 architect shape) and ≥ opus tier limit (600_000) for an opus-model
   agent with no explicit `timeoutMs`.
 - **T8:** existing dispatcher outage-gate pins (kpr-398 T11/T12) green
   unmodified.
-- **T10 (D9 item 3 pin):** `{ error: "boom", timedOut: true, aborted: true,
+- **T9 (D9 item 3 pin):** `{ error: "boom", timedOut: true, aborted: true,
   toolCalls: 1 }` → `{ outcome: "fault", kind: "turn-deadline",
   message: "boom" }` — pins the attenuation shape as deliberate.
 
