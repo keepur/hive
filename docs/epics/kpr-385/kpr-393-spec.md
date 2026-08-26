@@ -2,7 +2,7 @@
 
 **Epic:** KPR-385 (provider first-class-ness) · child 3 of 4 · independent of the adapter-layer arc
 **Status:** spec draft (investigation complete; fix scope follows findings, per ticket)
-**Evidence base:** `hive_dodi.provider_turn_history` (17 threads / 65 codex turns, 2026-08-24 → 08-26), worktree `6b58099` (post-KPR-391/392)
+**Evidence base:** `hive_dodi.provider_turn_history` (17 threads / 65 codex turns — the full surviving corpus under the store's 7-day TTL; live documents spanned 2026-08-24 → 2026-08-26 UTC, ~2 days), worktree `6b58099` (post-KPR-391/392)
 
 ---
 
@@ -13,13 +13,13 @@ The symptom is real but the ticket's premises need correcting: no agent runs `op
 ## Key Points
 
 - **Premise correction 1:** the fleet has zero `openai/…` agents. Observed instances are on the **codex adapter** (shared `runBoundedDispatchLoop`). The structural gap is nonetheless identical in both Lane B loop families: `calls.length === 0 → break` (dispatch-loop.ts:~110) and the `@openai/agents` SDK run ending on a no-tool final output. The fix targets the shared Lane B surface, not one adapter.
-- **Premise correction 2:** "openai-lane turns are fully persisted" is wrong for openai (`previous_response_id` chaining, no transcript store) and right for codex/grok (`provider_turn_history`, verbatim Responses items, **7d TTL** — evidence window is only the trailing week; the incident May observed may predate the surviving data).
+- **Premise correction 2:** "openai-lane turns are fully persisted" is wrong for openai (`previous_response_id` chaining, no transcript store) and right for codex/grok (`provider_turn_history`, verbatim Responses items, **7d TTL** — the store can retain at most a trailing week, and the surviving documents actually spanned only ~2 days (2026-08-24 → 08-26 UTC); the incident May observed may predate the surviving data).
 - **Quantified:** 65 turns; 38 zero-tool (mostly legitimate: meeting "No response needed," pure discussion verdicts); **2 clear zero-tool promise turns + 1 promise-with-token-tool-call turn** (~5%), 100% concentrated in #conf-tahoe meeting threads; 0 instances in #agent-gpt work threads (those average 3–8 tool calls/turn and deliver).
 - **Two failure sub-modes:** (a) *intra-turn* — model narrates its plan as the final message instead of executing ("First step is to inspect… then I'll post the exact proposed delta" → one `memory_recall`, turn ends); (b) *cross-turn* — contingent promise ("I'll draft rev 2 after we close it") dies with the thread because nothing re-invokes the agent. A loop nudge addresses only (a); (b) needs prompt-shaped norms (say what you're waiting on / schedule explicitly) and borders KPR-386 meeting-mode.
 - **In scope (this ticket):** D1 Lane B follow-through prompt section (all four Lane B adapters via `buildProviderInstructions`; Claude lane byte-untouched — golden suite stays zero-diff); D2 `intentTrailer` telemetry on `activity_log` (all providers, giving a Claude control baseline); D3 written decision criteria for the phase-2 nudge.
 - **Out of scope:** the loop-level continuation nudge itself (criteria-gated follow-up ticket — needs the D2 data and a registered decision), meeting-turn cadence (KPR-386), moving openai onto the hive loop (C1 — not proposed), any `agent_turn_telemetry` schema change.
 - **Risk:** prompt-only pressure may under-correct GPT; that is exactly what D2 measures, with numeric criteria for escalating. Detector is a conservative English-only regex — acceptable for telemetry (booleans, redaction-safe), deliberately NOT used to gate any runtime behavior in this ticket.
-- ⚠ **Delegated assumption:** ~5% frequency from a 7-day/65-turn window is treated as representative enough to justify deterministic-first over nudge-first. If the operator has fresh evidence of high-frequency work-thread failures (not meetings), the nudge should be promoted into scope.
+- ⚠ **Delegated assumption:** ~5% frequency from the surviving ~2-day/65-turn corpus (7d-TTL store) is treated as representative enough to justify deterministic-first over nudge-first. If the operator has fresh evidence of high-frequency work-thread failures (not meetings), the nudge should be promoted into scope.
 - ⚠ **Delegated assumption:** the follow-through section applies to all Lane B providers uniformly (codex/gemini/grok/openai) — no per-provider prompt forks.
 
 ---
@@ -94,10 +94,10 @@ export function detectIntentTrailer(text: string): boolean
 ```
 
 - Scans only the **final ~300 chars** of the delivered text (promises cluster at the end; cuts false positives from mid-text narration).
-- Conservative first-person-future patterns (`I'll <verb>`, `I will`, `I'm going to`, `let me <verb>`, `on it`, `first step is`), curly/straight apostrophes. Fixture set seeded from the real Sol transcripts above (both positives and the "No response needed" / verdict-style negatives).
+- Conservative first-person-future patterns (`I'll <verb>`, `I will`, `I'm going to`, `let me <verb>`, `on it`, `first step is`), curly/straight apostrophes; all patterns word-boundary-anchored (bare `on it` must not substring-match "based on it" / mid-sentence "working on it" — anchor to clause starts). Fixture set seeded from the real Sol transcripts above (both positives and the "No response needed" / verdict-style negatives).
 - **Text-based only — deliberately not conditioned on `toolCalls === 0`:** the archetype turn made one token tool call; `activity_log` already carries `toolCalls`, so analysts slice `intentTrailer × toolCalls` in queries.
 
-Wiring: in `AgentManager.recordActivity` (the existing `activityLogger.record` site), compute `detectIntentTrailer(result.text)` and add optional field `intentTrailer?: true` to `ActivityRecord` (`src/activity/types.ts`) — set only when detected, absent otherwise (additive, schemaless Mongo, no migration). One `log.info` when set (agentId, provider-prefixed model, toolCalls — no text). Runs for **every** provider, which is the point: Claude's rate is the natural control.
+Wiring: at the manager's turn-completion activity write — the inline `this.activityLogger?.record({...})` call (`agent-manager.ts` ~1860; there is no named `recordActivity` method), compute `detectIntentTrailer(result.text)` and add optional field `intentTrailer?: true` to `ActivityRecord` (`src/activity/types.ts`) — set only when detected, absent otherwise (additive, schemaless Mongo, no migration). One `log.info` when set (agentId, provider-prefixed model, toolCalls — no text). Runs for **every** provider, which is the point: Claude's rate is the natural control.
 
 Measurement query (documented in the spec, run manually or via doctor later — no doctor section in scope): per-model rate of `intentTrailer` turns over trailing 14d, split by `toolCalls === 0`.
 
@@ -116,13 +116,13 @@ Pre-agreed shape for that ticket (so it plans fast; all of it is future work):
 
 - `src/agents/prefix-builder.ts` — new exported `followThroughSection()`; `buildProviderInstructions` composes it (toolsExecutable-gated, after toolkit). `buildPrefix` untouched.
 - `src/agents/intent-trailer.ts` — new pure module + test.
-- `src/agents/agent-manager.ts` — one-line compute + field add at the `recordActivity` site; one info log.
+- `src/agents/agent-manager.ts` — one-line compute + field add at the inline `activityLogger?.record` call site (~1860); one info log.
 - `src/activity/types.ts` — additive optional `intentTrailer?: true`.
 - `docs/providers.md` — no parity-matrix behavior rows change (prompt content isn't a matrix row); confirm at implementation and note in PR if a "prompt guidance" caveat row is warranted.
 
 ## Edge cases
 
-- Empty delivered text (reflection turns, aborted/error turns): detector short-circuits false on empty/whitespace text; recordActivity path unchanged for error turns (field simply absent).
+- Empty delivered text (reflection turns, aborted/error turns): detector short-circuits false on empty/whitespace text; the activity write path is unchanged for error turns — detection is skipped when `result.error` is set even if text is present (exit-1-with-valid-response turns are delivered errors, not promises), so the field is simply absent.
 - Non-English output (e.g. bilingual agents): detector misses — accepted limitation, documented in the module docstring; telemetry undercounts rather than misfires.
 - "No response needed" meeting replies: no first-person-future match (fixture-pinned negative).
 - Turns with tools that still end on a promise: counted (text-based detection), distinguishable in queries via `toolCalls`.
@@ -139,7 +139,7 @@ Zero-diff surfaces (no expectation edits permitted): `dispatch-loop.ts`/`.test.t
 
 ## Open assumptions
 
-- ⚠ 7-day evidence window (65 turns) treated as representative; operator can veto deterministic-first if fresher work-thread failures exist. (non-blocking — default stands)
+- ⚠ surviving ~2-day evidence corpus (65 turns, 7d-TTL store) treated as representative; operator can veto deterministic-first if fresher work-thread failures exist. (non-blocking — default stands)
 - ⚠ Uniform Lane B application of the follow-through section, no per-provider forks. (non-blocking)
 - Detector thresholds in D3 (3×, 5/week, 70% precision) are operator-adjustable at follow-up filing time; they are defaults, not contracts. (non-blocking)
 - Exact prompt wording is implementation-final; the three behavioral clauses (do-then-report / state-the-wait / schedule-explicitly) are binding. (non-blocking)
