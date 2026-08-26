@@ -79,6 +79,10 @@ describe("Lane B adapter error strings → ProviderFaultKind (KPR-391 §8 cross-
     // previously worded "malformed stream", which matched no FAULT_PATTERNS
     // row and misclassified non-provider).
     "Grok gateway stream signaled tool_calls but no tool calls were assembled — connection terminated mid-stream",
+    // grok-gateway-adapter.ts — assembleToolCalls incomplete-fragment guard
+    // (id/name never arrived for an indexed fragment): same connect-fail
+    // routing via "terminated".
+    "Grok gateway stream delivered an incomplete tool_call at index 0 (missing id or name) — connection terminated mid-stream",
   ])("connect-fail: %s", (s) => expect(faultKind(s)).toBe("connect-fail"));
 
   it("round-budget exhaustion stays non-provider (shared dispatch loop emits error_max_turns)", () => {
