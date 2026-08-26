@@ -159,6 +159,17 @@ export interface TurnResult {
   timedOut?: boolean;
   /** KPR-307: propagated from RunResult.aborted (operator abort or deadline abort). */
   aborted?: boolean;
+  /**
+   * KPR-388: true iff the FINALIZED attempt was launched with a session
+   * handle (options.resume / previous_response_id / previous_interaction_id).
+   * False when the finalized attempt ran fresh — first turn, KPR-313
+   * provider handoff, auth-rebuild retry, KPR-350 stale-handle self-heal
+   * fresh retry. KPR-351 contender adoption counts as resumed. Known
+   * approximation (spec ⚠): for client-transcript lanes, "launched with a
+   * handle" is not proof the transcript was warm — accepted, failure mode is
+   * bounded duplication or one system-notice'd fresh turn.
+   */
+  resumedSession?: boolean;
 }
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
@@ -1004,6 +1015,13 @@ export class AgentManager {
       // regression prevention.
       const shaping = await this.prepareSpawn(effectiveCtx);
 
+      // KPR-388: sessionId actually passed to the FINALIZED runOneSpawnAttempt
+      // call — reassigned at each retry arm below. !!finalAttemptSessionId
+      // becomes TurnResult.resumedSession. Initialized AFTER the KPR-313
+      // guard and prepareSpawn, so a handoff-stripped (or adopt-branch)
+      // sessionId is what's captured.
+      let finalAttemptSessionId = effectiveCtx.sessionId;
+
       // KPR-306: exactly one breaker record per spawnTurn, on the FINALIZED
       // attempt. The auth-rebuild first attempt is locally recoverable —
       // when the retry fires, only the retry's result reaches the breaker
@@ -1023,6 +1041,7 @@ export class AgentManager {
             threadId: effectiveCtx.threadId,
             reason: finalResult.error,
           });
+          finalAttemptSessionId = undefined;
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: undefined },
             shaping,
@@ -1079,6 +1098,7 @@ export class AgentManager {
             provider: shaping.route.provider,
             adoptedContenderHandle: adoptedSessionId !== undefined,
           });
+          finalAttemptSessionId = adoptedSessionId;
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: adoptedSessionId },
             shaping,
@@ -1094,7 +1114,12 @@ export class AgentManager {
       }
       this.circuitBreakers.record(permit, classifyTurnResult(finalResult), finalResult.llmMs);
 
-      const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult, shaping.route);
+      const turnResult = this.finalizeSpawnResult(
+        effectiveCtx,
+        finalResult,
+        shaping.route,
+        !!finalAttemptSessionId,
+      );
       this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
@@ -1866,7 +1891,12 @@ export class AgentManager {
     });
   }
 
-  private finalizeSpawnResult(ctx: TurnContext, result: RunResult, route: ProviderModelRoute): TurnResult {
+  private finalizeSpawnResult(
+    ctx: TurnContext,
+    result: RunResult,
+    route: ProviderModelRoute,
+    resumedSession: boolean,
+  ): TurnResult {
     const newSessionId = result.sessionId || ctx.sessionId || "";
     if (result.sessionId && !result.aborted) {
       // KPR-313 §3.2: persist a resumable handle ONLY for providers whose
@@ -1939,6 +1969,7 @@ export class AgentManager {
       ephemeral1hTokens: result.ephemeral1hTokens,
       timedOut: result.timedOut,
       aborted: result.aborted,
+      resumedSession,
     };
   }
 
