@@ -1060,3 +1060,12 @@ Expected: every hunk falls within `recordSpawnObservability`; no hunk touches `s
 - **[Task 4/Task 6 fixtures]:** the aborted fixtures deliberately reuse the incident's magnitudes (294 391 ms, 46 tool calls, 2 200/120/18 500/250 tokens) so the rows read as the production shape; nothing asserts on the magnitudes beyond what the contract requires.
 - **[Prettier reflow]:** several new `it(...)` titles and object literals exceed print width; each task's `prettier --write` before commit rewraps them — do not treat the reflow as a deviation.
 - **[If PR #414 (KPR-399) merges into the epic branch mid-implementation]:** rebase; every anchor in this plan is text-based and lands in regions #414 does not touch (`recordSpawnObservability`, the runner, the dispatcher log site, test-insertion points). The only shared file-level neighbors are `agent-manager.ts`/`agent-manager.test.ts` — resolve any hunk-adjacency noise in favor of both changes; there is no semantic conflict (KPR-399's spec explicitly cedes the telemetry-gate edit to this ticket).
+
+---
+
+## Plan-review advisories (r1, verbatim — implementer notes, not deviations)
+
+1. [Task 6, Step 1] The in-test comment attributes gate non-interception to `stateFor → null`; the actual first exit is `if (!outage) return false` (the test dispatcher is built without an outage store). Both hold — word the comment "no outage store configured (and breaker state is null)" for precision.
+2. [Task 1, Step 4] The result-branch overwrite is conditional on the existing `if (usage)`: a hypothetical result message lacking `usage` would retain accumulator values instead of zeros. Unreachable with real SDK result messages (usage is required on `SDKResultMessage`) — implementer awareness only, change nothing.
+3. [Task 8, Step 2] "Expected file list, exactly" means the file SET shown, exactly — `git diff --stat` also prints change bars and a summary line; don't diff literal output.
+4. [Task 4] The two `await Promise.resolve()` waits are belt (the `record` call is synchronous inside `recordSpawnObservability` before `spawnTurn` resolves) — keep for symmetry with the existing success-observability row.
