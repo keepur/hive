@@ -23,6 +23,7 @@ describe("classifyToolTransport", () => {
         gemini: "mcp-bridge-candidate",
         codex: "mcp-bridge-candidate",
         grok: "mcp-bridge-candidate",
+        laneB: "mcp-bridge-candidate",
       });
       expect(descriptor.requiresTurnContext).toBe(false);
       expect(descriptor.requiresHiveRuntime).toBe(false);
@@ -74,6 +75,7 @@ describe("classifyToolTransport", () => {
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
       grok: "requires-hive-bridge",
+      laneB: "requires-hive-bridge",
     });
   });
 
@@ -91,6 +93,7 @@ describe("classifyToolTransport", () => {
       gemini: "claude-only",
       codex: "claude-only",
       grok: "claude-only",
+      laneB: "claude-only",
     });
   });
 
@@ -109,6 +112,7 @@ describe("classifyToolTransport", () => {
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
       grok: "requires-hive-bridge",
+      laneB: "requires-hive-bridge",
     });
   });
 
@@ -124,6 +128,7 @@ describe("classifyToolTransport", () => {
         gemini: "requires-hive-bridge",
         codex: "requires-hive-bridge",
         grok: "requires-hive-bridge",
+        laneB: "requires-hive-bridge",
       });
       expect(d.compatibility.codex).toEqual(d.compatibility.openai);
     },
@@ -162,6 +167,7 @@ describe("classifyToolTransport", () => {
       gemini: "unsupported",
       codex: "unsupported",
       grok: "unsupported",
+      laneB: "unsupported",
     });
   });
 
@@ -312,5 +318,42 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     const { omitted } = partitionInventoryForProvider([entry], "codex");
     expect(JSON.stringify(omitted)).not.toContain("hunter2");
     expect(Object.keys(omitted[0]!)).toEqual(["name", "transport", "compatibility"]);
+  });
+
+  it("R3: a plugin provider id reads the laneB fallback column (bridgeable)", () => {
+    const entry = makeEntry(
+      classifyToolTransport({ name: "mcp__memory__view", transport: "sdk-in-process", source: "engine" }),
+    );
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], "sol");
+    expect(bridgeable).toEqual([entry]);
+    expect(omitted).toEqual([]);
+  });
+
+  it("R3: claude-only stays omitted for a plugin id, with the truthful reason", () => {
+    const entry = makeEntry(
+      classifyToolTransport({ name: "WebSearch", transport: "claude-builtin", source: "sdk-builtin" }),
+    );
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], "sol");
+    expect(bridgeable).toEqual([]);
+    expect(omitted).toEqual([{ name: "WebSearch", transport: "claude-builtin", compatibility: "claude-only" }]);
+  });
+
+  it("R3: a record with neither the provider column nor laneB is honestly unsupported", () => {
+    const entry = {
+      ...makeEntry(classifyToolTransport({ name: "stale", transport: "stdio", source: "plugin" })),
+      compatibility: { claude: "direct", openai: "mcp-bridge-candidate", gemini: "mcp-bridge-candidate", codex: "mcp-bridge-candidate", grok: "mcp-bridge-candidate" },
+    } as any;
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], "sol");
+    expect(bridgeable).toEqual([]);
+    expect(omitted[0]!.compatibility).toBe("unsupported");
+  });
+
+  it("R3: built-in ids read their OWN column even when laneB diverges (precedence pin)", () => {
+    const entry = {
+      ...makeEntry(classifyToolTransport({ name: "diverge", transport: "stdio", source: "plugin" })),
+      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only", grok: "claude-only", laneB: "mcp-bridge-candidate" },
+    } as any;
+    const { bridgeable } = partitionInventoryForProvider([entry], "openai");
+    expect(bridgeable).toEqual([]); // own column wins; laneB is fallback only
   });
 });

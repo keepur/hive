@@ -11,7 +11,7 @@ import { createLogger } from "../../logging/logger.js";
 import { getArchetype } from "../../archetypes/registry.js";
 import type { AgentConfig } from "../../types/agent-config.js";
 import type { AgentRunner, WorkItemContext } from "../agent-runner.js";
-import type { GuardrailGate, LaneBProviderId } from "./types.js";
+import type { GuardrailGate } from "./types.js";
 import { buildArchetypeGuardrailGate } from "./archetype-gate.js";
 import {
   classifyToolTransport,
@@ -171,7 +171,7 @@ export function buildDefaultGuardrailGate(
 export async function assembleProviderTurn(input: {
   runner: AgentRunner;
   config: AgentConfig;
-  provider: LaneBProviderId;
+  provider: string;
   workItemContext?: WorkItemContext;
   delegateTurnRunner?: DelegateTurnRunner;
 }): Promise<ProviderTurnAssembly> {

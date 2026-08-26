@@ -127,7 +127,7 @@ export interface AgentProviderTurnRequest {
 }
 
 export interface AgentProviderAdapter {
-  readonly provider: AgentProviderId;
+  readonly provider: string; // R2 (KPR-394): widened — adapters keep their literals; ops surfaces key on strings
   runTurn(request: AgentProviderTurnRequest): Promise<RunResult>;
   abort(): void;
   readonly wasAborted: boolean;
