@@ -46,7 +46,13 @@ import {
   type PassthroughSpawnConfig,
 } from "./provider-adapters/passthrough-providers.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
-import { classifyThrown, classifyTurnResult, TURN_DEADLINE_SUBTYPE } from "./provider-adapters/error-classification.js";
+import {
+  classifyThrown,
+  classifyTurnResult,
+  hasObservedProgress,
+  isClaudeResumeLoadError,
+  TURN_DEADLINE_SUBTYPE,
+} from "./provider-adapters/error-classification.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -1085,6 +1091,43 @@ export class AgentManager {
             ticket,
             onStream,
           );
+        } else if (
+          // KPR-399 (§D3): claude-lane resume-rejection self-heal. The
+          // persist-on-abort arm (finalizeSpawnResult) creates a class of
+          // persisted ids whose resumability is uncertain (mid-tool-call
+          // kill, flush timing): the CLI may reject the resume
+          // (unknown-session) or the first continuation may 400 on a
+          // dangling tool_use. One fresh retry — bounded loss of one
+          // thread's context instead of a thread erroring identically until
+          // the 7-day row TTL. Semantics inherited from the arms above:
+          // `else if` ⇒ at most one retry per turn; record-once untouched
+          // (only the finalized attempt reaches the breaker); no pre-scrub —
+          // a successful retry overwrites the row via finalize, a failed one
+          // leaves it for the next turn's re-trip. SEMANTICS gate
+          // (client-transcript = claude + Lane A passthrough) — the KPR-347
+          // seam: dead for server-resumable (their resume errors have their
+          // own arm) and stateless-replay (nothing to resume). Both matcher
+          // surfaces classify non-provider (pinned), so the arm is
+          // breaker-invisible either way.
+          finalResult.error &&
+          isClaudeResumeLoadError(finalResult.error) &&
+          effectiveCtx.sessionId &&
+          sessionSemanticsFor(shaping.route.provider) === "client-transcript"
+        ) {
+          // Deliberately NOT logging the error string: the CLI's
+          // unknown-session surface embeds the session id (log-redaction
+          // posture — the KPR-350 arm's "no handle value" rule).
+          log.warn("spawnTurn claude resume rejected — one fresh retry (KPR-399)", {
+            agentId: effectiveCtx.agentId,
+            threadId: effectiveCtx.threadId,
+            timedOut: finalResult.timedOut === true,
+          });
+          finalResult = await this.runOneSpawnAttempt(
+            { ...effectiveCtx, sessionId: undefined },
+            shaping,
+            ticket,
+            onStream,
+          );
         }
       } catch (err) {
         if (!(err instanceof AgentStoppedError)) {
@@ -1546,8 +1589,9 @@ export class AgentManager {
    * skip in runOneSpawnAttempt (no runTurn() call was made). Mirrors the pilot
    * adapters' buildResult zero-shape (all counters 0, toolSummary "none") with
    * `aborted: true` so classifyTurnResult resolves to "aborted" and the
-   * downstream finalize path (session persist skipped on aborted, telemetry
-   * skipped) behaves exactly as a real adapter-emitted abort. sessionId is the
+   * downstream finalize path (telemetry skipped; KPR-399's persist-on-abort
+   * arm skips this zero-progress shape too — fail-closed) behaves exactly as
+   * a real adapter-emitted abort. sessionId is the
    * resumed handle (if any) so finalizeSpawnResult's newSessionId stays intact.
    */
   private synthesizeAbortedResult(sessionId: string): RunResult {
@@ -1868,6 +1912,31 @@ export class AgentManager {
 
   private finalizeSpawnResult(ctx: TurnContext, result: RunResult, route: ProviderModelRoute): TurnResult {
     const newSessionId = result.sessionId || ctx.sessionId || "";
+    // KPR-399 (§D2): an aborted claude-lane turn with observed progress
+    // persists its session so replays/retries/follow-ups RESUME instead of
+    // restarting from scratch. client-transcript ONLY (cross-epic canon C3 —
+    // claude + Lane A kimi/deepseek/grok): the id is a local transcript
+    // handle the CLI flushed incrementally, and observed progress (the
+    // exported KPR-398 D1 predicate — one source of truth with the
+    // classifier) is the proof it actually ran. Zero-progress aborts persist
+    // nothing (fail-closed = pre-399 behavior): the id may point at a
+    // never-flushed file, and a rotated id with zero progress is
+    // indistinguishable from a failed-resume mint (churn-mint's own
+    // rationale). Lane B (server-resumable / stateless-replay) keeps the
+    // !aborted behavior byte-for-byte — resume-on-abort there goes through
+    // the KPR-385 scaffold hooks, never a silent unification here.
+    const abortPersist =
+      result.aborted === true &&
+      !!result.sessionId &&
+      sessionSemanticsFor(route.provider) === "client-transcript" &&
+      hasObservedProgress(result) &&
+      // Mint-safety belt (the ⚠A4 churn-mint condition, applied verbatim):
+      // an aborted turn that ALSO errored, resumed a session, and came back
+      // with a DIFFERENT id never overwrites the row. Rare shape (deadline
+      // aborts carry no error), but it makes this arm self-evidently
+      // mint-safe.
+      !(result.error && ctx.sessionId && result.sessionId !== ctx.sessionId);
+
     if (result.sessionId && !result.aborted) {
       // KPR-313 §3.2: persist a resumable handle ONLY for providers whose
       // adapters actually resume. Stateless pilots keep the ROW (the session
@@ -1902,6 +1971,17 @@ export class AgentManager {
           preCompactTokens: result.preCompactTokens,
         });
       }
+    } else if (abortPersist) {
+      log.info("Persisting session from aborted turn — replay/follow-up will resume (KPR-399)", {
+        agentId: ctx.agentId,
+        threadId: ctx.threadId,
+        timedOut: result.timedOut === true,
+      });
+      // NO tokenData: aborted turns carry all-zero usage (the SDK result
+      // message never arrived) — set() without tokenData updates only
+      // sessionId/provider/updatedAt, preserving the prior turn's stats
+      // (session-store.ts set(): defaults land $setOnInsert-only).
+      this.sessionStore.set(ctx.agentId, ctx.threadId, result.sessionId, route.provider);
     }
 
     const state = this.states.get(ctx.agentId)!;

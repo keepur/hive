@@ -2015,9 +2015,16 @@ describe("AgentManager", () => {
       expect(sessionStore.set).toHaveBeenCalledTimes(3);
     });
 
-    it("does NOT update session-store when the result is aborted", async () => {
+    it("does NOT update session-store when the result is aborted with ZERO progress (KPR-399 re-scope)", async () => {
+      // Pre-KPR-399 this row pinned "aborted never persists" using the
+      // fixture's default progress fields (toolCalls: 1, text: "response") —
+      // a shape that now DELIBERATELY persists (§D2 persist-on-abort). It is
+      // re-scoped to the zero-progress shape (also synthesizeAbortedResult's
+      // shape): the fail-closed direction, which survives unchanged. The
+      // with-progress direction is pinned in the KPR-399 persist-on-abort
+      // describe below.
       mockRunnerSend.mockResolvedValueOnce(
-        makeRunResult({ aborted: true, sessionId: "session-aborted" }),
+        makeRunResult({ aborted: true, sessionId: "session-aborted", toolCalls: 0, streamed: false, text: "" }),
       );
       await manager.spawnTurn(smsCtx());
       expect(sessionStore.set).not.toHaveBeenCalled();
@@ -2646,8 +2653,19 @@ describe("AgentManager", () => {
       });
 
       it("⚠A4 churn-mint rider: errored turn that resumed and returned a DIFFERENT id never overwrites the row", async () => {
+        // KPR-399 fixture re-scope (error string only — the pinned direction
+        // is unchanged): this row previously used the CLI's unknown-session
+        // text ("No conversation found with session ID: s-old"), which is now
+        // an `isClaudeResumeLoadError` alternate — the §D3 self-heal arm
+        // intercepts it BEFORE finalize, retries fresh, and the healed retry
+        // legitimately persists (the arm's headline purpose: no more dead
+        // thread until the 7d TTL). `error_during_execution` is the other
+        // real failed-resume-mint surface (the source comment's own example:
+        // the CLI's error_during_execution result carries a freshly minted
+        // session_id) and matches no self-heal alternate, so the churn-mint
+        // rider is exercised exactly as before.
         mockRunnerSend.mockResolvedValueOnce(
-          makeRunResult({ error: "No conversation found with session ID: s-old", sessionId: "s-minted" }),
+          makeRunResult({ error: "error_during_execution", sessionId: "s-minted" }),
         );
         await manager.spawnTurn(
           smsCtx({ threadId: "sms:line-1:kpr313-mint", sessionId: "s-old", sessionProvider: "claude" }),
