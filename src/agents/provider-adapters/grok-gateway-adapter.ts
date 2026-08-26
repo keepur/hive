@@ -221,10 +221,11 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
           state.assembled = assembleToolCalls(state);
           // Edge 3 spirit guard: finish_reason=tool_calls with zero
           // assembled calls is a gateway stream-shape fault, never a
-          // silent empty harvest.
+          // silent empty harvest. "terminated" lands on the connect-fail
+          // FAULT_PATTERNS row, sibling-style with the other edge-3 anomalies.
           if (state.finishReason === "tool_calls" && state.assembled.length === 0) {
             throw new Error(
-              "Grok gateway stream signaled tool_calls with no tool calls assembled — malformed stream",
+              "Grok gateway stream signaled tool_calls but no tool calls were assembled — connection terminated mid-stream",
             );
           }
         }

@@ -550,7 +550,7 @@ describe("GrokGatewayAdapter — C5 error decoration (§4.4)", () => {
     expect(result.text).toBe("");
   });
 
-  it("finish_reason:tool_calls with zero assembled tool calls → error containing 'malformed stream', never a silent empty harvest", async () => {
+  it("finish_reason:tool_calls with zero assembled tool calls → error containing 'terminated', never a silent empty harvest", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(sse([finishChunk("cmpl-1", "tool_calls")])));
@@ -558,7 +558,7 @@ describe("GrokGatewayAdapter — C5 error decoration (§4.4)", () => {
 
     const result = await adapter.runTurn({ prompt: "go" });
 
-    expect(result.error).toContain("malformed stream");
+    expect(result.error).toContain("connection terminated mid-stream");
     expect(result.text).toBe("");
   });
 });

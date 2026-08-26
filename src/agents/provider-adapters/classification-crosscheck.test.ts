@@ -61,16 +61,24 @@ describe("Lane B adapter error strings → ProviderFaultKind (KPR-391 §8 cross-
   ])("server-error: %s", (s) => expect(faultKind(s)).toBe("server-error"));
 
   it.each([
-    // grok-gateway-adapter.ts — assembleToolCalls edge-3 drop decoration: a
+    // grok-gateway-adapter.ts — consumeGrokSse edge-3 drop decoration: a
     // stream that ended without finish_reason (not aborted by hive) is a
     // gateway drop, phrased to land on the connect-fail row via "terminated".
     // Deliberate attribution: the loopback gateway is grok route
     // infrastructure — its death classifies as a grok provider fault by
     // design (KPR-306/307 key on the route, not on the vendor endpoint).
+    // assembleToolCalls' own incomplete-fragment message is a different
+    // string that also carries "terminated" and is pinned separately below.
     // Raw `fetch failed`/`ECONNREFUSED` throws from the gateway fetch call
     // are already row-pinned by the shared FAULT_PATTERNS connect-fail
     // regex and need no adapter-specific row here.
     "Grok gateway stream ended without finish_reason — connection terminated mid-stream",
+    // grok-gateway-adapter.ts — Edge 3 spirit guard: finish_reason=tool_calls
+    // with zero assembled tool calls is a gateway stream-shape fault, phrased
+    // onto the same connect-fail row via "terminated" (r1 fix — was
+    // previously worded "malformed stream", which matched no FAULT_PATTERNS
+    // row and misclassified non-provider).
+    "Grok gateway stream signaled tool_calls but no tool calls were assembled — connection terminated mid-stream",
   ])("connect-fail: %s", (s) => expect(faultKind(s)).toBe("connect-fail"));
 
   it("round-budget exhaustion stays non-provider (shared dispatch loop emits error_max_turns)", () => {
