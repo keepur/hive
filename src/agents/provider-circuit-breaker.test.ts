@@ -474,3 +474,54 @@ describe("ProviderCircuitBreaker — turn-deadline is breaker-INCONCLUSIVE (Lane
     expect(expectOpenThrow(() => registry.acquire("claude")).retryAfterMs).toBe(15_000);
   });
 });
+
+describe("KPR-401 pins — aborted/deadline turns never pollute the p95 window (zero breaker code change)", () => {
+  // These rows pin EXISTING behavior that becomes load-bearing with KPR-401:
+  // aborted turns now carry large real llmMs values (wall-clock durationMs −
+  // toolMs) instead of negatives the pushSample guard happened to drop.
+  // Ticket constraint: "keep it that way" — success-only sampling at BOTH
+  // pushSample sites, plus the negative guard as belt. No source change
+  // backs this describe, so negative-verify is degenerate by construction
+  // (there is no pre-fix state to fail against) — these are pins, not
+  // regression proofs.
+  const deadlineFault = (): TurnClassification => ({
+    outcome: "fault",
+    kind: "turn-deadline",
+    message: "turn wall-clock deadline expired",
+  });
+
+  it("closed-state record(): aborted / turn-deadline with LARGE positive llmMs leave the window empty", () => {
+    const { registry, turn } = makeRegistry();
+    turn(aborted(), 294_391);
+    turn(deadlineFault(), 294_391);
+    const snap = registry.stateFor("claude")!;
+    expect(snap.state).toBe("closed");
+    expect(snap.sampleCount).toBe(0); // only `case "success"` samples
+    expect(snap.p95Ms).toBeNull();
+  });
+
+  it("probe settle: aborted / turn-deadline probes with LARGE llmMs reopen inconclusive, window stays empty", () => {
+    for (const classification of [aborted(), deadlineFault()]) {
+      const { registry, turn, advance } = makeRegistry();
+      turn(hardFault());
+      turn(hardFault());
+      turn(hardFault()); // open
+      advance(15_000);
+      const probe = registry.acquire("claude");
+      expect(probe.isProbe).toBe(true); // half-open probe admitted
+      registry.record(probe, classification, 294_391);
+      const snap = registry.stateFor("claude")!;
+      expect(snap.state).toBe("open"); // reopened inconclusive, not closed
+      expect(snap.sampleCount).toBe(0); // settleProbe's success gate did not sample
+      expect(snap.p95Ms).toBeNull();
+    }
+  });
+
+  it("pushSample negative guard: success with llmMs −1 never samples (belt for any future non-clamped caller)", () => {
+    const { registry, turn } = makeRegistry();
+    turn(success(), -1);
+    const snap = registry.stateFor("claude")!;
+    expect(snap.state).toBe("closed");
+    expect(snap.sampleCount).toBe(0);
+  });
+});

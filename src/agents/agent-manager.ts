@@ -1800,7 +1800,16 @@ export class AgentManager {
 
     // Per-turn telemetry — independent of sessionStore (no history in
     // sessionStore.set). Aggregator in `hive doctor` reads this collection.
-    if (result.sessionId && !result.aborted) {
+    // KPR-401: aborted turns with real spend are recorded (sparse aborted
+    // flag on the doc); zero-usage aborted turns — operator abort before the
+    // first API call, and the manager's synthesizeAbortedResult early-abort
+    // shape (resumed sessionId, never spawned) — stay out: nothing to
+    // account, no noise docs. Deliberately provider-AGNOSTIC: Lane B
+    // adapters already return real partial totals on operator-aborted
+    // turns, and that spend is just as real — do not provider-gate this.
+    const hadUsage =
+      result.inputTokens + result.outputTokens + result.cacheReadTokens + result.cacheCreationTokens > 0;
+    if (result.sessionId && (!result.aborted || hadUsage)) {
       this.turnTelemetryStore
         .record({
           agentId: ctx.agentId,
@@ -1813,6 +1822,8 @@ export class AgentManager {
           cacheCreationTokens: result.cacheCreationTokens,
           ephemeral5mTokens: result.ephemeral5mTokens,
           ephemeral1hTokens: result.ephemeral1hTokens,
+          // KPR-401: sparse — only aborted:true is ever written.
+          ...(result.aborted ? { aborted: true as const } : {}),
         })
         .catch(() => {
           // Already logged inside the store via withRetry. Swallow here.
@@ -1863,6 +1874,11 @@ export class AgentManager {
       compactions: result.compactions,
       streamed: result.streamed,
       error: result.error,
+      // KPR-401: sparse abort flags — the audit row's costUsd:0/durationMs
+      // zeros on aborted turns are now segmentable instead of masquerading
+      // as free, instant, clean turns.
+      ...(result.aborted ? { aborted: true } : {}),
+      ...(result.timedOut ? { timedOut: true } : {}),
     });
   }
 

@@ -885,6 +885,59 @@ describe("Per-turn dispatch (unconditional, KPR-220 Phase 9)", () => {
     expect(fields.toolSummary).toBe("memory:1x");
   });
 
+  it("KPR-401: aborted/timedOut TurnResult surfaces both flags + non-negative llmMs on the work-item-dispatched log", async () => {
+    // NEGATIVE-VERIFY prediction (Step 3): pre-fix the log-field object
+    // simply lacks the two keys — fields.aborted is undefined; this fails.
+    const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
+    dispatcher.registerAdapter(smsAdapter as any);
+
+    // The incident shape post-KPR-401: honest zeros for cost, real wall
+    // duration, clamped llmMs, real token counters, both flags. There is no
+    // outage store configured (and breaker state is null) in this mock, so the
+    // KPR-307 post-turn outage gate does not intercept — the turn reaches
+    // normal delivery.
+    agentManager.runWorkItemTurn.mockResolvedValueOnce({
+      finalMessage: "",
+      newSessionId: "s-kpr401",
+      usage: {
+        inputTokens: 2200,
+        outputTokens: 120,
+        cacheReadTokens: 18500,
+        cacheCreationTokens: 250,
+        contextWindow: 0,
+        costUsd: 0,
+        durationMs: 294_391,
+      },
+      errors: [],
+      llmMs: 0,
+      toolMs: 294_391,
+      toolCalls: 46,
+      toolSummary: "Bash:46x/294.4s",
+      streamed: true,
+      compactions: 0,
+      timedOut: true,
+      aborted: true,
+    });
+
+    mockLogInfo.mockClear();
+
+    const item = makeWorkItem({
+      source: { kind: "sms", id: "PN_LINE_M", label: "quo-may", adapterId: "sms" },
+      threadId: "sms:PN_LINE_M:+15550101",
+      text: "hey Jasper, kpr401 probe", // agent-name-bearing, mirroring the Phase-1 row's resolution path
+    });
+    await dispatcher.dispatch(item);
+
+    const logCall = mockLogInfo.mock.calls.find(([msg]) => msg === "Work item dispatched");
+    expect(logCall).toBeDefined();
+    const fields = logCall![1] as Record<string, unknown>;
+    expect(fields.aborted).toBe(true);
+    expect(fields.timedOut).toBe(true);
+    expect(fields.llmMs).toBe(0);
+    expect(fields.llmMs as number).toBeGreaterThanOrEqual(0);
+    expect(fields.costUsd).toBe(0); // honest zero, now segmentable
+  });
+
   it("routeVoiceTurn does NOT dedup on workItem.id", async () => {
     // Q4 invariant: voice WorkItem.id is the Vapi callId, reused across many
     // turns within a single call. Adding callId to the dispatcher dedup map

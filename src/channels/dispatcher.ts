@@ -344,6 +344,11 @@ export class Dispatcher {
           toolMs: runResult.toolMs,
           toolCalls: runResult.toolCalls,
           toolSummary: runResult.toolSummary,
+          // KPR-401: segmentation flags — log-based dashboards can now
+          // exclude aborted/timed-out turns' honest zeros from spend and
+          // latency stats. convertTurnResult already maps both faithfully.
+          aborted: runResult.aborted,
+          timedOut: runResult.timedOut,
         });
       }
 
