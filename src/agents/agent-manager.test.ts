@@ -3328,35 +3328,29 @@ describe("AgentManager", () => {
         expect(sessionStore.set).not.toHaveBeenCalled();
       });
 
-      it("Lane A inheritance pin: kimi and grok aborted-with-progress turns persist under their own tags (client-transcript)", async () => {
-        process.env.KIMI_API_KEY = "test-kimi-key";
-        process.env.GROK_GATEWAY_KEY = "test-grok-gateway-key";
-        try {
-          registry._agents.set(
-            "agent-kimi",
-            makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3", coreServers: [] }),
-          );
-          registry._agents.set(
-            "agent-grok",
-            makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6", coreServers: [] }),
-          );
-          mockRunnerSend.mockResolvedValueOnce(
-            makeRunResult({ aborted: true, timedOut: true, sessionId: "kimi-s1", toolCalls: 2, streamed: true, text: "" }),
-          );
-          const kctx = smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr399-kimi" });
-          await manager.spawnTurn(kctx);
-          expect(sessionStore.set).toHaveBeenCalledWith("agent-kimi", kctx.threadId, "kimi-s1", "kimi");
-          mockRunnerSend.mockResolvedValueOnce(
-            makeRunResult({ aborted: true, timedOut: true, sessionId: "grok-s1", toolCalls: 2, streamed: true, text: "" }),
-          );
-          const gctx = smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr399-grok" });
-          await manager.spawnTurn(gctx);
-          expect(sessionStore.set).toHaveBeenCalledWith("agent-grok", gctx.threadId, "grok-s1", "grok");
-        } finally {
-          delete process.env.KIMI_API_KEY;
-          delete process.env.GROK_GATEWAY_KEY;
-        }
-      });
+      // All three client-transcript passthrough providers, one row each — the
+      // arm gates on SEMANTICS, so every Lane A column must inherit it.
+      it.each([
+        ["kimi", "KIMI_API_KEY", "agent-kimi", "kimi/kimi-k3", "kimi-s1"],
+        ["deepseek", "DEEPSEEK_API_KEY", "agent-dseek", "deepseek/deepseek-v4-pro", "dseek-s1"],
+        ["grok", "GROK_GATEWAY_KEY", "agent-grok", "grok/grok-4.6", "grok-s1"],
+      ] as const)(
+        "Lane A inheritance pin: an aborted-with-progress %s turn persists under its own tag (client-transcript)",
+        async (provider, envKey, agentId, model, sessionId) => {
+          process.env[envKey] = `test-${provider}-key`;
+          try {
+            registry._agents.set(agentId, makeAgentConfig({ id: agentId, name: agentId, model, coreServers: [] }));
+            mockRunnerSend.mockResolvedValueOnce(
+              makeRunResult({ aborted: true, timedOut: true, sessionId, toolCalls: 2, streamed: true, text: "" }),
+            );
+            const ctx = smsCtx({ agentId, threadId: `sms:line-1:kpr399-${provider}` });
+            await manager.spawnTurn(ctx);
+            expect(sessionStore.set).toHaveBeenCalledWith(agentId, ctx.threadId, sessionId, provider);
+          } finally {
+            delete process.env[envKey];
+          }
+        },
+      );
 
       it("re-entry prefers resume: after an aborted-turn persist, the next runWorkItemTurn on the thread resumes the persisted id", async () => {
         // Pins spec Testing Contract 11 — "replay prefers resume" — via the
