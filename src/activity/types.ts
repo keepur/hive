@@ -31,4 +31,12 @@ export interface ActivityRecord {
   // Outcome
   streamed: boolean;
   error?: string;
+  /**
+   * KPR-393 §D2: present-and-true iff the delivered text ends on an
+   * unexecuted first-person commitment (detectIntentTrailer) on a
+   * non-error turn. Absent otherwise — never false. Additive/optional:
+   * schemaless Mongo, no migration. Detection is deliberately text-only —
+   * slice against `toolCalls` in queries.
+   */
+  intentTrailer?: true;
 }

@@ -3,6 +3,7 @@ import type { AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
+import { detectIntentTrailer } from "./intent-trailer.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
 import type { TurnHistoryStore } from "./turn-history-store.js";
@@ -1857,6 +1858,18 @@ export class AgentManager {
     }
 
     // Activity audit
+    // KPR-393 §D2: fleet-wide intent-trailer telemetry — boolean only, no
+    // text stored (redaction posture). Error turns are skipped even when
+    // text is present (a delivered error is not a promise). Every provider
+    // runs the detector — the Claude lane's rate is the phase-2 control.
+    const intentTrailer = !result.error && detectIntentTrailer(result.text);
+    if (intentTrailer) {
+      log.info("Intent trailer detected", {
+        agentId: ctx.agentId,
+        model: this.registry.get(ctx.agentId)?.model ?? "unknown",
+        toolCalls: result.toolCalls,
+      });
+    }
     this.activityLogger?.record({
       agentId: ctx.agentId,
       threadId: ctx.threadId,
@@ -1881,6 +1894,7 @@ export class AgentManager {
       compactions: result.compactions,
       streamed: result.streamed,
       error: result.error,
+      ...(intentTrailer ? { intentTrailer: true as const } : {}),
     });
   }
 
