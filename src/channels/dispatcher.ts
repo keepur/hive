@@ -43,6 +43,16 @@ const NON_RESPONSE_PATTERNS = [
   /^n\/a\.?$/i,
 ];
 
+/** KPR-388: max of raw Slack ts strings by numeric value; undefined when none present. */
+function maxSlackTs(candidates: Array<string | undefined>): string | undefined {
+  let best: string | undefined;
+  for (const ts of candidates) {
+    if (!ts) continue;
+    if (best === undefined || parseFloat(ts) > parseFloat(best)) best = ts;
+  }
+  return best;
+}
+
 /** Extended resolved-agent type carrying optional conference metadata */
 interface ResolvedAgent {
   agentId: string;
@@ -53,6 +63,10 @@ interface ResolvedAgent {
   meetingPreamble?: string;
   /** Round-1 only: the peer reply this reaction turn should engage with (KPR-387). */
   reactionTo?: { authorName: string; text: string };
+  /** KPR-388: how threadContext was assembled — full transcript or delta since the mark. */
+  injectionMode?: "full" | "delta";
+  /** KPR-388: max Slack ts (raw string) covered by this turn's injection; the mark advances to it on success. */
+  injectionHighWaterTs?: string;
 }
 
 /**
@@ -1144,14 +1158,14 @@ export class Dispatcher {
       return [];
     }
 
-    // Fetch thread context for injection and classifier recency
-    let threadContext = "";
+    // Fetch thread history once per trigger — per-agent injection contexts
+    // (full vs delta, KPR-388) are derived from it after classification.
+    let history: ThreadMessage[] = [];
     let recentMessages = "";
     if (this.slackAdapter) {
       const channelId = item.source.id;
       const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId;
-      const history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
-      threadContext = this.formatThreadContext(history, item.source.label, rosterMembers);
+      history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
       // Last 5 messages for classifier recency context
       recentMessages = history
         .slice(-5)
@@ -1189,14 +1203,32 @@ export class Dispatcher {
 
     const preamble = this.buildMeetingPreamble(item.source.label, rosterMembers);
 
-    return classification.respondAgentIds.map((agentId) => ({
-      agentId,
-      conferenceMode: true,
-      conferenceHumanTs: humanTs,
-      conferenceRound: 0,
-      threadContext,
-      meetingPreamble: preamble,
-    }));
+    // KPR-388: per-agent injection context — delta for agents with meeting
+    // continuity, full transcript otherwise. Round-0 maxes the trigger's own
+    // ts into the high-water mark (BOTH modes): the terminal slot presents
+    // the trigger, so the session absorbs it even when the fetch raced it.
+    return Promise.all(
+      classification.respondAgentIds.map(async (agentId): Promise<ResolvedAgent> => {
+        const injection = await this.buildConferenceContext(
+          agentId,
+          threadId,
+          history,
+          item.source.label,
+          rosterMembers,
+          humanTs,
+        );
+        return {
+          agentId,
+          conferenceMode: true,
+          conferenceHumanTs: humanTs,
+          conferenceRound: 0,
+          threadContext: injection.threadContext,
+          meetingPreamble: preamble,
+          injectionMode: injection.injectionMode,
+          injectionHighWaterTs: injection.injectionHighWaterTs,
+        };
+      }),
+    );
   }
 
   private formatThreadContext(history: ThreadMessage[], channelName: string, roster: RosterMember[]): string {
@@ -1205,15 +1237,7 @@ export class Dispatcher {
     const participantNames = roster.map((r) => r.name).join(", ");
     const header = `[Meeting thread in #${channelName} — participants: ${participantNames}]`;
 
-    // If thread is very long, include first 5 + last 100 messages
-    let messages = history;
-    if (history.length > 105) {
-      const first = history.slice(0, 5);
-      const last = history.slice(-100);
-      messages = [...first, ...last];
-    }
-
-    const formatted = messages
+    const formatted = this.truncateHistory(history)
       .map((m) => {
         const ago = this.formatTimeAgo(m.timestamp);
         return `${m.author} (${ago}): ${m.text}`;
@@ -1221,6 +1245,71 @@ export class Dispatcher {
       .join("\n");
 
     return `${header}\n\n${formatted}`;
+  }
+
+  /** If thread is very long, include first 5 + last 100 messages (KPR-388: shared with the high-water calc). */
+  private truncateHistory(history: ThreadMessage[]): ThreadMessage[] {
+    if (history.length <= 105) return history;
+    return [...history.slice(0, 5), ...history.slice(-100)];
+  }
+
+  /**
+   * KPR-388: per-agent conference injection context. Delta iff ALL hold:
+   * the stored ref has a resumable sessionId (excludes no-row, TTL'd,
+   * scrubbed, empty-handle/codex rows), the stored provider matches the
+   * agent's current provider (else spawnTurn's KPR-313 guard runs the turn
+   * fresh with a handoff notice — full injection is the correct pairing),
+   * and a meeting mark exists. Every miss ⇒ full transcript, byte-identical
+   * to the pre-KPR-388 shared context (C6 pin).
+   */
+  private async buildConferenceContext(
+    agentId: string,
+    threadId: string,
+    history: ThreadMessage[],
+    channelName: string,
+    roster: RosterMember[],
+    roundZeroTriggerTs?: string,
+  ): Promise<{ threadContext: string; injectionMode: "full" | "delta"; injectionHighWaterTs?: string }> {
+    const ref = await this.agentManager.getSessionStore().get(agentId, threadId);
+    const provider = this.agentManager.providerFor(agentId);
+    if (!ref?.sessionId || !ref.meetingLastSeenTs || ref.provider !== provider) {
+      return {
+        threadContext: this.formatThreadContext(history, channelName, roster),
+        injectionMode: "full",
+        injectionHighWaterTs: maxSlackTs([...this.truncateHistory(history).map((m) => m.ts), roundZeroTriggerTs]),
+      };
+    }
+
+    const markNum = parseFloat(ref.meetingLastSeenTs);
+    // Strictly greater than the mark; same 100-cap as truncateHistory's tail.
+    // No first-5 pin — the session already holds the thread opening (covering
+    // invariant, spec §5). An empty delta yields threadContext "" — dropped by
+    // dispatchToAgent's filter(Boolean) join; the terminal slot still carries
+    // the trigger (round-0) or peer reply (round-1), so it is always safe.
+    const delta = history.filter((m) => parseFloat(m.ts) > markNum).slice(-100);
+    return {
+      threadContext: delta.length > 0 ? this.formatDeltaContext(delta, channelName, roster) : "",
+      injectionMode: "delta",
+      injectionHighWaterTs: maxSlackTs([...delta.map((m) => m.ts), roundZeroTriggerTs]),
+    };
+  }
+
+  /**
+   * KPR-388: delta-mode context — same header and body format as
+   * formatThreadContext, headed as a delta. MUST NOT contain the
+   * terminal-slot marker "[New message]:" (the C3 framing test's negative
+   * assertions depend on its absence).
+   */
+  private formatDeltaContext(delta: ThreadMessage[], channelName: string, roster: RosterMember[]): string {
+    const participantNames = roster.map((r) => r.name).join(", ");
+    const header = `[Meeting thread in #${channelName} — participants: ${participantNames}]`;
+    const formatted = delta
+      .map((m) => {
+        const ago = this.formatTimeAgo(m.timestamp);
+        return `${m.author} (${ago}): ${m.text}`;
+      })
+      .join("\n");
+    return `${header}\n[New messages since your last turn:]\n\n${formatted}`;
   }
 
   private formatTimeAgo(timestamp: Date): string {
@@ -1302,15 +1391,16 @@ Meeting rules:
       peers: classification.respondAgentIds,
     });
 
-    // Re-fetch thread context (now includes the round-0 response)
-    let threadContext = "";
+    // Re-fetch thread history (now includes the round-0 response); per-reactor
+    // injection contexts (full vs delta, KPR-388) are derived from it below.
+    let history: ThreadMessage[] = [];
+    const allRosterMembers: RosterMember[] = [];
     let preamble = "";
     if (this.slackAdapter) {
       const channelId = originalItem.source.id;
       const threadTs =
         (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId;
-      const history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
-      const allRosterMembers: RosterMember[] = [];
+      history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
       for (const agentId of roster) {
         const agent = this.registry.get(agentId);
         if (!agent || agent.disabled) continue;
@@ -1321,20 +1411,31 @@ Meeting rules:
           role: agent.soul.split("\n")[0],
         });
       }
-      threadContext = this.formatThreadContext(history, originalItem.source.label, allRosterMembers);
       preamble = this.buildMeetingPreamble(originalItem.source.label, allRosterMembers);
     }
 
     // Dispatch reactions concurrently (peers already claimed in reacted set above)
     const responderName = this.registry.get(respondingAgentId)?.name ?? respondingAgentId;
-    const reactionDispatches = classification.respondAgentIds.map((agentId) => {
+    const reactionDispatches = classification.respondAgentIds.map(async (agentId) => {
+      // KPR-388: per-reactor full/delta decision. No trigger max-in on
+      // round-1 — new content reaches the mark only via the re-fetched
+      // transcript (the peer reply's ts is not knowable here).
+      const injection = await this.buildConferenceContext(
+        agentId,
+        threadId,
+        history,
+        originalItem.source.label,
+        allRosterMembers,
+      );
       const resolved: ResolvedAgent = {
         agentId,
         conferenceMode: true,
         conferenceHumanTs: humanTs,
         conferenceRound: 1,
-        threadContext,
+        threadContext: injection.threadContext,
         meetingPreamble: preamble,
+        injectionMode: injection.injectionMode,
+        injectionHighWaterTs: injection.injectionHighWaterTs,
         reactionTo: { authorName: responderName, text: responseText },
       };
       return this.dispatchToAgent(originalItem, resolved);

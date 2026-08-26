@@ -126,6 +126,17 @@ function makeMockRegistry() {
 }
 
 function makeMockAgentManager() {
+  // KPR-388: minimal session-store surface for the read-side delta decision
+  // and write-side mark bookkeeping. Tests seed _sessionRefs per
+  // "{agentId}:{threadId}"; unseeded agents get undefined ⇒ full injection.
+  const sessionRefs = new Map<string, { sessionId?: string; provider?: string; meetingLastSeenTs?: string }>();
+  const sessionStore = {
+    get: vi
+      .fn()
+      .mockImplementation(async (agentId: string, threadId: string) => sessionRefs.get(`${agentId}:${threadId}`)),
+    setMeetingMark: vi.fn().mockResolvedValue(undefined),
+    clearMeetingMark: vi.fn().mockResolvedValue(undefined),
+  };
   return {
     runWorkItemTurn: vi.fn().mockResolvedValue({
       finalMessage: "Agent response",
@@ -149,6 +160,12 @@ function makeMockAgentManager() {
     }),
     findAgentForThread: vi.fn().mockResolvedValue(null),
     findAgentsForThread: vi.fn().mockResolvedValue([]),
+    getSessionStore: () => sessionStore,
+    providerFor: vi.fn().mockReturnValue("claude"),
+    // Dormant breaker surface — only the outage-placement test flips it open.
+    circuitBreakers: { stateFor: vi.fn().mockReturnValue({ state: "closed", enabled: true }) },
+    _sessionRefs: sessionRefs,
+    _sessionStore: sessionStore,
   };
 }
 
