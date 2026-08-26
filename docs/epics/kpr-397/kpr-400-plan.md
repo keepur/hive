@@ -1391,3 +1391,11 @@ Expected: three hunks — the type import line, the `acquireDeadlineMs` helper a
 - **[Prettier reflow]:** several new `it(...)` titles and object literals exceed print width; each task's `prettier --write` before commit rewraps them — do not treat the reflow as a deviation.
 - **[If PR #414 (KPR-399) merges into the epic branch mid-implementation]:** rebase; every anchor is text-based and lands in regions #414 does not touch. Shared file-level neighbors are `agent-manager.ts`/`agent-manager.test.ts` — resolve hunk-adjacency noise in favor of both changes; there is no semantic conflict (kpr-400-spec §Edge-10). After rebase, re-run the negative-verify anchors' `git log --oneline` sanity checks — relative anchors (`HEAD~N`) shift if the rebase lands mid-sequence.
 - **[Adjacent, out of scope]:** the store's boot-only `recoverStaleReplaying`/`STALE_REPLAYING_MS` quirks (spec §Edge-9, ⚠A6) are flagged for the epic driver — do NOT fold them in here.
+
+---
+
+## Plan-review advisories (r1, verbatim — implementer notes, not deviations)
+
+1. [Header #414 posture + rebase advisory]: PR #414 ALSO touches error-classification.ts and appends a describe at the end of error-classification.test.ts — exactly where Task 8 Step 2's anchor lands. No semantic conflict (verified against the PR diff), but if #414 merges mid-implementation, read Task 8's anchor as "append at EOF" (the KPR-398 describe may no longer be last).
+2. [Task 3]: agent-manager.ts L1626's prose comment will reference the deleted `PROBE_STALE_MS` name after Task 1 — ruled do-not-fix here (region discipline); noted as a one-line follow-up for the epic driver.
+3. [Task 4, Step 1, row 2]: the second T7 row's `objectContaining` omits `agentId` — adding it makes the row self-locating on failure like row 1 (optional).
