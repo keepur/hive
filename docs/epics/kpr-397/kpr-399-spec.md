@@ -51,9 +51,11 @@ store-schema changes.
 - **One guard, one file.** The persist site is
   `finalizeSpawnResult` (`agent-manager.ts:1869-1905`), which runs inside the
   per-thread lock (`spawnTurn` L1097, inside the `withSpawnTicket` lambda) —
-  so an aborted-turn persist is race-free against same-thread contenders by
-  the existing lock, and lands *before* the lock releases, i.e. before any
-  replay or follow-up turn can read the store.
+  the write is issued before the lock releases (fire-and-forget, consistent
+  with the success-path write), so any re-entry whose store read happens
+  after finalize sees the handle. A contender *already waiting on the lock*
+  read the store pre-lock (`runWorkItemTurn` L861) and does not — a
+  pre-existing residual, see Edge case 7.
 - **Persist gate (aborted turns):** `sessionSemanticsFor(route.provider) ===
   "client-transcript"` **AND** `result.sessionId` nonempty **AND**
   `hasObservedProgress(result)` — the exact D1 predicate, exported from
@@ -99,14 +101,19 @@ store-schema changes.
   (`stateless-replay`) keep the `!result.aborted` behavior byte-for-byte —
   any Lane B resume-on-abort goes through the KPR-385 scaffold hooks, never a
   silent unification here.
-- **KPR-402's surface, stated:** post-399, a replayed or re-dispatched turn
-  (and any follow-up message) can rely on `sessionStore.get(agentId,
-  threadId)` returning the aborted turn's handle whenever the abort had
-  observed progress on a client-transcript route — written under the
-  per-thread lock before the aborted turn's lock released, pointing at a CLI
-  transcript that contains the original prompt plus all partial assistant/tool
-  work. What KPR-402 must NOT rely on: a persisted handle for zero-progress
-  aborts (none is written), or any replay-prompt shaping (replay still
+- **KPR-402's surface, stated:** post-399, a re-entry **whose store read
+  occurs after the aborted turn's finalize** can rely on
+  `sessionStore.get(agentId, threadId)` returning the aborted turn's handle
+  whenever the abort had observed progress on a client-transcript route —
+  pointing at a CLI transcript that contains the original prompt plus all
+  partial assistant/tool work. Outage replay and any later dispatch qualify
+  (their `runWorkItemTurn` read happens after the aborted turn completed —
+  modulo the fail-soft write residual, §Design.2); a
+  contender **already waiting on the per-thread lock** does not — it read the
+  store pre-lock and spawns on the stale value (pre-existing residual, Edge
+  case 7). What KPR-402 must NOT rely on: a persisted handle for
+  zero-progress aborts (none is written), a fresh handle for an
+  already-waiting contender, or any replay-prompt shaping (replay still
   re-sends the wrapped original prompt into a session that already contains
   it — accepted residual here, KPR-402's surface to refine).
 - ⚠ **Delegated:** predicate reuse via export (vs duplicating three
@@ -166,11 +173,12 @@ dies). The Testing Contract makes live verification a deliver-lane gate.
 ## Goals
 
 1. A deadline- or operator-aborted Claude-lane turn **with observed progress**
-   (D1 predicate) persists its sessionId to the `sessions` row before the
-   per-thread lock releases.
-2. Every re-entry path — outage replay, KPR-402 re-dispatch, next user
-   message, reflection — resumes that session automatically (no per-path
-   changes; falls out of the existing `sessionStore.get` reads).
+   (D1 predicate) issues its sessionId persist to the `sessions` row before
+   the per-thread lock releases (fire-and-forget, success-path parity).
+2. Every re-entry path whose store read occurs after finalize — outage
+   replay, KPR-402 re-dispatch, next user message, reflection — resumes that
+   session automatically (no per-path changes; falls out of the existing
+   `sessionStore.get` reads).
 3. A resume the SDK rejects (mid-tool-abort pathology, never-flushed id)
    self-heals with one fresh retry instead of producing a dead thread.
 4. Lane B (`server-resumable`/`stateless-replay`) behavior is byte-for-byte
@@ -249,7 +257,12 @@ const abortPersist =
   result.aborted === true &&
   !!result.sessionId &&
   sessionSemanticsFor(route.provider) === "client-transcript" &&
-  hasObservedProgress(result);
+  hasObservedProgress(result) &&
+  // Mint-safety belt (churn-mint's condition, applied verbatim): an aborted
+  // turn that ALSO errored, resumed a session, and came back with a
+  // DIFFERENT id never overwrites the row. Rare shape (deadline aborts
+  // carry no error), but it makes the arm self-evidently mint-safe.
+  !(result.error && ctx.sessionId && result.sessionId !== ctx.sessionId);
 
 if (result.sessionId && !result.aborted) {
   … existing block, byte-for-byte (churn-mint rider, resumable gate, tokenData) …
@@ -269,13 +282,18 @@ Properties:
 
 - **Success path byte-identical** (churn-mint rider, `resumable ? id : ""`
   row-keeping for stateless providers, tokenData handling — all untouched).
-- **Runs inside the per-thread lock** (`spawnTurn` calls it at L1097, inside
-  the `withSpawnTicket` lambda): the write is ordered before any queued
-  same-thread turn's post-lock/pre-spawn store read, and before the replay or
-  follow-up can even acquire the lock. `sessionStore.set` is awaited-not
-  (fire-and-forget with fail-soft `withRetry`) exactly as the success path is
-  today — same residual (a Mongo blip loses one persist, warn-logged,
-  self-corrects next turn).
+- **Issued before the lock releases** (`spawnTurn` calls finalize at L1097,
+  inside the `withSpawnTicket` lambda), fire-and-forget with fail-soft
+  `withRetry` exactly as the success-path write is today — same residual (a
+  Mongo blip loses one persist, error-logged by withRetry's fallback path,
+  self-corrects next turn). Any
+  re-entry whose store read occurs after finalize (outage replay, a later
+  dispatch, reflection's post-lock re-resolve) sees the handle. The post-lock
+  re-reads elsewhere in `spawnTurn` are **conditional** (reflection-only
+  L932, provider-mismatch-only L960, server-resumable-only L1065): an
+  ordinary same-provider contender reads the store **pre-lock**
+  (`runWorkItemTurn` L861) and then waits — see Edge case 7 for the accepted
+  residual.
 - **`persistsResumableHandle` is not consulted on this arm** — the
   `client-transcript` equality check is strictly narrower (it excludes
   `server-resumable` too, which `persistsResumableHandle` would admit). That
@@ -328,7 +346,7 @@ gains a third `else if` after auth-rebuild and stale-server-handle:
   sessionSemanticsFor(shaping.route.provider) === "client-transcript"
 ) {
   log.warn("spawnTurn claude resume rejected — one fresh retry (KPR-399)", {
-    agentId, threadId, timedOutResume: false, // no handle value logged (redaction posture)
+    agentId, threadId, timedOut: finalResult.timedOut === true, // no handle value logged (redaction posture)
   });
   finalResult = await this.runOneSpawnAttempt(
     { ...effectiveCtx, sessionId: undefined }, shaping, ticket, onStream,
@@ -430,9 +448,20 @@ whose only turns were aborted (previously such threads had no row at all).
    synthetic result (assembly-window abort) is zero-progress → skipped.
 6. **Abort before `system/init`** (operator abort in the first ~seconds of a
    first turn) — `result.sessionId === ""` → guard skips.
-7. **Concurrent same-thread turns** — persist runs under the per-thread lock;
-   queued contenders re-read post-lock (reflection L932, KPR-313 adopt-branch
-   L960, KPR-351 contender re-read L1065) — no torn reads.
+7. **Concurrent same-thread turns — mid-turn-contender stale read (ACCEPTED
+   PRE-EXISTING RESIDUAL).** A user message dispatched while the long turn is
+   still running/aborting (the mid-turn "are you there?" ping is exactly this
+   shape) reads the store **pre-lock** (`runWorkItemTurn` L861), waits on the
+   per-thread lock, then spawns with the stale value: it misses the aborted
+   turn's just-persisted handle, runs fresh, and its own success-persist
+   overwrites that handle. The post-lock re-reads in `spawnTurn` do not cover
+   this case — they are conditional (reflection-only L932,
+   provider-mismatch-only L960, server-resumable-only L1065). This race
+   predates KPR-399 (the same pre-lock read raced success-path persists) and
+   this fix neither creates nor worsens it; an unconditional post-lock
+   re-resolve is deliberately **out of scope** (YAGNI, hotfix) and noted as a
+   possible KPR-402-adjacent follow-up if KPR-402's spec wants the stronger
+   guarantee for its re-dispatch.
 8. **Reflection after an aborted turn** — post-quiescence reflection resumes
    the aborted session and reflects over partial work; acceptable and
    arguably desirable (memory captures the in-progress state).
@@ -492,7 +521,9 @@ Self-heal arm (`spawnTurn`, mocked adapter):
    `isAuthRebuildResumeError` alternate and both `isStaleServerHandleError`
    openai alternates negative-pinned against `isClaudeResumeLoadError` (and
    the new alternates against the auth row — superset rule holds:
-   `classifyErrorString` of both strings → `non-provider`, pinned).
+   `classifyErrorString` of both strings → `non-provider`, pinned —
+   `classifyErrorString` is module-private, so route the pin through
+   `classifyTurnResult({ error })` rather than exporting the helper).
 
 Predicate export:
 
@@ -513,26 +544,38 @@ To be executed on a real instance (dodi or keepur dev agent) before
 ready-to-merge; evidence pasted into the ticket:
 
 - **V1 — abort persists:** set a test agent's `timeoutMs` low (e.g. 60s);
-  send a thread message that forces a long multi-tool turn (e.g. "clone and
-  summarize a large repo"). Deadline aborts mid-tool. **Evidence:** the
+  send a thread message that forces a long multi-tool turn. Run the scenario
+  **twice**: once with the deadline landing mid-**Bash** tool call (e.g.
+  "clone and summarize a large repo"), and once with it landing mid-**MCP**
+  tool call (e.g. a slow `conversation-search` or `code-task` invocation) —
+  the dangling-`tool_use` repair path is the ticket Caution's real subject
+  and MCP tool_use blocks are its primary shape. **Evidence (each run):** the
   KPR-399 "Persisting session from aborted turn" log line; the `sessions` doc
   for `{agentId}:{threadId}` carrying a sessionId with `updatedAt` at abort
   time (mongosh).
 - **V2 — follow-up resumes with context (the headline scenario):** send a
-  follow-up message in the same thread ("continue"). **Evidence:** the spawn
-  log shows `resumeSession: <the persisted id>` (not `"new"`), AND the
-  agent's reply demonstrably builds on the partial work (references
-  tools/results from the aborted turn rather than restarting) — i.e. the SDK
-  resumed a transcript that ended mid-tool-call. This is the direct probe of
-  SDK behavior (i) vs (ii).
-- **V3 — outage-replay resumes:** with the same low timeout, force a
-  zero-progress... **correction:** replay requires an open breaker + queued
-  turn; simulate per the KPR-307 test recipe (breaker forced open) with a
-  with-prior-progress thread, confirm the replayed dispatch's spawn log shows
-  the persisted id. (If forcing is impractical, V2 plus unit test 11 is the
-  accepted fallback — record which was done.)
+  follow-up message in the same thread ("continue"). **Evidence — all four
+  corroborators:** (1) the follow-up spawn log shows `resumeSession: <id>`
+  (not `"new"`) with the id **equal to** the persisted `sessions` doc's
+  sessionId; (2) the resumed session's JSONL on disk
+  (`~/.claude/projects/…/<id>.jsonl`) contains the pre-abort tool calls;
+  (3) the agent's reply references a **concrete artifact created before the
+  abort** (a file it wrote, a command's output) rather than restarting;
+  (4) no resume-rejection warn fired. This is the direct probe of SDK
+  behavior (i) vs (ii).
+- **V3 — outage-replay resumes:** replay requires an open breaker plus a
+  queued turn, so force the breaker open per the KPR-307 test recipe against
+  a thread that already carries a persisted aborted-turn handle, let the 15s
+  poller replay it, and confirm the replayed dispatch's spawn log shows the
+  persisted id. If forcing is impractical on the instance, V2 plus unit test
+  11 is the accepted fallback — record in the ticket which of the two was
+  done.
 - **V4 — rejection self-heal (only if V2 exposes behavior (ii)):** capture
-  the exact production error string, refine `isClaudeResumeLoadError` to
+  the exact production error string — inspect `RunResult.error` itself, not
+  just CLI stderr: the runner flattens non-success result subtypes into
+  `error` (agent-runner.ts L2167-2171, raw text only when an `errors` array
+  is present), so a mid-continuation API failure may surface as the bare
+  subtype (e.g. `error_during_execution`), which the matcher will never see — refine `isClaudeResumeLoadError` to
   match it (matcher refinement is in-contract, KPR-350 posture), and verify
   the "resume rejected — one fresh retry" warn fires and the retry completes.
   If V2 shows behavior (i), V4 is a no-op; the arm remains as insurance for
