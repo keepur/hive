@@ -1,3 +1,17 @@
 {"worker":"spec-drafter-kpr-387","phase":"draft-spec","ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T02:33:00Z"}
 {"worker":"spec-reviewer-kpr-387-r1","phase":"spec-review","round":1,"ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T02:40:00Z"}
 {"worker":"plan-writer-kpr-387","phase":"write-plan","ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T02:52:00Z"}
+{"worker":"plan-reviewer-kpr-387-r1","phase":"plan-review","round":1,"ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T02:58:00Z"}
+{"worker":"implementer-kpr-387-task1","phase":"implement","ticket":"KPR-387","tier":"opus","dispatched_at":"2026-08-26T03:10:00Z"}
+{"worker":"implementer-kpr-387-task2","phase":"implement","ticket":"KPR-387","tier":"opus","dispatched_at":"2026-08-26T03:16:00Z"}
+{"worker":"pre-pr-review-kpr-387-r1","phase":"pre-pr-review","round":1,"ticket":"KPR-387","tier":"opus","dispatched_at":"2026-08-26T03:22:00Z"}
+{"worker":"pre-pr-review-kpr-387-final","phase":"pre-pr-review","round":2,"ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T03:30:00Z"}
+{"worker":"create-tests-kpr-387","phase":"create-tests","ticket":"KPR-387","tier":"sonnet","dispatched_at":"2026-08-26T03:38:00Z"}
+{"worker":"verify-negative-kpr-387","phase":"verify","ticket":"KPR-387","tier":"haiku","dispatched_at":"2026-08-26T03:45:00Z"}
+{"worker":"local-ci-runner-kpr-387","phase":"verify","ticket":"KPR-387","tier":"haiku","dispatched_at":"2026-08-26T03:52:00Z"}
+{"worker":"docs-sync-kpr-387","phase":"submit-ticket-pr","ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T04:00:00Z"}
+{"worker":"child-pr-review-kpr-387-r1","phase":"child-pr-review","round":1,"ticket":"KPR-387","tier":"opus","dispatched_at":"2026-08-26T04:08:00Z"}
+{"worker":"fix-kpr-387-test-pin","phase":"child-pr-review-fix","ticket":"KPR-387","tier":"opus","dispatched_at":"2026-08-26T04:20:00Z"}
+{"worker":"child-pr-review-kpr-387-final","phase":"child-pr-review","round":2,"ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T04:25:00Z"}
+{"worker":"coherence-review-kpr-387","phase":"coherence","ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T04:45:00Z"}
+{"worker":"spec-drafter-kpr-388","phase":"draft-spec","ticket":"KPR-388","tier":"fable","dispatched_at":"2026-08-26T05:00:00Z"}
