@@ -435,3 +435,11 @@ Per `feedback_negative_verify_regression_tests` and spec test-plan item 3: prove
 - No changes to `classifyMeetingMessage` (prompt, schema, signatures), transcript fetching/injection (KPR-388), `conferenceRound` spawn shaping/telemetry (KPR-389), worker pool (KPR-390), reaction depth (`conferenceRound === 0` gate at ~1049 untouched), sweep/eviction, tracker persistence, or non-Slack conference support.
 - No config, schema, cross-module, or `docs/providers.md` changes.
 - Do not "clean up" the redundant `respondingAgentId` skip in `triggerConferenceReactions` — it guards the `humanTs`-undefined path.
+
+---
+
+## Reviewer notes (plan-review r1, fable — advisory)
+
+- Task 5a: `--grep="KPR-387"` must stay case-sensitive (lowercase `docs(kpr-387)` commits exist; they're also path-filtered out). Don't switch to `-i`.
+- Task 5b: vitest will render the 2 expected failures alongside ~6 filtered/skipped tests ("2 failed | 6 skipped") — the skipped count is not anomalous.
+- Environment: `node_modules` is not installed in this worktree — run `npm install` before the first verify step.
