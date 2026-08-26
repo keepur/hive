@@ -4037,6 +4037,55 @@ describe("AgentManager", () => {
       expect(auditArg.channelKind).toBe("sms");
     });
 
+    describe("intent-trailer telemetry (KPR-393 §D2)", () => {
+      function makeAuditManager() {
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+        return { activityLogger, localManager };
+      }
+
+      it("sets intentTrailer: true when the delivered text ends on an unexecuted commitment", async () => {
+        const { activityLogger, localManager } = makeAuditManager();
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ text: "Understood — I'll check the deploy logs and report back." }),
+        );
+        const item = makeWorkItem({ text: "check the logs", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item, "sms"));
+        expect(activityLogger.record).toHaveBeenCalledTimes(1);
+        expect(activityLogger.record.mock.calls[0]![0].intentTrailer).toBe(true);
+      });
+
+      it("omits the field entirely on a non-promise turn (absent, not false)", async () => {
+        const { activityLogger, localManager } = makeAuditManager();
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ text: "Done — the fix is deployed and the check passed." }),
+        );
+        const item = makeWorkItem({ text: "status?", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item, "sms"));
+        const arg = activityLogger.record.mock.calls[0]![0];
+        expect("intentTrailer" in arg).toBe(false);
+      });
+
+      it("error turn with promise-shaped text stays unflagged (a delivered error is not a promise)", async () => {
+        const { activityLogger, localManager } = makeAuditManager();
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ text: "I'll retry the deploy right away.", error: "exit code 1" }),
+        );
+        const item = makeWorkItem({ text: "deploy", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item, "sms"));
+        const arg = activityLogger.record.mock.calls[0]![0];
+        expect(arg.error).toBe("exit code 1");
+        expect("intentTrailer" in arg).toBe(false);
+      });
+    });
+
     it("voice carve-out: passes raw text to runner.send and skips model router", async () => {
       // KPR-219 design: voice has its own systemPromptOverride and explicitly
       // bypasses sender prepending + model router. KPR-224's prepareSpawn must
