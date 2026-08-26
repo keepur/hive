@@ -119,6 +119,25 @@ export function fileTierMemoryGuidance(): string {
   );
 }
 
+/**
+ * KPR-393 §D1: Lane B follow-through pressure. Composed ONLY by
+ * buildProviderInstructions (toolsExecutable-gated, directly after the
+ * toolkit — it references tools, so tool-adjacent guidance stays
+ * contiguous). buildPrefix never calls this: the Claude lane is trained
+ * against the intent-trailer failure mode and its golden bytes stay
+ * untouched. Generic phrasing by design — no per-tool paragraphs (the
+ * toolkit section already names callback/schedule where provisioned).
+ */
+export function followThroughSection(): string {
+  return (
+    "## Follow-through\n" +
+    "When your reply commits to an action, do the action first: execute it with your tools in this turn, then report the result. " +
+    'Never end a turn on unexecuted intent ("I\'ll check…", "on it", "first step is…").\n' +
+    "If you genuinely cannot proceed, do not promise — state exactly what you are waiting on and from whom.\n" +
+    "For work that must happen later, schedule it explicitly with your tools; do not assume a future turn will remember this one."
+  );
+}
+
 export interface MemorySectionsOptions {
   /**
    * §D3/§D5 tool-claim gate. False strips the two tool-instruction lines
@@ -306,7 +325,7 @@ export function skillsSection(skillIndex: ProviderSkillIndexEntry[]): string {
  * Claude-specific fragments, plus the inventory-rendered toolkit and the
  * skills section. Layer order (spec G2, † = gated by toolsExecutable):
  * soul → archetype card → systemPrompt → constitution → team summary →
- * †toolkit → †file-tier guidance (iff memory entry in inventory) →
+ * †toolkit → †follow-through (KPR-393) → †file-tier guidance (iff memory entry in inventory) →
  * †skills (iff index non-empty) → hot-tier/legacy memory (interior
  * tool-claim lines separately gated) → datetime trailer.
  */
@@ -332,6 +351,8 @@ export async function buildProviderInstructions(
 
   if (input.toolsExecutable) {
     parts.push(buildProviderToolkitSection({ toolInventory: input.toolInventory, plugins: input.plugins }));
+    // KPR-393 §D1: follow-through pressure directly after the toolkit.
+    parts.push(followThroughSection());
     // §D1: guidance keyed on the INVENTORY (same predicate spirit as the
     // Claude lane's coreServerNames check — but the inventory is Lane B's
     // source of truth for what is actually bridged).

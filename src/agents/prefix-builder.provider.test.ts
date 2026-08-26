@@ -214,6 +214,7 @@ describe("buildProviderInstructions — composition / order", () => {
       "GOLDEN-CONSTITUTION",
       "GOLDEN-TEAM",
       "## Your toolkit",
+      "## Follow-through",
       "## File-Tier Memory",
       "## Your skills",
       "## Your Memory",
@@ -229,10 +230,10 @@ describe("buildProviderInstructions — composition / order", () => {
   it("sections are joined by \\n\\n---\\n\\n (joiners = sections − 1)", async () => {
     const { cfg, input } = richInput(true);
     const { instructions } = await buildProviderInstructions(cfg, input);
-    // 10 sections: soul, card, systemPrompt, constitution, team, toolkit,
-    // file-tier, skills, memory, datetime → 9 joiners.
+    // 11 sections: soul, card, systemPrompt, constitution, team, toolkit,
+    // follow-through, file-tier, skills, memory, datetime → 10 joiners.
     const joinerCount = instructions.split(SECTION_JOINER).length - 1;
-    expect(joinerCount).toBe(9);
+    expect(joinerCount).toBe(10);
   });
 
   it("hotTierPrompt is returned alongside the folded-in instructions", async () => {
@@ -274,6 +275,7 @@ describe("buildProviderInstructions — toolsExecutable gate", () => {
     input.toolsExecutable = false;
     const { instructions } = await buildProviderInstructions(makeAgentConfig(), input);
     expect(instructions).not.toContain("## Your toolkit");
+    expect(instructions).not.toContain("## Follow-through");
     expect(instructions).not.toContain("## File-Tier Memory");
     expect(instructions).not.toContain("## Your skills");
     expect(instructions).toContain("GOLDEN-CONSTITUTION");
@@ -297,6 +299,20 @@ describe("buildProviderInstructions — toolsExecutable gate", () => {
     const { instructions } = await buildProviderInstructions(makeAgentConfig(), input);
     expect(instructions).not.toContain("## File-Tier Memory");
     expect(instructions).toContain("## Your Memory"); // injection is memoryManager-side
+  });
+
+  it("follow-through renders whenever tools are executable and pins the three binding clauses (KPR-393 §D1)", async () => {
+    const input = richInputs();
+    input.toolsExecutable = true;
+    input.skillIndex = []; // independent of skills/memory inventory
+    input.toolInventory = [engineEntry("slack")];
+    const { instructions } = await buildProviderInstructions(makeAgentConfig(), input);
+    expect(instructions).toContain("## Follow-through");
+    // The three behavioral clauses are binding (spec §D1); wording drift
+    // beyond them is fine, these anchors are not.
+    expect(instructions).toContain("do the action first");
+    expect(instructions).toContain("state exactly what you are waiting on and from whom");
+    expect(instructions).toContain("schedule it explicitly with your tools");
   });
 });
 
