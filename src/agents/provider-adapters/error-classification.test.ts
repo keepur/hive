@@ -16,6 +16,9 @@ function faultKind(error: string): ProviderFaultKind {
 
 describe("classifyTurnResult (KPR-306)", () => {
   it("classifies timedOut + aborted as a timeout fault (precedence over aborted)", () => {
+    // KPR-398 fail-closed pin: progress fields ABSENT ⇒ no progress ⇒ hard
+    // timeout. A caller passing a narrowed input keeps pre-KPR-398 behavior.
+    // Do not weaken this row.
     expect(classifyTurnResult({ timedOut: true, aborted: true })).toEqual({
       outcome: "fault",
       kind: "timeout",
@@ -219,5 +222,72 @@ describe("KPR-350 §D3 — stale-resume strings stay non-provider (no 404 row, e
       kind: "non-provider",
       message: error,
     });
+  });
+});
+
+describe("KPR-398 — deadline abort with observed progress", () => {
+  // New direction: a deadline abort with proof the provider responded this
+  // turn classifies the breaker-INCONCLUSIVE turn-deadline kind, never the
+  // streak-counting hard timeout.
+  it("incident shape (toolCalls=46, streamed, empty text) classifies turn-deadline — never hard", () => {
+    const c = classifyTurnResult({ timedOut: true, aborted: true, toolCalls: 46, streamed: true, text: "" });
+    expect(c).toMatchObject({ outcome: "fault", kind: "turn-deadline" });
+    expect(c.outcome === "fault" && HARD_FAULT_KINDS.has(c.kind)).toBe(false);
+  });
+
+  it.each([
+    ["toolCalls alone", { toolCalls: 1, streamed: false, text: "" }],
+    ["streamed alone", { toolCalls: 0, streamed: true, text: "" }],
+    ["text alone", { toolCalls: 0, streamed: false, text: "partial reply" }],
+  ] as const)("each signal is independently sufficient: %s", (_label, progress) => {
+    expect(classifyTurnResult({ timedOut: true, aborted: true, ...progress })).toMatchObject({
+      outcome: "fault",
+      kind: "turn-deadline",
+    });
+  });
+
+  it("with-progress message embeds deterministic evidence (telemetry-distinguishability pin)", () => {
+    // Distinguishes a claude with-progress deadline from both the old hard
+    // "turn deadline exceeded" and Lane B's bare error_turn_deadline sentinel
+    // in lastFaultMessage / hive doctor.
+    expect(
+      classifyTurnResult({ timedOut: true, aborted: true, toolCalls: 46, streamed: true, text: "" }),
+    ).toEqual({
+      outcome: "fault",
+      kind: "turn-deadline",
+      message: "turn deadline exceeded with progress (toolCalls=46, streamed=true, textLen=0)",
+    });
+  });
+
+  // Preserved direction: zero progress is the hang signature.
+  it("explicit zero-progress deadline abort keeps classifying hard timeout", () => {
+    expect(
+      classifyTurnResult({ timedOut: true, aborted: true, toolCalls: 0, streamed: false, text: "" }),
+    ).toEqual({ outcome: "fault", kind: "timeout", message: "turn deadline exceeded" });
+  });
+
+  // Negative pins: progress fields are consulted ONLY inside rule 1 and must
+  // not create new outcomes anywhere else.
+  it("aborted-only input stays neutral aborted regardless of progress", () => {
+    expect(classifyTurnResult({ aborted: true, toolCalls: 46, streamed: true })).toEqual({
+      outcome: "aborted",
+    });
+  });
+
+  it("plain error-string input ignores progress fields (pattern tables unchanged)", () => {
+    expect(classifyTurnResult({ error: "429 Too Many Requests", toolCalls: 46 })).toMatchObject({
+      outcome: "fault",
+      kind: "rate-limit",
+    });
+  });
+
+  it("no flags, no error, with progress → success", () => {
+    expect(classifyTurnResult({ toolCalls: 46, streamed: true })).toEqual({ outcome: "success" });
+  });
+
+  it("Lane B sentinel shape stays progress-blind turn-deadline (short-circuit unchanged)", () => {
+    expect(
+      classifyTurnResult({ error: TURN_DEADLINE_SUBTYPE, timedOut: true, aborted: false, toolCalls: 0 }),
+    ).toEqual({ outcome: "fault", kind: "turn-deadline", message: TURN_DEADLINE_SUBTYPE });
   });
 });
