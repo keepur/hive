@@ -3534,7 +3534,10 @@ describe("AgentManager", () => {
       });
 
       // --- 2. model chain -----------------------------------------------------
-      it("model chain: route model wins over configured and constructor default", async () => {
+      // Non-discriminating for precedence (route model == module default here);
+      // the discriminating precedence pin lives in provider-modules.test.ts
+      // (route-grok vs cfg-grok). This pin covers routing + model delivery only.
+      it("model chain: route model is delivered to the adapter", async () => {
         await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-modelchain-route" }));
         expect(mockGrokConstructor).toHaveBeenLastCalledWith(expect.objectContaining({ model: "grok-4.6" }));
       });

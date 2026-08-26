@@ -437,6 +437,12 @@ describe("GrokGatewayAdapter — tool round-trip", () => {
     expect(result.toolCalls).toBe(1);
   });
 
+  // Accepted asymmetry in the round-2 body this pins: the assistant message
+  // carries both duplicate tool_calls but only ONE role:"tool" result — an
+  // invalid chat-completions shape, reachable only when the gateway itself
+  // repeats a call id (the condition the dedup belt guards). The failure mode
+  // is an attributable status-prefixed 400, never silence; this is not the
+  // intended wire shape.
   it("duplicate call id (two fragments, same id, different indices) executes once — loop dedup via callId", async () => {
     const onCall = vi.fn();
     const fetchMock = sseScript(
