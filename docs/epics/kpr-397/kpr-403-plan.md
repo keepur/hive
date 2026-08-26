@@ -1217,3 +1217,11 @@ Expected: one hunk — the `turnDeadlineUpperBoundMs` wrapper (plus its doc comm
 - **[Prettier reflow]:** several new `it(...)` titles and object literals exceed print width; each task's `prettier --write` before commit rewraps them — do not treat the reflow as a deviation.
 - **[Interim-state note, Task 3]:** between Tasks 3 and 4 the old flat-bound recovery row still exists and passes (stamped-300k docs reproduce the 360s clock). Its deletion is Task 4's declared migration, not a fix-up.
 - **[Adjacent, out of scope]:** `ensureIndexes`'s comment mentions `recoverStaleReplaying` "still read by it" — remains true post-fix (the sweep's `status: "replaying"` equality uses the `{ status, enqueuedAt }` index prefix); deliberately not edited. The `hive doctor` outage-queue section and `db.telemetry` surfaces are untouched (no observability additions in this hotfix — spec Non-Goals).
+
+---
+
+## Plan-review advisories (r1, verbatim — implementer notes, not deviations)
+
+1. [Task 7, Step 1 / Regression Surface]: "the L180 pre-interval pin itself is byte-unmodified" is imprecise — the replacement appends a trailing comment to that line (the ASSERTION EXPRESSION is unchanged, the line is not). Fully declared verbatim; don't treat the wording as a diff-check predicate — read it as "assertion-unmodified".
+2. [Tasks 2/4/5/7, NV steps]: expected vitest failure phrasings are illustrative — exact runtime error text may vary; the binding check is WHICH ROWS FAIL.
+3. [Task 8, Step 5]: `git diff --stat` prints a summary line; compare the file SET ("change bars/summary line aside" — as already written).
