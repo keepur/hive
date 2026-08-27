@@ -1424,13 +1424,21 @@ export class Dispatcher {
         return {
           threadContext: this.formatSummaryContext(summary.summaryText, tail, channelName, roster),
           injectionMode: "summary",
+          // ⚠ R2 (requested relaxation, spec §D4). If the coherence reviewer
+          // rules F1 instead, the reversal is to delete THIS ENTIRE
+          // injectionHighWaterTs property — not just the coveredThroughTs term
+          // below. Dropping only that term still leaves a defined mark on every
+          // round-0 turn (the trigger ts) and every non-empty-tail turn (the
+          // tail max), which is the withdrawn "max in only when the tail is
+          // non-empty" variant, not F1. True F1 = no injectionHighWaterTs key
+          // at all ⇒ undefined ⇒ the else-if at :1114 never calls
+          // setMeetingMark on any summary turn, inverting five tests (both
+          // T2(a) cases, T2(b), T2(c), T5) — see the plan header.
           injectionHighWaterTs: maxSlackTs([
             ...tail.map((m) => m.ts),
-            // ⚠ R2 (requested relaxation, spec §D4): REQUIRED, not cosmetic.
-            // Without it an empty tail at round 1 yields undefined, setMeetingMark
-            // is skipped, and the agent never converts to delta. If the coherence
-            // reviewer rules F1 instead, the fix is to delete this one line (and
-            // invert T2(b)/T5) — see the plan header.
+            // REQUIRED under R2, not cosmetic: without this term an empty tail
+            // at round 1 yields undefined, setMeetingMark is skipped, and the
+            // agent never converts to delta.
             summary.coveredThroughTs,
             roundZeroTriggerTs,
           ]),

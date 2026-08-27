@@ -1335,9 +1335,13 @@ Meeting rules:
     });
 
     // ⚠ Written against R2 (spec §D4, plan header decision). If the coherence
-    // reviewer rules F1 instead, (b) and T5 INVERT: injectionHighWaterTs is
-    // always undefined in summary mode and setMeetingMark is never called —
-    // rewrite both to pin the absence.
+    // reviewer rules F1 instead, ALL FIVE of the tests below INVERT — both
+    // T2(a) cases, T2(b), T2(c) and T5 — because true F1 deletes the whole
+    // injectionHighWaterTs property from buildConferenceContext's summary arm
+    // (NOT merely the summary.coveredThroughTs term, which would leave a
+    // defined mark on every round-0 and non-empty-tail turn). With the property
+    // gone the mark is undefined and setMeetingMark is never called on any
+    // summary turn — rewrite all five to pin the absence.
     it("T2(a): summary mode, non-empty tail, round 0 — the trigger ts maxes in", async () => {
       await soloClassifier();
       const threadId = "conf-thread-summary-mark-trigger";
