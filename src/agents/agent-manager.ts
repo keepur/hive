@@ -1,5 +1,5 @@
 import { createLogger } from "../logging/logger.js";
-import type { AgentState, AgentStatus } from "../types/agent-config.js";
+import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
 import { AgentRegistry } from "./agent-registry.js";
@@ -46,7 +46,13 @@ import {
   type PassthroughSpawnConfig,
 } from "./provider-adapters/passthrough-providers.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
-import { classifyThrown, classifyTurnResult, TURN_DEADLINE_SUBTYPE } from "./provider-adapters/error-classification.js";
+import {
+  classifyThrown,
+  classifyTurnResult,
+  hasObservedProgress,
+  isClaudeResumeLoadError,
+  TURN_DEADLINE_SUBTYPE,
+} from "./provider-adapters/error-classification.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -886,6 +892,39 @@ export class AgentManager {
   }
 
   /**
+   * KPR-400 (F1): acquire-time UPPER BOUND on the turn's effective wall
+   * clock, threaded into the breaker as probe-staleness meta. The runner's
+   * effective deadline is `resourceLimits?.timeoutMs ?? agentConfig.timeoutMs
+   * ?? 300_000` (agent-runner.ts), and resourceLimits presence depends on
+   * the router gate — unknowable exactly before prepareSpawn runs. So:
+   * max(agent timeoutMs, claude static-tier limit). Over-estimating only
+   * delays reconciliation of a structurally-prevented lost-permit case;
+   * under-estimating is the live bug (a legitimate long probe stale-killed
+   * mid-flight — kpr-400-spec R2, ⚠A3). Non-claude routes never get Claude
+   * tier limits: Lane B pins `agentConfig.timeoutMs ?? 300_000` exactly at
+   * prepareSpawn, Lane A uses the runner's identical fallback.
+   */
+  private acquireDeadlineMs(provider: AgentProviderId, agentConfig: AgentConfig | undefined): number {
+    const configuredMs = agentConfig?.timeoutMs ?? 300_000;
+    if (!agentConfig || provider !== "claude") return configuredMs;
+    const tierLimitMs = resolveResourceLimits(modelToTier(agentConfig.model), agentConfig.resourceTiers).timeoutMs;
+    return Math.max(configuredMs, tierLimitMs);
+  }
+
+  /** KPR-403: D20 acquire-time upper bound, exposed for outage-doc stamping.
+   *  The dispatcher stamps each outage-queue doc with this bound at enqueue
+   *  (the seam that has registry access), so the store's recovery sweep can
+   *  read a doc's replay-turn wall-clock ceiling from the doc itself — no
+   *  registry dependency at recovery time. Unknown agents fall back to the
+   *  300s default (the doc still recovers by its stamped bound even if the
+   *  agent is later deleted — kpr-403-spec §Edge-4). */
+  turnDeadlineUpperBoundMs(agentId: string): number {
+    const agentConfig = this.registry.get(agentId);
+    const provider = agentConfig ? resolveProviderModel(agentConfig.model).provider : "claude";
+    return this.acquireDeadlineMs(provider, agentConfig);
+  }
+
+  /**
    * KPR-216: per-turn spawn API (Phase A). Spawns a fresh `query()` per
    * turn with `options.resume = ctx.sessionId`. Replaces the long-lived
    * AgentRunner.send() path for opt-in channels.
@@ -912,10 +951,14 @@ export class AgentManager {
       // withSpawnTicket's finally releases the per-thread lock, budget slot,
       // and ticket set on the way out (no new cleanup path). The lock is
       // held for microseconds during a fast-fail — no I/O precedes the throw.
-      const route = resolveProviderModel(this.registry.get(ctx.agentId)?.model ?? "");
+      const acquireAgentConfig = this.registry.get(ctx.agentId);
+      const route = resolveProviderModel(acquireAgentConfig?.model ?? "");
       const permit = this.circuitBreakers.acquire(route.provider, {
         agentId: ctx.agentId,
         threadId: ctx.threadId,
+        // KPR-400 (F1): the probe turn's own deadline (upper bound) drives
+        // the breaker's probe-staleness bound — see acquireDeadlineMs.
+        deadlineMs: this.acquireDeadlineMs(route.provider, acquireAgentConfig),
       });
 
       // KPR-220 Phase 15: re-resolve sessionId post-lock for reflection
@@ -1081,6 +1124,43 @@ export class AgentManager {
           });
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: adoptedSessionId },
+            shaping,
+            ticket,
+            onStream,
+          );
+        } else if (
+          // KPR-399 (§D3): claude-lane resume-rejection self-heal. The
+          // persist-on-abort arm (finalizeSpawnResult) creates a class of
+          // persisted ids whose resumability is uncertain (mid-tool-call
+          // kill, flush timing): the CLI may reject the resume
+          // (unknown-session) or the first continuation may 400 on a
+          // dangling tool_use. One fresh retry — bounded loss of one
+          // thread's context instead of a thread erroring identically until
+          // the 7-day row TTL. Semantics inherited from the arms above:
+          // `else if` ⇒ at most one retry per turn; record-once untouched
+          // (only the finalized attempt reaches the breaker); no pre-scrub —
+          // a successful retry overwrites the row via finalize, a failed one
+          // leaves it for the next turn's re-trip. SEMANTICS gate
+          // (client-transcript = claude + Lane A passthrough) — the KPR-347
+          // seam: dead for server-resumable (their resume errors have their
+          // own arm) and stateless-replay (nothing to resume). Both matcher
+          // surfaces classify non-provider (pinned), so the arm is
+          // breaker-invisible either way.
+          finalResult.error &&
+          isClaudeResumeLoadError(finalResult.error) &&
+          effectiveCtx.sessionId &&
+          sessionSemanticsFor(shaping.route.provider) === "client-transcript"
+        ) {
+          // Deliberately NOT logging the error string: the CLI's
+          // unknown-session surface embeds the session id (log-redaction
+          // posture — the KPR-350 arm's "no handle value" rule).
+          log.warn("spawnTurn claude resume rejected — one fresh retry (KPR-399)", {
+            agentId: effectiveCtx.agentId,
+            threadId: effectiveCtx.threadId,
+            timedOut: finalResult.timedOut === true,
+          });
+          finalResult = await this.runOneSpawnAttempt(
+            { ...effectiveCtx, sessionId: undefined },
             shaping,
             ticket,
             onStream,
@@ -1546,8 +1626,9 @@ export class AgentManager {
    * skip in runOneSpawnAttempt (no runTurn() call was made). Mirrors the pilot
    * adapters' buildResult zero-shape (all counters 0, toolSummary "none") with
    * `aborted: true` so classifyTurnResult resolves to "aborted" and the
-   * downstream finalize path (session persist skipped on aborted, telemetry
-   * skipped) behaves exactly as a real adapter-emitted abort. sessionId is the
+   * downstream finalize path (telemetry skipped; KPR-399's persist-on-abort
+   * arm skips this zero-progress shape too — fail-closed) behaves exactly as
+   * a real adapter-emitted abort. sessionId is the
    * resumed handle (if any) so finalizeSpawnResult's newSessionId stays intact.
    */
   private synthesizeAbortedResult(sessionId: string): RunResult {
@@ -1622,8 +1703,9 @@ export class AgentManager {
     // acquire site (KPR-306): SIGUSR1 hot-reload can remove the agent
     // between spawnTurn's registry pre-check and this point, and an
     // unguarded dereference would throw OUTSIDE the recorded try — skipping
-    // the breaker's record() and wedging a half-open probe permit for up to
-    // PROBE_STALE_MS. The degenerate route ({provider:"claude", model:""})
+    // the breaker's record() and wedging a half-open probe permit until the
+    // probe's own stale bound (deadlineMs + grace; 360s meta-less fallback —
+    // KPR-400). The degenerate route ({provider:"claude", model:""})
     // flows on instead; the turn then fails INSIDE the recorded try via
     // createProviderAdapter's `Unknown agent` throw (classifyThrown →
     // non-provider → never trips).
@@ -1800,7 +1882,16 @@ export class AgentManager {
 
     // Per-turn telemetry — independent of sessionStore (no history in
     // sessionStore.set). Aggregator in `hive doctor` reads this collection.
-    if (result.sessionId && !result.aborted) {
+    // KPR-401: aborted turns with real spend are recorded (sparse aborted
+    // flag on the doc); zero-usage aborted turns — operator abort before the
+    // first API call, and the manager's synthesizeAbortedResult early-abort
+    // shape (resumed sessionId, never spawned) — stay out: nothing to
+    // account, no noise docs. Deliberately provider-AGNOSTIC: Lane B
+    // adapters already return real partial totals on operator-aborted
+    // turns, and that spend is just as real — do not provider-gate this.
+    const hadUsage =
+      result.inputTokens + result.outputTokens + result.cacheReadTokens + result.cacheCreationTokens > 0;
+    if (result.sessionId && (!result.aborted || hadUsage)) {
       this.turnTelemetryStore
         .record({
           agentId: ctx.agentId,
@@ -1813,6 +1904,8 @@ export class AgentManager {
           cacheCreationTokens: result.cacheCreationTokens,
           ephemeral5mTokens: result.ephemeral5mTokens,
           ephemeral1hTokens: result.ephemeral1hTokens,
+          // KPR-401: sparse — only aborted:true is ever written.
+          ...(result.aborted ? { aborted: true as const } : {}),
         })
         .catch(() => {
           // Already logged inside the store via withRetry. Swallow here.
@@ -1863,11 +1956,41 @@ export class AgentManager {
       compactions: result.compactions,
       streamed: result.streamed,
       error: result.error,
+      // KPR-401: sparse abort flags — the audit row's costUsd:0/durationMs
+      // zeros on aborted turns are now segmentable instead of masquerading
+      // as free, instant, clean turns.
+      ...(result.aborted ? { aborted: true } : {}),
+      ...(result.timedOut ? { timedOut: true } : {}),
     });
   }
 
   private finalizeSpawnResult(ctx: TurnContext, result: RunResult, route: ProviderModelRoute): TurnResult {
     const newSessionId = result.sessionId || ctx.sessionId || "";
+    // KPR-399 (§D2): an aborted claude-lane turn with observed progress
+    // persists its session so replays/retries/follow-ups RESUME instead of
+    // restarting from scratch. client-transcript ONLY (cross-epic canon C3 —
+    // claude + Lane A kimi/deepseek/grok): the id is a local transcript
+    // handle the CLI flushed incrementally, and observed progress (the
+    // exported KPR-398 D1 predicate — one source of truth with the
+    // classifier) is the proof it actually ran. Zero-progress aborts persist
+    // nothing (fail-closed = pre-399 behavior): the id may point at a
+    // never-flushed file, and a rotated id with zero progress is
+    // indistinguishable from a failed-resume mint (churn-mint's own
+    // rationale). Lane B (server-resumable / stateless-replay) keeps the
+    // !aborted behavior byte-for-byte — resume-on-abort there goes through
+    // the KPR-385 scaffold hooks, never a silent unification here.
+    const abortPersist =
+      result.aborted === true &&
+      !!result.sessionId &&
+      sessionSemanticsFor(route.provider) === "client-transcript" &&
+      hasObservedProgress(result) &&
+      // Mint-safety belt (the ⚠A4 churn-mint condition, applied verbatim):
+      // an aborted turn that ALSO errored, resumed a session, and came back
+      // with a DIFFERENT id never overwrites the row. Rare shape (deadline
+      // aborts carry no error), but it makes this arm self-evidently
+      // mint-safe.
+      !(result.error && ctx.sessionId && result.sessionId !== ctx.sessionId);
+
     if (result.sessionId && !result.aborted) {
       // KPR-313 §3.2: persist a resumable handle ONLY for providers whose
       // adapters actually resume. Stateless pilots keep the ROW (the session
@@ -1902,6 +2025,20 @@ export class AgentManager {
           preCompactTokens: result.preCompactTokens,
         });
       }
+    } else if (abortPersist) {
+      log.info("Persisting session from aborted turn — replay/follow-up will resume (KPR-399)", {
+        agentId: ctx.agentId,
+        threadId: ctx.threadId,
+        timedOut: result.timedOut === true,
+      });
+      // NO tokenData: deliberate. Post-KPR-401 an aborted turn CAN carry real
+      // partial usage (streamed-usage accumulator), but back-filling the
+      // session row's tokenData from a partial snapshot is a recorded
+      // follow-up (epic canon D15), not this write's job — set() without
+      // tokenData updates only sessionId/provider/updatedAt, preserving the
+      // prior turn's stats (session-store.ts set(): defaults land
+      // $setOnInsert-only).
+      this.sessionStore.set(ctx.agentId, ctx.threadId, result.sessionId, route.provider);
     }
 
     const state = this.states.get(ctx.agentId)!;

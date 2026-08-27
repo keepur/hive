@@ -35,6 +35,19 @@ export const DEFAULT_OUTAGE_QUEUE_CONFIG: OutageQueueConfig = {
 export type OutagePolicy = "notify" | "silent";
 export type OutageQueueStatus = "pending" | "replaying" | "done" | "expired" | "failed";
 
+/**
+ * KPR-400 (F2): why the doc was enqueued — drives claimNext's class
+ * ordering. "fast-fail" = the turn never ran (ProviderCircuitOpenError,
+ * rejected pre-router — zero evidence of being expensive, typically live
+ * interactive traffic). "post-turn-fault" = the turn RAN and classified
+ * into HARD_FAULT_KINDS with the breaker open (trip-crossing turns, incl.
+ * zero-progress deadline burns). The string values are load-bearing:
+ * "fast-fail" < "post-turn-fault" lexicographically, so a plain ascending
+ * sort yields the class preference (pinned in outage-queue-store.test.ts,
+ * spec ⚠A2 — a numeric weight field is an acceptable substitution).
+ */
+export type OutageEnqueueOrigin = "fast-fail" | "post-turn-fault";
+
 export interface OutageQueueDoc {
   _id?: ObjectId;
   /** Original WorkItem.id — composite-unique with agentId: a fan-out dispatch
@@ -47,6 +60,22 @@ export interface OutageQueueDoc {
   /** Serialized verbatim — Date + meta survive the BSON round-trip. */
   workItem: WorkItem;
   policy: OutagePolicy;
+  /** KPR-400 (F2): immutable after first enqueue ($setOnInsert; back-to-
+   *  pending releases never touch it — a replay that fast-fails again keeps
+   *  its original class, spec §Edge-7). Optional: absent on pre-KPR-400
+   *  docs — BSON type ordering sorts missing before string, so legacy docs
+   *  claim with top (fast-fail-class) priority for the one
+   *  deploy-mid-outage window (spec ⚠A5, accepted). */
+  enqueueOrigin?: OutageEnqueueOrigin;
+  /** KPR-403: upper bound on ONE replay turn's wall clock for this doc's
+   *  agent, captured at enqueue (D20 semantics via
+   *  AgentManager.turnDeadlineUpperBoundMs; mirrors the breaker acquire
+   *  meta's deadlineMs naming, KPR-400 F1). $setOnInsert-immutable —
+   *  back-to-pending releases and recovery never touch it; a re-enqueue
+   *  after config drift does not rewrite it (spec ⚠A3). Optional: absent
+   *  on pre-KPR-403 docs, which take the recovery sweep's legacy 300s
+   *  fallback (spec ⚠A2, D19-analog posture). */
+  deadlineMs?: number;
   status: OutageQueueStatus;
   /** Real (non-fast-fail) replay attempts. Breaker-open retries are free and never counted. */
   attempts: number;
@@ -65,16 +94,31 @@ export interface OutageEnqueueInput {
   provider: string;
   workItem: WorkItem;
   policy: OutagePolicy;
+  /** KPR-400 (F2): required from callers — see OutageEnqueueOrigin. */
+  enqueueOrigin: OutageEnqueueOrigin;
+  /** KPR-403: required from callers — see OutageQueueDoc.deadlineMs. */
+  deadlineMs: number;
 }
 
 /** Terminal-doc hygiene TTL (⚠ spec §10): 7 days. */
 const TERMINAL_TTL_SECONDS = 7 * 24 * 3600;
 
-/** `replaying` docs older than one turn deadline (300s) + slack revert to
- *  pending at boot — crash between claim and release (spec §7.1). */
-export const STALE_REPLAYING_MS = 300_000 + 60_000;
+/** Legacy-doc fallback: pre-KPR-403 docs carry no deadlineMs; 300s was the
+ *  flat-deadline assumption the old STALE_REPLAYING_MS encoded. */
+export const STALE_REPLAYING_FALLBACK_MS = 300_000;
+/** Grace beyond the turn's deadline for outcome-write + delivery latency. */
+export const STALE_REPLAYING_GRACE_MS = 60_000;
 
 export class OutageQueueStore {
+  /** KPR-403: `${itemId}:${agentId}` keys already warned about by
+   *  recoverStaleReplaying's malformed-doc skip. Sustained-condition
+   *  discipline per dispatcher §7.6 — one warn per episode: the
+   *  lastAttemptAt-null state is unreachable via engine code and permanent
+   *  until manual repair, so warning on every 15s tick forever would be a
+   *  4/min log storm. Per-process first sight keeps it conspicuous without
+   *  the storm. */
+  private warnedMalformedRecoveryKeys = new Set<string>();
+
   constructor(
     private collection: Collection<OutageQueueDoc>,
     private now: () => Date = () => new Date(),
@@ -86,6 +130,10 @@ export class OutageQueueStore {
     // of the fanned agents' replies (spec §7.1).
     await this.collection.createIndex({ itemId: 1, agentId: 1 }, { unique: true });
     await this.collection.createIndex({ status: 1, enqueuedAt: 1 });
+    // KPR-400 (F2): claimNext's class-ordered sort. The plain
+    // { status, enqueuedAt } index above stays — expireOlderThan and
+    // recoverStaleReplaying still read by it (harmless, other readers).
+    await this.collection.createIndex({ status: 1, enqueueOrigin: 1, enqueuedAt: 1 });
     // TTL applies only to docs where doneAt is a Date (terminal states);
     // pending/replaying docs carry doneAt: null and Mongo TTL skips non-Date values.
     await this.collection.createIndex({ doneAt: 1 }, { expireAfterSeconds: TERMINAL_TTL_SECONDS });
@@ -101,6 +149,10 @@ export class OutageQueueStore {
           provider: input.provider,
           workItem: input.workItem,
           policy: input.policy,
+          // KPR-400 (F2): $setOnInsert = immutable after first enqueue.
+          enqueueOrigin: input.enqueueOrigin,
+          // KPR-403: same immutability — the stamp is the enqueue-time truth.
+          deadlineMs: input.deadlineMs,
           status: "pending",
           attempts: 0,
           enqueuedAt: this.now(),
@@ -114,13 +166,22 @@ export class OutageQueueStore {
     );
   }
 
-  /** Atomic pending→replaying claim, oldest enqueuedAt first — copies the
-   *  callback poller's mark-before-dispatch pattern (scheduler.ts). */
+  /** Atomic pending→replaying claim — copies the callback poller's
+   *  mark-before-dispatch pattern (scheduler.ts). KPR-400 (F2):
+   *  class-ordered — fast-fail-class docs (turns that never ran) before
+   *  post-turn-fault-class docs (turns that demonstrably ran into a hard
+   *  fault, incl. full-deadline burns), oldest enqueuedAt first WITHIN each
+   *  class — so after cooldown the drain's next claim (with high
+   *  probability the half-open probe) is the cheapest available real turn.
+   *  Ascending sort on the origin string IS the class preference
+   *  ("fast-fail" < "post-turn-fault"); missing/legacy docs sort first
+   *  under BSON type order (null/missing < string — documented Mongo
+   *  behavior, mirrored in the test fake; spec ⚠A5). */
   async claimNext(): Promise<OutageQueueDoc | null> {
     return this.collection.findOneAndUpdate(
       { status: "pending" },
       { $set: { status: "replaying", lastAttemptAt: this.now() } },
-      { sort: { enqueuedAt: 1 }, returnDocument: "after" },
+      { sort: { enqueueOrigin: 1, enqueuedAt: 1 }, returnDocument: "after" },
     );
   }
 
@@ -196,16 +257,44 @@ export class OutageQueueStore {
     return docs;
   }
 
-  /** Boot recovery: crash between claim and release leaves `replaying` orphans. */
-  async recoverStaleReplaying(staleMs: number = STALE_REPLAYING_MS): Promise<number> {
-    const cutoff = new Date(this.now().getTime() - staleMs);
-    const result = await this.collection.updateMany(
-      { status: "replaying", lastAttemptAt: { $lt: cutoff } },
-      { $set: { status: "pending" } },
-    );
-    if (result.modifiedCount > 0) {
-      log.warn("Recovered stale replaying outage docs to pending", { count: result.modifiedCount });
+  /** Recovery sweep: crash between claim and release leaves `replaying`
+   *  orphans. Per-doc deadline-aware (KPR-403): a doc is stale only past its
+   *  own stamped turn-deadline upper bound (+grace) — never while its replay
+   *  turn could legitimately still be running. Runs at boot AND every poller
+   *  tick (the boot-only sweep stranded young orphans forever). CAS on
+   *  (_id, status, lastAttemptAt) so a doc that moved under the sweep —
+   *  released and re-claimed between read and write — is left alone. */
+  async recoverStaleReplaying(): Promise<number> {
+    const nowMs = this.now().getTime();
+    const docs = await this.collection.find({ status: "replaying" }).toArray();
+    let recovered = 0;
+    for (const doc of docs) {
+      if (!doc.lastAttemptAt) {
+        // Unreachable via claimNext (it always stamps lastAttemptAt) — skip,
+        // but loudly: malformed data should be conspicuous, not recycled.
+        // Latched to first sight per doc per process (see
+        // warnedMalformedRecoveryKeys): the skip itself is unconditional.
+        const key = `${doc.itemId}:${doc.agentId}`;
+        if (!this.warnedMalformedRecoveryKeys.has(key)) {
+          this.warnedMalformedRecoveryKeys.add(key);
+          log.warn("Replaying doc with no lastAttemptAt — skipped by recovery", {
+            itemId: doc.itemId,
+            agentId: doc.agentId,
+          });
+        }
+        continue;
+      }
+      const boundMs = (doc.deadlineMs ?? STALE_REPLAYING_FALLBACK_MS) + STALE_REPLAYING_GRACE_MS;
+      if (nowMs - doc.lastAttemptAt.getTime() <= boundMs) continue;
+      const result = await this.collection.updateOne(
+        { _id: doc._id, status: "replaying", lastAttemptAt: doc.lastAttemptAt },
+        { $set: { status: "pending" } },
+      );
+      recovered += result.modifiedCount;
     }
-    return result.modifiedCount;
+    if (recovered > 0) {
+      log.warn("Recovered stale replaying outage docs to pending", { count: recovered });
+    }
+    return recovered;
   }
 }
