@@ -64,15 +64,19 @@ const active = new Map<string, RegisteredProvider>();
 const declared = new Map<string, DeclaredPending>();
 const broken = new Map<string, BrokenProvider>();
 
-// Built-in seed — at module load, once per process.
-for (const [id, module] of Object.entries(LANE_B_PROVIDER_MODULES)) {
-  active.set(id, {
-    id,
-    module,
-    semantics: SESSION_SEMANTICS[id as keyof typeof SESSION_SEMANTICS],
-    source: "builtin",
-  });
+function seedBuiltinProviders(): void {
+  for (const [id, module] of Object.entries(LANE_B_PROVIDER_MODULES)) {
+    active.set(id, {
+      id,
+      module,
+      semantics: SESSION_SEMANTICS[id as keyof typeof SESSION_SEMANTICS],
+      source: "builtin",
+    });
+  }
 }
+
+// Built-in seed — at module load, once per process.
+seedBuiltinProviders();
 
 /** §4.2: the engine-injected kit — the RUNNING engine's shared layer by
  *  reference, so shared fixes cover plugin providers structurally. */
@@ -135,6 +139,24 @@ export function declarePluginProviders(
         provider: id,
         first: owner,
         second: plugin.name,
+      });
+      continue;
+    }
+    if (active.get(id)?.source === "builtin") {
+      // Edge 2 — a built-in engine provider already owns this id. The static
+      // RESERVED_PROVIDER_IDS list also covers today's built-ins, but that
+      // list is hand-maintained and WILL drift the day a new built-in ships
+      // without a matching list edit; this guard keys on the live seed, so a
+      // plugin can never replace a built-in module. Declared-broken, never
+      // shadowed — same first-wins/deterministic posture as the
+      // plugin-vs-plugin arm (the second plugin to try hits the collision
+      // arm above, since this row claims the id).
+      const reason = `provider id '${id}' is already served by a built-in engine provider — a plugin cannot replace a built-in`;
+      broken.set(id, { plugin: plugin.name, reason });
+      log.error("Provider plugin would shadow a built-in provider — declared-broken (KPR-394 edge 2)", {
+        provider: id,
+        plugin: plugin.name,
+        reason,
       });
       continue;
     }
@@ -297,20 +319,27 @@ export interface OrphanProviderModel {
  * /-prefix matching no registered or built-in provider — such turns run on
  * Claude via the unknown-prefix canon (e.g. after `hive plugin remove`).
  * Returns the orphan list so callers/tests can observe it.
+ *
+ * `model` is typed loosely and guarded on purpose: the rows are DB-sourced,
+ * and this scan runs at boot (a throw reaches main().catch — the engine does
+ * not start) and on every SIGUSR1 reload (a throw aborts the reload). One
+ * malformed agent doc must never cost the fleet either. Mirrors the sibling
+ * doctor implementation (`doctor-checks.ts`).
  */
 export function warnOrphanProviderPrefixes(
-  agents: readonly { agentId: string; model: string }[],
+  agents: readonly { agentId: string; model?: unknown }[],
 ): OrphanProviderModel[] {
   const orphans: OrphanProviderModel[] = [];
   for (const a of agents) {
-    const slash = a.model.indexOf("/");
+    const model = typeof a.model === "string" ? a.model : "";
+    const slash = model.indexOf("/");
     if (slash <= 0) continue;
-    const prefix = a.model.slice(0, slash).toLowerCase();
+    const prefix = model.slice(0, slash).toLowerCase();
     if (BUILTIN_ROUTABLE_PREFIXES.has(prefix) || isPluginDeclaredProvider(prefix)) continue;
-    orphans.push({ agentId: a.agentId, model: a.model, prefix });
+    orphans.push({ agentId: a.agentId, model, prefix });
     log.warn(
       "Agent model carries an unknown provider prefix — turns run on Claude via the unknown-prefix canon; if this id belonged to a removed provider plugin, repoint the agent's model",
-      { agentId: a.agentId, model: a.model, prefix },
+      { agentId: a.agentId, model, prefix },
     );
   }
   return orphans;
@@ -328,9 +357,12 @@ export function __markBrokenPluginProviderForTests(id: string, b: BrokenProvider
   broken.set(id, b);
 }
 
-/** Remove all plugin state; built-in seed stays. */
+/** Remove all plugin state and re-seed the built-ins from the table — a
+ *  full reset, so a test that seeds a synthetic built-in id (edge 2) does
+ *  not leak it into the next test. */
 export function __resetPluginProvidersForTests(): void {
-  for (const [id, p] of [...active]) if (p.source !== "builtin") active.delete(id);
+  active.clear();
+  seedBuiltinProviders();
   declared.clear();
   broken.clear();
 }

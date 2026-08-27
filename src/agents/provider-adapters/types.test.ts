@@ -2,14 +2,16 @@ import { describe, expect, it } from "vitest";
 import {
   SESSION_SEMANTICS,
   persistsResumableHandle,
-  sessionSemanticsFor,
   type AgentProviderId,
   type LaneBProviderId,
 } from "./types.js";
 
 describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
-  // Persistence pin: persistsResumableHandle(sessionSemanticsFor(p)) is true
-  // for every provider that holds a real resumable handle. This once mirrored
+  // Persistence pin: persistsResumableHandle(SESSION_SEMANTICS[p]) is true
+  // for every provider that holds a real resumable handle. (Reads the Record
+  // directly since KPR-394 retired the `sessionSemanticsFor` accessor —
+  // route-side lookups belong to the registry's `sessionSemanticsForRoute`.)
+  // This once mirrored
   // the deleted RESUMABLE_SESSION_PROVIDERS = {claude, openai} membership, but
   // gemini exited stateless-replay in KPR-352 (§D3 — Interactions adapter
   // chains previous_interaction_id, a real server handle), so the old-Set
@@ -23,7 +25,7 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
     ["deepseek", true],
     ["grok", false], // KPR-392: stateless-replay, was client-transcript under Lane A
   ] as const)("%s → persistsResumableHandle=%s", (provider, expected) => {
-    expect(persistsResumableHandle(sessionSemanticsFor(provider as AgentProviderId))).toBe(expected);
+    expect(persistsResumableHandle(SESSION_SEMANTICS[provider as AgentProviderId])).toBe(expected);
   });
 
   it("declares exactly the seven current provider ids (Record exhaustiveness is compile-time)", () => {

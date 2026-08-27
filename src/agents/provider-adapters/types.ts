@@ -91,9 +91,13 @@ export const SESSION_SEMANTICS: Readonly<Record<AgentProviderId, SessionSemantic
   grok: "stateless-replay",
 };
 
-export function sessionSemanticsFor(provider: AgentProviderId): SessionSemantics {
-  return SESSION_SEMANTICS[provider];
-}
+// KPR-394: the former `sessionSemanticsFor(provider)` accessor is deleted.
+// It read the built-in Record only, so it silently answered wrong for plugin
+// providers — and it sat one character from the registry-aware
+// `sessionSemanticsForRoute` (provider-registry.ts), the trap being a future
+// caller reaching for the obvious name and losing plugin providers. Read
+// SESSION_SEMANTICS directly for built-in-only facts; route lookups go
+// through `sessionSemanticsForRoute`.
 
 /** True ⇔ the persisted sessionId is a real handle worth storing/resuming. */
 export function persistsResumableHandle(semantics: SessionSemantics): boolean {

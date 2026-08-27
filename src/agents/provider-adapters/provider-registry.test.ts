@@ -115,6 +115,24 @@ describe("declare (phase a)", () => {
     expect(collisionLog![1]).toMatchObject({ provider: "sol", first: "hive-plugin-sol", second: "hive-plugin-sol2" });
   });
 
+  it("a plugin cannot shadow a BUILT-IN-seeded id — declared-broken, built-in module keeps the slot (edge 2)", () => {
+    // 'sol' is deliberately NOT in RESERVED_PROVIDER_IDS: this pins the guard
+    // to the live built-in seed, not to the hand-maintained reserved list
+    // (which will drift the day a new built-in ships without a list edit).
+    const builtinModule = fakeModule("sol");
+    __registerActivePluginProviderForTests({
+      id: "sol",
+      module: builtinModule as any,
+      semantics: "stateless-replay",
+      source: "builtin",
+    });
+    declareFixture();
+    expect(describeUnroutableProvider("sol")).toMatch(/built-in/);
+    const p = getRegisteredProvider("sol")!;
+    expect(p.source).toBe("builtin");
+    expect(p.module).toBe(builtinModule); // never replaced by the plugin's
+  });
+
   it("re-declare from the SAME plugin is idempotent (manager re-construction)", () => {
     declareFixture();
     declareFixture();
@@ -202,6 +220,19 @@ describe("semantics overlay + orphans + fixture e2e", () => {
     ]);
     expect(orphans).toEqual([{ agentId: "a5", model: "zeta/zeta-9", prefix: "zeta" }]);
     expect(mockLog.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("warnOrphanProviderPrefixes: a malformed agent doc never throws (boot + SIGUSR1 safety)", () => {
+    // A throw here reaches main().catch at boot (engine won't start) and
+    // aborts the registry reload on SIGUSR1 — one bad doc must not cost that.
+    const orphans = warnOrphanProviderPrefixes([
+      { agentId: "no-model" },
+      { agentId: "undef-model", model: undefined },
+      { agentId: "num-model", model: 42 },
+      { agentId: "null-model", model: null },
+      { agentId: "a5", model: "zeta/zeta-9" },
+    ]);
+    expect(orphans).toEqual([{ agentId: "a5", model: "zeta/zeta-9", prefix: "zeta" }]);
   });
 
   it("fixture e2e: real loadPlugins → declare → REAL dynamic import → adapter turn", async () => {

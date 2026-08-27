@@ -9,6 +9,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { allCredentialKeys } from "../setup/credential-registry.js";
 import type { PluginProviderDecl } from "./types.js";
 
 /** §4.1: model-prefix shape — lowercase, 2–16 chars, letter first. */
@@ -52,6 +53,18 @@ export const BUILTIN_ROUTABLE_PREFIXES: ReadonlySet<string> = new Set([
 ]);
 
 const ENV_KEY_REGEX = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * §4.9: a plugin provider is never handed a sibling's credential. `api-key-env`
+ * is otherwise unconstrained — the engine resolves whatever it names through
+ * env → Honeypot Keychain and hands the value to the plugin's module — so a
+ * manifest naming e.g. ANTHROPIC_API_KEY or GROK_GATEWAY_KEY would be a
+ * curated-registry credential grab. Derived from the curated registry itself,
+ * never hand-copied, so new engine credentials are covered the day they land.
+ * (credential-registry.ts is pure data with no imports of its own — the
+ * dependency-light posture of this module is preserved.)
+ */
+const RESERVED_CREDENTIAL_KEYS: ReadonlySet<string> = new Set(allCredentialKeys());
 
 /**
  * Structural normalization — THROWS on garbage (missing/mistyped required
@@ -130,6 +143,12 @@ export function validateProviderDecl(decl: PluginProviderDecl, engineAbi: number
   if (decl.apiKeyEnv !== undefined && !ENV_KEY_REGEX.test(decl.apiKeyEnv)) {
     return { ok: false, reason: `provider.api-key-env '${decl.apiKeyEnv}' is not a valid env var name` };
   }
+  if (decl.apiKeyEnv !== undefined && RESERVED_CREDENTIAL_KEYS.has(decl.apiKeyEnv)) {
+    return {
+      ok: false,
+      reason: `provider.api-key-env '${decl.apiKeyEnv}' is a curated engine credential key — a provider plugin must declare its own key (§4.9: a plugin provider is never handed a sibling's credential)`,
+    };
+  }
   if (decl.baseUrlEnv !== undefined && !ENV_KEY_REGEX.test(decl.baseUrlEnv)) {
     return { ok: false, reason: `provider.base-url-env '${decl.baseUrlEnv}' is not a valid env var name` };
   }
@@ -189,11 +208,13 @@ export function auditInstalledProviderDecls(
   const seen = new Map<string, string>(); // id → first registrant
   for (const { plugin, decl } of readInstalledProviderDecls(pluginNames, rootDir)) {
     const base = { plugin, id: decl.id, abi: decl.abi, semantics: decl.sessionSemantics };
-    const verdict = validateProviderDecl(decl, engineAbi);
-    if (!verdict.ok) {
-      rows.push({ ...base, status: "broken", reason: verdict.reason });
-      continue;
-    }
+    // Collision keying mirrors the runtime's `pluginOwnerOf`: the FIRST
+    // declarant claims the id even when its own decl is invalid (the runtime
+    // records it in `broken`, which owns the id for the process's life). So a
+    // later valid declarant of the same id renders broken-by-collision here —
+    // matching runtime, where every turn on that id fails with the FIRST
+    // declarant's reason. Validating before claiming would render the second
+    // "ok" in doctor while runtime fails it.
     const first = seen.get(decl.id);
     if (first) {
       rows.push({
@@ -204,6 +225,11 @@ export function auditInstalledProviderDecls(
       continue;
     }
     seen.set(decl.id, plugin);
+    const verdict = validateProviderDecl(decl, engineAbi);
+    if (!verdict.ok) {
+      rows.push({ ...base, status: "broken", reason: verdict.reason });
+      continue;
+    }
     if (resolveEntry && !resolveEntry(plugin, decl.entry)) {
       rows.push({
         ...base,

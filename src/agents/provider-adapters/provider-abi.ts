@@ -24,6 +24,15 @@ import type { createLogger } from "../../logging/logger.js";
  * Exact integer, not semver: the ABI is one frozen contract, and
  * "compatible range" semantics invite the silent-drift class the freeze
  * exists to prevent.
+ *
+ * ⚠ PLUGIN AUTHORS: do NOT import this constant at runtime. It is a value
+ * living behind a **types-only** subpath export (`@keepur/hive/provider-abi`
+ * maps to a `.d.ts` only), so `import { LANE_B_PROVIDER_ABI_VERSION }` in
+ * plugin code typechecks and then throws ERR_PACKAGE_PATH_NOT_EXPORTED when
+ * Node loads the module. Declare the version statically as `abi:` in
+ * plugin.yaml (the engine handshake reads it from there), and read
+ * `kit.abiVersion` inside `createProviderModule(kit)` if you need it at
+ * runtime.
  */
 export const LANE_B_PROVIDER_ABI_VERSION = 1;
 

@@ -11,6 +11,7 @@ import {
   readInstalledProviderDecls,
   validateProviderDecl,
 } from "./provider-decl.js";
+import { allCredentialKeys } from "../setup/credential-registry.js";
 
 const FULL_RAW = {
   id: "sol",
@@ -125,6 +126,21 @@ describe("validateProviderDecl", () => {
     const v = validateProviderDecl(decl({ "base-url-env": "1BAD" }), 1);
     expect(v.ok).toBe(false);
   });
+
+  it("api-key-env naming ANY curated engine credential key is rejected (§4.9 — no sibling credentials)", () => {
+    const keys = allCredentialKeys();
+    expect(keys).toContain("ANTHROPIC_API_KEY"); // registry sanity, not a hand-copied list
+    for (const key of keys) {
+      const v = validateProviderDecl(decl({ "api-key-env": key }), 1);
+      expect(v.ok, key).toBe(false);
+      if (!v.ok) expect(v.reason).toMatch(/curated engine credential key/);
+    }
+  });
+
+  it("a novel provider key is accepted", () => {
+    expect(allCredentialKeys()).not.toContain("SOL_API_KEY");
+    expect(validateProviderDecl(decl({ "api-key-env": "SOL_API_KEY" }), 1)).toEqual({ ok: true });
+  });
 });
 
 describe("readInstalledProviderDecls / auditInstalledProviderDecls", () => {
@@ -192,6 +208,26 @@ describe("readInstalledProviderDecls / auditInstalledProviderDecls", () => {
     expect(rows[0]!.status).toBe("ok");
     expect(rows[1]!.status).toBe("broken");
     expect(rows[1]!.reason).toContain("hive-plugin-sol");
+  });
+
+  it("audit: an INVALID first declarant still claims the id — the later valid one is broken-by-collision (runtime parity)", () => {
+    // Runtime's declare pass records the first declarant in `broken`, which
+    // owns the id for the process's life; every turn on 'sol' then fails with
+    // plugin A's reason. Doctor must not render B "ok" while runtime fails it.
+    const root = makeRoot(); // hive-plugin-sol declares sol validly at abi 1
+    const dir = join(root, "plugins", "hive-plugin-solbad");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "plugin.yaml"),
+      "name: hive-plugin-solbad\nprovider:\n  id: sol\n  entry: provider.ts\n  abi: 2\n  session-semantics: stateless-replay\n",
+    );
+    // A (invalid, abi 2 vs engine 1) is first; B (valid) is second.
+    const rows = auditInstalledProviderDecls(["hive-plugin-solbad", "hive-plugin-sol"], root, 1);
+    expect(rows[0]!.status).toBe("broken");
+    expect(rows[0]!.reason).toContain("ABI 2"); // A: its own abi reason
+    expect(rows[1]!.status).toBe("broken"); // B: never "ok" while runtime fails it
+    expect(rows[1]!.reason).toMatch(/id collision/);
+    expect(rows[1]!.reason).toContain("hive-plugin-solbad");
   });
 
   it("audit: unresolvable entry is a broken row when a resolver is supplied", () => {
