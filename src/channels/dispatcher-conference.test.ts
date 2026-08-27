@@ -1627,7 +1627,7 @@ Meeting rules:
       expect(scribe.noteActivity).toHaveBeenCalledTimes(1);
     });
 
-    it("T6: a scribe whose getSummary REJECTS is contained by the caller, never by the anchor", async () => {
+    it("T6: a scribe whose getSummary REJECTS degrades to the full arm — it never blocks the turn", async () => {
       await soloClassifier();
       const threadId = "conf-thread-summary-throws";
       const scribe = {
@@ -1637,28 +1637,29 @@ Meeting rules:
       dispatcher.setMeetingScribe(scribe as any);
       mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
 
-      // ⚠ Honest pin of TODAY's behavior, not of a tolerance the dispatcher
-      // does not have: `await this.meetingScribe?.getSummary(...)` sits on the
-      // un-try/catch'd resolveAgents path, so a REJECTING fake rejects
-      // dispatch() itself (index.ts .catch-logs it; the turn is lost).
-      // Production cannot reach this: MeetingScribe.getSummary is total —
-      // config-gated, findOne wrapped in try/catch, returns undefined on every
-      // failure — which is what the T3 control above exercises. Flagged for the
-      // reviewer: if dispatcher-level tolerance of a misbehaving INJECTED
-      // scribe is wanted, that is a deliberate production change (a `.catch(()
-      // => undefined)` on the anchor), not something to smuggle in here.
-      await expect(
-        dispatcher.dispatch(
-          makeWorkItem({
-            text: "Jasper, next steps?",
-            source: { kind: "slack", id: "C-CONF", label: "conf-summary-throws" },
-            threadId,
-            meta: { slackTs: "1000.0004" },
-          }),
-        ),
-      ).rejects.toThrow("scribe exploded");
-      expect(scribe.noteActivity).toHaveBeenCalledTimes(1); // the cadence seam already fired
-      expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
+      // Call-site fail-safety (KPR-390 canon C27): MeetingScribe.getSummary is
+      // documented total, but buildConferenceContext does not depend on that
+      // contract holding — a rejection is caught at the boundary and treated
+      // exactly like `summary === undefined`, i.e. the untouched pre-KPR-409
+      // full arm. Assertions below mirror the T3 control.
+      const item = makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-summary-throws" },
+        threadId,
+        meta: { slackTs: "1000.0004" },
+      });
+      await dispatcher.dispatch(item);
+
+      expect(scribe.getSummary).toHaveBeenCalledWith(threadId);
+      expect(scribe.noteActivity).toHaveBeenCalledTimes(1); // the cadence seam still fires
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+      const [, turnItem] = agentManager.runWorkItemTurn.mock.calls[0];
+      expect(turnItem.text).toContain("old message"); // raw transcript
+      expect(turnItem.text).toContain("newer message");
+      expect(turnItem.text).not.toContain("[Running summary of the meeting so far:]");
+      expect(turnItem.text).not.toContain("[Messages since the summary:]");
+      expect(turnItem.meta.conferenceInjectionMode).toBe("full");
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
     });
   });
 });

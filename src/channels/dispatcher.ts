@@ -15,7 +15,7 @@ import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
 import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
-import type { MeetingScribe } from "../workers/meeting-scribe.js";
+import type { MeetingScribe, MeetingSummary } from "../workers/meeting-scribe.js";
 import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
@@ -1379,10 +1379,27 @@ export class Dispatcher {
     if (!ref?.sessionId || !ref.meetingLastSeenTs || ref.provider !== provider) {
       // KPR-409 (C13-sanctioned anchor): a running summary replaces the raw
       // transcript for fresh-session entrants. Fail-soft by construction —
-      // getSummary never throws and returns undefined when the scribe is
-      // absent, disabled, or has nothing yet, in which case the three lines
-      // below are byte-identical to pre-KPR-409 (C6 pin).
-      const summary = await this.meetingScribe?.getSummary(threadId);
+      // getSummary returns undefined when the scribe is absent, disabled, or
+      // has nothing yet, in which case the full arm below is byte-identical to
+      // pre-KPR-409 (C6 pin).
+      //
+      // The try/catch makes that fail-open STRUCTURAL at this boundary rather
+      // than dependent on the callee's internals holding (KPR-390 canon C27,
+      // same bug shape as the worker-claim-dedup call site): getSummary is
+      // documented total, but a future edit that breaks the total-guarantee
+      // must degrade to the full arm — a throw or rejection here would
+      // otherwise propagate through resolveAgents and kill the entire
+      // conference turn, contradicting the spec's "the scribe never blocks a
+      // conference turn" requirement.
+      let summary: MeetingSummary | undefined;
+      try {
+        summary = await this.meetingScribe?.getSummary(threadId);
+      } catch (err) {
+        log.warn("Conference anchor: getSummary failed, falling back to the full transcript", {
+          agentId,
+          error: String(err),
+        });
+      }
       if (summary) {
         const coveredNum = parseFloat(summary.coveredThroughTs);
         // Same 100-cap as truncateHistory's tail; no first-5 pin — the summary
