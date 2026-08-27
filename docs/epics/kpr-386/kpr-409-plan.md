@@ -1055,11 +1055,12 @@ with `import type { MeetingScribe } from "../workers/meeting-scribe.js";` beside
           injectionMode: "summary",
           injectionHighWaterTs: maxSlackTs([
             ...tail.map((m) => m.ts),
-            // ⚠ R2 (requested relaxation, spec §D4): REQUIRED, not cosmetic.
+            // ⚠ R2 (AFFIRMED by coherence review, canon C31): REQUIRED, not cosmetic.
             // Without it an empty tail at round 1 yields undefined, setMeetingMark
-            // is skipped, and the agent never converts to delta. If the coherence
-            // reviewer rules F1 instead, the fix is to delete this one line (and
-            // invert T2(b)/T5) — see the plan header.
+            // is skipped, and the agent never converts to delta. The withdrawn F1
+            // fallback (never invoked — R2 shipped) required deleting the WHOLE
+            // injectionHighWaterTs property, not this one term, and inverted five
+            // assertions, not two — see the plan header for the corrected recipe.
             summary.coveredThroughTs,
             roundZeroTriggerTs,
           ]),
