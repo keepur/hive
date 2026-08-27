@@ -1564,3 +1564,11 @@ git log --oneline 92f8e71..HEAD
 ```
 
 Expected: six commits (Tasks 1–6), untracked/modified plan doc only.
+
+---
+
+## Plan-review advisories (r1, verbatim — implementer notes, not deviations)
+
+1. [Task 7, Steps 2/5]: the plan doc is already committed at f01a84b (tip), so the final gate sees SEVEN commits (plan doc + Tasks 1-6) and a CLEAN tree — read the expectations that way; don't report a spurious blocker.
+2. [Task 5, coupling rationale]: the "racy-red" claim about un-migrated 1304 is likely wrong-direction (would pass racily green); the coupling stands regardless (the KPR-401 row's break is deterministic; spec T10 mandates the migration) — don't treat "racy-red" as observed fact.
+3. [Task 1/5, `_replayMarker`]: the rest-sibling destructure emits one no-unused-vars WARNING (no varsIgnorePattern configured); `npm run check` passes (no --max-warnings); tolerate it — adding ignoreRestSiblings is out of scope.
