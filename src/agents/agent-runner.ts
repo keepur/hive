@@ -1125,7 +1125,7 @@ export class AgentRunner {
 
   /**
    * Resolve an agent-env path against the agent config. Supports dotted paths
-   * for nested objects (e.g. "metadata.dodiOpsMode"). Walks left-to-right; any
+   * for nested objects (e.g. "metadata.opsMode"). Walks left-to-right; any
    * missing intermediate key yields "". No fallback to top-level fields — a
    * misconfigured key surfaces as an empty value, which the plugin must
    * handle defensively (per spec §5.3 resolver semantics).

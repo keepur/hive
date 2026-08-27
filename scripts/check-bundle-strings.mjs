@@ -6,6 +6,11 @@
  * The pkg/ directory is what gets shipped in the @keepur/hive npm tarball;
  * a customer running `hive doctor` should see zero references to dodi,
  * hubspot, or cabinet in their installed copy.
+ *
+ * KPR-407 (finding 1): the shipped surface is not only the minified bundles —
+ * pkg/types/ carries the provider-abi .d.ts closure, and tsc preserves JSDoc
+ * into declarations. Scan those too, so a future closure growth that pulls in
+ * a tainted declaration fails the guard instead of shipping.
  */
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -18,27 +23,32 @@ if (!existsSync(PKG_DIR)) {
   process.exit(1);
 }
 
-function collectMinJs(dir) {
+function collectBySuffix(dir, suffix) {
   const out = [];
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) {
-      out.push(...collectMinJs(full));
-    } else if (entry.endsWith(".min.js")) {
+      out.push(...collectBySuffix(full, suffix));
+    } else if (entry.endsWith(suffix)) {
       out.push(full);
     }
   }
   return out;
 }
 
-const bundleFiles = collectMinJs(PKG_DIR);
+const bundleFiles = collectBySuffix(PKG_DIR, ".min.js");
 if (bundleFiles.length === 0) {
   console.error(`error: no .min.js files found in ${PKG_DIR}/`);
   process.exit(1);
 }
 
+// KPR-407: the shipped provider-abi declaration closure. Presence of the
+// barrel itself is check-bundle-pack.mjs's sentinel; here we only scan.
+const TYPES_DIR = join(PKG_DIR, "types");
+const typeFiles = existsSync(TYPES_DIR) ? collectBySuffix(TYPES_DIR, ".d.ts") : [];
+
 let totalHits = 0;
-for (const path of bundleFiles) {
+for (const path of [...bundleFiles, ...typeFiles]) {
   const content = readFileSync(path, "utf8").toLowerCase();
   for (const term of FORBIDDEN) {
     const matches = content.split(term).length - 1;
@@ -55,4 +65,6 @@ if (totalHits > 0) {
   process.exit(1);
 }
 
-console.log(`OK: ${bundleFiles.length} bundle file(s) clean of forbidden strings (${FORBIDDEN.join(", ")})`);
+console.log(
+  `OK: ${bundleFiles.length} bundle file(s) + ${typeFiles.length} declaration file(s) clean of forbidden strings (${FORBIDDEN.join(", ")})`,
+);

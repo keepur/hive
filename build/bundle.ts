@@ -6,8 +6,8 @@
  * Output: pkg/ (publish-ready minified bundles)
  */
 import { build, type Plugin } from "esbuild";
-import { rmSync, mkdirSync, copyFileSync, cpSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { rmSync, mkdirSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
 
 const PKG_DIR = "pkg";
 
@@ -46,15 +46,12 @@ const external = [
 const qdrantDispatcherStub: Plugin = {
   name: "qdrant-dispatcher-stub",
   setup(b) {
-    b.onLoad(
-      { filter: /[\\/]@qdrant[\\/]js-client-rest[\\/]dist[\\/][^\\/]+[\\/]dispatcher\.js$/ },
-      () => ({
-        contents:
-          "export const createDispatcher = () => undefined;\n" +
-          'createDispatcher.hiveStub = "hive-qdrant-dispatcher-stub";\n',
-        loader: "js",
-      }),
-    );
+    b.onLoad({ filter: /[\\/]@qdrant[\\/]js-client-rest[\\/]dist[\\/][^\\/]+[\\/]dispatcher\.js$/ }, () => ({
+      contents:
+        "export const createDispatcher = () => undefined;\n" +
+        'createDispatcher.hiveStub = "hive-qdrant-dispatcher-stub";\n',
+      loader: "js",
+    }));
   },
 };
 
@@ -116,14 +113,64 @@ await build({
   },
 });
 
-// KPR-394 (§4.2): ship the provider-abi type surface. The barrel's .d.ts
-// re-exports reach across the dist declaration tree, so copy ALL .d.ts
-// (directories included, maps excluded) into pkg/types/ — pkg/ is the
-// shipped root (dist/ is pack-forbidden).
-cpSync("dist", resolve(PKG_DIR, "types"), {
-  recursive: true,
-  filter: (src) => !statSync(src).isFile() || src.endsWith(".d.ts"),
-});
+// KPR-394 (§4.2) / KPR-407 (finding 1): ship the provider-abi type surface —
+// and ONLY it. The barrel's .d.ts re-exports reach across the dist declaration
+// tree, but the whole tree (213 files) is far more than the exports map needs
+// and drags customer-facing JSDoc from unrelated engine modules into the
+// tarball. Trace the transitive closure of relative import/export edges from
+// provider-abi.d.ts instead and copy just those, preserving structure.
+// Bare specifiers (mongodb, @slack/web-api, @anthropic-ai/claude-agent-sdk)
+// are runtime deps — resolvable from the consumer's own node_modules.
+// scripts/check-bundle-strings.mjs scans the result for forbidden strings.
+const DIST_ROOT = resolve("dist");
+const TYPES_ROOT = resolve(PKG_DIR, "types");
+const ABI_ENTRY = resolve(DIST_ROOT, "agents/provider-adapters/provider-abi.d.ts");
+
+// `from "…"` (import/export), inline `import("…")` type references, and
+// bare side-effect imports (`import "./x.js";` — tsc emits these into
+// declarations for module-augmenting modules, and a consumer resolves them).
+const SPECIFIER_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)["']([^"']+)["']/g;
+
+/** Resolve a relative specifier to a .d.ts on disk: `.js`→`.d.ts`, then `/index.d.ts`. */
+function resolveDeclaration(fromFile: string, spec: string): string | undefined {
+  const base = resolve(dirname(fromFile), spec);
+  const candidates = [
+    base.endsWith(".js") ? base.slice(0, -3) + ".d.ts" : `${base}.d.ts`,
+    resolve(base.endsWith(".js") ? base.slice(0, -3) : base, "index.d.ts"),
+  ];
+  return candidates.find((c) => existsSync(c));
+}
+
+if (!existsSync(ABI_ENTRY)) {
+  throw new Error(`bundle: provider-abi declaration missing at ${ABI_ENTRY} — run 'npm run build' first`);
+}
+
+const abiClosure = new Set<string>();
+const pending = [ABI_ENTRY];
+while (pending.length > 0) {
+  const file = pending.pop()!;
+  if (abiClosure.has(file)) continue;
+  abiClosure.add(file);
+  const decl = readFileSync(file, "utf-8");
+  for (const [, spec] of decl.matchAll(SPECIFIER_RE)) {
+    if (!spec.startsWith(".")) continue;
+    const target = resolveDeclaration(file, spec);
+    if (!target) {
+      throw new Error(
+        `bundle: unresolvable relative type edge "${spec}" from dist/${relative(DIST_ROOT, file)} — ` +
+          `the pkg/types closure would ship broken declarations`,
+      );
+    }
+    pending.push(target);
+  }
+}
+
+for (const file of abiClosure) {
+  const dest = resolve(TYPES_ROOT, relative(DIST_ROOT, file));
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(file, dest);
+}
+console.log(`  pkg/types/ (${abiClosure.size} .d.ts files — provider-abi transitive closure)`);
 
 // Copy non-JS assets to setup/
 const setupAssets = ["setup/slack-manifest.yaml"];
@@ -145,10 +192,7 @@ for (const m of configSrc.matchAll(/\brequired\(\s*"([A-Z0-9_]+)"\s*\)/g)) {
   requiredEnv.add(m[1]);
 }
 const requiredEnvList = [...requiredEnv].sort();
-writeFileSync(
-  resolve(PKG_DIR, "required-env.json"),
-  JSON.stringify({ requiredEnv: requiredEnvList }, null, 2) + "\n",
-);
+writeFileSync(resolve(PKG_DIR, "required-env.json"), JSON.stringify({ requiredEnv: requiredEnvList }, null, 2) + "\n");
 console.log(`  pkg/required-env.json (${requiredEnvList.length} keys: ${requiredEnvList.join(", ")})`);
 
 console.log("\n✓ Bundle complete → pkg/");

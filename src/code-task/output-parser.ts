@@ -1,5 +1,5 @@
 /**
- * Parse Claude Code CLI JSON output and detect dodi-dev escalation markers.
+ * Parse Claude Code CLI JSON output and detect dev-workflow escalation markers.
  */
 
 export interface ClaudeCodeOutput {
@@ -54,7 +54,7 @@ const QUESTION_RE = /\*{0,2}Question:?\*{0,2}\s+(.+?)(?:\n\n|\n\*{0,2}(?:Context
 const CONTEXT_RE = /\*{0,2}Context:?\*{0,2}\s+(.+?)(?:\n\n\*{0,2}(?:Status|Question|Files|To respond)|$)/is;
 
 /**
- * Scan the result text for dodi-dev escalation markers.
+ * Scan the result text for dev-workflow escalation markers.
  * The implementer subagent reports: DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
  */
 export function detectEscalation(result: string): EscalationInfo | null {
