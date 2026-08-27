@@ -7,7 +7,7 @@
  */
 import { build, type Plugin } from "esbuild";
 import { rmSync, mkdirSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 
 const PKG_DIR = "pkg";
 
@@ -159,6 +159,15 @@ while (pending.length > 0) {
       throw new Error(
         `bundle: unresolvable relative type edge "${spec}" from dist/${relative(DIST_ROOT, file)} — ` +
           `the pkg/types closure would ship broken declarations`,
+      );
+    }
+    // Containment: every resolved edge must stay under dist/ — tsc doesn't
+    // emit rootDir-escaping relative specifiers today, but a loud failure
+    // here (never a silent copy outside pkg/types/) is the point of the
+    // whole closure-trace, so make it total rather than trust the input.
+    if (!(target + sep).startsWith(DIST_ROOT + sep)) {
+      throw new Error(
+        `bundle: relative type edge "${spec}" from dist/${relative(DIST_ROOT, file)} resolves outside dist/ (${target}) — refusing to copy`,
       );
     }
     pending.push(target);
