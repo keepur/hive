@@ -1809,7 +1809,7 @@ describe("deadline-abort continuation (KPR-402)", () => {
     expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
   });
 
-  it("T8: per-leg id vs dedup — the continuation is first-seen (no bypass edit exists); a replayed continuation doc uses the existing outageReplay bypass", async () => {
+  it("T8: per-leg id vs dedup — a single-agent continuation is first-seen; fan-out legs ride the deadlineRetry bypass (D39/T16); a replayed continuation doc uses the existing outageReplay bypass", async () => {
     // Half 1: after origin id m1 is dedup-seen, the continuation m1#dl1
     // dispatches through step 0 untouched — proven by the second turn running.
     agentManager.runWorkItemTurn.mockResolvedValueOnce(withProgressAbort());

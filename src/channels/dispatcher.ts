@@ -781,8 +781,10 @@ export class Dispatcher {
       // $setOnInsert insert beside the origin's terminal doc that serializes
       // the leg's workItem (counter included) verbatim, never a silent
       // same-key no-op. Suffixing keeps policyFor's prefix classes intact
-      // (callback:x#dl1 is still callback:-classed), and dedup needs no
-      // bypass edit: each leg's id is first-seen.
+      // (callback:x#dl1 is still callback:-classed). Dedup: a leg's id is
+      // first-seen on the SINGLE-agent path, but fan-out mints the same leg
+      // id once per aborting agent, so dedup carries a deadlineRetry bypass
+      // for engine-authored legs (D39 / child-PR r1 SF-1, pinned T16).
       id: `${baseId}#dl${n + 1}`,
       // THREAD-KEY PINNING (spec r2 blocker): every threadId consumer falls
       // back to item.id when threadId is absent — runWorkItemTurn's session
