@@ -1,7 +1,7 @@
 /**
  * KPR-391 (§4.2): runBoundedDispatchLoop — the shared bounded tool-dispatch
- * loop for raw-API Lane B adapters (codex + gemini today; grok's gateway
- * next). Owns: the round budget (`resourceLimits?.maxTurns ?? 10`, with 0
+ * loop for raw-API Lane B adapters (codex, gemini, and grok today; plugin
+ * providers may consume it too via the KPR-394 kit). Owns: the round budget (`resourceLimits?.maxTurns ?? 10`, with 0
  * passing through ⇒ immediate error_max_turns and NO network call — the
  * codex/gemini-identical divergence pin; openai keeps handing 0 to its SDK),
  * the four abort checkpoints at their pre-extraction placements (pre-round /
@@ -125,8 +125,9 @@ export async function runBoundedDispatchLoop<TRound, TCall>(
   return {
     kind: "success",
     text: finalText,
-    // Both raw-API adapters' success formula: last provider round id, else
-    // the per-provider fallback (codex fabricated / gemini "").
+    // All three raw-API adapters' success formula: last provider round id,
+    // else the per-provider fallback (codex fabricated / gemini and grok
+    // take the scaffold default "").
     sessionId: harness.lastProviderRoundId() ?? harness.fallbackSessionId,
   };
 }

@@ -672,9 +672,10 @@ export class AgentManager {
     // `route.provider` (the nested runner is a same-provider delegate turn),
     // so one slice serves both. Handing a module the full per-provider map
     // would hand every module every other provider's apiKey — harmless while
-    // all three entries are in-tree, a real credential-exposure hazard once
-    // KPR-394 makes this contract the ABI for `hive plugin add`-loaded
-    // third-party modules (CLAUDE.md § Security (DOD-212)).
+    // all four entries are in-tree; now that KPR-394 has landed and made
+    // this contract the ABI for `hive plugin add`-loaded third-party
+    // modules, resolveProviderModuleSlice below is what keeps it that way
+    // (CLAUDE.md § Security (DOD-212)).
     // KPR-394: slice resolution generalized — see resolveProviderModuleSlice.
     const moduleDeps: LaneBModuleDeps = {
       providerConfig: this.resolveProviderModuleSlice(registered),

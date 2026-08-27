@@ -2,10 +2,10 @@
  * KPR-391 (§4.3): the static in-engine provider-module table. One
  * construction entry per Lane B provider, consumed by BOTH agent-manager
  * construction sites (top-level createProviderAdapter tail + the nested
- * KPR-354 delegateTurnRunner) so the two can never drift. KPR-394 makes
- * entries loadable via `hive plugin add`; until then this Record is the
- * whole registry. Model default chains moved here verbatim from the
- * pre-KPR-391 call sites.
+ * KPR-354 delegateTurnRunner) so the two can never drift. Since KPR-394,
+ * this Record is the builtin seed consumed by provider-registry.ts, which
+ * layers `hive plugin add`-loaded third-party entries on top. Model default
+ * chains moved here verbatim from the pre-KPR-391 call sites.
  */
 import { CodexSubscriptionAdapter } from "./codex-subscription-adapter.js";
 import { GeminiInteractionsAdapter } from "./gemini-interactions-adapter.js";

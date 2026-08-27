@@ -288,7 +288,8 @@ export const config = {
     agentModel: optional("DEEPSEEK_AGENT_MODEL", ""),
   },
   grok: {
-    /** KPR-371: Lane A passthrough default-model override (non-secret).
+    /** KPR-371: default-model override (non-secret). Grok moved to a
+     *  native Lane B adapter in KPR-392; this key just sets the default.
      *  The secret GROK_GATEWAY_KEY (KPR-384 — gateway API key for the
      *  self-hosted CLIProxyAPI shim) deliberately has NO boot-time entry —
      *  it resolves per spawn (env → Keychain) in AgentManager.resolveGrokModuleSlice,
