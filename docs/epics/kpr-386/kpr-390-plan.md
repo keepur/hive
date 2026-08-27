@@ -2,7 +2,7 @@
 
 **Goal:** a conference boss agent can dispatch a data-acquisition task to a cheap detached claude-lane worker with one tool call; "I got this" is atomic per meeting via a Mongo claim ledger; worker completion re-triggers the boss in the meeting thread through the existing callback-shaped re-entry; orphaned claims recover via TTL/watchdog/restart-sweep with honest notices.
 
-**Tech stack:** TypeScript (strict, no `any` without justification), Node 22, Claude Agent SDK in-process MCP (`createSdkMcpServer`), MongoDB (native driver v6), vitest (tests beside source).
+**Tech stack:** TypeScript (strict, no `any` without justification), Node 22, Claude Agent SDK in-process MCP (`createSdkMcpServer`), MongoDB (native driver `^7.5.0` — v7 `findOneAndUpdate` returns doc-or-null, which the null-gating below relies on; do not "fix" the label back to v6), vitest (tests beside source).
 
 **Spec:** `docs/epics/kpr-386/kpr-390-spec.md` (spec-ready, review clean r2 — binding contract). Epic branch `KPR-386` @ `9771b04` (KPR-387/388/389 merged).
 
@@ -18,7 +18,7 @@
 
 | Group | Verdict | Scope / Reason | Harness | Minimum assertions |
 |---|---|---|---|---|
-| **Unit** | **required** | All new modules and every touched engine seam: pool service (claims, gates, caps, dedup wiring, spawn shape, completion, re-entry, watchdog, restart sweep, cancel, abort), dedup sidecar, MCP tool handlers, config resolver, `policyFor` row, `workerClaimDedup` registry binding, runner in-process block, manager handshake + `stopAgent` hook | vitest beside source (`src/workers/*.test.ts` + additions to existing suites); fake `Db`/collection objects (callback-mcp-server.test.ts precedent), `vi.hoisted` mocks for config/LLM registry (meeting-classifier.test.ts precedent), injected fake manager hooks, `vi.useFakeTimers` for the watchdog | Spec T1–T10 (T1 incl. the cap-overshoot row; T5 both halves — boss-gone **and** no-conference-fan-out assertion) **plus**: atomic-claim duplicate-key race (concurrent identical dispatches ⇒ exactly one doc), dedup fail-open (throw / no-key / non-open-id ⇒ insert proceeds), denylist filtering is structural (captured worker `AgentConfig`, not prose), boss-gone guard (no `onDispatch` call at all), watchdog + restart sweep (atomic flip, exactly one re-entry, live-worker abort), re-entry WorkItem byte pin (id `worker:<claimId>`, `meta.targetAgentId`, source seven from the claim snapshot), worker containment (aborted worker ⇒ no status transition by the worker path; `abortForBoss` scoping; `stop()` aborts all + clears timer), index-spec pin (`partialFilterExpression: { status: "running" }` on the unique key; TTL on `updatedAt`), config-resolver liberal-loader rows (defaults, garbage input, wallclock<TTL clamp) |
+| **Unit** | **required** | All new modules and every touched engine seam: pool service (claims, gates, caps, dedup wiring, spawn shape, completion, re-entry, watchdog, restart sweep, cancel, abort), dedup sidecar, MCP tool handlers, config resolver, `policyFor` row, `workerClaimDedup` registry binding, runner in-process block, manager handshake + `stopAgent` hook | vitest beside source (`src/workers/*.test.ts` + additions to existing suites); fake `Db`/collection objects (callback-mcp-server.test.ts precedent), `vi.hoisted` mocks for config/LLM registry (meeting-classifier.test.ts precedent), injected fake manager hooks, `vi.useFakeTimers` for the watchdog | Spec T1–T10 (T1 incl. the cap-overshoot row; T5 both halves — boss-gone **and** no-conference-fan-out assertion) **plus**: atomic-claim duplicate-key race (concurrent identical dispatches ⇒ exactly one doc), dedup fail-open (throw / no-key / non-open-id ⇒ insert proceeds), denylist filtering is structural (captured worker `AgentConfig`, not prose), boss-gone guard (no `onDispatch` call at all), watchdog + restart sweep (atomic flip, exactly one re-entry, live-worker abort — watchdog covered via the **interval path on an empty-start ledger**, never masked by the restart sweep), re-entry WorkItem byte pin (id `worker:<claimId>`, `meta.targetAgentId`, source seven from the claim snapshot), worker containment (aborted worker ⇒ no status transition by the worker path; `abortForBoss` scoping; `stop()` aborts all + clears timer + fires no further sweeps), **worker-mode auto-injection suppression is structural** (a worker-flagged runner's **built server set** omits `team`/`schedule`/`team-roster` — the config-array filter alone is insufficient because `effectiveCoreServerSet`/`filterCoreServers` re-add them unconditionally), **Lane B inventory carries `worker-pool`** (KPR-327 memory-pattern compensation in `buildToolTransportInventory` — without it Lane B bosses never see the tools), index-spec pin (`partialFilterExpression: { status: "running" }` on the unique key; TTL on `updatedAt`), config-resolver liberal-loader rows (defaults, garbage input, wallclock<TTL clamp) |
 | **Integration** | **not-required** (as a separate harness) | The repo has no live-Mongo/integration tier — every engine suite runs on fake `Db` objects (callback, outage-queue, dispatcher precedents). The cross-module seams are each pinned at their boundary by unit suites: the re-entry WorkItem is byte-pinned against the exact shape the *already-shipped* callback path consumes (scheduler.ts:288–305 verified identical), the runner block is pinned via public `buildInProcessServers`, the manager handshake via `setWorkerPool` assertions. | n/a | n/a |
 | **E2E** | **not-required** | Requires live Slack + a real `conf-*` meeting + real Claude spawns. Covered by operator rollout validation on a fleet instance post-deploy (see Rollout note), the same posture KPR-387/388/389 shipped under (unit + pins + live validation). | n/a | n/a |
 
@@ -28,7 +28,7 @@
 |---|---|
 | T1 atomic claim (+ distinct tasks, perMeetingMax refusal, cap-overshoot tolerated) | Task D — `meeting-worker-pool.test.ts` |
 | T2 dedup (duplicate ⇒ no insert; null ⇒ insert; throw/no-key ⇒ insert; metadata stamped) | Task C (sidecar) + Task D (pool wiring) |
-| T3 worker spawn shape (clone pin; negative-verify leak) | Task E |
+| T3 worker spawn shape (clone pin; negative-verify leak) | Task E (config-array half) + Task G5 (**authoritative built-server-set half** — auto-injection suppression) |
 | T4 completion → re-entry (done/failed byte pin; drop after expiry) | Task E |
 | T5 guards (boss deleted ⇒ no dispatch AND no unpinned item; breaker open; non-meeting; disabled) | Task D (gates) + Task E (boss-gone) |
 | T6 watchdog + restart sweep | Task E |
@@ -68,6 +68,8 @@ npm run check                                             # typecheck + lint + f
 npm run check:bundle                                      # bundle + 4 guards
 ```
 
+Husky note: `.husky/pre-commit` runs `npx lint-staged` — expect staged files to be rewritten (prettier/eslint --fix) at commit time; if a commit's diff shifts, that is lint-staged, not a lost edit.
+
 ### Harness requirements
 
 - **In-process MCP server testing (repo precedent = `src/callback/callback-mcp-server.test.ts`):** `vi.mock("@anthropic-ai/claude-agent-sdk")` replacing `createSdkMcpServer`/`tool` with capture shims; export a `buildWorkerPoolTools(deps)` function (parallel to `buildCallbackTools`) and invoke handlers directly with a mutable `{ current }` context ref; assert the ref is read per-call, not captured.
@@ -95,7 +97,8 @@ Baseline check before starting:
 
 ```bash
 cd /Users/mokie/github/hive-KPR-386 && git status --short   # expect: clean
-git log --oneline -1                                        # expect: 9771b04 …
+git log --oneline -1   # expect: 82bccbe (plan draft) or a later docs-only commit
+# (the K1 T9 gate still ranges from 9771b04 — the last pre-KPR-390 code commit)
 ```
 
 ---
@@ -365,7 +368,11 @@ const CLAIMS_TTL_SECONDS = 7 * 86_400;
 /**
  * Through-the-boss + containment enforcement — STRUCTURAL, not prose
  * (code-enforce-don't-prose-enforce). Stripped from the worker's cloned
- * coreServers. Rationale per entry (spec §A3): outbound message surfaces
+ * coreServers — AND paired with the runner's suppressAutoInjectedServers
+ * worker-mode flag (set by the manager's buildWorkerAdapter): team/schedule/
+ * team-roster are auto-injected for every normal agent regardless of
+ * coreServers, so the strip alone would be a no-op without the flag.
+ * Rationale per entry (spec §A3): outbound message surfaces
  * (slack/quo/resend/team/event-bus/recall/voice); self-scheduling &
  * re-entry minting (callback/schedule); recursion (worker-pool); agent-def
  * editing (admin); detached-process escape hatch that would outlive every
@@ -919,6 +926,13 @@ const meetingCtx: WorkerPoolTurnContext = {
     const claimId = claim._id.toString();
     const startedAt = Date.now();
     try {
+      // Server containment is TWO-part: this config clone strips the
+      // explicitly-listed denylist servers, and the runner-side
+      // suppressAutoInjectedServers flag (set inside buildWorkerAdapter,
+      // Task G3) blocks the runner's unconditional auto-injection of
+      // team/schedule/team-roster/skill-author/workflow — without the flag,
+      // stripping them from coreServers would be a no-op
+      // (effectiveCoreServerSet/filterCoreServers re-add them).
       const workerConfig: AgentConfig = {
         ...boss,
         model: role.model,
@@ -1180,16 +1194,16 @@ function truncateResult(text: string): string {
   Type notes: `ChannelKind` must be exported from `src/types/work-item.ts` (it is — the scheduler imports it). All agent-runner-adjacent imports are `import type` (cycle-safe erasure). `RunResult` reaches the pool only through `AgentProviderAdapter.runTurn`'s return type — no direct agent-runner import needed.
 
 - [ ] **E2.** Extend `src/workers/meeting-worker-pool.test.ts` with Task-E assertions. To reach the spawn synchronously in tests, add a tiny helper: after `await pool.dispatch(...)`, `await vi.waitFor(() => expect(fixture.runTurn).toHaveBeenCalled())` (the spawn is `void`-detached), or export nothing extra — the fake adapter's `runTurn` resolving lets `await new Promise(setImmediate)` flush the chain. Assertions:
-  1. **(T3 spawn shape)** after a successful dispatch: `hooks.buildWorkerAdapter` called once with a config where `model === "sonnet"` (from config, boss is `"opus"`), `coreServers` deep-equals `["memory", "code-search"]` (denylist stripped `slack/callback/worker-pool/background/keychain`; memory + code-search survive), `delegateServers` deep-equals `[]`, `schedule` deep-equals `[]`, and `id === "boss"` (identity clone). `runTurn` received `sessionId: undefined`, `resourceLimits: { maxTurns: 25, timeoutMs: 600000, budgetUsd: 2.5 }`, a `systemPromptOverride` containing the boss name, channel label, and the task text, and a `workItemContext` matching the claim's source seven.
+  1. **(T3 spawn shape — config-array half; necessary but NOT sufficient)** after a successful dispatch: `hooks.buildWorkerAdapter` called once with a config where `model === "sonnet"` (from config, boss is `"opus"`), `coreServers` deep-equals `["memory", "code-search"]` (denylist stripped `slack/callback/worker-pool/background/keychain`; memory + code-search survive), `delegateServers` deep-equals `[]`, `schedule` deep-equals `[]`, and `id === "boss"` (identity clone). `runTurn` received `sessionId: undefined`, `resourceLimits: { maxTurns: 25, timeoutMs: 600000, budgetUsd: 2.5 }`, a `systemPromptOverride` containing the boss name, channel label, and the task text, and a `workItemContext` matching the claim's source seven. **The authoritative structural pin — that the worker runner's BUILT server set omits the auto-injected `team`/`schedule`/`team-roster` — cannot live here (the pool suite sees only a fake adapter); it lives in Task G5's runner/manager tests against `buildInProcessServers`.**
   2. **(T4 done)** default `runTurn` result ⇒ claim doc `status: "done"`, `resultText: "report body"`, `durationMs`/`costUsd`/`toolCalls` stamped; `onDispatch` called exactly once with the **byte-pinned** WorkItem: `id === \`worker:${claimId}\``, `sender: "system"`, `threadId`, `source: { kind: "slack", id: "C123", label: "conf-tahoe", adapterId: "slack-main" }`, `meta: { slackTs, slackThreadTs, targetAgentId: "boss" }`, `text` starting `"[Worker report — done] Task: "` and containing the report body and the `"No response needed."` escape sentence.
   3. **(T4 failed)** `runTurnImpl` resolving `{ text: "", error: "boom", … }` ⇒ `status: "failed"`, report text contains `"The worker failed: boom"`.
   4. **(T4 timeout)** `timedOut: true` ⇒ `failed` with `"timed out after 600000ms"` in the claim error.
   5. **(T4 drop pin)** flip the claim to `expired` (simulate watchdog) **before** the fake `runTurn` resolves (use a deferred promise) ⇒ after resolution, claim stays `expired`, resultText **absent**, `onDispatch` NOT called by the completion path.
   6. **(T4 truncation, E12)** `runTurn` text of 9000 chars ⇒ `resultText.length` ≈ 8000 + marker, marker present.
   7. **(T5 boss-gone)** delete the boss from the fixture registry between dispatch and completion ⇒ `onDispatch` **never called at all** (not merely "not called with an unpinned item" — the guard returns before item construction), claim error annotated `"re-entry skipped: boss agent gone or disabled"`; same for `disabled: true`.
-  8. **(T6 watchdog)** seed a running claim with `expiresAt` in the past and a live worker (dispatch with a never-resolving `runTurn`); invoke the sweep (either `vi.useFakeTimers` + `advanceTimersByTime(60_000)` after `pool.start()`, or call the private via `(pool as any).sweepExpired()` — prefer the fake-timer path through `start()` so the interval wiring is covered) ⇒ claim `status: "expired"`, `abortSpy` called, exactly **one** `onDispatch` with `text` starting `"[Worker report — expired]"` and containing the re-dispatch sentence.
+  8. **(T6 watchdog — interval path, NOT the restart sweep)** ordering matters: `pool.start()` runs `sweepOnRestart()` (which flips EVERY running claim unconditionally) **before** installing the interval, so a pre-seeded claim would be expired by the restart sweep and the 60s interval + `expiresAt` predicate would stay uncovered. Correct recipe: `vi.useFakeTimers()`; build the fixture with a **directly-constructed test config** `{ claimTtlMinutes: 1 }` (the resolver's TTL≥wallclock clamp does not apply to injected configs) and a never-resolving `runTurnImpl`; `await pool.start()` on the **empty** ledger (assert `onDispatch` not called — restart sweep no-ops); `await pool.dispatch(...)` (claim created, worker live; fake timers mock `Date`, so the pool's default `now` seam advances with them); `await vi.advanceTimersByTimeAsync(30_000)` ⇒ claim still `running`, no `onDispatch` (interval may not have fired or predicate false — pins the not-yet-expired half); `await vi.advanceTimersByTimeAsync(60_000)` (now past `expiresAt`) ⇒ claim `status: "expired"`, `abortSpy` called, exactly **one** `onDispatch` with `text` starting `"[Worker report — expired]"` and containing the re-dispatch sentence.
   9. **(T6 restart sweep)** construct a fresh pool over a claims fake pre-seeded with 2 `running` + 1 `done` docs; `await pool.start()` ⇒ both running docs `expired` with notices (2 `onDispatch` calls), `done` doc untouched.
-  10. **(T8 pool half)** two live workers for different bosses ⇒ `abortForBoss("boss")` aborts only boss's (`abortSpy` call count scoped); `pool.stop()` aborts all and a subsequent `advanceTimersByTime(120_000)` fires no sweep (timer cleared).
+  10. **(T8 pool half)** two live workers for different bosses ⇒ `abortForBoss("boss")` aborts only boss's (`abortSpy` call count scoped). Separately, with the item-8 recipe (empty start, fake timers, short TTL, live never-resolving worker): `pool.stop()` aborts all, then `await vi.advanceTimersByTimeAsync(120_000)` ⇒ the past-deadline claim is **still `running`** and `onDispatch` was never called — proving the interval is actually cleared (with the old pre-seed recipe this assertion was blind: the restart sweep would already have expired the claim).
   11. **(worker aborted)** `runTurn` resolves `{ aborted: true, … }` ⇒ **no** status transition (claim still `running`), no `onDispatch` — the claim is owned by the cancel/watchdog path (spec E5/E13 coherence).
   12. **(cancel + abort, completing D's deferred sub-assertion)** dispatch with deferred `runTurn`; `pool.cancel(claimId, "boss")` ⇒ status `cancelled`, `abortSpy` called; then resolve the deferred with a success result ⇒ claim stays `cancelled` (completion dropped).
 
@@ -1311,7 +1325,8 @@ export function createWorkerPoolMcpServer(deps: WorkerPoolToolDeps) {
 
 ### Task G — Engine wiring: in-process registry constant, AgentRunner, AgentManager, index.ts
 
-- [ ] **G1.** `src/agents/in-process-servers.ts` — add `"worker-pool"` to `IN_PROCESS_PORTED_SERVERS` and update the doc comment's first line from "the 10 KPR-122-ported in-process MCP servers" to "the KPR-122-ported in-process MCP servers, plus later in-process servers (KPR-390: worker-pool)". KPR-184 enforcement (admin-tool rejection + registry sanitization of `delegateServers`) then covers worker-pool for free.
+- [ ] **G1.** `src/agents/in-process-servers.ts` — add `"worker-pool"` to `IN_PROCESS_PORTED_SERVERS` and update the doc comment's first line from "the 10 KPR-122-ported in-process MCP servers" to "the KPR-122-ported in-process MCP servers, plus later in-process servers (KPR-390: worker-pool)". KPR-184 enforcement (admin-tool rejection + registry sanitization of `delegateServers`) then covers worker-pool for free — **and so does the plugin name-conflict guard** (agent-runner.ts:866 checks `IN_PROCESS_PORTED_SERVERS.has(name)` directly, the KPR-327 memory compensation's first dependent); of KPR-327's two compensation sites only `buildToolTransportInventory` needs an explicit block (G2).
+- [ ] **G1b.** `src/agents/server-traits.ts` — add `"worker-pool"` to `TURN_CONTEXT_DEPENDENT_SERVERS` (it is context-ref driven, exactly like `callback`). Consequences are all correct: inventory descriptors carry `requiresTurnContext: true` (compatibility stays `requires-hive-bridge`, same bucket as any in-process server), and `DELEGATE_UNSAFE_SERVERS` picks it up (redundant with KPR-184, harmless).
 - [ ] **G2.** `src/agents/agent-runner.ts`:
   - Add imports (type-only where possible):
 
@@ -1319,13 +1334,21 @@ export function createWorkerPoolMcpServer(deps: WorkerPoolToolDeps) {
     import { createWorkerPoolMcpServer } from "../workers/worker-pool-mcp-server.js";
     import type { MeetingWorkerPool, WorkerPoolTurnContext } from "../workers/meeting-worker-pool.js";
     ```
-  - `AgentRunnerOptions` (~line 311) gains:
+  - `AgentRunnerOptions` (~line 311) gains **two** members:
 
     ```ts
       /** KPR-390: meeting worker pool — set by AgentManager.createProviderAdapter
        *  once index.ts has wired the pool. Absent ⇒ the worker-pool in-process
        *  server is never built (tools invisible even if listed in coreServers). */
       workerPool?: MeetingWorkerPool;
+      /** KPR-390: worker-mode runner (set ONLY by the pool's buildWorkerAdapter
+       *  factory). Suppresses the unconditional auto-injection of implicit core
+       *  servers (schedule, team, team-roster, skill-author, workflow) in
+       *  effectiveCoreServerSet/filterCoreServers AND the teamRoster wiring —
+       *  without this, stripping those names from a worker's cloned coreServers
+       *  is a no-op and through-the-boss enforcement is fiction: `team` alone
+       *  lets a worker message an agent that posts to Slack. */
+      suppressAutoInjectedServers?: boolean;
     ```
     (Spec §A1 names the positional teamRoster/memoryLifecycle precedent; routing through the existing `runnerOptions` object is the same constructor-dep contract with zero churn on the many existing positional call sites — mechanical sharpening, flagged in the plan digest.)
   - Fields (beside `callbackContextRef`, ~line 343):
@@ -1334,8 +1357,54 @@ export function createWorkerPoolMcpServer(deps: WorkerPoolToolDeps) {
     private workerPoolMcpServer?: ReturnType<typeof createWorkerPoolMcpServer>;
     private workerPoolContextRef: { current: WorkerPoolTurnContext } = { current: {} };
     private workerPool?: MeetingWorkerPool;
+    private readonly suppressAutoInjectedServers: boolean;
     ```
-    Constructor body: `this.workerPool = runnerOptions?.workerPool;`
+    Constructor body: `this.workerPool = runnerOptions?.workerPool;` and `this.suppressAutoInjectedServers = runnerOptions?.suppressAutoInjectedServers ?? false;`
+  - **`effectiveCoreServerSet()` (~line 410–432) — gate the implicit adds** (memory→structured-memory pairing and the autonomy gates stay unconditional):
+
+    ```ts
+    const coreSet = new Set(this.agentConfig.coreServers);
+    if (coreSet.has("memory")) {
+      coreSet.add("structured-memory");
+    }
+    // KPR-390: worker-mode runners get NO implicit core servers — the
+    // auto-injected surfaces (team = outbound agent-to-agent messaging,
+    // schedule = self-scheduling) are exactly what WORKER_SERVER_DENYLIST
+    // exists to remove, and they are re-added here for every normal agent.
+    if (!this.suppressAutoInjectedServers) {
+      coreSet.add("schedule");
+      coreSet.add("team");
+      coreSet.add("team-roster");
+      if (config.workflow.enabled) {
+        coreSet.add("workflow");
+      }
+    }
+    ```
+    (Keep the existing autonomy-gate `delete` lines below unchanged.)
+  - **`filterCoreServers()` (~line 1073–1094) — mirror the same gate** (the file's own comment mandates the two sites stay in sync): wrap the `coreSet.add("schedule") / add("team") / add("team-roster") / add("skill-author")` lines and the `workflow` conditional in the identical `if (!this.suppressAutoInjectedServers) { … }` block, preserving each existing comment line inside it.
+  - **`buildInProcessServers` team-roster block (~line 1376)** — gate: `if (this.teamRoster && !this.suppressAutoInjectedServers) { … }` (a worker runner receives `this.teamRoster` from the manager's construction inputs; without the gate it would be wired unconditionally).
+  - **`buildToolTransportInventory` (~line 1290) — Lane B visibility compensation (KPR-327 memory pattern).** `worker-pool` has no vestigial stdio entry in `buildAllServerConfigs` (and must not get one — nothing to spawn), so without compensation it is absent from `filterCoreServers`' output and therefore from the Lane B partition: a Lane B conference boss would never see `worker_dispatch`. Add directly after the existing `memory` compensation block, gated exactly like the runtime block in `buildInProcessServers`:
+
+    ```ts
+    // KPR-390: worker-pool is in-process-only with no stdio placeholder
+    // (KPR-327 memory pattern) — surface its descriptor explicitly so the
+    // Lane B partition (assembleProviderTurn → partitionInventoryForProvider)
+    // bridges the tools. Gate mirrors the runtime wiring in send().
+    if (this.workerPool && this.shouldEnableInProcessServer("worker-pool") && !mcpServers["worker-pool"]) {
+      inventory.push({
+        ...classifyToolTransport({
+          name: "worker-pool",
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("worker-pool"),
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
+    }
+    ```
+    Also update the team-roster inventory push just below it to carry the same worker-mode gate (`if (this.teamRoster && !this.suppressAutoInjectedServers)`) for coherence with the runtime wiring.
   - `buildInProcessServers` (place the block directly after the callback block, ~line 1512):
 
     ```ts
@@ -1377,9 +1446,12 @@ export function createWorkerPoolMcpServer(deps: WorkerPoolToolDeps) {
      * The handshake keeps runner-construction inputs inside the manager —
      * the pool holds only capabilities (spec §A3 "factory callback" choice).
      * The factory deliberately passes NO prefixCache (worker turns provably
-     * can't touch the boss's cached prefix) and NO workerPool (a worker can
+     * can't touch the boss's cached prefix), NO workerPool (a worker can
      * never see worker-pool tools even if a config clone slipped the
-     * denylist — belt-and-braces recursion guard).
+     * denylist — belt-and-braces recursion guard), and sets
+     * suppressAutoInjectedServers — WITHOUT which the runner re-adds
+     * team/schedule/team-roster unconditionally and the denylist strip in
+     * runWorkerTurn is a no-op (through-the-boss would be fiction).
      */
     setWorkerPool(pool: MeetingWorkerPool): void {
       this.workerPool = pool;
@@ -1397,6 +1469,7 @@ export function createWorkerPoolMcpServer(deps: WorkerPoolToolDeps) {
             this.db,
             undefined, // prefixCache — deliberately absent
             this.memoryLifecycle,
+            { suppressAutoInjectedServers: true }, // worker mode — no workerPool
           );
           return new ClaudeAgentAdapter(runner);
         },
@@ -1447,8 +1520,12 @@ export function createWorkerPoolMcpServer(deps: WorkerPoolToolDeps) {
     ```
   - Shutdown handler (~line 856, beside `scheduler.stop()`): add `workerPool.stop();`
 - [ ] **G5.** Tests:
-  - `src/agents/agent-runner.test.ts` (+2, following the file's runner-construction fixtures): (a) a runner with `coreServers: ["worker-pool"]` and `runnerOptions.workerPool` = a fake pool object ⇒ `buildInProcessServers(ctx)` returns a map containing `"worker-pool"`, and the context ref (reach it via the captured `createSdkMcpServer` deps if the suite mocks the SDK, or assert presence + call again with a different ctx and assert refresh through the tools' deps object) reflects the seven; (b) same coreServers but **no** `workerPool` option ⇒ key absent (and: workerPool set but `coreServers: []` ⇒ absent — membership gate).
-  - `src/agents/agent-manager.test.ts` (+3, **whole-file runs only**): (a) `setWorkerPool` calls `bindManager` with hooks whose `breakerStateFor("claude")` proxies `circuitBreakers.stateFor`; (b) `hooks.buildWorkerAdapter(minimalConfig)` returns an adapter with `provider === "claude"`; (c) `stopAgent("a")` invokes `workerPool.abortForBoss("a")` (fake pool with spies).
+  - `src/agents/agent-runner.test.ts` (+4, following the file's runner-construction fixtures):
+    - (a) a runner with `coreServers: ["worker-pool"]` and `runnerOptions.workerPool` = a fake pool object ⇒ `buildInProcessServers(ctx)` returns a map containing `"worker-pool"`, and the context ref (reach it via the captured `createSdkMcpServer` deps if the suite mocks the SDK, or assert presence + call again with a different ctx and assert refresh through the tools' deps object) reflects the seven;
+    - (b) same coreServers but **no** `workerPool` option ⇒ key absent (and: workerPool set but `coreServers: []` ⇒ absent — membership gate);
+    - (c) **(BLOCKING-1 pin — worker-mode suppression is structural)** a runner with `suppressAutoInjectedServers: true`, `coreServers: ["memory", "contacts"]`, a fake `db`, and a `teamRoster` passed ⇒ `buildInProcessServers()` map **omits `"team"`, `"schedule"`, `"team-roster"`, and `"workflow"`** while containing `"memory"`/`"structured-memory"`/`"contacts"`; an otherwise-identical control runner without the flag **contains** `"team"`, `"schedule"`, `"team-roster"` — this pair fails on pre-fix code (auto-injection re-adds them regardless of coreServers) and is the test T3's config-array half cannot provide;
+    - (d) **(BLOCKING-2 pin — Lane B inventory)** a runner with `runnerOptions.workerPool` + `coreServers: ["worker-pool"]` ⇒ `buildToolTransportInventory()` contains an entry `name === "worker-pool"` with `inProcess: true`, `requiresTurnContext: true`, and `compatibility.openai === compatibility.gemini === compatibility.codex === "requires-hive-bridge"`; without the `workerPool` option (or without coreServers membership) ⇒ absent. Fails without the G2 compensation block (worker-pool has no stdio placeholder, so the base loop never emits it).
+  - `src/agents/agent-manager.test.ts` (+3, **whole-file runs only**): (a) `setWorkerPool` calls `bindManager` with hooks whose `breakerStateFor("claude")` proxies `circuitBreakers.stateFor`; (b) **(end-to-end worker-mode pin)** `hooks.buildWorkerAdapter(config with coreServers: ["memory"])` returns an adapter with `provider === "claude"` whose runner (reach it via `(adapter as unknown as { runner: AgentRunner }).runner`) has `buildInProcessServers()` **omitting `team`/`schedule`/`team-roster` AND `worker-pool`** (the factory sets the suppression flag and withholds the pool — recursion guard) — fails if the factory drops `{ suppressAutoInjectedServers: true }`; (c) `stopAgent("a")` invokes `workerPool.abortForBoss("a")` (fake pool with spies).
 - [ ] **G6.** Verify:
 
 ```bash
@@ -1479,7 +1556,7 @@ npm run typecheck && npm run lint
 
 ### Task I — Documentation
 
-- [ ] **I1.** `docs/providers.md` — spec calls for one additive row/note. **Conclusion: providers.md MUST be updated** (this change adds tools visible on every tool-executing lane and pins worker execution to the Claude lane — provider-behavior surface). Add a short note section after the parity matrix (before Footnotes):
+- [ ] **I1.** `docs/providers.md` — spec calls for one additive row/note. **Conclusion: providers.md MUST be updated** (this change adds tools visible on every tool-executing lane and pins worker execution to the Claude lane — provider-behavior surface). The note's "all tool-executing lanes" claim is made true by Task G2's Lane B inventory compensation — do not land this doc commit before commit 6. Add a short note section after the parity matrix (before Footnotes):
 
 ```markdown
 ### Meeting worker pool (KPR-390)
@@ -1504,15 +1581,17 @@ For each expected-FAIL probe: make the temporary edit, run the named suite, **co
 
 - [ ] **NV1 (T7):** remove the `worker:` line from `policyFor` → `npx vitest run src/outage/outage-notices.test.ts` — the new row fails (`"notify"` ≠ `"silent"`). Restore.
 - [ ] **NV2 (T1):** in `dispatch`, replace the duplicate-key catch branch with a bare `throw err` (no winner read) → pool suite: the concurrent-identical-dispatch test fails (rejection instead of claimed-by text). Restore.
-- [ ] **NV3 (T3):** in `spawnFetchWorker`, build the role with `coreServers: boss.coreServers` (drop the filter) and `model: boss.model` → pool suite: the spawn-shape test fails (boss model/servers leak through — the spec's named leak). Restore.
+- [ ] **NV3 (T3 config-array half):** in `spawnFetchWorker`, build the role with `coreServers: boss.coreServers` (drop the filter) and `model: boss.model` → pool suite: the spawn-shape test fails (boss model/servers leak through — the spec's named leak). Restore. (This probe alone is NOT sufficient for through-the-boss — NV6 covers the auto-injection half.)
 - [ ] **NV4 (T5):** in `dispatchReentry`, delete the boss-gone guard block → pool suite: the boss-gone test fails (`onDispatch` called). Restore.
 - [ ] **NV5 (T4 atomicity):** in `finishClaim`, change the filter to `{ _id: claim._id }` (drop `status: "running"`) → pool suite: the completion-after-expiry drop test fails (claim overwritten to `done`, re-entry fired). Restore.
+- [ ] **NV6 (BLOCKING-1 flag):** remove `{ suppressAutoInjectedServers: true }` from `setWorkerPool`'s `buildWorkerAdapter` factory → `npx vitest run src/agents/agent-manager.test.ts` (whole file): the end-to-end worker-mode pin (G5.b) fails (`team`/`schedule`/`team-roster` present in the worker runner's built server set). Restore. Then, separately: delete the `if (!this.suppressAutoInjectedServers)` gate in `effectiveCoreServerSet` (revert to unconditional adds) → `npx vitest run src/agents/agent-runner.test.ts`: the suppression pair (G5.c) fails. Restore.
+- [ ] **NV7 (BLOCKING-2 compensation):** delete the `worker-pool` compensation block in `buildToolTransportInventory` → `npx vitest run src/agents/agent-runner.test.ts`: the inventory pin (G5.d) fails (entry absent ⇒ Lane B partition would omit the tools). Restore.
 
 **Expected-PASS control (behavior-preserving edit ⇒ suites stay green, demonstrating the pins target behavior, not incidentals):**
 
-- [ ] **NV6:** rename the private method `sweepExpired` → `sweepExpiredClaims` (declaration + both internal call sites) → `npx vitest run src/workers/` stays green. Restore.
+- [ ] **NV8:** rename the private method `sweepExpired` → `sweepExpiredClaims` (declaration + both internal call sites) → `npx vitest run src/workers/` stays green. Restore.
 
-- [ ] **NV7:** `git status --short` → clean; `npx vitest run src/workers/ src/outage/outage-notices.test.ts` → all green.
+- [ ] **NV9:** `git status --short` → clean; `npx vitest run src/workers/ src/outage/outage-notices.test.ts src/agents/agent-runner.test.ts` and `npx vitest run src/agents/agent-manager.test.ts` → all green.
 
 ---
 
@@ -1553,6 +1632,8 @@ npm run check:bundle
 > 3. Optional `hive.yaml` `meetingWorkers:` section (all keys optional; defaults: sonnet workers, 4 engine-wide / 3 per meeting, 30m claim TTL, 10m worker wall clock, enabled).
 > 4. Validate on a live `conf-*` meeting: boss dispatches, room sees "sent someone", boss posts the finding on re-entry; check `db.meeting_worker_claims` for the C18 measurement fields.
 > Rollback: remove `worker-pool` from `coreServers` + SIGUSR1 (tools vanish), or `meetingWorkers.enabled: false` + restart (tools refuse honestly).
+>
+> Behavior note (deliberate, not a hang): after `stopAgent(boss)`, that boss's live workers are aborted but their claims stay `running` — the honest expiry notice arrives from the watchdog up to `claimTtlMinutes` (default 30m) later, or immediately from the restart sweep on the next engine boot. The abort path deliberately performs no status transition (E5/E13 coherence — the cancel/watchdog/sweep paths own the notice).
 
 ---
 
@@ -1576,7 +1657,7 @@ npm run check:bundle
 | 3 | `feat(workers): workerClaimDedup sidecar classifier — fail-open by construction (KPR-390)` | worker-claim-dedup.ts + test |
 | 4 | `feat(workers): meeting worker pool — claim ledger, atomic dispatch, detached spawn, re-entry, watchdog (KPR-390)` | meeting-worker-pool.ts + test |
 | 5 | `feat(workers): worker-pool in-process MCP server — 3 tools, context-ref template (KPR-390)` | worker-pool-mcp-server.ts + test |
-| 6 | `feat(agents): wire worker-pool — in-process registry, runner block, manager handshake, index lifecycle (KPR-390)` | in-process-servers.ts, agent-runner.ts (+test), agent-manager.ts (+test), index.ts |
+| 6 | `feat(agents): wire worker-pool — in-process registry, worker-mode suppression, Lane B inventory, manager handshake, index lifecycle (KPR-390)` | in-process-servers.ts, server-traits.ts, agent-runner.ts (+test), agent-manager.ts (+test), index.ts |
 | 7 | `feat(outage): worker re-entry items queue silently during provider outages (KPR-390)` | outage-notices.ts + test |
 | 8 | `docs: worker-pool provider note, meeting_worker_claims collection, KPR-184 list (KPR-390)` | docs/providers.md, CLAUDE.md |
 | 9 | (conditional) `chore: quality-gate fixes (KPR-390)` | — |
