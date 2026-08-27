@@ -73,3 +73,16 @@
 {"worker":"spec-reviewer-kpr-409-r1","phase":"spec-review","round":1,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T12:45:00Z"}
 {"worker":"spec-reviewer-kpr-409-r3","phase":"spec-review","round":3,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T14:30:00Z"}
 {"worker":"plan-writer-kpr-409","phase":"write-plan","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T15:00:00Z"}
+{"worker":"plan-reviewer-kpr-409-r1","phase":"plan-review","round":1,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T16:00:00Z"}
+{"worker":"plan-reviewer-kpr-409-r2","phase":"plan-review","round":2,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T16:45:00Z"}
+{"worker":"implementer-kpr-409-taskA","phase":"implement","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T17:15:00Z"}
+{"worker":"implementer-kpr-409-taskB","phase":"implement","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T17:35:00Z"}
+{"worker":"implementer-kpr-409-taskC","phase":"implement","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T18:00:00Z"}
+{"worker":"implementer-kpr-409-taskD","phase":"implement","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T18:30:00Z"}
+{"worker":"implementer-kpr-409-taskE","phase":"implement","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T19:15:00Z"}
+{"worker":"implementer-kpr-409-taskF","phase":"verify","ticket":"KPR-409","tier":"haiku","dispatched_at":"2026-08-27T20:00:00Z"}
+{"worker":"implementer-kpr-409-taskG","phase":"implement","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T20:30:00Z"}
+{"worker":"pre-pr-review-kpr-409-r1","phase":"pre-pr-review","round":1,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T21:00:00Z"}
+{"worker":"pre-pr-review-kpr-409-final","phase":"pre-pr-review","round":2,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T21:45:00Z"}
+{"worker":"pre-pr-review-kpr-409-r3","phase":"pre-pr-review","round":3,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T22:15:00Z"}
+{"worker":"docs-sync-kpr-409","phase":"submit-ticket-pr","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T22:40:00Z"}
