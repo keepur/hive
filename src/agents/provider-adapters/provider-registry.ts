@@ -292,7 +292,13 @@ export function describeUnroutableProvider(id: string): string {
  * even while it is broken). Unknown ⇒ undefined.
  */
 export function sessionSemanticsIfKnown(provider: string): SessionSemantics | undefined {
-  const builtin = (SESSION_SEMANTICS as Partial<Record<string, SessionSemantics>>)[provider];
+  // KPR-407 (finding 3): own-property guard — `provider` is plugin-controlled
+  // and PROVIDER_ID_REGEX admits "constructor", which would otherwise return
+  // Object's constructor function from the prototype chain as truthy garbage.
+  // (`active`/`declared`/`broken` below are Maps — prototype-safe already.)
+  const builtin = Object.prototype.hasOwnProperty.call(SESSION_SEMANTICS, provider)
+    ? (SESSION_SEMANTICS as Partial<Record<string, SessionSemantics>>)[provider]
+    : undefined;
   if (builtin) return builtin;
   return active.get(provider)?.semantics ?? declared.get(provider)?.decl.sessionSemantics ?? (broken.has(provider) ? brokenSemantics() : undefined);
 }

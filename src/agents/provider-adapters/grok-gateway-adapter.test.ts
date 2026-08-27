@@ -437,13 +437,13 @@ describe("GrokGatewayAdapter — tool round-trip", () => {
     expect(result.toolCalls).toBe(1);
   });
 
-  // Accepted asymmetry in the round-2 body this pins: the assistant message
-  // carries both duplicate tool_calls but only ONE role:"tool" result — an
-  // invalid chat-completions shape, reachable only when the gateway itself
-  // repeats a call id (the condition the dedup belt guards). The failure mode
-  // is an attributable status-prefixed 400, never silence; this is not the
-  // intended wire shape.
-  it("duplicate call id (two fragments, same id, different indices) executes once — loop dedup via callId", async () => {
+  // KPR-407 (finding 2): this used to pin an accepted asymmetry — the
+  // assistant message carried BOTH duplicate tool_calls while only ONE
+  // role:"tool" result answered them, an invalid chat-completions shape the
+  // vendor 400s. Dedup moved into assembleToolCalls, so the assistant message
+  // and the tool results now derive from one deduped list: exactly one
+  // tool_call, first-wins ("hi", the lowest fragment index), one tool result.
+  it("duplicate call id (two fragments, same id, different indices) → ONE tool_call in the assistant message and ONE tool result (first-wins)", async () => {
     const onCall = vi.fn();
     const fetchMock = sseScript(
       [
@@ -461,8 +461,15 @@ describe("GrokGatewayAdapter — tool round-trip", () => {
 
     expect(onCall).toHaveBeenCalledTimes(1);
     expect(onCall).toHaveBeenCalledWith("hi");
-    const toolMessages = (bodyOf(fetchMock, 1).messages as Array<{ role: string }>).filter((m) => m.role === "tool");
+    const messages = bodyOf(fetchMock, 1).messages as Array<Record<string, unknown>>;
+    // The assistant message carries ONE tool_call — the first fragment wins.
+    const assistant = messages[2] as { tool_calls?: Array<{ id: string; function: { arguments: string } }> };
+    expect(assistant.tool_calls).toHaveLength(1);
+    expect(assistant.tool_calls?.[0]?.id).toBe("call_dup");
+    expect(assistant.tool_calls?.[0]?.function.arguments).toBe('{"text":"hi"}');
+    const toolMessages = (messages as Array<{ role: string }>).filter((m) => m.role === "tool");
     expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0]).toEqual({ role: "tool", tool_call_id: "call_dup", content: "echo:hi" });
     expect(result.toolCalls).toBe(1);
   });
 

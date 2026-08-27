@@ -33,6 +33,13 @@ export const RESERVED_PROVIDER_IDS: ReadonlySet<string> = new Set([
   "deepseek",
   "laneB",
   "laneb",
+  // KPR-407 (finding 3): "constructor" is the SOLE Object.prototype member
+  // name PROVIDER_ID_REGEX can admit (every other one carries an uppercase
+  // letter or "__"), so this is a closed one-entry addition — not the start
+  // of a prototype-name list. The two indexed lookups it could reach are
+  // hasOwnProperty-guarded independently (provider-registry.ts,
+  // tool-transport.ts); reserving the id is the belt to that suspenders.
+  "constructor",
 ]);
 
 /**

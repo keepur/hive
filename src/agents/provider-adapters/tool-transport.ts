@@ -238,7 +238,15 @@ export function partitionInventoryForProvider(
     // ids fall back to the generic laneB column. A record carrying
     // neither column (a stale hand-built literal) is honestly
     // unsupported — never silently bridged.
-    const compatibility = columns[provider] ?? columns.laneB ?? "unsupported";
+    // KPR-407 (finding 3): own-property guard — `provider` is plugin-controlled
+    // and PROVIDER_ID_REGEX admits "constructor", whose unguarded lookup would
+    // return Object's constructor function (truthy, never in
+    // BRIDGEABLE_COMPATIBILITIES) and omit every tool with garbage in the
+    // reason field instead of falling through to the laneB column.
+    const providerColumn = Object.prototype.hasOwnProperty.call(columns, provider)
+      ? columns[provider]
+      : undefined;
+    const compatibility = providerColumn ?? columns.laneB ?? "unsupported";
     if (BRIDGEABLE_COMPATIBILITIES.has(compatibility)) {
       bridgeable.push(entry);
     } else {
