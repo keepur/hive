@@ -294,10 +294,10 @@ export function describeUnroutableProvider(id: string): string {
 export function sessionSemanticsIfKnown(provider: string): SessionSemantics | undefined {
   const builtin = (SESSION_SEMANTICS as Partial<Record<string, SessionSemantics>>)[provider];
   if (builtin) return builtin;
-  return active.get(provider)?.semantics ?? declared.get(provider)?.decl.sessionSemantics ?? (broken.has(provider) ? brokenSemantics(provider) : undefined);
+  return active.get(provider)?.semantics ?? declared.get(provider)?.decl.sessionSemantics ?? (broken.has(provider) ? brokenSemantics() : undefined);
 }
 
-function brokenSemantics(provider: string): SessionSemantics {
+function brokenSemantics(): SessionSemantics {
   // A broken provider never runs a turn, so no handle is ever produced;
   // fail-safe stateless-replay (never persist a handle).
   return "stateless-replay";

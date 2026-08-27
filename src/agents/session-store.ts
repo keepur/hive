@@ -107,9 +107,9 @@ export class SessionStore {
     // Tagged row (post-KPR-313 write).
     if (doc.provider) {
       // KPR-347 (review advisory): fail-closed on out-of-union provider
-      // strings. doc.provider is typed AgentProviderId, but the DB is not
-      // bound by the union — a row written by a newer/older engine may carry
-      // a provider this build doesn't know. The old Set's .has() scrubbed
+      // strings. doc.provider is a free string (R2), and the DB was never
+      // bound by the old union anyway — a row written by a newer/older
+      // engine may carry a provider this build doesn't know. The old Set's .has() scrubbed
       // unknowns implicitly; the ?? preserves exactly that posture (unknown
       // ⇒ stateless-replay ⇒ no handle).
       // KPR-394 (§4.3): registry-aware — a REGISTERED plugin provider's row
