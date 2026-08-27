@@ -71,6 +71,26 @@ vi.mock("../config.js", () => ({
     // end-to-end pin constructs a REAL AgentRunner (vi.importActual) whose
     // buildInProcessServers reads config.workflow.enabled unconditionally.
     workflow: { enabled: false },
+    // KPR-409 T7: the scribe containment pin also reaches
+    // buildToolTransportInventory → buildAllServerConfigs, which reads every
+    // stdio server's config block unconditionally. All falsy/empty so no
+    // vendor server is enabled — the pin is about what suppression strips.
+    slack: { localMcpServer: false, mcpToken: "" },
+    mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
+    google: { client: "", accounts: {} as Record<string, string[]>, sharedFolder: "" },
+    quo: { apiKey: "", phoneNumberId: "", lines: [] },
+    voice: { enabled: false, apiKey: "", phoneNumberId: "", assistants: {} },
+    taskLedger: { apiUrl: "", apiKey: "", agentKeys: {} as Record<string, string> },
+    brave: { apiKey: "" },
+    resend: { apiKey: "", emailDomain: "", businessName: "", fromAddress: "", defaultCc: "", defaultBcc: "" },
+    linear: { apiKey: "", teamId: "" },
+    github: { repo: "", token: "" },
+    clickup: { apiToken: "" },
+    recall: { apiKey: "", region: "", monitorPort: 3100, monitorPublicUrl: "", webhookSecret: "" },
+    browser: { cdpEndpoint: "" },
+    background: { port: 3200, authToken: "" },
+    codeTask: { port: 3202, authToken: "", pluginDir: "" },
+    defaultAgent: "chief-of-staff",
   },
 }));
 
@@ -5304,6 +5324,51 @@ describe("AgentManager — KPR-390 worker pool handshake", () => {
     expect(keys).toContain("memory");
     for (const name of ["team", "schedule", "team-roster", "worker-pool"]) {
       expect(keys).not.toContain(name);
+    }
+  });
+
+  it("KPR-409 T7: the scribe's coreServers:[] builds an EMPTY server set and a clean inventory (end-to-end)", async () => {
+    // Mirrors Part A's T3 posture on the scribe's ACTUAL role-params value:
+    // `coreServers: []` (meeting-scribe.ts C22), not a non-empty array. The
+    // scribe/pool suites assert the config array against a MOCKED
+    // buildWorkerAdapter — nothing there observes what [] actually BUILDS. If
+    // suppressAutoInjectedServers were ever dropped, [] silently re-gains
+    // team/schedule/team-roster (+ the LIVE skill-author stdio server on the
+    // inventory surface) and containment evaporates with those tests green.
+    const actual = await vi.importActual<typeof import("./agent-runner.js")>("./agent-runner.js");
+    vi.mocked(AgentRunner).mockImplementationOnce(function (...args: any[]) {
+      return new (actual.AgentRunner as any)(...args);
+    } as any);
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as any);
+    const hooks = pool.bindManager.mock.calls[0][0];
+
+    const scribeConfig: AgentConfig = {
+      id: "boss",
+      name: "Boss",
+      model: "sonnet",
+      channels: [],
+      passiveChannels: [],
+      keywords: [],
+      isDefault: false,
+      schedule: [],
+      budgetUsd: 1,
+      maxTurns: 4,
+      icon: "",
+      coreServers: [], // the scribe's real role-params value
+      delegateServers: [],
+      soul: "",
+      systemPrompt: "scribe",
+      autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+    } as unknown as AgentConfig;
+
+    const runner = (
+      hooks.buildWorkerAdapter(scribeConfig) as unknown as { runner: AgentRunner }
+    ).runner;
+    expect(Object.keys(runner.buildInProcessServers())).toEqual([]);
+    const inventory = runner.buildToolTransportInventory().map((e) => e.name);
+    for (const name of ["team", "schedule", "team-roster", "skill-author"]) {
+      expect(inventory).not.toContain(name);
     }
   });
 

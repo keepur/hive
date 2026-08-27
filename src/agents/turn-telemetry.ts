@@ -16,7 +16,7 @@ export interface TurnTelemetryDoc {
   ephemeral1hTokens?: number;
   // KPR-389: turn-kind + perf split for conference before/after measurement.
   conferenceRound?: number; // 0 | 1; absent on non-conference turns
-  injectionMode?: "full" | "delta"; // KPR-388 injection mode, from meta
+  injectionMode?: "full" | "delta" | "summary"; // KPR-388 injection mode, from meta
   resumedSession?: boolean; // C7 — finalized attempt launched with a handle
   durationMs?: number;
   llmMs?: number;
@@ -39,7 +39,7 @@ export interface TurnTelemetryInput {
   ephemeral1hTokens?: number;
   // KPR-389: turn-kind + perf split for conference before/after measurement.
   conferenceRound?: number; // 0 | 1; absent on non-conference turns
-  injectionMode?: "full" | "delta"; // KPR-388 injection mode, from meta
+  injectionMode?: "full" | "delta" | "summary"; // KPR-388 injection mode, from meta
   resumedSession?: boolean; // C7 — finalized attempt launched with a handle
   durationMs?: number;
   llmMs?: number;

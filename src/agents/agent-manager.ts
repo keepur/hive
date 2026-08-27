@@ -196,9 +196,9 @@ export function conferenceRoundOf(item: WorkItem): 0 | 1 | undefined {
 }
 
 /** KPR-389: typed read of the KPR-388 injection mode stamped beside the round. */
-function conferenceInjectionModeOf(item: WorkItem): "full" | "delta" | undefined {
+function conferenceInjectionModeOf(item: WorkItem): "full" | "delta" | "summary" | undefined {
   const v = item.meta?.conferenceInjectionMode;
-  return v === "full" || v === "delta" ? v : undefined;
+  return v === "full" || v === "delta" || v === "summary" ? v : undefined;
 }
 
 /**

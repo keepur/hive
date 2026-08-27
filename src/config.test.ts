@@ -224,6 +224,57 @@ describe("resolveMeetingWorkersConfig (KPR-390)", () => {
       perMeetingMax: 5,
     });
   });
+
+  it("KPR-409: scribe keys default when absent", () => {
+    const c = resolveMeetingWorkersConfig({ workerModel: "opus" });
+    expect(c.scribeEnabled).toBe(true);
+    expect(c.scribeModel).toBe("haiku");
+    expect(c.scribeDebounceMs).toBe(90_000);
+    expect(c.scribeMinNewMessages).toBe(6);
+    expect(c.scribeMaxConcurrent).toBe(2);
+    expect(c.scribeMaxTurns).toBe(4);
+    expect(c.scribeTimeoutMs).toBe(120_000);
+  });
+
+  it("KPR-409: garbage scribe values fall back to defaults", () => {
+    const c = resolveMeetingWorkersConfig({
+      scribeEnabled: "yes",
+      scribeModel: "   ",
+      scribeDebounceMs: -1,
+      scribeMinNewMessages: "six",
+      scribeMaxConcurrent: 0,
+      scribeMaxTurns: null,
+      scribeTimeoutMs: NaN,
+    });
+    expect(c).toMatchObject({
+      scribeEnabled: true,
+      scribeModel: "haiku",
+      scribeDebounceMs: 90_000,
+      scribeMinNewMessages: 6,
+      scribeMaxConcurrent: 2,
+      scribeMaxTurns: 4,
+      scribeTimeoutMs: 120_000,
+    });
+  });
+
+  it("KPR-409: valid scribe values pass through; scribeTimeoutMs never clamps claimTtlMinutes", () => {
+    const c = resolveMeetingWorkersConfig({
+      scribeEnabled: false,
+      scribeModel: "  sonnet  ",
+      scribeDebounceMs: 30_000,
+      scribeMinNewMessages: 3,
+      scribeMaxConcurrent: 5,
+      scribeMaxTurns: 2,
+      scribeTimeoutMs: 3_600_000, // 60m > claimTtlMinutes default 30m — must NOT clamp
+    });
+    expect(c.scribeEnabled).toBe(false);
+    expect(c.scribeModel).toBe("sonnet");
+    expect(c.scribeDebounceMs).toBe(30_000);
+    expect(c.scribeMinNewMessages).toBe(3);
+    expect(c.scribeMaxConcurrent).toBe(5);
+    expect(c.scribeMaxTurns).toBe(2);
+    expect(c.claimTtlMinutes).toBe(DEFAULT_MEETING_WORKERS_CONFIG.claimTtlMinutes);
+  });
 });
 
 describe("resolveToolSearchConfig (KPR-329)", () => {

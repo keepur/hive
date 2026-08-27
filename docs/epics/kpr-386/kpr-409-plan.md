@@ -20,7 +20,11 @@ injectionHighWaterTs: maxSlackTs([...tail.map((m) => m.ts), summary.coveredThrou
 
 — `coveredThroughTs` maxed in, per spec §D4's recommendation. Test **T2(b)** and **T5** are written against R2 (empty tail ⇒ `injectionHighWaterTs === coveredThroughTs`, and `setMeetingMark` IS called).
 
-**F1 is documented, not built.** If the coherence reviewer rejects R2 at the merge seam, F1 is the fallback: the summary arm returns `injectionHighWaterTs: undefined`, `dispatchToAgent:1106`'s `else if` skips `setMeetingMark`, and no mark is ever written from a summary turn. Cost of the switch: **delete one line** (the `summary.coveredThroughTs` entry in the `maxSlackTs` array) plus **invert two tests** (T2(b) and T5 flip from pinning the mark's value to pinning its absence — spec §Test plan T2's own callout). Cost of the *behavior*: a fresh entrant never converts to delta and re-enters the summary arm on every turn — traded deliberately, priced at spec §D4.
+**F1 is documented, not built.** If the coherence reviewer rejects R2 at the merge seam, F1 is the fallback: the summary arm returns `injectionHighWaterTs: undefined`, `dispatchToAgent:1114`'s `else if` skips `setMeetingMark`, and no mark is ever written from a summary turn.
+
+⚠ **Cost of the switch — stated precisely, because the obvious reading is wrong.** F1 is **not** "delete the `summary.coveredThroughTs` term". Deleting only that term leaves `maxSlackTs([...tail.map((m) => m.ts), roundZeroTriggerTs])`, which is still a **defined** string on every round-0 summary turn (the trigger ts) and on every non-empty-tail turn (the tail max) — so `setMeetingMark` still fires in three of the four cases, and what you would have built is the withdrawn "max in only when the tail is non-empty" variant (spec §D4 retracts it), not F1. **True F1 is the deletion of the entire `injectionHighWaterTs: maxSlackTs([...])` property assignment**, leaving the summary arm returning `{ threadContext, injectionMode: "summary" }` with **no `injectionHighWaterTs` key at all** (hence `undefined` on every summary turn, exactly as spec §D4 defines it).
+
+Consequently the test cost is **five inversions, not two**: both **T2(a)** cases, **T2(b)**, **T2(c)**, and **T5** all assert `setMeetingMark` was called with a value in summary mode, and all five flip to pinning its absence under F1. Cost of the *behavior*: a fresh entrant never converts to delta and re-enters the summary arm on every turn — traded deliberately, priced at spec §D4.
 
 Implementers: build R2. Do not build F1 speculatively, do not add a config flag to switch between them, and do not soften R2 into the withdrawn "max in only when the tail is non-empty" variant (spec §D4 explicitly retracts it — it does not exist).
 
@@ -1150,9 +1154,11 @@ with `import type { MeetingScribe } from "../workers/meeting-scribe.js";` beside
   - Record the F1 inversion in a comment above the block:
     ```ts
     // ⚠ Written against R2 (spec §D4, plan header decision). If the coherence
-    // reviewer rules F1 instead, (b) and T5 INVERT: injectionHighWaterTs is
-    // always undefined in summary mode and setMeetingMark is never called —
-    // rewrite both to pin the absence.
+    // reviewer rules F1 instead, ALL FIVE of the tests below INVERT — both
+    // T2(a) cases, T2(b), T2(c) and T5 — because true F1 deletes the whole
+    // injectionHighWaterTs property from the summary arm (not just the
+    // coveredThroughTs term), so the mark is undefined and setMeetingMark is
+    // never called on ANY summary turn. Rewrite all five to pin the absence.
     ```
 - [ ] **E8c — T3 C6 pin unchanged.** No new test; the gate is that the existing byte-exact assembly pin (`:492`) and full-mode mark case (`:770`) pass **unmodified**. Add one explicit control case: scribe installed but `getSummary` resolving `undefined` ⇒ `turnItem.text` byte-equals the pre-KPR-409 full-mode shape (`toContain("old message")`, no summary markers).
 - [ ] **E8d — T4 delta arm never reads summaries.** Delta-eligible agent (`seedRef` with sessionId + claude + mark) **with** a summary doc present ⇒ `getSummary` **not called**, `injectionMode: "delta"`, and the delta byte pin at `:715` shape reproduced.
@@ -1187,7 +1193,7 @@ For each expected-FAIL probe: make the temporary edit, run the named suite, **co
 **Expected-FAIL probes (revert-the-fix ⇒ the new test must fail):**
 
 - [ ] **NV1 (T1 anchor).** In `buildConferenceContext`, delete the `if (summary) { … }` block (leaving the plain full-arm return) → `npx vitest run src/channels/dispatcher-conference.test.ts`: the T1 byte pin fails with the raw-transcript shape. Restore.
-- [ ] **NV2 (T2 / R2 formula).** Delete `summary.coveredThroughTs,` from the summary arm's `maxSlackTs([...])` array → conference suite: **T2(b) fails** — `injectionHighWaterTs` is `undefined` and `setMeetingMark` is never called. Restore. ⚠ This probe is also the F1 diff: if the coherence reviewer rules F1, this "failure" is the intended behavior and T2(b)/T5 get rewritten to pin it.
+- [ ] **NV2 (T2 / R2 formula).** Delete `summary.coveredThroughTs,` from the summary arm's `maxSlackTs([...])` array → conference suite: **T2(b) fails** — `injectionHighWaterTs` is `undefined` and `setMeetingMark` is never called. Restore. ⚠ This probe proves the term is load-bearing for the empty-tail case; it is **not** the F1 diff. F1 deletes the entire `injectionHighWaterTs` property (see the plan header) and inverts all five summary-mode mark tests, not just T2(b).
 - [ ] **NV3 (T4 delta isolation).** Hoist `const summary = await this.meetingScribe?.getSummary(threadId);` **above** the `if (!ref?.sessionId || …)` predicate → conference suite: T4 fails (`getSummary` called on a delta-eligible agent). Restore.
 - [ ] **NV4 (⚠ seam-placement defect — T6. NOT the concurrency race; see NV5 for that).** Move the `noteActivity` call out of `resolveConferenceAgents` and into `buildConferenceContext`'s full arm (the earlier design the spec corrected) → conference suite: **the round-0 exactly-one call-count assertion fails at N** (one call per responder), **and** the classifier-selects-nobody case fails at 0 calls. Restore.
 

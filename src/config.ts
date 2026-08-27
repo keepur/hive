@@ -123,6 +123,15 @@ export function resolveMeetingWorkersConfig(raw: unknown): MeetingWorkersConfig 
     workerMaxTurns: posNum(r.workerMaxTurns, d.workerMaxTurns),
     workerTimeoutMs,
     enabled: typeof r.enabled === "boolean" ? r.enabled : d.enabled,
+    // KPR-409 scribe keys — same liberal-loader idioms; no TTL clamp (the
+    // scribe creates no claim, so claimTtlMinutes's invariant is untouched).
+    scribeEnabled: typeof r.scribeEnabled === "boolean" ? r.scribeEnabled : d.scribeEnabled,
+    scribeModel: typeof r.scribeModel === "string" && r.scribeModel.trim() ? r.scribeModel.trim() : d.scribeModel,
+    scribeDebounceMs: posNum(r.scribeDebounceMs, d.scribeDebounceMs),
+    scribeMinNewMessages: posNum(r.scribeMinNewMessages, d.scribeMinNewMessages),
+    scribeMaxConcurrent: posNum(r.scribeMaxConcurrent, d.scribeMaxConcurrent),
+    scribeMaxTurns: posNum(r.scribeMaxTurns, d.scribeMaxTurns),
+    scribeTimeoutMs: posNum(r.scribeTimeoutMs, d.scribeTimeoutMs),
   };
 }
 
@@ -487,7 +496,8 @@ export const config = {
   // optional; enabled:false = interception off, fast-fails fall back to the raw error path).
   outageQueue: resolveOutageQueueConfig(hive.outageQueue),
   // KPR-390: meeting worker pool (hive.yaml `meetingWorkers`, all keys
-  // optional; enabled:false = worker_dispatch refuses honestly, nothing else changes).
+  // optional; enabled:false = worker_dispatch refuses honestly AND — KPR-409 —
+  // the scribe + summary anchor are off; scribeEnabled:false is the scribe-only lever).
   meetingWorkers: resolveMeetingWorkersConfig(hive.meetingWorkers),
   // KPR-329: tool-search / deferred MCP tool loading (hive.yaml `toolSearch`,
   // all keys optional; mode: off = eager loading, the rollback posture).

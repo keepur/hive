@@ -742,3 +742,117 @@ describe("MeetingWorkerPool — watchdog interval (fake timers)", () => {
     expect(f.onDispatch).not.toHaveBeenCalled();
   });
 });
+
+describe("MeetingWorkerPool — runRoleTurn (KPR-409 sibling)", () => {
+  const roleArgs = (over: AnyDoc = {}) => ({
+    base: {
+      id: "boss",
+      name: "Jasper",
+      model: "opus",
+      coreServers: ["memory", "slack", "worker-pool"],
+      delegateServers: ["crm-search"],
+      schedule: [{ cron: "0 9 * * *" }],
+      budgetUsd: 2.5,
+    } as any,
+    role: { model: "haiku", coreServers: [], maxTurns: 4, timeoutMs: 120_000, charter: "CHARTER" },
+    prompt: "summarize this",
+    workItemContext: meetingCtx as any,
+    ...over,
+  });
+
+  it("clones the base config with the role's model/servers, delegateServers [] and schedule []", async () => {
+    const f = makeFixture();
+    await f.pool.runRoleTurn(roleArgs());
+    expect(f.builtConfigs).toHaveLength(1);
+    expect(f.builtConfigs[0]).toMatchObject({
+      id: "boss",
+      model: "haiku",
+      coreServers: [],
+      delegateServers: [],
+      schedule: [],
+      budgetUsd: 2.5,
+    });
+  });
+
+  it("passes the charter as systemPromptOverride, runs sessionless, and binds the base budget", async () => {
+    const f = makeFixture();
+    await f.pool.runRoleTurn(roleArgs());
+    const req = f.runTurn.mock.calls[0][0];
+    expect(req.systemPromptOverride).toBe("CHARTER");
+    expect(req.sessionId).toBeUndefined();
+    expect(req.resourceLimits).toEqual({ maxTurns: 4, timeoutMs: 120_000, budgetUsd: 2.5 });
+  });
+
+  // ⚠ Two cases, because at maxConcurrent: 4 the assertion
+  // `hasCapacity() === true` is INSENSITIVE to the bug: one wrongly-registered
+  // role turn gives liveWorkers.size 1, and `1 < 4` is still true. Only the
+  // dispatch-admission count discriminates there. The maxConcurrent: 1 case is
+  // the one where hasCapacity() itself genuinely flips.
+  it("T12 (pool half, maxConcurrent 1): a live role turn leaves hasCapacity() true", async () => {
+    const f = makeFixture({ config: { maxConcurrent: 1 }, runTurnImpl: () => new Promise(() => {}) });
+    void f.pool.runRoleTurn(roleArgs());
+    await flush();
+    // Discriminating: if runRoleTurn registered in liveWorkers, size would be
+    // 1 and `1 < 1` would make this false.
+    expect(f.pool.hasCapacity()).toBe(true);
+  });
+
+  it("T12 (pool half, maxConcurrent 4): a live role turn consumes no dispatch slot", async () => {
+    // ⚠ perMeetingMax raised: the default is 3, and four dispatches on ONE
+    // thread would be refused by the per-meeting cap before the engine-wide
+    // cap is ever reached — which would make this test pass for the wrong
+    // reason. maxConcurrent stays at its default 4 (the value under test).
+    const f = makeFixture({
+      config: { maxConcurrent: 4, perMeetingMax: 10 },
+      runTurnImpl: () => new Promise(() => {}),
+    });
+    void f.pool.runRoleTurn(roleArgs());
+    await flush();
+    const results = [];
+    for (const t of ["a", "b", "c", "d"]) results.push(await f.pool.dispatch(dispatchReq(t)));
+    // Discriminating: with the role turn wrongly in liveWorkers, the 4th
+    // dispatch sees size 4 >= 4 and is refused.
+    expect(results.every((r) => r.startsWith("Worker dispatched (claim "))).toBe(true);
+    expect(results.some((r) => r.includes("Worker pool saturated"))).toBe(false);
+    expect(f.hooks.buildWorkerAdapter).toHaveBeenCalledTimes(5); // 1 role + 4 fetch
+    expect(f.pool.hasCapacity()).toBe(false); // now genuinely full, on fetch workers alone
+  });
+
+  it("touches no claim ledger and fires no re-entry", async () => {
+    const f = makeFixture();
+    await f.pool.runRoleTurn(roleArgs());
+    expect(f.claims.docs).toHaveLength(0);
+    expect(f.onDispatch).not.toHaveBeenCalled();
+  });
+
+  it("invokes onAbortHandle synchronously with a working abort, and never throws on adapter failure", async () => {
+    const f = makeFixture({
+      runTurnImpl: async () => {
+        throw new Error("boom");
+      },
+    });
+    let handle: (() => void) | undefined;
+    const out = await f.pool.runRoleTurn(
+      roleArgs({
+        onAbortHandle: (a: () => void) => {
+          handle = a;
+        },
+      }),
+    );
+    expect(handle).toBeTypeOf("function");
+    handle!();
+    expect(f.abortSpy).toHaveBeenCalled();
+    expect(out?.error).toContain("boom");
+  });
+
+  it("returns null when manager hooks are not bound", async () => {
+    const claims = makeFakeClaims();
+    const pool = new MeetingWorkerPool({
+      db: { collection: () => claims } as any,
+      registry: { get: () => undefined } as any,
+      onDispatch: vi.fn(),
+      config: { ...DEFAULT_MEETING_WORKERS_CONFIG },
+    });
+    expect(await pool.runRoleTurn(roleArgs())).toBeNull();
+  });
+});
