@@ -1260,21 +1260,37 @@ export class Dispatcher {
     // (`rosterMembers.length > 0` is redundant with the :1229 early return —
     // kept deliberately so the seam states its own precondition locally and
     // survives any future reordering. Not a bug; do not "simplify" it away.)
+    //
+    // The try/catch makes the fail-open STRUCTURAL at this boundary rather than
+    // dependent on the callee's internals holding (KPR-390 canon C27, same bug
+    // shape as the getSummary call site). noteActivity's ASYNC portion is
+    // already self-contained (`void this.run().catch().finally()`), but its
+    // SYNCHRONOUS gate checks run on this stack — a throw there would propagate
+    // straight through conference dispatch and kill the turn, contradicting the
+    // spec's "the scribe never blocks a conference turn" requirement.
     if (history.length > 0 && rosterMembers.length > 0) {
-      this.meetingScribe?.noteActivity({
-        threadId,
-        history,
-        channelLabel: item.source.label,
-        roster: rosterMembers,
-        baseAgentId: rosterMembers[0].agentId,
-        source: {
-          adapterId: item.source.adapterId ?? item.source.kind,
-          channelId: item.source.id,
-          channelKind: item.source.kind,
-          slackTs: (item.meta?.slackTs as string) ?? "",
-          slackThreadTs: (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId,
-        },
-      });
+      try {
+        this.meetingScribe?.noteActivity({
+          threadId,
+          history,
+          channelLabel: item.source.label,
+          roster: rosterMembers,
+          baseAgentId: rosterMembers[0].agentId,
+          source: {
+            adapterId: item.source.adapterId ?? item.source.kind,
+            channelId: item.source.id,
+            channelKind: item.source.kind,
+            slackTs: (item.meta?.slackTs as string) ?? "",
+            slackThreadTs: (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId,
+          },
+        });
+      } catch (err) {
+        log.warn("Conference cadence: round-0 noteActivity threw, continuing the turn", {
+          agentId: rosterMembers[0].agentId,
+          threadId,
+          error: String(err),
+        });
+      }
     }
 
     // Run classifier
@@ -1591,23 +1607,34 @@ Meeting rules:
 
     // KPR-409 (R1 — requested C26 relaxation): round-1 cadence trigger.
     // Selection-gated by construction (the three early returns above precede
-    // the re-fetch). Same fire-and-forget contract as the round-0 seam.
+    // the re-fetch). Same fire-and-forget contract — and the same structural
+    // call-site fail-safety (KPR-390 canon C27) — as the round-0 seam: a throw
+    // out of noteActivity's synchronous gate checks must never take down the
+    // reaction dispatch below.
     if (history.length > 0 && allRosterMembers.length > 0) {
-      this.meetingScribe?.noteActivity({
-        threadId,
-        history,
-        channelLabel: originalItem.source.label,
-        roster: allRosterMembers,
-        baseAgentId: allRosterMembers[0].agentId,
-        source: {
-          adapterId: originalItem.source.adapterId ?? originalItem.source.kind,
-          channelId: originalItem.source.id,
-          channelKind: originalItem.source.kind,
-          slackTs: humanTs,
-          slackThreadTs:
-            (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId,
-        },
-      });
+      try {
+        this.meetingScribe?.noteActivity({
+          threadId,
+          history,
+          channelLabel: originalItem.source.label,
+          roster: allRosterMembers,
+          baseAgentId: allRosterMembers[0].agentId,
+          source: {
+            adapterId: originalItem.source.adapterId ?? originalItem.source.kind,
+            channelId: originalItem.source.id,
+            channelKind: originalItem.source.kind,
+            slackTs: humanTs,
+            slackThreadTs:
+              (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId,
+          },
+        });
+      } catch (err) {
+        log.warn("Conference cadence: round-1 noteActivity threw, continuing the turn", {
+          agentId: allRosterMembers[0].agentId,
+          threadId,
+          error: String(err),
+        });
+      }
     }
 
     // Dispatch reactions concurrently (peers already claimed in reacted set above)

@@ -1661,5 +1661,52 @@ Meeting rules:
       expect(turnItem.meta.conferenceInjectionMode).toBe("full");
       expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
     });
+
+    it("T6: a scribe whose noteActivity THROWS at both cadence seams never blocks the turn", async () => {
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+
+      const threadId = "conf-thread-cadence-throws";
+      // Call-site fail-safety (KPR-390 canon C27), the noteActivity twin of the
+      // getSummary case above. noteActivity's ASYNC portion is self-contained
+      // (`void this.run().catch()`), but its SYNCHRONOUS gate checks run on the
+      // dispatch stack — an unguarded throw there would propagate through
+      // resolveConferenceAgents (round 0) / triggerConferenceReactions (round 1)
+      // and kill the conference turn. Both seams are wrapped, so a scribe that
+      // explodes synchronously is inert: every turn still runs.
+      const scribe = {
+        getSummary: vi.fn().mockResolvedValue(undefined),
+        noteActivity: vi.fn(() => {
+          throw new Error("scribe gate exploded");
+        }),
+      };
+      dispatcher.setMeetingScribe(scribe as any);
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, and Jessica, please weigh in",
+          source: { kind: "slack", id: "C-CONF", label: "conf-cadence-throws" },
+          threadId,
+          meta: { slackTs: "1000.0004" },
+        }),
+      );
+
+      // Both seams were reached and both threw — round 0 (resolveConferenceAgents)
+      // and round 1 (triggerConferenceReactions).
+      await vi.waitFor(() => {
+        expect(scribe.noteActivity).toHaveBeenCalledTimes(2);
+      });
+      // ...and neither throw stopped dispatch: the round-0 responder AND the
+      // round-1 reactor both ran their turns.
+      await vi.waitFor(() => {
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+      });
+      const dispatched = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]);
+      expect(dispatched).toEqual(["jasper", "jessica"]);
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
+    });
   });
 });
