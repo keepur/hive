@@ -2,6 +2,7 @@
 
 **Epic:** KPR-386 (meeting mode) · **Blocked by:** KPR-390 (merged, `b611348`) · **Last child of the epic**
 **Lifted from:** Part B of `docs/epics/kpr-386/kpr-390-spec.md`, re-verified against merged `main`-line reality (§Code-verification deltas).
+**Status:** spec-ready (spec review clean r3, opus; r1 6 issues + r2 4 issues + r3 1 issue, all resolved).
 
 ## TL;DR
 
@@ -108,7 +109,7 @@ Gates 1, 3, 2a and 5a are all synchronous reads above the claim; nothing between
 4. Novelty: fewer than `scribeMinNewMessages` (default 6) messages with `ts > coveredThroughTs` ⇒ abandon. (First run: `coveredThroughTs` absent ⇒ every message counts, so a meeting summarizes once it is 6 messages deep.)
 5b. `pool.hasCapacity()` false ⇒ abandon. Fetch-workers are on someone's critical path; the scribe yields to them even though it no longer competes for their slots (§D3) — a saturated pool means the engine is busy.
 
-Then: set `updating`, run the turn, write the summary, clear `updating`, stamp `lastRunAt`. Every abandon path is a silent no-op re-evaluated on the next round's trigger; the `finally` clears the in-memory claim and the `updating` field on every path including throw.
+Then: set `updating`, run the turn, write the summary, clear `updating`, stamp `lastRunAt`. Every abandon path is a silent no-op re-evaluated on the next round's trigger; the `finally` clears the in-memory claim, the `updating` field, and the corresponding `abortHandles` entry on every path including throw — one shared lifecycle (see the gate-0 sketch above).
 
 **"Standing" is behavioral, not process-level** — there is no long-lived scribe process, no timer, and nothing to leak across a restart beyond a possibly-stale `updating` field, which gate 2b clears.
 
@@ -248,7 +249,7 @@ Two things make it a modest ask rather than a novel exception:
 **F1 spelled out precisely, because it is the only compliant option and it does *not* silently disable the feature.** With `injectionHighWaterTs: undefined`, `dispatchToAgent:1106`'s `else if` skips `setMeetingMark`, so no mark is ever written from a summary turn. Consequences, traced:
 
 - **The ticket's goal is still met.** A fresh entrant gets `summary + tail` instead of the 105-message transcript. That is the entire point of KPR-409 and it survives intact.
-- **But no summarized thread ever converts to delta.** With no mark, KPR-388's eligibility predicate fails forever, so *every* turn for *every* participant on that thread re-enters the summary arm. Per-turn cost becomes `~2500 chars of summary + messages since the last scribe run` (small — the scribe runs every ~90s) in place of KPR-388's pure delta. **This trades a shipped sibling ticket's warm-path savings for this ticket's cold-path savings** — bounded and arguably still net-positive, but a real regression against KPR-388 that the reviewer must price deliberately, not discover later.
+- **But a fresh-entrant participant never converts to delta.** F1 writes no mark and clears none — so this cost applies only to an agent entering summary mode *without a prior mark* (the fresh-entrant case, which is the dominant and target one: every new joiner, and every agent whose session/mark was never established). An agent that already held a mark and hit a handle miss (session document survives its handle — C8) or a KPR-313 provider mismatch keeps that mark untouched and returns to the **delta** arm on its next turn once the condition clears — F1 does not touch that path. For the fresh-entrant case, with no mark, KPR-388's eligibility predicate fails forever, so *every* turn re-enters the summary arm. Per-turn cost becomes `~2500 chars of summary + messages since the last scribe run` (small — the scribe runs every ~90s) in place of KPR-388's pure delta. **This trades a shipped sibling ticket's warm-path savings, for fresh entrants specifically, for this ticket's cold-path savings** — bounded and arguably still net-positive, but a real regression against KPR-388 that the reviewer must price deliberately, not discover later.
 - **It is not permanently absorbing.** If `scribeEnabled` is turned off or the summary doc ages out on its TTL, the plain full arm runs and sets a mark normally; delta resumes.
 - Cost to implement: deleting one line. F1 is a genuine fallback, not a euphemism for F2.
 
@@ -350,7 +351,7 @@ Negative-verify per repo convention (revert the source hunk, confirm the new tes
 **`src/channels/dispatcher-conference.test.ts`** (additions; the existing 28 cases must pass **unedited** — a review gate)
 
 - **T1 (summary-mode byte pin).** Summary doc present + fresh-session ref ⇒ `threadContext` byte-exact against the pinned `formatSummaryContext` shape (both markers present, neither `[New message]:` nor `[New messages since your last turn:]` present), `injectionMode: "summary"`. Table row: empty tail ⇒ no dangling `[Messages since the summary:]` header. *Negative-verify: revert the anchor branch ⇒ the pin fails with the raw-transcript shape.*
-- **T2 (high-water formula).** ⚠ The correction pin. (a) Non-empty tail ⇒ `injectionHighWaterTs === max(tail ts)`. (b) **Empty tail, round 1 (no trigger ts) ⇒ `injectionHighWaterTs === coveredThroughTs`, and the subsequent `setMeetingMark` is called** — the case the carried formula got wrong. (c) Round 0 ⇒ maxed against `roundZeroTriggerTs`. *Negative-verify: drop `coveredThroughTs` from the max ⇒ (b) fails with `undefined` and no mark write.*
+- **T2 (high-water formula).** ⚠ The correction pin, written against R2 (the default recommendation). (a) Non-empty tail ⇒ `injectionHighWaterTs === max(tail ts)`. (b) **Empty tail, round 1 (no trigger ts) ⇒ `injectionHighWaterTs === coveredThroughTs`, and the subsequent `setMeetingMark` is called** — the case the carried formula got wrong. (c) Round 0 ⇒ maxed against `roundZeroTriggerTs`. *Negative-verify: drop `coveredThroughTs` from the max ⇒ (b) fails with `undefined` and no mark write.* **If the ruling goes F1 instead of R2, T2(b) and T5 invert**: `injectionHighWaterTs` is always `undefined` in summary mode and `setMeetingMark` is never called — rewrite both to pin the absence.
 - **T3 (C6 pin unchanged).** No summary doc ⇒ the existing full-mode pin at `:770` and the byte-exact assembly pin at `:492` pass **without modification**. Asserted by construction (unedited suite) and called out as a plan review gate.
 - **T4 (delta arm never reads summaries).** Delta-eligible agent with a summary doc present ⇒ `getSummary` not called, `injectionMode: "delta"`, delta pin at `:715` byte-unchanged. *Negative-verify: hoist the summary lookup above the eligibility predicate ⇒ fails.*
 - **T5 (self-heal leg untouched).** Summary-mode turn with `resumedSession: false` ⇒ `setMeetingMark` (not `clearMeetingMark`) — the `=== "delta"`-exclusive clear branch, mirroring the existing `:1158` full-mode case.
