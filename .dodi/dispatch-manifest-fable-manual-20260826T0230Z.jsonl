@@ -1,0 +1,3 @@
+{"worker":"spec-drafter-kpr-387","phase":"draft-spec","ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T02:33:00Z"}
+{"worker":"spec-reviewer-kpr-387-r1","phase":"spec-review","round":1,"ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T02:40:00Z"}
+{"worker":"plan-writer-kpr-387","phase":"write-plan","ticket":"KPR-387","tier":"fable","dispatched_at":"2026-08-26T02:52:00Z"}

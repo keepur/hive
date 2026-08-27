@@ -160,7 +160,12 @@ export class OpenAIAgentsAdapter extends LaneBTurnScaffold {
         "OpenAI API key is not available; set OPENAI_API_KEY in the instance .env and restart — hive credentials add does not carry this key yet",
       );
     }
-    return new OpenAI({ apiKey });
+    // maxRetries 0: single-attempt by design (KPR-306 parity with the gemini
+    // and codex adapters) — openai-node defaults to 2 client-internal retries
+    // on 408/409/429/5xx/connection faults, which would mask provider faults
+    // from breaker classification and inflate llmMs (the breaker's p95 input).
+    // Retry policy belongs to the breaker/outage layer.
+    return new OpenAI({ apiKey, maxRetries: 0 });
   }
 
   private async consumeTextStream(result: OpenAIStreamResultLike, onStream?: (chunk: string) => void): Promise<string> {

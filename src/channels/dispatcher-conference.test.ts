@@ -376,4 +376,119 @@ describe("Conference channel routing", () => {
     // Agent responds with text, should be delivered back
     expect(adapter.deliver).toHaveBeenCalled();
   });
+
+  it("round-0 responders are excluded from the reaction-pass roster", async () => {
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    // Round-0: jasper + river respond. Reaction passes: capture roster, select nobody.
+    (classifyMeetingMessage as any)
+      .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river"], costUsd: 0.001, durationMs: 100 })
+      .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+
+    const item = makeWorkItem({
+      text: "Jasper, River, and Jessica, discuss the launch plan",
+      source: { kind: "slack", id: "C-CONF", label: "conf-strategy" },
+      threadId: "conf-thread-exclusion",
+      meta: { slackTs: "1700.0001" },
+    });
+
+    await dispatcher.dispatch(item);
+
+    // triggerConferenceReactions is fire-and-forget (dispatch() returns before the
+    // reaction pass runs): drain until at least one reaction-pass classifier call
+    // happened, then flush the event loop before asserting over ALL reaction calls.
+    const reactionCalls = () =>
+      (classifyMeetingMessage as any).mock.calls.filter((c: any[]) => c[0] === "Agent response");
+    await vi.waitFor(() => {
+      expect(reactionCalls().length).toBeGreaterThanOrEqual(1);
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Every reaction-pass roster contains only jessica — never a round-0 primary.
+    for (const call of reactionCalls()) {
+      const rosterIds = call[1].map((m: any) => m.agentId);
+      expect(rosterIds).toEqual(["jessica"]);
+    }
+
+    // Each agent ran at most once for this trigger (round-0 only; reactions suppressed).
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]).sort();
+    expect(calledAgents).toEqual(["jasper", "river"]);
+  });
+
+  it("round-1 reaction prompt frames the peer reply, not the human message", async () => {
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    // Round-0: jasper responds. Reaction pass: jessica reacts to jasper's reply.
+    // The trigger must mention BOTH agents — with only jasper in the roster,
+    // peerMembers is empty and the reaction pass returns before the classifier.
+    (classifyMeetingMessage as any)
+      .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+      .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+
+    const item = makeWorkItem({
+      text: "Jasper, and Jessica, please weigh in on the Q3 roadmap",
+      source: { kind: "slack", id: "C-CONF", label: "conf-strategy" },
+      threadId: "conf-thread-framing",
+      meta: { slackTs: "1700.0002" },
+    });
+
+    await dispatcher.dispatch(item);
+
+    // Drain the fire-and-forget reaction pass until jessica's round-1 turn ran.
+    const round1Call = () =>
+      agentManager.runWorkItemTurn.mock.calls.find((c: any[]) => c[1]?.meta?.conferenceRound === 1);
+    await vi.waitFor(() => {
+      expect(round1Call()).toBeDefined();
+    });
+
+    const [reactorId, round1Item] = round1Call()!;
+    expect(reactorId).toBe("jessica");
+    // Peer reply framed in the terminal slot: responder display name + full reply text.
+    // The reply label must carry reactionTo.authorName (display name, not the bare
+    // agent id) — a plain toContain("Jasper") would also pass on the preamble alone.
+    expect(round1Item.text).toContain("Agent response");
+    expect(round1Item.text).toContain("[Jasper just replied]:");
+    // Human message absent (fetchThreadHistory is mocked to [], so it cannot leak
+    // in via the transcript either) and the [New message] human-slot is gone.
+    expect(round1Item.text).not.toContain("please weigh in on the Q3 roadmap");
+    expect(round1Item.text).not.toMatch(/\[New message\]:\n/);
+  });
+
+  it("round-0 conference prompt assembly is byte-exact (KPR-387 join restructuring pin)", async () => {
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    // Single-agent round-0; reaction pass (if it ever ran) selects nobody.
+    (classifyMeetingMessage as any)
+      .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+      .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+
+    const item = makeWorkItem({
+      text: "Jasper, what's the exact prompt shape?",
+      source: { kind: "slack", id: "C-CONF", label: "conf-pin" },
+      threadId: "conf-thread-pin",
+      meta: { slackTs: "1700.0003" },
+    });
+
+    await dispatcher.dispatch(item);
+
+    // Round-0 fan-out is awaited inside dispatch(), so by the time dispatch() resolves
+    // the single round-0 turn has already run.
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+    const [, round0Item] = agentManager.runWorkItemTurn.mock.calls[0];
+
+    // Derived deterministically from Dispatcher.buildMeetingPreamble's literal template,
+    // with threadContext empty (fetchThreadHistory is mocked to [], so formatThreadContext
+    // returns "" and .filter(Boolean) drops that segment from the join entirely).
+    // Pins the full preamble wording too, not just the join — KPR-389's preamble
+    // hardening will need to update this expectation deliberately.
+    const expectedPreamble = `You are in a meeting in #conf-pin with Jasper.
+
+Meeting rules:
+- Be concise — others are also responding.
+- Build on what's been said. Don't repeat points already made.
+- If you have nothing meaningful to add, respond with "No response needed."
+- Stay in your lane — don't cover someone else's domain unless asked.
+- Address others by name when responding to their points.`;
+
+    expect(round0Item.text).toBe(`${expectedPreamble}\n---\n[New message]:\n${item.text}`);
+  });
 });
