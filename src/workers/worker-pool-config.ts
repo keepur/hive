@@ -16,7 +16,10 @@ export interface MeetingWorkersConfig {
   workerMaxTurns: number;
   /** 10m — KPR-354 nested-backstop precedent. */
   workerTimeoutMs: number;
-  /** false ⇒ tools refuse with an honest notice; nothing else changes. */
+  /** false ⇒ tools refuse with an honest notice, AND (KPR-409) the scribe and
+   *  the summary anchor are off — gate 1 of both `noteActivity` and
+   *  `getSummary` checks this flag, so it kills the whole subsystem, not just
+   *  fetch-worker dispatch. `scribeEnabled` is the scribe-only lever. */
   enabled: boolean;
 
   // --- KPR-409 scribe (Part B) ---

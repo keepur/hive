@@ -245,10 +245,14 @@ All keys optional with these defaults in `config.ts`. `workerModel: sonnet` (ali
 
 > ⚠ **SUPERSEDED (2026-08-27).** This Part B design is carried here as history.
 > The binding contract is `docs/epics/kpr-386/kpr-409-spec.md`, which corrects
-> it in three load-bearing places: the scribe uses a NEW sibling `runRoleTurn`
+> it in five load-bearing places: the scribe uses a NEW sibling `runRoleTurn`
 > (not `runWorkerTurn` — that path is claim-coupled and would post into the
-> meeting), the cadence trigger sits at two ROUND-LEVEL dispatch sites (not
-> inside `buildConferenceContext`), and the high-water formula is NOT unchanged
+> meeting); the cadence seam moved from `dispatchToAgent` (Part B's design
+> below) to the two ROUND-LEVEL dispatcher sites; the cadence/debounce/storage
+> model moved off the pool service — which would have needed a threaded Slack
+> fetch callback — onto a standalone `MeetingScribe` the dispatcher feeds
+> history directly (it already holds the fetched history at the seam);
+> `scribeMaxTurns` is 4, not 8; and the high-water formula is NOT unchanged
 > (R2, spec §D4). Read KPR-409's spec, not this section.
 
 ### B1. Turn kind — the forced decision (binding 1)

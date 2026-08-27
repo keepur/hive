@@ -1506,7 +1506,9 @@ export class Dispatcher {
   }
 
   /** KPR-389 D4: hardened — the transcript is already in prompt ∪ session
-   *  (C10 covering-invariant phrasing, true in full AND delta modes); decline
+   *  (C10 covering-invariant phrasing, true in full, delta, AND summary modes
+   *  — KPR-409's summary mode substitutes a running summary for the raw
+   *  transcript in the prompt, see formatSummaryContext); decline
    *  immediately with the C4-safe escape phrase. Escape phrase must stay
    *  "No response needed." verbatim (C4 + C3 terminal-slot coherence) — any
    *  rewording must re-run the C4 guard test. */
