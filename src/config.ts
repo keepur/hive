@@ -123,6 +123,15 @@ export function resolveMeetingWorkersConfig(raw: unknown): MeetingWorkersConfig 
     workerMaxTurns: posNum(r.workerMaxTurns, d.workerMaxTurns),
     workerTimeoutMs,
     enabled: typeof r.enabled === "boolean" ? r.enabled : d.enabled,
+    // KPR-409 scribe keys — same liberal-loader idioms; no TTL clamp (the
+    // scribe creates no claim, so claimTtlMinutes's invariant is untouched).
+    scribeEnabled: typeof r.scribeEnabled === "boolean" ? r.scribeEnabled : d.scribeEnabled,
+    scribeModel: typeof r.scribeModel === "string" && r.scribeModel.trim() ? r.scribeModel.trim() : d.scribeModel,
+    scribeDebounceMs: posNum(r.scribeDebounceMs, d.scribeDebounceMs),
+    scribeMinNewMessages: posNum(r.scribeMinNewMessages, d.scribeMinNewMessages),
+    scribeMaxConcurrent: posNum(r.scribeMaxConcurrent, d.scribeMaxConcurrent),
+    scribeMaxTurns: posNum(r.scribeMaxTurns, d.scribeMaxTurns),
+    scribeTimeoutMs: posNum(r.scribeTimeoutMs, d.scribeTimeoutMs),
   };
 }
 
