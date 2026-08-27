@@ -7,6 +7,7 @@ import {
   OUTAGE_NOTICE_DEFAULT,
   OUTAGE_OVERFLOW_NOTICE_DEFAULT,
 } from "../outage/outage-notices.js";
+import { DEADLINE_NOTICE_DEFAULT, DEADLINE_ZERO_PROGRESS_NOTICE_DEFAULT } from "./deadline-continuation.js";
 
 // KPR-220 Phase 1: shared mock so tests can assert what dispatcher logs to
 // `info` (e.g., per-turn telemetry breakdown — llmMs/toolMs/toolCalls/etc).
@@ -890,6 +891,13 @@ describe("Per-turn dispatch (unconditional, KPR-220 Phase 9)", () => {
   it("KPR-401: aborted/timedOut TurnResult surfaces both flags + non-negative llmMs on the work-item-dispatched log", async () => {
     // NEGATIVE-VERIFY prediction (Step 3): pre-fix the log-field object
     // simply lacks the two keys — fields.aborted is undefined; this fails.
+    // D28 fixture migration (KPR-402): a timedOut && aborted turn on a
+    // notify-policy channel is now intercepted by the deadline-continuation
+    // arm and never reaches normal delivery — the log-field pin migrates to
+    // the skip-policy (sched:) lane, the one lane where legacy delivery of
+    // an aborted turn deliberately remains (arm fully inert on cron). The
+    // assertions are byte-identical; only the item id changed. The
+    // notify-lane behavior is pinned by the KPR-402 rows below.
     const smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as const };
     dispatcher.registerAdapter(smsAdapter as any);
 
@@ -924,6 +932,7 @@ describe("Per-turn dispatch (unconditional, KPR-220 Phase 9)", () => {
     mockLogInfo.mockClear();
 
     const item = makeWorkItem({
+      id: "sched:jasper:kpr401-probe:1", // KPR-402 D28: skip policy — arm inert, legacy delivery + log preserved
       source: { kind: "sms", id: "PN_LINE_M", label: "quo-may", adapterId: "sms" },
       threadId: "sms:PN_LINE_M:+15550101",
       text: "hey Jasper, kpr401 probe", // agent-name-bearing, mirroring the Phase-1 row's resolution path
@@ -1289,8 +1298,14 @@ describe("outage interception (KPR-307)", () => {
     expect(adapter.deliver.mock.calls[0][0].text).toBe(OUTAGE_NOTICE_DEFAULT);
   });
 
-  it("★ timedOut with breaker closed → legacy path, unqueued", async () => {
+  it("★ KPR-402 (D28 migration): zero-progress deadline abort with breaker closed → honest zero-progress notice, still unqueued", async () => {
     // KPR-398 zero-progress pin (see the open-breaker row above).
+    // D28 fixture-migration justification: this row previously pinned the
+    // pre-KPR-402 defect shape — bare "_No response._" delivery ("as
+    // today"). The deadline arm now intercepts the closed-circuit
+    // zero-progress abort with an honest notice, no re-dispatch (spec
+    // §Design.3 / T10). The never-queued half of the old pin is retained
+    // verbatim.
     agentManager.runWorkItemTurn.mockResolvedValueOnce(
       makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true }),
     );
@@ -1298,23 +1313,34 @@ describe("outage interception (KPR-307)", () => {
 
     await dispatcher.dispatch(slackItem());
     expect(store.enqueue).not.toHaveBeenCalled();
-    expect(adapter.deliver).toHaveBeenCalledTimes(1); // "_No response._" as today
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toBe(DEADLINE_ZERO_PROGRESS_NOTICE_DEFAULT); // was: "_No response._"
+    expect(adapter.deliver.mock.calls[0][0].error).toBeUndefined();
   });
 
-  it("★ KPR-398: with-progress deadline turn with breaker open → legacy path, never queued", async () => {
+  it("★ KPR-398/KPR-402 (D28 migration): with-progress deadline turn with breaker open → deadline arm, never queued by the gate (D3 pin)", async () => {
     // A turn-deadline-with-progress by definition executed tools or streamed;
     // queuing it into outage_queue would silently re-run those side effects
-    // on replay (the gate's Finding 4 r1 rationale). Mirror of the zero-
-    // progress open-breaker row above, flipped by progress evidence alone.
+    // on replay (the gate's Finding 4 r1 rationale).
+    // D28 fixture-migration justification (spec ⚠A8): the with-progress+open
+    // row migrates from bare legacy "_No response._" delivery to the
+    // deadline arm — notice + in-process continuation. THE RETAINED
+    // never-queued ASSERTION IS THE D3 PIN: the original partially-executed
+    // turn is never enqueued for blind replay (turn-deadline ∉
+    // HARD_FAULT_KINDS keeps the outage gate declining); what may later
+    // reach the queue is only a continuation leg under its own per-leg id
+    // (the KPR-402 T13 row).
     agentManager.runWorkItemTurn.mockResolvedValueOnce(
       makeTurn({ finalMessage: "", errors: [], timedOut: true, aborted: true, toolCalls: 46, streamed: true }),
     );
     agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
 
     await dispatcher.dispatch(slackItem({ id: "m1", threadId: "t1" }));
-    expect(store.enqueue).not.toHaveBeenCalled();
-    expect(adapter.deliver).toHaveBeenCalledTimes(1); // legacy "_No response._" delivery, not the notice
+    expect(store.enqueue).not.toHaveBeenCalled(); // D3: never queued by the gate — retained verbatim
+    expect(adapter.deliver.mock.calls[0][0].text).toBe(DEADLINE_NOTICE_DEFAULT); // honest notice, not "_No response._"
     expect(adapter.deliver.mock.calls[0][0].text).not.toBe(OUTAGE_NOTICE_DEFAULT);
+    await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
+    expect((agentManager.runWorkItemTurn.mock.calls[1][1] as WorkItem).id).toBe("m1#dl1"); // the continuation
   });
 
   it("KPR-400 F2: ProviderCircuitOpenError fast-fail enqueues enqueueOrigin 'fast-fail'", async () => {
