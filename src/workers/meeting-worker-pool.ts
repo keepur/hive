@@ -9,8 +9,11 @@
  * and completion re-enters the boss through the callback-shaped WorkItem via
  * the onDispatch seam (dispatcher step-0 pin).
  *
- * The scribe role (Part B) is KPR-409 — it will reuse runWorkerTurn with its
- * own WorkerRoleParams and zero changes to this file's spawn path.
+ * The scribe role (KPR-409) is a SIBLING, not a reuse: runWorkerTurn is
+ * claim-coupled end-to-end (workerTaskPrompt → finishClaim → dispatchReentry),
+ * so a scribe on that path would post its summary into the meeting. The scribe
+ * calls runRoleTurn() instead — same clone-and-run core, zero ledger contact,
+ * zero re-entry — and this file's spawn path is unchanged.
  */
 import { createHash } from "node:crypto";
 import { ObjectId, type Collection, type Db } from "mongodb";
@@ -114,8 +117,9 @@ export interface WorkerClaimDoc {
 
 /**
  * Per-role spawn parameters (spec §A3 plan directive): the fetch-worker role
- * is Part A's only instantiation; KPR-409's scribe supplies its own object
- * (haiku pin, coreServers: [], scribe caps/charter) with zero changes here.
+ * is Part A's only instantiation on the claim path; KPR-409's scribe supplies
+ * its own object (haiku pin, coreServers: [], scribe caps/charter) to the
+ * sibling runRoleTurn(), with zero changes to this type.
  */
 export interface WorkerRoleParams {
   model: string;
@@ -166,6 +170,17 @@ function isDuplicateKeyError(err: unknown): boolean {
 interface LiveWorker {
   abort: () => void;
   bossAgentId: string;
+}
+
+/** KPR-409: raw outcome of a claim-free role turn (no ledger transition). */
+export interface RoleTurnOutcome {
+  text?: string;
+  error?: string;
+  timedOut?: boolean;
+  aborted?: boolean;
+  costUsd?: number;
+  toolCalls?: number;
+  durationMs: number;
 }
 
 export class MeetingWorkerPool {
@@ -227,6 +242,16 @@ export class MeetingWorkerPool {
         log.warn("Worker abort threw during pool stop — contained", { claimId, error: String(err) });
       }
     }
+  }
+
+  /**
+   * KPR-409: read-only capacity probe for out-of-band callers (the scribe's
+   * gate 5b). One-directional BY DESIGN: the scribe yields when fetch-workers
+   * are busy, and a scribe can never make the pool busy — scribes are never
+   * registered in liveWorkers, so this count is fetch-workers only.
+   */
+  hasCapacity(): boolean {
+    return this.liveWorkers.size < this.deps.config.maxConcurrent;
   }
 
   /** stopAgent hook — aborts THIS boss's live workers only. Claims stay
@@ -439,8 +464,11 @@ export class MeetingWorkerPool {
   }
 
   /**
-   * Role-parameterized worker turn (spec §A3 plan directive — KPR-409's
-   * scribe reuses this with its own role object). Never throws; completion
+   * Role-parameterized worker turn (spec §A3 plan directive). CLAIM-COUPLED:
+   * prompt from workerTaskPrompt(claim), context from workItemContextFromClaim,
+   * completion through finishClaim → dispatchReentry. KPR-409's scribe does NOT
+   * use this path (it would post into the meeting) — see runRoleTurn below.
+   * Never throws; completion
    * (both outcomes) transitions the claim atomically and the finally always
    * clears the live-worker handle.
    *
@@ -523,6 +551,75 @@ export class MeetingWorkerPool {
       }).catch((e) => log.error("Worker completion write failed", { claimId, error: String(e) }));
     } finally {
       this.liveWorkers.delete(claimId);
+    }
+  }
+
+  /**
+   * KPR-409: claim-free sibling of runWorkerTurn. Same clone-and-run core,
+   * but it touches NO collection, fires NO dispatchReentry, and registers in
+   * NO liveWorkers map — so a role turn can never post into a meeting and can
+   * never consume a maxConcurrent slot a boss's worker_dispatch needs
+   * (spec §D3 capacity disposition). Its bound and its abort registry belong
+   * to the caller, wired through onAbortHandle.
+   *
+   * Deliberate duplication of runWorkerTurn's ~25-line skeleton: C24 freezes
+   * Part A's spawn path and outranks DRY here. Do NOT extract a common core.
+   *
+   * Returns the raw outcome, or null when the manager hooks are not bound.
+   * Never throws.
+   */
+  async runRoleTurn(args: {
+    base: AgentConfig;
+    role: WorkerRoleParams;
+    prompt: string;
+    /** The seven-required shape `workItemContextFromClaim` already returns —
+     *  deliberately NOT the all-optional WorkerPoolTurnContext, so no cast and
+     *  no agent-runner import are needed to satisfy adapter.runTurn. */
+    workItemContext: {
+      adapterId: string;
+      channelId: string;
+      channelKind: string;
+      channelLabel: string;
+      threadId: string;
+      slackTs: string;
+      slackThreadTs: string;
+    };
+    onAbortHandle?: (abort: () => void) => void;
+  }): Promise<RoleTurnOutcome | null> {
+    const startedAt = Date.now();
+    if (!this.manager) return null;
+    try {
+      const workerConfig: AgentConfig = {
+        ...args.base,
+        model: args.role.model,
+        coreServers: args.role.coreServers,
+        delegateServers: [], // C19: role turns never nest delegates
+        schedule: [], // paranoia — nothing reads it on this path, keep it inert
+      };
+      const adapter = this.manager.buildWorkerAdapter(workerConfig);
+      args.onAbortHandle?.(() => adapter.abort());
+      const result = await adapter.runTurn({
+        prompt: args.prompt,
+        sessionId: undefined, // sessionless — `sessions` untouched
+        workItemContext: args.workItemContext,
+        resourceLimits: {
+          maxTurns: args.role.maxTurns,
+          timeoutMs: args.role.timeoutMs,
+          budgetUsd: args.base.budgetUsd, // operator's per-turn cost cap still binds
+        },
+        systemPromptOverride: args.role.charter, // total replacement — voice precedent
+      });
+      return {
+        text: result.text,
+        error: result.error,
+        timedOut: result.timedOut,
+        aborted: result.aborted,
+        costUsd: result.costUsd,
+        toolCalls: result.toolCalls,
+        durationMs: Date.now() - startedAt,
+      };
+    } catch (err) {
+      return { error: String(err).slice(0, 2000), durationMs: Date.now() - startedAt };
     }
   }
 
