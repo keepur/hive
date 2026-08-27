@@ -15,7 +15,7 @@ A fresh session entering a 105-message meeting today gets the raw transcript inj
 2. **⚠ Do NOT refactor `runWorkerTurn` to delegate to `runRoleTurn`.** The ~25 lines of adapter-invocation skeleton are duplicated on purpose: C24 freezes Part A's spawn path, and C24 outranks DRY here. A reviewer's "extract the common core" is the one refactor this spec forbids.
 3. **⚠ This spec REQUESTS one canon relaxation. It does not claim authorization.** C26 sanctions exactly one conference-code touch — the C13 full-arm anchor. This design needs **two additional conference-code hunks**: a cadence notification in `resolveConferenceAgents` and one in `triggerConferenceReactions` (§D1). C13 does **not** grant this; the delta arm and round-level conference code are named off-limits to KPR-409. The need is real (a full-arm-only trigger freezes the summary the moment every participant converts to delta — §D1), the hunks are additive and fire-and-forget, and **the relaxation is submitted for the coherence reviewer to affirm or reject at the merge seam** — the same mechanism this epic used for KPR-390's containment relaxations. If rejected, the fallback is the full-arm-only trigger with the freeze accepted and measured.
 4. **⚠ Dispatch model decision: activity-triggered debounced re-dispatch, not a self-relaunching daemon and not a lazy pull.** The meeting's own message flow is the clock (§D1) — no new recurring-dispatch mechanism, and no scribe turn on the critical path of the turn being optimized.
-5. **⚠ The high-water formula MUST change, and this is the spec's second requested relaxation.** In summary mode `injectionHighWaterTs` maxes in `summary.coveredThroughTs` alongside the tail; the carried design's "unchanged formula" yields `undefined` on an empty tail at round 1, `setMeetingMark` is skipped (`dispatcher.ts:1106`), and the agent never converts to delta. This advances the mark over messages that were *summarized* rather than *literally injected* — a relaxation of C9's literal-coverage invariant, **submitted for the same merge-seam ruling** (§D4). It is not a new exception in kind: `truncateHistory` (`dispatcher.ts:1323`) already does exactly this today — a >105-message thread injects first-5+last-100 while `maxSlackTs` advances the mark to the last message's ts, leaving the dropped middle mark-covered but never injected.
+5. **⚠ The high-water formula MUST change, and this is the spec's second requested relaxation — a constitutive one.** In summary mode `injectionHighWaterTs` maxes in `summary.coveredThroughTs` alongside the tail; the carried design's "unchanged formula" yields `undefined` on an empty tail at round 1, `setMeetingMark` is skipped (`dispatcher.ts:1106`), and the agent never converts to delta. This advances the mark over messages that were *summarized* rather than *literally injected* — a relaxation of C9's literal-coverage invariant, **submitted for the same merge-seam ruling** (§D4). It is not a new exception in kind: `truncateHistory` (`dispatcher.ts:1323`) already does exactly this today — a >105-message thread injects first-5+last-100 while `maxSlackTs` advances the mark to the last message's ts, leaving the dropped middle mark-covered but never injected. ⚠ **There is no partially-compliant variant**: the tail begins above `coveredThroughTs` by construction, so any mark derived from it jumps the summarized span whether or not `coveredThroughTs` is maxed in. The only compliant way to ship the feature is F1 (the summary arm sets no mark, trading KPR-388's warm-path delta) — full menu at §D4.
 6. **⚠ `injectionMode` widens to `"full" | "delta" | "summary"`** across four small sites so the epic can measure its own last child (C18: widening the existing KPR-389 field, not adding a parallel one). Load-bearing check: `dispatcher.ts:1100`'s self-heal leg is `=== "delta"`-exclusive and stays correct unmodified.
 7. **⚠ Containment surface, stated at its true boundary.** `coreServers: []` (C22) is the strongest available posture, but it removes **MCP** surfaces, not SDK builtins — under `bypassPermissions` the scribe still holds Read/Write/Bash, identical to Part A's fetch-worker (E5's stated boundary). `maxTurns: 4` is the bound, not a permission gate. And because the scribe adds no MCP server and no tool, **C23's Lane B `buildToolTransportInventory` compensation is a structural no-op** — nothing exists to compensate for.
 8. **⚠ The scribe must not steal fetch-worker capacity.** It gets its own `scribeMaxConcurrent` counter and its own abort registry inside `MeetingScribe` — it does **not** register in the pool's `liveWorkers`, so it never consumes a `maxConcurrent` slot a boss's `worker_dispatch` needs (§D3). This also keeps `stop()`/`abortForBoss`/`dispatch()` free of edits.
@@ -29,6 +29,8 @@ KPR-388 gave meeting agents delta injection: an agent with a live session and a 
 
 > "Preserved hook: the fresh-session branch is a single site (`buildConferenceContext`'s `mode: "full"` arm) where a future summary+recent-delta assembly can replace the raw transcript without touching the delta arm or the mark mechanics." — `kpr-388-spec.md:43`
 
+⚠ That hook's own final clause — "without touching … the mark mechanics" — is precisely where this spec has to ask for something. The mechanics stay untouched; the mark's *value semantics* cannot, because a summary is by definition content the agent absorbs without literal injection. R2 (§D4) is that request, made explicitly rather than read into the hook.
+
 KPR-390 delivered the machinery that makes a cheap background summarizer possible (detached, sessionless, breaker-invisible, budget-exempt worker spawns with structural containment). This ticket joins the two.
 
 ## Goals
@@ -41,7 +43,7 @@ KPR-390 delivered the machinery that makes a cheap background summarizer possibl
 ## Non-goals
 
 - **Not** a conference participant. No roster membership, no classifier candidacy, no reaction-pass exposure, no posting surface (§D2).
-- **Not** a change to the delta arm, `meetingLastSeenTs` mark mechanics, `setMeetingMark`/`clearMeetingMark`, the reaction tracker, the preamble, or spawn shaping.
+- **Not** a change to the delta arm, the `meetingLastSeenTs` mark **mechanics** (`setMeetingMark`/`clearMeetingMark`, their call sites, their placement), the reaction tracker, the preamble, or spawn shaping. ⚠ The mark's **value semantics** *are* relaxed on the summary arm — that is R2, requested explicitly, not smuggled in under this non-goal (§D4).
 - **Not** a change to Part A's claim ledger, `worker_dispatch`/`worker_status`/`worker_cancel`, the re-entry path, the watchdog, or the restart sweep.
 - **No** new MCP tool, no `hive doctor` section, no new telemetry collection, no cross-meeting/global summary, no summary versioning UI, no operator command to force a scribe run.
 
@@ -57,7 +59,7 @@ Three candidates were weighed against C24's frozen-surface constraint and the ep
 |---|---|---|
 | (a) | **Standing daemon** — scribe self-relaunches on a wall-clock cadence | **Rejected.** Requires a new recurring-dispatch mechanism the pool does not have (fetch-workers are one-shot; the 60s watchdog is a sweeper, not a scheduler). Burns haiku turns on idle threads. Pure YAGNI cost. |
 | (b) | **Lazy pull, blocking** — run the scribe inside the full arm when a summary is needed | **Rejected.** Puts a haiku turn on the critical path of the exact turn we are optimizing. Strictly worse than doing nothing. |
-| (c) | **Activity-triggered debounced re-dispatch** — every `buildConferenceContext` call notifies the scribe fire-and-forget; the scribe debounces and runs at most one turn per thread at a time | **CHOSEN.** |
+| (c) | **Activity-triggered debounced re-dispatch** — each conference round notifies the scribe once, fire-and-forget (seam placement below); the scribe debounces and runs at most one turn per thread at a time | **CHOSEN.** |
 
 **Rationale for (c).** It satisfies the ticket's "standing worker maintaining a running summary" behaviorally — the summary *is* continuously maintained during an active meeting — without inventing a scheduler: **the meeting's own message flow is the clock.**
 
@@ -69,6 +71,8 @@ Three candidates were weighed against C24's frozen-surface constraint and the ep
 | `triggerConferenceReactions` (~:1481, after the re-fetch, before the reaction map) | same shape |
 
 `baseAgentId` = the first entry of the round's roster/responder list (any roster member serves — §D3 explains why the choice is near-arbitrary).
+
+⚠ **The two sites have deliberately different coverage, and the round-0 one carries the cadence.** `resolveConferenceAgents` fires on **every** conference round-0 pass, including when the classifier selects nobody — the seam sits after `fetchThreadHistory` and before the responder fan-out. `triggerConferenceReactions` fires **only when reactors are actually selected**: it has three early returns (`!roster`, empty `peerMembers`, empty `respondAgentIds`) *before* its re-fetch, so there is no history to hand the scribe on those paths. That asymmetry is fine — round 0 already guarantees at least one trigger per human message, which is the cadence that matters — but it must not be papered over in the tests (§T6).
 
 ⚠ **This is the requested C26 relaxation** (Key Point 3): two round-level conference hunks beyond the sanctioned full-arm anchor. Rationale, stated plainly rather than dressed as authorization:
 
@@ -87,9 +91,16 @@ noteActivity(args): void {                       // returns void; never throws
   if (this.inFlight.has(threadId)) return;                       // 2a — SYNCHRONOUS
   if (this.inFlight.size >= scribeMaxConcurrent) return;         // 5a — SYNCHRONOUS
   this.inFlight.add(threadId);                                   // claimed BEFORE any await
-  void this.run(args).catch(logAndSwallow).finally(() => this.inFlight.delete(threadId));
+  void this.run(args)
+    .catch(logAndSwallow)
+    .finally(() => {
+      this.inFlight.delete(threadId);
+      this.abortHandles.delete(threadId);   // ⚠ BOTH lifecycles release here — see below
+    });
 }
 ```
+
+⚠ **`abortHandles` is released in the same `finally` as `inFlight`, never separately.** The two maps are keyed identically (`threadId`) and must have identical lifetimes: an entry is added by `runRoleTurn`'s `onAbortHandle` callback during the run and removed the moment the run settles, on every path including throw and abort. Omitting this — the shape the r2 review caught — leaks one entry per distinct thread ever summarized in the process's lifetime (bounded in practice only by same-thread reruns overwriting the key, which is luck rather than design) and, worse, leaves `scribe.stop()` calling `abort()` on adapters that completed long ago.
 
 Gates 1, 3, 2a and 5a are all synchronous reads above the claim; nothing between the `has` check and the `add` can yield. The remaining gates run inside `run()`, after the claim:
 
@@ -126,7 +137,7 @@ Body mirrors `runWorkerTurn`'s clone-and-run core — `{ ...base, model: role.mo
 
 ⚠ **Capacity disposition (issue 4): `runRoleTurn` does NOT register in `liveWorkers`.** Registering there would have made every live scribe consume one of the four engine-wide `maxConcurrent` slots that `dispatch()`'s saturation check guards — three meetings summarizing concurrently would leave a boss's `worker_dispatch` one slot from an honest-but-avoidable "pool saturated" refusal, a regression *caused by* an optional optimization. Instead:
 
-- **The scribe owns its own bound and its own abort registry.** `MeetingScribe` holds `inFlight: Set<threadId>` (bounded by `scribeMaxConcurrent`, default 2) and `abortHandles: Map<threadId, () => void>` populated via `onAbortHandle`. `scribe.stop()` (already wired in `index.ts`) aborts them all on shutdown.
+- **The scribe owns its own bound and its own abort registry.** `MeetingScribe` holds `inFlight: Set<threadId>` (bounded by `scribeMaxConcurrent`, default 2) and `abortHandles: Map<threadId, () => void>` populated via `onAbortHandle`. `scribe.stop()` (already wired in `index.ts`) aborts them all on shutdown. ⚠ Both maps are keyed on `threadId` and **released together in one `finally`** (§D1) — they are two views of one lifecycle, and any code path that clears one without the other is a bug.
 - **`pool.liveWorkers`, `dispatch()`'s cap check, `stop()`, and `abortForBoss` are all left unedited** — a bonus for C24's spirit: the capacity fix costs zero Part A behavioral edits.
 - **The check remains one-directional by design, in the safe direction:** gate 5b makes the scribe yield when the pool is busy, and a scribe can never make the pool busy. That is the correct asymmetry — it was the *other* direction that was the hazard.
 - Consequence: `abortForBoss(agentId)` no longer reaches a scribe run. This is an improvement — killing a summarizer because its *incidental* base-config donor was stopped was never desirable. A scribe run is instead bounded by `scribeTimeoutMs` (120s) and by `scribe.stop()`.
@@ -137,13 +148,13 @@ Body mirrors `runWorkerTurn`'s clone-and-run core — `{ ...base, model: role.mo
 | Field | Value | Rationale |
 |---|---|---|
 | `model` | `config.meetingWorkers.scribeModel`, default `"haiku"` | Summarization is the cheapest useful task in the engine. |
-| `coreServers` | `[]` | **C22.** Not "boss minus denylist" — the transcript is in the prompt; the scribe needs nothing. See ⚠ Key Point 8 for the boundary. |
+| `coreServers` | `[]` | **C22.** Not "boss minus denylist" — the transcript is in the prompt; the scribe needs nothing. See ⚠ Key Point 7 for the boundary. |
 | `delegateServers` | `[]` | Set by `runRoleTurn`'s clone (C19 — no nesting). |
 | `maxTurns` | `scribeMaxTurns`, default **4** | ⚠ **Deviation from the carried design's 8.** With `coreServers: []` there is no MCP tool loop to iterate; 8 was sized before C22 pinned the empty set. 4 is a runaway bound, not a working budget. |
 | `timeoutMs` | `scribeTimeoutMs`, default `120_000` | Carried unchanged. |
 | `charter` | §D3a | Total `systemPromptOverride` replacement (voice/fetch-worker precedent — no soul, no constitution). |
 
-**Base config.** `runRoleTurn` needs an `AgentConfig` to clone. The scribe uses the **triggering agent's** config — `baseAgentId` captured at the seam, re-resolved live from the registry at run time (mirroring `spawnFetchWorker`'s `registry.get` re-check; missing or disabled ⇒ silent skip, retried on the next trigger). With `coreServers: []`, `delegateServers: []`, model and system prompt all overridden, the only fields that survive the clone are `budgetUsd` (the operator's per-turn cost cap — correctly still binding) and the id/name used for logging and `liveWorkers` bookkeeping. ⚠ Consequence to note at review: `budgetUsd` therefore varies with whichever participant happened to trigger the run. Accepted — a tool-less haiku turn under a 4-turn cap is far below any realistic per-turn cap.
+**Base config.** `runRoleTurn` needs an `AgentConfig` to clone. The scribe uses the **triggering agent's** config — `baseAgentId` captured at the seam, re-resolved live from the registry at run time (mirroring `spawnFetchWorker`'s `registry.get` re-check; missing or disabled ⇒ silent skip, retried on the next trigger). With `coreServers: []`, `delegateServers: []`, model and system prompt all overridden, the only fields that survive the clone are `budgetUsd` (the operator's per-turn cost cap — correctly still binding) and the id/name, used for logging only (scribes never enter `liveWorkers` — see the capacity disposition below). ⚠ Consequence to note at review: `budgetUsd` therefore varies with whichever participant happened to trigger the run. Accepted — a tool-less haiku turn under a 4-turn cap is far below any realistic per-turn cap.
 
 **Storage — a new `meeting_summaries` collection, not the claim ledger.** Verified against `WorkerClaimDoc`: the ledger is `_id: ObjectId`-keyed with a partial-unique `(threadId, taskKey)` index scoped to `status: "running"`, and *every* terminal transition routes through `finishClaim` → `dispatchReentry`. A summary is one-per-thread, has no claim-atomicity story, and must produce no re-entry. Wrong shape; separate collection confirmed.
 
@@ -179,9 +190,9 @@ You have no tools and no messaging surface. Your final message IS the summary.
 
 ⚠ The charter says 2000 while `SUMMARY_TEXT_CAP` is 2500 (advisory c). **The 500-char headroom is deliberate**: the charter is a soft instruction to a small model, the cap is a hard truncation on write. Sizing them equal would make every mild overrun a mid-sentence truncation; the gap absorbs normal overshoot so the cap only ever fires on a genuinely runaway summary. Do not "fix" the mismatch by aligning the numbers.
 
-### D4. C13 anchor integration — the only conference-code edit
+### D4. C13 anchor integration — the sanctioned conference-code edit (one of three total)
 
-`buildConferenceContext` (`src/channels/dispatcher.ts:1337`), **full arm only**. The delta arm, the delta-eligibility predicate, and every mark mechanic are untouched.
+`buildConferenceContext` (`src/channels/dispatcher.ts:1337`), **full arm only**. This is the one edit C26 sanctions; the two round-level `noteActivity` hunks in §D1 are the separately-requested R1 relaxation. The delta arm and the delta-eligibility predicate are untouched, and the mark **mechanics** (`setMeetingMark`/`clearMeetingMark`, their call sites, their placement relative to the outage gates) are untouched — but the mark's **value semantics** are relaxed on this arm, which is R2 below.
 
 **Before** (current merged code, `:1348-1353`):
 
@@ -226,7 +237,22 @@ Two things make it a modest ask rather than a novel exception:
 - **The precedent already exists in the same file.** `truncateHistory` (`dispatcher.ts:1323`) drops the middle of any thread longer than 105 messages, injecting first-5 + last-100 — while the full arm's `maxSlackTs([...this.truncateHistory(history).map(m => m.ts), …])` advances the mark to the *last* message's ts. Every dropped middle message is therefore already mark-covered but never injected, today, in production. The summary case is the same shape: content the agent is trusted to have absorbed by other means, sitting below an advancing mark.
 - **The failure mode is duplication, never a gap** — the same argument KPR-388 relies on. A mark that is too *high* can only under-include on a later delta; here the under-included messages are exactly the ones the summary describes.
 
-If the ruling goes the other way, the fallback is to max in `coveredThroughTs` only when the tail is non-empty (mark ≥ tail max ≥ `coveredThroughTs` makes the relaxation moot in that case) and accept the empty-tail thread never converting to delta — degraded but never wrong.
+**⚠ There is no degraded-but-compliant variant of summary mode. The relaxation is constitutive, not incidental.** The tail is *by construction* the messages with `ts > coveredThroughTs`, so whenever it is non-empty, `max(tail) > coveredThroughTs` and the mark jumps the summarized span **regardless of whether `coveredThroughTs` is maxed in**. The `coveredThroughTs` max-in only decides the *empty-tail* case, where the alternative is `undefined` (no mark at all) rather than a compliant mark. Any mark derived from a tail that starts above `coveredThroughTs` relaxes C9. The real menu for the coherence reviewer is therefore three options, not a slider:
+
+| | Option | Effect |
+|---|---|---|
+| **R2 affirmed** | Mark = `max(tail ∪ coveredThroughTs ∪ trigger)` | **Recommended.** Feature ships whole; C9 relaxed with the `truncateHistory` precedent. |
+| **F1** | **The summary arm sets no mark at all** (`injectionHighWaterTs: undefined`) | The only genuinely C9-compliant way to ship this feature. See below. |
+| **F2** | Do not ship summary mode | KPR-409 delivers nothing. |
+
+**F1 spelled out precisely, because it is the only compliant option and it does *not* silently disable the feature.** With `injectionHighWaterTs: undefined`, `dispatchToAgent:1106`'s `else if` skips `setMeetingMark`, so no mark is ever written from a summary turn. Consequences, traced:
+
+- **The ticket's goal is still met.** A fresh entrant gets `summary + tail` instead of the 105-message transcript. That is the entire point of KPR-409 and it survives intact.
+- **But no summarized thread ever converts to delta.** With no mark, KPR-388's eligibility predicate fails forever, so *every* turn for *every* participant on that thread re-enters the summary arm. Per-turn cost becomes `~2500 chars of summary + messages since the last scribe run` (small — the scribe runs every ~90s) in place of KPR-388's pure delta. **This trades a shipped sibling ticket's warm-path savings for this ticket's cold-path savings** — bounded and arguably still net-positive, but a real regression against KPR-388 that the reviewer must price deliberately, not discover later.
+- **It is not permanently absorbing.** If `scribeEnabled` is turned off or the summary doc ages out on its TTL, the plain full arm runs and sets a mark normally; delta resumes.
+- Cost to implement: deleting one line. F1 is a genuine fallback, not a euphemism for F2.
+
+**The r1 draft of this spec offered a fourth option — "max in `coveredThroughTs` only when the tail is non-empty" — which does not exist.** It relaxes C9 in the common case and declines only where the effect would have been `undefined` anyway. It is withdrawn.
 
 **Format (`formatSummaryContext`, new private method beside `formatDeltaContext`).**
 
@@ -328,7 +354,7 @@ Negative-verify per repo convention (revert the source hunk, confirm the new tes
 - **T3 (C6 pin unchanged).** No summary doc ⇒ the existing full-mode pin at `:770` and the byte-exact assembly pin at `:492` pass **without modification**. Asserted by construction (unedited suite) and called out as a plan review gate.
 - **T4 (delta arm never reads summaries).** Delta-eligible agent with a summary doc present ⇒ `getSummary` not called, `injectionMode: "delta"`, delta pin at `:715` byte-unchanged. *Negative-verify: hoist the summary lookup above the eligibility predicate ⇒ fails.*
 - **T5 (self-heal leg untouched).** Summary-mode turn with `resumedSession: false` ⇒ `setMeetingMark` (not `clearMeetingMark`) — the `=== "delta"`-exclusive clear branch, mirroring the existing `:1158` full-mode case.
-- **T6 (cadence seam, round-level).** A round with N responders produces **exactly one** `noteActivity` call, from `resolveConferenceAgents`, carrying the full history; the reaction pass produces exactly one more from `triggerConferenceReactions`; a round where the classifier selects **nobody** still produces one (E12). `getSummary` throwing ⇒ full-arm fallback and the dispatch still completes. *Negative-verify: move the notify into `buildConferenceContext` ⇒ the call-count assertion fails at N.*
+- **T6 (cadence seam, round-level).** A round-0 pass with N responders produces **exactly one** `noteActivity` call, from `resolveConferenceAgents`, carrying the full history; a round-0 pass where the classifier selects **nobody** still produces one (E12 — the seam sits before the responder fan-out). ⚠ A round-1 pass produces one **only when reactors are selected**: `triggerConferenceReactions` returns early on an empty selection, *before* the re-fetch, so the round-1 seam is genuinely selection-gated and the test must not assert otherwise. `getSummary` throwing ⇒ full-arm fallback and the dispatch still completes. *Negative-verify: move the notify into `buildConferenceContext` ⇒ the round-0 call-count assertion fails at N.*
 
 **`src/workers/meeting-scribe.test.ts`** (new)
 
@@ -349,13 +375,13 @@ Negative-verify per repo convention (revert the source hunk, confirm the new tes
 - **C7** — a stale summary is at worst the allowed degraded window; every failure heals on the next trigger without operator action (§E2/E3).
 - **C9 — ⚠ RELAXATION REQUESTED, not claimed.** `setMeetingMark`/`clearMeetingMark` and their placement are untouched, but the summary arm advances the mark over messages absorbed as *summary* rather than as literal injected text (§D4). C13 grants no such license; this is submitted for the coherence reviewer's ruling. Mitigating: `truncateHistory` (`dispatcher.ts:1323`) already advances the mark past a dropped middle today, so the relaxation is precedented in kind, and the failure direction is duplication, never a gap. Fallback if rejected: §D4.
 - **C10** — the delta arm's own shape and predicate are untouched; delta-eligible agents never read a summary.
-- **C12** — mark bookkeeping placement untouched; scribe turns never reach `dispatchToAgent`.
+- **C12** — mark bookkeeping *placement* untouched (the value semantics relaxation is R2, scoped to the summary arm); scribe turns never reach `dispatchToAgent` at all.
 - **C13/C26 — ⚠ RELAXATION REQUESTED, not claimed.** The anchor sits at exactly the sanctioned site (`buildConferenceContext`'s full arm). Beyond it, this design adds **two round-level conference hunks** — fire-and-forget `noteActivity` calls in `resolveConferenceAgents` and `triggerConferenceReactions` — which C26 does not sanction. Rationale (freeze prevention), why the C26-clean and delta-arm alternatives are both worse, and the fallback if rejected: §D1. Submitted for the merge-seam ruling, same mechanism as KPR-390's containment relaxations.
 - **C14/C15** — resolved structurally (§D2): the scribe is an out-of-band pool worker, never a roster member, so no turn kind, reaction cap, or preamble applies. No new turn kind invented.
 - **C18** — the existing `injectionMode` field is **widened**, not paralleled; no new telemetry collection, no `hive doctor` section, no scribe-specific counters.
 - **C19** — `delegateServers: []` on the clone; nested delegates structurally unreachable.
 - **C21** — auto-injection suppression comes free via `buildWorkerAdapter`; **no second flag-setting site is added** (`runRoleTurn` calls the same hook).
-- **C22** — `coreServers: []`, the strongest available posture. Its boundary (SDK builtins survive) is stated at ⚠ Key Point 8 rather than overclaimed.
+- **C22** — `coreServers: []`, the strongest available posture. Its boundary (SDK builtins survive) is stated at ⚠ Key Point 7 rather than overclaimed.
 - **C23** — no new tool surface ⇒ no Lane B inventory compensation needed (§Integration points).
 - **C24** — `WorkerRoleParams` lifted verbatim; `runWorkerTurn`/`spawnFetchWorker` receive **zero executable diff hunks**; the new `runRoleTurn`/`hasCapacity` are pure additions, and the capacity fix (§D3) deliberately avoids editing `liveWorkers`/`stop()`/`abortForBoss`/`dispatch()` as well. The forbidden "extract the common core" refactor is called out at ⚠ Key Point 2 as a review gate. **Sanctioned exception:** three now-false doc comments in the file, including `runWorkerTurn`'s own, must be corrected (§Integration points, issue 6).
 - **C27** — ⚠ deliberate divergence: the scribe's `ensureIndexes` is **not** boot-fatal, because its only index is TTL housekeeping with no correctness role, unlike the claim ledger's atomicity index (§Integration points, issue 5).
@@ -365,7 +391,7 @@ Negative-verify per repo convention (revert the source hunk, confirm the new tes
 **Two canon relaxations are REQUESTED and require a merge-seam ruling** — neither is self-authorized, and each has a stated fallback if rejected:
 
 - **R1 (C26)** — two round-level conference hunks beyond the sanctioned full-arm anchor, for cadence. Fallback: full-arm-only trigger, freeze accepted and measured (§D1).
-- **R2 (C9)** — the mark advances over summarized-but-not-literally-injected messages. Precedented in kind by `truncateHistory`'s existing behavior. Fallback: max in `coveredThroughTs` only when the tail is non-empty (§D4).
+- **R2 (C9)** — the mark advances over summarized-but-not-literally-injected messages. Precedented in kind by `truncateHistory`'s existing behavior. ⚠ **The relaxation is constitutive of summary mode, not a tunable degree of it** — there is no partially-compliant variant. The only C9-compliant way to ship the feature is **F1: the summary arm sets no mark**, which keeps the cold-path win but costs KPR-388's warm-path delta on any summarized thread. Full three-option menu, traced: §D4.
 
 **Nothing else blocking.** ⚠-flagged spec-chosen calibrations for reviewer attention:
 
