@@ -6,7 +6,7 @@
  * Output: pkg/ (publish-ready minified bundles)
  */
 import { build, type Plugin } from "esbuild";
-import { rmSync, mkdirSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { rmSync, mkdirSync, copyFileSync, cpSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const PKG_DIR = "pkg";
@@ -114,6 +114,15 @@ await build({
     "mcp/slack": "dist/slack/slack-mcp-server.js",
     "mcp/skill-author": "dist/skill-author/skill-author-mcp-server.js",
   },
+});
+
+// KPR-394 (§4.2): ship the provider-abi type surface. The barrel's .d.ts
+// re-exports reach across the dist declaration tree, so copy ALL .d.ts
+// (directories included, maps excluded) into pkg/types/ — pkg/ is the
+// shipped root (dist/ is pack-forbidden).
+cpSync("dist", resolve(PKG_DIR, "types"), {
+  recursive: true,
+  filter: (src) => !statSync(src).isFile() || src.endsWith(".d.ts"),
 });
 
 // Copy non-JS assets to setup/
