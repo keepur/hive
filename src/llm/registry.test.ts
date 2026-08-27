@@ -106,6 +106,22 @@ describe("LLMRegistry — task resolution", () => {
     expect(mockGeminiGenerate.mock.calls[0][0].model).toBe("gemini-2.5-flash");
   });
 
+  it("workerClaimDedup resolves to the anthropic provider on config.modelRouter.model (KPR-390 T10)", async () => {
+    const r = new LLMRegistry({ anthropicApiKey: "a", geminiApiKey: "" });
+    await r.generateForTask("workerClaimDedup", { prompt: "p" });
+    expect(mockGeminiGenerate).not.toHaveBeenCalled();
+    expect(mockAnthropicGenerate).toHaveBeenCalledTimes(1);
+    expect(mockAnthropicGenerate.mock.calls[0][0].model).toBe("claude-haiku-4-5-20251001");
+  });
+
+  it("workerClaimDedup rejects with LLMProviderUnavailableError when no anthropic key is constructed (the sidecar's fail-open path — KPR-390)", async () => {
+    const r = new LLMRegistry({ anthropicApiKey: "", geminiApiKey: "g" });
+    await expect(r.generateForTask("workerClaimDedup", { prompt: "p" })).rejects.toBeInstanceOf(
+      LLMProviderUnavailableError,
+    );
+    expect(mockAnthropicGenerate).not.toHaveBeenCalled();
+  });
+
   it("request fields pass through to the provider", async () => {
     const r = new LLMRegistry({ anthropicApiKey: "a", geminiApiKey: "" });
     await r.generateForTask("memory", { prompt: "p", maxOutputTokens: 256, temperature: 0, timeoutMs: 30_000 });

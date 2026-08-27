@@ -1,7 +1,8 @@
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
-import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import { AgentRunner, DIST_DIR, type AgentRunnerOptions, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import type { MeetingWorkerPool } from "../workers/meeting-worker-pool.js";
 import { AgentRegistry } from "./agent-registry.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
 import type { SessionStore } from "./session-store.js";
@@ -527,6 +528,8 @@ export class AgentManager {
    * via the AgentManager instance (no new wiring surface).
    */
   readonly circuitBreakers: ProviderCircuitBreakerRegistry;
+  /** KPR-390: meeting worker pool — wired post-dispatcher by index.ts. */
+  private workerPool?: MeetingWorkerPool;
 
   constructor(
     registry: AgentRegistry,
@@ -564,6 +567,42 @@ export class AgentManager {
     this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
+  }
+
+  /**
+   * KPR-390: wire the meeting worker pool (index.ts, post-dispatcher).
+   * The handshake keeps runner-construction inputs inside the manager —
+   * the pool holds only capabilities (spec §A3 "factory callback" choice).
+   * The factory deliberately passes NO prefixCache (worker turns provably
+   * can't touch the boss's cached prefix), NO workerPool (a worker can
+   * never see worker-pool tools even if a config clone slipped the
+   * denylist — belt-and-braces recursion guard), and sets
+   * suppressAutoInjectedServers — WITHOUT which the runner re-adds
+   * team/schedule/team-roster unconditionally and the denylist strip in
+   * runWorkerTurn is a no-op (through-the-boss would be fiction).
+   */
+  setWorkerPool(pool: MeetingWorkerPool): void {
+    this.workerPool = pool;
+    pool.bindManager({
+      buildWorkerAdapter: (workerConfig) => {
+        const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
+        const runner = new AgentRunner(
+          workerConfig,
+          this.memoryManager,
+          this.plugins,
+          this.skillIndex,
+          eventSubscribersJson,
+          this.prefetcher,
+          this.teamRoster,
+          this.db,
+          undefined, // prefixCache — deliberately absent
+          this.memoryLifecycle,
+          { suppressAutoInjectedServers: true }, // worker mode — no workerPool
+        );
+        return new ClaudeAgentAdapter(runner);
+      },
+      breakerStateFor: (provider) => this.circuitBreakers.stateFor(provider),
+    });
   }
 
   /** KPR-213: expose the cache so out-of-band consumers (doctor heartbeat, etc.) can read stats. */
@@ -628,7 +667,14 @@ export class AgentManager {
       });
     }
 
-    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, laneAPassthrough ? { laneAPassthrough } : undefined);
+    // KPR-390: the pool rides along on every normal runner so a boss agent
+    // with "worker-pool" in coreServers gets the in-process server; absent
+    // pool ⇒ the runner never builds it (Day-1-OOB layer 2).
+    const runnerOptions: AgentRunnerOptions | undefined =
+      laneAPassthrough || this.workerPool
+        ? { laneAPassthrough, workerPool: this.workerPool }
+        : undefined;
+    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, runnerOptions);
     if (route.provider === "claude") {
       return new ClaudeAgentAdapter(runner);
     }
@@ -2147,6 +2193,9 @@ export class AgentManager {
     // finally's identity-check now also defends against any other
     // future caller making the same mistake.
     this.stoppedAgents.add(agentId);
+    // KPR-390: abort this boss's live meeting workers (claims stay `running`;
+    // the watchdog/restart sweep own the honest expiry notice).
+    this.workerPool?.abortForBoss(agentId);
     this.cancelReflectionsFor(agentId);
     const tickets = this.activeTickets.get(agentId);
     if (tickets) {

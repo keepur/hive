@@ -3794,3 +3794,157 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
     expect(instructions.split(HOT).length - 1).toBe(1);
   });
 });
+
+// ── KPR-390: worker-pool wiring + worker-mode auto-injection suppression ──────
+describe("AgentRunner — KPR-390 worker-pool wiring", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  function makeFakePool(): any {
+    return { dispatch: vi.fn(), status: vi.fn(), cancel: vi.fn(), abortForBoss: vi.fn() };
+  }
+
+  function makeWorkerPoolRunner(opts: {
+    coreServers: string[];
+    pool?: any;
+    suppress?: boolean;
+    db?: any;
+    teamRoster?: any;
+  }): AgentRunner {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers: opts.coreServers }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      opts.teamRoster,
+      opts.db,
+      undefined,
+      undefined,
+      { workerPool: opts.pool, suppressAutoInjectedServers: opts.suppress },
+    );
+  }
+
+  it("(a) pool wired + worker-pool in coreServers → in-process server built, context ref carries the seven and refreshes per turn", () => {
+    const runner = makeWorkerPoolRunner({ coreServers: ["worker-pool"], pool: makeFakePool() });
+    const servers = runner.buildInProcessServers({
+      adapterId: "slack",
+      channelId: "C1",
+      channelKind: "slack",
+      channelLabel: "conf-standup",
+      threadId: "1.0",
+      slackTs: "1.1",
+      slackThreadTs: "1.0",
+    } as any);
+    expect(Object.keys(servers)).toContain("worker-pool");
+    const ref = (runner as unknown as { workerPoolContextRef: { current: Record<string, unknown> } })
+      .workerPoolContextRef;
+    expect(ref.current).toEqual({
+      adapterId: "slack",
+      channelId: "C1",
+      channelKind: "slack",
+      channelLabel: "conf-standup",
+      threadId: "1.0",
+      slackTs: "1.1",
+      slackThreadTs: "1.0",
+    });
+    // Mutable-ref pin: a second turn refreshes the SAME object the tools close over.
+    const before = ref.current;
+    runner.buildInProcessServers({ channelLabel: "conf-other", threadId: "2.0" } as any);
+    expect(ref.current).not.toBe(before);
+    expect(ref.current.threadId).toBe("2.0");
+  });
+
+  it("(b) no pool option, or pool without coreServers membership → worker-pool absent", () => {
+    const noPool = makeWorkerPoolRunner({ coreServers: ["worker-pool"] });
+    expect(Object.keys(noPool.buildInProcessServers())).not.toContain("worker-pool");
+    const noMembership = makeWorkerPoolRunner({ coreServers: [], pool: makeFakePool() });
+    expect(Object.keys(noMembership.buildInProcessServers())).not.toContain("worker-pool");
+  });
+
+  it("(c) worker-mode suppression is structural on BOTH surfaces (built servers AND inventory)", () => {
+    const teamRoster = { teamSummary: async () => "## Team\n- Alice" };
+    const worker = makeWorkerPoolRunner({
+      coreServers: ["memory", "contacts"],
+      suppress: true,
+      db: makeFakeInProcessDb(),
+      teamRoster,
+    });
+    const workerKeys = Object.keys(worker.buildInProcessServers());
+    expect(workerKeys).toContain("memory");
+    expect(workerKeys).toContain("structured-memory");
+    expect(workerKeys).toContain("contacts");
+    for (const name of ["team", "schedule", "team-roster", "workflow"]) {
+      expect(workerKeys).not.toContain(name);
+    }
+    // filterCoreServers mirror gate — the ONLY site injecting the LIVE
+    // skill-author stdio server. buildToolTransportInventory iterates that
+    // method's output, so it is the only surface that can observe the gate.
+    const workerInventory = worker.buildToolTransportInventory().map((e) => e.name);
+    for (const name of ["team", "schedule", "team-roster", "skill-author"]) {
+      expect(workerInventory).not.toContain(name);
+    }
+
+    // Control: identical runner WITHOUT the flag re-adds all of them.
+    const control = makeWorkerPoolRunner({
+      coreServers: ["memory", "contacts"],
+      db: makeFakeInProcessDb(),
+      teamRoster,
+    });
+    const controlKeys = Object.keys(control.buildInProcessServers());
+    for (const name of ["team", "schedule", "team-roster"]) {
+      expect(controlKeys).toContain(name);
+    }
+    const controlInventory = control.buildToolTransportInventory().map((e) => e.name);
+    for (const name of ["team", "schedule", "team-roster", "skill-author"]) {
+      expect(controlInventory).toContain(name);
+    }
+  });
+
+  it("(e) worker mode auto-injects NOTHING — a role-granted server is a capability, not engine-provided", () => {
+    // autoInjectedServerNames() is the third sync site of the worker-mode gate,
+    // and the ONLY one observable here: it feeds the inventory `source` field
+    // (and, via buildSystemPrompt's buildContext, the toolkit section's
+    // engine-provided ∩ coreServerNames split). With the gate removed, a server
+    // the ROLE explicitly granted is mislabeled as engine-auto-injected even
+    // though worker-mode injects nothing.
+    const worker = makeWorkerPoolRunner({
+      coreServers: ["memory", "schedule"],
+      suppress: true,
+      db: makeFakeInProcessDb(),
+    });
+    expect(worker.buildToolTransportInventory().find((e) => e.name === "schedule")?.source).toBe("core");
+
+    // Control: same coreServers without the flag — schedule IS engine-injected.
+    const control = makeWorkerPoolRunner({ coreServers: ["memory", "schedule"], db: makeFakeInProcessDb() });
+    expect(control.buildToolTransportInventory().find((e) => e.name === "schedule")?.source).toBe("engine");
+  });
+
+  it("(d) Lane B inventory compensation — worker-pool descriptor surfaces with no stdio placeholder", () => {
+    const runner = makeWorkerPoolRunner({ coreServers: ["worker-pool"], pool: makeFakePool() });
+    const entry = runner.buildToolTransportInventory().find((e) => e.name === "worker-pool");
+    expect(entry).toBeDefined();
+    expect(entry).toMatchObject({
+      transport: "sdk-in-process",
+      inProcess: true,
+      requiresTurnContext: true,
+      requiresHiveRuntime: true,
+    });
+    expect(entry!.compatibility.openai).toBe("requires-hive-bridge");
+    expect(entry!.compatibility.gemini).toBe("requires-hive-bridge");
+    expect(entry!.compatibility.codex).toBe("requires-hive-bridge");
+
+    const noPool = makeWorkerPoolRunner({ coreServers: ["worker-pool"] });
+    expect(noPool.buildToolTransportInventory().find((e) => e.name === "worker-pool")).toBeUndefined();
+    const noMembership = makeWorkerPoolRunner({ coreServers: [], pool: makeFakePool() });
+    expect(
+      noMembership.buildToolTransportInventory().find((e) => e.name === "worker-pool"),
+    ).toBeUndefined();
+  });
+});

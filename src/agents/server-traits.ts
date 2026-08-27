@@ -11,6 +11,9 @@ export const TURN_CONTEXT_DEPENDENT_SERVERS = new Set<string>([
   "code-task",
   "recall",
   "structured-memory",
+  // KPR-390: worker-pool reads per-turn channel/thread metadata from a mutable
+  // context ref, exactly like `callback`.
+  "worker-pool",
 ]);
 
 export const DELEGATE_UNSAFE_SERVERS = new Set<string>([

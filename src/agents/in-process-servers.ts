@@ -1,5 +1,6 @@
 /**
- * KPR-184: the 10 KPR-122-ported in-process MCP servers.
+ * KPR-184: the KPR-122-ported in-process MCP servers, plus later in-process
+ * servers (KPR-390: worker-pool).
  *
  * These run in-process via `createSdkMcpServer` wired in
  * `agent-runner.ts:send()`. They cannot appear in `delegateServers` because
@@ -30,4 +31,6 @@ export const IN_PROCESS_PORTED_SERVERS = new Set<string>([
   "admin",
   "code-search",
   "workflow",
+  // KPR-390: meeting worker pool — in-process only (no per-server bundle).
+  "worker-pool",
 ]);

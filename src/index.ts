@@ -30,6 +30,7 @@ import { ContactsWatcher } from "./team-roster/contacts-watcher.js";
 import { SlackGateway } from "./slack/slack-gateway.js";
 import { MemoryManager } from "./memory/memory-manager.js";
 import { Scheduler } from "./scheduler/scheduler.js";
+import { MeetingWorkerPool } from "./workers/meeting-worker-pool.js";
 import { HealthReporter } from "./health/health-reporter.js";
 import { LinearClient } from "./linear/linear-client.js";
 import { SessionStore } from "./agents/session-store.js";
@@ -732,6 +733,30 @@ async function main(): Promise<void> {
   scheduler.start();
   log.info("Scheduler started");
 
+  // KPR-390: meeting worker pool — constructed after the dispatcher
+  // (scheduler-seam precedent, breaks the manager↔dispatcher cycle).
+  const workerPool = new MeetingWorkerPool({
+    db,
+    registry,
+    config: config.meetingWorkers,
+    onDispatch: (item) => {
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("Worker re-entry dispatch failed", { error: String(err) });
+      });
+    },
+  });
+  agentManager.setWorkerPool(workerPool);
+  // indexes + restart sweep + watchdog. Unguarded on purpose: the restart
+  // sweep self-contains its own failures (pool.start), so the only throw that
+  // reaches here is an ensureIndexes failure — boot-fatal like every other
+  // boot-time datastore failure.
+  await workerPool.start();
+  log.info("Meeting worker pool started", {
+    enabled: config.meetingWorkers.enabled,
+    maxConcurrent: config.meetingWorkers.maxConcurrent,
+    perMeetingMax: config.meetingWorkers.perMeetingMax,
+  });
+
   // Start watching for agent definition changes
   await registry.startWatching();
 
@@ -854,6 +879,7 @@ async function main(): Promise<void> {
     if (wsAdapter) await wsAdapter.stop();
     voiceAdapter?.stop();
     scheduler.stop();
+    workerPool.stop();
     outageReplayProcessor?.stop();
     await bgTaskManager.stop();
     await codeTaskManager.stop();
