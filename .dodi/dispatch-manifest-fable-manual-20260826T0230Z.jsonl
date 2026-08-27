@@ -49,3 +49,6 @@
 {"worker":"child-pr-review-kpr-389-final","phase":"child-pr-review","round":2,"ticket":"KPR-389","tier":"fable","dispatched_at":"2026-08-26T18:50:00Z"}
 {"worker":"coherence-review-kpr-389","phase":"coherence","ticket":"KPR-389","tier":"fable","dispatched_at":"2026-08-26T19:30:00Z"}
 {"worker":"spec-drafter-kpr-390","phase":"draft-spec","ticket":"KPR-390","tier":"fable","dispatched_at":"2026-08-26T20:30:00Z"}
+{"worker":"spec-reviewer-kpr-390-r1","phase":"spec-review","round":1,"ticket":"KPR-390","tier":"fable","dispatched_at":"2026-08-27T00:20:00Z"}
+{"worker":"spec-reviewer-kpr-390-r2","phase":"spec-review","round":2,"ticket":"KPR-390","tier":"fable","dispatched_at":"2026-08-27T01:00:00Z"}
+{"worker":"plan-writer-kpr-390","phase":"write-plan","ticket":"KPR-390","tier":"fable","dispatched_at":"2026-08-27T01:20:00Z"}
