@@ -5,10 +5,12 @@ import {
   resolveCircuitBreakerConfig,
   resolveOutageQueueConfig,
   resolveToolSearchConfig,
+  resolveMeetingWorkersConfig,
   DEFAULT_TOOL_SEARCH_CONFIG,
 } from "./config.js";
 import { DEFAULT_CIRCUIT_BREAKER_CONFIG } from "./agents/provider-circuit-breaker.js";
 import { DEFAULT_OUTAGE_QUEUE_CONFIG } from "./outage/outage-queue-store.js";
+import { DEFAULT_MEETING_WORKERS_CONFIG } from "./workers/worker-pool-config.js";
 
 describe("normalizeGoogleAccounts (KPR-242)", () => {
   it("returns an empty record for undefined or non-object input", () => {
@@ -157,6 +159,70 @@ describe("resolveOutageQueueConfig (KPR-307)", () => {
       maxReplayAttempts: 0,
     });
     expect(resolved).toEqual(DEFAULT_OUTAGE_QUEUE_CONFIG);
+  });
+});
+
+describe("resolveMeetingWorkersConfig (KPR-390)", () => {
+  it("returns all defaults for absent/garbage sections", () => {
+    expect(resolveMeetingWorkersConfig(undefined)).toEqual(DEFAULT_MEETING_WORKERS_CONFIG);
+    expect(resolveMeetingWorkersConfig(null)).toEqual(DEFAULT_MEETING_WORKERS_CONFIG);
+    expect(resolveMeetingWorkersConfig("nope")).toEqual(DEFAULT_MEETING_WORKERS_CONFIG);
+    expect(resolveMeetingWorkersConfig([])).toEqual(DEFAULT_MEETING_WORKERS_CONFIG);
+  });
+
+  it("returns a copy of defaults, not the shared object", () => {
+    const a = resolveMeetingWorkersConfig(undefined);
+    expect(a).not.toBe(DEFAULT_MEETING_WORKERS_CONFIG);
+  });
+
+  it("applies each key individually on partial sections", () => {
+    expect(resolveMeetingWorkersConfig({ workerModel: "  opus  " }).workerModel).toBe("opus");
+    expect(resolveMeetingWorkersConfig({ maxConcurrent: 9 }).maxConcurrent).toBe(9);
+    expect(resolveMeetingWorkersConfig({ perMeetingMax: 7 }).perMeetingMax).toBe(7);
+    expect(resolveMeetingWorkersConfig({ claimTtlMinutes: 45 }).claimTtlMinutes).toBe(45);
+    expect(resolveMeetingWorkersConfig({ workerMaxTurns: 40 }).workerMaxTurns).toBe(40);
+    // workerTimeoutMs of 60s ⇒ minTtl 2m, so the default 30m TTL still stands.
+    expect(resolveMeetingWorkersConfig({ workerTimeoutMs: 60_000 }).workerTimeoutMs).toBe(60_000);
+    expect(resolveMeetingWorkersConfig({ enabled: false }).enabled).toBe(false);
+  });
+
+  it("leaves untouched keys at their defaults on a partial section", () => {
+    const resolved = resolveMeetingWorkersConfig({ maxConcurrent: 2 });
+    expect(resolved).toEqual({ ...DEFAULT_MEETING_WORKERS_CONFIG, maxConcurrent: 2 });
+  });
+
+  it("rejects garbage-typed and non-positive values per key", () => {
+    const resolved = resolveMeetingWorkersConfig({
+      workerModel: "   ",
+      maxConcurrent: "four",
+      perMeetingMax: -3,
+      claimTtlMinutes: NaN,
+      workerMaxTurns: 0,
+      workerTimeoutMs: Infinity,
+      enabled: "yes",
+    });
+    expect(resolved).toEqual(DEFAULT_MEETING_WORKERS_CONFIG);
+  });
+
+  it("clamps a claim TTL that does not exceed the worker wall clock", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const resolved = resolveMeetingWorkersConfig({ workerTimeoutMs: 600_000, claimTtlMinutes: 5 });
+      expect(resolved.claimTtlMinutes).toBe(11);
+      expect(resolved.workerTimeoutMs).toBe(600_000);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("meetingWorkers.claimTtlMinutes");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("treats an empty section as defaults and ignores unknown keys", () => {
+    expect(resolveMeetingWorkersConfig({})).toEqual(DEFAULT_MEETING_WORKERS_CONFIG);
+    expect(resolveMeetingWorkersConfig({ perMeetingMax: 5, scribeCadenceMinutes: 3 })).toEqual({
+      ...DEFAULT_MEETING_WORKERS_CONFIG,
+      perMeetingMax: 5,
+    });
   });
 });
 
