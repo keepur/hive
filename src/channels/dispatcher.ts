@@ -70,7 +70,7 @@ interface ResolvedAgent {
   /** Round-1 only: the peer reply this reaction turn should engage with (KPR-387). */
   reactionTo?: { authorName: string; text: string };
   /** KPR-388: how threadContext was assembled — full transcript or delta since the mark. */
-  injectionMode?: "full" | "delta";
+  injectionMode?: "full" | "delta" | "summary";
   /** KPR-388: max Slack ts (raw string) covered by this turn's injection; the mark advances to it on success. */
   injectionHighWaterTs?: string;
 }
@@ -1341,7 +1341,7 @@ export class Dispatcher {
     channelName: string,
     roster: RosterMember[],
     roundZeroTriggerTs?: string,
-  ): Promise<{ threadContext: string; injectionMode: "full" | "delta"; injectionHighWaterTs?: string }> {
+  ): Promise<{ threadContext: string; injectionMode: "full" | "delta" | "summary"; injectionHighWaterTs?: string }> {
     const ref = await this.agentManager.getSessionStore().get(agentId, threadId);
     const provider = this.agentManager.providerFor(agentId);
     if (!ref?.sessionId || !ref.meetingLastSeenTs || ref.provider !== provider) {
