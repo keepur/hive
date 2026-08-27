@@ -1258,5 +1258,407 @@ Meeting rules:
 
       expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "2110");
     });
+
+    // -------------------------------------------------------------------
+    // KPR-409: summary-mode anchor + round-level cadence seams.
+    // ADDITIONS ONLY — every case above is untouched (T3 gate). Cases that
+    // do not call seedScribe() exercise the absent-scribe path, which is
+    // byte-identical to pre-KPR-409 (C6 pin).
+    // -------------------------------------------------------------------
+
+    /** Installs a fake scribe. `summary` undefined ⇒ getSummary resolves
+     *  undefined (the "nothing yet / disabled / absent" production shape). */
+    const seedScribe = (summary?: { summaryText: string; coveredThroughTs: string }) => {
+      const scribe = {
+        getSummary: vi.fn().mockResolvedValue(summary),
+        noteActivity: vi.fn(),
+      };
+      dispatcher.setMeetingScribe(scribe as any);
+      return scribe;
+    };
+
+    it("T1: summary mode replaces the raw transcript — byte-exact shape (KPR-409 summary pin)", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-pin";
+      // No seedRef ⇒ full arm ⇒ the summary anchor fires.
+      seedScribe({ summaryText: "S", coveredThroughTs: "1000.0002" });
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      const item = makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-summary" },
+        threadId,
+        meta: { slackTs: "1000.0004" },
+      });
+      await dispatcher.dispatch(item);
+
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+      const [, turnItem] = agentManager.runWorkItemTurn.mock.calls[0];
+
+      const expectedSummary =
+        `[Meeting thread in #conf-summary — participants: Jasper]\n` +
+        `[Running summary of the meeting so far:]\n\n` +
+        `S\n\n` +
+        `[Messages since the summary:]\n\n` +
+        `May (5 min ago): newer message`;
+      expect(turnItem.text).toBe(
+        `${PREAMBLE("conf-summary", "Jasper")}\n${expectedSummary}\n---\n[New message]:\n${item.text}`,
+      );
+      expect(turnItem.meta.conferenceInjectionMode).toBe("summary");
+      expect(turnItem.text).not.toContain("[New messages since your last turn:]");
+      expect(turnItem.text).not.toContain("old message"); // pre-summary content is gone
+    });
+
+    it("T1: an empty tail ends the context at the summary — no dangling tail header", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-empty-tail";
+      seedScribe({ summaryText: "S", coveredThroughTs: "1000.0003" }); // covers the whole history
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      const item = makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-summary" },
+        threadId,
+        meta: { slackTs: "1000.0004" },
+      });
+      await dispatcher.dispatch(item);
+
+      const [, turnItem] = agentManager.runWorkItemTurn.mock.calls[0];
+      const expectedSummary =
+        `[Meeting thread in #conf-summary — participants: Jasper]\n` +
+        `[Running summary of the meeting so far:]\n\n` +
+        `S`;
+      expect(turnItem.text).toBe(
+        `${PREAMBLE("conf-summary", "Jasper")}\n${expectedSummary}\n---\n[New message]:\n${item.text}`,
+      );
+      expect(turnItem.text).not.toContain("[Messages since the summary:]");
+    });
+
+    // ⚠ Written against R2 (spec §D4, plan header decision). If the coherence
+    // reviewer rules F1 instead, (b) and T5 INVERT: injectionHighWaterTs is
+    // always undefined in summary mode and setMeetingMark is never called —
+    // rewrite both to pin the absence.
+    it("T2(a): summary mode, non-empty tail, round 0 — the trigger ts maxes in", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-mark-trigger";
+      seedScribe({ summaryText: "S", coveredThroughTs: "1000.0002" });
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, next steps?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-summary-mark" },
+          threadId,
+          meta: { slackTs: "1000.0004" }, // above the tail max (1000.0003) — the trigger wins
+        }),
+      );
+
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
+    });
+
+    it("T2(a): summary mode — a trigger ts below the tail max loses to the tail max", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-mark-tail";
+      seedScribe({ summaryText: "S", coveredThroughTs: "1000.0002" });
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, next steps?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-summary-mark" },
+          threadId,
+          meta: { slackTs: "1000.0000" }, // below the tail max (1000.0003)
+        }),
+      );
+
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0003");
+    });
+
+    it("T2(c): summary mode, round 0, empty tail — coveredThroughTs maxes in (R2)", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-mark-covered-r0";
+      seedScribe({ summaryText: "S", coveredThroughTs: "1000.0009" }); // covers the whole history
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, next steps?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-summary-mark" },
+          threadId,
+          meta: { slackTs: "1000.0005" }, // below coveredThroughTs — only R2 can carry the mark this high
+        }),
+      );
+
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0009");
+    });
+
+    it("T2(b): summary mode, round 1, empty tail — the mark still advances, to coveredThroughTs (R2 correction pin)", async () => {
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+
+      const threadId = "conf-thread-summary-mark-covered-r1";
+      // Neither agent has a session ⇒ both take the full arm ⇒ summary anchor.
+      seedScribe({ summaryText: "S", coveredThroughTs: "1000.0009" });
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(
+        makeHistory([
+          { author: "May", text: "kickoff", ts: "1000.0001", minAgo: 30 },
+          { author: "Jasper", text: "Agent response", ts: "1000.0006", minAgo: 4, isBot: true },
+        ]),
+      );
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, and Jessica, please weigh in",
+          source: { kind: "slack", id: "C-CONF", label: "conf-summary-r1" },
+          threadId,
+          meta: { slackTs: "2000.0005" },
+        }),
+      );
+
+      // Round 1 has no trigger max-in and the tail is empty — without R2's
+      // coveredThroughTs term this call never happens and jessica never
+      // converts to delta.
+      await vi.waitFor(() => {
+        expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jessica", threadId, "1000.0009");
+      });
+      // Contrast: round 0 still maxes in its own trigger ts.
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "2000.0005");
+    });
+
+    it("T5: summary-mode turn with resumedSession:false still sets the mark — the clear branch stays delta-exclusive", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-resumed-false";
+      seedScribe({ summaryText: "S", coveredThroughTs: "1000.0002" });
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+      agentManager.runWorkItemTurn.mockResolvedValueOnce({
+        finalMessage: "Agent response",
+        newSessionId: "s-fresh",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 0,
+          costUsd: 0.01,
+          durationMs: 100,
+        },
+        errors: [],
+        llmMs: 0,
+        toolMs: 0,
+        toolCalls: 0,
+        toolSummary: null,
+        streamed: false,
+        compactions: 0,
+        resumedSession: false, // would clear on a DELTA turn — summary mode must still set
+      });
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, next steps?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-summary-resumed" },
+          threadId,
+          meta: { slackTs: "1000.0004" },
+        }),
+      );
+
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
+      expect(agentManager._sessionStore.clearMeetingMark).not.toHaveBeenCalled();
+    });
+
+    it("T3 control: a scribe with no summary yet ⇒ the pre-KPR-409 full-mode shape, unchanged", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-absent";
+      const scribe = seedScribe(undefined); // getSummary resolves undefined
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      const item = makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-summary-absent" },
+        threadId,
+        meta: { slackTs: "1000.0004" },
+      });
+      await dispatcher.dispatch(item);
+
+      expect(scribe.getSummary).toHaveBeenCalledWith(threadId);
+      const [, turnItem] = agentManager.runWorkItemTurn.mock.calls[0];
+      expect(turnItem.text).toContain("old message"); // raw transcript
+      expect(turnItem.text).toContain("newer message");
+      expect(turnItem.text).not.toContain("[Running summary of the meeting so far:]");
+      expect(turnItem.text).not.toContain("[Messages since the summary:]");
+      expect(turnItem.meta.conferenceInjectionMode).toBe("full");
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
+    });
+
+    it("T4: the delta arm never reads a summary — a delta-eligible agent stays byte-identical", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-delta-untouched";
+      seedRef("jasper", threadId, { sessionId: "sess-1", provider: "claude", meetingLastSeenTs: "1000.0002" });
+      const scribe = seedScribe({ summaryText: "S", coveredThroughTs: "1000.0002" });
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      const item = makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-delta" },
+        threadId,
+        meta: { slackTs: "1000.0004" },
+      });
+      await dispatcher.dispatch(item);
+
+      expect(scribe.getSummary).not.toHaveBeenCalled();
+      const [, turnItem] = agentManager.runWorkItemTurn.mock.calls[0];
+      expect(turnItem.meta.conferenceInjectionMode).toBe("delta");
+      const expectedDelta =
+        `[Meeting thread in #conf-delta — participants: Jasper]\n` +
+        `[New messages since your last turn:]\n\n` +
+        `May (5 min ago): newer message`;
+      expect(turnItem.text).toBe(
+        `${PREAMBLE("conf-delta", "Jasper")}\n${expectedDelta}\n---\n[New message]:\n${item.text}`,
+      );
+    });
+
+    it("T6: round 0 fires the cadence seam exactly once regardless of how many responders are selected", async () => {
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper", "jessica"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+
+      const threadId = "conf-thread-cadence-round0";
+      const scribe = seedScribe(undefined);
+      const history = THREE_MSG_HISTORY();
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(history);
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, and Jessica, please weigh in",
+          source: { kind: "slack", id: "C-CONF", label: "conf-cadence" },
+          threadId,
+          meta: { slackTs: "1000.0004", slackThreadTs: "1000.0001" },
+        }),
+      );
+
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2); // N = 2 responders
+      expect(scribe.noteActivity).toHaveBeenCalledTimes(1); // round-level, not per-agent
+      const [args] = scribe.noteActivity.mock.calls[0];
+      expect(args.threadId).toBe(threadId);
+      expect(args.history).toEqual(history);
+      expect(args.channelLabel).toBe("conf-cadence");
+      expect(args.roster.map((r: any) => r.agentId)).toEqual(["jasper", "jessica"]);
+      expect(args.baseAgentId).toBe("jasper");
+      expect(args.source).toEqual({
+        adapterId: "slack",
+        channelId: "C-CONF",
+        channelKind: "slack",
+        slackTs: "1000.0004",
+        slackThreadTs: "1000.0001",
+      });
+    });
+
+    it("T6: round 0 fires the cadence seam even when the classifier selects nobody", async () => {
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any).mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+
+      const threadId = "conf-thread-cadence-nobody";
+      const scribe = seedScribe(undefined);
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, thoughts?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-cadence" },
+          threadId,
+          meta: { slackTs: "1000.0004" },
+        }),
+      );
+
+      expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled(); // nobody selected
+      expect(scribe.noteActivity).toHaveBeenCalledTimes(1); // the seam precedes the classifier
+    });
+
+    it("T6: a round-1 pass WITH selected reactors adds one more cadence call", async () => {
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+
+      const threadId = "conf-thread-cadence-round1";
+      const scribe = seedScribe(undefined);
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, and Jessica, please weigh in",
+          source: { kind: "slack", id: "C-CONF", label: "conf-cadence" },
+          threadId,
+          meta: { slackTs: "1000.0004" },
+        }),
+      );
+
+      await vi.waitFor(() => {
+        expect(scribe.noteActivity).toHaveBeenCalledTimes(2); // round 0 + round 1
+      });
+      const [round1Args] = scribe.noteActivity.mock.calls[1];
+      expect(round1Args.threadId).toBe(threadId);
+      expect(round1Args.source.slackTs).toBe("1000.0004"); // the human ts, not a peer ts
+      expect(round1Args.roster.map((r: any) => r.agentId)).toEqual(["jasper", "jessica"]);
+    });
+
+    it("T6: a round-1 pass that selects NOBODY adds no cadence call — the early return precedes the re-fetch (deliberate asymmetry)", async () => {
+      await soloClassifier(); // round 0 = jasper; the reaction pass selects nobody
+      const threadId = "conf-thread-cadence-round1-nobody";
+      const scribe = seedScribe(undefined);
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, and Jessica, please weigh in",
+          source: { kind: "slack", id: "C-CONF", label: "conf-cadence" },
+          threadId,
+          meta: { slackTs: "1000.0004" },
+        }),
+      );
+
+      await vi.waitFor(() => {
+        expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
+      });
+      // Round 0 already guaranteed one trigger per human message — the round-1
+      // seam is selection-gated by construction and this is not a bug.
+      expect(scribe.noteActivity).toHaveBeenCalledTimes(1);
+    });
+
+    it("T6: a scribe whose getSummary REJECTS is contained by the caller, never by the anchor", async () => {
+      await soloClassifier();
+      const threadId = "conf-thread-summary-throws";
+      const scribe = {
+        getSummary: vi.fn().mockRejectedValue(new Error("scribe exploded")),
+        noteActivity: vi.fn(),
+      };
+      dispatcher.setMeetingScribe(scribe as any);
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(THREE_MSG_HISTORY());
+
+      // ⚠ Honest pin of TODAY's behavior, not of a tolerance the dispatcher
+      // does not have: `await this.meetingScribe?.getSummary(...)` sits on the
+      // un-try/catch'd resolveAgents path, so a REJECTING fake rejects
+      // dispatch() itself (index.ts .catch-logs it; the turn is lost).
+      // Production cannot reach this: MeetingScribe.getSummary is total —
+      // config-gated, findOne wrapped in try/catch, returns undefined on every
+      // failure — which is what the T3 control above exercises. Flagged for the
+      // reviewer: if dispatcher-level tolerance of a misbehaving INJECTED
+      // scribe is wanted, that is a deliberate production change (a `.catch(()
+      // => undefined)` on the anchor), not something to smuggle in here.
+      await expect(
+        dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, next steps?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-summary-throws" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        ),
+      ).rejects.toThrow("scribe exploded");
+      expect(scribe.noteActivity).toHaveBeenCalledTimes(1); // the cadence seam already fired
+      expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
+    });
   });
 });

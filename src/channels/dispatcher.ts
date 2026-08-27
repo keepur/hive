@@ -15,6 +15,7 @@ import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
 import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
+import type { MeetingScribe } from "../workers/meeting-scribe.js";
 import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
@@ -114,6 +115,9 @@ export class Dispatcher {
   private outage?: OutageHandlingDeps;
   private teamStore?: import("../team/team-store.js").TeamStore;
   private slackAdapter?: SlackAdapter;
+  /** KPR-409: optional running-summary source for the full-arm anchor.
+   *  Absent ⇒ every conference path behaves exactly as pre-KPR-409. */
+  private meetingScribe?: MeetingScribe;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
   // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents that responded or were
   // selected to respond on this human message, either round (KPR-387): round-0
@@ -169,6 +173,10 @@ export class Dispatcher {
 
   setSlackAdapter(adapter: SlackAdapter): void {
     this.slackAdapter = adapter;
+  }
+
+  setMeetingScribe(scribe: MeetingScribe): void {
+    this.meetingScribe = scribe;
   }
 
   async dispatch(item: WorkItem): Promise<void> {
@@ -1245,6 +1253,30 @@ export class Dispatcher {
         .join("\n");
     }
 
+    // KPR-409 (R1 — requested C26 relaxation): round-level cadence trigger.
+    // Fires once per round-0 pass INCLUDING passes where the classifier
+    // selects nobody. Fire-and-forget: noteActivity returns void, never
+    // throws, and removing this hunk restores byte-identical behavior.
+    // (`rosterMembers.length > 0` is redundant with the :1229 early return —
+    // kept deliberately so the seam states its own precondition locally and
+    // survives any future reordering. Not a bug; do not "simplify" it away.)
+    if (history.length > 0 && rosterMembers.length > 0) {
+      this.meetingScribe?.noteActivity({
+        threadId,
+        history,
+        channelLabel: item.source.label,
+        roster: rosterMembers,
+        baseAgentId: rosterMembers[0].agentId,
+        source: {
+          adapterId: item.source.adapterId ?? item.source.kind,
+          channelId: item.source.id,
+          channelKind: item.source.kind,
+          slackTs: (item.meta?.slackTs as string) ?? "",
+          slackThreadTs: (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId,
+        },
+      });
+    }
+
     // Run classifier
     const classification = await classifyMeetingMessage(item.text, rosterMembers, recentMessages);
 
@@ -1345,6 +1377,32 @@ export class Dispatcher {
     const ref = await this.agentManager.getSessionStore().get(agentId, threadId);
     const provider = this.agentManager.providerFor(agentId);
     if (!ref?.sessionId || !ref.meetingLastSeenTs || ref.provider !== provider) {
+      // KPR-409 (C13-sanctioned anchor): a running summary replaces the raw
+      // transcript for fresh-session entrants. Fail-soft by construction —
+      // getSummary never throws and returns undefined when the scribe is
+      // absent, disabled, or has nothing yet, in which case the three lines
+      // below are byte-identical to pre-KPR-409 (C6 pin).
+      const summary = await this.meetingScribe?.getSummary(threadId);
+      if (summary) {
+        const coveredNum = parseFloat(summary.coveredThroughTs);
+        // Same 100-cap as truncateHistory's tail; no first-5 pin — the summary
+        // holds the thread opening (the delta arm's own reasoning).
+        const tail = history.filter((m) => parseFloat(m.ts) > coveredNum).slice(-100);
+        return {
+          threadContext: this.formatSummaryContext(summary.summaryText, tail, channelName, roster),
+          injectionMode: "summary",
+          injectionHighWaterTs: maxSlackTs([
+            ...tail.map((m) => m.ts),
+            // ⚠ R2 (requested relaxation, spec §D4): REQUIRED, not cosmetic.
+            // Without it an empty tail at round 1 yields undefined, setMeetingMark
+            // is skipped, and the agent never converts to delta. If the coherence
+            // reviewer rules F1 instead, the fix is to delete this one line (and
+            // invert T2(b)/T5) — see the plan header.
+            summary.coveredThroughTs,
+            roundZeroTriggerTs,
+          ]),
+        };
+      }
       return {
         threadContext: this.formatThreadContext(history, channelName, roster),
         injectionMode: "full",
@@ -1382,6 +1440,27 @@ export class Dispatcher {
       })
       .join("\n");
     return `${header}\n[New messages since your last turn:]\n\n${formatted}`;
+  }
+
+  /**
+   * KPR-409: summary-mode context — running summary plus the messages that
+   * postdate it. Marker-collision checked (C3/C10): neither marker is
+   * "[New message]:" (the terminal slot) nor "[New messages since your last
+   * turn:]" (the delta header), and neither starts with "[New".
+   * The tail block is omitted entirely when `tail` is empty.
+   */
+  private formatSummaryContext(
+    summaryText: string,
+    tail: ThreadMessage[],
+    channelName: string,
+    roster: RosterMember[],
+  ): string {
+    const participantNames = roster.map((r) => r.name).join(", ");
+    const header = `[Meeting thread in #${channelName} — participants: ${participantNames}]`;
+    const base = `${header}\n[Running summary of the meeting so far:]\n\n${summaryText}`;
+    if (tail.length === 0) return base;
+    const formatted = tail.map((m) => `${m.author} (${this.formatTimeAgo(m.timestamp)}): ${m.text}`).join("\n");
+    return `${base}\n\n[Messages since the summary:]\n\n${formatted}`;
   }
 
   private formatTimeAgo(timestamp: Date): string {
@@ -1491,6 +1570,27 @@ Meeting rules:
         });
       }
       preamble = this.buildMeetingPreamble(originalItem.source.label, allRosterMembers);
+    }
+
+    // KPR-409 (R1 — requested C26 relaxation): round-1 cadence trigger.
+    // Selection-gated by construction (the three early returns above precede
+    // the re-fetch). Same fire-and-forget contract as the round-0 seam.
+    if (history.length > 0 && allRosterMembers.length > 0) {
+      this.meetingScribe?.noteActivity({
+        threadId,
+        history,
+        channelLabel: originalItem.source.label,
+        roster: allRosterMembers,
+        baseAgentId: allRosterMembers[0].agentId,
+        source: {
+          adapterId: originalItem.source.adapterId ?? originalItem.source.kind,
+          channelId: originalItem.source.id,
+          channelKind: originalItem.source.kind,
+          slackTs: humanTs,
+          slackThreadTs:
+            (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId,
+        },
+      });
     }
 
     // Dispatch reactions concurrently (peers already claimed in reacted set above)
