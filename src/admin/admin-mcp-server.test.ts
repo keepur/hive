@@ -151,11 +151,12 @@ function makeBaseAgent(overrides: Record<string, any> = {}): any {
   };
 }
 
-function makeTools() {
+function makeTools(depsOverride: Record<string, any> = {}) {
   return buildAdminTools({
     db: makeFakeDb(),
     agentId: "admin",
     instanceCapabilitiesJson: "{}",
+    ...depsOverride,
   });
 }
 
@@ -1032,14 +1033,19 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(catalogVersionsStore[0].changeSummary).toBe("+1 (gpt-5.5), -0");
   });
 
-  it("excludes gemini at the Zod schema level — no handler rejection needed", () => {
+  // KPR-394 (§4.11): the provider schema widened from a zod enum to z.string()
+  // so runtime-registered plugin ids are expressible; gemini exclusion and the
+  // valid-set check moved into the handler (pinned in the plugin-provider
+  // describe below). This test now pins the widening itself.
+  it("accepts any provider string at the Zod schema level — validation is in the handler", () => {
     const tools = makeTools();
     const t = tools.find((x: any) => x.name === "agent_model_catalog_refresh")!;
     const providerSchema = (t.inputSchema as any).provider;
-    expect(providerSchema.safeParse("gemini").success).toBe(false);
+    expect(providerSchema.safeParse("gemini").success).toBe(true);
     expect(providerSchema.safeParse("claude").success).toBe(true);
     expect(providerSchema.safeParse("grok").success).toBe(true);
     expect(providerSchema.safeParse("codex").success).toBe(true);
+    expect(providerSchema.safeParse("sol").success).toBe(true);
   });
 });
 
@@ -1398,5 +1404,59 @@ describe("admin-mcp-server — model field discoverability (KPR-381)", () => {
     const desc = (t.inputSchema as any).fields.description as string;
     expect(desc).toContain("<provider>/<model>[:effort]");
     expect(desc).toContain("agent_model_catalog_list");
+  });
+});
+
+describe("agent_model_catalog — plugin providers (KPR-394)", () => {
+  beforeEach(() => {
+    catalogDocsStore = new Map();
+    catalogVersionsStore = [];
+  });
+
+  it("list accepts a registered plugin id; unseeded returns the prose note", async () => {
+    const tools = makeTools({ listPluginProviderIds: () => ["sol"] });
+    const res = await getHandler(tools, "agent_model_catalog_list")({ provider: "sol" });
+    expect(res.isError).toBeUndefined();
+    const texts = res.content.map((c: any) => c.text).join("\n");
+    expect(texts).toContain("sol: not yet seeded");
+  });
+
+  it("refresh upserts a plugin provider's curated doc", async () => {
+    const tools = makeTools({ listPluginProviderIds: () => ["sol"] });
+    const res = await getHandler(
+      tools,
+      "agent_model_catalog_refresh",
+    )({
+      provider: "sol",
+      models: [{ id: "sol-large-2", displayName: "Sol Large 2" }],
+    });
+    expect(res.isError).toBeUndefined();
+    expect(catalogDocsStore.get("sol")?.models?.[0]?.id).toBe("sol-large-2");
+  });
+
+  it("refresh rejects an unknown provider naming the valid set", async () => {
+    const tools = makeTools({ listPluginProviderIds: () => ["sol"] });
+    const res = await getHandler(
+      tools,
+      "agent_model_catalog_refresh",
+    )({
+      provider: "zeta",
+      models: [{ id: "z", displayName: "Z" }],
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Valid: claude, grok, codex, sol");
+  });
+
+  it("gemini refresh still rejected (always live)", async () => {
+    const tools = makeTools({ listPluginProviderIds: () => ["sol"] });
+    const res = await getHandler(
+      tools,
+      "agent_model_catalog_refresh",
+    )({
+      provider: "gemini",
+      models: [{ id: "g", displayName: "G" }],
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("always resolved live");
   });
 });

@@ -1,6 +1,5 @@
 import { fromKeychain } from "../../keychain/from-keychain.js";
 import { TurnAssemblyError } from "./error-classification.js";
-import type { AgentProviderId } from "./types.js";
 
 /**
  * KPR-346 (epic KPR-345 §D1): Lane A passthrough providers — vendors that
@@ -94,7 +93,7 @@ export const PASSTHROUGH_PROVIDERS: Readonly<Record<LaneAProviderId, Passthrough
  * session-handoff notice (degrades to the Lane B variant) and its :effort
  * clamp (silently dropped instead of clamped). Every Lane A id must appear.
  */
-export function isLaneAProvider(p: AgentProviderId): p is LaneAProviderId {
+export function isLaneAProvider(p: string): p is LaneAProviderId {
   return p === "kimi" || p === "deepseek";
 }
 

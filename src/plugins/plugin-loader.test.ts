@@ -679,3 +679,39 @@ describe("rescanPluginBrokenServers", () => {
     expect(stillBroken).toEqual({});
   });
 });
+
+describe("normalizeManifest — provider block (KPR-394)", () => {
+  it("carries a normalized provider decl through the manifest", () => {
+    const manifest = normalizeManifest({
+      name: "hive-plugin-sol",
+      "mcp-servers": {},
+      provider: {
+        id: "sol",
+        entry: "provider.ts",
+        abi: 1,
+        "session-semantics": "stateless-replay",
+        "api-key-env": "SOL_API_KEY",
+      },
+    });
+    expect(manifest.provider).toEqual({
+      id: "sol",
+      entry: "provider.ts",
+      abi: 1,
+      sessionSemantics: "stateless-replay",
+      defaultModel: undefined,
+      apiKeyEnv: "SOL_API_KEY",
+      baseUrlEnv: undefined,
+      description: undefined,
+    });
+  });
+
+  it("absent provider block stays undefined", () => {
+    expect(normalizeManifest({ name: "p", "mcp-servers": {} }).provider).toBeUndefined();
+  });
+
+  it("a structurally-invalid provider block throws (manifest-invalid skip, MCP-entry precedent)", () => {
+    expect(() => normalizeManifest({ name: "p", "mcp-servers": {}, provider: { id: "sol" } })).toThrow(
+      /provider\.entry/,
+    );
+  });
+});

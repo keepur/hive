@@ -10,6 +10,7 @@ import {
   resolveServicePath,
   modelRouterModeLine,
   llmSidecarLine,
+  renderProviderPluginsSection,
 } from "./doctor-checks.js";
 
 // execFileSync and fetch are mocked per-test via vi.mock for subprocess checks.
@@ -702,5 +703,58 @@ describe("llmSidecarLine (KPR-314)", () => {
         expect(llmSidecarLine(a, g).length).toBeGreaterThan(0);
       }
     }
+  });
+});
+
+describe("renderProviderPluginsSection (KPR-394)", () => {
+  const emit = () => {
+    const lines: string[] = [];
+    return { lines, fn: (l: string) => lines.push(l) };
+  };
+
+  it("renders (none installed) when empty", () => {
+    const { lines, fn } = emit();
+    renderProviderPluginsSection([], [], fn);
+    expect(lines.join("\n")).toContain("(no provider plugins installed)");
+  });
+
+  it("renders ok rows with plugin, abi, semantics", () => {
+    const { lines, fn } = emit();
+    renderProviderPluginsSection(
+      [{ plugin: "hive-plugin-sol", id: "sol", abi: 1, semantics: "stateless-replay", status: "ok" }],
+      [],
+      fn,
+    );
+    const out = lines.join("\n");
+    expect(out).toContain("ok  sol");
+    expect(out).toContain("plugin=hive-plugin-sol");
+    expect(out).toContain("abi=1");
+  });
+
+  it("renders broken rows with the reason", () => {
+    const { lines, fn } = emit();
+    renderProviderPluginsSection(
+      [
+        {
+          plugin: "p",
+          id: "sol",
+          abi: 2,
+          semantics: "stateless-replay",
+          status: "broken",
+          reason: "plugin requires provider ABI 2; engine provides 1",
+        },
+      ],
+      [],
+      fn,
+    );
+    expect(lines.join("\n")).toContain("BROKEN: plugin requires provider ABI 2");
+  });
+
+  it("renders orphan model prefixes with the Claude-canon note", () => {
+    const { lines, fn } = emit();
+    renderProviderPluginsSection([], [{ agentId: "luna", model: "zeta/z-9" }], fn);
+    const out = lines.join("\n");
+    expect(out).toContain("orphan model prefix: agent=luna model=zeta/z-9");
+    expect(out).toContain("unknown-prefix canon");
   });
 });

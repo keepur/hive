@@ -4,6 +4,7 @@ import {
   allCredentialKeys,
   findCredentialEntry,
   findCredentialEntryByKey,
+  pluginProviderCredentialEntries,
 } from "./credential-registry.js";
 import { SERVER_CATALOG } from "../tools/server-catalog.js";
 
@@ -84,5 +85,27 @@ describe("CREDENTIAL_REGISTRY", () => {
     expect(findCredentialEntryByKey("LINEAR_API_KEY")?.server).toBe("linear");
     expect(findCredentialEntryByKey("GH_TOKEN")?.server).toBe("github-issues");
     expect(findCredentialEntryByKey("NONEXISTENT_KEY")).toBeUndefined();
+  });
+});
+
+describe("pluginProviderCredentialEntries (KPR-394)", () => {
+  it("maps a decl with api-key-env onto a secret entry", () => {
+    const entries = pluginProviderCredentialEntries([
+      { plugin: "hive-plugin-sol", decl: { id: "sol", apiKeyEnv: "SOL_API_KEY", description: "Sol models" } },
+    ]);
+    expect(entries).toEqual([
+      {
+        server: "sol",
+        title: "Provider 'sol' (plugin hive-plugin-sol)",
+        description: "Sol models",
+        helpUrl: "See the hive-plugin-sol plugin README.",
+        kind: "secret",
+        fields: [{ key: "SOL_API_KEY", label: "SOL_API_KEY" }],
+      },
+    ]);
+  });
+
+  it("a decl without api-key-env contributes nothing", () => {
+    expect(pluginProviderCredentialEntries([{ plugin: "p", decl: { id: "sol" } }])).toEqual([]);
   });
 });

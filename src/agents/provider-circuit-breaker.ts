@@ -21,7 +21,6 @@
  * "0 = probe currently in flight" is authoritative over the spec's half-open
  * prose ("the probe's remaining deadline budget").
  */
-import type { AgentProviderId } from "./provider-adapters/types.js";
 import {
   HARD_FAULT_KINDS,
   type ProviderFaultKind,
@@ -75,7 +74,7 @@ const PROBE_STALE_MS = 360_000;
 
 /** Opaque turn-admission handle. `record(permit, …)` makes probe bookkeeping airtight. */
 export interface TurnPermit {
-  readonly provider: AgentProviderId;
+  readonly provider: string;
   readonly isProbe: boolean;
 }
 
@@ -88,7 +87,7 @@ interface InternalPermit extends TurnPermit {
 export class ProviderCircuitOpenError extends Error {
   override readonly name = "ProviderCircuitOpenError";
   constructor(
-    readonly provider: AgentProviderId,
+    readonly provider: string,
     /** Epoch ms when the breaker (most recently) opened. */
     readonly openedAt: number,
     /** ms from now until the next half-open probe is eligible (0 = probe currently in flight). */
@@ -106,7 +105,7 @@ export class ProviderCircuitOpenError extends Error {
 
 /** OPEN-CIRCUIT CONTRACT — frozen fields; additive evolution only (KPR-307). */
 export interface CircuitBreakerSnapshot {
-  provider: AgentProviderId;
+  provider: string;
   state: "closed" | "open" | "half-open";
   enabled: boolean; // false = shadow mode
   openedAt: number | null;
@@ -153,7 +152,7 @@ export class ProviderCircuitBreaker {
   private lastClosedAt = -Infinity;
 
   constructor(
-    readonly provider: AgentProviderId,
+    readonly provider: string,
     private readonly config: CircuitBreakerConfig,
     private readonly now: () => number = Date.now,
   ) {}
@@ -475,7 +474,7 @@ export class ProviderCircuitBreaker {
  * mocks of appConfig may omit `circuitBreaker`) — defaults fill the gaps.
  */
 export class ProviderCircuitBreakerRegistry {
-  private readonly breakers = new Map<AgentProviderId, ProviderCircuitBreaker>();
+  private readonly breakers = new Map<string, ProviderCircuitBreaker>();
   private readonly config: CircuitBreakerConfig;
 
   constructor(
@@ -485,7 +484,7 @@ export class ProviderCircuitBreakerRegistry {
     this.config = { ...DEFAULT_CIRCUIT_BREAKER_CONFIG, ...config };
   }
 
-  private breakerFor(provider: AgentProviderId): ProviderCircuitBreaker {
+  private breakerFor(provider: string): ProviderCircuitBreaker {
     let breaker = this.breakers.get(provider);
     if (!breaker) {
       breaker = new ProviderCircuitBreaker(provider, this.config, this.now);
@@ -495,7 +494,7 @@ export class ProviderCircuitBreakerRegistry {
   }
 
   /** Throws ProviderCircuitOpenError if open (and no probe permit available). */
-  acquire(provider: AgentProviderId, meta?: { agentId?: string; threadId?: string }): TurnPermit {
+  acquire(provider: string, meta?: { agentId?: string; threadId?: string }): TurnPermit {
     return this.breakerFor(provider).acquire(meta);
   }
 
@@ -505,12 +504,12 @@ export class ProviderCircuitBreakerRegistry {
   }
 
   /** null = provider never used in this process. */
-  stateFor(provider: AgentProviderId): CircuitBreakerSnapshot | null {
+  stateFor(provider: string): CircuitBreakerSnapshot | null {
     return this.breakers.get(provider)?.snapshot() ?? null;
   }
 
-  getSnapshot(): Partial<Record<AgentProviderId, CircuitBreakerSnapshot>> {
-    const out: Partial<Record<AgentProviderId, CircuitBreakerSnapshot>> = {};
+  getSnapshot(): Partial<Record<string, CircuitBreakerSnapshot>> {
+    const out: Partial<Record<string, CircuitBreakerSnapshot>> = {};
     for (const [provider, breaker] of this.breakers) out[provider] = breaker.snapshot();
     return out;
   }

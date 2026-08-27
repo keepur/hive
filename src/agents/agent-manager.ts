@@ -28,13 +28,23 @@ import type { PrefixCache } from "./prefix-cache.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import { ClaudeAgentAdapter } from "./provider-adapters/claude-agent-adapter.js";
 import type { CodexReasoningEffort } from "./provider-adapters/codex-subscription-adapter.js";
-// KPR-391 (§4.3): both Lane B construction sites (top-level tail + the
-// KPR-354 nested delegate runner) resolve through this one table — the twin
-// construction switches they replace could drift; a table lookup cannot.
-import { LANE_B_PROVIDER_MODULES } from "./provider-adapters/provider-modules.js";
-import type { LaneBModuleDeps, LaneBProviderModule } from "./provider-adapters/provider-module.js";
-import type { AgentProviderAdapter, AgentProviderId, ReasoningEffort } from "./provider-adapters/types.js";
-import { persistsResumableHandle, sessionSemanticsFor } from "./provider-adapters/types.js";
+import type { LaneBModuleDeps } from "./provider-adapters/provider-module.js";
+import type { AgentProviderAdapter, ReasoningEffort } from "./provider-adapters/types.js";
+import { persistsResumableHandle } from "./provider-adapters/types.js";
+// KPR-394 (§4.3/§4.4): both Lane B construction sites resolve through the
+// runtime provider registry — builtin seed + hive-plugin-add-loaded
+// modules — via one shared lookup (getRegisteredProvider), so the two
+// sites still cannot drift (KPR-391 §4.3 property preserved).
+import {
+  activateDeclaredProviders,
+  declarePluginProviders,
+  describeUnroutableProvider,
+  getRegisteredProvider,
+  isPluginDeclaredProvider,
+  sessionSemanticsForRoute,
+  warnOrphanProviderPrefixes,
+  type RegisteredProvider,
+} from "./provider-adapters/provider-registry.js";
 import {
   assembleProviderTurn,
   buildNestedDelegateAssembly,
@@ -50,7 +60,12 @@ import {
 } from "./provider-adapters/passthrough-providers.js";
 import { DEFAULT_GROK_GATEWAY_URL } from "./provider-adapters/grok-gateway-adapter.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
-import { classifyThrown, classifyTurnResult, TURN_DEADLINE_SUBTYPE } from "./provider-adapters/error-classification.js";
+import {
+  classifyThrown,
+  classifyTurnResult,
+  TurnAssemblyError,
+  TURN_DEADLINE_SUBTYPE,
+} from "./provider-adapters/error-classification.js";
 
 const log = createLogger("agent-manager");
 const conversationIndex = new ConversationIndex();
@@ -97,7 +112,9 @@ export interface TurnContext {
    * session-identity guard. undefined ⇒ nothing known about the row's
    * producer (first turn, or a caller that resolved no session).
    */
-  sessionProvider?: AgentProviderId;
+  // R2 (KPR-394): widened from AgentProviderId — StoredSessionRef.provider is
+  // now a string (plugin provider ids are arbitrary registered strings).
+  sessionProvider?: string;
   /**
    * KPR-313: set ONLY by spawnTurn's session-identity guard when this turn
    * starts fresh due to a provider change; prepareSpawn prepends the handoff
@@ -177,19 +194,18 @@ export type SpawnTurnStreamCallback = StreamCallback;
  */
 const DEFAULT_PER_AGENT_SPAWN_BUDGET = 5;
 
-type ProviderModelRoute =
-  | { provider: "claude"; model: string }
-  | { provider: "openai"; model: string; reasoningEffort?: CodexReasoningEffort }
-  | { provider: "gemini"; model: string; reasoningEffort?: CodexReasoningEffort }
-  | { provider: "codex"; model: string; reasoningEffort?: CodexReasoningEffort }
-  // KPR-392 (§4.7): grok promoted off Lane A to a native Lane B module —
-  // same shape as the other Lane B members above; the full suffix set
-  // (incl. minimal/none) now flows to the route unclamped (§4.5).
-  | { provider: "grok"; model: string; reasoningEffort?: CodexReasoningEffort }
-  // KPR-346 (§D2): Lane A passthrough — Claude runtime, foreign endpoint.
-  // reasoningEffort survives splitProviderModel and delivers via the Claude
-  // adapter's existing effort channel (clamped in prepareSpawn, §D6).
-  | { provider: "kimi" | "deepseek"; model: string; reasoningEffort?: CodexReasoningEffort };
+/**
+ * KPR-394 (§4.3, R2): flattened from a closed literal union to a generic
+ * shape — `provider` is any routable provider string (built-in arms below
+ * plus plugin-declared ids from the registry). Construction literals are
+ * byte-identical to the pre-394 arms; in-tree `route.provider === "..."`
+ * comparisons still narrow. KPR-392/KPR-346 semantics unchanged.
+ */
+interface ProviderModelRoute {
+  provider: string;
+  model: string;
+  reasoningEffort?: CodexReasoningEffort;
+}
 
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
 
@@ -217,6 +233,16 @@ function resolveProviderModel(model: string): ProviderModelRoute {
   }
   if (provider === "grok") {
     return { provider: "grok", model: providerModel, reasoningEffort };
+  }
+
+  // KPR-394 (§4.3): a DECLARED plugin provider id (registered, still
+  // loading, or declared-broken) routes to ITSELF — the honest-failure path
+  // lives at adapter construction, never a silent Claude fallback. Only
+  // never-declared prefixes fall through to the Claude canon below.
+  // Registry state is module-global (this function is module-scope and is
+  // also consumed statically by providerFor and prepareSpawn).
+  if (isPluginDeclaredProvider(provider)) {
+    return { provider, model: providerModel, reasoningEffort };
   }
 
   return { provider: "claude", model: normalized };
@@ -525,6 +551,11 @@ export class AgentManager {
     // absent (test config mocks omit it).
     this.circuitBreakers = new ProviderCircuitBreakerRegistry(appConfig.circuitBreaker);
     this.plugins = loadPlugins(appConfig.plugins, hiveHome, { distDir: DIST_DIR });
+    // KPR-394 (§4.3 phase a): synchronous declaration — every declared
+    // provider id is honest-failure-routable from the first instant.
+    // Phase (b) activation is async and awaited by index.ts via
+    // activateProviderPlugins() before any spawn-capable surface starts.
+    declarePluginProviders(this.plugins, { hiveHome, distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
   }
@@ -545,6 +576,23 @@ export class AgentManager {
 
   getPlugins(): LoadedPlugin[] {
     return this.plugins;
+  }
+
+  /**
+   * KPR-394 (§4.3 phase b / §4.6): dynamic-import + factory-activate every
+   * declared provider plugin. index.ts MUST await this immediately after
+   * construction, BEFORE bgTaskManager.start()/scanOrphans() — their
+   * completion callbacks can already dispatch turns. Boot-only; SIGUSR1
+   * never loads or unloads provider code.
+   */
+  async activateProviderPlugins(): Promise<void> {
+    await activateDeclaredProviders();
+    this.warnOrphanProviderPrefixes();
+  }
+
+  /** KPR-394 (§4.6): orphan-model-prefix warn — boot + SIGUSR1 reload. */
+  warnOrphanProviderPrefixes(): void {
+    warnOrphanProviderPrefixes(this.registry.getAll().map((a) => ({ agentId: a.id, model: a.model })));
   }
 
   /**
@@ -604,6 +652,17 @@ export class AgentManager {
       return new ClaudeAgentAdapter(runner);
     }
 
+    // KPR-394 (§4.3/§4.4): registry lookup — the same shared path the nested
+    // delegate runner below resolves through. A declared-broken or
+    // still-declared id throws the honest breaker-invisible
+    // TurnAssemblyError here, inside runOneSpawnAttempt's recorded try
+    // (classifyThrown → non-provider: config faults never trip a breaker or
+    // open an outage episode).
+    const registered = getRegisteredProvider(route.provider);
+    if (!registered) {
+      throw new TurnAssemblyError(describeUnroutableProvider(route.provider));
+    }
+
     // KPR-391 (§4.3): named-handle deps for the provider modules — built
     // once, shared by the top-level tail and the nested delegate runner so
     // the two construction sites cannot drift.
@@ -616,13 +675,9 @@ export class AgentManager {
     // all three entries are in-tree, a real credential-exposure hazard once
     // KPR-394 makes this contract the ABI for `hive plugin add`-loaded
     // third-party modules (CLAUDE.md § Security (DOD-212)).
+    // KPR-394: slice resolution generalized — see resolveProviderModuleSlice.
     const moduleDeps: LaneBModuleDeps = {
-      providerConfig:
-        route.provider === "gemini"
-          ? { agentModel: appConfig.gemini.agentModel, apiKey: appConfig.gemini.apiKey || undefined }
-          : route.provider === "grok"
-            ? this.resolveGrokModuleSlice()
-            : { agentModel: appConfig[route.provider].agentModel },
+      providerConfig: this.resolveProviderModuleSlice(registered),
       turnHistoryStore: this.turnHistoryStore,
       agentId: config.id,
     };
@@ -678,14 +733,12 @@ export class AgentManager {
           // after the parent adapter is constructed, which requires assembly.
           sessionCwd: parentAssembly?.sessionCwd ?? "",
         });
-        const module = (LANE_B_PROVIDER_MODULES as Partial<Record<string, LaneBProviderModule>>)[
-          route.provider
-        ];
+        const module = getRegisteredProvider(route.provider)?.module;
         if (!module) {
-          // Unreachable while LaneBProviderId = {openai, codex, gemini, grok} —
-          // kept as containment for a future provider that ships tool-less
-          // (KPR-354 belt-and-braces; §D6). Registry-miss path.
-          return `Delegate turn failed (${call.delegate}): provider ${String((route as { provider: string }).provider)} does not execute tools`;
+          // KPR-354 belt-and-braces containment, now also the registry-miss
+          // path for any future gap (§4.4) — unreachable while construction
+          // is boot-locked, kept as containment.
+          return `Delegate turn failed (${call.delegate}): provider ${route.provider} does not execute tools`;
         }
         const nested: AgentProviderAdapter = module.createAdapter({
           name: `${config.name}:${call.delegate}`,
@@ -776,17 +829,61 @@ export class AgentManager {
     });
     parentAssembly = assembly;
 
-    // KPR-391 (§4.3/§5.5): the top-level construction is the same table
-    // lookup the nested runner above uses — model default chains, the
-    // KPR-353 history wiring (primary-only) and the gemini key threading all
-    // live in the module entries now.
-    return LANE_B_PROVIDER_MODULES[route.provider].createAdapter({
+    // KPR-394 (§4.4): same registry entry as the nested runner above —
+    // model default chains, primary-only history wiring, and key threading
+    // all live in the module entries (builtin or plugin).
+    return registered.module.createAdapter({
       name: config.name,
       route: { model: route.model, reasoningEffort: route.reasoningEffort },
       assembly,
       context: "primary",
       deps: moduleDeps,
     });
+  }
+
+  /**
+   * KPR-394 (§4.4): generalized caller-resolved module slice (C7/C15 —
+   * engine resolves, module consumes opaquely; a module is never handed a
+   * sibling's credential). Built-in arms preserve KPR-391/392 behavior
+   * byte-for-byte. Plugin arms resolve the manifest-named keys PER SPAWN:
+   * api-key-env on the exact secret-env chain (env → Honeypot; missing ⇒
+   * breaker-invisible TurnAssemblyError naming `hive credentials add
+   * <KEY>` — rotation takes effect next spawn); base-url-env as plain env
+   * validated https-or-loopback (KPR-384 posture: an override redirects
+   * credential AND conversation stream). Unset base-url-env ⇒ undefined ⇒
+   * the module's own built-in default endpoint (grok-override semantics,
+   * generalized).
+   */
+  private resolveProviderModuleSlice(
+    registered: RegisteredProvider,
+  ): { agentModel?: string; apiKey?: string; baseUrl?: string } {
+    if (registered.source !== "builtin") {
+      const slice = registered.slice;
+      const baseUrlOverride = slice?.baseUrlEnv ? process.env[slice.baseUrlEnv] : undefined;
+      return {
+        agentModel: slice?.defaultModel,
+        apiKey: slice?.apiKeyEnv
+          ? resolveEnvKeyCredential(slice.apiKeyEnv, { instanceId: appConfig.instance.id })
+          : undefined,
+        baseUrl:
+          baseUrlOverride && slice?.baseUrlEnv
+            ? assertSafeBaseUrlOverride(baseUrlOverride, slice.baseUrlEnv)
+            : undefined,
+      };
+    }
+    switch (registered.id) {
+      case "gemini":
+        return { agentModel: appConfig.gemini.agentModel, apiKey: appConfig.gemini.apiKey || undefined };
+      case "grok":
+        return this.resolveGrokModuleSlice();
+      case "codex":
+        return { agentModel: appConfig.codex.agentModel };
+      case "openai":
+        return { agentModel: appConfig.openai.agentModel };
+      default:
+        // Unreachable: the builtin seed is exactly the four Lane B ids.
+        return {};
+    }
   }
 
   /**
@@ -898,7 +995,7 @@ export class AgentManager {
    * same resolveProviderModel the KPR-306 wrap point uses, so dispatcher and
    * breaker always agree on the provider key.
    */
-  providerFor(agentId: string): AgentProviderId | null {
+  providerFor(agentId: string): string | null {
     const agentConfig = this.registry.get(agentId);
     if (!agentConfig) return null;
     return resolveProviderModel(agentConfig.model).provider;
@@ -1066,7 +1163,7 @@ export class AgentManager {
           finalResult.error &&
           isStaleServerHandleError(finalResult.error) &&
           effectiveCtx.sessionId &&
-          sessionSemanticsFor(shaping.route.provider) === "server-resumable"
+          sessionSemanticsForRoute(shaping.route.provider) === "server-resumable"
         ) {
           // KPR-351 (R2): chain-orphan closure. Two same-thread turns can
           // both resolve the same stale handle PRE-lock; the first heals and
@@ -1906,7 +2003,7 @@ export class AgentManager {
       // store doubles as the dispatcher's thread→agent map via
       // findAgentByThread) with an empty sessionId — the row persists, the
       // fake handle never does.
-      const resumable = persistsResumableHandle(sessionSemanticsFor(route.provider));
+      const resumable = persistsResumableHandle(sessionSemanticsForRoute(route.provider));
       // ⚠A4 churn-mint rider: an ERROR turn that attempted a resume and came
       // back with a DIFFERENT id is a failed-resume mint (the CLI's
       // error_during_execution result carries a freshly minted session_id) —

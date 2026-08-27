@@ -13,7 +13,7 @@
  * for now; re-homing or re-exporting those declarations is deferred to
  * KPR-394's ABI freeze (noted in the spec so it doesn't surprise).
  */
-import type { AgentProviderAdapter, LaneBProviderId, ReasoningEffort } from "./types.js";
+import type { AgentProviderAdapter, ReasoningEffort } from "./types.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { TurnHistoryStore } from "../turn-history-store.js";
 
@@ -65,6 +65,7 @@ export interface LaneBAdapterConstructionArgs {
 }
 
 export interface LaneBProviderModule {
-  provider: LaneBProviderId;
+  /** R2 (KPR-394): widened from LaneBProviderId — plugin ids are arbitrary registered strings; in-tree modules keep their literals. */
+  provider: string;
   createAdapter(args: LaneBAdapterConstructionArgs): AgentProviderAdapter;
 }

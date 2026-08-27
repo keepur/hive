@@ -25,7 +25,7 @@
  */
 import type { RunResult } from "../agent-runner.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
-import type { AgentProviderAdapter, AgentProviderTurnRequest, LaneBProviderId } from "./types.js";
+import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
 import { ToolBridge } from "./tool-bridge.js";
 import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
 
@@ -80,7 +80,7 @@ export interface LaneBTurnHarness {
 }
 
 export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
-  abstract readonly provider: LaneBProviderId;
+  abstract readonly provider: string;
 
   protected currentAbortController: AbortController | null = null;
   protected aborted = false;
