@@ -40,6 +40,9 @@ const TASKS: Record<LLMTask, TaskBinding> = {
   meetingClassifier: { provider: "anthropic", modelId: () => config.modelRouter.model },
   memory: { provider: "anthropic", modelId: () => MEMORY_MODEL_ID },
   vision: { provider: "gemini", modelId: () => config.gemini.visionModel, requiredCapability: "vision" },
+  // KPR-390: meeting worker-pool semantic claim dedup — classifier-grade,
+  // borrows the router's model like meetingClassifier (spec §A2).
+  workerClaimDedup: { provider: "anthropic", modelId: () => config.modelRouter.model },
 };
 
 export class LLMRegistry {
