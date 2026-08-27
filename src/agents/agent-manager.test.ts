@@ -67,6 +67,10 @@ vi.mock("../config.js", () => ({
     instance: { id: "test-instance" },
     modelRouter: { enabled: false },
     memory: { reflectionMinTurns: 3 },
+    // KPR-390: agent-manager.ts never reads this, but the worker-mode
+    // end-to-end pin constructs a REAL AgentRunner (vi.importActual) whose
+    // buildInProcessServers reads config.workflow.enabled unconditionally.
+    workflow: { enabled: false },
   },
 }));
 
@@ -5197,5 +5201,116 @@ describe("isStaleServerHandleError (KPR-350 §D3) — narrowness matrix", () => 
     // alternates: none of the stale strings contain an auth sentinel.
     const AUTH = /resolve authentication|credentials\.json|not authenticated|401 Unauthorized|ANTHROPIC_API_KEY|authToken/i;
     for (const s of MUST_MATCH) expect(AUTH.test(s)).toBe(false);
+  });
+});
+
+// ── KPR-390: meeting worker pool handshake ───────────────────────────────────
+describe("AgentManager — KPR-390 worker pool handshake", () => {
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let sessionStore: ReturnType<typeof makeMockSessionStore>;
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+  let manager: AgentManager;
+
+  /** In-process MCP factories only close over these — no-op stubs suffice. */
+  function makeFakeDb(): any {
+    const col = {
+      findOne: vi.fn(async () => null),
+      find: vi.fn(() => ({
+        project: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
+        toArray: vi.fn(async () => []),
+        sort: vi.fn(() => ({ limit: vi.fn(() => ({ toArray: vi.fn(async () => []) })) })),
+      })),
+      insertOne: vi.fn(async () => ({})),
+      updateOne: vi.fn(async () => ({})),
+      deleteOne: vi.fn(async () => ({})),
+      deleteMany: vi.fn(async () => ({})),
+      createIndex: vi.fn(async () => "idx"),
+      countDocuments: vi.fn(async () => 0),
+    };
+    return { collection: vi.fn(() => col) };
+  }
+
+  function makeFakePool() {
+    return {
+      bindManager: vi.fn(),
+      abortForBoss: vi.fn(),
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSupportsEffort.mockImplementation((m: string) => !m.includes("haiku"));
+    registry = makeMockRegistry();
+    sessionStore = makeMockSessionStore();
+    memoryManager = makeMockMemoryManager();
+    // Fixture requirement (plan G5 r2): a real fake `db` — every in-process
+    // block in buildInProcessServers gates on `this.db`, so a db-less manager
+    // makes the worker-mode pin below vacuously green.
+    manager = new AgentManager(
+      registry as any,
+      memoryManager as any,
+      sessionStore as any,
+      makeFakeDb(),
+      makeMockTurnTelemetryStore() as any,
+    );
+  });
+
+  it("setWorkerPool binds hooks whose breakerStateFor proxies the breaker registry", () => {
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as any);
+    expect(pool.bindManager).toHaveBeenCalledTimes(1);
+    const hooks = pool.bindManager.mock.calls[0][0];
+    const spy = vi.spyOn(manager.circuitBreakers, "stateFor").mockReturnValue(null);
+    expect(hooks.breakerStateFor("claude")).toBeNull();
+    expect(spy).toHaveBeenCalledWith("claude");
+    spy.mockRestore();
+  });
+
+  it("buildWorkerAdapter builds a worker-mode runner: no team/schedule/team-roster, no worker-pool (end-to-end)", async () => {
+    // The suite mocks AgentRunner globally; this pin needs the REAL runner so
+    // the suppression flag is observed on the actual built server set (a
+    // mock-shaped assertion would only test the mock).
+    const actual = await vi.importActual<typeof import("./agent-runner.js")>("./agent-runner.js");
+    vi.mocked(AgentRunner).mockImplementationOnce(function (...args: any[]) {
+      return new (actual.AgentRunner as any)(...args);
+    } as any);
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as any);
+    const hooks = pool.bindManager.mock.calls[0][0];
+
+    const workerConfig: AgentConfig = {
+      id: "worker",
+      name: "Worker",
+      model: "sonnet",
+      channels: [],
+      passiveChannels: [],
+      keywords: [],
+      isDefault: false,
+      schedule: [],
+      budgetUsd: 1,
+      maxTurns: 25,
+      icon: "",
+      coreServers: ["memory"],
+      delegateServers: [],
+      soul: "",
+      systemPrompt: "worker",
+      autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+    } as unknown as AgentConfig;
+
+    const adapter = hooks.buildWorkerAdapter(workerConfig);
+    expect(adapter.provider).toBe("claude");
+    const runner = (adapter as unknown as { runner: AgentRunner }).runner;
+    const keys = Object.keys(runner.buildInProcessServers());
+    expect(keys).toContain("memory");
+    for (const name of ["team", "schedule", "team-roster", "worker-pool"]) {
+      expect(keys).not.toContain(name);
+    }
+  });
+
+  it("stopAgent aborts that boss's live workers", () => {
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as any);
+    manager.stopAgent("agent-a");
+    expect(pool.abortForBoss).toHaveBeenCalledWith("agent-a");
   });
 });
