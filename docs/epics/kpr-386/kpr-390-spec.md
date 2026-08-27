@@ -243,6 +243,14 @@ All keys optional with these defaults in `config.ts`. `workerModel: sonnet` (ali
 
 ## Design — Part B: scribe (**KPR-409's design** — kept here deliberately so KPR-409's maturation lifts it verbatim; out of KPR-390's scope)
 
+> ⚠ **SUPERSEDED (2026-08-27).** This Part B design is carried here as history.
+> The binding contract is `docs/epics/kpr-386/kpr-409-spec.md`, which corrects
+> it in three load-bearing places: the scribe uses a NEW sibling `runRoleTurn`
+> (not `runWorkerTurn` — that path is claim-coupled and would post into the
+> meeting), the cadence trigger sits at two ROUND-LEVEL dispatch sites (not
+> inside `buildConferenceContext`), and the high-water formula is NOT unchanged
+> (R2, spec §D4). Read KPR-409's spec, not this section.
+
 ### B1. Turn kind — the forced decision (binding 1)
 
 **The scribe is a pool worker role, not a meeting participant.** It is never added to `meetingRosters`, never appears in classifier candidate lists (round 0 or reaction pass), never receives conference dispatch of any kind — so the C14/C15 question ("does it inherit reaction caps + decline pressure?") is answered structurally: neither turn kind applies; the scribe runs on the §A3 worker path (own caps: `scribeMaxTurns` 8 / `scribeTimeoutMs` 120s — summary-writing needs no tools beyond none-at-all; see B2) and has no posting surface (denylist). No roster/classifier/preamble code changes.
