@@ -218,7 +218,7 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
         // harvesting empty. Skipped when the turn aborted mid-stream (the
         // loop's post-stream checkpoint resolves the interruption).
         if (!harness.isAborted()) {
-          state.assembled = assembleToolCalls(state);
+          state.assembled = assembleToolCalls(state, this.options.name);
           // Edge 3 spirit guard: finish_reason=tool_calls with zero
           // assembled calls is a gateway stream-shape fault, never a
           // silent empty harvest. "terminated" lands on the connect-fail
@@ -255,10 +255,15 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
           text: state.text,
         };
       },
+      // KPR-407 (finding 2): NO callId hook — assembleToolCalls dedups, so
+      // the assistant message and the tool-result messages derive from ONE
+      // deduped list. The loop-level hook (correct for codex's Responses
+      // shape, where the assistant turn is server-side) was wrong here: the
+      // assistant message is composed from `state.assembled` BEFORE the loop
+      // filters, so a gateway-repeated id shipped two tool_calls with one
+      // tool_call_id response — a malformed chat-completions request.
+      // Gemini's pattern (harvest owns dedup, hook omitted) is now grok's.
       harvest: (state) => state.assembled,
-      // Dedup belt (spec §4.4): the gateway should never repeat a call id,
-      // but the loop-level guard closes the double-emission case for free.
-      callId: (call) => call.id,
       executeCall: async (call) => {
         const output = await executeGrokToolCall(call, bridgedByName);
         const toolMessage = { role: "tool", tool_call_id: call.id, content: output };
@@ -325,9 +330,17 @@ async function executeGrokToolCall(
 /** Edge 3: fragment assembly — index order, id/name required. A fragment
  *  set missing either is a mid-stream drop, decorated as such ("terminated"
  *  lands on the connect-fail row — the gateway is grok route
- *  infrastructure; its death is a grok outage). */
-function assembleToolCalls(state: GrokStreamState): GrokToolCall[] {
+ *  infrastructure; its death is a grok outage).
+ *
+ *  KPR-407 (finding 2): call-id dedup lives HERE, not at the loop's callId
+ *  hook — the assistant message is built from this list, so deduping later
+ *  would leave two `tool_calls` answered by one `tool_call_id` (a malformed
+ *  chat-completions request the vendor 400s). Lowest fragment index wins;
+ *  a drop is warned with the call id + tool name, never the arguments
+ *  payload (DOD-212 log-redaction convention). */
+function assembleToolCalls(state: GrokStreamState, agent: string): GrokToolCall[] {
   const calls: GrokToolCall[] = [];
+  const seen = new Set<string>();
   for (const index of [...state.fragments.keys()].sort((a, b) => a - b)) {
     const frag = state.fragments.get(index)!;
     if (!frag.id || !frag.name) {
@@ -335,6 +348,16 @@ function assembleToolCalls(state: GrokStreamState): GrokToolCall[] {
         `Grok gateway stream delivered an incomplete tool_call at index ${index} (missing id or name) — connection terminated mid-stream`,
       );
     }
+    if (seen.has(frag.id)) {
+      log.warn("Grok gateway repeated a tool_call id — dropping the later fragment (KPR-407)", {
+        agent,
+        callId: frag.id,
+        tool: frag.name,
+        index,
+      });
+      continue;
+    }
+    seen.add(frag.id);
     calls.push({ id: frag.id, name: frag.name, arguments: frag.arguments });
   }
   return calls;

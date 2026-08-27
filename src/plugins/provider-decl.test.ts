@@ -91,12 +91,17 @@ describe("validateProviderDecl", () => {
     if (!v.ok) expect(v.reason).toMatch(/invalid/);
   });
 
-  it.each(["claude", "codex", "openai-codex", "google-gemini", "kimi", "laneb"])("reserved id %j is rejected", (id) => {
-    expect(RESERVED_PROVIDER_IDS.has(id)).toBe(true);
-    const v = validateProviderDecl(decl({ id }), 1);
-    expect(v.ok).toBe(false);
-    if (!v.ok) expect(v.reason).toMatch(/reserved/);
-  });
+  // "constructor" (KPR-407 finding 3): the sole Object.prototype member name
+  // PROVIDER_ID_REGEX admits — reserved so it can never be registered at all.
+  it.each(["claude", "codex", "openai-codex", "google-gemini", "kimi", "laneb", "constructor"])(
+    "reserved id %j is rejected",
+    (id) => {
+      expect(RESERVED_PROVIDER_IDS.has(id)).toBe(true);
+      const v = validateProviderDecl(decl({ id }), 1);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.reason).toMatch(/reserved/);
+    },
+  );
 
   it("abi above the engine names both numbers and says upgrade hive", () => {
     const v = validateProviderDecl(decl({ abi: 2 }), 1);

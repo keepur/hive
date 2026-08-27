@@ -209,6 +209,15 @@ describe("semantics overlay + orphans + fixture e2e", () => {
     expect(sessionSemanticsForRoute("zeta")).toBe("stateless-replay");
   });
 
+  // KPR-407 (finding 3): "constructor" is the one Object.prototype member name
+  // PROVIDER_ID_REGEX admits. Unguarded, SESSION_SEMANTICS["constructor"]
+  // returned Object's constructor function — truthy garbage returned as if it
+  // were a SessionSemantics. Own-property guard ⇒ ordinary unknown handling.
+  it("prototype-chain id 'constructor' is unknown, not Object's constructor", () => {
+    expect(sessionSemanticsIfKnown("constructor")).toBeUndefined();
+    expect(sessionSemanticsForRoute("constructor")).toBe("stateless-replay");
+  });
+
   it("warnOrphanProviderPrefixes: bare + builtin + declared skipped; unknown returned + warned", () => {
     declareFixture();
     const orphans = warnOrphanProviderPrefixes([

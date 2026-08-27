@@ -329,6 +329,21 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     expect(omitted).toEqual([]);
   });
 
+  // KPR-407 (finding 3): "constructor" is the one Object.prototype member name
+  // PROVIDER_ID_REGEX admits. Unguarded, columns["constructor"] returned
+  // Object's constructor function — truthy, never in BRIDGEABLE_COMPATIBILITIES
+  // — so every tool was omitted with a function in the reason field instead of
+  // falling through to the laneB column. Own-property guard ⇒ laneB fallback.
+  it("KPR-407: a plugin id of 'constructor' falls through to laneB, never Object.prototype", () => {
+    const entry = makeEntry(
+      classifyToolTransport({ name: "mcp__memory__view", transport: "sdk-in-process", source: "engine" }),
+    );
+    expect(entry.compatibility.laneB).toBe("requires-hive-bridge"); // bridgeable
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], "constructor");
+    expect(bridgeable).toEqual([entry]);
+    expect(omitted).toEqual([]);
+  });
+
   it("R3: claude-only stays omitted for a plugin id, with the truthful reason", () => {
     const entry = makeEntry(
       classifyToolTransport({ name: "WebSearch", transport: "claude-builtin", source: "sdk-builtin" }),

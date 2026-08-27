@@ -45,7 +45,7 @@ export interface AgentDefinition {
   plugins?: string[];
   /**
    * Plugin-managed per-agent settings. Core never reads this field — plugins
-   * pull values via `agent-env` manifest mappings (e.g. `metadata.dodiOpsMode`).
+   * pull values via `agent-env` manifest mappings (e.g. `metadata.opsMode`).
    * Free-form to avoid coupling core to plugin schemas.
    */
   metadata?: Record<string, unknown>;
