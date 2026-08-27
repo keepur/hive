@@ -379,6 +379,13 @@ describe("AgentManager", () => {
 
     // Default mock: runner.send resolves with a result
     mockRunnerSend.mockResolvedValue(makeRunResult());
+    // Default mock: conversation indexing resolves. recordSpawnObservability
+    // chains `.catch` on `index()`'s return value, so an unprimed vi.fn()
+    // (returns undefined) throws. Priming here — not per-test — keeps every
+    // row hermetic under `-t` filter isolation (KPR-400/KPR-403 review debt:
+    // rows used to depend on an earlier sibling's inline prime surviving
+    // clearAllMocks).
+    mockConversationIndex.mockResolvedValue(undefined);
     mockRunnerToolInventory.mockReturnValue([]);
     mockCodexRunTurn.mockResolvedValue(makeRunResult({ text: "codex response", sessionId: "codex-session" }));
     mockOpenAIRunTurn.mockResolvedValue(makeRunResult({ text: "openai response", sessionId: "openai-session" }));
