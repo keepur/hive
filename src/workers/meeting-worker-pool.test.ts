@@ -282,6 +282,35 @@ describe("MeetingWorkerPool — claim ledger + gates (Task D)", () => {
     expect(uniqueFixture.claims.docs[1].dedup).toEqual({ compared: 1, verdict: "unique", costUsd: 0.0002 });
   });
 
+  it("T2: a THROWING dedup dependency still inserts — fail-open is structural at the call site", async () => {
+    // Not the sidecar's own rejecting-call path (covered above): this models
+    // getLLMRegistry()/hasProvider() throwing BEFORE worker-claim-dedup's try,
+    // i.e. an exception the sidecar cannot catch for us. §A2 forbids
+    // fail-closed, so dispatch() must swallow it and claim anyway.
+    const f = makeFixture({
+      dedup: () => {
+        throw new Error("llm registry not initialized");
+      },
+      runTurnImpl: () => new Promise(() => {}),
+    });
+    seedClaim(f.claims, { taskText: "pull the Q2 revenue figures" });
+    const res = await f.pool.dispatch(dispatchReq("get Q2 revenue"));
+    expect(res.startsWith("Worker dispatched")).toBe(true);
+    expect(f.claims.docs).toHaveLength(2);
+    expect(f.claims.docs[1].dedup).toEqual({ compared: 1, verdict: "unique", costUsd: 0 });
+
+    // Async-rejecting variant of the same dependency fault.
+    const rejecting = makeFixture({
+      dedup: async () => {
+        throw new Error("llm registry not initialized");
+      },
+      runTurnImpl: () => new Promise(() => {}),
+    });
+    seedClaim(rejecting.claims, { taskText: "pull the Q2 revenue figures" });
+    expect((await rejecting.pool.dispatch(dispatchReq("get Q2 revenue"))).startsWith("Worker dispatched")).toBe(true);
+    expect(rejecting.claims.docs).toHaveLength(2);
+  });
+
   it("T2: sidecar fail-open verdict still inserts (no blocked dispatch)", async () => {
     const f = makeFixture({
       dedup: async () => ({ duplicateOfClaimId: null, costUsd: 0 }), // sidecar's fail-open shape
@@ -616,6 +645,45 @@ describe("MeetingWorkerPool — spawn, completion, re-entry (Task E)", () => {
       expect(t.startsWith("[Worker report — expired] Task: ")).toBe(true);
       expect(t).toContain("re-dispatch if the room still needs it");
     }
+  });
+
+  it("review r1: a rejecting completion write on the boss-missing path never escapes as an unhandled rejection", async () => {
+    // The detached `void spawnFetchWorker(doc)` chain: the boss-missing early
+    // return awaits finishClaim OUTSIDE runWorkerTurn's try/catch, so a ledger
+    // write failure in the same tick as a registry miss rejects the detached
+    // promise — process-terminating under Node's default
+    // --unhandled-rejections=throw. The terminal .catch is what keeps this at
+    // zero.
+    const f = makeFixture({ registryAgents: {}, runTurnImpl: () => new Promise(() => {}) });
+    f.claims.findOneAndUpdate = async () => {
+      throw new Error("mongo down");
+    };
+    const rejections: unknown[] = [];
+    const handler = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", handler);
+    try {
+      const res = await f.pool.dispatch(dispatchReq("fetch Q2 numbers"));
+      expect(res.startsWith("Worker dispatched")).toBe(true);
+      await flush();
+      // Let a late rejection surface before asserting.
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      process.off("unhandledRejection", handler);
+    }
+    expect(rejections).toEqual([]);
+    // Boss-missing path, not the turn path — no adapter was ever built.
+    expect(f.hooks.buildWorkerAdapter).not.toHaveBeenCalled();
+  });
+
+  it("review r1: a failing restart sweep logs and start() still returns (interval-path parity)", async () => {
+    const f = makeFixture();
+    const realFind = f.claims.find.bind(f.claims);
+    f.claims.find = (() => {
+      throw new Error("ledger read failed");
+    }) as any;
+    await expect(f.pool.start()).resolves.toBeUndefined();
+    f.claims.find = realFind as any;
+    f.pool.stop();
   });
 });
 

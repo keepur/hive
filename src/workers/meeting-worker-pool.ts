@@ -20,7 +20,7 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { AgentProviderAdapter } from "../agents/provider-adapters/types.js";
 import type { CircuitBreakerSnapshot } from "../agents/provider-circuit-breaker.js";
 import type { MeetingWorkersConfig } from "./worker-pool-config.js";
-import { classifyClaimDedup } from "./worker-claim-dedup.js";
+import { classifyClaimDedup, type ClaimDedupVerdict } from "./worker-claim-dedup.js";
 
 const log = createLogger("meeting-worker-pool");
 
@@ -202,7 +202,13 @@ export class MeetingWorkerPool {
 
   async start(): Promise<void> {
     await this.ensureIndexes();
-    await this.sweepOnRestart();
+    // Same resilience posture as the interval path below: the restart sweep is
+    // best-effort orphan housekeeping (the watchdog re-attempts every 60s), so
+    // a transient ledger read failure logs and start() still returns — it must
+    // not take down boot through index.ts's unguarded `await workerPool.start()`.
+    // (ensureIndexes above deliberately stays fatal — a pool whose atomicity
+    // index is missing would silently permit duplicate claims.)
+    await this.sweepOnRestart().catch((err) => log.error("Worker restart sweep failed", { error: String(err) }));
     this.watchdogTimer = setInterval(() => {
       this.sweepExpired().catch((err) => log.error("Worker watchdog sweep failed", { error: String(err) }));
     }, WATCHDOG_INTERVAL_MS);
@@ -277,10 +283,20 @@ export class MeetingWorkerPool {
       .toArray();
     let dedupStamp: WorkerClaimDoc["dedup"];
     if (open.length > 0) {
-      const verdict = await this.dedup(
-        req.task,
-        open.map((c) => ({ claimId: c._id.toString(), taskText: c.taskText })),
-      );
+      // Fail-open is STRUCTURAL at this call site, not merely a property of the
+      // sidecar's internal try/catch: a dependency that THROWS before the
+      // sidecar's own try (getLLMRegistry()/hasProvider()) would otherwise
+      // propagate out of dispatch() and block the claim — the one outcome
+      // spec §A2 forbids.
+      let verdict: ClaimDedupVerdict = { duplicateOfClaimId: null, costUsd: 0 };
+      try {
+        verdict = await this.dedup(
+          req.task,
+          open.map((c) => ({ claimId: c._id.toString(), taskText: c.taskText })),
+        );
+      } catch (err) {
+        log.warn("Worker claim dedup threw — failing open to unique", { error: String(err) });
+      }
       dedupStamp = {
         compared: open.length,
         verdict: verdict.duplicateOfClaimId ? "duplicate" : "unique",
@@ -334,8 +350,15 @@ export class MeetingWorkerPool {
       }
       throw err; // MCP handler try/catch shapes this into a structured error
     }
-    // 6. Detached spawn — containment lives inside runWorkerTurn (never throws).
-    void this.spawnFetchWorker(doc);
+    // 6. Detached spawn — containment lives inside runWorkerTurn, but the
+    //    boss-missing early return in spawnFetchWorker awaits finishClaim
+    //    OUTSIDE that wrapper, so the chain CAN reject (e.g. ledger write
+    //    fails while the agent lookup also misses). Terminal .catch keeps a
+    //    detached rejection from becoming a process-terminating
+    //    unhandledRejection.
+    void this.spawnFetchWorker(doc).catch((err) =>
+      log.error("Worker spawn chain failed", { claimId: doc._id.toString(), error: String(err) }),
+    );
     log.info("Worker dispatched", {
       claimId: doc._id.toString(),
       bossAgentId: req.bossAgentId,

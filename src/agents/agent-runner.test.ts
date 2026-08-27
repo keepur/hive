@@ -3907,6 +3907,25 @@ describe("AgentRunner — KPR-390 worker-pool wiring", () => {
     }
   });
 
+  it("(e) worker mode auto-injects NOTHING — a role-granted server is a capability, not engine-provided", () => {
+    // autoInjectedServerNames() is the third sync site of the worker-mode gate,
+    // and the ONLY one observable here: it feeds the inventory `source` field
+    // (and, via buildSystemPrompt's buildContext, the toolkit section's
+    // engine-provided ∩ coreServerNames split). With the gate removed, a server
+    // the ROLE explicitly granted is mislabeled as engine-auto-injected even
+    // though worker-mode injects nothing.
+    const worker = makeWorkerPoolRunner({
+      coreServers: ["memory", "schedule"],
+      suppress: true,
+      db: makeFakeInProcessDb(),
+    });
+    expect(worker.buildToolTransportInventory().find((e) => e.name === "schedule")?.source).toBe("core");
+
+    // Control: same coreServers without the flag — schedule IS engine-injected.
+    const control = makeWorkerPoolRunner({ coreServers: ["memory", "schedule"], db: makeFakeInProcessDb() });
+    expect(control.buildToolTransportInventory().find((e) => e.name === "schedule")?.source).toBe("engine");
+  });
+
   it("(d) Lane B inventory compensation — worker-pool descriptor surfaces with no stdio placeholder", () => {
     const runner = makeWorkerPoolRunner({ coreServers: ["worker-pool"], pool: makeFakePool() });
     const entry = runner.buildToolTransportInventory().find((e) => e.name === "worker-pool");

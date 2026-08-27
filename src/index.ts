@@ -746,7 +746,11 @@ async function main(): Promise<void> {
     },
   });
   agentManager.setWorkerPool(workerPool);
-  await workerPool.start(); // indexes + restart sweep + watchdog
+  // indexes + restart sweep + watchdog. Unguarded on purpose: the restart
+  // sweep self-contains its own failures (pool.start), so the only throw that
+  // reaches here is an ensureIndexes failure — boot-fatal like every other
+  // boot-time datastore failure.
+  await workerPool.start();
   log.info("Meeting worker pool started", {
     enabled: config.meetingWorkers.enabled,
     maxConcurrent: config.meetingWorkers.maxConcurrent,
