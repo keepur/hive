@@ -98,7 +98,7 @@ Husky note: `.husky/pre-commit` runs `npx lint-staged` — expect staged files t
 - **Mongo-backed collection testing (repo precedent = `src/workers/meeting-worker-pool.test.ts`'s `makeFakeClaims()`, itself the `callback-mcp-server.test.ts` fake-`Db` pattern):** the scribe suite needs a **name-keyed** fake `Db` (`db.collection(name)` returns a distinct in-memory collection per name), because T12 instantiates a real `MeetingWorkerPool` (`meeting_worker_claims`) alongside the scribe (`meeting_summaries`) against one `Db`. Reuse the same `matches()` query-matcher shape and the same operator surface, extended with `$inc` and `$unset` for the summary upsert. Deliberate duplication across test files — repo precedent keeps test harnesses file-local (`meeting-worker-pool.test.ts` does not import from any other suite).
 - **Pool seam:** the scribe takes `pool` as an injected dep typed to a narrow interface (`{ runRoleTurn; hasCapacity }`) so T7/T8/T11 can pass a `vi.fn()` fake and T12 can pass the real pool. Same "capabilities not construction inputs" posture as `WorkerPoolManagerHooks`.
 - **Detached-run flushing:** `noteActivity` returns `void` and detaches through `void this.run(...)`. Reuse `meeting-worker-pool.test.ts`'s `flush(times = 6)` helper (microtask spins + a `setTimeout(0)`) — never real sleeps.
-- **Clock seams:** inject `now: () => Date` (constructor dep, `MeetingWorkerPoolDeps` precedent) for the debounce and the `2 × scribeTimeoutMs` staleness override. `vi.useFakeTimers()` is not needed — there are no intervals in the scribe.
+- **Clock seams:** inject `now: () => Date` (constructor dep, `MeetingWorkerPoolDeps` precedent) for the debounce and the `2 × scribeTimeoutMs` staleness override, as a mutable `let clock` advanced by reassignment. `vi.useFakeTimers()` is not needed — there are no intervals in the scribe. ⚠ **Default the fake epoch to a realistic value** (`new Date(1_724_680_000_000)`), never near zero: a small epoch interacts with any arithmetic debounce sentinel to block the first-ever run on every thread, which would make gating tests pass vacuously. One case (D2b′) deliberately uses a low epoch to pin that the source has no such sentinel.
 - **Dispatcher seam:** the conference suite injects a fake scribe via `dispatcher.setMeetingScribe({ noteActivity: vi.fn(), getSummary: vi.fn() } as any)` — same setter-injection shape as the existing `dispatcher.setSlackAdapter(mockSlackAdapter as any)` in that suite's `beforeEach`. Tests that must exercise today's behavior simply do not call the setter (undefined scribe ⇒ optional-chained no-op).
 - **Byte pins:** follow the existing conference-suite convention — template literals with **flush-left continuation lines** inside backticks (the preamble pin breaks on leading whitespace) and minute-granularity `timestamp` offsets so `(N min ago)` labels stay deterministic without fake timers.
 
@@ -348,7 +348,18 @@ with:
     base: AgentConfig;
     role: WorkerRoleParams;
     prompt: string;
-    workItemContext: WorkerPoolTurnContext;
+    /** The seven-required shape `workItemContextFromClaim` already returns —
+     *  deliberately NOT the all-optional WorkerPoolTurnContext, so no cast and
+     *  no agent-runner import are needed to satisfy adapter.runTurn. */
+    workItemContext: {
+      adapterId: string;
+      channelId: string;
+      channelKind: string;
+      channelLabel: string;
+      threadId: string;
+      slackTs: string;
+      slackThreadTs: string;
+    };
     onAbortHandle?: (abort: () => void) => void;
   }): Promise<RoleTurnOutcome | null> {
     const startedAt = Date.now();
@@ -366,7 +377,7 @@ with:
       const result = await adapter.runTurn({
         prompt: args.prompt,
         sessionId: undefined, // sessionless — `sessions` untouched
-        workItemContext: args.workItemContext as WorkItemContext,
+        workItemContext: args.workItemContext,
         resourceLimits: {
           maxTurns: args.role.maxTurns,
           timeoutMs: args.role.timeoutMs,
@@ -389,7 +400,7 @@ with:
   }
 ```
 
-- [ ] **B6.** Add the outcome type beside `LiveWorker` (before the class) and the `WorkItemContext` type import:
+- [ ] **B6.** Add the outcome type beside `LiveWorker` (before the class) — a pure addition:
 
 ```ts
 /** KPR-409: raw outcome of a claim-free role turn (no ledger transition). */
@@ -404,13 +415,7 @@ export interface RoleTurnOutcome {
 }
 ```
 
-and extend the existing runner import line:
-
-```ts
-import type { WorkItemContext } from "../agents/agent-runner.js";
-```
-
-⚠ Type-only import — erased at build time, so it introduces no runtime edge. (`WorkerPoolTurnContext` is structurally the same seven fields but all-optional; the `as WorkItemContext` cast is the one justified assertion in this file — the scribe always supplies all seven. Add the inline justification comment, per the repo's no-`any`/justify-assertions rule.)
+⚠ **No new import is needed, and none should be added.** `meeting-worker-pool.ts` does **not** import `../agents/agent-runner.js` today (it imports only `AgentProviderAdapter` from `provider-adapters/types.js`), so an earlier draft's "extend the existing runner import line" was a false premise. Typing `runRoleTurn`'s `workItemContext` as the **seven-required inline shape** (B5) — the same literal type `workItemContextFromClaim` already declares at `:702-709` — satisfies `adapter.runTurn`'s `WorkItemContext` structurally with **no import and no type assertion**. Do not reach for `WorkerPoolTurnContext` here: its fields are all-optional, which is exactly what would have forced the cast.
 
 - [ ] **B7.** Verify (no test changes yet — this must compile and leave the pool suite untouched):
 
@@ -473,20 +478,39 @@ describe("MeetingWorkerPool — runRoleTurn (KPR-409 sibling)", () => {
     expect(req.resourceLimits).toEqual({ maxTurns: 4, timeoutMs: 120_000, budgetUsd: 2.5 });
   });
 
-  it("T12 (pool half): a live role turn registers nothing in liveWorkers — hasCapacity unmoved", async () => {
+  // ⚠ Two cases, because at maxConcurrent: 4 the assertion
+  // `hasCapacity() === true` is INSENSITIVE to the bug: one wrongly-registered
+  // role turn gives liveWorkers.size 1, and `1 < 4` is still true. Only the
+  // dispatch-admission count discriminates there. The maxConcurrent: 1 case is
+  // the one where hasCapacity() itself genuinely flips.
+  it("T12 (pool half, maxConcurrent 1): a live role turn leaves hasCapacity() true", async () => {
+    const f = makeFixture({ config: { maxConcurrent: 1 }, runTurnImpl: () => new Promise(() => {}) });
+    void f.pool.runRoleTurn(roleArgs());
+    await flush();
+    // Discriminating: if runRoleTurn registered in liveWorkers, size would be
+    // 1 and `1 < 1` would make this false.
+    expect(f.pool.hasCapacity()).toBe(true);
+  });
+
+  it("T12 (pool half, maxConcurrent 4): a live role turn consumes no dispatch slot", async () => {
     // ⚠ perMeetingMax raised: the default is 3, and four dispatches on ONE
     // thread would be refused by the per-meeting cap before the engine-wide
     // cap is ever reached — which would make this test pass for the wrong
     // reason. maxConcurrent stays at its default 4 (the value under test).
-    const f = makeFixture({ config: { perMeetingMax: 10 }, runTurnImpl: () => new Promise(() => {}) });
-    expect(f.pool.hasCapacity()).toBe(true);
+    const f = makeFixture({
+      config: { maxConcurrent: 4, perMeetingMax: 10 },
+      runTurnImpl: () => new Promise(() => {}),
+    });
     void f.pool.runRoleTurn(roleArgs());
     await flush();
-    expect(f.pool.hasCapacity()).toBe(true);
-    // and four fetch dispatches still fit under the default maxConcurrent: 4
-    for (const t of ["a", "b", "c", "d"]) await f.pool.dispatch(dispatchReq(t));
+    const results = [];
+    for (const t of ["a", "b", "c", "d"]) results.push(await f.pool.dispatch(dispatchReq(t)));
+    // Discriminating: with the role turn wrongly in liveWorkers, the 4th
+    // dispatch sees size 4 >= 4 and is refused.
+    expect(results.every((r) => r.startsWith("Worker dispatched (claim "))).toBe(true);
+    expect(results.some((r) => r.includes("Worker pool saturated"))).toBe(false);
     expect(f.hooks.buildWorkerAdapter).toHaveBeenCalledTimes(5); // 1 role + 4 fetch
-    expect(f.pool.hasCapacity()).toBe(false);
+    expect(f.pool.hasCapacity()).toBe(false); // now genuinely full, on fetch workers alone
   });
 
   it("touches no claim ledger and fires no re-entry", async () => {
@@ -557,7 +581,7 @@ import type { Collection, Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MeetingWorkersConfig } from "./worker-pool-config.js";
-import type { RoleTurnOutcome, WorkerPoolTurnContext, WorkerRoleParams } from "./meeting-worker-pool.js";
+import type { RoleTurnOutcome, WorkerRoleParams } from "./meeting-worker-pool.js";
 
 const log = createLogger("meeting-scribe");
 
@@ -592,13 +616,22 @@ export interface MeetingSummary {
   coveredThroughTs: string;
 }
 
-/** Narrow pool surface — capabilities only (WorkerPoolManagerHooks posture). */
+/** Narrow pool surface — capabilities only (WorkerPoolManagerHooks posture).
+ *  Mirrors runRoleTurn's seven-required workItemContext shape exactly. */
 export interface ScribePoolSurface {
   runRoleTurn(args: {
     base: AgentConfig;
     role: WorkerRoleParams;
     prompt: string;
-    workItemContext: WorkerPoolTurnContext;
+    workItemContext: {
+      adapterId: string;
+      channelId: string;
+      channelKind: string;
+      channelLabel: string;
+      threadId: string;
+      slackTs: string;
+      slackThreadTs: string;
+    };
     onAbortHandle?: (abort: () => void) => void;
   }): Promise<RoleTurnOutcome | null>;
   hasCapacity(): boolean;
@@ -683,7 +716,15 @@ export class MeetingScribe {
     const cfg = this.deps.config;
     if (!cfg.enabled || !cfg.scribeEnabled) return; // gate 1
     const { threadId } = args;
-    if (this.now().getTime() - (this.lastRunAt.get(threadId) ?? 0) < cfg.scribeDebounceMs) return; // gate 3
+    // ⚠ Gate 3 must distinguish "never run" from "ran too recently". A `?? 0`
+    // sentinel conflates them: under any clock whose epoch is below
+    // scribeDebounceMs (a fake `now` seam, or a genuinely fresh process on a
+    // mocked clock), `now - 0 < 90_000` blocks the FIRST EVER run on every
+    // thread — the scribe would silently never start, and every "no run"
+    // gating test would pass for the wrong reason. Use an explicit
+    // has-run-before check, never an arithmetic sentinel.
+    const lastRun = this.lastRunAt.get(threadId);
+    if (lastRun !== undefined && this.now().getTime() - lastRun < cfg.scribeDebounceMs) return; // gate 3
     if (this.inFlight.has(threadId)) return; // gate 2a — synchronous
     if (this.inFlight.size >= cfg.scribeMaxConcurrent) return; // gate 5a — synchronous
     this.inFlight.add(threadId); // claimed BEFORE any await
@@ -891,12 +932,24 @@ Required helpers: `makeFakeCollection()` (supporting `createIndex` recorder, `fi
 
 Cases (spec T7–T12 + the additions from the Testing Contract):
 
-- [ ] **D2a — T7 role-params + containment pin.** Captured `runRoleTurn` args: `role.model === "haiku"` (from `scribeModel`), **`role.coreServers` deep-equals `[]`**, `role.maxTurns === 4`, `role.timeoutMs === 120_000`, `role.charter === scribeCharter("conf-tahoe")` **byte-exact** (assert against the literal string, not the function, for at least the first and last lines — the charter is a pinned contract), `base` is the resolved registry config, and `workItemContext` carries all seven fields from `args.source` + `channelLabel` + `threadId`.
-- [ ] **D2b — T8 gating table (7 rows, `it.each`).** `enabled: false` ⇒ no run; `scribeEnabled: false` ⇒ no run; already in flight (a first call whose `runRoleTurn` never resolves, then a second call) ⇒ no second run; `inFlight.size >= scribeMaxConcurrent` (two live threads at `scribeMaxConcurrent: 2`, third thread) ⇒ no run; within `scribeDebounceMs` of `lastRunAt` ⇒ no run; `newMessages.length < scribeMinNewMessages` ⇒ no run; `pool.hasCapacity()` false ⇒ no run; base agent missing **or** `disabled: true` ⇒ no run. Every row asserts `runRoleTurn` not called **and** no write to `meeting_summaries` beyond (at most) the `updating` flag — and that a later trigger outside the gate succeeds (silent + retried, not latched).
+- [ ] **D2a — T7 role-params + containment pin.** Captured `runRoleTurn` args: `role.model === "haiku"` (from `scribeModel`), **`role.coreServers` deep-equals `[]`**, `role.maxTurns === 4`, `role.timeoutMs === 120_000`, `role.charter === scribeCharter("conf-tahoe")` **byte-exact** (assert against the literal string, not the function, for at least the first and last lines — the charter is a pinned contract), `base` is the resolved registry config, and `workItemContext` carries all seven fields from `args.source` + `channelLabel` + `threadId`. **Also pin `prompt` byte-exact** against `scribeTurnPrompt(channelLabel, roster, priorSummary, newMessages, at)` — the function is exported "for a byte pin" and that claim must be backed by an assertion: assert the header lines (`Meeting: #conf-tahoe`, `Participants: …`), the `CURRENT SUMMARY:` block including the `(none yet — …)` sentinel on a first run **and** the prior text on a subsequent run, and the `NEW MESSAGES:` body's `Author (n min ago): text` shape.
+- [ ] **D2b — T8 gating table (7 rows, `it.each`).** `enabled: false` ⇒ no run; `scribeEnabled: false` ⇒ no run; already in flight (a first call whose `runRoleTurn` never resolves, then a second call) ⇒ no second run; `inFlight.size >= scribeMaxConcurrent` (two live threads at `scribeMaxConcurrent: 2`, third thread) ⇒ no run; within `scribeDebounceMs` of `lastRunAt` ⇒ no run; `newMessages.length < scribeMinNewMessages` ⇒ no run; `pool.hasCapacity()` false ⇒ no run; base agent missing **or** `disabled: true` ⇒ no run. Every row asserts `runRoleTurn` not called **and** no write to `meeting_summaries` beyond (at most) the `updating` flag.
+
+  ⚠ **Every row MUST carry a paired positive control in the same test:** after asserting the gate blocked the run, lift exactly that gate (flip the flag, resolve the in-flight run, advance the injected clock past `scribeDebounceMs`, add the missing messages, make `hasCapacity()` true, restore the agent) and assert `runRoleTurn` is then called **exactly once** with the same args. Without the control, a harness that never runs at all — the failure mode issue 2's sentinel fix closes at the source — makes all seven rows pass vacuously. The control is what turns "zero calls" from an ambiguous observation into a discriminating one.
+
+  ⚠ **Harness clock:** `now` is injected as a mutable `let clock = new Date(1_724_680_000_000)` with `now: () => clock` (a realistic epoch, orders of magnitude above `scribeDebounceMs` and `2 × scribeTimeoutMs`), advanced by reassignment. This is belt-and-braces on top of the `lastRun !== undefined` source fix, not a substitute for it — do not implement one without the other.
+
+- [ ] **D2b′ — gate-3 sentinel pin (⚠ the assertion that discriminates the sentinel bug).** A separate case constructed with a **deliberately low epoch**: `now: () => new Date(50_000)` (below the 90 000 ms `scribeDebounceMs`), a thread with no prior `lastRunAt` entry, and otherwise-passing gates ⇒ `runRoleTurn` called **exactly once**. Under the `?? 0` sentinel this evaluates `50_000 - 0 < 90_000` and blocks the first-ever run, so the case fails with zero calls; under `lastRun !== undefined` it passes. This is the one test that fails on the sentinel regardless of what the rest of the harness's epoch is set to. (Negative-verified in Task F/NV8b.)
 - [ ] **D2c — T9 write + single-flight.** Success ⇒ one upsert with `summaryText` present, `coveredThroughTs` equal to the max ts of the messages fed in, `version` incremented (`$inc`), `updating` unset. A >2500-char return ⇒ `summaryText.length === SUMMARY_TEXT_CAP`. Failure / `timedOut` / `aborted` / empty text ⇒ **no** `summaryText` write, `updating` cleared, prior summary intact. A seeded `updating.startedAt` **fresher** than `2 × scribeTimeoutMs` ⇒ abandoned; one **older** ⇒ overridden and the run proceeds.
 - [ ] **D2d — T10 no side effects (structural).** A scribe run performs zero writes to `meeting_worker_claims` (assert that collection's doc array stays empty), zero `onDispatch` calls on the shared pool, and zero `sessions` access (the fake Db records `collection()` names — assert only `meeting_summaries` and `meeting_worker_claims` are ever requested).
 - [ ] **D2e — T11 synchronous-claim race.** Five `noteActivity(args)` calls issued back-to-back in one tick against a thread with no prior summary, with `runRoleTurn` returning a never-resolving promise ⇒ `runRoleTurn` called **exactly once**. (Negative-verified in Task F/NV5.)
-- [ ] **D2f — T12 capacity isolation (end-to-end).** Build a real `MeetingWorkerPool` on the shared fake Db with `maxConcurrent: 4` **and `perMeetingMax: 10`** (⚠ the default 3 would refuse the fourth dispatch on the per-meeting cap before the engine-wide cap is reached — the test would then pass for the wrong reason) and a bound fake manager whose `runTurn` never resolves; construct the scribe with that pool. Start one scribe run, `flush()`, then issue four distinct `pool.dispatch(...)` calls ⇒ all four succeed (no "Worker pool saturated" string), and `buildWorkerAdapter` was called 5 times. Assert the scribe never appears in `liveWorkers` (observable via `pool.hasCapacity()` being `true` immediately after the scribe starts). (Negative-verified in Task F/NV6.)
+- [ ] **D2f — T12 capacity isolation (end-to-end).** Build a real `MeetingWorkerPool` on the shared fake Db with a bound fake manager whose `runTurn` never resolves; construct the scribe with that pool; start one scribe run via `noteActivity` + `flush()`.
+
+  ⚠ **The observable is dispatch admission, not `hasCapacity()`.** At `maxConcurrent: 4`, a wrongly-registered scribe gives `liveWorkers.size === 1`, and `1 < 4` is still `true` — so `expect(pool.hasCapacity()).toBe(true)` is **insensitive to the bug it is supposed to guard**, the same wrong-reason-pass trap the `perMeetingMax` note closes. Assert instead:
+  - **Config `{ maxConcurrent: 4, perMeetingMax: 10 }`** (the 3-default would refuse the fourth dispatch on the per-meeting cap first): four distinct `pool.dispatch(...)` calls **all return the "Worker dispatched (claim …" string**, none contains "Worker pool saturated", and `buildWorkerAdapter` was called **5** times. With the scribe in `liveWorkers`, the fourth dispatch is refused and the count is 4 — the assertion fails.
+  - **Plus a `{ maxConcurrent: 1 }` variant**, the only configuration where `hasCapacity()` itself discriminates: one live scribe ⇒ `hasCapacity()` **true** (registration would make it `1 < 1` = false).
+
+  (Negative-verified in Task F/NV6.)
 - [ ] **D2g — `getSummary` guards.** Absent doc ⇒ `undefined`. Stub doc (`{_id, updating, updatedAt}` only, no `summaryText`) ⇒ `undefined`. `scribeEnabled: false` with a complete doc present ⇒ `undefined` **and `findOne` never called** (short-circuit before the read — E10). `findOne` throwing ⇒ `undefined`, no throw escapes.
 - [ ] **D2h — `ensureIndexes` pin.** The recorded `createIndex` call is exactly `[{ updatedAt: 1 }, { expireAfterSeconds: 604800 }]`, and a rejecting `createIndex` makes `ensureIndexes()` reject (index.ts owns the `.catch` — the method itself does not swallow).
 - [ ] **D2i — `stop()`.** Two live runs on different threads ⇒ both aborts invoked; an abort that throws is contained and the other still fires; a settled run's handle is gone (call `stop()` after a completed run ⇒ zero aborts).
@@ -916,6 +969,8 @@ SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest r
 ### Task E — Dispatcher: `injectionMode` widening, summary anchor, cadence seams + conference-suite tests
 
 ⚠ **Three conference-code hunks total.** The full-arm anchor is the **C26-sanctioned** one; the two `noteActivity` calls are **R1, requested not claimed**. Both `noteActivity` hunks must remain additive, fire-and-forget, and behavior-neutral — removing them must restore byte-identical behavior.
+
+⚠ **R1 rollback, stated as concretely as R2's "delete one line":** if the coherence reviewer rejects R1, delete the two `noteActivity` blocks (E6 and E7) and add one call from `buildConferenceContext`'s full arm instead; rewrite T6's call-count rows (round-0 exactly-one becomes one-per-full-arm-agent, and the classifier-selects-nobody row is deleted — that path no longer fires); accept the summary freeze once every participant converts to delta, measure it through the `injectionMode: "summary"` telemetry, and file the follow-up. Nothing else in this ticket changes — the anchor, the scribe module, storage, and config are all R1-independent.
 
 - [ ] **E1.** Widen `injectionMode` at the four sites (one commit of its own — it is meaningless alone but reviewable as a unit):
   - `src/channels/dispatcher.ts:73` — `injectionMode?: "full" | "delta" | "summary";` on `ResolvedAgent`
@@ -1019,6 +1074,9 @@ with `import type { MeetingScribe } from "../workers/meeting-scribe.js";` beside
     // Fires once per round-0 pass INCLUDING passes where the classifier
     // selects nobody. Fire-and-forget: noteActivity returns void, never
     // throws, and removing this hunk restores byte-identical behavior.
+    // (`rosterMembers.length > 0` is redundant with the :1229 early return —
+    // kept deliberately so the seam states its own precondition locally and
+    // survives any future reordering. Not a bug; do not "simplify" it away.)
     if (history.length > 0 && rosterMembers.length > 0) {
       this.meetingScribe?.noteActivity({
         threadId,
@@ -1129,15 +1187,23 @@ For each expected-FAIL probe: make the temporary edit, run the named suite, **co
 - [ ] **NV1 (T1 anchor).** In `buildConferenceContext`, delete the `if (summary) { … }` block (leaving the plain full-arm return) → `npx vitest run src/channels/dispatcher-conference.test.ts`: the T1 byte pin fails with the raw-transcript shape. Restore.
 - [ ] **NV2 (T2 / R2 formula).** Delete `summary.coveredThroughTs,` from the summary arm's `maxSlackTs([...])` array → conference suite: **T2(b) fails** — `injectionHighWaterTs` is `undefined` and `setMeetingMark` is never called. Restore. ⚠ This probe is also the F1 diff: if the coherence reviewer rules F1, this "failure" is the intended behavior and T2(b)/T5 get rewritten to pin it.
 - [ ] **NV3 (T4 delta isolation).** Hoist `const summary = await this.meetingScribe?.getSummary(threadId);` **above** the `if (!ref?.sessionId || …)` predicate → conference suite: T4 fails (`getSummary` called on a delta-eligible agent). Restore.
-- [ ] **NV4 (⚠ the race the spec dissolved via seam relocation — T6).** Move the `noteActivity` call out of `resolveConferenceAgents` and into `buildConferenceContext`'s full arm (the earlier design the spec corrected) → conference suite: **the round-0 exactly-one call-count assertion fails at N** (one call per responder), **and** the classifier-selects-nobody case fails at 0 calls. Restore. This probe demonstrates the round-level seam is what makes the trigger per-round rather than per-agent — the defect the spec found.
+- [ ] **NV4 (⚠ seam-placement defect — T6. NOT the concurrency race; see NV5 for that).** Move the `noteActivity` call out of `resolveConferenceAgents` and into `buildConferenceContext`'s full arm (the earlier design the spec corrected) → conference suite: **the round-0 exactly-one call-count assertion fails at N** (one call per responder), **and** the classifier-selects-nobody case fails at 0 calls. Restore.
+
+  ⚠ **Scope note, so nobody reads this as the race guard:** the conference suite injects a **fake** scribe (`noteActivity: vi.fn()`), so no `inFlight` logic executes in this probe at all. NV4 measures a **dispatcher-side property** — that the trigger is per-round rather than per-agent, and fires even on an empty selection. The spec's *concurrency* race (the synchronous claim) is a scribe-internal property, guarded solely by **NV5/T11**. Both probes are real and neither substitutes for the other.
 - [ ] **NV5 (⚠ the synchronous-claim race — T11).** In `MeetingScribe.noteActivity`, move `this.inFlight.add(threadId)` from above `void this.run(args)` into the top of `run()` **below** the first `await` (i.e. after the `findOne`) → `npx vitest run src/workers/meeting-scribe.test.ts`: T11 observes **five** `runRoleTurn` invocations instead of one. Restore. ⚠ This must be observed **failing** on the pre-fix ordering — a T11 that only passes on the fixed code proves nothing.
 - [ ] **NV6 (⚠ the capacity-isolation gap — T12).** In `MeetingWorkerPool.runRoleTurn`, register the role turn in `liveWorkers` — add, immediately after `buildWorkerAdapter`:
   ```ts
-  this.liveWorkers.set(args.workItemContext.threadId!, { abort: () => adapter.abort(), bossAgentId: args.base.id });
+  this.liveWorkers.set(args.workItemContext.threadId, { abort: () => adapter.abort(), bossAgentId: args.base.id });
   ```
-  → `npx vitest run src/workers/`: **T12 (scribe-level) fails** — the fourth `pool.dispatch` is refused with "Worker pool saturated (4/4 …)" — **and** the Task C pool-level companion fails (`hasCapacity()` false with only a role turn live). Restore.
+  → `npx vitest run src/workers/`. ⚠ **Exactly which assertions fail, and why the obvious one does not:**
+  - **Fails:** the `maxConcurrent: 4` cases (D2f end-to-end and the Task C pool-level companion) — with the scribe holding a slot, the fourth `pool.dispatch` sees `4 >= 4` and returns "Worker pool saturated (4/4 engine-wide) …", so the all-dispatched assertion fails, the no-saturation assertion fails, and `buildWorkerAdapter` is called **4** times instead of 5.
+  - **Fails:** the `maxConcurrent: 1` variants — `hasCapacity()` becomes `1 < 1` = `false`.
+  - **⚠ Does NOT fail, and must not be relied on:** any `hasCapacity() === true` assertion taken at `maxConcurrent: 4`. One extra live worker leaves `1 < 4` true, so that assertion is blind to this exact bug. If the only red test in this probe is a `maxConcurrent: 1` case or a dispatch-count case, that is correct and expected.
+
+  Restore.
 - [ ] **NV7 (T7 containment).** In `MeetingScribe.run`, build the role with `coreServers: base.coreServers` and `model: base.model` → scribe suite: T7 fails (boss servers/model leak into the built worker config). Restore.
 - [ ] **NV8 (T9 `updating` lifecycle).** Delete the `finally` block's `$unset: { updating: "" }` clear in `MeetingScribe.run` → scribe suite: the failure/timeout row of T9 fails (`updating` still set after a failed run, so the next trigger is blocked by gate 2b). Restore.
+- [ ] **NV8b (⚠ the debounce sentinel — D2b′).** In `MeetingScribe.noteActivity`, revert gate 3 to the arithmetic sentinel: `if (this.now().getTime() - (this.lastRunAt.get(threadId) ?? 0) < cfg.scribeDebounceMs) return;` → `npx vitest run src/workers/meeting-scribe.test.ts`: **D2b′ fails with zero `runRoleTurn` calls** (its low-epoch clock makes `50_000 - 0 < 90_000` true, so the first-ever run on a never-summarized thread is blocked). The realistic-epoch rows stay green — which is exactly why D2b′ has to exist. Restore.
 - [ ] **NV9 (`getSummary` stub guard).** Change `getSummary`'s guard to `if (!doc) return undefined;` (dropping the `summaryText`/`coveredThroughTs` check) → scribe suite: the stub-doc case fails (a failed-first-run stub reads as a summary, which would inject `undefined` into the anchor). Restore.
 
 **Expected-PASS controls (behavior-preserving edits ⇒ suites stay green, demonstrating the pins target behavior, not incidentals):**
@@ -1221,7 +1287,9 @@ Commit: `feat: wire the meeting scribe into the engine lifecycle (KPR-409)`
 > (R2, spec §D4). Read KPR-409's spec, not this section.
 ```
 
-- [ ] **G5. `docs/providers.md` — stated conclusion: NO CHANGE REQUIRED.** Rationale, recorded here so review need not re-derive it: KPR-390 earned its "Meeting worker pool" section (`:40-42`) because it added a **tool surface** (`worker_dispatch`/`worker_status`/`worker_cancel`) whose cross-lane availability and Lane B bridging is a provider-parity fact. KPR-409 adds **no MCP server and no tool** (spec ⚠ Key Point 7, C23). Its only provider-visible effect is that agents on **every** lane receive a shorter injected prompt in the conference full arm — provider-agnostic by construction, and already covered by the existing meeting rows. The spec lists `docs/providers.md` under **Explicitly untouched**. Do not add a scribe sentence to the worker-pool section.
+- [ ] **G5. `docs/providers.md` — stated conclusion: NO CHANGE REQUIRED.** Rationale, recorded here so review need not re-derive it: KPR-390 earned its "Meeting worker pool" section (`:40-42`) because it added a **tool surface** (`worker_dispatch`/`worker_status`/`worker_cancel`) whose cross-lane availability and Lane B bridging is a provider-parity fact. KPR-409 adds **no MCP server and no tool** (spec ⚠ Key Point 7, C23). Its only provider-visible effect is that agents on **every** lane receive a shorter injected prompt in the conference full arm — provider-agnostic by construction, and already covered by the existing meeting rows. The spec lists `docs/providers.md` under **Explicitly untouched**, and a plan may not overrule its binding spec — so this plan makes no change.
+
+  ⚠ **Flagged for the coherence reviewer / a follow-up (not a code change in this ticket):** there is a genuine ops-relevant fact that the existing "Meeting worker pool" section arguably should carry — **the scribe, like the fetch-worker, is Claude-lane-pinned** (`scribeModel`, default `haiku`). A meeting whose participants are all Lane A/Lane B agents on an instance with no working Claude auth gets no summaries at all, silently, and the full arm quietly stays on raw transcripts. That is exactly the class of fact the section's existing "Dispatched workers themselves always run on the Claude lane" sentence exists to state. Adding one parallel sentence is a defensible call — but it is the reviewer's to make against the spec's untouched list, not this plan's to take.
 
 - [ ] **G6. C24 gate (frozen spawn path):**
 
@@ -1303,4 +1371,4 @@ npm run check:bundle
 | 8 | `docs: meeting_summaries collection, scribe key-file, KPR-390 Part B superseded pointer (KPR-409)` | `CLAUDE.md`, `docs/epics/kpr-386/kpr-390-spec.md` |
 | 9 | (conditional) `chore: quality-gate fixes (KPR-409)` | — |
 
-⚠ Task G's index wiring is commit 7; Task F (negative-verify) produces no commit. Task ordering is a hard dependency chain: A → B → C → D → E → G, with F immediately before G8.
+⚠ Task G's index wiring is commit 7 (step G2); Task F (negative-verify) produces no commit. Task ordering is the hard dependency chain **A → B → C → D → E → F → G**, exactly as the tasks are documented: F runs after Task E's dispatcher commit and before Task G's wiring, docs, and full sweep. (An earlier draft said "F immediately before G8" — F runs before *all* of Task G, not just the sweep step.)
