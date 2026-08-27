@@ -4,11 +4,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
-  GrokGatewayAdapter,
-  DEFAULT_GROK_GATEWAY_URL,
+  GrokAdapter,
+  GROK_API_BASE_URL,
   DEFAULT_GROK_MODEL,
   __resetGrokCoercionWarnedForTests,
-} from "./grok-gateway-adapter.js";
+} from "./grok-adapter.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import { ToolBridge } from "./tool-bridge.js";
@@ -39,15 +39,14 @@ function makeAssembly(overrides: Partial<ProviderTurnAssembly> = {}): ProviderTu
 }
 
 function makeAdapter(
-  overrides: Partial<ConstructorParameters<typeof GrokGatewayAdapter>[0]> = {},
+  overrides: Partial<ConstructorParameters<typeof GrokAdapter>[0]> = {},
   fetchMock = vi.fn<typeof fetch>(),
 ) {
-  const adapter = new GrokGatewayAdapter({
+  const adapter = new GrokAdapter({
     name: "Grok",
     assembly: makeAssembly(),
     model: "grok-4.6",
     apiKey: "test-key",
-    baseUrl: "https://grok-gateway.test",
     fetch: fetchMock,
     ...overrides,
   });
@@ -184,7 +183,7 @@ beforeEach(() => {
 
 // -----------------------------------------------------------------------------
 
-describe("GrokGatewayAdapter identity", () => {
+describe("GrokAdapter identity", () => {
   it("exposes the grok provider id and reflects abort()", () => {
     const { adapter } = makeAdapter();
     expect(adapter.provider).toBe("grok");
@@ -194,14 +193,14 @@ describe("GrokGatewayAdapter identity", () => {
   });
 });
 
-describe("GrokGatewayAdapter — request body", () => {
+describe("GrokAdapter — request body", () => {
   it("POSTs the full chat-completions shape: endpoint, auth header, model, stream flags", async () => {
     const fetchMock = sseScript([textChunk("cmpl-1", "hi"), finishChunk("cmpl-1")]);
     const { adapter } = makeAdapter({}, fetchMock);
 
     const result = await adapter.runTurn({ prompt: "say hi" });
 
-    expect(fetchMock).toHaveBeenCalledWith("https://grok-gateway.test/v1/chat/completions", {
+    expect(fetchMock).toHaveBeenCalledWith(`${GROK_API_BASE_URL}/v1/chat/completions`, {
       method: "POST",
       signal: expect.any(AbortSignal),
       headers: {
@@ -225,13 +224,6 @@ describe("GrokGatewayAdapter — request body", () => {
     const { adapter } = makeAdapter({ model: undefined }, fetchMock);
     await adapter.runTurn({ prompt: "go" });
     expect(bodyOf(fetchMock, 0).model).toBe(DEFAULT_GROK_MODEL);
-  });
-
-  it("defaults the endpoint to DEFAULT_GROK_GATEWAY_URL when baseUrl is unset", async () => {
-    const fetchMock = sseScript([finishChunk("cmpl-1")]);
-    const { adapter } = makeAdapter({ baseUrl: undefined }, fetchMock);
-    await adapter.runTurn({ prompt: "go" });
-    expect(fetchMock).toHaveBeenCalledWith(`${DEFAULT_GROK_GATEWAY_URL}/v1/chat/completions`, expect.anything());
   });
 
   it("messages = [system(instructions), ...replayed, user(prompt)] — replayed items sit between system and user", async () => {
@@ -281,7 +273,7 @@ describe("GrokGatewayAdapter — request body", () => {
   });
 });
 
-describe("GrokGatewayAdapter — effort mapping (§4.5)", () => {
+describe("GrokAdapter — effort mapping (§4.5)", () => {
   it("xhigh delivers verbatim as reasoning_effort", async () => {
     const fetchMock = sseScript([finishChunk("cmpl-1")]);
     const { adapter } = makeAdapter({ reasoningEffort: "xhigh" }, fetchMock);
@@ -331,7 +323,7 @@ describe("GrokGatewayAdapter — effort mapping (§4.5)", () => {
   });
 });
 
-describe("GrokGatewayAdapter — chunk application", () => {
+describe("GrokAdapter — chunk application", () => {
   it("text deltas accumulate and stream through onStream; final round id captured as sessionId", async () => {
     const fetchMock = sseScript([textChunk("cmpl-x", "hel"), textChunk("cmpl-x", "lo"), finishChunk("cmpl-x")]);
     const { adapter } = makeAdapter({}, fetchMock);
@@ -412,7 +404,7 @@ describe("GrokGatewayAdapter — chunk application", () => {
   });
 });
 
-describe("GrokGatewayAdapter — tool round-trip", () => {
+describe("GrokAdapter — tool round-trip", () => {
   it("round 1 emits a tool call → executeCall runs it → round-2 body carries the assistant tool_calls message and the role:tool result", async () => {
     const fetchMock = sseScript(
       [
@@ -513,7 +505,7 @@ describe("GrokGatewayAdapter — tool round-trip", () => {
   });
 });
 
-describe("GrokGatewayAdapter — multi-round sessionId (advisory 2)", () => {
+describe("GrokAdapter — multi-round sessionId (advisory 2)", () => {
   it("two rounds with completion ids cmpl-1/cmpl-2 → success sessionId is the LAST round's id", async () => {
     const fetchMock = sseScript(
       [
@@ -530,8 +522,8 @@ describe("GrokGatewayAdapter — multi-round sessionId (advisory 2)", () => {
   });
 });
 
-describe("GrokGatewayAdapter — C5 error decoration (§4.4)", () => {
-  it("non-2xx response → 'Grok gateway request failed (503): ...' (status present, classifiable)", async () => {
+describe("GrokAdapter — C5 error decoration (§4.4)", () => {
+  it("non-2xx response → 'Grok request failed (503): ...' (status present, classifiable)", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "upstream unavailable" } }), { status: 503 }));
@@ -540,17 +532,17 @@ describe("GrokGatewayAdapter — C5 error decoration (§4.4)", () => {
 
     const result = await adapter.runTurn({ prompt: "go", workItemContext: threadContext("sms:t1") });
 
-    expect(result.error).toBe("Grok gateway request failed (503): upstream unavailable");
+    expect(result.error).toBe("Grok request failed (503): upstream unavailable");
     expect(store.append).not.toHaveBeenCalled();
   });
 
-  it("in-stream error payload with `code` → 'Grok gateway stream failed (429): ...'", async () => {
+  it("in-stream error payload with `code` → 'Grok stream failed (429): ...'", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(sse([errorChunk(429, "rate limited")])));
     const { adapter } = makeAdapter({}, fetchMock);
 
     const result = await adapter.runTurn({ prompt: "go" });
 
-    expect(result.error).toBe("Grok gateway stream failed (429): rate limited");
+    expect(result.error).toBe("Grok stream failed (429): rate limited");
   });
 
   it("stream ending with no finish_reason → error containing 'terminated', never a success with empty text", async () => {
@@ -576,7 +568,7 @@ describe("GrokGatewayAdapter — C5 error decoration (§4.4)", () => {
   });
 });
 
-describe("GrokGatewayAdapter — history policy (§4.2)", () => {
+describe("GrokAdapter — history policy (§4.2)", () => {
   it("success appends exactly [user, assistant, tool, assistant] under provider 'grok' — system never stored", async () => {
     const store = makeFakeStore();
     const fetchMock = sseScript(
@@ -664,7 +656,7 @@ describe("GrokGatewayAdapter — history policy (§4.2)", () => {
 
   it("abort turn appends nothing", async () => {
     const store = makeFakeStore();
-    const ref: { current?: GrokGatewayAdapter } = {};
+    const ref: { current?: GrokAdapter } = {};
     const inproc = makeInProcessServer((s) =>
       s.registerTool("echo", { description: "", inputSchema: { text: z.string() } }, async ({ text }) => {
         ref.current?.abort();
@@ -695,7 +687,7 @@ describe("GrokGatewayAdapter — history policy (§4.2)", () => {
   });
 });
 
-describe("GrokGatewayAdapter — session policy (stateless transport)", () => {
+describe("GrokAdapter — session policy (stateless transport)", () => {
   it("request.sessionId never appears in the request body", async () => {
     const fetchMock = sseScript([finishChunk("cmpl-1")]);
     const { adapter } = makeAdapter({}, fetchMock);
@@ -723,8 +715,8 @@ describe("GrokGatewayAdapter — session policy (stateless transport)", () => {
   });
 });
 
-describe("GrokGatewayAdapter — missing key (bare construction)", () => {
-  it("no apiKey ⇒ error result naming GROK_GATEWAY_KEY; bridge.close still called (scaffold finally)", async () => {
+describe("GrokAdapter — missing key (bare construction)", () => {
+  it("no apiKey ⇒ error result telling the operator to run grok login; bridge.close still called (scaffold finally)", async () => {
     const closeSpy = vi.spyOn(ToolBridge.prototype, "close");
     try {
       const fetchMock = vi.fn<typeof fetch>();
@@ -732,7 +724,7 @@ describe("GrokGatewayAdapter — missing key (bare construction)", () => {
 
       const result = await adapter.runTurn({ prompt: "go" });
 
-      expect(result.error).toContain("Grok gateway API key is not available");
+      expect(result.error).toContain("Grok API key is not available");
       expect(fetchMock).not.toHaveBeenCalled();
       expect(closeSpy).toHaveBeenCalledTimes(1);
     } finally {
@@ -741,7 +733,7 @@ describe("GrokGatewayAdapter — missing key (bare construction)", () => {
   });
 });
 
-describe("GrokGatewayAdapter — maxTurns 0", () => {
+describe("GrokAdapter — maxTurns 0", () => {
   it("maxTurns: 0 ⇒ error_max_turns with zero fetch calls (loop-owned)", async () => {
     const fetchMock = vi.fn<typeof fetch>();
     const { adapter } = makeAdapter({}, fetchMock);
