@@ -162,7 +162,15 @@ export class Dispatcher {
     //    fast-fails, so a synthetic id would repeat and dedup would silently drop
     //    every replay after the first). Dedup exists for externally-duplicated
     //    deliveries; a replay has nothing to dedup against — bypass it.
-    if (this.recentMessageIds.has(item.id) && !item.meta?.outageReplay) {
+    //    KPR-402 (r1 SF-1): continuation legs are engine-authored on the same
+    //    rationale, and they NEED the bypass — under multi-agent fan-out /
+    //    conference every agent's leg derives the SAME id (`<origin>#dl<n>`:
+    //    the counter is per-chain, not per-agent), so id-only dedup would
+    //    silently drop agent 2's leg at debug level after its notice already
+    //    promised a continuation. A leg, like a replay, has nothing to dedup
+    //    against — its (agentId, id) pair is what's unique, and every
+    //    downstream store write is already keyed on the composite.
+    if (this.recentMessageIds.has(item.id) && !item.meta?.outageReplay && item.meta?.deadlineRetry === undefined) {
       log.debug("Duplicate message skipped", { id: item.id, source: item.source.adapterId });
       return;
     }
@@ -662,6 +670,21 @@ export class Dispatcher {
       }
       if (policy === "notify") {
         await this.deliverOutageNotice(item, agentId, adapter, deadlineZeroProgressNoticeFor(item.source.kind));
+        // r1 NIT-1: the notify arm exits were the only two silent ones. Same
+        // field shape as the silent twins' warns (no message text — KPR-307
+        // redaction posture), plus the KPR-401 segmentation fields, since
+        // "Work item dispatched" never fires for an arm-handled turn.
+        log.info("Deadline zero-progress abort — notice delivered, no continuation", {
+          agentId,
+          itemId: item.id,
+          threadId: item.threadId,
+          deadlineRetry: item.meta?.deadlineRetry,
+          timedOut: runResult.timedOut,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+          llmMs: runResult.llmMs,
+          toolCalls: runResult.toolCalls,
+        });
       } else {
         // Silent one-shot (callback:/event:/team-): warn log only — no
         // human is owed a notice (KPR-307 posture). The one-shot's trigger
@@ -688,7 +711,13 @@ export class Dispatcher {
         .catch((err) => log.error("Deadline-abort replay done-release failed", { error: String(err) }));
     }
 
-    const n = Number(item.meta?.deadlineRetry ?? 0);
+    // r1 NIT-2: fail CLOSED on a non-finite counter. A corrupted or
+    // hand-edited `deadlineRetry` (NaN from a non-numeric value, Infinity)
+    // would sail past `n >= MAX_DEADLINE_CONTINUATIONS` — NaN compares false
+    // against everything — and dispatch an unbounded chain of `#dlNaN` legs.
+    // Treat anything non-finite as at-cap: terminal notice, no leg.
+    const rawRetry = Number(item.meta?.deadlineRetry ?? 0);
+    const n = Number.isFinite(rawRetry) ? rawRetry : MAX_DEADLINE_CONTINUATIONS;
 
     // 2. Notice cadence: two per chain, maximum — one first-abort notice
     //    (deadlineRetry absent), silence on intermediate legs, one terminal
@@ -704,6 +733,17 @@ export class Dispatcher {
     if (n >= MAX_DEADLINE_CONTINUATIONS) {
       if (policy === "notify") {
         await this.deliverOutageNotice(item, agentId, adapter, deadlineTerminalNoticeFor(item.source.kind));
+        log.info("Deadline continuation cap exhausted — terminal notice delivered", {
+          agentId,
+          itemId: item.id,
+          threadId: item.threadId,
+          deadlineRetry: item.meta?.deadlineRetry,
+          timedOut: runResult.timedOut,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+          llmMs: runResult.llmMs,
+          toolCalls: runResult.toolCalls,
+        });
       } else {
         log.warn("Deadline continuation cap exhausted on silent one-shot", { agentId, itemId: item.id });
       }
@@ -771,7 +811,16 @@ export class Dispatcher {
     log.info("Deadline continuation dispatched in-process", {
       agentId,
       itemId: retryItem.id,
+      threadId: retryItem.threadId,
       deadlineRetry: n + 1,
+      timedOut: runResult.timedOut,
+      // KPR-401 log-segmentation parity: "Work item dispatched" never fires
+      // for an arm-handled turn, so the aborted leg's spend/latency would
+      // otherwise vanish from log-based dashboards entirely.
+      costUsd: runResult.costUsd,
+      durationMs: runResult.durationMs,
+      llmMs: runResult.llmMs,
+      toolCalls: runResult.toolCalls,
     });
     return true;
   }

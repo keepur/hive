@@ -1941,6 +1941,77 @@ describe("deadline-abort continuation (KPR-402)", () => {
     expect(cont.id).toBe("callback:x#dl1");
     expect(cont.threadId).toBe("callback:x"); // the origin's effective key, materialized before the id changed
   });
+
+  it("T16 (r1 SF-1): multi-agent fan-out — both agents' legs dispatch; neither is swallowed by the id-only dedup", async () => {
+    // The leg id is derived from the ORIGIN item (`m1#dl1`), and the counter
+    // is per-chain rather than per-agent, so under fan-out both agents mint
+    // the SAME leg id. Before the dedup bypass was extended to engine-authored
+    // legs, whichever leg lost the race was dropped at debug level — after its
+    // agent had already delivered a notice promising a continuation.
+    //
+    // NEGATIVE-VERIFY (Step: revert the `deadlineRetry === undefined` clause
+    // at dispatcher.ts step 0): the fourth runWorkItemTurn never fires, the
+    // waitFor times out, and the pair assertion below is one leg short.
+    agentManager.runWorkItemTurn
+      .mockResolvedValueOnce(withProgressAbort()) // agent 1's origin turn
+      .mockResolvedValueOnce(withProgressAbort()); // agent 2's origin turn (Promise.all sibling)
+    // "Jasper, and River" name-resolves to two agents in the mock registry;
+    // label "random" is nobody's dedicated channel, so step 1 doesn't capture it.
+    await dispatcher.dispatch(
+      makeWorkItem({
+        id: "m1",
+        threadId: "t1",
+        text: "hey Jasper, and River: thoughts?",
+        source: { kind: "slack", id: "C999", label: "random" },
+      }),
+    );
+
+    // Four turns total: two origin legs + BOTH continuation legs.
+    await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(adapter.deliver).toHaveBeenCalledTimes(4));
+    await flush();
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(4); // no third leg — the continuations succeeded
+
+    // Both agents delivered their own first-abort notice (the arm notices per
+    // agent — a deadline abort is a per-turn event, not a provider episode),
+    // and both continuations delivered a real answer. Counted, not ordered:
+    // the two origin turns interleave under Promise.all.
+    const texts = adapter.deliver.mock.calls.map((c: any[]) => c[0].text);
+    expect(texts.filter((t: string) => t === DEADLINE_NOTICE_DEFAULT)).toHaveLength(2);
+    expect(texts.filter((t: string) => t === "turn response")).toHaveLength(2);
+    expect(texts).not.toContain("_No response._");
+
+    // Assert by (agentId, itemId) pair — the composite is what's unique.
+    const pairs = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => `${c[0]}:${(c[1] as WorkItem).id}`).sort();
+    expect(pairs).toEqual(["jasper:m1", "jasper:m1#dl1", "river:m1", "river:m1#dl1"]);
+    // Each leg is pinned to its OWN agent (resolveAgents step 0), so a leg can
+    // never re-resolve onto its sibling.
+    for (const call of agentManager.runWorkItemTurn.mock.calls) {
+      const [agentId, wi] = call as [string, WorkItem];
+      if (wi.id === "m1#dl1") expect(wi.meta?.targetAgentId).toBe(agentId);
+    }
+    expect(store.enqueue).not.toHaveBeenCalled(); // closed circuit throughout
+  });
+
+  it("T17 (r1 NIT-2): a non-finite deadlineRetry fails CLOSED — treated at-cap, terminal notice, no leg", async () => {
+    // NEGATIVE-VERIFY: without the Number.isFinite guard, n is NaN — every
+    // comparison against the cap is false, so the arm dispatches an unbounded
+    // `m1#dlNaN` chain instead of terminating. The count assertion fails.
+    agentManager.runWorkItemTurn.mockResolvedValue(withProgressAbort());
+    await dispatcher.dispatch(
+      slackItem({
+        id: "m1",
+        threadId: "t1",
+        meta: { deadlineRetry: "garbage", targetAgentId: "executive-assistant" },
+      }),
+    );
+
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toBe(DEADLINE_TERMINAL_NOTICE_DEFAULT);
+    await flush();
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1); // no continuation leg was ever dispatched
+    expect(store.enqueue).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
