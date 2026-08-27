@@ -70,3 +70,6 @@
 {"worker":"child-pr-review-kpr-390-final","phase":"child-pr-review","round":2,"ticket":"KPR-390","tier":"fable","dispatched_at":"2026-08-27T10:45:00Z"}
 {"worker":"coherence-review-kpr-390","phase":"coherence","ticket":"KPR-390","tier":"fable","dispatched_at":"2026-08-27T11:30:00Z"}
 {"worker":"spec-drafter-kpr-409","phase":"draft-spec","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T12:00:00Z"}
+{"worker":"spec-reviewer-kpr-409-r1","phase":"spec-review","round":1,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T12:45:00Z"}
+{"worker":"spec-reviewer-kpr-409-r3","phase":"spec-review","round":3,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T14:30:00Z"}
+{"worker":"plan-writer-kpr-409","phase":"write-plan","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T15:00:00Z"}
