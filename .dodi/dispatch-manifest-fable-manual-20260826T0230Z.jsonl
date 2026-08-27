@@ -86,3 +86,7 @@
 {"worker":"pre-pr-review-kpr-409-final","phase":"pre-pr-review","round":2,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T21:45:00Z"}
 {"worker":"pre-pr-review-kpr-409-r3","phase":"pre-pr-review","round":3,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T22:15:00Z"}
 {"worker":"docs-sync-kpr-409","phase":"submit-ticket-pr","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T22:40:00Z"}
+{"worker":"child-pr-review-kpr-409-r1","phase":"child-pr-review","round":1,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-27T23:15:00Z"}
+{"worker":"child-pr-review-kpr-409-final","phase":"child-pr-review","round":2,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-28T00:00:00Z"}
+{"worker":"child-pr-review-kpr-409-r3","phase":"child-pr-review","round":3,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-28T00:30:00Z"}
+{"worker":"coherence-review-kpr-409","phase":"coherence","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-28T01:00:00Z"}
