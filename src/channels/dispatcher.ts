@@ -59,6 +59,8 @@ interface ResolvedAgent {
   conferenceRound?: number; // 0 = human-triggered, 1 = peer reaction
   threadContext?: string;
   meetingPreamble?: string;
+  /** Round-1 only: the peer reply this reaction turn should engage with (KPR-387). */
+  reactionTo?: { authorName: string; text: string };
 }
 
 /**
@@ -101,7 +103,9 @@ export class Dispatcher {
   private teamStore?: import("../team/team-store.js").TeamStore;
   private slackAdapter?: SlackAdapter;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
-  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — tracks which agents reacted in round 1
+  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents that responded or were
+  // selected to respond on this human message, either round (KPR-387): round-0
+  // primaries recorded at selection time, round-1 reactors at claim time.
   private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
@@ -1255,12 +1259,18 @@ export class Dispatcher {
     // Conference mode: inject thread context + preamble into the WorkItem
     let effectiveItem = item;
     if (resolved.conferenceMode) {
-      const contextPrefix = [resolved.meetingPreamble, "", resolved.threadContext, "", "---", `[New message]:`]
-        .filter(Boolean)
-        .join("\n");
+      // KPR-387: round-1 reaction turns are framed against the peer reply — the
+      // original human message is never re-presented in the terminal slot (it
+      // remains available via the re-fetched transcript in threadContext).
+      const newMessageSegment = resolved.reactionTo
+        ? `[${resolved.reactionTo.authorName} just replied]:\n${resolved.reactionTo.text}\n\n` +
+          `React to ${resolved.reactionTo.authorName}'s reply if you have something to add. ` +
+          `Do not re-answer the original question. If you have nothing to add, respond with "No response needed."`
+        : `[New message]:\n${item.text}`;
+      const contextPrefix = [resolved.meetingPreamble, resolved.threadContext, "---"].filter(Boolean).join("\n");
       effectiveItem = {
         ...item,
-        text: `${contextPrefix}\n${item.text}`,
+        text: `${contextPrefix}\n${newMessageSegment}`,
         meta: {
           ...item.meta,
           conferenceMode: true,
@@ -1431,12 +1441,29 @@ export class Dispatcher {
       costUsd: classification.costUsd,
     });
 
+    // KPR-387: record round-0 responders so the reaction pass never re-selects a
+    // primary for the same triggering human message. Recorded at selection time —
+    // a primary whose turn errors or is suppressed stays excluded for this trigger
+    // (deliberate: kills the suppressed-turn burn; Gate 1 delegated assumption).
+    // Runs synchronously before any round-0 dispatch starts, so there is no race
+    // with a fast round-0 completion triggering the reaction pass.
+    const humanTs = item.meta?.slackTs as string | undefined;
+    if (humanTs && classification.respondAgentIds.length > 0) {
+      if (!this.meetingReactionTracker.has(threadId)) {
+        this.meetingReactionTracker.set(threadId, new Map());
+      }
+      const threadTracker = this.meetingReactionTracker.get(threadId)!;
+      const responded = threadTracker.get(humanTs) ?? new Set<string>();
+      for (const id of classification.respondAgentIds) responded.add(id);
+      threadTracker.set(humanTs, responded);
+    }
+
     const preamble = this.buildMeetingPreamble(item.source.label, rosterMembers);
 
     return classification.respondAgentIds.map((agentId) => ({
       agentId,
       conferenceMode: true,
-      conferenceHumanTs: item.meta?.slackTs as string,
+      conferenceHumanTs: humanTs,
       conferenceRound: 0,
       threadContext,
       meetingPreamble: preamble,
@@ -1570,6 +1597,7 @@ Meeting rules:
     }
 
     // Dispatch reactions concurrently (peers already claimed in reacted set above)
+    const responderName = this.registry.get(respondingAgentId)?.name ?? respondingAgentId;
     const reactionDispatches = classification.respondAgentIds.map((agentId) => {
       const resolved: ResolvedAgent = {
         agentId,
@@ -1578,6 +1606,7 @@ Meeting rules:
         conferenceRound: 1,
         threadContext,
         meetingPreamble: preamble,
+        reactionTo: { authorName: responderName, text: responseText },
       };
       return this.dispatchToAgent(originalItem, resolved);
     });
