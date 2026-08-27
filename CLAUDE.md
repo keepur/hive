@@ -71,7 +71,8 @@ Message (Slack/SMS/WebSocket/Scheduler)
 - `src/agents/agent-registry.ts` — loads agent definitions from MongoDB
 - `src/agents/session-store.ts` — manages agent session state in MongoDB
 - `src/agents/model-router.ts` — per-turn effort classifier (KPR-338: models are static per agent; the classifier tunes reasoning effort only)
-- `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue
+- `src/channels/dispatcher.ts` — main routing logic, agent resolution, retry queue, honest-outage + deadline-continuation arms
+- `src/channels/deadline-continuation.ts` — deadline-abort continuation chain: cap, notice templates, flat per-leg `#dl<n>` id derivation (KPR-402)
 - `src/channels/slack-adapter.ts` — Slack events → WorkItems → delivery
 - `src/channels/sms-adapter.ts` — SMS message adapter via Quo/OpenPhone
 - `src/slack/slack-gateway.ts` — Socket Mode listener, message filtering
