@@ -227,6 +227,9 @@ async function main(): Promise<void> {
     // Reload schedule overrides
     await scheduler.reloadSchedules();
     agentManager.reloadSkills();
+    // KPR-394 (§4.6): re-scan for orphan provider-model prefixes after a
+    // roster reload (SIGUSR1 or change stream). Never loads provider code.
+    agentManager.warnOrphanProviderPrefixes();
     agentManager.rescanPlugins();
   };
 
@@ -391,6 +394,14 @@ async function main(): Promise<void> {
     memoryLifecycle,
     turnHistoryStore,
   );
+  // KPR-394 (§4.3 phase b / §4.6): activate declared provider plugins
+  // BEFORE any spawn-capable surface starts — bgTaskManager.start()/
+  // scanOrphans() completion callbacks can already dispatch turns, so the
+  // await sits here, immediately after construction. The
+  // registerPluginCommands slot further down runs after slackAdapter.start
+  // and would open a declared-but-unregistered boot window — deliberately
+  // not reused.
+  await agentManager.activateProviderPlugins();
   const healthReporter = new HealthReporter(agentManager, memoryManager, registry);
   const dispatcher = new Dispatcher(
     registry,

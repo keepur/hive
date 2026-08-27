@@ -69,6 +69,8 @@ import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
 import type { ReasoningEffort } from "./provider-adapters/types.js";
+// KPR-394 (§4.11): plugin provider ids widen the admin model-catalog tools.
+import { listPluginProviderIds } from "./provider-adapters/provider-registry.js";
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -308,7 +310,7 @@ function warnIfToolSearchForceDisabled(): void {
 /** KPR-346: optional per-spawn runner options (currently Lane A only). */
 export interface AgentRunnerOptions {
   /** Set by AgentManager.createProviderAdapter for Lane A routes
-   *  (kimi/deepseek/grok) —
+   *  (kimi/deepseek) —
    *  triggers §D5 env substitution in send(). Absent ⇒ vanilla Claude spawn. */
   laneAPassthrough?: PassthroughSpawnConfig;
 }
@@ -1123,7 +1125,7 @@ export class AgentRunner {
 
   /**
    * Resolve an agent-env path against the agent config. Supports dotted paths
-   * for nested objects (e.g. "metadata.dodiOpsMode"). Walks left-to-right; any
+   * for nested objects (e.g. "metadata.opsMode"). Walks left-to-right; any
    * missing intermediate key yields "". No fallback to top-level fields — a
    * misconfigured key surfaces as an empty value, which the plugin must
    * handle defensively (per spec §5.3 resolver semantics).
@@ -1456,6 +1458,7 @@ export class AgentRunner {
           agentId: this.agentConfig.id,
           instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
           memoryLifecycle: this.memoryLifecycle,
+          listPluginProviderIds,
         });
       }
       servers["admin"] = this.adminMcpServer;

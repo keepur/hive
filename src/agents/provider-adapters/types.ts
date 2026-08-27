@@ -7,13 +7,13 @@ export type AgentProviderId = "claude" | "openai" | "gemini" | "codex" | "kimi" 
  * KPR-347: the native-lane (Lane B) adapter providers — the set whose
  * adapters run a provider SDK/API directly and need the hive bridge.
  * DELIBERATELY a literal union, NOT Exclude<AgentProviderId, "claude">:
- * Lane A providers (kimi/deepseek — child 1; grok — KPR-371) join
- * AgentProviderId but run
+ * Lane A providers (kimi/deepseek — child 1) join AgentProviderId but run
  * the Claude-lane runtime and must NEVER gain a compatibility column or a
  * bridge path. Growing this union is a Lane B replication child's explicit
- * one-line concern.
+ * one-line concern. Grok promoted from Lane A passthrough to Lane B native
+ * in KPR-392 — it was the KPR-371 Lane A row, now joins this union instead.
  */
-export type LaneBProviderId = "openai" | "gemini" | "codex";
+export type LaneBProviderId = "openai" | "gemini" | "codex" | "grok";
 
 /**
  * KPR-347 (epic §D3): per-provider session continuity semantics. Drives
@@ -81,13 +81,23 @@ export const SESSION_SEMANTICS: Readonly<Record<AgentProviderId, SessionSemantic
   // documented parity-matrix caveat).
   kimi: "client-transcript",
   deepseek: "client-transcript",
-  // KPR-371 (§D1): Lane A — same client-transcript semantics as kimi/deepseek.
-  grok: "client-transcript",
+  // KPR-392 (§4.2): grok promoted from Lane A passthrough to a native Lane B
+  // stateless-replay adapter — the operator-hosted gateway is a stateless
+  // translation proxy with no provider-side handle to chain (no
+  // persistence tier of its own, undocumented vendor retention). Continuity
+  // is hive-persisted `provider_turn_history` replayed client-side, same as
+  // codex; the write side (never persist a handle) is automatic via
+  // `persistsResumableHandle`. Was "client-transcript" under KPR-371 Lane A.
+  grok: "stateless-replay",
 };
 
-export function sessionSemanticsFor(provider: AgentProviderId): SessionSemantics {
-  return SESSION_SEMANTICS[provider];
-}
+// KPR-394: the former `sessionSemanticsFor(provider)` accessor is deleted.
+// It read the built-in Record only, so it silently answered wrong for plugin
+// providers — and it sat one character from the registry-aware
+// `sessionSemanticsForRoute` (provider-registry.ts), the trap being a future
+// caller reaching for the obvious name and losing plugin providers. Read
+// SESSION_SEMANTICS directly for built-in-only facts; route lookups go
+// through `sessionSemanticsForRoute`.
 
 /** True ⇔ the persisted sessionId is a real handle worth storing/resuming. */
 export function persistsResumableHandle(semantics: SessionSemantics): boolean {
@@ -121,7 +131,7 @@ export interface AgentProviderTurnRequest {
 }
 
 export interface AgentProviderAdapter {
-  readonly provider: AgentProviderId;
+  readonly provider: string; // R2 (KPR-394): widened — adapters keep their literals; ops surfaces key on strings
   runTurn(request: AgentProviderTurnRequest): Promise<RunResult>;
   abort(): void;
   readonly wasAborted: boolean;

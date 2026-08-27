@@ -157,7 +157,7 @@ export const CREDENTIAL_REGISTRY: CredentialEntry[] = [
     server: "grok",
     title: "Grok (xAI) gateway",
     description:
-      "Lane A passthrough provider (KPR-384) — agents with model: grok/… run the Claude runtime against a " +
+      "Native Lane B adapter (KPR-392) — agents with model: grok/… speak chat-completions to a " +
       "self-hosted CLIProxyAPI gateway. The key is an `api-keys` entry from your gateway's config.yaml.",
     helpUrl: "https://github.com/keepur/hive/blob/main/docs/providers.md",
     kind: "secret",
@@ -176,4 +176,32 @@ export function findCredentialEntryByKey(key: string): CredentialEntry | undefin
 /** All collectable secret keys across the registry — used by `hive credentials list/add/remove`. */
 export function allCredentialKeys(): string[] {
   return CREDENTIAL_REGISTRY.flatMap((e) => e.fields.map((f) => f.key));
+}
+
+/**
+ * KPR-394 (§6 edge 5): dynamic credential entries for installed provider
+ * plugins — `hive credentials add <api-key-env>` must work for
+ * manifest-declared provider keys (the declared-broken/missing-key error
+ * text directs operators there). Shaped exactly like static entries so the
+ * CLI's list/add flow is uniform. The bootstrap wizard deliberately
+ * consumes only the static CREDENTIAL_REGISTRY — plugin keys are
+ * post-bootstrap by definition (plugins install after init).
+ */
+export function pluginProviderCredentialEntries(
+  decls: readonly { plugin: string; decl: { id: string; apiKeyEnv?: string; description?: string } }[],
+): CredentialEntry[] {
+  return decls.flatMap(({ plugin, decl }) =>
+    decl.apiKeyEnv
+      ? [
+          {
+            server: decl.id,
+            title: `Provider '${decl.id}' (plugin ${plugin})`,
+            description: decl.description ?? `API key for the '${decl.id}' provider plugin.`,
+            helpUrl: `See the ${plugin} plugin README.`,
+            kind: "secret" as const,
+            fields: [{ key: decl.apiKeyEnv, label: decl.apiKeyEnv }],
+          },
+        ]
+      : [],
+  );
 }

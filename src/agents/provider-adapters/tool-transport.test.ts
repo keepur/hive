@@ -22,6 +22,8 @@ describe("classifyToolTransport", () => {
         openai: "mcp-bridge-candidate",
         gemini: "mcp-bridge-candidate",
         codex: "mcp-bridge-candidate",
+        grok: "mcp-bridge-candidate",
+        laneB: "mcp-bridge-candidate",
       });
       expect(descriptor.requiresTurnContext).toBe(false);
       expect(descriptor.requiresHiveRuntime).toBe(false);
@@ -72,6 +74,8 @@ describe("classifyToolTransport", () => {
       openai: "requires-hive-bridge",
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
+      grok: "requires-hive-bridge",
+      laneB: "requires-hive-bridge",
     });
   });
 
@@ -88,6 +92,8 @@ describe("classifyToolTransport", () => {
       openai: "claude-only",
       gemini: "claude-only",
       codex: "claude-only",
+      grok: "claude-only",
+      laneB: "claude-only",
     });
   });
 
@@ -105,6 +111,8 @@ describe("classifyToolTransport", () => {
       openai: "requires-hive-bridge",
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
+      grok: "requires-hive-bridge",
+      laneB: "requires-hive-bridge",
     });
   });
 
@@ -119,6 +127,8 @@ describe("classifyToolTransport", () => {
         openai: "requires-hive-bridge",
         gemini: "requires-hive-bridge",
         codex: "requires-hive-bridge",
+        grok: "requires-hive-bridge",
+        laneB: "requires-hive-bridge",
       });
       expect(d.compatibility.codex).toEqual(d.compatibility.openai);
     },
@@ -156,6 +166,8 @@ describe("classifyToolTransport", () => {
       openai: "unsupported",
       gemini: "unsupported",
       codex: "unsupported",
+      grok: "unsupported",
+      laneB: "unsupported",
     });
   });
 
@@ -192,6 +204,7 @@ function makeEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInv
       openai: "mcp-bridge-candidate",
       gemini: "mcp-bridge-candidate",
       codex: "mcp-bridge-candidate",
+      grok: "mcp-bridge-candidate",
     },
     schemas: { kind: "connect-time" },
     ...overrides,
@@ -202,13 +215,13 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
   // 1. Each compatibility class × each LaneBProviderId.
   const bridgeableClasses = ["direct", "mcp-bridge-candidate", "requires-hive-bridge"] as const;
   const omittedClasses = ["claude-only", "unsupported"] as const;
-  const providers = ["openai", "gemini", "codex"] as const;
+  const providers = ["openai", "gemini", "codex", "grok"] as const;
 
   it.each(
     bridgeableClasses.flatMap((cls) => providers.map((provider) => ({ cls, provider }))),
   )("$cls lands in bridgeable for $provider", ({ cls, provider }) => {
     const entry = makeEntry({
-      compatibility: { claude: "direct", openai: cls, gemini: cls, codex: cls },
+      compatibility: { claude: "direct", openai: cls, gemini: cls, codex: cls, grok: cls },
     });
     const { bridgeable, omitted } = partitionInventoryForProvider([entry], provider);
     expect(bridgeable).toEqual([entry]);
@@ -221,7 +234,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     const entry = makeEntry({
       name: "gated",
       transport: "claude-builtin",
-      compatibility: { claude: "direct", openai: cls, gemini: cls, codex: cls },
+      compatibility: { claude: "direct", openai: cls, gemini: cls, codex: cls, grok: cls },
     });
     const { bridgeable, omitted } = partitionInventoryForProvider([entry], provider);
     expect(bridgeable).toEqual([]);
@@ -242,6 +255,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
         openai: "requires-hive-bridge",
         gemini: "requires-hive-bridge",
         codex: "requires-hive-bridge",
+        grok: "requires-hive-bridge",
       },
       schemas: { kind: "unavailable" },
     });
@@ -258,6 +272,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
         openai: "mcp-bridge-candidate",
         gemini: "mcp-bridge-candidate",
         codex: "claude-only",
+        grok: "mcp-bridge-candidate",
       },
     });
     expect(partitionInventoryForProvider([entry], "openai").bridgeable).toEqual([entry]);
@@ -274,7 +289,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     const b = makeEntry({
       name: "b",
       transport: "claude-builtin",
-      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only" },
+      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only", grok: "claude-only" },
     });
     const c = makeEntry({ name: "c" });
     const { bridgeable, omitted } = partitionInventoryForProvider([a, b, c], "openai");
@@ -292,7 +307,7 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     const entry = makeEntry({
       name: "quo",
       transport: "stdio",
-      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only" },
+      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only", grok: "claude-only" },
       serverConfig: {
         type: "stdio",
         command: "x",
@@ -303,5 +318,57 @@ describe("partitionInventoryForProvider (KPR-347)", () => {
     const { omitted } = partitionInventoryForProvider([entry], "codex");
     expect(JSON.stringify(omitted)).not.toContain("hunter2");
     expect(Object.keys(omitted[0]!)).toEqual(["name", "transport", "compatibility"]);
+  });
+
+  it("R3: a plugin provider id reads the laneB fallback column (bridgeable)", () => {
+    const entry = makeEntry(
+      classifyToolTransport({ name: "mcp__memory__view", transport: "sdk-in-process", source: "engine" }),
+    );
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], "sol");
+    expect(bridgeable).toEqual([entry]);
+    expect(omitted).toEqual([]);
+  });
+
+  // KPR-407 (finding 3): "constructor" is the one Object.prototype member name
+  // PROVIDER_ID_REGEX admits. Unguarded, columns["constructor"] returned
+  // Object's constructor function — truthy, never in BRIDGEABLE_COMPATIBILITIES
+  // — so every tool was omitted with a function in the reason field instead of
+  // falling through to the laneB column. Own-property guard ⇒ laneB fallback.
+  it("KPR-407: a plugin id of 'constructor' falls through to laneB, never Object.prototype", () => {
+    const entry = makeEntry(
+      classifyToolTransport({ name: "mcp__memory__view", transport: "sdk-in-process", source: "engine" }),
+    );
+    expect(entry.compatibility.laneB).toBe("requires-hive-bridge"); // bridgeable
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], "constructor");
+    expect(bridgeable).toEqual([entry]);
+    expect(omitted).toEqual([]);
+  });
+
+  it("R3: claude-only stays omitted for a plugin id, with the truthful reason", () => {
+    const entry = makeEntry(
+      classifyToolTransport({ name: "WebSearch", transport: "claude-builtin", source: "sdk-builtin" }),
+    );
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], "sol");
+    expect(bridgeable).toEqual([]);
+    expect(omitted).toEqual([{ name: "WebSearch", transport: "claude-builtin", compatibility: "claude-only" }]);
+  });
+
+  it("R3: a record with neither the provider column nor laneB is honestly unsupported", () => {
+    const entry = {
+      ...makeEntry(classifyToolTransport({ name: "stale", transport: "stdio", source: "plugin" })),
+      compatibility: { claude: "direct", openai: "mcp-bridge-candidate", gemini: "mcp-bridge-candidate", codex: "mcp-bridge-candidate", grok: "mcp-bridge-candidate" },
+    } as any;
+    const { bridgeable, omitted } = partitionInventoryForProvider([entry], "sol");
+    expect(bridgeable).toEqual([]);
+    expect(omitted[0]!.compatibility).toBe("unsupported");
+  });
+
+  it("R3: built-in ids read their OWN column even when laneB diverges (precedence pin)", () => {
+    const entry = {
+      ...makeEntry(classifyToolTransport({ name: "diverge", transport: "stdio", source: "plugin" })),
+      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only", grok: "claude-only", laneB: "mcp-bridge-candidate" },
+    } as any;
+    const { bridgeable } = partitionInventoryForProvider([entry], "openai");
+    expect(bridgeable).toEqual([]); // own column wins; laneB is fallback only
   });
 });
