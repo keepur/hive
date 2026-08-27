@@ -1572,3 +1572,9 @@ Expected: six commits (Tasks 1–6), untracked/modified plan doc only.
 1. [Task 7, Steps 2/5]: the plan doc is already committed at f01a84b (tip), so the final gate sees SEVEN commits (plan doc + Tasks 1-6) and a CLEAN tree — read the expectations that way; don't report a spurious blocker.
 2. [Task 5, coupling rationale]: the "racy-red" claim about un-migrated 1304 is likely wrong-direction (would pass racily green); the coupling stands regardless (the KPR-401 row's break is deterministic; spec T10 mandates the migration) — don't treat "racy-red" as observed fact.
 3. [Task 1/5, `_replayMarker`]: the rest-sibling destructure emits one no-unused-vars WARNING (no varsIgnorePattern configured); `npm run check` passes (no --max-warnings); tolerate it — adding ignoreRestSiblings is out of scope.
+
+---
+
+## Post-review amendment (child-PR r1)
+
+⚠A9's "no docs/providers.md edit" assumption was OVERRIDDEN at pre-PR review r1 (the spec's own escape hatch: "one-row caveat if review wants it") — the shipped change edits providers.md footnote 10 + adds a dated changelog entry, consistent with canon D29 and the KPR-398/KPR-399 precedent. The §Verification step expecting an empty providers.md diff is superseded accordingly; the epic-level integrated-head review should expect that diff.
