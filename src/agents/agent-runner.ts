@@ -69,6 +69,8 @@ import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
 import type { ReasoningEffort } from "./provider-adapters/types.js";
+// KPR-394 (§4.11): plugin provider ids widen the admin model-catalog tools.
+import { listPluginProviderIds } from "./provider-adapters/provider-registry.js";
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -1456,6 +1458,7 @@ export class AgentRunner {
           agentId: this.agentConfig.id,
           instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
           memoryLifecycle: this.memoryLifecycle,
+          listPluginProviderIds,
         });
       }
       servers["admin"] = this.adminMcpServer;
