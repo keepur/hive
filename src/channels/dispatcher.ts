@@ -13,7 +13,7 @@ import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
 import { classifyTurnResult, HARD_FAULT_KINDS } from "../agents/provider-adapters/error-classification.js";
-import type { OutageQueueStore, OutageQueueConfig } from "../outage/outage-queue-store.js";
+import type { OutageQueueStore, OutageQueueConfig, OutageEnqueueOrigin } from "../outage/outage-queue-store.js";
 import {
   OutageEpisodeTracker,
   adapterKeyFor,
@@ -23,6 +23,14 @@ import {
   terminalFailureNotice,
   threadKeyFor,
 } from "../outage/outage-notices.js";
+import {
+  MAX_DEADLINE_CONTINUATIONS,
+  deadlineBaseIdOf,
+  deadlineContinuationWrap,
+  deadlineNoticeFor,
+  deadlineTerminalNoticeFor,
+  deadlineZeroProgressNoticeFor,
+} from "./deadline-continuation.js";
 
 const log = createLogger("dispatcher");
 
@@ -158,7 +166,15 @@ export class Dispatcher {
     //    fast-fails, so a synthetic id would repeat and dedup would silently drop
     //    every replay after the first). Dedup exists for externally-duplicated
     //    deliveries; a replay has nothing to dedup against — bypass it.
-    if (this.recentMessageIds.has(item.id) && !item.meta?.outageReplay) {
+    //    KPR-402 (r1 SF-1): continuation legs are engine-authored on the same
+    //    rationale, and they NEED the bypass — under multi-agent fan-out /
+    //    conference every agent's leg derives the SAME id (`<origin>#dl<n>`:
+    //    the counter is per-chain, not per-agent), so id-only dedup would
+    //    silently drop agent 2's leg at debug level after its notice already
+    //    promised a continuation. A leg, like a replay, has nothing to dedup
+    //    against — its (agentId, id) pair is what's unique, and every
+    //    downstream store write is already keyed on the composite.
+    if (this.recentMessageIds.has(item.id) && !item.meta?.outageReplay && item.meta?.deadlineRetry === undefined) {
       log.debug("Duplicate message skipped", { id: item.id, source: item.source.adapterId });
       return;
     }
@@ -306,6 +322,16 @@ export class Dispatcher {
         return;
       }
 
+      // KPR-402: closed-circuit deadline-abort interception. Runs AFTER
+      // maybeHandlePostTurnOutage (the zero-progress+open ★ row keeps the
+      // outage path unchanged; the with-progress+open ★ row migrates from
+      // bare legacy delivery to this arm — spec §Design.6 / ⚠A8) and after
+      // the replay-error gate (disjoint: a Claude-lane deadline abort never
+      // sets error — the runner's deadline CLOSES the iterator).
+      if (await this.maybeHandleDeadlineAbort(item, agentId, adapter, runResult)) {
+        return;
+      }
+
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
@@ -348,6 +374,11 @@ export class Dispatcher {
           toolMs: runResult.toolMs,
           toolCalls: runResult.toolCalls,
           toolSummary: runResult.toolSummary,
+          // KPR-401: segmentation flags — log-based dashboards can now
+          // exclude aborted/timed-out turns' honest zeros from spend and
+          // latency stats. convertTurnResult already maps both faithfully.
+          aborted: runResult.aborted,
+          timedOut: runResult.timedOut,
         });
       }
 
@@ -513,7 +544,8 @@ export class Dispatcher {
   ): Promise<void> {
     if (this.outage) {
       if (err instanceof ProviderCircuitOpenError) {
-        const handled = await this.handleOutageTurn(item, agentId, adapter, err.provider);
+        // KPR-400 (F2): the turn never ran — fast-fail class (replays first).
+        const handled = await this.handleOutageTurn(item, agentId, adapter, err.provider, "fast-fail");
         if (handled) return;
       } else if (item.meta?.outageReplay) {
         await this.outage.store
@@ -543,14 +575,22 @@ export class Dispatcher {
 
   /**
    * §7.2 second classification leg (post-turn gate): the turn COMPLETED but
-   * the provider's breaker is open. Fires when the result classifies into
-   * HARD_FAULT_KINDS OR `timedOut && aborted` (Finding 3 r2 — a runner-
-   * deadline timeout typically leaves `error` unset, so `errors` alone never
-   * fires for hang-type outages). Gated on snapshot.enabled so shadow mode
-   * stays fully observational. A `non-provider` classification with the
-   * breaker coincidentally open follows the LEGACY path — a partially-
-   * executed tool turn's side effects must not be silently re-run
-   * (Finding 4 r1).
+   * the provider's breaker is open. Fires only when the FULL RunResult
+   * classifies into HARD_FAULT_KINDS (KPR-398: the classifier consults
+   * toolCalls/streamed/text inside its timedOut && aborted rule — a
+   * zero-progress hang classifies hard `timeout` and queues here; a
+   * with-progress deadline abort classifies breaker-inconclusive
+   * `turn-deadline` and follows the LEGACY path, because it by definition
+   * executed tools or streamed and a partially-executed tool turn's side
+   * effects must not be silently re-run — the same Finding 4 r1 rationale
+   * that keeps `non-provider` classifications out of the queue). The former
+   * redundant `timedOut && aborted` hangTimeout arm is deleted: rule 1
+   * classifies that shape as a fault irrespective of `error`, so hardFault
+   * alone covers exactly what it caught; the Finding 3 r2 concern (runner-
+   * deadline timeouts leave `error` unset, so `errors` alone never fires)
+   * lives in the cheap-exit condition below, which still admits error-less
+   * timedOut turns. Gated on snapshot.enabled so shadow mode stays fully
+   * observational.
    */
   private async maybeHandlePostTurnOutage(
     item: WorkItem,
@@ -567,16 +607,228 @@ export class Dispatcher {
     const snapshot = this.agentManager.circuitBreakers.stateFor(provider);
     if (!snapshot || snapshot.state !== "open" || snapshot.enabled !== true) return false;
 
-    const classification = classifyTurnResult({
-      error: runResult.error,
-      timedOut: runResult.timedOut,
-      aborted: runResult.aborted,
-    });
+    // KPR-398: full RunResult — structurally carries toolCalls/streamed/text.
+    const classification = classifyTurnResult(runResult);
     const hardFault = classification.outcome === "fault" && HARD_FAULT_KINDS.has(classification.kind);
-    const hangTimeout = runResult.timedOut === true && runResult.aborted === true;
-    if (!hardFault && !hangTimeout) return false;
+    if (!hardFault) return false;
 
-    return this.handleOutageTurn(item, agentId, adapter, provider);
+    // KPR-400 (F2): the turn RAN and hard-faulted with the breaker open —
+    // post-turn-fault class (deadline burners live here; replays last).
+    return this.handleOutageTurn(item, agentId, adapter, provider, "post-turn-fault");
+  }
+
+  /**
+   * KPR-402: deadline-abort continuation arm. Matches the D6 rows 1-2 shape
+   * only (`timedOut && aborted` — the Claude-lane/Lane-A deadline abort):
+   * Lane B's sentinel carries `aborted: false` and operator stops carry no
+   * `timedOut`, so neither ever enters. NOT outage machinery (⚠A6): active
+   * regardless of `outageQueue.enabled` — the replay-doc branches simply
+   * never fire when `this.outage` is unset (no replays exist then).
+   *
+   * With progress (D6 kind `turn-deadline` — the KPR-399-persisted session
+   * exists): honest first-abort notice on notify channels, then an
+   * IN-PROCESS re-dispatch of a synthetic continuation item whose session
+   * resumes through the unchanged runWorkItemTurn → sessionStore.get path
+   * (emergent, zero new code — and dependent on the thread-key pin below).
+   * Bounded chain: MAX_DEADLINE_CONTINUATIONS, then a terminal notice
+   * naming the manual "continue" hatch. Zero progress (hard `timeout` — the
+   * hang signature): notice only / warn-log only, never a re-dispatch.
+   * Cron: fully inert. The breaker never sees this arm — the aborted leg's
+   * record-once (inconclusive `turn-deadline`) already happened in the
+   * manager, and the arm adds no record site.
+   *
+   * Returns true when the turn was fully handled (notice and/or re-dispatch
+   * and/or replay-doc resolution); false = fall through to normal delivery.
+   */
+  private async maybeHandleDeadlineAbort(
+    item: WorkItem,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+    runResult: RunResult,
+  ): Promise<boolean> {
+    if (runResult.timedOut !== true || runResult.aborted !== true) return false;
+    const policy = policyFor(item);
+    if (policy === "skip") return false; // cron: re-fires at next match — arm fully inert (ticket ruling)
+
+    // D6 single source of truth — full RunResult through classifyTurnResult
+    // (the KPR-398 call-site convention), never a re-implemented predicate.
+    // (`outcome === "fault"` is the discriminant narrowing the union before
+    // `.kind` — the same two-step the KPR-398 hard-fault gate above uses.)
+    const classification = classifyTurnResult(runResult);
+    const withProgress = classification.outcome === "fault" && classification.kind === "turn-deadline";
+
+    if (!withProgress) {
+      // Zero progress (hard `timeout`): NEVER a re-dispatch (⚠A3) — nothing
+      // was persisted to resume (D1 fail-closed persist gate), a fresh
+      // restart would re-run the full turn against a provider that just sat
+      // silent for the entire deadline, and repeat hangs are the breaker's
+      // designed territory (three consecutive open the circuit and the
+      // KPR-307 queue+notice machinery takes over with its own honest story).
+      if (this.outage && item.meta?.outageReplay) {
+        // §5-2g "real failure while breaker closed": attempts+1, pending
+        // again (silent — the enqueue-time outage notice's promise still
+        // stands) or terminal `failed` with the existing terminal notice.
+        // No separate deadline notice — never double-notice one thread.
+        await this.resolveReplayRealFailure(item, agentId, adapter, "turn deadline exceeded (zero progress)");
+        return true;
+      }
+      if (policy === "notify") {
+        await this.deliverOutageNotice(item, agentId, adapter, deadlineZeroProgressNoticeFor(item.source.kind));
+        // r1 NIT-1: the notify arm exits were the only two silent ones. Same
+        // field shape as the silent twins' warns (no message text — KPR-307
+        // redaction posture), plus the KPR-401 segmentation fields, since
+        // "Work item dispatched" never fires for an arm-handled turn.
+        log.info("Deadline zero-progress abort — notice delivered, no continuation", {
+          agentId,
+          itemId: item.id,
+          threadId: item.threadId,
+          deadlineRetry: item.meta?.deadlineRetry,
+          timedOut: runResult.timedOut,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+          llmMs: runResult.llmMs,
+          toolCalls: runResult.toolCalls,
+        });
+      } else {
+        // Silent one-shot (callback:/event:/team-): warn log only — no
+        // human is owed a notice (KPR-307 posture). The one-shot's trigger
+        // is lost for this firing (accepted, spec §Design.3 r1 B2); the
+        // warn keeps it conspicuous, and the bare "_No response._" delivery
+        // to a system surface is suppressed too.
+        log.warn("Deadline zero-progress abort on silent one-shot — dropped with log", {
+          agentId,
+          itemId: item.id,
+        });
+      }
+      return true;
+    }
+
+    // ---- With progress: notice + in-process continuation ----
+
+    // 1. Replay-doc resolution: the queue slot resolves; the chain owns the
+    //    turn from here (⚠A5: a crash mid-chain loses only the continuation
+    //    — the session row survives, so the thread's next message resumes
+    //    the partial work; strictly better than today's done+"_No response._").
+    if (this.outage && item.meta?.outageReplay) {
+      await this.outage.store
+        .release(item.id, agentId, "done", "deadline abort — continuation dispatched in-process (KPR-402)")
+        .catch((err) => log.error("Deadline-abort replay done-release failed", { error: String(err) }));
+    }
+
+    // r1 NIT-2: fail CLOSED on a non-finite counter. A corrupted or
+    // hand-edited `deadlineRetry` (NaN from a non-numeric value, Infinity)
+    // would sail past `n >= MAX_DEADLINE_CONTINUATIONS` — NaN compares false
+    // against everything — and dispatch an unbounded chain of `#dlNaN` legs.
+    // Treat anything non-finite as at-cap: terminal notice, no leg.
+    const rawRetry = Number(item.meta?.deadlineRetry ?? 0);
+    const n = Number.isFinite(rawRetry) ? rawRetry : MAX_DEADLINE_CONTINUATIONS;
+
+    // 2. Notice cadence: two per chain, maximum — one first-abort notice
+    //    (deadlineRetry absent), silence on intermediate legs, one terminal
+    //    notice at the cap. No episode-tracker involvement (deadline aborts
+    //    are discrete per-thread events, not provider episodes).
+    if (policy === "notify" && item.meta?.deadlineRetry === undefined) {
+      await this.deliverOutageNotice(item, agentId, adapter, deadlineNoticeFor(item.source.kind));
+    }
+
+    // 3. Cap check (G3): the counter strictly increments and nothing resets
+    //    or strips it; the terminal notice's manual hatch is real — the
+    //    KPR-399 session row persists either way.
+    if (n >= MAX_DEADLINE_CONTINUATIONS) {
+      if (policy === "notify") {
+        await this.deliverOutageNotice(item, agentId, adapter, deadlineTerminalNoticeFor(item.source.kind));
+        log.info("Deadline continuation cap exhausted — terminal notice delivered", {
+          agentId,
+          itemId: item.id,
+          threadId: item.threadId,
+          deadlineRetry: item.meta?.deadlineRetry,
+          timedOut: runResult.timedOut,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+          llmMs: runResult.llmMs,
+          toolCalls: runResult.toolCalls,
+        });
+      } else {
+        log.warn("Deadline continuation cap exhausted on silent one-shot", { agentId, itemId: item.id });
+      }
+      return true;
+    }
+
+    // 4. Re-dispatch — AFTER the notice delivery completed (the adapter
+    //    round-trip also puts real time between finalize's fire-and-forget
+    //    session write and the continuation's store read — belt, ⚠A4).
+    //
+    // META HYGIENE (spec r1 B1): replay markers must NOT leak into the
+    // chain. The processor stamps `outageReplay: true` on every replayItem,
+    // and the dispatcher's three replay branches (resolveReplayRealFailure,
+    // handleOutageTurn's release-before-depth, handleTurnFailure's
+    // pending-release) key on that flag with store filters of {itemId,
+    // agentId} and NO status guard — an inherited flag would let a
+    // continuation leg's later failure resurrect the origin's resolved
+    // `done` doc back to pending (duplicate replay of the ORIGINAL stored
+    // workItem). Strip on EVERY leg construction: a fresh-seeded chain
+    // acquires the flag after one queue round-trip. Everything else in meta
+    // passes through unchanged (blocklist, not allowlist — channel keys
+    // like slackThreadTs are load-bearing for routing and delivery).
+    const { outageReplay: _replayMarker, ...carriedMeta } = item.meta ?? {};
+    const baseId = deadlineBaseIdOf(item.id); // leg ids stay flat: x#dl3, never x#dl1#dl2#dl3 (⚠A11)
+    const originalText =
+      typeof item.meta?.deadlineOriginalText === "string" ? item.meta.deadlineOriginalText : item.text;
+    const retryItem: WorkItem = {
+      ...item,
+      // Per-leg id (⚠A11): a chain leg's own outage enqueue (breaker opens
+      // mid-chain) writes under a FRESH (itemId, agentId) key — a real
+      // $setOnInsert insert beside the origin's terminal doc that serializes
+      // the leg's workItem (counter included) verbatim, never a silent
+      // same-key no-op. Suffixing keeps policyFor's prefix classes intact
+      // (callback:x#dl1 is still callback:-classed). Dedup: a leg's id is
+      // first-seen on the SINGLE-agent path, but fan-out mints the same leg
+      // id once per aborting agent, so dedup carries a deadlineRetry bypass
+      // for engine-authored legs (D39 / child-PR r1 SF-1, pinned T16).
+      id: `${baseId}#dl${n + 1}`,
+      // THREAD-KEY PINNING (spec r2 blocker): every threadId consumer falls
+      // back to item.id when threadId is absent — runWorkItemTurn's session
+      // read (agent-manager.ts:866), the per-thread lock, threadAgentMap,
+      // the task ledger. For threadId-less items (callback:/bg:/ct:/
+      // meeting: completions) the origin leg persisted its session under
+      // key `x` while an unpinned continuation would READ under `x#dl1`:
+      // no resume, ever — the blind fresh re-run Finding-4 forbids.
+      // Materialize the origin's EFFECTIVE thread key before the id changes;
+      // threaded items are unaffected (identity copy).
+      threadId: item.threadId ?? item.id,
+      text: deadlineContinuationWrap(originalText, n + 1, MAX_DEADLINE_CONTINUATIONS + 1),
+      meta: {
+        ...carriedMeta,
+        targetAgentId: agentId, // resolveAgents step 0 — routed exactly like a replay, no re-resolution drift
+        deadlineRetry: n + 1,
+        // Wrap round-trip (T9): a later leg wraps the ORIGINAL request, never
+        // a previous leg's wrap nested.
+        deadlineOriginalText: originalText,
+      },
+    };
+    // Fire-and-forget: awaiting would hold the caller (an adapter handler or
+    // the replay drain) for another full deadline. onProcessingEnd fires for
+    // the aborted leg; the continuation's own dispatch restarts the typing
+    // indicator. The replay drain's statusOf re-read sees `done` (step 1)
+    // and keeps draining — never the "no outcome recorded" defensive revert.
+    void this.dispatch(retryItem).catch((err) =>
+      log.error("Deadline continuation dispatch failed", { agentId, error: String(err) }),
+    );
+    log.info("Deadline continuation dispatched in-process", {
+      agentId,
+      itemId: retryItem.id,
+      threadId: retryItem.threadId,
+      deadlineRetry: n + 1,
+      timedOut: runResult.timedOut,
+      // KPR-401 log-segmentation parity: "Work item dispatched" never fires
+      // for an arm-handled turn, so the aborted leg's spend/latency would
+      // otherwise vanish from log-based dashboards entirely.
+      costUsd: runResult.costUsd,
+      durationMs: runResult.durationMs,
+      llmMs: runResult.llmMs,
+      toolCalls: runResult.toolCalls,
+    });
+    return true;
   }
 
   /**
@@ -590,6 +842,10 @@ export class Dispatcher {
     agentId: string,
     adapter: ChannelAdapter | undefined,
     provider: string,
+    /** KPR-400 (F2): enqueue class — threaded from the exactly two callers;
+     *  $setOnInsert-immutable, so a replayed doc's re-visit here (the
+     *  release-before-depth branch) never rewrites it. */
+    origin: OutageEnqueueOrigin,
   ): Promise<boolean> {
     const outage = this.outage;
     if (!outage) return false;
@@ -645,7 +901,20 @@ export class Dispatcher {
         return true;
       }
 
-      await outage.store.enqueue({ itemId: item.id, agentId, provider, workItem: item, policy });
+      await outage.store.enqueue({
+        itemId: item.id,
+        agentId,
+        provider,
+        workItem: item,
+        policy,
+        enqueueOrigin: origin,
+        // KPR-403: enqueue-time deadline stamp — the doc carries its own
+        // replay-turn wall-clock upper bound (D20 semantics) so the store's
+        // recovery sweep needs no registry access. Both origin callers flow
+        // through this single site; the replayed-fast-fail release branch
+        // above never writes the field ($setOnInsert-immutable, spec ⚠A3).
+        deadlineMs: this.agentManager.turnDeadlineUpperBoundMs(agentId),
+      });
     } catch (storeErr) {
       log.error("Outage enqueue failed — falling back to legacy error path", { error: String(storeErr) });
       return false;
@@ -1036,6 +1305,13 @@ export class Dispatcher {
       }
       if (this.outage && effectiveItem.meta?.outageReplay && runResult.error) {
         await this.resolveReplayRealFailure(effectiveItem, agentId, adapter, runResult.error);
+        return;
+      }
+
+      // KPR-402: same deadline-abort arm as the single-dispatch path — the
+      // fan-out body is a near-duplicate (same placement discipline as
+      // maybeHandlePostTurnOutage above).
+      if (await this.maybeHandleDeadlineAbort(effectiveItem, agentId, adapter, runResult)) {
         return;
       }
 

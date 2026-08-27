@@ -1,4 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+const { mockLog } = vi.hoisted(() => ({
+  mockLog: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
+
 import { OutageQueueStore, type OutageQueueDoc, type OutageEnqueueInput } from "./outage-queue-store.js";
 import type { Collection } from "mongodb";
 import type { WorkItem } from "../types/work-item.js";
@@ -71,8 +77,22 @@ class FakeOutageCollection {
   async findOneAndUpdate(filter: any, update: any, options?: { sort?: Record<string, 1 | -1> }) {
     let candidates = this.docs.filter((d) => matches(d, filter));
     if (options?.sort) {
-      const [[key, dir]] = Object.entries(options.sort);
-      candidates = [...candidates].sort((a, b) => (a[key] < b[key] ? -dir : a[key] > b[key] ? dir : 0));
+      // KPR-400 (F2): multi-key sort, mirroring the ONE BSON type-ordering
+      // fact claimNext relies on — a missing/null field sorts BEFORE any
+      // string (documented Mongo behavior: null/missing < string), so
+      // legacy docs without enqueueOrigin claim with top priority (⚠A5).
+      const entries = Object.entries(options.sort);
+      candidates = [...candidates].sort((a, b) => {
+        for (const [key, dir] of entries) {
+          const aMissing = a[key] === undefined || a[key] === null;
+          const bMissing = b[key] === undefined || b[key] === null;
+          if (aMissing !== bMissing) return (aMissing ? -1 : 1) * dir;
+          if (aMissing && bMissing) continue;
+          if (a[key] < b[key]) return -dir;
+          if (a[key] > b[key]) return dir;
+        }
+        return 0;
+      });
     }
     const doc = candidates[0];
     if (!doc) return null;
@@ -114,6 +134,8 @@ function makeInput(overrides: Partial<OutageEnqueueInput> = {}): OutageEnqueueIn
     provider: "claude",
     workItem: makeWorkItem(),
     policy: "notify",
+    enqueueOrigin: "fast-fail", // KPR-400 (F2): required input field; harness default
+    deadlineMs: 300_000, // KPR-403: required input field; 300s keeps old rows' 360s arithmetic identical
     ...overrides,
   };
 }
@@ -222,20 +244,6 @@ describe("OutageQueueStore (KPR-307)", () => {
     expect(await store.expireOlderThan(cutoff)).toEqual([]);
   });
 
-  it("recoverStaleReplaying reverts only over-age replaying docs", async () => {
-    const { store, fake, advance } = makeStore();
-    await store.enqueue(makeInput({ itemId: "stale" }));
-    await store.claimNext(); // replaying at T0
-    advance(400_000); // > 360s stale threshold
-    await store.enqueue(makeInput({ itemId: "fresh-claim" }));
-    await store.claimNext(); // replaying at T0+400s (fresh)
-
-    const recovered = await store.recoverStaleReplaying();
-    expect(recovered).toBe(1);
-    expect(fake.docs.find((d) => d.itemId === "stale")?.status).toBe("pending");
-    expect(fake.docs.find((d) => d.itemId === "fresh-claim")?.status).toBe("replaying");
-  });
-
   it("statusOf reads the composite-keyed doc", async () => {
     const { store } = makeStore();
     await store.enqueue(makeInput({ agentId: "agent-a" }));
@@ -244,5 +252,174 @@ describe("OutageQueueStore (KPR-307)", () => {
     expect(await store.statusOf("msg-1", "agent-a")).toBe("pending");
     expect(await store.statusOf("msg-1", "agent-b")).toBe("done");
     expect(await store.statusOf("nope", "agent-a")).toBeNull();
+  });
+});
+
+describe("OutageQueueStore — enqueue-origin replay ordering (KPR-400 F2)", () => {
+  it("claimNext prefers fast-fail-class docs, oldest-first within class", async () => {
+    // NEGATIVE-VERIFY prediction (Step 4): pre-fix claimNext sorts on
+    // enqueuedAt alone (and enqueue writes no origin) — the burner (oldest)
+    // claims first and this row fails.
+    const { store, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "burner", enqueueOrigin: "post-turn-fault" })); // T0 — trip-crosser
+    advance(60_000);
+    await store.enqueue(makeInput({ itemId: "ff-old", enqueueOrigin: "fast-fail" })); // T1
+    advance(60_000);
+    await store.enqueue(makeInput({ itemId: "ff-new", enqueueOrigin: "fast-fail" })); // T2
+    expect((await store.claimNext())?.itemId).toBe("ff-old"); // class first, then age
+    expect((await store.claimNext())?.itemId).toBe("ff-new");
+    expect((await store.claimNext())?.itemId).toBe("burner"); // deadline burner replays last
+    expect(await store.claimNext()).toBeNull();
+  });
+
+  it("legacy doc (field absent) claims first — BSON missing < string (deploy-mid-outage window, ⚠A5)", async () => {
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "ff", enqueueOrigin: "fast-fail" })); // T0
+    advance(60_000);
+    await store.enqueue(makeInput({ itemId: "legacy" })); // T1 — then strip the field to simulate pre-KPR-400
+    delete fake.docs.find((d) => d.itemId === "legacy")!.enqueueOrigin;
+    expect((await store.claimNext())?.itemId).toBe("legacy"); // missing sorts before "fast-fail" despite being newer
+    expect((await store.claimNext())?.itemId).toBe("ff");
+  });
+
+  it("constant-ordering pin: 'fast-fail' < 'post-turn-fault' as strings (load-bearing sort, ⚠A2)", () => {
+    // The ascending index/sort on the origin string IS the class
+    // preference. Renaming either literal breaks replay ordering silently —
+    // this row makes it loud. (A numeric weight field is the sanctioned
+    // substitution if a reviewer prefers it.)
+    expect("fast-fail" < "post-turn-fault").toBe(true);
+  });
+
+  it("origin is $setOnInsert-immutable: double-enqueue and back-to-pending release never touch it", async () => {
+    const { store, fake } = makeStore();
+    await store.enqueue(makeInput({ enqueueOrigin: "fast-fail" }));
+    await store.enqueue(makeInput({ enqueueOrigin: "post-turn-fault" })); // same (itemId, agentId) — no-op
+    expect(fake.docs).toHaveLength(1);
+    expect(fake.docs[0].enqueueOrigin).toBe("fast-fail");
+    await store.claimNext();
+    await store.release("msg-1", "agent-a", "pending", "circuit still open"); // fast-failed replay path
+    expect(fake.docs[0].enqueueOrigin).toBe("fast-fail"); // spec §Edge-7: class survives release
+  });
+});
+
+describe("OutageQueueStore — deadline-aware stale-replaying recovery (KPR-403)", () => {
+  it("T1: legacy doc (no deadlineMs) keeps the exact old 360s clock — 7 min recovered, 5 min not", async () => {
+    // Pin, passes both pre- and post-fix by design: fallback (300s) + grace
+    // (60s) = the old flat STALE_REPLAYING_MS. Migrated form of the original
+    // flat-bound recovery row, with the legacy shape made explicit.
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "legacy-old" }));
+    await store.claimNext(); // replaying, lastAttemptAt = T0
+    advance(120_000);
+    await store.enqueue(makeInput({ itemId: "legacy-young" }));
+    await store.claimNext(); // replaying, lastAttemptAt = T0+120s
+    for (const d of fake.docs) delete d.deadlineMs; // simulate pre-KPR-403 docs
+    advance(300_000); // now: old is 420s (>360s) stale, young is 300s (≤360s)
+
+    const recovered = await store.recoverStaleReplaying();
+    expect(recovered).toBe(1);
+    expect(fake.docs.find((d) => d.itemId === "legacy-old")?.status).toBe("pending");
+    expect(fake.docs.find((d) => d.itemId === "legacy-young")?.status).toBe("replaying");
+  });
+
+  it("T2: a doc stamped deadlineMs 900_000 is NOT recovered at 8 minutes (young under its 960s bound)", async () => {
+    // NEGATIVE-VERIFY prediction (Step 4): pre-fix the flat 360s bound
+    // (wrongly) recovers this doc — the replay turn could still be running.
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ deadlineMs: 900_000 }));
+    await store.claimNext(); // replaying, lastAttemptAt = T0
+    advance(480_000); // 8 min — far past the old flat 360s, well under 960s
+
+    expect(await store.recoverStaleReplaying()).toBe(0);
+    expect(fake.docs[0].status).toBe("replaying");
+  });
+
+  it("T3: the same doc at 17 minutes IS recovered to pending — attempts and enqueueOrigin byte-unchanged", async () => {
+    // Paired with T2. The recovery leg matches pre-fix too (1020s > both
+    // bounds), but the deadlineMs-persistence assertion still fails on
+    // pre-fix code (no stamp is ever written); the payload assertions pin
+    // that recovery writes status ONLY.
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ deadlineMs: 900_000, enqueueOrigin: "post-turn-fault" }));
+    await store.claimNext();
+    advance(1_020_000); // 17 min > 900s + 60s grace
+
+    expect(await store.recoverStaleReplaying()).toBe(1);
+    expect(fake.docs[0]).toMatchObject({
+      status: "pending",
+      attempts: 0,
+      enqueueOrigin: "post-turn-fault", // spec §Edge-9: never written by the sweep
+      deadlineMs: 900_000, // stamp immutable through recovery
+    });
+  });
+
+  it("T4: CAS — a doc that moved between the sweep's read and write is left alone", async () => {
+    // The fake's find() snapshots eagerly at call time, so the concurrent
+    // release + re-claim is injected INTO the read→write gap by a one-shot
+    // updateOne interposer: the CAS write then sees a moved lastAttemptAt.
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "stolen" }));
+    await store.claimNext(); // replaying, lastAttemptAt = T0, deadlineMs 300k (harness default)
+    advance(400_000); // past 360s — sweep-eligible on age alone
+
+    const target = fake.docs.find((d) => d.itemId === "stolen")!;
+    const originalUpdateOne = fake.updateOne.bind(fake);
+    fake.updateOne = async (filter: unknown, update: unknown, options?: { upsert?: boolean }) => {
+      fake.updateOne = originalUpdateOne; // interpose exactly once
+      // Simulate a release + fresh re-claim landing after the sweep's find:
+      target.lastAttemptAt = new Date((target.lastAttemptAt as Date).getTime() + 399_000);
+      return originalUpdateOne(filter, update, options);
+    };
+
+    expect(await store.recoverStaleReplaying()).toBe(0); // count excludes the moved doc
+    expect(fake.docs.find((d) => d.itemId === "stolen")?.status).toBe("replaying"); // untouched
+  });
+
+  it("T5: enqueue stamps deadlineMs via $setOnInsert; a re-enqueue with a different value never rewrites it", async () => {
+    // D19 immutability (spec ⚠A3): the enqueue-time stamp is the truth even
+    // after config drift + a back-to-pending release re-visits the same key.
+    const { store, fake } = makeStore();
+    await store.enqueue(makeInput({ deadlineMs: 600_000 }));
+    expect(fake.docs[0].deadlineMs).toBe(600_000);
+    await store.claimNext();
+    await store.release("msg-1", "agent-a", "pending", "circuit still open");
+    await store.enqueue(makeInput({ deadlineMs: 900_000 })); // same (itemId, agentId) — $setOnInsert no-op
+    expect(fake.docs).toHaveLength(1);
+    expect(fake.docs[0].deadlineMs).toBe(600_000);
+  });
+
+  it("a replaying doc with no lastAttemptAt is skipped by recovery, never reverted (skip-with-warn guard)", async () => {
+    // Unreachable via claimNext (it always stamps lastAttemptAt) — pins that
+    // malformed data stays conspicuous rather than being silently recycled.
+    // Passes both pre- and post-fix by design (the old $lt filter never
+    // matched null either); the pin makes the skip a decision, not an accident.
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "malformed" }));
+    fake.docs[0].status = "replaying";
+    fake.docs[0].lastAttemptAt = null;
+    advance(10_000_000);
+    expect(await store.recoverStaleReplaying()).toBe(0);
+    expect(fake.docs[0].status).toBe("replaying");
+  });
+
+  it("the malformed-doc skip warns once per doc per store, not once per 15s tick (sustained-condition latch)", async () => {
+    // The null-lastAttemptAt state is permanent until manual repair, and the
+    // sweep now runs every tick — an unlatched warn would be a 4/min storm.
+    // Skip behavior is unchanged across both sweeps; only the warn is latched.
+    const { store, fake, advance } = makeStore();
+    await store.enqueue(makeInput({ itemId: "malformed-latch" }));
+    fake.docs[0].status = "replaying";
+    fake.docs[0].lastAttemptAt = null;
+    advance(10_000_000);
+    mockLog.warn.mockClear();
+
+    expect(await store.recoverStaleReplaying()).toBe(0);
+    expect(await store.recoverStaleReplaying()).toBe(0); // second tick, same permanent state
+    expect(fake.docs[0].status).toBe("replaying"); // skip identical on both sweeps
+    expect(mockLog.warn).toHaveBeenCalledTimes(1);
+    expect(mockLog.warn).toHaveBeenCalledWith(expect.stringContaining("no lastAttemptAt"), {
+      itemId: "malformed-latch",
+      agentId: "agent-a",
+    });
   });
 });

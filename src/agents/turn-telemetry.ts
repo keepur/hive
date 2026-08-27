@@ -14,6 +14,11 @@ export interface TurnTelemetryDoc {
   cacheCreationTokens: number;
   ephemeral5mTokens?: number;
   ephemeral1hTokens?: number;
+  /** KPR-401: present (true) only on aborted turns with real usage — sparse,
+   * matching the ephemeral-counter optional style. Lets dashboards segment
+   * aborted-turn spend; the aggregation pipelines are deliberately unchanged
+   * (aborted turns' completed API calls are real cache traffic). */
+  aborted?: true;
   createdAt: Date;
 }
 
@@ -28,6 +33,8 @@ export interface TurnTelemetryInput {
   cacheCreationTokens: number;
   ephemeral5mTokens?: number;
   ephemeral1hTokens?: number;
+  /** KPR-401: sparse — set only when true (see TurnTelemetryDoc.aborted). */
+  aborted?: true;
 }
 
 export interface CacheHitRateRow {

@@ -39,4 +39,8 @@ export interface ActivityRecord {
    * slice against `toolCalls` in queries.
    */
   intentTrailer?: true;
+  /** KPR-401: sparse — set only when true, so aborted turns stop
+   * masquerading as free, instant, clean turns in the audit trail. */
+  aborted?: boolean;
+  timedOut?: boolean;
 }
