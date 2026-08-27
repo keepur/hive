@@ -31,6 +31,7 @@ import { SlackGateway } from "./slack/slack-gateway.js";
 import { MemoryManager } from "./memory/memory-manager.js";
 import { Scheduler } from "./scheduler/scheduler.js";
 import { MeetingWorkerPool } from "./workers/meeting-worker-pool.js";
+import { MeetingScribe } from "./workers/meeting-scribe.js";
 import { HealthReporter } from "./health/health-reporter.js";
 import { LinearClient } from "./linear/linear-client.js";
 import { SessionStore } from "./agents/session-store.js";
@@ -757,6 +758,28 @@ async function main(): Promise<void> {
     perMeetingMax: config.meetingWorkers.perMeetingMax,
   });
 
+  // KPR-409: meeting scribe — running summary for the conference full-arm
+  // anchor. Constructed after the pool (it consumes runRoleTurn/hasCapacity)
+  // and injected into the dispatcher by setter, the setSlackAdapter precedent.
+  const meetingScribe = new MeetingScribe({
+    db,
+    registry,
+    pool: workerPool,
+    config: config.meetingWorkers,
+  });
+  // ⚠ NOT awaited-fatal, deliberately diverging from the claim ledger's C27
+  // boot-fatal posture: the scribe's only index is 7-day TTL housekeeping with
+  // no correctness role. Without it, summary docs simply accumulate. Making an
+  // explicitly-optional, always-degradable feature boot-fatal would contradict
+  // this feature's own degrade-silently rule (spec §Integration points issue 5).
+  meetingScribe.ensureIndexes().catch((err) => log.error("Scribe index setup failed", { error: String(err) }));
+  dispatcher.setMeetingScribe(meetingScribe);
+  log.info("Meeting scribe wired", {
+    scribeEnabled: config.meetingWorkers.scribeEnabled,
+    scribeModel: config.meetingWorkers.scribeModel,
+    scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
+  });
+
   // Start watching for agent definition changes
   await registry.startWatching();
 
@@ -880,6 +903,7 @@ async function main(): Promise<void> {
     voiceAdapter?.stop();
     scheduler.stop();
     workerPool.stop();
+    meetingScribe.stop();
     outageReplayProcessor?.stop();
     await bgTaskManager.stop();
     await codeTaskManager.stop();
