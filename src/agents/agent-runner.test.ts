@@ -4401,16 +4401,43 @@ describe("cross-file turn-usage-accounting parity (KPR-401, round-2 finding B)",
     const { q, emit, endOutput } = makeFakeWarmQuery();
     const lease = new WarmVoiceSession({ agentId: "agent-a", threadKey: "agent-a:voice:call-1", onClosed: vi.fn() });
     lease.start(q);
+    // round-3 finding: mirror the runner-side fixture's second message with a
+    // tool_use block too, so totalToolMs > 0 on the warm side as well — a
+    // text-only fixture left the `Math.max(0, durationMs - toolMs)` recompute
+    // below trivially true (0 subtraction) with or without the clamp.
+    // Nonzero toolMs alone still isn't enough to make the clamp load-bearing:
+    // consumeOneTurn's `!sawResult` duration fallback (line ~615) and the
+    // last active tool call's endMs (line ~618) are both plain `Date.now()`
+    // reads of the SAME real clock a few synchronous statements apart, so
+    // toolMs structurally never outruns durationMs by more than sub-ms
+    // scheduler jitter — real-clock racing alone was empirically observed
+    // (dozens of local runs) to never trip Math.max's clamp. So the 4th
+    // `Date.now()` call inside this scenario's consumeOneTurn — pushedAt,
+    // the tool's startMs, the duration fallback, then the tool's endMs, in
+    // that fixed order — is deterministically pushed far into the future,
+    // forcing totalToolMs to deterministically exceed durationMs and proving
+    // the clamp is actually exercised rather than a same-tick coincidence.
+    const realDateNow = Date.now.bind(Date);
+    let dateNowCalls = 0;
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      dateNowCalls += 1;
+      return dateNowCalls === 4 ? realDateNow() + 50_000 : realDateNow();
+    });
     const leasePromise = lease.runTurn({ text: "hi", timeoutMs: 60_000 });
     await Promise.resolve();
     emit({ type: "assistant", message: { id: "msg_shared", usage: USAGE, content: [{ type: "text", text: "a" }] } });
-    emit({ type: "assistant", message: { id: "msg_shared", usage: USAGE, content: [{ type: "text", text: "a" }] } });
+    emit({
+      type: "assistant",
+      message: { id: "msg_shared", usage: USAGE, content: [{ type: "tool_use", name: "Bash", id: "toolu_1" }] },
+    });
     // Real elapsed time so the `!sawResult` wall-clock fallback is provably
     // nonzero rather than a same-tick 0 (matches the stream-death pin in
     // warm-voice-session.test.ts).
     await new Promise((r) => setTimeout(r, 5));
     endOutput();
     const leaseResult = await leasePromise;
+    dateNowSpy.mockRestore();
+    expect(dateNowCalls).toBe(4); // pins the call-count this fixture depends on
     lease.close("test-cleanup");
 
     for (const result of [runnerResult, leaseResult]) {
