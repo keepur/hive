@@ -1,6 +1,6 @@
 # KPR-417 — Delay-then-ack for long-running conference turns
 
-**Epic:** KPR-415 (Meeting mode hardening) · **Child:** B1 · **Kind:** child spec · **Status:** spec-ready (draft)
+**Epic:** KPR-415 (Meeting mode hardening) · **Child:** B1 · **Kind:** child spec · **Status:** spec-ready — approved spec-review/2/opus (tier-degraded, operator-override), clean
 **Governing design:** `keepur/hive-docs` → `internal/specs/2026-08-28-meeting-mode-hardening-design.md`, §"Design — Child B1: delay-then-ack for long-running turns", §"Background" (trial observation 2), §"Testing expectation (epic-level)" (approved, spec-review/8/frontier, clean)
 **Repo baseline:** `hive-KPR-415` worktree, branch `KPR-415` at `118bde4`. Every line citation below was re-verified against this tree.
 **Revision:** r1 — spec-review round 1 (5 blocking + 6 advisory findings folded in). Changed since r0: Key Points bullet on replay/leg ack-freedom (the two paths fail to ack for *different* reasons — replays retain conference meta); §11's behavioral dependency re-stated as depending on KPR-416's *relocation*, not its predicate (T11's purpose corrected to match); §6.6 added (KPR-308 outage diversion — the fifth orphan shape); §9's fake-timer/drain reconciliation prescribed; `MEETING_ACK_TEXT` changed to `"On it — picked this up."` so the text and its honesty rationale agree during the lock-wait window.
