@@ -127,9 +127,12 @@ export class Dispatcher {
    *  Absent ⇒ every conference path behaves exactly as pre-KPR-409. */
   private meetingScribe?: MeetingScribe;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
-  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents that responded or were
-  // selected to respond on this human message, either round (KPR-387): round-0
-  // primaries recorded at selection time, round-1 reactors at claim time.
+  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents excluded from
+  // reacting on this human message, either round (KPR-387). Round-0 primaries
+  // are recorded at DELIVERY time (KPR-416 — markReactionExclusion, three call
+  // sites; supersedes KPR-386 canon C1's selection-time recording, so a
+  // SUPPRESSED primary is no longer excluded), round-1 reactors at claim time
+  // (triggerConferenceReactions). Shape, keying and TTL are unchanged (C2).
   private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
@@ -560,6 +563,48 @@ export class Dispatcher {
       });
       return false;
     }
+  }
+
+  /**
+   * KPR-416: mark reaction-exclusion at DELIVERY time. One rule —
+   *
+   *   an agent is excluded from reacting on a trigger iff its own round-0
+   *   turn on that trigger handed text to delivery
+   *
+   * — implemented as one helper called from three sites (fan-out delivery,
+   * single-dispatch delivery, handleTurnFailure's adapter arm) so the
+   * invariant is auditable rather than emergent. "Handed to delivery", not
+   * "was posted": the call sites sit immediately before the delivery call, so
+   * a diverted (tryOutageDiversion) or adapter-less delivery still marks —
+   * the turn ran and consumed the trigger (spec §4).
+   *
+   * Keyed on `meta.meetingExclusionTs`, stamped round-0-only in
+   * dispatchToAgent's conference meta block. That key rides item.meta, so it
+   * reaches every delivery path for free: the outage-queued document, every
+   * KPR-402 continuation leg (whose construction strips the four `conference*`
+   * keys but not this one — deliberately named outside that family), and both
+   * handleTurnFailure legs. Engine-authored notices (KPR-307 outage, KPR-402
+   * first-abort/terminal, replay-terminal) never reach a call site and so
+   * never mark: they are engine chrome, not agent content.
+   *
+   * Synchronous and idempotent (Set add). Tracker shape, keying and TTL are
+   * unchanged — KPR-386 canon C2 preserved, C1 superseded.
+   * Spec: docs/epics/kpr-415/kpr-416-spec.md §5.3.
+   */
+  private markReactionExclusion(item: WorkItem, agentId: string): void {
+    const ts = item.meta?.meetingExclusionTs;
+    // Type-guarded, not cast: meta is Record<string, unknown> and this helper
+    // sits on the hot path of every single-dispatch turn in the engine, where
+    // the key is absent. Anything that is not a non-empty string is a no-op.
+    if (typeof ts !== "string" || ts.length === 0) return;
+    const threadId = item.threadId ?? item.id;
+    if (!this.meetingReactionTracker.has(threadId)) {
+      this.meetingReactionTracker.set(threadId, new Map());
+    }
+    const threadTracker = this.meetingReactionTracker.get(threadId)!;
+    const responded = threadTracker.get(ts) ?? new Set<string>();
+    responded.add(agentId);
+    threadTracker.set(ts, responded);
   }
 
   /**
