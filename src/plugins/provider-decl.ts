@@ -65,7 +65,7 @@ const ENV_KEY_REGEX = /^[A-Z][A-Z0-9_]*$/;
  * §4.9: a plugin provider is never handed a sibling's credential. `api-key-env`
  * is otherwise unconstrained — the engine resolves whatever it names through
  * env → Honeypot Keychain and hands the value to the plugin's module — so a
- * manifest naming e.g. ANTHROPIC_API_KEY or GROK_GATEWAY_KEY would be a
+ * manifest naming e.g. ANTHROPIC_API_KEY or GEMINI_API_KEY would be a
  * curated-registry credential grab. Derived from the curated registry itself,
  * never hand-copied, so new engine credentials are covered the day they land.
  * (credential-registry.ts is pure data with no imports of its own — the

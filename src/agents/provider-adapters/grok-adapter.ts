@@ -1,27 +1,33 @@
 /**
- * KPR-392: GrokGatewayAdapter — grok's Lane B native adapter, the fourth
- * consumer of the KPR-391 implementation layer (LaneBTurnScaffold +
+ * KPR-392: GrokAdapter — grok's Lane B native adapter, the fourth consumer
+ * of the KPR-391 implementation layer (LaneBTurnScaffold +
  * runBoundedDispatchLoop + module registry).
  *
- * Wire surface (spec §4.1): the operator-hosted CLIProxyAPI gateway's
- * OpenAI chat-completions endpoint — POST {baseUrl}/v1/chat/completions,
- * stream: true, stream_options.include_usage — the thinnest translation to
- * xAI's OpenAI-format backend (the KPR-384 lesson: cross-shape translation
- * layers breed quirks). The gateway keeps the `grok login` subscription
- * OAuth; hive holds only a gateway allowlist key (GROK_GATEWAY_KEY),
- * CALLER-resolved (env→Honeypot per spawn in agent-manager's grok arm) and
+ * KPR-410: talks to xAI's own OpenAI-format chat-completions endpoint
+ * directly — POST https://api.x.ai/v1/chat/completions, stream: true,
+ * stream_options.include_usage. The operator-hosted CLIProxyAPI gateway
+ * (KPR-384) this adapter used to sit behind is retired: the schema quirk
+ * that justified it (xAI's Anthropic-compat /v1/messages 400s on tool
+ * schemas missing `required`) never applied to this adapter's
+ * OpenAI-format call shape in the first place, and ToolBridge's
+ * normalizeSchema (tool-bridge.ts:538) fills `required: []` on every
+ * bridged schema regardless. Auth is the machine's `grok login`
+ * subscription OAuth session, resolved and refreshed by grok-oauth.ts
+ * (revived KPR-371 machinery) — hive holds the access token directly,
+ * CALLER-resolved (agent-manager's grok arm, per spawn) and
  * constructor-injected — never resolved in-adapter (DOD-212 / C7).
  *
- * Session semantics (spec §4.2): stateless-replay — the codex model minus
- * codex's quirks. Hive-persisted chat messages replay via TurnHistoryStore
- * (provider "grok"; system prompt NEVER stored — it assembles fresh each
- * turn); success-only whole-turn append; NO in-adapter 4xx self-heal (the
- * loop's onRequestError hook stays unused — grok replay items are plain
- * messages hive composed, so a 4xx on them is a real request-shape bug that
- * heal-by-clear would mask); no encrypted-reasoning replay. Session hooks
- * are scaffold defaults (no fabrication); the success sessionId is the loop
- * formula lastProviderRoundId ?? fallback, fed the LAST round's
- * chat-completion id — cosmetic under stateless-replay, never persisted.
+ * Session semantics (spec §4.2, unchanged by KPR-410): stateless-replay —
+ * the codex model minus codex's quirks. Hive-persisted chat messages
+ * replay via TurnHistoryStore (provider "grok"; system prompt NEVER
+ * stored — it assembles fresh each turn); success-only whole-turn append;
+ * NO in-adapter 4xx self-heal (the loop's onRequestError hook stays
+ * unused — grok replay items are plain messages hive composed, so a 4xx
+ * on them is a real request-shape bug that heal-by-clear would mask); no
+ * encrypted-reasoning replay. Session hooks are scaffold defaults (no
+ * fabrication); the success sessionId is the loop formula
+ * lastProviderRoundId ?? fallback, fed the LAST round's chat-completion id
+ * — cosmetic under stateless-replay, never persisted.
  *
  * C5 from birth (spec §4.4): every request/stream error decoration carries
  * the status when one exists — never codex's response.failed message-only
@@ -40,10 +46,8 @@ import {
 import { runBoundedDispatchLoop } from "./dispatch-loop.js";
 import { parseSseEvent, splitSseEvents, isSseDone, type SseEvent } from "./sse.js";
 
-/** KPR-384 posture, unchanged by the promotion: loopback default; the
- *  GROK_GATEWAY_URL override is validated at the manager
- *  (assertSafeBaseUrlOverride — https, or http to loopback only). */
-export const DEFAULT_GROK_GATEWAY_URL = "http://127.0.0.1:8317";
+/** KPR-410: xAI's own OpenAI-format endpoint — no override, no gateway. */
+export const GROK_API_BASE_URL = "https://api.x.ai";
 /** KPR-371 §3.5: the subscription session exposes only grok-4.6/grok-4.5. */
 export const DEFAULT_GROK_MODEL = "grok-4.6";
 
@@ -70,14 +74,13 @@ export function __resetGrokCoercionWarnedForTests(): void {
   coercionWarned.clear();
 }
 
-export interface GrokGatewayAdapterOptions {
+export interface GrokAdapterOptions {
   name: string;
   assembly: ProviderTurnAssembly;
   model?: string;
-  /** GROK_GATEWAY_KEY — caller-resolved per spawn; never resolved here. */
+  /** Resolved xAI OAuth access token — caller-resolved per spawn via
+   *  grok-oauth.ts; never resolved here. */
   apiKey?: string;
-  /** Validated gateway base URL — caller-resolved; defaults to loopback. */
-  baseUrl?: string;
   reasoningEffort?: ReasoningEffort;
   fetch?: typeof fetch;
   /** Stateless-replay history (primary context only — the module omits both
@@ -110,10 +113,10 @@ export interface GrokStreamState {
   assembled: GrokToolCall[];
 }
 
-export class GrokGatewayAdapter extends LaneBTurnScaffold {
+export class GrokAdapter extends LaneBTurnScaffold {
   readonly provider = "grok" as const;
 
-  constructor(private readonly options: GrokGatewayAdapterOptions) {
+  constructor(private readonly options: GrokAdapterOptions) {
     super({ name: options.name, assembly: options.assembly });
   }
 
@@ -146,14 +149,15 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
           .catch((): unknown[] => [])
       : [];
 
-    // Bare-construction guard only: the manager's grok arm resolves
-    // GROK_GATEWAY_KEY (env→Honeypot) and throws TurnAssemblyError BEFORE
-    // construction (breaker-invisible config fault). Phrased to hit the
-    // FAULT_PATTERNS auth row if it ever surfaces from a bare construction.
+    // Bare-construction guard only: the manager's grok arm resolves the
+    // OAuth access token via grok-oauth.ts and throws TurnAssemblyError
+    // BEFORE construction (breaker-invisible config fault). Phrased to hit
+    // the FAULT_PATTERNS auth row if it ever surfaces from a bare
+    // construction.
     const apiKey = this.options.apiKey;
     if (!apiKey) {
       throw new Error(
-        "Grok gateway API key is not available; seed GROK_GATEWAY_KEY via `hive credentials add GROK_GATEWAY_KEY`",
+        "Grok API key is not available; run `grok login` to sign in, then retry",
       );
     }
 
@@ -183,7 +187,7 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
      *  hive's tool results. Persisted only on success. */
     const thisTurnItems: unknown[] = [userMessage];
 
-    const endpoint = `${(this.options.baseUrl ?? DEFAULT_GROK_GATEWAY_URL).replace(/\/+$/, "")}/v1/chat/completions`;
+    const endpoint = `${GROK_API_BASE_URL}/v1/chat/completions`;
     const reasoningEffort = this.resolveReasoningEffort();
 
     const outcome = await runBoundedDispatchLoop<GrokStreamState, GrokToolCall>({
@@ -210,7 +214,7 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
         // C5: status-prefixed decoration, thrown directly — no onRequestError
         // hook (no self-heal, §4.2), so the throw routes through the loop to
         // the scaffold containment frame and classifies on the status.
-        if (!response.ok) throw new Error(await gatewayErrorMessage(response));
+        if (!response.ok) throw new Error(await grokErrorMessage(response));
 
         const state = await consumeGrokSse(response.body, request.onStream, harness.isAborted);
         // Edge 3: assemble fragments BEFORE harvest — partial calls are
@@ -220,12 +224,12 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
         if (!harness.isAborted()) {
           state.assembled = assembleToolCalls(state, this.options.name);
           // Edge 3 spirit guard: finish_reason=tool_calls with zero
-          // assembled calls is a gateway stream-shape fault, never a
+          // assembled calls is a stream-shape fault, never a
           // silent empty harvest. "terminated" lands on the connect-fail
           // FAULT_PATTERNS row, sibling-style with the other edge-3 anomalies.
           if (state.finishReason === "tool_calls" && state.assembled.length === 0) {
             throw new Error(
-              "Grok gateway stream signaled tool_calls but no tool calls were assembled — connection terminated mid-stream",
+              "Grok stream signaled tool_calls but no tool calls were assembled — connection terminated mid-stream",
             );
           }
         }
@@ -260,7 +264,7 @@ export class GrokGatewayAdapter extends LaneBTurnScaffold {
       // deduped list. The loop-level hook (correct for codex's Responses
       // shape, where the assistant turn is server-side) was wrong here: the
       // assistant message is composed from `state.assembled` BEFORE the loop
-      // filters, so a gateway-repeated id shipped two tool_calls with one
+      // filters, so a repeated id shipped two tool_calls with one
       // tool_call_id response — a malformed chat-completions request.
       // Gemini's pattern (harvest owns dedup, hook omitted) is now grok's.
       harvest: (state) => state.assembled,
@@ -329,7 +333,7 @@ async function executeGrokToolCall(
 
 /** Edge 3: fragment assembly — index order, id/name required. A fragment
  *  set missing either is a mid-stream drop, decorated as such ("terminated"
- *  lands on the connect-fail row — the gateway is grok route
+ *  lands on the connect-fail row — xAI's endpoint is grok route
  *  infrastructure; its death is a grok outage).
  *
  *  KPR-407 (finding 2): call-id dedup lives HERE, not at the loop's callId
@@ -345,11 +349,11 @@ function assembleToolCalls(state: GrokStreamState, agent: string): GrokToolCall[
     const frag = state.fragments.get(index)!;
     if (!frag.id || !frag.name) {
       throw new Error(
-        `Grok gateway stream delivered an incomplete tool_call at index ${index} (missing id or name) — connection terminated mid-stream`,
+        `Grok stream delivered an incomplete tool_call at index ${index} (missing id or name) — connection terminated mid-stream`,
       );
     }
     if (seen.has(frag.id)) {
-      log.warn("Grok gateway repeated a tool_call id — dropping the later fragment (KPR-407)", {
+      log.warn("Grok repeated a tool_call id — dropping the later fragment (KPR-407)", {
         agent,
         callId: frag.id,
         tool: frag.name,
@@ -368,7 +372,7 @@ export async function consumeGrokSse(
   onStream: ((chunk: string) => void) | undefined,
   isAborted: () => boolean = () => false,
 ): Promise<GrokStreamState> {
-  if (!body) throw new Error("Grok gateway response did not include a stream body");
+  if (!body) throw new Error("Grok response did not include a stream body");
 
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -400,10 +404,10 @@ export async function consumeGrokSse(
   }
 
   // Edge 3: a stream that ended without any finish_reason (and was not
-  // aborted by hive) is a gateway drop — surface it, never a silent empty
+  // aborted by hive) is a drop — surface it, never a silent empty
   // harvest. "terminated" lands on the connect-fail FAULT_PATTERNS row.
   if (!isAborted() && state.finishReason === undefined) {
-    throw new Error("Grok gateway stream ended without finish_reason — connection terminated mid-stream");
+    throw new Error("Grok stream ended without finish_reason — connection terminated mid-stream");
   }
   return state;
 }
@@ -435,8 +439,8 @@ function applyGrokChunk(event: SseEvent, state: GrokStreamState, onStream?: (chu
     const message = stringField(errorObj, "message") ?? JSON.stringify(errorObj);
     throw new Error(
       status !== undefined && status !== null
-        ? `Grok gateway stream failed (${String(status)}): ${message}`
-        : `Grok gateway stream failed: ${message}`,
+        ? `Grok stream failed (${String(status)}): ${message}`
+        : `Grok stream failed: ${message}`,
     );
   }
 
@@ -493,7 +497,7 @@ function applyGrokChunk(event: SseEvent, state: GrokStreamState, onStream?: (chu
 
 /** C5 decoration — mirrors codex's responseErrorMessage shape exactly
  *  (`(<status>):` is what the FAULT_PATTERNS rows key on). */
-async function gatewayErrorMessage(response: Response): Promise<string> {
+async function grokErrorMessage(response: Response): Promise<string> {
   const text = await response.text();
   const payload = parseJson(text);
   const message =
@@ -501,7 +505,7 @@ async function gatewayErrorMessage(response: Response): Promise<string> {
     stringField(payload, "detail") ??
     stringField(payload, "message") ??
     text;
-  return `Grok gateway request failed (${response.status}): ${message}`;
+  return `Grok request failed (${response.status}): ${message}`;
 }
 
 function parseJson(value: string): Record<string, unknown> | null {

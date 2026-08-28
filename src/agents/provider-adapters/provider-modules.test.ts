@@ -12,7 +12,7 @@ import { LANE_B_PROVIDER_MODULES } from "./provider-modules.js";
 import { CodexSubscriptionAdapter } from "./codex-subscription-adapter.js";
 import { GeminiInteractionsAdapter } from "./gemini-interactions-adapter.js";
 import { OpenAIAgentsAdapter } from "./openai-agents-adapter.js";
-import { GrokGatewayAdapter } from "./grok-gateway-adapter.js";
+import { GrokAdapter } from "./grok-adapter.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { LaneBModuleDeps } from "./provider-module.js";
 import type { LaneBProviderId } from "./types.js";
@@ -52,7 +52,7 @@ const OWN_SLICE: Record<LaneBProviderId, { agentModel?: string; apiKey?: string;
   codex: { agentModel: "cfg-codex" },
   openai: { agentModel: "cfg-openai" },
   gemini: { agentModel: "cfg-gemini", apiKey: "k" },
-  grok: { agentModel: "cfg-grok", apiKey: "gk", baseUrl: "http://gateway:9" },
+  grok: { agentModel: "cfg-grok", apiKey: "gk" },
 };
 
 function depsFor(provider: LaneBProviderId, overrides: Partial<LaneBModuleDeps> = {}): LaneBModuleDeps {
@@ -87,7 +87,7 @@ describe("LANE_B_PROVIDER_MODULES", () => {
     expect(openai.provider).toBe("openai");
     expect(gemini).toBeInstanceOf(GeminiInteractionsAdapter);
     expect(gemini.provider).toBe("gemini");
-    expect(grok).toBeInstanceOf(GrokGatewayAdapter);
+    expect(grok).toBeInstanceOf(GrokAdapter);
     expect(grok.provider).toBe("grok");
   });
 
@@ -193,14 +193,13 @@ describe("LANE_B_PROVIDER_MODULES", () => {
       expect(optionsOf(LANE_B_PROVIDER_MODULES.grok.createAdapter({ name: "A", route: { model: "" }, assembly, context: "primary", deps })).model).toBe("grok-4.6");
     });
 
-    it("threads apiKey (GROK_GATEWAY_KEY) and baseUrl from its OWN deps slice", () => {
-      const withBoth = optionsOf(
+    it("threads apiKey (grok's resolved OAuth access token) from its OWN deps slice", () => {
+      const withKey = optionsOf(
         LANE_B_PROVIDER_MODULES.grok.createAdapter({ name: "A", route: { model: "m" }, assembly, context: "primary", deps: depsFor("grok") }),
       );
-      expect(withBoth.apiKey).toBe("gk");
-      expect(withBoth.baseUrl).toBe("http://gateway:9");
+      expect(withKey.apiKey).toBe("gk");
 
-      const withoutEither = optionsOf(
+      const withoutKey = optionsOf(
         LANE_B_PROVIDER_MODULES.grok.createAdapter({
           name: "A",
           route: { model: "m" },
@@ -209,8 +208,7 @@ describe("LANE_B_PROVIDER_MODULES", () => {
           deps: makeDeps({ providerConfig: { agentModel: "cfg-grok" } }),
         }),
       );
-      expect(withoutEither.apiKey).toBeUndefined();
-      expect(withoutEither.baseUrl).toBeUndefined();
+      expect(withoutKey.apiKey).toBeUndefined();
     });
 
     it("passes the route's reasoningEffort through", () => {
