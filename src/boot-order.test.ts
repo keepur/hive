@@ -91,16 +91,27 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // preceding-context window (`codeOnly.slice(match.index - 40, ...)`)
     // let a genuine offender placed immediately after an allowlisted call
     // (e.g. on the very next line) silently pass — the allowlisted string
-    // was still inside the new match's own 40-char window. Match the
-    // receiver exactly instead: capture the identifier immediately before
-    // `.start(`/`.scanOrphans(` and compare the whole call, not a window.
-    const pattern = /([A-Za-z_$][\w$]*)\.(start|scanOrphans)\s*\(/g;
+    // was still inside the new match's own 40-char window. Matching the
+    // receiver exactly (round 1's fix) closed that, but round 2 found the
+    // exact-identifier regex was too narrow the OTHER way: a receiver that
+    // isn't a bare identifier — `x?.start()`, `x!.start()`, `new X().start()`,
+    // `arr[0].start()`, `getX().start()` — produced NO match at all, so it
+    // was invisible rather than misclassified. index.ts already uses `?.`
+    // for conditionally-constructed surfaces (`voiceAdapter?.stop()`,
+    // `meetingMonitor?.stop()`, etc.), so a future `newSurface?.start()` in
+    // the file's own idiom would have slipped past silently. The alternation
+    // below accepts a bare identifier (captured) OR the tail of a call/index/
+    // non-null expression (`)`, `]`, `!`), with an optional `?` before the
+    // dot for optional chaining — every receiver shape either resolves to a
+    // real identifier or normalizes to the un-allowlistable `<expr>.method(`.
+    const pattern = /(?:([A-Za-z_$][\w$]*)|[)\]!])\s*\??\.\s*(start|scanOrphans)\s*\(/g;
     let match: RegExpExecArray | null;
     const offenders: string[] = [];
     while ((match = pattern.exec(codeOnly)) !== null) {
       if (match.index >= wiringStart) continue; // only care about matches BEFORE the wiring
-      if (allowlist.includes(match[0])) continue;
-      offenders.push(match[0]);
+      const call = `${match[1] ?? "<expr>"}.${match[2]}(`;
+      if (allowlist.includes(call)) continue;
+      offenders.push(call);
     }
     expect(
       offenders,
