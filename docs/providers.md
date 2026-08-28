@@ -35,7 +35,7 @@ There are two lanes behind that routing:
 | 14. Streaming | `full` | `full` — unchanged | `full` | `full` | `full` | `full` |
 | 15. Ops integration (breaker/outage/telemetry/usage) | `full` | `caveat(costUsd nominal — Claude pricing math)` [^15] | `caveat(token counts report 0)` [^15] | `caveat(costUsd 0; real token counts)` [^15] | `caveat(costUsd 0; real token counts)` [^15] | `caveat(costUsd 0; real token counts)` [^15] |
 | 16. Auth & credentials | `full` — subscription OAuth [^16] | `full` — per-provider API key via Honeypot [^16] | `caveat(.env only)` [^16] | `caveat(paid-tier key for production)` [^16] | `full` — subscription OAuth [^16] | `full` — subscription OAuth [^16] |
-| 17. Validation status | `production (baseline)` | `live-unvalidated; production reassignment gated on funded-key validation` | `unit + 401-boundary; live legs key-conditioned, open` | `live-validated (dev key); production gated on paid tier` | `production-validated` | unit-tested; direct-to-xAI behavior validated by the KPR-410 spike (2026-08-27, 200 response with a valid completion) — the KPR-384 gateway rollout's V4–V6 validation legs are superseded, their subject having been retired |
+| 17. Validation status | `production (baseline)` | `live-unvalidated; production reassignment gated on funded-key validation` | `unit + 401-boundary; live legs key-conditioned, open` | `live-validated (dev key); production gated on paid tier` | `production-validated` | `unit-tested; direct-to-xAI behavior validated by the KPR-410 spike (2026-08-27, 200 response with a valid completion) — the KPR-384 gateway rollout's V4–V6 validation legs are superseded, their subject having been retired` |
 
 ## Footnotes
 
