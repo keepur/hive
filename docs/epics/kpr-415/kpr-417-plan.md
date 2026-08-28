@@ -18,16 +18,18 @@
 
 Per the epic's waterfall mode, **KPR-416 implements and merges into the epic branch before KPR-417 starts.** This plan's line numbers are as of `e0819fa` (pre-KPR-416). KPR-416's own plan (`kpr-416-plan.md`) tells us exactly what shape it leaves behind. Where a step's anchor is affected, it is flagged inline with **`⚠ POST-416 SHIFT`**. Summary of what KPR-416 changes in `dispatcher.ts`, in file order:
 
-| KPR-416 edit | Where (pre-416 line) | Net effect on this plan |
+> **⚠ NO LINE-SHIFT ARITHMETIC IS GIVEN, DELIBERATELY.** An earlier draft carried "~+N lines" estimates per row and cumulative "~+N above call site X" totals; they were measurably wrong and internally inconsistent, and they were **decorative** — every edit step in this plan already anchors on quoted verbatim text, not on a line number. The one rule that matters: **everything below the earliest KPR-416 edit shifts. Once KPR-416 has landed, always anchor on the quoted verbatim text, never on a line number.** The table below records *where each KPR-416 edit sits relative to this plan's anchors* — a structural fact — and nothing about how far anything moved.
+
+| KPR-416 edit | Where (pre-416 line) | Relation to this plan's anchors |
 |---|---|---|
-| Tracker field comment rewritten | `:130-133` | +~3 lines above my field insertion point. **My anchor (`private meetingReactionTracker = new Map<...>();` + the following `private static readonly DEDUP_TTL_MS`) is byte-identical pre and post.** |
-| `markReactionExclusion` write site 2 inserted | `:411` (single-dispatch `else`) | +~9 lines. Nothing of mine is in this block. |
-| `markReactionExclusion` helper inserted | after `:563` | +~42 lines. Everything below shifts. |
-| Write site 3 in `handleTurnFailure` | `:623` | +~12 lines. Nothing of mine here. |
-| KPR-388 premise comment rewritten | `:1344-1351` | +~26 lines *inside* `dispatchToAgent`, **above** my turn-await wrap. My anchor is the await statement itself, untouched by 416. |
-| `meetingExclusionTs` stamped in the conference meta block | `:1373-1382` | +~20 lines, still above my wrap. Untouched anchor. |
-| `markReactionExclusion` write site 1 in the fan-out `else` | `:1481` (immediately before `deliverAgentResult`) | +~8 lines, **below** my wrap. Untouched anchor. |
-| Selection-time tracker write **deleted**, comment rewritten | `:1635-1650` | Net +~13 lines, sits **between** my two `fetchMeetingHistory` call sites (site 1 at `:1576` is above it, site 2 at `:1932` below). Site 1's anchor is unaffected; site 2 shifts down. Both anchors are quoted text. |
+| Tracker field comment rewritten | `:130-133` | Directly above my field insertion point. **My anchor (`private meetingReactionTracker = new Map<...>();` + the following `private static readonly DEDUP_TTL_MS`) is byte-identical pre and post.** |
+| `markReactionExclusion` write site 2 inserted | `:411` (single-dispatch `else`) | Nothing of mine is in this block. |
+| `markReactionExclusion` helper inserted | after `:563` | Everything below shifts. This is the earliest edit that moves my anchors' line numbers. |
+| Write site 3 in `handleTurnFailure` | `:623` | Nothing of mine here. |
+| KPR-388 premise comment rewritten | `:1344-1351` | *Inside* `dispatchToAgent`, **above** my turn-await wrap. My anchor is the await statement itself, untouched by 416. |
+| `meetingExclusionTs` stamped in the conference meta block | `:1373-1382` | Still above my wrap. Untouched anchor. |
+| `markReactionExclusion` write site 1 in the fan-out `else` | `:1481` (immediately before `deliverAgentResult`) | **Below** my wrap. Untouched anchor. |
+| Selection-time tracker write **deleted**, comment rewritten | `:1635-1650` | Sits **between** my two `fetchMeetingHistory` call sites (site 1 at `:1576` is above it, site 2 at `:1932` below). Site 1's anchor is unaffected; site 2 shifts down. Both anchors are quoted text. |
 
 **Nothing in KPR-416 and nothing in this plan edits the same statement.** The two children are genuinely disjoint inside `dispatchToAgent`: A adds a synchronous statement immediately before `deliverAgentResult` (`:1481`), B1 wraps the `runWorkItemTurn` await (`:1400`). The one shared *file* is `dispatcher-conference.test.ts`, where both append new tests — merge conflicts there are additive and mechanical.
 
@@ -66,7 +68,7 @@ This worktree has **no `node_modules`** — verified at plan time (`ls node_modu
 - **Unit: required.**
   - *Scope:* `Dispatcher`'s ack arm/fire/cancel lifecycle and its round-0 gate; the ack recognition pattern and the single strip point across all five history consumers; the `ackEnabled` config resolver; the `index.ts` boot-order anchor.
   - *Reason:* the entire change is dispatcher-internal control flow plus one liberal-loader config key and one boot-wiring line. There is no I/O boundary to integrate against, no new schema, no new collection, no new Slack scope (spec §7, "Files touched").
-  - *Minimum assertions:* 14 test cases — T1, T2, T3, T4(a), T4(b), T5 (5 sub-assertions × 2 lever rows, folding T6 in as a parameterized row per spec §9's sanction), T7(a), T7(b) (4 resolver cases), T8 (2 arms), T9 (3 arms), T10 (2 arms), T11 (+ 1 KPR-416-dependent companion), T12, T13 (2 structural pins), T14. Executed `it` count is higher than 14 (several are `it.each` or sibling `it`s).
+  - *Minimum assertions:* 15 test cases — T1, T2, T3, T4(a), T4(b), T5 (5 sub-assertions × 2 lever rows, folding T6 in as a parameterized row per spec §9's sanction), T7(a), T7(b) (4 resolver cases), T8 (2 arms), T9 (3 arms), T10 (2 arms), T11 (+ 1 KPR-416-dependent companion), T12, T13 (2 structural pins), T14. Executed `it` count is higher than 15 (several are `it.each` or sibling `it`s).
 - **Integration: not-required.** See Non-Required Rationale.
 - **E2E: not-required.** See Non-Required Rationale.
 
@@ -149,7 +151,7 @@ Everything needed already exists in `src/channels/dispatcher-conference.test.ts`
    *  advanceTimersByTimeAsync(0) provides the same macrotask boundary. */
   const settleAcked = () => vi.advanceTimersByTimeAsync(0);
   ```
-- **Do not use `vi.waitFor` inside the ack block.** Its polling uses `setTimeout`, which the fake clock captures — it deadlocks. Drive every drain with `settleAcked()` / `advanceTimersByTimeAsync(n)` instead. (Outside the block, existing tests keep `vi.waitFor` unchanged.)
+- **Do not use `vi.waitFor` inside the ack block** — **not because it deadlocks (it does not).** Verified against the installed vitest 4.1.11 source (`node_modules/vitest/dist/chunks/test.DNmyFkvJ.js:3359-3400`): `waitFor` destructures its timers from `getSafeTimers()` — the *native, unfaked* timers stashed before `useFakeTimers()` installs — so its own polling is never captured by the fake clock, and it additionally calls `if (vi.isFakeTimers()) vi.advanceTimersByTime(interval)` inside its `checkCallback`. It **explicitly supports fake timers by design.** The reason to avoid it here is the opposite problem: it *fights these tests for control of the clock.* Each poll cycle auto-advances the fake clock by the polling `interval` (50ms), **synchronously**, through the exact bare `vi.advanceTimersByTime` API this block otherwise forbids — perturbing the very clock T1/T3/T8-T12 are stepping deliberately across a 15s threshold. Drive every drain with `settleAcked()` / `advanceTimersByTimeAsync(n)` instead. (Outside the block, existing tests keep `vi.waitFor` unchanged.)
 - Canonical timing sequence: arm (dispatch **without awaiting**, with a manually-settled `runWorkItemTurn` promise) → `await settleAcked()` (let dispatch reach the turn await) → `await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS)` → assert the ack → settle the turn → `await dispatched` → `await settleAcked()` → assert the downstream (answer, notice, leg, or reaction).
 - **Sanctioned fallback if a single case is still stubborn:** `vi.useFakeTimers({ shouldAdvanceTime: true })` for that case alone. Do **not** fall back to real timers with a literal 15s wait, and do **not** lower `MEETING_ACK_DELAY_MS` for tests.
 
@@ -319,7 +321,9 @@ Run:
 ```bash
 cd /Users/mokie/github/hive-KPR-415 && npm run typecheck && SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/config.test.ts
 ```
-Expected: typecheck exits 0. `config.test.ts` all green including the new `KPR-417` case. The three existing `toEqual(DEFAULT_MEETING_WORKERS_CONFIG)` cases (`:167-169`, `:221`) still pass — they compare against the constant, which now carries `ackEnabled: true`, so they need no edit.
+Expected: typecheck exits 0 — **but note `tsconfig.json:18` excludes `src/**/*.test.ts` entirely, so `npm run typecheck` gives no type-safety signal for the new test case itself; eslint is the only static gate on test files in this repo.** The real signal here is `config.test.ts` all green including the new `KPR-417` case.
+
+The existing `toEqual(DEFAULT_MEETING_WORKERS_CONFIG)` assertions still pass with **zero edits** — there are **six** of them (`:167-170` — four in one `it`, `:204`, `:221`) plus two spread forms (`:191`, `:223`) and one field read (`:276`). All of them compare against (or spread) the constant, which now carries `ackEnabled: true`, so none needs touching. Confirm all six/two/one are green rather than only spot-checking two.
 
 - [ ] **Step 6:** Commit.
 ```bash
@@ -484,8 +488,8 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/channels/dispatcher.ts:54-59` (module scope, beside `NON_RESPONSE_PATTERNS`)
-- Modify: `src/channels/dispatcher.ts:1569-1582` (`resolveConferenceAgents` fetch) — ⚠ POST-416 SHIFT: ~+70 lines
-- Modify: `src/channels/dispatcher.ts:1923-1944` (`triggerConferenceReactions` fetch) — ⚠ POST-416 SHIFT: ~+85 lines
+- Modify: `src/channels/dispatcher.ts:1569-1582` (`resolveConferenceAgents` fetch) — ⚠ POST-416 SHIFT: this line number is pre-416 and will be wrong; **anchor on the quoted verbatim text in Step 3**
+- Modify: `src/channels/dispatcher.ts:1923-1944` (`triggerConferenceReactions` fetch) — ⚠ POST-416 SHIFT: same; **anchor on the quoted verbatim text in Step 4**
 - Modify: `src/channels/dispatcher.ts` — new `fetchMeetingHistory` private method
 - Modify: `src/channels/slack-adapter.ts:198-202` (pointer comment only)
 - Test: `src/channels/dispatcher-conference.test.ts` — new `describe` with T5's five sub-assertions × 2 lever rows
@@ -866,6 +870,8 @@ cd /Users/mokie/github/hive-KPR-415 && npm run typecheck && SLACK_APP_TOKEN=test
 ```
 Expected: typecheck exits 0; every file in `src/channels/` green, including the three new KPR-417 tests (T5's `it.each` runs as 2 cases). **All KPR-387 / KPR-388 / KPR-389 / KPR-409 / KPR-413 / KPR-416 pins pass with zero edits** — the file's total count should be the Task 0 baseline + 4.
 
+> **⚠ Typecheck caveat — do not read false confidence into "typecheck exits 0".** `tsconfig.json:18` excludes `src/**/*.test.ts`, so `npm run typecheck` **never type-checks the new test code at all.** It is a real signal for this task's *source* edits (`dispatcher.ts`, `slack-adapter.ts`) and no signal whatsoever for Step 6's test block. **eslint is the only static gate on test files in this repo** — the `npm run check` in Task 9 is where a test-file type/shape problem would actually surface, via lint and via the tests running.
+
 - [ ] **Step 8:** **NEGATIVE-VERIFY T5 (mandatory).** Revert only the strip — leave the constants, the wrapper and both call sites in place — by neutering the filter, then confirm T5 fails, then restore.
 
 ```bash
@@ -916,7 +922,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/channels/dispatcher.ts` — new `scheduleMeetingAck` / `deliverMeetingAck` / `runTurnWithMeetingAck` private methods, placed immediately before `dispatchToAgent`
-- Modify: `src/channels/dispatcher.ts:1399-1400` (the fan-out turn await) — ⚠ POST-416 SHIFT: ~+90 lines, anchor is the await statement, which KPR-416 does not touch
+- Modify: `src/channels/dispatcher.ts:1399-1400` (the fan-out turn await) — ⚠ POST-416 SHIFT: this line number is pre-416 and will be wrong; **the anchor is the await statement itself**, which KPR-416 does not touch
 - Test: `src/channels/dispatcher-conference.test.ts` — new fake-timer `describe` with T1, T2, T7a
 
 - [ ] **Step 0 (conditional):** If Task 0 Step 3 found the KPR-416 hoist missing, perform it now exactly as KPR-416 Task 3 Step 2 specifies (move `turn` / `zeroUsage` / `settleReactions` out of the KPR-389 describe and `seedRef` / `makeHistory` out of the KPR-388 describe, up to suite scope — move, do not copy; do **not** hoist `twoAgentClassifier`). Otherwise skip.
@@ -1053,7 +1059,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 - [ ] **Step 2:** Wrap the fan-out turn await. **This is the only line of `dispatchToAgent` that changes.**
 
-> **⚠ POST-416 SHIFT:** this statement is at `:1400` pre-416 and roughly `:1490` post-416. It is unique in the file — the single-dispatch leg's twin at `:329` uses `item`, not `effectiveItem`. Anchor on the quoted text.
+> **⚠ POST-416 SHIFT:** this statement is at `:1400` pre-416 and **somewhere below that post-416 — do not go looking for a predicted line number.** It is unique in the file, which is what makes a text anchor sufficient: the single-dispatch leg's twin (pre-416 `:329`) uses `item`, not `effectiveItem`. **Anchor on the quoted text.**
 
 Replace:
 ```ts
@@ -1081,9 +1087,13 @@ with:
   // changes. Inside this block use ONLY the async advancement API — under
   // vi.useFakeTimers() the suite's `new Promise(r => setTimeout(r, 0))` drain
   // is itself captured by the fake clock and never resolves, so a naive
-  // useFakeTimers() + settleReactions() combination DEADLOCKS. Likewise
-  // `vi.waitFor` polls with setTimeout and deadlocks here — drive every drain
-  // with settleAcked()/advanceTimersByTimeAsync instead.
+  // useFakeTimers() + settleReactions() combination DEADLOCKS. Also avoid
+  // `vi.waitFor` here — NOT because it deadlocks (it does not: it polls on
+  // getSafeTimers()' native timers and explicitly supports fake clocks), but
+  // because each poll cycle auto-advances the fake clock by its 50ms interval
+  // via a bare synchronous vi.advanceTimersByTime — fighting these tests for
+  // control of the very clock they step across the 15s threshold. Drive every
+  // drain with settleAcked()/advanceTimersByTimeAsync instead.
   // -------------------------------------------------------------------------
   describe("delay-then-ack for slow round-0 conference turns (KPR-417)", () => {
     beforeEach(() => {
@@ -1209,6 +1219,8 @@ Run:
 cd /Users/mokie/github/hive-KPR-415 && npm run typecheck && SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/
 ```
 Expected: typecheck exits 0; every file in `src/channels/` green including `T1`, `T2`, `T7a`. **No existing test may become slow or flaky** — if any pre-existing test in this file now takes >1s, the fake timers have leaked out of the describe block; fix the `afterEach`, not the test.
+
+> **⚠ Same typecheck caveat as Task 3 Step 7:** `tsconfig.json:18` excludes `src/**/*.test.ts`, so "typecheck exits 0" covers only this task's `dispatcher.ts` edits (Steps 1-2) and says **nothing** about the Step 3 test block. eslint plus the tests actually running are the only gates on the test file.
 
 - [ ] **Step 5:** **Confirm the `.unref()` / fake-timer interaction empirically.** `@sinonjs/fake-timers` (which vitest uses) returns a timer *object* with `ref`/`unref`/`hasRef` when the host `setTimeout` does — which Node's does — so `handle.unref()` is expected to work under both real and fake clocks. T1 passing is the proof. **If T1 instead throws `handle.unref is not a function`,** the minimal fix is a guarded call (`handle.unref?.();`) with a comment naming the fake-timer reason — do **not** delete the `unref`, which is what keeps a pending ack from holding the process open at shutdown (spec §5.1, §8 test-harness safety).
 
@@ -1394,6 +1406,8 @@ Run:
 cd /Users/mokie/github/hive-KPR-415 && SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/dispatcher-conference.test.ts
 ```
 Expected: all green, `T3`, `T4a`, `T4b` passing.
+
+> **No typecheck step here, deliberately:** this task is test-file-only, and `tsconfig.json:18` excludes `src/**/*.test.ts` — running `npm run typecheck` after a test-only edit would exit 0 unconditionally and prove nothing. eslint (in Task 9's `npm run check`) is the only static gate on these files; the tests running green is the real signal.
 
 - [ ] **Step 5:** Commit.
 ```bash
@@ -1700,7 +1714,7 @@ cd /Users/mokie/github/hive-KPR-415 && SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test
 ```
 Expected: every file green. `T8` (2 cases), `T9a/b/c`, `T10` + companion, `T12` all passing.
 
-> **Implementation note on T9's notice matching:** `noticeCalls()` matches on the substring `"provider outage"`. Confirm the exact wording emitted by `outageNoticeFor("slack")` in `src/outage/outage-notices.ts` before relying on it — KPR-416's own T4 uses `toContain("provider outage")` against the same helper, so it is expected to hold, but re-check rather than assume.
+> **Implementation note on T9's notice matching:** `noticeCalls()` matches on the substring `"provider outage"`. **Confirmed, not assumed:** `outageNoticeFor("slack")` returns `OUTAGE_NOTICE_DEFAULT`, defined at `src/outage/outage-notices.ts:45` as `"⚠️ I can't reach my AI service right now (provider outage). Your message is saved — I'll answer it automatically as soon as service is back."` — the substring is present verbatim. KPR-416's own T4 matches the same helper the same way. (The SMS variant at `:47` does *not* contain it, but no KPR-417 case exercises an SMS adapter.)
 
 - [ ] **Step 6:** Commit.
 ```bash
@@ -1822,7 +1836,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 > **⚠ POST-416 DEPENDENCY:** the companion **requires KPR-416 to have landed**. If Task 0 Step 3 found `markReactionExclusion` absent, this test cannot pass and the ticket is blocked — report it, do not weaken the assertion.
 >
-> **If the reaction pass proves hard to drain deterministically under the fake clock** (it is a fire-and-forget chain of microtask-only mocks, so `settleAcked()` twice should suffice), add a third `await settleAcked()` before asserting. Do **not** reach for `vi.waitFor` — it deadlocks under fake timers. Do **not** move this test out of the ack block to use real timers: it needs the 15s advance to produce the acks it asserts on.
+> **If the reaction pass proves hard to drain deterministically under the fake clock** (it is a fire-and-forget chain of microtask-only mocks, so `settleAcked()` twice should suffice), add a third `await settleAcked()` before asserting. Do **not** reach for `vi.waitFor` — not because it deadlocks (it does not; it polls on `getSafeTimers()`' native timers and supports fake clocks by design), but because it auto-advances the fake clock 50ms per poll via a bare synchronous `vi.advanceTimersByTime`, which would silently move this test across the 15s ack threshold it is metering. Do **not** move this test out of the ack block to use real timers: it needs the 15s advance to produce the acks it asserts on.
 
 - [ ] **Step 2:** Verify.
 Run:
@@ -1958,7 +1972,7 @@ Run:
 cd /Users/mokie/github/hive-KPR-415 && git diff --stat KPR-416-merge-base..HEAD -- src/ CLAUDE.md
 ```
 (substitute the actual merge base — the commit at which KPR-416 landed on the epic branch).
-Expected: exactly seven entries — `src/channels/dispatcher.ts`, `src/channels/slack-adapter.ts`, `src/channels/dispatcher-conference.test.ts`, `src/workers/worker-pool-config.ts`, `src/config.ts`, `src/config.test.ts`, `src/index.ts`, `src/boot-order.test.ts`, plus `CLAUDE.md`. **`src/agents/*`, `src/slack/*` and `src/workers/meeting-scribe.ts` must not appear** — this ticket touches none of them.
+Expected: exactly **nine** entries — eight under `src/` (`src/channels/dispatcher.ts`, `src/channels/slack-adapter.ts`, `src/channels/dispatcher-conference.test.ts`, `src/workers/worker-pool-config.ts`, `src/config.ts`, `src/config.test.ts`, `src/index.ts`, `src/boot-order.test.ts`) plus `CLAUDE.md`. **`src/agents/*`, `src/slack/*` and `src/workers/meeting-scribe.ts` must not appear** — this ticket touches none of them.
 
 - [ ] **Step 4:** Commit.
 ```bash
@@ -1998,13 +2012,13 @@ KPR-415 is a **pre-register epic** — as of plan time its ticket carries no `##
 ## Post-implementation checklist
 
 - [ ] `npm run check` green with the three Slack env stubs.
-- [ ] All 14 test cases present: T1, T2, T3, T4a, T4b, T5 (`it.each` ×2 + delta sibling + anchored-regex unit), T7a, T7b, T8 (×2), T9a/b/c, T10 (+companion), T11 (+companion), T12, T13a/b, T14.
+- [ ] All 15 test cases present: T1, T2, T3, T4a, T4b, T5 (`it.each` ×2 + delta sibling + anchored-regex unit), T7a, T7b, T8 (×2), T9a/b/c, T10 (+companion), T11 (+companion), T12, T13a/b, T14.
 - [ ] **T1 and T5 negative-verify performed, and the failure REASON recorded** (not just "it failed") — T1 fails at `ackCalls()).toHaveLength(1)` receiving 0; T5 fails at sub-assertion (1) with the ack text present in `threadContext`.
 - [ ] `boot-order.test.ts` (c)'s `wiringStart` adversarially verified with an inserted surface between the two adjacent wiring calls.
 - [ ] T13a adversarially verified with a second `fetchThreadHistory` call.
 - [ ] Fake timers are scoped to the KPR-417 ack `describe` only — `vi.useRealTimers()` in its `afterEach`, and no existing test in the file changed or slowed.
-- [ ] No `vi.waitFor` inside the ack describe-block (it deadlocks under fake timers); no bare `vi.advanceTimersByTime` anywhere.
+- [ ] No `vi.waitFor` inside the ack describe-block — **not because it deadlocks (it does not)**, but because it auto-advances the fake clock 50ms per poll cycle through a bare synchronous `vi.advanceTimersByTime`, contesting control of the clock these tests step deliberately; no bare `vi.advanceTimersByTime` anywhere.
 - [ ] No prompt bytes changed anywhere. KPR-387 `:510`, KPR-388 `:849`, KPR-389 `:552`, KPR-409 and KPR-413 pins all green with zero edits, as are every test KPR-416 added.
 - [ ] `src/agents/*` untouched. `src/slack/slack-gateway.ts` untouched. `src/workers/meeting-scribe.ts` untouched.
-- [ ] The eight residuals in the out-of-scope table are still unfixed and still named in code comments or tests (T9c and T11 carry theirs inline).
+- [ ] All **nine** residuals in the out-of-scope table are still unfixed and still named in code comments or tests (T9c and T11 carry theirs inline).
 - [ ] PR body notes: `ackEnabled` is the rollback lever (config, not code revert — spec §10); the delegated Gate 1 assumptions (delay-then-ack substituting for the operator's literal immediate "got it"; `ackEnabled`'s independence from `enabled`) are named for the operator; the three canon entries are lifted or pending-lift; §6.6's outage-diversion orphan is a named residual with no test, deliberately.
