@@ -64,6 +64,14 @@ vi.mock("@openai/agents", () => {
   };
 });
 
+// The adapter (and the real ToolBridge it drives) log — mocked as in the
+// codex/gemini test files so the deadline warn is assertable; cleared per
+// test by each describe's beforeEach vi.clearAllMocks().
+const logMock = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }));
+vi.mock("../../logging/logger.js", () => ({
+  createLogger: () => logMock,
+}));
+
 const AgentMock = vi.mocked(Agent);
 const OpenAIProviderMock = vi.mocked(OpenAIProvider);
 const RunnerMock = vi.mocked(Runner);
@@ -388,6 +396,15 @@ describe("OpenAIAgentsAdapter", () => {
     // FUNCTION apiKey — string-typed is the single-path pin.
     expect(client._options.apiKey).toBe("sk-test");
     expect(typeof client._options.apiKey).toBe("string");
+  });
+
+  it("KPR-306: client pins maxRetries 0 — no openai-node internal retries ahead of breaker classification", async () => {
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+    await makeAdapter().runTurn({ prompt: "hello" });
+    const client = (OpenAIProviderMock.mock.calls[0]![0] as any).openAIClient;
+    // openai-node defaults to 2; anything nonzero silently absorbs 429/5xx
+    // with backoff before the fault reaches error classification.
+    expect(client.maxRetries).toBe(0);
   });
 
   it("KPR-351 R1: OPENAI_API_KEY env resolves when options.apiKey is absent", async () => {
@@ -810,5 +827,70 @@ describe("OpenAIAgentsAdapter — KPR-348 T5 (abort, adapter half)", () => {
       expect(result.error).toBeUndefined();
       expect(result.aborted).toBe(false);
     });
+  });
+});
+
+describe("OpenAIAgentsAdapter — Lane B wall-clock deadline (timeoutMs)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const limits = (timeoutMs: number) => ({ maxTurns: 10, timeoutMs, budgetUsd: 0 });
+
+  /** A run() that never settles until its abort signal fires (models a stalled SDK loop). */
+  function hangingRun() {
+    runMock.mockImplementationOnce(
+      (_agent, _prompt, options) =>
+        new Promise((_resolve, reject) => {
+          const abortErr = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          if (options?.signal?.aborted) return abortErr();
+          options?.signal?.addEventListener("abort", abortErr, { once: true });
+        }) as never,
+    );
+  }
+
+  it("stalled run past timeoutMs → error_turn_deadline, timedOut, NOT aborted, non-provider, warn logged", async () => {
+    hangingRun();
+    const adapter = makeAdapter();
+    const result = await adapter.runTurn({ prompt: "go", sessionId: "resp-prev", resourceLimits: limits(25) });
+    expect(result.error).toBe("error_turn_deadline");
+    expect(result.timedOut).toBe(true);
+    expect(result.aborted).toBe(false);
+    expect(adapter.wasAborted).toBe(false);
+    expect(result.sessionId).toBe("resp-prev");
+    expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "turn-deadline" });
+    expect(logMock.warn).toHaveBeenCalledWith(
+      "OpenAI turn deadline exceeded — aborting turn",
+      expect.objectContaining({ timeoutMs: 25 }),
+    );
+  });
+
+  it("quiet-resolve guard: a run that resolves normally AFTER the deadline fired still returns the deadline error, not partial success", async () => {
+    runMock.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve(makeSdkResult() as never), 120)) as never,
+    );
+    const adapter = makeAdapter();
+    const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(20) });
+    expect(result.error).toBe("error_turn_deadline");
+    expect(result.aborted).toBe(false);
+    expect(result.text).toBe("");
+  });
+
+  it("operator abort() outranks the deadline: abort well before timeoutMs → breaker-neutral aborted, no error", async () => {
+    hangingRun();
+    const adapter = makeAdapter();
+    const promise = adapter.runTurn({ prompt: "go", resourceLimits: limits(5000) });
+    adapter.abort();
+    const result = await promise;
+    expect(result.aborted).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(result.timedOut).toBeUndefined();
+  });
+
+  it("no timeoutMs (bare construction) arms no deadline — turn completes normally", async () => {
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+    const adapter = makeAdapter();
+    const result = await adapter.runTurn({ prompt: "go" });
+    expect(result.error).toBeUndefined();
+    expect(result.timedOut).toBeUndefined();
+    expect(result.text).toBe("hello");
   });
 });

@@ -118,6 +118,48 @@ describe("SessionStore — StoredSessionRef normalization + scrub (KPR-313)", ()
     expect(ref?.provider).toBe("some-future-provider"); // provenance passes through; handle does not
   });
 
+  it("KPR-394: a REGISTERED server-resumable plugin provider's row returns its handle", async () => {
+    const { __registerActivePluginProviderForTests, __resetPluginProvidersForTests } = await import(
+      "./provider-adapters/provider-registry.js"
+    );
+    __registerActivePluginProviderForTests({
+      id: "solr",
+      module: { provider: "solr", createAdapter: () => ({}) as any },
+      semantics: "server-resumable",
+      source: { plugin: "hive-plugin-solr" },
+    });
+    try {
+      mocks.findOne.mockResolvedValueOnce(doc("srv-handle-1", "solr"));
+      await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+        sessionId: "srv-handle-1",
+        provider: "solr",
+      });
+    } finally {
+      __resetPluginProvidersForTests();
+    }
+  });
+
+  it("KPR-394: a registered stateless-replay plugin provider's row yields no handle (belt-and-braces)", async () => {
+    const { __registerActivePluginProviderForTests, __resetPluginProvidersForTests } = await import(
+      "./provider-adapters/provider-registry.js"
+    );
+    __registerActivePluginProviderForTests({
+      id: "sol",
+      module: { provider: "sol", createAdapter: () => ({}) as any },
+      semantics: "stateless-replay",
+      source: { plugin: "hive-plugin-sol" },
+    });
+    try {
+      mocks.findOne.mockResolvedValueOnce(doc("stray-id", "sol"));
+      await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+        sessionId: undefined,
+        provider: "sol",
+      });
+    } finally {
+      __resetPluginProvidersForTests();
+    }
+  });
+
   it("legacy untagged plain uuid grandfathers as claude (fleet-upgrade no-op)", async () => {
     mocks.findOne.mockResolvedValueOnce(doc("3f2a77aa-1111-4222-8333-444455556666"));
     await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
@@ -192,5 +234,64 @@ describe("SessionStore — StoredSessionRef normalization + scrub (KPR-313)", ()
   it("findOne failure fail-softs to undefined (unchanged degraded mode — fresh turn, guard no-op)", async () => {
     mocks.findOne.mockRejectedValueOnce(new Error("down"));
     await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toBeUndefined();
+  });
+});
+
+describe("SessionStore — meeting-continuity mark (KPR-388)", () => {
+  let store: SessionStore;
+  let mocks: ReturnType<typeof makeMockDb>["mocks"];
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const m = makeMockDb();
+    store = new SessionStore(m.db);
+    mocks = m.mocks;
+    await store.init();
+  });
+
+  it("setMeetingMark: updateOne WITHOUT upsert, $set only the mark, updatedAt untouched (no-upsert pin)", async () => {
+    await store.setMeetingMark("agent-a", "sms:line-1:t1", "1724632800.123456");
+    const [filter, update, options] = mocks.updateOne.mock.calls[0]!;
+    expect(filter).toEqual({ _id: KEY });
+    expect(update).toEqual({ $set: { meetingLastSeenTs: "1724632800.123456" } });
+    // A mark must never create a row — no upsert option at all.
+    expect(options?.upsert).toBeFalsy();
+  });
+
+  it("clearMeetingMark: $unset the mark, no upsert", async () => {
+    await store.clearMeetingMark("agent-a", "sms:line-1:t1");
+    const [filter, update, options] = mocks.updateOne.mock.calls[0]!;
+    expect(filter).toEqual({ _id: KEY });
+    expect(update).toEqual({ $unset: { meetingLastSeenTs: "" } });
+    expect(options?.upsert).toBeFalsy();
+  });
+
+  it("get() surfaces the mark on tagged rows", async () => {
+    mocks.findOne.mockResolvedValueOnce({ ...doc("s-1", "claude"), meetingLastSeenTs: "1700.0001" });
+    await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+      sessionId: "s-1",
+      provider: "claude",
+      meetingLastSeenTs: "1700.0001",
+    });
+  });
+
+  it("get() surfaces the mark on grandfathered legacy rows; absent field ⇒ undefined", async () => {
+    mocks.findOne.mockResolvedValueOnce({
+      ...doc("3f2a77aa-1111-4222-8333-444455556666"),
+      meetingLastSeenTs: "1700.0002",
+    });
+    const ref = await store.get("agent-a", "sms:line-1:t1");
+    expect(ref?.meetingLastSeenTs).toBe("1700.0002");
+
+    mocks.findOne.mockResolvedValueOnce(doc("s-2", "claude"));
+    const ref2 = await store.get("agent-a", "sms:line-1:t1");
+    expect(ref2?.meetingLastSeenTs).toBeUndefined();
+  });
+
+  it("scrub branch returns NO mark even when the poisoned row carries one", async () => {
+    mocks.findOne.mockResolvedValue({ ...doc("codex-pilot-9d0e"), meetingLastSeenTs: "1700.0003" });
+    const ref = await store.get("agent-a", "sms:line-1:t1");
+    // toEqual is strict about DEFINED extra keys — a leaked mark would fail this.
+    expect(ref).toEqual({ sessionId: undefined, provider: undefined });
   });
 });

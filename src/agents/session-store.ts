@@ -1,11 +1,10 @@
 import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import {
-  SESSION_SEMANTICS,
   persistsResumableHandle,
-  type AgentProviderId,
   type SessionSemantics,
 } from "./provider-adapters/types.js";
+import { sessionSemanticsIfKnown } from "./provider-adapters/provider-registry.js";
 
 const log = createLogger("session-store");
 
@@ -14,7 +13,7 @@ interface SessionDoc {
   agentId: string;
   threadId: string;
   sessionId: string; // "" ⇒ row exists for thread-mapping only; nothing resumable (KPR-313)
-  provider?: AgentProviderId; // KPR-313: producer tag; absent ⇒ legacy (pre-313) row
+  provider?: string; // KPR-313: producer tag; absent ⇒ legacy (pre-313) row
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -25,6 +24,10 @@ interface SessionDoc {
   preCompactTokens?: number;
   createdAt: Date;
   updatedAt: Date;
+  /** KPR-388: Slack ts (raw string, e.g. "1724632800.123456") of the newest
+   *  thread message this agent's session has been shown via conference
+   *  injection. Absent ⇒ no delta basis ⇒ full-transcript injection. */
+  meetingLastSeenTs?: string;
 }
 
 /**
@@ -35,7 +38,9 @@ interface SessionDoc {
  */
 export interface StoredSessionRef {
   sessionId: string | undefined; // undefined ⇒ nothing to resume
-  provider: AgentProviderId | undefined;
+  provider: string | undefined;
+  /** KPR-388: meeting-continuity mark; absent ⇒ full injection. */
+  meetingLastSeenTs?: string;
 }
 
 /** KPR-313: legacy fabricated pilot ids (and unprovenanced resp_ chain ids) — scrub on read. */
@@ -108,17 +113,21 @@ export class SessionStore {
     // Tagged row (post-KPR-313 write).
     if (doc.provider) {
       // KPR-347 (review advisory): fail-closed on out-of-union provider
-      // strings. doc.provider is typed AgentProviderId, but the DB is not
-      // bound by the union — a row written by a newer/older engine may carry
-      // a provider this build doesn't know. The old Set's .has() scrubbed
+      // strings. doc.provider is a free string (R2), and the DB was never
+      // bound by the old union anyway — a row written by a newer/older
+      // engine may carry a provider this build doesn't know. The old Set's .has() scrubbed
       // unknowns implicitly; the ?? preserves exactly that posture (unknown
       // ⇒ stateless-replay ⇒ no handle).
-      const semantics: SessionSemantics | undefined = SESSION_SEMANTICS[doc.provider];
+      // KPR-394 (§4.3): registry-aware — a REGISTERED plugin provider's row
+      // is honored per its declared semantics; genuinely unknown provider
+      // strings keep the KPR-347 fail-closed posture (no handle).
+      const semantics: SessionSemantics | undefined = sessionSemanticsIfKnown(doc.provider);
       return {
         sessionId: persistsResumableHandle(semantics ?? "stateless-replay")
           ? doc.sessionId || undefined
           : undefined,
         provider: doc.provider,
+        meetingLastSeenTs: doc.meetingLastSeenTs,
       };
     }
 
@@ -150,10 +159,10 @@ export class SessionStore {
     }
 
     // Legacy untagged plain id: grandfathered as claude (pre-313 fleet rows).
-    return { sessionId: doc.sessionId || undefined, provider: "claude" };
+    return { sessionId: doc.sessionId || undefined, provider: "claude", meetingLastSeenTs: doc.meetingLastSeenTs };
   }
 
-  async set(agentId: string, threadId: string, sessionId: string, provider: AgentProviderId, tokenData?: {
+  async set(agentId: string, threadId: string, sessionId: string, provider: string, tokenData?: {
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens: number;
@@ -206,6 +215,33 @@ export class SessionStore {
         { upsert: true },
       );
     }, undefined, `set(${agentId}:${threadId})`);
+  }
+
+  /**
+   * KPR-388: advance the meeting-continuity mark. `updateOne` WITHOUT upsert
+   * — a mark must never create a row (an upserted skeleton would break
+   * normalizeRef's assumptions and fabricate thread-affinity via
+   * findAgentsByThread). Deliberately does NOT touch updatedAt: TTL stays
+   * owned by turn persistence (the same turn's finalizeSpawnResult set()
+   * already refreshed it).
+   */
+  async setMeetingMark(agentId: string, threadId: string, ts: string): Promise<void> {
+    await this.withRetry(async () => {
+      await this.collection.updateOne(
+        { _id: `${agentId}:${threadId}` },
+        { $set: { meetingLastSeenTs: ts } },
+      );
+    }, undefined, `setMeetingMark(${agentId}:${threadId})`);
+  }
+
+  /** KPR-388: clear the mark — the next conference turn injects the full transcript. */
+  async clearMeetingMark(agentId: string, threadId: string): Promise<void> {
+    await this.withRetry(async () => {
+      await this.collection.updateOne(
+        { _id: `${agentId}:${threadId}` },
+        { $unset: { meetingLastSeenTs: "" } },
+      );
+    }, undefined, `clearMeetingMark(${agentId}:${threadId})`);
   }
 
   async delete(agentId: string, threadId: string): Promise<void> {

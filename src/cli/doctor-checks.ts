@@ -1,6 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  BUILTIN_ROUTABLE_PREFIXES,
+  auditInstalledProviderDecls,
+  type ProviderDeclAuditRow,
+} from "../plugins/provider-decl.js";
+import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
+import { LANE_B_PROVIDER_ABI_VERSION } from "../agents/provider-adapters/provider-abi.js";
 
 export type CheckGroup = "prereq" | "config" | "agents" | "services";
 
@@ -1009,4 +1016,90 @@ export function resolveServicePath(label = "com.hive.agent"): string | null {
   const raw = readFileSync(plist, "utf-8");
   const m = raw.match(/<key>WorkingDirectory<\/key>\s*<string>([^<]+)<\/string>/);
   return m ? resolve(expandHome(m[1])) : null;
+}
+
+// ── KPR-394: provider plugins (informational — never flips the exit code) ──
+
+/** An agent whose `model` carries a `<prefix>/…` that no built-in route and no
+ *  installed provider plugin claims — it silently routes to Claude under the
+ *  unknown-prefix canon. Warn-only: the canon is deliberate, not a fault. */
+export interface OrphanProviderModelRow {
+  agentId: string;
+  model: string;
+}
+
+/**
+ * §4.8 doctor adapter: the STATIC manifest audit (validate + collision +
+ * compiled-entry resolution) plus the orphan-model scan over
+ * `agent_definitions`. Mongo read mirrors the sibling `*ForDoctor` fetchers —
+ * dynamic driver import, short-lived client, try/finally close — and a Mongo
+ * failure degrades to manifests-only rather than killing the section (the
+ * Agents group's `MongoDB reachable` check owns that report).
+ */
+export async function providerPluginsForDoctor(
+  mongoUri: string,
+  dbName: string,
+  pluginNames: readonly string[],
+  rootDir: string,
+  timeoutMs = 3000,
+): Promise<{ rows: ProviderDeclAuditRow[]; orphans: OrphanProviderModelRow[] }> {
+  const rows = auditInstalledProviderDecls(
+    pluginNames,
+    rootDir,
+    LANE_B_PROVIDER_ABI_VERSION,
+    (plugin, entry) => "path" in resolvePluginServerPath(plugin, entry, { hiveHome: rootDir }),
+  );
+  const declaredIds = new Set(rows.map((r) => r.id));
+  const orphans: OrphanProviderModelRow[] = [];
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: timeoutMs });
+  try {
+    await client.connect();
+    const docs = await client
+      .db(dbName)
+      .collection("agent_definitions")
+      .find({}, { projection: { _id: 1, model: 1 } })
+      .toArray();
+    for (const d of docs) {
+      const model = typeof d.model === "string" ? d.model : "";
+      const slash = model.indexOf("/");
+      if (slash <= 0) continue;
+      const prefix = model.slice(0, slash).toLowerCase();
+      if (BUILTIN_ROUTABLE_PREFIXES.has(prefix) || declaredIds.has(prefix)) continue;
+      orphans.push({ agentId: String(d._id), model });
+    }
+  } catch {
+    // Mongo unreachable — the Agents group reports that; render manifests only.
+  } finally {
+    await client.close().catch(() => {});
+  }
+  return { rows, orphans };
+}
+
+/**
+ * Render the "Provider plugins" section. INFORMATIONAL by construction —
+ * returns `void`, so it has no failure channel to fold into `allPassed`
+ * (KPR-296 canon: only the Datastore identity section flips the exit code).
+ */
+export function renderProviderPluginsSection(
+  rows: ProviderDeclAuditRow[],
+  orphans: OrphanProviderModelRow[],
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nProvider plugins (KPR-394)");
+  if (rows.length === 0 && orphans.length === 0) {
+    emit("  (no provider plugins installed)");
+    return;
+  }
+  for (const r of rows) {
+    if (r.status === "ok") {
+      emit(`  ok  ${r.id.padEnd(16)} plugin=${r.plugin}  abi=${r.abi}  semantics=${r.semantics}`);
+    } else {
+      emit(`  ✗   ${r.id.padEnd(16)} plugin=${r.plugin}  BROKEN: ${r.reason}`);
+    }
+  }
+  for (const o of orphans) {
+    emit(`  ⚠   orphan model prefix: agent=${o.agentId} model=${o.model} — routes to Claude (unknown-prefix canon)`);
+  }
+  emit("  note: static manifest validation; runtime activation faults appear in engine logs and as per-turn errors");
 }

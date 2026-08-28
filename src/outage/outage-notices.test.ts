@@ -35,6 +35,9 @@ describe("policyFor (§5-3a source policy table)", () => {
     expect(policyFor(item({ id: "event:65a1b2:agent-a" }))).toBe("silent");
     expect(policyFor(item({ id: "team-65a1b2" }))).toBe("silent");
   });
+  it("queues worker re-entry one-shots silently (worker: prefix — KPR-390)", () => {
+    expect(policyFor(item({ id: "worker:65a1b2c3d4" }))).toBe("silent");
+  });
   it("notifies human channels: slack, sms, imessage, app/ws, team DM", () => {
     expect(policyFor(item({ source: { kind: "slack", id: "C1", label: "x" } }))).toBe("notify");
     expect(policyFor(item({ source: { kind: "sms", id: "+1555", label: "x" } }))).toBe("notify");
@@ -122,5 +125,28 @@ describe("OutageEpisodeTracker (§7.3)", () => {
     expect(tracker.begin("claude")).toBe(false);
     tracker.clear("claude");
     expect(tracker.begin("claude")).toBe(true);
+  });
+});
+
+describe("replayWrap resume-aware sentence (KPR-402 ⚠A7 — KPR-399 §Edge-12 closure)", () => {
+  it("both policy variants carry the static sentence inside the note; the original still ends the wrap verbatim", () => {
+    // NEGATIVE-VERIFY prediction (Step 3): pre-fix replayWrap carries no
+    // resume sentence — both toContain assertions fail.
+    const notify = replayWrap("original question", new Date(), "notify");
+    const silent = replayWrap("do the thing", new Date(), "silent");
+    const sentence =
+      "If your session already contains this message and partial work on it, continue from where you left off instead of restarting.";
+    expect(notify).toContain(sentence);
+    expect(silent).toContain(sentence);
+    // The sentence lives INSIDE the bracketed note — shape pins hold.
+    // (r1 NIT-3: `toContain` alone would still pass if the sentence were
+    // appended AFTER the note's closing bracket, i.e. bled into the user's
+    // own text. The first `]` in the wrap closes the note, and neither the
+    // sentence nor these fixtures contain a bracket, so an index comparison
+    // is an exact inside-the-bracket pin.)
+    expect(notify.indexOf(sentence)).toBeLessThan(notify.indexOf("]"));
+    expect(silent.indexOf(sentence)).toBeLessThan(silent.indexOf("]"));
+    expect(notify.endsWith("original question")).toBe(true);
+    expect(silent.endsWith("do the thing")).toBe(true);
   });
 });

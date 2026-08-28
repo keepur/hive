@@ -54,6 +54,26 @@ export interface PluginMcpAuth {
 
 export type PluginMcpServer = StdioPluginMcpServer | HttpPluginMcpServer;
 
+/**
+ * KPR-394 (§4.1): a plugin's Lane B provider declaration — at most one per
+ * plugin (v1). `id` is the model prefix agents use; `entry` resolves through
+ * the same compiled-artifact chain as MCP server entries (`provider.ts` →
+ * `dist/provider.(min.)js`); `abi` must exactly equal the engine's
+ * LANE_B_PROVIDER_ABI_VERSION. `apiKeyEnv` is secret-env class (env →
+ * Honeypot per spawn, engine-resolved — modules never see env/Keychain, C7);
+ * `baseUrlEnv` is plain env, validated https-or-loopback when set.
+ */
+export interface PluginProviderDecl {
+  id: string;
+  entry: string;
+  abi: number;
+  sessionSemantics: "stateless-replay" | "server-resumable";
+  defaultModel?: string;
+  apiKeyEnv?: string;
+  baseUrlEnv?: string;
+  description?: string;
+}
+
 export interface PluginManifest {
   name: string;
   description?: string;
@@ -63,6 +83,8 @@ export interface PluginManifest {
   agentSeeds: string[];
   /** Optional: path to a JS module that exports registerCommands(registry) for Team slash commands */
   registerCommands?: string;
+  /** KPR-394: optional Lane B provider declaration (one per plugin, v1). */
+  provider?: PluginProviderDecl;
 }
 
 /** A plugin MCP server whose entry couldn't be resolved to a runnable file. */

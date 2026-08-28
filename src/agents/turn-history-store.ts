@@ -1,6 +1,5 @@
 import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import type { AgentProviderId } from "./provider-adapters/types.js";
 
 const log = createLogger("turn-history-store");
 
@@ -30,7 +29,8 @@ interface TurnHistoryDoc {
   _id: string; // "{agentId}:{threadId}:{provider}"
   agentId: string;
   threadId: string;
-  provider: AgentProviderId;
+  // R2 (KPR-394): widened from AgentProviderId — plugin ids are arbitrary registered strings.
+  provider: string;
   turns: TurnRecord[];
   updatedAt: Date;
 }
@@ -76,7 +76,7 @@ export class TurnHistoryStore {
     }
   }
 
-  private key(agentId: string, threadId: string, provider: AgentProviderId): string {
+  private key(agentId: string, threadId: string, provider: string): string {
     return `${agentId}:${threadId}:${provider}`;
   }
 
@@ -85,7 +85,7 @@ export class TurnHistoryStore {
    * the turn then runs fresh with a warn (continuity degrades for one turn,
    * delivery doesn't).
    */
-  async load(agentId: string, threadId: string, provider: AgentProviderId): Promise<unknown[]> {
+  async load(agentId: string, threadId: string, provider: string): Promise<unknown[]> {
     return this.withFallback(async () => {
       const doc = await this.collection.findOne({ _id: this.key(agentId, threadId, provider) });
       if (!doc) return [];
@@ -100,7 +100,7 @@ export class TurnHistoryStore {
    * whole (spec §D3: a split function_call/function_call_output pair is a
    * malformed replay — whole-turn granularity is the rule).
    */
-  async append(agentId: string, threadId: string, provider: AgentProviderId, items: unknown[]): Promise<void> {
+  async append(agentId: string, threadId: string, provider: string, items: unknown[]): Promise<void> {
     if (items.length === 0) return;
     await this.withFallback(async () => {
       const _id = this.key(agentId, threadId, provider);

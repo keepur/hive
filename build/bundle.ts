@@ -7,7 +7,7 @@
  */
 import { build, type Plugin } from "esbuild";
 import { rmSync, mkdirSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 
 const PKG_DIR = "pkg";
 
@@ -113,6 +113,74 @@ await build({
     "mcp/skill-author": "dist/skill-author/skill-author-mcp-server.js",
   },
 });
+
+// KPR-394 (§4.2) / KPR-407 (finding 1): ship the provider-abi type surface —
+// and ONLY it. The barrel's .d.ts re-exports reach across the dist declaration
+// tree, but the whole tree (213 files) is far more than the exports map needs
+// and drags customer-facing JSDoc from unrelated engine modules into the
+// tarball. Trace the transitive closure of relative import/export edges from
+// provider-abi.d.ts instead and copy just those, preserving structure.
+// Bare specifiers (mongodb, @slack/web-api, @anthropic-ai/claude-agent-sdk)
+// are runtime deps — resolvable from the consumer's own node_modules.
+// scripts/check-bundle-strings.mjs scans the result for forbidden strings.
+const DIST_ROOT = resolve("dist");
+const TYPES_ROOT = resolve(PKG_DIR, "types");
+const ABI_ENTRY = resolve(DIST_ROOT, "agents/provider-adapters/provider-abi.d.ts");
+
+// `from "…"` (import/export), inline `import("…")` type references, and
+// bare side-effect imports (`import "./x.js";` — tsc emits these into
+// declarations for module-augmenting modules, and a consumer resolves them).
+const SPECIFIER_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)["']([^"']+)["']/g;
+
+/** Resolve a relative specifier to a .d.ts on disk: `.js`→`.d.ts`, then `/index.d.ts`. */
+function resolveDeclaration(fromFile: string, spec: string): string | undefined {
+  const base = resolve(dirname(fromFile), spec);
+  const candidates = [
+    base.endsWith(".js") ? base.slice(0, -3) + ".d.ts" : `${base}.d.ts`,
+    resolve(base.endsWith(".js") ? base.slice(0, -3) : base, "index.d.ts"),
+  ];
+  return candidates.find((c) => existsSync(c));
+}
+
+if (!existsSync(ABI_ENTRY)) {
+  throw new Error(`bundle: provider-abi declaration missing at ${ABI_ENTRY} — run 'npm run build' first`);
+}
+
+const abiClosure = new Set<string>();
+const pending = [ABI_ENTRY];
+while (pending.length > 0) {
+  const file = pending.pop()!;
+  if (abiClosure.has(file)) continue;
+  abiClosure.add(file);
+  const decl = readFileSync(file, "utf-8");
+  for (const [, spec] of decl.matchAll(SPECIFIER_RE)) {
+    if (!spec.startsWith(".")) continue;
+    const target = resolveDeclaration(file, spec);
+    if (!target) {
+      throw new Error(
+        `bundle: unresolvable relative type edge "${spec}" from dist/${relative(DIST_ROOT, file)} — ` +
+          `the pkg/types closure would ship broken declarations`,
+      );
+    }
+    // Containment: every resolved edge must stay under dist/ — tsc doesn't
+    // emit rootDir-escaping relative specifiers today, but a loud failure
+    // here (never a silent copy outside pkg/types/) is the point of the
+    // whole closure-trace, so make it total rather than trust the input.
+    if (!(target + sep).startsWith(DIST_ROOT + sep)) {
+      throw new Error(
+        `bundle: relative type edge "${spec}" from dist/${relative(DIST_ROOT, file)} resolves outside dist/ (${target}) — refusing to copy`,
+      );
+    }
+    pending.push(target);
+  }
+}
+
+for (const file of abiClosure) {
+  const dest = resolve(TYPES_ROOT, relative(DIST_ROOT, file));
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(file, dest);
+}
+console.log(`  pkg/types/ (${abiClosure.size} .d.ts files — provider-abi transitive closure)`);
 
 // Copy non-JS assets to setup/
 const setupAssets = ["setup/slack-manifest.yaml"];

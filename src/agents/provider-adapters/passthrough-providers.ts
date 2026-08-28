@@ -1,46 +1,64 @@
 import { fromKeychain } from "../../keychain/from-keychain.js";
 import { TurnAssemblyError } from "./error-classification.js";
-import { resolveOAuthFileToken } from "./grok-oauth.js";
-import type { AgentProviderId } from "./types.js";
 
 /**
  * KPR-346 (epic KPR-345 §D1): Lane A passthrough providers — vendors that
  * operate an official Anthropic-compatible endpoint, run through the FULL
  * Claude-lane runtime (ClaudeAgentAdapter/AgentRunner: MCP tools, skills,
  * hooks, memory, subagents, resume) with per-spawn env substitution only.
- * Translation proxies are ruled out (epic canon); only vendor-operated
- * endpoints qualify. Adding the next compat vendor is: one table row + one
- * AgentProviderId union member + one SESSION_SEMANTICS entry (compile-forced)
- * + two resolveProviderModel-style prefix arms + the isLaneAProvider body
- * (NOT compile-forced) + a `credential` entry (KPR-371) — no new code path.
+ * Translation proxies are ruled out (epic canon); vendor-operated endpoints
+ * are the rule. Grok was briefly the one sanctioned exception (KPR-384: an
+ * OPERATOR-hosted gateway, because the vendor endpoint itself was broken for
+ * real toolkits) until KPR-392 promoted it to a native Lane B adapter, and
+ * KPR-410 then retired the gateway entirely — grok now talks to xAI directly
+ * (`grok-adapter.ts`); this table has no exceptions left, past or present.
+ * Adding the next compat vendor is:
+ * one table row + one AgentProviderId union member + one SESSION_SEMANTICS
+ * entry (compile-forced) + two resolveProviderModel-style prefix arms + the
+ * isLaneAProvider body (NOT compile-forced) + a `credential` entry
+ * (KPR-371) — no new code path.
  *
  * Lane A ids join AgentProviderId only. LaneBProviderId is NEVER touched:
  * these providers must never gain a tool-transport compatibility column or a
  * bridge path (decision-register canon).
  */
-export type LaneAProviderId = "kimi" | "deepseek" | "grok";
+export type LaneAProviderId = "kimi" | "deepseek";
 
 /**
- * KPR-371 (§D2): Lane A credential source. `authTokenKey: string` hardwired
- * "static key from env or Honeypot"; Grok authenticates with a subscription
- * OAuth token in a vendor-CLI-owned file that expires every 6h and whose
- * refresh token rotates on use. The discriminant keeps the kimi/deepseek
- * branch byte-for-byte unchanged while giving grok its own resolution path.
+ * Lane A credential source: a static key resolved env → Honeypot Keychain per
+ * spawn. KPR-371 briefly widened this to a discriminated union with an
+ * `oauth-file` variant for grok's vendor-CLI-owned subscription OAuth file;
+ * KPR-384 retired that variant when grok moved behind a self-hosted
+ * CLIProxyAPI gateway (short-lived — retired itself by KPR-410, which moved
+ * grok's OAuth-file resolution to grok-oauth.ts, consumed directly by its
+ * Lane B module rather than through this table). KPR-392 promoted grok off
+ * this table entirely; `resolveEnvKeyCredential` below stays exported only
+ * for kimi/deepseek and KPR-394 plugin `api-key-env` use. The `kind`
+ * discriminant stays so a future non-key vendor re-widens the union without
+ * touching existing rows.
  */
-export type PassthroughCredential =
-  | { kind: "env-key"; key: string }
-  | { kind: "oauth-file"; path: string };
+export type PassthroughCredential = { kind: "env-key"; key: string };
 
 export interface PassthroughProviderDef {
   id: LaneAProviderId;
   displayName: string;
-  /** Vendor-operated Anthropic-compat endpoint (never a translation proxy). */
-  baseUrl: string;
   /**
-   * Credential source — resolved PER SPAWN, never boot-time.
-   *  - env-key:    env → Keychain (Honeypot `hive/<instanceId>/<KEY>`).
-   *  - oauth-file: vendor-CLI-owned OAuth file, refreshed + written back.
+   * The endpoint the spawn's ANTHROPIC_BASE_URL is pinned to — the
+   * vendor-operated Anthropic-compat endpoint (never a translation proxy —
+   * epic KPR-345 canon). Grok was briefly the one sanctioned exception
+   * (KPR-384: an OPERATOR-hosted loopback CLIProxyAPI gateway, because
+   * xAI's own compat endpoint rejects the CLI's tool schemas) until KPR-392
+   * moved it to a native Lane B adapter, taking the exception with it —
+   * this table's remaining rows are all vendor-operated endpoints.
    */
+  baseUrl: string;
+  /** Env var that overrides `baseUrl` per spawn, for endpoints that are
+   *  deployment infrastructure rather than a universal vendor address. The
+   *  override is validated (https, or http to loopback only) — see
+   *  assertSafeBaseUrlOverride. */
+  baseUrlEnv?: string;
+  /** Credential source — resolved PER SPAWN (env → Honeypot Keychain
+   *  `hive/<instanceId>/<KEY>`), never boot-time. */
   credential: PassthroughCredential;
   /**
    * Fallback model when neither the route (`kimi/<model>`) nor config
@@ -70,17 +88,6 @@ export const PASSTHROUGH_PROVIDERS: Readonly<Record<LaneAProviderId, Passthrough
     credential: { kind: "env-key", key: "DEEPSEEK_API_KEY" },
     defaultModel: "deepseek-v4-pro",
   },
-  grok: {
-    id: "grok",
-    displayName: "Grok (xAI)",
-    baseUrl: "https://api.x.ai",
-    // KPR-371 (§D2/R5): subscription OAuth, shared with the `grok` CLI. Hive
-    // reads AND writes this file — the refresh token rotates on use.
-    credential: { kind: "oauth-file", path: "~/.grok/auth.json" },
-    // §3.5: the subscription session exposes only grok-4.6 / grok-4.5; the
-    // API's wider catalogue is not reachable under this auth.
-    defaultModel: "grok-4.6",
-  },
 };
 
 /**
@@ -89,8 +96,8 @@ export const PASSTHROUGH_PROVIDERS: Readonly<Record<LaneAProviderId, Passthrough
  * session-handoff notice (degrades to the Lane B variant) and its :effort
  * clamp (silently dropped instead of clamped). Every Lane A id must appear.
  */
-export function isLaneAProvider(p: AgentProviderId): p is LaneAProviderId {
-  return p === "kimi" || p === "deepseek" || p === "grok";
+export function isLaneAProvider(p: string): p is LaneAProviderId {
+  return p === "kimi" || p === "deepseek";
 }
 
 /** Per-spawn resolved shape handed to the runner (§D1). The credential lives
@@ -107,15 +114,13 @@ export interface PassthroughSpawnConfig {
  * KPR-346 (§D4): per-spawn credential + model resolution. Model chain mirrors
  * codex/openai/gemini: route.model || configured agentModel || table default.
  *
- * KPR-371 (§D2): the credential branches on the table's discriminant.
- *  - env-key    — the standard secret-env pattern (agent-runner.ts plugin
- *                 stdio servers): process.env first, then Honeypot Keychain
- *                 (hive/<instanceId>/<KEY>) — per spawn, not boot-time, so
- *                 `hive credentials add` takes effect on the next spawn
- *                 without a restart.
- *  - oauth-file — a vendor-CLI-owned OAuth file (grok-oauth.ts), which may
- *                 perform a refresh grant and write the rotated pair back.
- *                 This is why the function is async.
+ * The credential is the standard secret-env pattern (agent-runner.ts plugin
+ * stdio servers): process.env first, then Honeypot Keychain
+ * (hive/<instanceId>/<KEY>) — per spawn, not boot-time, so `hive credentials
+ * add` takes effect on the next spawn without a restart. The base URL is
+ * likewise re-read per spawn when the row declares a `baseUrlEnv` override.
+ * (KPR-371's async oauth-file arm lived here until KPR-384 removed it —
+ * resolution is synchronous again.)
  *
  * Missing/empty credential throws TurnAssemblyError — classifyThrown
  * short-circuits it to non-provider BEFORE the pattern tables
@@ -127,7 +132,7 @@ export interface PassthroughSpawnConfig {
  * exploits to prove the typed wrapper is load-bearing. Config fault, not
  * provider fault (epic §D2).
  */
-export async function resolvePassthroughSpawn(
+export function resolvePassthroughSpawn(
   provider: LaneAProviderId,
   routeModel: string,
   opts: {
@@ -136,27 +141,44 @@ export async function resolvePassthroughSpawn(
     instanceId: string;
     /** Test seam only; defaults to env → Keychain. */
     resolveSecret?: (instanceId: string, key: string) => string;
-    /** Test seam only (oauth-file providers); defaults to global fetch. */
-    fetchImpl?: typeof fetch;
-    /** Test seam only (oauth-file providers); defaults to Date.now. */
-    now?: () => number;
   },
-): Promise<PassthroughSpawnConfig> {
+): PassthroughSpawnConfig {
   const def = PASSTHROUGH_PROVIDERS[provider];
-  const authToken =
-    def.credential.kind === "env-key"
-      ? resolveEnvKeyCredential(def.credential.key, opts)
-      : await resolveOAuthFileToken(def.credential.path, { fetchImpl: opts.fetchImpl, now: opts.now });
+  const override = def.baseUrlEnv ? process.env[def.baseUrlEnv] : undefined;
   return {
     provider,
     model: routeModel || opts.configuredModel || def.defaultModel,
-    baseUrl: def.baseUrl,
-    authToken,
+    baseUrl: override ? assertSafeBaseUrlOverride(override, def.baseUrlEnv!) : def.baseUrl,
+    authToken: resolveEnvKeyCredential(def.credential.key, opts),
   };
 }
 
-/** The `env-key` branch — byte-for-byte the pre-KPR-371 behaviour. */
-function resolveEnvKeyCredential(
+/**
+ * KPR-384 (review r1): a base-URL override redirects the auth token AND the
+ * full prompt/tool-result stream, so refuse a cleartext off-box target:
+ * `http:` is allowed only toward loopback hosts; anything else must be
+ * `https:`. Thrown as TurnAssemblyError — a config fault, breaker-invisible
+ * like every other Lane A assembly fault.
+ */
+export function assertSafeBaseUrlOverride(raw: string, envKey: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new TurnAssemblyError(`${envKey} is not a valid URL ("${raw}") — fix or unset the override`);
+  }
+  const host = url.hostname;
+  const loopback = host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new TurnAssemblyError(
+      `${envKey} ("${raw}") would send the credential and conversation over cleartext to a non-loopback host — use https:// for off-box gateways, or an http://127.0.0.1/localhost address`,
+    );
+  }
+  return raw;
+}
+
+/** The env-key credential resolution — byte-for-byte the pre-KPR-371 behaviour. */
+export function resolveEnvKeyCredential(
   key: string,
   opts: { instanceId: string; resolveSecret?: (instanceId: string, key: string) => string },
 ): string {

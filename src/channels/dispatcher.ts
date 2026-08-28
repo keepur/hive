@@ -2,18 +2,25 @@ import { createLogger } from "../logging/logger.js";
 import type { WorkItem, WorkResult } from "../types/work-item.js";
 import type { ChannelAdapter } from "./channel-adapter.js";
 import { isBroadcastCapable } from "./channel-adapter.js";
-import type { AgentManager, TurnContext, TurnResult, SpawnTurnStreamCallback } from "../agents/agent-manager.js";
+import {
+  conferenceRoundOf,
+  type AgentManager,
+  type TurnContext,
+  type TurnResult,
+  type SpawnTurnStreamCallback,
+} from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import type { HealthReporter } from "../health/health-reporter.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
 import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
+import type { MeetingScribe, MeetingSummary } from "../workers/meeting-scribe.js";
 import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
 import { classifyTurnResult, HARD_FAULT_KINDS } from "../agents/provider-adapters/error-classification.js";
-import type { OutageQueueStore, OutageQueueConfig } from "../outage/outage-queue-store.js";
+import type { OutageQueueStore, OutageQueueConfig, OutageEnqueueOrigin } from "../outage/outage-queue-store.js";
 import {
   OutageEpisodeTracker,
   adapterKeyFor,
@@ -23,6 +30,14 @@ import {
   terminalFailureNotice,
   threadKeyFor,
 } from "../outage/outage-notices.js";
+import {
+  MAX_DEADLINE_CONTINUATIONS,
+  deadlineBaseIdOf,
+  deadlineContinuationWrap,
+  deadlineNoticeFor,
+  deadlineTerminalNoticeFor,
+  deadlineZeroProgressNoticeFor,
+} from "./deadline-continuation.js";
 
 const log = createLogger("dispatcher");
 
@@ -43,6 +58,16 @@ const NON_RESPONSE_PATTERNS = [
   /^n\/a\.?$/i,
 ];
 
+/** KPR-388: max of raw Slack ts strings by numeric value; undefined when none present. */
+function maxSlackTs(candidates: Array<string | undefined>): string | undefined {
+  let best: string | undefined;
+  for (const ts of candidates) {
+    if (!ts) continue;
+    if (best === undefined || parseFloat(ts) > parseFloat(best)) best = ts;
+  }
+  return best;
+}
+
 /** Extended resolved-agent type carrying optional conference metadata */
 interface ResolvedAgent {
   agentId: string;
@@ -51,6 +76,12 @@ interface ResolvedAgent {
   conferenceRound?: number; // 0 = human-triggered, 1 = peer reaction
   threadContext?: string;
   meetingPreamble?: string;
+  /** Round-1 only: the peer reply this reaction turn should engage with (KPR-387). */
+  reactionTo?: { authorName: string; text: string };
+  /** KPR-388: how threadContext was assembled — full transcript or delta since the mark. */
+  injectionMode?: "full" | "delta" | "summary";
+  /** KPR-388: max Slack ts (raw string) covered by this turn's injection; the mark advances to it on success. */
+  injectionHighWaterTs?: string;
 }
 
 /**
@@ -92,8 +123,13 @@ export class Dispatcher {
   private outage?: OutageHandlingDeps;
   private teamStore?: import("../team/team-store.js").TeamStore;
   private slackAdapter?: SlackAdapter;
+  /** KPR-409: optional running-summary source for the full-arm anchor.
+   *  Absent ⇒ every conference path behaves exactly as pre-KPR-409. */
+  private meetingScribe?: MeetingScribe;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
-  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — tracks which agents reacted in round 1
+  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents that responded or were
+  // selected to respond on this human message, either round (KPR-387): round-0
+  // primaries recorded at selection time, round-1 reactors at claim time.
   private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
@@ -147,6 +183,10 @@ export class Dispatcher {
     this.slackAdapter = adapter;
   }
 
+  setMeetingScribe(scribe: MeetingScribe): void {
+    this.meetingScribe = scribe;
+  }
+
   async dispatch(item: WorkItem): Promise<void> {
     // 0. Deduplicate — if two adapters see the same Slack message, only process it once.
     //    KPR-307: outage replays are engine-authored redispatches of the ORIGINAL
@@ -154,7 +194,15 @@ export class Dispatcher {
     //    fast-fails, so a synthetic id would repeat and dedup would silently drop
     //    every replay after the first). Dedup exists for externally-duplicated
     //    deliveries; a replay has nothing to dedup against — bypass it.
-    if (this.recentMessageIds.has(item.id) && !item.meta?.outageReplay) {
+    //    KPR-402 (r1 SF-1): continuation legs are engine-authored on the same
+    //    rationale, and they NEED the bypass — under multi-agent fan-out /
+    //    conference every agent's leg derives the SAME id (`<origin>#dl<n>`:
+    //    the counter is per-chain, not per-agent), so id-only dedup would
+    //    silently drop agent 2's leg at debug level after its notice already
+    //    promised a continuation. A leg, like a replay, has nothing to dedup
+    //    against — its (agentId, id) pair is what's unique, and every
+    //    downstream store write is already keyed on the composite.
+    if (this.recentMessageIds.has(item.id) && !item.meta?.outageReplay && item.meta?.deadlineRetry === undefined) {
       log.debug("Duplicate message skipped", { id: item.id, source: item.source.adapterId });
       return;
     }
@@ -305,6 +353,36 @@ export class Dispatcher {
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
+      // KPR-389 D5b: single-dispatch leg of the round-1 kill suppression —
+      // reachable only by replayed reactions (live conference turns always
+      // route via dispatchToAgent). Discriminator is the meta (replay
+      // `resolved` carries no conference fields). Delivery-only suppression:
+      // recordTurnSuccess below still runs, so replay → done resolution is
+      // unharmed. Text-bearing kills DELIVER here, unlike the fan-out leg —
+      // replay is the last delivery chance. No error arm: an errored replay
+      // already resolved via resolveReplayRealFailure above. Text-bearing
+      // kills DELIVER (below) rather than staying silent — replay is the
+      // last delivery chance — so the discriminator for bypassing the
+      // deadline-abort arm (immediately below) is the broader
+      // isRound1AbortedReplay, not killedReaction alone: BOTH the silent and
+      // the text-bearing round-1 replay outcomes own their own resolution
+      // here and must never be intercepted by the continuation-notice arm.
+      const isRound1AbortedReplay = conferenceRoundOf(item) === 1 && (runResult.aborted || runResult.timedOut);
+      const killedReaction = isRound1AbortedReplay && !trimmedText;
+
+      // KPR-402: closed-circuit deadline-abort interception. Runs AFTER
+      // maybeHandlePostTurnOutage (the zero-progress+open ★ row keeps the
+      // outage path unchanged; the with-progress+open ★ row migrates from
+      // bare legacy delivery to this arm — spec §Design.6 / ⚠A8), after the
+      // replay-error gate (disjoint: a Claude-lane deadline abort never sets
+      // error — the runner's deadline CLOSES the iterator), and — deliberately
+      // — after the D5b computation above: a round-1 aborted/timed-out replay
+      // owns its own resolution (silent drop or last-chance delivery, below)
+      // and must never be intercepted by the continuation-notice arm.
+      if (!isRound1AbortedReplay && (await this.maybeHandleDeadlineAbort(item, agentId, adapter, runResult))) {
+        return;
+      }
+
       if (isNonResponse) {
         log.info("Non-response suppressed", {
           agentId,
@@ -312,6 +390,13 @@ export class Dispatcher {
           text: trimmedText,
           costUsd: runResult.costUsd,
           durationMs: runResult.durationMs,
+          conferenceRound: conferenceRoundOf(item),
+        });
+      } else if (killedReaction) {
+        log.info("Round-1 reaction suppressed on replay (killed)", {
+          agentId,
+          aborted: runResult.aborted,
+          timedOut: runResult.timedOut,
         });
       } else {
         const workResult: WorkResult = {
@@ -344,6 +429,11 @@ export class Dispatcher {
           toolMs: runResult.toolMs,
           toolCalls: runResult.toolCalls,
           toolSummary: runResult.toolSummary,
+          // KPR-401: segmentation flags — log-based dashboards can now
+          // exclude aborted/timed-out turns' honest zeros from spend and
+          // latency stats. convertTurnResult already maps both faithfully.
+          aborted: runResult.aborted,
+          timedOut: runResult.timedOut,
         });
       }
 
@@ -408,6 +498,9 @@ export class Dispatcher {
       // downstream"; that stopped being true here).
       aborted: turn.aborted ?? false,
       timedOut: turn.timedOut,
+      // KPR-388: fresh-vs-resumed signal consumed by the conference
+      // meeting-mark bookkeeping in dispatchToAgent.
+      resumedSession: turn.resumedSession,
     };
   }
 
@@ -509,7 +602,8 @@ export class Dispatcher {
   ): Promise<void> {
     if (this.outage) {
       if (err instanceof ProviderCircuitOpenError) {
-        const handled = await this.handleOutageTurn(item, agentId, adapter, err.provider);
+        // KPR-400 (F2): the turn never ran — fast-fail class (replays first).
+        const handled = await this.handleOutageTurn(item, agentId, adapter, err.provider, "fast-fail");
         if (handled) return;
       } else if (item.meta?.outageReplay) {
         await this.outage.store
@@ -539,14 +633,22 @@ export class Dispatcher {
 
   /**
    * §7.2 second classification leg (post-turn gate): the turn COMPLETED but
-   * the provider's breaker is open. Fires when the result classifies into
-   * HARD_FAULT_KINDS OR `timedOut && aborted` (Finding 3 r2 — a runner-
-   * deadline timeout typically leaves `error` unset, so `errors` alone never
-   * fires for hang-type outages). Gated on snapshot.enabled so shadow mode
-   * stays fully observational. A `non-provider` classification with the
-   * breaker coincidentally open follows the LEGACY path — a partially-
-   * executed tool turn's side effects must not be silently re-run
-   * (Finding 4 r1).
+   * the provider's breaker is open. Fires only when the FULL RunResult
+   * classifies into HARD_FAULT_KINDS (KPR-398: the classifier consults
+   * toolCalls/streamed/text inside its timedOut && aborted rule — a
+   * zero-progress hang classifies hard `timeout` and queues here; a
+   * with-progress deadline abort classifies breaker-inconclusive
+   * `turn-deadline` and follows the LEGACY path, because it by definition
+   * executed tools or streamed and a partially-executed tool turn's side
+   * effects must not be silently re-run — the same Finding 4 r1 rationale
+   * that keeps `non-provider` classifications out of the queue). The former
+   * redundant `timedOut && aborted` hangTimeout arm is deleted: rule 1
+   * classifies that shape as a fault irrespective of `error`, so hardFault
+   * alone covers exactly what it caught; the Finding 3 r2 concern (runner-
+   * deadline timeouts leave `error` unset, so `errors` alone never fires)
+   * lives in the cheap-exit condition below, which still admits error-less
+   * timedOut turns. Gated on snapshot.enabled so shadow mode stays fully
+   * observational.
    */
   private async maybeHandlePostTurnOutage(
     item: WorkItem,
@@ -563,16 +665,250 @@ export class Dispatcher {
     const snapshot = this.agentManager.circuitBreakers.stateFor(provider);
     if (!snapshot || snapshot.state !== "open" || snapshot.enabled !== true) return false;
 
-    const classification = classifyTurnResult({
-      error: runResult.error,
-      timedOut: runResult.timedOut,
-      aborted: runResult.aborted,
-    });
+    // KPR-398: full RunResult — structurally carries toolCalls/streamed/text.
+    const classification = classifyTurnResult(runResult);
     const hardFault = classification.outcome === "fault" && HARD_FAULT_KINDS.has(classification.kind);
-    const hangTimeout = runResult.timedOut === true && runResult.aborted === true;
-    if (!hardFault && !hangTimeout) return false;
+    if (!hardFault) return false;
 
-    return this.handleOutageTurn(item, agentId, adapter, provider);
+    // KPR-400 (F2): the turn RAN and hard-faulted with the breaker open —
+    // post-turn-fault class (deadline burners live here; replays last).
+    return this.handleOutageTurn(item, agentId, adapter, provider, "post-turn-fault");
+  }
+
+  /**
+   * KPR-402: deadline-abort continuation arm. Matches the D6 rows 1-2 shape
+   * only (`timedOut && aborted` — the Claude-lane/Lane-A deadline abort):
+   * Lane B's sentinel carries `aborted: false` and operator stops carry no
+   * `timedOut`, so neither ever enters. NOT outage machinery (⚠A6): active
+   * regardless of `outageQueue.enabled` — the replay-doc branches simply
+   * never fire when `this.outage` is unset (no replays exist then).
+   *
+   * With progress (D6 kind `turn-deadline` — the KPR-399-persisted session
+   * exists): honest first-abort notice on notify channels, then an
+   * IN-PROCESS re-dispatch of a synthetic continuation item whose session
+   * resumes through the unchanged runWorkItemTurn → sessionStore.get path
+   * (emergent, zero new code — and dependent on the thread-key pin below).
+   * Bounded chain: MAX_DEADLINE_CONTINUATIONS, then a terminal notice
+   * naming the manual "continue" hatch. Zero progress (hard `timeout` — the
+   * hang signature): notice only / warn-log only, never a re-dispatch.
+   * Cron: fully inert. The breaker never sees this arm — the aborted leg's
+   * record-once (inconclusive `turn-deadline`) already happened in the
+   * manager, and the arm adds no record site.
+   *
+   * Returns true when the turn was fully handled (notice and/or re-dispatch
+   * and/or replay-doc resolution); false = fall through to normal delivery.
+   */
+  private async maybeHandleDeadlineAbort(
+    item: WorkItem,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+    runResult: RunResult,
+  ): Promise<boolean> {
+    if (runResult.timedOut !== true || runResult.aborted !== true) return false;
+    const policy = policyFor(item);
+    if (policy === "skip") return false; // cron: re-fires at next match — arm fully inert (ticket ruling)
+
+    // D6 single source of truth — full RunResult through classifyTurnResult
+    // (the KPR-398 call-site convention), never a re-implemented predicate.
+    // (`outcome === "fault"` is the discriminant narrowing the union before
+    // `.kind` — the same two-step the KPR-398 hard-fault gate above uses.)
+    const classification = classifyTurnResult(runResult);
+    const withProgress = classification.outcome === "fault" && classification.kind === "turn-deadline";
+
+    if (!withProgress) {
+      // Zero progress (hard `timeout`): NEVER a re-dispatch (⚠A3) — nothing
+      // was persisted to resume (D1 fail-closed persist gate), a fresh
+      // restart would re-run the full turn against a provider that just sat
+      // silent for the entire deadline, and repeat hangs are the breaker's
+      // designed territory (three consecutive open the circuit and the
+      // KPR-307 queue+notice machinery takes over with its own honest story).
+      if (this.outage && item.meta?.outageReplay) {
+        // §5-2g "real failure while breaker closed": attempts+1, pending
+        // again (silent — the enqueue-time outage notice's promise still
+        // stands) or terminal `failed` with the existing terminal notice.
+        // No separate deadline notice — never double-notice one thread.
+        await this.resolveReplayRealFailure(item, agentId, adapter, "turn deadline exceeded (zero progress)");
+        return true;
+      }
+      if (policy === "notify") {
+        await this.deliverOutageNotice(item, agentId, adapter, deadlineZeroProgressNoticeFor(item.source.kind));
+        // r1 NIT-1: the notify arm exits were the only two silent ones. Same
+        // field shape as the silent twins' warns (no message text — KPR-307
+        // redaction posture), plus the KPR-401 segmentation fields, since
+        // "Work item dispatched" never fires for an arm-handled turn.
+        log.info("Deadline zero-progress abort — notice delivered, no continuation", {
+          agentId,
+          itemId: item.id,
+          threadId: item.threadId,
+          deadlineRetry: item.meta?.deadlineRetry,
+          timedOut: runResult.timedOut,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+          llmMs: runResult.llmMs,
+          toolCalls: runResult.toolCalls,
+        });
+      } else {
+        // Silent one-shot (callback:/event:/team-): warn log only — no
+        // human is owed a notice (KPR-307 posture). The one-shot's trigger
+        // is lost for this firing (accepted, spec §Design.3 r1 B2); the
+        // warn keeps it conspicuous, and the bare "_No response._" delivery
+        // to a system surface is suppressed too.
+        log.warn("Deadline zero-progress abort on silent one-shot — dropped with log", {
+          agentId,
+          itemId: item.id,
+        });
+      }
+      return true;
+    }
+
+    // ---- With progress: notice + in-process continuation ----
+
+    // 1. Replay-doc resolution: the queue slot resolves; the chain owns the
+    //    turn from here (⚠A5: a crash mid-chain loses only the continuation
+    //    — the session row survives, so the thread's next message resumes
+    //    the partial work; strictly better than today's done+"_No response._").
+    if (this.outage && item.meta?.outageReplay) {
+      await this.outage.store
+        .release(item.id, agentId, "done", "deadline abort — continuation dispatched in-process (KPR-402)")
+        .catch((err) => log.error("Deadline-abort replay done-release failed", { error: String(err) }));
+    }
+
+    // r1 NIT-2: fail CLOSED on a non-finite counter. A corrupted or
+    // hand-edited `deadlineRetry` (NaN from a non-numeric value, Infinity)
+    // would sail past `n >= MAX_DEADLINE_CONTINUATIONS` — NaN compares false
+    // against everything — and dispatch an unbounded chain of `#dlNaN` legs.
+    // Treat anything non-finite as at-cap: terminal notice, no leg.
+    const rawRetry = Number(item.meta?.deadlineRetry ?? 0);
+    const n = Number.isFinite(rawRetry) ? rawRetry : MAX_DEADLINE_CONTINUATIONS;
+
+    // 2. Notice cadence: two per chain, maximum — one first-abort notice
+    //    (deadlineRetry absent), silence on intermediate legs, one terminal
+    //    notice at the cap. No episode-tracker involvement (deadline aborts
+    //    are discrete per-thread events, not provider episodes).
+    if (policy === "notify" && item.meta?.deadlineRetry === undefined) {
+      await this.deliverOutageNotice(item, agentId, adapter, deadlineNoticeFor(item.source.kind));
+    }
+
+    // 3. Cap check (G3): the counter strictly increments and nothing resets
+    //    or strips it; the terminal notice's manual hatch is real — the
+    //    KPR-399 session row persists either way.
+    if (n >= MAX_DEADLINE_CONTINUATIONS) {
+      if (policy === "notify") {
+        await this.deliverOutageNotice(item, agentId, adapter, deadlineTerminalNoticeFor(item.source.kind));
+        log.info("Deadline continuation cap exhausted — terminal notice delivered", {
+          agentId,
+          itemId: item.id,
+          threadId: item.threadId,
+          deadlineRetry: item.meta?.deadlineRetry,
+          timedOut: runResult.timedOut,
+          costUsd: runResult.costUsd,
+          durationMs: runResult.durationMs,
+          llmMs: runResult.llmMs,
+          toolCalls: runResult.toolCalls,
+        });
+      } else {
+        log.warn("Deadline continuation cap exhausted on silent one-shot", { agentId, itemId: item.id });
+      }
+      return true;
+    }
+
+    // 4. Re-dispatch — AFTER the notice delivery completed (the adapter
+    //    round-trip also puts real time between finalize's fire-and-forget
+    //    session write and the continuation's store read — belt, ⚠A4).
+    //
+    // META HYGIENE (spec r1 B1): replay markers must NOT leak into the
+    // chain. The processor stamps `outageReplay: true` on every replayItem,
+    // and the dispatcher's three replay branches (resolveReplayRealFailure,
+    // handleOutageTurn's release-before-depth, handleTurnFailure's
+    // pending-release) key on that flag with store filters of {itemId,
+    // agentId} and NO status guard — an inherited flag would let a
+    // continuation leg's later failure resurrect the origin's resolved
+    // `done` doc back to pending (duplicate replay of the ORIGINAL stored
+    // workItem). Strip on EVERY leg construction: a fresh-seeded chain
+    // acquires the flag after one queue round-trip. Everything else in meta
+    // passes through unchanged (blocklist, not allowlist — channel keys
+    // like slackThreadTs are load-bearing for routing and delivery).
+    //
+    // KPR-413: conference keys are stripped alongside the replay marker. A
+    // continuation leg computed no injection and never re-enters conference
+    // resolution (targetAgentId routes it through resolveAgents step 0,
+    // which precedes the conf-* check at step 0.7), so inheriting
+    // conferenceMode/Round/HumanTs/InjectionMode would stamp a
+    // non-conference turn as a conference turn with an injection mode it
+    // never used — corrupting both C18 measurement surfaces
+    // (agent_turn_telemetry, activity_log). Same shape as C26's `worker:`
+    // re-entry: an engine-authored re-dispatch into a meeting thread is an
+    // ordinary turn. This deliberately reverses KPR-402's own stated
+    // rationale (kpr-402-spec.md:359-362) that conference keys are
+    // load-bearing for routing — verified false for this codebase: routing
+    // is targetAgentId, not any conference meta key. Still a blocklist, not
+    // an allowlist — channel keys stay.
+    const {
+      outageReplay: _replayMarker,
+      conferenceMode: _confMode,
+      conferenceRound: _confRound,
+      conferenceHumanTs: _confHumanTs,
+      conferenceInjectionMode: _confInjectionMode,
+      ...carriedMeta
+    } = item.meta ?? {};
+    const baseId = deadlineBaseIdOf(item.id); // leg ids stay flat: x#dl3, never x#dl1#dl2#dl3 (⚠A11)
+    const originalText =
+      typeof item.meta?.deadlineOriginalText === "string" ? item.meta.deadlineOriginalText : item.text;
+    const retryItem: WorkItem = {
+      ...item,
+      // Per-leg id (⚠A11): a chain leg's own outage enqueue (breaker opens
+      // mid-chain) writes under a FRESH (itemId, agentId) key — a real
+      // $setOnInsert insert beside the origin's terminal doc that serializes
+      // the leg's workItem (counter included) verbatim, never a silent
+      // same-key no-op. Suffixing keeps policyFor's prefix classes intact
+      // (callback:x#dl1 is still callback:-classed). Dedup: a leg's id is
+      // first-seen on the SINGLE-agent path, but fan-out mints the same leg
+      // id once per aborting agent, so dedup carries a deadlineRetry bypass
+      // for engine-authored legs (D39 / child-PR r1 SF-1, pinned T16).
+      id: `${baseId}#dl${n + 1}`,
+      // THREAD-KEY PINNING (spec r2 blocker): every threadId consumer falls
+      // back to item.id when threadId is absent — runWorkItemTurn's session
+      // read (agent-manager.ts:866), the per-thread lock, threadAgentMap,
+      // the task ledger. For threadId-less items (callback:/bg:/ct:/
+      // meeting: completions) the origin leg persisted its session under
+      // key `x` while an unpinned continuation would READ under `x#dl1`:
+      // no resume, ever — the blind fresh re-run Finding-4 forbids.
+      // Materialize the origin's EFFECTIVE thread key before the id changes;
+      // threaded items are unaffected (identity copy).
+      threadId: item.threadId ?? item.id,
+      text: deadlineContinuationWrap(originalText, n + 1, MAX_DEADLINE_CONTINUATIONS + 1),
+      meta: {
+        ...carriedMeta,
+        targetAgentId: agentId, // resolveAgents step 0 — routed exactly like a replay, no re-resolution drift
+        deadlineRetry: n + 1,
+        // Wrap round-trip (T9): a later leg wraps the ORIGINAL request, never
+        // a previous leg's wrap nested.
+        deadlineOriginalText: originalText,
+      },
+    };
+    // Fire-and-forget: awaiting would hold the caller (an adapter handler or
+    // the replay drain) for another full deadline. onProcessingEnd fires for
+    // the aborted leg; the continuation's own dispatch restarts the typing
+    // indicator. The replay drain's statusOf re-read sees `done` (step 1)
+    // and keeps draining — never the "no outcome recorded" defensive revert.
+    void this.dispatch(retryItem).catch((err) =>
+      log.error("Deadline continuation dispatch failed", { agentId, error: String(err) }),
+    );
+    log.info("Deadline continuation dispatched in-process", {
+      agentId,
+      itemId: retryItem.id,
+      threadId: retryItem.threadId,
+      deadlineRetry: n + 1,
+      timedOut: runResult.timedOut,
+      // KPR-401 log-segmentation parity: "Work item dispatched" never fires
+      // for an arm-handled turn, so the aborted leg's spend/latency would
+      // otherwise vanish from log-based dashboards entirely.
+      costUsd: runResult.costUsd,
+      durationMs: runResult.durationMs,
+      llmMs: runResult.llmMs,
+      toolCalls: runResult.toolCalls,
+    });
+    return true;
   }
 
   /**
@@ -586,6 +922,10 @@ export class Dispatcher {
     agentId: string,
     adapter: ChannelAdapter | undefined,
     provider: string,
+    /** KPR-400 (F2): enqueue class — threaded from the exactly two callers;
+     *  $setOnInsert-immutable, so a replayed doc's re-visit here (the
+     *  release-before-depth branch) never rewrites it. */
+    origin: OutageEnqueueOrigin,
   ): Promise<boolean> {
     const outage = this.outage;
     if (!outage) return false;
@@ -641,7 +981,20 @@ export class Dispatcher {
         return true;
       }
 
-      await outage.store.enqueue({ itemId: item.id, agentId, provider, workItem: item, policy });
+      await outage.store.enqueue({
+        itemId: item.id,
+        agentId,
+        provider,
+        workItem: item,
+        policy,
+        enqueueOrigin: origin,
+        // KPR-403: enqueue-time deadline stamp — the doc carries its own
+        // replay-turn wall-clock upper bound (D20 semantics) so the store's
+        // recovery sweep needs no registry access. Both origin callers flow
+        // through this single site; the replayed-fast-fail release branch
+        // above never writes the field ($setOnInsert-immutable, spec ⚠A3).
+        deadlineMs: this.agentManager.turnDeadlineUpperBoundMs(agentId),
+      });
     } catch (storeErr) {
       log.error("Outage enqueue failed — falling back to legacy error path", { error: String(storeErr) });
       return false;
@@ -988,17 +1341,44 @@ export class Dispatcher {
     // Conference mode: inject thread context + preamble into the WorkItem
     let effectiveItem = item;
     if (resolved.conferenceMode) {
-      const contextPrefix = [resolved.meetingPreamble, "", resolved.threadContext, "", "---", `[New message]:`]
-        .filter(Boolean)
-        .join("\n");
+      // KPR-387: round-1 reaction turns are framed against the peer reply — the
+      // original human message is never re-presented in the terminal slot. It
+      // remains reachable via session ∪ injected context (KPR-388 generalizes
+      // the old re-fetched-transcript guarantee): a round-1 reactor was never a
+      // round-0 responder for this trigger (C1/C2), so its mark predates the
+      // triggering message — the message is in its delta, or already in its
+      // session by the covering invariant. A reactor with no session/mark gets
+      // the full transcript directly.
+      const newMessageSegment = resolved.reactionTo
+        ? `[${resolved.reactionTo.authorName} just replied]:\n${resolved.reactionTo.text}\n\n` +
+          `React to ${resolved.reactionTo.authorName}'s reply if you have something to add. ` +
+          `Do not re-answer the original question. If you have nothing to add, respond with "No response needed."`
+        : `[New message]:\n${item.text}`;
+      const contextPrefix = [resolved.meetingPreamble, resolved.threadContext, "---"].filter(Boolean).join("\n");
+      // KPR-413: the transcript belongs to the MEETING, not to this turn. A
+      // KPR-402 continuation leg re-wraps meta.deadlineOriginalText verbatim
+      // on every leg (up to MAX_DEADLINE_CONTINUATIONS), into a session that
+      // KPR-399 resume already loaded with the original composite — so
+      // letting the arm fall back to item.text (the assembled composite,
+      // preamble + full/delta/summary transcript + terminal slot) reproduces
+      // the N-copies bloat this epic exists to remove. Stamp the turn's OWN
+      // frame instead: preamble + terminal slot, no injection. Byte-shaped
+      // exactly like an empty-delta turn (C10), and it rides into the
+      // outage store so a replayed conference turn's later abort is honest
+      // too (single-dispatch leg).
+      const framePrefix = [resolved.meetingPreamble, "---"].filter(Boolean).join("\n");
       effectiveItem = {
         ...item,
-        text: `${contextPrefix}\n${item.text}`,
+        text: `${contextPrefix}\n${newMessageSegment}`,
         meta: {
           ...item.meta,
           conferenceMode: true,
           conferenceHumanTs: resolved.conferenceHumanTs,
           conferenceRound: resolved.conferenceRound,
+          // KPR-389 D1: injection mode rides along so telemetry can segment
+          // full vs delta turns (KPR-388 efficacy measurement).
+          conferenceInjectionMode: resolved.injectionMode,
+          deadlineOriginalText: `${framePrefix}\n${newMessageSegment}`,
         },
       };
     }
@@ -1029,11 +1409,66 @@ export class Dispatcher {
         return;
       }
 
+      // KPR-389 D5: a killed reaction is silent — never post filler into the
+      // meeting, and never routed through the KPR-402 deadline-continuation
+      // notice/re-dispatch machinery below (a round-1 reactor's timeout is
+      // always a quiet drop, not a "your turn is continuing" notice — this
+      // must run BEFORE maybeHandleDeadlineAbort). Keys on the in-memory
+      // ResolvedAgent (replay items never carry conference fields here — they
+      // take the single-dispatch leg, D5b). The early return deliberately
+      // skips recordTurnSuccess: a killed turn is not evidence of provider
+      // recovery (the KPR-307 episode ends on the next genuinely successful
+      // turn). An errored reaction WITH text still delivers (exit-code-1
+      // convention — may be a real answer + warning).
+      if (
+        resolved.conferenceRound === 1 &&
+        (runResult.aborted || runResult.timedOut || (runResult.error && !runResult.text.trim()))
+      ) {
+        log.info("Round-1 reaction suppressed (killed/errored)", {
+          agentId,
+          aborted: runResult.aborted,
+          timedOut: runResult.timedOut,
+          error: runResult.error?.slice(0, 120),
+        });
+        return;
+      }
+
+      // KPR-402: same deadline-abort arm as the single-dispatch path — the
+      // fan-out body is a near-duplicate (same placement discipline as
+      // maybeHandlePostTurnOutage above). Runs AFTER the D5 round-1 kill
+      // check above (round-1 owns its own silent-drop semantics; this arm is
+      // for round-0 / non-conference fan-out recipients).
+      if (await this.maybeHandleDeadlineAbort(effectiveItem, agentId, adapter, runResult)) {
+        return;
+      }
+
+      // KPR-388: meeting-continuity mark bookkeeping. Sits AFTER the outage,
+      // deadline-abort, and D5 kill gates (a queued/fast-failed/
+      // deadline-continued/killed turn must not touch the mark) and OUTSIDE
+      // the isNonResponse branch below — a suppressed turn consumed its
+      // injection all the same (C2's "responded or selected" spirit).
+      // Error/aborted turns leave the mark untouched: session absorption is
+      // unknown, and a stale-low mark only over-includes next turn
+      // (duplication, never a gap — covering invariant, spec §5). Both store
+      // methods are withRetry fail-soft and never throw.
+      if (resolved.conferenceMode && !runResult.error && !runResult.aborted) {
+        const sessionStore = this.agentManager.getSessionStore();
+        if (resolved.injectionMode === "delta" && runResult.resumedSession === false) {
+          // Delta went into a fresh session — continuity broke after
+          // injection was baked. Clear the mark: the NEXT turn injects the
+          // full transcript and heals (same-turn re-injection is impossible
+          // by construction — retries reuse the already-shaped prompt).
+          await sessionStore.clearMeetingMark(agentId, threadId);
+        } else if (resolved.injectionHighWaterTs) {
+          await sessionStore.setMeetingMark(agentId, threadId, resolved.injectionHighWaterTs);
+        }
+      }
+
       const trimmedText = runResult.text.trim();
       const isNonResponse = NON_RESPONSE_PATTERNS.some((p) => p.test(trimmedText));
 
       if (isNonResponse) {
-        log.info("Non-response suppressed (fan-out)", { agentId });
+        log.info("Non-response suppressed (fan-out)", { agentId, conferenceRound: resolved.conferenceRound });
       } else {
         const workResult: WorkResult = {
           text: runResult.text || "_No response._",
@@ -1131,19 +1566,59 @@ export class Dispatcher {
       return [];
     }
 
-    // Fetch thread context for injection and classifier recency
-    let threadContext = "";
+    // Fetch thread history once per trigger — per-agent injection contexts
+    // (full vs delta, KPR-388) are derived from it after classification.
+    let history: ThreadMessage[] = [];
     let recentMessages = "";
     if (this.slackAdapter) {
       const channelId = item.source.id;
       const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId;
-      const history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
-      threadContext = this.formatThreadContext(history, item.source.label, rosterMembers);
+      history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
       // Last 5 messages for classifier recency context
       recentMessages = history
         .slice(-5)
         .map((m) => `${m.author}: ${m.text.slice(0, 200)}`)
         .join("\n");
+    }
+
+    // KPR-409 (R1 — requested C26 relaxation): round-level cadence trigger.
+    // Fires once per round-0 pass INCLUDING passes where the classifier
+    // selects nobody. Fire-and-forget: noteActivity returns void, never
+    // throws, and removing this hunk restores byte-identical behavior.
+    // (`rosterMembers.length > 0` is redundant with the :1565 early return —
+    // kept deliberately so the seam states its own precondition locally and
+    // survives any future reordering. Not a bug; do not "simplify" it away.)
+    //
+    // The try/catch makes the fail-open STRUCTURAL at this boundary rather than
+    // dependent on the callee's internals holding (KPR-390 canon C27, same bug
+    // shape as the getSummary call site). noteActivity's ASYNC portion is
+    // already self-contained (`void this.run().catch().finally()`), but its
+    // SYNCHRONOUS gate checks run on this stack — a throw there would propagate
+    // straight through conference dispatch and kill the turn, contradicting the
+    // spec's "the scribe never blocks a conference turn" requirement.
+    if (history.length > 0 && rosterMembers.length > 0) {
+      try {
+        this.meetingScribe?.noteActivity({
+          threadId,
+          history,
+          channelLabel: item.source.label,
+          roster: rosterMembers,
+          baseAgentId: rosterMembers[0].agentId,
+          source: {
+            adapterId: item.source.adapterId ?? item.source.kind,
+            channelId: item.source.id,
+            channelKind: item.source.kind,
+            slackTs: (item.meta?.slackTs as string) ?? "",
+            slackThreadTs: (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId,
+          },
+        });
+      } catch (err) {
+        log.warn("Conference cadence: round-0 noteActivity threw, continuing the turn", {
+          agentId: rosterMembers[0].agentId,
+          threadId,
+          error: String(err),
+        });
+      }
     }
 
     // Run classifier
@@ -1157,16 +1632,51 @@ export class Dispatcher {
       costUsd: classification.costUsd,
     });
 
+    // KPR-387: record round-0 responders so the reaction pass never re-selects a
+    // primary for the same triggering human message. Recorded at selection time —
+    // a primary whose turn errors or is suppressed stays excluded for this trigger
+    // (deliberate: kills the suppressed-turn burn; Gate 1 delegated assumption).
+    // Runs synchronously before any round-0 dispatch starts, so there is no race
+    // with a fast round-0 completion triggering the reaction pass.
+    const humanTs = item.meta?.slackTs as string | undefined;
+    if (humanTs && classification.respondAgentIds.length > 0) {
+      if (!this.meetingReactionTracker.has(threadId)) {
+        this.meetingReactionTracker.set(threadId, new Map());
+      }
+      const threadTracker = this.meetingReactionTracker.get(threadId)!;
+      const responded = threadTracker.get(humanTs) ?? new Set<string>();
+      for (const id of classification.respondAgentIds) responded.add(id);
+      threadTracker.set(humanTs, responded);
+    }
+
     const preamble = this.buildMeetingPreamble(item.source.label, rosterMembers);
 
-    return classification.respondAgentIds.map((agentId) => ({
-      agentId,
-      conferenceMode: true,
-      conferenceHumanTs: item.meta?.slackTs as string,
-      conferenceRound: 0,
-      threadContext,
-      meetingPreamble: preamble,
-    }));
+    // KPR-388: per-agent injection context — delta for agents with meeting
+    // continuity, full transcript otherwise. Round-0 maxes the trigger's own
+    // ts into the high-water mark (BOTH modes): the terminal slot presents
+    // the trigger, so the session absorbs it even when the fetch raced it.
+    return Promise.all(
+      classification.respondAgentIds.map(async (agentId): Promise<ResolvedAgent> => {
+        const injection = await this.buildConferenceContext(
+          agentId,
+          threadId,
+          history,
+          item.source.label,
+          rosterMembers,
+          humanTs,
+        );
+        return {
+          agentId,
+          conferenceMode: true,
+          conferenceHumanTs: humanTs,
+          conferenceRound: 0,
+          threadContext: injection.threadContext,
+          meetingPreamble: preamble,
+          injectionMode: injection.injectionMode,
+          injectionHighWaterTs: injection.injectionHighWaterTs,
+        };
+      }),
+    );
   }
 
   private formatThreadContext(history: ThreadMessage[], channelName: string, roster: RosterMember[]): string {
@@ -1175,15 +1685,7 @@ export class Dispatcher {
     const participantNames = roster.map((r) => r.name).join(", ");
     const header = `[Meeting thread in #${channelName} — participants: ${participantNames}]`;
 
-    // If thread is very long, include first 5 + last 100 messages
-    let messages = history;
-    if (history.length > 105) {
-      const first = history.slice(0, 5);
-      const last = history.slice(-100);
-      messages = [...first, ...last];
-    }
-
-    const formatted = messages
+    const formatted = this.truncateHistory(history)
       .map((m) => {
         const ago = this.formatTimeAgo(m.timestamp);
         return `${m.author} (${ago}): ${m.text}`;
@@ -1191,6 +1693,143 @@ export class Dispatcher {
       .join("\n");
 
     return `${header}\n\n${formatted}`;
+  }
+
+  /** If thread is very long, include first 5 + last 100 messages (KPR-388: shared with the high-water calc). */
+  private truncateHistory(history: ThreadMessage[]): ThreadMessage[] {
+    if (history.length <= 105) return history;
+    return [...history.slice(0, 5), ...history.slice(-100)];
+  }
+
+  /**
+   * KPR-388: per-agent conference injection context. Delta iff ALL hold:
+   * the stored ref has a resumable sessionId (excludes no-row, TTL'd,
+   * scrubbed, empty-handle/codex rows), the stored provider matches the
+   * agent's current provider (else spawnTurn's KPR-313 guard runs the turn
+   * fresh with a handoff notice — full injection is the correct pairing),
+   * and a meeting mark exists. Every miss ⇒ full transcript, byte-identical
+   * to the pre-KPR-388 shared context (C6 pin).
+   */
+  private async buildConferenceContext(
+    agentId: string,
+    threadId: string,
+    history: ThreadMessage[],
+    channelName: string,
+    roster: RosterMember[],
+    roundZeroTriggerTs?: string,
+  ): Promise<{ threadContext: string; injectionMode: "full" | "delta" | "summary"; injectionHighWaterTs?: string }> {
+    const ref = await this.agentManager.getSessionStore().get(agentId, threadId);
+    const provider = this.agentManager.providerFor(agentId);
+    if (!ref?.sessionId || !ref.meetingLastSeenTs || ref.provider !== provider) {
+      // KPR-409 (C13-sanctioned anchor): a running summary replaces the raw
+      // transcript for fresh-session entrants. Fail-soft by construction —
+      // getSummary returns undefined when the scribe is absent, disabled, or
+      // has nothing yet, in which case the full arm below is byte-identical to
+      // pre-KPR-409 (C6 pin).
+      //
+      // The try/catch makes that fail-open STRUCTURAL at this boundary rather
+      // than dependent on the callee's internals holding (KPR-390 canon C27,
+      // same bug shape as the worker-claim-dedup call site): getSummary is
+      // documented total, but a future edit that breaks the total-guarantee
+      // must degrade to the full arm — a throw or rejection here would
+      // otherwise propagate through resolveAgents and kill the entire
+      // conference turn, contradicting the spec's "the scribe never blocks a
+      // conference turn" requirement.
+      let summary: MeetingSummary | undefined;
+      try {
+        summary = await this.meetingScribe?.getSummary(threadId);
+      } catch (err) {
+        log.warn("Conference anchor: getSummary failed, falling back to the full transcript", {
+          agentId,
+          error: String(err),
+        });
+      }
+      if (summary) {
+        const coveredNum = parseFloat(summary.coveredThroughTs);
+        // Same 100-cap as truncateHistory's tail; no first-5 pin — the summary
+        // holds the thread opening (the delta arm's own reasoning).
+        const tail = history.filter((m) => parseFloat(m.ts) > coveredNum).slice(-100);
+        return {
+          threadContext: this.formatSummaryContext(summary.summaryText, tail, channelName, roster),
+          injectionMode: "summary",
+          // ⚠ R2 (requested relaxation, spec §D4). If the coherence reviewer
+          // rules F1 instead, the reversal is to delete THIS ENTIRE
+          // injectionHighWaterTs property — not just the coveredThroughTs term
+          // below. Dropping only that term still leaves a defined mark on every
+          // round-0 turn (the trigger ts) and every non-empty-tail turn (the
+          // tail max), which is the withdrawn "max in only when the tail is
+          // non-empty" variant, not F1. True F1 = no injectionHighWaterTs key
+          // at all ⇒ undefined ⇒ the else-if at :1462 never calls
+          // setMeetingMark on any summary turn, inverting five tests (both
+          // T2(a) cases, T2(b), T2(c), T5) — see the plan header.
+          injectionHighWaterTs: maxSlackTs([
+            ...tail.map((m) => m.ts),
+            // REQUIRED under R2, not cosmetic: without this term an empty tail
+            // at round 1 yields undefined, setMeetingMark is skipped, and the
+            // agent never converts to delta.
+            summary.coveredThroughTs,
+            roundZeroTriggerTs,
+          ]),
+        };
+      }
+      return {
+        threadContext: this.formatThreadContext(history, channelName, roster),
+        injectionMode: "full",
+        injectionHighWaterTs: maxSlackTs([...this.truncateHistory(history).map((m) => m.ts), roundZeroTriggerTs]),
+      };
+    }
+
+    const markNum = parseFloat(ref.meetingLastSeenTs);
+    // Strictly greater than the mark; same 100-cap as truncateHistory's tail.
+    // No first-5 pin — the session already holds the thread opening (covering
+    // invariant, spec §5). An empty delta yields threadContext "" — dropped by
+    // dispatchToAgent's filter(Boolean) join; the terminal slot still carries
+    // the trigger (round-0) or peer reply (round-1), so it is always safe.
+    const delta = history.filter((m) => parseFloat(m.ts) > markNum).slice(-100);
+    return {
+      threadContext: delta.length > 0 ? this.formatDeltaContext(delta, channelName, roster) : "",
+      injectionMode: "delta",
+      injectionHighWaterTs: maxSlackTs([...delta.map((m) => m.ts), roundZeroTriggerTs]),
+    };
+  }
+
+  /**
+   * KPR-388: delta-mode context — same header and body format as
+   * formatThreadContext, headed as a delta. MUST NOT contain the
+   * terminal-slot marker "[New message]:" (the C3 framing test's negative
+   * assertions depend on its absence).
+   */
+  private formatDeltaContext(delta: ThreadMessage[], channelName: string, roster: RosterMember[]): string {
+    const participantNames = roster.map((r) => r.name).join(", ");
+    const header = `[Meeting thread in #${channelName} — participants: ${participantNames}]`;
+    const formatted = delta
+      .map((m) => {
+        const ago = this.formatTimeAgo(m.timestamp);
+        return `${m.author} (${ago}): ${m.text}`;
+      })
+      .join("\n");
+    return `${header}\n[New messages since your last turn:]\n\n${formatted}`;
+  }
+
+  /**
+   * KPR-409: summary-mode context — running summary plus the messages that
+   * postdate it. Marker-collision checked (C3/C10): neither marker is
+   * "[New message]:" (the terminal slot) nor "[New messages since your last
+   * turn:]" (the delta header), and neither starts with "[New".
+   * The tail block is omitted entirely when `tail` is empty.
+   */
+  private formatSummaryContext(
+    summaryText: string,
+    tail: ThreadMessage[],
+    channelName: string,
+    roster: RosterMember[],
+  ): string {
+    const participantNames = roster.map((r) => r.name).join(", ");
+    const header = `[Meeting thread in #${channelName} — participants: ${participantNames}]`;
+    const base = `${header}\n[Running summary of the meeting so far:]\n\n${summaryText}`;
+    if (tail.length === 0) return base;
+    const formatted = tail.map((m) => `${m.author} (${this.formatTimeAgo(m.timestamp)}): ${m.text}`).join("\n");
+    return `${base}\n\n[Messages since the summary:]\n\n${formatted}`;
   }
 
   private formatTimeAgo(timestamp: Date): string {
@@ -1202,14 +1841,23 @@ export class Dispatcher {
     return `${hours}h ago`;
   }
 
+  /** KPR-389 D4: hardened — the transcript is already in prompt ∪ session
+   *  (C10 covering-invariant phrasing, true in full, delta, AND summary modes
+   *  — KPR-409's summary mode substitutes a running summary for the raw
+   *  transcript in the prompt, see formatSummaryContext); decline
+   *  immediately with the C4-safe escape phrase. Escape phrase must stay
+   *  "No response needed." verbatim (C4 + C3 terminal-slot coherence) — any
+   *  rewording must re-run the C4 guard test. */
   private buildMeetingPreamble(channelName: string, roster: RosterMember[]): string {
     const names = roster.map((r) => r.name).join(", ");
     return `You are in a meeting in #${channelName} with ${names}.
 
 Meeting rules:
+- The discussion so far is already in this prompt and your session context — do NOT re-read the channel, search the workspace, or re-orient with tools before speaking.
+- If you have nothing meaningful to add, reply "No response needed." immediately — as your first output, with no tool calls first.
+- Only use a tool if your reply genuinely needs information that is not already in this thread — never to re-read the meeting itself.
 - Be concise — others are also responding.
 - Build on what's been said. Don't repeat points already made.
-- If you have nothing meaningful to add, respond with "No response needed."
 - Stay in your lane — don't cover someone else's domain unless asked.
 - Address others by name when responding to their points.`;
   }
@@ -1272,15 +1920,16 @@ Meeting rules:
       peers: classification.respondAgentIds,
     });
 
-    // Re-fetch thread context (now includes the round-0 response)
-    let threadContext = "";
+    // Re-fetch thread history (now includes the round-0 response); per-reactor
+    // injection contexts (full vs delta, KPR-388) are derived from it below.
+    let history: ThreadMessage[] = [];
+    const allRosterMembers: RosterMember[] = [];
     let preamble = "";
     if (this.slackAdapter) {
       const channelId = originalItem.source.id;
       const threadTs =
         (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId;
-      const history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
-      const allRosterMembers: RosterMember[] = [];
+      history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
       for (const agentId of roster) {
         const agent = this.registry.get(agentId);
         if (!agent || agent.disabled) continue;
@@ -1291,19 +1940,64 @@ Meeting rules:
           role: agent.soul.split("\n")[0],
         });
       }
-      threadContext = this.formatThreadContext(history, originalItem.source.label, allRosterMembers);
       preamble = this.buildMeetingPreamble(originalItem.source.label, allRosterMembers);
     }
 
+    // KPR-409 (R1 — requested C26 relaxation): round-1 cadence trigger.
+    // Selection-gated by construction (the three early returns above precede
+    // the re-fetch). Same fire-and-forget contract — and the same structural
+    // call-site fail-safety (KPR-390 canon C27) — as the round-0 seam: a throw
+    // out of noteActivity's synchronous gate checks must never take down the
+    // reaction dispatch below.
+    if (history.length > 0 && allRosterMembers.length > 0) {
+      try {
+        this.meetingScribe?.noteActivity({
+          threadId,
+          history,
+          channelLabel: originalItem.source.label,
+          roster: allRosterMembers,
+          baseAgentId: allRosterMembers[0].agentId,
+          source: {
+            adapterId: originalItem.source.adapterId ?? originalItem.source.kind,
+            channelId: originalItem.source.id,
+            channelKind: originalItem.source.kind,
+            slackTs: humanTs,
+            slackThreadTs:
+              (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId,
+          },
+        });
+      } catch (err) {
+        log.warn("Conference cadence: round-1 noteActivity threw, continuing the turn", {
+          agentId: allRosterMembers[0].agentId,
+          threadId,
+          error: String(err),
+        });
+      }
+    }
+
     // Dispatch reactions concurrently (peers already claimed in reacted set above)
-    const reactionDispatches = classification.respondAgentIds.map((agentId) => {
+    const responderName = this.registry.get(respondingAgentId)?.name ?? respondingAgentId;
+    const reactionDispatches = classification.respondAgentIds.map(async (agentId) => {
+      // KPR-388: per-reactor full/delta decision. No trigger max-in on
+      // round-1 — new content reaches the mark only via the re-fetched
+      // transcript (the peer reply's ts is not knowable here).
+      const injection = await this.buildConferenceContext(
+        agentId,
+        threadId,
+        history,
+        originalItem.source.label,
+        allRosterMembers,
+      );
       const resolved: ResolvedAgent = {
         agentId,
         conferenceMode: true,
         conferenceHumanTs: humanTs,
         conferenceRound: 1,
-        threadContext,
+        threadContext: injection.threadContext,
         meetingPreamble: preamble,
+        injectionMode: injection.injectionMode,
+        injectionHighWaterTs: injection.injectionHighWaterTs,
+        reactionTo: { authorName: responderName, text: responseText },
       };
       return this.dispatchToAgent(originalItem, resolved);
     });

@@ -3,6 +3,9 @@ import {
   classifyTurnResult,
   classifyThrown,
   HARD_FAULT_KINDS,
+  hasObservedProgress,
+  isClaudeResumeLoadError,
+  TURN_DEADLINE_SUBTYPE,
   TurnAssemblyError,
   type ProviderFaultKind,
 } from "./error-classification.js";
@@ -15,6 +18,9 @@ function faultKind(error: string): ProviderFaultKind {
 
 describe("classifyTurnResult (KPR-306)", () => {
   it("classifies timedOut + aborted as a timeout fault (precedence over aborted)", () => {
+    // KPR-398 fail-closed pin: progress fields ABSENT ⇒ no progress ⇒ hard
+    // timeout. A caller passing a narrowed input keeps pre-KPR-398 behavior.
+    // Do not weaken this row.
     expect(classifyTurnResult({ timedOut: true, aborted: true })).toEqual({
       outcome: "fault",
       kind: "timeout",
@@ -55,7 +61,17 @@ describe("classifyTurnResult (KPR-306)", () => {
     "rate limit exceeded",
     "rate-limited, retry later",
     "too many requests",
+    "Resource has been exhausted (e.g. check quota).", // Gemini prose 429 (dodi 2026-08-24)
+    "Status RESOURCE_EXHAUSTED on generateContent", // gRPC-style status token
+    "Quota exceeded for quota metric 'Generate requests'", // quota-phrased 429
   ])("rate-limit: %s", (s) => expect(faultKind(s)).toBe("rate-limit"));
+
+  // Negative pins for the Google-429 alternates (false-positive bias — a
+  // hive-internal budget message must never take breaker weight).
+  it.each([
+    "Task denied: spawn budget exhausted (2/2) — try again shortly",
+    "autoDream run budget exhausted",
+  ])("non-provider (not a vendor 429): %s", (s) => expect(faultKind(s)).toBe("non-provider"));
 
   it.each([
     "401 unauthorized-ish", // \b401\b
@@ -99,6 +115,20 @@ describe("classifyTurnResult (KPR-306)", () => {
   it("classifies SDK result subtypes as non-provider (short-circuit)", () => {
     expect(faultKind("error_max_turns")).toBe("non-provider");
     expect(faultKind("error_during_execution")).toBe("non-provider");
+  });
+
+  it("classifies the Lane B deadline sentinel as the dedicated turn-deadline kind (short-circuit)", () => {
+    expect(TURN_DEADLINE_SUBTYPE).toBe("error_turn_deadline");
+    expect(faultKind(TURN_DEADLINE_SUBTYPE)).toBe("turn-deadline");
+  });
+
+  it("Lane B deadline result shape (timedOut without aborted) classifies turn-deadline — never the breaker-tripping timeout kind", () => {
+    // The adapters pin aborted:false on deadline results precisely so the
+    // timedOut && aborted hang rule (Claude-lane) can never match; the
+    // turn-deadline kind is outside HARD_FAULT_KINDS, so it can never trip.
+    const c = classifyTurnResult({ error: TURN_DEADLINE_SUBTYPE, timedOut: true, aborted: false });
+    expect(c).toEqual({ outcome: "fault", kind: "turn-deadline", message: TURN_DEADLINE_SUBTYPE });
+    expect(c.outcome === "fault" && HARD_FAULT_KINDS.has(c.kind)).toBe(false);
   });
 
   it("classifies unknown strings as non-provider (fail-safe default)", () => {
@@ -194,5 +224,158 @@ describe("KPR-350 §D3 — stale-resume strings stay non-provider (no 404 row, e
       kind: "non-provider",
       message: error,
     });
+  });
+});
+
+describe("KPR-398 — deadline abort with observed progress", () => {
+  // New direction: a deadline abort with proof the provider responded this
+  // turn classifies the breaker-INCONCLUSIVE turn-deadline kind, never the
+  // streak-counting hard timeout.
+  it("incident shape (toolCalls=46, streamed, empty text) classifies turn-deadline — never hard", () => {
+    const c = classifyTurnResult({ timedOut: true, aborted: true, toolCalls: 46, streamed: true, text: "" });
+    expect(c).toMatchObject({ outcome: "fault", kind: "turn-deadline" });
+    expect(c.outcome === "fault" && HARD_FAULT_KINDS.has(c.kind)).toBe(false);
+  });
+
+  it.each([
+    ["toolCalls alone", { toolCalls: 1, streamed: false, text: "" }],
+    ["streamed alone", { toolCalls: 0, streamed: true, text: "" }],
+    ["text alone", { toolCalls: 0, streamed: false, text: "partial reply" }],
+  ] as const)("each signal is independently sufficient: %s", (_label, progress) => {
+    expect(classifyTurnResult({ timedOut: true, aborted: true, ...progress })).toMatchObject({
+      outcome: "fault",
+      kind: "turn-deadline",
+    });
+  });
+
+  it("with-progress message embeds deterministic evidence (telemetry-distinguishability pin)", () => {
+    // Distinguishes a claude with-progress deadline from both the old hard
+    // "turn deadline exceeded" and Lane B's bare error_turn_deadline sentinel
+    // in lastFaultMessage / hive doctor.
+    expect(
+      classifyTurnResult({ timedOut: true, aborted: true, toolCalls: 46, streamed: true, text: "" }),
+    ).toEqual({
+      outcome: "fault",
+      kind: "turn-deadline",
+      message: "turn deadline exceeded with progress (toolCalls=46, streamed=true, textLen=0)",
+    });
+  });
+
+  // Preserved direction: zero progress is the hang signature.
+  it("explicit zero-progress deadline abort keeps classifying hard timeout", () => {
+    expect(
+      classifyTurnResult({ timedOut: true, aborted: true, toolCalls: 0, streamed: false, text: "" }),
+    ).toEqual({ outcome: "fault", kind: "timeout", message: "turn deadline exceeded" });
+  });
+
+  // Negative pins: progress fields are consulted ONLY inside rule 1 and must
+  // not create new outcomes anywhere else.
+  it("aborted-only input stays neutral aborted regardless of progress", () => {
+    expect(classifyTurnResult({ aborted: true, toolCalls: 46, streamed: true })).toEqual({
+      outcome: "aborted",
+    });
+  });
+
+  it("plain error-string input ignores progress fields (pattern tables unchanged)", () => {
+    expect(classifyTurnResult({ error: "429 Too Many Requests", toolCalls: 46 })).toMatchObject({
+      outcome: "fault",
+      kind: "rate-limit",
+    });
+  });
+
+  it("no flags, no error, with progress → success", () => {
+    expect(classifyTurnResult({ toolCalls: 46, streamed: true })).toEqual({ outcome: "success" });
+  });
+
+  it("Lane B sentinel shape stays progress-blind turn-deadline (short-circuit unchanged)", () => {
+    expect(
+      classifyTurnResult({ error: TURN_DEADLINE_SUBTYPE, timedOut: true, aborted: false, toolCalls: 0 }),
+    ).toEqual({ outcome: "fault", kind: "turn-deadline", message: TURN_DEADLINE_SUBTYPE });
+  });
+});
+
+describe("KPR-399 — claude resume-rejection matcher + persist-predicate export", () => {
+  // Realistic surface strings (docs/community-sourced — matcher wording is
+  // ⚠A3, REFINED against the live V4 capture at delivery, KPR-350 posture).
+  const UNKNOWN_SESSION = "No conversation found with session ID: 0198c3f2-abcd-7890-b1c2-d3e4f5a6b7c8";
+  const DANGLING_TOOL_USE =
+    "400 invalid_request_error: messages.57: the following `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01AbCdEfGh";
+
+  it.each([UNKNOWN_SESSION, DANGLING_TOOL_USE])("positive pin — matches: %s", (s) =>
+    expect(isClaudeResumeLoadError(s)).toBe(true),
+  );
+
+  // Breaker-invisibility pin: both surfaces classify non-provider (no
+  // FAULT_PATTERNS row matches), so the self-heal arm is breaker-invisible
+  // whether or not it fires. classifyErrorString is module-private — route
+  // the pin through classifyTurnResult({ error }) (spec Testing Contract 9).
+  it.each([UNKNOWN_SESSION, DANGLING_TOOL_USE])("breaker-invisible — classifies non-provider: %s", (s) => {
+    expect(classifyTurnResult({ error: s })).toEqual({
+      outcome: "fault",
+      kind: "non-provider",
+      message: s,
+    });
+  });
+
+  // Narrowness matrix, auth direction: every isAuthRebuildResumeError
+  // alternate (agent-manager.ts — strings mirrored per the auth-superset-pin
+  // precedent above) must NOT match the new matcher (no cross-arm capture;
+  // the auth-row superset rule is untouched by this ticket).
+  it.each([
+    "could not resolve authentication",
+    "missing credentials.json",
+    "not authenticated",
+    "401 Unauthorized",
+    "ANTHROPIC_API_KEY is not set",
+    "invalid authToken",
+  ])("auth-rebuild alternate does NOT match isClaudeResumeLoadError: %s", (s) =>
+    expect(isClaudeResumeLoadError(s)).toBe(false),
+  );
+
+  // Narrowness matrix, stale-server direction: the isStaleServerHandleError
+  // alternates (agent-manager.ts — openai prose surfaces + the gemini
+  // adapter sentinel) must not cross-match either.
+  it.each([
+    "Previous response with id 'resp_abc123' not found.",
+    "400 invalid_request_error: previous_response_id 'resp_x' not found",
+    "Previous response resp_9 has expired",
+    "gemini interaction resume rejected (status 400): previous_interaction_id invalid",
+  ])("stale-server alternate does NOT match isClaudeResumeLoadError: %s", (s) =>
+    expect(isClaudeResumeLoadError(s)).toBe(false),
+  );
+
+  it("generic 400s / unrelated strings / bare SDK subtypes do not match (deliberate narrowness)", () => {
+    expect(isClaudeResumeLoadError("400 Bad Request")).toBe(false);
+    expect(isClaudeResumeLoadError("session not found")).toBe(false); // no "conversation" anchor
+    expect(isClaudeResumeLoadError("tool_use block streamed mid-turn")).toBe(false); // no without…tool_result tail
+    // The V4 watch item: the runner may flatten a mid-continuation API
+    // failure to the bare subtype — the matcher deliberately does NOT match
+    // it today (refinement is in-contract if V4 observes it).
+    expect(isClaudeResumeLoadError("error_during_execution")).toBe(false);
+  });
+
+  // Spec Testing Contract 10: the exported symbol IS the D1 predicate both
+  // sites consume (single source of truth). The KPR-398 classifier rows
+  // above re-run unedited; the persist-gate tests (agent-manager.test.ts)
+  // exercise the import at the second site.
+  it("hasObservedProgress export: each signal independently sufficient; zero/absent shapes false", () => {
+    expect(hasObservedProgress({ toolCalls: 1 })).toBe(true);
+    expect(hasObservedProgress({ streamed: true })).toBe(true);
+    expect(hasObservedProgress({ text: "x" })).toBe(true);
+    expect(hasObservedProgress({ toolCalls: 0, streamed: false, text: "" })).toBe(false);
+    expect(hasObservedProgress({})).toBe(false);
+  });
+});
+
+describe("KPR-400 D9 — error-string attenuation on the with-progress deadline arm (pin)", () => {
+  it("a real error string coexisting with deadline+progress becomes the message verbatim (error wins over synthesized evidence)", () => {
+    // Unreachable on the Claude deadline path today (error stays undefined;
+    // iterator closed, not thrown) — this pins the deliberate error-wins
+    // choice for any future caller that supplies both. Comment-only source
+    // change behind this row: negative-verify is degenerate by construction
+    // (no pre-fix state to fail against — KPR-401 Task 7 precedent).
+    expect(
+      classifyTurnResult({ error: "boom", timedOut: true, aborted: true, toolCalls: 1 }),
+    ).toEqual({ outcome: "fault", kind: "turn-deadline", message: "boom" });
   });
 });

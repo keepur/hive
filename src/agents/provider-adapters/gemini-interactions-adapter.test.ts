@@ -502,6 +502,38 @@ describe("T5 stale-handle tag (adapter half)", () => {
     expect(result.error).toBe("connect ECONNREFUSED 10.0.0.1:443");
     expect(classifyTurnResult(result)).toMatchObject({ kind: "connect-fail" });
   });
+
+  it("mid-stream throw preserves status — a stream-phase 429 classifies rate-limit (dodi 2026-08-24)", async () => {
+    const client: GeminiInteractionsClient = {
+      create: vi.fn(async () =>
+        (async function* () {
+          yield created("interactions/rl");
+          throw statusError(429, "Resource has been exhausted (e.g. check quota).");
+        })(),
+      ),
+    };
+    const adapter = makeAdapter({ client });
+    const result = await adapter.runTurn({ prompt: "hi" });
+    expect(result.error).toBe(
+      "Gemini interaction stream failed (429): Resource has been exhausted (e.g. check quota).",
+    );
+    expect(classifyTurnResult(result)).toMatchObject({ kind: "rate-limit" });
+  });
+
+  it("mid-stream statusless throw passes through verbatim (connect-fail stays reachable)", async () => {
+    const client: GeminiInteractionsClient = {
+      create: vi.fn(async () =>
+        (async function* () {
+          yield created("interactions/rl");
+          throw new Error("connect ECONNRESET 10.0.0.1:443");
+        })(),
+      ),
+    };
+    const adapter = makeAdapter({ client });
+    const result = await adapter.runTurn({ prompt: "hi" });
+    expect(result.error).toBe("connect ECONNRESET 10.0.0.1:443");
+    expect(classifyTurnResult(result)).toMatchObject({ kind: "connect-fail" });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -754,5 +786,74 @@ describe("stream consumer units", () => {
       sawCompleted: false,
     };
     expect(() => applyInteractionEvent(errorEvent("boom"), state)).toThrow(/boom/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lane B wall-clock deadline (timeoutMs)
+// ---------------------------------------------------------------------------
+
+describe("Lane B wall-clock deadline (timeoutMs)", () => {
+  const limits = (timeoutMs: number) => ({ maxTurns: 10, timeoutMs, budgetUsd: 0 });
+
+  /** A create() that never settles until the request signal aborts (models a stalled Interactions round). */
+  function hangingClient() {
+    const create = vi.fn(
+      (_params: Record<string, unknown>, options: { fetchOptions: { signal: AbortSignal } }) =>
+        new Promise<AsyncIterable<Record<string, unknown>>>((_resolve, reject) => {
+          const signal = options.fetchOptions.signal;
+          const abortErr = () => reject(new DOMException("The operation was aborted.", "AbortError"));
+          if (signal.aborted) return abortErr();
+          signal.addEventListener("abort", abortErr, { once: true });
+        }),
+    );
+    return { client: { create } as GeminiInteractionsClient, create };
+  }
+
+  it("mid-round: stalled create past timeoutMs → error_turn_deadline, timedOut, NOT aborted, non-provider, warn logged", async () => {
+    const { client, create } = hangingClient();
+    const adapter = makeAdapter({ client });
+    const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(25) });
+    expect(result.error).toBe("error_turn_deadline");
+    expect(result.timedOut).toBe(true);
+    expect(result.aborted).toBe(false);
+    expect(adapter.wasAborted).toBe(false);
+    expect(classifyTurnResult(result)).toMatchObject({ outcome: "fault", kind: "turn-deadline" });
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(logMock.warn).toHaveBeenCalledWith(
+      "Gemini turn deadline exceeded — aborting turn",
+      expect.objectContaining({ timeoutMs: 25 }),
+    );
+  });
+
+  it("deadline result keeps the resumed handle (error-path §D1 shape), never a mid-turn mint", async () => {
+    const { client } = hangingClient();
+    const adapter = makeAdapter({ client });
+    const result = await adapter.runTurn({ prompt: "go", sessionId: "i-resumed", resourceLimits: limits(25) });
+    expect(result.error).toBe("error_turn_deadline");
+    expect(result.sessionId).toBe("i-resumed");
+  });
+
+  it("between-checkpoint: deadline elapses inside a slow tool call → caught at the next loop checkpoint, no round-2 create", async () => {
+    const { client, calls } = makeClient([
+      [created("i1"), fnCallStart(0, "c1", ECHO), argsDelta(0, '{"text":"a"}'), completed("i1", { status: "requires_action" })],
+      [created("i2"), textDelta("done"), completed("i2")],
+    ]);
+    const adapter = makeAdapter({ client, assembly: echoAssembly({ delayMs: 1000 }) });
+    const result = await adapter.runTurn({ prompt: "go", resourceLimits: limits(100) });
+    expect(result.error).toBe("error_turn_deadline");
+    expect(result.aborted).toBe(false);
+    expect(calls).toHaveLength(1); // round 2 never created
+  });
+
+  it("operator abort() outranks the deadline: abort well before timeoutMs → breaker-neutral aborted, no error", async () => {
+    const { client } = hangingClient();
+    const adapter = makeAdapter({ client });
+    const pending = adapter.runTurn({ prompt: "go", resourceLimits: limits(5000) });
+    setTimeout(() => adapter.abort(), 10);
+    const result = await pending;
+    expect(result.aborted).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(result.timedOut).toBeUndefined();
   });
 });

@@ -29,6 +29,8 @@ const required = [
   "seeds/chief-of-staff/agent.yaml",
   "templates/constitution-bootstrap.md.tpl",
   "scripts/honeypot",
+  "pkg/types/agents/provider-adapters/provider-abi.d.ts",
+  "pkg/types/agents/provider-adapters/provider-module.d.ts",
 ];
 
 // All MCP servers must be present.

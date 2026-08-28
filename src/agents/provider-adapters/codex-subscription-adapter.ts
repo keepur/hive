@@ -1,18 +1,23 @@
 import { randomUUID } from "node:crypto";
-import type { RunResult } from "../agent-runner.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
-import type { AgentProviderAdapter, AgentProviderTurnRequest, ReasoningEffort } from "./types.js";
+import type { AgentProviderTurnRequest, ReasoningEffort } from "./types.js";
 import { createCodexOpenAITokenProvider } from "./oauth-credentials.js";
 import { createLogger } from "../../logging/logger.js";
-import { ToolBridge, type BridgedTool } from "./tool-bridge.js";
+import type { BridgedTool } from "./tool-bridge.js";
 import type { TurnHistoryStore } from "../turn-history-store.js";
+import {
+  LaneBTurnScaffold,
+  type LaneBTurnHarness,
+  type LaneBTurnOutcome,
+  type LaneBSessionPolicyState,
+} from "./turn-scaffold.js";
+import { runBoundedDispatchLoop } from "./dispatch-loop.js";
+import { parseSseEvent, splitSseEvents, isSseDone, type SseEvent } from "./sse.js";
 
 const DEFAULT_CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_CODEX_MODEL = "gpt-5.4-mini";
 
 const log = createLogger("codex-adapter");
-/** §D2: mirrors the openai adapter's SDK default when resourceLimits is absent. */
-const DEFAULT_MAX_ROUNDS = 10;
 
 /** Back-compat alias — KPR-311 moved the canonical type to types.ts. */
 export type CodexReasoningEffort = ReasoningEffort;
@@ -97,43 +102,44 @@ interface CodexStreamState {
   outputItems: unknown[];
 }
 
-interface SseEvent {
-  event?: string;
-  data: string;
+/** Carries a non-ok Response from executeRound to the loop's onRequestError
+ *  hook (the §D7 heal decision needs the status; the decorated message is
+ *  built lazily — responseErrorMessage awaits the body). */
+class CodexResponseHttpError extends Error {
+  constructor(readonly response: Response) {
+    super(`Codex subscription request failed (${response.status})`);
+  }
 }
 
-export class CodexSubscriptionAdapter implements AgentProviderAdapter {
+export class CodexSubscriptionAdapter extends LaneBTurnScaffold {
   readonly provider = "codex" as const;
 
-  private currentAbortController: AbortController | null = null;
-  private aborted = false;
+  constructor(private readonly options: CodexSubscriptionAdapterOptions) {
+    super({ name: options.name, assembly: options.assembly });
+  }
 
-  constructor(private readonly options: CodexSubscriptionAdapterOptions) {}
+  /** Pilot-era fabricated fallback (persisted-id behavior pin — the
+   *  stateless-replay surface never persists it as a handle). */
+  protected override fallbackSessionId(request: AgentProviderTurnRequest): string {
+    return request.sessionId ?? `codex-pilot-${randomUUID()}`;
+  }
 
-  async runTurn(request: AgentProviderTurnRequest): Promise<RunResult> {
-    const startedAt = Date.now();
-    const abortController = new AbortController();
-    this.currentAbortController = abortController;
-    this.aborted = false;
+  /** Codex aborted / error_max_turns results carry the last response id when
+   *  one exists (§7 three-way pin); deadline/catch-error stay bare fallback
+   *  via the scaffold. */
+  protected override interruptionSessionId(state: LaneBSessionPolicyState): string {
+    return state.lastProviderRoundId ?? state.fallbackSessionId;
+  }
 
-    const streamed = !!request.onStream;
-    const sessionId = request.sessionId ?? `codex-pilot-${randomUUID()}`;
-
-    // KPR-353 (§D1): per-spawn tool bridge — the openai adapter's exact
-    // construction (openai-agents-adapter.ts:54-63). connect() inside the
-    // try (fail-soft per server; an all-failed bridge yields [] and the turn
-    // runs tool-less); close() in the finally.
-    const bridge = new ToolBridge({
-      inventory: this.options.assembly.toolInventory,
-      inProcessServers: this.options.assembly.inProcessServers,
-      gate: this.options.assembly.guardrailGate,
-      workItemContext: request.workItemContext,
-      signal: abortController.signal,
-      agentId: this.options.name,
-      sessionCwd: this.options.assembly.sessionCwd,
-      skillIndex: this.options.assembly.skillIndex,
-      delegateRunner: this.options.assembly.delegateTurnRunner, // KPR-354 (§D3)
+  protected override warnDeadlineExpired(timeoutMs: number): void {
+    log.warn("Codex turn deadline exceeded — aborting turn", {
+      agent: this.options.name,
+      timeoutMs,
     });
+  }
+
+  protected async executeTurn(harness: LaneBTurnHarness): Promise<LaneBTurnOutcome> {
+    const { request, bridge } = harness;
 
     // §D3 thread key: absent context ⇒ replay and persist both skip.
     const threadId = request.workItemContext?.threadId || undefined;
@@ -142,94 +148,50 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
         ? { store: this.options.historyStore, agentId: this.options.agentId, threadId }
         : undefined;
 
-    // Turn accumulators (visible to the abort helper below).
-    const totals = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
-    let lastResponseId: string | undefined;
+    // §D3: load NEVER throws and NEVER returns Mongo error text (breaker
+    // safety). Deliberately BEFORE the auth check: degradation ordering is
+    // deterministic (T4-pinned) — the scaffold does not sequence this.
+    const replayed = historyKey
+      ? await historyKey.store
+          .load(historyKey.agentId, historyKey.threadId, "codex")
+          .catch((): unknown[] => [])
+      : [];
 
-    const abortedResult = (): RunResult =>
-      this.buildResult({
-        text: "",
-        sessionId: lastResponseId ?? sessionId,
-        durationMs: Date.now() - startedAt,
-        streamed,
-        aborted: true,
-        inputTokens: totals.inputTokens,
-        outputTokens: totals.outputTokens,
-        cacheReadTokens: totals.cacheReadTokens,
-        toolStats: bridge.stats,
-      });
+    const tokenProvider = createCodexOpenAITokenProvider({
+      authPath: this.options.codexAuthPath,
+      refreshCommand: this.options.codexRefreshCommand,
+    });
+    if (!tokenProvider) {
+      throw new Error("Codex OAuth session is not available; run `codex login` first");
+    }
 
-    try {
-      // §D3: load NEVER throws and NEVER returns Mongo error text (breaker
-      // safety — store-owned contract; the .catch is belt-and-braces against
-      // a future non-conforming store impl leaking Mongo text into
-      // RunResult.error). Deliberately BEFORE the auth check: degradation
-      // ordering is deterministic and manager-level ordering tests (T4)
-      // observe load via runTurn without a credential.
-      const replayed = historyKey
-        ? await historyKey.store
-            .load(historyKey.agentId, historyKey.threadId, "codex")
-            .catch((): unknown[] => [])
-        : [];
+    const bridged = await bridge.connect();
+    const bridgedByName = new Map(bridged.map((bt) => [bt.name, bt]));
+    // §D1: BridgedTool[] → Responses function tools. Name/cap edges are
+    // bridge-owned (KPR-348/349).
+    const toolPayloads = bridged.map((bt) => ({
+      type: "function" as const,
+      name: bt.name,
+      description: bt.description,
+      parameters: bt.inputSchema,
+      strict: false as const,
+    }));
 
-      const tokenProvider = createCodexOpenAITokenProvider({
-        authPath: this.options.codexAuthPath,
-        refreshCommand: this.options.codexRefreshCommand,
-      });
-      if (!tokenProvider) {
-        throw new Error("Codex OAuth session is not available; run `codex login` first");
-      }
+    const userItem = { role: "user", content: [{ type: "input_text", text: request.prompt }] };
+    const inputItems: unknown[] = [...replayed, userItem];
+    /** §D3 turn record: user item + every round's output items + hive's
+     *  function_call_output items. Persisted only on success. */
+    const thisTurnItems: unknown[] = [userItem];
+    let replayedNonEmpty = replayed.length > 0;
+    let selfHealed = false;
 
-      const bridged = await bridge.connect();
-      const bridgedByName = new Map(bridged.map((bt) => [bt.name, bt]));
-      // §D1: BridgedTool[] → Responses function tools. Name/cap edges
-      // (sanitization, 128-cap with the KPR-349 pinned tier) are bridge-owned.
-      const toolPayloads = bridged.map((bt) => ({
-        type: "function" as const,
-        name: bt.name,
-        description: bt.description,
-        parameters: bt.inputSchema,
-        strict: false as const,
-      }));
-
-      const userItem = { role: "user", content: [{ type: "input_text", text: request.prompt }] };
-      const inputItems: unknown[] = [...replayed, userItem];
-      /** §D3 turn record: user item + every round's output items + hive's
-       *  function_call_output items. Persisted only on success. */
-      const thisTurnItems: unknown[] = [userItem];
-      let finalText = "";
-      let replayedNonEmpty = replayed.length > 0;
-      let selfHealed = false;
-
-      // Note `maxTurns: 0` ⇒ maxRounds 0 (`??` passes 0 through) ⇒ immediate
-      // error_max_turns without a POST. Deliberate divergence from the openai
-      // lane, which hands 0 to the SDK — a zero budget honestly means "no
-      // model rounds" here; not normalized.
-      const maxRounds = request.resourceLimits?.maxTurns ?? DEFAULT_MAX_ROUNDS;
-      let round = 0;
-      for (;;) {
-        round += 1;
-        if (round > maxRounds) {
-          // §D2: the SDK sentinel string, already pinned non-provider
-          // (error-classification.ts:57). No history persist.
-          return this.buildResult({
-            text: "",
-            sessionId: lastResponseId ?? sessionId,
-            durationMs: Date.now() - startedAt,
-            streamed,
-            aborted: false,
-            error: "error_max_turns",
-            inputTokens: totals.inputTokens,
-            outputTokens: totals.outputTokens,
-            cacheReadTokens: totals.cacheReadTokens,
-            toolStats: bridge.stats,
-          });
-        }
-        if (this.aborted || abortController.signal.aborted) return abortedResult();
-
+    const outcome = await runBoundedDispatchLoop<CodexStreamState, FunctionCallItem>({
+      request,
+      harness,
+      executeRound: async () => {
         const response = await this.fetchImpl()(this.options.endpoint ?? DEFAULT_CODEX_RESPONSES_URL, {
           method: "POST",
-          signal: abortController.signal,
+          signal: harness.signal,
           headers: {
             authorization: `Bearer ${await tokenProvider()}`,
             "content-type": "application/json",
@@ -243,214 +205,89 @@ export class CodexSubscriptionAdapter implements AgentProviderAdapter {
             input: inputItems,
             stream: true,
             store: false,
-            // §D2/§D3: encrypted reasoning must round-trip for replay quality
-            // on this store:false surface (spike leg (c)).
+            // §D2/§D3: encrypted reasoning must round-trip for replay quality.
             include: ["reasoning.encrypted_content"],
             tools: toolPayloads,
           }),
         });
+        if (!response.ok) throw new CodexResponseHttpError(response);
 
-        if (!response.ok) {
-          // §D7 poisoned-replay self-heal: first-round 4xx on a request that
-          // replayed non-empty history ⇒ ONE retry with history dropped +
-          // clear the doc. 5xx/network keep full breaker weight — no retry,
-          // no clear. A non-replay 4xx never retries.
-          // Breadth PINNED (deliberate): ALL 4xx incl. 401/403/429 heal-and-
-          // clear per §D7 — a transient-fault over-clear (expired token, rate
-          // limit) costs one bounded reset + one retry; accepted as the §D7
-          // backstop rather than status-sniffing. T7 pins the 429 case.
-          if (
-            round === 1 &&
-            !selfHealed &&
-            replayedNonEmpty &&
-            response.status >= 400 &&
-            response.status < 500 &&
-            historyKey
-          ) {
-            log.warn("Codex replay rejected (4xx) — one fresh retry + history clear (KPR-353 §D7)", {
-              agentId: historyKey.agentId,
-              status: response.status,
-            });
-            // never throws (§D3); .catch = belt-and-braces store-impl guard
-            await historyKey.store.clear(historyKey.agentId, historyKey.threadId).catch(() => {});
-            inputItems.length = 0;
-            inputItems.push(userItem);
-            replayedNonEmpty = false;
-            selfHealed = true;
-            round = 0; // healed turn gets its full round budget
-            continue;
-          }
-          throw new Error(await responseErrorMessage(response));
-        }
-
-        // Fresh per-round state; text deltas stream to onStream across ALL
-        // rounds (intermediate think-aloud), but RunResult.text is the FINAL
-        // round's assistant text only (§D2 final-reply semantics).
-        const state = await consumeCodexSse(response.body, request.onStream, () => this.aborted);
-        totals.inputTokens += state.inputTokens;
-        totals.outputTokens += state.outputTokens;
-        totals.cacheReadTokens += state.cacheReadTokens;
-        if (state.responseId) lastResponseId = state.responseId;
-        finalText = state.text;
-
+        // Deadline-aware consume: harness.isAborted subsumes the #407
+        // signal-abort leg.
+        const state = await consumeCodexSse(response.body, request.onStream, harness.isAborted);
         inputItems.push(...state.outputItems);
         thisTurnItems.push(...state.outputItems);
-
-        if (this.aborted || abortController.signal.aborted) return abortedResult();
-
-        // Dedupe by call_id: closes the degenerate double-`response.completed`
-        // case (both payloads captured into outputItems) that would otherwise
-        // double-execute the tool and double-append its output item.
-        const seenCallIds = new Set<string>();
-        const calls = state.outputItems.filter(
-          (item): item is FunctionCallItem =>
-            isFunctionCallItem(item) && !seenCallIds.has(item.call_id) && !!seenCallIds.add(item.call_id),
-        );
-        if (calls.length === 0) break;
-
-        // Sequential by design (spec ⚠: hive's in-process handlers are not
-        // concurrency-audited under one turn; parallelizing is a follow-up
-        // lever, deliberately not pre-built).
-        for (const call of calls) {
-          if (this.aborted || abortController.signal.aborted) return abortedResult();
-          const output = await executeFunctionCall(call, bridgedByName);
-          const outputItem = { type: "function_call_output", call_id: call.call_id, output };
-          inputItems.push(outputItem);
-          thisTurnItems.push(outputItem);
+        return {
+          state,
+          usage: {
+            inputTokens: state.inputTokens,
+            outputTokens: state.outputTokens,
+            cacheReadTokens: state.cacheReadTokens,
+          },
+          providerRoundId: state.responseId,
+          text: state.text,
+        };
+      },
+      harvest: (state) => state.outputItems.filter(isFunctionCallItem),
+      // Dedupe by call_id: closes the degenerate double-`response.completed`
+      // case that would otherwise double-execute the tool.
+      callId: (call) => call.call_id,
+      executeCall: async (call) => {
+        const output = await executeFunctionCall(call, bridgedByName);
+        const outputItem = { type: "function_call_output", call_id: call.call_id, output };
+        inputItems.push(outputItem);
+        thisTurnItems.push(outputItem);
+      },
+      onRequestError: async (error, round) => {
+        if (!(error instanceof CodexResponseHttpError)) return undefined;
+        const { response } = error;
+        // §D7 poisoned-replay self-heal: first-round 4xx on a request that
+        // replayed non-empty history ⇒ ONE retry with history dropped +
+        // clear the doc. Breadth PINNED: ALL 4xx incl. 401/403/429 (T7).
+        // 5xx/network keep full breaker weight — no retry, no clear.
+        if (
+          round === 1 &&
+          !selfHealed &&
+          replayedNonEmpty &&
+          response.status >= 400 &&
+          response.status < 500 &&
+          historyKey
+        ) {
+          log.warn("Codex replay rejected (4xx) — one fresh retry + history clear (KPR-353 §D7)", {
+            agentId: historyKey.agentId,
+            status: response.status,
+          });
+          await historyKey.store.clear(historyKey.agentId, historyKey.threadId).catch(() => {});
+          inputItems.length = 0;
+          inputItems.push(userItem);
+          replayedNonEmpty = false;
+          selfHealed = true;
+          return { action: "restart-fresh" };
         }
-      }
+        return { action: "rethrow", error: new Error(await responseErrorMessage(response)) };
+      },
+    });
 
-      const durationMs = Date.now() - startedAt;
-      if (this.aborted || abortController.signal.aborted) return abortedResult();
+    if (outcome.kind !== "success") return outcome;
 
-      // §D3 persist policy: success only — error/aborted turns never persist
-      // (an errored turn's item may be re-delivered by the retry/outage path;
-      // persisting would duplicate the user message on replay). Fail-soft
-      // void; .catch = belt-and-braces store-impl guard.
-      if (historyKey) {
-        await historyKey.store
-          .append(historyKey.agentId, historyKey.threadId, "codex", thisTurnItems)
-          .catch(() => {});
-      }
-
-      return this.buildResult({
-        text: finalText,
-        sessionId: lastResponseId ?? sessionId,
-        durationMs,
-        streamed,
-        aborted: false,
-        inputTokens: totals.inputTokens,
-        outputTokens: totals.outputTokens,
-        cacheReadTokens: totals.cacheReadTokens,
-        toolStats: bridge.stats,
-      });
-    } catch (error) {
-      const durationMs = Date.now() - startedAt;
-      if (this.isAbortError(error, abortController)) {
-        return this.buildResult({
-          text: "",
-          sessionId: lastResponseId ?? sessionId,
-          durationMs,
-          streamed,
-          aborted: true,
-          inputTokens: totals.inputTokens,
-          outputTokens: totals.outputTokens,
-          cacheReadTokens: totals.cacheReadTokens,
-          toolStats: bridge.stats,
-        });
-      }
-
-      return this.buildResult({
-        text: "",
-        sessionId,
-        durationMs,
-        streamed,
-        aborted: false,
-        error: errorMessage(error),
-        inputTokens: totals.inputTokens,
-        outputTokens: totals.outputTokens,
-        cacheReadTokens: totals.cacheReadTokens,
-        toolStats: bridge.stats,
-      });
-    } finally {
-      await bridge.close(); // never throws/rejects (KPR-348 advisory 1)
-      if (this.currentAbortController === abortController) {
-        this.currentAbortController = null;
-      }
+    // §D3 persist policy: success only — interrupted/max-turns/deadline
+    // outcomes return above without persisting (deadline resolves to
+    // "interrupted" at a loop checkpoint or in the scaffold catch).
+    // Timing note (KPR-391 §Task 5, plan-accepted delta — NOT a bug): the
+    // scaffold's finish() snapshots durationMs after executeTurn returns, so
+    // this await now folds history-persist latency into codex durationMs/llmMs
+    // (pre-migration the snapshot was taken before it). Acknowledged rather
+    // than special-cased — ~ms-scale, and no test observes it.
+    if (historyKey) {
+      await historyKey.store
+        .append(historyKey.agentId, historyKey.threadId, "codex", thisTurnItems)
+        .catch(() => {});
     }
-  }
-
-  abort(): void {
-    this.aborted = true;
-    this.currentAbortController?.abort();
-  }
-
-  get wasAborted(): boolean {
-    return this.aborted;
+    return outcome;
   }
 
   private fetchImpl(): typeof fetch {
     return this.options.fetch ?? fetch;
-  }
-
-  private isAbortError(error: unknown, abortController: AbortController): boolean {
-    if (this.aborted || abortController.signal.aborted) return true;
-    if (!error || typeof error !== "object") return false;
-    const maybeAbort = error as { name?: unknown; code?: unknown };
-    return maybeAbort.name === "AbortError" || maybeAbort.code === "ABORT_ERR";
-  }
-
-  private buildResult({
-    text,
-    sessionId,
-    durationMs,
-    streamed,
-    aborted,
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    error,
-    toolStats,
-  }: {
-    text: string;
-    sessionId: string;
-    durationMs: number;
-    streamed: boolean;
-    aborted: boolean;
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-    error?: string;
-    toolStats?: Readonly<{ toolCalls: number; toolMs: number; perTool: Map<string, number> }>;
-  }): RunResult {
-    const toolMs = toolStats?.toolMs ?? 0;
-    const toolCalls = toolStats?.toolCalls ?? 0;
-    const toolSummary =
-      toolStats && toolStats.perTool.size > 0
-        ? [...toolStats.perTool.entries()].map(([n, c]) => `${n}×${c}`).join(", ")
-        : "none";
-    return {
-      text,
-      sessionId,
-      costUsd: 0,
-      durationMs,
-      // §D6 (KPR-348 §D8 rule): the breaker's p95 window samples llmMs —
-      // folding tool time in would let slow-but-healthy tools trip a healthy
-      // codex endpoint. Clamped: degenerate/mocked timing can't go negative.
-      llmMs: Math.max(0, durationMs - toolMs),
-      toolMs,
-      toolCalls,
-      toolSummary,
-      streamed,
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheCreationTokens: 0,
-      contextWindow: 0,
-      compactions: 0,
-      aborted,
-      ...(error ? { error } : {}),
-    };
   }
 }
 
@@ -497,39 +334,17 @@ export function consumeBufferedSseEvents(
   state: CodexStreamState,
   onStream?: (chunk: string) => void,
 ): string {
-  const parts = buffer.split(/\r?\n\r?\n/);
-  const remainder = parts.pop() ?? "";
-
-  for (const part of parts) {
-    const event = parseSseEvent(part);
+  const { events, remainder } = splitSseEvents(buffer);
+  for (const raw of events) {
+    const event = parseSseEvent(raw);
     if (!event) continue;
     applyCodexEvent(event, state, onStream);
   }
-
   return remainder;
 }
 
-function parseSseEvent(raw: string): SseEvent | null {
-  let event: string | undefined;
-  const data: string[] = [];
-
-  for (const line of raw.split(/\r?\n/)) {
-    if (!line || line.startsWith(":")) continue;
-    if (line.startsWith("event:")) {
-      event = line.slice("event:".length).trim();
-      continue;
-    }
-    if (line.startsWith("data:")) {
-      data.push(line.slice("data:".length).trimStart());
-    }
-  }
-
-  if (data.length === 0) return null;
-  return { event, data: data.join("\n") };
-}
-
 function applyCodexEvent(event: SseEvent, state: CodexStreamState, onStream?: (chunk: string) => void): void {
-  if (event.data === "[DONE]") return;
+  if (isSseDone(event)) return;
 
   const payload = parseJson(event.data);
   if (!payload) return;
@@ -666,14 +481,4 @@ function objectField(value: Record<string, unknown> | null | undefined, key: str
 function stringField(value: Record<string, unknown> | null | undefined, key: string): string | undefined {
   const field = value?.[key];
   return typeof field === "string" ? field : undefined;
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  try {
-    return JSON.stringify(error) ?? String(error);
-  } catch {
-    return String(error);
-  }
 }

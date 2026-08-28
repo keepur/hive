@@ -21,7 +21,6 @@
  * "0 = probe currently in flight" is authoritative over the spec's half-open
  * prose ("the probe's remaining deadline budget").
  */
-import type { AgentProviderId } from "./provider-adapters/types.js";
 import {
   HARD_FAULT_KINDS,
   type ProviderFaultKind,
@@ -62,20 +61,24 @@ export const DEFAULT_CIRCUIT_BREAKER_CONFIG: CircuitBreakerConfig = Object.freez
 const FAULT_MESSAGE_MAX = 240;
 
 /**
- * Probe-permit staleness bound: default 300s turn deadline + 60s grace. A
- * probe permit never recorded (caller lost between acquire and record —
- * structurally prevented at the wrap point, belt-and-braces here) is
- * reconciled as inconclusive on the next acquire.
- *
- * Agents with a custom `timeoutMs` > 300s can hit premature stale-probe
- * reconciliation here — bounded and safe: a late probe success still
- * records as telemetry-only, and the next post-cooldown turn re-probes.
+ * Probe-permit staleness (KPR-400 F1): the bound follows the probe turn's
+ * OWN deadline, captured at its acquire() (`meta.deadlineMs`), plus a fixed
+ * grace. Staleness is a lost-permit guard for THIS probe (caller lost
+ * between acquire and record — structurally prevented at the wrap point,
+ * belt-and-braces here); the old flat 360s bound stale-killed any probe
+ * legitimately running past 360s (900s per-agent `timeoutMs` architects,
+ * 600s opus-tier agents on the router path) and discarded its eventual
+ * outcome — including success — as telemetry-only, wedging recovery
+ * (kpr-400-spec R2). Meta-less acquires (tests, hypothetical future
+ * callers) keep the exact pre-KPR-400 bound: 300s default deadline + 60s
+ * grace = 360s.
  */
-const PROBE_STALE_MS = 360_000;
+const PROBE_STALE_DEFAULT_DEADLINE_MS = 300_000;
+const PROBE_STALE_GRACE_MS = 60_000;
 
 /** Opaque turn-admission handle. `record(permit, …)` makes probe bookkeeping airtight. */
 export interface TurnPermit {
-  readonly provider: AgentProviderId;
+  readonly provider: string;
   readonly isProbe: boolean;
 }
 
@@ -88,7 +91,7 @@ interface InternalPermit extends TurnPermit {
 export class ProviderCircuitOpenError extends Error {
   override readonly name = "ProviderCircuitOpenError";
   constructor(
-    readonly provider: AgentProviderId,
+    readonly provider: string,
     /** Epoch ms when the breaker (most recently) opened. */
     readonly openedAt: number,
     /** ms from now until the next half-open probe is eligible (0 = probe currently in flight). */
@@ -106,7 +109,7 @@ export class ProviderCircuitOpenError extends Error {
 
 /** OPEN-CIRCUIT CONTRACT — frozen fields; additive evolution only (KPR-307). */
 export interface CircuitBreakerSnapshot {
-  provider: AgentProviderId;
+  provider: string;
   state: "closed" | "open" | "half-open";
   enabled: boolean; // false = shadow mode
   openedAt: number | null;
@@ -143,6 +146,11 @@ export class ProviderCircuitBreaker {
   private windowCursor = 0;
   private probe: InternalPermit | null = null;
   private probeStartedAt: number | null = null;
+  // KPR-400 (F1): this probe's staleness bound — (deadlineMs at acquire ??
+  // 300s default) + 60s grace. Armed with the probe, cleared wherever the
+  // probe slot is cleared. Deliberately NOT surfaced in snapshot() (no
+  // contract field additions — kpr-400-spec Non-Goals).
+  private probeStaleAfterMs: number | null = null;
   // Episode marker: epoch ms of the most recent half-open → closed
   // transition. -Infinity for a breaker that has never tripped, so no
   // permit issued at a real timestamp is ever rejected as cross-episode.
@@ -153,7 +161,7 @@ export class ProviderCircuitBreaker {
   private lastClosedAt = -Infinity;
 
   constructor(
-    readonly provider: AgentProviderId,
+    readonly provider: string,
     private readonly config: CircuitBreakerConfig,
     private readonly now: () => number = Date.now,
   ) {}
@@ -168,15 +176,22 @@ export class ProviderCircuitBreaker {
    * transitions: open → half-open happens here, on the first acquire at or
    * after openedAt + cooldown — that acquire becomes the probe.
    */
-  acquire(meta?: { agentId?: string; threadId?: string }): TurnPermit {
+  acquire(meta?: { agentId?: string; threadId?: string; deadlineMs?: number }): TurnPermit {
     const now = this.now();
 
     // Belt-and-braces: reconcile a probe permit that was never recorded.
+    // KPR-400 (F1): the comparison uses the per-probe bound armed below — a
+    // probe still inside its own turn's wall clock (+grace) is never
+    // reconciled; concurrent acquires keep rejecting with the contract's
+    // retryAfterMs 0 until the probe records or genuinely goes stale. The
+    // ?? fallback covers only a probe armed before this field existed
+    // (impossible in-process) — belt for the belt.
     if (
       this.state === "half-open" &&
       this.probe !== null &&
       this.probeStartedAt !== null &&
-      now - this.probeStartedAt > PROBE_STALE_MS
+      now - this.probeStartedAt >
+        (this.probeStaleAfterMs ?? PROBE_STALE_DEFAULT_DEADLINE_MS + PROBE_STALE_GRACE_MS)
     ) {
       log.warn("Provider circuit probe went stale — treating as inconclusive", {
         provider: this.provider,
@@ -184,6 +199,7 @@ export class ProviderCircuitBreaker {
       });
       this.probe = null;
       this.probeStartedAt = null;
+      this.probeStaleAfterMs = null;
       this.reopen(now, false);
     }
 
@@ -200,6 +216,10 @@ export class ProviderCircuitBreaker {
         const permit = this.issuePermit(true, now);
         this.probe = permit;
         this.probeStartedAt = now;
+        // KPR-400 (F1): the probe's staleness bound follows its own turn's
+        // deadline; meta-less acquires keep the pre-KPR-400 360s bound.
+        this.probeStaleAfterMs =
+          (meta?.deadlineMs ?? PROBE_STALE_DEFAULT_DEADLINE_MS) + PROBE_STALE_GRACE_MS;
         log.info("Provider circuit half-open — admitting probe turn", {
           provider: this.provider,
           agentId: meta?.agentId,
@@ -243,6 +263,7 @@ export class ProviderCircuitBreaker {
     if (this.probe === p) {
       this.probe = null;
       this.probeStartedAt = null;
+      this.probeStaleAfterMs = null;
       this.settleProbe(classification, now, llmMs);
       return;
     }
@@ -282,6 +303,19 @@ export class ProviderCircuitBreaker {
           if (this.consecutiveHardFaults >= this.config.consecutiveFaultThreshold) {
             this.open(now, classification.kind);
           }
+        } else if (classification.kind === "turn-deadline") {
+          // Deadline expiry: inconclusive, like "aborted". TWO sources map
+          // here (D9 truth-up, KPR-400): the Lane B wall-clock sentinel
+          // (error_turn_deadline — progress-blind) AND the Claude-lane /
+          // Lane A passthrough deadline abort WITH observed progress
+          // (timedOut && aborted && progress — KPR-398). Never trips (a
+          // slow-but-healthy tool can consume the whole wall clock) but
+          // ALSO never resets the streak: the Lane B sentinel is NOT proof
+          // the provider responded (a genuinely hung provider yields
+          // exactly this result every turn — the hive deadline preempts
+          // undici's own timeouts), and a reset here would blind hang-type
+          // outage detection permanently.
+          return;
         } else {
           // non-provider: the turn traversed the provider path and got a
           // response — proves the provider is up. Resets the streak (same
@@ -415,7 +449,18 @@ export class ProviderCircuitBreaker {
   private settleProbe(classification: TurnClassification, now: number, llmMs: number): void {
     if (
       classification.outcome === "success" ||
-      (classification.outcome === "fault" && !HARD_FAULT_KINDS.has(classification.kind))
+      (classification.outcome === "fault" &&
+        !HARD_FAULT_KINDS.has(classification.kind) &&
+        // A deadline-expired probe stays inconclusive — NOT a recovery
+        // close — even though a WITH-PROGRESS deadline abort (Claude lane,
+        // KPR-398) DOES prove the provider responded this turn. Binding
+        // ruling (kpr-398-spec §Design.4 / epic D6; D9 truth-up, KPR-400):
+        // closing on that shape would close the circuit on exactly the
+        // turn-shape that caused the incident, and a provider degraded to
+        // trickle-slow (first bytes, then stall) would close every probe.
+        // The Lane B sentinel (progress-blind) proves nothing either way.
+        // Inconclusive like "aborted" below.
+        classification.kind !== "turn-deadline")
     ) {
       // A turn that reached the provider and failed on something else still
       // proves the provider is reachable — closes.
@@ -428,7 +473,10 @@ export class ProviderCircuitBreaker {
       }
       return;
     }
-    if (classification.outcome === "aborted") {
+    if (
+      classification.outcome === "aborted" ||
+      (classification.outcome === "fault" && classification.kind === "turn-deadline")
+    ) {
       this.reopen(now, false); // inconclusive: exponent unchanged
       return;
     }
@@ -459,7 +507,7 @@ export class ProviderCircuitBreaker {
  * mocks of appConfig may omit `circuitBreaker`) — defaults fill the gaps.
  */
 export class ProviderCircuitBreakerRegistry {
-  private readonly breakers = new Map<AgentProviderId, ProviderCircuitBreaker>();
+  private readonly breakers = new Map<string, ProviderCircuitBreaker>();
   private readonly config: CircuitBreakerConfig;
 
   constructor(
@@ -469,7 +517,7 @@ export class ProviderCircuitBreakerRegistry {
     this.config = { ...DEFAULT_CIRCUIT_BREAKER_CONFIG, ...config };
   }
 
-  private breakerFor(provider: AgentProviderId): ProviderCircuitBreaker {
+  private breakerFor(provider: string): ProviderCircuitBreaker {
     let breaker = this.breakers.get(provider);
     if (!breaker) {
       breaker = new ProviderCircuitBreaker(provider, this.config, this.now);
@@ -478,8 +526,15 @@ export class ProviderCircuitBreakerRegistry {
     return breaker;
   }
 
-  /** Throws ProviderCircuitOpenError if open (and no probe permit available). */
-  acquire(provider: AgentProviderId, meta?: { agentId?: string; threadId?: string }): TurnPermit {
+  /** Throws ProviderCircuitOpenError if open (and no probe permit available).
+   *  meta.deadlineMs (KPR-400 F1): the turn's effective wall-clock upper
+   *  bound — becomes the armed probe's staleness bound (+60s grace).
+   *  provider is `string` (KPR-394 R2) — plugin ids are arbitrary registered
+   *  strings; in-tree callers keep their literals. */
+  acquire(
+    provider: string,
+    meta?: { agentId?: string; threadId?: string; deadlineMs?: number },
+  ): TurnPermit {
     return this.breakerFor(provider).acquire(meta);
   }
 
@@ -489,12 +544,12 @@ export class ProviderCircuitBreakerRegistry {
   }
 
   /** null = provider never used in this process. */
-  stateFor(provider: AgentProviderId): CircuitBreakerSnapshot | null {
+  stateFor(provider: string): CircuitBreakerSnapshot | null {
     return this.breakers.get(provider)?.snapshot() ?? null;
   }
 
-  getSnapshot(): Partial<Record<AgentProviderId, CircuitBreakerSnapshot>> {
-    const out: Partial<Record<AgentProviderId, CircuitBreakerSnapshot>> = {};
+  getSnapshot(): Partial<Record<string, CircuitBreakerSnapshot>> {
+    const out: Partial<Record<string, CircuitBreakerSnapshot>> = {};
     for (const [provider, breaker] of this.breakers) out[provider] = breaker.snapshot();
     return out;
   }

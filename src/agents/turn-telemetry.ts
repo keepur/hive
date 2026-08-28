@@ -14,6 +14,20 @@ export interface TurnTelemetryDoc {
   cacheCreationTokens: number;
   ephemeral5mTokens?: number;
   ephemeral1hTokens?: number;
+  // KPR-389: turn-kind + perf split for conference before/after measurement.
+  conferenceRound?: number; // 0 | 1; absent on non-conference turns
+  injectionMode?: "full" | "delta" | "summary"; // KPR-388 injection mode, from meta
+  resumedSession?: boolean; // C7 — finalized attempt launched with a handle
+  durationMs?: number;
+  llmMs?: number;
+  toolMs?: number;
+  toolCalls?: number;
+  effort?: string; // delivered effortOverride ("low" pin visible)
+  /** KPR-401: present (true) only on aborted turns with real usage — sparse,
+   * matching the ephemeral-counter optional style. Lets dashboards segment
+   * aborted-turn spend; the aggregation pipelines are deliberately unchanged
+   * (aborted turns' completed API calls are real cache traffic). */
+  aborted?: true;
   createdAt: Date;
 }
 
@@ -28,6 +42,17 @@ export interface TurnTelemetryInput {
   cacheCreationTokens: number;
   ephemeral5mTokens?: number;
   ephemeral1hTokens?: number;
+  // KPR-389: turn-kind + perf split for conference before/after measurement.
+  conferenceRound?: number; // 0 | 1; absent on non-conference turns
+  injectionMode?: "full" | "delta" | "summary"; // KPR-388 injection mode, from meta
+  resumedSession?: boolean; // C7 — finalized attempt launched with a handle
+  durationMs?: number;
+  llmMs?: number;
+  toolMs?: number;
+  toolCalls?: number;
+  effort?: string; // delivered effortOverride ("low" pin visible)
+  /** KPR-401: sparse — set only when true (see TurnTelemetryDoc.aborted). */
+  aborted?: true;
 }
 
 export interface CacheHitRateRow {

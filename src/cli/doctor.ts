@@ -36,6 +36,8 @@ import {
   memoryLifecycleStatsForDoctor,
   modelRouterModeLine,
   llmSidecarLine,
+  providerPluginsForDoctor,
+  renderProviderPluginsSection,
 } from "./doctor-checks.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -759,6 +761,15 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       outageStats,
       breakerRows.some((r) => r.state === "open"),
     );
+    // KPR-394: provider plugins — informational only (KPR-296 canon: only
+    // identity-class incidents flip the exit code).
+    const providerPlugins = await providerPluginsForDoctor(
+      config.mongo.uri,
+      config.mongo.dbName,
+      config.plugins ?? [],
+      hiveHome,
+    );
+    renderProviderPluginsSection(providerPlugins.rows, providerPlugins.orphans);
     // KPR-241: memory lifecycle per-agent stats.
     const memoryRows = await memoryLifecycleStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderMemoryLifecycleSection(memoryRows, console.log, config.memory.spendWarnThresholdUsd ?? 5);
@@ -781,6 +792,8 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     console.log("\nProvider circuit breakers (live engine, per provider)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nOutage queue (honest outage behavior)");
+    console.log("  ○ skipped: config not loaded");
+    console.log("\nProvider plugins (KPR-394)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nMemory lifecycle: skipped (config not loaded)");
     console.log("\nmodel router: skipped (config not loaded)");

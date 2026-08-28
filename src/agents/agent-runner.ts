@@ -66,9 +66,13 @@ import { createTeamMcpServer } from "../team/team-mcp-server.js";
 import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
+import { createWorkerPoolMcpServer } from "../workers/worker-pool-mcp-server.js";
+import type { MeetingWorkerPool, WorkerPoolTurnContext } from "../workers/meeting-worker-pool.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
 import type { ReasoningEffort } from "./provider-adapters/types.js";
+// KPR-394 (§4.11): plugin provider ids widen the admin model-catalog tools.
+import { listPluginProviderIds } from "./provider-adapters/provider-registry.js";
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -165,6 +169,8 @@ export interface RunResult {
   bootToInitMs?: number;
   /** KPR-323 C1: system/init → first streamed text_delta (≈ model TTFT). On warm turns (KPR-323 C2): push → first delta. */
   initToFirstTokenMs?: number;
+  /** KPR-388: populated ONLY by the dispatcher's convertTurnResult mapping (TurnResult passthrough); runner/adapters never set it. */
+  resumedSession?: boolean;
 }
 
 /**
@@ -321,9 +327,23 @@ function warnIfToolSearchForceDisabled(): void {
 /** KPR-346: optional per-spawn runner options (currently Lane A only). */
 export interface AgentRunnerOptions {
   /** Set by AgentManager.createProviderAdapter for Lane A routes
-   *  (kimi/deepseek/grok) —
+   *  (kimi/deepseek) —
    *  triggers §D5 env substitution in send(). Absent ⇒ vanilla Claude spawn. */
   laneAPassthrough?: PassthroughSpawnConfig;
+  /** KPR-390: meeting worker pool — set by AgentManager.createProviderAdapter
+   *  once index.ts has wired the pool. Absent ⇒ the worker-pool in-process
+   *  server is never built (tools invisible even if listed in coreServers). */
+  workerPool?: MeetingWorkerPool;
+  /** KPR-390: worker-mode runner (set ONLY by the pool's buildWorkerAdapter
+   *  factory). Suppresses the unconditional auto-injection of implicit core
+   *  servers (schedule, team, team-roster, skill-author, workflow) at all
+   *  three sync sites — effectiveCoreServerSet, filterCoreServers,
+   *  autoInjectedServerNames — AND the teamRoster wiring. Without this,
+   *  stripping those names from a worker's cloned coreServers is a no-op
+   *  and through-the-boss enforcement is fiction: `team` alone lets a
+   *  worker message an agent that posts to Slack, and `skill-author` is a
+   *  live stdio subprocess. */
+  suppressAutoInjectedServers?: boolean;
 }
 
 export class AgentRunner {
@@ -352,6 +372,10 @@ export class AgentRunner {
   private eventBusMcpServer?: ReturnType<typeof createEventBusMcpServer>;
   private callbackMcpServer?: ReturnType<typeof createCallbackMcpServer>;
   private callbackContextRef: { current: CallbackTurnContext } = { current: {} };
+  private workerPoolMcpServer?: ReturnType<typeof createWorkerPoolMcpServer>;
+  private workerPoolContextRef: { current: WorkerPoolTurnContext } = { current: {} };
+  private workerPool?: MeetingWorkerPool;
+  private readonly suppressAutoInjectedServers: boolean;
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
   private teamMcpServer?: ReturnType<typeof createTeamMcpServer>;
@@ -378,6 +402,8 @@ export class AgentRunner {
     this.prefixCache = prefixCache;
     this.memoryLifecycle = memoryLifecycle;
     this.laneAPassthrough = runnerOptions?.laneAPassthrough;
+    this.workerPool = runnerOptions?.workerPool;
+    this.suppressAutoInjectedServers = runnerOptions?.suppressAutoInjectedServers ?? false;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
@@ -396,7 +422,7 @@ export class AgentRunner {
       skillIndex: this.skillIndex,
       prefetcher: this.prefetcher,
       eventSubscribersJson: this.eventSubscribersJson,
-      autoInjectedServers: AgentRunner.autoInjectedServerNames(),
+      autoInjectedServers: this.autoInjectedServerNames(),
     };
     const prefix = this.prefixCache
       ? await this.prefixCache.getOrBuild(this.agentConfig.id, () => buildPrefix(this.agentConfig, buildContext))
@@ -423,11 +449,17 @@ export class AgentRunner {
     if (coreSet.has("memory")) {
       coreSet.add("structured-memory");
     }
-    coreSet.add("schedule");
-    coreSet.add("team");
-    coreSet.add("team-roster");
-    if (config.workflow.enabled) {
-      coreSet.add("workflow");
+    // KPR-390: worker-mode runners get NO implicit core servers — the
+    // auto-injected surfaces (team = outbound agent-to-agent messaging,
+    // schedule = self-scheduling) are exactly what WORKER_SERVER_DENYLIST
+    // exists to remove, and they are re-added here for every normal agent.
+    if (!this.suppressAutoInjectedServers) {
+      coreSet.add("schedule");
+      coreSet.add("team");
+      coreSet.add("team-roster");
+      if (config.workflow.enabled) {
+        coreSet.add("workflow");
+      }
     }
     if (!this.agentConfig.autonomy.externalComms) {
       coreSet.delete("resend");
@@ -1109,22 +1141,29 @@ export class AgentRunner {
     if (coreSet.has("memory")) {
       coreSet.add("structured-memory");
     }
-    // Auto-injected servers below MUST mirror AgentRunner.autoInjectedServerNames()
+    // Auto-injected servers below MUST mirror this.autoInjectedServerNames()
     // so the toolkit section (KPR-87) classifies them under "engine-provided"
     // instead of "capability MCPs". Keep both sites in sync.
-    // schedule is an implicit core server — available to all agents unconditionally
-    coreSet.add("schedule");
-    // team is an implicit core server — available to all agents unconditionally
-    coreSet.add("team");
-    // team-roster is an implicit core server — every agent gets the engine-native
-    // team API (in-process MCP) for team_list / team_lookup_human / team_lookup_agent.
-    coreSet.add("team-roster");
-    // skill-author is an implicit core server — every agent can author its own
-    // skills unconditionally (KPR-104). No permission flag; empowerment posture.
-    coreSet.add("skill-author");
-    // workflow is an implicit core server when workflow layer is enabled
-    if (config.workflow.enabled) {
-      coreSet.add("workflow");
+    // KPR-390: worker-mode runners auto-inject nothing — mirror of the
+    // effectiveCoreServerSet/autoInjectedServerNames gates (three-site sync).
+    // This is the only gate guarding a LIVE surface: `skill-author` is a real
+    // spawnable stdio server injected ONLY here, so without this gate a worker
+    // gets a live skill-author subprocess authoring skills as the boss.
+    if (!this.suppressAutoInjectedServers) {
+      // schedule is an implicit core server — available to all agents unconditionally
+      coreSet.add("schedule");
+      // team is an implicit core server — available to all agents unconditionally
+      coreSet.add("team");
+      // team-roster is an implicit core server — every agent gets the engine-native
+      // team API (in-process MCP) for team_list / team_lookup_human / team_lookup_agent.
+      coreSet.add("team-roster");
+      // skill-author is an implicit core server — every agent can author its own
+      // skills unconditionally (KPR-104). No permission flag; empowerment posture.
+      coreSet.add("skill-author");
+      // workflow is an implicit core server when workflow layer is enabled
+      if (config.workflow.enabled) {
+        coreSet.add("workflow");
+      }
     }
     for (const key of Object.keys(servers)) {
       if (!coreSet.has(key)) {
@@ -1159,7 +1198,7 @@ export class AgentRunner {
 
   /**
    * Resolve an agent-env path against the agent config. Supports dotted paths
-   * for nested objects (e.g. "metadata.dodiOpsMode"). Walks left-to-right; any
+   * for nested objects (e.g. "metadata.opsMode"). Walks left-to-right; any
    * missing intermediate key yields "". No fallback to top-level fields — a
    * misconfigured key surfaces as an empty value, which the plugin must
    * handle defensively (per spec §5.3 resolver semantics).
@@ -1207,13 +1246,16 @@ export class AgentRunner {
    * keep both sites in sync. (Computed dynamically because `workflow` is
    * config-gated.)
    */
-  private static autoInjectedServerNames(): ReadonlySet<string> {
+  private autoInjectedServerNames(): ReadonlySet<string> {
     // structured-memory is paired with `memory` (filterCoreServers gates it on
     // `memory` being in coreServers), so it's not unconditional. Agents with
     // memory will have structured-memory in their post-filter coreServerNames
     // and the toolkit will correctly classify it under Capability MCPs.
     // skill-author is unconditional (KPR-104) — every agent can author its own
     // private skills.
+    // KPR-390: worker-mode runners auto-inject nothing — mirror of the
+    // effectiveCoreServerSet/filterCoreServers gates (three-site sync).
+    if (this.suppressAutoInjectedServers) return new Set<string>();
     const set = new Set<string>(["schedule", "team", "team-roster", "skill-author"]);
     if (config.workflow.enabled) set.add("workflow");
     return set;
@@ -1287,7 +1329,7 @@ export class AgentRunner {
   buildToolTransportInventory(context?: WorkItemContext): HiveToolInventoryEntry[] {
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
-    const autoInjectedServers = AgentRunner.autoInjectedServerNames();
+    const autoInjectedServers = this.autoInjectedServerNames();
     const pluginServerNames = this.pluginServerNames();
     const inventory: HiveToolInventoryEntry[] = [];
 
@@ -1336,7 +1378,25 @@ export class AgentRunner {
       });
     }
 
-    if (this.teamRoster) {
+    // KPR-390: worker-pool is in-process-only with no stdio placeholder
+    // (KPR-327 memory pattern) — surface its descriptor explicitly so the
+    // Lane B partition (assembleProviderTurn → partitionInventoryForProvider)
+    // bridges the tools. Gate mirrors the runtime wiring in send().
+    if (this.workerPool && this.shouldEnableInProcessServer("worker-pool") && !mcpServers["worker-pool"]) {
+      inventory.push({
+        ...classifyToolTransport({
+          name: "worker-pool",
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("worker-pool"),
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
+    }
+
+    if (this.teamRoster && !this.suppressAutoInjectedServers) {
       inventory.push({
         ...classifyToolTransport({
           name: "team-roster",
@@ -1407,7 +1467,9 @@ export class AgentRunner {
     // long-lived object holding tool handlers that close over the shared
     // teamRoster cache. Built once per AgentRunner and reused across send()
     // invocations to avoid per-message allocation.
-    if (this.teamRoster) {
+    // KPR-390: worker-mode runners receive `teamRoster` from the manager's
+    // construction inputs; the flag suppresses the wiring (auto-injection).
+    if (this.teamRoster && !this.suppressAutoInjectedServers) {
       if (!this.teamRosterMcpServer) {
         this.teamRosterMcpServer = createTeamRosterMcpServer(this.teamRoster);
       }
@@ -1492,6 +1554,7 @@ export class AgentRunner {
           agentId: this.agentConfig.id,
           instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
           memoryLifecycle: this.memoryLifecycle,
+          listPluginProviderIds,
         });
       }
       servers["admin"] = this.adminMcpServer;
@@ -1541,6 +1604,33 @@ export class AgentRunner {
         });
       }
       servers["callback"] = this.callbackMcpServer;
+    }
+
+    // KPR-390: worker-pool MCP — in-process. Meeting bosses dispatch detached
+    // fetch-workers; per-turn source metadata flows through
+    // workerPoolContextRef (callback template). Gated on the pool being wired
+    // (index.ts) AND coreServers membership — Day-1-OOB layer 2: shipping the
+    // engine changes nothing until the operator adds "worker-pool" to a
+    // boss's coreServers. Lane B reaches these tools through the KPR-348
+    // bridge like every other in-process server — no adapter changes.
+    if (this.workerPool && this.shouldEnableInProcessServer("worker-pool")) {
+      this.workerPoolContextRef.current = {
+        adapterId: context?.adapterId,
+        channelId: context?.channelId,
+        channelKind: context?.channelKind,
+        channelLabel: context?.channelLabel,
+        threadId: context?.threadId,
+        slackTs: context?.slackTs,
+        slackThreadTs: context?.slackThreadTs,
+      };
+      if (!this.workerPoolMcpServer) {
+        this.workerPoolMcpServer = createWorkerPoolMcpServer({
+          pool: this.workerPool,
+          agentId: this.agentConfig.id,
+          context: this.workerPoolContextRef,
+        });
+      }
+      servers["worker-pool"] = this.workerPoolMcpServer;
     }
 
     // KPR-122: structured-memory MCP — in-process, paired with memory.
@@ -2098,6 +2188,19 @@ export class AgentRunner {
     let outputTokens = 0;
     let cacheReadTokens = 0;
     let cacheCreationTokens = 0;
+    // KPR-401: streamed-usage accumulation for result-less turns (deadline
+    // abort, operator abort, mid-iteration throw). The SDK emits one
+    // `assistant` message per CONTENT BLOCK, repeating the same message.id
+    // with identical usage — countedUsageIds counts each API call's usage
+    // exactly once. The Set (not a last-seen-id comparison) is prescribed:
+    // its once-per-id guarantee holds unconditionally, including under any
+    // future interleaving of parallel-subagent bursts (spec-review ruling —
+    // a silent double-count under an SDK ordering change is the exact bug
+    // class this ticket exists to fix). When a result message arrives, its
+    // cumulative totals authoritatively OVERWRITE the accumulator (sawResult
+    // gates the durationMs fallback below).
+    let sawResult = false;
+    const countedUsageIds = new Set<string>();
     let ephemeral5mTokens: number | undefined;
     let ephemeral1hTokens: number | undefined;
     let contextWindow = 0;
@@ -2118,6 +2221,9 @@ export class AgentRunner {
     // activeQuery = null run back-to-back, synchronously, in send()'s
     // finally.)
     let timedOut = false;
+    // KPR-401: wall-clock anchor — durationMs comes from the result message
+    // when one arrives; result-less exits fall back to Date.now() − this.
+    const turnStartedAt = Date.now();
     const deadline = setTimeout(() => {
       if (this.activeQuery) {
         timedOut = true;
@@ -2184,7 +2290,25 @@ export class AgentRunner {
         }
 
         if (msg.type === "assistant") {
-          const content = (msg as any).message?.content;
+          const assistantMessage = (msg as any).message;
+          // KPR-401: per-API-call usage snapshot — ADDED once per distinct
+          // message.id (repetitions carry identical usage; first emission
+          // suffices). Subagent messages (parent_tool_use_id != null) are
+          // deliberately included: subagent spawns are paid spend. The four
+          // counters coalesce uniformly — cache_read/cache_creation are
+          // typed number | null; input/output are plain number (harmless
+          // belt). The result branch below overwrites all four when a
+          // result message arrives, so success turns are byte-identical.
+          const usageMessageId: string | undefined = assistantMessage?.id;
+          const messageUsage = assistantMessage?.usage;
+          if (usageMessageId && messageUsage && !countedUsageIds.has(usageMessageId)) {
+            countedUsageIds.add(usageMessageId);
+            inputTokens += messageUsage.input_tokens ?? 0;
+            outputTokens += messageUsage.output_tokens ?? 0;
+            cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
+            cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
+          }
+          const content = assistantMessage?.content;
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === "text") {
@@ -2211,6 +2335,12 @@ export class AgentRunner {
 
         if (msg.type === "result") {
           const result = msg as SDKResultMessage;
+          // KPR-401: the result message is the SDK's own cumulative turn
+          // total — authoritative. The usage ASSIGNMENTS below (not
+          // additions) overwrite the streamed accumulator, keeping the
+          // success path and the error_during_execution / error_max_turns
+          // paths byte-identical to pre-401 behavior.
+          sawResult = true;
           costUsd = result.total_cost_usd;
           durationMs = result.duration_ms;
           resultSessionId = result.session_id;
@@ -2311,7 +2441,19 @@ export class AgentRunner {
       .join(", ");
 
     const totalToolMs = toolCalls.reduce((sum, tc) => sum + ((tc.endMs ?? Date.now()) - tc.startMs), 0);
-    const llmMs = durationMs - totalToolMs;
+    // KPR-401 (c): result-less exits (deadline abort, operator abort, mid-
+    // iteration throw) never assigned durationMs — real wall clock instead
+    // of 0. Cosmetic residual, deliberate: the two catch-block log lines
+    // above print durationMs BEFORE this fallback runs, so they still show
+    // 0 on result-less crashes; the completion log and RunResult carry the
+    // corrected value (spec Edge cases — noted so review doesn't re-flag).
+    if (!sawResult) durationMs = Date.now() - turnStartedAt;
+    // KPR-401 (d): unconditional clamp — Lane B parity (all three adapters
+    // clamp verbatim). Pre-401 this computed 0 − toolMs on aborted turns
+    // (the llmMs=-294391 incident shape); on success turns it only alters
+    // clock-skew negatives, which pushSample dropped anyway (they now enter
+    // the window as 0-samples, matching Lane B — accepted, spec Edge cases).
+    const llmMs = Math.max(0, durationMs - totalToolMs);
 
     // A deadline fire or an abort() unwinds the iterator by CLOSING it, not by
     // throwing — so `error` stays undefined and the old `hasError: !!error`

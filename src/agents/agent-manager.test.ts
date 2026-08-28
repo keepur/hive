@@ -61,16 +61,46 @@ vi.mock("../config.js", () => ({
     // createProviderAdapter's resolvePassthroughSpawn call.
     kimi: { agentModel: "" },
     deepseek: { agentModel: "" },
-    // KPR-371: grok's default-model override. No credential entry — the
-    // credential is an OAuth file, mocked below.
+    // KPR-371/KPR-410: grok's default-model override; the credential (an xAI
+    // subscription OAuth access token) is resolved from ~/.grok/auth.json by
+    // grok-oauth.ts, not from config/env.
     grok: { agentModel: "" },
     instance: { id: "test-instance" },
     modelRouter: { enabled: false },
     memory: { reflectionMinTurns: 3 },
-    // KPR-323 C2: warm voice lease master switch. Default OFF here so every
-    // pre-existing voice case keeps running the cold path unchanged; the warm
-    // describe flips it per-block.
-    voice: { warmPath: { enabled: false } },
+    // KPR-390: agent-manager.ts never reads this, but the worker-mode
+    // end-to-end pin constructs a REAL AgentRunner (vi.importActual) whose
+    // buildInProcessServers reads config.workflow.enabled unconditionally.
+    workflow: { enabled: false },
+    // KPR-409 T7: the scribe containment pin also reaches
+    // buildToolTransportInventory → buildAllServerConfigs, which reads every
+    // stdio server's config block unconditionally. All falsy/empty so no
+    // vendor server is enabled — the pin is about what suppression strips.
+    slack: { localMcpServer: false, mcpToken: "" },
+    mongo: { uri: "mongodb://localhost:27017", dbName: "hive-test" },
+    google: { client: "", accounts: {} as Record<string, string[]>, sharedFolder: "" },
+    quo: { apiKey: "", phoneNumberId: "", lines: [] },
+    voice: {
+      enabled: false,
+      apiKey: "",
+      phoneNumberId: "",
+      assistants: {},
+      // KPR-323 C2: warm voice lease master switch. Default OFF here so
+      // every pre-existing voice case keeps running the cold path
+      // unchanged; the warm describe flips it per-block.
+      warmPath: { enabled: false },
+    },
+    taskLedger: { apiUrl: "", apiKey: "", agentKeys: {} as Record<string, string> },
+    brave: { apiKey: "" },
+    resend: { apiKey: "", emailDomain: "", businessName: "", fromAddress: "", defaultCc: "", defaultBcc: "" },
+    linear: { apiKey: "", teamId: "" },
+    github: { repo: "", token: "" },
+    clickup: { apiToken: "" },
+    recall: { apiKey: "", region: "", monitorPort: 3100, monitorPublicUrl: "", webhookSecret: "" },
+    browser: { cdpEndpoint: "" },
+    background: { port: 3200, authToken: "" },
+    codeTask: { port: 3202, authToken: "", pluginDir: "" },
+    defaultAgent: "chief-of-staff",
   },
 }));
 
@@ -78,13 +108,6 @@ vi.mock("../config.js", () => ({
 // leg so no real `security` subprocess ever runs; env (KIMI_API_KEY /
 // DEEPSEEK_API_KEY, set per-test) is the only live source in the suite.
 vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: vi.fn(() => "") }));
-
-// KPR-371: grok's credential is a vendor-CLI-owned OAuth file. Mock the
-// resolver so the suite never reads the operator's real ~/.grok/auth.json
-// and never issues a refresh grant.
-vi.mock("./provider-adapters/grok-oauth.js", () => ({
-  resolveOAuthFileToken: vi.fn(async () => "test-grok-oauth-token"),
-}));
 
 // Mock plugin loader
 vi.mock("../plugins/plugin-loader.js", () => ({
@@ -142,6 +165,7 @@ const {
   mockCodexConstructor, mockCodexRunTurn, mockCodexAbort,
   mockOpenAIConstructor, mockOpenAIRunTurn, mockOpenAIAbort,
   mockGeminiConstructor, mockGeminiRunTurn, mockGeminiAbort,
+  mockGrokConstructor, mockGrokRunTurn, mockGrokAbort,
 } = vi.hoisted(() => ({
   mockCodexConstructor: vi.fn(),
   mockCodexRunTurn: vi.fn(),
@@ -152,6 +176,9 @@ const {
   mockGeminiConstructor: vi.fn(),
   mockGeminiRunTurn: vi.fn(),
   mockGeminiAbort: vi.fn(),
+  mockGrokConstructor: vi.fn(),
+  mockGrokRunTurn: vi.fn(),
+  mockGrokAbort: vi.fn(),
 }));
 
 vi.mock("./provider-adapters/codex-subscription-adapter.js", () => ({
@@ -190,6 +217,31 @@ vi.mock("./provider-adapters/gemini-interactions-adapter.js", () => ({
   }),
 }));
 
+// KPR-410: grok's credential is an xAI subscription OAuth access token read
+// from ~/.grok/auth.json by grok-oauth.ts — resolved per spawn by the
+// manager's own grok arm. Hoisted so the vi.mock factory below can reference it.
+const mockResolveOAuthFileToken = vi.hoisted(() => vi.fn());
+vi.mock("./provider-adapters/grok-oauth.js", () => ({
+  resolveOAuthFileToken: mockResolveOAuthFileToken,
+}));
+
+// KPR-392: importOriginal preserves the module's real constant exports
+// (DEFAULT_GROK_MODEL, __resetGrokCoercionWarnedForTests) —
+// provider-modules.ts (fallback model) imports one of them at module load,
+// so a bare mock factory would silently zero that default out.
+vi.mock("./provider-adapters/grok-adapter.js", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  GrokAdapter: vi.fn().mockImplementation(function (options) {
+    mockGrokConstructor(options);
+    return {
+      provider: "grok",
+      runTurn: mockGrokRunTurn,
+      abort: mockGrokAbort,
+      wasAborted: false,
+    };
+  }),
+}));
+
 // Mock conversation index (hoisted because ConversationIndex is instantiated at module level)
 const { mockConversationIndex } = vi.hoisted(() => ({
   mockConversationIndex: vi.fn(),
@@ -202,7 +254,7 @@ vi.mock("../search/conversation-index.js", () => ({
   }),
 }));
 
-import { AgentManager, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
+import { AgentManager, conferenceRoundOf, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
 import { AgentRunner, type RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -214,10 +266,7 @@ import type { AgentProviderId } from "./provider-adapters/types.js";
 import { buildGenericDelegatePrompt, type DelegateTurnRunner } from "./provider-adapters/turn-assembly.js";
 import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
 import { classifyTurnResult, TurnAssemblyError } from "./provider-adapters/error-classification.js";
-import { resolveOAuthFileToken } from "./provider-adapters/grok-oauth.js";
 import { AsyncPushQueue, WARM_IDLE_TIMEOUT_MS, type WarmVoiceSession } from "./warm-voice-session.js";
-
-const mockResolveOAuthFileToken = vi.mocked(resolveOAuthFileToken);
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -361,6 +410,32 @@ function makeVoiceCtx(
   };
 }
 
+/** KPR-389: conference-shaped TurnContext + item, meta stamped like the dispatcher does. */
+function makeConfCtx(
+  round: 0 | 1,
+  agentId = "agent-s",
+  extraMeta: Record<string, unknown> = {},
+): TurnContext & { workItem: WorkItem } {
+  const threadId = `conf:${agentId}:${Math.random()}`;
+  const workItem = makeWorkItem({
+    text: "shaped preamble + transcript + peer reply",
+    threadId,
+    source: { kind: "slack", id: "C-CONF", label: "conf-tahoe" },
+    sender: "U-MAY",
+    senderName: "May",
+    meta: { conferenceMode: true, conferenceRound: round, ...extraMeta },
+  });
+  return {
+    agentId,
+    sessionId: undefined,
+    channelId: "C-CONF",
+    threadId,
+    workItem,
+    channel: "slack" as const,
+    conferenceRound: round,
+  };
+}
+
 function makeMockRegistry() {
   const agents = new Map<string, AgentConfig>();
   agents.set("agent-a", makeAgentConfig({ id: "agent-a", name: "AgentA", maxConcurrent: 2 }));
@@ -440,10 +515,18 @@ describe("AgentManager", () => {
 
     // Default mock: runner.send resolves with a result
     mockRunnerSend.mockResolvedValue(makeRunResult());
+    // Default mock: conversation indexing resolves. recordSpawnObservability
+    // chains `.catch` on `index()`'s return value, so an unprimed vi.fn()
+    // (returns undefined) throws. Priming here — not per-test — keeps every
+    // row hermetic under `-t` filter isolation (KPR-400/KPR-403 review debt:
+    // rows used to depend on an earlier sibling's inline prime surviving
+    // clearAllMocks).
+    mockConversationIndex.mockResolvedValue(undefined);
     mockRunnerToolInventory.mockReturnValue([]);
     mockCodexRunTurn.mockResolvedValue(makeRunResult({ text: "codex response", sessionId: "codex-session" }));
     mockOpenAIRunTurn.mockResolvedValue(makeRunResult({ text: "openai response", sessionId: "openai-session" }));
     mockGeminiRunTurn.mockResolvedValue(makeRunResult({ text: "gemini response", sessionId: "gemini-session" }));
+    mockGrokRunTurn.mockResolvedValue(makeRunResult({ text: "grok response", sessionId: "grok-session" }));
 
     manager = new AgentManager(
       registry as any,
@@ -2183,9 +2266,16 @@ describe("AgentManager", () => {
       expect(sessionStore.set).toHaveBeenCalledTimes(3);
     });
 
-    it("does NOT update session-store when the result is aborted", async () => {
+    it("does NOT update session-store when the result is aborted with ZERO progress (KPR-399 re-scope)", async () => {
+      // Pre-KPR-399 this row pinned "aborted never persists" using the
+      // fixture's default progress fields (toolCalls: 1, text: "response") —
+      // a shape that now DELIBERATELY persists (§D2 persist-on-abort). It is
+      // re-scoped to the zero-progress shape (also synthesizeAbortedResult's
+      // shape): the fail-closed direction, which survives unchanged. The
+      // with-progress direction is pinned in the KPR-399 persist-on-abort
+      // describe below.
       mockRunnerSend.mockResolvedValueOnce(
-        makeRunResult({ aborted: true, sessionId: "session-aborted" }),
+        makeRunResult({ aborted: true, sessionId: "session-aborted", toolCalls: 0, streamed: false, text: "" }),
       );
       await manager.spawnTurn(smsCtx());
       expect(sessionStore.set).not.toHaveBeenCalled();
@@ -2363,6 +2453,62 @@ describe("AgentManager", () => {
         const result = await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:probe-turn" }));
         expect(result.finalMessage).toBe("back");
         expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
+      });
+
+      it("KPR-400 F1: acquire meta deadlineMs ≥ the agent's own timeoutMs (900s architect shape)", async () => {
+        // NEGATIVE-VERIFY prediction (Task 4 Step 3): pre-fix the acquire
+        // meta carries agentId/threadId only — objectContaining fails.
+        registry._agents.set(
+          "agent-arch",
+          makeAgentConfig({ id: "agent-arch", name: "Architect", model: "claude-sonnet-4-6", timeoutMs: 900_000 }),
+        );
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult());
+        await manager.spawnTurn(smsCtx({ agentId: "agent-arch", threadId: "sms:line-1:kpr400-arch" }));
+        // sonnet tier limit (300s) < explicit timeoutMs → max picks 900s.
+        expect(acquireSpy).toHaveBeenCalledWith(
+          "claude",
+          expect.objectContaining({ agentId: "agent-arch", deadlineMs: 900_000 }),
+        );
+      });
+
+      it("KPR-400 F1: acquire meta deadlineMs ≥ the opus tier limit when the agent has no explicit timeoutMs", async () => {
+        registry._agents.set(
+          "agent-opus",
+          makeAgentConfig({ id: "agent-opus", name: "OpusAgent", model: "claude-opus-4-7" }),
+        );
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult());
+        await manager.spawnTurn(smsCtx({ agentId: "agent-opus", threadId: "sms:line-1:kpr400-opus" }));
+        // No explicit timeoutMs (default 300s) < opus tier limit → max picks 600s.
+        expect(acquireSpy).toHaveBeenCalledWith(
+          "claude",
+          expect.objectContaining({ agentId: "agent-opus", deadlineMs: RESOURCE_TIER_DEFAULTS.opus.timeoutMs }),
+        );
+      });
+
+      it("KPR-403: turnDeadlineUpperBoundMs — per-agent timeoutMs override wins (900s architect shape)", () => {
+        // NEGATIVE-VERIFY prediction (Step 3): pre-fix the wrapper does not
+        // exist — all three KPR-403 rows fail with a TypeError.
+        registry._agents.set(
+          "agent-arch-403",
+          makeAgentConfig({ id: "agent-arch-403", name: "Architect", model: "claude-sonnet-4-6", timeoutMs: 900_000 }),
+        );
+        // sonnet tier limit (300s) < explicit timeoutMs → max picks 900s.
+        expect(manager.turnDeadlineUpperBoundMs("agent-arch-403")).toBe(900_000);
+      });
+
+      it("KPR-403: turnDeadlineUpperBoundMs — router-path agent with no override gets the long tier limit", () => {
+        registry._agents.set(
+          "agent-opus-403",
+          makeAgentConfig({ id: "agent-opus-403", name: "OpusAgent", model: "claude-opus-4-7" }),
+        );
+        // No explicit timeoutMs (default 300s) < opus tier limit → max picks the tier.
+        expect(manager.turnDeadlineUpperBoundMs("agent-opus-403")).toBe(RESOURCE_TIER_DEFAULTS.opus.timeoutMs);
+      });
+
+      it("KPR-403: turnDeadlineUpperBoundMs — unknown agentId falls back to the 300s default", () => {
+        expect(manager.turnDeadlineUpperBoundMs("no-such-agent")).toBe(300_000);
       });
 
       it("KPR-347 T5: assembly throws with a provider-fault-shaped message — classifies non-provider, breaker closed after 3 repeats", async () => {
@@ -2814,8 +2960,19 @@ describe("AgentManager", () => {
       });
 
       it("⚠A4 churn-mint rider: errored turn that resumed and returned a DIFFERENT id never overwrites the row", async () => {
+        // KPR-399 fixture re-scope (error string only — the pinned direction
+        // is unchanged): this row previously used the CLI's unknown-session
+        // text ("No conversation found with session ID: s-old"), which is now
+        // an `isClaudeResumeLoadError` alternate — the §D3 self-heal arm
+        // intercepts it BEFORE finalize, retries fresh, and the healed retry
+        // legitimately persists (the arm's headline purpose: no more dead
+        // thread until the 7d TTL). `error_during_execution` is the other
+        // real failed-resume-mint surface (the source comment's own example:
+        // the CLI's error_during_execution result carries a freshly minted
+        // session_id) and matches no self-heal alternate, so the churn-mint
+        // rider is exercised exactly as before.
         mockRunnerSend.mockResolvedValueOnce(
-          makeRunResult({ error: "No conversation found with session ID: s-old", sessionId: "s-minted" }),
+          makeRunResult({ error: "error_during_execution", sessionId: "s-minted" }),
         );
         await manager.spawnTurn(
           smsCtx({ threadId: "sms:line-1:kpr313-mint", sessionId: "s-old", sessionProvider: "claude" }),
@@ -3268,6 +3425,111 @@ describe("AgentManager", () => {
       });
     });
 
+    describe("TurnResult.resumedSession (KPR-388)", () => {
+      const STALE = "Previous response with id 'resp_stale' not found.";
+      function openai388(id = "openai-pilot") {
+        registry._agents.set(
+          id,
+          makeAgentConfig({ id, name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        return id;
+      }
+
+      it("true on a happy-path resume", async () => {
+        const result = await manager.spawnTurn(
+          smsCtx({ sessionId: "s1", threadId: "sms:line-1:kpr388-r1" }),
+        );
+        expect(result.resumedSession).toBe(true);
+      });
+
+      it("false on a first turn (no stored session)", async () => {
+        const result = await manager.spawnTurn(
+          smsCtx({ sessionId: undefined, threadId: "sms:line-1:kpr388-r2" }),
+        );
+        expect(result.resumedSession).toBe(false);
+      });
+
+      it("false after the auth-rebuild retry (finalized attempt ran fresh)", async () => {
+        mockRunnerSend
+          .mockResolvedValueOnce(
+            makeRunResult({ error: "Could not resolve authentication method", sessionId: "" }),
+          )
+          .mockResolvedValueOnce(makeRunResult({ text: "ok after retry", sessionId: "session-retry" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ sessionId: "stale-session", threadId: "sms:line-1:kpr388-r3" }),
+        );
+        expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+        expect(result.resumedSession).toBe(false);
+      });
+
+      it("false after the stale-handle self-heal fresh retry", async () => {
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "resp-fresh" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ agentId: openai388(), sessionId: "resp_stale", sessionProvider: "openai", threadId: "sms:line-1:kpr388-r4" }),
+        );
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(2);
+        expect(result.resumedSession).toBe(false);
+      });
+
+      it("true after self-heal contender adoption (adopted handle counts as resumed)", async () => {
+        const threadId = "sms:line-1:kpr388-r5";
+        sessionStore._sessions.set(`openai-pilot:${threadId}`, { sessionId: "resp-contender", provider: "openai" });
+        mockOpenAIRunTurn
+          .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "adopted", sessionId: "resp-contender-2" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ agentId: openai388(), sessionId: "resp_stale", sessionProvider: "openai", threadId }),
+        );
+        expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBe("resp-contender");
+        expect(result.resumedSession).toBe(true);
+      });
+
+      it("false on a KPR-313 provider-handoff turn (guard strips the session pre-attempt)", async () => {
+        // Stored codex tag, claude turn: guard trips, turn runs fresh with the
+        // handoff annotation — resumedSession must report the fresh reality.
+        const result = await manager.spawnTurn(
+          smsCtx({ sessionId: "s-codex-row", sessionProvider: "codex", threadId: "sms:line-1:kpr388-r6" }),
+        );
+        expect(result.resumedSession).toBe(false);
+      });
+
+      // --- KPR-412: the KPR-399 arm had no coverage in this block ----------
+      describe("false after the KPR-399 claude resume-rejection fresh retry (KPR-412)", () => {
+        const UNKNOWN_SESSION = "No conversation found with session ID: 0198c3f2-abcd-7890-b1c2-d3e4f5a6b7c8";
+        const DANGLING_TOOL_USE =
+          "400 invalid_request_error: messages.57: the following `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01AbCdEfGh";
+
+        it.each([
+          ["unknown-session", UNKNOWN_SESSION],
+          ["dangling tool_use 400", DANGLING_TOOL_USE],
+        ])("T1: resumedSession is false on %s (was true pre-fix — negative-verified)", async (_label, reason) => {
+          mockRunnerSend
+            .mockResolvedValueOnce(makeRunResult({ error: reason, sessionId: "" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "s-fresh" }));
+          const result = await manager.spawnTurn(
+            smsCtx({ threadId: "sms:line-1:kpr412-t1", sessionId: "s-dead", sessionProvider: "claude" }),
+          );
+          expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+          expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined(); // fresh retry — no sessionId (matches the sibling "resume-rejection self-heal (KPR-399 §D3)" describe's assertion form)
+          expect(result.resumedSession).toBe(false);
+        });
+
+        it("T2: agent_turn_telemetry.resumedSession is false on the same path (C18 single-sourcing)", async () => {
+          mockRunnerSend
+            .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "s-fresh" }));
+          await manager.spawnTurn(
+            smsCtx({ threadId: "sms:line-1:kpr412-t2", sessionId: "s-dead", sessionProvider: "claude" }),
+          );
+          expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+          const doc = turnTelemetryStore.record.mock.calls[0]![0];
+          expect(doc.resumedSession).toBe(false);
+        });
+      });
+    });
+
     describe("stale-handle self-heal — gemini (KPR-352 §D3)", () => {
       // Binding delta (Task-0/1 spike): the live Interactions API returns 400
       // for fabricated AND malformed ids; the adapter tags only round-1
@@ -3374,6 +3636,257 @@ describe("AgentManager", () => {
         mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ error: TAGGED, sessionId: "" }));
         await manager.spawnTurn(smsCtx({ agentId: id, threadId: "sms:line-1:kpr352-nosess", sessionId: undefined }));
         expect(mockGeminiRunTurn).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("persist-on-abort (KPR-399 §D2)", () => {
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+      });
+
+      // Incident shape (KPR-397 epic, 2026-08-26): deadline abort mid-tool
+      // turn with a valid transcript id — must persist so replay/follow-up
+      // resumes instead of restarting ("think / hit-wall / restart" loop).
+      it("aborted claude turn WITH progress persists sessionId — no tokenData (new direction)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "s1", toolCalls: 46, streamed: true, text: "" }),
+        );
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-p1" });
+        await manager.spawnTurn(ctx);
+        expect(sessionStore.set).toHaveBeenCalledTimes(1);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude");
+        // No 5th arg: tokenData omitted — aborted turns carry all-zero usage;
+        // set() without tokenData preserves the prior turn's stats.
+        expect(sessionStore.set.mock.calls[0]!.length).toBe(4);
+      });
+
+      it.each([
+        ["toolCalls alone", { toolCalls: 1, streamed: false, text: "" }],
+        ["streamed alone", { toolCalls: 0, streamed: true, text: "" }],
+        ["text alone", { toolCalls: 0, streamed: false, text: "partial reply" }],
+      ] as const)("each D1 signal independently sufficient: %s", async (_label, progress) => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "s1", ...progress }),
+        );
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-sig" });
+        await manager.spawnTurn(ctx);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude");
+      });
+
+      it("fail-closed: aborted with ZERO progress persists nothing (also synthesizeAbortedResult's shape)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "s1", toolCalls: 0, streamed: false, text: "" }),
+        );
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr399-zero" }));
+        expect(sessionStore.set).not.toHaveBeenCalled();
+      });
+
+      it("empty sessionId on an aborted result persists nothing (abort before system/init)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "", toolCalls: 3, streamed: true, text: "" }),
+        );
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr399-noid" }));
+        expect(sessionStore.set).not.toHaveBeenCalled();
+      });
+
+      it("operator abort (aborted without timedOut) with progress persists too — uniform handling (⚠A4)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, sessionId: "s-stop", toolCalls: 3, streamed: true, text: "" }),
+        );
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-stop" });
+        await manager.spawnTurn(ctx);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-stop", "claude");
+      });
+
+      it("mint-safety belt: aborted + errored + resumed + DIFFERENT id never overwrites the row", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, error: "boom", sessionId: "s-minted", toolCalls: 3, streamed: true, text: "" }),
+        );
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr399-mint", sessionId: "s-old", sessionProvider: "claude" }),
+        );
+        expect(sessionStore.set).not.toHaveBeenCalled();
+      });
+
+      it("mint-safety belt scope: aborted + errored turn re-persisting the SAME id it resumed is allowed (TTL refresh)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, error: "boom", sessionId: "s-same", toolCalls: 3, streamed: true, text: "" }),
+        );
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-same", sessionId: "s-same", sessionProvider: "claude" });
+        await manager.spawnTurn(ctx);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-same", "claude");
+      });
+
+      it("C3 pins: aborted-with-progress on openai / gemini / codex routes persists NOTHING (Lane B byte-for-byte)", async () => {
+        registry._agents.set(
+          "openai-pilot",
+          makeAgentConfig({ id: "openai-pilot", name: "OP", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        registry._agents.set(
+          "gemini-pilot",
+          makeAgentConfig({ id: "gemini-pilot", name: "GP", model: "gemini/gemini-2.5-pro", coreServers: [] }),
+        );
+        registry._agents.set(
+          "codex-pilot",
+          makeAgentConfig({ id: "codex-pilot", name: "CP", model: "codex/gpt-5.5:medium", coreServers: [] }),
+        );
+        const shape = { aborted: true, timedOut: true, toolCalls: 5, streamed: true, text: "" };
+        mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ ...shape, sessionId: "resp-abort" }));
+        await manager.spawnTurn(smsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr399-c3-o" }));
+        mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ ...shape, sessionId: "int-abort" }));
+        await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr399-c3-g" }));
+        mockCodexRunTurn.mockResolvedValueOnce(makeRunResult({ ...shape, sessionId: "codex-abort" }));
+        await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr399-c3-c" }));
+        expect(sessionStore.set).not.toHaveBeenCalled();
+      });
+
+      // Both client-transcript Lane A columns, one row each — the arm gates
+      // on SEMANTICS, so every Lane A column must inherit it. Grok is
+      // deliberately absent: KPR-392 promoted it to a native Lane B
+      // stateless-replay adapter (merged into this epic branch after this
+      // test's original authoring), so it now belongs with the
+      // "aborted-with-progress ... persists NOTHING" C3 pins above, not here.
+      it.each([
+        ["kimi", "KIMI_API_KEY", "agent-kimi", "kimi/kimi-k3", "kimi-s1"],
+        ["deepseek", "DEEPSEEK_API_KEY", "agent-dseek", "deepseek/deepseek-v4-pro", "dseek-s1"],
+      ] as const)(
+        "Lane A inheritance pin: an aborted-with-progress %s turn persists under its own tag (client-transcript)",
+        async (provider, envKey, agentId, model, sessionId) => {
+          process.env[envKey] = `test-${provider}-key`;
+          try {
+            registry._agents.set(agentId, makeAgentConfig({ id: agentId, name: agentId, model, coreServers: [] }));
+            mockRunnerSend.mockResolvedValueOnce(
+              makeRunResult({ aborted: true, timedOut: true, sessionId, toolCalls: 2, streamed: true, text: "" }),
+            );
+            const ctx = smsCtx({ agentId, threadId: `sms:line-1:kpr399-${provider}` });
+            await manager.spawnTurn(ctx);
+            expect(sessionStore.set).toHaveBeenCalledWith(agentId, ctx.threadId, sessionId, provider);
+          } finally {
+            delete process.env[envKey];
+          }
+        },
+      );
+
+      it("re-entry prefers resume: after an aborted-turn persist, the next runWorkItemTurn on the thread resumes the persisted id", async () => {
+        // Pins spec Testing Contract 11 — "replay prefers resume" — via the
+        // real store-backed path (runWorkItemTurn → sessionStore.get →
+        // ctx.sessionId → runner resume), without touching dispatcher code.
+        mockRunnerSend
+          .mockResolvedValueOnce(
+            makeRunResult({ aborted: true, timedOut: true, sessionId: "s-abort", toolCalls: 7, streamed: true, text: "" }),
+          )
+          .mockResolvedValueOnce(makeRunResult({ text: "resumed", sessionId: "s-abort" }));
+        const threadId = "sms:line-1:kpr399-replay";
+        const src = { kind: "sms" as const, id: "line-1", label: "May (CEO)" };
+        await manager.runWorkItemTurn("agent-a", makeWorkItem({ threadId, source: src, sender: "+15551234567" }));
+        const second = await manager.runWorkItemTurn(
+          "agent-a",
+          makeWorkItem({ threadId, source: src, sender: "+15551234567" }),
+        );
+        expect(mockRunnerSend.mock.calls[1]![1]).toBe("s-abort"); // resumed, not "new"
+        expect(second.newSessionId).toBe("s-abort");
+      });
+    });
+
+    describe("resume-rejection self-heal (KPR-399 §D3)", () => {
+      const UNKNOWN_SESSION = "No conversation found with session ID: 0198c3f2-abcd-7890-b1c2-d3e4f5a6b7c8";
+      const DANGLING_TOOL_USE =
+        "400 invalid_request_error: messages.57: the following `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01AbCdEfGh";
+
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        // Hermetic queue: the outer beforeEach's clearAllMocks() clears call
+        // history but NOT the mockResolvedValueOnce queue. Rows here queue two
+        // responses expecting a retry; if the retry does not fire (pre-fix
+        // source under negative-verify) the second value would bleed into the
+        // next row. Reset the queue, then restore the suite-wide default.
+        mockRunnerSend.mockReset();
+        mockRunnerSend.mockResolvedValue(makeRunResult());
+      });
+
+      it.each([
+        ["unknown-session", UNKNOWN_SESSION],
+        ["dangling tool_use 400", DANGLING_TOOL_USE],
+      ])("retries exactly once with sessionId stripped on %s; retry result is the turn result", async (_label, reason) => {
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ error: reason, sessionId: "" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "s-fresh" }));
+        const ctx = smsCtx({ threadId: "sms:line-1:kpr399-heal", sessionId: "s-dead", sessionProvider: "claude" });
+        const result = await manager.spawnTurn(ctx);
+        expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+        expect(mockRunnerSend.mock.calls[0]![1]).toBe("s-dead"); // first attempt resumed
+        expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined(); // fresh retry
+        expect(result.finalMessage).toBe("healed");
+        expect(result.newSessionId).toBe("s-fresh");
+        // Write path self-corrects: fresh handle persisted normally (no scrub).
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-fresh", "claude", expect.anything());
+        // Redaction posture: the warn carries no error string / handle value.
+        expect(mockLogWarn).toHaveBeenCalledWith(
+          expect.stringContaining("resume rejected"),
+          expect.not.objectContaining({ reason: expect.anything() }),
+        );
+        const leaked = mockLogWarn.mock.calls.some(([, meta]) => JSON.stringify(meta ?? "").includes("s-dead"));
+        expect(leaked).toBe(false);
+      });
+
+      it("breaker record-once: only the finalized attempt is recorded; streak stays 0 (breaker-invisible)", async () => {
+        const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "s-2" }));
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr399-brk", sessionId: "s-dead", sessionProvider: "claude" }),
+        );
+        expect(recordSpy).toHaveBeenCalledTimes(1); // first attempt's rejection never recorded
+        expect(recordSpy.mock.calls[0]![1]).toEqual({ outcome: "success" });
+        const snap = manager.circuitBreakers.stateFor("claude")!;
+        expect(snap.state).toBe("closed");
+        expect(snap.consecutiveHardFaults).toBe(0);
+      });
+
+      it("single retry: a retry that fails with the matcher string again is NOT retried a second time", async () => {
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }))
+          .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }));
+        const result = await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr399-once", sessionId: "s-dead", sessionProvider: "claude" }),
+        );
+        expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+        expect(result.errors).toEqual([UNKNOWN_SESSION]);
+      });
+
+      it("gating: dead without a stored sessionId; dead on openai (semantics gate); auth sentinel routes to the auth arm", async () => {
+        // No sessionId → no retry (arm requires effectiveCtx.sessionId).
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }));
+        await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr399-g1", sessionId: undefined }));
+        expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        // openai route + same string + sessionId → no retry: server-resumable
+        // is not this arm's semantics, and the string does not match the
+        // KPR-350 arm's matcher either (mutual exclusivity, both directions).
+        // NOTE: the pre-existing KPR-313 churn-mint warn ("Skipping session
+        // persist — errored turn returned a different id…") also fires here
+        // (errored result id "resp-x" ≠ resumed "resp-old") — expected and
+        // harmless to these assertions.
+        registry._agents.set(
+          "openai-pilot",
+          makeAgentConfig({ id: "openai-pilot", name: "OP", model: "openai/gpt-5.4-mini", coreServers: [] }),
+        );
+        mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "resp-x" }));
+        await manager.spawnTurn(
+          smsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr399-g2", sessionId: "resp-old", sessionProvider: "openai" }),
+        );
+        expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+        // Auth sentinel on claude + sessionId → the FIRST arm fires (else-if
+        // chain order), never this one: its warn appears, ours does not.
+        mockRunnerSend
+          .mockResolvedValueOnce(makeRunResult({ error: "Could not resolve authentication method", sessionId: "" }))
+          .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "s-a" }));
+        await manager.spawnTurn(
+          smsCtx({ threadId: "sms:line-1:kpr399-g3", sessionId: "s-x", sessionProvider: "claude" }),
+        );
+        expect(mockLogWarn).toHaveBeenCalledWith(expect.stringContaining("auth-rebuild"), expect.anything());
+        const resumeWarn = mockLogWarn.mock.calls.some(([msg]) => String(msg).includes("resume rejected"));
+        expect(resumeWarn).toBe(false);
       });
     });
 
@@ -3608,11 +4121,12 @@ describe("AgentManager", () => {
       });
     });
 
-    describe("Lane A passthrough — Grok (KPR-371)", () => {
+    describe("Lane B grok (KPR-392)", () => {
       function seed(threadId: string, sessionId: string, provider: string, agentId: string) {
         sessionStore._sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
       }
 
+      // The last AgentRunner construction's options bag (11th ctor arg).
       function lastRunnerOptions() {
         const call = vi.mocked(AgentRunner).mock.calls.at(-1)!;
         return call[10];
@@ -3620,7 +4134,7 @@ describe("AgentManager", () => {
 
       beforeEach(() => {
         mockConversationIndex.mockResolvedValue(undefined);
-        mockResolveOAuthFileToken.mockResolvedValue("test-grok-oauth-token");
+        mockResolveOAuthFileToken.mockReset().mockResolvedValue("test-grok-oauth-token");
         process.env.KIMI_API_KEY = "test-kimi-key";
         registry._agents.set(
           "agent-grok",
@@ -3630,6 +4144,7 @@ describe("AgentManager", () => {
           "agent-kimi",
           makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3", coreServers: [] }),
         );
+        mockGrokRunTurn.mockResolvedValue(makeRunResult({ text: "grok response", sessionId: "chatcmpl-default" }));
       });
 
       afterEach(() => {
@@ -3650,155 +4165,445 @@ describe("AgentManager", () => {
         expect(manager.providerFor("agent-typo")).toBe("claude");
       });
 
-      // --- adapter selection ------------------------------------------------
-      it("grok turn constructs AgentRunner with the laneAPassthrough bag and runs the Claude adapter — no Lane B", async () => {
-        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-adapter" }));
+      // --- 1. construction: module-table lookup, no Lane A residue ----------
+      it("grok turn constructs GrokAdapter through the module table — no laneAPassthrough bag, no Claude adapter", async () => {
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-adapter" }));
 
-        expect(lastRunnerOptions()).toEqual({
-          laneAPassthrough: expect.objectContaining({
-            provider: "grok",
+        expect(mockGrokConstructor).toHaveBeenCalledWith(
+          expect.objectContaining({
+            apiKey: "test-grok-oauth-token",
             model: "grok-4.6",
-            baseUrl: "https://api.x.ai",
-            authToken: "test-grok-oauth-token",
           }),
-        });
-        expect(mockRunnerSend).toHaveBeenCalled();
+        );
+        // Pin the literal credential-file path passed to resolveOAuthFileToken —
+        // this is fully mocked elsewhere in the suite, so nothing else catches
+        // a typo in the path string that agent-manager.ts hands off.
+        expect(mockResolveOAuthFileToken).toHaveBeenCalledWith("~/.grok/auth.json");
+        // KPR-410: no baseUrl in the constructor options at all — GrokAdapter
+        // hardcodes GROK_API_BASE_URL, there is nothing left to thread.
+        expect(mockGrokConstructor).not.toHaveBeenCalledWith(
+          expect.objectContaining({ baseUrl: expect.anything() }),
+        );
+        // Lane A retired for grok: AgentRunner gets no laneAPassthrough bag,
+        // and the Claude adapter (mockRunnerSend) never runs.
+        expect(lastRunnerOptions()).toBeUndefined();
+        expect(mockRunnerSend).not.toHaveBeenCalled();
+        expect(mockGrokRunTurn).toHaveBeenCalled();
         expect(mockCodexConstructor).not.toHaveBeenCalled();
         expect(mockOpenAIConstructor).not.toHaveBeenCalled();
         expect(mockGeminiConstructor).not.toHaveBeenCalled();
-        const grokRunner = vi.mocked(AgentRunner).mock.results.at(-1)!.value as {
-          buildProviderPrompt: ReturnType<typeof vi.fn>;
-        };
-        expect(grokRunner.buildProviderPrompt).not.toHaveBeenCalled();
       });
 
-      // --- model chain ------------------------------------------------------
-      it("model chain — empty route model falls to the grok-4.6 table default", async () => {
-        registry._agents.set(
-          "agent-grok",
-          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/", coreServers: [] }),
-        );
-        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-default" }));
-        expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("grok-4.6");
+      // --- 2. model chain -----------------------------------------------------
+      // Non-discriminating for precedence (route model == module default here);
+      // the discriminating precedence pin lives in provider-modules.test.ts
+      // (route-grok vs cfg-grok). This pin covers routing + model delivery only.
+      it("model chain: route model is delivered to the adapter", async () => {
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-modelchain-route" }));
+        expect(mockGrokConstructor).toHaveBeenLastCalledWith(expect.objectContaining({ model: "grok-4.6" }));
       });
 
-      it("model chain — GROK_AGENT_MODEL wins over the table default, and an explicit route wins over both", async () => {
+      it("model chain: empty route model falls to appConfig.grok.agentModel", async () => {
         registry._agents.set(
           "agent-grok",
           makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/", coreServers: [] }),
         );
         (appConfig as any).grok.agentModel = "grok-4.5";
         try {
-          await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-cfgmodel" }));
-          expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("grok-4.5");
-
-          registry._agents.set(
-            "agent-grok",
-            makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6", coreServers: [] }),
-          );
-          await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-routewins" }));
-          expect((lastRunnerOptions() as any).laneAPassthrough.model).toBe("grok-4.6");
+          await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-modelchain-cfg" }));
+          expect(mockGrokConstructor).toHaveBeenLastCalledWith(expect.objectContaining({ model: "grok-4.5" }));
         } finally {
           (appConfig as any).grok.agentModel = "";
         }
       });
 
-      // --- credential fault, breaker-invisible ------------------------------
-      it("an unavailable OAuth credential is a config fault that never trips the grok breaker", async () => {
-        mockResolveOAuthFileToken.mockRejectedValue(
+      it("model chain: empty route + empty config falls to the module's grok-4.6 constructor default", async () => {
+        registry._agents.set(
+          "agent-grok",
+          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-modelchain-default" }));
+        expect(mockGrokConstructor).toHaveBeenLastCalledWith(expect.objectContaining({ model: "grok-4.6" }));
+      });
+
+      // --- 3. effort — the Lane A clamp retires for grok ----------------------
+      it(":xhigh flows to the constructor's reasoningEffort unchanged — no Lane A clamp warn (grok's native xhigh is now expressible)", async () => {
+        registry._agents.set(
+          "agent-grok",
+          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6:xhigh", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-effort-xhigh" }));
+        expect(mockGrokConstructor).toHaveBeenLastCalledWith(expect.objectContaining({ reasoningEffort: "xhigh" }));
+        // kimi's clamp pin lives in the Lane A describe above; grok must NOT
+        // exercise it any more (isLaneAProvider("grok") is false).
+        const clampWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("outside the deliverable"));
+        expect(clampWarns).toHaveLength(0);
+      });
+
+      // --- 3b. KPR-389 D2 round-1 reaction shaping, post-KPR-392 migration ---
+      // grok is Lane B now (isLaneAProvider("grok") === false), so
+      // shapeReactionTurn's effort pin — Lane-A/claude-only by contract — no
+      // longer reaches it: request.effort stays undefined in both rounds, and
+      // the :high suffix keeps flowing to the adapter CONSTRUCTOR (see the
+      // :xhigh test above), unaffected by conferenceRound. resourceLimits
+      // clamping is provider-lane-agnostic (same legacy-triple-then-min()
+      // formula for Lane A and Lane B), so that half of the original T4 pin
+      // still holds; round-0 now MATERIALIZES limits too (the Lane B
+      // no-runner-fallback branch), where the retired Lane A path used to
+      // leave them undefined.
+      it("T4 (KPR-389, revised): grok round-1 clamps resourceLimits but does not pin effort (Lane B ignores request.effort); round-0 materializes the agent-def triple unclamped, also without effort", async () => {
+        registry._agents.set(
+          "agent-grok-high",
+          makeAgentConfig({ id: "agent-grok-high", name: "GrokHigh", model: "grok/grok-4.6:high", coreServers: [] }),
+        );
+        await manager.spawnTurn(makeConfCtx(1, "agent-grok-high"));
+        const req1 = mockGrokRunTurn.mock.calls.at(-1)![0];
+        expect(req1.resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 10 });
+        expect(req1.effort).toBeUndefined();
+        expect(mockGrokConstructor).toHaveBeenLastCalledWith(expect.objectContaining({ reasoningEffort: "high" }));
+
+        await manager.spawnTurn(makeConfCtx(0, "agent-grok-high"));
+        const req0 = mockGrokRunTurn.mock.calls.at(-1)![0];
+        expect(req0.resourceLimits).toEqual({ maxTurns: 25, timeoutMs: 300_000, budgetUsd: 10 });
+        expect(req0.effort).toBeUndefined();
+        expect(mockGrokConstructor).toHaveBeenLastCalledWith(expect.objectContaining({ reasoningEffort: "high" }));
+      });
+
+      // --- 4. missing credential, breaker-invisible ---------------------------
+      it("a missing/unreadable OAuth credential file is a config fault that never trips the grok breaker", async () => {
+        mockResolveOAuthFileToken.mockReset().mockRejectedValue(
           new TurnAssemblyError(
             "Grok OAuth credential unavailable (authentication) at ~/.grok/auth.json — the file is absent or unreadable; run `grok login` to sign in",
           ),
         );
         for (let i = 0; i < 3; i++) {
           await expect(
-            manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr371-cred-${i}` })),
+            manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr392-cred-${i}` })),
           ).rejects.toThrow(/Grok OAuth credential unavailable \(authentication\)/);
         }
         // Breaker never tripped — restore the credential and the 4th spawn RUNS.
-        mockResolveOAuthFileToken.mockResolvedValue("test-grok-oauth-token");
+        mockResolveOAuthFileToken.mockReset().mockResolvedValue("test-grok-oauth-token");
         const result = await manager.spawnTurn(
-          smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-cred-ok" }),
+          smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-cred-ok" }),
         );
         expect(result.errors).toEqual([]);
         expect(manager.circuitBreakers.stateFor("grok")?.state ?? "closed").toBe("closed");
       });
 
-      // --- breaker attribution ---------------------------------------------
+      // --- 6. breaker attribution ---------------------------------------------
       it("three hard faults open the grok breaker only — claude and kimi stay closed", async () => {
         for (let i = 0; i < 3; i++) {
-          mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "connect ECONNREFUSED 1.2.3.4:443" }));
-          await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr371-trip-${i}` }));
+          mockGrokRunTurn.mockResolvedValueOnce(makeRunResult({ error: "Grok request failed (503): boom" }));
+          await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr392-trip-${i}` }));
         }
         expect(manager.circuitBreakers.stateFor("grok")!.state).toBe("open");
 
         await expect(
-          manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-fastfail" })),
+          manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-fastfail" })),
         ).rejects.toBeInstanceOf(ProviderCircuitOpenError);
 
         // Sibling providers are untouched — the breaker keys on the route.
         expect(manager.circuitBreakers.stateFor("kimi")?.state ?? "closed").toBe("closed");
         const kimiResult = await manager.spawnTurn(
-          smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr371-kimi-ok" }),
+          smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr392-kimi-ok" }),
         );
         expect(kimiResult.finalMessage).toBe("response");
         const claudeResult = await manager.spawnTurn(
-          smsCtx({ agentId: "agent-a", threadId: "sms:line-1:kpr371-claude-ok" }),
+          smsCtx({ agentId: "agent-a", threadId: "sms:line-1:kpr392-claude-ok" }),
         );
         expect(claudeResult.finalMessage).toBe("response");
       });
 
-      // --- KPR-313 session-identity guard ----------------------------------
-      // This is the assertion that catches a missed isLaneAProvider edit: with
-      // grok absent from that predicate the notice silently degrades to the
-      // Lane B variant, with no compile or runtime error anywhere.
-      it("claude-tagged row + grok turn trips handoff with the CLAUDE variant (conversation_search)", async () => {
-        const threadId = "sms:line-1:kpr371-handoff";
+      // --- 7. stateless-replay session persistence (KPR-313 write side) ------
+      it("a success turn persists the session row with an empty sessionId under the grok tag", async () => {
+        const threadId = "sms:line-1:kpr392-persist";
+        mockGrokRunTurn.mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "chatcmpl-abc123" }));
+        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId }));
+        expect(sessionStore.set).toHaveBeenCalledWith(
+          "agent-grok", threadId, "", "grok", expect.anything(),
+        );
+      });
+
+      // --- 8. KPR-313 session-identity guard ----------------------------------
+      it("claude-tagged row + grok turn resets continuity with the pilot (Lane B) notice variant", async () => {
+        const threadId = "sms:line-1:kpr392-handoff-toGrok";
         seed(threadId, "s-old", "claude", "agent-grok");
-        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "s-new" }));
+        mockGrokRunTurn.mockResolvedValueOnce(makeRunResult({ text: "fresh", sessionId: "chatcmpl-new" }));
 
         await manager.spawnTurn(
           smsCtx({ agentId: "agent-grok", threadId, sessionId: "s-old", sessionProvider: "claude" }),
         );
 
-        const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
-        expect(sessionArg).toBeUndefined();
-        expect(prompt.startsWith("[System notice:")).toBe(true);
-        expect(prompt).toContain("conversation_search");
+        const req = mockGrokRunTurn.mock.calls[0]![0];
+        expect(req.sessionId).toBeUndefined();
+        expect(req.prompt.startsWith("[System notice:")).toBe(true);
+        expect(req.prompt).toContain("session continuity was reset");
+        // Lane B keeps the conservative pilot-era variant — no conversation_search.
+        expect(req.prompt).not.toContain("conversation_search");
       });
 
-      it("persists the real handle under the grok tag (client-transcript)", async () => {
-        const threadId = "sms:line-1:kpr371-persist";
-        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-grok-new" }));
-        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId }));
-        expect(sessionStore.set).toHaveBeenCalledWith(
-          "agent-grok", threadId, "s-grok-new", "grok", expect.anything(),
+      it("grok-tagged stale row + grok turn resumes with zero store reads and no handoff notice (same provider id — stateless semantics)", async () => {
+        const threadId = "sms:line-1:kpr392-samegrok";
+        seed(threadId, "chatcmpl-old", "grok", "agent-grok");
+        mockGrokRunTurn.mockResolvedValueOnce(makeRunResult({ text: "back", sessionId: "chatcmpl-new" }));
+
+        await manager.spawnTurn(
+          smsCtx({ agentId: "agent-grok", threadId, sessionId: "chatcmpl-old", sessionProvider: "grok" }),
         );
+
+        expect(sessionStore.get).not.toHaveBeenCalled(); // same-provider tag: zero-I/O hot path
+        const req = mockGrokRunTurn.mock.calls[0]![0];
+        expect(req.prompt).not.toContain("session continuity was reset");
       });
 
-      // --- effort ------------------------------------------------------------
-      it(":effort inside the deliverable set flows to the runner; the router is never called", async () => {
+      // --- 9. provider handoff away from grok still clears provider_turn_history ---
+      // Reuse of the existing codex-handoff test pattern (TurnHistoryStore
+      // wiring describe, KPR-353 §D3/§D4) — the clear is already
+      // provider-agnostic (agent-manager.ts:979), so this is correct by
+      // construction; pinned directly here for the grok-specific direction.
+      describe("provider_turn_history handoff away from grok", () => {
+        function makeFakeTurnHistoryStore() {
+          return {
+            load: vi.fn(async () => [] as unknown[]),
+            append: vi.fn(async () => {}),
+            clear: vi.fn(async () => {}),
+            init: vi.fn(async () => {}),
+          };
+        }
+
+        function makeManagerWithStore(fakeStore: ReturnType<typeof makeFakeTurnHistoryStore>) {
+          return new AgentManager(
+            registry as any,
+            memoryManager as any,
+            sessionStore as any,
+            undefined as any,
+            turnTelemetryStore as any,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            fakeStore as any,
+          );
+        }
+
+        it("grok-tagged row + claude turn clears provider_turn_history via the provider-agnostic clear", async () => {
+          const fakeStore = makeFakeTurnHistoryStore();
+          const mgr = makeManagerWithStore(fakeStore);
+          const threadId = "sms:line-1:kpr392-handoff-fromGrok";
+          seed(threadId, "", "grok", "agent-a");
+
+          await mgr.spawnTurn(
+            smsCtx({ agentId: "agent-a", threadId, sessionId: undefined, sessionProvider: "grok" }),
+          );
+
+          expect(fakeStore.clear).toHaveBeenCalledTimes(1);
+          expect(fakeStore.clear).toHaveBeenCalledWith("agent-a", threadId);
+        });
+      });
+    });
+
+    describe("provider plugins (KPR-394)", () => {
+      let fixture: ReturnType<typeof makeFixtureProviderModule>;
+
+      function makeFixtureProviderModule(id = "sol") {
+        const constructions: any[] = [];
+        const runTurn = vi.fn(async () => makeRunResult({ text: `${id} says hi` }));
+        const abort = vi.fn();
+        const module = {
+          provider: id,
+          createAdapter: vi.fn((args: any) => {
+            constructions.push(args);
+            return { provider: id, runTurn, abort, wasAborted: false };
+          }),
+        };
+        return { module, constructions, runTurn, abort };
+      }
+
+      // Replicated from the KPR-354 describe's makeSubagentEntry (scoped
+      // there, deliberately not hoisted). `laneB` is the R3 generic column a
+      // PLUGIN provider id reads through partitionInventoryForProvider's
+      // fallback — the KPR-354 literal only carries built-in columns, so a
+      // verbatim copy would be honestly `unsupported` for "sol".
+      function makeSolSubagentEntry(): any {
+        return {
+          name: "google",
+          transport: "claude-subagent",
+          source: "core",
+          requiresTurnContext: false,
+          requiresHiveRuntime: false,
+          inProcess: false,
+          compatibility: {
+            claude: "direct",
+            openai: "requires-hive-bridge",
+            gemini: "requires-hive-bridge",
+            codex: "requires-hive-bridge",
+            grok: "requires-hive-bridge",
+            laneB: "requires-hive-bridge",
+          },
+          schemas: { kind: "unavailable" },
+          description: "Gmail + Calendar",
+          serverConfig: { type: "stdio", command: "gog-mcp" },
+        };
+      }
+
+      async function registerSol(slice: Record<string, unknown> | undefined = {
+        defaultModel: "sol-large-2",
+        apiKeyEnv: "SOL_API_KEY",
+        baseUrlEnv: "SOL_BASE_URL",
+      }) {
+        const reg = await import("./provider-adapters/provider-registry.js");
+        fixture = makeFixtureProviderModule();
+        reg.__registerActivePluginProviderForTests({
+          id: "sol",
+          module: fixture.module as any,
+          semantics: "stateless-replay",
+          source: { plugin: "hive-plugin-sol" },
+          slice: slice as any,
+        });
         registry._agents.set(
-          "agent-grok",
-          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6:high", coreServers: [] }),
+          "agent-sol",
+          makeAgentConfig({ id: "agent-sol", name: "AgentSol", model: "sol/sol-large-2:high", coreServers: [] }),
         );
-        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-effort-high" }));
-        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
-        expect(effort).toBe("high");
-        expect(vi.mocked(routeModel)).not.toHaveBeenCalled();
+      }
+
+      beforeEach(() => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        process.env.SOL_API_KEY = "test-sol-key";
       });
 
-      it("grok's native :xhigh is clamped to undefined with a warn — not silently dropped", async () => {
+      afterEach(async () => {
+        delete process.env.SOL_API_KEY;
+        delete process.env.SOL_BASE_URL;
+        const reg = await import("./provider-adapters/provider-registry.js");
+        reg.__resetPluginProvidersForTests();
+      });
+
+      it("routing: registered plugin id maps via providerFor; declared-broken routes to itself; undeclared falls back to claude", async () => {
+        await registerSol();
+        const reg = await import("./provider-adapters/provider-registry.js");
+        reg.__markBrokenPluginProviderForTests("bad", { plugin: "hive-plugin-bad", reason: "abi mismatch" });
         registry._agents.set(
-          "agent-grok",
-          makeAgentConfig({ id: "agent-grok", name: "AgentGrok", model: "grok/grok-4.6:xhigh", coreServers: [] }),
+          "agent-bad",
+          makeAgentConfig({ id: "agent-bad", name: "AgentBad", model: "bad/bad-1", coreServers: [] }),
         );
-        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr371-effort-xhigh" }));
-        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
-        expect(effort).toBeUndefined();
-        // The warn is the Lane A clamp — proof the turn took the Lane A branch.
-        const clampWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("outside the deliverable"));
-        expect(clampWarns).toHaveLength(1);
+        expect(manager.providerFor("agent-sol")).toBe("sol");
+        expect(manager.providerFor("agent-bad")).toBe("bad"); // declared-broken: routes, then fails honestly
+        registry._agents.set(
+          "agent-typo2",
+          makeAgentConfig({ id: "agent-typo2", name: "AgentTypo2", model: "zeta/z-1" }),
+        );
+        expect(manager.providerFor("agent-typo2")).toBe("claude"); // never-declared canon unchanged
+      });
+
+      it("primary construction: fixture module builds the adapter with context primary, route model+effort, agentId deps", async () => {
+        await registerSol();
+        const result = await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-primary" }));
+        expect(result.errors).toEqual([]);
+        expect(fixture.runTurn).toHaveBeenCalled();
+        const args = fixture.constructions[0]!;
+        expect(args.context).toBe("primary");
+        expect(args.name).toBe("AgentSol");
+        expect(args.route).toEqual({ model: "sol-large-2", reasoningEffort: "high" });
+        expect(args.deps.agentId).toBe("agent-sol");
+        // No builtin adapter and no Claude runner ran.
+        expect(mockRunnerSend).not.toHaveBeenCalled();
+        expect(mockCodexConstructor).not.toHaveBeenCalled();
+      });
+
+      it("slice resolution: agentModel default + env-resolved apiKey; baseUrl undefined when override unset", async () => {
+        await registerSol();
+        await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-slice" }));
+        expect(fixture.constructions[0]!.deps.providerConfig).toEqual({
+          agentModel: "sol-large-2",
+          apiKey: "test-sol-key",
+          baseUrl: undefined,
+        });
+      });
+
+      it("missing SOL_API_KEY is a config fault that never trips the sol breaker (byte-identical grok contract)", async () => {
+        await registerSol();
+        delete process.env.SOL_API_KEY;
+        for (let i = 0; i < 3; i++) {
+          await expect(
+            manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: `sms:line-1:kpr394-cred-${i}` })),
+          ).rejects.toThrow(/Passthrough credential missing \(authentication\): SOL_API_KEY/);
+        }
+        process.env.SOL_API_KEY = "test-sol-key";
+        const result = await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-cred-ok" }));
+        expect(result.errors).toEqual([]);
+        expect(manager.circuitBreakers.stateFor("sol")?.state ?? "closed").toBe("closed");
+      });
+
+      it("a loopback SOL_BASE_URL override flows to the slice", async () => {
+        await registerSol();
+        process.env.SOL_BASE_URL = "http://127.0.0.1:4141";
+        await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-baseurl-ok" }));
+        expect(fixture.constructions[0]!.deps.providerConfig.baseUrl).toBe("http://127.0.0.1:4141");
+      });
+
+      it("a cleartext off-box SOL_BASE_URL override is a breaker-invisible config fault", async () => {
+        await registerSol();
+        process.env.SOL_BASE_URL = "http://evil.example:8317";
+        await expect(
+          manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-baseurl-bad" })),
+        ).rejects.toThrow(/cleartext to a non-loopback host/);
+        expect(manager.circuitBreakers.stateFor("sol")?.state ?? "closed").toBe("closed");
+      });
+
+      it("declared-broken provider: honest TurnAssemblyError naming plugin + reason; breaker closed; never Claude", async () => {
+        const reg = await import("./provider-adapters/provider-registry.js");
+        reg.__markBrokenPluginProviderForTests("bad", { plugin: "hive-plugin-bad", reason: "plugin requires provider ABI 2; engine provides 1" });
+        registry._agents.set(
+          "agent-bad",
+          makeAgentConfig({ id: "agent-bad", name: "AgentBad", model: "bad/bad-1", coreServers: [] }),
+        );
+        await expect(
+          manager.spawnTurn(smsCtx({ agentId: "agent-bad", threadId: "sms:line-1:kpr394-broken" })),
+        ).rejects.toThrow(/provider 'bad' from plugin 'hive-plugin-bad' failed to load: plugin requires provider ABI 2/);
+        expect(manager.circuitBreakers.stateFor("bad")?.state ?? "closed").toBe("closed");
+        expect(mockRunnerSend).not.toHaveBeenCalled(); // no silent Claude fallback
+      });
+
+      it("nested delegate turn constructs the SAME plugin module with context nested (KPR-354 parity)", async () => {
+        await registerSol();
+        registry._agents.set(
+          "agent-sol",
+          makeAgentConfig({
+            id: "agent-sol",
+            name: "AgentSol",
+            model: "sol/sol-large-2",
+            delegateServers: ["google"],
+            coreServers: [],
+          }),
+        );
+        mockRunnerToolInventory.mockReturnValue([makeSolSubagentEntry()]);
+        await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: "sms:line-1:kpr394-nested" }));
+        const delegateRunner = fixture.constructions[0]!.assembly.delegateTurnRunner;
+        const text = await delegateRunner({
+          delegate: "google",
+          entry: makeSolSubagentEntry(),
+          prompt: "do the thing",
+          workItemContext: undefined,
+          signal: new AbortController().signal,
+        });
+        expect(text).toBe("sol says hi");
+        const nested = fixture.constructions.find((c) => c.context === "nested")!;
+        expect(nested.name).toBe("AgentSol:google");
+        expect(nested.deps).toBe(fixture.constructions[0]!.deps); // one shared deps object, both sites
+      });
+
+      it("three hard faults trip ONLY the sol breaker — sibling breakers untouched", async () => {
+        await registerSol();
+        fixture.runTurn.mockResolvedValue(
+          makeRunResult({ error: "connect ECONNREFUSED 127.0.0.1:4141", text: "" }),
+        );
+        for (let i = 0; i < 3; i++) {
+          await manager.spawnTurn(smsCtx({ agentId: "agent-sol", threadId: `sms:line-1:kpr394-fault-${i}` }));
+        }
+        expect(manager.circuitBreakers.stateFor("sol")?.state).toBe("open");
+        expect(manager.circuitBreakers.stateFor("codex")).toBeNull(); // never used this process
       });
     });
   });
@@ -4111,6 +4916,152 @@ describe("AgentManager", () => {
       expect(auditArg.durationMs).toBe(250);
       expect(auditArg.channelKind).toBe("sms");
     });
+
+
+    describe("intent-trailer telemetry (KPR-393 §D2)", () => {
+      function makeAuditManager() {
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+        return { activityLogger, localManager };
+      }
+
+      it("sets intentTrailer: true when the delivered text ends on an unexecuted commitment", async () => {
+        const { activityLogger, localManager } = makeAuditManager();
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ text: "Understood — I'll check the deploy logs and report back." }),
+        );
+        const item = makeWorkItem({ text: "check the logs", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item, "sms"));
+        expect(activityLogger.record).toHaveBeenCalledTimes(1);
+        expect(activityLogger.record.mock.calls[0]![0].intentTrailer).toBe(true);
+      });
+
+      it("omits the field entirely on a non-promise turn (absent, not false)", async () => {
+        const { activityLogger, localManager } = makeAuditManager();
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ text: "Done — the fix is deployed and the check passed." }),
+        );
+        const item = makeWorkItem({ text: "status?", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item, "sms"));
+        const arg = activityLogger.record.mock.calls[0]![0];
+        expect("intentTrailer" in arg).toBe(false);
+      });
+
+      it("error turn with promise-shaped text stays unflagged (a delivered error is not a promise)", async () => {
+        const { activityLogger, localManager } = makeAuditManager();
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ text: "I'll retry the deploy right away.", error: "exit code 1" }),
+        );
+        const item = makeWorkItem({ text: "deploy", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item, "sms"));
+        const arg = activityLogger.record.mock.calls[0]![0];
+        expect(arg.error).toBe("exit code 1");
+        expect("intentTrailer" in arg).toBe(false);
+      });
+    });
+
+    describe("aborted-turn observability (KPR-401)", () => {
+      function makeObsManager() {
+        const activityLogger = { record: vi.fn() };
+        const localManager = new AgentManager(
+          registry as any,
+          memoryManager as any,
+          sessionStore as any,
+          undefined as any,
+          turnTelemetryStore as any,
+          activityLogger as any,
+        );
+        return { localManager, activityLogger };
+      }
+
+      it("aborted turn WITH usage + sessionId records telemetry with aborted: true (relaxed gate)", async () => {
+        // NEGATIVE-VERIFY prediction (Step 3): pre-fix the gate is
+        // `sessionId && !aborted` — record() is never called; this row fails.
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({ aborted: true, timedOut: true, sessionId: "s-kpr401-tel", text: "" }),
+        );
+        const item = makeWorkItem({ text: "tel aborted", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+        const telArg = turnTelemetryStore.record.mock.calls[0]![0];
+        expect(telArg.aborted).toBe(true);
+        expect(telArg.sessionId).toBe("s-kpr401-tel");
+        expect(telArg.inputTokens).toBe(100); // real spend from the runner accumulator, not zeros
+        expect("timedOut" in telArg).toBe(false); // telemetry doc carries aborted only (spec §Design 2)
+      });
+
+      it("aborted turn with ZERO usage stays out of telemetry (synthesizeAbortedResult noise guard)", async () => {
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({
+            aborted: true,
+            timedOut: true,
+            sessionId: "s-kpr401-zero",
+            text: "",
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+          }),
+        );
+        const item = makeWorkItem({ text: "tel zero", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(turnTelemetryStore.record).not.toHaveBeenCalled();
+      });
+
+      it("success turns record WITHOUT the aborted field — doc shape unchanged", async () => {
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-kpr401-ok" }));
+        const item = makeWorkItem({ text: "tel clean", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn(makeCtx(item, "sms"));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+        const telArg = turnTelemetryStore.record.mock.calls[0]![0];
+        expect("aborted" in telArg).toBe(false);
+      });
+
+      it("activity audit passes aborted/timedOut through sparsely — set on aborted turns, absent on success", async () => {
+        // NEGATIVE-VERIFY prediction (Step 3): pre-fix the audit payload has
+        // neither key — the aborted-turn assertions fail.
+        const { localManager, activityLogger } = makeObsManager();
+        mockRunnerSend.mockResolvedValueOnce(
+          makeRunResult({
+            aborted: true,
+            timedOut: true,
+            sessionId: "s-kpr401-act",
+            text: "",
+            costUsd: 0,
+            durationMs: 294_391,
+          }),
+        );
+        const item1 = makeWorkItem({ text: "audit aborted", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item1, "sms"));
+        expect(activityLogger.record).toHaveBeenCalledTimes(1);
+        const abortedArg = activityLogger.record.mock.calls[0]![0];
+        expect(abortedArg.aborted).toBe(true);
+        expect(abortedArg.timedOut).toBe(true);
+        expect(abortedArg.costUsd).toBe(0); // honest zero, now flagged
+        expect(abortedArg.durationMs).toBe(294_391); // real wall clock from the runner
+
+        mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-kpr401-ok2" }));
+        const item2 = makeWorkItem({ text: "audit clean", source: { kind: "sms", id: "line-1", label: "May" } });
+        await localManager.spawnTurn(makeCtx(item2, "sms"));
+        const successArg = activityLogger.record.mock.calls.at(-1)![0];
+        expect("aborted" in successArg).toBe(false); // sparse: absent, not false
+        expect("timedOut" in successArg).toBe(false);
+      });
+    });
+
 
     it("voice carve-out: passes raw text to runner.send and skips model router", async () => {
       // KPR-219 design: voice has its own systemPromptOverride and explicitly
@@ -4458,7 +5409,59 @@ describe("AgentManager", () => {
           expect(routeModel).not.toHaveBeenCalled();
           const req = mockCodexRunTurn.mock.calls[0]![0];
           expect(req.effort).toBeUndefined();
-          expect(req.resourceLimits).toBeUndefined();
+          // Lane B limits come from the agent definition (fixture defaults),
+          // not the adapters' DEFAULT_MAX_ROUNDS — see the dedicated tests.
+          expect(req.resourceLimits).toEqual({ maxTurns: 25, timeoutMs: 300_000, budgetUsd: 10 });
+        });
+
+        it("Lane B resourceLimits mirror the agent definition (maxTurns is not dead config)", async () => {
+          registry._agents.set(
+            "gemini-b",
+            makeAgentConfig({
+              id: "gemini-b",
+              name: "GeminiB",
+              model: "gemini/gemini-3.1-pro-preview",
+              maxTurns: 40,
+              budgetUsd: 7,
+              timeoutMs: 120_000,
+              coreServers: [],
+              soul: "",
+              systemPrompt: "gemini system",
+            }),
+          );
+
+          const item = makeWorkItem({ text: "hello gemini", source: { kind: "sms", id: "line-1", label: "May" } });
+          await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "gemini-b" });
+
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.resourceLimits).toEqual({ maxTurns: 40, timeoutMs: 120_000, budgetUsd: 7 });
+        });
+
+        it("Lane B system-sender turns carry agent-def limits too (router still skipped)", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          registry._agents.set(
+            "gemini-b",
+            makeAgentConfig({
+              id: "gemini-b",
+              name: "GeminiB",
+              model: "gemini/gemini-3.1-pro-preview",
+              maxTurns: 40,
+              coreServers: [],
+              soul: "",
+              systemPrompt: "gemini system",
+            }),
+          );
+
+          const sys = makeWorkItem({
+            text: "execute your scheduled digest task",
+            sender: "system",
+            source: { kind: "sms", id: "line-1", label: "May" },
+          });
+          await manager.spawnTurn({ ...makeCtx(sys, "sms"), agentId: "gemini-b", threadId: "sms:line-1:gsys" });
+
+          expect(routeModel).not.toHaveBeenCalled();
+          const req = mockGeminiRunTurn.mock.calls[0]![0];
+          expect(req.resourceLimits?.maxTurns).toBe(40);
         });
       });
     });
@@ -4994,6 +5997,182 @@ describe("AgentManager", () => {
       resolveNested(makeRunResult({ text: "x" }));
       await p;
       expect(activeSlots("gp")).toBe(0); // released in finally
+    });
+  });
+
+  describe("round-1 reaction shaping (KPR-389 D2/D3)", () => {
+    beforeEach(() => {
+      mockConversationIndex.mockResolvedValue(undefined);
+    });
+
+    it("T1: round-1 claude effort-capable — classifier skipped, effort low, static-tier base clamped (router on)", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        await manager.spawnTurn(makeConfCtx(1));
+        expect(routeModel).not.toHaveBeenCalled();
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        // sonnet base {300s, 50, 5} → min() clamp
+        expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 5 });
+        expect(effort).toBe("low");
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+
+    it("T1b: round-1 claude router OFF — legacy triple is the base; tighter operator maxTurns wins the min()", async () => {
+      registry._agents.set(
+        "agent-tight",
+        makeAgentConfig({ id: "agent-tight", name: "Tight", model: "claude-sonnet-4-6", maxTurns: 3 }),
+      );
+      await manager.spawnTurn(makeConfCtx(1, "agent-tight"));
+      expect(routeModel).not.toHaveBeenCalled();
+      const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+      // base = { maxTurns: 3, timeoutMs: 300_000 (undefined ?? default), budgetUsd: 10 }
+      expect(resourceLimits).toEqual({ maxTurns: 3, timeoutMs: 120_000, budgetUsd: 10 });
+      expect(effort).toBe("low");
+    });
+
+    it("E7: round-1 haiku agent — caps clamp, no effort pin (undeliverable, same as today)", async () => {
+      await manager.spawnTurn(makeConfCtx(1, "agent-a")); // agent-a = haiku default fixture
+      expect(routeModel).not.toHaveBeenCalled();
+      const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 10 });
+      expect(effort).toBeUndefined();
+    });
+
+    it("T2: round-0 conference turn untouched — classifier runs, static-tier limits, classifier effort (negative pin, D3)", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "high" }));
+        await manager.spawnTurn(makeConfCtx(0));
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(effort).toBe("high");
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+
+    it("T2b: non-conference control — no meta key ⇒ branch not taken ⇒ today's path byte-unchanged", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "medium" }));
+        await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(effort).toBe("medium");
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
+    });
+
+    it("T3: Lane B (codex) round-1 — clamped agent-def limits, request.effort undefined; round-0 byte-identical to the Lane B branch", async () => {
+      registry._agents.set(
+        "codex-conf",
+        makeAgentConfig({ id: "codex-conf", name: "CodexConf", model: "codex/gpt-5.5:medium", coreServers: [] }),
+      );
+      await manager.spawnTurn(makeConfCtx(1, "codex-conf"));
+      const req1 = mockCodexRunTurn.mock.calls[0]![0];
+      expect(req1.resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 10 });
+      expect(req1.effort).toBeUndefined();
+
+      await manager.spawnTurn(makeConfCtx(0, "codex-conf"));
+      const req0 = mockCodexRunTurn.mock.calls[1]![0];
+      expect(req0.resourceLimits).toEqual({ maxTurns: 25, timeoutMs: 300_000, budgetUsd: 10 });
+    });
+  });
+
+  describe("turn-kind telemetry (KPR-389 D6)", () => {
+    function makeActivityLogger() {
+      return { record: vi.fn() };
+    }
+    function buildManager(activityLogger: { record: ReturnType<typeof vi.fn> }) {
+      return new AgentManager(
+        registry as any,
+        memoryManager as any,
+        sessionStore as any,
+        undefined as any,
+        turnTelemetryStore as any,
+        activityLogger as any,
+      );
+    }
+
+    beforeEach(() => {
+      mockConversationIndex.mockResolvedValue(undefined);
+    });
+
+    it("T7: round-1 conference turn stamps round, injectionMode, resumedSession, perf split, effort — telemetry AND activity", async () => {
+      const activityLogger = makeActivityLogger();
+      const mgr = buildManager(activityLogger);
+      const { workItem, threadId } = makeConfCtx(1, "agent-s", { conferenceInjectionMode: "delta" });
+      // Seed a resumable same-provider session so runWorkItemTurn resolves it
+      // (C7: resumedSession = the finalized attempt launched with a handle).
+      sessionStore._sessions.set(`agent-s:${threadId}`, { sessionId: "sess-live", provider: "claude" });
+
+      await mgr.runWorkItemTurn("agent-s", workItem);
+
+      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc).toMatchObject({
+        conferenceRound: 1,
+        injectionMode: "delta",
+        resumedSession: true,
+        durationMs: 1000, // makeRunResult defaults
+        llmMs: 800,
+        toolMs: 200,
+        toolCalls: 1,
+        effort: "low", // the D2 pin, visible in telemetry
+      });
+      expect(activityLogger.record.mock.calls[0]![0].conferenceRound).toBe(1);
+    });
+
+    it("T7b: plain DM turn — perf fields present, conference keys ABSENT", async () => {
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-s" }));
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc.durationMs).toBe(1000);
+      expect(doc.resumedSession).toBe(false);
+      expect(doc).not.toHaveProperty("conferenceRound");
+      expect(doc).not.toHaveProperty("injectionMode");
+      expect(doc).not.toHaveProperty("effort"); // router off ⇒ no override on a DM turn
+    });
+
+    it("T7c: an aborted (clamp-killed) reaction WITH real spend records round-tagged telemetry (KPR-401 relaxed gate) and lands round-tagged in the activity log", async () => {
+      // KPR-401 refined the D6 gate from `!aborted` to `!aborted || hadUsage`
+      // (see the dedicated "aborted-turn observability (KPR-401)" describe
+      // below for the provider-agnostic coverage) — a clamp-killed round-1
+      // reaction realistically made SOME progress before hitting the tight
+      // maxTurns:6/timeoutMs:120s ceiling, so makeRunResult's default nonzero
+      // usage is the representative case: telemetry now records it, sparse
+      // aborted:true, still round-tagged.
+      const activityLogger = makeActivityLogger();
+      const mgr = buildManager(activityLogger);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ aborted: true, text: "", timedOut: true }));
+
+      await mgr.runWorkItemTurn("agent-s", makeConfCtx(1, "agent-s").workItem);
+
+      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc.aborted).toBe(true);
+      expect(doc.conferenceRound).toBe(1);
+      expect(activityLogger.record.mock.calls[0]![0].conferenceRound).toBe(1); // kills stay measurable (C5 volume counter)
+    });
+  });
+
+  describe("conferenceRoundOf (KPR-389 D1)", () => {
+    it.each([
+      ["round 0", { conferenceRound: 0 }, 0],
+      ["round 1", { conferenceRound: 1 }, 1],
+      ['malformed string "1"', { conferenceRound: "1" }, undefined],
+      ["out-of-range 2", { conferenceRound: 2 }, undefined],
+      ["explicit undefined", { conferenceRound: undefined }, undefined],
+    ])("%s ⇒ %s", (_label, meta, expected) => {
+      expect(conferenceRoundOf(makeWorkItem({ meta: meta as Record<string, unknown> }))).toBe(expected);
+    });
+
+    it("missing meta ⇒ undefined (fail-open to full-resource turn, E10)", () => {
+      expect(conferenceRoundOf(makeWorkItem())).toBeUndefined();
     });
   });
 
@@ -5776,5 +6955,161 @@ describe("isStaleServerHandleError (KPR-350 §D3) — narrowness matrix", () => 
     // alternates: none of the stale strings contain an auth sentinel.
     const AUTH = /resolve authentication|credentials\.json|not authenticated|401 Unauthorized|ANTHROPIC_API_KEY|authToken/i;
     for (const s of MUST_MATCH) expect(AUTH.test(s)).toBe(false);
+  });
+});
+
+// ── KPR-390: meeting worker pool handshake ───────────────────────────────────
+describe("AgentManager — KPR-390 worker pool handshake", () => {
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let sessionStore: ReturnType<typeof makeMockSessionStore>;
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+  let manager: AgentManager;
+
+  /** In-process MCP factories only close over these — no-op stubs suffice. */
+  function makeFakeDb(): any {
+    const col = {
+      findOne: vi.fn(async () => null),
+      find: vi.fn(() => ({
+        project: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
+        toArray: vi.fn(async () => []),
+        sort: vi.fn(() => ({ limit: vi.fn(() => ({ toArray: vi.fn(async () => []) })) })),
+      })),
+      insertOne: vi.fn(async () => ({})),
+      updateOne: vi.fn(async () => ({})),
+      deleteOne: vi.fn(async () => ({})),
+      deleteMany: vi.fn(async () => ({})),
+      createIndex: vi.fn(async () => "idx"),
+      countDocuments: vi.fn(async () => 0),
+    };
+    return { collection: vi.fn(() => col) };
+  }
+
+  function makeFakePool() {
+    return {
+      bindManager: vi.fn(),
+      abortForBoss: vi.fn(),
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSupportsEffort.mockImplementation((m: string) => !m.includes("haiku"));
+    registry = makeMockRegistry();
+    sessionStore = makeMockSessionStore();
+    memoryManager = makeMockMemoryManager();
+    // Fixture requirement (plan G5 r2): a real fake `db` — every in-process
+    // block in buildInProcessServers gates on `this.db`, so a db-less manager
+    // makes the worker-mode pin below vacuously green.
+    manager = new AgentManager(
+      registry as any,
+      memoryManager as any,
+      sessionStore as any,
+      makeFakeDb(),
+      makeMockTurnTelemetryStore() as any,
+    );
+  });
+
+  it("setWorkerPool binds hooks whose breakerStateFor proxies the breaker registry", () => {
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as any);
+    expect(pool.bindManager).toHaveBeenCalledTimes(1);
+    const hooks = pool.bindManager.mock.calls[0][0];
+    const spy = vi.spyOn(manager.circuitBreakers, "stateFor").mockReturnValue(null);
+    expect(hooks.breakerStateFor("claude")).toBeNull();
+    expect(spy).toHaveBeenCalledWith("claude");
+    spy.mockRestore();
+  });
+
+  it("buildWorkerAdapter builds a worker-mode runner: no team/schedule/team-roster, no worker-pool (end-to-end)", async () => {
+    // The suite mocks AgentRunner globally; this pin needs the REAL runner so
+    // the suppression flag is observed on the actual built server set (a
+    // mock-shaped assertion would only test the mock).
+    const actual = await vi.importActual<typeof import("./agent-runner.js")>("./agent-runner.js");
+    vi.mocked(AgentRunner).mockImplementationOnce(function (...args: any[]) {
+      return new (actual.AgentRunner as any)(...args);
+    } as any);
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as any);
+    const hooks = pool.bindManager.mock.calls[0][0];
+
+    const workerConfig: AgentConfig = {
+      id: "worker",
+      name: "Worker",
+      model: "sonnet",
+      channels: [],
+      passiveChannels: [],
+      keywords: [],
+      isDefault: false,
+      schedule: [],
+      budgetUsd: 1,
+      maxTurns: 25,
+      icon: "",
+      coreServers: ["memory"],
+      delegateServers: [],
+      soul: "",
+      systemPrompt: "worker",
+      autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+    } as unknown as AgentConfig;
+
+    const adapter = hooks.buildWorkerAdapter(workerConfig);
+    expect(adapter.provider).toBe("claude");
+    const runner = (adapter as unknown as { runner: AgentRunner }).runner;
+    const keys = Object.keys(runner.buildInProcessServers());
+    expect(keys).toContain("memory");
+    for (const name of ["team", "schedule", "team-roster", "worker-pool"]) {
+      expect(keys).not.toContain(name);
+    }
+  });
+
+  it("KPR-409 T7: the scribe's coreServers:[] builds an EMPTY server set and a clean inventory (end-to-end)", async () => {
+    // Mirrors Part A's T3 posture on the scribe's ACTUAL role-params value:
+    // `coreServers: []` (meeting-scribe.ts C22), not a non-empty array. The
+    // scribe/pool suites assert the config array against a MOCKED
+    // buildWorkerAdapter — nothing there observes what [] actually BUILDS. If
+    // suppressAutoInjectedServers were ever dropped, [] silently re-gains
+    // team/schedule/team-roster (+ the LIVE skill-author stdio server on the
+    // inventory surface) and containment evaporates with those tests green.
+    const actual = await vi.importActual<typeof import("./agent-runner.js")>("./agent-runner.js");
+    vi.mocked(AgentRunner).mockImplementationOnce(function (...args: any[]) {
+      return new (actual.AgentRunner as any)(...args);
+    } as any);
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as any);
+    const hooks = pool.bindManager.mock.calls[0][0];
+
+    const scribeConfig: AgentConfig = {
+      id: "boss",
+      name: "Boss",
+      model: "sonnet",
+      channels: [],
+      passiveChannels: [],
+      keywords: [],
+      isDefault: false,
+      schedule: [],
+      budgetUsd: 1,
+      maxTurns: 4,
+      icon: "",
+      coreServers: [], // the scribe's real role-params value
+      delegateServers: [],
+      soul: "",
+      systemPrompt: "scribe",
+      autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+    } as unknown as AgentConfig;
+
+    const runner = (
+      hooks.buildWorkerAdapter(scribeConfig) as unknown as { runner: AgentRunner }
+    ).runner;
+    expect(Object.keys(runner.buildInProcessServers())).toEqual([]);
+    const inventory = runner.buildToolTransportInventory().map((e) => e.name);
+    for (const name of ["team", "schedule", "team-roster", "skill-author"]) {
+      expect(inventory).not.toContain(name);
+    }
+  });
+
+  it("stopAgent aborts that boss's live workers", () => {
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as any);
+    manager.stopAgent("agent-a");
+    expect(pool.abortForBoss).toHaveBeenCalledWith("agent-a");
   });
 });

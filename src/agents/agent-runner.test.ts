@@ -1245,6 +1245,8 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       openai: "mcp-bridge-candidate",
       gemini: "mcp-bridge-candidate",
       codex: "mcp-bridge-candidate",
+      grok: "mcp-bridge-candidate",
+      laneB: "mcp-bridge-candidate",
     });
   });
 
@@ -1441,6 +1443,8 @@ describe("AgentRunner.buildToolTransportInventory", () => {
       openai: "requires-hive-bridge",
       gemini: "requires-hive-bridge",
       codex: "requires-hive-bridge",
+      grok: "requires-hive-bridge",
+      laneB: "requires-hive-bridge",
     });
     // KPR-354 §D2: the entry carries the delegate's real external MCP config
     // (the same object buildAllServerConfigs resolves) and the catalog text
@@ -1496,6 +1500,8 @@ describe("AgentRunner.buildToolTransportInventory", () => {
         openai: "claude-only",
         gemini: "claude-only",
         codex: "claude-only",
+        grok: "claude-only",
+        laneB: "claude-only",
       });
     }
   });
@@ -1521,6 +1527,8 @@ describe("AgentRunner.buildToolTransportInventory", () => {
         openai: "requires-hive-bridge",
         gemini: "requires-hive-bridge",
         codex: "requires-hive-bridge",
+        grok: "requires-hive-bridge",
+        laneB: "requires-hive-bridge",
       });
       expect(entry.schemas.kind).toBe("static");
       if (entry.schemas.kind === "static") {
@@ -3723,6 +3731,129 @@ describe("completion record reports killed runs as failures", () => {
   });
 });
 
+describe("aborted-turn accounting (KPR-401)", () => {
+  beforeEach(() => {
+    mockQueryOverride = null;
+    mockMessages = null;
+  });
+  afterEach(() => {
+    mockQueryOverride = null;
+    mockMessages = null;
+  });
+
+  // Per-API-call BetaUsage shapes. USAGE_B's cache_creation is null on
+  // purpose — the accumulator's ?? 0 coalesce belt (cache counters are
+  // typed number | null).
+  const USAGE_A = { input_tokens: 1000, output_tokens: 40, cache_read_input_tokens: 9000, cache_creation_input_tokens: 250 };
+  const USAGE_B = { input_tokens: 1200, output_tokens: 80, cache_read_input_tokens: 9500, cache_creation_input_tokens: null };
+
+  function assistantMsg(id: string, usage: Record<string, number | null> | undefined, content: any[]) {
+    return { type: "assistant", session_id: "s-kpr401", message: { id, usage, content } };
+  }
+
+  /** Yields `messages`, then hangs until abort()/the deadline close()s the query. */
+  function yieldingThenHangingQuery(messages: any[]) {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mockQueryOverride = () => ({
+      close: () => release(),
+      [Symbol.asyncIterator]: async function* () {
+        for (const m of messages) yield m;
+        await gate;
+      },
+    });
+  }
+
+  it("deadline abort snapshots streamed usage: per-id sum, wall durationMs, clamped llmMs, costUsd 0", async () => {
+    // NEGATIVE-VERIFY prediction (Step 3): on pre-fix code this row fails
+    // with all token counters 0 (assistant usage never read), durationMs 0
+    // (only the result branch assigned it), and llmMs === -toolMs (negative).
+    yieldingThenHangingQuery([
+      assistantMsg("msg_A", USAGE_A, [{ type: "tool_use", name: "Bash", id: "toolu_1" }]),
+      assistantMsg("msg_B", USAGE_B, [{ type: "text", text: "partial" }]),
+    ]);
+    const runner = makeRunner({ timeoutMs: 25 });
+    const result = await runner.send("hi");
+    expect(result.aborted).toBe(true);
+    expect(result.timedOut).toBe(true);
+    expect(result.inputTokens).toBe(2200);
+    expect(result.outputTokens).toBe(120);
+    expect(result.cacheReadTokens).toBe(18500);
+    expect(result.cacheCreationTokens).toBe(250); // null in USAGE_B coalesced to 0
+    expect(result.costUsd).toBe(0); // SDK never streams cost — honest zero, segmented by aborted
+    expect(result.durationMs).toBeGreaterThan(0);
+    expect(result.llmMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("per-content-block repetitions of one message.id count usage exactly ONCE (duplicate-id pin)", async () => {
+    // The SDK emits one assistant message per content block, repeating the
+    // same message.id with identical usage (verified empirically: 42
+    // messages / 18 API calls, all ids duplicated). The naive-sum bug would
+    // report 2×A here — on exactly the tool-heavy turns this ticket targets.
+    yieldingThenHangingQuery([
+      assistantMsg("msg_X", USAGE_A, [{ type: "text", text: "thinking" }]),
+      assistantMsg("msg_X", USAGE_A, [{ type: "tool_use", name: "Bash", id: "toolu_2" }]),
+    ]);
+    const runner = makeRunner({ timeoutMs: 25 });
+    const result = await runner.send("hi");
+    expect(result.inputTokens).toBe(USAGE_A.input_tokens); // exactly once, not 2×
+    expect(result.outputTokens).toBe(USAGE_A.output_tokens);
+    expect(result.cacheReadTokens).toBe(USAGE_A.cache_read_input_tokens);
+    expect(result.cacheCreationTokens).toBe(USAGE_A.cache_creation_input_tokens);
+  });
+
+  it("result message stays authoritative: cumulative totals OVERWRITE the accumulator (success path byte-identical)", async () => {
+    // Passes both pre- and post-fix — that is the point (spec Goal 4).
+    mockMessages = [
+      assistantMsg("msg_A", USAGE_A, [{ type: "text", text: "working" }]),
+      {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        total_cost_usd: 0.42,
+        duration_ms: 1234,
+        session_id: "s-kpr401",
+        usage: { input_tokens: 7, output_tokens: 8, cache_read_input_tokens: 9, cache_creation_input_tokens: 10 },
+      },
+    ];
+    const runner = makeRunner();
+    const result = await runner.send("hi");
+    expect(result.inputTokens).toBe(7); // NOT 7 + USAGE_A.input_tokens — assignment, not addition
+    expect(result.outputTokens).toBe(8);
+    expect(result.cacheReadTokens).toBe(9);
+    expect(result.cacheCreationTokens).toBe(10);
+    expect(result.costUsd).toBe(0.42);
+    expect(result.durationMs).toBe(1234); // result-reported, not wall clock
+    expect(result.text).toBe("done");
+  });
+
+  it("abort before any assistant message: zero counters, wall durationMs > 0, llmMs ≥ 0", async () => {
+    yieldingThenHangingQuery([]);
+    const runner = makeRunner({ timeoutMs: 25 });
+    const result = await runner.send("hi");
+    expect(result.inputTokens).toBe(0);
+    expect(result.outputTokens).toBe(0);
+    expect(result.cacheReadTokens).toBe(0);
+    expect(result.cacheCreationTokens).toBe(0);
+    expect(result.costUsd).toBe(0);
+    expect(result.durationMs).toBeGreaterThan(0); // pre-fix: 0
+    expect(result.llmMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("clamp: result-less turn with recorded tool time — llmMs === max(0, durationMs − toolMs), never negative", async () => {
+    yieldingThenHangingQuery([
+      assistantMsg("msg_T", USAGE_A, [{ type: "tool_use", name: "Bash", id: "toolu_3" }]),
+    ]);
+    const runner = makeRunner({ timeoutMs: 25 });
+    const result = await runner.send("hi");
+    expect(result.toolMs).toBeGreaterThan(0); // tool timing runs until the post-loop close
+    // Exact identity against the returned fields — pre-fix llmMs is -toolMs,
+    // which can never equal max(0, 0 − toolMs) = 0 while toolMs > 0.
+    expect(result.llmMs).toBe(Math.max(0, result.durationMs - result.toolMs));
+    expect(result.llmMs).toBeGreaterThanOrEqual(0);
+  });
+});
+
 describe("AgentRunner is_error result guard (KPR-312, via send)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -4018,5 +4149,159 @@ describe("AgentRunner.openVoiceStreamingSession (KPR-323 C2)", () => {
     const coldOptions = getCapturedOptions();
     expect(coldOptions.maxTurns).toBe(200);
     expect(coldOptions.maxBudgetUsd).toBe(5);
+  });
+});
+
+// ── KPR-390: worker-pool wiring + worker-mode auto-injection suppression ──────
+describe("AgentRunner — KPR-390 worker-pool wiring", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  function makeFakePool(): any {
+    return { dispatch: vi.fn(), status: vi.fn(), cancel: vi.fn(), abortForBoss: vi.fn() };
+  }
+
+  function makeWorkerPoolRunner(opts: {
+    coreServers: string[];
+    pool?: any;
+    suppress?: boolean;
+    db?: any;
+    teamRoster?: any;
+  }): AgentRunner {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers: opts.coreServers }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      opts.teamRoster,
+      opts.db,
+      undefined,
+      undefined,
+      { workerPool: opts.pool, suppressAutoInjectedServers: opts.suppress },
+    );
+  }
+
+  it("(a) pool wired + worker-pool in coreServers → in-process server built, context ref carries the seven and refreshes per turn", () => {
+    const runner = makeWorkerPoolRunner({ coreServers: ["worker-pool"], pool: makeFakePool() });
+    const servers = runner.buildInProcessServers({
+      adapterId: "slack",
+      channelId: "C1",
+      channelKind: "slack",
+      channelLabel: "conf-standup",
+      threadId: "1.0",
+      slackTs: "1.1",
+      slackThreadTs: "1.0",
+    } as any);
+    expect(Object.keys(servers)).toContain("worker-pool");
+    const ref = (runner as unknown as { workerPoolContextRef: { current: Record<string, unknown> } })
+      .workerPoolContextRef;
+    expect(ref.current).toEqual({
+      adapterId: "slack",
+      channelId: "C1",
+      channelKind: "slack",
+      channelLabel: "conf-standup",
+      threadId: "1.0",
+      slackTs: "1.1",
+      slackThreadTs: "1.0",
+    });
+    // Mutable-ref pin: a second turn refreshes the SAME object the tools close over.
+    const before = ref.current;
+    runner.buildInProcessServers({ channelLabel: "conf-other", threadId: "2.0" } as any);
+    expect(ref.current).not.toBe(before);
+    expect(ref.current.threadId).toBe("2.0");
+  });
+
+  it("(b) no pool option, or pool without coreServers membership → worker-pool absent", () => {
+    const noPool = makeWorkerPoolRunner({ coreServers: ["worker-pool"] });
+    expect(Object.keys(noPool.buildInProcessServers())).not.toContain("worker-pool");
+    const noMembership = makeWorkerPoolRunner({ coreServers: [], pool: makeFakePool() });
+    expect(Object.keys(noMembership.buildInProcessServers())).not.toContain("worker-pool");
+  });
+
+  it("(c) worker-mode suppression is structural on BOTH surfaces (built servers AND inventory)", () => {
+    const teamRoster = { teamSummary: async () => "## Team\n- Alice" };
+    const worker = makeWorkerPoolRunner({
+      coreServers: ["memory", "contacts"],
+      suppress: true,
+      db: makeFakeInProcessDb(),
+      teamRoster,
+    });
+    const workerKeys = Object.keys(worker.buildInProcessServers());
+    expect(workerKeys).toContain("memory");
+    expect(workerKeys).toContain("structured-memory");
+    expect(workerKeys).toContain("contacts");
+    for (const name of ["team", "schedule", "team-roster", "workflow"]) {
+      expect(workerKeys).not.toContain(name);
+    }
+    // filterCoreServers mirror gate — the ONLY site injecting the LIVE
+    // skill-author stdio server. buildToolTransportInventory iterates that
+    // method's output, so it is the only surface that can observe the gate.
+    const workerInventory = worker.buildToolTransportInventory().map((e) => e.name);
+    for (const name of ["team", "schedule", "team-roster", "skill-author"]) {
+      expect(workerInventory).not.toContain(name);
+    }
+
+    // Control: identical runner WITHOUT the flag re-adds all of them.
+    const control = makeWorkerPoolRunner({
+      coreServers: ["memory", "contacts"],
+      db: makeFakeInProcessDb(),
+      teamRoster,
+    });
+    const controlKeys = Object.keys(control.buildInProcessServers());
+    for (const name of ["team", "schedule", "team-roster"]) {
+      expect(controlKeys).toContain(name);
+    }
+    const controlInventory = control.buildToolTransportInventory().map((e) => e.name);
+    for (const name of ["team", "schedule", "team-roster", "skill-author"]) {
+      expect(controlInventory).toContain(name);
+    }
+  });
+
+  it("(e) worker mode auto-injects NOTHING — a role-granted server is a capability, not engine-provided", () => {
+    // autoInjectedServerNames() is the third sync site of the worker-mode gate,
+    // and the ONLY one observable here: it feeds the inventory `source` field
+    // (and, via buildSystemPrompt's buildContext, the toolkit section's
+    // engine-provided ∩ coreServerNames split). With the gate removed, a server
+    // the ROLE explicitly granted is mislabeled as engine-auto-injected even
+    // though worker-mode injects nothing.
+    const worker = makeWorkerPoolRunner({
+      coreServers: ["memory", "schedule"],
+      suppress: true,
+      db: makeFakeInProcessDb(),
+    });
+    expect(worker.buildToolTransportInventory().find((e) => e.name === "schedule")?.source).toBe("core");
+
+    // Control: same coreServers without the flag — schedule IS engine-injected.
+    const control = makeWorkerPoolRunner({ coreServers: ["memory", "schedule"], db: makeFakeInProcessDb() });
+    expect(control.buildToolTransportInventory().find((e) => e.name === "schedule")?.source).toBe("engine");
+  });
+
+  it("(d) Lane B inventory compensation — worker-pool descriptor surfaces with no stdio placeholder", () => {
+    const runner = makeWorkerPoolRunner({ coreServers: ["worker-pool"], pool: makeFakePool() });
+    const entry = runner.buildToolTransportInventory().find((e) => e.name === "worker-pool");
+    expect(entry).toBeDefined();
+    expect(entry).toMatchObject({
+      transport: "sdk-in-process",
+      inProcess: true,
+      requiresTurnContext: true,
+      requiresHiveRuntime: true,
+    });
+    expect(entry!.compatibility.openai).toBe("requires-hive-bridge");
+    expect(entry!.compatibility.gemini).toBe("requires-hive-bridge");
+    expect(entry!.compatibility.codex).toBe("requires-hive-bridge");
+
+    const noPool = makeWorkerPoolRunner({ coreServers: ["worker-pool"] });
+    expect(noPool.buildToolTransportInventory().find((e) => e.name === "worker-pool")).toBeUndefined();
+    const noMembership = makeWorkerPoolRunner({ coreServers: [], pool: makeFakePool() });
+    expect(
+      noMembership.buildToolTransportInventory().find((e) => e.name === "worker-pool"),
+    ).toBeUndefined();
   });
 });

@@ -7,6 +7,9 @@ import { readConfig, writeConfig, configPath } from "./hive-config.js";
 import { restartHiveService } from "./hive-restart.js";
 import { HIVE_PLUGIN_API_VERSION } from "../plugins/api-version.js";
 import { isHiveApiCompatible } from "../plugins/plugin-loader.js";
+import { normalizeProviderDecl, readInstalledProviderDecls, validateProviderDecl } from "../plugins/provider-decl.js";
+import { LANE_B_PROVIDER_ABI_VERSION } from "../agents/provider-adapters/provider-abi.js";
+import type { PluginProviderDecl } from "../plugins/types.js";
 
 // Instance-authored plugins live at <hiveHome>/plugins/, outside the engine dir
 // so they survive `hive update` / `hive rollback` wipes of <hiveHome>/.hive/.
@@ -85,6 +88,38 @@ function pluginAdd(target?: string): void {
     console.error(`Plugin requires hiveApi ${hiveApi} but this hive is ${HIVE_PLUGIN_API_VERSION}.`);
     rollbackInstall(target);
     process.exit(1);
+  }
+
+  // KPR-394 (§4.8): provider-block validation against the INSTALLED engine +
+  // installed plugin set, and the in-process disclosure — all before the
+  // restart, so a rejected provider never reaches a boot.
+  if (raw?.provider !== undefined) {
+    let decl: PluginProviderDecl;
+    try {
+      decl = normalizeProviderDecl(raw.provider);
+    } catch (err) {
+      console.error(
+        `Invalid provider block in ${target}/plugin.yaml: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      rollbackInstall(target);
+      process.exit(1);
+    }
+    const verdict = validateProviderDecl(decl, LANE_B_PROVIDER_ABI_VERSION);
+    if (!verdict.ok) {
+      console.error(`Provider '${decl.id}' rejected: ${verdict.reason}`);
+      rollbackInstall(target);
+      process.exit(1);
+    }
+    const installedNames = (readConfig(configPath()).plugins ?? []).filter((n: string) => n !== target);
+    const collision = readInstalledProviderDecls(installedNames, hiveHome).find(({ decl: d }) => d.id === decl.id);
+    if (collision) {
+      console.error(`Provider id '${decl.id}' is already registered by installed plugin '${collision.plugin}'.`);
+      rollbackInstall(target);
+      process.exit(1);
+    }
+    console.log(
+      `⚠ ${target} registers provider '${decl.id}' — its code runs in-process inside the hive engine (curated-registry trust, DOD-212).`,
+    );
   }
 
   const version = resolvePluginVersion(manifestPath, raw);

@@ -17,17 +17,26 @@
 
 export type ProviderFaultKind =
   | "connect-fail" // network-level: refused/reset/DNS/fetch failed
-  | "timeout" // runner deadline fired (RunResult.timedOut)
+  | "timeout" // runner deadline fired with ZERO observed progress — the hang signature (KPR-398)
   | "rate-limit" // 429 / rate limit / too many requests
   | "auth" // 401/403/authentication/invalid key
   | "server-error" // 5xx / overloaded / service unavailable
   | "bad-model" // rejected/unknown model id (KPR-312, M8) — config fault, NEVER trips the breaker
+  | "turn-deadline" // deadline expiry with proof the provider responded — breaker-INCONCLUSIVE. Lane B sentinel (see TURN_DEADLINE_SUBTYPE, progress-blind) + Claude-lane deadline abort with observed progress (KPR-398)
   | "non-provider"; // everything else — NEVER trips the breaker
 
 export interface TurnFaultInput {
   error?: string; // RunResult.error
   timedOut?: boolean; // RunResult.timedOut (KPR-306)
   aborted?: boolean; // RunResult.aborted
+  // KPR-398: per-turn progress evidence (RunResult field names, verbatim, so
+  // full-RunResult callers are structurally assignable with no call-site
+  // edits). Consulted ONLY inside the timedOut && aborted rule; absent fields
+  // are fail-closed (no progress ⇒ hard timeout — a narrowed caller keeps
+  // pre-KPR-398 behavior).
+  toolCalls?: number;
+  streamed?: boolean;
+  text?: string;
 }
 
 export type TurnClassification =
@@ -48,10 +57,29 @@ export const HARD_FAULT_KINDS: ReadonlySet<ProviderFaultKind> = new Set([
 ]);
 
 /**
+ * Lane B wall-clock deadline sentinel. The three native adapters emit this
+ * as RunResult.error when the turn's `resourceLimits.timeoutMs` deadline
+ * fires (with `timedOut: true` but `aborted: false` — so the Claude-lane
+ * `timedOut && aborted` hang rule in classifyTurnResult can never match).
+ *
+ * Classifies as the dedicated `turn-deadline` kind, which the breaker treats
+ * as INCONCLUSIVE — never trips (a Lane B turn's wall clock folds bridged
+ * tool execution time in, and a slow-but-healthy tool must never trip a
+ * healthy provider — the same asymmetry that keeps toolMs out of the p95
+ * llmMs window), but ALSO never resets a hard-fault streak and never closes
+ * a half-open probe: unlike every other non-hard fault, a deadline expiry is
+ * NOT proof the provider responded (a genuinely hung provider produces
+ * exactly this result every turn, since the hive deadline deterministically
+ * preempts undici's own timeouts). Short-circuits before the pattern tables.
+ */
+export const TURN_DEADLINE_SUBTYPE = "error_turn_deadline";
+
+/**
  * SDK result subtypes flattened into RunResult.error verbatim
- * (agent-runner.ts `msg.type === "result"` non-success branch). These are
- * turn-shape conditions (budget/turn caps, in-execution tool failures), not
- * provider faults — short-circuit them before the pattern tables so e.g.
+ * (agent-runner.ts `msg.type === "result"` non-success branch; the Lane B
+ * dispatch loops share error_max_turns). These are turn-shape conditions
+ * (budget/turn caps, in-execution tool failures), not provider faults —
+ * short-circuit them before the pattern tables so e.g.
  * "error_during_execution" can never match a fault row.
  */
 const SDK_NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_execution"]);
@@ -69,13 +97,21 @@ const SDK_NON_PROVIDER_SUBTYPES = new Set(["error_max_turns", "error_during_exec
  * change (regression-pinned per-alternate in error-classification.test.ts).
  */
 const FAULT_PATTERNS: ReadonlyArray<
-  readonly [Exclude<ProviderFaultKind, "non-provider" | "timeout">, RegExp]
+  readonly [Exclude<ProviderFaultKind, "non-provider" | "timeout" | "turn-deadline">, RegExp]
 > = [
   [
     "connect-fail",
     /ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EPIPE|socket hang up|fetch failed|network error|terminated/i,
   ],
-  ["rate-limit", /\b429\b|rate.?limit|too many requests/i],
+  [
+    // The Google alternates cover Gemini's canonical 429 surfaces — the
+    // prose message ("Resource has been exhausted (e.g. check quota).",
+    // observed classifying non-provider on dodi 2026-08-24), the gRPC-style
+    // status token, and the quota-phrased variant. At Google a quota breach
+    // IS a 429, so quota-exceeded belongs on this row, not a new kind.
+    "rate-limit",
+    /\b429\b|rate.?limit|too many requests|resource has been exhausted|RESOURCE_EXHAUSTED|quota exceeded/i,
+  ],
   [
     "auth",
     /\b401\b|\b403\b|authentication|unauthorized|invalid.?api.?key|OAuth session is not available|api.?key is not available|not.?authenticated|credentials\.json|ANTHROPIC_API_KEY|authToken|resolve authentication/i,
@@ -92,6 +128,9 @@ const FAULT_PATTERNS: ReadonlyArray<
 ];
 
 function classifyErrorString(error: string): TurnClassification {
+  if (error.trim() === TURN_DEADLINE_SUBTYPE) {
+    return { outcome: "fault", kind: "turn-deadline", message: error };
+  }
   if (SDK_NON_PROVIDER_SUBTYPES.has(error.trim())) {
     return { outcome: "fault", kind: "non-provider", message: error };
   }
@@ -101,19 +140,80 @@ function classifyErrorString(error: string): TurnClassification {
   return { outcome: "fault", kind: "non-provider", message: error };
 }
 
+/** KPR-398: proof the provider responded THIS turn. Any one signal suffices;
+ * all three absent is indistinguishable from a hung provider.
+ * KPR-399: exported — finalizeSpawnResult's persist-on-abort gate
+ * (agent-manager.ts) reuses this exact predicate as its D1 progress check, so
+ * the classifier and the persist gate can never silently diverge. A body
+ * change here is a Decision-Register event: it moves both surfaces at once. */
+export function hasObservedProgress(input: TurnFaultInput): boolean {
+  return (input.toolCalls ?? 0) > 0 || input.streamed === true || (input.text?.length ?? 0) > 0;
+}
+
+/**
+ * KPR-399: Claude-lane resume-rejection surfaces. (1) the CLI's
+ * unknown-session error — the persisted id's transcript never flushed
+ * (abort before first write) or was removed; (2) the Messages API 400 when a
+ * resumed transcript ends with a dangling tool_use the CLI did not repair.
+ * Docs/community-sourced — REFINE against the live capture at delivery
+ * (KPR-350 posture; its matcher was refined in KPR-351 L2). Deliberately
+ * narrow: a false positive costs one thread's context (fresh retry), a miss
+ * costs a dead thread until the 7d TTL. Neither alternate may overlap the
+ * auth row (superset rule) — both classify non-provider today, keeping the
+ * arm breaker-invisible (pinned in error-classification.test.ts).
+ */
+export function isClaudeResumeLoadError(reason: string): boolean {
+  return (
+    /no conversation found with session/i.test(reason) ||
+    /tool_use[\s\S]{0,120}?without[\s\S]{0,40}?tool_result/i.test(reason)
+  );
+}
+
 /**
  * Classify a finished turn's RunResult. Order (first match wins):
- *  1. timedOut && aborted  → timeout fault (the deadline path sets both;
+ *  1. timedOut && aborted  → deadline abort (the deadline path sets both;
  *     requiring both is belt-and-suspenders on top of the runner-side
- *     activeQuery guard, which is the primary fix).
+ *     activeQuery guard, which is the primary fix). KPR-398 splits this rule
+ *     on observed progress: with progress (toolCalls > 0 | streamed | text
+ *     nonempty) → the breaker-INCONCLUSIVE turn-deadline kind; zero or
+ *     absent progress → the hard timeout kind (the hang signature —
+ *     fail-closed, so a caller passing a narrowed input keeps pre-KPR-398
+ *     behavior).
  *  2. aborted (alone)      → aborted (neutral — never reached a
- *     provider-attributable outcome).
+ *     provider-attributable outcome; progress fields are never consulted).
  *  3. no error             → success.
  *  4. pattern tables       → fault kind.
  *  5. default              → non-provider (fail-safe).
  */
 export function classifyTurnResult(input: TurnFaultInput): TurnClassification {
   if (input.timedOut === true && input.aborted === true) {
+    // KPR-398: the Claude runner's own deadline sets BOTH flags
+    // (agent-runner.ts deadline timer → abort()), so this shape covers two
+    // very different turns. Observed progress = the provider responded this
+    // turn ⇒ the same breaker-INCONCLUSIVE turn-deadline kind Lane B's
+    // sentinel gets (never trips, never resets a streak, never closes a
+    // probe). Zero progress = the hang signature ⇒ hard timeout, so a
+    // genuinely hung provider still trips the breaker. Fail-closed on
+    // absent fields.
+    if (hasObservedProgress(input)) {
+      return {
+        outcome: "fault",
+        kind: "turn-deadline",
+        // Attenuation shape (D9 truth-up, KPR-400 — deliberate, pinned in
+        // error-classification.test.ts): a real error string coexisting
+        // with deadline+progress becomes the turn-deadline message
+        // VERBATIM, suppressing the synthesized evidence string below.
+        // Unreachable on the Claude deadline path today (`error` stays
+        // undefined — the runner's deadline closes the iterator, nothing
+        // throws), but if a future caller supplies both, the error string
+        // wins: it carries strictly more debugging signal than the
+        // synthesized counters, and the KIND (not the message) is what the
+        // breaker keys on.
+        message:
+          input.error ??
+          `turn deadline exceeded with progress (toolCalls=${input.toolCalls ?? 0}, streamed=${input.streamed === true}, textLen=${input.text?.length ?? 0})`,
+      };
+    }
     return { outcome: "fault", kind: "timeout", message: input.error ?? "turn deadline exceeded" };
   }
   if (input.aborted === true) return { outcome: "aborted" };
