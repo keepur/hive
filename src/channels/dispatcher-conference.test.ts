@@ -1547,6 +1547,105 @@ Meeting rules:
       expect(round1Item.text).toContain("[Jasper just replied]:"); // terminal slot untouched (C3)
     });
 
+    it("T2 (KPR-416): a suppressed round-0 responder re-invited as a reactor takes the DELTA arm, which omits the trigger", async () => {
+      // The §7.2 re-based invariant, on the path KPR-416 newly exposes. The
+      // asserted property is mark-advance-implies-own-turn-presented-it — NOT
+      // "the delta covers the trigger", which is precisely what stops being
+      // true here. Preconditions pinned explicitly: jessica's round-0 turn was
+      // SUPPRESSED, her injection mode was `delta`, and resumedSession is true
+      // so the clearMeetingMark branch does not apply.
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper", "jessica"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+
+      const threadId = "conf-thread-kpr416-t2";
+      const TRIGGER = "settle the pricing question before Friday";
+      seedRef("jessica", threadId, { sessionId: "sess-j", provider: "claude", meetingLastSeenTs: "1000.0001" });
+
+      // The mark write must actually feed the round-1 read for this invariant
+      // to mean anything, so make setMeetingMark mutate the seeded ref.
+      agentManager._sessionStore.setMeetingMark.mockImplementation(
+        async (agentId: string, thread: string, ts: string) => {
+          const key = `${agentId}:${thread}`;
+          const ref = agentManager._sessionRefs.get(key);
+          if (ref) agentManager._sessionRefs.set(key, { ...ref, meetingLastSeenTs: ts });
+        },
+      );
+
+      mockSlackAdapter.fetchThreadHistory
+        .mockResolvedValueOnce(
+          makeHistory([
+            { author: "May", text: "kickoff notes", ts: "1000.0001", minAgo: 30 },
+            { author: "May", text: TRIGGER, ts: "1000.0005", minAgo: 5 },
+          ]),
+        )
+        .mockResolvedValue(
+          makeHistory([
+            { author: "May", text: "kickoff notes", ts: "1000.0001", minAgo: 30 },
+            { author: "May", text: TRIGGER, ts: "1000.0005", minAgo: 5 },
+            { author: "Jasper", text: "Slow findings on pricing", ts: "1000.0006", minAgo: 4, isBot: true },
+          ]),
+        );
+
+      agentManager.runWorkItemTurn.mockImplementation(async (agentId: string) => {
+        if (agentId === "jasper") {
+          await new Promise((r) => setTimeout(r, 10)); // slow peer: jessica's mark lands first
+          return turn({ finalMessage: "Slow findings on pricing", resumedSession: true });
+        }
+        return turn({ finalMessage: "No response needed.", resumedSession: true });
+      });
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: `Jasper, and Jessica, ${TRIGGER}`,
+          source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t2" },
+          threadId,
+          meta: { slackTs: "1000.0005" },
+        }),
+      );
+
+      // Precondition: jessica's round-0 turn was delta-mode and suppressed.
+      const jessicaRound0 = agentManager.runWorkItemTurn.mock.calls.find(
+        (c: any[]) => c[0] === "jessica" && c[1]?.meta?.conferenceRound === 0,
+      );
+      expect(jessicaRound0).toBeDefined();
+      expect(jessicaRound0![1].meta.conferenceInjectionMode).toBe("delta");
+      expect(mockLogInfo).toHaveBeenCalledWith(
+        "Non-response suppressed (fan-out)",
+        expect.objectContaining({ agentId: "jessica", conferenceRound: 0 }),
+      );
+
+      // (i) The mark advanced to >= the trigger ts on that suppressed turn.
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jessica", threadId, "1000.0005");
+
+      // Vacuous-pass guard: a round-1 turn must actually have happened before
+      // asserting over its text (pre-fix it never dispatches at all).
+      const round1Call = () =>
+        agentManager.runWorkItemTurn.mock.calls.find(
+          (c: any[]) => c[0] === "jessica" && c[1]?.meta?.conferenceRound === 1,
+        );
+      await vi.waitFor(() => expect(round1Call()).toBeDefined());
+
+      // (ii) It took the delta arm, and the delta OMITS the trigger — safe only
+      // by the §7.2 invariant (jessica's own round-0 terminal slot presented it).
+      const round1Item = round1Call()![1];
+      expect(round1Item.meta.conferenceInjectionMode).toBe("delta");
+      // The two load-bearing assertions: the delta header is present, and the
+      // human trigger is ABSENT from a re-invited suppressed agent's context.
+      expect(round1Item.text).toContain("[New messages since your last turn:]");
+      expect(round1Item.text).not.toContain(TRIGGER);
+      // The delta BODY, pinned against the line shape formatDeltaContext
+      // actually emits (`${author} (${ago}): ${text}`, dispatcher.ts:1808)
+      // and anchored to the header so it cannot be satisfied from elsewhere.
+      // A bare `toContain("Slow findings on pricing")` would be near-vacuous:
+      // that string is also in reactionTo.text in the terminal slot, so it
+      // passes even when the delta is empty or wrong.
+      expect(round1Item.text).toMatch(
+        /\[New messages since your last turn:\]\n\nJasper \([^)]+\): Slow findings on pricing/,
+      );
+    });
+
     it("C3: round-1 reactor with no session gets the full transcript", async () => {
       const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
       (classifyMeetingMessage as any)
