@@ -3,6 +3,7 @@
 **Epic:** KPR-415 (Meeting mode hardening) · **Child:** B1 · **Kind:** child spec · **Status:** spec-ready (draft)
 **Governing design:** `keepur/hive-docs` → `internal/specs/2026-08-28-meeting-mode-hardening-design.md`, §"Design — Child B1: delay-then-ack for long-running turns", §"Background" (trial observation 2), §"Testing expectation (epic-level)" (approved, spec-review/8/frontier, clean)
 **Repo baseline:** `hive-KPR-415` worktree, branch `KPR-415` at `118bde4`. Every line citation below was re-verified against this tree.
+**Revision:** r1 — spec-review round 1 (5 blocking + 6 advisory findings folded in). Changed since r0: Key Points bullet on replay/leg ack-freedom (the two paths fail to ack for *different* reasons — replays retain conference meta); §11's behavioral dependency re-stated as depending on KPR-416's *relocation*, not its predicate (T11's purpose corrected to match); §6.6 added (KPR-308 outage diversion — the fifth orphan shape); §9's fake-timer/drain reconciliation prescribed; `MEETING_ACK_TEXT` changed to `"On it — picked this up."` so the text and its honesty rationale agree during the lock-wait window.
 **Blocked by:** KPR-416 (Child A) — merges first; see §11 for the shared hunk and the behavioral dependency.
 
 ---
@@ -19,9 +20,9 @@ A round-0 conference responder that is still unresolved ~15s after dispatch post
 - **All five exclusions collapse to one code change.** Every one of the five consumers reads the *same* `ThreadMessage[]` produced at exactly two sites (`dispatcher.ts:1576`, `:1932`). Replacing both with one private `fetchMeetingHistory` wrapper that strips acks makes the full arm, the delta arm, the high-water mark, `history.slice(-5)` (`:1578-1581`) and `noteActivity` (`:1601`, `:1954`) ack-blind with **no per-consumer edits**. The strip is deliberately **not** gated on `ackEnabled` — flipping the lever off must not un-hide acks already in the thread.
 - **Prior art determination (`onProcessingStart`/`onProcessingEnd`) — NOT sufficient, and not adopted as a complement.** Both epic-design candidate reasons verified true in this tree, and the second is disqualifying on its own: `setThreadStatus(channel, threadTs, status)` (`slack-gateway.ts:292-298`) has **no agent dimension**, so N concurrent responders collapse into one slot; and `onProcessingEnd` clears unconditionally with no refcount (`slack-adapter.ts:166-173`), so in a 4-agent fan-out the 2-second finisher **erases the indicator while the 130s agent is still working** — it inverts the signal for precisely the case this epic exists to fix. Third, verified-in-code: the call targets Slack's *Assistant* thread surface and its failures are swallowed by a warn (`:295-297`), so on an ordinary `conf-*` channel thread a non-render is indistinguishable from success. Full derivation in §4.
 - **Four failure paths, one uniform rule: the ack is never retracted and never followed by an engine-authored "never mind."** It is a true statement about dispatch state at the moment it was posted, and the ack wording is chosen to say exactly that rather than promise a reply (§5.3). Errored/thrown turns and deadline aborts already post their own visible resolution; the two paths that can end in *silence* are the 2nd..Nth agent of an outage episode (per-thread notice dedup, `dispatcher.ts:1003`) and the suppressed responder. Both are accepted, not mechanized — see §6 and the next bullet.
-- **The fourth case is materially less bad than the epic design assumed, because of KPR-416.** Under Child A's branch-position predicate a **suppressed** round-0 turn writes no reaction-exclusion, so an agent that acked and then said `"No response needed."` stays round-1-eligible and may still post a reaction to a slower peer on the same trigger. "Orphaned ack" is therefore often "ack, then a reaction two minutes later" — not necessarily permanent silence. This weakens the case for a retraction mechanism that would itself be new meeting noise.
+- **The fourth case is materially less bad than the epic design assumed, because of KPR-416.** Under Child A's delivery-time write a **suppressed** round-0 turn writes no reaction-exclusion, so an agent that acked and then said `"No response needed."` stays round-1-eligible and may still post a reaction to a slower peer on the same trigger. "Orphaned ack" therefore *can be* "ack, then a reaction two minutes later" rather than permanent silence — a real possibility, not a common outcome (§6.4 ground 2 bounds how narrow the population actually is). This weakens the case for a retraction mechanism that would itself be new meeting noise.
 - **Round-0 gating is a contract, not a default.** `resolved.conferenceMode && resolved.conferenceRound === 0` only. KPR-389 §D5's goal 5 — *"A clamp-killed reaction never posts noise into the meeting channel"* (`kpr-389-spec.md:39`) — is violated the instant a round-1 turn acks and is then silently killed at `dispatcher.ts:1423-1434`. No round-1 retraction path is designed here; round-1 acking is out of scope for this child.
-- **At most one ack per (agent, human trigger).** Replays (single-dispatch leg) and KPR-402 continuation legs both arrive with no conference meta — KPR-413 strips it at `:846-853` — so neither can ack. Total acks per trigger ≤ the number of round-0 selectees still unresolved at 15s, i.e. the grok-shaped population only.
+- **At most one ack per (agent, human trigger)** — and the two other legs that can carry a round-0 conference turn are ack-free for **different reasons, which must not be conflated.** *Outage replays keep their conference meta*: `meta.conferenceRound` survives onto the replayed item and is load-bearing elsewhere (it is the KPR-389 §D5b discriminator at `dispatcher.ts:370`, `conferenceRoundOf(item) === 1`, and the item KPR-416 reads `meta.meetingExclusionTs` off). A replay cannot ack because it runs `dispatch()`'s **single-dispatch leg**, which builds a bare `ResolvedAgent` with no `conferenceMode`/`conferenceRound` on it and has **no ack machinery wired to it at all** — the gate reads `resolved`, never `meta`, and there is nothing on that leg to fire. *KPR-402 continuation legs* are ack-free for the other reason: the KPR-413 blocklist at `:846-853` strips the four conference keys off the leg's meta, so the leg is not a conference turn on either surface. Total acks per trigger ≤ the number of round-0 selectees still unresolved at 15s, i.e. the grok-shaped population only.
 - ⚠ **Delegated assumption (non-blocking) — the substitution itself.** The operator's literal ask was an *immediate* "got it" (epic design, Background/trial observation 2); this ships delay-then-ack instead, and the epic design flags that as wanting her confirmation. Recorded here as delegated under KPR-415's Gate 1 signoff (granted 2026-08-28), per the mature-playbook signoff model. Rollback if she disagrees is a one-line constant (`MEETING_ACK_DELAY_MS = 0` behaves as an immediate ack) — the mechanism does not need redesigning to honor the literal ask.
 - ⚠ **Delegated assumption (non-blocking) — `ackEnabled` is independent of `meetingWorkers.enabled`,** deliberately diverging from `scribeEnabled`'s nesting under it. The scribe consumes `pool.runRoleTurn`/`hasCapacity`, so the worker master switch must kill it; the ack consumes no pool machinery at all. It lives in the `meetingWorkers` section for config locality (the epic design's explicit choice), not because it is a worker feature. §5.6.
 
@@ -42,7 +43,7 @@ Two facts make this structural rather than incidental:
 - Fast turns never ack — no new noise for the 2-5s population.
 - The ack is invisible to every consumer of meeting thread history: full injection, delta injection, the `meetingLastSeenTs` high-water mark, the round-0 classifier's recency window, and the meeting scribe.
 - The ack never re-triggers dispatch on itself.
-- Every failure path an acked turn can take is named, with the ack's interaction stated.
+- Every failure path an acked turn can take is named, with the ack's interaction stated — and so is every non-failure shape that can still leave an ack without a companion in the thread (the ack's own delivery failure, and KPR-308 outage diversion of the answer). §6.
 - An operator can turn the whole thing off without a deploy.
 
 ## 3. Non-goals
@@ -110,7 +111,7 @@ Fire-and-forget throughout: the timer callback is `void this.deliverMeetingAck(.
 | Constant | Value | Rationale |
 |---|---|---|
 | `MEETING_ACK_DELAY_MS` | `15_000` | ~3x the observed fast band (2-5s), far below the ~130s case, and far below the round-1 clamp (`REACTION_TIMEOUT_MS = 120_000`) and any turn deadline. |
-| `MEETING_ACK_TEXT` | `"On it — looking into this."` | §5.3. |
+| `MEETING_ACK_TEXT` | `"On it — picked this up."` | §5.3. |
 
 ### 5.2 Round gating
 
@@ -120,8 +121,8 @@ Round-1 is excluded because the two contracts are in direct collision, not merel
 
 Structural consequences, all following from the gate rather than needing their own guards:
 
-- **Outage replays never ack.** A replayed round-0 conference turn takes `dispatch()`'s single-dispatch leg with a bare `ResolvedAgent` (KPR-389 §E4, verified: conference meta rides `item.meta`, never `resolved`), so `resolved.conferenceMode` is falsy.
-- **KPR-402 continuation legs never ack.** Same leg, and the leg's meta has been conference-stripped at `:846-853` (KPR-413).
+- **Outage replays never ack — because of the leg, not because of the meta.** A replayed round-0 conference turn **keeps** `meta.conferenceMode`/`meta.conferenceRound` (KPR-389 §E4, verified: conference meta rides `item.meta`, never `resolved` — and that retained `conferenceRound` is exactly what `:370` and KPR-416's `meetingExclusionTs` read). It cannot ack because it takes `dispatch()`'s **single-dispatch leg** with a bare `ResolvedAgent` whose `conferenceMode` is falsy, and because that leg has no `runTurnWithMeetingAck` wrapper on it at all — the ack machinery lives only in `dispatchToAgent`.
+- **KPR-402 continuation legs never ack — for a second, independent reason.** Same leg, *and* the leg's meta has been conference-stripped at `:846-853` (KPR-413), so it is not a conference turn on either surface. Do not collapse this with the replay case: replays retain conference meta and legs do not.
 - **`worker:` boss re-entry never acks** — ordinary non-conference turns (KPR-390 canon C26).
 - Therefore **≤ 1 ack per (agent, human trigger)**, with no chain and no duplicate across legs.
 
@@ -144,12 +145,14 @@ Four deliberate properties:
 
 - **`error` unset**, so `SlackAdapter.deliver` renders it through `formatResponse`, not `formatError` (`slack-adapter.ts:147`) — same rationale as `deliverOutageNotice`'s own comment.
 - **`agentId` set**, so `deliver` picks up `agentConfig` and posts with the agent's `username`/`icon` identity and the `${icon} *${Name}*: ` text prefix (`:148-154` → `slack-gateway.ts:366-410`). Per-agent attribution costs nothing new.
-- **Not `deliverAgentResult`** — that begins with `tryOutageDiversion` (`:571`), and an ack diverted to a WS floor broadcast is meaningless.
+- **Not `deliverAgentResult`** — that begins with `tryOutageDiversion` (`:521-563`, called at `:571`), and an ack diverted to a WS floor broadcast is meaningless. ⚠ The *symmetric* case — the ack posts to the thread and the turn's real **answer** is then diverted away from it — is a named residual, §6.6.
 - **Never enqueued to the retry queue on failure.** A retried ack lands minutes later, potentially after the answer. A dropped ack is strictly better than a late one.
 
-**Text.** `MEETING_ACK_TEXT = "On it — looking into this."` — verified to round-trip byte-identically through `markdownToMrkdwn` (`response-formatter.ts:6-22`: no header, bold, link, strikethrough or rule construct present), which the recognition pattern depends on.
+**Text.** `MEETING_ACK_TEXT = "On it — picked this up."` — verified to round-trip byte-identically through `markdownToMrkdwn` (`response-formatter.ts:6-22`: no header, bold, link, strikethrough or rule construct present), which the recognition pattern depends on.
 
-⚠ **Wording is load-bearing, not cosmetic.** It is a statement of *state*, not a promise of a reply. This is what makes §6.4's "no retraction" ruling tolerable: silence after "On it — looking into this." is a turn that looked and had nothing to add; silence after "On it — I'll get back to you shortly" would be a broken promise. It is also honest about a case the epic design does not name: because the per-thread lock spin-waits **before** the breaker permit is acquired (`agent-manager.ts:1452-1459` precedes `:1175`), an acked turn may be queued behind a sibling turn rather than generating. "Still outstanding" covers both; "generating" would not.
+⚠ **Wording is load-bearing, not cosmetic — and it is deliberately a receipt, not a progress report.** The ack must be true at every instant it can fire, including one the epic design does not name: the per-thread lock spin-waits **before** the breaker permit is acquired (`agent-manager.ts:1453-1458` precedes `:1175`), so an acked turn may be *queued behind a sibling turn on the same `agentId:threadId`* rather than generating anything. Any wording that asserts work is happening **right now** — "looking into this", "working on it", "generating" — is therefore false in that window. "Picked this up" claims only assignment, which is true from the moment the round-0 fan-out selected this agent and stays true through the lock wait, the breaker acquire and the model call alike. It is equally a statement of *state*, not a promise of a reply, which is what makes §6.4's "no retraction" ruling tolerable: silence after "On it — picked this up." is a turn that took the item and had nothing to add; silence after "On it — I'll get back to you shortly" would be a broken promise.
+
+A bare `"On it."` was considered and is honest on the same grounds, but rejected on **collision surface**: a whole agent reply of exactly "On it." is plausible in a conference thread (a peer claiming a sub-task), while the two-clause sentence is not — see §5.4's residual, whose bound depends on the phrase being one no agent would author verbatim as its entire contribution.
 
 ### 5.4 Recognition mechanism — a stable content pattern
 
@@ -158,15 +161,24 @@ Beside `NON_RESPONSE_PATTERNS`:
 ```ts
 /** KPR-417: the exact sentence B1 posts (§5.3). MEETING_ACK_PATTERNS below
  *  recognizes it back off the thread transcript — the two MUST change in
- *  lockstep, exactly as NON_RESPONSE_PATTERNS pins "No response needed." */
-export const MEETING_ACK_TEXT = "On it — looking into this.";
+ *  lockstep, exactly as NON_RESPONSE_PATTERNS pins "No response needed."
+ *  Exported (unlike NON_RESPONSE_PATTERNS, which is module-private and which
+ *  the suite deliberately mirrors by hand at dispatcher-conference.test.ts:556
+ *  / dispatcher.test.ts:283) because this constant sits on BOTH sides of a
+ *  two-sided contract: T1 asserts these bytes were posted and T5 seeds a
+ *  fixture message that these bytes must strip. A hand-mirrored copy would let
+ *  T5 keep passing while the real posted text drifted away from it — the exact
+ *  drift the strip exists to prevent. isMeetingAck is exported alongside it so
+ *  the anchored-regex bound (a reply that merely BEGINS with the sentence is
+ *  not an ack) is unit-assertable without routing through a full dispatch. */
+export const MEETING_ACK_TEXT = "On it — picked this up.";
 
 /** SlackAdapter.deliver prefixes agent posts with `${icon} *${Name}*: `
  *  (icon optional when the agent has none, absent entirely when the agent was
  *  deleted mid-turn). Mirrors the author-extraction regex at
  *  slack-adapter.ts:222, widened to make the icon optional. */
 const AGENT_PREFIX_RE = /^(?:\S+\s+)?\*[^*]+\*:\s*/;
-const MEETING_ACK_PATTERNS = [/^on it\s*—\s*looking into this\.?$/i];
+const MEETING_ACK_PATTERNS = [/^on it\s*—\s*picked this up\.?$/i];
 
 export function isMeetingAck(m: ThreadMessage): boolean {
   if (!m.isBot) return false;
@@ -181,7 +193,7 @@ Anchored `^…$` on the whole body, so a real reply that merely *begins* with th
 - **A `meta` flag threaded through history-fetch.** `ThreadMessage` (`slack-adapter.ts:19-29`) is assembled from `conversations.replies`; there is no hive-side channel on it. Carrying a flag would mean Slack message metadata (`chat.postMessage` `metadata` + `include_all_metadata` on the replies read), a new `ThreadMessage` field, a story for `postSplit`/`postAsFile`, and a new scope/API surface — for a fact we can already read off bytes we authored. Rejected on cost, not on principle; if a future consumer needs richer per-message provenance, this is the option to revisit.
 - **A ts-keyed ack registry (parallel to `outboundTsCache`).** Rejected on **restart fragility**, which is not hypothetical: meeting threads outlive engine restarts (deploys, `hive update`), `meeting_summaries` alone has a 7d TTL, and `OutboundTsCache`'s own TTL is 120s (`outbound-ts-cache.ts:16`). After a restart the registry is empty while every ack is still sitting in Slack, so the classifier-window regression the epic design names as "a functional regression, not just transcript bloat" comes back silently and with no signal. Making it durable means a Mongo collection and a new write on a hot path — strictly more machinery than a regex, for strictly less coverage.
 
-⚠ **Collision residual, accepted:** an agent whose entire reply is exactly the ack sentence has that message stripped from meeting history. Impact is bounded to one near-contentless message; the identical hazard already exists and is accepted repo-wide for `NON_RESPONSE_PATTERNS`; and the meeting preamble steers agents toward `"No response needed."`, not toward this sentence. Named, not fixed.
+⚠ **Collision residual, accepted:** an agent whose entire reply is exactly the ack sentence has that message stripped from meeting history. Impact is bounded to one near-contentless message; the identical hazard already exists and is accepted repo-wide for `NON_RESPONSE_PATTERNS`; and the meeting preamble steers agents toward `"No response needed."`, not toward this sentence. The bound depends on the phrase being one no agent would plausibly author verbatim as its *entire* contribution — which is why §5.3 keeps the two-clause form rather than a bare `"On it."`. Named, not fixed.
 
 ### 5.5 One strip point covers all five consumers
 
@@ -213,6 +225,8 @@ Call sites: `resolveConferenceAgents` (`:1574-1576`) and `triggerConferenceReact
 
 **Also unaffected, verified:** `meetingRosters` is built from the human trigger's text only, never from history — so the roster is not a sixth consumer.
 
+**Scope of "ack-blind," stated precisely:** the five consumers are the engine's own history-processing paths. An agent that reads the meeting channel through its **own `slack` MCP tool surface** bypasses this function entirely and sees the acks as the ordinary Slack messages they are. Deliberately out of scope — see §8.
+
 **Timing note (from the epic design, re-verified):** `buildConferenceContext` runs inside `resolveConferenceAgents`, *before* any round-0 turn of the same trigger is dispatched — so an ack can never pollute a round-0 turn of its own trigger even without the filter. The filter is what covers everything after that: round-1 reaction context, the scribe, and every later trigger's round-0.
 
 ### 5.6 Config lever — `meetingWorkers.ackEnabled`
@@ -231,9 +245,9 @@ Dispatcher side: `private meetingAckEnabled = false;` — **fail-closed default*
 
 **Boot order (KPR-414).** The flag is read per turn inside `dispatchToAgent`, so it is a spawn-read fact and its wiring belongs above the boundary. `src/boot-order.test.ts` must gain `dispatcher.setMeetingAckEnabled(` as an anchor in **all three** of its lists — (a) presence, (b) the `Math.max` wiring bound, and (c) the superset sweep's `wiringStart` — per that test's own "bound on the **latest** anchor" rule. Note this is belt-and-braces rather than load-bearing: conference dispatch is unreachable until `dispatcher.setSlackAdapter(slackAdapter)` at `:625`, well below the boundary, and the fail-closed default means a mis-wire degrades to "no acks" rather than to a fault.
 
-## 6. Failure-path interactions — four cases
+## 6. Failure-path interactions — four turn-failure cases, plus two non-turn shapes
 
-The uniform rule: **an ack is a true statement about dispatch state at the time it was posted, and is never retracted.** Applied to each path:
+The uniform rule: **an ack is a true statement about dispatch state at the time it was posted, and is never retracted.** Applied to each path. §6.1-6.4 are the four ways an *acked turn* can end; §6.5-6.6 are the two shapes that are not turn failures at all but still leave an ack without a companion in the thread.
 
 ### 6.1 The turn errors (or throws)
 
@@ -247,7 +261,7 @@ In all three the cancel in `runTurnWithMeetingAck`'s `finally` runs before any o
 
 Two sub-shapes:
 
-- **Pre-turn `ProviderCircuitOpenError`.** Normally returns in well under 15s (the breaker permit is acquired at the top of the spawn), so no ack fires — the common case is structurally clean. **But it is not guaranteed:** `withSpawnTicket`'s per-thread lock spin-waits (`agent-manager.ts:1452-1459`) *before* the breaker acquire (`:1175`), so a turn queued behind a sibling on the same `agentId:threadId` can ack at 15s and only then fast-fail. Outcome: ack, then the honest outage notice — a coherent sequence.
+- **Pre-turn `ProviderCircuitOpenError`.** Normally returns in well under 15s (the breaker permit is acquired at the top of the spawn), so no ack fires — the common case is structurally clean. **But it is not guaranteed:** `withSpawnTicket`'s per-thread lock spin-waits (`agent-manager.ts:1453-1458`) *before* the breaker acquire (`:1175`), so a turn queued behind a sibling on the same `agentId:threadId` can ack at 15s and only then fast-fail. Outcome: ack, then the honest outage notice — a coherent sequence.
 - **Post-turn hard fault while the breaker is open** (`maybeHandlePostTurnOutage`, `:1404`): the turn ran for real, so the ack almost certainly fired. The turn is queued for replay (4h TTL) and the notice is issued.
 
 ⚠ **The silence case, named precisely:** the outage notice is deduped **once per (provider, adapterKey, threadKey) per episode** (`:1003`, `firstForThread`). In a 4-agent meeting on one provider, only the first agent's turn produces a notice; agents 2-4 queue silently. If those agents acked, their acks are followed by silence until the replay eventually delivers — possibly hours later, and via the single-dispatch leg, which fires no reaction pass (KPR-416 §3's named pre-existing scope bound).
@@ -266,8 +280,8 @@ The round-0 responder returns `"No response needed."`, `isNonResponse` is true (
 
 **Ruling: accept the orphaned ack. No retraction, no resolution message, no reaction marker.** Four grounds:
 
-1. **The wording already carries it.** "On it — looking into this." followed by nothing reads as *looked, nothing to add* — which is exactly what happened. Nothing was promised (§5.3).
-2. **KPR-416 materially changes this case.** Child A's branch-position predicate writes reaction-exclusion only on delivery to the non-suppressed branch, so a **suppressed** round-0 turn writes nothing and the agent stays round-1-eligible for that trigger (KPR-416 §4, §11). The acked-then-suppressed agent may therefore still post a real round-1 reaction to a slower peer minutes later. The epic design's framing of this case — written before A's predicate was chosen — assumed the ack was followed by permanent silence; it often is not.
+1. **The wording already carries it.** "On it — picked this up." followed by nothing reads as *took the item, had nothing to add* — which is exactly what happened. Nothing was promised, and no active work was claimed (§5.3).
+2. **KPR-416 materially changes this case.** Child A writes reaction-exclusion at delivery time, on the non-suppressed branch only, so a **suppressed** round-0 turn writes nothing and the agent stays round-1-eligible for that trigger (KPR-416 §4, §11). The acked-then-suppressed agent may therefore still post a real round-1 reaction to a slower peer minutes later. The epic design's framing of this case — written before A's write site was chosen — assumed the ack was followed by permanent silence; it **need not be**. ⚠ Deliberately not stronger than that: the acked-and-suppressed population is by construction made of *slow* suppressors, and for one of them to earn a round-1 reaction an even **slower** peer must deliver real content on the same trigger. The escape hatch is real but narrow, and this ground is the weakest of the four — the ruling stands on grounds 1, 3 and 4 regardless of how often ground 2 fires.
 3. **Every mechanized alternative is worse.** `chat.delete` needs new gateway surface, races the very consumers §5.5 exists to protect (a round-1 turn dispatched in between may already have injected the ack), and mutates thread history under readers. `chat.update` to a terminal line is the same surface cost plus a second visible state change. A ✅/💤 reaction is Slack-native reaction signaling, which the epic's Non-goals set aside on stated operator preference. A "…had nothing to add" follow-up message doubles the noise this feature is already spending, for the least informative outcome.
 4. **The population is small and bounded** — only round-0 selectees still unresolved at 15s that then decline.
 
@@ -276,6 +290,19 @@ The round-0 responder returns `"No response needed."`, `isNonResponse` is true (
 ### 6.5 Not a turn failure: the ack's own delivery fails
 
 Swallowed with a warn (`deliverMeetingAck`'s catch), never enqueued for retry, never observable by the turn. The turn's own outcome is unaffected in every case.
+
+### 6.6 Not a turn failure: the answer is diverted away from the thread (KPR-308 outage diversion)
+
+⚠ **Residual, accepted and named.** `deliverAgentResult` opens with `tryOutageDiversion` (`:521-563`), which redirects a **successful** turn's result to a WS floor broadcast instead of the source adapter when three conditions hold together: outage state is active (`:534`), the agent is `floorCritical` (`:537`), and at least one device is connected (`:538-546`). Slack-sourced items are explicitly in scope (`:536`). So a round-0 conference turn can ack into the meeting thread at 15s, succeed at 90s, and have its **answer** delivered to the app floor — leaving the ack sitting in the meeting thread with no visible resolution *there*, even though the turn resolved perfectly and the operator saw the answer somewhere else.
+
+This is the fifth orphan shape and it is materially different from §6.2/§6.4: nothing failed, and the "missing" content exists — it was routed elsewhere by a deliberate, pre-existing engine behavior. It is accepted unchanged, on the same grounds and by the same precedent as KPR-416's own micro-residual at its write site:
+
+- The ack remains true — the agent did pick the item up, and did answer it.
+- Every mechanism that would close it is the retraction machinery §6.4 already rejected (delete/edit/follow-up), now made *worse* by having to reason about a second delivery surface.
+- The population is the intersection of three narrow conditions (open outage episode × `floorCritical` agent × connected device) with the already-narrow ">15s round-0 responder" set.
+- Diversion is itself an outage-time behavior, so a thread in this state is already showing the §6.2 outage notice for the episode's first agent.
+
+**Not a required test case.** Reproducing it needs the outage-state provider, a `floorCritical` registry entry and a broadcast-capable WS adapter stubbed together purely to assert an *absence* — cost far above the residual's weight. Named here so a future reader does not file it as an ack bug. Revisit trigger is the same as §6.4's: operator-observed confusion in a live trial.
 
 ## 7. Integration points
 
@@ -295,6 +322,7 @@ Swallowed with a warn (`deliverMeetingAck`'s catch), never enqueued for retry, n
 | KPR-389 §D5 round-1 kill guard (`:1423-1434`) | **unchanged** — preserved by the round-0 gate, never worked around |
 | KPR-402 / KPR-413 continuation legs | **unchanged** — structurally ack-free (§5.2) |
 | KPR-307 outage machinery | **unchanged** — notices and the ack are independent (§6.2) |
+| KPR-308 `tryOutageDiversion` (`:521-563`) | **unchanged** — the ack never routes through it (§5.3); a diverted *answer* is a named residual (§6.6) |
 | KPR-416 `markReactionExclusion` + `meetingExclusionTs` | **unchanged** — different statements in the same function; see §11 |
 | `CLAUDE.md` Meeting-mode bullet | must name `ackEnabled` and its independence from `enabled`, alongside `scribeEnabled` |
 
@@ -309,17 +337,32 @@ Swallowed with a warn (`deliverMeetingAck`'s catch), never enqueued for retry, n
 - **`ackEnabled: false` mid-meeting.** New acks stop; existing acks stay stripped (§5.5). Verified as a required test (§9 T6).
 - **Non-Slack conference surfaces.** None exist — `conferenceMode` is reachable only from `kind === "slack"` + `conf-*` label (`:1175-1177`). Stated so a future surface knows the ack path assumes Slack delivery semantics.
 - **Test-harness safety.** `.unref()` on the timer plus the fail-closed `meetingAckEnabled = false` default means no existing test can acquire a stray 15s timer.
+- **Agents reading the channel with their own Slack tools still see acks — deliberately.** The five consumers of §5.5 are all *engine-internal history-processing paths*; the strip lives in the dispatcher, not in Slack. An agent holding the `slack` MCP server that calls `conversations.replies` on a `conf-*` thread reads real Slack messages and will see the acks verbatim, and may quote them. This is out of scope by construction — closing it would mean filtering at the vendor-API boundary for every agent, which is neither desirable (the acks *are* real messages the operator can see) nor achievable from the dispatcher. Named so a future "why did the agent quote the ack" report is recognized as expected behavior, not a strip-point leak.
 - ⚠ **Assumption:** an ack is engine chrome and must never be meeting content — the same class of judgment KPR-416 §4 makes about engine-authored notices. If a future reviewer disagrees, the affected surfaces are the five consumers of §5.5.
 - ⚠ **Assumption (delegated, non-blocking):** delay-then-ack substitutes for the operator's literal immediate "got it" — see Key Points.
 - ⚠ **Residual (accepted):** content-pattern collision, §5.4.
 - ⚠ **Residual (accepted):** orphaned ack in the outage-silence and suppression cases, §6.2 / §6.4.
+- ⚠ **Residual (accepted):** orphaned ack when a *successful* turn's answer is diverted to the WS floor by KPR-308 outage diversion, §6.6. The fifth orphan shape; not a failure, and not a required test case.
 - ⚠ **Unverified-at-spec-time (non-blocking):** whether `assistant.threads.setStatus` renders at all on a `conf-*` channel thread, §4 fact 3. The prior-art determination does not depend on it.
 
 ## 9. Testing contract
 
 Home: `src/channels/dispatcher-conference.test.ts` (existing harness already provides everything needed — `adapter.deliver` is a `vi.fn()` recording every post, `mockSlackAdapter.fetchThreadHistory` is seedable, `runWorkItemTurn` is a settle-controllable mock). Config-resolver cases go in `src/config.test.ts`; the boot anchor in `src/boot-order.test.ts`.
 
-Timing tests use `vi.useFakeTimers()` with a manually-settled `runWorkItemTurn` promise: arm, `vi.advanceTimersByTime(15_000)`, assert, then settle.
+**Two harness preconditions, stated once so they are not rediscovered case by case.**
+
+**(1) The lever must be armed.** `meetingAckEnabled` defaults to **`false`** on the dispatcher (§5.6, fail-closed), and the conference harness does not wire `index.ts`. So **every** case that expects an ack to actually post — T1, T8, T9(b)(c), T10, T11 — must call `dispatcher.setMeetingAckEnabled(true)` in setup. Put it in the ack describe-block's `beforeEach`; the negative-lever cases (T6, T7a) override it to `false` in-test. (T5 seeds an ack-*shaped* fixture message rather than posting one, so it is lever-independent by design — which is precisely what T6 pins.) A missing call makes every positive case pass vacuously as "no ack posted" — exactly the failure mode T1's negative-verify exists to catch.
+
+**(2) Fake timers and the suite's existing drain idiom must be reconciled — use the async advancement API, exclusively.** The ack needs a 15s fake-clock jump, but several required cases *also* need the suite's fire-and-forget reaction/continuation drain, and that drain is real-timer-based: `settleReactions = () => new Promise((r) => setTimeout(r, 0))` (`dispatcher-conference.test.ts:623`, with the explicit note at `:613-622` that `vi.waitFor` alone is insufficient), plus the bare `await new Promise((r) => setTimeout(r, 0))` pair at `:457-458`. Under `vi.useFakeTimers()` those `setTimeout(…, 0)` calls are themselves captured by the fake clock and **never resolve** without advancement — so a naive `vi.useFakeTimers()` + `settleReactions()` combination deadlocks. Affected at minimum: T5(2), T9(c), T10's continuation-leg arm, and T11's round-1 companion.
+
+**Prescription:**
+
+- Install fake timers **scoped to the ack describe-block only** — `vi.useFakeTimers()` in its `beforeEach`, `vi.useRealTimers()` in its `afterEach` — so the rest of `dispatcher-conference.test.ts` keeps its real-timer `settleReactions` untouched and no existing test changes.
+- Inside that block use **only** the async advancement API, never the synchronous `vi.advanceTimersByTime`: `await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS)` to fire the ack, and `await vi.advanceTimersByTimeAsync(0)` **everywhere the suite would otherwise `await settleReactions()`**. `advanceTimersByTimeAsync` drains the microtask queue between ticks, which is precisely the macrotask boundary `settleReactions` provides per its own comment at `:613-622` — so the drain semantics the existing tests rely on are preserved, not approximated.
+- Define one local alias in the block so the intent stays legible against the existing idiom: `const settleAcked = () => vi.advanceTimersByTimeAsync(0);`, commented with a pointer to `:623` saying it is the fake-timer equivalent of `settleReactions`, not a second mechanism.
+- Sequence for a timing case is therefore: arm (dispatch with a manually-settled `runWorkItemTurn` promise) → `await vi.advanceTimersByTimeAsync(15_000)` → assert the ack → settle the turn → `await settleAcked()` → assert the downstream (answer, notice, leg, or reaction).
+
+If a specific case still proves stubborn under this recipe, the sanctioned fallback is `vi.useFakeTimers({ shouldAdvanceTime: true })` for that case alone — do **not** fall back to real timers with a literal 15s wait, and do not lower `MEETING_ACK_DELAY_MS` for tests.
 
 ### Negative-verify obligation — scoped to T1 and T5 only
 
@@ -337,13 +380,16 @@ Per `feedback_negative_verify_regression_tests` and the scoping precedent of `kp
   **Fails pre-fix** for every sub-assertion (nothing strips it).
 - **T2 — fast turns never ack.** A round-0 conference turn settling at t=2s (fake timers advanced past 15s afterward) ⇒ no ack in `adapter.deliver`'s calls. *Coverage; vacuous pre-fix.*
 - **T3 — round-0 gating / KPR-389 §D5.** A round-1 reaction turn still unsettled at t=15s ⇒ **no** ack. Companion: that turn then returns `aborted: true` ⇒ the D5 guard's existing silence holds and the channel saw **zero** posts for it. Comment the test with the D5 goal-5 citation so a future "just ack round-1 too" edit fails loudly. *Coverage; vacuous pre-fix — but the load-bearing guard for the one contract this feature could break.*
-- **T4 — non-conference turns never ack.** (a) plain multi-agent fan-out (`conferenceMode` absent) and (b) an outage-replay item carrying `meta.conferenceRound: 0` but a bare `resolved` (the single-dispatch leg) ⇒ no ack in either, even when unsettled past 15s. Pins that the gate reads `resolved`, never `meta`. *Coverage; vacuous pre-fix.*
+- **T4 — non-conference turns never ack.** Two cases doing **different** amounts of work; keep both, but do not conflate their purposes.
+  - **(a) plain multi-agent fan-out** — goes through `dispatchToAgent` (so the ack wrapper *is* on the code path) with a bare `resolved` object carrying no `conferenceMode` ⇒ no ack even when unsettled past 15s. **This is the case that actually exercises the gate**, and it is the one that would fail if someone widened the gate to read `item.meta`.
+  - **(b) an outage-replay item carrying `meta.conferenceRound: 0`** ⇒ no ack. ⚠ Structurally **vacuous by construction**: the replay takes the single-dispatch leg, which has no `runTurnWithMeetingAck` wrapper on it at all, so there is no gate there to evaluate. It pins the *leg-level* absence (§5.2) — a regression where the ack wrapper is later added to the single-dispatch leg — not the meta-vs-`resolved` gate. Comment it as such so a future reader does not read it as gate coverage.
+  *Coverage; vacuous pre-fix.*
 - **T6 — the strip is not gated on the lever.** With `setMeetingAckEnabled(false)`, an ack-shaped message already in the seeded history is **still** stripped from all five consumers, and no new ack is posted. *Coverage; the "still stripped" half is genuinely new behavior and fails pre-fix for the same reason T5 does — it may be folded into T5 as a parameterized case rather than duplicated.*
 - **T7 — config lever.** (a) dispatcher-level: `ackEnabled` false ⇒ no ack on an unsettled round-0 turn; (b) `resolveMeetingWorkersConfig` unit cases in `config.test.ts`: absent section ⇒ `true`; `{ ackEnabled: false }` ⇒ `false`; `{ ackEnabled: "no" }` (non-boolean) ⇒ default `true`; and — pinning §5.6's independence ruling — `{ enabled: false }` alone ⇒ `ackEnabled` still `true`. *Coverage.*
 - **T8 — failure path 1 (§6.1).** Unsettled past 15s, then (a) the turn resolves with `error` + text, and (b) `runWorkItemTurn` rejects. Both: exactly two `deliver` calls, the ack first and the error second, and **no** retraction/edit/delete of the ack. *Coverage.*
 - **T9 — failure path 2 (§6.2).** (a) An immediate `ProviderCircuitOpenError` rejection ⇒ no ack (fast-fail beats the threshold). (b) A rejection delayed past 15s ⇒ ack, then exactly one honest outage notice; assert the ack is not repeated. (c) Two agents in the same thread and episode ⇒ two acks, **one** notice — the orphaned-ack residual of §6.2, commented as accepted behavior with a pointer to that section. *Coverage.*
 - **T10 — failure path 3 (§6.3).** A round-0 conference turn unsettled past 15s that then returns `timedOut && aborted` with progress ⇒ ack, then the first-abort notice, then a continuation leg dispatched; assert the leg carries no conference meta (reusing the KPR-413 pin) and that **the leg itself posts no ack**. Companion: the zero-progress arm ⇒ ack + notice only, no leg, no second ack. *Coverage.*
-- **T11 — failure path 4 (§6.4).** A round-0 turn unsettled past 15s that then returns `"No response needed."` ⇒ the ack is the **only** post from that agent for that turn; assert no retraction, no follow-up, no `_No response._`. Companion (depends on KPR-416 having landed, §11): the same agent is still selected and dispatched as a round-1 reactor when a slower peer delivers, and its reaction posts — pinning that the orphan can resolve. Comment the companion with a pointer to KPR-416 §11 so a future revert of Child A visibly breaks it. *Coverage.*
+- **T11 — failure path 4 (§6.4).** A round-0 turn unsettled past 15s that then returns `"No response needed."` ⇒ the ack is the **only** post from that agent for that turn; assert no retraction, no follow-up, no `_No response._`. Companion (depends on KPR-416 having landed, §11): the same agent is still selected and dispatched as a round-1 reactor when a slower peer delivers, and its reaction posts — pinning that the orphan **can** resolve. ⚠ Its purpose is precise: it is a tripwire for a **revert of Child A's relocation of the exclusion write from selection time to delivery time** — not for a change to A's write *predicate*. Under either predicate A considered, a suppressed turn writes nothing (it sits in the `isNonResponse` branch with no real content either way), so this test is predicate-insensitive; it fails only if the write moves back to selection time, where every selected round-0 agent is excluded regardless of outcome and the orphan becomes permanent by construction. Comment it with that framing plus a pointer to KPR-416 §11. *Coverage.*
 - **T12 — containment of the ack's own failure (§6.5).** `adapter.deliver` rejects on the ack call ⇒ warn logged, **no** `retryQueue.enqueue`, and the turn's own delivery still happens normally. *Coverage.*
 - **T13 — structural pins (drift-catching).** (a) `dispatcher.ts` contains exactly **one** `fetchThreadHistory(` call site — a third meeting-history read added later without going through `fetchMeetingHistory` fails here. (b) The `ack?.cancel()` statement appears inside `runTurnWithMeetingAck`, not in a `finally` around the whole `dispatchToAgent` body. Same posture and same escape hatch as KPR-416's T5: if a source-scan assertion is judged too brittle for this suite, the accepted substitute is a structural comment at each site naming the requirement and pointing at §5.1/§5.5, and T13 is dropped — do **not** substitute a timing-based test. *Coverage.*
 - **T14 — boot order.** `boot-order.test.ts` gains `dispatcher.setMeetingAckEnabled(` in all three anchor lists; the suite must stay green with the new anchor participating in the `Math.max` bound. Per that file's own warning, this edit deserves an adversarial pass, not a skim. *Coverage.*
@@ -362,9 +408,13 @@ Full code revert remains available and is a clean single-hunk removal (helper + 
 
 ## 11. Relationship to KPR-416 (Child A)
 
-**Sequencing.** A lands first, per the epic design's own note. The shared function is `dispatchToAgent`: A adds `markReactionExclusion` immediately before `deliverAgentResult` (`:1481`) and stamps `meetingExclusionTs` in the conference meta block (`:1373-1385`); B1 wraps the turn await at `:1400` and adds module-scope helpers. **The two edits are in different statements and do not overlap** — the rebase is mechanical — but merging A first keeps the diff review honest.
+**Sequencing.** A lands first, per the epic design's own note. The shared function is `dispatchToAgent`: A adds `markReactionExclusion` immediately before `deliverAgentResult` (`:1481`) and stamps `meetingExclusionTs` in the conference meta block (`:1373-1382` — the same range KPR-416's own spec cites; verified against this tree, the block opens at `meta: {` on `:1373` and closes on `:1382`); B1 wraps the turn await at `:1400` and adds module-scope helpers. **The two edits are in different statements and do not overlap** — the rebase is mechanical — but merging A first keeps the diff review honest.
 
-**Behavioral dependency (the reason Linear blocks B1 on A).** A's chosen write predicate is **branch position** (`!isNonResponse`), so a suppressed round-0 turn writes no exclusion and the agent remains round-1-eligible. §6.4's ruling on the fourth failure path rests on that: the orphaned ack is frequently followed by a real round-1 reaction from the same agent, not by permanent silence. **If A's predicate is ever changed to "genuinely non-empty non-errored content," §6.4 must be re-derived** — under that predicate a suppressed agent's status is unchanged from today only in the errored case, and the orphan reasoning shifts. T11's companion assertion is the tripwire.
+**Behavioral dependency (the reason Linear blocks B1 on A) — it is on A's *relocation*, not on A's *predicate*.** What §6.4's ruling actually consumes is that A moved the reaction-exclusion write from **selection time** to **delivery time**. At delivery time a suppressed round-0 turn takes the `isNonResponse` branch and writes no exclusion, so the acked-then-suppressed agent stays round-1-eligible.
+
+That property is **invariant across both write predicates A considered.** Under branch position (`!isNonResponse`) and under the narrower "genuinely non-empty non-errored content," a suppressed turn writes nothing either way — it is in the `isNonResponse` branch by definition, and it has no real content to satisfy the narrower test. §6.4 ground 2 therefore holds identically under either. (If anything the narrower predicate is *more* favourable: it would also leave **errored** turns unexcluded, making orphaned acks less permanent, not more.) So a predicate change is **not** a tripwire for this spec, and §6.4 does not need re-deriving on one.
+
+**What would break §6.4 is a revert of the relocation** — moving the write back to selection time, where every agent selected for round 0 is excluded from round 1 regardless of how its turn ended. Under that shape the acked-and-suppressed agent is permanently silent by construction and ground 2 evaporates entirely. T11's companion assertion is the tripwire for exactly that revert, and is stated that way in §9.
 
 **No conflict in the other direction:** A's tracker and meta key are read by nothing this child adds, and B1's ack is engine chrome that never delivers agent text, so it can never mark reaction-exclusion under A's rule ("handed text to delivery" — the ack is delivered by `deliverMeetingAck`, which is not a turn result and touches neither of A's three write sites).
 
@@ -377,4 +427,4 @@ KPR-415 is a pre-register epic with no register section yet; recorded here per t
 - **New:** *an ack is never retracted* — no delete, no edit, no follow-up, no reaction marker. The wording is a statement of state, not a promise of a reply, and that is what makes the rule liveable.
 - **Preserves KPR-389 §D5 (goal 5)** in full — the round-0 gate is the mechanism, and T3 is its guard.
 - **Preserves KPR-413** — continuation legs stay conference-stripped and gain no ack behavior.
-- **Depends on KPR-416's branch-position predicate** for §6.4's reasoning (§11).
+- **Depends on KPR-416's *relocation* of the reaction-exclusion write to delivery time** — not on which write predicate A chose — for §6.4's reasoning (§11).
