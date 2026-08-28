@@ -198,6 +198,12 @@ export class SlackAdapter implements ChannelAdapter {
   /**
    * Fetch thread replies for context injection into conference channel agents.
    * Returns messages formatted with author names and timestamps.
+   *
+   * KPR-417: this is the CHANNEL-domain read and deliberately returns what
+   * Slack actually has, acks included. The MEETING-domain filter that hides
+   * engine-authored acknowledgments from the five history consumers lives in
+   * `Dispatcher.fetchMeetingHistory` — every meeting-side read must go through
+   * that wrapper, never straight to this method.
    */
   async fetchThreadHistory(channelId: string, threadTs: string): Promise<ThreadMessage[]> {
     try {

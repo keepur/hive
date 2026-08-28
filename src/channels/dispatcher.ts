@@ -58,6 +58,73 @@ const NON_RESPONSE_PATTERNS = [
   /^n\/a\.?$/i,
 ];
 
+/**
+ * KPR-417: the exact sentence the delay-then-ack posts (spec §5.3), and the
+ * pattern that recognizes it back off the thread transcript.
+ *
+ * ⚠ THE TWO MUST CHANGE IN LOCKSTEP, exactly as NON_RESPONSE_PATTERNS pins
+ * "No response needed." Exported (unlike NON_RESPONSE_PATTERNS, which is
+ * module-private and which the suite deliberately mirrors by hand at
+ * dispatcher-conference.test.ts:556 / dispatcher.test.ts:283) because this
+ * constant sits on BOTH sides of a two-sided contract: T1 asserts these bytes
+ * were posted and T5 seeds a fixture message that these bytes must strip. A
+ * hand-mirrored copy would let T5 keep passing while the real posted text
+ * drifted away from it — the exact drift the strip exists to prevent.
+ *
+ * ⚠ WORDING IS LOAD-BEARING, NOT COSMETIC (spec §5.3). The ack must be true at
+ * every instant it can fire, including one that is easy to miss: the
+ * per-thread lock spin-waits BEFORE the breaker permit is acquired
+ * (agent-manager.ts), so an acked turn may be queued behind a sibling on the
+ * same `agentId:threadId` rather than generating anything. Any wording
+ * asserting work is happening RIGHT NOW ("looking into this", "working on
+ * it") is false in that window. "Picked this up" claims only assignment,
+ * which is true from selection through the lock wait, the breaker acquire and
+ * the model call alike. It is a statement of STATE, not a promise of a reply
+ * — which is what makes the "an ack is never retracted" rule (§6.4) liveable.
+ * A bare "On it." is equally honest but was rejected on collision surface: a
+ * whole agent reply of exactly "On it." is plausible in a conference thread,
+ * while the two-clause sentence is not.
+ *
+ * Verified byte-identical round-trip through markdownToMrkdwn
+ * (response-formatter.ts:5-22 — no header, bold, link, strikethrough or rule
+ * construct present), which the recognition pattern depends on.
+ */
+export const MEETING_ACK_TEXT = "On it — picked this up.";
+
+/** KPR-417: ~3x the observed fast band (2-5s), far below the ~130s case, and
+ *  far below both the round-1 clamp (REACTION_TIMEOUT_MS = 120_000) and any
+ *  turn deadline. Exported so tests advance the fake clock by exactly this
+ *  value rather than a hand-mirrored literal (spec §9). NOT configurable —
+ *  only `ackEnabled` ships (spec §5.6). Setting it to 0 behaves as an
+ *  immediate ack, which is the one-line rollback if the operator prefers the
+ *  literal "got it" she originally asked for. */
+export const MEETING_ACK_DELAY_MS = 15_000;
+
+/** SlackAdapter.deliver prefixes agent posts with `${icon} *${Name}*: `
+ *  (icon optional when the agent has none, absent entirely when the agent was
+ *  deleted mid-turn). Mirrors the author-extraction regex at
+ *  slack-adapter.ts:222, widened to make the icon optional. */
+const AGENT_PREFIX_RE = /^(?:\S+\s+)?\*[^*]+\*:\s*/;
+const MEETING_ACK_PATTERNS = [/^on it\s*—\s*picked this up\.?$/i];
+
+/**
+ * KPR-417: is this thread message an engine-authored ack? Anchored `^…$` on
+ * the whole body, so a real reply that merely BEGINS with the sentence is not
+ * stripped; `isBot` gates out any human typing it. Exported alongside
+ * MEETING_ACK_TEXT so the anchored-regex bound is unit-assertable without
+ * routing through a full dispatch.
+ *
+ * ⚠ Accepted residual (spec §5.4): an agent whose ENTIRE reply is exactly the
+ * ack sentence has that message stripped from meeting history. Bounded to one
+ * near-contentless message; the identical hazard already exists and is
+ * accepted repo-wide for NON_RESPONSE_PATTERNS; and the meeting preamble
+ * steers agents toward "No response needed.", not toward this sentence.
+ */
+export function isMeetingAck(m: ThreadMessage): boolean {
+  if (!m.isBot) return false;
+  return MEETING_ACK_PATTERNS.some((p) => p.test(m.text.replace(AGENT_PREFIX_RE, "").trim()));
+}
+
 /** KPR-388: max of raw Slack ts strings by numeric value; undefined when none present. */
 function maxSlackTs(candidates: Array<string | undefined>): string | undefined {
   let best: string | undefined;
@@ -1689,6 +1756,42 @@ export class Dispatcher {
     return { component: "dispatcher", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 
+  /**
+   * KPR-417: the ONLY meeting history fetch in this class. Acks are
+   * operational chrome, not meeting content — stripping here makes all five
+   * consumers ack-blind with NO per-consumer edits:
+   *   1. the full arm (formatThreadContext),
+   *   2. the delta arm (formatDeltaContext),
+   *   3. the meetingLastSeenTs high-water calc  — all three via buildConferenceContext,
+   *   4. the round-0 classifier's `history.slice(-5)` recency window,
+   *   5. the meeting scribe's noteActivity (novelty count + summary prompt).
+   *
+   * ⚠ DELIBERATELY NOT GATED ON `meetingAckEnabled`: flipping the lever off
+   * must not un-hide acks that are already sitting in a live thread (spec
+   * §5.5 / §10 — the rollback is clean at both ends). Pinned by the
+   * `ackEnabled: false` row of T5.
+   *
+   * ⚠ ANY NEW MEETING-HISTORY READ MUST COME THROUGH HERE. A direct
+   * slackAdapter call would silently re-expose acks to that consumer. Pinned
+   * structurally by T13(a).
+   *
+   * The strip lives here rather than in SlackAdapter because "is this an ack"
+   * is a MEETING-domain fact; the channel-domain adapter should keep returning
+   * what Slack actually has (an agent reading the channel with its own `slack`
+   * MCP tools sees the acks verbatim, and that is expected — spec §8).
+   *
+   * Exact factoring, not a behavior change for non-ack messages: both former
+   * call sites computed this identical channelId/threadTs pair, and the
+   * no-slackAdapter branch returns [] exactly as the old `let history = []`
+   * initialization did.
+   */
+  private async fetchMeetingHistory(item: WorkItem, threadId: string): Promise<ThreadMessage[]> {
+    if (!this.slackAdapter) return [];
+    const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId;
+    const history = await this.slackAdapter.fetchThreadHistory(item.source.id, threadTs);
+    return history.filter((m) => !isMeetingAck(m));
+  }
+
   private async resolveConferenceAgents(item: WorkItem): Promise<ResolvedAgent[]> {
     const threadId = item.threadId ?? item.id;
 
@@ -1728,18 +1831,15 @@ export class Dispatcher {
 
     // Fetch thread history once per trigger — per-agent injection contexts
     // (full vs delta, KPR-388) are derived from it after classification.
-    let history: ThreadMessage[] = [];
-    let recentMessages = "";
-    if (this.slackAdapter) {
-      const channelId = item.source.id;
-      const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId;
-      history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
-      // Last 5 messages for classifier recency context
-      recentMessages = history
-        .slice(-5)
-        .map((m) => `${m.author}: ${m.text.slice(0, 200)}`)
-        .join("\n");
-    }
+    // KPR-417: via fetchMeetingHistory, which strips engine-authored acks.
+    // Behaviorally identical for non-ack messages, including the
+    // no-slackAdapter case ([] history ⇒ "" recentMessages, as before).
+    const history = await this.fetchMeetingHistory(item, threadId);
+    // Last 5 messages for classifier recency context
+    const recentMessages = history
+      .slice(-5)
+      .map((m) => `${m.author}: ${m.text.slice(0, 200)}`)
+      .join("\n");
 
     // KPR-409 (R1 — requested C26 relaxation): round-level cadence trigger.
     // Fires once per round-0 pass INCLUDING passes where the classifier
@@ -2090,14 +2190,14 @@ Meeting rules:
 
     // Re-fetch thread history (now includes the round-0 response); per-reactor
     // injection contexts (full vs delta, KPR-388) are derived from it below.
-    let history: ThreadMessage[] = [];
+    // KPR-417: via fetchMeetingHistory, which strips engine-authored acks —
+    // including any ack this very trigger's round-0 responders posted.
+    const history = await this.fetchMeetingHistory(originalItem, threadId);
     const allRosterMembers: RosterMember[] = [];
     let preamble = "";
+    // The guard stays: it also gates allRosterMembers and the preamble, whose
+    // "no slack adapter ⇒ empty roster, empty preamble" behavior is unchanged.
     if (this.slackAdapter) {
-      const channelId = originalItem.source.id;
-      const threadTs =
-        (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId;
-      history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
       for (const agentId of roster) {
         const agent = this.registry.get(agentId);
         if (!agent || agent.disabled) continue;

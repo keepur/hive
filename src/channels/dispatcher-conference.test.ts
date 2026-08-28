@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Dispatcher } from "./dispatcher.js";
+import { Dispatcher, MEETING_ACK_TEXT, isMeetingAck } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { OutageEpisodeTracker } from "../outage/outage-notices.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
@@ -727,6 +727,147 @@ Meeting rules:
     const quoted = [...preamble.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(quoted.length).toBeGreaterThan(0);
     expect(quoted.some((p) => NON_RESPONSE_PATTERNS.some((rx) => rx.test(p!.trim())))).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // KPR-417 — the ack is invisible to every engine-internal history consumer
+  // -------------------------------------------------------------------------
+  describe("meeting-ack recognition and the single strip point (KPR-417)", () => {
+    // The fixture. THREE messages, of which exactly ONE is ack-shaped and TWO
+    // are not — the vacuous-pass guard (kpr-387-spec.md:155): every
+    // sub-assertion below asserts the PEER REPLY *is* present as well as that
+    // the ack is absent, so "everything got filtered" cannot masquerade as
+    // "acks got filtered".
+    //
+    // The ack's ts is the STRICTLY HIGHEST in the fixture and strictly above
+    // the trigger ts — that is what makes the mark sub-assertion (3) real: if
+    // the ack survived, it would win maxSlackTs and the mark would be
+    // "1000.0009". The prefix on the ack text is the real
+    // SlackAdapter.deliver shape (`${icon} *${Name}*: `), which also exercises
+    // AGENT_PREFIX_RE.
+    const ACK_TS = "1000.0009";
+    const TRIGGER_TS = "1000.0003";
+    const PEER_TEXT = "The migration is blocked on the schema review.";
+    const ackFixture = () =>
+      makeHistory([
+        { author: "May", text: "kickoff notes", ts: "1000.0001", minAgo: 30 },
+        { author: "River", text: `🤖 *River*: ${PEER_TEXT}`, ts: "1000.0002", minAgo: 10, isBot: true },
+        { author: "Jasper", text: `🤖 *Jasper*: ${MEETING_ACK_TEXT}`, ts: ACK_TS, minAgo: 1, isBot: true },
+      ]);
+
+    /** Fake scribe whose getSummary resolves undefined, so the FULL arm is
+     *  preserved (a summary would flip injectionMode to "summary"). Mirrors
+     *  the in-file seedScribe precedent at :1403. */
+    const seedAckScribe = () => {
+      const scribe = { getSummary: vi.fn().mockResolvedValue(undefined), noteActivity: vi.fn() };
+      dispatcher.setMeetingScribe(scribe as any);
+      return scribe;
+    };
+
+    it.each([
+      ["with the lever ON", true],
+      ["with the lever OFF (T6: the strip is NOT gated on ackEnabled)", false],
+    ])(
+      "T5 (KPR-417): an ack-shaped message is stripped from the full arm, the mark, the classifier window and the scribe — %s",
+      async (_label, lever) => {
+        // T6 is folded in as the second row rather than duplicated (spec §9
+        // sanctions this). The `false` row is the load-bearing one for §5.5's
+        // ruling: flipping the lever off must NOT un-hide acks already in a
+        // live thread. If a future edit gates fetchMeetingHistory's filter on
+        // meetingAckEnabled, this row fails and the ON row still passes.
+        dispatcher.setMeetingAckEnabled(lever);
+        await soloClassifier();
+        const scribe = seedAckScribe();
+        const threadId = `conf-thread-kpr417-t5-${lever}`;
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ackFixture());
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, where are we?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr417-t5" },
+            threadId,
+            meta: { slackTs: TRIGGER_TS },
+          }),
+        );
+
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+        const round0Item = agentManager.runWorkItemTurn.mock.calls[0][1];
+
+        // (1) FULL ARM — the injected threadContext carries the peer reply and
+        //     not the ack.
+        expect(round0Item.meta.conferenceInjectionMode).toBe("full");
+        expect(round0Item.text).toContain(PEER_TEXT); // vacuous-pass guard
+        expect(round0Item.text).not.toContain(MEETING_ACK_TEXT);
+
+        // (3) MARK — the high-water calc never saw the ack, so it lands on the
+        //     trigger ts, NOT the ack's (which is numerically higher).
+        expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, TRIGGER_TS);
+        expect(agentManager._sessionStore.setMeetingMark).not.toHaveBeenCalledWith("jasper", threadId, ACK_TS);
+
+        // (4) CLASSIFIER RECENCY WINDOW — third arg to classifyMeetingMessage.
+        const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+        const recent = (classifyMeetingMessage as any).mock.calls[0][2] as string;
+        expect(recent).toContain(PEER_TEXT); // vacuous-pass guard
+        expect(recent).not.toContain(MEETING_ACK_TEXT);
+
+        // (5) SCRIBE — noteActivity's history carries no ack-shaped entry.
+        expect(scribe.noteActivity).toHaveBeenCalledTimes(1);
+        const scribeHistory = scribe.noteActivity.mock.calls[0][0].history as Array<{ text: string; ts: string }>;
+        expect(scribeHistory.map((m) => m.ts)).toEqual(["1000.0001", "1000.0002"]); // vacuous-pass guard
+        expect(scribeHistory.some((m) => m.text.includes(MEETING_ACK_TEXT))).toBe(false);
+      },
+    );
+
+    it("T5 (KPR-417) — sub-assertion (2): the DELTA arm also omits the ack", async () => {
+      // Separate `it` because seeding a resumable ref flips injectionMode to
+      // "delta", which is mutually exclusive with the full arm above. Mark is
+      // seeded BELOW the peer reply's ts so both the peer and the ack are
+      // inside the strictly-greater delta window pre-fix.
+      dispatcher.setMeetingAckEnabled(true);
+      await soloClassifier();
+      seedAckScribe();
+      const threadId = "conf-thread-kpr417-t5-delta";
+      seedRef("jasper", threadId, { sessionId: "sess-1", provider: "claude", meetingLastSeenTs: "1000.0001" });
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ackFixture());
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, where are we?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-kpr417-t5" },
+          threadId,
+          meta: { slackTs: TRIGGER_TS },
+        }),
+      );
+
+      const round0Item = agentManager.runWorkItemTurn.mock.calls[0][1];
+      expect(round0Item.meta.conferenceInjectionMode).toBe("delta");
+      expect(round0Item.text).toContain("[New messages since your last turn:]");
+      expect(round0Item.text).toContain(PEER_TEXT); // vacuous-pass guard
+      expect(round0Item.text).not.toContain(MEETING_ACK_TEXT);
+      // The delta's own high-water never saw the ack either.
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, TRIGGER_TS);
+    });
+
+    it("T5 (KPR-417) — isMeetingAck is anchored: a reply that merely BEGINS with the sentence is NOT an ack", () => {
+      // Unit-level bound on the collision residual (spec §5.4). Exported
+      // alongside MEETING_ACK_TEXT precisely so this is assertable without
+      // routing through a dispatch.
+      const msg = (text: string, isBot = true) => ({
+        author: "Jasper",
+        text,
+        timestamp: new Date(),
+        isBot,
+        ts: "1",
+      });
+      expect(isMeetingAck(msg(MEETING_ACK_TEXT))).toBe(true);
+      expect(isMeetingAck(msg(`🤖 *Jasper*: ${MEETING_ACK_TEXT}`))).toBe(true);
+      expect(isMeetingAck(msg(`*Jasper*: ${MEETING_ACK_TEXT}`))).toBe(true); // agent with no icon
+      expect(isMeetingAck(msg(`  ${MEETING_ACK_TEXT}  `))).toBe(true); // trimmed
+      // Anchored: a real reply that starts with the sentence is real content.
+      expect(isMeetingAck(msg(`${MEETING_ACK_TEXT} Here is what I found.`))).toBe(false);
+      // isBot gates a human typing it.
+      expect(isMeetingAck(msg(MEETING_ACK_TEXT, false))).toBe(false);
+    });
   });
 
   it("T5 (KPR-416): the exclusion write precedes BOTH the fan-out delivery and the reaction trigger", () => {
