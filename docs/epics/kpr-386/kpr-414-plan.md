@@ -77,11 +77,13 @@
 ## Task 1: D1 + D2 — `src/index.ts`
 
 **Files:**
-- Modify: `src/index.ts:399-406` (D2, boundary marker — inserted, `:399-406` itself untouched)
-- Modify: `src/index.ts:414` (D1, insertion point for the moved block)
-- Modify: `src/index.ts:748-792` (D1, the block being split and moved)
+- Modify: `src/index.ts:399-406` (KPR-394's original comment — left untouched, D2 does not edit this)
+- Modify: `src/index.ts:414` (insertion point for the moved wiring block AND, immediately after it, the D2 boundary marker)
+- Modify: `src/index.ts:748-792` (D1, the block being split and moved out of)
 
-- [ ] **Step 1 (D2):** Insert the boundary marker comment immediately after the `Dispatcher` construction closes, before the background-task-manager block begins.
+⚠ **Step order matters and differs from an earlier draft of this plan.** The spec's D2 (`kpr-414-spec.md:157`) places the boundary marker **immediately above the background-task-manager block**, i.e. AFTER the moved wiring, not before it — empirically confirmed: a draft that inserted the marker first (with the wiring below it) reads as self-contradicting, since the marker's own text says "must be wired ABOVE it" while the wiring sits directly below. Step 1 below inserts the wiring block only; Step 2 adds the marker at its correct site, immediately before `// Background task manager`.
+
+- [ ] **Step 1 (D1, wiring):** Insert the moved pool/scribe wiring block immediately after the `Dispatcher` construction closes.
 
 Current text (`index.ts:406-417`, unchanged context shown for the insertion point):
 
@@ -100,7 +102,7 @@ Current text (`index.ts:406-417`, unchanged context shown for the insertion poin
   const bgTaskManager = new BackgroundTaskManager(
 ```
 
-Insert the D2 marker (and the D1 block from Step 2 below) between the `Dispatcher` construction's closing `);` and the `// Background task manager` comment:
+Insert the D1 wiring block between the `Dispatcher` construction's closing `);` and the `// Background task manager` comment (the D2 marker goes in AFTER this, in Step 2 — inserting both at once here would put the marker above the wiring it's supposed to sit below):
 
 ```ts
   await agentManager.activateProviderPlugins();
@@ -112,14 +114,6 @@ Insert the D2 marker (and the D1 block from Step 2 below) between the `Dispatche
     config.defaultAgent,
     taskLedger.isConfigured ? taskLedger : undefined,
   );
-
-  // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
-  // Everything BELOW this line can dispatch a turn: bgTaskManager /
-  // codeTaskManager orphan-completion callbacks, meetingMonitor, every
-  // channel adapter, the scheduler. Anything a turn READS PER SPAWN —
-  // provider plugins, the worker pool, the meeting scribe — must be wired
-  // ABOVE it, or turns in the boot window silently see the pre-feature
-  // engine. Guarded by src/boot-order.test.ts.
 
   // KPR-390: meeting worker pool — constructed after the dispatcher
   // (scheduler-seam precedent, breaks the manager↔dispatcher cycle).
@@ -171,11 +165,25 @@ Insert the D2 marker (and the D1 block from Step 2 below) between the `Dispatche
     scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
   });
 
+  // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
+  // Everything BELOW this line can dispatch a turn: bgTaskManager /
+  // codeTaskManager orphan-completion callbacks, meetingMonitor, every
+  // channel adapter, the scheduler. Anything a turn READS PER SPAWN —
+  // provider plugins, the worker pool, the meeting scribe — must be wired
+  // ABOVE it, or turns in the boot window silently see the pre-feature
+  // engine. Guarded by src/boot-order.test.ts.
+
   // Background task manager — agents can spawn detached background processes
   const bgTaskManager = new BackgroundTaskManager(
 ```
 
-- [ ] **Step 2 (D1):** Remove the pool/scribe block from its old site, replacing it with only the retained `workerPool.start()` call (now carrying a rationale comment) and the "Meeting worker pool started" log — the construction/wiring/`setMeetingScribe`/scribe-log statements moved to Step 1 are deleted from here, not duplicated.
+Note: this single edit contains both Step 1's wiring block AND Step 2's marker comment, already in their final relative order (wiring, then marker, then bgTaskManager) — Steps 1 and 2 are described separately below only to name each piece's origin (D1 vs D2) per the spec's own itemization; apply them as one edit as shown.
+
+- [ ] **Step 2 (D2, marker — same edit as Step 1, described separately per the spec's D1/D2 split):** The `// ── Spawn-capable boundary ──` block above is D2's contribution; it is already correctly placed immediately above `// Background task manager` by the Step 1 edit. No separate action needed here beyond confirming that placement — do not insert it a second time.
+
+⚠ **A2 (advisory, worth knowing, not actioned):** immediately after Step 1's edit and before Step 3 removes the old site, the file has two declarations each of `const workerPool` and `const meetingScribe` and will not compile. This is expected and harmless — `npm run typecheck` is Step 4, run only after Step 3 also completes. Do not run an incremental typecheck between Steps 1 and 3 and treat a duplicate-declaration error as a problem.
+
+- [ ] **Step 3 (D1, removal):** Remove the pool/scribe block from its old site, replacing it with only the retained `workerPool.start()` call (now carrying a rationale comment) and the "Meeting worker pool started" log — the construction/wiring/`setMeetingScribe`/scribe-log statements moved to Step 1 are deleted from here, not duplicated.
 
 Current text (`index.ts:748-792`):
 
@@ -252,12 +260,12 @@ Replace with (the pool/scribe construction, `setWorkerPool`, `ensureIndexes`, `s
   });
 ```
 
-- [ ] **Step 3:** Verify the file still typechecks.
+- [ ] **Step 4:** Verify the file still typechecks and is formatted.
 
-Run: `npm run typecheck`
-Expected: no errors. (Both `workerPool` and `meetingScribe` are declared with `const` at their new site and referenced later in the file — e.g. `workerPool.stop()`/`meetingScribe.stop()` in the shutdown handler around `:916-917` — TypeScript's block-scoping means these references now resolve to the earlier declaration; there is no forward-reference issue since the whole file is one function body executed top-to-bottom.)
+Run: `npm run typecheck && npx prettier --check src/index.ts`
+Expected: no errors. (Both `workerPool` and `meetingScribe` are declared with `const` at their new site and referenced later in the file — e.g. `workerPool.stop()`/`meetingScribe.stop()` in the shutdown handler around `:916-917` — TypeScript's block-scoping means these references now resolve to the earlier declaration; there is no forward-reference issue since the whole file is one function body executed top-to-bottom.) If prettier reports drift, `npx prettier --write src/index.ts` and re-check.
 
-- [ ] **Step 4:** Commit.
+- [ ] **Step 5:** Commit.
 
 ```bash
 git add src/index.ts
@@ -671,6 +679,8 @@ Expected: same pass count as before this step (pure fidelity fix, no new tests y
 
 - [ ] **Step 4: T4 — a turn whose handle is minted after `stop()` is never started (checkpoint 3).** This is the row that pins the blocker fix. Do not write it as "assert `abort` was called" — that assertion is exactly what would let an inert `abort()`-based checkpoint 3 pass review; it must assert the turn never ran.
 
+Spec T4's assertion (1) requires routing the turn body through a dedicated `vi.fn()` probe — a plan-review round flagged an earlier draft's reliance on inferring "never started" from assertions (2)/(3) alone as not actually implementing the spec's stated mechanism. `makeFakePool()` already exposes `setImpl()` for exactly this.
+
 ```ts
   it("T4 (KPR-414): a handle minted after stop()'s sweep is never started, and the mechanism is a throw, not an inert abort (checkpoint 3)", async () => {
     const f = makeScribe();
@@ -684,10 +694,17 @@ Expected: same pass count as before this step (pure fidelity fix, no new tests y
       updatedAt: new Date(BASE_EPOCH - 300_000),
     });
 
+    // Route the turn body through a dedicated probe — this mock IS the
+    // "did the turn start?" probe, standing in for adapter.runTurn(), which
+    // in the real pool is the statement immediately after onAbortHandle.
+    const implProbe = vi.fn(async () => ({ text: DEFAULT_SUMMARY, costUsd: 0.002, durationMs: 400 }));
+    f.pool.setImpl(implProbe);
+
     // f.summaries.updateOne is a plain method, not vi.fn-backed (unlike
     // findOne) — delegate-patch it, mirroring the f.claims.find swap at
     // meeting-worker-pool.test.ts:679-682, so its FIRST call (the checkpoint-2
-    // `updating` write) triggers stop() before returning.
+    // `updating` write) triggers stop() before returning, landing stop()
+    // strictly between checkpoint 2 and checkpoint 3.
     const realUpdateOne = f.summaries.updateOne.bind(f.summaries);
     let armed = true;
     f.summaries.updateOne = (async (...callArgs: [any, any, any?]) => {
@@ -701,19 +718,30 @@ Expected: same pass count as before this step (pure fidelity fix, no new tests y
     f.scribe.noteActivity(makeArgs());
     await flush();
 
-    // (1) the outcome is contained, not an escaped rejection, and (3) it
-    // carries the specific SCRIBE_STOPPED_ERROR marker — proving the
-    // mechanism is checkpoint 3's throw, not some other failure or a
-    // silently-inert abort() call.
-    expect(f.pool.runRoleTurn).toHaveBeenCalledTimes(1);
-    const outcome = await f.pool.runRoleTurn.mock.results[0].value;
-    expect(outcome.error).toContain(SCRIBE_STOPPED_ERROR);
+    // (1) the impl probe was NEVER called — the turn was never started. Not
+    // sufficient alone (a fully-gated noteActivity would make this trivially
+    // true with zero calls at all) — see (3), the anti-vacuity guard.
+    expect(implProbe).not.toHaveBeenCalled();
 
     // (2) the prior summary survives untouched (the updating stub/clear
-    // cycle is excluded by summarySnapshot's projection).
+    // cycle is excluded by summarySnapshot's projection) — proving the run
+    // left no trace beyond the expected stub/clear cycle run()'s finally
+    // already performs on every path.
     expect(summarySnapshot(f.summaries)).toEqual([
       { _id: THREAD, summaryText: "PRIOR", coveredThroughTs: "0", version: 1 },
     ]);
+
+    // (3) THE ANTI-VACUITY GUARD. Dereferencing mock.results[0] on zero calls
+    // throws, so this alone closes the "gated out entirely" hole (1) leaves
+    // open (empirically confirmed: forcing noteActivity to return
+    // immediately makes this assertion — specifically the toHaveBeenCalledTimes(1)
+    // check — fail, rather than letting (1)/(4) pass vacuously). The outcome
+    // is contained, not an escaped rejection, and carries the specific
+    // SCRIBE_STOPPED_ERROR marker — proving the mechanism is checkpoint 3's
+    // throw, not some other failure or a silently-inert abort() call.
+    expect(f.pool.runRoleTurn).toHaveBeenCalledTimes(1);
+    const outcome = await f.pool.runRoleTurn.mock.results[0].value;
+    expect(outcome.error).toContain(SCRIBE_STOPPED_ERROR);
 
     // (4) no handle was ever registered in the scribe's OWN abortHandles map.
     // f.pool.abortByThread is a test-fixture tracking map the fake sets
@@ -731,17 +759,62 @@ Expected: same pass count as before this step (pure fidelity fix, no new tests y
   });
 ```
 
-Note: `f.pool.runRoleTurn`'s fake resolves via Step 1's try/catch wrapper — since the callback throws synchronously inside that try, `runRoleTurn` itself is still "called" (assertion count 1) but its returned outcome is the caught error, never a real turn result. Do not assert `not.toHaveBeenCalled()` on `runRoleTurn` itself — the attempt happens; what must never happen is the turn BODY completing, which assertions (2), (3), and (4) together establish.
+**Sibling test — T4 containment cross-check (spec's "Testing" T4 final bullet).** The spec separately requires confirming `noteActivity` did not reject and the scribe's shared lifecycle `finally` released its maps on this path too — `inFlight`/`abortHandles` are private, so "maps are empty" isn't directly assertable from outside, and reusing the same scribe instance after it has already called `stop()` doesn't work either (gate 0 blocks everything unconditionally once latched, so a same-instance recheck can't distinguish "maps released" from "gate 0 blocked it" — confirmed empirically: an earlier draft's same-instance recheck asserted a second call went through, which is false once `stop()` has latched). The genuinely testable proxy is the pool suite's own precedent for the identical class of claim (`meeting-worker-pool.test.ts` "review r1" row) — an `unhandledRejection` listener around the fresh instance's run:
 
-**Negative-verify (two variants, both empirically confirmed to fail this row; run against the live worktree before trusting either):**
-1. Replace checkpoint 3's `throw new Error(SCRIBE_STOPPED_ERROR)` with the inert design `if (this.stopped) { abort(); return; }` → confirmed failure: assertion (3) fails with `expected [Function Mock] to be undefined` — wait, actually the observed failure is on `outcome.error` no longer being defined at all (`toContain` on `undefined` throws "invalid combination of arguments"), since the turn body ran to completion and returned the default summary outcome, not an error-shaped one.
-2. Remove checkpoint 3 entirely (the `if (this.stopped) ...` line, keeping only `this.abortHandles.set(threadId, abort);`) → confirmed identical failure mode to variant 1 (same assertion, same error).
+```ts
+  it("T4 containment cross-check (KPR-414): checkpoint 3's throw never escapes as an unhandled rejection", async () => {
+    // `noteActivity`'s detached chain is `void this.run(args).catch(...).finally(...)`
+    // (meeting-scribe.ts) — the `.catch()` is what must contain checkpoint
+    // 3's throw. Mirrors the pool suite's own precedent for the same class
+    // of claim (meeting-worker-pool.test.ts "review r1" row).
+    const f = makeScribe();
+    f.summaries.docs.push({
+      _id: THREAD,
+      summaryText: "PRIOR",
+      coveredThroughTs: "0",
+      version: 1,
+      updatedAt: new Date(BASE_EPOCH - 300_000),
+    });
+    const realUpdateOne = f.summaries.updateOne.bind(f.summaries);
+    let armed = true;
+    f.summaries.updateOne = (async (...callArgs: [any, any, any?]) => {
+      if (armed) {
+        armed = false;
+        f.scribe.stop();
+      }
+      return realUpdateOne(...callArgs);
+    }) as any;
+
+    const rejections: unknown[] = [];
+    const handler = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", handler);
+    try {
+      f.scribe.noteActivity(makeArgs());
+      await flush();
+      await new Promise((r) => setTimeout(r, 20)); // let a late rejection surface before asserting
+    } finally {
+      process.off("unhandledRejection", handler);
+    }
+    expect(rejections).toEqual([]);
+  });
+```
+
+Note: `f.pool.runRoleTurn`'s fake resolves via Step 1's try/catch wrapper — since the callback throws synchronously inside that try, `runRoleTurn` itself is still "called" (assertion count 1) but its returned outcome is the caught error, never a real turn result. Do not assert `not.toHaveBeenCalled()` on `runRoleTurn` itself — the attempt happens; what must never happen is the turn BODY completing, which assertions (1)/(2)/(3)/(4) together establish.
+
+**Negative-verify (three variants, all empirically confirmed against the live worktree before trusting any):**
+1. Replace checkpoint 3's `throw new Error(SCRIBE_STOPPED_ERROR)` with the inert design `if (this.stopped) { abort(); return; }` → confirmed failure on assertion (1): `implProbe` runs to completion, because the inert `abort()` cannot prevent the turn.
+2. Remove checkpoint 3 entirely (the `if (this.stopped) ...` line, keeping only `this.abortHandles.set(threadId, abort);`) → confirmed identical failure mode to variant 1 (assertion (1) fails the same way).
+3. Gate `noteActivity` out entirely (e.g. an unconditional early `return;` at the top, simulating checkpoint 1 always firing) → confirmed assertions (1)/(4) pass vacuously (zero calls), but assertion (3)'s `expect(f.pool.runRoleTurn).toHaveBeenCalledTimes(1)` fails — confirming (3) is load-bearing, not decorative, and no variant (inert or vacuous) can turn this row green.
 
 Restore checkpoint 3 to its Task 3 Step 4 form before proceeding.
 
 - [ ] **Step 5: T5 — the restart sweep spares a live claim (D3), in `meeting-worker-pool.test.ts`.**
 
-Uses the pool test file's own `makeFixture()`/`seedClaim()`/`dispatchReq()`/`vi.waitFor` idiom (`:96-203`) and the existing restart-sweep test (`:630`, T6) as a model. `makeFixture()` already calls `pool.bindManager(hooks)`, so `dispatch()` works without `start()` — this is exactly the pre-sweep dispatch window D3 exists for. `runWorkerTurn` (`meeting-worker-pool.ts:497-498`) calls `this.liveWorkers.set(claimId, ...)` synchronously, one line before it awaits the (here, never-resolving) `adapter.runTurn(...)` — so `buildWorkerAdapter` having been called is the correct, verified signal that `liveWorkers` is populated. Add a new row:
+Uses the pool test file's own `makeFixture()`/`seedClaim()`/`dispatchReq()`/`vi.waitFor` idiom (`:96-203`) and the existing restart-sweep test (`:630`, T6) as a model. `makeFixture()` already calls `pool.bindManager(hooks)`, so `dispatch()` works without `start()` — this is exactly the pre-sweep dispatch window D3 exists for. `runWorkerTurn` (`meeting-worker-pool.ts:497-498`) calls `this.liveWorkers.set(claimId, ...)` synchronously, one line before it awaits the (here, never-resolving) `adapter.runTurn(...)` — so `buildWorkerAdapter` having been called is the correct, verified signal that `liveWorkers` is populated.
+
+⚠ **Place this row in the same describe as T6** — `MeetingWorkerPool — spawn, completion, re-entry (Task E)` (`:446-690`), right beside T6 (`:630`) and the `review r1` row (`:650`), NOT in the file's third describe (`— watchdog interval (fake timers)`, `:690+`), which runs `vi.useFakeTimers()` in its own `beforeEach` and would change `vi.waitFor`'s semantics and the watchdog interval this row's `stop()` call relies on clearing. (A plan-review round correctly flagged the describe choice as unstated and the fake-timers risk as real, but misnamed the target as "claim ledger + gates (Task D)" — confirmed by reading the file directly: T6 and the row this test sits beside are both inside Task E, not Task D. Task E, beside T6, is correct.)
+
+Add a new row:
 
 ```ts
   it("T5 (KPR-414): sweepOnRestart spares a claim this process is actively running", async () => {
@@ -762,6 +835,7 @@ Uses the pool test file's own `makeFixture()`/`seedClaim()`/`dispatchReq()`/`vi.
     // unrelated to (and would mask) the sweepOnRestart guard under test.
     expect(f.claims.docs.find((d) => d._id.toString() === live._id.toString())!.status).toBe("running");
     expect(f.abortSpy).not.toHaveBeenCalled(); // the live worker was never aborted BY THE SWEEP
+    expect(f.onDispatch).toHaveBeenCalledTimes(1); // the orphan's re-entry only — the live claim fires none
 
     // The true orphan is still expired with the normal notice.
     const orphanAfter = f.claims.docs.find((d) => d._id.toString() === orphan._id.toString())!;
@@ -774,9 +848,13 @@ Uses the pool test file's own `makeFixture()`/`seedClaim()`/`dispatchReq()`/`vi.
 
 ⚠ **Assertion ordering is load-bearing, empirically confirmed.** An earlier draft of this row called `f.pool.stop()` before asserting `f.abortSpy`, and that assertion failed — `stop()` itself unconditionally aborts every remaining live worker (`meeting-worker-pool.ts:238-244`, normal shutdown behavior, unrelated to D3). Assert the "never aborted by the sweep" claim strictly before calling `stop()`, or the assertion tests the wrong thing.
 
+The `onDispatch` count directly pins the spec's "fires no re-entry" clause for the live claim (spec T5) — without it, "no re-entry from the live claim" was only implied by the status assertion, not directly checked.
+
 **Negative-verify (empirically confirmed):** temporarily remove the D3 guard (Task 2 Step 1, `if (this.liveWorkers.has(claim._id.toString())) continue;`) → confirmed failure: `expect(...).toBe("running")` on the live claim's status fails with `expected 'expired' to be 'running'` — the sweep expired it exactly as the guard exists to prevent.
 
 - [ ] **Step 6: T1 — boot-order guard, `src/boot-order.test.ts` (new file).**
+
+Spec T1 bullet 4 requires this file to document, in-comment, that the named anchor set is partial and what covers the residual — a plan-review round confirmed this was missing from an earlier draft. It is included below.
 
 ```typescript
 import { describe, it, expect } from "vitest";
@@ -788,6 +866,16 @@ import { fileURLToPath } from "node:url";
 // worker-pool/scribe wiring silently landed ~330 lines below it. This test
 // is a text-scan, not an import: index.ts is a side-effecting main() that
 // would boot the engine if imported directly.
+//
+// The named anchor set in (a)/(b) is an ANCHOR SET, not an exhaustive
+// inventory of every spawn-capable surface in the file. outageReplayProcessor
+// .start() (index.ts:~840) is a real spawn-capable surface deliberately not
+// named here — it sits below the wiring already, so naming it adds nothing
+// to the ordering bound. Coverage for surfaces NOT named here comes from (c)'s
+// superset sweep, which fails on any unallowlisted `.start(`/`.scanOrphans(`
+// occurring before the wiring, named or not. The one residual (c) does not
+// close: a spawn-capable surface that starts itself through some spelling
+// other than `.start(`/`.scanOrphans(` — accepted, not exhaustive.
 describe("boot order — spawn-capable boundary (KPR-414)", () => {
   const source = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf8");
   // Strip `//` line comments before scanning — the boundary marker comment
@@ -860,7 +948,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
 ```
 
 **Negative-verify (empirically confirmed — all three run against the live worktree during plan-writing):**
-1. Swap in the pre-fix `index.ts` wholesale (`git show HEAD:src/index.ts`, i.e. before Task 1's D1/D2) → confirmed all three tests (a)/(b)/(c) fail together: (a)/(b) because the wiring calls now sit after the surface calls, (c) with a 17-entry offender list (every spawn-capable surface in the file) — a strong signal this guard is genuinely discriminating pre-fix from post-fix state, not just checking for anchor presence.
+1. Swap in the pre-fix `index.ts` wholesale — ⚠ do NOT use `git show HEAD:src/index.ts` to fetch it: by the time this step runs, Tasks 1-3 are already committed, so `HEAD` points at the POST-fix file and this negative-verify would be vacuous (confirmed this exact mistake during plan-writing — using `HEAD` here silently passes all three assertions instead of failing them). Use the specific pre-KPR-414 commit instead: `git show 9a9e8ba:src/index.ts > /tmp/index-pre-fix.ts && cp /tmp/index-pre-fix.ts src/index.ts` (`9a9e8ba` is the "spec review r3 approved" commit — the epic-branch head this plan's lane was created from, before any KPR-414 code landed; confirm with `git log --oneline` if the branch has since diverged) → confirmed all three tests (a)/(b)/(c) fail together: (a)/(b) because the wiring calls now sit after the surface calls, (c) with a 17-entry offender list (every spawn-capable surface in the file) — a strong signal this guard is genuinely discriminating pre-fix from post-fix state, not just checking for anchor presence.
 2. Insert `fooAdapter.start();` immediately above `agentManager.activateProviderPlugins()` (before the wiring) → confirmed test (c) fails with exactly one offender containing `fooAdapter.start(`.
 
 Restore `index.ts` to its Task 1 (post-fix) state before proceeding — do not leave the pre-fix swap or the scratch insertion in place.
@@ -869,6 +957,11 @@ Restore `index.ts` to its Task 1 (post-fix) state before proceeding — do not l
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/boot-order.test.ts src/workers/meeting-worker-pool.test.ts src/workers/meeting-scribe.test.ts`
 Expected: all tests pass, including the existing rows in both worker-pool and scribe suites (no regressions) and all new T1-T5 rows.
+
+- [ ] **Step 7b:** Format check.
+
+Run: `npx prettier --check src/boot-order.test.ts src/workers/meeting-worker-pool.test.ts src/workers/meeting-scribe.test.ts`
+Expected: no drift. `printWidth` is 120 and `format:check` (part of `npm run check`) is non-fixing, so any drift here fails Task 5's gate later rather than just this one. If prettier reports issues (a few of T1's longer `expect(...)` failure-message lines are a likely spot), run `npx prettier --write` on the same file list and re-check.
 
 - [ ] **Step 8:** Commit.
 
@@ -888,14 +981,16 @@ including a required harness fidelity fix to makeFakePool() so its
 runRoleTurn mirrors the real one's try/catch containment. T4 is
 deliberately not written as "assert abort was called" — that
 assertion is exactly what let an inert checkpoint-3 design through an
-earlier review round; it asserts the turn never started and pins the
-throw-based mechanism via SCRIBE_STOPPED_ERROR, which cannot pass
-under either an inert-abort or a missing-checkpoint variant.
+earlier review round; it routes the turn body through a dedicated
+probe to assert it never started, and pins the throw-based mechanism
+via SCRIBE_STOPPED_ERROR, which cannot pass under an inert-abort, a
+missing-checkpoint, or a fully-gated-out variant. A sibling row proves
+the throw never escapes as an unhandled rejection.
 
 T5 (meeting-worker-pool.test.ts): the restart sweep spares a claim
-this process is actively running, and the full pre-fix residual
-(expired status, mid-flight abort, false re-entry reason) is asserted
-in the negative-verify pass.
+this process is actively running, fires no re-entry for it, and the
+full pre-fix residual (expired status, mid-flight abort, false
+re-entry reason) is asserted in the negative-verify pass.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
