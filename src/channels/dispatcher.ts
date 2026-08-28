@@ -828,7 +828,29 @@ export class Dispatcher {
     // acquires the flag after one queue round-trip. Everything else in meta
     // passes through unchanged (blocklist, not allowlist — channel keys
     // like slackThreadTs are load-bearing for routing and delivery).
-    const { outageReplay: _replayMarker, ...carriedMeta } = item.meta ?? {};
+    //
+    // KPR-413: conference keys are stripped alongside the replay marker. A
+    // continuation leg computed no injection and never re-enters conference
+    // resolution (targetAgentId routes it through resolveAgents step 0,
+    // which precedes the conf-* check at step 0.7), so inheriting
+    // conferenceMode/Round/HumanTs/InjectionMode would stamp a
+    // non-conference turn as a conference turn with an injection mode it
+    // never used — corrupting both C18 measurement surfaces
+    // (agent_turn_telemetry, activity_log). Same shape as C26's `worker:`
+    // re-entry: an engine-authored re-dispatch into a meeting thread is an
+    // ordinary turn. This deliberately reverses KPR-402's own stated
+    // rationale (kpr-402-spec.md:359-362) that conference keys are
+    // load-bearing for routing — verified false for this codebase: routing
+    // is targetAgentId, not any conference meta key. Still a blocklist, not
+    // an allowlist — channel keys stay.
+    const {
+      outageReplay: _replayMarker,
+      conferenceMode: _confMode,
+      conferenceRound: _confRound,
+      conferenceHumanTs: _confHumanTs,
+      conferenceInjectionMode: _confInjectionMode,
+      ...carriedMeta
+    } = item.meta ?? {};
     const baseId = deadlineBaseIdOf(item.id); // leg ids stay flat: x#dl3, never x#dl1#dl2#dl3 (⚠A11)
     const originalText =
       typeof item.meta?.deadlineOriginalText === "string" ? item.meta.deadlineOriginalText : item.text;
@@ -1333,6 +1355,18 @@ export class Dispatcher {
           `Do not re-answer the original question. If you have nothing to add, respond with "No response needed."`
         : `[New message]:\n${item.text}`;
       const contextPrefix = [resolved.meetingPreamble, resolved.threadContext, "---"].filter(Boolean).join("\n");
+      // KPR-413: the transcript belongs to the MEETING, not to this turn. A
+      // KPR-402 continuation leg re-wraps meta.deadlineOriginalText verbatim
+      // on every leg (up to MAX_DEADLINE_CONTINUATIONS), into a session that
+      // KPR-399 resume already loaded with the original composite — so
+      // letting the arm fall back to item.text (the assembled composite,
+      // preamble + full/delta/summary transcript + terminal slot) reproduces
+      // the N-copies bloat this epic exists to remove. Stamp the turn's OWN
+      // frame instead: preamble + terminal slot, no injection. Byte-shaped
+      // exactly like an empty-delta turn (C10), and it rides into the
+      // outage store so a replayed conference turn's later abort is honest
+      // too (single-dispatch leg).
+      const framePrefix = [resolved.meetingPreamble, "---"].filter(Boolean).join("\n");
       effectiveItem = {
         ...item,
         text: `${contextPrefix}\n${newMessageSegment}`,
@@ -1344,6 +1378,7 @@ export class Dispatcher {
           // KPR-389 D1: injection mode rides along so telemetry can segment
           // full vs delta turns (KPR-388 efficacy measurement).
           conferenceInjectionMode: resolved.injectionMode,
+          deadlineOriginalText: `${framePrefix}\n${newMessageSegment}`,
         },
       };
     }
