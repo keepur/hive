@@ -3323,6 +3323,40 @@ describe("AgentManager", () => {
         );
         expect(result.resumedSession).toBe(false);
       });
+
+      // --- KPR-412: the KPR-399 arm had no coverage in this block ----------
+      describe("false after the KPR-399 claude resume-rejection fresh retry (KPR-412)", () => {
+        const UNKNOWN_SESSION = "No conversation found with session ID: 0198c3f2-abcd-7890-b1c2-d3e4f5a6b7c8";
+        const DANGLING_TOOL_USE =
+          "400 invalid_request_error: messages.57: the following `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01AbCdEfGh";
+
+        it.each([
+          ["unknown-session", UNKNOWN_SESSION],
+          ["dangling tool_use 400", DANGLING_TOOL_USE],
+        ])("T1: resumedSession is false on %s (was true pre-fix — negative-verified)", async (_label, reason) => {
+          mockRunnerSend
+            .mockResolvedValueOnce(makeRunResult({ error: reason, sessionId: "" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "s-fresh" }));
+          const result = await manager.spawnTurn(
+            smsCtx({ threadId: "sms:line-1:kpr412-t1", sessionId: "s-dead", sessionProvider: "claude" }),
+          );
+          expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+          expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined(); // fresh retry — no sessionId (matches :3613's form)
+          expect(result.resumedSession).toBe(false);
+        });
+
+        it("T2: agent_turn_telemetry.resumedSession is false on the same path (C18 single-sourcing)", async () => {
+          mockRunnerSend
+            .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }))
+            .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "s-fresh" }));
+          await manager.spawnTurn(
+            smsCtx({ threadId: "sms:line-1:kpr412-t2", sessionId: "s-dead", sessionProvider: "claude" }),
+          );
+          expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+          const doc = turnTelemetryStore.record.mock.calls[0]![0];
+          expect(doc.resumedSession).toBe(false);
+        });
+      });
     });
 
     describe("stale-handle self-heal — gemini (KPR-352 §D3)", () => {
