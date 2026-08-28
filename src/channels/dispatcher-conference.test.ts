@@ -957,6 +957,64 @@ Meeting rules:
     expect(excludedFor(fastFailThread, "1700.0010")).toBeUndefined(); // notice, not agent text
   });
 
+  it("T9 (KPR-416): ⚠ ACCEPTED RESIDUAL — a peer whose round-0 turn has not landed IS invited as a round-1 reactor", async () => {
+    // This pins a KNOWN, DELIBERATELY DEFERRED gap, not desired behavior.
+    // Post-relocation there is no in-flight round-0 registry (the removed
+    // selection-time write was incidentally serving as one), so within the
+    // overlap window a peer that still owes a round-0 answer can also be
+    // invited to react. Deferred because: (1) agent-manager's per-thread lock
+    // `agentId:threadId` serializes the peer's round-1 turn behind its own
+    // round-0 turn, so it answers first and then reacts — an extra turn, not a
+    // duplicate answer, with round-1's "do not re-answer" framing holding the
+    // line; (2) the in-scope fix would need an await inside
+    // triggerConferenceReactions' claim-before-await loop, forfeiting KPR-387's
+    // actual guarantee, and a pending-set leak at any early return means
+    // PERMANENT exclusion — the original bug, worse.
+    //
+    // Spec: docs/epics/kpr-415/kpr-416-spec.md §6.4(d). The follow-on child
+    // filed against KPR-415 INVERTS this assertion — when it lands, this test
+    // is expected to change, and that is the signal, not a regression.
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    (classifyMeetingMessage as any)
+      .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river"], costUsd: 0.001, durationMs: 100 })
+      .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+
+    const threadId = "conf-thread-kpr416-t9";
+    let releaseRiver!: () => void;
+    const riverLanded = new Promise<void>((resolve) => {
+      releaseRiver = resolve;
+    });
+    agentManager.runWorkItemTurn.mockImplementation(async (agentId: string) => {
+      if (agentId === "river") {
+        await riverLanded; // river's round-0 turn has NOT landed when jasper reacts
+        return turn({ finalMessage: "River, eventually" });
+      }
+      return turn({ finalMessage: "Jasper answers immediately" });
+    });
+
+    const dispatched = dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, River, and Jessica, discuss the launch plan",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t9" },
+        threadId,
+        meta: { slackTs: "1700.0012" },
+      }),
+    );
+
+    // Jasper's reaction pass fires while river is still in flight.
+    const reactionCalls = () =>
+      (classifyMeetingMessage as any).mock.calls.filter((c: any[]) => c[0] === "Jasper answers immediately");
+    await vi.waitFor(() => expect(reactionCalls().length).toBeGreaterThanOrEqual(1));
+
+    const peerIds = reactionCalls()[0][1].map((m: any) => m.agentId);
+    expect(peerIds).toContain("river"); // ⚠ the residual: river owes an answer AND is invited
+    expect(peerIds).toContain("jessica"); // jessica never ran at all — expected
+
+    releaseRiver();
+    await dispatched;
+    await settleReactions();
+  });
+
   describe("round-1 kill suppression (KPR-389 D5)", () => {
     async function twoAgentClassifier() {
       const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
