@@ -1408,11 +1408,34 @@ export class Dispatcher {
       // KPR-387: round-1 reaction turns are framed against the peer reply — the
       // original human message is never re-presented in the terminal slot. It
       // remains reachable via session ∪ injected context (KPR-388 generalizes
-      // the old re-fetched-transcript guarantee): a round-1 reactor was never a
-      // round-0 responder for this trigger (C1/C2), so its mark predates the
-      // triggering message — the message is in its delta, or already in its
-      // session by the covering invariant. A reactor with no session/mark gets
-      // the full transcript directly.
+      // the old re-fetched-transcript guarantee).
+      //
+      // KPR-416 falsified the premise this comment used to state (KPR-386 canon
+      // C1, selection-time recording: "a round-1 reactor was never a round-0
+      // responder for this trigger, so its mark predates the triggering
+      // message"). A SUPPRESSED round-0 responder is now re-invitable, and the
+      // mark bookkeeping below runs outside the suppression branch, so its own
+      // round-0 turn already advanced the mark to >= the trigger's ts — its
+      // round-1 delta therefore MAY OMIT the human trigger (the delta filter is
+      // strictly greater than the mark). The replacement invariant:
+      //
+      //   A round-1 reactor's delta may omit the human trigger. That is safe
+      //   because the delta arm is reachable only when the reactor holds a
+      //   resumable session row whose meetingLastSeenTs was advanced by one of
+      //   ITS OWN earlier turns on this thread; and the mark advances (below)
+      //   only after a non-errored, non-aborted turn, and only to the maximum
+      //   ts over what that turn actually absorbed — its injected context ∪ its
+      //   terminal slot. A mark at or above the trigger's ts therefore implies
+      //   some turn of this agent PRESENTED the trigger (round-0 terminal slot)
+      //   or INJECTED it (a later trigger's context). Either the mark predates
+      //   the trigger (trigger in the delta) or the agent's own turn presented
+      //   it (trigger in the transcript that turn produced) — no gap.
+      //
+      // ⚠ That invariant carries one named, accepted caveat: the mark advance
+      // and the session persist are independent fail-soft writes and can
+      // diverge, so the "session absorbed it" step is asserted, not derived.
+      // See docs/epics/kpr-415/kpr-416-spec.md §7.2 — do not assume airtight.
+      // A reactor with no session/mark gets the full transcript directly.
       const newMessageSegment = resolved.reactionTo
         ? `[${resolved.reactionTo.authorName} just replied]:\n${resolved.reactionTo.text}\n\n` +
           `React to ${resolved.reactionTo.authorName}'s reply if you have something to add. ` +
@@ -1724,22 +1747,30 @@ export class Dispatcher {
       costUsd: classification.costUsd,
     });
 
-    // KPR-387: record round-0 responders so the reaction pass never re-selects a
-    // primary for the same triggering human message. Recorded at selection time —
-    // a primary whose turn errors or is suppressed stays excluded for this trigger
-    // (deliberate: kills the suppressed-turn burn; Gate 1 delegated assumption).
-    // Runs synchronously before any round-0 dispatch starts, so there is no race
-    // with a fast round-0 completion triggering the reaction pass.
+    // KPR-387/KPR-416: round-0 responders are still recorded so the reaction
+    // pass never re-selects a primary for the same triggering human message —
+    // but the write now lands at DELIVERY time (markReactionExclusion, three
+    // call sites), not here at selection time. KPR-416 relocated it so a
+    // primary whose turn was SUPPRESSED becomes eligible to react to a slower
+    // peer's later, substantive reply — the exact shape that silenced the live
+    // trial meeting. Delivered, `_No response._`-placeholder, errored-with-text
+    // and thrown turns all keep today's exclusion. Supersedes KPR-386 canon C1
+    // ("selection-time recording"); C2 (shape/keying/TTL) is unchanged.
+    //
+    // ⚠ THE RACE THIS MOVE RE-OPENS — read before "simplifying" anything here.
+    // The old placement ran synchronously before any round-0 dispatch, so no
+    // fast completion could trigger a reaction pass against an unrecorded
+    // agent. That is gone. WITHIN one agent the window is still zero by
+    // construction: the write is the statement immediately before both the
+    // delivery and the reaction trigger (ordering pin, pinned by T5). ACROSS
+    // agents a peer whose own round-0 turn has not landed CAN now be invited
+    // as a round-1 reactor for the same trigger — deliberately deferred,
+    // bounded by the per-thread lock in agent-manager.ts (its round-1 turn
+    // serializes behind its own round-0 turn) plus round-1's "do not re-answer"
+    // framing, and pinned as known behavior by T9. See
+    // docs/epics/kpr-415/kpr-416-spec.md §6.4(d) and its follow-on child
+    // before attempting a fix here.
     const humanTs = item.meta?.slackTs as string | undefined;
-    if (humanTs && classification.respondAgentIds.length > 0) {
-      if (!this.meetingReactionTracker.has(threadId)) {
-        this.meetingReactionTracker.set(threadId, new Map());
-      }
-      const threadTracker = this.meetingReactionTracker.get(threadId)!;
-      const responded = threadTracker.get(humanTs) ?? new Set<string>();
-      for (const id of classification.respondAgentIds) responded.add(id);
-      threadTracker.set(humanTs, responded);
-    }
 
     const preamble = this.buildMeetingPreamble(item.source.label, rosterMembers);
 

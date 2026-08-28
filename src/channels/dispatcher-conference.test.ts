@@ -506,12 +506,27 @@ Meeting rules:
     expect(adapter.deliver).toHaveBeenCalled();
   });
 
+  // KPR-387 duplicate-answer regression guard, re-derived for KPR-416 (§7.1):
+  // half (a) of the fix — tracker recording — is RELOCATED, not removed, so a
+  // round-0 primary that DELIVERED must still be skipped by the reaction pass.
+  // Half (b) (the reactionTo terminal-slot reframing) is untouched by KPR-416.
   it("round-0 responders are excluded from the reaction-pass roster", async () => {
     const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
     // Round-0: jasper + river respond. Reaction passes: capture roster, select nobody.
     (classifyMeetingMessage as any)
       .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river"], costUsd: 0.001, durationMs: 100 })
       .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+
+    // KPR-416 determinism gate (spec §10, T3). Post-relocation each responder's
+    // exclusion write is the synchronous statement immediately BEFORE its own
+    // delivery, and the reaction pass fires immediately AFTER it. Putting one
+    // macrotask boundary inside delivery orders every round-0 write (reachable
+    // on microtasks alone — all other harness mocks resolve immediately) ahead
+    // of every reaction pass, by construction rather than by await-depth
+    // coincidence. A flaky T3 is not acceptable as the KPR-387 guard.
+    adapter.deliver.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
 
     const item = makeWorkItem({
       text: "Jasper, River, and Jessica, discuss the launch plan",
@@ -543,6 +558,69 @@ Meeting rules:
     expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
     const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]).sort();
     expect(calledAgents).toEqual(["jasper", "river"]);
+  });
+
+  it("T1 (KPR-416): a SUPPRESSED round-0 primary becomes eligible to react to a slower peer's later reply", async () => {
+    // Trial observation 1, reproduced (spec §1): the classifier selects three
+    // primaries; two finish fast with "No response needed." (formed before the
+    // slow peer's findings existed); the slow one later delivers real content.
+    // Pre-KPR-416 the selection-time write had already excluded all three, so
+    // peerMembers was empty and NOBODY reacted. Post-fix the two suppressed
+    // agents are eligible and actually run round-1 turns.
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    (classifyMeetingMessage as any)
+      .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river", "jessica"], costUsd: 0.001, durationMs: 100 })
+      .mockResolvedValue({ respondAgentIds: ["river", "jessica"], costUsd: 0.001, durationMs: 100 });
+
+    const threadId = "conf-thread-kpr416-t1";
+    // Keyed by agentId, not call order: the slow primary resolves on a real
+    // timer so the two suppressions are guaranteed to have completed first —
+    // the trial's actual shape, and deterministic without leaning on
+    // Promise.all ordering.
+    agentManager.runWorkItemTurn.mockImplementation(async (agentId: string) => {
+      if (agentId === "jasper") {
+        await new Promise((r) => setTimeout(r, 10));
+        return turn({ finalMessage: "Here is what I found after a long dig." });
+      }
+      return turn({ finalMessage: "No response needed." });
+    });
+
+    await dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, River, and Jessica, discuss the launch plan",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t1" },
+        threadId,
+        meta: { slackTs: "1700.0011" },
+      }),
+    );
+
+    // Vacuous-pass guard (kpr-387-spec.md:155): assert a NON-EMPTY set of
+    // round-0 turns actually ran before asserting anything about round 1.
+    const round0Agents = agentManager.runWorkItemTurn.mock.calls
+      .filter((c: any[]) => c[1]?.meta?.conferenceRound === 0)
+      .map((c: any[]) => c[0])
+      .sort();
+    expect(round0Agents).toEqual(["jasper", "jessica", "river"]);
+
+    // The reaction pass ran with BOTH suppressed peers on the roster...
+    const reactionCalls = () =>
+      (classifyMeetingMessage as any).mock.calls.filter(
+        (c: any[]) => c[0] === "Here is what I found after a long dig.",
+      );
+    await vi.waitFor(() => expect(reactionCalls().length).toBeGreaterThanOrEqual(1));
+    const peerIds = reactionCalls()[0][1]
+      .map((m: any) => m.agentId)
+      .sort();
+    expect(peerIds).toEqual(["jessica", "river"]);
+
+    // ...and both actually ran a round-1 turn.
+    await vi.waitFor(() => {
+      const round1Agents = agentManager.runWorkItemTurn.mock.calls
+        .filter((c: any[]) => c[1]?.meta?.conferenceRound === 1)
+        .map((c: any[]) => c[0])
+        .sort();
+      expect(round1Agents).toEqual(["jessica", "river"]);
+    });
   });
 
   it("round-1 reaction prompt frames the peer reply, not the human message", async () => {
@@ -798,10 +876,7 @@ Meeting rules:
     expect(adapter.deliver).toHaveBeenCalledTimes(1);
     expect(adapter.deliver.mock.calls[0][0].text).toContain("provider outage");
     adapter.deliver.mockClear();
-    // NOTE: `expect(excludedFor(threadId, "1700.0008")).toBeUndefined()` — the
-    // "queued ⇒ NOT excluded" pin — belongs here logically but is UNREACHABLE
-    // until Task 6 deletes the selection-time write, which records jasper at
-    // classification time regardless. Task 6 Step 5 adds it at this exact spot.
+    expect(excludedFor(threadId, "1700.0008")).toBeUndefined(); // queued ⇒ NOT excluded
 
     // Phase 2 — replay the item the store actually holds, breaker closed.
     const queued = outageStore.enqueue.mock.calls[0][0].workItem as WorkItem;
@@ -879,11 +954,7 @@ Meeting rules:
     );
 
     expect(outageStore.enqueue).toHaveBeenCalledTimes(1); // queued as a notice, not agent text
-    // NOTE: `expect(excludedFor(fastFailThread, "1700.0010")).toBeUndefined()`
-    // — the actual exemption pin — is UNREACHABLE here for the same reason as
-    // T4's phase-1 assertion: the selection-time write in resolveConferenceAgents
-    // already recorded jasper at classification time, regardless of the later
-    // ProviderCircuitOpenError. Task 6 Step 5 adds it once that write is gone.
+    expect(excludedFor(fastFailThread, "1700.0010")).toBeUndefined(); // notice, not agent text
   });
 
   describe("round-1 kill suppression (KPR-389 D5)", () => {
