@@ -1369,6 +1369,96 @@ Meeting rules:
       expect(answers[0][0].text).toBe("The answer regardless.");
       expect(retryQueue.enqueue).not.toHaveBeenCalled();
     });
+
+    it("T11 (KPR-417, §6.4): an acked turn that SUPPRESSES leaves the ack as its only post — no retraction, no follow-up", async () => {
+      // The fourth failure case. Under delay-then-ack this requires the
+      // suppressor to ALSO be slow, narrowing it to the grok-shaped
+      // population — but it is not exotic: the meeting preamble actively
+      // instructs the decline, and three of four round-0 responders suppressed
+      // in the live trial.
+      //
+      // ⚠ RULING: ACCEPT THE ORPHANED ACK (spec §6.4). "On it — picked this
+      // up." followed by nothing reads as *took the item, had nothing to add*
+      // — exactly what happened. Nothing was promised and no active work was
+      // claimed; that is what makes the no-retraction rule liveable. Do NOT
+      // add a chat.delete, a chat.update, a "…had nothing to add" follow-up,
+      // or a ✅/💤 reaction. All four are argued down in §6.4 ground 3.
+      await soloClassifier();
+      const slow = hangingTurn();
+      agentManager.runWorkItemTurn.mockReturnValue(slow.promise);
+
+      const dispatched = dispatcher.dispatch(confAckItem("conf-thread-kpr417-t11"));
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+      expect(ackCalls()).toHaveLength(1);
+
+      slow.release(turn({ finalMessage: "No response needed." }));
+      await dispatched;
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 2);
+
+      // The ack is the ONLY post from that agent for that turn.
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe(MEETING_ACK_TEXT);
+      // Explicitly: no retraction, no follow-up, no "_No response._" placeholder.
+      expect(adapter.deliver.mock.calls.some((c: any[]) => c[0].text === "_No response._")).toBe(false);
+      expect(mockLogInfo).toHaveBeenCalledWith(
+        "Non-response suppressed (fan-out)",
+        expect.objectContaining({ agentId: "jasper", conferenceRound: 0 }),
+      );
+    });
+
+    it("T11 companion (KPR-417/KPR-416): the acked-then-suppressed agent is STILL round-1-eligible, so the orphan CAN resolve", async () => {
+      // ⚠ ITS PURPOSE IS PRECISE (spec §11): this is a tripwire for a REVERT
+      // OF KPR-416's RELOCATION of the reaction-exclusion write from selection
+      // time to delivery time — NOT for a change to A's write PREDICATE.
+      // Under either predicate A considered, a suppressed turn writes nothing
+      // (it sits in the isNonResponse branch with no real content either way),
+      // so this test is predicate-INSENSITIVE. It fails only if the write
+      // moves back to selection time, where every selected round-0 agent is
+      // excluded regardless of outcome and the orphan becomes permanent by
+      // construction — which is exactly what evaporates §6.4 ground 2.
+      //
+      // Ground 2 is deliberately the WEAKEST of §6.4's four grounds: the
+      // acked-and-suppressed population is by construction made of SLOW
+      // suppressors, and for one of them to earn a round-1 reaction an even
+      // SLOWER peer must deliver real content on the same trigger. The ruling
+      // stands on grounds 1, 3 and 4 regardless of how often this fires.
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper", "jessica"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+
+      const jasperSlow = hangingTurn();
+      const jessicaSlow = hangingTurn();
+      agentManager.runWorkItemTurn.mockImplementation((agentId: string, item: any) => {
+        if (item?.meta?.conferenceRound === 1) return Promise.resolve(turn({ finalMessage: "Jessica reacts." }));
+        return agentId === "jasper" ? jasperSlow.promise : jessicaSlow.promise;
+      });
+
+      const dispatched = dispatcher.dispatch(
+        confAckItem("conf-thread-kpr417-t11b", "Jasper, and Jessica, discuss the launch plan"),
+      );
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+      expect(ackCalls()).toHaveLength(2); // both slow agents acked
+
+      // Jessica suppresses; Jasper then delivers real content.
+      jessicaSlow.release(turn({ finalMessage: "No response needed." }));
+      await settleAcked();
+      jasperSlow.release(turn({ finalMessage: "Here is what I found after a long dig." }));
+      await dispatched;
+      await settleAcked();
+      await settleAcked();
+
+      // ← THE PIN: the acked-then-suppressed agent still runs a round-1 turn
+      //   and its reaction posts. The orphan resolved.
+      const round1 = agentManager.runWorkItemTurn.mock.calls.filter((c: any[]) => c[1]?.meta?.conferenceRound === 1);
+      expect(round1.map((c: any[]) => c[0])).toEqual(["jessica"]);
+      expect(adapter.deliver.mock.calls.some((c: any[]) => c[0].text === "Jessica reacts.")).toBe(true);
+      // Still exactly two acks — round-1 never acks (T3's contract, re-checked here).
+      expect(ackCalls()).toHaveLength(2);
+    });
   });
 
   it("T5 (KPR-416): the exclusion write precedes BOTH the fan-out delivery and the reaction trigger", () => {
