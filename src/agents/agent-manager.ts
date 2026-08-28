@@ -1530,11 +1530,14 @@ export class AgentManager {
    *    `openVoiceStreamingSession`. Nothing to warm.
    *  - Lane A (kimi/deepseek/grok) DOES run the full ClaudeAgentAdapter /
    *    AgentRunner, so the capability exists — it is excluded because
-   *    `openWarmLease` builds its runner with `createRunner(ctx.agentId)`
-   *    and threads NO `laneAPassthrough` options through, so a Lane A agent
-   *    on the warm path would silently run against Anthropic with the wrong
-   *    model. An unwired gap, deliberately gated closed rather than
-   *    half-wired; wiring it is a follow-up, not a hidden limitation.
+   *    `openWarmLease` builds its runner via `createRunner` with NO
+   *    `laneAPassthrough` option threaded through, so a Lane A agent on the
+   *    warm path would silently run against Anthropic with the wrong model.
+   *    An unwired gap, deliberately gated closed rather than half-wired;
+   *    wiring it is a follow-up, not a hidden limitation. (`createRunner`'s
+   *    warm-path call DOES thread `workerPool` — KPR-390 parity with the
+   *    cold path's runnerOptions — but that addition is orthogonal to this
+   *    laneAPassthrough omission decision and does not reopen the gap.)
    */
   private isWarmPathEligible(ctx: TurnContext): boolean {
     if (ctx.channel !== "voice" || ctx.kind === "reflection") return false;
@@ -1699,7 +1702,16 @@ export class AgentManager {
       // adapter stays the single authority on resume-vs-full-prompt; the
       // retry-shaped ctx {sessionId: undefined, full transcript} therefore
       // opens a FRESH session and never resumes the one a retry escaped).
-      const runner = this.createRunner(ctx.agentId);
+      // KPR-390 parity with the cold path's runnerOptions (createProviderAdapter):
+      // an agent with "worker-pool" in coreServers must get the in-process
+      // server on a warm turn too, not just a cold one — laneAPassthrough
+      // stays deliberately omitted (see the isWarmPathEligible doc comment
+      // above: the warm path is claude-only, so there is no Lane A route to
+      // thread through here).
+      const runner = this.createRunner(
+        ctx.agentId,
+        this.workerPool ? { workerPool: this.workerPool } : undefined,
+      );
       const q = await runner.openVoiceStreamingSession({
         input: lease.inputQueue,
         sessionId: ctx.sessionId,
@@ -1788,11 +1800,17 @@ export class AgentManager {
     this.circuitBreakers.record(permit, classifyTurnResult(runResult), runResult.llmMs);
 
     // KPR-388's resumedSession means "launched with a session handle"
-    // (options.resume / previous_response_id / previous_interaction_id). A
-    // warm-lease turn never launches via a handle at all — turns 2+ ride the
-    // SAME already-open streaming query() — so it is always false here, not
-    // an approximation of "was this call warm" (that's warmPath/warmTurnSeq).
-    const turnResult = this.finalizeSpawnResult(ctx, runResult, route, false);
+    // (options.resume / previous_response_id / previous_interaction_id).
+    // Turn 1 of a warm lease DOES launch via a handle — openWarmLease passes
+    // `sessionId: ctx.sessionId` into openVoiceStreamingSession, which flows
+    // into buildQueryEnvelope's `resume`, exactly like a cold turn. Turns 2+
+    // ride the SAME already-open streaming query() with no fresh resume, so
+    // they are unconditionally false. `lease.turns === 1` (post-increment,
+    // since consumeOneTurn bumps turnCount before the SDK loop) is the
+    // reliable "was this the lease-opening turn" signal — not an
+    // approximation of "was this call warm" (that's warmPath/warmTurnSeq).
+    const resumedSession = lease.turns === 1 && !!ctx.sessionId;
+    const turnResult = this.finalizeSpawnResult(ctx, runResult, route, resumedSession);
     turnResult.warmPath = true;
     turnResult.warmTurnSeq = lease.turns;
     // C1 on warm turns (plan review r1 adv. 3): admission/spawn stages do

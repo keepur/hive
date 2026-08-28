@@ -423,6 +423,15 @@ export class WarmVoiceSession {
     let outputTokens = 0;
     let cacheReadTokens = 0;
     let cacheCreationTokens = 0;
+    // KPR-401 parity (agent-runner.ts's identical accumulator): a warm turn
+    // that never yields a `result` message (stream-ended, or a mid-loop
+    // throw) must still report real spend — countedUsageIds counts each
+    // API call's streamed usage exactly once (by message.id), and the
+    // `result` branch's assignments authoritatively OVERWRITE this
+    // accumulator when one does arrive, so the success path stays
+    // byte-identical to pre-401 behavior.
+    let sawResult = false;
+    const countedUsageIds = new Set<string>();
     let ephemeral5mTokens: number | undefined;
     let ephemeral1hTokens: number | undefined;
     let contextWindow = 0;
@@ -501,7 +510,21 @@ export class WarmVoiceSession {
           }
           case "assistant": {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const content = (msg as any).message?.content;
+            const assistantMessage = (msg as any).message;
+            // KPR-401 parity: per-API-call usage snapshot — ADDED once per
+            // distinct message.id (repetitions carry identical usage); the
+            // `result` case below overwrites all four counters when a result
+            // message arrives, so success turns are byte-identical.
+            const usageMessageId: string | undefined = assistantMessage?.id;
+            const messageUsage = assistantMessage?.usage;
+            if (usageMessageId && messageUsage && !countedUsageIds.has(usageMessageId)) {
+              countedUsageIds.add(usageMessageId);
+              inputTokens += messageUsage.input_tokens ?? 0;
+              outputTokens += messageUsage.output_tokens ?? 0;
+              cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
+              cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
+            }
+            const content = assistantMessage?.content;
             if (Array.isArray(content)) {
               for (const block of content) {
                 if (block.type === "text") {
@@ -520,6 +543,7 @@ export class WarmVoiceSession {
           }
           case "result": {
             const result = msg as SDKResultMessage;
+            sawResult = true;
             costUsd = result.total_cost_usd;
             durationMs = result.duration_ms;
             sessionId = result.session_id;
@@ -584,6 +608,12 @@ export class WarmVoiceSession {
       if (!this.closed) this.armIdleTimer();
     }
 
+    // KPR-401 parity: result-less exits (stream-ended before `result`, or a
+    // mid-loop throw) never assigned durationMs — fall back to wall clock
+    // from the turn's own push instead of leaving 0 (the zero-duration /
+    // negative-llmMs incident shape KPR-401 exists to prevent).
+    if (!sawResult) durationMs = Date.now() - pushedAt;
+
     if (activeToolName && toolCalls.length > 0) {
       toolCalls[toolCalls.length - 1]!.endMs = Date.now();
     }
@@ -606,7 +636,10 @@ export class WarmVoiceSession {
       sessionId,
       costUsd,
       durationMs,
-      llmMs: durationMs - totalToolMs,
+      // KPR-401 (d) parity: unconditional clamp — matches agent-runner.ts's
+      // and turn-scaffold.ts's identical guard against a negative llmMs on
+      // aborted/timed-out turns.
+      llmMs: Math.max(0, durationMs - totalToolMs),
       toolMs: totalToolMs,
       toolCalls: toolCalls.length,
       toolSummary: toolSummary || "none",

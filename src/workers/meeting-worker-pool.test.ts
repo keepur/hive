@@ -434,6 +434,7 @@ describe("MeetingWorkerPool — claim ledger + gates (Task D)", () => {
       "admin",
       "recall",
       "voice",
+      "voice-livekit",
     ]) {
       expect(WORKER_SERVER_DENYLIST.has(s)).toBe(true);
     }
