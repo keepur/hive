@@ -674,6 +674,17 @@ export class Dispatcher {
       error: String(err),
     };
     if (adapter) {
+      // KPR-416 write site 3 (spec §6.2). A thrown round-0 turn posts
+      // `Something went wrong: …` — the same user-visible artifact an
+      // in-branch errored turn produces — so it stays excluded; letting the
+      // two diverge would be an accident, not a design. Reachable on this
+      // epic's own hot path: a grok TurnAssemblyError from an unreadable
+      // ~/.grok/auth.json throws here rather than raising
+      // ProviderCircuitOpenError. Inside `if (adapter)` so the rule ("handed
+      // text to delivery") stays literally true, and correctly NOT reached
+      // when handleOutageTurn already absorbed a fast-fail above (early
+      // return) — that path delivers a notice, not agent text.
+      this.markReactionExclusion(item, agentId);
       try {
         await adapter.deliver(errorResult);
       } catch (deliverErr) {

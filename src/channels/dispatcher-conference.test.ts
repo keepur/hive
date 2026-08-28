@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { OutageEpisodeTracker } from "../outage/outage-notices.js";
+import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
 import { deadlineContinuationWrap, MAX_DEADLINE_CONTINUATIONS } from "./deadline-continuation.js";
 
 // KPR-389 C5: the suppression log lines carry the `conferenceRound` tag that is
@@ -815,6 +816,74 @@ Meeting rules:
     expect(adapter.deliver).toHaveBeenCalledTimes(1); // post-mockClear: the real content only
     expect(adapter.deliver.mock.calls[0][0].text).toBe("The real answer, at last");
     expect(excludedFor(threadId, "1700.0008")).toEqual(new Set(["jasper"]));
+  });
+
+  it("T7 (KPR-416): a THROWN round-0 turn stays excluded (write site 3)", async () => {
+    // Disposition (b), spec §6.2. The thrown turn posts visible error text —
+    // the same user-visible artifact an in-branch errored turn produces — so
+    // it stays excluded. Passes pre- and post-fix: this half pins the
+    // predicate, not the relocation.
+    await soloClassifier();
+    const thrownThread = "conf-thread-kpr416-t7-thrown";
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(new Error("boom"));
+
+    await dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t7" },
+        threadId: thrownThread,
+        meta: { slackTs: "1700.0009" },
+      }),
+    );
+
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toContain("Something went wrong");
+    expect(excludedFor(thrownThread, "1700.0009")).toEqual(new Set(["jasper"]));
+  });
+
+  it("T7 companion (KPR-416): a ProviderCircuitOpenError fast-fail is NOT excluded", async () => {
+    // The exemption half. A fast-fail posts an engine NOTICE, not agent
+    // content, so it must never mark — handleOutageTurn's early return in
+    // handleTurnFailure lands before write site 3, and this is its pin.
+    await soloClassifier();
+    const outageStore = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      release: vi.fn().mockResolvedValue(undefined),
+      recordFailedAttempt: vi.fn().mockResolvedValue({ terminal: false, doc: null }),
+      markNoticeSent: vi.fn().mockResolvedValue(undefined),
+      pendingCount: vi.fn().mockResolvedValue(0),
+      statusOf: vi.fn().mockResolvedValue(null),
+      expireOlderThan: vi.fn().mockResolvedValue([]),
+      recoverStaleReplaying: vi.fn().mockResolvedValue(0),
+      ensureIndexes: vi.fn().mockResolvedValue(undefined),
+    };
+    dispatcher.setOutageHandling({
+      store: outageStore as never,
+      episodes: new OutageEpisodeTracker(),
+      config: { enabled: true, replayIntervalMs: 15_000, maxAgeHours: 4, maxDepth: 500, maxReplayAttempts: 3 },
+    });
+    const fastFailThread = "conf-thread-kpr416-t7-fastfail";
+    // ProviderCircuitOpenError's `provider` param is typed `string` (see
+    // provider-circuit-breaker.ts:94) — no cast needed.
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(
+      new ProviderCircuitOpenError("claude", Date.now(), 15_000, "connect-fail", "fetch failed"),
+    );
+
+    await dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t7" },
+        threadId: fastFailThread,
+        meta: { slackTs: "1700.0010" },
+      }),
+    );
+
+    expect(outageStore.enqueue).toHaveBeenCalledTimes(1); // queued as a notice, not agent text
+    // NOTE: `expect(excludedFor(fastFailThread, "1700.0010")).toBeUndefined()`
+    // — the actual exemption pin — is UNREACHABLE here for the same reason as
+    // T4's phase-1 assertion: the selection-time write in resolveConferenceAgents
+    // already recorded jasper at classification time, regardless of the later
+    // ProviderCircuitOpenError. Task 6 Step 5 adds it once that write is gone.
   });
 
   describe("round-1 kill suppression (KPR-389 D5)", () => {
