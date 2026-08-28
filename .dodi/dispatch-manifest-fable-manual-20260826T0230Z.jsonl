@@ -92,3 +92,13 @@
 {"worker":"coherence-review-kpr-409","phase":"coherence","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-28T01:00:00Z"}
 {"worker":"docs-sync-epic-sweep-kpr-386","phase":"submit-epic-pr","mode":"epic-sweep","ticket":"KPR-386","tier":"opus","dispatched_at":"2026-08-28T00:10:00Z"}
 {"worker":"epic-integration-review-kpr-386-r1","phase":"submit-epic-pr","round":1,"ticket":"KPR-386","tier":"opus","dispatched_at":"2026-08-28T00:15:00Z","result":"issues_found","judgment_findings":3,"mechanical_findings":1,"corrective_tickets":["KPR-412","KPR-413","KPR-414"]}
+{"worker":"spec-drafter-kpr-412","phase":"mature-ticket","ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T00:20:00Z"}
+{"worker":"spec-review-kpr-412-r1","phase":"spec-review","round":1,"ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T00:35:00Z"}
+{"worker":"plan-review-kpr-412-r1","phase":"plan-review","round":1,"ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T00:55:00Z"}
+{"worker":"implement-kpr-412-task1","phase":"implement-ticket","task":1,"ticket":"KPR-412","tier":"sonnet","dispatched_at":"2026-08-28T01:05:00Z"}
+{"worker":"implement-kpr-412-task2","phase":"implement-ticket","task":2,"ticket":"KPR-412","tier":"sonnet","dispatched_at":"2026-08-28T01:08:00Z"}
+{"worker":"pre-pr-review-kpr-412-r1","phase":"review","round":1,"ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T01:12:00Z"}
+{"worker":"docs-sync-kpr-412","phase":"submit-ticket-pr","mode":"child","ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T01:17:00Z"}
+{"worker":"child-pr-review-kpr-412-r1","phase":"child-pr-review","round":1,"ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T01:19:00Z"}
+{"worker":"child-pr-review-kpr-412-final","phase":"child-pr-review","round":2,"ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T01:23:00Z"}
+{"worker":"coherence-review-kpr-412","phase":"coherence","ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T01:27:00Z"}
