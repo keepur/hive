@@ -898,10 +898,18 @@ export class AgentManager {
    * unchanged since the gateway (KPR-384) that made it briefly dead code is
    * itself now retired. No baseUrl slot: the adapter's endpoint is fixed at
    * https://api.x.ai, there is no override. This turns resolveGrokModuleSlice
-   * async (file read, and — within an hour of token expiry — one network
-   * round-trip), which is why resolveProviderModuleSlice above is now async
-   * too; both run after the breaker permit is acquired and inside the turn
-   * deadline, same as codex's/openai's own per-spawn credential resolution.
+   * async (file read, and near expiry — up to two network round-trips on a
+   * cold discovery cache, one thereafter; each capped by grok-oauth.ts's own
+   * 10s fetch timeout), which is why resolveProviderModuleSlice above is now
+   * async too. This runs while createProviderAdapter builds moduleDeps —
+   * after the breaker permit is acquired, but BEFORE the adapter is
+   * constructed and before runTurn arms `timeoutMs`, so it sits outside the
+   * turn deadline and can't be interrupted by abort(). Not the same
+   * placement as codex's/openai's own credential resolution, which runs
+   * inside executeTurn and so genuinely is deadline-bound. A half-open
+   * probe's own staleness bound (deadlineMs + 60s grace, KPR-400) still caps
+   * this; in the ordinary closed-circuit case no permit-level staleness
+   * bound applies.
    */
   private async resolveGrokModuleSlice(): Promise<{ agentModel?: string; apiKey?: string }> {
     return {
