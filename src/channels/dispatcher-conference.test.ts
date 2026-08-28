@@ -1146,6 +1146,82 @@ Meeting rules:
         expect(legItem.meta.conferenceInjectionMode).toBeUndefined();
       });
 
+      it("T8b (KPR-416): a continuation leg's delivery excludes; a cap-exhausted chain and a zero-progress abort do NOT", async () => {
+        // Disposition (c), spec §6.3. The exclusion is written at DELIVERY, so
+        // the leg that finally answers is what marks — and a chain that never
+        // answers marks nothing. The two companions assert the same shape
+        // through different arms, so a regression that starts marking at the
+        // ABORT site rather than at delivery fails on both.
+        await soloClassifier();
+        const threadId = "conf-thread-kpr416-t8b";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn
+          .mockResolvedValueOnce(ABORT_WITH_PROGRESS) // origin: deadline abort with progress
+          .mockResolvedValueOnce(turn({ finalMessage: "Finished it on the second pass" })); // leg 1: answers
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t8b" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+        await settleReactions();
+
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+        expect(excludedFor(threadId, "1000.0004")).toEqual(new Set(["jasper"]));
+      });
+
+      it("T8b companion 1 (KPR-416): a chain that exhausts MAX_DEADLINE_CONTINUATIONS never excludes", async () => {
+        await soloClassifier();
+        const threadId = "conf-thread-kpr416-t8b-cap";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValue(ABORT_WITH_PROGRESS); // every leg aborts
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t8b" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+        await settleReactions();
+
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(MAX_DEADLINE_CONTINUATIONS + 1);
+        // Terminal notice only — the agent never answered, so it is correctly
+        // still eligible to react to a peer on this trigger.
+        expect(excludedFor(threadId, "1000.0004")).toBeUndefined();
+      });
+
+      it("T8b companion 2 (KPR-416): a ZERO-progress deadline abort (notice only, no leg) never excludes", async () => {
+        // §4's zero-progress row: maybeHandleDeadlineAbort's !withProgress arm
+        // returns true after a notice, with no continuation leg and no
+        // deliverAgentResult call — so no write site is ever reached.
+        await soloClassifier();
+        const threadId = "conf-thread-kpr416-t8b-zero";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValueOnce(
+          turn({ finalMessage: "", timedOut: true, aborted: true }), // no toolCalls, not streamed
+        );
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t8b" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1); // no leg
+        expect(excludedFor(threadId, "1000.0004")).toBeUndefined();
+      });
+
       it("T2b: the stamp is written at assembly time, on the ORIGIN turn's own dispatch — independent of whether an abort ever happens", async () => {
         // Direct pin for D1 itself (plan-review r1 finding): T1/T2 only
         // prove the ARM's output; this proves the stamp exists on every
