@@ -998,6 +998,120 @@ Meeting rules:
       expect(adapter.deliver).toHaveBeenCalledTimes(1);
       expect(adapter.deliver.mock.calls[0][0].text).toBe("Eventually.");
     });
+
+    it("T3 (KPR-417): a round-1 reaction turn NEVER acks, and a killed one leaves the channel silent (KPR-389 §D5)", async () => {
+      // ⚠ THIS IS THE GUARD FOR KPR-389 §D5 GOAL 5, quoted verbatim from
+      // kpr-389-spec.md:39: "A clamp-killed reaction never posts noise into
+      // the meeting channel." A round-1 reaction clamp-killed at 120s would,
+      // under an unguarded ack, have posted "On it" at 15s — the ack IS the
+      // filler D5 forbids, already in the channel before the kill. There is no
+      // round-1 retraction path in this design (spec §5.2, §6.4), so round-1
+      // acking is simply out of scope. If a future edit "just acks round-1
+      // too", this test must fail loudly.
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+
+      const slowReaction = hangingTurn();
+      agentManager.runWorkItemTurn
+        .mockResolvedValueOnce(turn({ finalMessage: "Jasper's round-0 answer" })) // fast round-0
+        .mockReturnValueOnce(slowReaction.promise); // jessica's round-1: hangs
+
+      await dispatcher.dispatch(confAckItem("conf-thread-kpr417-t3", "Jasper, and Jessica, please weigh in"));
+      // Drain the fire-and-forget reaction pass under the fake clock, then let
+      // the round-1 turn sit past the ack threshold.
+      await settleAcked();
+      await settleAcked();
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+      expect(agentManager.runWorkItemTurn.mock.calls[1][1].meta.conferenceRound).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 2);
+      expect(ackCalls()).toHaveLength(0); // ← the gate
+
+      // Companion: the round-1 turn is then clamp-killed. D5's existing
+      // silence holds and the channel saw ZERO posts for that agent.
+      slowReaction.release(turn({ finalMessage: "", aborted: true, timedOut: true }));
+      await settleAcked();
+      await settleAcked();
+
+      expect(ackCalls()).toHaveLength(0);
+      expect(adapter.deliver).toHaveBeenCalledTimes(1); // only jasper's round-0 reply
+      expect(adapter.deliver.mock.calls[0][0].agentId).toBe("jasper");
+    });
+
+    it("T4a (KPR-417): a plain multi-agent fan-out turn never acks — THIS is the gate's real exercise", async () => {
+      // Goes through dispatchToAgent (so the ack wrapper IS on the code path)
+      // with a bare `resolved` carrying no conferenceMode. This is the case
+      // that would fail if someone widened the gate to read item.meta.
+      //
+      // Label "random", NOT "general": executive-assistant OWNS the general
+      // channel in the mock registry, which would take the dedicated-channel
+      // single-dispatch path instead of fan-out.
+      const slowA = hangingTurn();
+      agentManager.runWorkItemTurn.mockReturnValue(slowA.promise);
+
+      const dispatched = dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, and Jessica, what's the deploy status?",
+          source: { kind: "slack", id: "C999", label: "random" },
+          threadId: "plain-fanout-kpr417-t4a",
+          meta: { slackTs: "1700.0101" },
+        }),
+      );
+      await settleAcked();
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2); // real fan-out
+      expect(agentManager.runWorkItemTurn.mock.calls[0][1].meta.conferenceMode).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 2);
+      expect(ackCalls()).toHaveLength(0);
+
+      slowA.release(turn({ finalMessage: "Deployed." }));
+      await dispatched;
+      await settleAcked();
+      expect(ackCalls()).toHaveLength(0);
+    });
+
+    it("T4b (KPR-417): an outage-replay item carrying meta.conferenceRound: 0 never acks", async () => {
+      // ⚠ STRUCTURALLY VACUOUS BY CONSTRUCTION, even post-fix — read the
+      // comment before treating this as gate coverage. A replay takes
+      // dispatch()'s SINGLE-DISPATCH leg, which has no runTurnWithMeetingAck
+      // wrapper on it at all, so there is no gate there to evaluate. What it
+      // pins is the LEG-LEVEL absence (spec §5.2): a regression where the ack
+      // wrapper is later added to the single-dispatch leg. The meta-vs-
+      // `resolved` gate is exercised by T4a, not here.
+      //
+      // Note the replay DOES retain its conference meta (KPR-389 §E4) — that
+      // is the point: meta says round 0 and it still must not ack.
+      const slow = hangingTurn();
+      agentManager.runWorkItemTurn.mockReturnValue(slow.promise);
+
+      const dispatched = dispatcher.dispatch(
+        makeWorkItem({
+          text: "some replayed conference turn text",
+          source: { kind: "slack", id: "C-CONF", label: "conf-kpr417" },
+          threadId: "conf-thread-kpr417-t4b",
+          meta: {
+            slackTs: "1700.0102",
+            outageReplay: true,
+            targetAgentId: "jasper", // resolveAgents step 0 — the single-dispatch leg
+            conferenceMode: true,
+            conferenceRound: 0,
+            conferenceHumanTs: "1700.0102",
+          },
+        }),
+      );
+      await settleAcked();
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 2);
+      expect(ackCalls()).toHaveLength(0);
+
+      slow.release(turn({ finalMessage: "The replayed answer." }));
+      await dispatched;
+      await settleAcked();
+      expect(ackCalls()).toHaveLength(0);
+    });
   });
 
   it("T5 (KPR-416): the exclusion write precedes BOTH the fan-out delivery and the reaction trigger", () => {
