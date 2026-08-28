@@ -409,7 +409,7 @@ with:
 
 > **Do NOT hoist `twoAgentClassifier`.** It is used only inside its own KPR-389 describe block and nothing this plan adds calls it — hoisting it is churn in the regression surface for no benefit. Leave it where it is.
 >
-> **`turn` must stay a hoisted `function` declaration — do not convert it to a `const`.** `ABORT_WITH_PROGRESS` (`:710`, inside the KPR-413 describe) is initialized from a `turn({...})` call at **describe-registration time**, which works only because function declarations hoist fully within their scope. A `const turn = (...) => ...` at suite scope would put `turn` in the temporal dead zone at that moment and throw a `ReferenceError` during collection, taking the whole file down. Keep it as `function turn(overrides: Record<string, unknown> = {}) { ... }`.
+> **`turn` stays a `function` declaration — no need to churn it to a `const`.** `ABORT_WITH_PROGRESS` (`:710`, inside the KPR-413 describe) is initialized from a `turn({...})` call; leaving `turn` as `function turn(overrides: Record<string, unknown> = {}) { ... }` at suite scope is simplest and matches the file's existing convention. No functional reason to change its form.
 
 Then add, immediately after `soloClassifier()` in the suite scope:
 
@@ -485,14 +485,9 @@ Then add, immediately after `soloClassifier()` in the suite scope:
       // silently re-including them.
       await soloClassifier();
       const threadId = `conf-thread-kpr416-t6-${String(_label).replace(/\W+/g, "-")}`;
-      // `turn({ ...flags })`, NOT `turn(flags)`. The it.each table widens each
-      // column to a union across rows, so `flags` infers as
-      // `string | { finalMessage: string; errors?: string[] }` and the bare
-      // `string` member is not assignable to `Record<string, unknown>` —
-      // `npm run typecheck` rejects it. Object-spreading a string IS legal TS
-      // (it spreads to no own enumerable props), so the spread form typechecks
-      // for every member of the union. Same reason the existing KPR-389 D5
-      // it.each at :625 already writes `turn({ finalMessage: "", ...flags })`.
+      // Spread form, consistent with the KPR-389 D5 it.each above (:625);
+      // both `turn(flags)` and `turn({ ...flags })` typecheck here since
+      // vitest infers `flags` per-position, not as a cross-row union.
       agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ ...flags }));
 
       await dispatcher.dispatch(
