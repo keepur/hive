@@ -87,14 +87,20 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // precede the wiring. Adding to this list is a deliberate, reviewed
     // classification decision — not a way to silence a real finding.
     const allowlist = ["dbIdentityMonitor.start(", "contactsWatcher.start("];
-    const pattern = /\.(start|scanOrphans)\s*\(/g;
+    // Round-1 child-PR review found and empirically confirmed that a
+    // preceding-context window (`codeOnly.slice(match.index - 40, ...)`)
+    // let a genuine offender placed immediately after an allowlisted call
+    // (e.g. on the very next line) silently pass — the allowlisted string
+    // was still inside the new match's own 40-char window. Match the
+    // receiver exactly instead: capture the identifier immediately before
+    // `.start(`/`.scanOrphans(` and compare the whole call, not a window.
+    const pattern = /([A-Za-z_$][\w$]*)\.(start|scanOrphans)\s*\(/g;
     let match: RegExpExecArray | null;
     const offenders: string[] = [];
     while ((match = pattern.exec(codeOnly)) !== null) {
       if (match.index >= wiringStart) continue; // only care about matches BEFORE the wiring
-      const context = codeOnly.slice(Math.max(0, match.index - 40), match.index + match[0].length);
-      if (allowlist.some((a) => context.includes(a))) continue;
-      offenders.push(context.trim());
+      if (allowlist.includes(match[0])) continue;
+      offenders.push(match[0]);
     }
     expect(
       offenders,
