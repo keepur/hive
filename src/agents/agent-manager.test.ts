@@ -3341,7 +3341,7 @@ describe("AgentManager", () => {
             smsCtx({ threadId: "sms:line-1:kpr412-t1", sessionId: "s-dead", sessionProvider: "claude" }),
           );
           expect(mockRunnerSend).toHaveBeenCalledTimes(2);
-          expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined(); // fresh retry — no sessionId (matches :3613's form)
+          expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined(); // fresh retry — no sessionId (matches the sibling "resume-rejection self-heal (KPR-399 §D3)" describe's assertion form)
           expect(result.resumedSession).toBe(false);
         });
 
