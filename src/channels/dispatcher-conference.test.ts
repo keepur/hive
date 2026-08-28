@@ -1,7 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Dispatcher, MEETING_ACK_TEXT, isMeetingAck } from "./dispatcher.js";
+import { Dispatcher, MEETING_ACK_TEXT, MEETING_ACK_DELAY_MS, isMeetingAck } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { OutageEpisodeTracker } from "../outage/outage-notices.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
@@ -867,6 +867,136 @@ Meeting rules:
       expect(isMeetingAck(msg(`${MEETING_ACK_TEXT} Here is what I found.`))).toBe(false);
       // isBot gates a human typing it.
       expect(isMeetingAck(msg(MEETING_ACK_TEXT, false))).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // KPR-417 — delay-then-ack: arm, fire, cancel
+  //
+  // ⚠ FAKE TIMERS ARE SCOPED TO THIS BLOCK ONLY. The rest of the file keeps
+  // its real-timer `settleReactions` (:623) untouched and no existing test
+  // changes. Inside this block use ONLY the async advancement API — under
+  // vi.useFakeTimers() the suite's `new Promise(r => setTimeout(r, 0))` drain
+  // is itself captured by the fake clock and never resolves, so a naive
+  // useFakeTimers() + settleReactions() combination DEADLOCKS. Also avoid
+  // `vi.waitFor` here — NOT because it deadlocks (it does not: it polls on
+  // getSafeTimers()' native timers and explicitly supports fake clocks), but
+  // because each poll cycle auto-advances the fake clock by its 50ms interval
+  // via a bare synchronous vi.advanceTimersByTime — fighting these tests for
+  // control of the very clock they step across the 15s threshold. Drive every
+  // drain with settleAcked()/advanceTimersByTimeAsync instead.
+  // -------------------------------------------------------------------------
+  describe("delay-then-ack for slow round-0 conference turns (KPR-417)", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      // Precondition (spec §9): meetingAckEnabled is FAIL-CLOSED false and the
+      // conference harness never wires index.ts. Without this line every
+      // positive case below passes VACUOUSLY as "no ack posted".
+      dispatcher.setMeetingAckEnabled(true);
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** KPR-417: the fake-timer equivalent of the suite's real-timer
+     *  `settleReactions` (:623) — NOT a second mechanism.
+     *  advanceTimersByTimeAsync yields a real macrotask boundary between
+     *  ticks, which is precisely the drain semantics settleReactions provides
+     *  per its own comment at :613-622. */
+    const settleAcked = () => vi.advanceTimersByTimeAsync(0);
+
+    /** A turn that never settles until the test releases it. */
+    const hangingTurn = () => {
+      let release!: (v: unknown) => void;
+      const promise = new Promise((r) => {
+        release = r;
+      });
+      return { promise, release };
+    };
+
+    const ackCalls = () => adapter.deliver.mock.calls.filter((c: any[]) => c[0].text === MEETING_ACK_TEXT);
+
+    const confAckItem = (threadId: string, text = "Jasper, where are we?") =>
+      makeWorkItem({
+        text,
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr417" },
+        threadId,
+        meta: { slackTs: "1700.0100" },
+      });
+
+    it("T1 (KPR-417): a round-0 conference turn unresolved at t=15s posts exactly one attributed ack, then its answer", async () => {
+      // THE primary mechanism. Trial observation 2 reproduced: grok's ~130s
+      // chairing turn left no signal in Slack that anything was happening.
+      await soloClassifier();
+      const slow = hangingTurn();
+      agentManager.runWorkItemTurn.mockReturnValue(slow.promise);
+
+      const dispatched = dispatcher.dispatch(confAckItem("conf-thread-kpr417-t1"));
+      await settleAcked(); // let dispatch reach the turn await (timer armed)
+
+      // Nothing yet — a fast turn must never ack (this is also T2's premise).
+      expect(adapter.deliver).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+
+      expect(ackCalls()).toHaveLength(1);
+      const ack = ackCalls()[0][0];
+      expect(ack.text).toBe(MEETING_ACK_TEXT);
+      expect(ack.agentId).toBe("jasper"); // attributed — deliver picks up identity
+      expect(ack.error).toBeUndefined(); // formatResponse, not formatError
+      expect(ack.costUsd).toBe(0);
+
+      // Settle the turn: the answer delivers, and no SECOND ack fires.
+      slow.release(turn({ finalMessage: "Here is the long-awaited answer." }));
+      await dispatched;
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS); // the timer is dead
+
+      expect(ackCalls()).toHaveLength(1);
+      const answers = adapter.deliver.mock.calls.filter((c: any[]) => c[0].text !== MEETING_ACK_TEXT);
+      expect(answers).toHaveLength(1);
+      expect(answers[0][0].text).toBe("Here is the long-awaited answer.");
+      // Ordering is correct BY CONSTRUCTION, not by luck (spec §8): the ack
+      // fires at 15s, the answer strictly after, since a faster turn cancels.
+      expect(adapter.deliver.mock.calls[0][0].text).toBe(MEETING_ACK_TEXT);
+    });
+
+    it("T2 (KPR-417): a fast round-0 turn never acks, even after the clock passes the threshold", async () => {
+      // No new noise for the 2-5s population — the whole point of
+      // delay-then-ack over the operator's literal immediate 'got it'.
+      await soloClassifier();
+      agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ finalMessage: "Quick answer." }));
+
+      await dispatcher.dispatch(confAckItem("conf-thread-kpr417-t2"));
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 3);
+      await settleAcked();
+
+      expect(ackCalls()).toHaveLength(0);
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe("Quick answer.");
+    });
+
+    it("T7a (KPR-417): with the dispatcher lever OFF, a slow round-0 turn posts no ack", async () => {
+      // The operator rollback path (spec §10): ackEnabled: false + restart ⇒
+      // no NEW acks. (The strip keeps running regardless — pinned by T5's
+      // false row, not here.)
+      dispatcher.setMeetingAckEnabled(false);
+      await soloClassifier();
+      const slow = hangingTurn();
+      agentManager.runWorkItemTurn.mockReturnValue(slow.promise);
+
+      const dispatched = dispatcher.dispatch(confAckItem("conf-thread-kpr417-t7a"));
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 3);
+
+      expect(ackCalls()).toHaveLength(0);
+      expect(adapter.deliver).not.toHaveBeenCalled();
+
+      slow.release(turn({ finalMessage: "Eventually." }));
+      await dispatched;
+      await settleAcked();
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe("Eventually.");
     });
   });
 

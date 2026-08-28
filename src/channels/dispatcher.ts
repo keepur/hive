@@ -1488,6 +1488,130 @@ export class Dispatcher {
     return [];
   }
 
+  /**
+   * KPR-417: arm the delayed ack for a slow round-0 conference turn.
+   *
+   * Returns `undefined` — no timer at all — unless ALL hold:
+   *   - the operator lever is on (`meetingAckEnabled`, fail-closed default),
+   *   - `resolved.conferenceMode === true`,
+   *   - `resolved.conferenceRound === 0`,
+   *   - an adapter exists to deliver through.
+   *
+   * ⚠ THE ROUND-0 GATE IS A CONTRACT, NOT A DEFAULT (spec §5.2). KPR-389 §D5
+   * goal 5 — "a clamp-killed reaction never posts noise into the meeting
+   * channel" — is violated the INSTANT a round-1 turn acks and is then
+   * silently killed by the guard in dispatchToAgent: the ack IS the filler D5
+   * forbids, already in the channel before the kill. Honoring round-1 would
+   * require an explicit retraction (delete or edit), which spec §6.4 rejects.
+   * Do not widen this gate. Pinned by T3.
+   *
+   * ⚠ THE GATE READS `resolved`, NEVER `item.meta`. That is what makes the
+   * other two legs that can carry a round-0 conference turn structurally
+   * ack-free, for two DIFFERENT reasons which must not be conflated:
+   *   - a KPR-307 outage REPLAY keeps its conference meta (conferenceRound is
+   *     load-bearing elsewhere) but runs dispatch()'s single-dispatch leg with
+   *     a bare ResolvedAgent and no ack wrapper on it at all;
+   *   - a KPR-402 continuation LEG has had the four conference keys stripped
+   *     by KPR-413, so it is not a conference turn on either surface.
+   * Result: ≤ 1 ack per (agent, human trigger), with no chain and no duplicate
+   * across legs.
+   */
+  private scheduleMeetingAck(
+    item: WorkItem,
+    resolved: ResolvedAgent,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+  ): { cancel: () => void } | undefined {
+    if (!this.meetingAckEnabled) return undefined;
+    if (resolved.conferenceMode !== true || resolved.conferenceRound !== 0) return undefined;
+    if (!adapter) return undefined;
+
+    let cancelled = false;
+    const handle = setTimeout(() => {
+      // Re-check the latch: cancel() may have run between the clock firing
+      // this callback and the callback actually executing.
+      if (cancelled) return;
+      // Fire-and-forget by construction — never awaited by the turn, never
+      // able to reject into it (deliverMeetingAck is a total function).
+      void this.deliverMeetingAck(item, agentId, adapter);
+    }, MEETING_ACK_DELAY_MS);
+    // A pending ack must never hold the process open at shutdown. Existing
+    // precedent: index.ts prefixCacheHeartbeat, outage-replay-processor.ts:44.
+    handle.unref();
+
+    return {
+      cancel: () => {
+        cancelled = true;
+        clearTimeout(handle);
+      },
+    };
+  }
+
+  /**
+   * KPR-417: post one acknowledgment into the meeting thread. Four deliberate
+   * properties (spec §5.3):
+   *   - `error` UNSET, so SlackAdapter.deliver renders it through
+   *     formatResponse, not formatError — same rationale as
+   *     deliverOutageNotice's own comment.
+   *   - `agentId` SET, so deliver picks up agentConfig and posts with the
+   *     agent's username/icon identity and the `${icon} *${Name}*: ` prefix.
+   *     Per-agent attribution costs nothing new — and AGENT_PREFIX_RE is built
+   *     to strip exactly that prefix back off.
+   *   - NOT deliverAgentResult — that begins with tryOutageDiversion, and an
+   *     ack diverted to a WS floor broadcast is meaningless. (The symmetric
+   *     case, where the ANSWER is diverted away from a thread that already has
+   *     the ack, is a named accepted residual — spec §6.6. Do not fix it here.)
+   *   - NEVER enqueued to the retry queue on failure. A retried ack lands
+   *     minutes later, potentially AFTER the answer. A dropped ack is strictly
+   *     better than a late one. Pinned by T12.
+   *
+   * ⚠ Must go through `adapter.deliver`, never a direct web.chat.postMessage:
+   * that path registers the outbound ts (slack-gateway.ts postSingle) and the
+   * inbound handler skips on it. Load-bearing, not a nicety — the ack text
+   * embeds the agent's own name in its `*Name*:` prefix, and
+   * resolveConferenceAgents builds the roster with findAllByName(item.text),
+   * so an ack that leaked back through the inbound path would both add its own
+   * author to the roster and mint a fresh conference turn.
+   */
+  private async deliverMeetingAck(item: WorkItem, agentId: string, adapter: ChannelAdapter): Promise<void> {
+    const ack: WorkResult = { text: MEETING_ACK_TEXT, agentId, workItem: item, costUsd: 0, durationMs: 0 };
+    try {
+      await adapter.deliver(ack);
+    } catch (err) {
+      log.warn("Meeting ack delivery failed — dropped", { agentId, error: String(err) });
+    }
+  }
+
+  /**
+   * KPR-417: arm the delayed ack, run the turn, cancel on ANY settle.
+   *
+   * ⚠ THE CANCEL LIVES IN THIS HELPER'S `finally` — adjacent to the await — so
+   * the ack can never outlive the turn it describes. DO NOT relocate it to a
+   * finally around the whole dispatchToAgent body: delivery, the KPR-388 mark
+   * write and the outage/deadline gates all run AFTER the turn settles, and a
+   * timer still armed across them can post "On it" AFTER the answer. Pinned
+   * structurally by T13(b).
+   *
+   * The one race this cannot close is named and accepted (spec §8): cancel()
+   * cannot unpost a deliver already in flight. Worst case is an ack
+   * immediately followed by its answer — mildly redundant, never
+   * contradictory, since the answer's own delivery begins strictly after the
+   * turn settles, i.e. after the ack post already started.
+   */
+  private async runTurnWithMeetingAck(
+    agentId: string,
+    item: WorkItem,
+    resolved: ResolvedAgent,
+    adapter: ChannelAdapter | undefined,
+  ): Promise<TurnResult> {
+    const ack = this.scheduleMeetingAck(item, resolved, agentId, adapter);
+    try {
+      return await this.agentManager.runWorkItemTurn(agentId, item);
+    } finally {
+      ack?.cancel();
+    }
+  }
+
   /** Dispatch a single work item to a single agent (used for fan-out) */
   private async dispatchToAgent(item: WorkItem, resolved: ResolvedAgent): Promise<void> {
     const { agentId } = resolved;
@@ -1614,7 +1738,13 @@ export class Dispatcher {
     const adapter = this.adapters.get(effectiveItem.source.adapterId ?? effectiveItem.source.kind);
 
     try {
-      const runResult = this.convertTurnResult(await this.agentManager.runWorkItemTurn(agentId, effectiveItem));
+      // KPR-417: the ack wrapper lives HERE and only here — the fan-out leg is
+      // the only leg a live conference turn takes. See runTurnWithMeetingAck
+      // for why the cancel must stay inside that helper's finally rather than
+      // around this whole try block.
+      const runResult = this.convertTurnResult(
+        await this.runTurnWithMeetingAck(agentId, effectiveItem, resolved, adapter),
+      );
 
       // KPR-307: same post-turn outage gate + replay-failure gate as the
       // single-dispatch path — the fan-out body is a near-duplicate.
