@@ -761,6 +761,41 @@ Meeting rules:
         expect(secondCallItem.meta.conferenceInjectionMode).toBeUndefined();
       });
 
+      it("T8a (KPR-416): the continuation leg carries meetingExclusionTs and still none of the four conference keys", async () => {
+        // Sibling of T2 above, not a replacement — T2 stays byte-identical.
+        // The key is deliberately named outside the `conference*` family so
+        // it survives KPR-413's blocklist strip; that survival is exactly
+        // what lets write site 2 mark exclusion on the leg's own delivery
+        // (T8b). Spec §5.2 / §6.3.
+        await soloClassifier();
+        const threadId = "conf-thread-kpr416-t8a";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValueOnce(ABORT_WITH_PROGRESS);
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+
+        // The ORIGIN turn carries it (stamped at assembly, like T2b's pin)...
+        const originItem = agentManager.runWorkItemTurn.mock.calls[0][1];
+        expect(originItem.meta.meetingExclusionTs).toBe("1000.0004");
+
+        // ...and it survives the leg construction, while the four conference
+        // keys still do not.
+        const legItem = agentManager.runWorkItemTurn.mock.calls[1][1];
+        expect(legItem.meta.meetingExclusionTs).toBe("1000.0004");
+        expect(legItem.meta.conferenceMode).toBeUndefined();
+        expect(legItem.meta.conferenceRound).toBeUndefined();
+        expect(legItem.meta.conferenceHumanTs).toBeUndefined();
+        expect(legItem.meta.conferenceInjectionMode).toBeUndefined();
+      });
+
       it("T2b: the stamp is written at assembly time, on the ORIGIN turn's own dispatch — independent of whether an abort ever happens", async () => {
         // Direct pin for D1 itself (plan-review r1 finding): T1/T2 only
         // prove the ARM's output; this proves the stamp exists on every

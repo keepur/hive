@@ -1424,6 +1424,24 @@ export class Dispatcher {
           // full vs delta turns (KPR-388 efficacy measurement).
           conferenceInjectionMode: resolved.injectionMode,
           deadlineOriginalText: `${framePrefix}\n${newMessageSegment}`,
+          // KPR-416: the exclusion key rides the item so every delivery path
+          // can mark reaction-exclusion uniformly — including the KPR-402
+          // continuation chain, which deliberately strips the four conference
+          // keys (see maybeHandleDeadlineAbort's leg construction). Named
+          // OUTSIDE the `conference*` family on purpose: it must survive that
+          // blocklist, and nothing telemetric reads it (verified: there is no
+          // meta allowlist anywhere, and neither agent_turn_telemetry nor
+          // activity_log spreads item.meta), so KPR-413's rationale — never
+          // stamp a non-conference turn as a conference turn — is untouched.
+          //
+          // Round-0 only: a round-1 reactor's exclusion is claimed by
+          // triggerConferenceReactions at dispatch, not by delivery. Guarded
+          // on conferenceHumanTs because it is optional on ResolvedAgent (a
+          // non-Slack conference surface has no ts to key on) — the same
+          // guard the deleted selection-time write applied.
+          ...(resolved.conferenceRound === 0 && resolved.conferenceHumanTs
+            ? { meetingExclusionTs: resolved.conferenceHumanTs }
+            : {}),
         },
       };
     }
