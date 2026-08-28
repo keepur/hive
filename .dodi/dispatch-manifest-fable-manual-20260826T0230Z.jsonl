@@ -102,3 +102,16 @@
 {"worker":"child-pr-review-kpr-412-r1","phase":"child-pr-review","round":1,"ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T01:19:00Z"}
 {"worker":"child-pr-review-kpr-412-final","phase":"child-pr-review","round":2,"ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T01:23:00Z"}
 {"worker":"coherence-review-kpr-412","phase":"coherence","ticket":"KPR-412","tier":"opus","dispatched_at":"2026-08-28T01:27:00Z"}
+{"worker":"spec-drafter-kpr-413","phase":"mature-ticket","ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T01:35:00Z"}
+{"worker":"spec-review-kpr-413-r1","phase":"spec-review","round":1,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T02:00:00Z"}
+{"worker":"plan-review-kpr-413-r1","phase":"plan-review","round":1,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T02:15:00Z","result":"issues_found"}
+{"worker":"plan-review-kpr-413-r2","phase":"plan-review","round":2,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T02:25:00Z","result":"issues_found"}
+{"worker":"plan-review-kpr-413-r3","phase":"plan-review","round":3,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T02:35:00Z","result":"issues_found"}
+{"worker":"plan-review-kpr-413-r4","phase":"plan-review","round":4,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T02:45:00Z","result":"approved"}
+{"worker":"implement-kpr-413-task1","phase":"implement-ticket","task":1,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T02:50:00Z"}
+{"worker":"implement-kpr-413-task2","phase":"implement-ticket","task":2,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T02:55:00Z"}
+{"worker":"pre-pr-review-kpr-413-r1","phase":"review","round":1,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T03:00:00Z"}
+{"worker":"docs-sync-kpr-413","phase":"submit-ticket-pr","mode":"child","ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T03:02:00Z"}
+{"worker":"child-pr-review-kpr-413-r1","phase":"child-pr-review","round":1,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T03:04:00Z"}
+{"worker":"child-pr-review-kpr-413-final","phase":"child-pr-review","round":2,"ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T03:06:00Z"}
+{"worker":"coherence-review-kpr-413","phase":"coherence","ticket":"KPR-413","tier":"opus","dispatched_at":"2026-08-28T03:09:00Z"}
