@@ -103,12 +103,17 @@ export interface NoteActivityArgs {
   };
 }
 
+/** Thrown out of the scribe's onAbortHandle callback when stop() has already
+ *  latched. Exported so the test can pin the mechanism, not the prose. */
+export const SCRIBE_STOPPED_ERROR = "meeting scribe stopped before turn start";
+
 export class MeetingScribe {
   private readonly summaries: Collection<MeetingSummaryDoc>;
   private readonly inFlight = new Set<string>();
   private readonly abortHandles = new Map<string, () => void>();
   private readonly lastRunAt = new Map<string, number>();
   private readonly now: () => Date;
+  private stopped = false;
 
   constructor(private readonly deps: MeetingScribeDeps) {
     this.summaries = deps.db.collection<MeetingSummaryDoc>("meeting_summaries");
@@ -148,6 +153,7 @@ export class MeetingScribe {
    * overlapping rounds both land in one tick). Do not reorder.
    */
   noteActivity(args: NoteActivityArgs): void {
+    if (this.stopped) return; // gate 0 — shutdown latched; see stop()
     const cfg = this.deps.config;
     if (!cfg.enabled || !cfg.scribeEnabled) return; // gate 1
     const { threadId } = args;
@@ -178,6 +184,8 @@ export class MeetingScribe {
   /** Aborts every live scribe run. Scribes are not in the pool's liveWorkers,
    *  so pool.stop()/abortForBoss deliberately do not reach them (spec §D3/E5). */
   stop(): void {
+    this.stopped = true; // latch BEFORE the sweep — anything minted after this
+    // point self-refuses at the onAbortHandle checkpoint
     for (const [threadId, abort] of this.abortHandles) {
       try {
         abort();
@@ -215,6 +223,8 @@ export class MeetingScribe {
     const base = this.deps.registry.get(args.baseAgentId);
     if (!base || base.disabled) return;
 
+    if (this.stopped) return; // checkpoint 2 — shutdown began while this run awaited Mongo
+
     const startedAt = this.now();
     await this.summaries
       .updateOne({ _id: threadId }, { $set: { updating: { startedAt }, updatedAt: startedAt } }, { upsert: true })
@@ -241,7 +251,29 @@ export class MeetingScribe {
           slackTs: args.source.slackTs,
           slackThreadTs: args.source.slackThreadTs,
         },
-        onAbortHandle: (abort) => this.abortHandles.set(threadId, abort),
+        onAbortHandle: (abort) => {
+          // KPR-414 checkpoint 3. stop() makes a single synchronous pass over
+          // abortHandles; a handle minted after that pass would be an orphan.
+          //
+          // ⚠ We THROW rather than calling `abort()`, and that is load-bearing,
+          // not stylistic. runRoleTurn invokes this callback at
+          // meeting-worker-pool.ts:600, one line BEFORE adapter.runTurn() at
+          // :601 — and ClaudeAgentAdapter.abort() → AgentRunner.abort() is a
+          // no-op while activeQuery is null, which it is until deep inside
+          // send() (agent-runner.ts:2091). Calling abort() here would return
+          // silently having done nothing, and the turn would run to completion
+          // unaborted AND unregistered: strictly worse than today.
+          //
+          // The throw unwinds INSIDE runRoleTurn's single try (:591-623), so
+          // adapter.runTurn() is never reached — nothing is spawned, so there
+          // is nothing to abort — and its catch (:621-623) contains the throw
+          // into a normal error-shaped RoleTurnOutcome, which run()'s existing
+          // `outcome.error` branch already handles. runRoleTurn is byte-
+          // untouched: onAbortHandle is OUR closure, and throwing from a
+          // caller-supplied callback is inside its existing contract.
+          if (this.stopped) throw new Error(SCRIBE_STOPPED_ERROR);
+          this.abortHandles.set(threadId, abort);
+        },
       });
 
       const text = outcome?.text?.trim();
