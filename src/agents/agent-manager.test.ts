@@ -6298,6 +6298,11 @@ describe("AgentManager", () => {
       expect(r1.finalMessage).toBe("reply-1");
       expect(r1.warmPath).toBe(true);
       expect(r1.warmTurnSeq).toBe(1);
+      // KPR-388 parity (round-2 finding A.2): turn 1 launched WITH a stored
+      // ctx.sessionId is a real resume, exactly like the cold path — the
+      // lease's resumedSession computation (`lease.turns === 1 &&
+      // !!ctx.sessionId`) must report it as such.
+      expect(r1.resumedSession).toBe(true);
       expect(r1.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, initToFirstTokenMs: expect.any(Number) });
       // Ticket outlives the turn — the lease holds lock + one budget slot.
       const snap1 = manager.getSnapshot().perAgent["agent-a"]!;
@@ -6311,6 +6316,9 @@ describe("AgentManager", () => {
       expect(r2.finalMessage).toBe("reply-2");
       expect(r2.warmPath).toBe(true);
       expect(r2.warmTurnSeq).toBe(2);
+      // Turn 2 rides the already-open streaming query() — no fresh resume,
+      // so resumedSession must be false even though ctx.sessionId is set.
+      expect(r2.resumedSession).toBe(false);
       expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // still ONE ticket
       expect(pushed).toEqual(["hello over voice", "hello over voice"]); // one push per turn, in order
 
@@ -6333,6 +6341,19 @@ describe("AgentManager", () => {
       await manager.spawnTurn(makeVoiceCtx({ sessionId: undefined }));
       expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
       expect(mockRunnerOpenStream.mock.calls[0]![0].sessionId).toBeUndefined();
+    });
+
+    it("(2c) openWarmLease's createRunner call threads workerPool (KPR-390 parity with the cold path's runnerOptions, round-2 finding A.3)", async () => {
+      installEchoStreamingRunner();
+      const pool = { bindManager: vi.fn(), buildWorkerAdapter: vi.fn(), abortForBoss: vi.fn() };
+      manager.setWorkerPool(pool as any);
+
+      await manager.spawnTurn(makeVoiceCtx({ sessionId: "stored-abc" }));
+
+      // createRunner(agentId, runnerOptions, preRead?) — runnerOptions is the
+      // 2nd positional arg to AgentRunner's constructor (index 10, matching
+      // the cold-path laneAPassthrough pin at (6b) above).
+      expect(vi.mocked(AgentRunner).mock.calls.at(-1)![10]).toEqual({ workerPool: pool });
     });
 
     // ---- assertion 5 -----------------------------------------------------

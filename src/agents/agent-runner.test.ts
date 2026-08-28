@@ -244,6 +244,12 @@ import { AgentRunner, resolveToolSearchEnv, resolveToolSearchMode } from "./agen
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 import { config } from "../config.js";
+// Round-2 finding B: cross-file KPR-401 accounting parity (see the describe
+// block near the end of this file) drives WarmVoiceSession's consumeOneTurn
+// through an equivalent scenario to AgentRunner.send() — both implement the
+// same sawResult/countedUsageIds/wall-clock-fallback/clamped-llmMs pattern
+// with nothing else pinning them to stay in sync.
+import { WarmVoiceSession, AsyncPushQueue } from "./warm-voice-session.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
 
@@ -4303,5 +4309,122 @@ describe("AgentRunner — KPR-390 worker-pool wiring", () => {
     expect(
       noMembership.buildToolTransportInventory().find((e) => e.name === "worker-pool"),
     ).toBeUndefined();
+  });
+});
+
+// ── Cross-file turn-usage-accounting parity (round-2 coherence review,
+// finding B) ─────────────────────────────────────────────────────────────
+// The KPR-401 accumulator pattern — `sawResult` + `countedUsageIds` + a
+// wall-clock `durationMs` fallback + a clamped `llmMs` — is hand-duplicated
+// ~15 lines apart between this file's `AgentRunner.send()` and
+// `WarmVoiceSession.consumeOneTurn()` (src/agents/warm-voice-session.ts).
+// Nothing pins the two to stay in sync, which is exactly the drift class a
+// round-1 coherence review caught (one side got KPR-401, the other didn't,
+// until that review's issue 3 flagged it).
+//
+// A shared-helper extraction was deliberately NOT attempted here: both are
+// hot spawn-turn paths with materially different control flow around the
+// shared accumulator (`send()`'s `for await` loop vs. the lease's manual
+// `next()` loop + `break turnLoop`, required so `break` never invokes the
+// streaming generator's `return()` and closes the whole call) — a subtly
+// wrong extraction risks being worse than the duplication it removes.
+// Instead this suite drives BOTH implementations through an equivalent
+// result-less-turn scenario (repeated-id streamed usage, no `result`
+// message) and asserts the identical invariant on both `RunResult`s. A
+// future KPR-40x-class fix landing in only one of the two files fails here.
+describe("cross-file turn-usage-accounting parity (KPR-401, round-2 finding B)", () => {
+  beforeEach(() => {
+    mockQueryOverride = null;
+    mockMessages = null;
+  });
+  afterEach(() => {
+    mockQueryOverride = null;
+    mockMessages = null;
+  });
+
+  const USAGE = {
+    input_tokens: 500,
+    output_tokens: 20,
+    cache_read_input_tokens: 100,
+    cache_creation_input_tokens: 5,
+  };
+
+  /** AgentRunner.send() side: streams messages, then hangs until the deadline abort()s the query. */
+  function yieldingThenHangingQuery(messages: unknown[]) {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mockQueryOverride = () => ({
+      close: () => release(),
+      [Symbol.asyncIterator]: async function* () {
+        for (const m of messages) yield m;
+        await gate;
+      },
+    });
+  }
+
+  /** WarmVoiceSession side: a minimal fake streaming Query driven by an AsyncPushQueue. */
+  function makeFakeWarmQuery() {
+    const out = new AsyncPushQueue<any>();
+    const it = out[Symbol.asyncIterator]();
+    return {
+      q: {
+        next: () => it.next(),
+        interrupt: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn(() => out.end()),
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      } as any,
+      emit: (m: Record<string, unknown>) => out.push(m),
+      endOutput: () => out.end(),
+    };
+  }
+
+  it("both sides count a repeated message.id's streamed usage exactly once, fall back to a positive wall-clock durationMs, and clamp llmMs >= 0 on a result-less turn", async () => {
+    // ── AgentRunner.send() ──
+    yieldingThenHangingQuery([
+      {
+        type: "assistant",
+        session_id: "s-parity",
+        message: { id: "msg_shared", usage: USAGE, content: [{ type: "text", text: "a" }] },
+      },
+      {
+        type: "assistant",
+        session_id: "s-parity",
+        message: { id: "msg_shared", usage: USAGE, content: [{ type: "tool_use", name: "Bash", id: "toolu_1" }] },
+      },
+    ]);
+    const runner = makeRunner({ timeoutMs: 25 });
+    const runnerResult = await runner.send("hi");
+
+    // ── WarmVoiceSession.consumeOneTurn() (via runTurn) ──
+    const { q, emit, endOutput } = makeFakeWarmQuery();
+    const lease = new WarmVoiceSession({ agentId: "agent-a", threadKey: "agent-a:voice:call-1", onClosed: vi.fn() });
+    lease.start(q);
+    const leasePromise = lease.runTurn({ text: "hi", timeoutMs: 60_000 });
+    await Promise.resolve();
+    emit({ type: "assistant", message: { id: "msg_shared", usage: USAGE, content: [{ type: "text", text: "a" }] } });
+    emit({ type: "assistant", message: { id: "msg_shared", usage: USAGE, content: [{ type: "text", text: "a" }] } });
+    // Real elapsed time so the `!sawResult` wall-clock fallback is provably
+    // nonzero rather than a same-tick 0 (matches the stream-death pin in
+    // warm-voice-session.test.ts).
+    await new Promise((r) => setTimeout(r, 5));
+    endOutput();
+    const leaseResult = await leasePromise;
+    lease.close("test-cleanup");
+
+    for (const result of [runnerResult, leaseResult]) {
+      // Exactly-once accumulation on a repeated message.id — never doubled.
+      expect(result.inputTokens).toBe(USAGE.input_tokens);
+      expect(result.outputTokens).toBe(USAGE.output_tokens);
+      expect(result.cacheReadTokens).toBe(USAGE.cache_read_input_tokens);
+      expect(result.cacheCreationTokens).toBe(USAGE.cache_creation_input_tokens);
+      // Wall-clock fallback fired — no `result` message ever arrived.
+      expect(result.durationMs).toBeGreaterThan(0);
+      // llmMs stays clamped non-negative and identity-matches the shared
+      // `max(0, durationMs - toolMs)` formula on both sides.
+      expect(result.llmMs).toBeGreaterThanOrEqual(0);
+      expect(result.llmMs).toBe(Math.max(0, result.durationMs - result.toolMs));
+    }
   });
 });

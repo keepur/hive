@@ -514,21 +514,48 @@ describe("WarmVoiceSession", () => {
   });
 
   // ------------------------------------------------------ 10: stream death
-  it("returns an error result (never hangs) when the output stream ends mid-turn", async () => {
-    const { q, endOutput } = makeFakeQuery();
+  it("returns an error result (never hangs) when the output stream ends mid-turn — with wall-clock duration fallback and accumulated usage (KPR-401 parity, round-2 finding A.1)", async () => {
+    const { q, emit, endOutput } = makeFakeQuery();
     const { lease } = makeLease();
     lease.start(q);
 
     const p = lease.runTurn({ text: "u1", timeoutMs: 60_000 });
     await microFlush();
+    // A streamed assistant message with usage arrives before the stream
+    // dies — the KPR-401 countedUsageIds accumulator must capture it even
+    // though no `result` message ever arrives to overwrite these counters.
+    emit({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: "msg-1",
+        content: [{ type: "text", text: "partial" }],
+        usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 },
+      },
+    });
+    await microFlush();
+    // Real elapsed time so the `!sawResult` wall-clock fallback (durationMs
+    // = Date.now() - pushedAt) is provably nonzero rather than a same-tick 0.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     endOutput();
 
     const r = await p;
     expect(r.error).toContain("output ended before turn result");
-    expect(r.text).toBe("");
+    expect(r.text).toBe("partial");
     expect(r.sessionId).toBe("");
     expect(lease.turns).toBe(1);
     expect(lease.hasTurnInFlight).toBe(false);
+    // KPR-401 parity pin: a result-less turn still reports a positive
+    // wall-clock durationMs — proving the `!sawResult` fallback fired
+    // instead of leaving 0 (the zero-duration/negative-llmMs incident shape
+    // KPR-401 exists to prevent) — and llmMs stays clamped non-negative.
+    expect(r.durationMs).toBeGreaterThan(0);
+    expect(r.llmMs).toBeGreaterThanOrEqual(0);
+    // Streamed usage accumulated via countedUsageIds even with no `result`
+    // message to authoritatively overwrite it — not left at zero.
+    expect(r.inputTokens).toBe(7);
+    expect(r.outputTokens).toBe(3);
+    expect(r.cacheReadTokens).toBe(1);
 
     lease.close("test-cleanup");
   });
