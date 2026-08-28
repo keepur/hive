@@ -8,6 +8,8 @@
 
 **Tech Stack:** TypeScript, Vitest.
 
+**Plan-review r1 verification note:** every code block in this plan (D1, D2, and all six new/extended test cases) was applied directly to this worktree and run, not just reasoned about — `npx vitest run src/channels/dispatcher.test.ts src/channels/dispatcher-conference.test.ts` passed 174/174, `npm run check` passed clean (3282 tests, exit 0), and each negative-verify in Task 2 Step 7 (D1 alone reverted, D2 alone reverted, D5 reordered after the arm for T4, T5's fixture-level revert) was actually performed and failed for the stated reason. The exploratory changes were then discarded (`git checkout --`) so the deliver-ticket lane's implementer redoes the work fresh per the plan text below, per the mature/deliver lane separation — but every step below is now empirically de-risked, not merely plausible.
+
 ## Testing Contract
 
 ### Required Test Groups
@@ -233,61 +235,74 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ## Task 2: Regression tests
 
 **Files:**
-- Modify: `src/channels/dispatcher-conference.test.ts` (fixture lift + new describe T1-T3 + T4 extension)
+- Modify: `src/channels/dispatcher-conference.test.ts` (`PREAMBLE` lift + import + new describe T1-T2b-T3 + T4 extension)
 - Modify: `src/channels/dispatcher.test.ts` (T5)
 
-- [ ] **Step 1: Lift three fixtures to shared scope.**
+**Revision note (plan-review r1):** round 1 applied this plan's original test code to the live worktree and ran it. Two mock-wiring bugs surfaced: T1/T2/T3's leading `.mockResolvedValueOnce(turn())` assumed a separate "origin succeeds, then a later call aborts" shape that doesn't exist for `soloClassifier()` (only one turn is ever dispatched per abort event — the ORIGIN call itself is what aborts), and T4 extended an `it.each` row that has zero tool calls, so it never reaches the "with progress" branch that redispatches at all, making the added assertion pass regardless of ordering. Both are fixed below (verified empirically by the reviewer, including the negative-verify reorder). The `turn()`/`settleReactions()` lift from round 1's Step 1 was also dead work — both are already in closure scope where the new describe nests — and is removed; only `PREAMBLE` (now load-bearing for T1's restored byte-exact assertion) plus the `deadlineContinuationWrap`/`MAX_DEADLINE_CONTINUATIONS` import are lifted/added.
 
-`turn()` (`:567-581`), `settleReactions()` (`:606`), and `PREAMBLE` (`:678`) are currently block-scoped where the new T1-T3 describe cannot reach them: `turn()` and `settleReactions()` live inside `describe("round-1 kill suppression (KPR-389 D5)", ...)` (`:557-672`), and `PREAMBLE` lives inside the separate sibling `describe("delta context injection (KPR-388)", ...)` (`:674+`). Move each definition to the outer `describe("Conference channel routing", ...)` scope (the block starting at `:208`, immediately after the `beforeEach` that ends around `:227`), following the existing hoist precedent already in the file for `soloClassifier()` at `:229-230` ("Hoisted out of the delta describe (KPR-389 T8 needs it too — it only touches the classifier mock)") — mirror that comment's shape, e.g. "Hoisted out of round-1 kill suppression / delta context injection (KPR-413 needs them too)". Do not duplicate the fixtures — move them once; every existing test that used to reach them via the narrower scope still compiles and passes (JS closures over an outer-scoped `const`/`function` work identically to an inner-scoped one for every existing caller).
+- [ ] **Step 1: Lift `PREAMBLE` to shared scope; import `deadlineContinuationWrap` and `MAX_DEADLINE_CONTINUATIONS`.**
 
-**Do not lift `THREE_MSG_HISTORY`/`makeHistory`** (also scoped inside `delta context injection`, `:698-714`) — the new T1-T3 tests below deliberately construct their own minimal inline history rather than reusing that fixture, keeping the lift to exactly the three fixtures spec-review approved.
+`PREAMBLE` (`:678`) is block-scoped inside the sibling `describe("delta context injection (KPR-388)", ...)` (`:674+`), where the new T1/T2b describe (nested inside `round-1 kill suppression (KPR-389 D5)`, `:557-672`) cannot reach it. Move its definition to the outer `describe("Conference channel routing", ...)` scope (starting `:208`, after the `beforeEach` ending `:227`), following the existing hoist precedent for `soloClassifier()` at `:229-230` ("Hoisted out of the delta describe (KPR-389 T8 needs it too — it only touches the classifier mock)") — mirror that comment's shape. `turn()` and `settleReactions()` need **no lift** — both are already defined inside `round-1 kill suppression`, the same describe the new tests nest inside.
 
-- [ ] **Step 2:** Run the two target files to confirm the lift alone breaks nothing.
+Add to this file's imports (find the existing `import` block at the top and add a new one, or extend an existing import from `../channels/deadline-continuation.js` if one already exists — check first):
+
+```typescript
+import { deadlineContinuationWrap, MAX_DEADLINE_CONTINUATIONS } from "./deadline-continuation.js";
+```
+
+- [ ] **Step 2:** Run the file to confirm the lift and import alone break nothing.
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/dispatcher-conference.test.ts`
-Expected: all existing tests still pass (same count as before the lift) — the lift is a pure scope move, zero behavior change.
+Expected: all existing tests still pass (same count as before) — the lift is a pure scope move, zero behavior change; the import is unused until Step 3 adds its consumer (an unused-import lint warning at this intermediate point is expected and self-resolves once Step 3 lands — do not treat it as a blocker mid-step).
 
-- [ ] **Step 3: Add the new describe (T1-T3) inside `round-1 kill suppression (KPR-389 D5)`.**
+- [ ] **Step 3: Add the new describe (T1, T2, T2b, T3) inside `round-1 kill suppression (KPR-389 D5)`.**
 
-Add a new nested describe as the last member of `describe("round-1 kill suppression (KPR-389 D5)", () => { ... })` (`:557-672`), immediately before that describe's closing `});` at `:672`. Uses `soloClassifier()` for the round-0-only classifier mock (already hoisted at `:229`), a minimal one-message inline history (the mock factory's `fetchThreadHistory` defaults to `mockResolvedValue([])`, `:200` — an explicit non-empty override is required here so the pre-fix composite actually contains a transcript, making the negative-verify meaningful), and `agentManager.runWorkItemTurn.mockResolvedValueOnce(turn())` chained with a second resolved value shaped `turn({ finalMessage: "", timedOut: true, aborted: true, toolCalls: 46, streamed: true })` for the deadline-abort-with-progress shape (mirrors `withProgressAbort()`'s field shape in `dispatcher.test.ts:1735-1736`, adapted to this file's `turn()` helper). `agentManager.runWorkItemTurn.mock.calls[N][1]` is the confirmed pattern for extracting the dispatched `WorkItem` in this file (e.g. `:264`, `:349`, `:512`, `:731`).
+Add a new nested describe as the last member of `describe("round-1 kill suppression (KPR-389 D5)", () => { ... })` (`:557-672`), immediately before that describe's closing `});` at `:672`. Uses `soloClassifier()` (already in scope, hoisted at `:229`), a minimal one-message inline history (the mock factory's `fetchThreadHistory` defaults to `mockResolvedValue([])`, `:200` — a non-empty override is required so the pre-fix composite actually contains a transcript). **Mock wiring, corrected:** the ORIGIN turn itself is what deadline-aborts — there is no separate prior "succeeds" call for `soloClassifier()`'s single-agent round-0 path — so T1/T2/T2b use exactly ONE `.mockResolvedValueOnce(...)` shaped as the abort-with-progress `turn()`, and the continuation leg's own `runWorkItemTurn` call falls through to the mock factory's default (a healthy `turn()`-shaped success, ending the chain at one leg). T3 (which needs two legs) uses `.mockResolvedValue(...)` (persistent, not `Once`) so origin AND leg 1 both abort with progress, and leg 2 hits the `MAX_DEADLINE_CONTINUATIONS` cap. `agentManager.runWorkItemTurn.mock.calls[N][1]` is the confirmed pattern for extracting the dispatched `WorkItem` (e.g. `:264`, `:349`, `:512`, `:731`).
 
 ```typescript
       describe("deadline-continuation legs carry the turn's own frame, not the conference transcript (KPR-413)", () => {
         const ONE_MSG_HISTORY = () => [
-          { author: "May", text: "earlier meeting context", timestamp: new Date(Date.now() - 5 * 60_000), isBot: false, ts: "1000.0001" },
+          {
+            author: "May",
+            text: "earlier meeting context",
+            timestamp: new Date(Date.now() - 5 * 60_000),
+            isBot: false,
+            ts: "1000.0001",
+          },
         ];
+        const ABORT_WITH_PROGRESS = turn({
+          finalMessage: "",
+          timedOut: true,
+          aborted: true,
+          toolCalls: 46,
+          streamed: true,
+        });
 
-        it("T1: continuation text is the turn's frame, not the composite", async () => {
+        it("T1: continuation text is the turn's frame, not the composite (byte-exact)", async () => {
           await soloClassifier();
           const threadId = "conf-thread-kpr413-t1";
           mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
-          agentManager.runWorkItemTurn
-            .mockResolvedValueOnce(turn())
-            .mockResolvedValueOnce(turn({ finalMessage: "", timedOut: true, aborted: true, toolCalls: 46, streamed: true }));
+          agentManager.runWorkItemTurn.mockResolvedValueOnce(ABORT_WITH_PROGRESS);
 
-          await dispatcher.dispatch(
-            makeWorkItem({
-              text: "Jasper, status update?",
-              source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
-              threadId,
-              meta: { slackTs: "1000.0004" },
-            }),
-          );
+          const item = makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          });
+          await dispatcher.dispatch(item);
           await settleReactions();
 
+          const expectedFrame = `${PREAMBLE("conf-kpr413", "Jasper")}\n---\n[New message]:\n${item.text}`;
           const secondCallItem = agentManager.runWorkItemTurn.mock.calls[1][1];
-          expect(secondCallItem.text).not.toContain("[Meeting thread in #"); // no transcript marker
-          expect(secondCallItem.text).toContain("Meeting rules:"); // frame preserved
-          expect(secondCallItem.text).toContain("Jasper, status update?"); // human text preserved
+          expect(secondCallItem.text).toBe(deadlineContinuationWrap(expectedFrame, 1, MAX_DEADLINE_CONTINUATIONS + 1));
         });
 
         it("T2: continuation leg carries no conference meta", async () => {
           await soloClassifier();
           const threadId = "conf-thread-kpr413-t2";
           mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
-          agentManager.runWorkItemTurn
-            .mockResolvedValueOnce(turn())
-            .mockResolvedValueOnce(turn({ finalMessage: "", timedOut: true, aborted: true, toolCalls: 46, streamed: true }));
+          agentManager.runWorkItemTurn.mockResolvedValueOnce(ABORT_WITH_PROGRESS);
 
           await dispatcher.dispatch(
             makeWorkItem({
@@ -309,14 +324,36 @@ Add a new nested describe as the last member of `describe("round-1 kill suppress
           expect(secondCallItem.meta.conferenceInjectionMode).toBeUndefined();
         });
 
-        it("T3: chain does not nest — every leg wraps the same frame", async () => {
+        it("T2b: the stamp is written at assembly time, on the ORIGIN turn's own dispatch — independent of whether an abort ever happens", async () => {
+          // Direct pin for D1 itself (plan-review r1 finding): T1/T2 only
+          // prove the ARM's output; this proves the stamp exists on every
+          // conference turn's dispatch args unconditionally, which is also
+          // what makes the outage-store replay case (T5) sound — the store
+          // serializes this same effectiveItem.
+          await soloClassifier();
+          const threadId = "conf-thread-kpr413-t2b";
+          mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+          agentManager.runWorkItemTurn.mockResolvedValueOnce(turn()); // healthy — no abort at all
+
+          await dispatcher.dispatch(
+            makeWorkItem({
+              text: "Jasper, status update?",
+              source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
+              threadId,
+              meta: { slackTs: "1000.0004" },
+            }),
+          );
+
+          const originCallItem = agentManager.runWorkItemTurn.mock.calls[0][1];
+          expect(originCallItem.meta.deadlineOriginalText).toContain("Meeting rules:");
+          expect(originCallItem.meta.deadlineOriginalText).not.toContain("[Meeting thread in #");
+        });
+
+        it("T3: chain does not nest — every leg wraps the same frame, never a wrap-of-a-wrap", async () => {
           await soloClassifier();
           const threadId = "conf-thread-kpr413-t3";
           mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
-          agentManager.runWorkItemTurn
-            .mockResolvedValueOnce(turn())
-            .mockResolvedValueOnce(turn({ finalMessage: "", timedOut: true, aborted: true, toolCalls: 46, streamed: true }))
-            .mockResolvedValueOnce(turn({ finalMessage: "", timedOut: true, aborted: true, toolCalls: 46, streamed: true }));
+          agentManager.runWorkItemTurn.mockResolvedValue(ABORT_WITH_PROGRESS); // persistent: origin AND leg 1 both abort
 
           await dispatcher.dispatch(
             makeWorkItem({
@@ -334,40 +371,59 @@ Add a new nested describe as the last member of `describe("round-1 kill suppress
           const leg2 = agentManager.runWorkItemTurn.mock.calls[2][1];
           expect(leg1.id).toMatch(/#dl1$/);
           expect(leg2.id).toMatch(/#dl2$/);
-          // leg2's wrapped original text is byte-identical to leg1's — never a
-          // wrap-of-a-wrap. Both derive from the SAME frame string.
-          expect(leg2.meta.deadlineOriginalText).toBe(leg1.meta.deadlineOriginalText);
+          expect(leg2.meta.deadlineOriginalText).toBe(leg1.meta.deadlineOriginalText); // same frame, not leg1's wrap
+          // Strengthened per plan-review r1 (this property alone holds
+          // pre-fix too, by coincidence, since both legs would carry the
+          // same composite either way — the marker check is what actually
+          // distinguishes fixed from unfixed):
+          expect(leg2.text).not.toContain("[Meeting thread in #");
         });
       });
 ```
 
-- [ ] **Step 4: Extend the existing round-1 `it.each` with T4 (the ordering pin).**
+- [ ] **Step 4: Extend the existing round-1 `it.each` with a third row, then add T4 (the ordering pin).**
 
-The existing `it.each` at `:608-626` has two cases (`["aborted", { aborted: true }]`, `["timedOut", { timedOut: true, aborted: true }]`); only the `timedOut` case can reach `maybeHandleDeadlineAbort`'s own gate (`timedOut !== true || aborted !== true` early-returns), but running the added assertion unconditionally for both cases is harmless — it holds trivially for the `aborted`-only case and carries the real signal for `timedOut`. After the existing `await settleReactions();` call (`:618`) and before the existing `expect(adapter.deliver)...` assertions, add:
+The existing `it.each` at `:608-626` has two cases — `["aborted", { aborted: true }]` and `["timedOut", { timedOut: true, aborted: true }]` (`toolCalls: 0`, `streamed: false` by the `turn()` default) — neither reaches `maybeHandleDeadlineAbort`'s "with progress" re-dispatch branch: the `aborted`-only case fails the arm's own `timedOut !== true` gate, and the existing `timedOut` case has zero observed progress, so it takes the **zero-progress** notice-only branch, never a re-dispatch. **A third case with observed progress is required** for T4 to test anything real. Add it to the `it.each` array:
+
+```typescript
+    it.each([
+      ["aborted", { aborted: true }],
+      ["timedOut", { timedOut: true, aborted: true }],
+      ["timedOut with progress", { timedOut: true, aborted: true, toolCalls: 46, streamed: true }],
+    ])("killed round-1 reaction (%s) never delivers; mark untouched for the reactor", async (_label, flags) => {
+```
+
+(This replaces only the `it.each` array literal and the `it.each(...)(` call's first line — the test body and its existing assertions below are unchanged and must still pass for all three cases, including the new one: D5's gate checks only `resolved.conferenceRound === 1 && (aborted || timedOut || ...)`, with no dependency on `toolCalls`/`streamed`, so the existing `adapter.deliver`/`setMeetingMark` assertions hold identically for the new row.)
+
+Then, after the existing `await settleReactions();` call (`:618`) and before the existing `expect(adapter.deliver)...` assertions, add:
 
 ```typescript
           // KPR-413 T4: pins the D5-before-deadline-abort-arm ordering
           // established at the epic's main-sync (705f9f9) — a killed round-1
           // reaction must never reach maybeHandleDeadlineAbort and produce a
-          // continuation dispatch. Negative-verify: reorder D5 after the arm
-          // in dispatchToAgent → the timedOut case fires a third dispatch and
-          // this assertion fails.
+          // continuation dispatch, even when it has observed progress (the
+          // one case that could otherwise redispatch). Only the third
+          // ("timedOut with progress") case exercises this meaningfully; the
+          // other two never reach the arm's own gate regardless of D5's
+          // position, so the assertion is trivially true for them.
           expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
 ```
 
 - [ ] **Step 5: Add T5 in `dispatcher.test.ts`'s deadline-abort continuation describe.**
 
-Add a new row inside `describe("deadline-abort continuation (KPR-402)", ...)` (`:1699+`), after the existing chain-nesting test around `:1905-1920`. Confirmed helper shapes from the file: `makeTurn(overrides)` is a module-level function (`:1177`, outside any describe) that mirrors this file's `TurnResult`-shaped mock return, used the same way `turn()` is used in `dispatcher-conference.test.ts`; `replayItem(overrides)` (defined at `:1730` inside this describe) is `slackItem({ meta: { outageReplay: true, targetAgentId: "executive-assistant" }, ...overrides })` — **a shallow spread, so `overrides.meta` fully replaces the default meta object**, meaning the test below must include `outageReplay: true` and `targetAgentId` explicitly inside its own `meta` override, not rely on the default surviving. There is no `replayWrap` helper anywhere in `dispatcher.test.ts` — the file's existing replay tests dispatch raw `WorkItem`s directly (bypassing the real `outage-replay-processor.ts`'s own wrapping entirely), so this test does the same; `item.text`'s exact content is irrelevant to this test since the fix makes `maybeHandleDeadlineAbort` prefer `item.meta.deadlineOriginalText` over `item.text` unconditionally once that key is present — the test proves exactly that preference.
+Add a new row inside `describe("deadline-abort continuation (KPR-402)", ...)` (`:1699+`), after the existing chain-nesting test around `:1905-1920`. Confirmed helper shapes: `makeTurn(overrides)` is module-level (`:1177`, outside any describe); `replayItem(overrides)` (`:1730`, inside this describe) is `slackItem({ meta: { outageReplay: true, targetAgentId: "executive-assistant" }, ...overrides })` — **a shallow spread, so `overrides.meta` fully replaces the default meta object** — the test below includes `outageReplay`/`targetAgentId` explicitly. There is no `replayWrap` helper in `dispatcher.test.ts` (a same-named function exists in `src/outage/outage-notices.ts`, applied by the real `outage-replay-processor.ts:123`, but this file's existing replay tests dispatch raw `WorkItem`s directly, bypassing that layer entirely — this test matches that established idiom rather than introducing a new one).
+
+**What this test actually proves (plan-review r1 correction):** T5 proves **D2** on the single-dispatch leg — that conference meta is stripped from a replay-originated continuation the same way it is from a fan-out one. It does **not** independently prove D1 (that's T2b's job) — the fixture directly supplies `deadlineOriginalText` because that is what a real D1-fixed conference-assembly call would already have written into the item *before* it was ever queued (T2b proves that write happens); T5's own negative-verify is therefore at the fixture level (see Step 7), not by reverting the arm's source.
 
 ```typescript
     it("T5 (KPR-413): a replayed conference turn's continuation leg carries the stamped frame from meta, not item.text, and no conference meta", async () => {
       const composite = "[Meeting thread in #conf-x — participants: Jasper]\n---\n[New message]:\ntrigger text";
-      const frame = "You are in a meeting in #conf-x with Jasper.\n\nMeeting rules:\n---\n[New message]:\ntrigger text"; // the D1-stamped frame, distinct from the composite
+      const frame = "You are in a meeting in #conf-x with Jasper.\n\nMeeting rules:\n---\n[New message]:\ntrigger text";
       agentManager.runWorkItemTurn.mockResolvedValueOnce(withProgressAbort());
       await dispatcher.dispatch(
         replayItem({
           id: "m1",
-          text: composite, // what a pre-fix stored queue doc's text would have been — must be IGNORED once deadlineOriginalText is present
+          text: composite, // must be IGNORED once meta.deadlineOriginalText is present
           meta: {
             outageReplay: true,
             targetAgentId: "executive-assistant",
@@ -375,7 +431,7 @@ Add a new row inside `describe("deadline-abort continuation (KPR-402)", ...)` (`
             conferenceRound: 0,
             conferenceHumanTs: "1000.0004",
             conferenceInjectionMode: "full",
-            deadlineOriginalText: frame, // the D1 stamp, as it would have been written at conference-assembly time and ridden into the outage store
+            deadlineOriginalText: frame, // simulates the D1 stamp a real conference-assembly call already wrote
           },
         }),
       );
@@ -389,23 +445,30 @@ Add a new row inside `describe("deadline-abort continuation (KPR-402)", ...)` (`
     });
 ```
 
-- [ ] **Step 6:** Run both target files and confirm all new rows pass.
+- [ ] **Step 6:** Format, then run both target files and confirm all new rows pass.
+
+Several code blocks above exceed the repo's 120-char `printWidth` at their nested nesting depth (notably the `ABORT_WITH_PROGRESS`/history-entry object literals and the T4 `it.each` array as inline-typed above) — `npm run check` runs `format:check`, which fails on unformatted code, so format before the final check rather than after:
+
+Run: `npm run format`
+Expected: exit 0; `git diff` shows only whitespace/wrapping changes in the two edited test files, no logic changes (review the diff to confirm this — if `format` changes anything beyond wrapping, something was pasted wrong).
+
+Then:
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/dispatcher.test.ts src/channels/dispatcher-conference.test.ts`
-Expected: all tests pass; both files' case counts increase by exactly 6 over their pre-edit baselines (dispatcher-conference.test.ts: T1+T2+T3+T4 = 4; dispatcher.test.ts: T5 = 1 — capture baselines by running each file once before Task 1's edit if precise counts are wanted, though the pass/fail signal matters more than the exact totals here).
+Expected: all tests pass; `dispatcher-conference.test.ts`'s case count increases by exactly 5 over its pre-edit baseline (T1, T2, T2b, T3, plus the `it.each` gaining one case = T4's row) and `dispatcher.test.ts`'s by exactly 1 (T5) — capture baselines by running each file once before Task 1's edit if precise counts are wanted.
 
 - [ ] **Step 7:** Negative-verify each new test fails for the right reason on pre-fix source.
 
-For T1/T2/T3 (dispatcher-conference.test.ts): temporarily revert Task 1 Step 1 (D1) only — remove the `framePrefix` line and the `deadlineOriginalText` key from the conference-assembly meta — and re-run:
+For T1/T2/T2b/T3 (dispatcher-conference.test.ts): temporarily revert Task 1 Step 1 (D1) only — remove the `framePrefix` line and the `deadlineOriginalText` key from the conference-assembly meta — and re-run:
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/dispatcher-conference.test.ts -t "KPR-413"`
-Expected: T1 fails (the transcript-marker negative assertion trips — `originalText` falls back to the composite `item.text`, which contains `"[Meeting thread in #"`), T3 fails or is unaffected depending on which half of D1 it exercises. T2's `conferenceMode`/etc. assertions depend on D2, not D1 — they will still pass here since D2 is untouched by this revert; verify each assertion's actual failure mode matches its stated purpose, don't just confirm "something failed."
+Expected: T1 fails (the byte-exact equality no longer holds — `originalText` falls back to the composite `item.text`, which contains the transcript header the expected frame does not); T2b fails (`meta.deadlineOriginalText` on the origin call is now the composite, containing `"[Meeting thread in #"`); T3's `not.toContain` assertion fails (both legs now carry the composite). T2's assertions depend on D2, not D1 — they still pass here since D2 is untouched by this revert.
 
-For T2 and T4 specifically (the meta-stripping assertions): revert Task 1 Step 2 (D2) only instead — restore the four conference keys to the destructure's pass-through — and re-run the same `-t "KPR-413"` filter. Expected: T2's `conferenceMode`/`conferenceRound`/`conferenceHumanTs`/`conferenceInjectionMode` assertions fail (they're no longer `undefined`); T4's count assertion is unaffected by D2 alone (D5's ordering, not D2's meta strip, is what T4 pins) and should still pass.
+For T2/T4 specifically (the meta-stripping assertions): revert Task 1 Step 2 (D2) only instead — restore the four conference keys to the destructure's pass-through — and re-run the same `-t "KPR-413"` filter. Expected: T2's `conferenceMode`/`conferenceRound`/`conferenceHumanTs`/`conferenceInjectionMode` assertions fail (they're no longer `undefined`). T4's count assertion is unaffected by D2 alone and should still pass — then perform T4's OWN negative-verify separately: in `dispatchToAgent`, temporarily move the D5 round-1 kill-suppression block (the `if (resolved.conferenceRound === 1 && (...))` block) to AFTER the `maybeHandleDeadlineAbort` call instead of before it, re-run `-t "KPR-413"`, and confirm T4's `toHaveBeenCalledTimes(2)` assertion fails (a third dispatch fires for the "timedOut with progress" case). Restore the D5 ordering (this is a control-flow reorder, not covered by `git restore` on an already-committed file mid-negative-verify — apply and then manually undo the reorder, or use a scratch diff you discard).
 
-For T5 (dispatcher.test.ts): revert both D1 and D2, re-run `-t "KPR-413"` in that file. Expected: T5's marker-absence and meta-undefined assertions fail — though note T5's fixture supplies `deadlineOriginalText` directly (simulating an already-D1-fixed stored doc), so reverting D1/D2 in the ARM's own code doesn't change T5's outcome by itself (the arm still prefers the supplied `deadlineOriginalText` over `item.text` regardless of D1/D2's presence, since that preference logic is pre-existing KPR-402 code, not part of this fix). T5's real negative-verify is therefore at the FIXTURE level, not the source level: change the fixture's `meta.deadlineOriginalText` to `composite` (simulating a pre-fix stored doc, i.e. what the queue would have held before D1 existed) and re-run — now the assertions fail, proving T5 actually distinguishes the two fixture shapes.
+For T5 (dispatcher.test.ts): T5's negative-verify is at the fixture level, not the source level (see Step 5's explanation) — change the fixture's `meta.deadlineOriginalText` from `frame` to `composite` (simulating what a pre-D1 stored queue doc would have held) and re-run `-t "KPR-413"` in this file. Expected: the assertions fail, proving T5 actually distinguishes the two fixture shapes rather than passing vacuously regardless of which text arrives in meta.
 
-Restore `src/channels/dispatcher.ts` (`git restore src/channels/dispatcher.ts` — the fix is already committed from Task 1, so this returns the file to that committed state) after each negative-verify sub-step. Confirm `git status --short` shows only the two test files as modified before proceeding to commit.
+Restore `src/channels/dispatcher.ts` (`git restore src/channels/dispatcher.ts` — the fix is already committed from Task 1, so this returns the file to that committed state) after each source-level negative-verify sub-step, and restore T5's fixture back to `frame` before committing. Confirm `git status --short` shows only the two test files as modified before proceeding to commit.
 
 - [ ] **Step 8:** Commit.
 
@@ -413,16 +476,21 @@ Restore `src/channels/dispatcher.ts` (`git restore src/channels/dispatcher.ts` �
 git add src/channels/dispatcher-conference.test.ts src/channels/dispatcher.test.ts
 git commit -m "test(kpr-413): regression coverage for deadline-continuation legs under conference turns
 
-Five new cases across both dispatcher test files: T1 (continuation
-text is the turn's frame, not the composite), T2 (leg carries no
-conference meta), T3 (chain does not nest across legs), T4 (round-1
-reactors stay unreachable through the deadline-abort arm — an
-ordering pin, not new behavior), T5 (the single-dispatch outage-replay
-leg for a conference turn gets the same treatment as the live
-fan-out leg). Each negative-verified against the pre-fix source.
-Lifted turn()/settleReactions()/PREAMBLE to the outer describe scope
-in dispatcher-conference.test.ts so the new describe can reach them,
-following the file's existing soloClassifier() hoist precedent.
+Six new cases across both dispatcher test files: T1 (continuation
+text is the turn's frame, byte-exact), T2 (leg carries no conference
+meta), T2b (the stamp is written at assembly time, on the origin
+turn's own dispatch, independent of whether an abort ever happens),
+T3 (chain does not nest across legs), T4 (round-1 reactors with
+observed progress stay unreachable through the deadline-abort arm —
+an ordering pin on the epic's main-sync D5-before-arm placement, not
+new behavior), T5 (the single-dispatch outage-replay leg for a
+conference turn gets the same meta-stripping treatment as the live
+fan-out leg). Each negative-verified against the pre-fix source or,
+for T5, against the pre-D1 fixture shape. Lifted PREAMBLE to the
+outer describe scope in dispatcher-conference.test.ts (turn()/
+settleReactions() needed no lift — already in scope where the new
+describe nests), following the file's existing soloClassifier() hoist
+precedent.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
