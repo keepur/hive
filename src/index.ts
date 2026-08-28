@@ -413,6 +413,64 @@ async function main(): Promise<void> {
     taskLedger.isConfigured ? taskLedger : undefined,
   );
 
+  // KPR-390: meeting worker pool — constructed after the dispatcher
+  // (scheduler-seam precedent, breaks the manager↔dispatcher cycle).
+  // KPR-414: wiring (incl. ensureIndexes) moved here, ABOVE the
+  // spawn-capable boundary; workerPool.start() itself (restart sweep +
+  // watchdog) deliberately stays at its original, later site — see the
+  // comment there for why the split is forced, not stylistic.
+  const workerPool = new MeetingWorkerPool({
+    db,
+    registry,
+    config: config.meetingWorkers,
+    onDispatch: (item) => {
+      dispatcher.dispatch(item).catch((err) => {
+        log.error("Worker re-entry dispatch failed", { error: String(err) });
+      });
+    },
+  });
+  agentManager.setWorkerPool(workerPool);
+  // KPR-414: ensureIndexes is public and idempotent (three createIndex
+  // calls, no-ops when the indexes already exist). Calling it here closes
+  // the window — real once wiring moved ~340 lines earlier than start() —
+  // in which the pool is dispatchable but its claim-ledger atomicity index
+  // might not exist yet. start() re-runs it later at the cost of three
+  // no-op round-trips; its own boot-fatal posture and contract are
+  // untouched at both sites.
+  await workerPool.ensureIndexes();
+
+  // KPR-409: meeting scribe — running summary for the conference full-arm
+  // anchor. Constructed after the pool (it consumes runRoleTurn/hasCapacity)
+  // and injected into the dispatcher by setter, the setSlackAdapter precedent.
+  // KPR-414: wiring moved here, ABOVE the spawn-capable boundary, alongside
+  // the pool's.
+  const meetingScribe = new MeetingScribe({
+    db,
+    registry,
+    pool: workerPool,
+    config: config.meetingWorkers,
+  });
+  // ⚠ NOT awaited-fatal, deliberately diverging from the claim ledger's C27
+  // boot-fatal posture: the scribe's only index is 7-day TTL housekeeping with
+  // no correctness role. Without it, summary docs simply accumulate. Making an
+  // explicitly-optional, always-degradable feature boot-fatal would contradict
+  // this feature's own degrade-silently rule (spec §Integration points issue 5).
+  meetingScribe.ensureIndexes().catch((err) => log.error("Scribe index setup failed", { error: String(err) }));
+  dispatcher.setMeetingScribe(meetingScribe);
+  log.info("Meeting scribe wired", {
+    scribeEnabled: config.meetingWorkers.scribeEnabled,
+    scribeModel: config.meetingWorkers.scribeModel,
+    scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
+  });
+
+  // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
+  // Everything BELOW this line can dispatch a turn: bgTaskManager /
+  // codeTaskManager orphan-completion callbacks, meetingMonitor, every
+  // channel adapter, the scheduler. Anything a turn READS PER SPAWN —
+  // provider plugins, the worker pool, the meeting scribe — must be wired
+  // ABOVE it, or turns in the boot window silently see the pre-feature
+  // engine. Guarded by src/boot-order.test.ts.
+
   // Background task manager — agents can spawn detached background processes
   const bgTaskManager = new BackgroundTaskManager(
     config.background.port,
@@ -745,50 +803,25 @@ async function main(): Promise<void> {
   scheduler.start();
   log.info("Scheduler started");
 
-  // KPR-390: meeting worker pool — constructed after the dispatcher
-  // (scheduler-seam precedent, breaks the manager↔dispatcher cycle).
-  const workerPool = new MeetingWorkerPool({
-    db,
-    registry,
-    config: config.meetingWorkers,
-    onDispatch: (item) => {
-      dispatcher.dispatch(item).catch((err) => {
-        log.error("Worker re-entry dispatch failed", { error: String(err) });
-      });
-    },
-  });
-  agentManager.setWorkerPool(workerPool);
-  // indexes + restart sweep + watchdog. Unguarded on purpose: the restart
-  // sweep self-contains its own failures (pool.start), so the only throw that
-  // reaches here is an ensureIndexes failure — boot-fatal like every other
-  // boot-time datastore failure.
+  // KPR-414: the pool's WIRING — and its ensureIndexes() — moved above the
+  // spawn-capable boundary (see the block after the Dispatcher construction);
+  // ensureIndexes is idempotent, so start() re-running it here is three
+  // no-op createIndex calls and start()'s contract is intact. This call —
+  // restart sweep, watchdog — deliberately stays HERE, below
+  // dispatcher.registerAdapter(slackAdapter): the sweep's honest expiry
+  // re-entry is a real boss turn, and dispatchToAgent resolves its delivery
+  // adapter BEFORE running the turn (dispatcher.ts:324 / :570-572), so an
+  // early sweep would pay for the turn and silently drop the notice.
+  // Wiring-before-surfaces and sweep-after-adapters have disjoint valid
+  // ranges; the split is forced, not stylistic. Unguarded on purpose: the
+  // restart sweep self-contains its own failures (pool.start), so the only
+  // throw that reaches here is an ensureIndexes failure — boot-fatal like
+  // every other boot-time datastore failure.
   await workerPool.start();
   log.info("Meeting worker pool started", {
     enabled: config.meetingWorkers.enabled,
     maxConcurrent: config.meetingWorkers.maxConcurrent,
     perMeetingMax: config.meetingWorkers.perMeetingMax,
-  });
-
-  // KPR-409: meeting scribe — running summary for the conference full-arm
-  // anchor. Constructed after the pool (it consumes runRoleTurn/hasCapacity)
-  // and injected into the dispatcher by setter, the setSlackAdapter precedent.
-  const meetingScribe = new MeetingScribe({
-    db,
-    registry,
-    pool: workerPool,
-    config: config.meetingWorkers,
-  });
-  // ⚠ NOT awaited-fatal, deliberately diverging from the claim ledger's C27
-  // boot-fatal posture: the scribe's only index is 7-day TTL housekeeping with
-  // no correctness role. Without it, summary docs simply accumulate. Making an
-  // explicitly-optional, always-degradable feature boot-fatal would contradict
-  // this feature's own degrade-silently rule (spec §Integration points issue 5).
-  meetingScribe.ensureIndexes().catch((err) => log.error("Scribe index setup failed", { error: String(err) }));
-  dispatcher.setMeetingScribe(meetingScribe);
-  log.info("Meeting scribe wired", {
-    scribeEnabled: config.meetingWorkers.scribeEnabled,
-    scribeModel: config.meetingWorkers.scribeModel,
-    scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
   });
 
   // Start watching for agent definition changes
