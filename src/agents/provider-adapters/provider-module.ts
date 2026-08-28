@@ -39,10 +39,10 @@ export interface LaneBModuleDeps {
    *  full map would receive every other provider's apiKey with it
    *  (CLAUDE.md § Security (DOD-212): a malicious plugin can exfil secrets
    *  directly). `baseUrl` (KPR-392) is the caller-validated provider
-   *  endpoint for providers whose endpoint is deployment infrastructure
-   *  (grok's operator-hosted gateway) rather than a universal vendor
-   *  address — resolved and validated by the engine, consumed opaquely by
-   *  the module. */
+   *  endpoint (a KPR-394 provider plugin's `base-url-env`) rather than a
+   *  universal vendor address — resolved and validated by the engine,
+   *  consumed opaquely by the module. Built-in Lane B providers (codex,
+   *  openai, gemini, grok) don't use it — each has one fixed endpoint. */
   providerConfig?: { agentModel?: string; apiKey?: string; baseUrl?: string };
   /** KPR-353 stateless-replay history store — consumed only by modules whose
    *  session strategy persists replay history, and only in primary context:

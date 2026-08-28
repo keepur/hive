@@ -61,8 +61,9 @@ vi.mock("../config.js", () => ({
     // createProviderAdapter's resolvePassthroughSpawn call.
     kimi: { agentModel: "" },
     deepseek: { agentModel: "" },
-    // KPR-371/KPR-384: grok's default-model override; the credential
-    // (GROK_GATEWAY_KEY) rides the same env → Keychain chain as kimi/deepseek.
+    // KPR-371/KPR-410: grok's default-model override; the credential (an xAI
+    // subscription OAuth access token) is resolved from ~/.grok/auth.json by
+    // grok-oauth.ts, not from config/env.
     grok: { agentModel: "" },
     instance: { id: "test-instance" },
     modelRouter: { enabled: false },
@@ -72,8 +73,7 @@ vi.mock("../config.js", () => ({
 
 // KPR-346: the Lane A credential chain is env → Keychain. Stub the Keychain
 // leg so no real `security` subprocess ever runs; env (KIMI_API_KEY /
-// DEEPSEEK_API_KEY / GROK_GATEWAY_KEY, set per-test) is the only live source
-// in the suite.
+// DEEPSEEK_API_KEY, set per-test) is the only live source in the suite.
 vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: vi.fn(() => "") }));
 
 // Mock plugin loader
@@ -179,14 +179,21 @@ vi.mock("./provider-adapters/gemini-interactions-adapter.js", () => ({
   }),
 }));
 
+// KPR-410: grok's credential is an xAI subscription OAuth access token read
+// from ~/.grok/auth.json by grok-oauth.ts — resolved per spawn by the
+// manager's own grok arm. Hoisted so the vi.mock factory below can reference it.
+const mockResolveOAuthFileToken = vi.hoisted(() => vi.fn());
+vi.mock("./provider-adapters/grok-oauth.js", () => ({
+  resolveOAuthFileToken: mockResolveOAuthFileToken,
+}));
+
 // KPR-392: importOriginal preserves the module's real constant exports
-// (DEFAULT_GROK_GATEWAY_URL, DEFAULT_GROK_MODEL,
-// __resetGrokCoercionWarnedForTests) — both provider-modules.ts (fallback
-// model) and agent-manager.ts (default gateway URL) import them at module
-// load, so a bare mock factory would silently zero those defaults out.
-vi.mock("./provider-adapters/grok-gateway-adapter.js", async (importOriginal) => ({
+// (DEFAULT_GROK_MODEL, __resetGrokCoercionWarnedForTests) —
+// provider-modules.ts (fallback model) imports one of them at module load,
+// so a bare mock factory would silently zero that default out.
+vi.mock("./provider-adapters/grok-adapter.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
-  GrokGatewayAdapter: vi.fn().mockImplementation(function (options) {
+  GrokAdapter: vi.fn().mockImplementation(function (options) {
     mockGrokConstructor(options);
     return {
       provider: "grok",
@@ -3808,7 +3815,7 @@ describe("AgentManager", () => {
 
       beforeEach(() => {
         mockConversationIndex.mockResolvedValue(undefined);
-        process.env.GROK_GATEWAY_KEY = "test-grok-gateway-key";
+        mockResolveOAuthFileToken.mockReset().mockResolvedValue("test-grok-oauth-token");
         process.env.KIMI_API_KEY = "test-kimi-key";
         registry._agents.set(
           "agent-grok",
@@ -3823,8 +3830,6 @@ describe("AgentManager", () => {
 
       afterEach(() => {
         delete process.env.KIMI_API_KEY;
-        delete process.env.GROK_GATEWAY_KEY;
-        delete process.env.GROK_GATEWAY_URL;
       });
 
       // --- routing ----------------------------------------------------------
@@ -3842,18 +3847,23 @@ describe("AgentManager", () => {
       });
 
       // --- 1. construction: module-table lookup, no Lane A residue ----------
-      it("grok turn constructs GrokGatewayAdapter through the module table — no laneAPassthrough bag, no Claude adapter", async () => {
+      it("grok turn constructs GrokAdapter through the module table — no laneAPassthrough bag, no Claude adapter", async () => {
         await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-adapter" }));
 
         expect(mockGrokConstructor).toHaveBeenCalledWith(
           expect.objectContaining({
-            apiKey: "test-grok-gateway-key",
-            // KPR-384/KPR-392: the loopback CLIProxyAPI gateway, never
-            // api.x.ai — xAI's own compat endpoint 400s on schemas lacking
-            // `required`.
-            baseUrl: "http://127.0.0.1:8317",
+            apiKey: "test-grok-oauth-token",
             model: "grok-4.6",
           }),
+        );
+        // Pin the literal credential-file path passed to resolveOAuthFileToken —
+        // this is fully mocked elsewhere in the suite, so nothing else catches
+        // a typo in the path string that agent-manager.ts hands off.
+        expect(mockResolveOAuthFileToken).toHaveBeenCalledWith("~/.grok/auth.json");
+        // KPR-410: no baseUrl in the constructor options at all — GrokAdapter
+        // hardcodes GROK_API_BASE_URL, there is nothing left to thread.
+        expect(mockGrokConstructor).not.toHaveBeenCalledWith(
+          expect.objectContaining({ baseUrl: expect.anything() }),
         );
         // Lane A retired for grok: AgentRunner gets no laneAPassthrough bag,
         // and the Claude adapter (mockRunnerSend) never runs.
@@ -3912,15 +3922,19 @@ describe("AgentManager", () => {
       });
 
       // --- 4. missing credential, breaker-invisible ---------------------------
-      it("a missing GROK_GATEWAY_KEY is a config fault that never trips the grok breaker", async () => {
-        delete process.env.GROK_GATEWAY_KEY;
+      it("a missing/unreadable OAuth credential file is a config fault that never trips the grok breaker", async () => {
+        mockResolveOAuthFileToken.mockReset().mockRejectedValue(
+          new TurnAssemblyError(
+            "Grok OAuth credential unavailable (authentication) at ~/.grok/auth.json — the file is absent or unreadable; run `grok login` to sign in",
+          ),
+        );
         for (let i = 0; i < 3; i++) {
           await expect(
             manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr392-cred-${i}` })),
-          ).rejects.toThrow(/Passthrough credential missing \(authentication\): GROK_GATEWAY_KEY/);
+          ).rejects.toThrow(/Grok OAuth credential unavailable \(authentication\)/);
         }
         // Breaker never tripped — restore the credential and the 4th spawn RUNS.
-        process.env.GROK_GATEWAY_KEY = "test-grok-gateway-key";
+        mockResolveOAuthFileToken.mockReset().mockResolvedValue("test-grok-oauth-token");
         const result = await manager.spawnTurn(
           smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-cred-ok" }),
         );
@@ -3928,27 +3942,10 @@ describe("AgentManager", () => {
         expect(manager.circuitBreakers.stateFor("grok")?.state ?? "closed").toBe("closed");
       });
 
-      // --- 5. GROK_GATEWAY_URL override validation ----------------------------
-      it("a loopback GROK_GATEWAY_URL override is accepted and flows to the constructor's baseUrl", async () => {
-        process.env.GROK_GATEWAY_URL = "http://127.0.0.1:9999";
-        await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-url-loopback" }));
-        expect(mockGrokConstructor).toHaveBeenLastCalledWith(
-          expect.objectContaining({ baseUrl: "http://127.0.0.1:9999" }),
-        );
-      });
-
-      it("a cleartext off-box GROK_GATEWAY_URL fails the turn with the byte-identical cleartext message, breaker closed", async () => {
-        process.env.GROK_GATEWAY_URL = "http://evil.example";
-        await expect(
-          manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: "sms:line-1:kpr392-url-cleartext" })),
-        ).rejects.toThrow(/cleartext to a non-loopback host/);
-        expect(manager.circuitBreakers.stateFor("grok")?.state ?? "closed").toBe("closed");
-      });
-
       // --- 6. breaker attribution ---------------------------------------------
       it("three hard faults open the grok breaker only — claude and kimi stay closed", async () => {
         for (let i = 0; i < 3; i++) {
-          mockGrokRunTurn.mockResolvedValueOnce(makeRunResult({ error: "Grok gateway request failed (503): boom" }));
+          mockGrokRunTurn.mockResolvedValueOnce(makeRunResult({ error: "Grok request failed (503): boom" }));
           await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId: `sms:line-1:kpr392-trip-${i}` }));
         }
         expect(manager.circuitBreakers.stateFor("grok")!.state).toBe("open");

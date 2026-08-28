@@ -12,8 +12,8 @@ import { GeminiInteractionsAdapter } from "./gemini-interactions-adapter.js";
 import { OpenAIAgentsAdapter } from "./openai-agents-adapter.js";
 import {
   DEFAULT_GROK_MODEL,
-  GrokGatewayAdapter,
-} from "./grok-gateway-adapter.js";
+  GrokAdapter,
+} from "./grok-adapter.js";
 import type { LaneBProviderId } from "./types.js";
 import type { LaneBProviderModule } from "./provider-module.js";
 
@@ -65,11 +65,10 @@ const geminiModule: LaneBProviderModule = {
 const grokModule: LaneBProviderModule = {
   provider: "grok",
   createAdapter: (args) =>
-    new GrokGatewayAdapter({
+    new GrokAdapter({
       name: args.name,
       model: args.route.model || args.deps.providerConfig?.agentModel || DEFAULT_GROK_MODEL,
-      apiKey: args.deps.providerConfig?.apiKey, // GROK_GATEWAY_KEY, caller-resolved
-      baseUrl: args.deps.providerConfig?.baseUrl, // validated gateway URL, caller-resolved
+      apiKey: args.deps.providerConfig?.apiKey, // xAI OAuth access token, caller-resolved
       reasoningEffort: args.route.reasoningEffort,
       assembly: args.assembly,
       // C8 analog: history wiring in PRIMARY context only — nested grok

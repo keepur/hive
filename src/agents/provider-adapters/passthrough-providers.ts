@@ -7,11 +7,12 @@ import { TurnAssemblyError } from "./error-classification.js";
  * Claude-lane runtime (ClaudeAgentAdapter/AgentRunner: MCP tools, skills,
  * hooks, memory, subagents, resume) with per-spawn env substitution only.
  * Translation proxies are ruled out (epic canon); vendor-operated endpoints
- * are the rule. Grok was the one sanctioned exception (KPR-384: an
- * OPERATOR-hosted gateway, because the vendor endpoint itself is broken for
- * real toolkits) until KPR-392 promoted it to a native Lane B adapter
- * (`grok-gateway-adapter.ts`) — the gateway-exception canon note now lives
- * there; this table has no exceptions left. Adding the next compat vendor is:
+ * are the rule. Grok was briefly the one sanctioned exception (KPR-384: an
+ * OPERATOR-hosted gateway, because the vendor endpoint itself was broken for
+ * real toolkits) until KPR-392 promoted it to a native Lane B adapter, and
+ * KPR-410 then retired the gateway entirely — grok now talks to xAI directly
+ * (`grok-adapter.ts`); this table has no exceptions left, past or present.
+ * Adding the next compat vendor is:
  * one table row + one AgentProviderId union member + one SESSION_SEMANTICS
  * entry (compile-forced) + two resolveProviderModel-style prefix arms + the
  * isLaneAProvider body (NOT compile-forced) + a `credential` entry
@@ -27,12 +28,14 @@ export type LaneAProviderId = "kimi" | "deepseek";
  * Lane A credential source: a static key resolved env → Honeypot Keychain per
  * spawn. KPR-371 briefly widened this to a discriminated union with an
  * `oauth-file` variant for grok's vendor-CLI-owned subscription OAuth file;
- * KPR-384 retired that variant when grok moved behind the self-hosted
- * CLIProxyAPI gateway and its credential became an ordinary gateway API key.
- * KPR-392 then promoted grok off this table entirely — Lane B now resolves
- * its own gateway key via `resolveEnvKeyCredential` below (exported for
- * that purpose). The `kind` discriminant stays so a future non-key vendor
- * re-widens the union without touching existing rows.
+ * KPR-384 retired that variant when grok moved behind a self-hosted
+ * CLIProxyAPI gateway (short-lived — retired itself by KPR-410, which moved
+ * grok's OAuth-file resolution to grok-oauth.ts, consumed directly by its
+ * Lane B module rather than through this table). KPR-392 promoted grok off
+ * this table entirely; `resolveEnvKeyCredential` below stays exported only
+ * for kimi/deepseek and KPR-394 plugin `api-key-env` use. The `kind`
+ * discriminant stays so a future non-key vendor re-widens the union without
+ * touching existing rows.
  */
 export type PassthroughCredential = { kind: "env-key"; key: string };
 
@@ -42,11 +45,11 @@ export interface PassthroughProviderDef {
   /**
    * The endpoint the spawn's ANTHROPIC_BASE_URL is pinned to — the
    * vendor-operated Anthropic-compat endpoint (never a translation proxy —
-   * epic KPR-345 canon). Grok was the one sanctioned exception (KPR-384: an
-   * OPERATOR-hosted loopback CLIProxyAPI gateway, because xAI's own compat
-   * endpoint rejects the CLI's tool schemas) until KPR-392 moved it to a
-   * native Lane B adapter, taking the exception with it — this table's
-   * remaining rows are all vendor-operated endpoints.
+   * epic KPR-345 canon). Grok was briefly the one sanctioned exception
+   * (KPR-384: an OPERATOR-hosted loopback CLIProxyAPI gateway, because
+   * xAI's own compat endpoint rejects the CLI's tool schemas) until KPR-392
+   * moved it to a native Lane B adapter, taking the exception with it —
+   * this table's remaining rows are all vendor-operated endpoints.
    */
   baseUrl: string;
   /** Env var that overrides `baseUrl` per spawn, for endpoints that are

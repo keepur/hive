@@ -58,7 +58,7 @@ import {
   resolveEnvKeyCredential,
   type PassthroughSpawnConfig,
 } from "./provider-adapters/passthrough-providers.js";
-import { DEFAULT_GROK_GATEWAY_URL } from "./provider-adapters/grok-gateway-adapter.js";
+import { resolveOAuthFileToken } from "./provider-adapters/grok-oauth.js";
 import { ProviderCircuitBreakerRegistry } from "./provider-circuit-breaker.js";
 import {
   classifyThrown,
@@ -680,7 +680,7 @@ export class AgentManager {
     // (CLAUDE.md § Security (DOD-212)).
     // KPR-394: slice resolution generalized — see resolveProviderModuleSlice.
     const moduleDeps: LaneBModuleDeps = {
-      providerConfig: this.resolveProviderModuleSlice(registered),
+      providerConfig: await this.resolveProviderModuleSlice(registered),
       turnHistoryStore: this.turnHistoryStore,
       agentId: config.id,
     };
@@ -854,12 +854,12 @@ export class AgentManager {
    * <KEY>` — rotation takes effect next spawn); base-url-env as plain env
    * validated https-or-loopback (KPR-384 posture: an override redirects
    * credential AND conversation stream). Unset base-url-env ⇒ undefined ⇒
-   * the module's own built-in default endpoint (grok-override semantics,
-   * generalized).
+   * the module's own built-in default endpoint (a KPR-394 plugin's
+   * base-url-env semantics, generalized).
    */
-  private resolveProviderModuleSlice(
+  private async resolveProviderModuleSlice(
     registered: RegisteredProvider,
-  ): { agentModel?: string; apiKey?: string; baseUrl?: string } {
+  ): Promise<{ agentModel?: string; apiKey?: string; baseUrl?: string }> {
     if (registered.source !== "builtin") {
       const slice = registered.slice;
       const baseUrlOverride = slice?.baseUrlEnv ? process.env[slice.baseUrlEnv] : undefined;
@@ -890,22 +890,33 @@ export class AgentManager {
   }
 
   /**
-   * KPR-392 (§4.3): grok's caller-resolved module slice — the engine
-   * resolves, the module consumes (DOD-212; load-bearing for KPR-394).
-   * GROK_GATEWAY_KEY: env→Honeypot PER SPAWN via the exported Lane A helper
-   * so the "authentication"-bearing TurnAssemblyError message and chain stay
-   * byte-identical to KPR-384 (spec-review advisory 1). GROK_GATEWAY_URL:
-   * re-read per spawn, validated (https, or http to loopback only) —
-   * verbatim KPR-384 semantics.
+   * KPR-410: grok's caller-resolved module slice — the engine resolves, the
+   * module consumes (DOD-212; load-bearing for KPR-394). The credential is
+   * the machine's `grok login` subscription OAuth access token, resolved
+   * (and refreshed + written back, if near expiry) from
+   * `~/.grok/auth.json` by grok-oauth.ts — revived KPR-371 machinery,
+   * byte-identical to the version KPR-384 deleted when it introduced the
+   * now-retired gateway. No baseUrl slot: the adapter's endpoint is fixed at
+   * https://api.x.ai, there is no override. This turns resolveGrokModuleSlice
+   * async (file read, and near expiry — up to two network round-trips on a
+   * cold discovery cache, one thereafter; each capped by grok-oauth.ts's own
+   * 10s fetch timeout), which is why resolveProviderModuleSlice above is now
+   * async too. This runs while createProviderAdapter builds moduleDeps —
+   * after the breaker permit is acquired, but BEFORE the adapter is
+   * constructed and before runTurn arms `timeoutMs`, so it sits outside the
+   * turn deadline and can't be interrupted by abort(). Not the same
+   * placement as codex's/openai's own credential resolution, which runs
+   * inside executeTurn and so genuinely is deadline-bound. This work's own
+   * bound is grok-oauth.ts's 10s fetch timeout, not the turn deadline —
+   * separately, a half-open PROBE permit (not an ordinary closed-circuit
+   * one) carries its own staleness bound (deadlineMs + 60s grace, KPR-400),
+   * but that bounds how long the breaker waits on the permit, not how long
+   * this credential resolution itself may run.
    */
-  private resolveGrokModuleSlice(): { agentModel?: string; apiKey?: string; baseUrl?: string } {
-    const override = process.env.GROK_GATEWAY_URL;
+  private async resolveGrokModuleSlice(): Promise<{ agentModel?: string; apiKey?: string }> {
     return {
       agentModel: appConfig.grok.agentModel,
-      apiKey: resolveEnvKeyCredential("GROK_GATEWAY_KEY", { instanceId: appConfig.instance.id }),
-      baseUrl: override
-        ? assertSafeBaseUrlOverride(override, "GROK_GATEWAY_URL")
-        : DEFAULT_GROK_GATEWAY_URL,
+      apiKey: await resolveOAuthFileToken("~/.grok/auth.json"),
     };
   }
 
