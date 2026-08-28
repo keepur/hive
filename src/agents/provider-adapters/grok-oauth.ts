@@ -10,7 +10,10 @@ const log = createLogger("grok-oauth");
  * KPR-371 (§D3): resolve a Lane A access token from a vendor-CLI-owned OAuth
  * file (`~/.grok/auth.json`). The access token's TTL is 6h and the refresh
  * grant ROTATES the refresh token — spending the old one — so hive must
- * write the new pair back or it signs the operator's `grok` CLI out.
+ * write the new pair back or it signs the operator's `grok` CLI out. This
+ * module's logic is unchanged since KPR-371, but its original Lane A
+ * consumer is gone: since KPR-392 (and KPR-410's gateway retirement), the
+ * only production caller is grok's native Lane B module.
  *
  * Every failure raises TurnAssemblyError, which classifyThrown short-circuits
  * to `non-provider`: a credential fault is a config fault and must never count

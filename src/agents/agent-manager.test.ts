@@ -3856,6 +3856,10 @@ describe("AgentManager", () => {
             model: "grok-4.6",
           }),
         );
+        // Pin the literal credential-file path passed to resolveOAuthFileToken —
+        // this is fully mocked elsewhere in the suite, so nothing else catches
+        // a typo in the path string that agent-manager.ts hands off.
+        expect(mockResolveOAuthFileToken).toHaveBeenCalledWith("~/.grok/auth.json");
         // KPR-410: no baseUrl in the constructor options at all — GrokAdapter
         // hardcodes GROK_API_BASE_URL, there is nothing left to thread.
         expect(mockGrokConstructor).not.toHaveBeenCalledWith(
