@@ -906,10 +906,12 @@ export class AgentManager {
    * constructed and before runTurn arms `timeoutMs`, so it sits outside the
    * turn deadline and can't be interrupted by abort(). Not the same
    * placement as codex's/openai's own credential resolution, which runs
-   * inside executeTurn and so genuinely is deadline-bound. A half-open
-   * probe's own staleness bound (deadlineMs + 60s grace, KPR-400) still caps
-   * this; in the ordinary closed-circuit case no permit-level staleness
-   * bound applies.
+   * inside executeTurn and so genuinely is deadline-bound. This work's own
+   * bound is grok-oauth.ts's 10s fetch timeout, not the turn deadline —
+   * separately, a half-open PROBE permit (not an ordinary closed-circuit
+   * one) carries its own staleness bound (deadlineMs + 60s grace, KPR-400),
+   * but that bounds how long the breaker waits on the permit, not how long
+   * this credential resolution itself may run.
    */
   private async resolveGrokModuleSlice(): Promise<{ agentModel?: string; apiKey?: string }> {
     return {
