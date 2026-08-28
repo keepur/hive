@@ -21,6 +21,11 @@ export interface ThreadMessage {
   text: string;
   timestamp: Date;
   isBot: boolean;
+  /** KPR-388: raw Slack ts (e.g. "1724632800.123456") — microsecond-precision
+   *  delta comparisons; `timestamp`'s millisecond Date is not collision-safe.
+   *  Carries the existing `msg.ts ?? "0"` posture: a hypothetical ts-less
+   *  message sorts permanently below any mark (typing artifact, accepted). */
+  ts: string;
 }
 
 export class SlackAdapter implements ChannelAdapter {
@@ -240,6 +245,7 @@ export class SlackAdapter implements ChannelAdapter {
           text: msg.text ?? "",
           timestamp: new Date(parseFloat(msg.ts ?? "0") * 1000),
           isBot,
+          ts: msg.ts ?? "0",
         });
       }
 

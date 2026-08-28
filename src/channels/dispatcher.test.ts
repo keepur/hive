@@ -1600,11 +1600,80 @@ describe("outage interception (KPR-307)", () => {
     expect(adapter.deliver).toHaveBeenCalledTimes(1); // the real answer, delivered normally
   });
 
+  it("T8b (KPR-389 D5b): replayed killed reaction — delivery suppressed, replay doc still resolves done", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ finalMessage: "", aborted: true, timedOut: true }));
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        meta: { outageReplay: true, targetAgentId: "executive-assistant", conferenceRound: 1 },
+      }),
+    );
+    expect(adapter.deliver).not.toHaveBeenCalled(); // no "_No response._" filler into the meeting
+    expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "done"); // recordTurnSuccess intact
+  });
+
+  it("T8b variant: a TEXT-BEARING killed replay still delivers (replay is the last delivery chance)", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(
+      makeTurn({ finalMessage: "partial but real", aborted: true, timedOut: true }),
+    );
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        meta: { outageReplay: true, targetAgentId: "executive-assistant", conferenceRound: 1 },
+      }),
+    );
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toBe("partial but real");
+  });
+
+  it("T8b control: replayed reaction with a clean result delivers normally and resolves done", async () => {
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        meta: { outageReplay: true, targetAgentId: "executive-assistant", conferenceRound: 1 },
+      }),
+    );
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // default mock returns real text
+    expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "done");
+  });
+
+  it("T9 (KPR-389): replay retains meta.conferenceRound through the pinned-agent path (shaping re-applies downstream)", async () => {
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        meta: { outageReplay: true, targetAgentId: "executive-assistant", conferenceRound: 1 },
+      }),
+    );
+    const [, turnItem] = agentManager.runWorkItemTurn.mock.calls[0];
+    expect(turnItem.meta?.conferenceRound).toBe(1); // conferenceRoundOf ⇒ 1 in prepareSpawn (T1 covers the shaping itself)
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // D5 fan-out guard did NOT fire (replay resolved bare)
+  });
+
   it("non-response-suppressed replay also releases done (§5-2g: nothing left to redeliver)", async () => {
     agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ finalMessage: "No response needed." }));
     await dispatcher.dispatch(replayItem({ id: "m1" }));
     expect(store.release).toHaveBeenCalledWith("m1", "executive-assistant", "done");
     expect(adapter.deliver).not.toHaveBeenCalled();
+  });
+
+  // KPR-389 C5 numerator pin. The T8b kill test above takes the D5b branch,
+  // which logs a different line — nothing exercised the tagged single-dispatch
+  // suppression log at round 1, so this does: a replayed round-1 reaction whose
+  // answer is a non-response phrase.
+  it("C5 pin: a replayed round-1 non-response suppression logs conferenceRound: 1", async () => {
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ finalMessage: "No response needed." }));
+    mockLogInfo.mockClear(); // this suite's beforeEach does not clear it
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        meta: { outageReplay: true, targetAgentId: "executive-assistant", conferenceRound: 1 },
+      }),
+    );
+    expect(adapter.deliver).not.toHaveBeenCalled();
+    expect(mockLogInfo).toHaveBeenCalledWith(
+      "Non-response suppressed",
+      expect.objectContaining({ agentId: "executive-assistant", conferenceRound: 1 }),
+    );
   });
 
   it("outage wiring absent (setOutageHandling never called) → behavior identical to today", async () => {
@@ -1852,6 +1921,34 @@ describe("deadline-abort continuation (KPR-402)", () => {
     // Cadence: exactly two notices per chain — first + terminal; the middle leg is silent.
     const texts = adapter.deliver.mock.calls.map((c: any[]) => c[0].text);
     expect(texts).toEqual([DEADLINE_NOTICE_DEFAULT, DEADLINE_TERMINAL_NOTICE_DEFAULT]);
+  });
+
+  it("T5 (KPR-413): a replayed conference turn's continuation leg carries the stamped frame from meta, not item.text, and no conference meta", async () => {
+    const composite = "[Meeting thread in #conf-x — participants: Jasper]\n---\n[New message]:\ntrigger text";
+    const frame = "You are in a meeting in #conf-x with Jasper.\n\nMeeting rules:\n---\n[New message]:\ntrigger text";
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(withProgressAbort());
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        text: composite, // must be IGNORED once meta.deadlineOriginalText is present
+        meta: {
+          outageReplay: true,
+          targetAgentId: "executive-assistant",
+          conferenceMode: true,
+          conferenceRound: 0,
+          conferenceHumanTs: "1000.0004",
+          conferenceInjectionMode: "full",
+          deadlineOriginalText: frame, // simulates the D1 stamp a real conference-assembly call already wrote
+        },
+      }),
+    );
+    const [, legItem] = agentManager.runWorkItemTurn.mock.calls[1];
+    expect(legItem.text).toContain(frame);
+    expect(legItem.text).not.toContain(composite);
+    expect(legItem.meta.conferenceMode).toBeUndefined();
+    expect(legItem.meta.conferenceRound).toBeUndefined();
+    expect(legItem.meta.conferenceHumanTs).toBeUndefined();
+    expect(legItem.meta.conferenceInjectionMode).toBeUndefined();
   });
 
   it("T11: Lane B sentinel (aborted: false) and operator abort (no timedOut) never enter the arm", async () => {

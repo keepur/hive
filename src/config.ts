@@ -6,6 +6,7 @@ import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
 import { DEFAULT_CIRCUIT_BREAKER_CONFIG, type CircuitBreakerConfig } from "./agents/provider-circuit-breaker.js";
 import { DEFAULT_OUTAGE_QUEUE_CONFIG, type OutageQueueConfig } from "./outage/outage-queue-store.js";
+import { DEFAULT_MEETING_WORKERS_CONFIG, type MeetingWorkersConfig } from "./workers/worker-pool-config.js";
 import { fromKeychain as fromKeychainRaw } from "./keychain/from-keychain.js";
 import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
 
@@ -88,6 +89,49 @@ export function resolveOutageQueueConfig(raw: unknown): OutageQueueConfig {
     maxAgeHours: posNum(r.maxAgeHours, d.maxAgeHours),
     maxDepth: posNum(r.maxDepth, d.maxDepth),
     maxReplayAttempts: posNum(r.maxReplayAttempts, d.maxReplayAttempts),
+  };
+}
+
+/**
+ * KPR-390: liberal-loader resolver for the `meetingWorkers` hive.yaml section
+ * (KPR-225 F3 — all keys optional, unknown keys ignored, absent section =
+ * all defaults). Exported pure for unit tests. Invariant (spec §A5): the
+ * worker wall clock must stay < the claim TTL — a violating TTL is clamped
+ * up with a warning so the watchdog can never expire a still-sanctioned
+ * worker.
+ */
+export function resolveMeetingWorkersConfig(raw: unknown): MeetingWorkersConfig {
+  const d = DEFAULT_MEETING_WORKERS_CONFIG;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ...d };
+  const r = raw as Record<string, unknown>;
+  const posNum = (v: unknown, fallback: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
+  const workerTimeoutMs = posNum(r.workerTimeoutMs, d.workerTimeoutMs);
+  let claimTtlMinutes = posNum(r.claimTtlMinutes, d.claimTtlMinutes);
+  const minTtl = Math.ceil(workerTimeoutMs / 60_000) + 1;
+  if (claimTtlMinutes < minTtl) {
+    console.warn(
+      `[config] meetingWorkers.claimTtlMinutes (${claimTtlMinutes}m) must exceed workerTimeoutMs (${workerTimeoutMs}ms) — clamping to ${minTtl}m.`,
+    );
+    claimTtlMinutes = minTtl;
+  }
+  return {
+    workerModel: typeof r.workerModel === "string" && r.workerModel.trim() ? r.workerModel.trim() : d.workerModel,
+    maxConcurrent: posNum(r.maxConcurrent, d.maxConcurrent),
+    perMeetingMax: posNum(r.perMeetingMax, d.perMeetingMax),
+    claimTtlMinutes,
+    workerMaxTurns: posNum(r.workerMaxTurns, d.workerMaxTurns),
+    workerTimeoutMs,
+    enabled: typeof r.enabled === "boolean" ? r.enabled : d.enabled,
+    // KPR-409 scribe keys — same liberal-loader idioms; no TTL clamp (the
+    // scribe creates no claim, so claimTtlMinutes's invariant is untouched).
+    scribeEnabled: typeof r.scribeEnabled === "boolean" ? r.scribeEnabled : d.scribeEnabled,
+    scribeModel: typeof r.scribeModel === "string" && r.scribeModel.trim() ? r.scribeModel.trim() : d.scribeModel,
+    scribeDebounceMs: posNum(r.scribeDebounceMs, d.scribeDebounceMs),
+    scribeMinNewMessages: posNum(r.scribeMinNewMessages, d.scribeMinNewMessages),
+    scribeMaxConcurrent: posNum(r.scribeMaxConcurrent, d.scribeMaxConcurrent),
+    scribeMaxTurns: posNum(r.scribeMaxTurns, d.scribeMaxTurns),
+    scribeTimeoutMs: posNum(r.scribeTimeoutMs, d.scribeTimeoutMs),
   };
 }
 
@@ -452,6 +496,10 @@ export const config = {
   // KPR-307: Mongo-backed outage queue (hive.yaml `outageQueue`, all keys
   // optional; enabled:false = interception off, fast-fails fall back to the raw error path).
   outageQueue: resolveOutageQueueConfig(hive.outageQueue),
+  // KPR-390: meeting worker pool (hive.yaml `meetingWorkers`, all keys
+  // optional; enabled:false = worker_dispatch refuses honestly AND — KPR-409 —
+  // the scribe + summary anchor are off; scribeEnabled:false is the scribe-only lever).
+  meetingWorkers: resolveMeetingWorkersConfig(hive.meetingWorkers),
   // KPR-329: tool-search / deferred MCP tool loading (hive.yaml `toolSearch`,
   // all keys optional; mode: off = eager loading, the rollback posture).
   toolSearch: resolveToolSearchConfig(hive.toolSearch),

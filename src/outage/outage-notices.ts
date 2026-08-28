@@ -21,6 +21,7 @@ export function policyFor(item: WorkItem): OutageSourcePolicy {
   if (id.startsWith("callback:")) return "silent"; // one-shot, marked fired pre-dispatch — queue preserves it
   if (id.startsWith("event:")) return "silent";
   if (id.startsWith("team-")) return "silent";
+  if (id.startsWith("worker:")) return "silent"; // KPR-390: one-shot boss re-entry, claim already terminal — queue preserves it
   return "notify"; // human channels: slack, sms, imessage, app/ws, team DM
 }
 

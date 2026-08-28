@@ -37,6 +37,10 @@ There are two lanes behind that routing:
 | 16. Auth & credentials | `full` — subscription OAuth [^16] | `full` — per-provider API key via Honeypot [^16] | `caveat(.env only)` [^16] | `caveat(paid-tier key for production)` [^16] | `full` — subscription OAuth [^16] | `full` — subscription OAuth [^16] |
 | 17. Validation status | `production (baseline)` | `live-unvalidated; production reassignment gated on funded-key validation` | `unit + 401-boundary; live legs key-conditioned, open` | `live-validated (dev key); production gated on paid tier` | `production-validated` | `unit-tested; direct-to-xAI behavior validated by the KPR-410 spike (2026-08-27, 200 response with a valid completion) — the KPR-384 gateway rollout's V4–V6 validation legs are superseded, their subject having been retired` |
 
+### Meeting worker pool
+
+The `worker-pool` in-process MCP tools (`worker_dispatch` / `worker_status` / `worker_cancel`) are available on **all tool-executing lanes** — Claude and Lane A directly, Lane B through the tool bridge like every other in-process server. **Dispatched workers themselves always run on the Claude lane** (sonnet-pinned by default via `meetingWorkers.workerModel`), regardless of the dispatching boss's lane. Worker spawns are sessionless, breaker-invisible, and not `spawnBudget`-accounted; their measurement surface is the `meeting_worker_claims` collection.
+
 ## Footnotes
 
 [^4]: **Builtins.** openai/gemini/codex/grok run hive-native implementations of Bash/Read/Write/Edit/Glob/Grep rather than the SDK's own builtins. Three documented deltas: Read is text-only — no images, PDFs, or notebooks; Grep is a JS-regex subset, not full ripgrep; Bash's working directory and environment do not persist across calls.

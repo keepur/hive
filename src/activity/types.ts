@@ -31,6 +31,11 @@ export interface ActivityRecord {
   // Outcome
   streamed: boolean;
   error?: string;
+
+  /** KPR-389: conference turn kind — 0 primary, 1 peer reaction; absent on
+   *  non-conference turns. Kills/errors DO reach this log (unlike turn
+   *  telemetry), keeping reaction kill counts measurable. */
+  conferenceRound?: number;
   /**
    * KPR-393 §D2: present-and-true iff the delivered text ends on an
    * unexecuted first-person commitment (detectIntentTrailer) on a

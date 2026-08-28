@@ -24,6 +24,10 @@ interface SessionDoc {
   preCompactTokens?: number;
   createdAt: Date;
   updatedAt: Date;
+  /** KPR-388: Slack ts (raw string, e.g. "1724632800.123456") of the newest
+   *  thread message this agent's session has been shown via conference
+   *  injection. Absent ⇒ no delta basis ⇒ full-transcript injection. */
+  meetingLastSeenTs?: string;
 }
 
 /**
@@ -35,6 +39,8 @@ interface SessionDoc {
 export interface StoredSessionRef {
   sessionId: string | undefined; // undefined ⇒ nothing to resume
   provider: string | undefined;
+  /** KPR-388: meeting-continuity mark; absent ⇒ full injection. */
+  meetingLastSeenTs?: string;
 }
 
 /** KPR-313: legacy fabricated pilot ids (and unprovenanced resp_ chain ids) — scrub on read. */
@@ -121,6 +127,7 @@ export class SessionStore {
           ? doc.sessionId || undefined
           : undefined,
         provider: doc.provider,
+        meetingLastSeenTs: doc.meetingLastSeenTs,
       };
     }
 
@@ -152,7 +159,7 @@ export class SessionStore {
     }
 
     // Legacy untagged plain id: grandfathered as claude (pre-313 fleet rows).
-    return { sessionId: doc.sessionId || undefined, provider: "claude" };
+    return { sessionId: doc.sessionId || undefined, provider: "claude", meetingLastSeenTs: doc.meetingLastSeenTs };
   }
 
   async set(agentId: string, threadId: string, sessionId: string, provider: string, tokenData?: {
@@ -208,6 +215,33 @@ export class SessionStore {
         { upsert: true },
       );
     }, undefined, `set(${agentId}:${threadId})`);
+  }
+
+  /**
+   * KPR-388: advance the meeting-continuity mark. `updateOne` WITHOUT upsert
+   * — a mark must never create a row (an upserted skeleton would break
+   * normalizeRef's assumptions and fabricate thread-affinity via
+   * findAgentsByThread). Deliberately does NOT touch updatedAt: TTL stays
+   * owned by turn persistence (the same turn's finalizeSpawnResult set()
+   * already refreshed it).
+   */
+  async setMeetingMark(agentId: string, threadId: string, ts: string): Promise<void> {
+    await this.withRetry(async () => {
+      await this.collection.updateOne(
+        { _id: `${agentId}:${threadId}` },
+        { $set: { meetingLastSeenTs: ts } },
+      );
+    }, undefined, `setMeetingMark(${agentId}:${threadId})`);
+  }
+
+  /** KPR-388: clear the mark — the next conference turn injects the full transcript. */
+  async clearMeetingMark(agentId: string, threadId: string): Promise<void> {
+    await this.withRetry(async () => {
+      await this.collection.updateOne(
+        { _id: `${agentId}:${threadId}` },
+        { $unset: { meetingLastSeenTs: "" } },
+      );
+    }, undefined, `clearMeetingMark(${agentId}:${threadId})`);
   }
 
   async delete(agentId: string, threadId: string): Promise<void> {

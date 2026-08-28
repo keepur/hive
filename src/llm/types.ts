@@ -74,8 +74,8 @@ export interface LLMProvider {
   generate(request: LLMRequest): Promise<LLMResult>;
 }
 
-/** The four audited call sites — task bindings are code constants (spec ⚠3). */
-export type LLMTask = "routerClassifier" | "meetingClassifier" | "memory" | "vision";
+/** The five audited call sites — task bindings are code constants (spec ⚠3). */
+export type LLMTask = "routerClassifier" | "meetingClassifier" | "memory" | "vision" | "workerClaimDedup";
 
 /** What call sites pass to generateForTask — the registry fills the model. */
 export type LLMTaskRequest = Omit<LLMRequest, "model">;

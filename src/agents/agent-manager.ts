@@ -1,7 +1,8 @@
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
-import { AgentRunner, DIST_DIR, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import { AgentRunner, DIST_DIR, type AgentRunnerOptions, type RunResult, type StreamCallback, type WorkItemContext } from "./agent-runner.js";
+import type { MeetingWorkerPool } from "../workers/meeting-worker-pool.js";
 import { AgentRegistry } from "./agent-registry.js";
 import { detectIntentTrailer } from "./intent-trailer.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
@@ -11,7 +12,13 @@ import type { TurnTelemetryStore } from "./turn-telemetry.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { Db } from "mongodb";
 import { formatFilesForPrompt } from "../files/file-processor.js";
-import { routeModel, modelToTier, resolveResourceLimits, type ResourceLimits } from "./model-router.js";
+import {
+  routeModel,
+  modelToTier,
+  resolveResourceLimits,
+  type ResourceLimits,
+  type ModelTier,
+} from "./model-router.js";
 import { getLLMRegistry } from "../llm/registry.js";
 import { config as appConfig } from "../config.js";
 import { loadPlugins, rescanPluginBrokenServers } from "../plugins/plugin-loader.js";
@@ -127,6 +134,10 @@ export interface TurnContext {
   threadId: string;
   workItem: WorkItem;
   channel: ChannelKind;
+  /** KPR-389: conference turn kind — 0 primary, 1 peer reaction. Set by
+   *  runWorkItemTurn from WorkItem meta; undefined for every non-conference
+   *  turn and for voice/reflection contexts (which never carry the meta). */
+  conferenceRound?: 0 | 1;
   /**
    * KPR-219: bypass `AgentRunner.buildSystemPrompt` entirely when set. Voice
    * uses this to inject `buildVoiceSystemPrompt` output (omits tool summaries,
@@ -182,10 +193,37 @@ export interface TurnResult {
   timedOut?: boolean;
   /** KPR-307: propagated from RunResult.aborted (operator abort or deadline abort). */
   aborted?: boolean;
+  /**
+   * KPR-388: true iff the FINALIZED attempt was launched with a session
+   * handle (options.resume / previous_response_id / previous_interaction_id).
+   * False when the finalized attempt ran fresh — first turn, KPR-313
+   * provider handoff, auth-rebuild retry, KPR-350 stale-handle self-heal
+   * fresh retry, KPR-399 claude resume-rejection fresh retry. KPR-351
+   * contender adoption counts as resumed. Known approximation (spec ⚠): for
+   * client-transcript lanes, "launched with a handle" is not proof the
+   * transcript was warm — accepted, failure mode is bounded duplication or
+   * one system-notice'd fresh turn.
+   */
+  resumedSession?: boolean;
 }
 
 /** Mirrors AgentRunner.send()'s StreamCallback so adapter-side relay code stays the same. */
 export type SpawnTurnStreamCallback = StreamCallback;
+
+/** KPR-389: typed read of the dispatcher's conference discriminator (C3 —
+ *  meta.conferenceRound is the round-1 discriminator). Returns undefined for
+ *  non-conference items and malformed values. Exported — the dispatcher's
+ *  D5b single-dispatch suppression leg reads it too. */
+export function conferenceRoundOf(item: WorkItem): 0 | 1 | undefined {
+  const v = item.meta?.conferenceRound;
+  return v === 0 || v === 1 ? v : undefined;
+}
+
+/** KPR-389: typed read of the KPR-388 injection mode stamped beside the round. */
+function conferenceInjectionModeOf(item: WorkItem): "full" | "delta" | "summary" | undefined {
+  const v = item.meta?.conferenceInjectionMode;
+  return v === "full" || v === "delta" || v === "summary" ? v : undefined;
+}
 
 /**
  * Default per-agent in-flight spawn budget. Long-lived `maxConcurrent`
@@ -455,6 +493,15 @@ const REFLECTION_PROMPT = [
   "If nothing worth saving, do nothing.",
 ].join("\n");
 
+/** KPR-389: turn-scoped reaction caps. Template: KPR-354's nested-delegate
+ *  literal override (resourceLimits: { maxTurns, timeoutMs: 600_000,
+ *  budgetUsd: 0 }); here we clamp with min() instead of replacing so tighter
+ *  operator config always wins. maxTurns 6 < KPR-354's 7/10 delegate budgets
+ *  (a reaction is strictly lighter); 120s reuses the haiku-tier light-turn
+ *  precedent. Plain constants — tune when the D6 telemetry says otherwise. */
+const REACTION_MAX_TURNS = 6;
+const REACTION_TIMEOUT_MS = 120_000;
+
 export class AgentManager {
   private states = new Map<string, AgentState>();
   // Per-thread serialization lock — `agentId:threadId`. Phase 10: queue/runner
@@ -518,6 +565,8 @@ export class AgentManager {
    * via the AgentManager instance (no new wiring surface).
    */
   readonly circuitBreakers: ProviderCircuitBreakerRegistry;
+  /** KPR-390: meeting worker pool — wired post-dispatcher by index.ts. */
+  private workerPool?: MeetingWorkerPool;
 
   constructor(
     registry: AgentRegistry,
@@ -560,6 +609,42 @@ export class AgentManager {
     declarePluginProviders(this.plugins, { hiveHome, distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
+  }
+
+  /**
+   * KPR-390: wire the meeting worker pool (index.ts, post-dispatcher).
+   * The handshake keeps runner-construction inputs inside the manager —
+   * the pool holds only capabilities (spec §A3 "factory callback" choice).
+   * The factory deliberately passes NO prefixCache (worker turns provably
+   * can't touch the boss's cached prefix), NO workerPool (a worker can
+   * never see worker-pool tools even if a config clone slipped the
+   * denylist — belt-and-braces recursion guard), and sets
+   * suppressAutoInjectedServers — WITHOUT which the runner re-adds
+   * team/schedule/team-roster unconditionally and the denylist strip in
+   * runWorkerTurn is a no-op (through-the-boss would be fiction).
+   */
+  setWorkerPool(pool: MeetingWorkerPool): void {
+    this.workerPool = pool;
+    pool.bindManager({
+      buildWorkerAdapter: (workerConfig) => {
+        const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
+        const runner = new AgentRunner(
+          workerConfig,
+          this.memoryManager,
+          this.plugins,
+          this.skillIndex,
+          eventSubscribersJson,
+          this.prefetcher,
+          this.teamRoster,
+          this.db,
+          undefined, // prefixCache — deliberately absent
+          this.memoryLifecycle,
+          { suppressAutoInjectedServers: true }, // worker mode — no workerPool
+        );
+        return new ClaudeAgentAdapter(runner);
+      },
+      breakerStateFor: (provider) => this.circuitBreakers.stateFor(provider),
+    });
   }
 
   /** KPR-213: expose the cache so out-of-band consumers (doctor heartbeat, etc.) can read stats. */
@@ -641,7 +726,14 @@ export class AgentManager {
       });
     }
 
-    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, laneAPassthrough ? { laneAPassthrough } : undefined);
+    // KPR-390: the pool rides along on every normal runner so a boss agent
+    // with "worker-pool" in coreServers gets the in-process server; absent
+    // pool ⇒ the runner never builds it (Day-1-OOB layer 2).
+    const runnerOptions: AgentRunnerOptions | undefined =
+      laneAPassthrough || this.workerPool
+        ? { laneAPassthrough, workerPool: this.workerPool }
+        : undefined;
+    const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, runnerOptions);
     if (route.provider === "claude") {
       return new ClaudeAgentAdapter(runner);
     }
@@ -998,6 +1090,7 @@ export class AgentManager {
       threadId,
       workItem: item,
       channel: item.source.kind,
+      conferenceRound: conferenceRoundOf(item),
     };
 
     return this.spawnTurn(ctx, onStream);
@@ -1173,6 +1266,13 @@ export class AgentManager {
       // regression prevention.
       const shaping = await this.prepareSpawn(effectiveCtx);
 
+      // KPR-388: sessionId actually passed to the FINALIZED runOneSpawnAttempt
+      // call — reassigned at each retry arm below. !!finalAttemptSessionId
+      // becomes TurnResult.resumedSession. Initialized AFTER the KPR-313
+      // guard and prepareSpawn, so a handoff-stripped (or adopt-branch)
+      // sessionId is what's captured.
+      let finalAttemptSessionId = effectiveCtx.sessionId;
+
       // KPR-306: exactly one breaker record per spawnTurn, on the FINALIZED
       // attempt. The auth-rebuild first attempt is locally recoverable —
       // when the retry fires, only the retry's result reaches the breaker
@@ -1192,6 +1292,7 @@ export class AgentManager {
             threadId: effectiveCtx.threadId,
             reason: finalResult.error,
           });
+          finalAttemptSessionId = undefined;
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: undefined },
             shaping,
@@ -1248,6 +1349,7 @@ export class AgentManager {
             provider: shaping.route.provider,
             adoptedContenderHandle: adoptedSessionId !== undefined,
           });
+          finalAttemptSessionId = adoptedSessionId;
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: adoptedSessionId },
             shaping,
@@ -1285,6 +1387,12 @@ export class AgentManager {
             threadId: effectiveCtx.threadId,
             timedOut: finalResult.timedOut === true,
           });
+          // KPR-412: the retry runs fresh — the finalized attempt carries no
+          // handle. Mirrors the auth-rebuild arm above; without this,
+          // !!finalAttemptSessionId reports a resume that never happened
+          // (C7), and the dispatcher's delta-into-fresh mark heal inverts
+          // into a mark ADVANCE instead of a clear (C9 gap).
+          finalAttemptSessionId = undefined;
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: undefined },
             shaping,
@@ -1300,8 +1408,13 @@ export class AgentManager {
       }
       this.circuitBreakers.record(permit, classifyTurnResult(finalResult), finalResult.llmMs);
 
-      const turnResult = this.finalizeSpawnResult(effectiveCtx, finalResult, shaping.route);
-      this.recordSpawnObservability(effectiveCtx, shaping, finalResult);
+      const turnResult = this.finalizeSpawnResult(
+        effectiveCtx,
+        finalResult,
+        shaping.route,
+        !!finalAttemptSessionId,
+      );
+      this.recordSpawnObservability(effectiveCtx, shaping, finalResult, !!finalAttemptSessionId);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
       // turns themselves don't reschedule (kind="reflection" guard).
@@ -1805,6 +1918,77 @@ export class AgentManager {
     return undefined;
   }
 
+  /** KPR-389 D2: round-1 conference reactions spawn cheap — classifier
+   *  skipped, effort pinned low where deliverable, limits clamped against the
+   *  config-accurate base (exactly what today's turn would have received). */
+  private shapeReactionTurn(
+    prompt: string,
+    staticRoute: ProviderModelRoute,
+    staticTier: ModelTier,
+    agentConfig: AgentConfig | undefined,
+    agentId: string,
+  ): SpawnShaping {
+    // Degenerate guard (mirrors staticRoute's `?? ""` idiom, E9): agent
+    // vanished mid-turn ⇒ flow on; the turn fails inside the recorded try as
+    // today (KPR-306 wedged-permit hazard respected).
+    if (!agentConfig) {
+      return { prompt, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+    }
+    // Base limits — config-accurate: exactly the values today's turn would
+    // otherwise receive, so the min() invariant ("tighter operator config
+    // always wins") holds on every reachable path:
+    //   claude, router ON:  static-tier limits (resolveResourceLimits). The
+    //               legacy triple is dead config there and is deliberately
+    //               NOT folded in (folding it would newly activate config
+    //               that has no effect today).
+    //   claude, router OFF: agent-def legacy triple — today the router gate
+    //               returns resourceLimits: undefined and the runner's
+    //               per-field fallback applies agentConfig values; operator
+    //               tightness may live there (e.g. maxTurns: 3) and must win
+    //               the min(). The other undefined-resolving claude paths are
+    //               unreachable for round-1: reactions always carry a human
+    //               sender (never "system"), and the router-catch cannot fire
+    //               because routeModel is never called here.
+    //   Lane A + B: agent-def legacy triple (byte-identical to the Lane B
+    //               branch construction; for Lane A this newly MATERIALIZES
+    //               the same values the runner's per-field fallback would
+    //               have applied — no behavior change beyond the clamp).
+    const legacy = {
+      maxTurns: agentConfig.maxTurns,
+      timeoutMs: agentConfig.timeoutMs ?? 300_000,
+      budgetUsd: agentConfig.budgetUsd,
+    };
+    const base =
+      staticRoute.provider === "claude" && appConfig.modelRouter.enabled
+        ? resolveResourceLimits(staticTier, agentConfig.resourceTiers)
+        : legacy;
+    const limits: ResourceLimits = {
+      maxTurns: Math.min(base.maxTurns, REACTION_MAX_TURNS),
+      timeoutMs: Math.min(base.timeoutMs, REACTION_TIMEOUT_MS),
+      budgetUsd: base.budgetUsd, // untouched — budget is not the reaction pathology
+    };
+    // Effort: claude-runtime lanes deliver via Options.effort ("low" is inside
+    // the runner's {low,medium,high} narrowing). The claude arm keeps the
+    // KPR-338 deliverability gate (haiku / off-catalog ⇒ undefined — pinning
+    // an undeliverable hint is a no-op at best). Lane B ignores request.effort
+    // by contract (types.ts) ⇒ undefined.
+    const effortOverride: ReasoningEffort | undefined =
+      staticRoute.provider === "claude"
+        ? staticTier !== "haiku" && getLLMRegistry().supportsEffort(agentConfig.model)
+          ? "low"
+          : undefined
+        : isLaneAProvider(staticRoute.provider)
+          ? "low"
+          : undefined;
+    log.debug("Round-1 reaction shaping applied (KPR-389)", {
+      agentId,
+      maxTurns: limits.maxTurns,
+      timeoutMs: limits.timeoutMs,
+      effort: effortOverride,
+    });
+    return { prompt, route: staticRoute, resourceLimits: limits, routerCostUsd: 0, effortOverride };
+  }
+
   /**
    * KPR-224 + KPR-311: per-turn shaping for `spawnTurn` (its single caller
    * post-KPR-220). Centralizes:
@@ -1889,6 +2073,14 @@ export class AgentManager {
         (staticRoute.provider === "claude" || isLaneAProvider(staticRoute.provider)
           ? SESSION_HANDOFF_NOTICE_CLAUDE
           : SESSION_HANDOFF_NOTICE_PILOT) + prompt;
+    }
+
+    // KPR-389: round-1 conference reactions spawn cheap — classifier skipped,
+    // effort pinned low where deliverable, limits clamped. Round 0 falls
+    // through to every existing path untouched (D3). Voice is structurally
+    // unreachable here (carve-out returned above; voice never carries the meta).
+    if (ctx.conferenceRound === 1) {
+      return this.shapeReactionTurn(prompt, staticRoute, staticTier, agentConfig, ctx.agentId);
     }
 
     // KPR-346 (§D6): Lane A — the router stays skipped (foreign ids are
@@ -2003,8 +2195,12 @@ export class AgentManager {
     ctx: TurnContext,
     shaping: SpawnShaping,
     result: RunResult,
+    resumedSession: boolean,
   ): void {
     const item = ctx.workItem;
+    // KPR-389 D6: turn-kind discriminators from the dispatcher's conference meta.
+    const confRound = conferenceRoundOf(item);
+    const injectionMode = conferenceInjectionModeOf(item);
 
     // Per-turn telemetry — independent of sessionStore (no history in
     // sessionStore.set). Aggregator in `hive doctor` reads this collection.
@@ -2030,6 +2226,16 @@ export class AgentManager {
           cacheCreationTokens: result.cacheCreationTokens,
           ephemeral5mTokens: result.ephemeral5mTokens,
           ephemeral1hTokens: result.ephemeral1hTokens,
+          // KPR-389: perf split + turn kind (conditional spreads keep absent
+          // keys absent — no BSON nulls on non-conference turns).
+          durationMs: result.durationMs,
+          llmMs: result.llmMs,
+          toolMs: result.toolMs,
+          toolCalls: result.toolCalls,
+          resumedSession,
+          ...(shaping.effortOverride ? { effort: shaping.effortOverride } : {}),
+          ...(confRound !== undefined ? { conferenceRound: confRound } : {}),
+          ...(injectionMode ? { injectionMode } : {}),
           // KPR-401: sparse — only aborted:true is ever written.
           ...(result.aborted ? { aborted: true as const } : {}),
         })
@@ -2094,6 +2300,7 @@ export class AgentManager {
       compactions: result.compactions,
       streamed: result.streamed,
       error: result.error,
+      ...(confRound !== undefined ? { conferenceRound: confRound } : {}),
       ...(intentTrailer ? { intentTrailer: true as const } : {}),
       // KPR-401: sparse abort flags — the audit row's costUsd:0/durationMs
       // zeros on aborted turns are now segmentable instead of masquerading
@@ -2103,7 +2310,12 @@ export class AgentManager {
     });
   }
 
-  private finalizeSpawnResult(ctx: TurnContext, result: RunResult, route: ProviderModelRoute): TurnResult {
+  private finalizeSpawnResult(
+    ctx: TurnContext,
+    result: RunResult,
+    route: ProviderModelRoute,
+    resumedSession: boolean,
+  ): TurnResult {
     const newSessionId = result.sessionId || ctx.sessionId || "";
     // KPR-399 (§D2): an aborted claude-lane turn with observed progress
     // persists its session so replays/retries/follow-ups RESUME instead of
@@ -2215,6 +2427,7 @@ export class AgentManager {
       ephemeral1hTokens: result.ephemeral1hTokens,
       timedOut: result.timedOut,
       aborted: result.aborted,
+      resumedSession,
     };
   }
 
@@ -2263,6 +2476,9 @@ export class AgentManager {
     // finally's identity-check now also defends against any other
     // future caller making the same mistake.
     this.stoppedAgents.add(agentId);
+    // KPR-390: abort this boss's live meeting workers (claims stay `running`;
+    // the watchdog/restart sweep own the honest expiry notice).
+    this.workerPool?.abortForBoss(agentId);
     this.cancelReflectionsFor(agentId);
     const tickets = this.activeTickets.get(agentId);
     if (tickets) {

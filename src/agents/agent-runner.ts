@@ -66,6 +66,8 @@ import { createTeamMcpServer } from "../team/team-mcp-server.js";
 import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
+import { createWorkerPoolMcpServer } from "../workers/worker-pool-mcp-server.js";
+import type { MeetingWorkerPool, WorkerPoolTurnContext } from "../workers/meeting-worker-pool.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
 import type { ReasoningEffort } from "./provider-adapters/types.js";
@@ -155,6 +157,8 @@ export interface RunResult {
   error?: string;
   aborted?: boolean;
   timedOut?: boolean; // KPR-306: deadline fired; distinguishes timeout-abort from operator abort
+  /** KPR-388: populated ONLY by the dispatcher's convertTurnResult mapping (TurnResult passthrough); runner/adapters never set it. */
+  resumedSession?: boolean;
 }
 
 /**
@@ -313,6 +317,20 @@ export interface AgentRunnerOptions {
    *  (kimi/deepseek) —
    *  triggers §D5 env substitution in send(). Absent ⇒ vanilla Claude spawn. */
   laneAPassthrough?: PassthroughSpawnConfig;
+  /** KPR-390: meeting worker pool — set by AgentManager.createProviderAdapter
+   *  once index.ts has wired the pool. Absent ⇒ the worker-pool in-process
+   *  server is never built (tools invisible even if listed in coreServers). */
+  workerPool?: MeetingWorkerPool;
+  /** KPR-390: worker-mode runner (set ONLY by the pool's buildWorkerAdapter
+   *  factory). Suppresses the unconditional auto-injection of implicit core
+   *  servers (schedule, team, team-roster, skill-author, workflow) at all
+   *  three sync sites — effectiveCoreServerSet, filterCoreServers,
+   *  autoInjectedServerNames — AND the teamRoster wiring. Without this,
+   *  stripping those names from a worker's cloned coreServers is a no-op
+   *  and through-the-boss enforcement is fiction: `team` alone lets a
+   *  worker message an agent that posts to Slack, and `skill-author` is a
+   *  live stdio subprocess. */
+  suppressAutoInjectedServers?: boolean;
 }
 
 export class AgentRunner {
@@ -341,6 +359,10 @@ export class AgentRunner {
   private eventBusMcpServer?: ReturnType<typeof createEventBusMcpServer>;
   private callbackMcpServer?: ReturnType<typeof createCallbackMcpServer>;
   private callbackContextRef: { current: CallbackTurnContext } = { current: {} };
+  private workerPoolMcpServer?: ReturnType<typeof createWorkerPoolMcpServer>;
+  private workerPoolContextRef: { current: WorkerPoolTurnContext } = { current: {} };
+  private workerPool?: MeetingWorkerPool;
+  private readonly suppressAutoInjectedServers: boolean;
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
   private teamMcpServer?: ReturnType<typeof createTeamMcpServer>;
@@ -367,6 +389,8 @@ export class AgentRunner {
     this.prefixCache = prefixCache;
     this.memoryLifecycle = memoryLifecycle;
     this.laneAPassthrough = runnerOptions?.laneAPassthrough;
+    this.workerPool = runnerOptions?.workerPool;
+    this.suppressAutoInjectedServers = runnerOptions?.suppressAutoInjectedServers ?? false;
   }
 
   private async buildSystemPrompt(coreServerNames: string[], activeDelegates?: string[]): Promise<string> {
@@ -385,7 +409,7 @@ export class AgentRunner {
       skillIndex: this.skillIndex,
       prefetcher: this.prefetcher,
       eventSubscribersJson: this.eventSubscribersJson,
-      autoInjectedServers: AgentRunner.autoInjectedServerNames(),
+      autoInjectedServers: this.autoInjectedServerNames(),
     };
     const prefix = this.prefixCache
       ? await this.prefixCache.getOrBuild(this.agentConfig.id, () => buildPrefix(this.agentConfig, buildContext))
@@ -412,11 +436,17 @@ export class AgentRunner {
     if (coreSet.has("memory")) {
       coreSet.add("structured-memory");
     }
-    coreSet.add("schedule");
-    coreSet.add("team");
-    coreSet.add("team-roster");
-    if (config.workflow.enabled) {
-      coreSet.add("workflow");
+    // KPR-390: worker-mode runners get NO implicit core servers — the
+    // auto-injected surfaces (team = outbound agent-to-agent messaging,
+    // schedule = self-scheduling) are exactly what WORKER_SERVER_DENYLIST
+    // exists to remove, and they are re-added here for every normal agent.
+    if (!this.suppressAutoInjectedServers) {
+      coreSet.add("schedule");
+      coreSet.add("team");
+      coreSet.add("team-roster");
+      if (config.workflow.enabled) {
+        coreSet.add("workflow");
+      }
     }
     if (!this.agentConfig.autonomy.externalComms) {
       coreSet.delete("resend");
@@ -1075,22 +1105,29 @@ export class AgentRunner {
     if (coreSet.has("memory")) {
       coreSet.add("structured-memory");
     }
-    // Auto-injected servers below MUST mirror AgentRunner.autoInjectedServerNames()
+    // Auto-injected servers below MUST mirror this.autoInjectedServerNames()
     // so the toolkit section (KPR-87) classifies them under "engine-provided"
     // instead of "capability MCPs". Keep both sites in sync.
-    // schedule is an implicit core server — available to all agents unconditionally
-    coreSet.add("schedule");
-    // team is an implicit core server — available to all agents unconditionally
-    coreSet.add("team");
-    // team-roster is an implicit core server — every agent gets the engine-native
-    // team API (in-process MCP) for team_list / team_lookup_human / team_lookup_agent.
-    coreSet.add("team-roster");
-    // skill-author is an implicit core server — every agent can author its own
-    // skills unconditionally (KPR-104). No permission flag; empowerment posture.
-    coreSet.add("skill-author");
-    // workflow is an implicit core server when workflow layer is enabled
-    if (config.workflow.enabled) {
-      coreSet.add("workflow");
+    // KPR-390: worker-mode runners auto-inject nothing — mirror of the
+    // effectiveCoreServerSet/autoInjectedServerNames gates (three-site sync).
+    // This is the only gate guarding a LIVE surface: `skill-author` is a real
+    // spawnable stdio server injected ONLY here, so without this gate a worker
+    // gets a live skill-author subprocess authoring skills as the boss.
+    if (!this.suppressAutoInjectedServers) {
+      // schedule is an implicit core server — available to all agents unconditionally
+      coreSet.add("schedule");
+      // team is an implicit core server — available to all agents unconditionally
+      coreSet.add("team");
+      // team-roster is an implicit core server — every agent gets the engine-native
+      // team API (in-process MCP) for team_list / team_lookup_human / team_lookup_agent.
+      coreSet.add("team-roster");
+      // skill-author is an implicit core server — every agent can author its own
+      // skills unconditionally (KPR-104). No permission flag; empowerment posture.
+      coreSet.add("skill-author");
+      // workflow is an implicit core server when workflow layer is enabled
+      if (config.workflow.enabled) {
+        coreSet.add("workflow");
+      }
     }
     for (const key of Object.keys(servers)) {
       if (!coreSet.has(key)) {
@@ -1173,13 +1210,16 @@ export class AgentRunner {
    * keep both sites in sync. (Computed dynamically because `workflow` is
    * config-gated.)
    */
-  private static autoInjectedServerNames(): ReadonlySet<string> {
+  private autoInjectedServerNames(): ReadonlySet<string> {
     // structured-memory is paired with `memory` (filterCoreServers gates it on
     // `memory` being in coreServers), so it's not unconditional. Agents with
     // memory will have structured-memory in their post-filter coreServerNames
     // and the toolkit will correctly classify it under Capability MCPs.
     // skill-author is unconditional (KPR-104) — every agent can author its own
     // private skills.
+    // KPR-390: worker-mode runners auto-inject nothing — mirror of the
+    // effectiveCoreServerSet/filterCoreServers gates (three-site sync).
+    if (this.suppressAutoInjectedServers) return new Set<string>();
     const set = new Set<string>(["schedule", "team", "team-roster", "skill-author"]);
     if (config.workflow.enabled) set.add("workflow");
     return set;
@@ -1253,7 +1293,7 @@ export class AgentRunner {
   buildToolTransportInventory(context?: WorkItemContext): HiveToolInventoryEntry[] {
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
-    const autoInjectedServers = AgentRunner.autoInjectedServerNames();
+    const autoInjectedServers = this.autoInjectedServerNames();
     const pluginServerNames = this.pluginServerNames();
     const inventory: HiveToolInventoryEntry[] = [];
 
@@ -1302,7 +1342,25 @@ export class AgentRunner {
       });
     }
 
-    if (this.teamRoster) {
+    // KPR-390: worker-pool is in-process-only with no stdio placeholder
+    // (KPR-327 memory pattern) — surface its descriptor explicitly so the
+    // Lane B partition (assembleProviderTurn → partitionInventoryForProvider)
+    // bridges the tools. Gate mirrors the runtime wiring in send().
+    if (this.workerPool && this.shouldEnableInProcessServer("worker-pool") && !mcpServers["worker-pool"]) {
+      inventory.push({
+        ...classifyToolTransport({
+          name: "worker-pool",
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("worker-pool"),
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
+    }
+
+    if (this.teamRoster && !this.suppressAutoInjectedServers) {
       inventory.push({
         ...classifyToolTransport({
           name: "team-roster",
@@ -1373,7 +1431,9 @@ export class AgentRunner {
     // long-lived object holding tool handlers that close over the shared
     // teamRoster cache. Built once per AgentRunner and reused across send()
     // invocations to avoid per-message allocation.
-    if (this.teamRoster) {
+    // KPR-390: worker-mode runners receive `teamRoster` from the manager's
+    // construction inputs; the flag suppresses the wiring (auto-injection).
+    if (this.teamRoster && !this.suppressAutoInjectedServers) {
       if (!this.teamRosterMcpServer) {
         this.teamRosterMcpServer = createTeamRosterMcpServer(this.teamRoster);
       }
@@ -1508,6 +1568,33 @@ export class AgentRunner {
         });
       }
       servers["callback"] = this.callbackMcpServer;
+    }
+
+    // KPR-390: worker-pool MCP — in-process. Meeting bosses dispatch detached
+    // fetch-workers; per-turn source metadata flows through
+    // workerPoolContextRef (callback template). Gated on the pool being wired
+    // (index.ts) AND coreServers membership — Day-1-OOB layer 2: shipping the
+    // engine changes nothing until the operator adds "worker-pool" to a
+    // boss's coreServers. Lane B reaches these tools through the KPR-348
+    // bridge like every other in-process server — no adapter changes.
+    if (this.workerPool && this.shouldEnableInProcessServer("worker-pool")) {
+      this.workerPoolContextRef.current = {
+        adapterId: context?.adapterId,
+        channelId: context?.channelId,
+        channelKind: context?.channelKind,
+        channelLabel: context?.channelLabel,
+        threadId: context?.threadId,
+        slackTs: context?.slackTs,
+        slackThreadTs: context?.slackThreadTs,
+      };
+      if (!this.workerPoolMcpServer) {
+        this.workerPoolMcpServer = createWorkerPoolMcpServer({
+          pool: this.workerPool,
+          agentId: this.agentConfig.id,
+          context: this.workerPoolContextRef,
+        });
+      }
+      servers["worker-pool"] = this.workerPoolMcpServer;
     }
 
     // KPR-122: structured-memory MCP — in-process, paired with memory.

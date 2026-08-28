@@ -35,6 +35,9 @@ describe("policyFor (§5-3a source policy table)", () => {
     expect(policyFor(item({ id: "event:65a1b2:agent-a" }))).toBe("silent");
     expect(policyFor(item({ id: "team-65a1b2" }))).toBe("silent");
   });
+  it("queues worker re-entry one-shots silently (worker: prefix — KPR-390)", () => {
+    expect(policyFor(item({ id: "worker:65a1b2c3d4" }))).toBe("silent");
+  });
   it("notifies human channels: slack, sms, imessage, app/ws, team DM", () => {
     expect(policyFor(item({ source: { kind: "slack", id: "C1", label: "x" } }))).toBe("notify");
     expect(policyFor(item({ source: { kind: "sms", id: "+1555", label: "x" } }))).toBe("notify");
