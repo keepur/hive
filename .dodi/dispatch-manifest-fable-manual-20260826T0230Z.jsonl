@@ -90,3 +90,5 @@
 {"worker":"child-pr-review-kpr-409-final","phase":"child-pr-review","round":2,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-28T00:00:00Z"}
 {"worker":"child-pr-review-kpr-409-r3","phase":"child-pr-review","round":3,"ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-28T00:30:00Z"}
 {"worker":"coherence-review-kpr-409","phase":"coherence","ticket":"KPR-409","tier":"opus","dispatched_at":"2026-08-28T01:00:00Z"}
+{"worker":"docs-sync-epic-sweep-kpr-386","phase":"submit-epic-pr","mode":"epic-sweep","ticket":"KPR-386","tier":"opus","dispatched_at":"2026-08-28T00:10:00Z"}
+{"worker":"epic-integration-review-kpr-386-r1","phase":"submit-epic-pr","round":1,"ticket":"KPR-386","tier":"opus","dispatched_at":"2026-08-28T00:15:00Z","result":"issues_found","judgment_findings":3,"mechanical_findings":1,"corrective_tickets":["KPR-412","KPR-413","KPR-414"]}
