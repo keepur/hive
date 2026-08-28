@@ -907,6 +907,12 @@ export class Dispatcher {
     // load-bearing for routing — verified false for this codebase: routing
     // is targetAgentId, not any conference meta key. Still a blocklist, not
     // an allowlist — channel keys stay.
+    //
+    // KPR-416: `meetingExclusionTs` deliberately SURVIVES this strip — it is
+    // named outside the `conference*` family precisely so it does. Write site
+    // 2 marks reaction-exclusion on the leg that finally answers, and it
+    // reads that key. Do NOT add it here when extending this blocklist with
+    // a meeting-shaped key; T8a pins its survival.
     const {
       outageReplay: _replayMarker,
       conferenceMode: _confMode,
