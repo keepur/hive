@@ -4,7 +4,7 @@
 
 **Goal:** Make `TurnResult.resumedSession` report `false` when `spawnTurn`'s KPR-399 claude-resume-rejection self-heal arm fires, matching the reality that the finalized attempt ran fresh — restoring the KPR-388 delta-into-fresh mark heal (C9) and the C18 telemetry measurement contract.
 
-**Architecture:** One assignment (`finalAttemptSessionId = undefined;`) added to the existing KPR-399 arm in `AgentManager.spawnTurn`, mirroring the auth-rebuild arm's identical idiom three arms above it. One JSDoc clause added to `TurnResult.resumedSession`'s doc comment enumerating the now-correct fresh case. Two new test rows in the existing `TurnResult.resumedSession (KPR-388)` describe block, reusing the fixture strings and `it.each` matcher-surface pattern already established in the sibling `resume-rejection self-heal (KPR-399 §D3)` describe.
+**Architecture:** One assignment (`finalAttemptSessionId = undefined;`) added to the existing KPR-399 arm in `AgentManager.spawnTurn`, mirroring the auth-rebuild arm's identical idiom three arms above it. One JSDoc clause added to `TurnResult.resumedSession`'s doc comment enumerating the now-correct fresh case. One new nested `describe` (3 `it` cases) inside the existing `TurnResult.resumedSession (KPR-388)` describe block, reusing the fixture strings and `it.each` matcher-surface pattern already established in the sibling `resume-rejection self-heal (KPR-399 §D3)` describe.
 
 **Tech Stack:** TypeScript, Vitest.
 
@@ -35,7 +35,7 @@
 
 ### Regression Surface
 
-- `TurnResult.resumedSession (KPR-388)`'s five existing rows (happy-path resume, first-turn, auth-rebuild retry, stale-handle self-heal, contender adoption, KPR-313 handoff) must all stay green — the fix touches only the KPR-399 arm's branch, verified by keeping those rows unmodified.
+- `TurnResult.resumedSession (KPR-388)`'s six existing rows (happy-path resume, first-turn, auth-rebuild retry, stale-handle self-heal, contender adoption, KPR-313 handoff) must all stay green — the fix touches only the KPR-399 arm's branch, verified by keeping those rows unmodified.
 - `resume-rejection self-heal (KPR-399 §D3)`'s four existing rows (both matcher-surface retries, breaker record-once, single-retry cap, gating) must all stay green — the fix adds one line inside the arm's already-passing control flow, touching no gate, matcher, or retry-count logic.
 
 ### Commands
@@ -65,7 +65,7 @@
 ## File Structure
 
 - `src/agents/agent-manager.ts` — the fix (one assignment + one comment) and the JSDoc update. Both edits are localized to the existing `spawnTurn` method and the existing `TurnResult` interface; no new file.
-- `src/agents/agent-manager.test.ts` — two new `it` rows appended to the existing `TurnResult.resumedSession (KPR-388)` describe block (`:3257-3326`); no new file, no new describe block.
+- `src/agents/agent-manager.test.ts` — one new nested `describe` (containing 3 `it` cases: T1's `it.each` ×2 + T2) appended inside the existing `TurnResult.resumedSession (KPR-388)` describe block (`:3257-3326`); no new top-level describe block, no new file.
 
 ## Task 1: Fix `finalAttemptSessionId` tracking on the KPR-399 arm
 
@@ -110,7 +110,7 @@ Replace with:
 
 - [ ] **Step 2:** Add the tracker reset to the KPR-399 arm, mirroring the auth-rebuild arm's idiom.
 
-Current text (`agent-manager.ts:1370-1384`, the tail of the KPR-399 `else if` block):
+Current text (`agent-manager.ts:1373-1384`, the tail of the KPR-399 `else if` block):
 
 ```typescript
           log.warn("spawnTurn claude resume rejected — one fresh retry (KPR-399)", {
@@ -150,9 +150,9 @@ Replace with:
         }
 ```
 
-- [ ] **Step 3:** Verify the file still typechecks and lints.
+- [ ] **Step 3:** Verify the file still typechecks.
 
-Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx tsc --noEmit`
+Run: `npm run typecheck`
 Expected: no errors.
 
 - [ ] **Step 4:** Commit.
@@ -175,7 +175,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ## Task 2: Regression tests
 
 **Files:**
-- Modify: `src/agents/agent-manager.test.ts:3257-3326` (append two `it` rows to the existing describe block)
+- Modify: `src/agents/agent-manager.test.ts:3257-3326` (append one new nested `describe` — 3 `it` cases total — to the existing describe block)
 
 - [ ] **Step 1:** Append T1 (the direct regression, both matcher surfaces) and T2 (C18 telemetry single-sourcing) inside the `TurnResult.resumedSession (KPR-388)` describe block, immediately after the existing `"false on a KPR-313 provider-handoff turn..."` row (`:3318-3325`) and before the describe's closing `});` (`:3326`).
 
@@ -222,6 +222,7 @@ Replace with:
             smsCtx({ threadId: "sms:line-1:kpr412-t1", sessionId: "s-dead", sessionProvider: "claude" }),
           );
           expect(mockRunnerSend).toHaveBeenCalledTimes(2);
+          expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined(); // fresh retry — no sessionId (matches :3613's form)
           expect(result.resumedSession).toBe(false);
         });
 
@@ -240,31 +241,30 @@ Replace with:
     });
 ```
 
-**Note on hermetic queueing:** this describe block (unlike the sibling `resume-rejection self-heal (KPR-399 §D3)` describe) has no local `mockRunnerSend.mockReset()` `beforeEach` — the outer suite-level `beforeEach` (`agent-manager.test.ts:~455`, `clearAllMocks()`) clears call history but not the `mockResolvedValueOnce` queue. T1 and T2 each queue exactly two values and each spawnTurn call drains exactly two (first attempt errors, retry succeeds) — no bleed risk between the two new rows or into the pre-existing rows above them, since every row in this file that queues `mockResolvedValueOnce` values fully drains its own queue in a single `spawnTurn` call (the existing five rows above already establish this pattern at `:3282-3286`, `:3295-3297`, `:3308-3310`). Do not add a `mockReset()` `beforeEach` to this describe — that would be an unrequested scope change (YAGNI) affecting the block's five pre-existing rows for no reason tied to this fix.
+**Note on hermetic queueing:** this describe block (unlike the sibling `resume-rejection self-heal (KPR-399 §D3)` describe) has no local `mockRunnerSend.mockReset()` `beforeEach` — the outer suite-level `beforeEach` (`agent-manager.test.ts:~455`, `clearAllMocks()`) clears call history but not the `mockResolvedValueOnce` queue. T1 and T2 each queue exactly two values and each spawnTurn call drains exactly two (first attempt errors, retry succeeds) — no bleed risk, because pre-fix the KPR-399 retry still fires regardless of the tracker bug, so both queued values drain in either source state (fixed or unfixed) — this is what makes the Step 3 negative-verify below meaningful rather than a false-fail. Do not add a `mockReset()` `beforeEach` to this describe — that would be an unrequested scope change (YAGNI) affecting the block's six pre-existing rows for no reason tied to this fix.
 
-- [ ] **Step 2:** Run the target test file and confirm all rows pass, including the two new ones.
+- [ ] **Step 2:** Run the target test file and confirm all rows pass, including the three new ones.
+
+First, capture the pre-edit baseline case count for a relative comparison (absolute counts drift as the epic branch evolves):
+
+Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/agent-manager.test.ts 2>&1 | tail -5`
+Expected: note the "Tests N passed" total — call it `N_before`.
+
+Then, after Step 1's edit:
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/agent-manager.test.ts`
-Expected: all tests pass (293 total — 292 existing + 1 new `it` for T2, plus T1's `it.each` over 2 cases replacing... note: T1 is a NEW `it.each`, not a replacement, so the count increases by 3 total: 2 from T1's `it.each` rows + 1 from T2).
+Expected: all tests pass; total case count is exactly `N_before + 3` (T1's `it.each` contributes 2, T2 contributes 1).
 
 - [ ] **Step 3:** Negative-verify — confirm the tests fail for the right reason on pre-fix source.
 
-```bash
-git stash push -u -m "kpr-412-negative-verify-temp"
-```
+At this point Task 1's fix is already committed and Task 2's new tests are uncommitted in the working tree. The mechanism is `git restore`, not `git stash` — there is nothing to stash, since restoring a single tracked file from its last commit is exactly "undo the fix, keep the tests":
 
-Then temporarily revert Task 1's Step 2 edit only (remove the `finalAttemptSessionId = undefined;` line and its comment), leaving the JSDoc update and the new tests in place, and run:
-
-Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/agent-manager.test.ts -t "KPR-412"`
-Expected: T1's both rows and T2 FAIL — `result.resumedSession` / `doc.resumedSession` is `true` instead of `false` — confirming the tests catch the actual defect, not a tautology. `mockRunnerSend` is still called twice in both failing rows (the retry still fires; only the tracker is wrong), matching the spec's stated negative-verify (§Key Points 8).
-
-Then restore the fix:
-
-```bash
-git stash pop
-```
-
-Verify `git status --short` is clean relative to the Task 1 + Task 2 commits before proceeding (the stash pop should restore exactly the fixed state — if `git stash pop` reports a conflict, resolve by re-applying Task 1 Step 2's exact diff, never by discarding the negative-verify finding).
+1. Manually edit `src/agents/agent-manager.ts`: delete the `// KPR-412: ...` comment block and the `finalAttemptSessionId = undefined;` line added in Task 1 Step 2 (the four-line insertion between the `log.warn(...)` call and the `finalResult = await this.runOneSpawnAttempt(...)` call). Leave everything else — including the JSDoc update — untouched.
+2. Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/agents/agent-manager.test.ts -t "KPR-412"`
+   Expected: exactly 3 FAILING (T1's 2 `it.each` cases + T2) — `result.resumedSession` / `doc.resumedSession` is `true` instead of `false` — confirming the tests catch the actual defect, not a tautology. `mockRunnerSend` is still called twice in each failing case (the retry still fires; only the tracker is wrong), matching the spec's stated negative-verify (§Key Points 8).
+3. Restore the fix: `git restore src/agents/agent-manager.ts` (this file has no uncommitted changes other than the manual revert just made in step 1, so `restore` cleanly returns it to Task 1's committed state — the uncommitted test file is untouched by this command).
+4. Run: `git status --short`
+   Expected: exactly one line, `M src/agents/agent-manager.test.ts` — confirming `agent-manager.ts` is back to the committed fix and only the new tests remain uncommitted.
 
 - [ ] **Step 4:** Commit.
 
@@ -288,9 +288,9 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - [ ] **Step 1:** Run the full check suite.
 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run check`
-Expected: exit 0 — typecheck, lint, format, and the full test suite (3273 + 3 new = 3276 tests, 3 skipped) all pass.
+Expected: exit 0 — typecheck, lint, format, and the full test suite all pass.
 
-- [ ] **Step 2:** Push the branch (per the deliver-ticket lane's own submit-ticket-pr step — not part of this plan's scope beyond confirming the commits are ready to push cleanly).
+- [ ] **Step 2:** Confirm the commits are ready to push (pushing itself is the deliver-ticket lane's own submit-ticket-pr step — not part of this plan's scope).
 
 Run: `git log --oneline -3`
 Expected: the two commits from Task 1 and Task 2, on top of the epic branch head this lane branched from.
