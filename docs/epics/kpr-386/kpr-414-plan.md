@@ -38,7 +38,7 @@
 ### Regression Surface
 
 - `src/workers/meeting-worker-pool.test.ts`'s existing restart-sweep row (`:630`, T6) and all four `pool.start()` fixtures (`:635`, `:684`, `:703`, `:733`) must stay green — D3 must not change behavior for the case (no live claims) those rows already cover.
-- `src/workers/meeting-scribe.test.ts`'s existing `stop() (D2i)` describe (`:812-840`) must stay green — the latch adds behavior only on paths those two rows don't exercise.
+- `src/workers/meeting-scribe.test.ts`'s existing `stop() (D2i)` describe (`:812-842`) must stay green — the latch adds behavior only on paths those two rows don't exercise.
 - The full conference test suite (`dispatcher-conference.test.ts`), containment pins, and capacity-isolation rows (D2f in the pool suite) are untouched by every change here and must stay green.
 
 ### Commands
@@ -637,7 +637,7 @@ No existing row in the file passes a throwing `onAbortHandle` callback, so this 
 Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/workers/meeting-scribe.test.ts`
 Expected: same pass count as before this step (pure fidelity fix, no new tests yet).
 
-- [ ] **Step 2: T2 — `noteActivity` after `stop()` is inert (gate 0).** Add to the existing `stop() (D2i)` describe (`:812-840`, before its closing `});`):
+- [ ] **Step 2: T2 — `noteActivity` after `stop()` is inert (gate 0).** Add to the existing `stop() (D2i)` describe (`:812-842`, before its closing `});`):
 
 ```ts
   it("T2 (KPR-414): noteActivity after stop() does nothing (gate 0)", async () => {
@@ -759,7 +759,9 @@ Spec T4's assertion (1) requires routing the turn body through a dedicated `vi.f
   });
 ```
 
-**Sibling test — T4 containment cross-check (spec's "Testing" T4 final bullet).** The spec separately requires confirming `noteActivity` did not reject and the scribe's shared lifecycle `finally` released its maps on this path too — `inFlight`/`abortHandles` are private, so "maps are empty" isn't directly assertable from outside, and reusing the same scribe instance after it has already called `stop()` doesn't work either (gate 0 blocks everything unconditionally once latched, so a same-instance recheck can't distinguish "maps released" from "gate 0 blocked it" — confirmed empirically: an earlier draft's same-instance recheck asserted a second call went through, which is false once `stop()` has latched). The genuinely testable proxy is the pool suite's own precedent for the identical class of claim (`meeting-worker-pool.test.ts` "review r1" row) — an `unhandledRejection` listener around the fresh instance's run:
+**Sibling test — T4 containment cross-check (spec's "Testing" T4 final bullet).** The spec separately requires confirming `noteActivity` did not reject and the scribe's shared lifecycle `finally` released its maps on this path too — `inFlight`/`abortHandles` are private, so "maps are empty" isn't directly assertable from outside, and reusing the same scribe instance after it has already called `stop()` doesn't work either (gate 0 blocks everything unconditionally once latched, so a same-instance recheck can't distinguish "maps released" from "gate 0 blocked it" — confirmed empirically: an earlier draft's same-instance recheck asserted a second call went through, which is false once `stop()` has latched). The genuinely testable proxy is the pool suite's own precedent for the identical class of claim (`meeting-worker-pool.test.ts` "review r1" row) — an `unhandledRejection` listener around the fresh instance's run.
+
+⚠ **A round-2 plan-review pass caught that `expect(rejections).toEqual([])` alone doesn't discriminate — it also passes if checkpoint 3 is removed entirely, since a normally-completing turn rejects nothing either.** The pool suite's own precedent this row mirrors (`meeting-worker-pool.test.ts:650`) carries a path-pin (`expect(f.hooks.buildWorkerAdapter).not.toHaveBeenCalled()`) that this row's first draft dropped. Fixed by adding the same two-line path-pin used in T4 itself (assert the turn attempted once and its outcome carries `SCRIBE_STOPPED_ERROR`) — empirically confirmed: with checkpoint 3 removed, the pinned assertions now fail (`error` is `undefined`), where the bare rejection check alone would have passed:
 
 ```ts
   it("T4 containment cross-check (KPR-414): checkpoint 3's throw never escapes as an unhandled rejection", async () => {
@@ -796,10 +798,18 @@ Spec T4's assertion (1) requires routing the turn body through a dedicated `vi.f
       process.off("unhandledRejection", handler);
     }
     expect(rejections).toEqual([]);
+    // Path-pin (round-2 review fix): "no unhandled rejection" alone is true
+    // even with checkpoint 3 removed entirely, since a normally-completing
+    // turn also rejects nothing — assert the throw actually happened and was
+    // contained, not merely that nothing escaped.
+    expect(f.pool.runRoleTurn).toHaveBeenCalledTimes(1);
+    expect((await f.pool.runRoleTurn.mock.results[0].value).error).toContain(SCRIBE_STOPPED_ERROR);
   });
 ```
 
 Note: `f.pool.runRoleTurn`'s fake resolves via Step 1's try/catch wrapper — since the callback throws synchronously inside that try, `runRoleTurn` itself is still "called" (assertion count 1) but its returned outcome is the caught error, never a real turn result. Do not assert `not.toHaveBeenCalled()` on `runRoleTurn` itself — the attempt happens; what must never happen is the turn BODY completing, which assertions (1)/(2)/(3)/(4) together establish.
+
+**Negative-verify (containment cross-check, empirically confirmed):** temporarily remove checkpoint 3 (the `if (this.stopped) throw ...` line, keeping only `this.abortHandles.set(threadId, abort);`) → confirmed failure on the path-pin: `(await f.pool.runRoleTurn.mock.results[0].value).error` is `undefined`, so `.toContain(...)` throws "invalid combination of arguments" — the row fails, where the bare `rejections` check alone would have passed. Restore checkpoint 3 before proceeding.
 
 **Negative-verify (three variants, all empirically confirmed against the live worktree before trusting any):**
 1. Replace checkpoint 3's `throw new Error(SCRIBE_STOPPED_ERROR)` with the inert design `if (this.stopped) { abort(); return; }` → confirmed failure on assertion (1): `implProbe` runs to completion, because the inert `abort()` cannot prevent the turn.
@@ -948,7 +958,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
 ```
 
 **Negative-verify (empirically confirmed — all three run against the live worktree during plan-writing):**
-1. Swap in the pre-fix `index.ts` wholesale — ⚠ do NOT use `git show HEAD:src/index.ts` to fetch it: by the time this step runs, Tasks 1-3 are already committed, so `HEAD` points at the POST-fix file and this negative-verify would be vacuous (confirmed this exact mistake during plan-writing — using `HEAD` here silently passes all three assertions instead of failing them). Use the specific pre-KPR-414 commit instead: `git show 9a9e8ba:src/index.ts > /tmp/index-pre-fix.ts && cp /tmp/index-pre-fix.ts src/index.ts` (`9a9e8ba` is the "spec review r3 approved" commit — the epic-branch head this plan's lane was created from, before any KPR-414 code landed; confirm with `git log --oneline` if the branch has since diverged) → confirmed all three tests (a)/(b)/(c) fail together: (a)/(b) because the wiring calls now sit after the surface calls, (c) with a 17-entry offender list (every spawn-capable surface in the file) — a strong signal this guard is genuinely discriminating pre-fix from post-fix state, not just checking for anchor presence.
+1. Swap in the pre-fix `index.ts` wholesale — ⚠ do NOT use `git show HEAD:src/index.ts` to fetch it: by the time this step runs, Tasks 1-3 are already committed, so `HEAD` points at the POST-fix file and this negative-verify would be vacuous (confirmed this exact mistake during plan-writing — using `HEAD` here silently passes all three assertions instead of failing them). Use the specific pre-KPR-414 commit instead: `git show 9a9e8ba:src/index.ts > /tmp/index-pre-fix.ts && cp /tmp/index-pre-fix.ts src/index.ts` (`9a9e8ba` is this plan's own lane-docs commit — "spec review r3 approved" — the last commit before any KPR-414 code changes; NOT the epic branch's own head, which is a separate, earlier commit; confirm with `git log --oneline` if this lane has since diverged) → confirmed all three tests (a)/(b)/(c) fail together: (a)/(b) because the wiring calls now sit after the surface calls, (c) with a 15-entry offender list (every named-and-unnamed spawn-capable `.start(`/`.scanOrphans(` call that precedes the wiring in the pre-fix file, minus the two always-allowlisted entries — empirically counted, not estimated) — a strong signal this guard is genuinely discriminating pre-fix from post-fix state, not just checking for anchor presence.
 2. Insert `fooAdapter.start();` immediately above `agentManager.activateProviderPlugins()` (before the wiring) → confirmed test (c) fails with exactly one offender containing `fooAdapter.start(`.
 
 Restore `index.ts` to its Task 1 (post-fix) state before proceeding — do not leave the pre-fix swap or the scratch insertion in place.
