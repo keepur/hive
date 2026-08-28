@@ -1461,6 +1461,50 @@ Meeting rules:
     });
   });
 
+  it("T13a (KPR-417): dispatcher.ts has exactly ONE fetchThreadHistory call site", () => {
+    // Drift catcher for spec §5.5's central claim. A third meeting-history
+    // read added later WITHOUT going through fetchMeetingHistory would
+    // silently re-expose acks to that consumer — the one failure mode the
+    // one-strip-point design exists to prevent. `//` line comments are
+    // stripped so prose mentioning the method cannot false-positive.
+    const source = readFileSync(fileURLToPath(new URL("./dispatcher.ts", import.meta.url)), "utf8");
+    const codeOnly = source
+      .split("\n")
+      .map((line) => line.replace(/\/\/.*$/, ""))
+      .join("\n");
+    const hits = codeOnly.match(/\.fetchThreadHistory\s*\(/g) ?? [];
+    expect(
+      hits.length,
+      "dispatcher.ts must read meeting history through exactly one fetchThreadHistory call, inside fetchMeetingHistory (KPR-417 §5.5)",
+    ).toBe(1);
+    // ...and that one call must be inside fetchMeetingHistory.
+    const fnStart = codeOnly.indexOf("private async fetchMeetingHistory(");
+    const fnEnd = codeOnly.indexOf("private async resolveConferenceAgents(", fnStart);
+    expect(fnStart, "fetchMeetingHistory not found — update this test's anchors").toBeGreaterThan(-1);
+    expect(fnEnd).toBeGreaterThan(fnStart);
+    expect(codeOnly.slice(fnStart, fnEnd)).toContain(".fetchThreadHistory(");
+  });
+
+  it("T13b (KPR-417): the ack cancel lives inside runTurnWithMeetingAck, not around the dispatchToAgent body", () => {
+    // Drift catcher for spec §5.1's ordering guarantee. Relocating the cancel
+    // to a finally around the whole dispatchToAgent body would let a still-
+    // armed timer post "On it" AFTER the answer: delivery, the KPR-388 mark
+    // write and the outage/deadline gates all run after the turn settles.
+    const source = readFileSync(fileURLToPath(new URL("./dispatcher.ts", import.meta.url)), "utf8");
+    const codeOnly = source
+      .split("\n")
+      .map((line) => line.replace(/\/\/.*$/, ""))
+      .join("\n");
+    const helperStart = codeOnly.indexOf("private async runTurnWithMeetingAck(");
+    const dispatchStart = codeOnly.indexOf("private async dispatchToAgent(");
+    expect(helperStart, "runTurnWithMeetingAck not found — update this test's anchors").toBeGreaterThan(-1);
+    expect(dispatchStart, "dispatchToAgent not found — update this test's anchors").toBeGreaterThan(helperStart);
+    const helperBody = codeOnly.slice(helperStart, dispatchStart);
+    expect(helperBody).toContain("ack?.cancel();");
+    // And nowhere else in the file.
+    expect((codeOnly.match(/ack\?\.cancel\(\);/g) ?? []).length).toBe(1);
+  });
+
   it("T5 (KPR-416): the exclusion write precedes BOTH the fan-out delivery and the reaction trigger", () => {
     // Structural, not a race test. Post-KPR-416 the window between the write
     // and the two call sites is zero BY CONSTRUCTION — the write is a
