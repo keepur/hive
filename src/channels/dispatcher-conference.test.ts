@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { OutageEpisodeTracker } from "../outage/outage-notices.js";
+import { deadlineContinuationWrap, MAX_DEADLINE_CONTINUATIONS } from "./deadline-continuation.js";
 
 // KPR-389 C5: the suppression log lines carry the `conferenceRound` tag that is
 // the measurement numerator, so tests must be able to read what dispatcher logs
@@ -225,6 +226,22 @@ describe("Conference channel routing", () => {
     dispatcher.registerAdapter(adapter as any);
     dispatcher.setSlackAdapter(mockSlackAdapter as any);
   });
+
+  // Hoisted out of the delta describe (KPR-413 T1 needs it too — it pins the
+  // continuation leg's frame byte-exactly).
+  // NOTE: continuation lines are deliberately flush-left inside the
+  // backticks — the preamble byte pin breaks on any leading whitespace.
+  // KPR-389 D4: deliberate C10 pin update (see C6 note above).
+  const PREAMBLE = (channel: string, names: string) => `You are in a meeting in #${channel} with ${names}.
+
+Meeting rules:
+- The discussion so far is already in this prompt and your session context — do NOT re-read the channel, search the workspace, or re-orient with tools before speaking.
+- If you have nothing meaningful to add, reply "No response needed." immediately — as your first output, with no tool calls first.
+- Only use a tool if your reply genuinely needs information that is not already in this thread — never to re-read the meeting itself.
+- Be concise — others are also responding.
+- Build on what's been said. Don't repeat points already made.
+- Stay in your lane — don't cover someone else's domain unless asked.
+- Address others by name when responding to their points.`;
 
   // Hoisted out of the delta describe (KPR-389 T8 needs it too — it only
   // touches the classifier mock).
@@ -608,6 +625,7 @@ Meeting rules:
     it.each([
       ["aborted", { aborted: true }],
       ["timedOut", { timedOut: true, aborted: true }],
+      ["timedOut with progress", { timedOut: true, aborted: true, toolCalls: 46, streamed: true }],
     ])("killed round-1 reaction (%s) never delivers; mark untouched for the reactor", async (_label, flags) => {
       await twoAgentClassifier();
       agentManager.runWorkItemTurn
@@ -616,6 +634,15 @@ Meeting rules:
       await dispatcher.dispatch(confItem(`conf-kill-${_label}`));
       await vi.waitFor(() => expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2));
       await settleReactions();
+      // KPR-413 T4: pins the D5-before-deadline-abort-arm ordering
+      // established at the epic's main-sync (705f9f9) — a killed round-1
+      // reaction must never reach maybeHandleDeadlineAbort and produce a
+      // continuation dispatch, even when it has observed progress (the
+      // one case that could otherwise redispatch). Only the third
+      // ("timedOut with progress") case exercises this meaningfully; the
+      // other two never reach the arm's own gate regardless of D5's
+      // position, so the assertion is trivially true for them.
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
       expect(adapter.deliver).toHaveBeenCalledTimes(1); // only jasper's round-0 reply
       expect(adapter.deliver.mock.calls[0][0].agentId).toBe("jasper");
       expect(agentManager._sessionStore.setMeetingMark).not.toHaveBeenCalledWith(
@@ -669,23 +696,129 @@ Meeting rules:
       expect(adapter.deliver).toHaveBeenCalledTimes(1);
       expect(adapter.deliver.mock.calls[0][0].text).toBe("_No response._");
     });
+
+    describe("deadline-continuation legs carry the turn's own frame, not the conference transcript (KPR-413)", () => {
+      const ONE_MSG_HISTORY = () => [
+        {
+          author: "May",
+          text: "earlier meeting context",
+          timestamp: new Date(Date.now() - 5 * 60_000),
+          isBot: false,
+          ts: "1000.0001",
+        },
+      ];
+      const ABORT_WITH_PROGRESS = turn({
+        finalMessage: "",
+        timedOut: true,
+        aborted: true,
+        toolCalls: 46,
+        streamed: true,
+      });
+
+      it("T1: continuation text is the turn's frame, not the composite (byte-exact)", async () => {
+        await soloClassifier();
+        const threadId = "conf-thread-kpr413-t1";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValueOnce(ABORT_WITH_PROGRESS);
+
+        const item = makeWorkItem({
+          text: "Jasper, status update?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
+          threadId,
+          meta: { slackTs: "1000.0004" },
+        });
+        await dispatcher.dispatch(item);
+        await settleReactions();
+
+        const expectedFrame = `${PREAMBLE("conf-kpr413", "Jasper")}\n---\n[New message]:\n${item.text}`;
+        const secondCallItem = agentManager.runWorkItemTurn.mock.calls[1][1];
+        expect(secondCallItem.text).toBe(deadlineContinuationWrap(expectedFrame, 1, MAX_DEADLINE_CONTINUATIONS + 1));
+      });
+
+      it("T2: continuation leg carries no conference meta", async () => {
+        await soloClassifier();
+        const threadId = "conf-thread-kpr413-t2";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValueOnce(ABORT_WITH_PROGRESS);
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+
+        const secondCallItem = agentManager.runWorkItemTurn.mock.calls[1][1];
+        expect(secondCallItem.meta.deadlineRetry).toBe(1);
+        expect(secondCallItem.meta.targetAgentId).toBeDefined();
+        expect(secondCallItem.meta.deadlineOriginalText).not.toContain("[Meeting thread in #");
+        expect(secondCallItem.meta.conferenceMode).toBeUndefined();
+        expect(secondCallItem.meta.conferenceRound).toBeUndefined();
+        expect(secondCallItem.meta.conferenceHumanTs).toBeUndefined();
+        expect(secondCallItem.meta.conferenceInjectionMode).toBeUndefined();
+      });
+
+      it("T2b: the stamp is written at assembly time, on the ORIGIN turn's own dispatch — independent of whether an abort ever happens", async () => {
+        // Direct pin for D1 itself (plan-review r1 finding): T1/T2 only
+        // prove the ARM's output; this proves the stamp exists on every
+        // conference turn's dispatch args unconditionally, which is also
+        // what makes the outage-store replay case (T5) sound — the store
+        // serializes this same effectiveItem.
+        await soloClassifier();
+        const threadId = "conf-thread-kpr413-t2b";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValueOnce(turn()); // healthy — no abort at all
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+
+        const originCallItem = agentManager.runWorkItemTurn.mock.calls[0][1];
+        expect(originCallItem.meta.deadlineOriginalText).toContain("Meeting rules:");
+        expect(originCallItem.meta.deadlineOriginalText).not.toContain("[Meeting thread in #");
+      });
+
+      it("T3: chain does not nest — every leg wraps the same frame, never a wrap-of-a-wrap", async () => {
+        await soloClassifier();
+        const threadId = "conf-thread-kpr413-t3";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValue(ABORT_WITH_PROGRESS); // persistent: origin AND leg 1 both abort
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+        await settleReactions();
+
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(3); // origin + 2 legs (cap)
+        const leg1 = agentManager.runWorkItemTurn.mock.calls[1][1];
+        const leg2 = agentManager.runWorkItemTurn.mock.calls[2][1];
+        expect(leg1.id).toMatch(/#dl1$/);
+        expect(leg2.id).toMatch(/#dl2$/);
+        expect(leg2.meta.deadlineOriginalText).toBe(leg1.meta.deadlineOriginalText); // same frame, not leg1's wrap
+        // Strengthened per plan-review r1 (this property alone holds
+        // pre-fix too, by coincidence, since both legs would carry the
+        // same composite either way — the marker check is what actually
+        // distinguishes fixed from unfixed):
+        expect(leg2.text).not.toContain("[Meeting thread in #");
+      });
+    });
   });
 
   describe("delta context injection (KPR-388)", () => {
-    // NOTE: continuation lines are deliberately flush-left inside the
-    // backticks — the preamble byte pin breaks on any leading whitespace.
-    // KPR-389 D4: deliberate C10 pin update (see C6 note above).
-    const PREAMBLE = (channel: string, names: string) => `You are in a meeting in #${channel} with ${names}.
-
-Meeting rules:
-- The discussion so far is already in this prompt and your session context — do NOT re-read the channel, search the workspace, or re-orient with tools before speaking.
-- If you have nothing meaningful to add, reply "No response needed." immediately — as your first output, with no tool calls first.
-- Only use a tool if your reply genuinely needs information that is not already in this thread — never to re-read the meeting itself.
-- Be concise — others are also responding.
-- Build on what's been said. Don't repeat points already made.
-- Stay in your lane — don't cover someone else's domain unless asked.
-- Address others by name when responding to their points.`;
-
     const seedRef = (
       agentId: string,
       threadId: string,
