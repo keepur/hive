@@ -647,6 +647,34 @@ describe("MeetingWorkerPool — spawn, completion, re-entry (Task E)", () => {
     }
   });
 
+  it("T5 (KPR-414): sweepOnRestart spares a claim this process is actively running", async () => {
+    const f = makeFixture({ runTurnImpl: () => new Promise(() => {}) }); // held forever — worker stays "live"
+    const orphan = seedClaim(f.claims, { taskText: "orphan-task" });
+    await f.pool.dispatch(dispatchReq("live-task"));
+    // Wait for the detached runWorkerTurn to reach buildWorkerAdapter — that
+    // call is what registers the claim in liveWorkers, synchronously and
+    // BEFORE the (never-resolving) runTurn await.
+    await vi.waitFor(() => expect(f.hooks.buildWorkerAdapter).toHaveBeenCalled());
+    const live = f.claims.docs.find((d) => d.taskText === "live-task")!;
+    expect(live.status).toBe("running");
+
+    await f.pool.start();
+
+    // Spared — this process is actively running it. Assert BEFORE stop():
+    // stop() itself aborts every live worker as normal shutdown behavior,
+    // unrelated to (and would mask) the sweepOnRestart guard under test.
+    expect(f.claims.docs.find((d) => d._id.toString() === live._id.toString())!.status).toBe("running");
+    expect(f.abortSpy).not.toHaveBeenCalled(); // the live worker was never aborted BY THE SWEEP
+    expect(f.onDispatch).toHaveBeenCalledTimes(1); // the orphan's re-entry only — the live claim fires none
+
+    // The true orphan is still expired with the normal notice.
+    const orphanAfter = f.claims.docs.find((d) => d._id.toString() === orphan._id.toString())!;
+    expect(orphanAfter.status).toBe("expired");
+    expect(orphanAfter.error).toBe("engine restarted mid-worker");
+
+    f.pool.stop(); // clear the watchdog interval, per this file's own T6 precedent
+  });
+
   it("review r1: a rejecting completion write on the boss-missing path never escapes as an unhandled rejection", async () => {
     // The detached `void spawnFetchWorker(doc)` chain: the boss-missing early
     // return awaits finishClaim OUTSIDE runWorkerTurn's try/catch, so a ledger

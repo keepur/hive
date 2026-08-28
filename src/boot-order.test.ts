@@ -1,0 +1,94 @@
+import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+// KPR-414: index.ts states its own boundary invariant (KPR-394, restated at
+// the "Spawn-capable boundary" marker) but nothing enforced it — the
+// worker-pool/scribe wiring silently landed ~330 lines below it. This test
+// is a text-scan, not an import: index.ts is a side-effecting main() that
+// would boot the engine if imported directly.
+//
+// The named anchor set in (a)/(b) is an ANCHOR SET, not an exhaustive
+// inventory of every spawn-capable surface in the file. outageReplayProcessor
+// .start() (index.ts:~840) is a real spawn-capable surface deliberately not
+// named here — it sits below the wiring already, so naming it adds nothing
+// to the ordering bound. Coverage for surfaces NOT named here comes from (c)'s
+// superset sweep, which fails on any unallowlisted `.start(`/`.scanOrphans(`
+// occurring before the wiring, named or not. The one residual (c) does not
+// close: a spawn-capable surface that starts itself through some spelling
+// other than `.start(`/`.scanOrphans(` — accepted, not exhaustive.
+describe("boot order — spawn-capable boundary (KPR-414)", () => {
+  const source = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf8");
+  // Strip `//` line comments before scanning — the boundary marker comment
+  // itself contains the substring "bgTaskManager.start()" in prose, which
+  // would otherwise be a false-positive match for both the anchor scan and
+  // the superset sweep below.
+  const codeOnly = source
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/, ""))
+    .join("\n");
+
+  function offsetOf(needle: string): number {
+    const i = codeOnly.indexOf(needle);
+    expect(
+      i,
+      `anchor not found: ${JSON.stringify(needle)} — index.ts may have been renamed/refactored; update this test's anchors`,
+    ).toBeGreaterThanOrEqual(0);
+    return i;
+  }
+
+  it("(a) named wiring and surface anchors are all present", () => {
+    // Presence-only pass; offsetOf's own expect() does the assertion. Calling
+    // each once here documents the full anchor set in one place.
+    offsetOf("await agentManager.activateProviderPlugins()");
+    offsetOf("agentManager.setWorkerPool(");
+    offsetOf("await workerPool.ensureIndexes()");
+    offsetOf("dispatcher.setMeetingScribe(");
+    offsetOf("await bgTaskManager.start()");
+    offsetOf("await bgTaskManager.scanOrphans()");
+    offsetOf("await codeTaskManager.start()");
+    offsetOf("await slackAdapter.start(");
+    offsetOf("await smsAdapter.start(");
+    offsetOf("scheduler.start()");
+  });
+
+  it("(b) wiring precedes every named spawn-capable surface", () => {
+    const wiringOffsets = [
+      offsetOf("agentManager.setWorkerPool("),
+      offsetOf("await workerPool.ensureIndexes()"),
+      offsetOf("dispatcher.setMeetingScribe("),
+    ];
+    const surfaceOffsets = [
+      offsetOf("await bgTaskManager.start()"),
+      offsetOf("await bgTaskManager.scanOrphans()"),
+      offsetOf("await codeTaskManager.start()"),
+      offsetOf("await slackAdapter.start("),
+      offsetOf("await smsAdapter.start("),
+      offsetOf("scheduler.start()"),
+    ];
+    const maxWiring = Math.max(...wiringOffsets);
+    const minSurface = Math.min(...surfaceOffsets);
+    expect(maxWiring).toBeLessThan(minSurface);
+  });
+
+  it("(c) no unallowlisted spawn-capable start precedes the wiring (superset sweep)", () => {
+    const wiringStart = offsetOf("agentManager.setWorkerPool(");
+    // Known non-spawn-capable `.start(`/`.scanOrphans(` calls that legitimately
+    // precede the wiring. Adding to this list is a deliberate, reviewed
+    // classification decision — not a way to silence a real finding.
+    const allowlist = ["dbIdentityMonitor.start(", "contactsWatcher.start("];
+    const pattern = /\.(start|scanOrphans)\s*\(/g;
+    let match: RegExpExecArray | null;
+    const offenders: string[] = [];
+    while ((match = pattern.exec(codeOnly)) !== null) {
+      if (match.index >= wiringStart) continue; // only care about matches BEFORE the wiring
+      const context = codeOnly.slice(Math.max(0, match.index - 40), match.index + match[0].length);
+      if (allowlist.some((a) => context.includes(a))) continue;
+      offenders.push(context.trim());
+    }
+    expect(
+      offenders,
+      "an unallowlisted spawn-capable start/scanOrphans precedes the wiring — classify it (allowlist if inert, move the wiring if not)",
+    ).toEqual([]);
+  });
+});

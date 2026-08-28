@@ -12,6 +12,7 @@ import {
   scribeCharter,
   scribeTurnPrompt,
   SUMMARY_TEXT_CAP,
+  SCRIBE_STOPPED_ERROR,
   type NoteActivityArgs,
   type ScribeMessage,
 } from "./meeting-scribe.js";
@@ -157,9 +158,19 @@ function makeFakePool() {
   const runRoleTurn = vi.fn(async (args: any) => {
     const threadId = args.workItemContext.threadId as string;
     const abort = vi.fn();
-    abortByThread.set(threadId, abort);
-    args.onAbortHandle?.(abort);
-    return impl(args);
+    // KPR-414 (T4 fidelity): the real runRoleTurn wraps the onAbortHandle
+    // call and the turn body in ONE try/catch (meeting-worker-pool.ts
+    // :591-623), containing a throw from onAbortHandle into an
+    // error-shaped outcome rather than letting it escape. This fake must
+    // mirror that or T4 (checkpoint 3's throw-based containment) would
+    // pass against a fake that doesn't actually exercise the real contract.
+    try {
+      abortByThread.set(threadId, abort);
+      args.onAbortHandle?.(abort);
+      return await impl(args);
+    } catch (err) {
+      return { error: String(err).slice(0, 2000), durationMs: 0 };
+    }
   });
   const hasCapacity = vi.fn(() => true);
   return {
@@ -838,5 +849,151 @@ describe("MeetingScribe — stop() (D2i)", () => {
 
     f.scribe.stop();
     expect(abort).not.toHaveBeenCalled(); // handle cleared in the shared finally
+  });
+
+  it("T2 (KPR-414): noteActivity after stop() does nothing (gate 0)", async () => {
+    const f = makeScribe();
+    f.scribe.stop();
+    f.scribe.noteActivity(makeArgs());
+    await flush();
+    expect(f.pool.runRoleTurn).not.toHaveBeenCalled();
+    expect(summarySnapshot(f.summaries)).toEqual([]);
+    expect(f.summaries.updateCalls).toEqual([]);
+    // Distinguishes gate 0 from checkpoint 2: checkpoint 2 sits AFTER the
+    // summary read inside run(), so removing gate 0 alone would still block
+    // the write via checkpoint 2 — the three assertions above would still
+    // pass and this test would silently stop covering gate 0. findOne must
+    // never even be reached.
+    expect(f.summaries.findOne).not.toHaveBeenCalled();
+  });
+
+  it("T3 (KPR-414): stop() landing during the summary read prevents the spawn (checkpoint 2)", async () => {
+    const f = makeScribe();
+    f.summaries.findOne.mockImplementationOnce(async () => {
+      f.scribe.stop();
+      return null;
+    });
+    f.scribe.noteActivity(makeArgs());
+    await flush();
+    expect(f.pool.runRoleTurn).not.toHaveBeenCalled();
+    expect(f.summaries.updateCalls).toEqual([]);
+  });
+
+  it("T4 (KPR-414): a handle minted after stop()'s sweep is never started, and the mechanism is a throw, not an inert abort (checkpoint 3)", async () => {
+    const f = makeScribe();
+    // Seed a prior summary so "unchanged" (assertion 2) is a real check, not
+    // a vacuous [] === [] comparison against an upsert-created row.
+    f.summaries.docs.push({
+      _id: THREAD,
+      summaryText: "PRIOR",
+      coveredThroughTs: "0",
+      version: 1,
+      updatedAt: new Date(BASE_EPOCH - 300_000),
+    });
+
+    // Route the turn body through a dedicated probe — this mock IS the
+    // "did the turn start?" probe, standing in for adapter.runTurn(), which
+    // in the real pool is the statement immediately after onAbortHandle.
+    const implProbe = vi.fn(async () => ({ text: DEFAULT_SUMMARY, costUsd: 0.002, durationMs: 400 }));
+    f.pool.setImpl(implProbe);
+
+    // f.summaries.updateOne is a plain method, not vi.fn-backed (unlike
+    // findOne) — delegate-patch it, mirroring the f.claims.find swap at
+    // meeting-worker-pool.test.ts:679-682, so its FIRST call (the checkpoint-2
+    // `updating` write) triggers stop() before returning, landing stop()
+    // strictly between checkpoint 2 and checkpoint 3.
+    const realUpdateOne = f.summaries.updateOne.bind(f.summaries);
+    let armed = true;
+    f.summaries.updateOne = (async (...callArgs: [any, any, any?]) => {
+      if (armed) {
+        armed = false;
+        f.scribe.stop();
+      }
+      return realUpdateOne(...callArgs);
+    }) as any;
+
+    f.scribe.noteActivity(makeArgs());
+    await flush();
+
+    // (1) the impl probe was NEVER called — the turn was never started. Not
+    // sufficient alone (a fully-gated noteActivity would make this trivially
+    // true with zero calls at all) — see (3), the anti-vacuity guard.
+    expect(implProbe).not.toHaveBeenCalled();
+
+    // (2) the prior summary survives untouched (the updating stub/clear
+    // cycle is excluded by summarySnapshot's projection) — proving the run
+    // left no trace beyond the expected stub/clear cycle run()'s finally
+    // already performs on every path.
+    expect(summarySnapshot(f.summaries)).toEqual([
+      { _id: THREAD, summaryText: "PRIOR", coveredThroughTs: "0", version: 1 },
+    ]);
+
+    // (3) THE ANTI-VACUITY GUARD. Dereferencing mock.results[0] on zero calls
+    // throws, so this alone closes the "gated out entirely" hole (1) leaves
+    // open (empirically confirmed: forcing noteActivity to return
+    // immediately makes this assertion — specifically the toHaveBeenCalledTimes(1)
+    // check — fail, rather than letting (1)/(4) pass vacuously). The outcome
+    // is contained, not an escaped rejection, and carries the specific
+    // SCRIBE_STOPPED_ERROR marker — proving the mechanism is checkpoint 3's
+    // throw, not some other failure or a silently-inert abort() call.
+    expect(f.pool.runRoleTurn).toHaveBeenCalledTimes(1);
+    const outcome = await f.pool.runRoleTurn.mock.results[0].value;
+    expect(outcome.error).toContain(SCRIBE_STOPPED_ERROR);
+
+    // (4) no handle was ever registered in the scribe's OWN abortHandles map.
+    // f.pool.abortByThread is a test-fixture tracking map the fake sets
+    // unconditionally BEFORE invoking onAbortHandle (see Step 1's fidelity
+    // fix), so it is populated regardless of whether the callback throws —
+    // asserting it is undefined is WRONG (empirically confirmed: it fails,
+    // because the map always has an entry). Observe indirectly instead: if
+    // checkpoint 3's throw had NOT prevented `this.abortHandles.set(...)`
+    // from running, a second stop() would find that entry and invoke abort()
+    // on it. It must not.
+    const abort = f.pool.abortByThread.get(THREAD)!;
+    abort.mockClear();
+    f.scribe.stop();
+    expect(abort).not.toHaveBeenCalled();
+  });
+
+  it("T4 containment cross-check (KPR-414): checkpoint 3's throw never escapes as an unhandled rejection", async () => {
+    // `noteActivity`'s detached chain is `void this.run(args).catch(...).finally(...)`
+    // (meeting-scribe.ts) — the `.catch()` is what must contain checkpoint
+    // 3's throw. Mirrors the pool suite's own precedent for the same class
+    // of claim (meeting-worker-pool.test.ts "review r1" row).
+    const f = makeScribe();
+    f.summaries.docs.push({
+      _id: THREAD,
+      summaryText: "PRIOR",
+      coveredThroughTs: "0",
+      version: 1,
+      updatedAt: new Date(BASE_EPOCH - 300_000),
+    });
+    const realUpdateOne = f.summaries.updateOne.bind(f.summaries);
+    let armed = true;
+    f.summaries.updateOne = (async (...callArgs: [any, any, any?]) => {
+      if (armed) {
+        armed = false;
+        f.scribe.stop();
+      }
+      return realUpdateOne(...callArgs);
+    }) as any;
+
+    const rejections: unknown[] = [];
+    const handler = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", handler);
+    try {
+      f.scribe.noteActivity(makeArgs());
+      await flush();
+      await new Promise((r) => setTimeout(r, 20)); // let a late rejection surface before asserting
+    } finally {
+      process.off("unhandledRejection", handler);
+    }
+    expect(rejections).toEqual([]);
+    // Path-pin (round-2 review fix): "no unhandled rejection" alone is true
+    // even with checkpoint 3 removed entirely, since a normally-completing
+    // turn also rejects nothing — assert the throw actually happened and was
+    // contained, not merely that nothing escaped.
+    expect(f.pool.runRoleTurn).toHaveBeenCalledTimes(1);
+    expect((await f.pool.runRoleTurn.mock.results[0].value).error).toContain(SCRIBE_STOPPED_ERROR);
   });
 });
