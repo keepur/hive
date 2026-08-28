@@ -1481,6 +1481,28 @@ export class Dispatcher {
           // on conferenceHumanTs because it is optional on ResolvedAgent (a
           // non-Slack conference surface has no ts to key on) — the same
           // guard the deleted selection-time write applied.
+          //
+          // ⚠ ADDITIVE-ONLY, by position: this spread sits AFTER `...item.meta`,
+          // so the round-1 / no-humanTs arm evaluates to `{}` — it can add the
+          // key but never CLEAR one already on the incoming item. Unreachable
+          // today, verified: all three dispatchToAgent call sites pass a RAW
+          // item (the two fan-out sites pass dispatch()'s own argument;
+          // triggerConferenceReactions passes `originalItem`, which is this
+          // method's `item` param, never `effectiveItem`), and the two
+          // re-entries that DO carry effectiveItem-derived meta — a KPR-307
+          // outage replay and every KPR-402 continuation leg, both of which
+          // deliberately keep meetingExclusionTs — pin meta.targetAgentId,
+          // which resolveAgents answers at step 0, before the conf-* check at
+          // step 0.7. So they resolve without conferenceMode and never reach
+          // here. A future caller that re-enters dispatchToAgent with an
+          // effectiveItem-derived meta would silently turn this no-op into a
+          // FALSE EXCLUSION: the round-1 reactor would inherit the round-0
+          // trigger's ts and markReactionExclusion would claim it as having
+          // already answered. Worth naming because KPR-417 wraps this same
+          // dispatch and the deferred §6.4(d) follow-on child edits this
+          // region — if either makes such an item reach here, invert the
+          // spread to write the key unconditionally (value or `undefined`)
+          // rather than leaving the clear implicit.
           ...(resolved.conferenceRound === 0 && resolved.conferenceHumanTs
             ? { meetingExclusionTs: resolved.conferenceHumanTs }
             : {}),

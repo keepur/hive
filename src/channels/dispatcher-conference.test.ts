@@ -299,14 +299,18 @@ Meeting rules:
   }
 
   /**
-   * Deterministic barrier for the fire-and-forget reaction pass (plan-review
-   * r1 note). `waitFor(runWorkItemTurn × 2)` alone is NOT enough: everything
-   * downstream of the reactor's turn resolution — the D5 guard and the
-   * delivery it suppresses — is a pure microtask chain (all harness mocks
-   * resolve immediately, no timers), so the deliver-count assert can run
-   * before it. One macrotask boundary drains the whole chain, because the
-   * microtask queue is fully emptied before the next macrotask. Negative-
-   * verified: with the D5 guard disabled these tests fail in ~3ms.
+   * Suite-wide settle barrier for anything downstream of a turn's resolution
+   * (plan-review r1 note). `waitFor(runWorkItemTurn × N)` alone is NOT enough:
+   * everything the dispatcher does after a turn resolves — delivery-time
+   * writes (the KPR-416 exclusion mark), the guards that suppress a delivery,
+   * and every fire-and-forget follow-on the dispatch spawns (the reaction
+   * pass, continuation legs) — is a pure microtask chain (all harness mocks
+   * resolve immediately, no timers), so an assert can run before it. One
+   * macrotask boundary drains the whole chain, because the microtask queue is
+   * fully emptied before the next macrotask. Used by T4/T6/T8a/T8b/T9 and the
+   * KPR-389 D5 tests alike; where a test awaits it twice, that is one boundary
+   * per nested fire-and-forget generation. Negative-verified on one instance:
+   * with the D5 guard disabled those tests fail in ~3ms.
    */
   const settleReactions = () => new Promise((r) => setTimeout(r, 0));
 
