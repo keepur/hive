@@ -1923,6 +1923,34 @@ describe("deadline-abort continuation (KPR-402)", () => {
     expect(texts).toEqual([DEADLINE_NOTICE_DEFAULT, DEADLINE_TERMINAL_NOTICE_DEFAULT]);
   });
 
+  it("T5 (KPR-413): a replayed conference turn's continuation leg carries the stamped frame from meta, not item.text, and no conference meta", async () => {
+    const composite = "[Meeting thread in #conf-x — participants: Jasper]\n---\n[New message]:\ntrigger text";
+    const frame = "You are in a meeting in #conf-x with Jasper.\n\nMeeting rules:\n---\n[New message]:\ntrigger text";
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(withProgressAbort());
+    await dispatcher.dispatch(
+      replayItem({
+        id: "m1",
+        text: composite, // must be IGNORED once meta.deadlineOriginalText is present
+        meta: {
+          outageReplay: true,
+          targetAgentId: "executive-assistant",
+          conferenceMode: true,
+          conferenceRound: 0,
+          conferenceHumanTs: "1000.0004",
+          conferenceInjectionMode: "full",
+          deadlineOriginalText: frame, // simulates the D1 stamp a real conference-assembly call already wrote
+        },
+      }),
+    );
+    const [, legItem] = agentManager.runWorkItemTurn.mock.calls[1];
+    expect(legItem.text).toContain(frame);
+    expect(legItem.text).not.toContain(composite);
+    expect(legItem.meta.conferenceMode).toBeUndefined();
+    expect(legItem.meta.conferenceRound).toBeUndefined();
+    expect(legItem.meta.conferenceHumanTs).toBeUndefined();
+    expect(legItem.meta.conferenceInjectionMode).toBeUndefined();
+  });
+
   it("T11: Lane B sentinel (aborted: false) and operator abort (no timedOut) never enter the arm", async () => {
     // Pin, passes both ways by design (Non-Goals / C3: Lane B keeps
     // !result.aborted byte-for-byte; an operator who stopped a turn needs no
