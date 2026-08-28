@@ -1585,7 +1585,7 @@ export class Dispatcher {
     // Fires once per round-0 pass INCLUDING passes where the classifier
     // selects nobody. Fire-and-forget: noteActivity returns void, never
     // throws, and removing this hunk restores byte-identical behavior.
-    // (`rosterMembers.length > 0` is redundant with the :1229 early return —
+    // (`rosterMembers.length > 0` is redundant with the :1565 early return —
     // kept deliberately so the seam states its own precondition locally and
     // survives any future reordering. Not a bug; do not "simplify" it away.)
     //
@@ -1759,7 +1759,7 @@ export class Dispatcher {
           // round-0 turn (the trigger ts) and every non-empty-tail turn (the
           // tail max), which is the withdrawn "max in only when the tail is
           // non-empty" variant, not F1. True F1 = no injectionHighWaterTs key
-          // at all ⇒ undefined ⇒ the else-if at :1114 never calls
+          // at all ⇒ undefined ⇒ the else-if at :1462 never calls
           // setMeetingMark on any summary turn, inverting five tests (both
           // T2(a) cases, T2(b), T2(c), T5) — see the plan header.
           injectionHighWaterTs: maxSlackTs([
