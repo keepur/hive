@@ -44,6 +44,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     offsetOf("agentManager.setWorkerPool(");
     offsetOf("await workerPool.ensureIndexes()");
     offsetOf("dispatcher.setMeetingScribe(");
+    offsetOf("dispatcher.setMeetingAckEnabled(");
     offsetOf("await bgTaskManager.start()");
     offsetOf("await bgTaskManager.scanOrphans()");
     offsetOf("await codeTaskManager.start()");
@@ -57,6 +58,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("agentManager.setWorkerPool("),
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
+      offsetOf("dispatcher.setMeetingAckEnabled("),
     ];
     const surfaceOffsets = [
       offsetOf("await bgTaskManager.start()"),
@@ -82,6 +84,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("agentManager.setWorkerPool("),
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
+      offsetOf("dispatcher.setMeetingAckEnabled("),
     );
     // Known non-spawn-capable `.start(`/`.scanOrphans(` calls that legitimately
     // precede the wiring. Adding to this list is a deliberate, reviewed

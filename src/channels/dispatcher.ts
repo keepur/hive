@@ -134,6 +134,14 @@ export class Dispatcher {
   // SUPPRESSED primary is no longer excluded), round-1 reactors at claim time
   // (triggerConferenceReactions). Shape, keying and TTL are unchanged (C2).
   private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
+  /** KPR-417: delay-then-ack master switch, mirrored from
+   *  config.meetingWorkers.ackEnabled by index.ts. FAIL-CLOSED default: an
+   *  unwired dispatcher (a test harness, or a mis-ordered boot) posts no acks
+   *  rather than misbehaving. Read per turn inside dispatchToAgent, which is
+   *  why its wiring belongs above index.ts's spawn-capable boundary (KPR-414).
+   *  Note the recognition filter in fetchMeetingHistory is deliberately NOT
+   *  gated on this flag — spec §5.5. */
+  private meetingAckEnabled = false;
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
 
@@ -188,6 +196,15 @@ export class Dispatcher {
 
   setMeetingScribe(scribe: MeetingScribe): void {
     this.meetingScribe = scribe;
+  }
+
+  /** KPR-417: mirror config.meetingWorkers.ackEnabled. Wired in index.ts
+   *  ABOVE the spawn-capable boundary (KPR-414) — the flag is a spawn-read
+   *  fact. Belt-and-braces rather than load-bearing: conference dispatch is
+   *  unreachable until setSlackAdapter runs, well below the boundary, and the
+   *  fail-closed default degrades a mis-wire to "no acks", never to a fault. */
+  setMeetingAckEnabled(enabled: boolean): void {
+    this.meetingAckEnabled = enabled;
   }
 
   async dispatch(item: WorkItem): Promise<void> {
