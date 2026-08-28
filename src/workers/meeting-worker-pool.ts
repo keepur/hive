@@ -731,6 +731,12 @@ export class MeetingWorkerPool {
   private async sweepOnRestart(): Promise<void> {
     const orphans = await this.claims.find({ status: "running" }).toArray();
     for (const claim of orphans) {
+      // KPR-414: the pool is now WIRED above the spawn-capable boundary but
+      // SWEPT after adapter registration, so a boss can legitimately claim in
+      // between. A claim this process is actively running is by definition not
+      // an orphan — the comment above ("a fresh process can never have live
+      // workers") is the premise this guard now enforces.
+      if (this.liveWorkers.has(claim._id.toString())) continue;
       await this.expireClaim(claim, "engine restarted mid-worker");
     }
   }
