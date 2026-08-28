@@ -198,10 +198,11 @@ export interface TurnResult {
    * handle (options.resume / previous_response_id / previous_interaction_id).
    * False when the finalized attempt ran fresh — first turn, KPR-313
    * provider handoff, auth-rebuild retry, KPR-350 stale-handle self-heal
-   * fresh retry. KPR-351 contender adoption counts as resumed. Known
-   * approximation (spec ⚠): for client-transcript lanes, "launched with a
-   * handle" is not proof the transcript was warm — accepted, failure mode is
-   * bounded duplication or one system-notice'd fresh turn.
+   * fresh retry, KPR-399 claude resume-rejection fresh retry. KPR-351
+   * contender adoption counts as resumed. Known approximation (spec ⚠): for
+   * client-transcript lanes, "launched with a handle" is not proof the
+   * transcript was warm — accepted, failure mode is bounded duplication or
+   * one system-notice'd fresh turn.
    */
   resumedSession?: boolean;
 }
@@ -1375,6 +1376,12 @@ export class AgentManager {
             threadId: effectiveCtx.threadId,
             timedOut: finalResult.timedOut === true,
           });
+          // KPR-412: the retry runs fresh — the finalized attempt carries no
+          // handle. Mirrors the auth-rebuild arm above; without this,
+          // !!finalAttemptSessionId reports a resume that never happened
+          // (C7), and the dispatcher's delta-into-fresh mark heal inverts
+          // into a mark ADVANCE instead of a clear (C9 gap).
+          finalAttemptSessionId = undefined;
           finalResult = await this.runOneSpawnAttempt(
             { ...effectiveCtx, sessionId: undefined },
             shaping,
