@@ -79,12 +79,22 @@ export function expiryNotice(count: number): string {
 /**
  * §5-2d replayed-turn presentation: prompt-note, not hard text prefix — the
  * model handles phrasing, staleness, and the re-ask-dedup case in its own voice.
+ *
+ * KPR-402 (⚠A7 — KPR-399 §Edge-12 closure): both variants carry one static
+ * resume-aware sentence. Post-KPR-399 a post-turn-fault doc's replay resumes
+ * the aborted session, whose transcript already contains this very message
+ * and partial work on it — without the sentence the model would restart.
+ * Safe when no session resumes (the normal fast-fail-class case — nothing to
+ * falsely reference), materially better when one does. Static text only; no
+ * processor logic, no store reads.
  */
 export function replayWrap(originalText: string, receivedAt: Date, policy: "notify" | "silent"): string {
+  const resumeNote =
+    "If your session already contains this message and partial work on it, continue from where you left off instead of restarting.";
   const note =
     policy === "notify"
-      ? `[This message was received at ${formatNoticeTime(receivedAt)} during an AI service outage and is being replayed now. Acknowledge the delay briefly if a human sent it.]`
-      : `[Replayed after an AI service outage; originally received ${formatNoticeTime(receivedAt)}.]`;
+      ? `[This message was received at ${formatNoticeTime(receivedAt)} during an AI service outage and is being replayed now. Acknowledge the delay briefly if a human sent it. ${resumeNote}]`
+      : `[Replayed after an AI service outage; originally received ${formatNoticeTime(receivedAt)}. ${resumeNote}]`;
   return `${note}\n\n${originalText}`;
 }
 

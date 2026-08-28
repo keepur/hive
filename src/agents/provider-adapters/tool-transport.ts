@@ -34,7 +34,8 @@ export interface HiveToolTransportDescriptor {
   requiresTurnContext: boolean;
   requiresHiveRuntime: boolean;
   inProcess: boolean;
-  compatibility: Record<"claude" | LaneBProviderId, ProviderToolCompatibility>;
+  // R3 (KPR-394): laneB = the single non-Claude value every classify site computes — the generic Lane B column plugin providers read via the partition fallback.
+  compatibility: Record<"claude" | LaneBProviderId | "laneB", ProviderToolCompatibility>;
 }
 
 /**
@@ -85,6 +86,8 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
         openai: "unsupported",
         gemini: "unsupported",
         codex: "unsupported",
+        grok: "unsupported",
+        laneB: "unsupported",
       },
     };
   }
@@ -116,6 +119,8 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
         openai: nonClaude,
         gemini: nonClaude,
         codex: nonClaude,
+        grok: nonClaude,
+        laneB: nonClaude,
       },
     };
   }
@@ -137,6 +142,8 @@ export function classifyToolTransport(input: ClassifyToolTransportInput): HiveTo
       openai: nonClaudeCompatibility,
       gemini: nonClaudeCompatibility,
       codex: nonClaudeCompatibility,
+      grok: nonClaudeCompatibility,
+      laneB: nonClaudeCompatibility,
     },
   };
 }
@@ -220,12 +227,26 @@ export interface OmittedToolRecord {
  */
 export function partitionInventoryForProvider(
   inventory: readonly HiveToolInventoryEntry[],
-  provider: LaneBProviderId,
+  provider: string,
 ): { bridgeable: HiveToolInventoryEntry[]; omitted: OmittedToolRecord[] } {
   const bridgeable: HiveToolInventoryEntry[] = [];
   const omitted: OmittedToolRecord[] = [];
   for (const entry of inventory) {
-    const compatibility = entry.compatibility[provider];
+    const columns = entry.compatibility as Partial<Record<string, ProviderToolCompatibility>>;
+    // R3 (KPR-394): built-in ids read their own column (bit-identical to
+    // pre-R3, which the type guaranteed present); non-built-in (plugin)
+    // ids fall back to the generic laneB column. A record carrying
+    // neither column (a stale hand-built literal) is honestly
+    // unsupported — never silently bridged.
+    // KPR-407 (finding 3): own-property guard — `provider` is plugin-controlled
+    // and PROVIDER_ID_REGEX admits "constructor", whose unguarded lookup would
+    // return Object's constructor function (truthy, never in
+    // BRIDGEABLE_COMPATIBILITIES) and omit every tool with garbage in the
+    // reason field instead of falling through to the laneB column.
+    const providerColumn = Object.prototype.hasOwnProperty.call(columns, provider)
+      ? columns[provider]
+      : undefined;
+    const compatibility = providerColumn ?? columns.laneB ?? "unsupported";
     if (BRIDGEABLE_COMPATIBILITIES.has(compatibility)) {
       bridgeable.push(entry);
     } else {

@@ -127,3 +127,26 @@ describe("OutageEpisodeTracker (§7.3)", () => {
     expect(tracker.begin("claude")).toBe(true);
   });
 });
+
+describe("replayWrap resume-aware sentence (KPR-402 ⚠A7 — KPR-399 §Edge-12 closure)", () => {
+  it("both policy variants carry the static sentence inside the note; the original still ends the wrap verbatim", () => {
+    // NEGATIVE-VERIFY prediction (Step 3): pre-fix replayWrap carries no
+    // resume sentence — both toContain assertions fail.
+    const notify = replayWrap("original question", new Date(), "notify");
+    const silent = replayWrap("do the thing", new Date(), "silent");
+    const sentence =
+      "If your session already contains this message and partial work on it, continue from where you left off instead of restarting.";
+    expect(notify).toContain(sentence);
+    expect(silent).toContain(sentence);
+    // The sentence lives INSIDE the bracketed note — shape pins hold.
+    // (r1 NIT-3: `toContain` alone would still pass if the sentence were
+    // appended AFTER the note's closing bracket, i.e. bled into the user's
+    // own text. The first `]` in the wrap closes the note, and neither the
+    // sentence nor these fixtures contain a bracket, so an index comparison
+    // is an exact inside-the-bracket pin.)
+    expect(notify.indexOf(sentence)).toBeLessThan(notify.indexOf("]"));
+    expect(silent.indexOf(sentence)).toBeLessThan(silent.indexOf("]"));
+    expect(notify.endsWith("original question")).toBe(true);
+    expect(silent.endsWith("do the thing")).toBe(true);
+  });
+});

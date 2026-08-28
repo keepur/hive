@@ -103,8 +103,10 @@ interface AgentModelCatalogEntry {
 }
 
 interface AgentModelCatalogDoc {
-  _id: CuratedCatalogProvider;
-  provider: CuratedCatalogProvider;
+  // KPR-394 (§4.11): widened to string — curated docs can now hold
+  // plugin-registered provider ids alongside the built-in curated set.
+  _id: string;
+  provider: string;
   models: AgentModelCatalogEntry[];
   updatedAt: Date;
   updatedBy: string; // agentId that called the refresh tool
@@ -112,7 +114,7 @@ interface AgentModelCatalogDoc {
 
 /** Append-only audit trail — mirrors AgentDefinitionVersion's shape. */
 interface AgentModelCatalogVersion {
-  provider: CuratedCatalogProvider;
+  provider: string; // KPR-394: built-in curated id or a plugin provider id
   snapshot: AgentModelCatalogEntry[];
   changeSummary: string;
   createdAt: Date;
@@ -121,7 +123,7 @@ interface AgentModelCatalogVersion {
 
 /** One row in agent_model_catalog_list's entries JSON. */
 interface CatalogListEntry {
-  provider: CuratedCatalogProvider | "gemini";
+  provider: string; // KPR-394: built-in curated id, "gemini", or a plugin provider id
   id: string;
   displayName: string;
   notes?: string;
@@ -220,6 +222,10 @@ export interface AdminToolDeps {
    * derived from `buildInstanceCapabilities(plugins)` once per runner.
    */
   instanceCapabilitiesJson: string;
+  /** KPR-394 (§4.11): registered plugin provider ids (any state) — widens
+   *  the catalog tools' accepted provider set. Injected (not imported) so
+   *  the admin harness stays light; absent ⇒ built-ins only. */
+  listPluginProviderIds?: () => string[];
 }
 
 export function buildAdminTools(deps: AdminToolDeps) {
@@ -923,16 +929,28 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "agent_model_catalog_list",
-      "List valid LLM model ids per provider for agent `model` assignment. Gemini is resolved live from the vendor (cached ~10 min); claude/grok/codex come from the curated catalog (maintained via agent_model_catalog_refresh). Use before setting `model` on agent_create/agent_update. Returns a JSON entries array plus prose notes for any provider leg that is unseeded or unavailable.",
+      "List valid LLM model ids per provider for agent `model` assignment. Gemini is resolved live from the vendor (cached ~10 min); claude/grok/codex come from the curated catalog (maintained via agent_model_catalog_refresh). Use before setting `model` on agent_create/agent_update. Returns a JSON entries array plus prose notes for any provider leg that is unseeded or unavailable. Plugin-registered providers (KPR-394) list from the curated catalog as well.",
       {
-        provider: z.enum(["claude", "grok", "codex", "gemini"]).optional().describe("Omit to list all 4 providers."),
+        provider: z
+          .string()
+          .optional()
+          .describe("Omit to list all providers (built-ins + registered plugin providers)."),
       },
       async ({ provider }) => {
         try {
           await ensureIndexes();
-          const wantCurated = provider
-            ? CURATED_CATALOG_PROVIDERS.filter((p) => p === provider)
-            : [...CURATED_CATALOG_PROVIDERS];
+          // KPR-394 (§4.11): plugin providers map onto the curated-collection
+          // path (unseeded ⇒ the existing prose note); gemini stays live.
+          const pluginIds = deps.listPluginProviderIds?.() ?? [];
+          const curatedSet: string[] = [...CURATED_CATALOG_PROVIDERS, ...pluginIds];
+          const validSet = [...curatedSet, "gemini"];
+          if (provider !== undefined && !validSet.includes(provider)) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `Unknown provider '${provider}'. Valid: ${validSet.join(", ")}.` }],
+            };
+          }
+          const wantCurated = provider ? curatedSet.filter((p) => p === provider) : curatedSet;
           const wantGemini = provider === undefined || provider === "gemini";
 
           const entries: CatalogListEntry[] = [];
@@ -1023,9 +1041,13 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "agent_model_catalog_refresh",
-      "Replace the curated model list for one provider (claude/grok/codex) after researching current vendor reality with your own WebSearch/WebFetch. Pass the FULL replacement list, not a delta. Upserts agent_model_catalog, appends a version-history row, returns a diff summary. Performs no vendor calls itself. Gemini is always resolved live and cannot be refreshed.",
+      "Replace the curated model list for one curated provider (claude/grok/codex, or a registered plugin provider id — KPR-394) after researching current vendor reality with your own WebSearch/WebFetch. Pass the FULL replacement list, not a delta. Upserts agent_model_catalog, appends a version-history row, returns a diff summary. Performs no vendor calls itself. Gemini is always resolved live and cannot be refreshed.",
       {
-        provider: z.enum(["claude", "grok", "codex"]).describe("Gemini is always live — nothing to refresh."),
+        provider: z
+          .string()
+          .describe(
+            "A curated provider: claude/grok/codex or a registered plugin provider id. Gemini is always live — nothing to refresh.",
+          ),
         models: z
           .array(
             z.object({
@@ -1049,6 +1071,24 @@ export function buildAdminTools(deps: AdminToolDeps) {
       async ({ provider, models, changeSummary }) => {
         try {
           await ensureIndexes();
+
+          // KPR-394 (§4.11): in-handler validation, not a zod enum — plugin
+          // ids are only known at runtime, and the admin harness mocks the
+          // SDK `tool()` wrapper (zod never runs there).
+          const pluginIds = deps.listPluginProviderIds?.() ?? [];
+          const curatedSet: string[] = [...CURATED_CATALOG_PROVIDERS, ...pluginIds];
+          if (provider === "gemini") {
+            return {
+              isError: true,
+              content: [{ type: "text", text: "Gemini is always resolved live and cannot be refreshed." }],
+            };
+          }
+          if (!curatedSet.includes(provider)) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `Unknown provider '${provider}'. Valid: ${curatedSet.join(", ")}.` }],
+            };
+          }
 
           const ids = models.map((m) => m.id);
           if (new Set(ids).size !== ids.length) {

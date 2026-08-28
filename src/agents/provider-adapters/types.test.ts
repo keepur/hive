@@ -2,14 +2,16 @@ import { describe, expect, it } from "vitest";
 import {
   SESSION_SEMANTICS,
   persistsResumableHandle,
-  sessionSemanticsFor,
   type AgentProviderId,
   type LaneBProviderId,
 } from "./types.js";
 
 describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
-  // Persistence pin: persistsResumableHandle(sessionSemanticsFor(p)) is true
-  // for every provider that holds a real resumable handle. This once mirrored
+  // Persistence pin: persistsResumableHandle(SESSION_SEMANTICS[p]) is true
+  // for every provider that holds a real resumable handle. (Reads the Record
+  // directly since KPR-394 retired the `sessionSemanticsFor` accessor —
+  // route-side lookups belong to the registry's `sessionSemanticsForRoute`.)
+  // This once mirrored
   // the deleted RESUMABLE_SESSION_PROVIDERS = {claude, openai} membership, but
   // gemini exited stateless-replay in KPR-352 (§D3 — Interactions adapter
   // chains previous_interaction_id, a real server handle), so the old-Set
@@ -21,9 +23,9 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
     ["codex", false],
     ["kimi", true],
     ["deepseek", true],
-    ["grok", true],
+    ["grok", false], // KPR-392: stateless-replay, was client-transcript under Lane A
   ] as const)("%s → persistsResumableHandle=%s", (provider, expected) => {
-    expect(persistsResumableHandle(sessionSemanticsFor(provider as AgentProviderId))).toBe(expected);
+    expect(persistsResumableHandle(SESSION_SEMANTICS[provider as AgentProviderId])).toBe(expected);
   });
 
   it("declares exactly the seven current provider ids (Record exhaustiveness is compile-time)", () => {
@@ -39,8 +41,7 @@ describe("SESSION_SEMANTICS (KPR-347 §D3)", () => {
   });
 });
 
-it("LaneBProviderId stays exactly {openai, gemini, codex} — Lane A never joins (KPR-346 canon pin)", () => {
-  // Compile-time exhaustiveness in both directions; runtime assert is a formality.
-  const laneB: Record<LaneBProviderId, true> = { openai: true, gemini: true, codex: true };
-  expect(Object.keys(laneB)).toHaveLength(3);
+it("LaneBProviderId is exactly {openai, gemini, codex, grok} — kimi/deepseek Lane A never joins (KPR-346 canon; grok promoted KPR-392)", () => {
+  const laneB: Record<LaneBProviderId, true> = { openai: true, gemini: true, codex: true, grok: true };
+  expect(Object.keys(laneB)).toHaveLength(4);
 });

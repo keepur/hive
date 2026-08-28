@@ -118,6 +118,48 @@ describe("SessionStore — StoredSessionRef normalization + scrub (KPR-313)", ()
     expect(ref?.provider).toBe("some-future-provider"); // provenance passes through; handle does not
   });
 
+  it("KPR-394: a REGISTERED server-resumable plugin provider's row returns its handle", async () => {
+    const { __registerActivePluginProviderForTests, __resetPluginProvidersForTests } = await import(
+      "./provider-adapters/provider-registry.js"
+    );
+    __registerActivePluginProviderForTests({
+      id: "solr",
+      module: { provider: "solr", createAdapter: () => ({}) as any },
+      semantics: "server-resumable",
+      source: { plugin: "hive-plugin-solr" },
+    });
+    try {
+      mocks.findOne.mockResolvedValueOnce(doc("srv-handle-1", "solr"));
+      await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+        sessionId: "srv-handle-1",
+        provider: "solr",
+      });
+    } finally {
+      __resetPluginProvidersForTests();
+    }
+  });
+
+  it("KPR-394: a registered stateless-replay plugin provider's row yields no handle (belt-and-braces)", async () => {
+    const { __registerActivePluginProviderForTests, __resetPluginProvidersForTests } = await import(
+      "./provider-adapters/provider-registry.js"
+    );
+    __registerActivePluginProviderForTests({
+      id: "sol",
+      module: { provider: "sol", createAdapter: () => ({}) as any },
+      semantics: "stateless-replay",
+      source: { plugin: "hive-plugin-sol" },
+    });
+    try {
+      mocks.findOne.mockResolvedValueOnce(doc("stray-id", "sol"));
+      await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+        sessionId: undefined,
+        provider: "sol",
+      });
+    } finally {
+      __resetPluginProvidersForTests();
+    }
+  });
+
   it("legacy untagged plain uuid grandfathers as claude (fleet-upgrade no-op)", async () => {
     mocks.findOne.mockResolvedValueOnce(doc("3f2a77aa-1111-4222-8333-444455556666"));
     await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({

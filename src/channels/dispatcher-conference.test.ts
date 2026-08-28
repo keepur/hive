@@ -171,6 +171,7 @@ function makeMockAgentManager() {
     providerFor: vi.fn().mockReturnValue("claude"),
     // Dormant breaker surface — only the outage-placement test flips it open.
     circuitBreakers: { stateFor: vi.fn().mockReturnValue({ state: "closed", enabled: true }) },
+    turnDeadlineUpperBoundMs: vi.fn().mockReturnValue(900_000),
     _sessionRefs: sessionRefs,
     _sessionStore: sessionStore,
   };

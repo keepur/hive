@@ -4,6 +4,7 @@ import { parse as parseYaml } from "yaml";
 import { createLogger } from "../logging/logger.js";
 import type { BrokenServer, LoadedPlugin, PluginManifest, PluginMcpServer } from "./types.js";
 import { isHttpServer } from "./types.js";
+import { normalizeProviderDecl } from "./provider-decl.js";
 import { HIVE_PLUGIN_API_VERSION } from "./api-version.js";
 
 const log = createLogger("plugin-loader");
@@ -246,6 +247,7 @@ export function normalizeManifest(raw: any): PluginManifest {
     ),
     agentSeeds: raw["agent-seeds"] ?? raw["agents-templates"] ?? [],
     registerCommands: raw["register-commands"] ?? undefined,
+    provider: raw.provider !== undefined ? normalizeProviderDecl(raw.provider) : undefined,
   };
 }
 

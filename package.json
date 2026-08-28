@@ -13,6 +13,12 @@
     "url": "https://github.com/keepur/hive/issues",
     "email": "beta@keepur.io"
   },
+  "exports": {
+    "./provider-abi": {
+      "types": "./pkg/types/agents/provider-adapters/provider-abi.d.ts"
+    },
+    "./package.json": "./package.json"
+  },
   "bin": {
     "hive": "pkg/cli.min.js",
     "honeypot": "scripts/honeypot"

@@ -11,6 +11,8 @@ import {
   buildPassthroughEnv,
   isLaneAProvider,
   resolvePassthroughSpawn,
+  assertSafeBaseUrlOverride,
+  resolveEnvKeyCredential,
   type PassthroughSpawnConfig,
 } from "./passthrough-providers.js";
 import type { AgentProviderId } from "./types.js";
@@ -35,15 +37,8 @@ describe("PASSTHROUGH_PROVIDERS table (KPR-346 §D1)", () => {
     });
   });
 
-  it("KPR-384: grok carries the loopback gateway endpoint (env-overridable), the gateway-key credential, and grok-4.6", () => {
-    expect(PASSTHROUGH_PROVIDERS.grok).toEqual({
-      id: "grok",
-      displayName: "Grok (xAI)",
-      baseUrl: "http://127.0.0.1:8317",
-      baseUrlEnv: "GROK_GATEWAY_URL",
-      credential: { kind: "env-key", key: "GROK_GATEWAY_KEY" },
-      defaultModel: "grok-4.6",
-    });
+  it("KPR-392: the table holds exactly kimi and deepseek — grok promoted off Lane A to a native Lane B module", () => {
+    expect(Object.keys(PASSTHROUGH_PROVIDERS).sort()).toEqual(["deepseek", "kimi"]);
   });
 });
 
@@ -51,9 +46,11 @@ describe("isLaneAProvider (KPR-346 §D1)", () => {
   it.each([
     ["kimi", true],
     ["deepseek", true],
-    // KPR-371: NOT compile-forced. A missed id here silently degrades the
-    // session-handoff notice and silently drops :effort instead of clamping.
-    ["grok", true],
+    // KPR-392: explicit promotion pin — grok left Lane A for a native Lane B
+    // module; NOT compile-forced, so this row guards the regression directly
+    // (a false positive here would silently re-degrade the session-handoff
+    // notice and re-clamp grok's :effort suffix).
+    ["grok", false],
     ["claude", false],
     ["openai", false],
     ["gemini", false],
@@ -162,41 +159,72 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
   });
 });
 
-describe("resolvePassthroughSpawn — grok gateway (KPR-384)", () => {
-  const ORIG_KEY = process.env.GROK_GATEWAY_KEY;
-  const ORIG_URL = process.env.GROK_GATEWAY_URL;
+describe("assertSafeBaseUrlOverride (KPR-392 — exported for the manager's grok arm)", () => {
+  const call = (url: string) => assertSafeBaseUrlOverride(url, "TEST_URL_ENV");
 
+  it.each(["http://localhost:9999", "http://127.0.0.1:8317", "http://127.5.5.5:80", "http://[::1]:8317", "https://gw.internal.example:8317"])(
+    "accepts %s",
+    (url) => {
+      expect(call(url)).toBe(url);
+    },
+  );
+
+  it("rejects cleartext http to a non-loopback host as a breaker-invisible config fault", () => {
+    const attempt = () => call("http://gw.internal.example:8317");
+    expect(attempt).toThrow(TurnAssemblyError);
+    expect(attempt).toThrow(/cleartext to a non-loopback host/);
+    let thrown: unknown;
+    try {
+      attempt();
+    } catch (err) {
+      thrown = err;
+    }
+    expect(classifyThrown(thrown)).toMatchObject({ outcome: "fault", kind: "non-provider" });
+  });
+
+  it("rejects a malformed override URL", () => {
+    const attempt = () => call("not a url");
+    expect(attempt).toThrow(TurnAssemblyError);
+    expect(attempt).toThrow(/TEST_URL_ENV is not a valid URL/);
+  });
+});
+
+describe("resolveEnvKeyCredential (KPR-392 — exported for the manager's grok arm)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockFromKeychain.mockReturnValue("");
-    delete process.env.GROK_GATEWAY_KEY;
-    delete process.env.GROK_GATEWAY_URL;
   });
 
-  afterEach(() => {
-    if (ORIG_KEY === undefined) delete process.env.GROK_GATEWAY_KEY;
-    else process.env.GROK_GATEWAY_KEY = ORIG_KEY;
-    if (ORIG_URL === undefined) delete process.env.GROK_GATEWAY_URL;
-    else process.env.GROK_GATEWAY_URL = ORIG_URL;
-  });
-
-  it("resolves GROK_GATEWAY_KEY on the standard env → Keychain chain — no OAuth-file path remains", () => {
-    process.env.GROK_GATEWAY_KEY = "gw-env-tok";
-    const cfg = resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst" });
-    expect(cfg.authToken).toBe("gw-env-tok");
+  it("honors the resolveSecret test seam", () => {
+    const token = resolveEnvKeyCredential("TEST_KEY", { instanceId: "inst", resolveSecret: () => "seam-tok" });
+    expect(token).toBe("seam-tok");
     expect(mockFromKeychain).not.toHaveBeenCalled();
-
-    delete process.env.GROK_GATEWAY_KEY;
-    mockFromKeychain.mockReturnValue("gw-kc-tok");
-    const kc = resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst-9" });
-    expect(kc.authToken).toBe("gw-kc-tok");
-    expect(mockFromKeychain).toHaveBeenCalledWith("inst-9", "GROK_GATEWAY_KEY");
   });
 
-  it("missing gateway key throws the standard breaker-invisible config fault naming GROK_GATEWAY_KEY", () => {
-    const call = () => resolvePassthroughSpawn("grok", "", { configuredModel: "", instanceId: "inst" });
+  it("defaults to env-first-then-Keychain when no seam is supplied", () => {
+    const ORIG = process.env.TEST_KEY;
+    delete process.env.TEST_KEY;
+    try {
+      mockFromKeychain.mockReturnValue("kc-tok");
+      const token = resolveEnvKeyCredential("TEST_KEY", { instanceId: "inst-7" });
+      expect(token).toBe("kc-tok");
+      expect(mockFromKeychain).toHaveBeenCalledWith("inst-7", "TEST_KEY");
+
+      process.env.TEST_KEY = "env-tok";
+      mockFromKeychain.mockClear();
+      const envToken = resolveEnvKeyCredential("TEST_KEY", { instanceId: "inst-7" });
+      expect(envToken).toBe("env-tok");
+      expect(mockFromKeychain).not.toHaveBeenCalled();
+    } finally {
+      if (ORIG === undefined) delete process.env.TEST_KEY;
+      else process.env.TEST_KEY = ORIG;
+    }
+  });
+
+  it("missing credential throws TurnAssemblyError naming the key and the remediation, byte-pinned", () => {
+    const call = () => resolveEnvKeyCredential("TEST_KEY", { instanceId: "inst", resolveSecret: () => "" });
     expect(call).toThrow(TurnAssemblyError);
-    expect(call).toThrow(/Passthrough credential missing \(authentication\): GROK_GATEWAY_KEY/);
+    expect(call).toThrow(/Passthrough credential missing \(authentication\): TEST_KEY — seed it via `hive credentials add TEST_KEY`/);
     let thrown: unknown;
     try {
       call();
@@ -204,75 +232,6 @@ describe("resolvePassthroughSpawn — grok gateway (KPR-384)", () => {
       thrown = err;
     }
     expect(classifyThrown(thrown)).toMatchObject({ outcome: "fault", kind: "non-provider" });
-  });
-
-  it("model chain: route → configured → grok-4.6", () => {
-    const base = { instanceId: "inst", resolveSecret: () => "tok" };
-    expect(resolvePassthroughSpawn("grok", "grok-4.5", { ...base, configuredModel: "cfg" }).model).toBe("grok-4.5");
-    expect(resolvePassthroughSpawn("grok", "", { ...base, configuredModel: "cfg" }).model).toBe("cfg");
-    expect(resolvePassthroughSpawn("grok", "", { ...base, configuredModel: "" }).model).toBe("grok-4.6");
-  });
-
-  it("carries the loopback gateway base URL by default", () => {
-    const cfg = resolvePassthroughSpawn("grok", "", {
-      configuredModel: "",
-      instanceId: "inst",
-      resolveSecret: () => "tok",
-    });
-    expect(cfg.baseUrl).toBe("http://127.0.0.1:8317");
-    expect(cfg.provider).toBe("grok");
-  });
-
-  it("GROK_GATEWAY_URL overrides the gateway address per spawn", () => {
-    process.env.GROK_GATEWAY_URL = "http://127.0.0.1:9999";
-    const cfg = resolvePassthroughSpawn("grok", "", {
-      configuredModel: "",
-      instanceId: "inst",
-      resolveSecret: () => "tok",
-    });
-    expect(cfg.baseUrl).toBe("http://127.0.0.1:9999");
-
-    // Per-spawn, not module-load: clearing the override restores the default
-    // on the very next resolution.
-    delete process.env.GROK_GATEWAY_URL;
-    const next = resolvePassthroughSpawn("grok", "", {
-      configuredModel: "",
-      instanceId: "inst",
-      resolveSecret: () => "tok",
-    });
-    expect(next.baseUrl).toBe("http://127.0.0.1:8317");
-  });
-
-  describe("override validation: https, or http to loopback only (review r1)", () => {
-    const base = { configuredModel: "", instanceId: "inst", resolveSecret: () => "tok" };
-    const call = () => resolvePassthroughSpawn("grok", "", base);
-
-    it.each(["http://localhost:9999", "http://127.0.0.1:8317", "http://127.5.5.5:80", "http://[::1]:8317", "https://gw.internal.example:8317"])(
-      "accepts %s",
-      (url) => {
-        process.env.GROK_GATEWAY_URL = url;
-        expect(call().baseUrl).toBe(url);
-      },
-    );
-
-    it("rejects cleartext http to a non-loopback host as a breaker-invisible config fault", () => {
-      process.env.GROK_GATEWAY_URL = "http://gw.internal.example:8317";
-      expect(call).toThrow(TurnAssemblyError);
-      expect(call).toThrow(/cleartext to a non-loopback host/);
-      let thrown: unknown;
-      try {
-        call();
-      } catch (err) {
-        thrown = err;
-      }
-      expect(classifyThrown(thrown)).toMatchObject({ outcome: "fault", kind: "non-provider" });
-    });
-
-    it("rejects a malformed override URL", () => {
-      process.env.GROK_GATEWAY_URL = "not a url";
-      expect(call).toThrow(TurnAssemblyError);
-      expect(call).toThrow(/GROK_GATEWAY_URL is not a valid URL/);
-    });
   });
 });
 
@@ -322,25 +281,4 @@ describe("buildPassthroughEnv (KPR-346 §D5)", () => {
     });
   });
 
-  it("KPR-384: grok pins the gateway endpoint and grok-4.6 across every model var", () => {
-    const env = buildPassthroughEnv({
-      provider: "grok",
-      model: "grok-4.6",
-      baseUrl: "http://127.0.0.1:8317",
-      authToken: "grok-gateway-key",
-    });
-    expect(env).toStrictEqual({
-      ANTHROPIC_BASE_URL: "http://127.0.0.1:8317",
-      ANTHROPIC_AUTH_TOKEN: "grok-gateway-key",
-      ANTHROPIC_API_KEY: undefined,
-      ANTHROPIC_MODEL: "grok-4.6",
-      ANTHROPIC_SMALL_FAST_MODEL: "grok-4.6",
-      ANTHROPIC_DEFAULT_OPUS_MODEL: "grok-4.6",
-      ANTHROPIC_DEFAULT_SONNET_MODEL: "grok-4.6",
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: "grok-4.6",
-      CLAUDE_CODE_SUBAGENT_MODEL: "grok-4.6",
-      ENABLE_TOOL_SEARCH: "false",
-      CLAUDE_CODE_ENTRYPOINT: undefined,
-    });
-  });
 });

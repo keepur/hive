@@ -37,7 +37,7 @@ function makeEntry(overrides: Partial<HiveToolInventoryEntry> = {}): HiveToolInv
     requiresTurnContext: false, requiresHiveRuntime: true, inProcess: true,
     compatibility: {
       claude: "direct", openai: "requires-hive-bridge",
-      gemini: "requires-hive-bridge", codex: "requires-hive-bridge",
+      gemini: "requires-hive-bridge", codex: "requires-hive-bridge", grok: "requires-hive-bridge",
     },
     schemas: { kind: "connect-time" },
     ...overrides,
@@ -74,7 +74,7 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     const bridgeable = makeEntry();
     const omittedEntry = makeEntry({
       name: "Bash", transport: "claude-builtin", inProcess: false, requiresHiveRuntime: false,
-      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only" },
+      compatibility: { claude: "direct", openai: "claude-only", gemini: "claude-only", codex: "claude-only", grok: "claude-only" },
       schemas: { kind: "unavailable" },
     });
     const plantedServers = { memory: { instance: {} } } as never;
@@ -152,7 +152,7 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
   it("omission log carries names + reasons only — never serverConfig/env values (§edge: serverConfig secrecy)", async () => {
     const secretEntry = makeEntry({
       name: "quo", transport: "stdio", inProcess: false, requiresHiveRuntime: false,
-      compatibility: { claude: "direct", openai: "unsupported", gemini: "unsupported", codex: "unsupported" },
+      compatibility: { claude: "direct", openai: "unsupported", gemini: "unsupported", codex: "unsupported", grok: "unsupported" },
       serverConfig: { type: "stdio", command: "quo", args: [], env: { QUO_API_KEY: "hunter2" } } as never,
     });
     await assembleProviderTurn({ runner: makeRunner([secretEntry]), config: makeAgentConfig(), provider: "openai" });
@@ -255,7 +255,7 @@ describe("buildNestedDelegateAssembly (KPR-354 §D5.3, T4)", () => {
       name: "google", transport: "claude-subagent", inProcess: false, requiresHiveRuntime: false,
       compatibility: {
         claude: "direct", openai: "requires-hive-bridge",
-        gemini: "requires-hive-bridge", codex: "requires-hive-bridge",
+        gemini: "requires-hive-bridge", codex: "requires-hive-bridge", grok: "requires-hive-bridge",
       },
       schemas: { kind: "unavailable" },
       description: "Gmail + Calendar",
