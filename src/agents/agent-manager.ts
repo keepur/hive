@@ -895,8 +895,8 @@ export class AgentManager {
    * the machine's `grok login` subscription OAuth access token, resolved
    * (and refreshed + written back, if near expiry) from
    * `~/.grok/auth.json` by grok-oauth.ts — revived KPR-371 machinery,
-   * unchanged since the gateway (KPR-384) that made it briefly dead code is
-   * itself now retired. No baseUrl slot: the adapter's endpoint is fixed at
+   * byte-identical to the version KPR-384 deleted when it introduced the
+   * now-retired gateway. No baseUrl slot: the adapter's endpoint is fixed at
    * https://api.x.ai, there is no override. This turns resolveGrokModuleSlice
    * async (file read, and near expiry — up to two network round-trips on a
    * cold discovery cache, one thereafter; each capped by grok-oauth.ts's own
