@@ -4,7 +4,7 @@
 
 **Spec:** `docs/epics/kpr-415/kpr-416-spec.md` (spec-ready, clean, spec-review r1). The spec is authoritative on every design question; this plan implements it and does not re-open it. Where the spec departs from the governing epic design (§6.1, write predicate), the spec wins.
 **Epic:** KPR-415 (Meeting mode hardening) · Child A · **Downstream:** KPR-417 blocks on this; land A first (spec §11).
-**Baseline:** worktree `hive-KPR-415`, branch `KPR-415` at `0ed653d`. All line citations below were re-verified against this tree on 2026-08-28 and match the spec's.
+**Baseline:** worktree `hive-KPR-415`, branch `KPR-415` at `a5382c7` (this plan's own commit; the source tree is identical to `0ed653d`, which is what the line citations were taken against). All line citations below were re-verified against this tree on 2026-08-28 and match the spec's. **Re-check every number against the live tree before editing — anchor on quoted text, not on the number.**
 
 **Goal:** Move the single eligibility-deciding `meetingReactionTracker` write from classifier-selection time to delivery time, so a round-0 primary whose turn was *suppressed* becomes eligible to react to a slower peer's later reply — while every other round-0 outcome keeps today's exclusion.
 
@@ -28,6 +28,7 @@ An implementer or reviewer must not treat any of these as an oversight. Each is 
 | An errored outage **replay** that delivers error text marks exclusion, then may replay again and deliver real content (idempotent second write). | §4 rule, uniform | Not a regression — it is excluded today too. Do not special-case it. |
 | KPR-389 §C5's round-1 volume baseline shifts. | Key Points | Advisory only. Do not add instrumentation or a config lever. |
 | No config lever; rollback is code revert. | §12 | Do **not** add an `enabled` flag. |
+| `triggerConferenceReactions` is only ever called from the **fan-out leg** (`dispatcher.ts:1485`), so an outage-replayed round-0 delivery — or a KPR-402 continuation leg that finally answers — never fires a reaction pass at all. | §3 (named non-goal) | Do **not** add a `triggerConferenceReactions` call to the single-dispatch delivery branch (write site 2) while working Task 4. This is a **pre-existing scope bound the spec explicitly declines to close**, not an oversight in this plan and not a gap this ticket opened. Task 4 deliberately gives that leg an exclusion *write* and no reaction *trigger*: the write is what KPR-416 owes; the trigger is a separate, unfiled decision. Touching it would silently expand this child's blast radius into the replay and continuation paths. |
 
 ---
 
@@ -44,7 +45,7 @@ This worktree has **no `node_modules`** — verified at plan time (`ls node_modu
 - **Unit: required.**
   - *Scope:* `Dispatcher`'s reaction-exclusion write predicate and its three call sites, the `meetingExclusionTs` meta stamp and its survival of the KPR-413 continuation-leg strip, and the KPR-387/KPR-388 regression surfaces the relocation touches.
   - *Reason:* the entire change is dispatcher-internal control flow over an in-memory map; there is no I/O boundary to integrate against and no new schema, config, or cross-module surface (spec §8, "Files touched").
-  - *Minimum assertions:* 11 test cases (T1, T2, T3, T4, T4b, T5, T6, T7, T8a, T8b, T9), of which T1 and T2 carry a mandatory negative-verify step.
+  - *Minimum assertions:* 11 test cases (T1, T2, T3, T4, T4b, T5, T6, T7, T8a, T8b, T9), of which T1 and T2 carry a mandatory negative-verify step. Several are written as more than one `it` — T6 as a 2-row `it.each`, T4b as a 3-row `it.each`, T7 as two siblings, T8b as a main test plus two companions — so the executed-test count is higher than 11.
 - **Integration: not-required.** See Non-Required Rationale.
 - **E2E: not-required.** See Non-Required Rationale.
 
@@ -132,13 +133,32 @@ const excludedFor = (threadId: string, humanTs: string): Set<string> | undefined
 - If a test failure exposes an implementation issue, fix the implementation, not the test.
 - If testing exposes a spec or plan mismatch, demote the ticket to the spec lane.
 - **Negative-verify obligation (mandatory, spec §10):** T1 and T2 must be demonstrated to **fail on pre-fix code**. Each of Task 6 and Task 7 carries an explicit revert → run → confirm-fail → re-apply → confirm-pass step. Both must also guard the vacuous-pass hazard (`kpr-387-spec.md:155`) by asserting a **non-empty** set of turns actually ran before asserting over their content.
-- T4, T5, T8b and T9 also fail on pre-fix code (they pin newly-reachable paths). That is expected and is **not** a required demonstration — only T1 and T2 carry the obligation. T3, T4b, T6, T7's companion and T8a's KPR-413 half pass on both old and new code.
+- **Pre-fix pass/fail, precisely.** "Pre-fix" below means *pre-KPR-416 code* — the selection-time write present, no helper, no stamp, no call sites. Only T1 and T2 carry the mandatory demonstration; the rest of this table is a correctness statement about the suite, not extra work. Note the three categories are different in kind and must not be conflated: a **reachability** failure is real evidence of the behavior change; a **structurally-absent** failure is a compile/anchor failure that proves nothing about behavior.
+
+  | Test | Pre-fix | Why |
+  |---|---|---|
+  | T1 | **fails — reachability** | Selection-time write excludes all three primaries ⇒ `peerMembers` empty ⇒ the reaction classifier is never called and the waitFor times out. The mandatory demo (Task 6 Step 7). |
+  | T2 | **fails — reachability** | Jessica is excluded at selection time ⇒ no round-1 turn dispatches at all ⇒ `round1Call()` stays undefined. The mandatory demo (Task 7 Step 3). |
+  | T4 (phase-1 assertion only) | **fails — reachability** | `excludedFor(...).toBeUndefined()` after queueing: pre-fix the selection-time write already recorded `jasper`. T4's phase-2 assertion passes on both. *This assertion is added in Task 6 Step 5, not Task 4 — it is unreachable before the selection-time write is deleted.* |
+  | T7 fast-fail sibling (negative assertion only) | **fails — reachability** | Same shape: pre-fix `jasper` is recorded at selection time regardless of the later `ProviderCircuitOpenError`. *Also added in Task 6 Step 5.* |
+  | T8b companion 1 (cap-exhausted) | **fails — reachability** | Pre-fix the never-answering chain's agent is nonetheless excluded at selection time. |
+  | T8b companion 2 (zero-progress abort) | **fails — reachability** | Same. |
+  | T9 | **fails — reachability** | Pre-fix `river` is excluded at selection time, so `peerIds` never contains it. |
+  | T5 | **fails — structurally absent** | Not a behavior signal: `this.markReactionExclusion(` simply does not appear in the fan-out block, so the source-order scan's first anchor assertion fails. Proves the call site exists, nothing about the relocation. |
+  | T8a | **fails — structurally absent** | Same category: `meta.meetingExclusionTs` is never stamped pre-fix, so the pin fails on an absent key rather than on divergent behavior. |
+  | T3 | **passes on both** | A *delivered* round-0 responder is excluded under either placement — that is exactly the KPR-387 guarantee this ticket preserves. |
+  | T4b | **passes on both** | Ordinary non-conference single-dispatch turn; neither placement touches the tracker. |
+  | T6 (both cases) | **passes on both** | Placeholder and errored-with-text turns are excluded under either placement; T6 pins the *predicate*, not the placement. |
+  | T7 thrown-turn half | **passes on both** | A thrown round-0 turn is excluded under either placement. |
+  | T8b main test | **passes on both** | The leg's agent is already excluded from selection time pre-fix, so there is nothing new for it to fail on. It pins that the *delivery-time* placement still reaches the continuation leg — a claim only its two companions can falsify. |
 
 ---
 
 ## Task ordering rationale
 
 Tasks 1-5 add machinery and call sites **while the selection-time write is still in place**. Every intermediate commit is therefore behaviorally identical to today: the selection-time write already covers a superset of what the new delivery-time writes mark, and the tracker is a `Set`, so the extra writes are idempotent no-ops. Task 6 is the single behavior-changing commit (deletion + comment rewrites), and it is where T1's negative-verify lands. Do not reorder Task 6 ahead of Tasks 1-5.
+
+**The direct consequence — do not fight it (plan-review r1, blocking issues 1 and 2).** Any assertion of the form "this agent is **not** in the tracker" is *unreachable* before Task 6, because a non-empty classifier result records every selected agent at classification time no matter what the delivery-time sites do. Two such assertions belong to tests introduced earlier — T4's phase-1 "queued ⇒ not excluded" pin and T7's fast-fail-companion pin. Both are therefore **deliberately deferred to Task 6 Step 5**, with a `NOTE:` left at the exact spot they belong. Tasks 4 and 5 assert only what holds with the selection-time write still present. Writing either assertion early would make its own commit red and destroy the additive-then-single-behavior-change property this ordering exists to provide.
 
 ---
 
@@ -165,7 +185,7 @@ Expected: all files pass, `0 failed`. Record the passing test count — it is th
 **Files:**
 - Modify: `src/channels/dispatcher.ts:129-133` (tracker field comment) and `:563-564` (insert the helper between `tryOutageDiversion` and `deliverAgentResult`)
 
-> Line numbers throughout are as of `0ed653d` and shift as earlier tasks land. **Anchor every edit on the quoted text, not the number.**
+> Line numbers throughout are as of `a5382c7` (source tree identical to `0ed653d`) and shift as earlier tasks land. **Anchor every edit on the quoted text, not the number.**
 
 - [ ] **Step 1:** Update the tracker field's comment at `dispatcher.ts:130-133` so it no longer claims selection-time recording.
 
@@ -187,7 +207,7 @@ with:
   private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
 ```
 
-- [ ] **Step 2:** Insert the helper immediately **before** `deliverAgentResult` (i.e. after `tryOutageDiversion`'s closing brace at `:563`, before the `/** KPR-308 §5.2: shared agent-response delivery ... */` block comment).
+- [ ] **Step 2:** Insert the helper immediately **before** `deliverAgentResult` (i.e. after `tryOutageDiversion`'s closing brace at `:563`, before the block comment that begins — verified verbatim in this tree at `:566` — `/** KPR-308: shared agent-response delivery for the two dispatch paths.`). Note the anchor has **no** `§5.2`; the `§5.2`-bearing KPR-308 comment is a *different* one at `:508` (outage-mode delivery preference), so do not anchor on that.
 
 ```ts
   /**
@@ -385,7 +405,11 @@ with:
         // Conference mode: trigger depth-1 peer reactions
 ```
 
-- [ ] **Step 2:** Hoist the test helpers this plan needs out of the nested `describe`s into the suite scope of `describe("Conference channel routing")`, alongside the existing `PREAMBLE` and `soloClassifier` (which already live there, `:235-255`). Move — do not copy — `turn(...)` / `zeroUsage` / `settleReactions` / `twoAgentClassifier` from `describe("round-1 kill suppression (KPR-389 D5)")` (`:575-623`) and `seedRef` / `makeHistory` from `describe("delta context injection (KPR-388)")` (`:822-840`) up to suite scope, leaving the nested describes referencing the hoisted versions. `confItem`, `THREE_MSG_HISTORY`, `ONE_MSG_HISTORY` and `ABORT_WITH_PROGRESS` stay where they are.
+- [ ] **Step 2:** Hoist the test helpers this plan needs out of the nested `describe`s into the suite scope of `describe("Conference channel routing")`, alongside the existing `PREAMBLE` and `soloClassifier` (which already live there, `:235-255`). Move — do not copy — `turn(...)` / `zeroUsage` / `settleReactions` from `describe("round-1 kill suppression (KPR-389 D5)")` (`:575-623`) and `seedRef` / `makeHistory` from `describe("delta context injection (KPR-388)")` (`:822-840`) up to suite scope, leaving the nested describes referencing the hoisted versions. `confItem`, `THREE_MSG_HISTORY`, `ONE_MSG_HISTORY` and `ABORT_WITH_PROGRESS` stay where they are.
+
+> **Do NOT hoist `twoAgentClassifier`.** It is used only inside its own KPR-389 describe block and nothing this plan adds calls it — hoisting it is churn in the regression surface for no benefit. Leave it where it is.
+>
+> **`turn` must stay a hoisted `function` declaration — do not convert it to a `const`.** `ABORT_WITH_PROGRESS` (`:710`, inside the KPR-413 describe) is initialized from a `turn({...})` call at **describe-registration time**, which works only because function declarations hoist fully within their scope. A `const turn = (...) => ...` at suite scope would put `turn` in the temporal dead zone at that moment and throw a `ReferenceError` during collection, taking the whole file down. Keep it as `function turn(overrides: Record<string, unknown> = {}) { ... }`.
 
 Then add, immediately after `soloClassifier()` in the suite scope:
 
@@ -461,7 +485,15 @@ Then add, immediately after `soloClassifier()` in the suite scope:
       // silently re-including them.
       await soloClassifier();
       const threadId = `conf-thread-kpr416-t6-${String(_label).replace(/\W+/g, "-")}`;
-      agentManager.runWorkItemTurn.mockResolvedValueOnce(turn(flags));
+      // `turn({ ...flags })`, NOT `turn(flags)`. The it.each table widens each
+      // column to a union across rows, so `flags` infers as
+      // `string | { finalMessage: string; errors?: string[] }` and the bare
+      // `string` member is not assignable to `Record<string, unknown>` —
+      // `npm run typecheck` rejects it. Object-spreading a string IS legal TS
+      // (it spreads to no own enumerable props), so the spread form typechecks
+      // for every member of the union. Same reason the existing KPR-389 D5
+      // it.each at :625 already writes `turn({ finalMessage: "", ...flags })`.
+      agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ ...flags }));
 
       await dispatcher.dispatch(
         makeWorkItem({
@@ -568,6 +600,12 @@ with:
 
 - [ ] **Step 3:** Add **T4** (outage-replay leg marks exclusion) as a new top-level `it`. It round-trips the *real* enqueued workItem, so it pins that `meetingExclusionTs` actually survives the outage store.
 
+> **Two hazards this test has to handle — both were caught in plan-review r1.**
+>
+> **(a) The phase-1 negative assertion is NOT written here.** `expect(excludedFor(threadId, "1700.0008")).toBeUndefined()` after queueing is *unreachable* at Task 4: the selection-time write in `resolveConferenceAgents` still exists until Task 6 and records `jasper` at classification time regardless of anything Task 4 adds, so the assertion would fail on the very commit that introduces it. Task 4 asserts only what is true with the selection-time write still in place; the negative assertion is added in **Task 6 Step 5**, immediately after the write is deleted, where it is both reachable and meaningful. This preserves the plan's shape: Tasks 1-5 stay additive and behavior-neutral, Task 6 remains the single behavior-changing commit.
+>
+> **(b) `adapter.deliver` is called TWICE across the two phases, and the outage notice comes FIRST.** Phase 1's item id is `msg-N-…`, so `policyFor(item)` returns `"notify"` (`src/outage/outage-notices.ts:18-26`) and `episodes.firstForThread(...)` is true on a freshly constructed `OutageEpisodeTracker` — so `maybeHandlePostTurnOutage` calls `deliverOutageNotice` → `adapter.deliver` **before** phase 2's real-content delivery. `calls[0]` is therefore the notice, not the content. The in-file precedent this test is modelled on (`"outage-queued turn never touches the mark"`, `:1042`) sidesteps this only because it never asserts on `deliver` contents or counts; this test does, so it must handle it explicitly. The test below asserts the notice deliberately (it is real behavior worth pinning) and then **clears `adapter.deliver`'s call record** before phase 2, so the phase-2 assertions read `calls[0]` of a clean record. `mockClear()` — not `mockReset()`/`clearAllMocks()` — so the harness's `deliver` implementation survives.
+
 ```ts
   it("T4 (KPR-416): an outage-queued round-0 turn that later replays and delivers excludes that agent", async () => {
     // Write site 2's replay half, end-to-end: phase 1 queues the real
@@ -608,7 +646,18 @@ with:
       }),
     );
     expect(outageStore.enqueue).toHaveBeenCalledTimes(1);
-    expect(excludedFor(threadId, "1700.0008")).toBeUndefined(); // queued ⇒ NOT excluded
+    // Phase 1 delivered the KPR-307 honest-outage NOTICE (policyFor ⇒ "notify",
+    // first episode for this thread), so deliver has already fired once. That
+    // notice is engine chrome, not agent content — pin it, then clear the call
+    // record so phase 2's assertions read a clean `calls[0]`. mockClear only:
+    // mockReset/clearAllMocks would drop the harness's deliver implementation.
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toContain("provider outage");
+    adapter.deliver.mockClear();
+    // NOTE: `expect(excludedFor(threadId, "1700.0008")).toBeUndefined()` — the
+    // "queued ⇒ NOT excluded" pin — belongs here logically but is UNREACHABLE
+    // until Task 6 deletes the selection-time write, which records jasper at
+    // classification time regardless. Task 6 Step 5 adds it at this exact spot.
 
     // Phase 2 — replay the item the store actually holds, breaker closed.
     const queued = outageStore.enqueue.mock.calls[0][0].workItem as WorkItem;
@@ -620,7 +669,7 @@ with:
       meta: { ...queued.meta, outageReplay: true, targetAgentId: "jasper" },
     });
 
-    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // post-mockClear: the real content only
     expect(adapter.deliver.mock.calls[0][0].text).toBe("The real answer, at last");
     expect(excludedFor(threadId, "1700.0008")).toEqual(new Set(["jasper"]));
   });
@@ -653,7 +702,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/channels/dispatcher.ts:623-625`
-- Test: `src/channels/dispatcher-conference.test.ts` — add T7 (+ its fast-fail companion)
+- Test: `src/channels/dispatcher-conference.test.ts` — add T7 and its fast-fail companion as **two sibling `it`s**
 
 - [ ] **Step 1:** Insert the call inside `if (adapter)`, before `adapter.deliver(errorResult)`.
 
@@ -681,14 +730,16 @@ with:
         await adapter.deliver(errorResult);
 ```
 
-- [ ] **Step 2:** Add **T7** as a new top-level `it` in the suite. Import `ProviderCircuitOpenError` from `../agents/provider-circuit-breaker.js` at the top of the test file.
+- [ ] **Step 2:** Add **T7** as **two sibling top-level `it`s** in the suite. Import `ProviderCircuitOpenError` from `../agents/provider-circuit-breaker.js` at the top of the test file.
+
+> **Two `it`s, not one with a mid-test reset.** An earlier draft packed both halves into a single test separated by `vi.clearAllMocks()`. Do not do that. Two independent tests get the suite's own `beforeEach` teardown between them for free, and they fail independently — the fast-fail exemption is a *separate* claim from the thrown-turn inclusion and deserves its own red line. (For the record, the abandoned draft's stated rationale was also wrong: `vi.clearAllMocks()` is `mockClear` across all mocks — it resets **call records**, not queued `mockResolvedValueOnce` implementations. It happened to be harmless there only because the once-value was already consumed before the reset. Don't reason from that premise anywhere else in this suite.)
 
 ```ts
-  it("T7 (KPR-416): a THROWN round-0 turn is excluded; a ProviderCircuitOpenError fast-fail is NOT", async () => {
-    // Disposition (b), spec §6.2. The thrown turn posts visible error text,
-    // so it stays excluded (write site 3). The fast-fail posts an engine
-    // NOTICE, not agent content, so it must not — handleOutageTurn's early
-    // return in handleTurnFailure is the exemption, and this is its pin.
+  it("T7 (KPR-416): a THROWN round-0 turn stays excluded (write site 3)", async () => {
+    // Disposition (b), spec §6.2. The thrown turn posts visible error text —
+    // the same user-visible artifact an in-branch errored turn produces — so
+    // it stays excluded. Passes pre- and post-fix: this half pins the
+    // predicate, not the relocation.
     await soloClassifier();
     const thrownThread = "conf-thread-kpr416-t7-thrown";
     agentManager.runWorkItemTurn.mockRejectedValueOnce(new Error("boom"));
@@ -705,10 +756,12 @@ with:
     expect(adapter.deliver).toHaveBeenCalledTimes(1);
     expect(adapter.deliver.mock.calls[0][0].text).toContain("Something went wrong");
     expect(excludedFor(thrownThread, "1700.0009")).toEqual(new Set(["jasper"]));
+  });
 
-    // Companion: the fast-fail arm. Wire outage handling so handleOutageTurn
-    // absorbs the ProviderCircuitOpenError and returns before write site 3.
-    vi.clearAllMocks();
+  it("T7 companion (KPR-416): a ProviderCircuitOpenError fast-fail is NOT excluded", async () => {
+    // The exemption half. A fast-fail posts an engine NOTICE, not agent
+    // content, so it must never mark — handleOutageTurn's early return in
+    // handleTurnFailure lands before write site 3, and this is its pin.
     await soloClassifier();
     const outageStore = {
       enqueue: vi.fn().mockResolvedValue(undefined),
@@ -727,8 +780,10 @@ with:
       config: { enabled: true, replayIntervalMs: 15_000, maxAgeHours: 4, maxDepth: 500, maxReplayAttempts: 3 },
     });
     const fastFailThread = "conf-thread-kpr416-t7-fastfail";
+    // ProviderCircuitOpenError's `provider` param is typed `string` (see
+    // provider-circuit-breaker.ts:94) — no cast needed.
     agentManager.runWorkItemTurn.mockRejectedValueOnce(
-      new ProviderCircuitOpenError("claude" as never, Date.now(), 15_000, "connect-fail", "fetch failed"),
+      new ProviderCircuitOpenError("claude", Date.now(), 15_000, "connect-fail", "fetch failed"),
     );
 
     await dispatcher.dispatch(
@@ -741,18 +796,22 @@ with:
     );
 
     expect(outageStore.enqueue).toHaveBeenCalledTimes(1); // queued as a notice, not agent text
-    expect(excludedFor(fastFailThread, "1700.0010")).toBeUndefined();
+    // NOTE: `expect(excludedFor(fastFailThread, "1700.0010")).toBeUndefined()`
+    // — the actual exemption pin — is UNREACHABLE here for the same reason as
+    // T4's phase-1 assertion: the selection-time write in resolveConferenceAgents
+    // already recorded jasper at classification time, regardless of the later
+    // ProviderCircuitOpenError. Task 6 Step 5 adds it once that write is gone.
   });
 ```
 
-> **Implementation note:** `vi.clearAllMocks()` mid-test resets the classifier mock's queued `mockResolvedValueOnce`, hence the second `await soloClassifier()`. If mid-test reset proves awkward, split T7 into two sibling `it`s — the assertions are what matter, not the packaging.
+> **Sequencing note (plan-review r1, blocking issue 2).** As written above, this task's fast-fail sibling asserts only that the turn queued. That is deliberately weaker than the test's final form — its load-bearing negative assertion lands in **Task 6 Step 5**, alongside T4's. Do not "helpfully" write it here: it cannot pass until the selection-time write is deleted, and adding it now would break the invariant that every commit through Task 5 is behaviorally identical to today and green.
 
 - [ ] **Step 3:** Verify.
 Run:
 ```bash
 cd /Users/mokie/github/hive-KPR-415 && SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/
 ```
-Expected: every file green, `T7 (KPR-416)` passing.
+Expected: every file green, both `T7 (KPR-416)` and `T7 companion (KPR-416)` passing. Note the companion is deliberately weak at this task — its negative assertion lands in Task 6 Step 5.
 
 - [ ] **Step 4:** Commit.
 ```bash
@@ -773,9 +832,9 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 **Files:**
 - Modify: `src/channels/dispatcher.ts:1635-1650` (delete the write, rewrite the comment)
 - Modify: `src/channels/dispatcher.ts:1344-1351` (rewrite the KPR-388 invariant comment)
-- Test: `src/channels/dispatcher-conference.test.ts:433` (T3 determinism gate) and a new T1
+- Test: `src/channels/dispatcher-conference.test.ts:433` (T3 determinism gate), a new T1, and the two deferred `toBeUndefined()` assertions Tasks 4 and 5 left as `NOTE:` placeholders (Step 5)
 
-This is the only commit that changes behavior. Everything before it was additive.
+This is the only commit that changes behavior. Everything before it was additive — which is precisely why the two negative assertions could not be written earlier: an assertion that the tracker is *empty* is only true once the selection-time write is gone, and that happens here.
 
 - [ ] **Step 1:** In `resolveConferenceAgents`, delete the write and rewrite the comment. Keep `const humanTs = ...` — it is still consumed at `:1666` and `:1671`.
 
@@ -961,21 +1020,38 @@ Add a header comment above the `it(...)` naming what it now guards:
   });
 ```
 
-- [ ] **Step 5:** Verify the suite.
+- [ ] **Step 5:** **Land the two deferred negative assertions** (plan-review r1, blocking issues 1 and 2). Tasks 4 and 5 left placeholder `NOTE:` comments where these belong, because until Step 1 above deleted the selection-time write they were unreachable — a non-empty classifier result recorded the agent in the tracker at classification time no matter what the delivery-time sites did. With the write gone they are now both reachable **and** load-bearing: each is the assertion that actually distinguishes post-KPR-416 behavior from pre.
+
+  1. In **T4**, replace the `NOTE:` placed after `adapter.deliver.mockClear()` with the real pin:
+```ts
+    expect(excludedFor(threadId, "1700.0008")).toBeUndefined(); // queued ⇒ NOT excluded
+```
+  2. In **T7 companion**, replace the trailing `NOTE:` with the real pin:
+```ts
+    expect(excludedFor(fastFailThread, "1700.0010")).toBeUndefined(); // notice, not agent text
+```
+
+  Both must now pass. If either still fails, the Step 1 deletion is incomplete — fix the source, not the assertion.
+
+- [ ] **Step 6:** Verify the suite.
 Run:
 ```bash
 cd /Users/mokie/github/hive-KPR-415 && SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/channels/
 ```
-Expected: every file green, `T1 (KPR-416)` and the (now determinism-gated) `round-0 responders are excluded from the reaction-pass roster` both passing.
+Expected: every file green, `T1 (KPR-416)`, the two newly-tightened assertions in `T4`/`T7 companion`, and the (now determinism-gated) `round-0 responders are excluded from the reaction-pass roster` all passing.
 
-- [ ] **Step 6:** **NEGATIVE-VERIFY T1 (mandatory).** Restore the selection-time write only, run T1, confirm it fails, restore the fix.
+- [ ] **Step 7:** **NEGATIVE-VERIFY T1 (mandatory).** Restore the selection-time write only, run T1, confirm it fails, restore the fix.
 ```bash
 cd /Users/mokie/github/hive-KPR-415
 git stash push -- src/channels/dispatcher.ts
 SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test \
   npx vitest run src/channels/dispatcher-conference.test.ts -t "T1 (KPR-416)"
 ```
-Expected: **FAIL** — pre-fix the selection-time write records all three primaries, so `peerMembers` is empty, the reaction classifier is never called with the slow peer's text, and the `reactionCalls().length >= 1` waitFor times out. (Note: with the whole `dispatcher.ts` stashed the T5 source-order test also fails and the T8a/T4/T7 sites are gone — that is expected under a whole-file stash; T1's own failure is the signal, and it must be the `peerMembers`/round-1 assertion, not a compile error.)
+Expected: **FAIL** — pre-fix the selection-time write records all three primaries, so `peerMembers` is empty, the reaction classifier is never called with the slow peer's text, and the `reactionCalls().length >= 1` waitFor times out.
+
+> **What this stash actually reverts — read before doubting it.** `git stash push` stashes only **uncommitted** changes, and the `-- src/channels/dispatcher.ts` pathspec narrows it further to that one file. By the time you reach this step, Tasks 1-5 are already **committed**, so `markReactionExclusion`, the `meetingExclusionTs` stamp, and all three delivery-time call sites survive the stash untouched. The only thing removed is Task 6's own uncommitted source edit: the selection-time deletion and the two comment rewrites. The test file is not in the pathspec at all, so the T3 gate, T1 and the Step 5 assertions all stay in the working tree — which is exactly what makes the run meaningful.
+>
+> That makes the coarse `git stash` **exactly the precise pre-fix delta for this purpose** — equivalent to, not inferior to, a narrower per-hunk revert, and there is no reason to reach for one. T5, T8a, T4's phase-2 half and both T7 halves stay **green** during the stash: their source is committed and present. Only the Task-6-dependent assertions flip — T1 fails (the demonstration), and Step 5's two `toBeUndefined()` pins in T4/T7-companion fail, which is the same behavior change seen from the other side and is corroborating, not noise. T1's failure must be the `peerMembers`/round-1 assertion, not a compile error; a compile error means something committed got caught in the stash and the tree is dirtier than this step assumes — check `git status` before proceeding.
 
 Then restore and re-confirm:
 ```bash
@@ -985,9 +1061,9 @@ SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test \
 ```
 Expected: **PASS**.
 
-> If a whole-file stash proves too coarse to attribute the failure, do the narrower revert instead: re-insert only the deleted `if (humanTs && classification.respondAgentIds.length > 0) { ... }` block from Step 1 (leaving the three call sites in place), run T1, confirm it fails, then delete it again. That is the precise pre-fix/post-fix delta and is the preferred form of this step.
+> The path-limited stash above is already the precise delta, so no narrower revert is needed. Only if the stash/pop cycle is impractical for some local reason, the equivalent by-hand form is: re-insert the deleted `if (humanTs && classification.respondAgentIds.length > 0) { ... }` block from Step 1 (leaving the three call sites and both rewritten comments in place), run T1, confirm it fails, then delete it again. Same delta, more keystrokes.
 
-- [ ] **Step 7:** Commit.
+- [ ] **Step 8:** Commit.
 ```bash
 git add src/channels/dispatcher.ts src/channels/dispatcher-conference.test.ts
 git commit -m "fix(kpr-416): relocate reaction-exclusion write from selection to delivery time
@@ -1002,6 +1078,9 @@ Rewrites the two comments the move falsifies: the selection-time rationale
 (now naming the re-opened cross-agent race and its deferral) and KPR-388's
 delta-injection premise (now stating the re-based covering invariant and
 its accepted session-write caveat).
+
+Also tightens T4 and T7's companion with the two 'not excluded' assertions
+that only become reachable once the selection-time write is deleted.
 
 Supersedes KPR-386 canon C1; preserves C2, KPR-387 half (b), KPR-413.
 Negative-verified: T1 fails on pre-fix code.
@@ -1105,9 +1184,19 @@ No source change. This test pins the §7.2 re-based invariant on the newly-reach
       // by the §7.2 invariant (jessica's own round-0 terminal slot presented it).
       const round1Item = round1Call()![1];
       expect(round1Item.meta.conferenceInjectionMode).toBe("delta");
+      // The two load-bearing assertions: the delta header is present, and the
+      // human trigger is ABSENT from a re-invited suppressed agent's context.
       expect(round1Item.text).toContain("[New messages since your last turn:]");
-      expect(round1Item.text).toContain("Slow findings on pricing");
       expect(round1Item.text).not.toContain(TRIGGER);
+      // The delta BODY, pinned against the line shape formatDeltaContext
+      // actually emits (`${author} (${ago}): ${text}`, dispatcher.ts:1808)
+      // and anchored to the header so it cannot be satisfied from elsewhere.
+      // A bare `toContain("Slow findings on pricing")` would be near-vacuous:
+      // that string is also in reactionTo.text in the terminal slot, so it
+      // passes even when the delta is empty or wrong.
+      expect(round1Item.text).toMatch(
+        /\[New messages since your last turn:\]\n\nJasper \([^)]+\): Slow findings on pricing/,
+      );
     });
 ```
 
@@ -1348,26 +1437,30 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 10: Canon note
+### Task 10: Canon note — procedural, no files change
 
-**Files:**
-- Modify: `docs/epics/kpr-415/kpr-416-spec.md` — no content change; only if the epic's Decision Register opens before this merges.
+**This task edits nothing.** It is a hand-off item for the driver, kept in the task list so it is not dropped between implementation and PR. There is no code change, no spec edit, and no commit; `git status` must be clean when this task is done.
 
-- [ ] **Step 1:** KPR-415 is a pre-register epic (no `## Decision Register — Canon` section on the epic description, no merged children). Check whether the section has opened since plan time.
-```bash
-# via the epic ticket, not the repo
-```
-- [ ] **Step 2:** If it has opened, lift these two entries into it (spec §13); if not, leave them recorded in the spec and flag it in the PR body so the orchestrator lifts them when the register opens:
-  - **Supersedes KPR-386 canon C1** ("selection-time recording"). C2 (tracker shape/keying/TTL) preserved.
-  - **KPR-388's covering invariant statement is preserved**, but `kpr-388-spec.md:145`'s "Round-1 reachability (C3)" *consequence bullet* is **falsified** by this child, and `kpr-388-spec.md:17`'s "duplication, never gaps" classification no longer holds for the suppressed-round-0-responder case (§7.2 accepted residual).
-- [ ] **Step 3:** No code commit. Record in the PR description.
+KPR-415 is a **pre-register epic** — as of plan time its ticket carries no `## Decision Register — Canon` section and no children have merged, so there is nowhere in-repo to write canon to. The two entries below therefore live in `kpr-416-spec.md` §13 (where they already are) until the register opens.
+
+**What the driver does:**
+
+1. Check the KPR-415 epic **ticket** (the tracker, not the repo) for a `## Decision Register — Canon` section — it may have opened since plan time.
+2. **If it has opened:** lift both entries below into it verbatim.
+   **If it has not:** leave them in the spec and state in the PR body that they are pending lift, so the orchestrator picks them up when the register opens. Either way they must be named in the PR body.
+3. The two entries:
+   - **Supersedes KPR-386 canon C1** ("selection-time recording"). C2 (tracker shape / keying / TTL) is preserved.
+   - **KPR-388's covering invariant statement is preserved**, but `kpr-388-spec.md:145`'s "Round-1 reachability (C3)" *consequence bullet* is **falsified** by this child, and `kpr-388-spec.md:17`'s "duplication, never gaps" classification no longer holds for the suppressed-round-0-responder case (spec §7.2, accepted residual).
+
+- [ ] Register state checked, both canon entries either lifted into the epic's Decision Register or flagged as pending-lift in the PR body. No files changed, nothing committed.
 
 ---
 
 ## Post-implementation checklist
 
 - [ ] `npm run check` green with the three Slack env stubs.
-- [ ] All 11 new/edited test cases present: T1, T2, T3 (edited harness), T4, T4b, T5, T6 (×2 cases), T7, T8a, T8b (+2 companions), T9.
+- [ ] All 11 new/edited test cases present: T1, T2, T3 (edited harness), T4, T4b (×3 cases), T5, T6 (×2 cases), T7 (×2 sibling `it`s), T8a, T8b (+2 companions), T9.
+- [ ] The two deferred assertions landed in Task 6 Step 5 — no `NOTE:` placeholder is left behind in T4 or T7's companion.
 - [ ] T1 and T2 negative-verify performed and the failure reason recorded (not just "it failed").
 - [ ] `src/agents/agent-manager.ts` untouched.
 - [ ] No new config key, no schema change, no cross-module surface.
