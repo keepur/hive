@@ -718,6 +718,105 @@ Meeting rules:
     },
   );
 
+  it.each([
+    ["no meetingExclusionTs at all", undefined],
+    ["a malformed non-string meetingExclusionTs", 42],
+    ["an empty-string meetingExclusionTs", ""],
+  ])(
+    "T4b (KPR-416): write site 2 no-ops cleanly for a plain single-dispatch turn with %s",
+    async (_label, exclusionTs) => {
+      // Write site 2 sits on the delivery branch of the ORDINARY single-
+      // dispatch path — the hot path of every non-conference turn in the
+      // engine. This is the only test guarding that blast radius: no tracker
+      // mutation, no throw, delivery unaffected. Non-`conf-` label ⇒ ordinary
+      // routing (dispatcher.ts:1176).
+      const meta: Record<string, unknown> = { slackTs: "1700.0007" };
+      if (exclusionTs !== undefined) meta.meetingExclusionTs = exclusionTs;
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "what is the deploy status?",
+          source: { kind: "slack", id: "C999", label: "general" },
+          threadId: `plain-thread-${String(_label).replace(/\W+/g, "-")}`,
+          meta,
+        }),
+      );
+
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe("Agent response");
+      expect(
+        (dispatcher as unknown as { meetingReactionTracker: Map<string, unknown> }).meetingReactionTracker.size,
+      ).toBe(0);
+    },
+  );
+
+  it("T4 (KPR-416): an outage-queued round-0 turn that later replays and delivers excludes that agent", async () => {
+    // Write site 2's replay half, end-to-end: phase 1 queues the real
+    // effectiveItem via the outage path; phase 2 replays THAT item with the
+    // breaker closed and asserts the delivery marked exclusion. §4's table
+    // row: "post-turn outage queue" is no longer excluded at queue time — the
+    // replay's own delivery is what excludes.
+    await soloClassifier();
+    const threadId = "conf-thread-kpr416-t4";
+    const outageStore = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      release: vi.fn().mockResolvedValue(undefined),
+      recordFailedAttempt: vi.fn().mockResolvedValue({ terminal: false, doc: null }),
+      markNoticeSent: vi.fn().mockResolvedValue(undefined),
+      pendingCount: vi.fn().mockResolvedValue(0),
+      statusOf: vi.fn().mockResolvedValue(null),
+      expireOlderThan: vi.fn().mockResolvedValue([]),
+      recoverStaleReplaying: vi.fn().mockResolvedValue(0),
+      ensureIndexes: vi.fn().mockResolvedValue(undefined),
+    };
+    dispatcher.setOutageHandling({
+      store: outageStore as never,
+      episodes: new OutageEpisodeTracker(),
+      config: { enabled: true, replayIntervalMs: 15_000, maxAgeHours: 4, maxDepth: 500, maxReplayAttempts: 3 },
+    });
+
+    // Phase 1 — breaker open + hard fault ⇒ the turn queues, nothing delivered.
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(
+      turn({ finalMessage: "", errors: ["connect ECONNREFUSED api"] }),
+    );
+    await dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t4" },
+        threadId,
+        meta: { slackTs: "1700.0008" },
+      }),
+    );
+    expect(outageStore.enqueue).toHaveBeenCalledTimes(1);
+    // Phase 1 delivered the KPR-307 honest-outage NOTICE (policyFor ⇒ "notify",
+    // first episode for this thread), so deliver has already fired once. That
+    // notice is engine chrome, not agent content — pin it, then clear the call
+    // record so phase 2's assertions read a clean `calls[0]`. mockClear only:
+    // mockReset/clearAllMocks would drop the harness's deliver implementation.
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toContain("provider outage");
+    adapter.deliver.mockClear();
+    // NOTE: `expect(excludedFor(threadId, "1700.0008")).toBeUndefined()` — the
+    // "queued ⇒ NOT excluded" pin — belongs here logically but is UNREACHABLE
+    // until Task 6 deletes the selection-time write, which records jasper at
+    // classification time regardless. Task 6 Step 5 adds it at this exact spot.
+
+    // Phase 2 — replay the item the store actually holds, breaker closed.
+    const queued = outageStore.enqueue.mock.calls[0][0].workItem as WorkItem;
+    expect(queued.meta?.meetingExclusionTs).toBe("1700.0008"); // the key rode the doc
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "closed", enabled: true });
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ finalMessage: "The real answer, at last" }));
+    await dispatcher.dispatch({
+      ...queued,
+      meta: { ...queued.meta, outageReplay: true, targetAgentId: "jasper" },
+    });
+
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // post-mockClear: the real content only
+    expect(adapter.deliver.mock.calls[0][0].text).toBe("The real answer, at last");
+    expect(excludedFor(threadId, "1700.0008")).toEqual(new Set(["jasper"]));
+  });
+
   describe("round-1 kill suppression (KPR-389 D5)", () => {
     async function twoAgentClassifier() {
       const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");

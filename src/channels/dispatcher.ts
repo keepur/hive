@@ -411,6 +411,14 @@ export class Dispatcher {
           error: runResult.error,
         };
 
+        // KPR-416 write site 2. Covers the two paths that never reach the
+        // fan-out leg: a KPR-307 outage replay of a round-0 conference turn,
+        // and every KPR-402 deadline-continuation leg — both re-enter here
+        // via meta.targetAgentId (resolveAgents step 0), carrying
+        // meetingExclusionTs in meta. This sits on the hot path of every
+        // ordinary non-conference turn in the engine, where it is a `meta`
+        // read plus a type check and nothing else (pinned by T4b).
+        this.markReactionExclusion(item, agentId);
         await this.deliverAgentResult(workResult, adapter);
 
         if (tracked) {
