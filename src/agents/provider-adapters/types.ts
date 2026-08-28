@@ -82,9 +82,9 @@ export const SESSION_SEMANTICS: Readonly<Record<AgentProviderId, SessionSemantic
   kimi: "client-transcript",
   deepseek: "client-transcript",
   // KPR-392 (§4.2): grok promoted from Lane A passthrough to a native Lane B
-  // stateless-replay adapter — the operator-hosted gateway is a stateless
-  // translation proxy with no provider-side handle to chain (no
-  // persistence tier of its own, undocumented vendor retention). Continuity
+  // stateless-replay adapter — xAI's chat-completions API itself exposes no
+  // server-side conversation handle to chain against (unrelated to KPR-410's
+  // later gateway retirement; direct-to-xAI has the same property). Continuity
   // is hive-persisted `provider_turn_history` replayed client-side, same as
   // codex; the write side (never persist a handle) is automatic via
   // `persistsResumableHandle`. Was "client-transcript" under KPR-371 Lane A.

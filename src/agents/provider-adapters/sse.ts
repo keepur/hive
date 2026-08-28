@@ -1,9 +1,10 @@
 /**
  * KPR-391 (§4.3): generic SSE FRAMING — event-boundary splitting, field
  * parsing, and the Responses-style `[DONE]` sentinel — extracted from the
- * codex adapter because KPR-392's gateway-fronted grok speaks the same
- * framing. Provider-specific event APPLICATION (what a `response.*` /
- * `interaction.*` payload means) stays in each adapter.
+ * codex adapter because KPR-392's grok speaks the same framing directly, via
+ * its OpenAI-format chat-completions endpoint. Provider-specific event
+ * APPLICATION (what a `response.*` / `interaction.*` payload means) stays in
+ * each adapter.
  */
 
 export interface SseEvent {

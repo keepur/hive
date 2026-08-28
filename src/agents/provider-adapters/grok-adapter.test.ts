@@ -219,6 +219,15 @@ describe("GrokAdapter — request body", () => {
     expect(result.aborted).toBe(false);
   });
 
+  it("posts to the real xAI endpoint, not just whatever GROK_API_BASE_URL happens to be", async () => {
+    const fetchMock = sseScript([textChunk("cmpl-1", "hi"), finishChunk("cmpl-1")]);
+    const { adapter } = makeAdapter({}, fetchMock);
+
+    await adapter.runTurn({ prompt: "say hi" });
+
+    expect(fetchMock).toHaveBeenCalledWith("https://api.x.ai/v1/chat/completions", expect.anything());
+  });
+
   it("defaults the model to DEFAULT_GROK_MODEL when unset", async () => {
     const fetchMock = sseScript([finishChunk("cmpl-1")]);
     const { adapter } = makeAdapter({ model: undefined }, fetchMock);

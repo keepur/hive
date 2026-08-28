@@ -39,7 +39,7 @@ describe("Lane B adapter error strings → ProviderFaultKind (KPR-391 §8 cross-
     // gemini-interactions-adapter.ts — KPR-352 §D7 missing-key throw.
     "Gemini API key is not available; set GEMINI_API_KEY (hive credentials add GEMINI_API_KEY) or GOOGLE_API_KEY, and restart the service",
     // grok-adapter.ts — grokErrorMessage C5 decoration at a 401 status.
-    "Grok request failed (401): key not in allowlist",
+    "Grok request failed (401): invalid or expired token",
     // grok-adapter.ts — bare-construction guard (manager resolves the OAuth
     // access token via grok-oauth.ts before construction; this throw only
     // surfaces if the adapter is ever constructed without it, e.g. a future
