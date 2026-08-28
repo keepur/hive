@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { OutageEpisodeTracker } from "../outage/outage-notices.js";
@@ -253,6 +255,79 @@ Meeting rules:
         .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
     });
   }
+
+  /**
+   * KPR-416: the tracker is the eligibility STATE under test, so the write-
+   * site cases read it directly rather than inferring it from a downstream
+   * reaction pass. The behavioral pins (T1, T3, T9) assert through
+   * triggerConferenceReactions instead. Same `dispatcher as unknown as {...}`
+   * convention as the T6/C4 guard below.
+   */
+  const excludedFor = (threadId: string, humanTs: string): Set<string> | undefined =>
+    (
+      dispatcher as unknown as {
+        meetingReactionTracker: Map<string, Map<string, Set<string>>>;
+      }
+    ).meetingReactionTracker
+      .get(threadId)
+      ?.get(humanTs);
+
+  const zeroUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    contextWindow: 0,
+    costUsd: 0,
+    durationMs: 100,
+  };
+  function turn(overrides: Record<string, unknown> = {}) {
+    return {
+      finalMessage: "Agent response",
+      newSessionId: "s2",
+      usage: zeroUsage,
+      errors: [] as string[],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+      ...overrides,
+    };
+  }
+
+  /**
+   * Deterministic barrier for the fire-and-forget reaction pass (plan-review
+   * r1 note). `waitFor(runWorkItemTurn × 2)` alone is NOT enough: everything
+   * downstream of the reactor's turn resolution — the D5 guard and the
+   * delivery it suppresses — is a pure microtask chain (all harness mocks
+   * resolve immediately, no timers), so the deliver-count assert can run
+   * before it. One macrotask boundary drains the whole chain, because the
+   * microtask queue is fully emptied before the next macrotask. Negative-
+   * verified: with the D5 guard disabled these tests fail in ~3ms.
+   */
+  const settleReactions = () => new Promise((r) => setTimeout(r, 0));
+
+  const seedRef = (
+    agentId: string,
+    threadId: string,
+    ref: { sessionId?: string; provider?: string; meetingLastSeenTs?: string },
+  ) => agentManager._sessionRefs.set(`${agentId}:${threadId}`, ref);
+
+  // ts drives delta filtering (raw string); timestamp only drives the
+  // "(N min ago)" display label — minute granularity keeps byte pins
+  // deterministic without fake timers (stable unless the test stalls ~60s).
+  const makeHistory = (
+    entries: Array<{ author: string; text: string; ts: string; minAgo?: number; isBot?: boolean }>,
+  ) =>
+    entries.map((e) => ({
+      author: e.author,
+      text: e.text,
+      ts: e.ts,
+      timestamp: new Date(Date.now() - (e.minAgo ?? 5) * 60_000),
+      isBot: e.isBot ?? false,
+    }));
 
   it("routes conference channel message through classifier", async () => {
     const item = makeWorkItem({
@@ -571,31 +646,79 @@ Meeting rules:
     expect(quoted.some((p) => NON_RESPONSE_PATTERNS.some((rx) => rx.test(p!.trim())))).toBe(true);
   });
 
+  it("T5 (KPR-416): the exclusion write precedes BOTH the fan-out delivery and the reaction trigger", () => {
+    // Structural, not a race test. Post-KPR-416 the window between the write
+    // and the two call sites is zero BY CONSTRUCTION — the write is a
+    // synchronous statement immediately preceding both — so a timing/
+    // microtask test here would be theater. This is a drift catcher: a later
+    // refactor that moves the write below either call fails it.
+    // Text-scan (same technique as src/boot-order.test.ts), with `//` line
+    // comments stripped so prose mentioning the call cannot false-positive.
+    const source = readFileSync(fileURLToPath(new URL("./dispatcher.ts", import.meta.url)), "utf8");
+    const codeOnly = source
+      .split("\n")
+      .map((line) => line.replace(/\/\/.*$/, ""))
+      .join("\n");
+
+    // Bound the scan to the fan-out `else` branch of dispatchToAgent, so the
+    // single-dispatch call site (write site 2, earlier in the file) can never
+    // stand in for a fan-out write that was moved or deleted.
+    const blockStart = codeOnly.indexOf('log.info("Non-response suppressed (fan-out)"');
+    const blockEnd = codeOnly.indexOf('log.info("Fan-out dispatch complete"');
+    expect(blockStart, "fan-out branch anchor not found — update this test's anchors").toBeGreaterThan(-1);
+    expect(blockEnd, "fan-out branch end anchor not found — update this test's anchors").toBeGreaterThan(blockStart);
+    const block = codeOnly.slice(blockStart, blockEnd);
+
+    const markIdx = block.indexOf("this.markReactionExclusion(");
+    const deliverIdx = block.indexOf("await this.deliverAgentResult(workResult, adapter);");
+    const triggerIdx = block.indexOf("this.triggerConferenceReactions(");
+    expect(markIdx, "markReactionExclusion is not called in the fan-out delivery branch").toBeGreaterThan(-1);
+    expect(deliverIdx).toBeGreaterThan(-1);
+    expect(triggerIdx).toBeGreaterThan(-1);
+    expect(markIdx).toBeLessThan(deliverIdx);
+    expect(deliverIdx).toBeLessThan(triggerIdx);
+  });
+
+  it.each([
+    ["empty text delivering the _No response._ placeholder", { finalMessage: "" }, "_No response._"],
+    [
+      "error WITH text (exit-code-1 convention)",
+      { finalMessage: "Partial answer", errors: ["exit 1"] },
+      "Partial answer",
+    ],
+  ])(
+    "T6 (KPR-416): a round-0 turn that %s stays excluded (predicate is branch position, not 'real content')",
+    async (_label, flags, expectedText) => {
+      // Disposition (a), spec §6.1. Neither shape matches NON_RESPONSE_PATTERNS,
+      // so both land in the delivering `else` — under branch position the write
+      // FIRES for them, keeping them excluded. Passes pre- and post-fix (before
+      // the relocation the selection-time write covered them); it is the pin
+      // that stops a future "genuinely non-empty non-errored content" predicate
+      // silently re-including them.
+      await soloClassifier();
+      const threadId = `conf-thread-kpr416-t6-${String(_label).replace(/\W+/g, "-")}`;
+      // Spread form, consistent with the KPR-389 D5 it.each above (:625);
+      // both `turn(flags)` and `turn({ ...flags })` typecheck here since
+      // vitest infers `flags` per-position, not as a cross-row union.
+      agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ ...flags }));
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, next steps?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t6" },
+          threadId,
+          meta: { slackTs: "1700.0006" },
+        }),
+      );
+      await settleReactions();
+
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe(expectedText);
+      expect(excludedFor(threadId, "1700.0006")).toEqual(new Set(["jasper"]));
+    },
+  );
+
   describe("round-1 kill suppression (KPR-389 D5)", () => {
-    const zeroUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      cacheCreationTokens: 0,
-      contextWindow: 0,
-      costUsd: 0,
-      durationMs: 100,
-    };
-    function turn(overrides: Record<string, unknown> = {}) {
-      return {
-        finalMessage: "Agent response",
-        newSessionId: "s2",
-        usage: zeroUsage,
-        errors: [] as string[],
-        llmMs: 0,
-        toolMs: 0,
-        toolCalls: 0,
-        toolSummary: null,
-        streamed: false,
-        compactions: 0,
-        ...overrides,
-      };
-    }
     async function twoAgentClassifier() {
       const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
       (classifyMeetingMessage as any)
@@ -610,18 +733,6 @@ Meeting rules:
         meta: { slackTs: "1700.0001" },
       });
     }
-    /**
-     * Deterministic barrier for the fire-and-forget reaction pass (plan-review
-     * r1 note). `waitFor(runWorkItemTurn × 2)` alone is NOT enough: everything
-     * downstream of the reactor's turn resolution — the D5 guard and the
-     * delivery it suppresses — is a pure microtask chain (all harness mocks
-     * resolve immediately, no timers), so the deliver-count assert can run
-     * before it. One macrotask boundary drains the whole chain, because the
-     * microtask queue is fully emptied before the next macrotask. Negative-
-     * verified: with the D5 guard disabled these tests fail in ~3ms.
-     */
-    const settleReactions = () => new Promise((r) => setTimeout(r, 0));
-
     it.each([
       ["aborted", { aborted: true }],
       ["timedOut", { timedOut: true, aborted: true }],
@@ -854,26 +965,6 @@ Meeting rules:
   });
 
   describe("delta context injection (KPR-388)", () => {
-    const seedRef = (
-      agentId: string,
-      threadId: string,
-      ref: { sessionId?: string; provider?: string; meetingLastSeenTs?: string },
-    ) => agentManager._sessionRefs.set(`${agentId}:${threadId}`, ref);
-
-    // ts drives delta filtering (raw string); timestamp only drives the
-    // "(N min ago)" display label — minute granularity keeps byte pins
-    // deterministic without fake timers (stable unless the test stalls ~60s).
-    const makeHistory = (
-      entries: Array<{ author: string; text: string; ts: string; minAgo?: number; isBot?: boolean }>,
-    ) =>
-      entries.map((e) => ({
-        author: e.author,
-        text: e.text,
-        ts: e.ts,
-        timestamp: new Date(Date.now() - (e.minAgo ?? 5) * 60_000),
-        isBot: e.isBot ?? false,
-      }));
-
     const THREE_MSG_HISTORY = () =>
       makeHistory([
         { author: "May", text: "old message", ts: "1000.0001", minAgo: 10 },

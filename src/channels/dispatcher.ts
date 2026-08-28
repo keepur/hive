@@ -1541,6 +1541,16 @@ export class Dispatcher {
           durationMs: runResult.durationMs,
           error: runResult.error,
         };
+        // KPR-416 write site 1 — ORDERING PIN. This is a synchronous
+        // statement placed immediately before BOTH the delivery below and
+        // the triggerConferenceReactions fire-and-forget that follows it, so
+        // the window in which this agent could be re-invited as a reactor to
+        // its own trigger is zero by construction — there is nothing here to
+        // race. Do NOT move it below either call (pinned by T5).
+        // The remaining window is cross-agent, not self: a PEER whose own
+        // round-0 turn has not landed can still be invited. That is the
+        // accepted, deferred residual — kpr-416-spec.md §6.4(d), pinned T9.
+        this.markReactionExclusion(effectiveItem, agentId);
         await this.deliverAgentResult(workResult, adapter);
 
         // Conference mode: trigger depth-1 peer reactions
