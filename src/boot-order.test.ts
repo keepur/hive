@@ -72,7 +72,17 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
   });
 
   it("(c) no unallowlisted spawn-capable start precedes the wiring (superset sweep)", () => {
-    const wiringStart = offsetOf("agentManager.setWorkerPool(");
+    // Bounded by the LATEST wiring anchor, not the first — a surface
+    // introduced between setWorkerPool and setMeetingScribe is still above
+    // the wiring block and must be caught, not silently inside the "already
+    // wired" region. Empirically confirmed (pre-PR review): using only the
+    // first anchor let an inserted `.start()` call between the two existing
+    // anchors pass all three tests green.
+    const wiringStart = Math.max(
+      offsetOf("agentManager.setWorkerPool("),
+      offsetOf("await workerPool.ensureIndexes()"),
+      offsetOf("dispatcher.setMeetingScribe("),
+    );
     // Known non-spawn-capable `.start(`/`.scanOrphans(` calls that legitimately
     // precede the wiring. Adding to this list is a deliberate, reviewed
     // classification decision — not a way to silence a real finding.
