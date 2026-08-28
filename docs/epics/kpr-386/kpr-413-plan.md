@@ -449,7 +449,7 @@ Add a new row inside `describe("deadline-abort continuation (KPR-402)", ...)` (`
 
 - [ ] **Step 6:** Format, then run both target files and confirm all new rows pass.
 
-Applied at the exact indentation shown above, the new code blocks are already `printWidth: 120`-clean (plan-review r2 confirmed this by running `npm run format` and getting a zero-diff result) — the markdown code blocks in this plan are written at their own nesting depth (`describe(` at 6 spaces, `it(` at 8) which is one level deeper than where the outer `describe("round-1 kill suppression (KPR-389 D5)", ...)` body itself sits (4 spaces) — pasting them in at that position lands correctly, no re-indent needed in practice, but run `npm run format` regardless as a mechanical safety net: `npm run check` runs `format:check`, which fails on any unformatted line, so format before the final check rather than after:
+The new code's line lengths are already `printWidth: 120`-clean at their target nesting depth (`describe(` at 6 spaces, `it(` at 8, one level deeper than the outer `describe("round-1 kill suppression (KPR-389 D5)", ...)` body's 4 spaces). Pasting the plan's code blocks in verbatim does produce a real (indentation-only) diff once run through Prettier — run `npm run format` as a mandatory step, not an optional safety net: `npm run check` runs `format:check`, which fails on any unformatted line, so format before the final check rather than after:
 
 Run: `npm run format`
 Expected: exit 0; `git diff` shows only indentation changes in the two edited test files (a genuine re-indent to match nesting depth, not a logic change) — review the diff to confirm this before proceeding.
