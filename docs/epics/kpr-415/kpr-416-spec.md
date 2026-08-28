@@ -319,3 +319,39 @@ Code revert. No config lever — inherited from the epic design's §Rollback and
   - It does **not** extend to `kpr-388-spec.md:145`'s "Round-1 reachability (C3)" consequence bullet, which is **falsified** by this child: that bullet is derived from the premise that a round-1 reactor was never a round-0 responder for the trigger, which Child A overturns by design. The invariant survives; that derived bullet does not.
   - The invariant's session-absorption step carries a **newly exposed accepted residual** (§7.2, cross-referenced from §9) — the mark advance and the fire-and-forget session persist are independent writes, so `kpr-388-spec.md:17`'s "duplication, never gaps" classification of that race no longer holds for the suppressed-round-0-responder case specifically.
 - **Preserves KPR-413** in full — the four-key conference strip is untouched; the new key is deliberately outside that family.
+
+---
+
+## 14. Post-merge addendum — coherence review of `fa48196` (2026-08-28)
+
+*Appended by the KPR-415 coherence seam after this child merged (`fa48196`, PR #436). Verdict: **LEGITIMATE_DIVERGENCE**, no Gate-1 amendment, no corrective. Added rather than edited in place, so the pre-merge artifact stays legible.*
+
+The coherence review upheld §6.1's departure from the epic design (re-deriving independently that `isNonResponse` never reads `runResult.error`, so the design's parenthetical had the two predicates' consequences swapped, and that Gate 1 had delegated the choice) — and found **two scope defects in this spec** that the delivery gates did not catch, because both are questions of *what the change decided*, not of whether it works.
+
+### 14.1 The all-roster-fallback consequence is missing from §4, §12 and §13
+
+**§13's supersession of KPR-386 canon C1 quotes only C1's first clause.** C1 has two:
+
+> *C1: Round-0 conference responders recorded in meetingReactionTracker at SELECTION time — suppressed/errored primaries stay excluded per trigger; **classifier all-roster fallbacks suppress all reactions for that trigger** (KPR-387, 3896a24).*
+
+The second clause is falsified too, and materially. `classifyMeetingMessage` has three all-roster fallback arms (`src/agents/meeting-classifier.ts:126` no-key pre-check, `:160` call-failure catch, `:175` parse-failure). Pre-KPR-416, an all-roster selection pre-recorded the whole roster, so `peerMembers` was empty and **no reaction pass fired at all**. Post-KPR-416 nothing is pre-recorded, so under a classifier outage every roster member is a round-0 primary **and** every not-yet-landed peer is reaction-eligible — turns per trigger roughly **double**.
+
+**This is bounded, not a cascade**, and both legs are verifiable in source: `dispatcher.ts:1629` gates the reaction pass on `conferenceRound === 0`, so a round-1 turn never fires its own pass (depth stays 1); and the release at `:2059` fires on **non**-selection only, so a selected reactor is never released and each agent reacts at most once per trigger. For roster N the ceiling is **≤ 2N−1 turns**, which is inside §12's stated boundedness argument — §12's *conclusion* holds, but its argument never considered this path.
+
+**Consequently the Key Points scope statement (§ Key Points, the "Scope statement" bullet) is over-tight.** "Exactly one class of round-0 outcome changes state — the suppressed turn" is true on the ordinary path. On the all-roster path the **delivering** class also changes observable state: deliverers are no longer pre-excluded, so they are invitable during the §6.4(d) overlap window.
+
+The consequence was caught in pre-PR review round 1, written correctly into `CLAUDE.md`'s meeting-mode bullet and the PR body, but never propagated back here. It is now canon as **KPR-415/C2**.
+
+### 14.2 The KPR-388 canon entry is keyed to the wrong artifact
+
+§13's third bullet cites `kpr-388-spec.md:145` and `:17` — repo line references. Both falsified phrases are *also* **KPR-386 canon C9** text (*"all races err to duplication, never gaps; C3 reachability generalized to 'session ∪ injected delta'"*). The entry is re-keyed in the register to **amend C9** — whose invariant statement survives, whose "C3 reachability generalized" clause acquires §7.2's new derivation, and whose "never gaps" clause no longer holds for the suppressed-round-0-responder case. It is now canon as **KPR-415/C7**.
+
+**Root cause worth recording for sibling children:** this spec cites C1/C2 by identifier but did not re-read the KPR-386 register in full — otherwise C1's second clause and C9's ownership of both falsified phrases would have been named at spec time. **A child that supersedes a canon entry should quote that entry in full before superseding it.**
+
+### 14.3 What the review did *not* find
+
+No Gate-1 amendment, no corrective ticket, and **no affected children** — KPR-417's dependency is on the *relocation*, not the predicate, and its acks are round-0-gated, so §14.1's round-1 volume increase does not propagate to ack volume. §6.4(d)'s deferral was ruled fully satisfied against the epic design (which offered deferral as a sanctioned option and asked only that the child pick one and record which); its follow-on child is an ordinary follow-up that need not precede KPR-417.
+
+The review also named one cost §6.4(d) did not: `agent-manager`'s per-thread lock is a **spin-wait**, so the serialized round-0-then-round-1 pair can burn two full turn deadlines back to back with the thread lock held.
+
+Full reasoning: the `# Decision Register Entry` comment keyed to `fa48196` on KPR-415, and the `## Decision Register — Canon` section of that epic's description.
