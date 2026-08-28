@@ -127,9 +127,12 @@ export class Dispatcher {
    *  Absent ⇒ every conference path behaves exactly as pre-KPR-409. */
   private meetingScribe?: MeetingScribe;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
-  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents that responded or were
-  // selected to respond on this human message, either round (KPR-387): round-0
-  // primaries recorded at selection time, round-1 reactors at claim time.
+  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents excluded from
+  // reacting on this human message, either round (KPR-387). Round-0 primaries
+  // are recorded at DELIVERY time (KPR-416 — markReactionExclusion, three call
+  // sites; supersedes KPR-386 canon C1's selection-time recording, so a
+  // SUPPRESSED primary is no longer excluded), round-1 reactors at claim time
+  // (triggerConferenceReactions). Shape, keying and TTL are unchanged (C2).
   private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
@@ -408,6 +411,14 @@ export class Dispatcher {
           error: runResult.error,
         };
 
+        // KPR-416 write site 2. Covers the two paths that never reach the
+        // fan-out leg: a KPR-307 outage replay of a round-0 conference turn,
+        // and every KPR-402 deadline-continuation leg — both re-enter here
+        // via meta.targetAgentId (resolveAgents step 0), carrying
+        // meetingExclusionTs in meta. This sits on the hot path of every
+        // ordinary non-conference turn in the engine, where it is a `meta`
+        // read plus a type check and nothing else (pinned by T4b).
+        this.markReactionExclusion(item, agentId);
         await this.deliverAgentResult(workResult, adapter);
 
         if (tracked) {
@@ -563,6 +574,48 @@ export class Dispatcher {
   }
 
   /**
+   * KPR-416: mark reaction-exclusion at DELIVERY time. One rule —
+   *
+   *   an agent is excluded from reacting on a trigger iff its own round-0
+   *   turn on that trigger handed text to delivery
+   *
+   * — implemented as one helper called from three sites (fan-out delivery,
+   * single-dispatch delivery, handleTurnFailure's adapter arm) so the
+   * invariant is auditable rather than emergent. "Handed to delivery", not
+   * "was posted": the call sites sit immediately before the delivery call, so
+   * a diverted (tryOutageDiversion) or adapter-less delivery still marks —
+   * the turn ran and consumed the trigger (spec §4).
+   *
+   * Keyed on `meta.meetingExclusionTs`, stamped round-0-only in
+   * dispatchToAgent's conference meta block. That key rides item.meta, so it
+   * reaches every delivery path for free: the outage-queued document, every
+   * KPR-402 continuation leg (whose construction strips the four `conference*`
+   * keys but not this one — deliberately named outside that family), and both
+   * handleTurnFailure legs. Engine-authored notices (KPR-307 outage, KPR-402
+   * first-abort/terminal, replay-terminal) never reach a call site and so
+   * never mark: they are engine chrome, not agent content.
+   *
+   * Synchronous and idempotent (Set add). Tracker shape, keying and TTL are
+   * unchanged — KPR-386 canon C2 preserved, C1 superseded.
+   * Spec: docs/epics/kpr-415/kpr-416-spec.md §5.3.
+   */
+  private markReactionExclusion(item: WorkItem, agentId: string): void {
+    const ts = item.meta?.meetingExclusionTs;
+    // Type-guarded, not cast: meta is Record<string, unknown> and this helper
+    // sits on the hot path of every single-dispatch turn in the engine, where
+    // the key is absent. Anything that is not a non-empty string is a no-op.
+    if (typeof ts !== "string" || ts.length === 0) return;
+    const threadId = item.threadId ?? item.id;
+    if (!this.meetingReactionTracker.has(threadId)) {
+      this.meetingReactionTracker.set(threadId, new Map());
+    }
+    const threadTracker = this.meetingReactionTracker.get(threadId)!;
+    const responded = threadTracker.get(ts) ?? new Set<string>();
+    responded.add(agentId);
+    threadTracker.set(ts, responded);
+  }
+
+  /**
    * KPR-308: shared agent-response delivery for the two dispatch paths.
    * Diversion guard first; otherwise the pre-existing source-adapter
    * delivery with retry-queue semantics, unchanged.
@@ -621,6 +674,17 @@ export class Dispatcher {
       error: String(err),
     };
     if (adapter) {
+      // KPR-416 write site 3 (spec §6.2). A thrown round-0 turn posts
+      // `Something went wrong: …` — the same user-visible artifact an
+      // in-branch errored turn produces — so it stays excluded; letting the
+      // two diverge would be an accident, not a design. Reachable on this
+      // epic's own hot path: a grok TurnAssemblyError from an unreadable
+      // ~/.grok/auth.json throws here rather than raising
+      // ProviderCircuitOpenError. Inside `if (adapter)` so the rule ("handed
+      // text to delivery") stays literally true, and correctly NOT reached
+      // when handleOutageTurn already absorbed a fast-fail above (early
+      // return) — that path delivers a notice, not agent text.
+      this.markReactionExclusion(item, agentId);
       try {
         await adapter.deliver(errorResult);
       } catch (deliverErr) {
@@ -843,6 +907,12 @@ export class Dispatcher {
     // load-bearing for routing — verified false for this codebase: routing
     // is targetAgentId, not any conference meta key. Still a blocklist, not
     // an allowlist — channel keys stay.
+    //
+    // KPR-416: `meetingExclusionTs` deliberately SURVIVES this strip — it is
+    // named outside the `conference*` family precisely so it does. Write site
+    // 2 marks reaction-exclusion on the leg that finally answers, and it
+    // reads that key. Do NOT add it here when extending this blocklist with
+    // a meeting-shaped key; T8a pins its survival.
     const {
       outageReplay: _replayMarker,
       conferenceMode: _confMode,
@@ -1344,11 +1414,34 @@ export class Dispatcher {
       // KPR-387: round-1 reaction turns are framed against the peer reply — the
       // original human message is never re-presented in the terminal slot. It
       // remains reachable via session ∪ injected context (KPR-388 generalizes
-      // the old re-fetched-transcript guarantee): a round-1 reactor was never a
-      // round-0 responder for this trigger (C1/C2), so its mark predates the
-      // triggering message — the message is in its delta, or already in its
-      // session by the covering invariant. A reactor with no session/mark gets
-      // the full transcript directly.
+      // the old re-fetched-transcript guarantee).
+      //
+      // KPR-416 falsified the premise this comment used to state (KPR-386 canon
+      // C1, selection-time recording: "a round-1 reactor was never a round-0
+      // responder for this trigger, so its mark predates the triggering
+      // message"). A SUPPRESSED round-0 responder is now re-invitable, and the
+      // mark bookkeeping below runs outside the suppression branch, so its own
+      // round-0 turn already advanced the mark to >= the trigger's ts — its
+      // round-1 delta therefore MAY OMIT the human trigger (the delta filter is
+      // strictly greater than the mark). The replacement invariant:
+      //
+      //   A round-1 reactor's delta may omit the human trigger. That is safe
+      //   because the delta arm is reachable only when the reactor holds a
+      //   resumable session row whose meetingLastSeenTs was advanced by one of
+      //   ITS OWN earlier turns on this thread; and the mark advances (below)
+      //   only after a non-errored, non-aborted turn, and only to the maximum
+      //   ts over what that turn actually absorbed — its injected context ∪ its
+      //   terminal slot. A mark at or above the trigger's ts therefore implies
+      //   some turn of this agent PRESENTED the trigger (round-0 terminal slot)
+      //   or INJECTED it (a later trigger's context). Either the mark predates
+      //   the trigger (trigger in the delta) or the agent's own turn presented
+      //   it (trigger in the transcript that turn produced) — no gap.
+      //
+      // ⚠ That invariant carries one named, accepted caveat: the mark advance
+      // and the session persist are independent fail-soft writes and can
+      // diverge, so the "session absorbed it" step is asserted, not derived.
+      // See docs/epics/kpr-415/kpr-416-spec.md §7.2 — do not assume airtight.
+      // A reactor with no session/mark gets the full transcript directly.
       const newMessageSegment = resolved.reactionTo
         ? `[${resolved.reactionTo.authorName} just replied]:\n${resolved.reactionTo.text}\n\n` +
           `React to ${resolved.reactionTo.authorName}'s reply if you have something to add. ` +
@@ -1379,6 +1472,46 @@ export class Dispatcher {
           // full vs delta turns (KPR-388 efficacy measurement).
           conferenceInjectionMode: resolved.injectionMode,
           deadlineOriginalText: `${framePrefix}\n${newMessageSegment}`,
+          // KPR-416: the exclusion key rides the item so every delivery path
+          // can mark reaction-exclusion uniformly — including the KPR-402
+          // continuation chain, which deliberately strips the four conference
+          // keys (see maybeHandleDeadlineAbort's leg construction). Named
+          // OUTSIDE the `conference*` family on purpose: it must survive that
+          // blocklist, and nothing telemetric reads it (verified: there is no
+          // meta allowlist anywhere, and neither agent_turn_telemetry nor
+          // activity_log spreads item.meta), so KPR-413's rationale — never
+          // stamp a non-conference turn as a conference turn — is untouched.
+          //
+          // Round-0 only: a round-1 reactor's exclusion is claimed by
+          // triggerConferenceReactions at dispatch, not by delivery. Guarded
+          // on conferenceHumanTs because it is optional on ResolvedAgent (a
+          // non-Slack conference surface has no ts to key on) — the same
+          // guard the deleted selection-time write applied.
+          //
+          // ⚠ ADDITIVE-ONLY, by position: this spread sits AFTER `...item.meta`,
+          // so the round-1 / no-humanTs arm evaluates to `{}` — it can add the
+          // key but never CLEAR one already on the incoming item. Unreachable
+          // today, verified: all three dispatchToAgent call sites pass a RAW
+          // item (the two fan-out sites pass dispatch()'s own argument;
+          // triggerConferenceReactions passes `originalItem`, which is this
+          // method's `item` param, never `effectiveItem`), and the two
+          // re-entries that DO carry effectiveItem-derived meta — a KPR-307
+          // outage replay and every KPR-402 continuation leg, both of which
+          // deliberately keep meetingExclusionTs — pin meta.targetAgentId,
+          // which resolveAgents answers at step 0, before the conf-* check at
+          // step 0.7. So they resolve without conferenceMode and never reach
+          // here. A future caller that re-enters dispatchToAgent with an
+          // effectiveItem-derived meta would silently turn this no-op into a
+          // FALSE EXCLUSION: the round-1 reactor would inherit the round-0
+          // trigger's ts and markReactionExclusion would claim it as having
+          // already answered. Worth naming because KPR-417 wraps this same
+          // dispatch and the deferred §6.4(d) follow-on child edits this
+          // region — if either makes such an item reach here, invert the
+          // spread to write the key unconditionally (value or `undefined`)
+          // rather than leaving the clear implicit.
+          ...(resolved.conferenceRound === 0 && resolved.conferenceHumanTs
+            ? { meetingExclusionTs: resolved.conferenceHumanTs }
+            : {}),
         },
       };
     }
@@ -1478,6 +1611,16 @@ export class Dispatcher {
           durationMs: runResult.durationMs,
           error: runResult.error,
         };
+        // KPR-416 write site 1 — ORDERING PIN. This is a synchronous
+        // statement placed immediately before BOTH the delivery below and
+        // the triggerConferenceReactions fire-and-forget that follows it, so
+        // the window in which this agent could be re-invited as a reactor to
+        // its own trigger is zero by construction — there is nothing here to
+        // race. Do NOT move it below either call (pinned by T5).
+        // The remaining window is cross-agent, not self: a PEER whose own
+        // round-0 turn has not landed can still be invited. That is the
+        // accepted, deferred residual — kpr-416-spec.md §6.4(d), pinned T9.
+        this.markReactionExclusion(effectiveItem, agentId);
         await this.deliverAgentResult(workResult, adapter);
 
         // Conference mode: trigger depth-1 peer reactions
@@ -1632,22 +1775,30 @@ export class Dispatcher {
       costUsd: classification.costUsd,
     });
 
-    // KPR-387: record round-0 responders so the reaction pass never re-selects a
-    // primary for the same triggering human message. Recorded at selection time —
-    // a primary whose turn errors or is suppressed stays excluded for this trigger
-    // (deliberate: kills the suppressed-turn burn; Gate 1 delegated assumption).
-    // Runs synchronously before any round-0 dispatch starts, so there is no race
-    // with a fast round-0 completion triggering the reaction pass.
+    // KPR-387/KPR-416: round-0 responders are still recorded so the reaction
+    // pass never re-selects a primary for the same triggering human message —
+    // but the write now lands at DELIVERY time (markReactionExclusion, three
+    // call sites), not here at selection time. KPR-416 relocated it so a
+    // primary whose turn was SUPPRESSED becomes eligible to react to a slower
+    // peer's later, substantive reply — the exact shape that silenced the live
+    // trial meeting. Delivered, `_No response._`-placeholder, errored-with-text
+    // and thrown turns all keep today's exclusion. Supersedes KPR-386 canon C1
+    // ("selection-time recording"); C2 (shape/keying/TTL) is unchanged.
+    //
+    // ⚠ THE RACE THIS MOVE RE-OPENS — read before "simplifying" anything here.
+    // The old placement ran synchronously before any round-0 dispatch, so no
+    // fast completion could trigger a reaction pass against an unrecorded
+    // agent. That is gone. WITHIN one agent the window is still zero by
+    // construction: the write is the statement immediately before both the
+    // delivery and the reaction trigger (ordering pin, pinned by T5). ACROSS
+    // agents a peer whose own round-0 turn has not landed CAN now be invited
+    // as a round-1 reactor for the same trigger — deliberately deferred,
+    // bounded by the per-thread lock in agent-manager.ts (its round-1 turn
+    // serializes behind its own round-0 turn) plus round-1's "do not re-answer"
+    // framing, and pinned as known behavior by T9. See
+    // docs/epics/kpr-415/kpr-416-spec.md §6.4(d) and its follow-on child
+    // before attempting a fix here.
     const humanTs = item.meta?.slackTs as string | undefined;
-    if (humanTs && classification.respondAgentIds.length > 0) {
-      if (!this.meetingReactionTracker.has(threadId)) {
-        this.meetingReactionTracker.set(threadId, new Map());
-      }
-      const threadTracker = this.meetingReactionTracker.get(threadId)!;
-      const responded = threadTracker.get(humanTs) ?? new Set<string>();
-      for (const id of classification.respondAgentIds) responded.add(id);
-      threadTracker.set(humanTs, responded);
-    }
 
     const preamble = this.buildMeetingPreamble(item.source.label, rosterMembers);
 

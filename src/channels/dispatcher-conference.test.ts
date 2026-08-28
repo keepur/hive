@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { OutageEpisodeTracker } from "../outage/outage-notices.js";
+import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
 import { deadlineContinuationWrap, MAX_DEADLINE_CONTINUATIONS } from "./deadline-continuation.js";
 
 // KPR-389 C5: the suppression log lines carry the `conferenceRound` tag that is
@@ -254,6 +257,83 @@ Meeting rules:
     });
   }
 
+  /**
+   * KPR-416: the tracker is the eligibility STATE under test, so the write-
+   * site cases read it directly rather than inferring it from a downstream
+   * reaction pass. The behavioral pins (T1, T3, T9) assert through
+   * triggerConferenceReactions instead. Same `dispatcher as unknown as {...}`
+   * convention as the T6/C4 guard below.
+   */
+  const excludedFor = (threadId: string, humanTs: string): Set<string> | undefined =>
+    (
+      dispatcher as unknown as {
+        meetingReactionTracker: Map<string, Map<string, Set<string>>>;
+      }
+    ).meetingReactionTracker
+      .get(threadId)
+      ?.get(humanTs);
+
+  const zeroUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    contextWindow: 0,
+    costUsd: 0,
+    durationMs: 100,
+  };
+  function turn(overrides: Record<string, unknown> = {}) {
+    return {
+      finalMessage: "Agent response",
+      newSessionId: "s2",
+      usage: zeroUsage,
+      errors: [] as string[],
+      llmMs: 0,
+      toolMs: 0,
+      toolCalls: 0,
+      toolSummary: null,
+      streamed: false,
+      compactions: 0,
+      ...overrides,
+    };
+  }
+
+  /**
+   * Suite-wide settle barrier for anything downstream of a turn's resolution
+   * (plan-review r1 note). `waitFor(runWorkItemTurn × N)` alone is NOT enough:
+   * everything the dispatcher does after a turn resolves — delivery-time
+   * writes (the KPR-416 exclusion mark), the guards that suppress a delivery,
+   * and every fire-and-forget follow-on the dispatch spawns (the reaction
+   * pass, continuation legs) — is a pure microtask chain (all harness mocks
+   * resolve immediately, no timers), so an assert can run before it. One
+   * macrotask boundary drains the whole chain, because the microtask queue is
+   * fully emptied before the next macrotask. Used by T6/T8a/T8b/T9 and the
+   * KPR-389 D5 tests alike; where a test awaits it twice, that is one boundary
+   * per nested fire-and-forget generation. Negative-verified on one instance:
+   * with the D5 guard disabled those tests fail in ~3ms.
+   */
+  const settleReactions = () => new Promise((r) => setTimeout(r, 0));
+
+  const seedRef = (
+    agentId: string,
+    threadId: string,
+    ref: { sessionId?: string; provider?: string; meetingLastSeenTs?: string },
+  ) => agentManager._sessionRefs.set(`${agentId}:${threadId}`, ref);
+
+  // ts drives delta filtering (raw string); timestamp only drives the
+  // "(N min ago)" display label — minute granularity keeps byte pins
+  // deterministic without fake timers (stable unless the test stalls ~60s).
+  const makeHistory = (
+    entries: Array<{ author: string; text: string; ts: string; minAgo?: number; isBot?: boolean }>,
+  ) =>
+    entries.map((e) => ({
+      author: e.author,
+      text: e.text,
+      ts: e.ts,
+      timestamp: new Date(Date.now() - (e.minAgo ?? 5) * 60_000),
+      isBot: e.isBot ?? false,
+    }));
+
   it("routes conference channel message through classifier", async () => {
     const item = makeWorkItem({
       text: "Jasper, what's the engineering status?",
@@ -430,12 +510,27 @@ Meeting rules:
     expect(adapter.deliver).toHaveBeenCalled();
   });
 
+  // KPR-387 duplicate-answer regression guard, re-derived for KPR-416 (§7.1):
+  // half (a) of the fix — tracker recording — is RELOCATED, not removed, so a
+  // round-0 primary that DELIVERED must still be skipped by the reaction pass.
+  // Half (b) (the reactionTo terminal-slot reframing) is untouched by KPR-416.
   it("round-0 responders are excluded from the reaction-pass roster", async () => {
     const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
     // Round-0: jasper + river respond. Reaction passes: capture roster, select nobody.
     (classifyMeetingMessage as any)
       .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river"], costUsd: 0.001, durationMs: 100 })
       .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+
+    // KPR-416 determinism gate (spec §10, T3). Post-relocation each responder's
+    // exclusion write is the synchronous statement immediately BEFORE its own
+    // delivery, and the reaction pass fires immediately AFTER it. Putting one
+    // macrotask boundary inside delivery orders every round-0 write (reachable
+    // on microtasks alone — all other harness mocks resolve immediately) ahead
+    // of every reaction pass, by construction rather than by await-depth
+    // coincidence. A flaky T3 is not acceptable as the KPR-387 guard.
+    adapter.deliver.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
 
     const item = makeWorkItem({
       text: "Jasper, River, and Jessica, discuss the launch plan",
@@ -467,6 +562,69 @@ Meeting rules:
     expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
     const calledAgents = agentManager.runWorkItemTurn.mock.calls.map((c: any[]) => c[0]).sort();
     expect(calledAgents).toEqual(["jasper", "river"]);
+  });
+
+  it("T1 (KPR-416): a SUPPRESSED round-0 primary becomes eligible to react to a slower peer's later reply", async () => {
+    // Trial observation 1, reproduced (spec §1): the classifier selects three
+    // primaries; two finish fast with "No response needed." (formed before the
+    // slow peer's findings existed); the slow one later delivers real content.
+    // Pre-KPR-416 the selection-time write had already excluded all three, so
+    // peerMembers was empty and NOBODY reacted. Post-fix the two suppressed
+    // agents are eligible and actually run round-1 turns.
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    (classifyMeetingMessage as any)
+      .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river", "jessica"], costUsd: 0.001, durationMs: 100 })
+      .mockResolvedValue({ respondAgentIds: ["river", "jessica"], costUsd: 0.001, durationMs: 100 });
+
+    const threadId = "conf-thread-kpr416-t1";
+    // Keyed by agentId, not call order: the slow primary resolves on a real
+    // timer so the two suppressions are guaranteed to have completed first —
+    // the trial's actual shape, and deterministic without leaning on
+    // Promise.all ordering.
+    agentManager.runWorkItemTurn.mockImplementation(async (agentId: string) => {
+      if (agentId === "jasper") {
+        await new Promise((r) => setTimeout(r, 10));
+        return turn({ finalMessage: "Here is what I found after a long dig." });
+      }
+      return turn({ finalMessage: "No response needed." });
+    });
+
+    await dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, River, and Jessica, discuss the launch plan",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t1" },
+        threadId,
+        meta: { slackTs: "1700.0011" },
+      }),
+    );
+
+    // Vacuous-pass guard (kpr-387-spec.md:155): assert a NON-EMPTY set of
+    // round-0 turns actually ran before asserting anything about round 1.
+    const round0Agents = agentManager.runWorkItemTurn.mock.calls
+      .filter((c: any[]) => c[1]?.meta?.conferenceRound === 0)
+      .map((c: any[]) => c[0])
+      .sort();
+    expect(round0Agents).toEqual(["jasper", "jessica", "river"]);
+
+    // The reaction pass ran with BOTH suppressed peers on the roster...
+    const reactionCalls = () =>
+      (classifyMeetingMessage as any).mock.calls.filter(
+        (c: any[]) => c[0] === "Here is what I found after a long dig.",
+      );
+    await vi.waitFor(() => expect(reactionCalls().length).toBeGreaterThanOrEqual(1));
+    const peerIds = reactionCalls()[0][1]
+      .map((m: any) => m.agentId)
+      .sort();
+    expect(peerIds).toEqual(["jessica", "river"]);
+
+    // ...and both actually ran a round-1 turn.
+    await vi.waitFor(() => {
+      const round1Agents = agentManager.runWorkItemTurn.mock.calls
+        .filter((c: any[]) => c[1]?.meta?.conferenceRound === 1)
+        .map((c: any[]) => c[0])
+        .sort();
+      expect(round1Agents).toEqual(["jessica", "river"]);
+    });
   });
 
   it("round-1 reaction prompt frames the peer reply, not the human message", async () => {
@@ -571,31 +729,297 @@ Meeting rules:
     expect(quoted.some((p) => NON_RESPONSE_PATTERNS.some((rx) => rx.test(p!.trim())))).toBe(true);
   });
 
-  describe("round-1 kill suppression (KPR-389 D5)", () => {
-    const zeroUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      cacheCreationTokens: 0,
-      contextWindow: 0,
-      costUsd: 0,
-      durationMs: 100,
+  it("T5 (KPR-416): the exclusion write precedes BOTH the fan-out delivery and the reaction trigger", () => {
+    // Structural, not a race test. Post-KPR-416 the window between the write
+    // and the two call sites is zero BY CONSTRUCTION — the write is a
+    // synchronous statement immediately preceding both — so a timing/
+    // microtask test here would be theater. This is a drift catcher: a later
+    // refactor that moves the write below either call fails it.
+    // Text-scan (same technique as src/boot-order.test.ts), with `//` line
+    // comments stripped so prose mentioning the call cannot false-positive.
+    const source = readFileSync(fileURLToPath(new URL("./dispatcher.ts", import.meta.url)), "utf8");
+    const codeOnly = source
+      .split("\n")
+      .map((line) => line.replace(/\/\/.*$/, ""))
+      .join("\n");
+
+    // Bound the scan to the fan-out `else` branch of dispatchToAgent, so the
+    // single-dispatch call site (write site 2, earlier in the file) can never
+    // stand in for a fan-out write that was moved or deleted.
+    const blockStart = codeOnly.indexOf('log.info("Non-response suppressed (fan-out)"');
+    const blockEnd = codeOnly.indexOf('log.info("Fan-out dispatch complete"');
+    expect(blockStart, "fan-out branch anchor not found — update this test's anchors").toBeGreaterThan(-1);
+    expect(blockEnd, "fan-out branch end anchor not found — update this test's anchors").toBeGreaterThan(blockStart);
+    const block = codeOnly.slice(blockStart, blockEnd);
+
+    const markIdx = block.indexOf("this.markReactionExclusion(");
+    const deliverIdx = block.indexOf("await this.deliverAgentResult(workResult, adapter);");
+    const triggerIdx = block.indexOf("this.triggerConferenceReactions(");
+    expect(markIdx, "markReactionExclusion is not called in the fan-out delivery branch").toBeGreaterThan(-1);
+    expect(deliverIdx).toBeGreaterThan(-1);
+    expect(triggerIdx).toBeGreaterThan(-1);
+    expect(markIdx).toBeLessThan(deliverIdx);
+    expect(deliverIdx).toBeLessThan(triggerIdx);
+  });
+
+  it.each([
+    ["empty text delivering the _No response._ placeholder", { finalMessage: "" }, "_No response._"],
+    [
+      "error WITH text (exit-code-1 convention)",
+      { finalMessage: "Partial answer", errors: ["exit 1"] },
+      "Partial answer",
+    ],
+  ])(
+    "T6 (KPR-416): a round-0 turn that %s stays excluded (predicate is branch position, not 'real content')",
+    async (_label, flags, expectedText) => {
+      // Disposition (a), spec §6.1. Neither shape matches NON_RESPONSE_PATTERNS,
+      // so both land in the delivering `else` — under branch position the write
+      // FIRES for them, keeping them excluded. Passes pre- and post-fix (before
+      // the relocation the selection-time write covered them); it is the pin
+      // that stops a future "genuinely non-empty non-errored content" predicate
+      // silently re-including them.
+      await soloClassifier();
+      const threadId = `conf-thread-kpr416-t6-${String(_label).replace(/\W+/g, "-")}`;
+      // Spread form, consistent with the KPR-389 D5 it.each above (:625);
+      // both `turn(flags)` and `turn({ ...flags })` typecheck here since
+      // vitest infers `flags` per-position, not as a cross-row union.
+      agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ ...flags }));
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "Jasper, next steps?",
+          source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t6" },
+          threadId,
+          meta: { slackTs: "1700.0006" },
+        }),
+      );
+      await settleReactions();
+
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe(expectedText);
+      expect(excludedFor(threadId, "1700.0006")).toEqual(new Set(["jasper"]));
+    },
+  );
+
+  it.each([
+    ["no meetingExclusionTs at all", undefined],
+    ["a malformed non-string meetingExclusionTs", 42],
+    ["an empty-string meetingExclusionTs", ""],
+  ])(
+    "T4b (KPR-416): write site 2 no-ops cleanly for a plain single-dispatch turn with %s",
+    async (_label, exclusionTs) => {
+      // Write site 2 sits on the delivery branch of the ORDINARY single-
+      // dispatch path — the hot path of every non-conference turn in the
+      // engine. This is the only test guarding that blast radius: no tracker
+      // mutation, no throw, delivery unaffected. Non-`conf-` label ⇒ ordinary
+      // routing (dispatcher.ts:1176).
+      const meta: Record<string, unknown> = { slackTs: "1700.0007" };
+      if (exclusionTs !== undefined) meta.meetingExclusionTs = exclusionTs;
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: "what is the deploy status?",
+          source: { kind: "slack", id: "C999", label: "general" },
+          threadId: `plain-thread-${String(_label).replace(/\W+/g, "-")}`,
+          meta,
+        }),
+      );
+
+      expect(adapter.deliver).toHaveBeenCalledTimes(1);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe("Agent response");
+      expect(
+        (dispatcher as unknown as { meetingReactionTracker: Map<string, unknown> }).meetingReactionTracker.size,
+      ).toBe(0);
+    },
+  );
+
+  it("T4 (KPR-416): an outage-queued round-0 turn that later replays and delivers excludes that agent", async () => {
+    // Write site 2's replay half, end-to-end: phase 1 queues the real
+    // effectiveItem via the outage path; phase 2 replays THAT item with the
+    // breaker closed and asserts the delivery marked exclusion. §4's table
+    // row: "post-turn outage queue" is no longer excluded at queue time — the
+    // replay's own delivery is what excludes.
+    await soloClassifier();
+    const threadId = "conf-thread-kpr416-t4";
+    const outageStore = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      release: vi.fn().mockResolvedValue(undefined),
+      recordFailedAttempt: vi.fn().mockResolvedValue({ terminal: false, doc: null }),
+      markNoticeSent: vi.fn().mockResolvedValue(undefined),
+      pendingCount: vi.fn().mockResolvedValue(0),
+      statusOf: vi.fn().mockResolvedValue(null),
+      expireOlderThan: vi.fn().mockResolvedValue([]),
+      recoverStaleReplaying: vi.fn().mockResolvedValue(0),
+      ensureIndexes: vi.fn().mockResolvedValue(undefined),
     };
-    function turn(overrides: Record<string, unknown> = {}) {
-      return {
-        finalMessage: "Agent response",
-        newSessionId: "s2",
-        usage: zeroUsage,
-        errors: [] as string[],
-        llmMs: 0,
-        toolMs: 0,
-        toolCalls: 0,
-        toolSummary: null,
-        streamed: false,
-        compactions: 0,
-        ...overrides,
-      };
-    }
+    dispatcher.setOutageHandling({
+      store: outageStore as never,
+      episodes: new OutageEpisodeTracker(),
+      config: { enabled: true, replayIntervalMs: 15_000, maxAgeHours: 4, maxDepth: 500, maxReplayAttempts: 3 },
+    });
+
+    // Phase 1 — breaker open + hard fault ⇒ the turn queues, nothing delivered.
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "open", enabled: true });
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(
+      turn({ finalMessage: "", errors: ["connect ECONNREFUSED api"] }),
+    );
+    await dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t4" },
+        threadId,
+        meta: { slackTs: "1700.0008" },
+      }),
+    );
+    expect(outageStore.enqueue).toHaveBeenCalledTimes(1);
+    // Phase 1 delivered the KPR-307 honest-outage NOTICE (policyFor ⇒ "notify",
+    // first episode for this thread), so deliver has already fired once. That
+    // notice is engine chrome, not agent content — pin it, then clear the call
+    // record so phase 2's assertions read a clean `calls[0]`. mockClear only:
+    // mockReset/clearAllMocks would drop the harness's deliver implementation.
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toContain("provider outage");
+    adapter.deliver.mockClear();
+    expect(excludedFor(threadId, "1700.0008")).toBeUndefined(); // queued ⇒ NOT excluded
+
+    // Phase 2 — replay the item the store actually holds, breaker closed.
+    const queued = outageStore.enqueue.mock.calls[0][0].workItem as WorkItem;
+    expect(queued.meta?.meetingExclusionTs).toBe("1700.0008"); // the key rode the doc
+    agentManager.circuitBreakers.stateFor.mockReturnValue({ state: "closed", enabled: true });
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(turn({ finalMessage: "The real answer, at last" }));
+    await dispatcher.dispatch({
+      ...queued,
+      meta: { ...queued.meta, outageReplay: true, targetAgentId: "jasper" },
+    });
+
+    expect(adapter.deliver).toHaveBeenCalledTimes(1); // post-mockClear: the real content only
+    expect(adapter.deliver.mock.calls[0][0].text).toBe("The real answer, at last");
+    expect(excludedFor(threadId, "1700.0008")).toEqual(new Set(["jasper"]));
+  });
+
+  it("T7 (KPR-416): a THROWN round-0 turn stays excluded (write site 3)", async () => {
+    // Disposition (b), spec §6.2. The thrown turn posts visible error text —
+    // the same user-visible artifact an in-branch errored turn produces — so
+    // it stays excluded. Passes pre- and post-fix: this half pins the
+    // predicate, not the relocation.
+    await soloClassifier();
+    const thrownThread = "conf-thread-kpr416-t7-thrown";
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(new Error("boom"));
+
+    await dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t7" },
+        threadId: thrownThread,
+        meta: { slackTs: "1700.0009" },
+      }),
+    );
+
+    expect(adapter.deliver).toHaveBeenCalledTimes(1);
+    expect(adapter.deliver.mock.calls[0][0].text).toContain("Something went wrong");
+    expect(excludedFor(thrownThread, "1700.0009")).toEqual(new Set(["jasper"]));
+  });
+
+  it("T7 companion (KPR-416): a ProviderCircuitOpenError fast-fail is NOT excluded", async () => {
+    // The exemption half. A fast-fail posts an engine NOTICE, not agent
+    // content, so it must never mark — handleOutageTurn's early return in
+    // handleTurnFailure lands before write site 3, and this is its pin.
+    await soloClassifier();
+    const outageStore = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      release: vi.fn().mockResolvedValue(undefined),
+      recordFailedAttempt: vi.fn().mockResolvedValue({ terminal: false, doc: null }),
+      markNoticeSent: vi.fn().mockResolvedValue(undefined),
+      pendingCount: vi.fn().mockResolvedValue(0),
+      statusOf: vi.fn().mockResolvedValue(null),
+      expireOlderThan: vi.fn().mockResolvedValue([]),
+      recoverStaleReplaying: vi.fn().mockResolvedValue(0),
+      ensureIndexes: vi.fn().mockResolvedValue(undefined),
+    };
+    dispatcher.setOutageHandling({
+      store: outageStore as never,
+      episodes: new OutageEpisodeTracker(),
+      config: { enabled: true, replayIntervalMs: 15_000, maxAgeHours: 4, maxDepth: 500, maxReplayAttempts: 3 },
+    });
+    const fastFailThread = "conf-thread-kpr416-t7-fastfail";
+    // ProviderCircuitOpenError's `provider` param is typed `string` (see
+    // provider-circuit-breaker.ts:94) — no cast needed.
+    agentManager.runWorkItemTurn.mockRejectedValueOnce(
+      new ProviderCircuitOpenError("claude", Date.now(), 15_000, "connect-fail", "fetch failed"),
+    );
+
+    await dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, next steps?",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t7" },
+        threadId: fastFailThread,
+        meta: { slackTs: "1700.0010" },
+      }),
+    );
+
+    expect(outageStore.enqueue).toHaveBeenCalledTimes(1); // queued as a notice, not agent text
+    expect(excludedFor(fastFailThread, "1700.0010")).toBeUndefined(); // notice, not agent text
+  });
+
+  it("T9 (KPR-416): ⚠ ACCEPTED RESIDUAL — a peer whose round-0 turn has not landed IS invited as a round-1 reactor", async () => {
+    // This pins a KNOWN, DELIBERATELY DEFERRED gap, not desired behavior.
+    // Post-relocation there is no in-flight round-0 registry (the removed
+    // selection-time write was incidentally serving as one), so within the
+    // overlap window a peer that still owes a round-0 answer can also be
+    // invited to react. Deferred because: (1) agent-manager's per-thread lock
+    // `agentId:threadId` serializes the peer's round-1 turn behind its own
+    // round-0 turn, so it answers first and then reacts — an extra turn, not a
+    // duplicate answer, with round-1's "do not re-answer" framing holding the
+    // line; (2) the in-scope fix would need an await inside
+    // triggerConferenceReactions' claim-before-await loop, forfeiting KPR-387's
+    // actual guarantee, and a pending-set leak at any early return means
+    // PERMANENT exclusion — the original bug, worse.
+    //
+    // Spec: docs/epics/kpr-415/kpr-416-spec.md §6.4(d). The follow-on child
+    // filed against KPR-415 INVERTS this assertion — when it lands, this test
+    // is expected to change, and that is the signal, not a regression.
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    (classifyMeetingMessage as any)
+      .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river"], costUsd: 0.001, durationMs: 100 })
+      .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+
+    const threadId = "conf-thread-kpr416-t9";
+    let releaseRiver!: () => void;
+    const riverLanded = new Promise<void>((resolve) => {
+      releaseRiver = resolve;
+    });
+    agentManager.runWorkItemTurn.mockImplementation(async (agentId: string) => {
+      if (agentId === "river") {
+        await riverLanded; // river's round-0 turn has NOT landed when jasper reacts
+        return turn({ finalMessage: "River, eventually" });
+      }
+      return turn({ finalMessage: "Jasper answers immediately" });
+    });
+
+    const dispatched = dispatcher.dispatch(
+      makeWorkItem({
+        text: "Jasper, River, and Jessica, discuss the launch plan",
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t9" },
+        threadId,
+        meta: { slackTs: "1700.0012" },
+      }),
+    );
+
+    // Jasper's reaction pass fires while river is still in flight.
+    const reactionCalls = () =>
+      (classifyMeetingMessage as any).mock.calls.filter((c: any[]) => c[0] === "Jasper answers immediately");
+    await vi.waitFor(() => expect(reactionCalls().length).toBeGreaterThanOrEqual(1));
+
+    const peerIds = reactionCalls()[0][1].map((m: any) => m.agentId);
+    expect(peerIds).toContain("river"); // ⚠ the residual: river owes an answer AND is invited
+    expect(peerIds).toContain("jessica"); // jessica never ran at all — expected
+
+    releaseRiver();
+    await dispatched;
+    await settleReactions();
+  });
+
+  describe("round-1 kill suppression (KPR-389 D5)", () => {
     async function twoAgentClassifier() {
       const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
       (classifyMeetingMessage as any)
@@ -610,18 +1034,6 @@ Meeting rules:
         meta: { slackTs: "1700.0001" },
       });
     }
-    /**
-     * Deterministic barrier for the fire-and-forget reaction pass (plan-review
-     * r1 note). `waitFor(runWorkItemTurn × 2)` alone is NOT enough: everything
-     * downstream of the reactor's turn resolution — the D5 guard and the
-     * delivery it suppresses — is a pure microtask chain (all harness mocks
-     * resolve immediately, no timers), so the deliver-count assert can run
-     * before it. One macrotask boundary drains the whole chain, because the
-     * microtask queue is fully emptied before the next macrotask. Negative-
-     * verified: with the D5 guard disabled these tests fail in ~3ms.
-     */
-    const settleReactions = () => new Promise((r) => setTimeout(r, 0));
-
     it.each([
       ["aborted", { aborted: true }],
       ["timedOut", { timedOut: true, aborted: true }],
@@ -761,6 +1173,117 @@ Meeting rules:
         expect(secondCallItem.meta.conferenceInjectionMode).toBeUndefined();
       });
 
+      it("T8a (KPR-416): the continuation leg carries meetingExclusionTs and still none of the four conference keys", async () => {
+        // Sibling of T2 above, not a replacement — T2 stays byte-identical.
+        // The key is deliberately named outside the `conference*` family so
+        // it survives KPR-413's blocklist strip; that survival is exactly
+        // what lets write site 2 mark exclusion on the leg's own delivery
+        // (T8b). Spec §5.2 / §6.3.
+        await soloClassifier();
+        const threadId = "conf-thread-kpr416-t8a";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValueOnce(ABORT_WITH_PROGRESS);
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr413" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+
+        // The ORIGIN turn carries it (stamped at assembly, like T2b's pin)...
+        const originItem = agentManager.runWorkItemTurn.mock.calls[0][1];
+        expect(originItem.meta.meetingExclusionTs).toBe("1000.0004");
+
+        // ...and it survives the leg construction, while the four conference
+        // keys still do not.
+        const legItem = agentManager.runWorkItemTurn.mock.calls[1][1];
+        expect(legItem.meta.meetingExclusionTs).toBe("1000.0004");
+        expect(legItem.meta.conferenceMode).toBeUndefined();
+        expect(legItem.meta.conferenceRound).toBeUndefined();
+        expect(legItem.meta.conferenceHumanTs).toBeUndefined();
+        expect(legItem.meta.conferenceInjectionMode).toBeUndefined();
+      });
+
+      it("T8b (KPR-416): a continuation leg's delivery excludes; a cap-exhausted chain and a zero-progress abort do NOT", async () => {
+        // Disposition (c), spec §6.3. The exclusion is written at DELIVERY, so
+        // the leg that finally answers is what marks — and a chain that never
+        // answers marks nothing. The two companions assert the same shape
+        // through different arms, so a regression that starts marking at the
+        // ABORT site rather than at delivery fails on both.
+        await soloClassifier();
+        const threadId = "conf-thread-kpr416-t8b";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn
+          .mockResolvedValueOnce(ABORT_WITH_PROGRESS) // origin: deadline abort with progress
+          .mockResolvedValueOnce(turn({ finalMessage: "Finished it on the second pass" })); // leg 1: answers
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t8b" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+        await settleReactions();
+
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+        expect(excludedFor(threadId, "1000.0004")).toEqual(new Set(["jasper"]));
+      });
+
+      it("T8b companion 1 (KPR-416): a chain that exhausts MAX_DEADLINE_CONTINUATIONS never excludes", async () => {
+        await soloClassifier();
+        const threadId = "conf-thread-kpr416-t8b-cap";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValue(ABORT_WITH_PROGRESS); // every leg aborts
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t8b" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+        await settleReactions();
+
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(MAX_DEADLINE_CONTINUATIONS + 1);
+        // Terminal notice only — the agent never answered, so it is correctly
+        // still eligible to react to a peer on this trigger.
+        expect(excludedFor(threadId, "1000.0004")).toBeUndefined();
+      });
+
+      it("T8b companion 2 (KPR-416): a ZERO-progress deadline abort (notice only, no leg) never excludes", async () => {
+        // §4's zero-progress row: maybeHandleDeadlineAbort's !withProgress arm
+        // returns true after a notice, with no continuation leg and no
+        // deliverAgentResult call — so no write site is ever reached.
+        await soloClassifier();
+        const threadId = "conf-thread-kpr416-t8b-zero";
+        mockSlackAdapter.fetchThreadHistory.mockResolvedValue(ONE_MSG_HISTORY());
+        agentManager.runWorkItemTurn.mockResolvedValueOnce(
+          turn({ finalMessage: "", timedOut: true, aborted: true }), // no toolCalls, not streamed
+        );
+
+        await dispatcher.dispatch(
+          makeWorkItem({
+            text: "Jasper, status update?",
+            source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t8b" },
+            threadId,
+            meta: { slackTs: "1000.0004" },
+          }),
+        );
+        await settleReactions();
+
+        expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1); // no leg
+        expect(excludedFor(threadId, "1000.0004")).toBeUndefined();
+      });
+
       it("T2b: the stamp is written at assembly time, on the ORIGIN turn's own dispatch — independent of whether an abort ever happens", async () => {
         // Direct pin for D1 itself (plan-review r1 finding): T1/T2 only
         // prove the ARM's output; this proves the stamp exists on every
@@ -819,26 +1342,6 @@ Meeting rules:
   });
 
   describe("delta context injection (KPR-388)", () => {
-    const seedRef = (
-      agentId: string,
-      threadId: string,
-      ref: { sessionId?: string; provider?: string; meetingLastSeenTs?: string },
-    ) => agentManager._sessionRefs.set(`${agentId}:${threadId}`, ref);
-
-    // ts drives delta filtering (raw string); timestamp only drives the
-    // "(N min ago)" display label — minute granularity keeps byte pins
-    // deterministic without fake timers (stable unless the test stalls ~60s).
-    const makeHistory = (
-      entries: Array<{ author: string; text: string; ts: string; minAgo?: number; isBot?: boolean }>,
-    ) =>
-      entries.map((e) => ({
-        author: e.author,
-        text: e.text,
-        ts: e.ts,
-        timestamp: new Date(Date.now() - (e.minAgo ?? 5) * 60_000),
-        isBot: e.isBot ?? false,
-      }));
-
     const THREE_MSG_HISTORY = () =>
       makeHistory([
         { author: "May", text: "old message", ts: "1000.0001", minAgo: 10 },
@@ -1180,6 +1683,105 @@ Meeting rules:
       expect(round1Item.text).toContain("please weigh in on the Q3 roadmap"); // C3 reachability via delta
       expect(round1Item.text).not.toContain("kickoff notes"); // ts == mark ⇒ excluded (strictly-greater pin)
       expect(round1Item.text).toContain("[Jasper just replied]:"); // terminal slot untouched (C3)
+    });
+
+    it("T2 (KPR-416): a suppressed round-0 responder re-invited as a reactor takes the DELTA arm, which omits the trigger", async () => {
+      // The §7.2 re-based invariant, on the path KPR-416 newly exposes. The
+      // asserted property is mark-advance-implies-own-turn-presented-it — NOT
+      // "the delta covers the trigger", which is precisely what stops being
+      // true here. Preconditions pinned explicitly: jessica's round-0 turn was
+      // SUPPRESSED, her injection mode was `delta`, and resumedSession is true
+      // so the clearMeetingMark branch does not apply.
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper", "jessica"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: ["jessica"], costUsd: 0.001, durationMs: 100 });
+
+      const threadId = "conf-thread-kpr416-t2";
+      const TRIGGER = "settle the pricing question before Friday";
+      seedRef("jessica", threadId, { sessionId: "sess-j", provider: "claude", meetingLastSeenTs: "1000.0001" });
+
+      // The mark write must actually feed the round-1 read for this invariant
+      // to mean anything, so make setMeetingMark mutate the seeded ref.
+      agentManager._sessionStore.setMeetingMark.mockImplementation(
+        async (agentId: string, thread: string, ts: string) => {
+          const key = `${agentId}:${thread}`;
+          const ref = agentManager._sessionRefs.get(key);
+          if (ref) agentManager._sessionRefs.set(key, { ...ref, meetingLastSeenTs: ts });
+        },
+      );
+
+      mockSlackAdapter.fetchThreadHistory
+        .mockResolvedValueOnce(
+          makeHistory([
+            { author: "May", text: "kickoff notes", ts: "1000.0001", minAgo: 30 },
+            { author: "May", text: TRIGGER, ts: "1000.0005", minAgo: 5 },
+          ]),
+        )
+        .mockResolvedValue(
+          makeHistory([
+            { author: "May", text: "kickoff notes", ts: "1000.0001", minAgo: 30 },
+            { author: "May", text: TRIGGER, ts: "1000.0005", minAgo: 5 },
+            { author: "Jasper", text: "Slow findings on pricing", ts: "1000.0006", minAgo: 4, isBot: true },
+          ]),
+        );
+
+      agentManager.runWorkItemTurn.mockImplementation(async (agentId: string) => {
+        if (agentId === "jasper") {
+          await new Promise((r) => setTimeout(r, 10)); // slow peer: jessica's mark lands first
+          return turn({ finalMessage: "Slow findings on pricing", resumedSession: true });
+        }
+        return turn({ finalMessage: "No response needed.", resumedSession: true });
+      });
+
+      await dispatcher.dispatch(
+        makeWorkItem({
+          text: `Jasper, and Jessica, ${TRIGGER}`,
+          source: { kind: "slack", id: "C-CONF", label: "conf-kpr416-t2" },
+          threadId,
+          meta: { slackTs: "1000.0005" },
+        }),
+      );
+
+      // Precondition: jessica's round-0 turn was delta-mode and suppressed.
+      const jessicaRound0 = agentManager.runWorkItemTurn.mock.calls.find(
+        (c: any[]) => c[0] === "jessica" && c[1]?.meta?.conferenceRound === 0,
+      );
+      expect(jessicaRound0).toBeDefined();
+      expect(jessicaRound0![1].meta.conferenceInjectionMode).toBe("delta");
+      expect(mockLogInfo).toHaveBeenCalledWith(
+        "Non-response suppressed (fan-out)",
+        expect.objectContaining({ agentId: "jessica", conferenceRound: 0 }),
+      );
+
+      // (i) The mark advanced to >= the trigger ts on that suppressed turn.
+      expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jessica", threadId, "1000.0005");
+
+      // Vacuous-pass guard: a round-1 turn must actually have happened before
+      // asserting over its text (pre-fix it never dispatches at all).
+      const round1Call = () =>
+        agentManager.runWorkItemTurn.mock.calls.find(
+          (c: any[]) => c[0] === "jessica" && c[1]?.meta?.conferenceRound === 1,
+        );
+      await vi.waitFor(() => expect(round1Call()).toBeDefined());
+
+      // (ii) It took the delta arm, and the delta OMITS the trigger — safe only
+      // by the §7.2 invariant (jessica's own round-0 terminal slot presented it).
+      const round1Item = round1Call()![1];
+      expect(round1Item.meta.conferenceInjectionMode).toBe("delta");
+      // The two load-bearing assertions: the delta header is present, and the
+      // human trigger is ABSENT from a re-invited suppressed agent's context.
+      expect(round1Item.text).toContain("[New messages since your last turn:]");
+      expect(round1Item.text).not.toContain(TRIGGER);
+      // The delta BODY, pinned against the line shape formatDeltaContext
+      // actually emits (`${author} (${ago}): ${text}`, dispatcher.ts:1808)
+      // and anchored to the header so it cannot be satisfied from elsewhere.
+      // A bare `toContain("Slow findings on pricing")` would be near-vacuous:
+      // that string is also in reactionTo.text in the terminal slot, so it
+      // passes even when the delta is empty or wrong.
+      expect(round1Item.text).toMatch(
+        /\[New messages since your last turn:\]\n\nJasper \([^)]+\): Slow findings on pricing/,
+      );
     });
 
     it("C3: round-1 reactor with no session gets the full transcript", async () => {
