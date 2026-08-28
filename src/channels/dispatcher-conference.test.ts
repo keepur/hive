@@ -1112,6 +1112,263 @@ Meeting rules:
       await settleAcked();
       expect(ackCalls()).toHaveLength(0);
     });
+
+    it.each([
+      [
+        "resolves with error + text (exit-code-1 convention)",
+        (release: (v: unknown) => void) => release(turn({ finalMessage: "Partial answer", errors: ["exit 1"] })),
+        "Partial answer",
+      ],
+      [
+        "rejects (thrown — e.g. a grok TurnAssemblyError from an unreadable ~/.grok/auth.json)",
+        (_release: (v: unknown) => void, reject: (e: unknown) => void) => reject(new Error("boom")),
+        "Something went wrong",
+      ],
+    ])(
+      "T8 (KPR-417, §6.1): an acked turn that %s delivers the ack first and the error second — never a retraction",
+      async (_label, settle, expectedFragment) => {
+        await soloClassifier();
+        let release!: (v: unknown) => void;
+        let reject!: (e: unknown) => void;
+        agentManager.runWorkItemTurn.mockReturnValue(
+          new Promise((res, rej) => {
+            release = res;
+            reject = rej;
+          }),
+        );
+
+        const dispatched = dispatcher.dispatch(confAckItem(`conf-thread-kpr417-t8-${String(_label).slice(0, 12)}`));
+        await settleAcked();
+        await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+        expect(ackCalls()).toHaveLength(1);
+
+        settle(release, reject);
+        await dispatched;
+        await settleAcked();
+
+        // Exactly two posts, ack first, error second. NO third post, no edit,
+        // no delete — the ack is never retracted (spec §6.4 ruling, applied
+        // uniformly across every failure path).
+        expect(adapter.deliver).toHaveBeenCalledTimes(2);
+        expect(adapter.deliver.mock.calls[0][0].text).toBe(MEETING_ACK_TEXT);
+        expect(adapter.deliver.mock.calls[1][0].text).toContain(expectedFragment);
+      },
+    );
+
+    /** Outage wiring, same shape as the in-file precedent at :1049-1064. */
+    const armOutage = () => {
+      const outageStore = {
+        enqueue: vi.fn().mockResolvedValue(undefined),
+        release: vi.fn().mockResolvedValue(undefined),
+        recordFailedAttempt: vi.fn().mockResolvedValue({ terminal: false, doc: null }),
+        markNoticeSent: vi.fn().mockResolvedValue(undefined),
+        pendingCount: vi.fn().mockResolvedValue(0),
+        statusOf: vi.fn().mockResolvedValue(null),
+        expireOlderThan: vi.fn().mockResolvedValue([]),
+        recoverStaleReplaying: vi.fn().mockResolvedValue(0),
+        ensureIndexes: vi.fn().mockResolvedValue(undefined),
+      };
+      dispatcher.setOutageHandling({
+        store: outageStore as never,
+        episodes: new OutageEpisodeTracker(),
+        config: { enabled: true, replayIntervalMs: 15_000, maxAgeHours: 4, maxDepth: 500, maxReplayAttempts: 3 },
+      });
+      return outageStore;
+    };
+    const noticeCalls = () =>
+      adapter.deliver.mock.calls.filter((c: any[]) => String(c[0].text).includes("provider outage"));
+
+    it("T9a (KPR-417, §6.2): an IMMEDIATE circuit-open fast-fail beats the threshold — no ack", async () => {
+      // The common case is structurally clean: the breaker permit is acquired
+      // at the top of the spawn, so a fast-fail returns well under 15s.
+      await soloClassifier();
+      const outageStore = armOutage();
+      agentManager.runWorkItemTurn.mockRejectedValueOnce(
+        new ProviderCircuitOpenError("claude", Date.now(), 15_000, "connect-fail", "fetch failed"),
+      );
+
+      await dispatcher.dispatch(confAckItem("conf-thread-kpr417-t9a"));
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 2);
+      await settleAcked();
+
+      expect(outageStore.enqueue).toHaveBeenCalledTimes(1);
+      expect(ackCalls()).toHaveLength(0);
+    });
+
+    it("T9b (KPR-417, §6.2): a fast-fail DELAYED past 15s (lock contention) acks, then the honest notice — one each", async () => {
+      // NOT hypothetical: withSpawnTicket's per-thread lock spin-waits BEFORE
+      // the breaker acquire, so a turn queued behind a sibling on the same
+      // agentId:threadId can ack at 15s and only then fast-fail. The resulting
+      // "ack, then honest outage notice" is a coherent sequence.
+      await soloClassifier();
+      const outageStore = armOutage();
+      let reject!: (e: unknown) => void;
+      agentManager.runWorkItemTurn.mockReturnValue(
+        new Promise((_res, rej) => {
+          reject = rej;
+        }),
+      );
+
+      const dispatched = dispatcher.dispatch(confAckItem("conf-thread-kpr417-t9b"));
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+      expect(ackCalls()).toHaveLength(1);
+
+      reject(new ProviderCircuitOpenError("claude", Date.now(), 15_000, "connect-fail", "fetch failed"));
+      await dispatched;
+      await settleAcked();
+
+      expect(outageStore.enqueue).toHaveBeenCalledTimes(1);
+      expect(ackCalls()).toHaveLength(1); // not repeated
+      expect(noticeCalls()).toHaveLength(1);
+      expect(adapter.deliver).toHaveBeenCalledTimes(2);
+      expect(adapter.deliver.mock.calls[0][0].text).toBe(MEETING_ACK_TEXT); // ack first
+    });
+
+    it("T9c (KPR-417, §6.2): ⚠ ACCEPTED RESIDUAL — two agents in one episode produce TWO acks and ONE notice", async () => {
+      // This pins KNOWN, ACCEPTED behavior, not desired behavior. The outage
+      // notice is deduped once per (provider, adapterKey, threadKey) per
+      // episode (dispatcher.ts:1003, firstForThread), so in an N-agent meeting
+      // on one provider only the first agent's turn produces a notice; the
+      // rest queue silently. If those agents acked, their acks are followed by
+      // silence until replay — possibly hours later, and via the
+      // single-dispatch leg, which fires no reaction pass.
+      //
+      // Spec §6.2 CONSIDERED and REJECTED gating the ack at fire time on
+      // breaker state, on three grounds: it covers only the lock-contended
+      // sub-shape; it does nothing for the post-turn shape; and it makes the
+      // ack rule conditional on cross-module state for partial coverage. Do
+      // NOT "fix" this test. Revisit trigger: trial logs showing acks
+      // correlated with outage episodes at a rate the operator notices.
+      const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+      (classifyMeetingMessage as any)
+        .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river"], costUsd: 0.001, durationMs: 100 })
+        .mockResolvedValue({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+      const outageStore = armOutage();
+
+      const rejects: Array<(e: unknown) => void> = [];
+      agentManager.runWorkItemTurn.mockImplementation(
+        () =>
+          new Promise((_res, rej) => {
+            rejects.push(rej);
+          }),
+      );
+
+      const dispatched = dispatcher.dispatch(confAckItem("conf-thread-kpr417-t9c", "Jasper, and River, status please"));
+      await settleAcked();
+      expect(rejects).toHaveLength(2);
+
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+      expect(ackCalls()).toHaveLength(2); // ⚠ both slow agents acked
+
+      for (const rej of rejects) {
+        rej(new ProviderCircuitOpenError("claude", Date.now(), 15_000, "connect-fail", "fetch failed"));
+      }
+      await dispatched;
+      await settleAcked();
+
+      expect(outageStore.enqueue).toHaveBeenCalledTimes(2); // both queued
+      expect(noticeCalls()).toHaveLength(1); // ⚠ but only ONE notice — the residual
+    });
+
+    it("T10 (KPR-417, §6.3): a deadline abort WITH progress acks, notices, dispatches a leg — and the leg itself never acks", async () => {
+      // Sequence: ack at 15s → "taking longer than expected, continuing" at
+      // the deadline → the leg's answer. A coherent progression, not a
+      // redundant double-post. The leg carries no conference meta (KPR-413) and
+      // re-enters the single-dispatch leg, so it CANNOT ack — asserted by
+      // hanging the leg's own turn past the threshold too.
+      await soloClassifier();
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue([]);
+      const origin = hangingTurn();
+      const leg = hangingTurn();
+      agentManager.runWorkItemTurn.mockReturnValueOnce(origin.promise).mockReturnValueOnce(leg.promise);
+
+      const dispatched = dispatcher.dispatch(confAckItem("conf-thread-kpr417-t10"));
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+      expect(ackCalls()).toHaveLength(1);
+
+      origin.release(turn({ finalMessage: "", timedOut: true, aborted: true, toolCalls: 46, streamed: true }));
+      await dispatched;
+      await settleAcked();
+      await settleAcked();
+
+      // First-abort notice delivered, and a continuation leg dispatched.
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+      const legItem = agentManager.runWorkItemTurn.mock.calls[1][1];
+      expect(legItem.meta.deadlineRetry).toBe(1);
+      // Reuses the KPR-413 pin: the leg carries none of the four conference keys.
+      expect(legItem.meta.conferenceMode).toBeUndefined();
+      expect(legItem.meta.conferenceRound).toBeUndefined();
+      expect(legItem.meta.conferenceHumanTs).toBeUndefined();
+      expect(legItem.meta.conferenceInjectionMode).toBeUndefined();
+      expect(adapter.deliver).toHaveBeenCalledTimes(2); // ack + first-abort notice
+      expect(adapter.deliver.mock.calls[0][0].text).toBe(MEETING_ACK_TEXT);
+
+      // ← the load-bearing half: the leg hangs well past the threshold and
+      //   STILL posts no ack (there is no wrapper on that leg at all).
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 2);
+      expect(ackCalls()).toHaveLength(1);
+
+      leg.release(turn({ finalMessage: "Finished on the second pass." }));
+      await settleAcked();
+      await settleAcked();
+      expect(ackCalls()).toHaveLength(1);
+    });
+
+    it("T10 companion (KPR-417, §6.3): a ZERO-progress deadline abort acks, then a notice only — no leg, no second ack", async () => {
+      await soloClassifier();
+      mockSlackAdapter.fetchThreadHistory.mockResolvedValue([]);
+      const origin = hangingTurn();
+      agentManager.runWorkItemTurn.mockReturnValueOnce(origin.promise);
+
+      const dispatched = dispatcher.dispatch(confAckItem("conf-thread-kpr417-t10b"));
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+      expect(ackCalls()).toHaveLength(1);
+
+      // No toolCalls, not streamed, empty text ⇒ zero progress.
+      origin.release(turn({ finalMessage: "", timedOut: true, aborted: true }));
+      await dispatched;
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS * 2);
+
+      expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(1); // no leg
+      expect(ackCalls()).toHaveLength(1);
+      expect(adapter.deliver).toHaveBeenCalledTimes(2); // ack + zero-progress notice
+      expect(adapter.deliver.mock.calls[0][0].text).toBe(MEETING_ACK_TEXT);
+    });
+
+    it("T12 (KPR-417, §6.5): a failed ack delivery is warned and dropped — never retried, and the turn is unaffected", async () => {
+      // A retried ack lands minutes later, potentially AFTER the answer. A
+      // dropped ack is strictly better than a late one, so it must never reach
+      // the retry queue (unlike deliverOutageNotice, which does enqueue).
+      const retryQueue = { enqueue: vi.fn(), sweep: vi.fn() };
+      dispatcher.setRetryQueue(retryQueue as any);
+      await soloClassifier();
+      adapter.deliver.mockImplementation(async (result: any) => {
+        if (result.text === MEETING_ACK_TEXT) throw new Error("slack 503");
+      });
+      const slow = hangingTurn();
+      agentManager.runWorkItemTurn.mockReturnValue(slow.promise);
+
+      const dispatched = dispatcher.dispatch(confAckItem("conf-thread-kpr417-t12"));
+      await settleAcked();
+      await vi.advanceTimersByTimeAsync(MEETING_ACK_DELAY_MS);
+      await settleAcked();
+
+      expect(ackCalls()).toHaveLength(1); // attempted...
+      expect(retryQueue.enqueue).not.toHaveBeenCalled(); // ...and NOT queued
+
+      // The turn's own delivery still happens normally.
+      slow.release(turn({ finalMessage: "The answer regardless." }));
+      await dispatched;
+      await settleAcked();
+      const answers = adapter.deliver.mock.calls.filter((c: any[]) => c[0].text !== MEETING_ACK_TEXT);
+      expect(answers).toHaveLength(1);
+      expect(answers[0][0].text).toBe("The answer regardless.");
+      expect(retryQueue.enqueue).not.toHaveBeenCalled();
+    });
   });
 
   it("T5 (KPR-416): the exclusion write precedes BOTH the fan-out delivery and the reaction trigger", () => {
