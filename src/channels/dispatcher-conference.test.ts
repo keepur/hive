@@ -307,7 +307,7 @@ Meeting rules:
    * pass, continuation legs) — is a pure microtask chain (all harness mocks
    * resolve immediately, no timers), so an assert can run before it. One
    * macrotask boundary drains the whole chain, because the microtask queue is
-   * fully emptied before the next macrotask. Used by T4/T6/T8a/T8b/T9 and the
+   * fully emptied before the next macrotask. Used by T6/T8a/T8b/T9 and the
    * KPR-389 D5 tests alike; where a test awaits it twice, that is one boundary
    * per nested fire-and-forget generation. Negative-verified on one instance:
    * with the D5 guard disabled those tests fail in ~3ms.
