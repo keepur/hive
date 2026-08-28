@@ -159,7 +159,7 @@ describe("resolvePassthroughSpawn (KPR-346 §D4)", () => {
   });
 });
 
-describe("assertSafeBaseUrlOverride (exported for kimi/deepseek + KPR-394 plugin api-key-env use)", () => {
+describe("assertSafeBaseUrlOverride (exported for kimi/deepseek + KPR-394 plugin base-url-env use)", () => {
   const call = (url: string) => assertSafeBaseUrlOverride(url, "TEST_URL_ENV");
 
   it.each(["http://localhost:9999", "http://127.0.0.1:8317", "http://127.5.5.5:80", "http://[::1]:8317", "https://gw.internal.example:8317"])(
