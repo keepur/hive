@@ -263,15 +263,27 @@ Meeting rules:
    * reaction pass. The behavioral pins (T1, T3, T9) assert through
    * triggerConferenceReactions instead. Same `dispatcher as unknown as {...}`
    * convention as the T6/C4 guard below.
+   *
+   * KPR-420: the leaf is now Map<agentId, "claim" | "delivery-mark">.
+   * excludedFor projects KEYS to a value-level Set — membership still means
+   * "excluded", so the existing value assertions stand unmodified. The
+   * projection is deliberately shape-agnostic (Set.prototype.keys() yields
+   * values), which keeps it working against pre-fix code for the T1
+   * negative-verify pass. rawTrackerLeaf exposes the tag itself for the
+   * KPR-420 provenance assertions.
    */
-  const excludedFor = (threadId: string, humanTs: string): Set<string> | undefined =>
+  const rawTrackerLeaf = (threadId: string, humanTs: string): Map<string, "claim" | "delivery-mark"> | undefined =>
     (
       dispatcher as unknown as {
-        meetingReactionTracker: Map<string, Map<string, Set<string>>>;
+        meetingReactionTracker: Map<string, Map<string, Map<string, "claim" | "delivery-mark">>>;
       }
     ).meetingReactionTracker
       .get(threadId)
       ?.get(humanTs);
+  const excludedFor = (threadId: string, humanTs: string): Set<string> | undefined => {
+    const leaf = rawTrackerLeaf(threadId, humanTs);
+    return leaf === undefined ? undefined : new Set(leaf.keys());
+  };
 
   const zeroUsage = {
     inputTokens: 0,
@@ -528,6 +540,8 @@ Meeting rules:
     // on microtasks alone — all other harness mocks resolve immediately) ahead
     // of every reaction pass, by construction rather than by await-depth
     // coincidence. A flaky T3 is not acceptable as the KPR-387 guard.
+    // "T1 (KPR-420)" below is the UNSUPPRESSED sibling: it engineers the
+    // real mid-await interleaving this boundary deliberately orders away.
     adapter.deliver.mockImplementation(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
@@ -1754,6 +1768,11 @@ Meeting rules:
     // Spec: docs/epics/kpr-415/kpr-416-spec.md §6.4(d). The follow-on child
     // filed against KPR-415 INVERTS this assertion — when it lands, this test
     // is expected to change, and that is the signal, not a regression.
+    //
+    // KPR-420 non-conflation note: this residual is CLAIM-TIME invitation of
+    // an in-flight peer (KPR-419's scope). It is distinct from RELEASE-TIME
+    // erasure of a landed peer's delivery mark, which KPR-420 fixed (see
+    // "T1 (KPR-420)" below) — the two must not be conflated.
     const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
     (classifyMeetingMessage as any)
       .mockResolvedValueOnce({ respondAgentIds: ["jasper", "river"], costUsd: 0.001, durationMs: 100 })
@@ -1793,6 +1812,175 @@ Meeting rules:
     releaseRiver();
     await dispatched;
     await settleReactions();
+  });
+
+  it("T1 (KPR-420): a round-0 primary that delivers DURING a sibling's classifier await stays excluded after release", async () => {
+    // The delivery-mark erasure race (kpr-420-spec.md §1), engineered for
+    // real — the unsuppressed sibling of the macrotask-ordered KPR-387 guard
+    // above (:517). Sequence: jasper delivers fast and his reaction pass
+    // synchronously claims river + jessica, then parks on a HELD classifier
+    // call; river's round-0 turn delivers mid-await (promoting his claim to
+    // a delivery mark); the classifier resolves selecting nobody, so the
+    // release loop runs; jessica then delivers round-0 and fires her own
+    // pass. Pre-fix the release erased river's mark (claim and delivery mark
+    // were the same aliased Set entry), so jessica's pass re-claimed river
+    // and selected him for a round-1 reaction to a trigger he had already
+    // answered. Post-fix the release spares the promoted entry and river
+    // never reappears in any roster.
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    const threadId = "conf-thread-kpr420-t1";
+    const humanText = "Jasper, River, and Jessica, discuss the launch plan";
+
+    let resolveJasperPass!: (v: unknown) => void;
+    const jasperPassHeld = new Promise((r) => {
+      resolveJasperPass = r;
+    });
+    (classifyMeetingMessage as any).mockImplementation(async (text: string) => {
+      if (text === humanText) {
+        // Round-0: all three named agents are primaries.
+        return { respondAgentIds: ["jasper", "river", "jessica"], costUsd: 0.001, durationMs: 100 };
+      }
+      if (text === "Jasper's answer") return jasperPassHeld; // held mid-await
+      if (text === "Jessica's answer") {
+        // Reachable PRE-FIX ONLY (post-fix jessica's peerMembers is empty and
+        // no call happens): select river — the erased-mark re-invitation.
+        return { respondAgentIds: ["river"], costUsd: 0.001, durationMs: 100 };
+      }
+      return { respondAgentIds: [], costUsd: 0.001, durationMs: 100 };
+    });
+
+    let releaseRiver!: () => void;
+    const riverGate = new Promise<void>((r) => (releaseRiver = r));
+    let releaseJessica!: () => void;
+    const jessicaGate = new Promise<void>((r) => (releaseJessica = r));
+    agentManager.runWorkItemTurn.mockImplementation(async (agentId: string, dispatchedItem: any) => {
+      if (agentId === "river" && dispatchedItem?.meta?.conferenceRound === 0) {
+        await riverGate;
+        return turn({ finalMessage: "River's answer" });
+      }
+      if (agentId === "jessica") {
+        await jessicaGate;
+        return turn({ finalMessage: "Jessica's answer" });
+      }
+      return turn({ finalMessage: "Jasper's answer" });
+    });
+
+    const dispatched = dispatcher.dispatch(
+      makeWorkItem({
+        text: humanText,
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr420-t1" },
+        threadId,
+        meta: { slackTs: "1700.0420" },
+      }),
+    );
+
+    // Step 1 — jasper delivered; his pass has synchronously claimed river +
+    // jessica and is now parked on the held classifier call.
+    const jasperPassCalls = () =>
+      (classifyMeetingMessage as any).mock.calls.filter((c: any[]) => c[0] === "Jasper's answer");
+    await vi.waitFor(() => expect(jasperPassCalls().length).toBe(1));
+
+    // Step 2 — river's round-0 turn delivers MID-AWAIT (write site 1 fires;
+    // river's own pass finds nothing unclaimed and returns without a
+    // classifier call).
+    releaseRiver();
+    await vi.waitFor(() =>
+      expect(adapter.deliver.mock.calls.some((c: any[]) => c[0].text === "River's answer")).toBe(true),
+    );
+
+    // Step 3 — jasper's classifier resolves selecting nobody; the release
+    // loop runs over his pass's peerMembers (river + jessica).
+    resolveJasperPass({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+    await settleReactions();
+
+    // Step 4 — jessica delivers round-0 and fires her own pass.
+    releaseJessica();
+    await dispatched;
+    await settleReactions();
+    await settleReactions();
+
+    // No reaction-pass roster captured after river's delivery contains river.
+    const jessicaPassRosters = (classifyMeetingMessage as any).mock.calls
+      .filter((c: any[]) => c[0] === "Jessica's answer")
+      .map((c: any[]) => c[1].map((m: any) => m.agentId));
+    for (const rosterIds of jessicaPassRosters) {
+      expect(rosterIds).not.toContain("river"); // pre-fix: FAILS — river re-claimed
+    }
+
+    // River ran exactly once (round-0) — never a round-1 turn on this trigger.
+    const riverTurns = agentManager.runWorkItemTurn.mock.calls.filter((c: any[]) => c[0] === "river");
+    expect(riverTurns.length).toBe(1); // pre-fix: FAILS at 2
+
+    // The promoted entry survived release as a delivery mark.
+    expect(excludedFor(threadId, "1700.0420")?.has("river")).toBe(true);
+    expect(rawTrackerLeaf(threadId, "1700.0420")?.get("river")).toBe("delivery-mark");
+  });
+
+  it("T2 (KPR-420): an unselected, UNDELIVERED claim is still released and re-claimable by a later pass", async () => {
+    // Pins that the provenance guard does not over-retain (spec goal 2, the
+    // KPR-387→KPR-416 release semantics unchanged): jessica is a roster
+    // member who is NOT a round-0 primary — claimed by jasper's pass, held
+    // as a plain "claim" through the classifier await, released on
+    // non-selection, then re-claimed by river's later pass. Also pins the §7
+    // convergence edge: river's claim is released while he is undelivered,
+    // and his subsequent delivery writes a FRESH "delivery-mark".
+    const { classifyMeetingMessage } = await import("../agents/meeting-classifier.js");
+    const threadId = "conf-thread-kpr420-t2";
+    const humanText = "Jasper, River, and Jessica, discuss the launch plan";
+
+    let resolveJasperPass!: (v: unknown) => void;
+    const jasperPassHeld = new Promise((r) => {
+      resolveJasperPass = r;
+    });
+    (classifyMeetingMessage as any).mockImplementation(async (text: string) => {
+      if (text === humanText) {
+        // Round-0: jasper + river only — jessica never runs a round-0 turn.
+        return { respondAgentIds: ["jasper", "river"], costUsd: 0.001, durationMs: 100 };
+      }
+      if (text === "Jasper's answer") return jasperPassHeld;
+      return { respondAgentIds: [], costUsd: 0.001, durationMs: 100 };
+    });
+
+    let releaseRiver!: () => void;
+    const riverGate = new Promise<void>((r) => (releaseRiver = r));
+    agentManager.runWorkItemTurn.mockImplementation(async (agentId: string) => {
+      if (agentId === "river") {
+        await riverGate;
+        return turn({ finalMessage: "River's answer" });
+      }
+      return turn({ finalMessage: "Jasper's answer" });
+    });
+
+    const dispatched = dispatcher.dispatch(
+      makeWorkItem({
+        text: humanText,
+        source: { kind: "slack", id: "C-CONF", label: "conf-kpr420-t2" },
+        threadId,
+        meta: { slackTs: "1700.0421" },
+      }),
+    );
+
+    // Jasper's pass has claimed river (in-flight) and jessica (never runs).
+    const jasperPassCalls = () =>
+      (classifyMeetingMessage as any).mock.calls.filter((c: any[]) => c[0] === "Jasper's answer");
+    await vi.waitFor(() => expect(jasperPassCalls().length).toBe(1));
+    expect(rawTrackerLeaf(threadId, "1700.0421")?.get("jessica")).toBe("claim");
+
+    // Classifier selects nobody → both UNDELIVERED claims are released.
+    resolveJasperPass({ respondAgentIds: [], costUsd: 0.001, durationMs: 100 });
+    await settleReactions();
+    expect(excludedFor(threadId, "1700.0421")?.has("jessica")).toBe(false);
+    expect(excludedFor(threadId, "1700.0421")?.has("river")).toBe(false);
+
+    // River then delivers round-0: fresh "delivery-mark", and his own pass
+    // re-claims jessica — release did not over-retain.
+    releaseRiver();
+    await dispatched;
+    await settleReactions();
+    const riverPassCalls = (classifyMeetingMessage as any).mock.calls.filter((c: any[]) => c[0] === "River's answer");
+    expect(riverPassCalls.length).toBe(1);
+    expect(riverPassCalls[0][1].map((m: any) => m.agentId)).toContain("jessica");
+    expect(rawTrackerLeaf(threadId, "1700.0421")?.get("river")).toBe("delivery-mark");
   });
 
   describe("round-1 kill suppression (KPR-389 D5)", () => {

@@ -174,6 +174,12 @@ export interface OutageHandlingDeps {
   config: OutageQueueConfig;
 }
 
+/** KPR-420: provenance tag for a reaction-tracker entry. "claim" = written by
+ *  triggerConferenceReactions' claim-before-await loop, releasable on
+ *  non-selection; "delivery-mark" = written by markReactionExclusion at a
+ *  KPR-416 delivery site (or promoted from a claim mid-await), never released. */
+type ReactionTrackerEntry = "claim" | "delivery-mark";
+
 export class Dispatcher {
   private adapters = new Map<string, ChannelAdapter>();
   private registry: AgentRegistry;
@@ -197,13 +203,18 @@ export class Dispatcher {
    *  Absent ⇒ every conference path behaves exactly as pre-KPR-409. */
   private meetingScribe?: MeetingScribe;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
-  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents excluded from
-  // reacting on this human message, either round (KPR-387). Round-0 primaries
-  // are recorded at DELIVERY time (KPR-416 — markReactionExclusion, three call
-  // sites; supersedes KPR-386 canon C1's selection-time recording, so a
-  // SUPPRESSED primary is no longer excluded), round-1 reactors at claim time
-  // (triggerConferenceReactions). Shape, keying and TTL are unchanged (C2).
-  private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
+  // Map<threadId, Map<humanMessageTs, Map<agentId, ReactionTrackerEntry>>> —
+  // agents excluded from reacting on this human message, either round
+  // (KPR-387). Round-0 primaries are recorded at DELIVERY time (KPR-416 —
+  // markReactionExclusion, three call sites; supersedes KPR-386 canon C1's
+  // selection-time recording, so a SUPPRESSED primary is no longer excluded),
+  // round-1 reactors at claim time (triggerConferenceReactions). Keying and
+  // TTL are unchanged; the leaf was amended by KPR-420 to carry PROVENANCE
+  // (ReactionTrackerEntry) so release-on-non-selection can tell an erasable
+  // claim from a delivery mark. Membership (.has) still means "excluded" and
+  // stays the SINGLE exclusion read — never introduce a second exclusion
+  // structure (KPR-415 canon C19).
+  private meetingReactionTracker = new Map<string, Map<string, Map<string, ReactionTrackerEntry>>>();
   /** KPR-417: delay-then-ack master switch, mirrored from
    *  config.meetingWorkers.ackEnabled by index.ts. FAIL-CLOSED default: an
    *  unwired dispatcher (a test harness, or a mis-ordered boot) posts no acks
@@ -682,8 +693,10 @@ export class Dispatcher {
    * first-abort/terminal, replay-terminal) never reach a call site and so
    * never mark: they are engine chrome, not agent content.
    *
-   * Synchronous and idempotent (Set add). Tracker shape, keying and TTL are
-   * unchanged — KPR-386 canon C2 preserved, C1 superseded.
+   * Synchronous and idempotent (unconditional Map set). Tracker keying and
+   * TTL are unchanged — KPR-386 canon C1 superseded; the leaf carries a
+   * KPR-420 provenance tag ("delivery-mark" here), so a write landing on an
+   * existing "claim" is a PROMOTION the release loop must spare.
    * Spec: docs/epics/kpr-415/kpr-416-spec.md §5.3.
    */
   private markReactionExclusion(item: WorkItem, agentId: string): void {
@@ -697,8 +710,8 @@ export class Dispatcher {
       this.meetingReactionTracker.set(threadId, new Map());
     }
     const threadTracker = this.meetingReactionTracker.get(threadId)!;
-    const responded = threadTracker.get(ts) ?? new Set<string>();
-    responded.add(agentId);
+    const responded = threadTracker.get(ts) ?? new Map<string, ReactionTrackerEntry>();
+    responded.set(agentId, "delivery-mark");
     threadTracker.set(ts, responded);
   }
 
@@ -1845,9 +1858,12 @@ export class Dispatcher {
         // the window in which this agent could be re-invited as a reactor to
         // its own trigger is zero by construction — there is nothing here to
         // race. Do NOT move it below either call (pinned by T5).
-        // The remaining window is cross-agent, not self: a PEER whose own
-        // round-0 turn has not landed can still be invited. That is the
-        // accepted, deferred residual — kpr-416-spec.md §6.4(d), pinned T9.
+        // The remaining window is cross-agent, not self — and it is ONLY the
+        // claim-time half: a PEER whose round-0 turn has not landed can be
+        // claimed and invited. That is the accepted, deferred residual —
+        // kpr-416-spec.md §6.4(d), owned by KPR-419, pinned T9. Release-time
+        // erasure of a LANDED peer's delivery mark is FIXED (KPR-420, the
+        // provenance-guarded release) — do not conflate the two.
         this.markReactionExclusion(effectiveItem, agentId);
         await this.deliverAgentResult(workResult, adapter);
 
@@ -2290,7 +2306,7 @@ Meeting rules:
       this.meetingReactionTracker.set(threadId, new Map());
     }
     const threadTracker = this.meetingReactionTracker.get(threadId)!;
-    const reacted = threadTracker.get(humanTs) ?? new Set<string>();
+    const reacted = threadTracker.get(humanTs) ?? new Map<string, ReactionTrackerEntry>();
     threadTracker.set(humanTs, reacted);
 
     // Build roster of peers who haven't reacted yet.
@@ -2302,7 +2318,11 @@ Meeting rules:
       if (reacted.has(agentId)) continue;
       const agent = this.registry.get(agentId);
       if (!agent || agent.disabled) continue;
-      reacted.add(agentId); // claim before await — prevents race with concurrent calls
+      // Claim before await — prevents race with concurrent calls. The
+      // reacted.has() skip above guarantees this never overwrites an
+      // existing "delivery-mark" (an agent already present never enters
+      // peerMembers).
+      reacted.set(agentId, "claim");
       peerMembers.push({
         agentId: agent.id,
         name: agent.name,
@@ -2316,11 +2336,28 @@ Meeting rules:
     // Classify which peers should react to this response
     const classification = await classifyMeetingMessage(responseText, peerMembers);
 
-    // Release peers that weren't selected — they can still be triggered by other round-0 responders
+    // Release peers that weren't selected — they can still be triggered by
+    // other round-0 responders. KPR-420: delete only entries still tagged
+    // "claim" — this read runs AFTER the classifier await above, exactly
+    // where a mid-await promotion is observable, so a peer whose round-0
+    // turn DELIVERED during the await keeps its "delivery-mark" instead of
+    // being erased and re-invited to a trigger it already answered (the
+    // delivery-mark erasure found at integrated-head review round 1).
     const selectedSet = new Set(classification.respondAgentIds);
     for (const member of peerMembers) {
       if (!selectedSet.has(member.agentId)) {
-        reacted.delete(member.agentId);
+        if (reacted.get(member.agentId) === "claim") {
+          reacted.delete(member.agentId);
+        } else if (reacted.get(member.agentId) === "delivery-mark") {
+          // Diagnostically motivated (this race was found by a live probe —
+          // this line makes the next probe free); redaction-compliant: ids
+          // and ts only, never message text.
+          log.info("Reaction release spared delivered peer", {
+            threadId,
+            humanTs,
+            agentId: member.agentId,
+          });
+        }
       }
     }
 
