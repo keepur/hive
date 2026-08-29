@@ -595,6 +595,72 @@ describe("KPR-184 — AgentRegistry sanitizes in-process-ported servers from del
   });
 });
 
+describe("KPR-324 C7 — AgentRegistry strips voice-fixture from non-pilot coreServers", () => {
+  let FixtureAgentRegistry: AgentRegistryModule["AgentRegistry"];
+
+  beforeAll(async () => {
+    const registryModule = await import("./agent-registry.js");
+    FixtureAgentRegistry = registryModule.AgentRegistry;
+  });
+
+  /** log.error emits to stderr (logger.ts) — capture it to assert the operator-facing alarm. */
+  function captureStderr(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array): boolean => {
+      lines.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    });
+    return { lines, restore: () => spy.mockRestore() };
+  }
+
+  it("strips voice-fixture from a non-pilot agent and logs an error", async () => {
+    const def = makeDefinition({
+      _id: "nora",
+      coreServers: ["contacts", "voice-fixture"],
+    });
+    const registry = new FixtureAgentRegistry(makeFakeCollection([def]));
+    const captured = captureStderr();
+    try {
+      await registry.load();
+    } finally {
+      captured.restore();
+    }
+
+    expect(registry.get("nora")?.coreServers).toEqual(["contacts"]);
+    expect(captured.lines.some((l) => l.includes("voice-fixture is test-only"))).toBe(true);
+  });
+
+  it("keeps voice-fixture on the dedicated voice-pilot agent", async () => {
+    const def = makeDefinition({
+      _id: "voice-pilot",
+      coreServers: ["voice-fixture"],
+    });
+    const registry = new FixtureAgentRegistry(makeFakeCollection([def]));
+    await registry.load();
+
+    expect(registry.get("voice-pilot")?.coreServers).toEqual(["voice-fixture"]);
+  });
+
+  it("loads the stripped agent successfully (non-fatal sanitization)", async () => {
+    const def = makeDefinition({
+      _id: "stripped-fixture-agent",
+      coreServers: ["voice-fixture"],
+    });
+    const registry = new FixtureAgentRegistry(makeFakeCollection([def]));
+    const captured = captureStderr();
+    let result: Awaited<ReturnType<typeof registry.load>>;
+    try {
+      result = await registry.load();
+    } finally {
+      captured.restore();
+    }
+
+    expect(result.added).toContain("stripped-fixture-agent");
+    expect(registry.get("stripped-fixture-agent")).toBeDefined();
+    expect(registry.get("stripped-fixture-agent")?.coreServers).toEqual([]);
+  });
+});
+
 describe("AgentRegistry toolSearch sanitization (KPR-329)", () => {
   beforeAll(async () => {
     const registryModule = await import("./agent-registry.js");

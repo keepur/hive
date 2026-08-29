@@ -44,7 +44,11 @@ import {
   DELEGATE_UNSAFE_SERVERS as DELEGATE_UNSAFE_SERVER_NAMES,
   TURN_CONTEXT_DEPENDENT_SERVERS,
 } from "./server-traits.js";
-import { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
+import {
+  IN_PROCESS_PORTED_SERVERS,
+  VOICE_FIXTURE_SERVER_NAME,
+  VOICE_FIXTURE_ALLOWED_AGENT_ID,
+} from "./in-process-servers.js";
 
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
@@ -67,6 +71,7 @@ import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import { createWorkerPoolMcpServer } from "../workers/worker-pool-mcp-server.js";
+import { createVoiceFixtureMcpServer } from "../voice/voice-fixture-mcp-server.js";
 import type { MeetingWorkerPool, WorkerPoolTurnContext } from "../workers/meeting-worker-pool.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
@@ -387,6 +392,8 @@ export class AgentRunner {
   private workerPoolMcpServer?: ReturnType<typeof createWorkerPoolMcpServer>;
   private workerPoolContextRef: { current: WorkerPoolTurnContext } = { current: {} };
   private workerPool?: MeetingWorkerPool;
+  // KPR-324 C7: voice-pilot-only test fixture (no db dependency — canned data).
+  private voiceFixtureMcpServer?: ReturnType<typeof createVoiceFixtureMcpServer>;
   private readonly suppressAutoInjectedServers: boolean;
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
@@ -1408,6 +1415,30 @@ export class AgentRunner {
       });
     }
 
+    // KPR-324 C7 + KPR-327 pattern: voice-fixture is in-process-only with no
+    // stdio placeholder — surface its descriptor explicitly so the Lane B
+    // partition sees it honestly (bridged, not silently absent). Gate
+    // mirrors the runtime wiring in buildInProcessServers, including the
+    // voice-pilot-only belt. (Standing obligation, CLAUDE.md "Adding an
+    // in-process MCP server".)
+    if (
+      this.agentConfig.id === VOICE_FIXTURE_ALLOWED_AGENT_ID &&
+      this.shouldEnableInProcessServer(VOICE_FIXTURE_SERVER_NAME) &&
+      !mcpServers[VOICE_FIXTURE_SERVER_NAME]
+    ) {
+      inventory.push({
+        ...classifyToolTransport({
+          name: VOICE_FIXTURE_SERVER_NAME,
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: false,
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
+    }
+
     if (this.teamRoster && !this.suppressAutoInjectedServers) {
       inventory.push({
         ...classifyToolTransport({
@@ -1643,6 +1674,21 @@ export class AgentRunner {
         });
       }
       servers["worker-pool"] = this.workerPoolMcpServer;
+    }
+
+    // KPR-324 C7: voice-fixture — in-process test double, voice-pilot ONLY.
+    // Double gate: registry load already strips it from other defs; this
+    // agent-id check is the belt so a bypassed registry (direct DB write +
+    // SIGUSR1 race) still cannot arm the fixture on a production agent.
+    // No db dependency — canned data. No SERVER_CATALOG key (C8 trap).
+    if (
+      this.agentConfig.id === VOICE_FIXTURE_ALLOWED_AGENT_ID &&
+      this.shouldEnableInProcessServer(VOICE_FIXTURE_SERVER_NAME)
+    ) {
+      if (!this.voiceFixtureMcpServer) {
+        this.voiceFixtureMcpServer = createVoiceFixtureMcpServer();
+      }
+      servers[VOICE_FIXTURE_SERVER_NAME] = this.voiceFixtureMcpServer;
     }
 
     // KPR-122: structured-memory MCP — in-process, paired with memory.
