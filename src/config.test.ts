@@ -293,7 +293,10 @@ describe("resolveMeetingWorkersConfig (KPR-390)", () => {
     // ⚠ THE INDEPENDENCE PIN (spec §5.6). `scribeEnabled` is nested under
     // `enabled` because the scribe consumes pool machinery; the ack consumes
     // none. Disabling fetch-workers must NOT silently kill the ack. If a
-    // future edit nests ackEnabled under `enabled`, this line fails.
+    // future edit nests ackEnabled under `enabled` IN THE RESOLVER, this line
+    // fails. It does NOT cover the consumption end: `enabled && ackEnabled` at
+    // index.ts's setMeetingAckEnabled call would keep this green, which is why
+    // boot-order.test.ts list (a) anchors that call's exact ARGUMENT.
     expect(resolveMeetingWorkersConfig({ enabled: false }).ackEnabled).toBe(true);
     expect(resolveMeetingWorkersConfig({ enabled: false }).enabled).toBe(false);
   });
