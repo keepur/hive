@@ -477,8 +477,8 @@ async function main(): Promise<void> {
   // Everything BELOW this line can dispatch a turn: bgTaskManager /
   // codeTaskManager orphan-completion callbacks, meetingMonitor, every
   // channel adapter, the scheduler. Anything a turn READS PER SPAWN —
-  // provider plugins, the worker pool, the meeting scribe — must be wired
-  // ABOVE it, or turns in the boot window silently see the pre-feature
+  // provider plugins, the worker pool, the meeting scribe, the ack lever —
+  // must be wired ABOVE it, or turns in the boot window silently see the pre-feature
   // engine. Guarded by src/boot-order.test.ts.
 
   // Background task manager — agents can spawn detached background processes
