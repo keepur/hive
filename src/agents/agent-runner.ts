@@ -144,6 +144,16 @@ export interface RunResult {
   toolMs: number;
   toolCalls: number;
   toolSummary: string;
+  /**
+   * KPR-324 C5a/S4: count of hive-injected tool-start acknowledgment phrases
+   * spoken on this turn (voice channel only — 0 on every other channel, when
+   * voice.toolAck.enabled is false, or when the model spoke before each
+   * tool_use). REQUIRED, not optional: a spawn-loop counter that is not on
+   * RunResult drops at the finalizeSpawnResult copy and the adapter logs
+   * 0/undefined (spec §4.6) — the required type makes every construction
+   * site declare it.
+   */
+  toolAckInjected: number;
   streamed: boolean;
   inputTokens: number;
   outputTokens: number;
@@ -2508,7 +2518,7 @@ export class AgentRunner {
     return {
       text: resultText, sessionId: resultSessionId, costUsd, durationMs,
       llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length,
-      toolSummary: toolSummary || "none", streamed,
+      toolSummary: toolSummary || "none", toolAckInjected: 0, streamed,
       inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
       ephemeral5mTokens, ephemeral1hTokens,
       contextWindow, compactions, preCompactTokens,

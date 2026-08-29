@@ -318,6 +318,10 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
       llmMs: Math.max(0, durationMs - toolMs),
       toolMs,
       toolCalls,
+      // KPR-324 C5a: Lane B adapters never inject voice acks (spec §4.3 —
+      // W5 voice is Claude-lane; a future Lane B voice path reopens the
+      // helper at that adapter's tool-round boundary). Honest zero.
+      toolAckInjected: 0,
       toolSummary,
       streamed,
       inputTokens,

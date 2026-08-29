@@ -190,6 +190,7 @@ function makeMockAgentManager() {
       toolMs: 0,
       toolCalls: 0,
       toolSummary: null,
+      toolAckInjected: 0,
       streamed: false,
       compactions: 0,
     }),
@@ -210,6 +211,7 @@ function makeMockAgentManager() {
       toolMs: 0,
       toolCalls: 0,
       toolSummary: null,
+      toolAckInjected: 0,
       streamed: false,
       compactions: 0,
     }),
@@ -442,6 +444,7 @@ describe("Dispatcher routing", () => {
       toolMs: 0,
       toolCalls: 0,
       toolSummary: null,
+      toolAckInjected: 0,
       streamed: false,
       compactions: 0,
     });
@@ -868,6 +871,7 @@ describe("Per-turn dispatch (unconditional, KPR-220 Phase 9)", () => {
       toolMs: 333,
       toolCalls: 7,
       toolSummary: "memory:1x",
+      toolAckInjected: 0,
       streamed: true,
       compactions: 1,
       preCompactTokens: 12345,
@@ -893,6 +897,20 @@ describe("Per-turn dispatch (unconditional, KPR-220 Phase 9)", () => {
     expect(fields.toolMs).toBe(333);
     expect(fields.toolCalls).toBe(7);
     expect(fields.toolSummary).toBe("memory:1x");
+  });
+
+  it("KPR-324 C5e: convertTurnResult maps toolAckInjected TurnResult → RunResult", () => {
+    // The helper's contract is "every RunResult field mapped explicitly" —
+    // a dropped field here would silently zero/undefined the counter on the
+    // chat lane. Asserted directly on the private helper because the
+    // `Work item dispatched` log deliberately does not carry the field
+    // (chat is always 0; the counter is a voice-lane signal, C5d).
+    const converted = (
+      dispatcher as unknown as {
+        convertTurnResult: (t: ReturnType<typeof makeTurn>) => { toolAckInjected: number };
+      }
+    ).convertTurnResult(makeTurn({ toolAckInjected: 2 }));
+    expect(converted.toolAckInjected).toBe(2);
   });
 
   it("KPR-401: aborted/timedOut TurnResult surfaces both flags + non-negative llmMs on the work-item-dispatched log", async () => {
@@ -930,6 +948,7 @@ describe("Per-turn dispatch (unconditional, KPR-220 Phase 9)", () => {
       toolMs: 294_391,
       toolCalls: 46,
       toolSummary: "Bash:46x/294.4s",
+      toolAckInjected: 0,
       streamed: true,
       compactions: 0,
       timedOut: true,
@@ -1192,6 +1211,7 @@ function makeTurn(overrides: Record<string, unknown> = {}) {
     toolMs: 0,
     toolCalls: 0,
     toolSummary: null,
+    toolAckInjected: 0,
     streamed: false,
     compactions: 0,
     ...overrides,
@@ -2275,6 +2295,7 @@ describe("outage-mode delivery preference (KPR-308)", () => {
       toolMs: 0,
       toolCalls: 0,
       toolSummary: null,
+      toolAckInjected: 0,
       streamed: false,
       compactions: 0,
     });

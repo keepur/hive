@@ -314,6 +314,10 @@ function makeRunResult(overrides: Partial<RunResult> = {}) {
     toolMs: 200,
     toolCalls: 1,
     toolSummary: "memory:1x/0.2s",
+    // KPR-324 C5a: the helper's return type is INFERRED, not annotated
+    // `: RunResult` — a missing field compiles clean and would surface only as
+    // a runtime `undefined` in the C5c copy-path assertion below.
+    toolAckInjected: 0,
     streamed: false,
     aborted: false,
     inputTokens: 100,
@@ -1277,6 +1281,28 @@ describe("AgentManager", () => {
       mockRunnerSend.mockResolvedValueOnce(makeRunResult({ toolSummary: "" }));
       const result = await manager.spawnTurn(smsCtx());
       expect(result.toolSummary).toBeNull();
+    });
+
+    it("KPR-324 C5c: finalizeSpawnResult copies RunResult.toolAckInjected onto TurnResult", async () => {
+      // The copy is channel-agnostic — an SMS turn proves it, because the
+      // voice-only gating lives in the spawn loops (C2/C3) that PRODUCE the
+      // counter, never in finalizeSpawnResult which merely carries it.
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ toolAckInjected: 3 }));
+      const result = await manager.spawnTurn(smsCtx());
+      expect(result.toolAckInjected).toBe(3);
+    });
+
+    it("KPR-324 C5c: a RunResult omitting toolAckInjected degrades to 0, never undefined", async () => {
+      // The `?? 0` belt for out-of-engine adapters (KPR-394 provider plugins
+      // compiled against an older pkg/types/ RunResult). Cast because the
+      // in-engine type makes the field required.
+      mockConversationIndex.mockResolvedValue(undefined);
+      const legacyShape = makeRunResult() as Record<string, unknown>;
+      delete legacyShape.toolAckInjected;
+      mockRunnerSend.mockResolvedValueOnce(legacyShape);
+      const result = await manager.spawnTurn(smsCtx());
+      expect(result.toolAckInjected).toBe(0);
     });
 
     it("KPR-220 Phase 2: withSpawnTicket registers the ticket in activeTickets during fn, removes after", async () => {

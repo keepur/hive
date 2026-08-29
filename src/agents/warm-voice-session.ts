@@ -642,6 +642,10 @@ export class WarmVoiceSession {
       llmMs: Math.max(0, durationMs - totalToolMs),
       toolMs: totalToolMs,
       toolCalls: toolCalls.length,
+      // KPR-324 C5a: placeholder zero — unlike turn-scaffold's honest Lane B
+      // zero, the warm voice lease IS an ack-injecting path; its live counter
+      // lands here when the warm-loop injection ships (C3).
+      toolAckInjected: 0,
       toolSummary: toolSummary || "none",
       streamed,
       inputTokens,

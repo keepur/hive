@@ -486,6 +486,11 @@ export class Dispatcher {
       toolMs: turn.toolMs,
       toolCalls: turn.toolCalls,
       toolSummary: turn.toolSummary ?? "",
+      // KPR-324 C5e: helper contract — every RunResult field mapped
+      // explicitly. Voice never passes through here (routeVoiceTurn returns
+      // TurnResult straight from spawnTurn); this mapping keeps the chat
+      // lane's RunResult honest and is what C5a's required type enforces.
+      toolAckInjected: turn.toolAckInjected,
       streamed: turn.streamed,
       compactions: turn.compactions,
       preCompactTokens: turn.preCompactTokens,
