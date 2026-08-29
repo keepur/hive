@@ -2348,7 +2348,7 @@ Meeting rules:
       if (!selectedSet.has(member.agentId)) {
         if (reacted.get(member.agentId) === "claim") {
           reacted.delete(member.agentId);
-        } else {
+        } else if (reacted.get(member.agentId) === "delivery-mark") {
           // Diagnostically motivated (this race was found by a live probe —
           // this line makes the next probe free); redaction-compliant: ids
           // and ts only, never message text.

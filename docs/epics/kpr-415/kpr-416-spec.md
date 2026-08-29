@@ -358,7 +358,7 @@ Full reasoning: the `# Decision Register Entry` comment keyed to `fa48196` on KP
 
 ## 15. Post-KPR-420 addendum — the release loop is no longer "unchanged" (2026-08-29)
 
-*Appended by KPR-420 (`kpr-420-spec.md`, blocking corrective from integrated-head review round 1). Append-only, per the §14 precedent — the superseded rows and sentences below stay as written.*
+*Appended by KPR-420 (`kpr-420-spec.md`, blocking corrective from integrated-head review round 1). Append-only, per the §14 precedent — the superseded rows and sentences above stay as written.*
 
 KPR-420 found (verified by live probe) that this spec's delivery-time write and `triggerConferenceReactions`' claim-before-await release loop mutate the **same aliased leaf** per `(threadId, humanTs)`: a round-0 primary delivering *during* a sibling pass's classifier await had its delivery mark silently erased by the release-on-non-selection that followed — reopening C1's "delivered stays excluded" guarantee through a timing window. Corrections to this document:
 

@@ -474,7 +474,7 @@ Full reasoning: the `# Decision Register Entry` comment keyed to `2499a57` on KP
 
 ### 13.5 C18 ruling — the substitution is ratified (2026-08-29)
 
-*Appended by KPR-420 (folded-in mechanical fix, `kpr-420-spec.md` §5.5). Added rather than edited in place — the same append-only convention as §13 itself; the superseded lines below stay as written.*
+*Appended by KPR-420 (folded-in mechanical fix, `kpr-420-spec.md` §5.5). Added rather than edited in place — the same append-only convention as §13 itself; the superseded lines above stay as written.*
 
 §13.3's pending `GATE1_AMENDMENT` is **resolved**: May Huang ratified the delay-then-ack substitution at the 15s threshold **directly**, via `rule-coherence` on `2499a57` (2026-08-29, ruling session `rule-kpr415-20260829T045458Z`) — now canon **KPR-415/C18**. Consequences for this document:
 
