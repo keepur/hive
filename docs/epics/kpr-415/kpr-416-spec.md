@@ -355,3 +355,13 @@ No Gate-1 amendment, no corrective ticket, and **no affected children** — KPR-
 The review also named one cost §6.4(d) did not: `agent-manager`'s per-thread lock is a **spin-wait**, so the serialized round-0-then-round-1 pair can burn two full turn deadlines back to back with the thread lock held.
 
 Full reasoning: the `# Decision Register Entry` comment keyed to `fa48196` on KPR-415, and the `## Decision Register — Canon` section of that epic's description.
+
+## 15. Post-KPR-420 addendum — the release loop is no longer "unchanged" (2026-08-29)
+
+*Appended by KPR-420 (`kpr-420-spec.md`, blocking corrective from integrated-head review round 1). Append-only, per the §14 precedent — the superseded rows and sentences below stay as written.*
+
+KPR-420 found (verified by live probe) that this spec's delivery-time write and `triggerConferenceReactions`' claim-before-await release loop mutate the **same aliased leaf** per `(threadId, humanTs)`: a round-0 primary delivering *during* a sibling pass's classifier await had its delivery mark silently erased by the release-on-non-selection that followed — reopening C1's "delivered stays excluded" guarantee through a timing window. Corrections to this document:
+
+- **§8's integration-points row "`triggerConferenceReactions` unchanged" (`:253`, including the release at `:1911`) is falsified**, as are its echoes — the §3 non-goal at `:59` and §5.4's untouched list at `:129`. The release loop is now **provenance-guarded**: the tracker leaf is `Map<agentId, "claim" | "delivery-mark">` (KPR-415/C19), `markReactionExclusion` writes/promotes to `"delivery-mark"`, and release deletes only entries still tagged `"claim"`. Membership semantics (`.has()` = excluded), keying, and TTL are unchanged; the "shape … unchanged (C2)" phrasing this spec carried forward from KPR-386 is amended — the amendment is leaf type only.
+- **§6.4(d)'s residual framing is narrowed.** The accepted residual is the *claim-time* half only — a peer claimed while its round-0 turn is in flight can still be selected (owned by KPR-419). Release-time erasure of a landed peer's mark was never part of that residual's bounding argument and is fixed by KPR-420 — the two must not be conflated.
+- **§14.1's boundedness re-derivation cited the release (`:2059`) without analyzing the aliasing.** Its ≤ 2N−1 conclusion survives; its argument now runs through the provenance guard (a selected reactor is still never released; a spared delivery mark only ever shrinks eligibility).
