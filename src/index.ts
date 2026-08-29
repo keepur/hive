@@ -457,10 +457,17 @@ async function main(): Promise<void> {
   // this feature's own degrade-silently rule (spec §Integration points issue 5).
   meetingScribe.ensureIndexes().catch((err) => log.error("Scribe index setup failed", { error: String(err) }));
   dispatcher.setMeetingScribe(meetingScribe);
+  // KPR-417: the delay-then-ack lever is a SPAWN-READ fact (dispatchToAgent
+  // reads it per turn), so it is wired here, above the spawn-capable boundary
+  // below — same rule as the pool and the scribe. Guarded by
+  // src/boot-order.test.ts, which carries this call as an anchor in all three
+  // of its lists.
+  dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled);
   log.info("Meeting scribe wired", {
     scribeEnabled: config.meetingWorkers.scribeEnabled,
     scribeModel: config.meetingWorkers.scribeModel,
     scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
+    ackEnabled: config.meetingWorkers.ackEnabled,
   });
 
   // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
