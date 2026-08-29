@@ -2387,7 +2387,12 @@ export class AgentRunner {
           // nested tool_use must not reset it to false (would mis-frame the next
           // top-level segment). Usage accounting above and the tool-timing/
           // logging below deliberately keep processing these messages (KPR-401)
-          // — this guard touches ack + segment state alone.
+          // — this guard touches ack + segment state alone, and only on THIS
+          // (assistant-message) branch. The text_delta branch above sets
+          // streamedThisSegment unconditionally on every delta, nesting or not
+          // — that is correct as-is, not an oversight: the SDK does not forward
+          // subagent text by default (forwardSubagentText unset), so any delta
+          // reaching that branch really was spoken to the live caller.
           const subagentNested =
             (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
           const content = assistantMessage?.content;

@@ -545,6 +545,12 @@ export class WarmVoiceSession {
             // nested call, and would move `streamedThisSegment` — which models
             // what the LIVE CALLER heard — on machinery the caller never hears.
             // Usage accounting above and tool timing below still process them.
+            // This guard covers only THIS (assistant-message) branch — the
+            // stream_event/text_delta case above sets streamedThisSegment
+            // unconditionally on every delta, nesting or not, which is correct
+            // as-is: the SDK does not forward subagent text by default
+            // (forwardSubagentText unset), so any delta reaching that branch
+            // really was spoken to the live caller.
             const subagentNested =
               (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
             const content = assistantMessage?.content;

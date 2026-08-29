@@ -373,8 +373,11 @@ describe("resolveVoiceToolAckConfig (KPR-324 C6)", () => {
       expect(resolveVoiceToolAckConfig(input).enabled).toBe(true);
     }
   });
-  it("disables on literal false only", () => {
+  it("disables on { enabled: false }", () => {
     expect(resolveVoiceToolAckConfig({ enabled: false }).enabled).toBe(false);
+  });
+  it("disables on the bare scalar false (child-PR/1 finding: the operator shorthand)", () => {
+    expect(resolveVoiceToolAckConfig(false).enabled).toBe(false);
   });
   it("enables on literal true; ignores unknown keys", () => {
     expect(resolveVoiceToolAckConfig({ enabled: true, phrases: ["x"] }).enabled).toBe(true);

@@ -267,6 +267,11 @@ export function resolveVoiceWarmPathConfig(raw: unknown): VoiceWarmPathConfig {
  * Liberal-loader style (KPR-225 F3) with the INVERSE default of 323's
  * warm-path flag: masking IS the ticket, so absent/garbage → ENABLED.
  * Only a literal `false` disables injection (the rollback lever, spec §8).
+ * Accepts a bare `voice.toolAck: false` scalar as well as `{ enabled: false }`
+ * — the rollback lever is the one setting an operator reaches for under
+ * pressure, so the scalar shorthand must not silently no-op (child-PR/1
+ * finding: the object-coercion below previously collapsed a bare `false`
+ * to `{}`, which resolved as enabled).
  * Phrases, rotation, and the fixture delay cap are constants in
  * voice-tool-ack.ts / voice-fixture-mcp-server.ts — deliberately NOT config.
  * Exported pure for unit tests.
@@ -276,6 +281,7 @@ export interface VoiceToolAckConfig {
 }
 
 export function resolveVoiceToolAckConfig(raw: unknown): VoiceToolAckConfig {
+  if (raw === false) return { enabled: false };
   const src = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
   return { enabled: src.enabled !== false };
 }
