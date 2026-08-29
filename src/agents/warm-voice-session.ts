@@ -536,19 +536,22 @@ export class WarmVoiceSession {
               cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
               cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
             }
-            // KPR-324 pre-PR R1 (cold-path twin, agent-runner.ts): exclude
-            // subagent/delegate-nested messages from ack injection ONLY. The
-            // lease runs a full AgentRunner query, so a Task delegation's
-            // nested tool_use blocks (parent_tool_use_id != null — forwarded
-            // by default) reach this same loop and would otherwise stack one
-            // canned hold line per nested call. Usage accounting above and
-            // tool timing below still process them.
+            // KPR-324 pre-PR R1/R3 (cold-path twin, agent-runner.ts): exclude
+            // subagent/delegate-nested messages from the ack decision AND from
+            // every segment-state mutation. The lease runs a full AgentRunner
+            // query, so a Task delegation's nested tool_use blocks
+            // (parent_tool_use_id != null — forwarded by default) reach this
+            // same loop and would otherwise stack one canned hold line per
+            // nested call, and would move `streamedThisSegment` — which models
+            // what the LIVE CALLER heard — on machinery the caller never hears.
+            // Usage accounting above and tool timing below still process them.
             const subagentNested =
               (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
             const content = assistantMessage?.content;
             if (Array.isArray(content)) {
               // KPR-324 §4.1: text blocks BEFORE tool blocks (same-message rule).
               if (
+                !subagentNested &&
                 content.some(
                   (b: { type?: string; text?: string }) =>
                     b.type === "text" && typeof b.text === "string" && b.text.length > 0,
@@ -590,7 +593,12 @@ export class WarmVoiceSession {
                     }
                     toolAckInjected += 1;
                   }
-                  streamedThisSegment = false; // §4.1: tool-run gap starts now
+                  // §4.1: tool-run gap starts now. Nested (subagent) tool calls
+                  // open no caller-perceived gap — they must not reset the
+                  // top-level segment's spoken state (R3, cold-path twin).
+                  if (!subagentNested) {
+                    streamedThisSegment = false;
+                  }
                   if (activeToolName && toolCalls.length > 0) {
                     toolCalls[toolCalls.length - 1]!.endMs = Date.now();
                   }

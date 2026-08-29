@@ -2374,16 +2374,20 @@ export class AgentRunner {
             cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
             cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
           }
-          // KPR-324 pre-PR R1: subagent/delegate-nested messages are excluded
-          // from ack injection ONLY. The SDK forwards subagent tool_use /
-          // tool_result blocks by default (parent_tool_use_id != null), so a
-          // single Task delegation would otherwise speak one canned hold line
-          // per NESTED tool call — several "One moment." lines for what the
-          // caller experiences as one silent gap. The ack acknowledges the
-          // model's OWN tool call to the live caller, not internal delegate
-          // machinery the caller never sees. Usage accounting above and the
-          // tool-timing/logging below deliberately keep processing these
-          // messages (KPR-401) — this guard touches the ack decision alone.
+          // KPR-324 pre-PR R1/R3: subagent/delegate-nested messages are excluded
+          // from the ack decision AND from every segment-state mutation. The SDK
+          // forwards subagent tool_use / tool_result blocks by default
+          // (parent_tool_use_id != null), so a single Task delegation would
+          // otherwise speak one canned hold line per NESTED tool call — several
+          // "One moment." lines for what the caller experiences as one silent
+          // gap. `streamedThisSegment` models what the LIVE CALLER has heard in
+          // the current segment, so machinery the caller never hears must not
+          // move it in either direction: nested text must not mark the segment
+          // "spoken" (would suppress a genuinely-silent top-level ack), and a
+          // nested tool_use must not reset it to false (would mis-frame the next
+          // top-level segment). Usage accounting above and the tool-timing/
+          // logging below deliberately keep processing these messages (KPR-401)
+          // — this guard touches ack + segment state alone.
           const subagentNested =
             (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
           const content = assistantMessage?.content;
@@ -2392,6 +2396,7 @@ export class AgentRunner {
             // "let me check that" + tool_use in ONE assistant message counts
             // as streamed (no double-speak — spec §4.1 same-message rule).
             if (
+              !subagentNested &&
               content.some(
                 (b: { type?: string; text?: string }) =>
                   b.type === "text" && typeof b.text === "string" && b.text.length > 0,
@@ -2424,7 +2429,12 @@ export class AgentRunner {
                   onStream!(next.phrase + VOICE_TOOL_ACK_SEPARATOR);
                   toolAckInjected += 1;
                 }
-                streamedThisSegment = false; // §4.1: the tool-run gap starts now
+                // §4.1: the tool-run gap starts now. Nested (subagent) tool
+                // calls open no gap the caller perceives — they must not reset
+                // the top-level segment's spoken state (R3).
+                if (!subagentNested) {
+                  streamedThisSegment = false;
+                }
                 // Close previous tool timing if any
                 if (activeToolName && toolCalls.length > 0) {
                   toolCalls[toolCalls.length - 1]!.endMs = Date.now();

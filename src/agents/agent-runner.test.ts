@@ -4819,6 +4819,81 @@ describe("KPR-324 C2: cold-path tool-start ack injection (AgentRunner.send)", ()
     expect(result.toolSummary).toContain("voice-fixture");
   });
 
+  // ── Pre-PR R3: nested messages must not mutate SEGMENT STATE either ────
+  // R1 gated the ack DECISION on !subagentNested but left the surrounding
+  // `streamedThisSegment` mutations ungated. That variable models what the
+  // LIVE CALLER has heard in the current segment, so delegate machinery the
+  // caller never hears must not move it in EITHER direction.
+
+  it("nested TEXT does not mark the segment spoken — the next silent top-level tool still acks", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        // Boss delegates (top-level, silent) → ACK0, segment resets.
+        yield toolUseMsg("m1", [{ type: "tool_use", name: "Task", id: "toolu_task", input: {} }]);
+        // The SUBAGENT's own prose: forwarded by the SDK, never spoken to
+        // the caller — it must not count as "the model spoke this segment".
+        yield nestedToolUseMsg("m2", [{ type: "text", text: "I found three records" }], "toolu_task");
+        // Boss's next tool call. From the caller's ear this segment is still
+        // silent, so it must ack.
+        yield toolUseMsg("m3", [toolBlock("t3")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    // Pre-fix the nested text set streamedThisSegment = true and swallowed
+    // the second ack, leaving the caller in an unannounced silent gap.
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0, ACK1]);
+    expect(result.toolAckInjected).toBe(2);
+  });
+
+  it("nested tool_use does not reset the segment — no spurious ack right after the model spoke", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield deltaMsg("let me check on that"); // the caller genuinely heard this
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield toolUseMsg("m3", [toolBlock("t3")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    // Pre-fix the nested tool_use reset streamedThisSegment = false, so the
+    // top-level call acked on top of speech the caller had just heard.
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual(["let me check on that"]);
+  });
+
+  it("a silent top-level tool_use after nested tool calls still acks (state is gated, the ack path is not)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield nestedToolUseMsg("m1", [toolBlock("t1")], "toolu_task");
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield toolUseMsg("m3", [toolBlock("t3")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0]);
+    expect(result.toolAckInjected).toBe(1);
+  });
+
   it("no onStream: the silent-tool voice script neither throws nor counts an inject", async () => {
     mockQueryOverride = () => ({
       close: vi.fn(),
