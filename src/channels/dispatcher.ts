@@ -58,6 +58,76 @@ const NON_RESPONSE_PATTERNS = [
   /^n\/a\.?$/i,
 ];
 
+/**
+ * KPR-417: the exact sentence the delay-then-ack posts (spec §5.3), and the
+ * pattern that recognizes it back off the thread transcript.
+ *
+ * ⚠ THE TWO MUST CHANGE IN LOCKSTEP, exactly as NON_RESPONSE_PATTERNS pins
+ * "No response needed." Exported (unlike NON_RESPONSE_PATTERNS, which is
+ * module-private and which the suite deliberately mirrors by hand at
+ * dispatcher-conference.test.ts:714 (T6) / dispatcher.test.ts:283) because this
+ * constant sits on BOTH sides of a two-sided contract: T1 asserts these bytes
+ * were posted and T5 seeds a fixture message that these bytes must strip. A
+ * hand-mirrored copy would let T5 keep passing while the real posted text
+ * drifted away from it — the exact drift the strip exists to prevent.
+ *
+ * ⚠ WORDING IS LOAD-BEARING, NOT COSMETIC (spec §5.3). The ack must be true at
+ * every instant it can fire, including one that is easy to miss: the
+ * per-thread lock spin-waits BEFORE the breaker permit is acquired
+ * (agent-manager.ts), so an acked turn may be queued behind a sibling on the
+ * same `agentId:threadId` rather than generating anything. Any wording
+ * asserting work is happening RIGHT NOW ("looking into this", "working on
+ * it") is false in that window. "Picked this up" claims only assignment,
+ * which is true from selection through the lock wait, the breaker acquire and
+ * the model call alike. It is a statement of STATE, not a promise of a reply
+ * — which is what makes the "an ack is never retracted" rule (§6.4) liveable.
+ * A bare "On it." is equally honest but was rejected on collision surface: a
+ * whole agent reply of exactly "On it." is plausible in a conference thread,
+ * while the two-clause sentence is not.
+ *
+ * Verified byte-identical round-trip through markdownToMrkdwn
+ * (response-formatter.ts:5-22 — no header, bold, link, strikethrough or rule
+ * construct present), which the recognition pattern depends on.
+ */
+export const MEETING_ACK_TEXT = "On it — picked this up.";
+
+/** KPR-417: ~3x the observed fast band (2-5s), far below the ~130s case, and
+ *  far below both the round-1 clamp (REACTION_TIMEOUT_MS = 120_000) and any
+ *  turn deadline. Exported so tests advance the fake clock by exactly this
+ *  value rather than a hand-mirrored literal (spec §9). NOT configurable —
+ *  only `ackEnabled` ships (spec §5.6). Setting it to 0 behaves as an
+ *  immediate ack, which is the one-line rollback if the operator prefers the
+ *  literal "got it" she originally asked for. */
+export const MEETING_ACK_DELAY_MS = 15_000;
+
+/** SlackAdapter.deliver prefixes agent posts with `${icon} *${Name}*: `
+ *  (icon optional when the agent has none, absent entirely when the agent was
+ *  deleted mid-turn). Mirrors the author-extraction regex at
+ *  slack-adapter.ts:228, widened to make the icon optional. */
+const AGENT_PREFIX_RE = /^(?:\S+\s+)?\*[^*]+\*:\s*/;
+const MEETING_ACK_PATTERNS = [/^on it\s*—\s*picked this up\.?$/i];
+
+/**
+ * KPR-417: is this thread message an engine-authored ack? Anchored `^…$` on
+ * the whole body, so a real reply that merely BEGINS with the sentence is not
+ * stripped; `isBot` gates out any human typing it. Exported alongside
+ * MEETING_ACK_TEXT so the anchored-regex bound is unit-assertable without
+ * routing through a full dispatch.
+ *
+ * ⚠ Accepted residual (spec §5.4): an agent whose ENTIRE reply is exactly the
+ * ack sentence has that message stripped from meeting history. The eaten set
+ * is wider than §5.4's wording — the two regexes above are the authority, not
+ * this prose. AGENT_PREFIX_RE also eats a leading `[token ]*Bold*: `, and
+ * case, dash spacing, a trailing period and outer whitespace all vary freely.
+ * Same class, same negligible impact — one near-contentless message; the
+ * identical hazard is accepted repo-wide for NON_RESPONSE_PATTERNS; and the
+ * preamble steers agents toward "No response needed.", not this sentence.
+ */
+export function isMeetingAck(m: ThreadMessage): boolean {
+  if (!m.isBot) return false;
+  return MEETING_ACK_PATTERNS.some((p) => p.test(m.text.replace(AGENT_PREFIX_RE, "").trim()));
+}
+
 /** KPR-388: max of raw Slack ts strings by numeric value; undefined when none present. */
 function maxSlackTs(candidates: Array<string | undefined>): string | undefined {
   let best: string | undefined;
@@ -104,6 +174,12 @@ export interface OutageHandlingDeps {
   config: OutageQueueConfig;
 }
 
+/** KPR-420: provenance tag for a reaction-tracker entry. "claim" = written by
+ *  triggerConferenceReactions' claim-before-await loop, releasable on
+ *  non-selection; "delivery-mark" = written by markReactionExclusion at a
+ *  KPR-416 delivery site (or promoted from a claim mid-await), never released. */
+type ReactionTrackerEntry = "claim" | "delivery-mark";
+
 export class Dispatcher {
   private adapters = new Map<string, ChannelAdapter>();
   private registry: AgentRegistry;
@@ -127,10 +203,26 @@ export class Dispatcher {
    *  Absent ⇒ every conference path behaves exactly as pre-KPR-409. */
   private meetingScribe?: MeetingScribe;
   private meetingRosters = new Map<string, Set<string>>(); // threadId → agent IDs
-  // Map<threadId, Map<humanMessageTs, Set<agentId>>> — agents that responded or were
-  // selected to respond on this human message, either round (KPR-387): round-0
-  // primaries recorded at selection time, round-1 reactors at claim time.
-  private meetingReactionTracker = new Map<string, Map<string, Set<string>>>();
+  // Map<threadId, Map<humanMessageTs, Map<agentId, ReactionTrackerEntry>>> —
+  // agents excluded from reacting on this human message, either round
+  // (KPR-387). Round-0 primaries are recorded at DELIVERY time (KPR-416 —
+  // markReactionExclusion, three call sites; supersedes KPR-386 canon C1's
+  // selection-time recording, so a SUPPRESSED primary is no longer excluded),
+  // round-1 reactors at claim time (triggerConferenceReactions). Keying and
+  // TTL are unchanged; the leaf was amended by KPR-420 to carry PROVENANCE
+  // (ReactionTrackerEntry) so release-on-non-selection can tell an erasable
+  // claim from a delivery mark. Membership (.has) still means "excluded" and
+  // stays the SINGLE exclusion read — never introduce a second exclusion
+  // structure (KPR-415 canon C19).
+  private meetingReactionTracker = new Map<string, Map<string, Map<string, ReactionTrackerEntry>>>();
+  /** KPR-417: delay-then-ack master switch, mirrored from
+   *  config.meetingWorkers.ackEnabled by index.ts. FAIL-CLOSED default: an
+   *  unwired dispatcher (a test harness, or a mis-ordered boot) posts no acks
+   *  rather than misbehaving. Read per turn inside dispatchToAgent, which is
+   *  why its wiring belongs above index.ts's spawn-capable boundary (KPR-414).
+   *  Note the recognition filter in fetchMeetingHistory is deliberately NOT
+   *  gated on this flag — spec §5.5. */
+  private meetingAckEnabled = false;
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
 
@@ -185,6 +277,15 @@ export class Dispatcher {
 
   setMeetingScribe(scribe: MeetingScribe): void {
     this.meetingScribe = scribe;
+  }
+
+  /** KPR-417: mirror config.meetingWorkers.ackEnabled. Wired in index.ts
+   *  ABOVE the spawn-capable boundary (KPR-414) — the flag is a spawn-read
+   *  fact. Belt-and-braces rather than load-bearing: conference dispatch is
+   *  unreachable until setSlackAdapter runs, well below the boundary, and the
+   *  fail-closed default degrades a mis-wire to "no acks", never to a fault. */
+  setMeetingAckEnabled(enabled: boolean): void {
+    this.meetingAckEnabled = enabled;
   }
 
   async dispatch(item: WorkItem): Promise<void> {
@@ -408,6 +509,14 @@ export class Dispatcher {
           error: runResult.error,
         };
 
+        // KPR-416 write site 2. Covers the two paths that never reach the
+        // fan-out leg: a KPR-307 outage replay of a round-0 conference turn,
+        // and every KPR-402 deadline-continuation leg — both re-enter here
+        // via meta.targetAgentId (resolveAgents step 0), carrying
+        // meetingExclusionTs in meta. This sits on the hot path of every
+        // ordinary non-conference turn in the engine, where it is a `meta`
+        // read plus a type check and nothing else (pinned by T4b).
+        this.markReactionExclusion(item, agentId);
         await this.deliverAgentResult(workResult, adapter);
 
         if (tracked) {
@@ -563,6 +672,50 @@ export class Dispatcher {
   }
 
   /**
+   * KPR-416: mark reaction-exclusion at DELIVERY time. One rule —
+   *
+   *   an agent is excluded from reacting on a trigger iff its own round-0
+   *   turn on that trigger handed text to delivery
+   *
+   * — implemented as one helper called from three sites (fan-out delivery,
+   * single-dispatch delivery, handleTurnFailure's adapter arm) so the
+   * invariant is auditable rather than emergent. "Handed to delivery", not
+   * "was posted": the call sites sit immediately before the delivery call, so
+   * a diverted (tryOutageDiversion) or adapter-less delivery still marks —
+   * the turn ran and consumed the trigger (spec §4).
+   *
+   * Keyed on `meta.meetingExclusionTs`, stamped round-0-only in
+   * dispatchToAgent's conference meta block. That key rides item.meta, so it
+   * reaches every delivery path for free: the outage-queued document, every
+   * KPR-402 continuation leg (whose construction strips the four `conference*`
+   * keys but not this one — deliberately named outside that family), and both
+   * handleTurnFailure legs. Engine-authored notices (KPR-307 outage, KPR-402
+   * first-abort/terminal, replay-terminal) never reach a call site and so
+   * never mark: they are engine chrome, not agent content.
+   *
+   * Synchronous and idempotent (unconditional Map set). Tracker keying and
+   * TTL are unchanged — KPR-386 canon C1 superseded; the leaf carries a
+   * KPR-420 provenance tag ("delivery-mark" here), so a write landing on an
+   * existing "claim" is a PROMOTION the release loop must spare.
+   * Spec: docs/epics/kpr-415/kpr-416-spec.md §5.3.
+   */
+  private markReactionExclusion(item: WorkItem, agentId: string): void {
+    const ts = item.meta?.meetingExclusionTs;
+    // Type-guarded, not cast: meta is Record<string, unknown> and this helper
+    // sits on the hot path of every single-dispatch turn in the engine, where
+    // the key is absent. Anything that is not a non-empty string is a no-op.
+    if (typeof ts !== "string" || ts.length === 0) return;
+    const threadId = item.threadId ?? item.id;
+    if (!this.meetingReactionTracker.has(threadId)) {
+      this.meetingReactionTracker.set(threadId, new Map());
+    }
+    const threadTracker = this.meetingReactionTracker.get(threadId)!;
+    const responded = threadTracker.get(ts) ?? new Map<string, ReactionTrackerEntry>();
+    responded.set(agentId, "delivery-mark");
+    threadTracker.set(ts, responded);
+  }
+
+  /**
    * KPR-308: shared agent-response delivery for the two dispatch paths.
    * Diversion guard first; otherwise the pre-existing source-adapter
    * delivery with retry-queue semantics, unchanged.
@@ -621,6 +774,17 @@ export class Dispatcher {
       error: String(err),
     };
     if (adapter) {
+      // KPR-416 write site 3 (spec §6.2). A thrown round-0 turn posts
+      // `Something went wrong: …` — the same user-visible artifact an
+      // in-branch errored turn produces — so it stays excluded; letting the
+      // two diverge would be an accident, not a design. Reachable on this
+      // epic's own hot path: a grok TurnAssemblyError from an unreadable
+      // ~/.grok/auth.json throws here rather than raising
+      // ProviderCircuitOpenError. Inside `if (adapter)` so the rule ("handed
+      // text to delivery") stays literally true, and correctly NOT reached
+      // when handleOutageTurn already absorbed a fast-fail above (early
+      // return) — that path delivers a notice, not agent text.
+      this.markReactionExclusion(item, agentId);
       try {
         await adapter.deliver(errorResult);
       } catch (deliverErr) {
@@ -843,6 +1007,12 @@ export class Dispatcher {
     // load-bearing for routing — verified false for this codebase: routing
     // is targetAgentId, not any conference meta key. Still a blocklist, not
     // an allowlist — channel keys stay.
+    //
+    // KPR-416: `meetingExclusionTs` deliberately SURVIVES this strip — it is
+    // named outside the `conference*` family precisely so it does. Write site
+    // 2 marks reaction-exclusion on the leg that finally answers, and it
+    // reads that key. Do NOT add it here when extending this blocklist with
+    // a meeting-shaped key; T8a pins its survival.
     const {
       outageReplay: _replayMarker,
       conferenceMode: _confMode,
@@ -1334,6 +1504,142 @@ export class Dispatcher {
     return [];
   }
 
+  /**
+   * KPR-417: arm the delayed ack for a slow round-0 conference turn.
+   *
+   * Returns `undefined` — no timer at all — unless ALL hold:
+   *   - the operator lever is on (`meetingAckEnabled`, fail-closed default),
+   *   - `resolved.conferenceMode === true`,
+   *   - `resolved.conferenceRound === 0`,
+   *   - an adapter exists to deliver through.
+   *
+   * ⚠ THE ROUND-0 GATE IS A CONTRACT, NOT A DEFAULT (spec §5.2). KPR-389 §D5
+   * goal 5 — "a clamp-killed reaction never posts noise into the meeting
+   * channel" — is violated the INSTANT a round-1 turn acks and is then
+   * silently killed by the guard in dispatchToAgent: the ack IS the filler D5
+   * forbids, already in the channel before the kill. Honoring round-1 would
+   * require an explicit retraction (delete or edit), which spec §6.4 rejects.
+   * Do not widen this gate. Pinned by T3.
+   *
+   * ⚠ THE GATE READS `resolved`, NEVER `item.meta`. That is what makes the
+   * other two legs that can carry a round-0 conference turn structurally
+   * ack-free, for two DIFFERENT reasons which must not be conflated:
+   *   - a KPR-307 outage REPLAY keeps its conference meta (conferenceRound is
+   *     load-bearing elsewhere) but runs dispatch()'s single-dispatch leg with
+   *     a bare ResolvedAgent and no ack wrapper on it at all;
+   *   - a KPR-402 continuation LEG has had the four conference keys stripped
+   *     by KPR-413, so it is not a conference turn on either surface.
+   * Result: ≤ 1 ack per (agent, human trigger), with no chain and no duplicate
+   * across legs.
+   */
+  private scheduleMeetingAck(
+    item: WorkItem,
+    resolved: ResolvedAgent,
+    agentId: string,
+    adapter: ChannelAdapter | undefined,
+  ): { cancel: () => void } | undefined {
+    if (!this.meetingAckEnabled) return undefined;
+    if (resolved.conferenceMode !== true || resolved.conferenceRound !== 0) return undefined;
+    if (!adapter) return undefined;
+
+    let cancelled = false;
+    const handle = setTimeout(() => {
+      // Re-check the latch: cancel() may have run between the clock firing
+      // this callback and the callback actually executing.
+      if (cancelled) return;
+      // Fire-and-forget by construction — never awaited by the turn, never
+      // able to reject into it (deliverMeetingAck is a total function).
+      void this.deliverMeetingAck(item, agentId, adapter);
+    }, MEETING_ACK_DELAY_MS);
+    // A pending ack must never hold the process open at shutdown. Existing
+    // precedent: index.ts prefixCacheHeartbeat, outage-replay-processor.ts:44.
+    handle.unref();
+
+    return {
+      cancel: () => {
+        cancelled = true;
+        clearTimeout(handle);
+      },
+    };
+  }
+
+  /**
+   * KPR-417: post one acknowledgment into the meeting thread. Four deliberate
+   * properties (spec §5.3):
+   *   - `error` UNSET, so SlackAdapter.deliver renders it through
+   *     formatResponse, not formatError — same rationale as
+   *     deliverOutageNotice's own comment.
+   *   - `agentId` SET, so deliver picks up agentConfig and posts with the
+   *     agent's username/icon identity and the `${icon} *${Name}*: ` prefix.
+   *     Per-agent attribution costs nothing new — and AGENT_PREFIX_RE is built
+   *     to strip exactly that prefix back off.
+   *   - NOT deliverAgentResult — that begins with tryOutageDiversion, and an
+   *     ack diverted to a WS floor broadcast is meaningless. (The symmetric
+   *     case, where the ANSWER is diverted away from a thread that already has
+   *     the ack, is a named accepted residual — spec §6.6. Do not fix it here.)
+   *   - NEVER enqueued to the retry queue on failure. A retried ack lands
+   *     minutes later, potentially AFTER the answer. A dropped ack is strictly
+   *     better than a late one. Pinned by T12.
+   *
+   * ⚠ Must go through `adapter.deliver`, never a direct web.chat.postMessage:
+   * that path registers the outbound ts (slack-gateway.ts postSingle) and the
+   * inbound handler skips on it. Load-bearing, not a nicety — the ack text
+   * embeds the agent's own name in its `*Name*:` prefix, and
+   * resolveConferenceAgents builds the roster with findAllByName(item.text),
+   * so an ack that leaked back through the inbound path would both add its own
+   * author to the roster and mint a fresh conference turn.
+   */
+  private async deliverMeetingAck(item: WorkItem, agentId: string, adapter: ChannelAdapter): Promise<void> {
+    const ack: WorkResult = { text: MEETING_ACK_TEXT, agentId, workItem: item, costUsd: 0, durationMs: 0 };
+    try {
+      await adapter.deliver(ack);
+      log.info("Meeting ack delivered", { agentId, threadId: item.threadId });
+    } catch (err) {
+      log.warn("Meeting ack delivery failed — dropped", { agentId, error: String(err) });
+    }
+  }
+
+  /**
+   * KPR-417: arm the delayed ack, run the turn, cancel on ANY settle.
+   *
+   * ⚠ THE CANCEL LIVES IN THIS HELPER'S `finally` — adjacent to the await — so
+   * the ack can never outlive the turn it describes. DO NOT relocate it to a
+   * finally around the whole dispatchToAgent body: delivery, the KPR-388 mark
+   * write and the outage/deadline gates all run AFTER the turn settles, and a
+   * timer still armed across them can post "On it" AFTER the answer. Pinned
+   * structurally by T13(b).
+   *
+   * The one race this cannot close is named and accepted (spec §8): cancel()
+   * cannot unpost a deliver already in flight. Worst case is an ack
+   * immediately followed by its answer — mildly redundant, never
+   * contradictory: the answer's own delivery begins strictly after the turn
+   * settles, i.e. after the ack post already started.
+   *
+   * ⚠ That is a bound on post START order, not on LANDING order, and Slack
+   * does not preserve the two. chat.postMessage is ~1/sec per channel, and in
+   * an N-agent cohort every unresolved responder fires its ack at the same
+   * instant into the same channel, so the WebClient's 429 retry can land an
+   * ack AFTER its own answer — in exactly the multi-agent population this
+   * feature targets. Harmless in effect (the ack is stripped from history
+   * either way, and "picked this up" stays true whenever it lands), and NOT
+   * the §8 cancel race above, which is about cancel() failing to unpost. Do
+   * not "fix" the ordering by awaiting the ack or sequencing posts — that
+   * would put Slack latency on the turn's critical path.
+   */
+  private async runTurnWithMeetingAck(
+    agentId: string,
+    item: WorkItem,
+    resolved: ResolvedAgent,
+    adapter: ChannelAdapter | undefined,
+  ): Promise<TurnResult> {
+    const ack = this.scheduleMeetingAck(item, resolved, agentId, adapter);
+    try {
+      return await this.agentManager.runWorkItemTurn(agentId, item);
+    } finally {
+      ack?.cancel();
+    }
+  }
+
   /** Dispatch a single work item to a single agent (used for fan-out) */
   private async dispatchToAgent(item: WorkItem, resolved: ResolvedAgent): Promise<void> {
     const { agentId } = resolved;
@@ -1344,11 +1650,34 @@ export class Dispatcher {
       // KPR-387: round-1 reaction turns are framed against the peer reply — the
       // original human message is never re-presented in the terminal slot. It
       // remains reachable via session ∪ injected context (KPR-388 generalizes
-      // the old re-fetched-transcript guarantee): a round-1 reactor was never a
-      // round-0 responder for this trigger (C1/C2), so its mark predates the
-      // triggering message — the message is in its delta, or already in its
-      // session by the covering invariant. A reactor with no session/mark gets
-      // the full transcript directly.
+      // the old re-fetched-transcript guarantee).
+      //
+      // KPR-416 falsified the premise this comment used to state (KPR-386 canon
+      // C1, selection-time recording: "a round-1 reactor was never a round-0
+      // responder for this trigger, so its mark predates the triggering
+      // message"). A SUPPRESSED round-0 responder is now re-invitable, and the
+      // mark bookkeeping below runs outside the suppression branch, so its own
+      // round-0 turn already advanced the mark to >= the trigger's ts — its
+      // round-1 delta therefore MAY OMIT the human trigger (the delta filter is
+      // strictly greater than the mark). The replacement invariant:
+      //
+      //   A round-1 reactor's delta may omit the human trigger. That is safe
+      //   because the delta arm is reachable only when the reactor holds a
+      //   resumable session row whose meetingLastSeenTs was advanced by one of
+      //   ITS OWN earlier turns on this thread; and the mark advances (below)
+      //   only after a non-errored, non-aborted turn, and only to the maximum
+      //   ts over what that turn actually absorbed — its injected context ∪ its
+      //   terminal slot. A mark at or above the trigger's ts therefore implies
+      //   some turn of this agent PRESENTED the trigger (round-0 terminal slot)
+      //   or INJECTED it (a later trigger's context). Either the mark predates
+      //   the trigger (trigger in the delta) or the agent's own turn presented
+      //   it (trigger in the transcript that turn produced) — no gap.
+      //
+      // ⚠ That invariant carries one named, accepted caveat: the mark advance
+      // and the session persist are independent fail-soft writes and can
+      // diverge, so the "session absorbed it" step is asserted, not derived.
+      // See docs/epics/kpr-415/kpr-416-spec.md §7.2 — do not assume airtight.
+      // A reactor with no session/mark gets the full transcript directly.
       const newMessageSegment = resolved.reactionTo
         ? `[${resolved.reactionTo.authorName} just replied]:\n${resolved.reactionTo.text}\n\n` +
           `React to ${resolved.reactionTo.authorName}'s reply if you have something to add. ` +
@@ -1379,6 +1708,46 @@ export class Dispatcher {
           // full vs delta turns (KPR-388 efficacy measurement).
           conferenceInjectionMode: resolved.injectionMode,
           deadlineOriginalText: `${framePrefix}\n${newMessageSegment}`,
+          // KPR-416: the exclusion key rides the item so every delivery path
+          // can mark reaction-exclusion uniformly — including the KPR-402
+          // continuation chain, which deliberately strips the four conference
+          // keys (see maybeHandleDeadlineAbort's leg construction). Named
+          // OUTSIDE the `conference*` family on purpose: it must survive that
+          // blocklist, and nothing telemetric reads it (verified: there is no
+          // meta allowlist anywhere, and neither agent_turn_telemetry nor
+          // activity_log spreads item.meta), so KPR-413's rationale — never
+          // stamp a non-conference turn as a conference turn — is untouched.
+          //
+          // Round-0 only: a round-1 reactor's exclusion is claimed by
+          // triggerConferenceReactions at dispatch, not by delivery. Guarded
+          // on conferenceHumanTs because it is optional on ResolvedAgent (a
+          // non-Slack conference surface has no ts to key on) — the same
+          // guard the deleted selection-time write applied.
+          //
+          // ⚠ ADDITIVE-ONLY, by position: this spread sits AFTER `...item.meta`,
+          // so the round-1 / no-humanTs arm evaluates to `{}` — it can add the
+          // key but never CLEAR one already on the incoming item. Unreachable
+          // today, verified: all three dispatchToAgent call sites pass a RAW
+          // item (the two fan-out sites pass dispatch()'s own argument;
+          // triggerConferenceReactions passes `originalItem`, which is this
+          // method's `item` param, never `effectiveItem`), and the two
+          // re-entries that DO carry effectiveItem-derived meta — a KPR-307
+          // outage replay and every KPR-402 continuation leg, both of which
+          // deliberately keep meetingExclusionTs — pin meta.targetAgentId,
+          // which resolveAgents answers at step 0, before the conf-* check at
+          // step 0.7. So they resolve without conferenceMode and never reach
+          // here. A future caller that re-enters dispatchToAgent with an
+          // effectiveItem-derived meta would silently turn this no-op into a
+          // FALSE EXCLUSION: the round-1 reactor would inherit the round-0
+          // trigger's ts and markReactionExclusion would claim it as having
+          // already answered. Worth naming because KPR-417 wraps this same
+          // dispatch and the deferred §6.4(d) follow-on child edits this
+          // region — if either makes such an item reach here, invert the
+          // spread to write the key unconditionally (value or `undefined`)
+          // rather than leaving the clear implicit.
+          ...(resolved.conferenceRound === 0 && resolved.conferenceHumanTs
+            ? { meetingExclusionTs: resolved.conferenceHumanTs }
+            : {}),
         },
       };
     }
@@ -1397,7 +1766,13 @@ export class Dispatcher {
     const adapter = this.adapters.get(effectiveItem.source.adapterId ?? effectiveItem.source.kind);
 
     try {
-      const runResult = this.convertTurnResult(await this.agentManager.runWorkItemTurn(agentId, effectiveItem));
+      // KPR-417: the ack wrapper lives HERE and only here — the fan-out leg is
+      // the only leg a live conference turn takes. See runTurnWithMeetingAck
+      // for why the cancel must stay inside that helper's finally rather than
+      // around this whole try block.
+      const runResult = this.convertTurnResult(
+        await this.runTurnWithMeetingAck(agentId, effectiveItem, resolved, adapter),
+      );
 
       // KPR-307: same post-turn outage gate + replay-failure gate as the
       // single-dispatch path — the fan-out body is a near-duplicate.
@@ -1478,6 +1853,19 @@ export class Dispatcher {
           durationMs: runResult.durationMs,
           error: runResult.error,
         };
+        // KPR-416 write site 1 — ORDERING PIN. This is a synchronous
+        // statement placed immediately before BOTH the delivery below and
+        // the triggerConferenceReactions fire-and-forget that follows it, so
+        // the window in which this agent could be re-invited as a reactor to
+        // its own trigger is zero by construction — there is nothing here to
+        // race. Do NOT move it below either call (pinned by T5).
+        // The remaining window is cross-agent, not self — and it is ONLY the
+        // claim-time half: a PEER whose round-0 turn has not landed can be
+        // claimed and invited. That is the accepted, deferred residual —
+        // kpr-416-spec.md §6.4(d), owned by KPR-419, pinned T9. Release-time
+        // erasure of a LANDED peer's delivery mark is FIXED (KPR-420, the
+        // provenance-guarded release) — do not conflate the two.
+        this.markReactionExclusion(effectiveItem, agentId);
         await this.deliverAgentResult(workResult, adapter);
 
         // Conference mode: trigger depth-1 peer reactions
@@ -1529,6 +1917,42 @@ export class Dispatcher {
     return { component: "dispatcher", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 
+  /**
+   * KPR-417: the ONLY meeting history fetch in this class. Acks are
+   * operational chrome, not meeting content — stripping here makes all five
+   * consumers ack-blind with NO per-consumer edits:
+   *   1. the full arm (formatThreadContext),
+   *   2. the delta arm (formatDeltaContext),
+   *   3. the meetingLastSeenTs high-water calc  — all three via buildConferenceContext,
+   *   4. the round-0 classifier's `history.slice(-5)` recency window,
+   *   5. the meeting scribe's noteActivity (novelty count + summary prompt).
+   *
+   * ⚠ DELIBERATELY NOT GATED ON `meetingAckEnabled`: flipping the lever off
+   * must not un-hide acks that are already sitting in a live thread (spec
+   * §5.5 / §10 — the rollback is clean at both ends). Pinned by the
+   * `ackEnabled: false` row of T5.
+   *
+   * ⚠ ANY NEW MEETING-HISTORY READ MUST COME THROUGH HERE. A direct
+   * slackAdapter call would silently re-expose acks to that consumer. Pinned
+   * structurally by T13(a).
+   *
+   * The strip lives here rather than in SlackAdapter because "is this an ack"
+   * is a MEETING-domain fact; the channel-domain adapter should keep returning
+   * what Slack actually has (an agent reading the channel with its own `slack`
+   * MCP tools sees the acks verbatim, and that is expected — spec §8).
+   *
+   * Exact factoring, not a behavior change for non-ack messages: both former
+   * call sites computed this identical channelId/threadTs pair, and the
+   * no-slackAdapter branch returns [] exactly as the old `let history = []`
+   * initialization did.
+   */
+  private async fetchMeetingHistory(item: WorkItem, threadId: string): Promise<ThreadMessage[]> {
+    if (!this.slackAdapter) return [];
+    const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId;
+    const history = await this.slackAdapter.fetchThreadHistory(item.source.id, threadTs);
+    return history.filter((m) => !isMeetingAck(m));
+  }
+
   private async resolveConferenceAgents(item: WorkItem): Promise<ResolvedAgent[]> {
     const threadId = item.threadId ?? item.id;
 
@@ -1568,18 +1992,15 @@ export class Dispatcher {
 
     // Fetch thread history once per trigger — per-agent injection contexts
     // (full vs delta, KPR-388) are derived from it after classification.
-    let history: ThreadMessage[] = [];
-    let recentMessages = "";
-    if (this.slackAdapter) {
-      const channelId = item.source.id;
-      const threadTs = (item.meta?.slackThreadTs as string) ?? (item.meta?.slackTs as string) ?? threadId;
-      history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
-      // Last 5 messages for classifier recency context
-      recentMessages = history
-        .slice(-5)
-        .map((m) => `${m.author}: ${m.text.slice(0, 200)}`)
-        .join("\n");
-    }
+    // KPR-417: via fetchMeetingHistory, which strips engine-authored acks.
+    // Behaviorally identical for non-ack messages, including the
+    // no-slackAdapter case ([] history ⇒ "" recentMessages, as before).
+    const history = await this.fetchMeetingHistory(item, threadId);
+    // Last 5 messages for classifier recency context
+    const recentMessages = history
+      .slice(-5)
+      .map((m) => `${m.author}: ${m.text.slice(0, 200)}`)
+      .join("\n");
 
     // KPR-409 (R1 — requested C26 relaxation): round-level cadence trigger.
     // Fires once per round-0 pass INCLUDING passes where the classifier
@@ -1632,22 +2053,30 @@ export class Dispatcher {
       costUsd: classification.costUsd,
     });
 
-    // KPR-387: record round-0 responders so the reaction pass never re-selects a
-    // primary for the same triggering human message. Recorded at selection time —
-    // a primary whose turn errors or is suppressed stays excluded for this trigger
-    // (deliberate: kills the suppressed-turn burn; Gate 1 delegated assumption).
-    // Runs synchronously before any round-0 dispatch starts, so there is no race
-    // with a fast round-0 completion triggering the reaction pass.
+    // KPR-387/KPR-416: round-0 responders are still recorded so the reaction
+    // pass never re-selects a primary for the same triggering human message —
+    // but the write now lands at DELIVERY time (markReactionExclusion, three
+    // call sites), not here at selection time. KPR-416 relocated it so a
+    // primary whose turn was SUPPRESSED becomes eligible to react to a slower
+    // peer's later, substantive reply — the exact shape that silenced the live
+    // trial meeting. Delivered, `_No response._`-placeholder, errored-with-text
+    // and thrown turns all keep today's exclusion. Supersedes KPR-386 canon C1
+    // ("selection-time recording"); C2 (shape/keying/TTL) is unchanged.
+    //
+    // ⚠ THE RACE THIS MOVE RE-OPENS — read before "simplifying" anything here.
+    // The old placement ran synchronously before any round-0 dispatch, so no
+    // fast completion could trigger a reaction pass against an unrecorded
+    // agent. That is gone. WITHIN one agent the window is still zero by
+    // construction: the write is the statement immediately before both the
+    // delivery and the reaction trigger (ordering pin, pinned by T5). ACROSS
+    // agents a peer whose own round-0 turn has not landed CAN now be invited
+    // as a round-1 reactor for the same trigger — deliberately deferred,
+    // bounded by the per-thread lock in agent-manager.ts (its round-1 turn
+    // serializes behind its own round-0 turn) plus round-1's "do not re-answer"
+    // framing, and pinned as known behavior by T9. See
+    // docs/epics/kpr-415/kpr-416-spec.md §6.4(d) and its follow-on child
+    // before attempting a fix here.
     const humanTs = item.meta?.slackTs as string | undefined;
-    if (humanTs && classification.respondAgentIds.length > 0) {
-      if (!this.meetingReactionTracker.has(threadId)) {
-        this.meetingReactionTracker.set(threadId, new Map());
-      }
-      const threadTracker = this.meetingReactionTracker.get(threadId)!;
-      const responded = threadTracker.get(humanTs) ?? new Set<string>();
-      for (const id of classification.respondAgentIds) responded.add(id);
-      threadTracker.set(humanTs, responded);
-    }
 
     const preamble = this.buildMeetingPreamble(item.source.label, rosterMembers);
 
@@ -1878,7 +2307,7 @@ Meeting rules:
       this.meetingReactionTracker.set(threadId, new Map());
     }
     const threadTracker = this.meetingReactionTracker.get(threadId)!;
-    const reacted = threadTracker.get(humanTs) ?? new Set<string>();
+    const reacted = threadTracker.get(humanTs) ?? new Map<string, ReactionTrackerEntry>();
     threadTracker.set(humanTs, reacted);
 
     // Build roster of peers who haven't reacted yet.
@@ -1890,7 +2319,11 @@ Meeting rules:
       if (reacted.has(agentId)) continue;
       const agent = this.registry.get(agentId);
       if (!agent || agent.disabled) continue;
-      reacted.add(agentId); // claim before await — prevents race with concurrent calls
+      // Claim before await — prevents race with concurrent calls. The
+      // reacted.has() skip above guarantees this never overwrites an
+      // existing "delivery-mark" (an agent already present never enters
+      // peerMembers).
+      reacted.set(agentId, "claim");
       peerMembers.push({
         agentId: agent.id,
         name: agent.name,
@@ -1904,11 +2337,28 @@ Meeting rules:
     // Classify which peers should react to this response
     const classification = await classifyMeetingMessage(responseText, peerMembers);
 
-    // Release peers that weren't selected — they can still be triggered by other round-0 responders
+    // Release peers that weren't selected — they can still be triggered by
+    // other round-0 responders. KPR-420: delete only entries still tagged
+    // "claim" — this read runs AFTER the classifier await above, exactly
+    // where a mid-await promotion is observable, so a peer whose round-0
+    // turn DELIVERED during the await keeps its "delivery-mark" instead of
+    // being erased and re-invited to a trigger it already answered (the
+    // delivery-mark erasure found at integrated-head review round 1).
     const selectedSet = new Set(classification.respondAgentIds);
     for (const member of peerMembers) {
       if (!selectedSet.has(member.agentId)) {
-        reacted.delete(member.agentId);
+        if (reacted.get(member.agentId) === "claim") {
+          reacted.delete(member.agentId);
+        } else if (reacted.get(member.agentId) === "delivery-mark") {
+          // Diagnostically motivated (this race was found by a live probe —
+          // this line makes the next probe free); redaction-compliant: ids
+          // and ts only, never message text.
+          log.info("Reaction release spared delivered peer", {
+            threadId,
+            humanTs,
+            agentId: member.agentId,
+          });
+        }
       }
     }
 
@@ -1922,14 +2372,14 @@ Meeting rules:
 
     // Re-fetch thread history (now includes the round-0 response); per-reactor
     // injection contexts (full vs delta, KPR-388) are derived from it below.
-    let history: ThreadMessage[] = [];
+    // KPR-417: via fetchMeetingHistory, which strips engine-authored acks —
+    // including any ack this very trigger's round-0 responders posted.
+    const history = await this.fetchMeetingHistory(originalItem, threadId);
     const allRosterMembers: RosterMember[] = [];
     let preamble = "";
+    // The guard stays: it also gates allRosterMembers and the preamble, whose
+    // "no slack adapter ⇒ empty roster, empty preamble" behavior is unchanged.
     if (this.slackAdapter) {
-      const channelId = originalItem.source.id;
-      const threadTs =
-        (originalItem.meta?.slackThreadTs as string) ?? (originalItem.meta?.slackTs as string) ?? threadId;
-      history = await this.slackAdapter.fetchThreadHistory(channelId, threadTs);
       for (const agentId of roster) {
         const agent = this.registry.get(agentId);
         if (!agent || agent.disabled) continue;

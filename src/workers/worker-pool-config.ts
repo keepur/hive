@@ -22,6 +22,24 @@ export interface MeetingWorkersConfig {
    *  fetch-worker dispatch. `scribeEnabled` is the scribe-only lever. */
   enabled: boolean;
 
+  // --- KPR-417 delay-then-ack (Child B1) ---
+  /** false ⇒ a slow round-0 conference turn posts no acknowledgment. The
+   *  rollback lever for KPR-417 — it changes VISIBLE meeting output (up to N
+   *  messages per human trigger), so an operator must be able to silence it
+   *  without a deploy (spec §10).
+   *
+   *  ⚠ DELIBERATELY INDEPENDENT OF `enabled`, unlike `scribeEnabled`. The
+   *  scribe genuinely consumes pool machinery (runRoleTurn / hasCapacity), so
+   *  the worker master switch must kill it. The ack consumes NO pool machinery
+   *  at all — it lives in this section for config locality only. Gating it
+   *  under `enabled` would mean an operator disabling fetch-workers silently
+   *  loses an unrelated UX feature. Spec §5.6; pinned by config.test.ts.
+   *
+   *  Note the RECOGNITION FILTER is not gated on this flag at all (see
+   *  Dispatcher.fetchMeetingHistory): flipping the lever off must not un-hide
+   *  acks that are already sitting in a live thread. */
+  ackEnabled: boolean;
+
   // --- KPR-409 scribe (Part B) ---
   /** The rollback lever for the prompt-shape change. false ⇒ no scribe runs
    *  AND no anchor branch (getSummary short-circuits) ⇒ byte-identical to
@@ -51,6 +69,7 @@ export const DEFAULT_MEETING_WORKERS_CONFIG: MeetingWorkersConfig = {
   workerMaxTurns: 25,
   workerTimeoutMs: 600_000,
   enabled: true,
+  ackEnabled: true,
   scribeEnabled: true,
   scribeModel: "haiku",
   scribeDebounceMs: 90_000,
