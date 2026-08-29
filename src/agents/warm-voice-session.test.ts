@@ -7,9 +7,18 @@ import {
   WARM_LIFETIME_CAP_MS,
   WARM_INTERRUPT_GRACE_MS,
 } from "./warm-voice-session.js";
+import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+}));
+
+// KPR-324 C3: the module now imports the real config.ts, which throws in a
+// bare vitest process (no env). Factory mock with a hoisted mutable flag so
+// cases can flip the S7 lever.
+const toolAckFlag = vi.hoisted(() => ({ enabled: true }));
+vi.mock("../config.js", () => ({
+  config: { voice: { toolAck: toolAckFlag } },
 }));
 
 /**
@@ -765,5 +774,139 @@ describe("WarmVoiceSession", () => {
     expect(r.aborted).toBeUndefined();
 
     lease.close("test-cleanup");
+  });
+
+  // ------------------------------------------- KPR-324 C3: warm tool-start ack
+  describe("tool-start acknowledgment (KPR-324 C3)", () => {
+    const toolUseMsg = (names: string[]) => ({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: names.map((name, i) => ({ type: "tool_use", name, id: `t${i + 1}`, input: {} })),
+      },
+    });
+
+    afterEach(() => {
+      toolAckFlag.enabled = true;
+    });
+
+    // Warm half of spec §12.1 #4.
+    it("injects one ack when a silent segment hits a tool_use", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(initMsg("sess-1"));
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      await microFlush();
+
+      // The ack reached TTS BEFORE the turn's result was even emitted.
+      expect(chunks[0]).toBe(VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR);
+
+      emit(delta("the answer "));
+      emit(resultMsg({ result: "the answer", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(1);
+      expect(chunks).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR, "the answer "]);
+      // SSE-only: the phrase never enters the turn text.
+      expect(r.text).toBe("the answer");
+
+      lease.close("test-cleanup");
+    });
+
+    it("does NOT inject when the segment already spoke (text-then-tool)", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(delta("let me look "));
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(0);
+      expect(chunks).toEqual(["let me look "]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("injects per tool_use block, rotating phrases within the turn", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup", "mcp__voice-fixture__voice_fixture_slow"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(2);
+      expect(chunks).toEqual([
+        VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR,
+        VOICE_TOOL_ACK_PHRASES[1] + VOICE_TOOL_ACK_SEPARATOR,
+      ]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("injects nothing when the S7 flag is off", async () => {
+      toolAckFlag.enabled = false;
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(0);
+      expect(chunks).toEqual([]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("restarts the rotation on every turn of the same lease (per-turn, not per-lease)", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks1: string[] = [];
+      const p1 = lease.runTurn({ text: "u1", onStream: (c) => chunks1.push(c), timeoutMs: 60_000 });
+      await microFlush();
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "one", session_id: "sess-1" }));
+      const r1 = await p1;
+
+      const chunks2: string[] = [];
+      const p2 = lease.runTurn({ text: "u2", onStream: (c) => chunks2.push(c), timeoutMs: 60_000 });
+      await microFlush();
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "two", session_id: "sess-1" }));
+      const r2 = await p2;
+
+      expect(r1.toolAckInjected).toBe(1);
+      expect(r2.toolAckInjected).toBe(1);
+      // BOTH turns speak phrase [0] — rotation state is per-turn.
+      expect(chunks1).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+      expect(chunks2).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+
+      lease.close("test-cleanup");
+    });
   });
 });

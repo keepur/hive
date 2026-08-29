@@ -4,6 +4,10 @@ import type { RunResult, StreamCallback } from "./agent-runner.js";
 // agent-manager.ts (which imports this module at runtime).
 import type { TurnContext, TurnResult } from "./agent-manager.js";
 import { createLogger } from "../logging/logger.js";
+// KPR-324 C3: voice tool-start acknowledgment (warm spawn loop). `config` is
+// read per-turn at the boundary — same as the cold path (spec §4.3).
+import { config } from "../config.js";
+import { shouldInjectToolAck, nextAckPhrase, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
 const log = createLogger("warm-voice-session");
 
@@ -442,6 +446,13 @@ export class WarmVoiceSession {
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
     let activeToolName: string | null = null;
 
+    // KPR-324 C3/S2: tool-start ack state — per-turn locals (spec §4.2
+    // caller-owned rotation; a lease serves ONE call but each turn restarts
+    // the rotation, matching the cold path).
+    let streamedThisSegment = false;
+    let toolAckInjected = 0;
+    let ackRotation = { index: 0 };
+
     // Per-turn watchdog (spec §4.2): maps the cold path's deadline to an
     // in-session interrupt. The session survives a timed-out turn.
     const watchdog = setTimeout(() => {
@@ -497,6 +508,7 @@ export class WarmVoiceSession {
             if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
               if (initToFirstTokenMs === undefined) initToFirstTokenMs = Date.now() - pushedAt;
               streamed = true;
+              streamedThisSegment = true; // KPR-324 §4.1: the model spoke in this segment
               try {
                 req.onStream?.(event.delta.text);
               } catch (err) {
@@ -526,10 +538,48 @@ export class WarmVoiceSession {
             }
             const content = assistantMessage?.content;
             if (Array.isArray(content)) {
+              // KPR-324 §4.1: text blocks BEFORE tool blocks (same-message rule).
+              if (
+                content.some(
+                  (b: { type?: string; text?: string }) =>
+                    b.type === "text" && typeof b.text === "string" && b.text.length > 0,
+                )
+              ) {
+                streamedThisSegment = true;
+              }
               for (const block of content) {
                 if (block.type === "text") {
                   text = block.text;
                 } else if (block.type === "tool_use") {
+                  // KPR-324 C3/S2: warm twin of the cold inject. channel is
+                  // the literal "voice" — warm eligibility is already
+                  // voice-only (323 §4.7); passing it keeps C2/C3 on one
+                  // shared gate (spec §4.3). SSE-only; never into history.
+                  if (
+                    shouldInjectToolAck({
+                      enabled: config.voice.toolAck.enabled,
+                      streamedThisSegment,
+                      hasOnStream: !!req.onStream,
+                      channel: "voice",
+                    })
+                  ) {
+                    const next = nextAckPhrase(ackRotation);
+                    ackRotation = { index: next.index };
+                    try {
+                      req.onStream!(next.phrase + VOICE_TOOL_ACK_SEPARATOR);
+                    } catch (err) {
+                      // Same containment as the delta relay above: a throwing
+                      // onStream must not kill the turn (322 E2 suppression
+                      // throws nothing, but the lease's throw-safety posture
+                      // is unconditional).
+                      safeLog("warn", "onStream callback threw during tool ack", {
+                        ...this.logCtx(),
+                        error: String(err),
+                      });
+                    }
+                    toolAckInjected += 1;
+                  }
+                  streamedThisSegment = false; // §4.1: tool-run gap starts now
                   if (activeToolName && toolCalls.length > 0) {
                     toolCalls[toolCalls.length - 1]!.endMs = Date.now();
                   }
@@ -642,10 +692,8 @@ export class WarmVoiceSession {
       llmMs: Math.max(0, durationMs - totalToolMs),
       toolMs: totalToolMs,
       toolCalls: toolCalls.length,
-      // KPR-324 C5a: placeholder zero — unlike turn-scaffold's honest Lane B
-      // zero, the warm voice lease IS an ack-injecting path; its live counter
-      // lands here when the warm-loop injection ships (C3).
-      toolAckInjected: 0,
+      // KPR-324 C3: live warm-loop ack count (SSE-only injections this turn).
+      toolAckInjected,
       toolSummary: toolSummary || "none",
       streamed,
       inputTokens,
