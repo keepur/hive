@@ -1593,6 +1593,7 @@ export class Dispatcher {
     const ack: WorkResult = { text: MEETING_ACK_TEXT, agentId, workItem: item, costUsd: 0, durationMs: 0 };
     try {
       await adapter.deliver(ack);
+      log.info("Meeting ack delivered", { agentId, threadId: item.threadId });
     } catch (err) {
       log.warn("Meeting ack delivery failed — dropped", { agentId, error: String(err) });
     }
