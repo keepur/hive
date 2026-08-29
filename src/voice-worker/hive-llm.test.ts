@@ -391,4 +391,36 @@ describe("HiveLLM (KPR-322)", () => {
     expect(bodies[1]![0]!.content).toBe(marked);
     expect(hive.interruptedSpokenText).toBeNull();
   });
+
+  it("KPR-324 S1: POST body carries no tools key (tool_use never crosses the bridge)", async () => {
+    // Capture idiom matches the interruption-marker test above: accumulate the
+    // request body off the local HTTP stub's `data`/`end` events. There is no
+    // fetch-init spy in this file.
+    let parsedBody: Record<string, unknown> | undefined;
+
+    const stub = await listen((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        parsedBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(formatSSETextChunk(STREAM_ID, "ok", MODEL));
+        res.end(formatSSEDone(STREAM_ID, MODEL));
+      });
+    });
+    openServers.push(stub.server);
+
+    const hive = makeHive(stub.url);
+    const { chunks, bridge } = await consumeTurn(hive, userCtx("hello"));
+    expect(bridge).toBeUndefined();
+    expect(chunks.map((c) => c.delta?.content)).toEqual(["ok"]);
+
+    // Guard the guard: prove the body was actually captured, so the two
+    // negative assertions below cannot pass vacuously on an undefined body.
+    expect(parsedBody).toBeDefined();
+    const body = parsedBody!;
+    expect(body).toHaveProperty("messages");
+    expect(body).not.toHaveProperty("tools");
+    expect(body).not.toHaveProperty("tool_choice");
+  });
 });
