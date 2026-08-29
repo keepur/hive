@@ -180,6 +180,10 @@ export interface TurnResult {
   toolMs: number;
   toolCalls: number;
   toolSummary: string | null;
+  /** KPR-324 C5b/S4: copied verbatim from RunResult.toolAckInjected by
+   *  finalizeSpawnResult (the same copy the other three tool fields ride).
+   *  Voice adapter logs it (C5d); chat convertTurnResult maps it back (C5e). */
+  toolAckInjected: number;
   streamed: boolean;
   compactions: number;
   preCompactTokens?: number;
@@ -2313,6 +2317,7 @@ export class AgentManager {
       llmMs: 0,
       toolMs: 0,
       toolCalls: 0,
+      toolAckInjected: 0,
       toolSummary: "none",
       streamed: false,
       inputTokens: 0,
@@ -2854,6 +2859,14 @@ export class AgentManager {
       toolMs: result.toolMs,
       toolCalls: result.toolCalls,
       toolSummary: result.toolSummary || null,
+      // KPR-324 C5c — the load-bearing copy (spec §4.6 step 3). The `?? 0`
+      // is the out-of-engine belt, NOT slack for in-engine callers: an
+      // adapter shipped by a provider plugin (KPR-394) was compiled against
+      // an older `pkg/types/` RunResult and can legitimately omit the field
+      // at runtime, where `undefined` would flow into a required-number
+      // TurnResult slot and log as `undefined` on C5d. Every in-engine
+      // construction site still declares it explicitly (C5a is required).
+      toolAckInjected: result.toolAckInjected ?? 0,
       streamed: result.streamed,
       compactions: result.compactions,
       preCompactTokens: result.preCompactTokens,

@@ -44,7 +44,11 @@ import {
   DELEGATE_UNSAFE_SERVERS as DELEGATE_UNSAFE_SERVER_NAMES,
   TURN_CONTEXT_DEPENDENT_SERVERS,
 } from "./server-traits.js";
-import { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
+import {
+  IN_PROCESS_PORTED_SERVERS,
+  VOICE_FIXTURE_SERVER_NAME,
+  VOICE_FIXTURE_ALLOWED_AGENT_ID,
+} from "./in-process-servers.js";
 
 import type { ResourceLimits } from "./model-router.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
@@ -67,12 +71,15 @@ import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import { createWorkerPoolMcpServer } from "../workers/worker-pool-mcp-server.js";
+import { createVoiceFixtureMcpServer } from "../voice/voice-fixture-mcp-server.js";
 import type { MeetingWorkerPool, WorkerPoolTurnContext } from "../workers/meeting-worker-pool.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
 import type { ReasoningEffort } from "./provider-adapters/types.js";
 // KPR-394 (§4.11): plugin provider ids widen the admin model-catalog tools.
 import { listPluginProviderIds } from "./provider-adapters/provider-registry.js";
+// KPR-324 C2: voice tool-start acknowledgment (cold spawn loop).
+import { shouldInjectToolAck, nextAckPhrase, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -144,6 +151,16 @@ export interface RunResult {
   toolMs: number;
   toolCalls: number;
   toolSummary: string;
+  /**
+   * KPR-324 C5a/S4: count of hive-injected tool-start acknowledgment phrases
+   * spoken on this turn (voice channel only — 0 on every other channel, when
+   * voice.toolAck.enabled is false, or when the model spoke before each
+   * tool_use). REQUIRED, not optional: a spawn-loop counter that is not on
+   * RunResult drops at the finalizeSpawnResult copy and the adapter logs
+   * 0/undefined (spec §4.6) — the required type makes every construction
+   * site declare it.
+   */
+  toolAckInjected: number;
   streamed: boolean;
   inputTokens: number;
   outputTokens: number;
@@ -375,6 +392,8 @@ export class AgentRunner {
   private workerPoolMcpServer?: ReturnType<typeof createWorkerPoolMcpServer>;
   private workerPoolContextRef: { current: WorkerPoolTurnContext } = { current: {} };
   private workerPool?: MeetingWorkerPool;
+  // KPR-324 C7: voice-pilot-only test fixture (no db dependency — canned data).
+  private voiceFixtureMcpServer?: ReturnType<typeof createVoiceFixtureMcpServer>;
   private readonly suppressAutoInjectedServers: boolean;
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
@@ -1396,6 +1415,30 @@ export class AgentRunner {
       });
     }
 
+    // KPR-324 C7 + KPR-327 pattern: voice-fixture is in-process-only with no
+    // stdio placeholder — surface its descriptor explicitly so the Lane B
+    // partition sees it honestly (bridged, not silently absent). Gate
+    // mirrors the runtime wiring in buildInProcessServers, including the
+    // voice-pilot-only belt. (Standing obligation, CLAUDE.md "Adding an
+    // in-process MCP server".)
+    if (
+      this.agentConfig.id === VOICE_FIXTURE_ALLOWED_AGENT_ID &&
+      this.shouldEnableInProcessServer(VOICE_FIXTURE_SERVER_NAME) &&
+      !mcpServers[VOICE_FIXTURE_SERVER_NAME]
+    ) {
+      inventory.push({
+        ...classifyToolTransport({
+          name: VOICE_FIXTURE_SERVER_NAME,
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: false,
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
+    }
+
     if (this.teamRoster && !this.suppressAutoInjectedServers) {
       inventory.push({
         ...classifyToolTransport({
@@ -1631,6 +1674,21 @@ export class AgentRunner {
         });
       }
       servers["worker-pool"] = this.workerPoolMcpServer;
+    }
+
+    // KPR-324 C7: voice-fixture — in-process test double, voice-pilot ONLY.
+    // Double gate: registry load already strips it from other defs; this
+    // agent-id check is the belt so a bypassed registry (direct DB write +
+    // SIGUSR1 race) still cannot arm the fixture on a production agent.
+    // No db dependency — canned data. No SERVER_CATALOG key (C8 trap).
+    if (
+      this.agentConfig.id === VOICE_FIXTURE_ALLOWED_AGENT_ID &&
+      this.shouldEnableInProcessServer(VOICE_FIXTURE_SERVER_NAME)
+    ) {
+      if (!this.voiceFixtureMcpServer) {
+        this.voiceFixtureMcpServer = createVoiceFixtureMcpServer();
+      }
+      servers[VOICE_FIXTURE_SERVER_NAME] = this.voiceFixtureMcpServer;
     }
 
     // KPR-122: structured-memory MCP — in-process, paired with memory.
@@ -2211,6 +2269,13 @@ export class AgentRunner {
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
     let activeToolName: string | null = null;
 
+    // KPR-324 C2/S2: tool-start acknowledgment state (spec §4.1 segment
+    // rule). Per-turn locals — rotation is caller-owned so concurrent calls
+    // never share a counter (spec §4.2).
+    let streamedThisSegment = false;
+    let toolAckInjected = 0;
+    let ackRotation = { index: 0 };
+
     const timeoutMs = resourceLimits?.timeoutMs ?? this.agentConfig.timeoutMs ?? 300_000; // 5 min default
     // KPR-306: stamp timedOut ONLY when the deadline actually cancels an
     // active query — mirrors abort()'s own null guard. The gap this closes:
@@ -2276,6 +2341,7 @@ export class AgentRunner {
             }
             onStream(event.delta.text);
             streamed = true;
+            streamedThisSegment = true; // KPR-324 §4.1: the model spoke in this segment
           }
         }
 
@@ -2308,12 +2374,72 @@ export class AgentRunner {
             cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
             cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
           }
+          // KPR-324 pre-PR R1/R3: subagent/delegate-nested messages are excluded
+          // from the ack decision AND from every segment-state mutation. The SDK
+          // forwards subagent tool_use / tool_result blocks by default
+          // (parent_tool_use_id != null), so a single Task delegation would
+          // otherwise speak one canned hold line per NESTED tool call — several
+          // "One moment." lines for what the caller experiences as one silent
+          // gap. `streamedThisSegment` models what the LIVE CALLER has heard in
+          // the current segment, so machinery the caller never hears must not
+          // move it in either direction: nested text must not mark the segment
+          // "spoken" (would suppress a genuinely-silent top-level ack), and a
+          // nested tool_use must not reset it to false (would mis-frame the next
+          // top-level segment). Usage accounting above and the tool-timing/
+          // logging below deliberately keep processing these messages (KPR-401)
+          // — this guard touches ack + segment state alone, and only on THIS
+          // (assistant-message) branch. The text_delta branch above sets
+          // streamedThisSegment unconditionally on every delta, nesting or not
+          // — that is correct as-is, not an oversight: the SDK does not forward
+          // subagent text by default (forwardSubagentText unset), so any delta
+          // reaching that branch really was spoken to the live caller.
+          const subagentNested =
+            (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
           const content = assistantMessage?.content;
           if (Array.isArray(content)) {
+            // KPR-324 §4.1: text blocks are processed BEFORE tool blocks so a
+            // "let me check that" + tool_use in ONE assistant message counts
+            // as streamed (no double-speak — spec §4.1 same-message rule).
+            if (
+              !subagentNested &&
+              content.some(
+                (b: { type?: string; text?: string }) =>
+                  b.type === "text" && typeof b.text === "string" && b.text.length > 0,
+              )
+            ) {
+              streamedThisSegment = true;
+            }
             for (const block of content) {
               if (block.type === "text") {
                 resultText = block.text;
               } else if (block.type === "tool_use") {
+                // KPR-324 C2/S2: speak a canned hold line iff this segment was
+                // silent and this is a streaming VOICE turn. SSE-only — the
+                // phrase never enters the SDK transcript or resultText, and
+                // does not set `streamed` (not model text). tool_use is
+                // observed BEFORE the handler runs (⚠ registry #2, Task 0),
+                // so the ack reaches TTS while the tool executes. Nested
+                // (subagent/delegate) tool calls never ack — see above.
+                if (
+                  !subagentNested &&
+                  shouldInjectToolAck({
+                    enabled: config.voice.toolAck.enabled,
+                    streamedThisSegment,
+                    hasOnStream: !!onStream,
+                    channel: context?.channelKind ?? "",
+                  })
+                ) {
+                  const next = nextAckPhrase(ackRotation);
+                  ackRotation = { index: next.index };
+                  onStream!(next.phrase + VOICE_TOOL_ACK_SEPARATOR);
+                  toolAckInjected += 1;
+                }
+                // §4.1: the tool-run gap starts now. Nested (subagent) tool
+                // calls open no gap the caller perceives — they must not reset
+                // the top-level segment's spoken state (R3).
+                if (!subagentNested) {
+                  streamedThisSegment = false;
+                }
                 // Close previous tool timing if any
                 if (activeToolName && toolCalls.length > 0) {
                   toolCalls[toolCalls.length - 1]!.endMs = Date.now();
@@ -2508,7 +2634,7 @@ export class AgentRunner {
     return {
       text: resultText, sessionId: resultSessionId, costUsd, durationMs,
       llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length,
-      toolSummary: toolSummary || "none", streamed,
+      toolSummary: toolSummary || "none", toolAckInjected, streamed,
       inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
       ephemeral5mTokens, ephemeral1hTokens,
       contextWindow, compactions, preCompactTokens,

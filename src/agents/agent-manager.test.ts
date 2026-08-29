@@ -89,6 +89,10 @@ vi.mock("../config.js", () => ({
       // every pre-existing voice case keeps running the cold path
       // unchanged; the warm describe flips it per-block.
       warmPath: { enabled: false },
+      // KPR-324 C3: tool-start ack master switch. Default OFF here (the
+      // engine default is ON) so every pre-existing case stays
+      // behavior-identical; the ack cases flip it explicitly.
+      toolAck: { enabled: false },
     },
     taskLedger: { apiUrl: "", apiKey: "", agentKeys: {} as Record<string, string> },
     brave: { apiKey: "" },
@@ -267,6 +271,7 @@ import { buildGenericDelegatePrompt, type DelegateTurnRunner } from "./provider-
 import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
 import { classifyTurnResult, TurnAssemblyError } from "./provider-adapters/error-classification.js";
 import { AsyncPushQueue, WARM_IDLE_TIMEOUT_MS, type WarmVoiceSession } from "./warm-voice-session.js";
+import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -314,6 +319,10 @@ function makeRunResult(overrides: Partial<RunResult> = {}) {
     toolMs: 200,
     toolCalls: 1,
     toolSummary: "memory:1x/0.2s",
+    // KPR-324 C5a: the helper's return type is INFERRED, not annotated
+    // `: RunResult` — a missing field compiles clean and would surface only as
+    // a runtime `undefined` in the C5c copy-path assertion below.
+    toolAckInjected: 0,
     streamed: false,
     aborted: false,
     inputTokens: 100,
@@ -1277,6 +1286,28 @@ describe("AgentManager", () => {
       mockRunnerSend.mockResolvedValueOnce(makeRunResult({ toolSummary: "" }));
       const result = await manager.spawnTurn(smsCtx());
       expect(result.toolSummary).toBeNull();
+    });
+
+    it("KPR-324 C5c: finalizeSpawnResult copies RunResult.toolAckInjected onto TurnResult", async () => {
+      // The copy is channel-agnostic — an SMS turn proves it, because the
+      // voice-only gating lives in the spawn loops (C2/C3) that PRODUCE the
+      // counter, never in finalizeSpawnResult which merely carries it.
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ toolAckInjected: 3 }));
+      const result = await manager.spawnTurn(smsCtx());
+      expect(result.toolAckInjected).toBe(3);
+    });
+
+    it("KPR-324 C5c: a RunResult omitting toolAckInjected degrades to 0, never undefined", async () => {
+      // The `?? 0` belt for out-of-engine adapters (KPR-394 provider plugins
+      // compiled against an older pkg/types/ RunResult). Cast because the
+      // in-engine type makes the field required.
+      mockConversationIndex.mockResolvedValue(undefined);
+      const legacyShape = makeRunResult() as Record<string, unknown>;
+      delete legacyShape.toolAckInjected;
+      mockRunnerSend.mockResolvedValueOnce(legacyShape);
+      const result = await manager.spawnTurn(smsCtx());
+      expect(result.toolAckInjected).toBe(0);
     });
 
     it("KPR-220 Phase 2: withSpawnTicket registers the ticket in activeTickets during fn, removes after", async () => {
@@ -6199,7 +6230,16 @@ describe("AgentManager", () => {
      * timed-out cases a real in-flight turn without ad-hoc harness invention.
      */
     function installEchoStreamingRunner(
-      opts: { failOnTurn?: number; hangOnTurn?: number; hangResultSubtype?: string } = {},
+      opts: {
+        failOnTurn?: number;
+        hangOnTurn?: number;
+        hangResultSubtype?: string;
+        /**
+         * KPR-324 C3: emit a SILENT assistant tool_use message before that
+         * turn's delta — the shape the warm ack gate fires on.
+         */
+        silentToolOnTurn?: number;
+      } = {},
     ) {
       let releaseHang: () => void = () => {};
       const hangReleased = new Promise<void>((r) => {
@@ -6225,6 +6265,17 @@ describe("AgentManager", () => {
             if (opts.failOnTurn === n) {
               out.push({ type: "result", subtype: "error_during_execution", errors: ["boom"], session_id: `sess-warm-${n}`, total_cost_usd: 0, duration_ms: 1 });
               continue;
+            }
+            if (opts.silentToolOnTurn === n) {
+              out.push({
+                type: "assistant",
+                message: {
+                  role: "assistant",
+                  content: [
+                    { type: "tool_use", name: "mcp__voice-fixture__voice_fixture_lookup", id: "t1", input: {} },
+                  ],
+                },
+              });
             }
             out.push({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: `reply-${n} ` } } });
             if (opts.hangOnTurn === n) {
@@ -6255,7 +6306,7 @@ describe("AgentManager", () => {
     beforeEach(() => {
       mockConversationIndex.mockResolvedValue(undefined);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (appConfig as any).voice = { warmPath: { enabled: true } };
+      (appConfig as any).voice = { warmPath: { enabled: true }, toolAck: { enabled: false } };
     });
 
     afterEach(() => {
@@ -6263,13 +6314,13 @@ describe("AgentManager", () => {
       // coordinator lambda (and its lock/budget) behind for the next one.
       for (const lease of [...warmLeases(manager).values()]) lease.close("test-cleanup");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (appConfig as any).voice = { warmPath: { enabled: false } };
+      (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
     });
 
     // ---- assertion 1 -----------------------------------------------------
     it("(1) flag OFF: voice ctx takes the cold path exactly — no stream open, no lease, no ticket held", async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (appConfig as any).voice = { warmPath: { enabled: false } };
+      (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
       installEchoStreamingRunner();
       mockRunnerSend.mockResolvedValueOnce(makeRunResult({ text: "cold reply", sessionId: "cold-1" }));
 
@@ -6917,7 +6968,7 @@ describe("AgentManager", () => {
       it("(11b) falls through to the 322 ticket-walk when no lease exists (cold voice spawn)", async () => {
         // Flag OFF for this case — cold spawn holds the ticket.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (appConfig as any).voice = { warmPath: { enabled: false } };
+        (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
         mockConversationIndex.mockResolvedValue(undefined);
         // 322's zombie-spawn pattern: send hangs, runner.abort releases it.
         let releaseSend!: (r: ReturnType<typeof makeRunResult>) => void;
@@ -6936,6 +6987,43 @@ describe("AgentManager", () => {
         expect(mockRunnerAbort).toHaveBeenCalledTimes(1);
         expect(mockRunnerOpenStream).not.toHaveBeenCalled();
         expect((await inflight).aborted).toBe(true);
+      });
+    });
+
+    // ------------------------------------------------------------------
+    // KPR-324 C3 — warm tool-start ack, end to end through the REAL
+    // WarmVoiceSession + spawnTurn (the suite's config mock is what the
+    // warm loop reads). Additive; every other case leaves toolAck OFF.
+    // ------------------------------------------------------------------
+    describe("tool-start acknowledgment (KPR-324 C3)", () => {
+      it("a silent tool_use on a warm turn speaks one ack and reports it on the TurnResult", async () => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (appConfig as any).voice = { warmPath: { enabled: true }, toolAck: { enabled: true } };
+        installEchoStreamingRunner({ silentToolOnTurn: 1 });
+
+        const chunks: string[] = [];
+        const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: "stored-abc" }), (c) => chunks.push(c));
+
+        expect(r.warmPath).toBe(true);
+        expect(r.toolAckInjected).toBe(1);
+        expect(chunks).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR, "reply-1 "]);
+        // SSE-only — the ack never enters the delivered turn text.
+        expect(r.finalMessage).toBe("reply-1");
+      });
+
+      it("the S7 flag off leaves a warm turn with a silent tool_use byte-identical", async () => {
+        mockConversationIndex.mockResolvedValue(undefined);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (appConfig as any).voice = { warmPath: { enabled: true }, toolAck: { enabled: false } };
+        installEchoStreamingRunner({ silentToolOnTurn: 1 });
+
+        const chunks: string[] = [];
+        const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: "stored-abc" }), (c) => chunks.push(c));
+
+        expect(r.warmPath).toBe(true);
+        expect(r.toolAckInjected).toBe(0);
+        expect(chunks).toEqual(["reply-1 "]);
       });
     });
   });

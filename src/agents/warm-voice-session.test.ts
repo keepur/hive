@@ -7,9 +7,18 @@ import {
   WARM_LIFETIME_CAP_MS,
   WARM_INTERRUPT_GRACE_MS,
 } from "./warm-voice-session.js";
+import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+}));
+
+// KPR-324 C3: the module now imports the real config.ts, which throws in a
+// bare vitest process (no env). Factory mock with a hoisted mutable flag so
+// cases can flip the S7 lever.
+const toolAckFlag = vi.hoisted(() => ({ enabled: true }));
+vi.mock("../config.js", () => ({
+  config: { voice: { toolAck: toolAckFlag } },
 }));
 
 /**
@@ -765,5 +774,293 @@ describe("WarmVoiceSession", () => {
     expect(r.aborted).toBeUndefined();
 
     lease.close("test-cleanup");
+  });
+
+  // ------------------------------------------- KPR-324 C3: warm tool-start ack
+  describe("tool-start acknowledgment (KPR-324 C3)", () => {
+    const toolUseMsg = (names: string[]) => ({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: names.map((name, i) => ({ type: "tool_use", name, id: `t${i + 1}`, input: {} })),
+      },
+    });
+
+    afterEach(() => {
+      toolAckFlag.enabled = true;
+    });
+
+    // Warm half of spec §12.1 #4.
+    it("injects one ack when a silent segment hits a tool_use", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(initMsg("sess-1"));
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      await microFlush();
+
+      // The ack reached TTS BEFORE the turn's result was even emitted.
+      expect(chunks[0]).toBe(VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR);
+
+      emit(delta("the answer "));
+      emit(resultMsg({ result: "the answer", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(1);
+      expect(chunks).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR, "the answer "]);
+      // SSE-only: the phrase never enters the turn text.
+      expect(r.text).toBe("the answer");
+
+      lease.close("test-cleanup");
+    });
+
+    it("does NOT inject when the segment already spoke (text-then-tool)", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(delta("let me look "));
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(0);
+      expect(chunks).toEqual(["let me look "]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("injects per tool_use block, rotating phrases within the turn", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup", "mcp__voice-fixture__voice_fixture_slow"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(2);
+      expect(chunks).toEqual([
+        VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR,
+        VOICE_TOOL_ACK_PHRASES[1] + VOICE_TOOL_ACK_SEPARATOR,
+      ]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("injects nothing when the S7 flag is off", async () => {
+      toolAckFlag.enabled = false;
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(0);
+      expect(chunks).toEqual([]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("restarts the rotation on every turn of the same lease (per-turn, not per-lease)", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks1: string[] = [];
+      const p1 = lease.runTurn({ text: "u1", onStream: (c) => chunks1.push(c), timeoutMs: 60_000 });
+      await microFlush();
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "one", session_id: "sess-1" }));
+      const r1 = await p1;
+
+      const chunks2: string[] = [];
+      const p2 = lease.runTurn({ text: "u2", onStream: (c) => chunks2.push(c), timeoutMs: 60_000 });
+      await microFlush();
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "two", session_id: "sess-1" }));
+      const r2 = await p2;
+
+      expect(r1.toolAckInjected).toBe(1);
+      expect(r2.toolAckInjected).toBe(1);
+      // BOTH turns speak phrase [0] — rotation state is per-turn.
+      expect(chunks1).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+      expect(chunks2).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+
+      lease.close("test-cleanup");
+    });
+
+    // ── Pre-PR R1: delegate/subagent-nested tool_use is excluded ────────
+    // The lease reuses buildQueryEnvelope verbatim (same MCP + delegate
+    // wiring as the cold path), so a Task delegation's nested tool_use
+    // blocks reach this loop with parent_tool_use_id set.
+    const nestedToolUseMsg = (names: string[], parentToolUseId = "toolu_task") => ({
+      ...toolUseMsg(names),
+      parent_tool_use_id: parentToolUseId,
+    });
+
+    it("does NOT inject for subagent-nested tool_use blocks", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_slow"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(0);
+      expect(chunks).toEqual([]);
+      // Ack-only exclusion: the nested calls are still timed/counted.
+      expect(r.toolCalls).toBe(2);
+
+      lease.close("test-cleanup");
+    });
+
+    it("acks the top-level Task once while its nested calls stay silent", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(toolUseMsg(["Task"]));
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_slow"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(1);
+      expect(chunks).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("parent_tool_use_id: null is top level and still injects (regression lock)", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit({
+        ...toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]),
+        parent_tool_use_id: null,
+      });
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(1);
+      expect(chunks).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+
+      lease.close("test-cleanup");
+    });
+
+    // ── Pre-PR R3: nested messages must not mutate SEGMENT STATE either ──
+    // Cold-path twin (agent-runner.test.ts). R1 gated the ack DECISION on
+    // !subagentNested but left the surrounding `streamedThisSegment`
+    // mutations ungated; that variable models what the LIVE CALLER heard.
+    const nestedTextMsg = (text: string, parentToolUseId = "toolu_task") => ({
+      type: "assistant",
+      parent_tool_use_id: parentToolUseId,
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    });
+
+    it("nested TEXT does not mark the segment spoken — the next silent top-level tool still acks", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(initMsg("sess-1"));
+      emit(toolUseMsg(["Task"])); // top-level, silent → ACK0
+      emit(nestedTextMsg("I found three records")); // subagent prose, never spoken
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"])); // still silent → ACK1
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      // Pre-fix the nested text swallowed the second ack.
+      expect(r.toolAckInjected).toBe(2);
+      expect(chunks).toEqual([
+        VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR,
+        VOICE_TOOL_ACK_PHRASES[1] + VOICE_TOOL_ACK_SEPARATOR,
+      ]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("nested tool_use does not reset the segment — no spurious ack right after the model spoke", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(delta("let me look ")); // the caller genuinely heard this
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_slow"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      // Pre-fix the nested tool_use reset streamedThisSegment = false, so the
+      // top-level call acked on top of speech the caller had just heard.
+      expect(r.toolAckInjected).toBe(0);
+      expect(chunks).toEqual(["let me look "]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("a silent top-level tool_use after nested tool calls still acks (state is gated, the ack path is not)", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_slow"]));
+      emit(toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(1);
+      expect(chunks).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+
+      lease.close("test-cleanup");
+    });
   });
 });

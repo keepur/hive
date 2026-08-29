@@ -4,7 +4,11 @@ import type { AgentDefinition } from "../types/agent-definition.js";
 import { toAgentConfig } from "../types/agent-definition.js";
 import { config as appConfig } from "../config.js";
 import { getArchetype } from "../archetypes/registry.js";
-import { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
+import {
+  IN_PROCESS_PORTED_SERVERS,
+  VOICE_FIXTURE_SERVER_NAME,
+  VOICE_FIXTURE_ALLOWED_AGENT_ID,
+} from "./in-process-servers.js";
 import "../archetypes/index.js";
 import type { Collection, ChangeStream } from "mongodb";
 
@@ -52,6 +56,23 @@ function sanitizeDelegateServers(agentId: string, delegateServers: string[]): st
       "Move these servers to coreServers (or remove) via admin_agent_update. Per KPR-122, they're in-process and the SDK's AgentDefinition type doesn't accept in-process configs.",
   });
   return delegateServers.filter((s) => !IN_PROCESS_PORTED_SERVERS.has(s));
+}
+
+/**
+ * KPR-324 C7 (spec §7 guard): `voice-fixture` is a test double that returns
+ * fake purchase-order data — a loaded gun on a production call. Only the
+ * dedicated `voice-pilot` test agent may carry it. Same posture as the
+ * KPR-184 delegate sanitizer: strip + error log, operator repairs the doc
+ * via admin agent_update.
+ */
+function sanitizeVoiceFixture(agentId: string, coreServers: string[]): string[] {
+  if (agentId === VOICE_FIXTURE_ALLOWED_AGENT_ID) return coreServers;
+  if (!coreServers.includes(VOICE_FIXTURE_SERVER_NAME)) return coreServers;
+  log.error("voice-fixture is test-only (voice-pilot). Stripping from coreServers.", {
+    agentId,
+    allowedAgent: VOICE_FIXTURE_ALLOWED_AGENT_ID,
+  });
+  return coreServers.filter((s) => s !== VOICE_FIXTURE_SERVER_NAME);
 }
 
 /**
@@ -242,6 +263,8 @@ export class AgentRegistry {
       // any downstream consumer (subagent assembly, toolkit listing, etc.)
       // sees the value. Logs an error if any are stripped.
       agentConfig.delegateServers = sanitizeDelegateServers(agentConfig.id, agentConfig.delegateServers);
+      // KPR-324 C7: strip the test fixture from any non-pilot def.
+      agentConfig.coreServers = sanitizeVoiceFixture(agentConfig.id, agentConfig.coreServers);
       // KPR-329: sanitize the optional toolSearch override before any
       // downstream consumer (spawn env resolution, prefix builder) sees it.
       agentConfig.toolSearch = sanitizeToolSearch(agentConfig.id, agentConfig.toolSearch);

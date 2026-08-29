@@ -7,6 +7,7 @@ import {
   resolveToolSearchConfig,
   resolveVoiceLivekitConfig,
   resolveVoiceWarmPathConfig,
+  resolveVoiceToolAckConfig,
   resolveMeetingWorkersConfig,
   DEFAULT_TOOL_SEARCH_CONFIG,
 } from "./config.js";
@@ -363,5 +364,22 @@ describe("resolveVoiceWarmPathConfig (KPR-323 C4)", () => {
   });
   it("ignores unknown keys", () => {
     expect(resolveVoiceWarmPathConfig({ enabled: true, idleMs: 5 }).enabled).toBe(true);
+  });
+});
+
+describe("resolveVoiceToolAckConfig (KPR-324 C6)", () => {
+  it("defaults to enabled on absent/garbage input (spec §12.1 #7)", () => {
+    for (const input of [undefined, null, 42, "x", [], {}, { enabled: "false" }, { enabled: 0 }, { enabled: "no" }]) {
+      expect(resolveVoiceToolAckConfig(input).enabled).toBe(true);
+    }
+  });
+  it("disables on { enabled: false }", () => {
+    expect(resolveVoiceToolAckConfig({ enabled: false }).enabled).toBe(false);
+  });
+  it("disables on the bare scalar false (child-PR/1 finding: the operator shorthand)", () => {
+    expect(resolveVoiceToolAckConfig(false).enabled).toBe(false);
+  });
+  it("enables on literal true; ignores unknown keys", () => {
+    expect(resolveVoiceToolAckConfig({ enabled: true, phrases: ["x"] }).enabled).toBe(true);
   });
 });

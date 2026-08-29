@@ -263,6 +263,30 @@ export function resolveVoiceWarmPathConfig(raw: unknown): VoiceWarmPathConfig {
 }
 
 /**
+ * KPR-324 C6/S7: resolve the optional hive.yaml `voice.toolAck` section.
+ * Liberal-loader style (KPR-225 F3) with the INVERSE default of 323's
+ * warm-path flag: masking IS the ticket, so absent/garbage → ENABLED.
+ * Only a literal `false` disables injection (the rollback lever, spec §8).
+ * Accepts a bare `voice.toolAck: false` scalar as well as `{ enabled: false }`
+ * — the rollback lever is the one setting an operator reaches for under
+ * pressure, so the scalar shorthand must not silently no-op (child-PR/1
+ * finding: the object-coercion below previously collapsed a bare `false`
+ * to `{}`, which resolved as enabled).
+ * Phrases, rotation, and the fixture delay cap are constants in
+ * voice-tool-ack.ts / voice-fixture-mcp-server.ts — deliberately NOT config.
+ * Exported pure for unit tests.
+ */
+export interface VoiceToolAckConfig {
+  enabled: boolean;
+}
+
+export function resolveVoiceToolAckConfig(raw: unknown): VoiceToolAckConfig {
+  if (raw === false) return { enabled: false };
+  const src = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  return { enabled: src.enabled !== false };
+}
+
+/**
  * KPR-322: env-first / Honeypot-second secret resolution for out-of-engine
  * processes (the voice worker reuses the engine loader). Delegates to the
  * loader's own `optional()` so the semantics can never drift from the
@@ -554,6 +578,9 @@ export const config = {
     // KPR-323 C4: per-call warm session lease master switch. Default false
     // on merge; flipped per-instance after W2 passes.
     warmPath: resolveVoiceWarmPathConfig((hive.voice as Record<string, unknown> | undefined)?.warmPath),
+    // KPR-324 C6: mid-call tool-start acknowledgment master switch. Default
+    // ON (S7 — masking is the ticket); literal `false` is the rollback lever.
+    toolAck: resolveVoiceToolAckConfig((hive.voice as Record<string, unknown> | undefined)?.toolAck),
   },
   // KPR-322 E3: names reserved by 321 §9, wired here. Consumed by
   // scripts/livekit-setup.ts (SIP-1) — never by cloud-model-facing code.

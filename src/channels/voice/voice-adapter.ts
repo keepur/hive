@@ -430,6 +430,13 @@ export class VoiceAdapter {
     // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
     // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
     // cover (stale id without auth-error pattern, etc.).
+    //
+    // KPR-324 semantics note: `bytesSent` (= headersSent) now flips true on a
+    // hive-injected tool-start ack too, not just model text — the ack goes
+    // through this same `onStream`/SSE path. That is intentional: once the
+    // caller has HEARD the ack, replaying the turn would double-speak it, so
+    // an ack-only turn is correctly treated as "already on the wire" and is
+    // not retried here.
     if (!outcome.ok && !outcome.circuitOpen && effectiveResume && !outcome.bytesSent && !clientGone) {
       log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
         callId,
@@ -532,6 +539,13 @@ export class VoiceAdapter {
     log.info("Voice turn complete", {
       callId,
       agentId,
+      // KPR-324: on an ack turn, firstTokenMs now measures time-to-FIRST-
+      // AUDIO (model text OR a hive-injected ack, whichever the caller hears
+      // first via onStream) — not necessarily time-to-model-text anymore.
+      // stageTimings.initToFirstTokenMs (below) is a separate, SDK-side stamp
+      // that still measures time-to-first-model-text specifically and
+      // includes toolMs; the two intentionally diverge on ack turns. Read
+      // both, not just one, when interpreting a T-gate row.
       firstTokenMs,
       totalMs: Date.now() - startedAt,
       mode: isStreaming ? "streaming" : "non-streaming",
@@ -544,6 +558,14 @@ export class VoiceAdapter {
       promptBuildMs,
       sessionLookupMs,
       ...(result.stageTimings ?? {}),
+      // KPR-324 C5d/S4: tool observability for T-gates and 325 pause
+      // attribution. Counts + durations + server-name summary only — the
+      // existing redaction posture (tool NAMES, never args, never content,
+      // never the ack phrase text).
+      toolCalls: result.toolCalls,
+      toolMs: result.toolMs,
+      toolSummary: result.toolSummary ?? "none",
+      toolAckInjected: result.toolAckInjected,
       // KPR-323 C2: warm-lease markers (false/absent until Task 5 lands).
       warmPath: result.warmPath ?? false,
       ...(result.warmTurnSeq !== undefined ? { warmTurnSeq: result.warmTurnSeq } : {}),
