@@ -490,7 +490,7 @@ export class Dispatcher {
       // explicitly. Voice never passes through here (routeVoiceTurn returns
       // TurnResult straight from spawnTurn); this mapping keeps the chat
       // lane's RunResult honest and is what C5a's required type enforces.
-      toolAckInjected: turn.toolAckInjected,
+      toolAckInjected: turn.toolAckInjected ?? 0,
       streamed: turn.streamed,
       compactions: turn.compactions,
       preCompactTokens: turn.preCompactTokens,

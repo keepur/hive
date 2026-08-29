@@ -539,6 +539,13 @@ export class VoiceAdapter {
     log.info("Voice turn complete", {
       callId,
       agentId,
+      // KPR-324: on an ack turn, firstTokenMs now measures time-to-FIRST-
+      // AUDIO (model text OR a hive-injected ack, whichever the caller hears
+      // first via onStream) — not necessarily time-to-model-text anymore.
+      // stageTimings.initToFirstTokenMs (below) is a separate, SDK-side stamp
+      // that still measures time-to-first-model-text specifically and
+      // includes toolMs; the two intentionally diverge on ack turns. Read
+      // both, not just one, when interpreting a T-gate row.
       firstTokenMs,
       totalMs: Date.now() - startedAt,
       mode: isStreaming ? "streaming" : "non-streaming",
