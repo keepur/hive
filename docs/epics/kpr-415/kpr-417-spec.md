@@ -428,3 +428,46 @@ KPR-415 is a pre-register epic with no register section yet; recorded here per t
 - **Preserves KPR-389 §D5 (goal 5)** in full — the round-0 gate is the mechanism, and T3 is its guard.
 - **Preserves KPR-413** — continuation legs stay conference-stripped and gain no ack behavior.
 - **Depends on KPR-416's *relocation* of the reaction-exclusion write to delivery time** — not on which write predicate A chose — for §6.4's reasoning (§11).
+
+---
+
+## 13. Post-merge addendum — coherence review of `2499a57` (2026-08-29)
+
+*Appended by the KPR-415 coherence seam after this child merged (`2499a57`, PR #437). Verdict: **ALIGNED**, with one **`GATE1_AMENDMENT`** pending the operator's ruling. Added rather than edited in place, so the pre-merge artifact stays legible — same precedent as `kpr-416-spec.md` §14.*
+
+### 13.1 §8's ordering claim is falsified — the merged code is right, this spec is stale
+
+`:334` states:
+
+> **Ack ordering vs. the answer, generally.** The ack fires at 15s; the answer at turn end (>15s by construction, since a faster turn cancels). Ordering is therefore **correct by construction, not by luck**.
+
+**That is a bound on post *start*, not on post *landing*, and Slack does not preserve the two.** The pre-PR review adjudicated this by reading `@slack/web-api`'s retry semantics out of `node_modules` rather than from memory, and found the concern *stronger* than first stated: `WebClient` 429 handling **pauses the shared request queue**, delays, then restarts it and re-throws to retry — so a 429'd ack is silently re-queued **behind whatever entered the queue during the pause**, which can include that agent's own answer. `chat.postMessage` is ~1/sec per channel and `maxRequestConcurrency` defaults to 100, so in an N-agent cohort every unresolved responder really does fire its ack into one channel simultaneously.
+
+The merged code says the right thing (`dispatcher.ts`, `runTurnWithMeetingAck`'s doc comment): the guarantee is on start order, the effect is harmless (the ack is stripped from history either way and "picked this up" stays true whenever it lands), it is **distinct** from §8's accepted *cancel-vs-in-flight-post* race — that one is about `cancel()` failing to unpost — and the tempting fix is warned off, because awaiting the ack would put up to thirty minutes of Slack retry latency on the turn's critical path.
+
+The coherence seat tightened the population bound further than the in-code comment: the reordering window is roughly turns settling within (N−1) seconds of the threshold, **narrower** than "exactly the multi-agent population this feature targets". Whoever revisits should carry the tighter bound. Now canon as **KPR-415/C16**.
+
+### 13.2 The three canon entries in §12 were not lifted verbatim, deliberately
+
+§12 parked three entries "to lift into KPR-415's Decision Register when it opens". The register **had** opened (at KPR-416's coherence seam), and plan Task 10 says lift verbatim — but the driver declined and handed them to this seat instead. The seat upheld that call, and found **entry 2 was not merely under-scoped but mis-reasoned**:
+
+- **Entry 2 conflated what this very spec forbids conflating.** It said replays, KPR-402 legs and worker re-entry are ack-free *"because the gate reads `resolved`, never `meta`"*. Key Points and §5.2 are emphatic these are ack-free for **different** reasons: a replay **retains** its conference meta and is ack-free because the single-dispatch leg **carries no ack wrapper at all**; a KPR-402 leg is ack-free because KPR-413 stripped the four keys. "The gate reads `resolved`" explains the **plain fan-out** case only — which is exactly why T4b is labelled vacuous-by-construction in its own comment. Lifting verbatim would have canonized the conflation this spec spent a Key Point preventing, and left T4b's real invariant ("never add the ack wrapper to the single-dispatch leg") unstated anywhere.
+- **Entry 1 over-claimed** ("never meeting content" holds only for the five *engine-internal* consumers) and omitted the Dispatcher-not-adapter domain-boundary call and the §5.4 residual whose eaten set is wider than §5.4's own prose.
+- **Entry 3 was over-tight** — "never retracted" as an absolute drops §6.4's recorded revisit trigger (an ack **edit**, not a delete).
+- **Three consequential decisions were absent entirely:** the `ackEnabled`/`enabled` independence, the rollback asymmetry with KPR-416, and the `MEETING_ACK_TEXT`↔recognizer lockstep.
+
+All corrected as **KPR-415/C11–C16**. **Root cause worth recording for sibling children, and the same one KPR-416 hit:** a child that supersedes or extends canon should quote the target entry **in full** before writing its own.
+
+### 13.3 The pending Gate-1 amendment
+
+Gate 1's work-queue item 3, approved verbatim, required *"confirmation that the delay-then-ack substitutes acceptably for the operator's literal 'immediate ack' ask (flagged in the design doc as needing confirmation, **not assumed**)"*. `:26` resolves this as *delegated under the Gate 1 signoff* — **circular**, because that signoff is the instrument that recorded the confirmation as still owed.
+
+The design implemented is the approved design; only the approval checkpoint was skipped. It is flagged `GATE1_AMENDMENT` on the epic, **deliberately not canonized**, and the epic is parked until the operator rules. If she prefers the literal immediate ack, the change is one line (`MEETING_ACK_DELAY_MS` → `0`) on the epic branch, and **T2 must be retired rather than repaired** — it is the only case encoding the delay's existence.
+
+### 13.4 Follow-up not taken at this seat
+
+**T13a's guard is narrower than the canon claim it protects.** C11 asserts "exactly one history-fetch point", verified **repo-wide**; T13a scans `dispatcher.ts` **only**, so a future `slackAdapter.fetchThreadHistory(...)` in another module escapes it silently. Not hypothetical: **the scribe is a named C11 consumer whose ack-blindness rests entirely on being *handed* the array rather than fetching its own**, and `meeting-scribe.ts` is the likeliest place a future reader adds one. Either widen the scan to `src/` (excluding the adapter's own definition) or narrow the canon claim; both the coherence seat and the driver would widen. Deliberately not done here — the epic is parking, and a post-gate test change no gate prescribed should get its own round.
+
+Also trivial, mentioned only: `:179` cites the author-extraction regex at `slack-adapter.ts:222`; post-KPR-416 it is `:228`. The merged code comment is already correct.
+
+Full reasoning: the `# Decision Register Entry` comment keyed to `2499a57` on KPR-415, and that epic's `## Decision Register — Canon` section.
