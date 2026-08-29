@@ -65,7 +65,7 @@ const NON_RESPONSE_PATTERNS = [
  * ⚠ THE TWO MUST CHANGE IN LOCKSTEP, exactly as NON_RESPONSE_PATTERNS pins
  * "No response needed." Exported (unlike NON_RESPONSE_PATTERNS, which is
  * module-private and which the suite deliberately mirrors by hand at
- * dispatcher-conference.test.ts:556 / dispatcher.test.ts:283) because this
+ * dispatcher-conference.test.ts:714 (T6) / dispatcher.test.ts:283) because this
  * constant sits on BOTH sides of a two-sided contract: T1 asserts these bytes
  * were posted and T5 seeds a fixture message that these bytes must strip. A
  * hand-mirrored copy would let T5 keep passing while the real posted text
@@ -103,7 +103,7 @@ export const MEETING_ACK_DELAY_MS = 15_000;
 /** SlackAdapter.deliver prefixes agent posts with `${icon} *${Name}*: `
  *  (icon optional when the agent has none, absent entirely when the agent was
  *  deleted mid-turn). Mirrors the author-extraction regex at
- *  slack-adapter.ts:222, widened to make the icon optional. */
+ *  slack-adapter.ts:228, widened to make the icon optional. */
 const AGENT_PREFIX_RE = /^(?:\S+\s+)?\*[^*]+\*:\s*/;
 const MEETING_ACK_PATTERNS = [/^on it\s*—\s*picked this up\.?$/i];
 
@@ -115,13 +115,13 @@ const MEETING_ACK_PATTERNS = [/^on it\s*—\s*picked this up\.?$/i];
  * routing through a full dispatch.
  *
  * ⚠ Accepted residual (spec §5.4): an agent whose ENTIRE reply is exactly the
- * ack sentence has that message stripped from meeting history. Precisely, the
- * eaten set is slightly wider than §5.4's wording: AGENT_PREFIX_RE strips any
- * leading `[token ]*Bold*: `, so a bot reply of e.g. `*Status*: On it — picked
- * this up.` is stripped too. Same class, same negligible impact — bounded to
- * one near-contentless message; the identical hazard already exists and is
- * accepted repo-wide for NON_RESPONSE_PATTERNS; and the meeting preamble
- * steers agents toward "No response needed.", not toward this sentence.
+ * ack sentence has that message stripped from meeting history. The eaten set
+ * is wider than §5.4's wording — the two regexes above are the authority, not
+ * this prose. AGENT_PREFIX_RE also eats a leading `[token ]*Bold*: `, and
+ * case, dash spacing, a trailing period and outer whitespace all vary freely.
+ * Same class, same negligible impact — one near-contentless message; the
+ * identical hazard is accepted repo-wide for NON_RESPONSE_PATTERNS; and the
+ * preamble steers agents toward "No response needed.", not this sentence.
  */
 export function isMeetingAck(m: ThreadMessage): boolean {
   if (!m.isBot) return false;

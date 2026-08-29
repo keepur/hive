@@ -757,7 +757,7 @@ Meeting rules:
 
     /** Fake scribe whose getSummary resolves undefined, so the FULL arm is
      *  preserved (a summary would flip injectionMode to "summary"). Mirrors
-     *  the in-file seedScribe precedent at :1403. */
+     *  the in-file seedScribe precedent at :2783. */
     const seedAckScribe = () => {
       const scribe = { getSummary: vi.fn().mockResolvedValue(undefined), noteActivity: vi.fn() };
       dispatcher.setMeetingScribe(scribe as any);
@@ -874,7 +874,7 @@ Meeting rules:
   // KPR-417 — delay-then-ack: arm, fire, cancel
   //
   // ⚠ FAKE TIMERS ARE SCOPED TO THIS BLOCK ONLY. The rest of the file keeps
-  // its real-timer `settleReactions` (:623) untouched and no existing test
+  // its real-timer `settleReactions` (:315) untouched and no existing test
   // changes. Inside this block use ONLY the async advancement API — under
   // vi.useFakeTimers() the suite's `new Promise(r => setTimeout(r, 0))` drain
   // is itself captured by the fake clock and never resolves, so a naive
@@ -899,10 +899,10 @@ Meeting rules:
     });
 
     /** KPR-417: the fake-timer equivalent of the suite's real-timer
-     *  `settleReactions` (:623) — NOT a second mechanism.
+     *  `settleReactions` (:315) — NOT a second mechanism.
      *  advanceTimersByTimeAsync yields a real macrotask boundary between
      *  ticks, which is precisely the drain semantics settleReactions provides
-     *  per its own comment at :613-622. */
+     *  per its own JSDoc at :301-314. */
     const settleAcked = () => vi.advanceTimersByTimeAsync(0);
 
     /** A turn that never settles until the test releases it. */
@@ -1155,7 +1155,7 @@ Meeting rules:
       },
     );
 
-    /** Outage wiring, same shape as the in-file precedent at :1049-1064. */
+    /** Outage wiring, same shape as T4's in-file precedent at :1620-1635. */
     const armOutage = () => {
       const outageStore = {
         enqueue: vi.fn().mockResolvedValue(undefined),
@@ -1228,7 +1228,7 @@ Meeting rules:
     it("T9c (KPR-417, §6.2): ⚠ ACCEPTED RESIDUAL — two agents in one episode produce TWO acks and ONE notice", async () => {
       // This pins KNOWN, ACCEPTED behavior, not desired behavior. The outage
       // notice is deduped once per (provider, adapterKey, threadKey) per
-      // episode (dispatcher.ts:1003, firstForThread), so in an N-agent meeting
+      // episode (dispatcher.ts:1160, firstForThread), so in an N-agent meeting
       // on one provider only the first agent's turn produces a notice; the
       // rest queue silently. If those agents acked, their acks are followed by
       // silence until replay — possibly hours later, and via the
