@@ -115,8 +115,11 @@ const MEETING_ACK_PATTERNS = [/^on it\s*—\s*picked this up\.?$/i];
  * routing through a full dispatch.
  *
  * ⚠ Accepted residual (spec §5.4): an agent whose ENTIRE reply is exactly the
- * ack sentence has that message stripped from meeting history. Bounded to one
- * near-contentless message; the identical hazard already exists and is
+ * ack sentence has that message stripped from meeting history. Precisely, the
+ * eaten set is slightly wider than §5.4's wording: AGENT_PREFIX_RE strips any
+ * leading `[token ]*Bold*: `, so a bot reply of e.g. `*Status*: On it — picked
+ * this up.` is stripped too. Same class, same negligible impact — bounded to
+ * one near-contentless message; the identical hazard already exists and is
  * accepted repo-wide for NON_RESPONSE_PATTERNS; and the meeting preamble
  * steers agents toward "No response needed.", not toward this sentence.
  */
@@ -1595,8 +1598,19 @@ export class Dispatcher {
    * The one race this cannot close is named and accepted (spec §8): cancel()
    * cannot unpost a deliver already in flight. Worst case is an ack
    * immediately followed by its answer — mildly redundant, never
-   * contradictory, since the answer's own delivery begins strictly after the
-   * turn settles, i.e. after the ack post already started.
+   * contradictory: the answer's own delivery begins strictly after the turn
+   * settles, i.e. after the ack post already started.
+   *
+   * ⚠ That is a bound on post START order, not on LANDING order, and Slack
+   * does not preserve the two. chat.postMessage is ~1/sec per channel, and in
+   * an N-agent cohort every unresolved responder fires its ack at the same
+   * instant into the same channel, so the WebClient's 429 retry can land an
+   * ack AFTER its own answer — in exactly the multi-agent population this
+   * feature targets. Harmless in effect (the ack is stripped from history
+   * either way, and "picked this up" stays true whenever it lands), and NOT
+   * the §8 cancel race above, which is about cancel() failing to unpost. Do
+   * not "fix" the ordering by awaiting the ack or sequencing posts — that
+   * would put Slack latency on the turn's critical path.
    */
   private async runTurnWithMeetingAck(
     agentId: string,
