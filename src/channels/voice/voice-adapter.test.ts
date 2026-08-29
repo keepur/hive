@@ -6,6 +6,7 @@ import type { OpenAIChatRequest } from "./openai-translator.js";
 import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
 import { ProviderCircuitOpenError } from "../../agents/provider-circuit-breaker.js";
 import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../../outage/outage-notices.js";
+import { VOICE_TOOL_ACK_PHRASES } from "../../agents/voice-tool-ack.js";
 
 // ---------------------------------------------------------------------------
 // Mocks shared across the file
@@ -385,6 +386,65 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
       warmPath: true,
       warmTurnSeq: 4,
     });
+  });
+
+  // KPR-324 C5d/S4: the tool-observability quartet on the same log line.
+  // Mirrors the C1/C2 populated-branch case above: drive a TurnResult that
+  // carries real tool numbers and prove they reach the log entry verbatim.
+  // The no-content assertion is spec §12.1 #5 — only COUNTS may be logged;
+  // the ack phrase text itself must never appear in telemetry.
+  it("KPR-324 C5d: Voice turn complete carries toolCalls/toolMs/toolSummary/toolAckInjected without leaking ack text", async () => {
+    const am = makeAgentManager({
+      toolCalls: 2,
+      toolMs: 1800,
+      toolSummary: "voice-fixture:1x/1.5s",
+      toolAckInjected: 1,
+    });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    const completeCall = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete");
+    expect(completeCall).toBeDefined();
+    const fields = completeCall![1] as Record<string, unknown>;
+    expect(fields).toMatchObject({
+      toolCalls: 2,
+      toolMs: 1800,
+      toolSummary: "voice-fixture:1x/1.5s",
+      toolAckInjected: 1,
+    });
+
+    // No-content check: serialize every field and assert none of the canned
+    // ack phrases appear anywhere in the entry.
+    const serialized = JSON.stringify(fields);
+    for (const phrase of VOICE_TOOL_ACK_PHRASES) {
+      expect(serialized).not.toContain(phrase);
+    }
+  });
+
+  // The null-toolSummary branch of the `?? "none"` fallback — a turn that ran
+  // no tools logs the literal "none", never `null`/undefined.
+  it('KPR-324 C5d: a null toolSummary degrades to the literal "none"', async () => {
+    const am = makeAgentManager({
+      toolCalls: 0,
+      toolMs: 0,
+      toolSummary: null,
+      toolAckInjected: 0,
+    });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    const completeCall = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete");
+    expect(completeCall).toBeDefined();
+    const fields = completeCall![1] as Record<string, unknown>;
+    expect(fields.toolSummary).toBe("none");
+    expect(fields.toolCalls).toBe(0);
+    expect(fields.toolAckInjected).toBe(0);
   });
 
   it("populates the in-adapter callId→agentId map on first turn (used as fast in-flight cache)", async () => {

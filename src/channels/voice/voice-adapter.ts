@@ -544,6 +544,14 @@ export class VoiceAdapter {
       promptBuildMs,
       sessionLookupMs,
       ...(result.stageTimings ?? {}),
+      // KPR-324 C5d/S4: tool observability for T-gates and 325 pause
+      // attribution. Counts + durations + server-name summary only — the
+      // existing redaction posture (tool NAMES, never args, never content,
+      // never the ack phrase text).
+      toolCalls: result.toolCalls,
+      toolMs: result.toolMs,
+      toolSummary: result.toolSummary ?? "none",
+      toolAckInjected: result.toolAckInjected,
       // KPR-323 C2: warm-lease markers (false/absent until Task 5 lands).
       warmPath: result.warmPath ?? false,
       ...(result.warmTurnSeq !== undefined ? { warmTurnSeq: result.warmTurnSeq } : {}),
