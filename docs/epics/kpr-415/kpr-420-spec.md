@@ -15,12 +15,12 @@
 - **Fix shape: option 1 (tag in place), not option 2 (two sets) or option 3 (canonize as residual).** One structure keeps one source of truth for "excluded" — `.has()` stays the sole eligibility read (`dispatcher.ts:2302`) — where a second parallel set would reintroduce the aliasing-class hazard this ticket exists to fix (a future eligibility or sweep site reading one structure but not the other). Option 3 is rejected outright: this is a verified regression of the epic's own founding fix, the code fix is ~6 lines, and canonizing it away after an empirical repro would trade a cheap fix for a permanent C1 asterisk.
 - **Membership semantics are untouched; only release provenance changes.** Every existing read (`reacted.has()` at `:2302`, `responded`-presence in tests) keeps its meaning. The only behavioral delta: an unselected peer whose entry was promoted to `"delivery-mark"` during the classifier await is **spared** by the release loop instead of erased. C1's write-time predicate (positional, delivery-time, three call sites) is byte-for-byte preserved.
 - **The claim-time residual (canon C6 / KPR-419) is deliberately NOT touched.** A peer claimed while its round-0 turn is in flight can still be *selected* as a reactor even if it delivers mid-await — that is C6's accepted residual, bounded by the per-thread lock, and KPR-419's structural fix (`isThreadActive`) closes it. A pre-dispatch `"delivery-mark"` check was considered and rejected as a race-dependent partial duplicate of KPR-419 (§5.4). This spec's fix closes only the **release-erasure** path, which C6 never covered because the peer there has already delivered.
-- **Tracker shape amendment, keying/TTL preserved:** the leaf collection changes `Set<string>` → `Map<string, ReactionTrackerEntry>`; the two outer Map levels, the `(threadId, humanTs)` keying, and the `sweep()` TTL path (`:1895`, whole-thread delete) are unchanged. This amends the "shape unchanged" clause KPR-416's C1 carried forward from KPR-386 C2 — recorded in §12 canon for the register.
+- **Tracker shape amendment, keying/TTL preserved:** the leaf collection changes `Set<string>` → `Map<string, ReactionTrackerEntry>`; the two outer Map levels, the `(threadId, humanTs)` keying, and the `sweep()` TTL path (`:1895`, whole-thread delete) are unchanged. This amends the "shape/keying/TTL unchanged (C2)" framing KPR-416 carried forward from KPR-386 C2 — which lives in the code comments (`dispatcher.ts:205`, `:685-686`) and CLAUDE.md's meeting-mode bullet, not in the register's C1 entry itself — recorded in §12 canon for the register.
 - **Testing: the deliberately-suppressed interleaving gets a live sibling, not a replacement.** The macrotask boundary at `dispatcher-conference.test.ts:531` stays (it is what makes the KPR-387 duplicate-answer guard deterministic); a **new** test engineers the exact race with a gated classifier — delivery lands during a pending reaction-pass await, release runs, and the delivered agent must stay excluded from every subsequent roster. The T9 residual comment (`:1740`) gains a non-conflation note separating claim-time (KPR-419's scope) from the erasure fixed here.
 - **No config lever; rollback = code revert** — per the C8/C15 discriminant (*internal eligibility state ⇒ code revert; visible meeting output ⇒ operator lever*). This is pure internal eligibility state, same posture as KPR-416.
-- **Folded-in mechanical fix 1 (docs):** `kpr-417-spec.md:26` and §13.3 (`:461`) still describe the delay-then-ack substitution as delegated/parked; canon C18 (May Huang, 2026-08-29) ratified it directly and retired that framing. A **§13.5 appended addendum** records the ruling — append, never edit the historical record (the sibling-spec convention).
-- **Folded-in mechanical fix 2 (boot log):** `src/index.ts:465-472` logs `ackEnabled` inside the `"Meeting scribe wired"` line, though C15 establishes the ack lever is scribe/pool-independent. It gets its own log line adjacent to the `setMeetingAckEnabled` call; the boot-order guard's anchors are on the *call*, not the log, so the guard is unaffected (verified against `src/boot-order.test.ts:47/:55/:69/:95`).
-- ⚠ **Delegated assumptions** (Gate 1 delegation; recorded, not blocking): tag-value naming and exact log-line wording (§5.6, §7); keeping T3's suppression rather than inverting it, satisfied instead by the new race test (§9); appending a short correction addendum to `kpr-416-spec.md` (§15) since its §14.1 "release line unchanged" row is falsified by this fix.
+- **Folded-in mechanical fix 1 (docs):** `kpr-417-spec.md:26` (restated at `:342`) and §13.3 (`:461`) still describe the delay-then-ack substitution as delegated/parked; canon C18 (May Huang, 2026-08-29) ratified it directly and retired that framing. A **§13.5 appended addendum** records the ruling — append, never edit the historical record (the sibling-spec convention).
+- **Folded-in mechanical fix 2 (boot log):** `src/index.ts:465-471` logs `ackEnabled` inside the `"Meeting scribe wired"` line, though C15 establishes the ack lever is scribe/pool-independent. It gets its own log line adjacent to the `setMeetingAckEnabled` call; the boot-order guard's anchors are on the *call*, not the log, so the guard is unaffected (verified against `src/boot-order.test.ts:47/:55/:69/:95`).
+- ⚠ **Delegated assumptions** (Gate 1 delegation; recorded, not blocking): tag-value naming and exact log-line wording (§5.6, §7); keeping T3's suppression rather than inverting it, satisfied instead by the new race test (§9); appending a short correction addendum to `kpr-416-spec.md` (§15) since its §8 "`triggerConferenceReactions` **unchanged**" row (`:253`) is falsified by this fix.
 
 ---
 
@@ -37,7 +37,7 @@ Both writers operate on the **same aliased `Set`** retrieved from `meetingReacti
 
 Verified empirically by the integrated-head reviewer (live probe, 3-agent roster, integrated head `6c1ed68`): a genuinely-delivered agent (confirmed via `adapter.deliver` assertion) ended up absent from the exclusion set and present in a subsequent reaction-pass roster. Pre-KPR-416 this was structurally impossible — the selection-time write put every primary in the tracker before any dispatch, so a primary never entered `peerMembers` and could never be released.
 
-**Un-canonized:** C6 covers only the *claim-time* residual (peer's round-0 **not landed** at claim), bounded by the per-thread lock serializing the pair. Here the peer has **delivered** before re-invitation — C6's bounding argument does not apply and its stated cost is reached via a path C6 never described. `kpr-416-spec.md` §14.1 lists the release line as "unchanged" and never analyzes the aliasing. The register (C1–C18) has no entry for a delivered primary losing its mark.
+**Un-canonized:** C6 covers only the *claim-time* residual (peer's round-0 **not landed** at claim), bounded by the per-thread lock serializing the pair. Here the peer has **delivered** before re-invitation — C6's bounding argument does not apply and its stated cost is reached via a path C6 never described. `kpr-416-spec.md` §8's integration-points table lists `triggerConferenceReactions` as **unchanged** (`:253` — including the release at `:1911`; the same not-touching claim rides §3's non-goals at `:59` and §5.4's untouched list at `:129`), and §14.1's boundedness re-derivation cites the release (`:2059`) without ever analyzing the aliasing. The register (C1–C18) has no entry for a delivered primary losing its mark.
 
 **Bounded, not a cascade** (why "important," not "critical"): the ≤2N−1 turns-per-trigger ceiling and "reacts at most once, once selected" both survive — only an *unselected, released* peer is affected. Blast radius is one extra round-1 turn by an agent that already answered, with round-1's "do not re-answer" framing holding the content line. It still violates C1's stated guarantee, on the exact starvation axis this epic was founded to fix.
 
@@ -45,8 +45,8 @@ The existing regression guard (`dispatcher-conference.test.ts:531-533`) delibera
 
 ### Folded-in mechanical findings (same review round)
 
-1. `docs/epics/kpr-415/kpr-417-spec.md:26` (Key Points delegated-assumption bullet) and §13.3 (`:461-465`) still present the delay-then-ack substitution as *delegated under the Gate 1 signoff* / *parked pending the operator's ruling*. Canon **C18** ratified the substitution directly (`rule-coherence` on `2499a57`, 2026-08-29), resolved the pending `GATE1_AMENDMENT`, and explicitly retired the circular delegated-from-the-signoff framing as precedent.
-2. `src/index.ts:465-472`: `dispatcher.setMeetingAckEnabled(...)` is immediately followed by `log.info("Meeting scribe wired", { ..., ackEnabled })` — the ack lever's boot-time state is filed under the scribe subsystem, though canon **C15** establishes `ackEnabled` is independent of the scribe/worker-pool machinery. An operator diagnosing "why no acks" greps the wrong subsystem.
+1. `docs/epics/kpr-415/kpr-417-spec.md:26` (Key Points delegated-assumption bullet), its §8 assumption-ledger restatement (`:342`), and §13.3 (`:461-465`) still present the delay-then-ack substitution as *delegated under the Gate 1 signoff* / *parked pending the operator's ruling*. Canon **C18** ratified the substitution directly (`rule-coherence` on `2499a57`, 2026-08-29), resolved the pending `GATE1_AMENDMENT`, and explicitly retired the circular delegated-from-the-signoff framing as precedent.
+2. `src/index.ts:465-471`: `dispatcher.setMeetingAckEnabled(...)` is immediately followed by `log.info("Meeting scribe wired", { ..., ackEnabled })` — the ack lever's boot-time state is filed under the scribe subsystem, though canon **C15** establishes `ackEnabled` is independent of the scribe/worker-pool machinery. An operator diagnosing "why no acks" greps the wrong subsystem.
 
 ## 2. Goals
 
@@ -112,7 +112,7 @@ for (const member of peerMembers) {
 The `=== "claim"` read happens **after** the await — exactly where a mid-await promotion is observable. A spared promotion should log (`log.info`, agentId/threadId/humanTs only — no message text, per log-redaction rules), because this race was found by a live probe and a log line makes the next probe free:
 
 ```ts
-log.info("Reaction release spared delivered peer", { threadId, agentId: member.agentId });
+log.info("Reaction release spared delivered peer", { threadId, humanTs, agentId: member.agentId });
 ```
 
 ### 5.3 Interleaving analysis (why this closes the race and nothing else moves)
@@ -132,7 +132,7 @@ After this fix the *only* remaining path for a round-1 invitation to an agent th
 
 ### 5.5 Mechanical fix 1 — `kpr-417-spec.md` §13.5 addendum
 
-Append a new `### 13.5 C18 ruling — the substitution is ratified (2026-08-29)` after §13.4, recording: May Huang ratified delay-then-ack at the 15s threshold directly via `rule-coherence` on `2499a57` (canon C18, session `rule-kpr415-20260829T045458Z`); the pending `GATE1_AMENDMENT` of §13.3 is resolved; the `:26` "delegated under the Gate 1 signoff" framing is superseded and its circular reasoning retired as precedent; `MEETING_ACK_DELAY_MS` stays a non-configurable constant with `0` as the recorded one-line path to the literal immediate ack. Lines `:26` and `:461-465` themselves are **not edited** — the addendum convention both sibling specs already follow (kpr-416 §14, kpr-417 §13).
+Append a new `### 13.5 C18 ruling — the substitution is ratified (2026-08-29)` after §13.4, recording: May Huang ratified delay-then-ack at the 15s threshold directly via `rule-coherence` on `2499a57` (canon C18, session `rule-kpr415-20260829T045458Z`); the pending `GATE1_AMENDMENT` of §13.3 is resolved; the `:26` "delegated under the Gate 1 signoff" framing is superseded **wherever it appears** (C18's register text names both `:26` and the §8 assumption-ledger restatement at `:342`) and its circular reasoning retired as precedent; `MEETING_ACK_DELAY_MS` stays a non-configurable constant with `0` as the recorded one-line path to the literal immediate ack. Lines `:26` and `:461-465` themselves are **not edited** — the addendum convention both sibling specs already follow (kpr-416 §14, kpr-417 §13).
 
 ### 5.6 Mechanical fix 2 — ack lever boot log
 
@@ -142,14 +142,15 @@ In `src/index.ts`, immediately after `dispatcher.setMeetingAckEnabled(config.mee
 log.info("Meeting ack lever wired (KPR-417)", { ackEnabled: config.meetingWorkers.ackEnabled });
 ```
 
-and **remove** `ackEnabled` from the `"Meeting scribe wired"` payload (`:471`) — leaving it in both places invites drift and re-creates the wrong-subsystem grep hit. The boot-order guard (`src/boot-order.test.ts`) anchors on the `dispatcher.setMeetingAckEnabled(` **call** text, not the log line; the call itself does not move, so all three lists stay green. ⚠ Delegated: exact log message wording.
+and **remove** `ackEnabled` from the `"Meeting scribe wired"` payload (`:470`) — leaving it in both places invites drift and re-creates the wrong-subsystem grep hit. The boot-order guard (`src/boot-order.test.ts`) anchors on the `dispatcher.setMeetingAckEnabled(` **call** text, not the log line; the call itself does not move, so all three lists stay green. ⚠ Delegated: exact log message wording.
 
 ## 6. Integration points
 
 | Surface | Change |
 |---|---|
 | `dispatcher.ts:206` tracker decl + `:200-205` doc comment | leaf `Set<string>` → `Map<string, ReactionTrackerEntry>`; comment gains the provenance-tag sentence and drops "Set" phrasing |
-| `dispatcher.ts:689-703` `markReactionExclusion` + doc (`:685` "Set add") | `.add` → `.set("delivery-mark")`; doc updated |
+| `dispatcher.ts:689-703` `markReactionExclusion` + doc (`:685` "Set add") | `.add` → `.set("delivery-mark")` (`:701`); doc updated |
+| `dispatcher.ts:700` `markReactionExclusion` get-or-create | `?? new Set<string>()` → `?? new Map<string, ReactionTrackerEntry>()` — the symmetric twin of the claim-path get-or-create below |
 | `dispatcher.ts:2293-2294, :2305` claim path | `Set` get-or-create → `Map` get-or-create; `.add` → `.set("claim")` |
 | `dispatcher.ts:2320-2325` release loop | provenance guard + spared-peer log line (§5.2) |
 | `dispatcher.ts:1848-1850` site-1 comment, `:1895` sweep | comment: split the residual sentence per §5.4; sweep untouched (verify only) |
@@ -157,8 +158,8 @@ and **remove** `ackEnabled` from the `"Meeting scribe wired"` payload (`:471`) �
 | `dispatcher-conference.test.ts` new test | the real-interleaving regression guard (§9 T1) |
 | `dispatcher-conference.test.ts:1740` T9 comment | non-conflation note (§5.4 boundary; KPR-419 vs KPR-420) |
 | `docs/epics/kpr-415/kpr-417-spec.md` | appended §13.5 (§5.5) |
-| `docs/epics/kpr-415/kpr-416-spec.md` | appended short §15 addendum: §14.1's "`triggerConferenceReactions` unchanged (release `:1911`)" row and §6.4's residual framing are amended by KPR-420 — the release loop is now provenance-guarded; the claim-time residual alone remains, owned by KPR-419. ⚠ Delegated: exact addendum wording |
-| `src/index.ts:465-472` | dedicated ack-lever log line; `ackEnabled` removed from scribe line (§5.6) |
+| `docs/epics/kpr-415/kpr-416-spec.md` | appended short §15 addendum: §8's "`triggerConferenceReactions` **unchanged** (release `:1911`)" row (`:253` — echoed by the §3 non-goal at `:59` and §5.4's list at `:129`) and §6.4's residual framing are amended by KPR-420 — the release loop is now provenance-guarded; the claim-time residual alone remains, owned by KPR-419. §14.1's boundedness derivation likewise never analyzed the aliasing. ⚠ Delegated: exact addendum wording |
+| `src/index.ts:465-471` | dedicated ack-lever log line; `ackEnabled` removed from scribe line (§5.6) |
 | root `CLAUDE.md` (Meeting mode section) | per C9, docs-sync on this child branch: amend the "Accepted residual (deliberately deferred by KPR-416)" sentence — the release loop no longer erases delivered marks (KPR-420); residual narrows to claim-time only |
 | Canon register | §12 entries proposed for lift at merge |
 
@@ -192,14 +193,14 @@ Code revert of this ticket's commits. No lever, per the C8/C15 discriminant — 
 
 ## 11. Relationship to siblings
 
-- **KPR-416:** this is a corrective *to* its release-loop blind spot; its predicate, call sites, meta key, and all other canon (C1, C3, C4, C5, C7) are preserved verbatim. Its spec's §14.1 "release unchanged" row is amended by appended addendum.
+- **KPR-416:** this is a corrective *to* its release-loop blind spot; its predicate, call sites, meta key, and all other canon (C1, C3, C4, C5, C7) are preserved verbatim. Its spec's §8 "`triggerConferenceReactions` unchanged" row (`:253`) is amended by appended addendum.
 - **KPR-417:** untouched at runtime (acks never enter the tracker — `deliverMeetingAck` is not a write site); receives the §13.5 docs addendum and the boot-log relocation.
 - **KPR-419:** owns the claim-time residual this fix deliberately leaves; T9 remains its inversion target. Nothing here pre-empts or partially implements it (§5.3's rejected pre-dispatch check).
 - **KPR-418:** untouched.
 
 ## 12. Canon (to lift into KPR-415's Decision Register at merge)
 
-- **C19 (proposed):** The reaction tracker's per-trigger leaf carries **provenance** — `Map<agentId, "claim" | "delivery-mark">` — and the release-on-non-selection loop deletes **only `"claim"` entries**, so a delivery mark written (or promoted) during a concurrent pass's classifier await survives release. Restores C1's "delivered stays excluded" against the timing window found at integrated-head review round 1. Membership semantics (`.has()` = excluded), keying, and TTL unchanged; **amends the "tracker shape unchanged" clause** C1 carried from KPR-386 C2 (leaf type only). Eligibility remains the single `.has()` read — **standing invariant: never introduce a second exclusion structure** (option 2 rejected for aliasing-class drift risk). Claim-time invitation of an in-flight peer remains C6's residual, owned by KPR-419 — the two must not be conflated. (KPR-420)
+- **C19 (proposed):** The reaction tracker's per-trigger leaf carries **provenance** — `Map<agentId, "claim" | "delivery-mark">` — and the release-on-non-selection loop deletes **only `"claim"` entries**, so a delivery mark written (or promoted) during a concurrent pass's classifier await survives release. Restores C1's "delivered stays excluded" against the timing window found at integrated-head review round 1. Membership semantics (`.has()` = excluded), keying, and TTL unchanged; **amends the "tracker shape/keying/TTL unchanged (C2)" framing** KPR-416 carried forward from KPR-386 C2 — its actual carriers are the code comments at `dispatcher.ts:205` and `:685-686` plus CLAUDE.md's "preserves C2's tracker shape/keying/TTL" language, not the register's C1 entry (which states no shape clause); the amendment is leaf type only. Eligibility remains the single `.has()` read — **standing invariant: never introduce a second exclusion structure** (option 2 rejected for aliasing-class drift risk). Claim-time invitation of an in-flight peer remains C6's residual, owned by KPR-419 — the two must not be conflated. (KPR-420)
 - **C20 (proposed, mechanical):** C18's ratification is recorded in `kpr-417-spec.md` §13.5 by appended addendum; the ack lever logs its boot state on its own line, not under the scribe's — C15's independence holds down to the boot log. (KPR-420)
 
 ## 13. Open assumptions (⚠ delegated under Gate 1)
