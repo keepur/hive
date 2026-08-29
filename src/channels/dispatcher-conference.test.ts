@@ -709,7 +709,7 @@ Meeting rules:
 
   it("T6 (C4 guard): a double-quoted escape phrase in the preamble matches NON_RESPONSE_PATTERNS", () => {
     // Local mirror of dispatcher.ts NON_RESPONSE_PATTERNS — same deliberate-copy
-    // convention as dispatcher.test.ts:273 (the pin IS the point: widen-or-match
+    // convention as dispatcher.test.ts:283 (the pin IS the point: widen-or-match
     // is enforced by this test failing on any preamble rewording).
     const NON_RESPONSE_PATTERNS = [
       /^no response (requested|needed|required|necessary)\.?$/i,
