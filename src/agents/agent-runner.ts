@@ -73,6 +73,8 @@ import type { Db } from "mongodb";
 import type { ReasoningEffort } from "./provider-adapters/types.js";
 // KPR-394 (§4.11): plugin provider ids widen the admin model-catalog tools.
 import { listPluginProviderIds } from "./provider-adapters/provider-registry.js";
+// KPR-324 C2: voice tool-start acknowledgment (cold spawn loop).
+import { shouldInjectToolAck, nextAckPhrase, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -2221,6 +2223,13 @@ export class AgentRunner {
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
     let activeToolName: string | null = null;
 
+    // KPR-324 C2/S2: tool-start acknowledgment state (spec §4.1 segment
+    // rule). Per-turn locals — rotation is caller-owned so concurrent calls
+    // never share a counter (spec §4.2).
+    let streamedThisSegment = false;
+    let toolAckInjected = 0;
+    let ackRotation = { index: 0 };
+
     const timeoutMs = resourceLimits?.timeoutMs ?? this.agentConfig.timeoutMs ?? 300_000; // 5 min default
     // KPR-306: stamp timedOut ONLY when the deadline actually cancels an
     // active query — mirrors abort()'s own null guard. The gap this closes:
@@ -2286,6 +2295,7 @@ export class AgentRunner {
             }
             onStream(event.delta.text);
             streamed = true;
+            streamedThisSegment = true; // KPR-324 §4.1: the model spoke in this segment
           }
         }
 
@@ -2320,10 +2330,40 @@ export class AgentRunner {
           }
           const content = assistantMessage?.content;
           if (Array.isArray(content)) {
+            // KPR-324 §4.1: text blocks are processed BEFORE tool blocks so a
+            // "let me check that" + tool_use in ONE assistant message counts
+            // as streamed (no double-speak — spec §4.1 same-message rule).
+            if (
+              content.some(
+                (b: any) => b.type === "text" && typeof b.text === "string" && b.text.length > 0,
+              )
+            ) {
+              streamedThisSegment = true;
+            }
             for (const block of content) {
               if (block.type === "text") {
                 resultText = block.text;
               } else if (block.type === "tool_use") {
+                // KPR-324 C2/S2: speak a canned hold line iff this segment was
+                // silent and this is a streaming VOICE turn. SSE-only — the
+                // phrase never enters the SDK transcript or resultText, and
+                // does not set `streamed` (not model text). tool_use is
+                // observed BEFORE the handler runs (⚠ registry #2, Task 0),
+                // so the ack reaches TTS while the tool executes.
+                if (
+                  shouldInjectToolAck({
+                    enabled: config.voice.toolAck.enabled,
+                    streamedThisSegment,
+                    hasOnStream: !!onStream,
+                    channel: context?.channelKind ?? "",
+                  })
+                ) {
+                  const next = nextAckPhrase(ackRotation);
+                  ackRotation = { index: next.index };
+                  onStream!(next.phrase + VOICE_TOOL_ACK_SEPARATOR);
+                  toolAckInjected += 1;
+                }
+                streamedThisSegment = false; // §4.1: the tool-run gap starts now
                 // Close previous tool timing if any
                 if (activeToolName && toolCalls.length > 0) {
                   toolCalls[toolCalls.length - 1]!.endMs = Date.now();
@@ -2518,7 +2558,7 @@ export class AgentRunner {
     return {
       text: resultText, sessionId: resultSessionId, costUsd, durationMs,
       llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length,
-      toolSummary: toolSummary || "none", toolAckInjected: 0, streamed,
+      toolSummary: toolSummary || "none", toolAckInjected, streamed,
       inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
       ephemeral5mTokens, ephemeral1hTokens,
       contextWindow, compactions, preCompactTokens,

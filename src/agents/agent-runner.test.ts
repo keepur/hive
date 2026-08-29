@@ -187,6 +187,8 @@ vi.mock("../config.js", async (importOriginal) => {
         livekit: { enabled: false, url: "", sipTrunkId: "", inboundAgents: {}, defaultStt: "", defaultTts: "" },
         livekitApiKey: "",
         livekitApiSecret: "",
+        // KPR-324 C6: the runner reads this at every tool_use boundary.
+        toolAck: { enabled: true },
       },
       // KPR-329: engine-default tool-search config for the mocked module.
       toolSearch: { mode: "auto", source: "default" },
@@ -250,6 +252,9 @@ import { config } from "../config.js";
 // same sawResult/countedUsageIds/wall-clock-fallback/clamped-llmMs pattern
 // with nothing else pinning them to stay in sync.
 import { WarmVoiceSession, AsyncPushQueue } from "./warm-voice-session.js";
+// KPR-324 C2: the cold-path injection tests assert against the real phrase
+// constants, so a wording retune can never silently pass a stale literal.
+import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
 
@@ -4453,5 +4458,224 @@ describe("cross-file turn-usage-accounting parity (KPR-401, round-2 finding B)",
       expect(result.llmMs).toBeGreaterThanOrEqual(0);
       expect(result.llmMs).toBe(Math.max(0, result.durationMs - result.toolMs));
     }
+  });
+});
+
+describe("KPR-324 C2: cold-path tool-start ack injection (AgentRunner.send)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockQueryOverride = null;
+  });
+  afterEach(() => {
+    mockMessages = null;
+    mockQueryOverride = null;
+  });
+
+  const voiceCtx = {
+    adapterId: "voice",
+    channelId: "call-1",
+    channelKind: "voice",
+    channelLabel: "voice:call-1",
+    threadId: "voice:call-1",
+    slackTs: "",
+    slackThreadTs: "",
+  };
+
+  const INIT = { type: "system", subtype: "init", session_id: "s-324" };
+  const RESULT = {
+    type: "result",
+    subtype: "success",
+    result: "all set",
+    total_cost_usd: 0.001,
+    duration_ms: 100,
+    session_id: "s-324",
+  };
+
+  function toolUseMsg(id: string, blocks: any[]) {
+    return { type: "assistant", session_id: "s-324", message: { id, content: blocks } };
+  }
+
+  function toolBlock(id: string) {
+    return {
+      type: "tool_use",
+      name: "mcp__voice-fixture__voice_fixture_lookup",
+      id,
+      input: {},
+    };
+  }
+
+  function deltaMsg(text: string) {
+    return {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+    };
+  }
+
+  const ACK0 = VOICE_TOOL_ACK_PHRASES[0]! + VOICE_TOOL_ACK_SEPARATOR;
+  const ACK1 = VOICE_TOOL_ACK_PHRASES[1]! + VOICE_TOOL_ACK_SEPARATOR;
+
+  it("silent tool injects exactly once, before the result message reaches the loop", async () => {
+    const onStream = vi.fn();
+    // The generator snapshots the spy's call count immediately before the
+    // result message is yielded — the ordering assertion (spec §12.1 #2):
+    // the ack must already have been spoken while the tool was running.
+    let streamCallsBeforeResult = -1;
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield toolUseMsg("m2", [{ type: "text", text: "all set" }]);
+        streamCallsBeforeResult = onStream.mock.calls.length;
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls[0]?.[0]).toBe(ACK0);
+    expect(streamCallsBeforeResult).toBe(1);
+    expect(result.toolAckInjected).toBe(1);
+    // SSE-only: never in resultText, and never flips `streamed` (not model text).
+    expect(result.text).toBe("all set");
+    expect(result.streamed).toBe(false);
+  });
+
+  it("text-then-tool does not inject (the model already spoke this segment)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield deltaMsg("let me check");
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual(["let me check"]);
+    expect(result.streamed).toBe(true);
+  });
+
+  it("two silent tools inject twice in rotation — sequential assistant messages", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield toolUseMsg("m2", [toolBlock("t2")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0, ACK1]);
+    expect(result.toolAckInjected).toBe(2);
+  });
+
+  it("two silent tools inject twice in rotation — ONE assistant message, two tool_use blocks", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1"), toolBlock("t2")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0, ACK1]);
+    expect(result.toolAckInjected).toBe(2);
+  });
+
+  it("text + tool in the SAME assistant message does not inject (text scanned first)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [{ type: "text", text: "let me check" }, toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream).not.toHaveBeenCalled();
+  });
+
+  it("channel gate: an identical silent-tool script on slack never injects", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, {
+      ...voiceCtx,
+      adapterId: "slack",
+      channelKind: "slack",
+    } as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream).not.toHaveBeenCalled();
+  });
+
+  it("disabled (config.voice.toolAck.enabled = false) never injects — the S7 rollback lever", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    (config as any).voice.toolAck.enabled = false;
+    try {
+      const runner = makeRunner();
+      const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+      expect(result.toolAckInjected).toBe(0);
+      expect(onStream).not.toHaveBeenCalled();
+    } finally {
+      (config as any).voice.toolAck.enabled = true;
+    }
+  });
+
+  it("no onStream: the silent-tool voice script neither throws nor counts an inject", async () => {
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, undefined, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(result.text).toBe("all set");
   });
 });
