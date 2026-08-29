@@ -461,13 +461,16 @@ async function main(): Promise<void> {
   // reads it per turn), so it is wired here, above the spawn-capable boundary
   // below — same rule as the pool and the scribe. Guarded by
   // src/boot-order.test.ts, which carries this call as an anchor in all three
-  // of its lists.
+  // of its lists. KPR-420: it logs on its own line — the lever is
+  // scribe/pool-INDEPENDENT (canon C15), so its boot state must not be filed
+  // under the scribe's log line where an operator diagnosing "why no acks"
+  // would grep the wrong subsystem.
   dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled);
+  log.info("Meeting ack lever wired (KPR-417)", { ackEnabled: config.meetingWorkers.ackEnabled });
   log.info("Meeting scribe wired", {
     scribeEnabled: config.meetingWorkers.scribeEnabled,
     scribeModel: config.meetingWorkers.scribeModel,
     scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
-    ackEnabled: config.meetingWorkers.ackEnabled,
   });
 
   // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
