@@ -263,15 +263,27 @@ Meeting rules:
    * reaction pass. The behavioral pins (T1, T3, T9) assert through
    * triggerConferenceReactions instead. Same `dispatcher as unknown as {...}`
    * convention as the T6/C4 guard below.
+   *
+   * KPR-420: the leaf is now Map<agentId, "claim" | "delivery-mark">.
+   * excludedFor projects KEYS to a value-level Set — membership still means
+   * "excluded", so the existing value assertions stand unmodified. The
+   * projection is deliberately shape-agnostic (Set.prototype.keys() yields
+   * values), which keeps it working against pre-fix code for the T1
+   * negative-verify pass. rawTrackerLeaf exposes the tag itself for the
+   * KPR-420 provenance assertions.
    */
-  const excludedFor = (threadId: string, humanTs: string): Set<string> | undefined =>
+  const rawTrackerLeaf = (threadId: string, humanTs: string): Map<string, "claim" | "delivery-mark"> | undefined =>
     (
       dispatcher as unknown as {
-        meetingReactionTracker: Map<string, Map<string, Set<string>>>;
+        meetingReactionTracker: Map<string, Map<string, Map<string, "claim" | "delivery-mark">>>;
       }
     ).meetingReactionTracker
       .get(threadId)
       ?.get(humanTs);
+  const excludedFor = (threadId: string, humanTs: string): Set<string> | undefined => {
+    const leaf = rawTrackerLeaf(threadId, humanTs);
+    return leaf === undefined ? undefined : new Set(leaf.keys());
+  };
 
   const zeroUsage = {
     inputTokens: 0,
