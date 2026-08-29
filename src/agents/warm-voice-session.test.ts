@@ -908,5 +908,79 @@ describe("WarmVoiceSession", () => {
 
       lease.close("test-cleanup");
     });
+
+    // ── Pre-PR R1: delegate/subagent-nested tool_use is excluded ────────
+    // The lease reuses buildQueryEnvelope verbatim (same MCP + delegate
+    // wiring as the cold path), so a Task delegation's nested tool_use
+    // blocks reach this loop with parent_tool_use_id set.
+    const nestedToolUseMsg = (names: string[], parentToolUseId = "toolu_task") => ({
+      ...toolUseMsg(names),
+      parent_tool_use_id: parentToolUseId,
+    });
+
+    it("does NOT inject for subagent-nested tool_use blocks", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_slow"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(0);
+      expect(chunks).toEqual([]);
+      // Ack-only exclusion: the nested calls are still timed/counted.
+      expect(r.toolCalls).toBe(2);
+
+      lease.close("test-cleanup");
+    });
+
+    it("acks the top-level Task once while its nested calls stay silent", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit(toolUseMsg(["Task"]));
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]));
+      emit(nestedToolUseMsg(["mcp__voice-fixture__voice_fixture_slow"]));
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(1);
+      expect(chunks).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+
+      lease.close("test-cleanup");
+    });
+
+    it("parent_tool_use_id: null is top level and still injects (regression lock)", async () => {
+      const { q, emit } = makeFakeQuery();
+      const { lease } = makeLease();
+      lease.start(q);
+
+      const chunks: string[] = [];
+      const p = lease.runTurn({ text: "u1", onStream: (c) => chunks.push(c), timeoutMs: 60_000 });
+      await microFlush();
+
+      emit({
+        ...toolUseMsg(["mcp__voice-fixture__voice_fixture_lookup"]),
+        parent_tool_use_id: null,
+      });
+      emit(resultMsg({ result: "done", session_id: "sess-1" }));
+      const r = await p;
+
+      expect(r.toolAckInjected).toBe(1);
+      expect(chunks).toEqual([VOICE_TOOL_ACK_PHRASES[0] + VOICE_TOOL_ACK_SEPARATOR]);
+
+      lease.close("test-cleanup");
+    });
   });
 });

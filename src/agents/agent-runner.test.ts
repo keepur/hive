@@ -255,6 +255,9 @@ import { WarmVoiceSession, AsyncPushQueue } from "./warm-voice-session.js";
 // KPR-324 C2: the cold-path injection tests assert against the real phrase
 // constants, so a wording retune can never silently pass a stale literal.
 import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
+// KPR-324 C7: the runner-belt tests read the real constants, so renaming the
+// server or the allowed agent id cannot silently orphan the belt coverage.
+import { VOICE_FIXTURE_SERVER_NAME, VOICE_FIXTURE_ALLOWED_AGENT_ID } from "./in-process-servers.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
 
@@ -4317,6 +4320,69 @@ describe("AgentRunner — KPR-390 worker-pool wiring", () => {
   });
 });
 
+// ── KPR-324 C7: the runner's voice-fixture belt ──────────────────────────
+// The registry strip (agent-registry.test.ts) is the first gate; THIS is the
+// second — the runner refuses to BUILD the fixture for any agent id but
+// voice-pilot, so a bypassed registry (direct DB write + SIGUSR1 race) still
+// cannot arm a production agent. Per CLAUDE.md's containment rule, both
+// assertions target the runner's BUILT surfaces (in-process server set +
+// tool-transport inventory), never the config array.
+describe("KPR-324 C7: voice-fixture is refused for non-voice-pilot agent ids (runner belt)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+  });
+
+  it("a non-pilot agent carrying voice-fixture in coreServers gets it on NEITHER built surface", () => {
+    const runner = makeRunner({ id: "chief-of-staff", coreServers: ["voice-fixture"] });
+    expect(Object.keys(runner.buildInProcessServers())).not.toContain(VOICE_FIXTURE_SERVER_NAME);
+    expect(runner.buildToolTransportInventory().map((e) => e.name)).not.toContain(
+      VOICE_FIXTURE_SERVER_NAME,
+    );
+  });
+
+  it("voice-pilot with voice-fixture in coreServers gets BOTH the built server and the Lane B descriptor", () => {
+    const runner = makeRunner({
+      id: VOICE_FIXTURE_ALLOWED_AGENT_ID,
+      coreServers: ["voice-fixture"],
+    });
+    const servers = runner.buildInProcessServers();
+    expect(Object.keys(servers)).toContain(VOICE_FIXTURE_SERVER_NAME);
+    expect(servers[VOICE_FIXTURE_SERVER_NAME].type).toBe("sdk");
+
+    const entry = runner
+      .buildToolTransportInventory()
+      .find((e) => e.name === VOICE_FIXTURE_SERVER_NAME);
+    expect(entry).toBeDefined();
+    expect(entry).toMatchObject({
+      transport: "sdk-in-process",
+      inProcess: true,
+      requiresTurnContext: false,
+      requiresHiveRuntime: true,
+    });
+    // KPR-327 compensation: in-process-only, so Lane B must bridge it.
+    expect(entry!.compatibility.openai).toBe("requires-hive-bridge");
+  });
+
+  it("voice-pilot WITHOUT coreServers membership still gets nothing (coreServers gate intact)", () => {
+    const runner = makeRunner({ id: VOICE_FIXTURE_ALLOWED_AGENT_ID, coreServers: [] });
+    expect(Object.keys(runner.buildInProcessServers())).not.toContain(VOICE_FIXTURE_SERVER_NAME);
+    expect(runner.buildToolTransportInventory().map((e) => e.name)).not.toContain(
+      VOICE_FIXTURE_SERVER_NAME,
+    );
+  });
+
+  it("the fixture server instance is cached across builds (one construction per runner)", () => {
+    const runner = makeRunner({
+      id: VOICE_FIXTURE_ALLOWED_AGENT_ID,
+      coreServers: ["voice-fixture"],
+    });
+    const first = runner.buildInProcessServers()[VOICE_FIXTURE_SERVER_NAME];
+    const second = runner.buildInProcessServers()[VOICE_FIXTURE_SERVER_NAME];
+    expect(second).toBe(first);
+  });
+});
+
 // ── Cross-file turn-usage-accounting parity (round-2 coherence review,
 // finding B) ─────────────────────────────────────────────────────────────
 // The KPR-401 accumulator pattern — `sawResult` + `countedUsageIds` + a
@@ -4496,6 +4562,17 @@ describe("KPR-324 C2: cold-path tool-start ack injection (AgentRunner.send)", ()
     return { type: "assistant", session_id: "s-324", message: { id, content: blocks } };
   }
 
+  // Subagent/delegate-nested twin: identical shape with parent_tool_use_id set
+  // (the SDK forwards subagent tool_use blocks by default).
+  function nestedToolUseMsg(id: string, blocks: any[], parentToolUseId = "toolu_parent") {
+    return {
+      type: "assistant",
+      session_id: "s-324",
+      parent_tool_use_id: parentToolUseId,
+      message: { id, content: blocks },
+    };
+  }
+
   function toolBlock(id: string) {
     return {
       type: "tool_use",
@@ -4660,6 +4737,86 @@ describe("KPR-324 C2: cold-path tool-start ack injection (AgentRunner.send)", ()
     } finally {
       (config as any).voice.toolAck.enabled = true;
     }
+  });
+
+  // ── Pre-PR R1: delegate/subagent-nested tool_use is excluded ──────────
+  it("subagent-nested silent tool_use never injects (delegate machinery the caller never hears)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        // The boss's own Task call is top-level; the two tool calls the
+        // subagent makes inside it arrive with parent_tool_use_id set.
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield nestedToolUseMsg("m3", [toolBlock("t3")], "toolu_task");
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream).not.toHaveBeenCalled();
+  });
+
+  it("one Task delegation acks ONCE (top level) even though nested calls follow", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [{ type: "tool_use", name: "Task", id: "toolu_task", input: {} }]);
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield nestedToolUseMsg("m3", [toolBlock("t3")], "toolu_task");
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    // Exactly one ack — the top-level Task — not one per nested call.
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0]);
+    expect(result.toolAckInjected).toBe(1);
+  });
+
+  it("parent_tool_use_id: null is top level and still injects (regression lock)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield { ...toolUseMsg("m1", [toolBlock("t1")]), parent_tool_use_id: null };
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0]);
+    expect(result.toolAckInjected).toBe(1);
+  });
+
+  it("nested tool calls are still timed/counted — the exclusion is ack-only", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(result.toolCalls).toBe(1);
+    expect(result.toolSummary).toContain("voice-fixture");
   });
 
   it("no onStream: the silent-tool voice script neither throws nor counts an inject", async () => {

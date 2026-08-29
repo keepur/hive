@@ -536,6 +536,15 @@ export class WarmVoiceSession {
               cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
               cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
             }
+            // KPR-324 pre-PR R1 (cold-path twin, agent-runner.ts): exclude
+            // subagent/delegate-nested messages from ack injection ONLY. The
+            // lease runs a full AgentRunner query, so a Task delegation's
+            // nested tool_use blocks (parent_tool_use_id != null — forwarded
+            // by default) reach this same loop and would otherwise stack one
+            // canned hold line per nested call. Usage accounting above and
+            // tool timing below still process them.
+            const subagentNested =
+              (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
             const content = assistantMessage?.content;
             if (Array.isArray(content)) {
               // KPR-324 §4.1: text blocks BEFORE tool blocks (same-message rule).
@@ -555,7 +564,9 @@ export class WarmVoiceSession {
                   // the literal "voice" — warm eligibility is already
                   // voice-only (323 §4.7); passing it keeps C2/C3 on one
                   // shared gate (spec §4.3). SSE-only; never into history.
+                  // Nested (subagent/delegate) tool calls never ack — above.
                   if (
+                    !subagentNested &&
                     shouldInjectToolAck({
                       enabled: config.voice.toolAck.enabled,
                       streamedThisSegment,

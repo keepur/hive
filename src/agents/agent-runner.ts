@@ -2374,6 +2374,18 @@ export class AgentRunner {
             cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
             cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
           }
+          // KPR-324 pre-PR R1: subagent/delegate-nested messages are excluded
+          // from ack injection ONLY. The SDK forwards subagent tool_use /
+          // tool_result blocks by default (parent_tool_use_id != null), so a
+          // single Task delegation would otherwise speak one canned hold line
+          // per NESTED tool call — several "One moment." lines for what the
+          // caller experiences as one silent gap. The ack acknowledges the
+          // model's OWN tool call to the live caller, not internal delegate
+          // machinery the caller never sees. Usage accounting above and the
+          // tool-timing/logging below deliberately keep processing these
+          // messages (KPR-401) — this guard touches the ack decision alone.
+          const subagentNested =
+            (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
           const content = assistantMessage?.content;
           if (Array.isArray(content)) {
             // KPR-324 §4.1: text blocks are processed BEFORE tool blocks so a
@@ -2381,7 +2393,8 @@ export class AgentRunner {
             // as streamed (no double-speak — spec §4.1 same-message rule).
             if (
               content.some(
-                (b: any) => b.type === "text" && typeof b.text === "string" && b.text.length > 0,
+                (b: { type?: string; text?: string }) =>
+                  b.type === "text" && typeof b.text === "string" && b.text.length > 0,
               )
             ) {
               streamedThisSegment = true;
@@ -2395,8 +2408,10 @@ export class AgentRunner {
                 // phrase never enters the SDK transcript or resultText, and
                 // does not set `streamed` (not model text). tool_use is
                 // observed BEFORE the handler runs (⚠ registry #2, Task 0),
-                // so the ack reaches TTS while the tool executes.
+                // so the ack reaches TTS while the tool executes. Nested
+                // (subagent/delegate) tool calls never ack — see above.
                 if (
+                  !subagentNested &&
                   shouldInjectToolAck({
                     enabled: config.voice.toolAck.enabled,
                     streamedThisSegment,

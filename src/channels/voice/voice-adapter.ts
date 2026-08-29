@@ -430,6 +430,13 @@ export class VoiceAdapter {
     // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
     // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
     // cover (stale id without auth-error pattern, etc.).
+    //
+    // KPR-324 semantics note: `bytesSent` (= headersSent) now flips true on a
+    // hive-injected tool-start ack too, not just model text — the ack goes
+    // through this same `onStream`/SSE path. That is intentional: once the
+    // caller has HEARD the ack, replaying the turn would double-speak it, so
+    // an ack-only turn is correctly treated as "already on the wire" and is
+    // not retried here.
     if (!outcome.ok && !outcome.circuitOpen && effectiveResume && !outcome.bytesSent && !clientGone) {
       log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
         callId,
