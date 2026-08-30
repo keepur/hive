@@ -42,6 +42,7 @@ const WC = {
   livekitApiSecret: "s",
   sipTrunkId: "ST_x",
   inboundAgents: {},
+  agentVoices: {},
   defaultStt: "deepgram/flux-general-en",
   defaultTts: "cartesia/sonic-3",
   deepgramApiKey: "dg",

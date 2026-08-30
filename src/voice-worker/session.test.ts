@@ -27,7 +27,26 @@ vi.mock("mongodb", () => {
   return { MongoClient: mongoMocks.MongoClient };
 });
 
-import { recordSetupFailure, resolveInboundAgent, runJobShutdown } from "./session.js";
+const { cartesiaCtorCalls, elevenlabsCtorCalls } = vi.hoisted(() => ({
+  cartesiaCtorCalls: [] as Array<Record<string, unknown>>,
+  elevenlabsCtorCalls: [] as Array<Record<string, unknown>>,
+}));
+
+vi.mock("@livekit/agents-plugin-cartesia", () => ({
+  TTS: vi.fn().mockImplementation(function (this: unknown, opts: Record<string, unknown>) {
+    cartesiaCtorCalls.push(opts);
+    return { label: "cartesia-tts-mock" };
+  }),
+}));
+
+vi.mock("@livekit/agents-plugin-elevenlabs", () => ({
+  TTS: vi.fn().mockImplementation(function (this: unknown, opts: Record<string, unknown>) {
+    elevenlabsCtorCalls.push(opts);
+    return { label: "elevenlabs-tts-mock" };
+  }),
+}));
+
+import { buildTts, recordSetupFailure, resolveInboundAgent, runJobShutdown } from "./session.js";
 import { CallStats, VoiceWorkerHeartbeat } from "./telemetry.js";
 
 const INBOUND_COPY = {
@@ -110,6 +129,7 @@ describe("CallStats.retryConsumed (KPR-322 Task 7 stand-in)", () => {
     livekitApiSecret: "s",
     sipTrunkId: "ST_x",
     inboundAgents: {},
+    agentVoices: {},
     defaultStt: "deepgram/flux-general-en",
     defaultTts: "cartesia/sonic-3",
     deepgramApiKey: "dg",
@@ -138,6 +158,7 @@ describe("recordSetupFailure (KPR-322 setup telemetry)", () => {
     livekitApiSecret: "s",
     sipTrunkId: "ST_x",
     inboundAgents: {},
+    agentVoices: {},
     defaultStt: "deepgram/flux-general-en",
     defaultTts: "cartesia/sonic-3",
     deepgramApiKey: "dg",
@@ -205,5 +226,54 @@ describe("runJobShutdown (KPR-322 call-end heartbeat)", () => {
     finishRelease();
     await running;
     expect(order).toEqual(["release-started", "release-finished", "flush", "close"]);
+  });
+});
+
+describe("buildTts (KPR-325 per-agent voice)", () => {
+  const baseWc = {
+    cartesiaApiKey: "ck_test",
+    elevenlabsApiKey: "el_test",
+    agentVoices: {},
+  } as WorkerConfig;
+  const cartesiaCell = { stt: "deepgram/flux-general-en", tts: "cartesia/sonic-3" } as VendorCell;
+  const elevenlabsCell = { stt: "deepgram/flux-general-en", tts: "elevenlabs/eleven_flash_v2_5" } as VendorCell;
+
+  beforeEach(() => {
+    cartesiaCtorCalls.length = 0;
+    elevenlabsCtorCalls.length = 0;
+  });
+
+  it("passes the agent's configured voice id to Cartesia", () => {
+    const wc = { ...baseWc, agentVoices: { mokie: "47c38ca4-5f35-497b-b1a3-415245fb35e1" } };
+    buildTts(cartesiaCell, wc, "mokie");
+    expect(cartesiaCtorCalls[0]).toMatchObject({
+      model: "sonic-3",
+      apiKey: "ck_test",
+      voice: "47c38ca4-5f35-497b-b1a3-415245fb35e1",
+    });
+  });
+
+  it("omits the voice option when the agent has no configured voice", () => {
+    buildTts(cartesiaCell, baseWc, "sige");
+    expect(cartesiaCtorCalls[0]).toEqual({ model: "sonic-3", apiKey: "ck_test" });
+    expect(cartesiaCtorCalls[0]).not.toHaveProperty("voice");
+  });
+
+  it("omits the voice option when agentId is unset entirely", () => {
+    buildTts(cartesiaCell, baseWc, "");
+    expect(cartesiaCtorCalls[0]).not.toHaveProperty("voice");
+  });
+
+  it("omits the voice option for a prototype-chain agentId (no accidental Function value)", () => {
+    buildTts(cartesiaCell, baseWc, "constructor");
+    expect(cartesiaCtorCalls[0]).toEqual({ model: "sonic-3", apiKey: "ck_test" });
+    expect(cartesiaCtorCalls[0]).not.toHaveProperty("voice");
+  });
+
+  it("ElevenLabs branch is unaffected by agentVoices — no voice option threaded", () => {
+    const wc = { ...baseWc, agentVoices: { mokie: "47c38ca4-5f35-497b-b1a3-415245fb35e1" } };
+    buildTts(elevenlabsCell, wc, "mokie");
+    expect(elevenlabsCtorCalls[0]).toEqual({ model: "eleven_flash_v2_5", apiKey: "el_test" });
+    expect(cartesiaCtorCalls).toHaveLength(0);
   });
 });

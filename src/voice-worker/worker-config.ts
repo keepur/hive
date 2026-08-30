@@ -15,6 +15,7 @@ export interface WorkerConfig {
   livekitApiSecret: string;
   sipTrunkId: string;
   inboundAgents: Record<string, string>;
+  agentVoices: Record<string, string>;
   defaultStt: string;
   defaultTts: string;
   deepgramApiKey: string;
@@ -44,6 +45,7 @@ export function loadWorkerConfig(): WorkerConfig {
     livekitApiSecret: config.voice.livekitApiSecret,
     sipTrunkId: lk.sipTrunkId,
     inboundAgents: lk.inboundAgents,
+    agentVoices: lk.agentVoices,
     defaultStt: lk.defaultStt,
     defaultTts: lk.defaultTts,
     deepgramApiKey: resolveSecretEnv("DEEPGRAM_API_KEY"),
