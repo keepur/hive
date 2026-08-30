@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Mock config before importing the module under test
 vi.mock("../config.js", () => ({
@@ -124,6 +124,7 @@ describe("SERVER_CREDENTIAL_CHECKS invariant", () => {
       "code-search",
       "browser",
       "tasks",
+      "voice-livekit",
     ];
 
     for (const server of credentialCheckServers) {
@@ -306,5 +307,63 @@ describe("buildInstanceCapabilities — broken plugin servers", () => {
   it("returns empty broken list when plugins have no broken servers", () => {
     const result = buildInstanceCapabilities([]);
     expect(result.servers.broken).toEqual([]);
+  });
+});
+
+describe("voice-livekit credential check", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.doUnmock("../config.js");
+  });
+
+  it("classifies configured when livekit is fully enabled", async () => {
+    vi.doMock("../config.js", () => ({
+      config: {
+        instance: { id: "test-instance" },
+        voice: {
+          livekit: { enabled: true, url: "wss://p.livekit.cloud" },
+          livekitApiKey: "lk_key",
+          livekitApiSecret: "lk_secret",
+        },
+      },
+    }));
+    const { buildInstanceCapabilities } = await import("./instance-capabilities.js");
+    const result = buildInstanceCapabilities();
+    expect(result.servers.configured).toContain("voice-livekit");
+  });
+
+  it("classifies unconfigured when the API pair is missing", async () => {
+    vi.doMock("../config.js", () => ({
+      config: {
+        instance: { id: "test-instance" },
+        voice: {
+          livekit: { enabled: true, url: "wss://p.livekit.cloud" },
+          livekitApiKey: "",
+          livekitApiSecret: "",
+        },
+      },
+    }));
+    const { buildInstanceCapabilities } = await import("./instance-capabilities.js");
+    const result = buildInstanceCapabilities();
+    expect(result.servers.unconfigured).toContain("voice-livekit");
+  });
+
+  it("classifies unconfigured when livekit is disabled", async () => {
+    vi.doMock("../config.js", () => ({
+      config: {
+        instance: { id: "test-instance" },
+        voice: {
+          livekit: { enabled: false, url: "" },
+          livekitApiKey: "",
+          livekitApiSecret: "",
+        },
+      },
+    }));
+    const { buildInstanceCapabilities } = await import("./instance-capabilities.js");
+    const result = buildInstanceCapabilities();
+    expect(result.servers.unconfigured).toContain("voice-livekit");
   });
 });

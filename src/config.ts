@@ -221,6 +221,8 @@ export interface VoiceLivekitConfig {
   sipTrunkId: string;
   /** E.164 → hive agent id map for inbound dispatch (S5). */
   inboundAgents: Record<string, string>;
+  /** Cartesia voice id per hive agent id (Phase-0 scope, Cartesia only — KPR-325). */
+  agentVoices: Record<string, string>;
   /** A/B cell defaults (S7); per-dispatch metadata overrides. */
   defaultStt: string;
   defaultTts: string;
@@ -235,11 +237,18 @@ export function resolveVoiceLivekitConfig(raw: unknown): VoiceLivekitConfig {
       if (typeof agent === "string" && agent.trim()) inboundAgents[num] = agent.trim();
     }
   }
+  const agentVoices: Record<string, string> = {};
+  if (src.agentVoices && typeof src.agentVoices === "object" && !Array.isArray(src.agentVoices)) {
+    for (const [agentId, voiceId] of Object.entries(src.agentVoices as Record<string, unknown>)) {
+      if (typeof voiceId === "string" && voiceId.trim()) agentVoices[agentId] = voiceId.trim();
+    }
+  }
   return {
     enabled: src.enabled === true,
     url: str(src.url, ""),
     sipTrunkId: str(src.sipTrunkId, ""),
     inboundAgents,
+    agentVoices,
     defaultStt: str(src.defaultStt, "deepgram/flux-general-en"),
     defaultTts: str(src.defaultTts, "cartesia/sonic-3"),
   };

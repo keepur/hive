@@ -63,9 +63,14 @@ export function buildStt(cell: VendorCell, deepgramApiKey: string) {
     : new deepgram.STT({ model: "nova-3", apiKey: deepgramApiKey });
 }
 
-export function buildTts(cell: VendorCell, wc: WorkerConfig) {
+export function buildTts(cell: VendorCell, wc: WorkerConfig, agentId: string) {
+  const voiceId = wc.agentVoices[agentId];
   return cell.tts === "cartesia/sonic-3"
-    ? new cartesia.TTS({ model: "sonic-3", apiKey: wc.cartesiaApiKey })
+    ? new cartesia.TTS({
+        model: "sonic-3",
+        apiKey: wc.cartesiaApiKey,
+        ...(typeof voiceId === "string" && voiceId ? { voice: voiceId } : {}),
+      })
     : new elevenlabs.TTS({ model: "eleven_flash_v2_5", apiKey: wc.elevenlabsApiKey });
 }
 
@@ -157,7 +162,7 @@ export async function runCallSession(
   const vad = await silero.VAD.load();
   const session = new voice.AgentSession({
     stt: buildStt(cell, wc.deepgramApiKey),
-    tts: buildTts(cell, wc),
+    tts: buildTts(cell, wc, hiveAgentId),
     vad,
     llm: hiveLLM,
     turnHandling: { turnDetection: cell.stt === "deepgram/flux-general-en" ? "stt" : "vad" },
