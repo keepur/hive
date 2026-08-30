@@ -368,10 +368,16 @@ with:
 export function buildTts(cell: VendorCell, wc: WorkerConfig, agentId: string) {
   const voiceId = wc.agentVoices[agentId];
   return cell.tts === "cartesia/sonic-3"
-    ? new cartesia.TTS({ model: "sonic-3", apiKey: wc.cartesiaApiKey, ...(voiceId ? { voice: voiceId } : {}) })
+    ? new cartesia.TTS({
+        model: "sonic-3",
+        apiKey: wc.cartesiaApiKey,
+        ...(typeof voiceId === "string" && voiceId ? { voice: voiceId } : {}),
+      })
     : new elevenlabs.TTS({ model: "eleven_flash_v2_5", apiKey: wc.elevenlabsApiKey });
 }
 ```
+
+(Guard is mandatory, not optional — `agentVoices` is a plain `{}` literal (Step 2), so an unguarded indexed lookup with `agentId = "constructor"` would return `Object.prototype.constructor`, a truthy `Function` that a bare truthiness check would spread into the TTS options. `caught-by: plan-review/1/fable`.)
 
 - [ ] **Step 7:** Update the call site.
 
@@ -503,6 +509,12 @@ describe("buildTts (KPR-325 per-agent voice)", () => {
     expect(cartesiaCtorCalls[0]).not.toHaveProperty("voice");
   });
 
+  it("omits the voice option for a prototype-chain agentId (no accidental Function value)", () => {
+    buildTts(cartesiaCell, baseWc, "constructor");
+    expect(cartesiaCtorCalls[0]).toEqual({ model: "sonic-3", apiKey: "ck_test" });
+    expect(cartesiaCtorCalls[0]).not.toHaveProperty("voice");
+  });
+
   it("ElevenLabs branch is unaffected by agentVoices — no voice option threaded", () => {
     const wc = { ...baseWc, agentVoices: { mokie: "47c38ca4-5f35-497b-b1a3-415245fb35e1" } };
     buildTts(elevenlabsCell, wc, "mokie");
@@ -518,7 +530,7 @@ Run:
 ```bash
 npx vitest run src/config.test.ts src/voice-worker/session.test.ts src/voice-worker/telemetry.test.ts
 ```
-Expected: all tests pass, including the new `resolveVoiceLivekitConfig` assertions and the four new `buildTts` cases (Cartesia-with-voice, Cartesia-without-voice, Cartesia-empty-agentId, ElevenLabs-unaffected), and the three pre-existing fixture-based tests still pass with `agentVoices: {}` added.
+Expected: all tests pass, including the new `resolveVoiceLivekitConfig` assertions and the five new `buildTts` cases (Cartesia-with-voice, Cartesia-without-voice, Cartesia-empty-agentId, Cartesia-prototype-chain-agentId, ElevenLabs-unaffected), and the three pre-existing fixture-based tests still pass with `agentVoices: {}` added.
 
 Run:
 ```bash
