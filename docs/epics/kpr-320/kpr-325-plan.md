@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, Vitest, `@livekit/agents-plugin-cartesia`.
 
-**Spec:** [docs/epics/kpr-320/kpr-325-spec.md](../epics/kpr-320/kpr-325-spec.md)
+**Spec:** [docs/epics/kpr-320/kpr-325-spec.md](./kpr-325-spec.md)
 
 ## Testing Contract
 
