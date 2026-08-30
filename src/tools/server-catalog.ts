@@ -79,6 +79,11 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     description: "Make outbound phone calls via Vapi",
     usage: "Calling customers, scheduling appointments, following up by phone",
   },
+  "voice-livekit": {
+    description: "Make outbound phone calls via the LiveKit voice pipeline",
+    usage: "Calling someone by phone when a live voice conversation is what's needed",
+    notFor: "Vapi-based calling — use voice instead; that server key is separate and unrelated",
+  },
   tasks: {
     description: "Task management — create, update, and track agent tasks",
     usage: "Managing your own task queue",
