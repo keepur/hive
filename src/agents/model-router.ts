@@ -42,9 +42,16 @@ export const RESOURCE_TIER_DEFAULTS: Record<ModelTier, ResourceLimits> = {
  * every haiku agent from 120s to 300s. Residual corner (accepted): explicitly
  * setting exactly 300_000 on a non-sonnet tier is indistinguishable from the
  * materialized default and keeps the tier default. `maxTurns`/`budgetUsd`
- * deliberately stay tier-defaulted — their materialized defaults (200/10)
- * don't coincide with any single tier value, so the same disambiguation is
- * impossible there.
+ * deliberately stay tier-defaulted — their materialized defaults (200/10) are
+ * likewise indistinguishable from operator intent, and folding them in would
+ * flip real bounds (e.g. every sonnet agent's maxTurns 50 → 200; note the
+ * maxTurns default coincides with the opus tier value, so no sentinel trick
+ * exists for it).
+ *
+ * Non-finite / non-positive values (a `timeoutMs: 0`, a string cast, NaN) are
+ * ignored here rather than armed as a millisecond deadline — the admin write
+ * path doesn't validate the field, and pre-KPR-422 such garbage was inert on
+ * this path. (Other lanes read the raw field directly and always did.)
  */
 export function resolveResourceLimits(
   tier: ModelTier,
@@ -54,7 +61,10 @@ export function resolveResourceLimits(
   const defaults = RESOURCE_TIER_DEFAULTS[tier];
   const overrides = agentOverrides?.[tier];
   const explicitTimeoutMs =
-    agentTimeoutMs !== undefined && agentTimeoutMs !== AGENT_DEFINITION_DEFAULTS.timeoutMs
+    typeof agentTimeoutMs === "number" &&
+    Number.isFinite(agentTimeoutMs) &&
+    agentTimeoutMs > 0 &&
+    agentTimeoutMs !== AGENT_DEFINITION_DEFAULTS.timeoutMs
       ? agentTimeoutMs
       : undefined;
   return {

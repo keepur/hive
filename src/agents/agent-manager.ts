@@ -1126,7 +1126,14 @@ export class AgentManager {
   private acquireDeadlineMs(provider: string, agentConfig: AgentConfig | undefined): number {
     const configuredMs = agentConfig?.timeoutMs ?? 300_000;
     if (!agentConfig || provider !== "claude") return configuredMs;
-    const tierLimitMs = resolveResourceLimits(modelToTier(agentConfig.model), agentConfig.resourceTiers, agentConfig.timeoutMs).timeoutMs;
+    // KPR-422: the agent's top-level timeoutMs is deliberately NOT passed as
+    // the third argument here — the max() below already folds it in, and
+    // passing it could only LOWER tierLimitMs (top-level wins over the tier
+    // default inside resolveResourceLimits), tightening a bound whose
+    // documented posture is over-estimation. The turn's effective deadline is
+    // always ≤ max(configured, override ?? tierDefault), so the bound stays a
+    // true upper bound.
+    const tierLimitMs = resolveResourceLimits(modelToTier(agentConfig.model), agentConfig.resourceTiers).timeoutMs;
     return Math.max(configuredMs, tierLimitMs);
   }
 

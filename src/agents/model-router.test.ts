@@ -114,6 +114,18 @@ describe("resolveResourceLimits", () => {
     it("undefined agentTimeoutMs preserves pre-KPR-422 behavior exactly", () => {
       expect(resolveResourceLimits("sonnet", undefined, undefined)).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
     });
+
+    it("garbage values are ignored, never armed as a deadline (unvalidated admin write path)", () => {
+      expect(resolveResourceLimits("sonnet", undefined, 0).timeoutMs).toBe(RESOURCE_TIER_DEFAULTS.sonnet.timeoutMs);
+      expect(resolveResourceLimits("sonnet", undefined, -5).timeoutMs).toBe(RESOURCE_TIER_DEFAULTS.sonnet.timeoutMs);
+      expect(resolveResourceLimits("sonnet", undefined, NaN).timeoutMs).toBe(RESOURCE_TIER_DEFAULTS.sonnet.timeoutMs);
+      expect(resolveResourceLimits("sonnet", undefined, Infinity).timeoutMs).toBe(
+        RESOURCE_TIER_DEFAULTS.sonnet.timeoutMs,
+      );
+      expect(
+        resolveResourceLimits("sonnet", undefined, "600000" as unknown as number).timeoutMs,
+      ).toBe(RESOURCE_TIER_DEFAULTS.sonnet.timeoutMs);
+    });
   });
 });
 
