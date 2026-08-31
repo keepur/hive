@@ -121,8 +121,10 @@ export class SmsAdapter implements ChannelAdapter {
     for (const line of this.lines) {
       try {
         // Get recent conversations with new activity
+        // NOTE: Quo's API 400s on bracketed array notation ("phoneNumbers[]") — it
+        // wants the plain key, same as the working quo-mcp-server.ts tool calls.
         const convResult = await this.quoApi("/conversations", {
-          "phoneNumbers[]": line.id,
+          phoneNumbers: line.id,
           updatedAfter: line.lastSeen,
           maxResults: "20",
         });
@@ -134,46 +136,53 @@ export class SmsAdapter implements ChannelAdapter {
           const participant = conv.participants?.[0];
           if (!participant) continue;
 
-          const msgResult = await this.quoApi("/messages", {
-            phoneNumberId: line.id,
-            "participants[]": participant,
-            maxResults: "10",
-            createdAfter: line.lastSeen,
-          });
-
-          const messages: QuoMessage[] = (msgResult.data ?? [])
-            .filter((m: any) => m.direction === "incoming")
-            .reverse(); // chronological order
-
-          for (const msg of messages) {
-            if (!msg.text) continue;
-
-            const smsText = `SMS from ${msg.from} → ${line.label}:\n${msg.text}`;
-
-            const workItem: WorkItem = {
-              id: msg.id,
-              text: smsText,
-              source: {
-                kind: "sms",
-                id: line.id,
-                label: line.routeLabel,
-              },
-              sender: msg.from,
-              threadId: `sms:${line.id}:${msg.from}`,
-              timestamp: new Date(),
-              meta: {
-                quoMessageId: msg.id,
-                lineNumber: line.number,
-              },
-            };
-
-            log.info("SMS received", {
-              from: msg.from,
-              line: line.label,
-              textLength: msg.text.length,
+          try {
+            const msgResult = await this.quoApi("/messages", {
+              phoneNumberId: line.id,
+              participants: participant,
+              maxResults: "10",
+              createdAfter: line.lastSeen,
             });
 
-            onWorkItem(workItem);
+            const messages: QuoMessage[] = (msgResult.data ?? [])
+              .filter((m: any) => m.direction === "incoming")
+              .reverse(); // chronological order
+
+            for (const msg of messages) {
+              if (!msg.text) continue;
+
+              const smsText = `SMS from ${msg.from} → ${line.label}:\n${msg.text}`;
+
+              const workItem: WorkItem = {
+                id: msg.id,
+                text: smsText,
+                source: {
+                  kind: "sms",
+                  id: line.id,
+                  label: line.routeLabel,
+                },
+                sender: msg.from,
+                threadId: `sms:${line.id}:${msg.from}`,
+                timestamp: new Date(),
+                meta: {
+                  quoMessageId: msg.id,
+                  lineNumber: line.number,
+                },
+              };
+
+              log.info("SMS received", {
+                from: msg.from,
+                line: line.label,
+                textLength: msg.text.length,
+              });
+
+              onWorkItem(workItem);
+            }
+          } catch (err) {
+            // Scoped per-conversation so one bad participant can't block lastSeen
+            // from advancing below — that gap is what turned a single-request bug
+            // into a months-long every-30s hammer against Quo (see incident notes).
+            log.error("SMS message fetch failed", { line: line.label, participant, error: String(err) });
           }
         }
 
