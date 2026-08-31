@@ -76,6 +76,45 @@ describe("resolveResourceLimits", () => {
     limits.timeoutMs = 999;
     expect(RESOURCE_TIER_DEFAULTS.haiku.timeoutMs).toBe(120_000);
   });
+
+  describe("top-level agentTimeoutMs participation (KPR-422)", () => {
+    it("honors a custom top-level timeoutMs over the tier default (the fable shape)", () => {
+      // claude-fable-5 → modelToTier "sonnet"; timeoutMs 1_800_000 on the
+      // agent def was dead config pre-KPR-422 (turns killed at 300s).
+      const limits = resolveResourceLimits("sonnet", undefined, 1_800_000);
+      expect(limits.timeoutMs).toBe(1_800_000);
+      // maxTurns/budgetUsd stay tier-defaulted — deliberately out of scope.
+      expect(limits.maxTurns).toBe(RESOURCE_TIER_DEFAULTS.sonnet.maxTurns);
+      expect(limits.budgetUsd).toBe(RESOURCE_TIER_DEFAULTS.sonnet.budgetUsd);
+    });
+
+    it("explicit resourceTiers.<tier>.timeoutMs override beats the top-level value", () => {
+      const limits = resolveResourceLimits("sonnet", { sonnet: { timeoutMs: 600_000 } }, 1_800_000);
+      expect(limits.timeoutMs).toBe(600_000);
+    });
+
+    it("the materialized default (300_000) does NOT override a longer tier default (opus stays 600s)", () => {
+      // toAgentConfig/agent_create write timeoutMs: 300_000 into every doc
+      // that never set one — treating that as operator intent would drop
+      // every opus agent from 600s to 300s.
+      const limits = resolveResourceLimits("opus", undefined, 300_000);
+      expect(limits.timeoutMs).toBe(RESOURCE_TIER_DEFAULTS.opus.timeoutMs);
+    });
+
+    it("the materialized default (300_000) does NOT loosen a tighter tier default (haiku stays 120s)", () => {
+      const limits = resolveResourceLimits("haiku", undefined, 300_000);
+      expect(limits.timeoutMs).toBe(RESOURCE_TIER_DEFAULTS.haiku.timeoutMs);
+    });
+
+    it("a custom top-level timeoutMs can tighten below the tier default (haiku 60s)", () => {
+      const limits = resolveResourceLimits("haiku", undefined, 60_000);
+      expect(limits.timeoutMs).toBe(60_000);
+    });
+
+    it("undefined agentTimeoutMs preserves pre-KPR-422 behavior exactly", () => {
+      expect(resolveResourceLimits("sonnet", undefined, undefined)).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+    });
+  });
 });
 
 function makeLlmResult(

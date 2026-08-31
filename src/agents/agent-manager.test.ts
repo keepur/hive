@@ -780,6 +780,32 @@ describe("AgentManager", () => {
       expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
     });
 
+    it("KPR-422: a custom top-level timeoutMs survives to the runner on the router-on path (the fable shape)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // claude-fable-5: no opus/haiku substring → static tier "sonnet". Pre-fix
+      // the hardcoded sonnet default (300s) silently overrode the agent's own
+      // 30-minute timeoutMs; turns died at exactly 5:00 into the KPR-402 chain.
+      registry._agents.set(
+        "agent-fable",
+        makeAgentConfig({
+          id: "agent-fable",
+          name: "AgentFable",
+          model: "claude-fable-5",
+          timeoutMs: 1_800_000,
+        }),
+      );
+      vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
+
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-fable" }));
+
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual({
+        timeoutMs: 1_800_000,
+        maxTurns: RESOURCE_TIER_DEFAULTS.sonnet.maxTurns,
+        budgetUsd: RESOURCE_TIER_DEFAULTS.sonnet.budgetUsd,
+      });
+    });
+
     it("merges per-agent resourceTiers overrides into the static limits (KPR-338)", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       registry._agents.set(

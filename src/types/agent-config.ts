@@ -47,7 +47,15 @@ export interface AgentConfig {
    * anything, which resolveToolSearchEnv treats as absent.
    */
   toolSearch?: "auto" | "on" | "off";
-  timeoutMs?: number; // Response timeout in ms. Default 300000 (5 min)
+  /**
+   * Response timeout in ms. Default 300000 (5 min). Honored on every lane
+   * (KPR-422): on the claude/router-on path it participates in
+   * resolveResourceLimits (resourceTiers.<tier>.timeoutMs override wins over
+   * it; it wins over the tier default — except a value of exactly 300000,
+   * which is indistinguishable from the materialized default and yields the
+   * tier default).
+   */
+  timeoutMs?: number;
   betas?: string[]; // SDK beta features. Note: "context-1m-2025-08-07" retires 2026-04-30
   metadata?: Record<string, unknown>; // plugin-managed bag — read via agent-env dotted paths
   disabled?: boolean; // Agent is offline — won't receive messages or run schedules
