@@ -457,6 +457,16 @@ async function main(): Promise<void> {
   // this feature's own degrade-silently rule (spec §Integration points issue 5).
   meetingScribe.ensureIndexes().catch((err) => log.error("Scribe index setup failed", { error: String(err) }));
   dispatcher.setMeetingScribe(meetingScribe);
+  // KPR-417: the delay-then-ack lever is a SPAWN-READ fact (dispatchToAgent
+  // reads it per turn), so it is wired here, above the spawn-capable boundary
+  // below — same rule as the pool and the scribe. Guarded by
+  // src/boot-order.test.ts, which carries this call as an anchor in all three
+  // of its lists. KPR-420: it logs on its own line — the lever is
+  // scribe/pool-INDEPENDENT (canon C15), so its boot state must not be filed
+  // under the scribe's log line where an operator diagnosing "why no acks"
+  // would grep the wrong subsystem.
+  dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled);
+  log.info("Meeting ack lever wired (KPR-417)", { ackEnabled: config.meetingWorkers.ackEnabled });
   log.info("Meeting scribe wired", {
     scribeEnabled: config.meetingWorkers.scribeEnabled,
     scribeModel: config.meetingWorkers.scribeModel,
@@ -467,8 +477,8 @@ async function main(): Promise<void> {
   // Everything BELOW this line can dispatch a turn: bgTaskManager /
   // codeTaskManager orphan-completion callbacks, meetingMonitor, every
   // channel adapter, the scheduler. Anything a turn READS PER SPAWN —
-  // provider plugins, the worker pool, the meeting scribe — must be wired
-  // ABOVE it, or turns in the boot window silently see the pre-feature
+  // provider plugins, the worker pool, the meeting scribe, the ack lever —
+  // must be wired ABOVE it, or turns in the boot window silently see the pre-feature
   // engine. Guarded by src/boot-order.test.ts.
 
   // Background task manager — agents can spawn detached background processes

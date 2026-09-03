@@ -58,6 +58,13 @@ export const LLM_CATALOG: readonly CatalogModel[] = [
     capabilities: ["json", "structured-outputs", "vision", "effort"],
   },
   {
+    // Fable 5.1 (2026-09): same Mythos-tier surface as fable-5 — thinking
+    // always on, effort accepted. Current default for Fable-tier agents.
+    id: "claude-fable-5-1",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
     // Default vision-task model (config.gemini.visionModel default).
     id: "gemini-2.5-flash",
     provider: "gemini",

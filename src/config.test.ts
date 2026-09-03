@@ -278,6 +278,31 @@ describe("resolveMeetingWorkersConfig (KPR-390)", () => {
     expect(c.scribeMaxTurns).toBe(2);
     expect(c.claimTtlMinutes).toBe(DEFAULT_MEETING_WORKERS_CONFIG.claimTtlMinutes);
   });
+
+  it("KPR-417: ackEnabled defaults on, resolves liberally, and is INDEPENDENT of `enabled`", () => {
+    // Absent section / absent key ⇒ default true.
+    expect(resolveMeetingWorkersConfig(undefined).ackEnabled).toBe(true);
+    expect(resolveMeetingWorkersConfig({}).ackEnabled).toBe(true);
+    expect(resolveMeetingWorkersConfig({ workerModel: "opus" }).ackEnabled).toBe(true);
+
+    // Explicit false honored.
+    expect(resolveMeetingWorkersConfig({ ackEnabled: false }).ackEnabled).toBe(false);
+
+    // Non-boolean garbage falls back to the default (liberal loader, KPR-225 F3).
+    expect(resolveMeetingWorkersConfig({ ackEnabled: "no" }).ackEnabled).toBe(true);
+    expect(resolveMeetingWorkersConfig({ ackEnabled: 0 }).ackEnabled).toBe(true);
+    expect(resolveMeetingWorkersConfig({ ackEnabled: null }).ackEnabled).toBe(true);
+
+    // ⚠ THE INDEPENDENCE PIN (spec §5.6). `scribeEnabled` is nested under
+    // `enabled` because the scribe consumes pool machinery; the ack consumes
+    // none. Disabling fetch-workers must NOT silently kill the ack. If a
+    // future edit nests ackEnabled under `enabled` IN THE RESOLVER, this line
+    // fails. It does NOT cover the consumption end: `enabled && ackEnabled` at
+    // index.ts's setMeetingAckEnabled call would keep this green, which is why
+    // boot-order.test.ts list (a) anchors that call's exact ARGUMENT.
+    expect(resolveMeetingWorkersConfig({ enabled: false }).ackEnabled).toBe(true);
+    expect(resolveMeetingWorkersConfig({ enabled: false }).enabled).toBe(false);
+  });
 });
 
 describe("resolveToolSearchConfig (KPR-329)", () => {

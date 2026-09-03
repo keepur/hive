@@ -190,6 +190,7 @@ describe("catalog metadata (spec §3.2 pins)", () => {
     expect(r.supportsEffort("claude-opus-4-8")).toBe(true);
     expect(r.supportsEffort("claude-sonnet-5")).toBe(true);
     expect(r.supportsEffort("claude-fable-5")).toBe(true);
+    expect(r.supportsEffort("claude-fable-5-1")).toBe(true);
     expect(r.supportsEffort("mystery-model")).toBe(false);
   });
 

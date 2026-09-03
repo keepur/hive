@@ -1,6 +1,7 @@
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
 import { getLLMRegistry } from "../llm/registry.js";
+import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { ReasoningEffort } from "./provider-adapters/types.js";
 
 const log = createLogger("model-router");
@@ -25,18 +26,51 @@ export const RESOURCE_TIER_DEFAULTS: Record<ModelTier, ResourceLimits> = {
 
 /**
  * Resolve resource limits for a tier, applying per-agent overrides on top of global defaults.
+ *
+ * KPR-422: `agentTimeoutMs` is the agent definition's top-level `timeoutMs`.
+ * Before this fix it was silently dead config on the claude/router-on path —
+ * the tier default always won, so a custom-tier model (modelToTier → "sonnet")
+ * with `timeoutMs: 1_800_000` still got killed at 300s. Precedence now:
+ * explicit `resourceTiers.<tier>.timeoutMs` > top-level `timeoutMs` > tier
+ * default.
+ *
+ * The top-level value participates only when it differs from the materialized
+ * default (300_000): `agent_create` and `toAgentConfig` both write
+ * `timeoutMs: 300_000` into docs/configs that never set one, so the raw value
+ * cannot distinguish operator intent — and folding the materialized default in
+ * unconditionally would drop every opus agent from 600s to 300s and loosen
+ * every haiku agent from 120s to 300s. Residual corner (accepted): explicitly
+ * setting exactly 300_000 on a non-sonnet tier is indistinguishable from the
+ * materialized default and keeps the tier default. `maxTurns`/`budgetUsd`
+ * deliberately stay tier-defaulted — their materialized defaults (200/10) are
+ * likewise indistinguishable from operator intent, and folding them in would
+ * flip real bounds (e.g. every sonnet agent's maxTurns 50 → 200; note the
+ * maxTurns default coincides with the opus tier value, so no sentinel trick
+ * exists for it).
+ *
+ * Non-finite / non-positive values (a `timeoutMs: 0`, a string cast, NaN) are
+ * ignored here rather than armed as a millisecond deadline — the admin write
+ * path doesn't validate the field, and pre-KPR-422 such garbage was inert on
+ * this path. (Other lanes read the raw field directly and always did.)
  */
 export function resolveResourceLimits(
   tier: ModelTier,
   agentOverrides?: ResourceTierOverrides,
+  agentTimeoutMs?: number,
 ): ResourceLimits {
   const defaults = RESOURCE_TIER_DEFAULTS[tier];
   const overrides = agentOverrides?.[tier];
-  if (!overrides) return { ...defaults };
+  const explicitTimeoutMs =
+    typeof agentTimeoutMs === "number" &&
+    Number.isFinite(agentTimeoutMs) &&
+    agentTimeoutMs > 0 &&
+    agentTimeoutMs !== AGENT_DEFINITION_DEFAULTS.timeoutMs
+      ? agentTimeoutMs
+      : undefined;
   return {
-    timeoutMs: overrides.timeoutMs ?? defaults.timeoutMs,
-    maxTurns: overrides.maxTurns ?? defaults.maxTurns,
-    budgetUsd: overrides.budgetUsd ?? defaults.budgetUsd,
+    timeoutMs: overrides?.timeoutMs ?? explicitTimeoutMs ?? defaults.timeoutMs,
+    maxTurns: overrides?.maxTurns ?? defaults.maxTurns,
+    budgetUsd: overrides?.budgetUsd ?? defaults.budgetUsd,
   };
 }
 

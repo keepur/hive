@@ -123,6 +123,11 @@ export function resolveMeetingWorkersConfig(raw: unknown): MeetingWorkersConfig 
     workerMaxTurns: posNum(r.workerMaxTurns, d.workerMaxTurns),
     workerTimeoutMs,
     enabled: typeof r.enabled === "boolean" ? r.enabled : d.enabled,
+    // KPR-417: same liberal-loader idiom as `enabled`/`scribeEnabled`, and no
+    // clamp interaction. Resolved INDEPENDENTLY of `enabled` — this key is in
+    // the meetingWorkers section for locality, not because it is a worker
+    // feature (spec §5.6). Do not nest it under `enabled`.
+    ackEnabled: typeof r.ackEnabled === "boolean" ? r.ackEnabled : d.ackEnabled,
     // KPR-409 scribe keys — same liberal-loader idioms; no TTL clamp (the
     // scribe creates no claim, so claimTtlMinutes's invariant is untouched).
     scribeEnabled: typeof r.scribeEnabled === "boolean" ? r.scribeEnabled : d.scribeEnabled,

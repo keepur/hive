@@ -44,6 +44,15 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     offsetOf("agentManager.setWorkerPool(");
     offsetOf("await workerPool.ensureIndexes()");
     offsetOf("dispatcher.setMeetingScribe(");
+    offsetOf("dispatcher.setMeetingAckEnabled(");
+    // KPR-417: the ARGUMENT, not just the call. The delegated Gate-1
+    // assumption is that ackEnabled is independent of `enabled`, and
+    // config.test.ts pins that only in the RESOLVER. The realistic nesting
+    // site is right here at the consumption end — `enabled && ackEnabled`
+    // would keep every resolver test green. That is exactly where
+    // scribeEnabled's own nesting lives (meeting-scribe.ts, not config.ts),
+    // so this anchor is what closes the gap at the one live feed.
+    offsetOf("dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled)");
     offsetOf("await bgTaskManager.start()");
     offsetOf("await bgTaskManager.scanOrphans()");
     offsetOf("await codeTaskManager.start()");
@@ -57,6 +66,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("agentManager.setWorkerPool("),
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
+      offsetOf("dispatcher.setMeetingAckEnabled("),
     ];
     const surfaceOffsets = [
       offsetOf("await bgTaskManager.start()"),
@@ -82,6 +92,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("agentManager.setWorkerPool("),
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
+      offsetOf("dispatcher.setMeetingAckEnabled("),
     );
     // Known non-spawn-capable `.start(`/`.scanOrphans(` calls that legitimately
     // precede the wiring. Adding to this list is a deliberate, reviewed

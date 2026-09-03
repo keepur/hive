@@ -1188,6 +1188,13 @@ export class AgentManager {
   private acquireDeadlineMs(provider: string, agentConfig: AgentConfig | undefined): number {
     const configuredMs = agentConfig?.timeoutMs ?? 300_000;
     if (!agentConfig || provider !== "claude") return configuredMs;
+    // KPR-422: the agent's top-level timeoutMs is deliberately NOT passed as
+    // the third argument here — the max() below already folds it in, and
+    // passing it could only LOWER tierLimitMs (top-level wins over the tier
+    // default inside resolveResourceLimits), tightening a bound whose
+    // documented posture is over-estimation. The turn's effective deadline is
+    // always ≤ max(configured, override ?? tierDefault), so the bound stays a
+    // true upper bound.
     const tierLimitMs = resolveResourceLimits(modelToTier(agentConfig.model), agentConfig.resourceTiers).timeoutMs;
     return Math.max(configuredMs, tierLimitMs);
   }
@@ -2377,9 +2384,12 @@ export class AgentManager {
     // otherwise receive, so the min() invariant ("tighter operator config
     // always wins") holds on every reachable path:
     //   claude, router ON:  static-tier limits (resolveResourceLimits). The
-    //               legacy triple is dead config there and is deliberately
-    //               NOT folded in (folding it would newly activate config
-    //               that has no effect today).
+    //               legacy maxTurns/budgetUsd are dead config there and are
+    //               deliberately NOT folded in (folding them would newly
+    //               activate config that has no effect today); timeoutMs is
+    //               live since KPR-422 — resolveResourceLimits itself folds
+    //               the agent's top-level timeoutMs in, so the base here
+    //               matches what a round-0 turn would receive.
     //   claude, router OFF: agent-def legacy triple — today the router gate
     //               returns resourceLimits: undefined and the runner's
     //               per-field fallback applies agentConfig values; operator
@@ -2399,7 +2409,7 @@ export class AgentManager {
     };
     const base =
       staticRoute.provider === "claude" && appConfig.modelRouter.enabled
-        ? resolveResourceLimits(staticTier, agentConfig.resourceTiers)
+        ? resolveResourceLimits(staticTier, agentConfig.resourceTiers, agentConfig.timeoutMs)
         : legacy;
     const limits: ResourceLimits = {
       maxTurns: Math.min(base.maxTurns, REACTION_MAX_TURNS),
@@ -2581,8 +2591,10 @@ export class AgentManager {
     // KPR-338: the turn's model is ALWAYS agentConfig.model (fixed-tier
     // invariant, kpr-338-spec §1.3). Execution bounds derive from the agent's
     // STATIC tier — same path that carried router-derived limits before
-    // (path-preserving), explicitly NOT effort-keyed.
-    const staticLimits = resolveResourceLimits(staticTier, agentConfig.resourceTiers);
+    // (path-preserving), explicitly NOT effort-keyed. KPR-422: the agent's
+    // top-level timeoutMs participates in the resolution (tier override >
+    // top-level > tier default) — it is no longer dead config on this path.
+    const staticLimits = resolveResourceLimits(staticTier, agentConfig.resourceTiers, agentConfig.timeoutMs);
 
     // Haiku-skip (replaces router H1) + effort-capability gate (kpr-338-spec
     // §3.1 residual, plan D1/D2): when the static model cannot receive the

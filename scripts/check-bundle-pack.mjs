@@ -18,7 +18,10 @@ const packOutput = execFileSync("npm", ["pack", "--dry-run", "--json"], {
   stdio: ["pipe", "pipe", "pipe"],
 });
 
-const [packInfo] = JSON.parse(packOutput);
+const parsed = JSON.parse(packOutput);
+// npm pack --json returned a one-element array on older npm; newer npm
+// (confirmed npm 12.0.2 / Node 26) returns an object keyed by package name instead.
+const packInfo = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
 const files = packInfo.files.map((f) => f.path);
 
 // --- Required files ---

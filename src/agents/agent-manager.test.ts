@@ -953,6 +953,32 @@ describe("AgentManager", () => {
       expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
     });
 
+    it("KPR-422: a custom top-level timeoutMs survives to the runner on the router-on path (the fable shape)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // claude-fable-5: no opus/haiku substring → static tier "sonnet". Pre-fix
+      // the hardcoded sonnet default (300s) silently overrode the agent's own
+      // 30-minute timeoutMs; turns died at exactly 5:00 into the KPR-402 chain.
+      registry._agents.set(
+        "agent-fable",
+        makeAgentConfig({
+          id: "agent-fable",
+          name: "AgentFable",
+          model: "claude-fable-5",
+          timeoutMs: 1_800_000,
+        }),
+      );
+      vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
+
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-fable" }));
+
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual({
+        timeoutMs: 1_800_000,
+        maxTurns: RESOURCE_TIER_DEFAULTS.sonnet.maxTurns,
+        budgetUsd: RESOURCE_TIER_DEFAULTS.sonnet.budgetUsd,
+      });
+    });
+
     it("merges per-agent resourceTiers overrides into the static limits (KPR-338)", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       registry._agents.set(
@@ -2540,6 +2566,19 @@ describe("AgentManager", () => {
 
       it("KPR-403: turnDeadlineUpperBoundMs — unknown agentId falls back to the 300s default", () => {
         expect(manager.turnDeadlineUpperBoundMs("no-such-agent")).toBe(300_000);
+      });
+
+      it("KPR-422: a tight custom timeoutMs does NOT lower the acquire bound below the tier limit (over-estimation posture)", () => {
+        // Post-KPR-422 this agent's effective turn deadline is 120s (top-level
+        // timeoutMs wins the resolution), but acquireDeadlineMs deliberately
+        // does not pass the third argument — the bound stays max(120s, opus
+        // 600s) = 600s. Over-estimating only delays reconciliation;
+        // under-estimating stale-kills a legitimate self-heal retry mid-flight.
+        registry._agents.set(
+          "agent-opus-422",
+          makeAgentConfig({ id: "agent-opus-422", name: "OpusTight", model: "claude-opus-4-7", timeoutMs: 120_000 }),
+        );
+        expect(manager.turnDeadlineUpperBoundMs("agent-opus-422")).toBe(RESOURCE_TIER_DEFAULTS.opus.timeoutMs);
       });
 
       it("KPR-347 T5: assembly throws with a provider-fault-shaped message — classifies non-provider, breaker closed after 3 repeats", async () => {
@@ -6069,6 +6108,24 @@ describe("AgentManager", () => {
       const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
       expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 10 });
       expect(effort).toBeUndefined();
+    });
+
+    it("KPR-422: round-1 claude router ON — a top-level timeoutMs tighter than the reaction cap wins the min()", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      try {
+        registry._agents.set(
+          "agent-tight-t",
+          makeAgentConfig({ id: "agent-tight-t", name: "TightT", model: "claude-sonnet-4-6", timeoutMs: 60_000 }),
+        );
+        await manager.spawnTurn(makeConfCtx(1, "agent-tight-t"));
+        const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+        // base = resolveResourceLimits(sonnet, undefined, 60_000) → timeoutMs
+        // 60_000 (pre-KPR-422 the base was the 300s tier default and the clamp
+        // landed on 120s) → min(60_000, REACTION_TIMEOUT_MS) = 60_000.
+        expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 60_000, budgetUsd: 5 });
+      } finally {
+        (appConfig as any).modelRouter.enabled = false;
+      }
     });
 
     it("T2: round-0 conference turn untouched — classifier runs, static-tier limits, classifier effort (negative pin, D3)", async () => {

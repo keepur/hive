@@ -158,6 +158,39 @@ describe("SmsAdapter", () => {
       expect(calls.some((u) => u.includes("/messages") && !u.includes("?"))).toBe(false);
     });
 
+    it("sends phoneNumbers/participants as plain (non-bracketed) query params", async () => {
+      // Regression test: Quo's API 400s on bracketed array notation
+      // ("phoneNumbers[]"/"participants[]"). Because that failure sat inside the
+      // same try/catch that advances `lastSeen`, it never advanced — turning a
+      // single bad request into a permanent every-30s hammer against Quo in
+      // production. See src/channels/sms-adapter.ts poll() for the fix.
+      const { fetchStub } = wireQuoFetch({
+        participant: "+15551112222",
+        msgId: "MSG_3",
+        text: "hi",
+        lineNumber: lineFixture.number,
+      });
+
+      const adapter = new SmsAdapter("quo-key-z", [lineFixture]);
+      stoppers.push(() => adapter.stop());
+
+      const onWorkItem = vi.fn();
+      await adapter.start(onWorkItem);
+      await waitFor(() => onWorkItem.mock.calls.length > 0);
+
+      const calls = fetchStub.mock.calls.map((c) => String(c[0]));
+      const convCall = calls.find((u) => u.includes("/conversations"));
+      const msgCall = calls.find((u) => u.includes("/messages") && u.includes("?"));
+
+      expect(convCall).toContain("phoneNumbers=");
+      expect(convCall).not.toContain("phoneNumbers%5B%5D");
+      expect(convCall).not.toContain("phoneNumbers[]");
+
+      expect(msgCall).toContain("participants=");
+      expect(msgCall).not.toContain("participants%5B%5D");
+      expect(msgCall).not.toContain("participants[]");
+    });
+
     it("uses slackChannel as the routing label when provided", async () => {
       wireQuoFetch({
         participant: "+15553334444",
