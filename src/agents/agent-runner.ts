@@ -155,12 +155,17 @@ export interface RunResult {
    * KPR-324 C5a/S4: count of hive-injected tool-start acknowledgment phrases
    * spoken on this turn (voice channel only — 0 on every other channel, when
    * voice.toolAck.enabled is false, or when the model spoke before each
-   * tool_use). REQUIRED, not optional: a spawn-loop counter that is not on
-   * RunResult drops at the finalizeSpawnResult copy and the adapter logs
-   * 0/undefined (spec §4.6) — the required type makes every construction
-   * site declare it.
+   * tool_use). Every in-engine construction site still declares it
+   * explicitly (C5a). Optional (not required), epic-integration review
+   * round 1 mechanical fix: RunResult is re-exported to plugin authors via
+   * `@keepur/hive/provider-abi`, and a required field forces a TypeScript
+   * compile error on any plugin `RunResult`-shaped object literal compiled
+   * against a pre-KPR-324 `pkg/types/` — even though the runtime already
+   * tolerates absence via the `?? 0` belt at the finalizeSpawnResult copy
+   * site. Making the type itself optional restores source compatibility
+   * with zero runtime effect (types erase at compile time).
    */
-  toolAckInjected: number;
+  toolAckInjected?: number;
   streamed: boolean;
   inputTokens: number;
   outputTokens: number;
