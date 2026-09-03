@@ -3,8 +3,8 @@
  * Pure: given current LiveKit state, decide create/skip per object. Matching
  * is by our fixed names — re-running the script never duplicates objects.
  */
-export const OUTBOUND_TRUNK_NAME = "dodihome-ops-outbound (KPR-322)";
-export const INBOUND_TRUNK_NAME = "dodihome-ops-inbound (KPR-322)";
+export const OUTBOUND_TRUNK_NAME = "hive-voice-outbound (KPR-322)";
+export const INBOUND_TRUNK_NAME = "hive-voice-inbound (KPR-322)";
 export const DISPATCH_RULE_NAME = "hive-voice-individual (KPR-322)";
 export const ROOM_PREFIX = "call-";
 export const AGENT_NAME = "hive-voice";

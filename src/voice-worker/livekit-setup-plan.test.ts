@@ -68,8 +68,8 @@ describe("planSetup (KPR-322 SIP-1..3)", () => {
   });
 
   it("name constants are distinct and stable", () => {
-    expect(OUTBOUND_TRUNK_NAME).toBe("dodihome-ops-outbound (KPR-322)");
-    expect(INBOUND_TRUNK_NAME).toBe("dodihome-ops-inbound (KPR-322)");
+    expect(OUTBOUND_TRUNK_NAME).toBe("hive-voice-outbound (KPR-322)");
+    expect(INBOUND_TRUNK_NAME).toBe("hive-voice-inbound (KPR-322)");
     expect(DISPATCH_RULE_NAME).toBe("hive-voice-individual (KPR-322)");
     expect(ROOM_PREFIX).toBe("call-");
     expect(AGENT_NAME).toBe("hive-voice");
@@ -79,7 +79,7 @@ describe("planSetup (KPR-322 SIP-1..3)", () => {
   it("name match is exact — similarly named objects do not count", () => {
     const plan = planSetup({
       outboundTrunks: [
-        { sipTrunkId: "ST_near", name: "dodihome-ops-outbound" },
+        { sipTrunkId: "ST_near", name: "hive-voice-outbound" },
         { sipTrunkId: "ST_suffix", name: `${OUTBOUND_TRUNK_NAME} v2` },
       ],
       inboundTrunks: [{ sipTrunkId: "ST_in_near", name: `${INBOUND_TRUNK_NAME} ` }],
