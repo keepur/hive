@@ -155,15 +155,23 @@ export interface RunResult {
    * KPR-324 C5a/S4: count of hive-injected tool-start acknowledgment phrases
    * spoken on this turn (voice channel only — 0 on every other channel, when
    * voice.toolAck.enabled is false, or when the model spoke before each
-   * tool_use). Every in-engine construction site still declares it
-   * explicitly (C5a). Optional (not required), epic-integration review
-   * round 1 mechanical fix: RunResult is re-exported to plugin authors via
-   * `@keepur/hive/provider-abi`, and a required field forces a TypeScript
-   * compile error on any plugin `RunResult`-shaped object literal compiled
-   * against a pre-KPR-324 `pkg/types/` — even though the runtime already
-   * tolerates absence via the `?? 0` belt at the finalizeSpawnResult copy
-   * site. Making the type itself optional restores source compatibility
-   * with zero runtime effect (types erase at compile time).
+   * tool_use).
+   *
+   * Optional here — not compiler-enforced — specifically because `RunResult`
+   * is re-exported as frozen plugin-facing ABI via
+   * `src/agents/provider-adapters/provider-abi.ts` (`@keepur/hive/provider-abi`):
+   * a required field would be source-breaking for a plugin author's
+   * `runTurn(): Promise<RunResult>` implementation compiled against an older
+   * `pkg/types/` (epic-integration review round 1, `2edb14e`, ratified by
+   * May). `TurnResult` (agent-manager.ts) is NOT re-exported via
+   * provider-abi.ts and stays required.
+   *
+   * Every in-engine construction site MUST still declare it explicitly, by
+   * convention — this is no longer compiler-enforced, so a new construction
+   * site can silently omit it. What makes an omission runtime-safe
+   * regardless is the `?? 0` belt at the `finalizeSpawnResult` copy site
+   * (agent-manager.ts) — see also the guard test in agent-runner.test.ts
+   * pinning that the `send()` return path yields a defined number.
    */
   toolAckInjected?: number;
   streamed: boolean;

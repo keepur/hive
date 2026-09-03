@@ -4084,6 +4084,31 @@ describe("AgentRunner C1 stage stamps (KPR-323)", () => {
   });
 });
 
+// Epic-integration review round 1 (2edb14e, ratified by May): RunResult.toolAckInjected
+// went from required to optional so RunResult stays source-compatible as frozen
+// plugin-facing ABI (provider-abi.ts). That drops the compile-time guarantee that
+// every construction site declares the field — this pins the practical runtime
+// property instead: the ordinary send() return path (the one construction site
+// testable at this level) still yields a defined number, never undefined, under a
+// plain default invocation with no voice context and no tool use. The KPR-324 C2
+// "cold-path tool-start ack injection" suite below separately pins the same
+// definedness across voice-channel ack/no-ack branches (0/1/2) — this test covers
+// the non-voice default case those don't.
+describe("AgentRunner RunResult.toolAckInjected ABI guard (epic-integration round 1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+  });
+
+  it("send() yields a defined toolAckInjected number on a plain default invocation", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), makeMockMemoryManager() as any);
+    const result = await runner.send("hello");
+
+    expect(typeof result.toolAckInjected).toBe("number");
+    expect(result.toolAckInjected).toBe(0);
+  });
+});
+
 describe("AgentRunner.openVoiceStreamingSession (KPR-323 C2)", () => {
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;
 
