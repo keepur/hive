@@ -419,6 +419,24 @@ describe("renderVoiceWorkerSection (KPR-322)", () => {
     renderVoiceWorkerSection({ ...fullRow, staleSeconds: 90 }, (l) => lines.push(l), "keepur");
     expect(lines.join("\n")).not.toMatch(/heartbeat stale/);
   });
+
+  it("warns when sipTrunkId is empty", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection(fullRow, (l) => lines.push(l), "keepur", "");
+    expect(lines.join("\n")).toContain("voice.livekit.sipTrunkId is not set");
+  });
+
+  it("does not warn when sipTrunkId is set", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection(fullRow, (l) => lines.push(l), "keepur", "ST_abc123");
+    expect(lines.join("\n")).not.toContain("sipTrunkId is not set");
+  });
+
+  it("does not warn when sipTrunkId is omitted (caller not passing it)", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection(fullRow, (l) => lines.push(l), "keepur");
+    expect(lines.join("\n")).not.toContain("sipTrunkId is not set");
+  });
 });
 
 describe("renderCircuitBreakerSection (KPR-306)", () => {

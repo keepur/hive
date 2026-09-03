@@ -91,12 +91,19 @@ export function resolveInboundAgent(
   inboundAgents: Record<string, string>,
 ): { agentId: string; goal: string; context: string } | null {
   if (!calledNumber) return null;
+  // Epic-integration review round 1 (mechanical): own-property guard — the
+  // called number is telephony-supplied (SIP "To"), and a plain indexed
+  // lookup would let a key like "constructor" resolve Object's constructor
+  // function off the prototype chain instead of returning null for a
+  // genuinely-unmapped number. Mirrors the pattern in provider-registry.ts /
+  // tool-transport.ts (KPR-407).
+  if (!Object.prototype.hasOwnProperty.call(inboundAgents, calledNumber)) return null;
   const agentId = inboundAgents[calledNumber];
   if (!agentId) return null;
   return {
     agentId,
     goal: "Answer this inbound vendor callback professionally and help the caller.",
-    context: "Inbound call to the DodiHome ops line (vendor callback).",
+    context: "Inbound call to the hive ops line (vendor callback).",
   };
 }
 

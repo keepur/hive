@@ -51,7 +51,7 @@ import { CallStats, VoiceWorkerHeartbeat } from "./telemetry.js";
 
 const INBOUND_COPY = {
   goal: "Answer this inbound vendor callback professionally and help the caller.",
-  context: "Inbound call to the DodiHome ops line (vendor callback).",
+  context: "Inbound call to the hive ops line (vendor callback).",
 } as const;
 
 describe("resolveInboundAgent (KPR-322)", () => {
@@ -75,6 +75,15 @@ describe("resolveInboundAgent (KPR-322)", () => {
   it("returns null when the called-number is undefined or empty", () => {
     expect(resolveInboundAgent(undefined, inboundAgents)).toBeNull();
     expect(resolveInboundAgent("", inboundAgents)).toBeNull();
+  });
+
+  it("returns null for a prototype-chain called-number, not Object's constructor", () => {
+    // Epic-integration review round 1 (mechanical): telephony-supplied
+    // "constructor" would otherwise resolve Object.prototype.constructor
+    // (truthy, typeof "function") off the prototype chain instead of
+    // hitting the own-property guard and returning null.
+    expect(resolveInboundAgent("constructor", inboundAgents)).toBeNull();
+    expect(resolveInboundAgent("toString", inboundAgents)).toBeNull();
   });
 });
 

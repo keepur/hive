@@ -164,8 +164,16 @@ export function renderVoiceWorkerSection(
   row: VoiceWorkerStatsRow | null,
   emit: (line: string) => void = console.log,
   instanceId = "<id>",
+  sipTrunkId?: string,
 ): void {
   emit("\nVoice worker (LiveKit)");
+  // Epic-integration review round 1 (mechanical): warn when livekit is
+  // enabled but no outbound SIP trunk id is configured — outbound calls
+  // will fail at dispatch. Informational only, never affects allPassed
+  // (same D4 posture as the rest of this section).
+  if (sipTrunkId !== undefined && !sipTrunkId.trim()) {
+    emit("  ⚠ voice.livekit.sipTrunkId is not set — outbound calls will fail");
+  }
   if (!row) {
     emit("  ○ no heartbeat yet — worker never started?");
     return;
@@ -748,7 +756,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // (the worker isn't expected to run).
     if (config.voice.livekit.enabled) {
       const voiceWorkerStats = await voiceWorkerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
-      renderVoiceWorkerSection(voiceWorkerStats, console.log, config.instance.id);
+      renderVoiceWorkerSection(voiceWorkerStats, console.log, config.instance.id, config.voice.livekit.sipTrunkId);
     }
     // KPR-306: provider circuit-breaker per-provider stats. Informational —
     // NEVER contributes to allPassed (D4).
