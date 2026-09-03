@@ -253,12 +253,12 @@ describe("buildTts (KPR-325 per-agent voice)", () => {
   });
 
   it("passes the agent's configured voice id to Cartesia", () => {
-    const wc = { ...baseWc, agentVoices: { mokie: "47c38ca4-5f35-497b-b1a3-415245fb35e1" } };
+    const wc = { ...baseWc, agentVoices: { mokie: "00000000-0000-4000-8000-000000000001" } };
     buildTts(cartesiaCell, wc, "mokie");
     expect(cartesiaCtorCalls[0]).toMatchObject({
       model: "sonic-3",
       apiKey: "ck_test",
-      voice: "47c38ca4-5f35-497b-b1a3-415245fb35e1",
+      voice: "00000000-0000-4000-8000-000000000001",
     });
   });
 
@@ -280,7 +280,7 @@ describe("buildTts (KPR-325 per-agent voice)", () => {
   });
 
   it("ElevenLabs branch is unaffected by agentVoices — no voice option threaded", () => {
-    const wc = { ...baseWc, agentVoices: { mokie: "47c38ca4-5f35-497b-b1a3-415245fb35e1" } };
+    const wc = { ...baseWc, agentVoices: { mokie: "00000000-0000-4000-8000-000000000001" } };
     buildTts(elevenlabsCell, wc, "mokie");
     expect(elevenlabsCtorCalls[0]).toEqual({ model: "eleven_flash_v2_5", apiKey: "el_test" });
     expect(cartesiaCtorCalls).toHaveLength(0);
