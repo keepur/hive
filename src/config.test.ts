@@ -365,7 +365,7 @@ describe("resolveVoiceLivekitConfig (KPR-322 E3)", () => {
       url: " wss://p.livekit.cloud ",
       sipTrunkId: "ST_1",
       inboundAgents: { "+15551230000": "nora", "+15551231111": 7, "+15551232222": " " },
-      agentVoices: { mokie: " 47c38ca4-5f35-497b-b1a3-415245fb35e1 ", nora: 7, sige: " " },
+      agentVoices: { mokie: " 00000000-0000-4000-8000-000000000001 ", nora: 7, sige: " " },
       defaultStt: "deepgram/nova-3",
       defaultTts: "elevenlabs/eleven_flash_v2_5",
       unknownKey: "ignored",
@@ -373,7 +373,7 @@ describe("resolveVoiceLivekitConfig (KPR-322 E3)", () => {
     expect(c.enabled).toBe(true);
     expect(c.url).toBe("wss://p.livekit.cloud");
     expect(c.inboundAgents).toEqual({ "+15551230000": "nora" });
-    expect(c.agentVoices).toEqual({ mokie: "47c38ca4-5f35-497b-b1a3-415245fb35e1" });
+    expect(c.agentVoices).toEqual({ mokie: "00000000-0000-4000-8000-000000000001" });
     expect(c.defaultStt).toBe("deepgram/nova-3");
   });
   it("enabled must be literal true", () => {
