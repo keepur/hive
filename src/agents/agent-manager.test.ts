@@ -3989,6 +3989,42 @@ describe("AgentManager", () => {
         expect(clampWarns).toHaveLength(1);
       });
 
+      it("KPR-430 T7a: static effort field wins over the :effort suffix on Lane A (clamped set)", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:high", effort: "low", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr430-a" }));
+        const [, , , , , , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(effort).toBe("low");
+        expect(vi.mocked(routeModel)).not.toHaveBeenCalled();
+        expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "low", effortSource: "static" });
+      });
+
+      it("KPR-430 T7b: static field max on Lane A clamps to nothing (no suffix fallback), one static-flavoured clamp warn", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:high", effort: "max", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr430-b1" }));
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr430-b2" }));
+        expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+        const clampWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("outside the deliverable"));
+        expect(clampWarns).toHaveLength(1);
+        expect(String(clampWarns[0]![0])).toContain("Static effort field");
+        expect(turnTelemetryStore.record.mock.calls[0]![0]).not.toHaveProperty("effortSource");
+      });
+
+      it("KPR-430 T7c: field absent — suffix path unchanged, source suffix", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:medium", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr430-c" }));
+        expect(mockRunnerSend.mock.calls[0]![6]).toBe("medium");
+        expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "medium", effortSource: "suffix" });
+      });
+
       it("T5: Lane A resourceLimits stays undefined (runner legacy fallback)", async () => {
         await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-limits" }));
         const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
@@ -5289,6 +5325,37 @@ describe("AgentManager", () => {
           expect(req.resourceLimits).toEqual({ maxTurns: 25, timeoutMs: 300_000, budgetUsd: 10 });
         });
 
+        it("KPR-430 T8: static effort field on a Lane B (codex) agent — request.effort undefined, one warn, no telemetry effort", async () => {
+          (appConfig as any).modelRouter.enabled = true;
+          registry._agents.set(
+            "codex-fx",
+            makeAgentConfig({
+              id: "codex-fx",
+              name: "Codex Fx",
+              model: "codex/gpt-5.5:medium",
+              effort: "max",
+              coreServers: [],
+            }),
+          );
+          await manager.spawnTurn({
+            ...makeCtx(makeWorkItem({ text: "lane b", source: { kind: "sms", id: "line-1", label: "May" } }), "sms"),
+            agentId: "codex-fx",
+            threadId: "sms:line-1:t8a",
+          });
+          await manager.spawnTurn({
+            ...makeCtx(makeWorkItem({ text: "lane b", source: { kind: "sms", id: "line-1", label: "May" } }), "sms"),
+            agentId: "codex-fx",
+            threadId: "sms:line-1:t8b",
+          });
+          expect(routeModel).not.toHaveBeenCalled();
+          expect(mockCodexRunTurn.mock.calls[0]![0].effort).toBeUndefined();
+          const laneBWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("not delivered on this provider"));
+          expect(laneBWarns).toHaveLength(1);
+          const doc = turnTelemetryStore.record.mock.calls[0]![0];
+          expect(doc).not.toHaveProperty("effort");
+          expect(doc).not.toHaveProperty("effortSource");
+        });
+
         it("Lane B resourceLimits mirror the agent definition (maxTurns is not dead config)", async () => {
           registry._agents.set(
             "gemini-b",
@@ -5974,6 +6041,172 @@ describe("AgentManager", () => {
       await manager.spawnTurn(makeConfCtx(0, "codex-conf"));
       const req0 = mockCodexRunTurn.mock.calls[1]![0];
       expect(req0.resourceLimits).toEqual({ maxTurns: 25, timeoutMs: 300_000, budgetUsd: 10 });
+    });
+  });
+
+  describe("static per-agent effort field (KPR-430)", () => {
+    const FABLE_TIER_LIMITS = { maxTurns: 50, timeoutMs: 300_000, budgetUsd: 5 }; // modelToTier(fable) → sonnet
+
+    function setFable(effort?: "low" | "medium" | "high" | "xhigh" | "max", id = "agent-fx") {
+      registry._agents.set(id, makeAgentConfig({ id, name: "Fx", model: "claude-fable-5-1", ...(effort ? { effort } : {}) }));
+      return id;
+    }
+    const staticWarns = () =>
+      mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("Static effort field set but the agent model cannot receive"));
+
+    beforeEach(() => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // clearAllMocks does not drain a queued mockResolvedValueOnce; reset so a
+      // deliberately-unconsumed queue entry cannot leak into the next row.
+      vi.mocked(routeModel).mockReset();
+    });
+    afterEach(() => {
+      (appConfig as any).modelRouter.enabled = false;
+    });
+
+    it("T1: static set, router on — classifier skipped, static delivered, static-tier limits, cost 0, source static", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "low" })); // would be consumed only if the classifier ran
+      const id = setFable("max");
+      await manager.spawnTurn(makeSmsCtx({ agentId: id }));
+      expect(routeModel).not.toHaveBeenCalled();
+      const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+      expect(effort).toBe("max");
+      expect(resourceLimits).toEqual(FABLE_TIER_LIMITS);
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc.effort).toBe("max");
+      expect(doc.effortSource).toBe("static");
+    });
+
+    it("T2: static absent, router on — five shaping fields unchanged; source router only when the classifier returned an effort", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      const id = setFable(undefined);
+
+      vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "high" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: id, threadId: "sms:line-1:t2a" }));
+      expect(routeModel).toHaveBeenCalledTimes(1);
+      const [, , , , limitsA, , effortA] = mockRunnerSend.mock.calls[0]!;
+      expect(effortA).toBe("high");
+      expect(limitsA).toEqual(FABLE_TIER_LIMITS);
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "high", effortSource: "router" });
+
+      // no-key / fallback shape: routeModel returns no effort ⇒ no effort, no source
+      vi.mocked(routeModel).mockResolvedValueOnce({ costUsd: 0, durationMs: 0, method: "no-key" });
+      await manager.spawnTurn(makeSmsCtx({ agentId: id, threadId: "sms:line-1:t2b" }));
+      const [, , , , limitsB, , effortB] = mockRunnerSend.mock.calls[1]!;
+      expect(effortB).toBeUndefined();
+      expect(limitsB).toEqual(FABLE_TIER_LIMITS);
+      const docB = turnTelemetryStore.record.mock.calls[1]![0];
+      expect(docB).not.toHaveProperty("effort");
+      expect(docB).not.toHaveProperty("effortSource");
+    });
+
+    it("T3: router-off and system-sender paths deliver the static value with resourceLimits undefined", async () => {
+      const id = setFable("xhigh");
+      (appConfig as any).modelRouter.enabled = false;
+      await manager.spawnTurn(makeSmsCtx({ agentId: id, threadId: "sms:line-1:t3a" }));
+      expect(mockRunnerSend.mock.calls[0]![4]).toBeUndefined();
+      expect(mockRunnerSend.mock.calls[0]![6]).toBe("xhigh");
+
+      (appConfig as any).modelRouter.enabled = true;
+      const sys = makeWorkItem({
+        text: "execute your scheduled digest task",
+        sender: "system",
+        threadId: "sms:line-1:t3b",
+        source: { kind: "sms", id: "line-1", label: "May" },
+      });
+      await manager.spawnTurn(makeSmsCtx({ agentId: id, threadId: "sms:line-1:t3b", workItem: sys }));
+      expect(routeModel).not.toHaveBeenCalled();
+      expect(mockRunnerSend.mock.calls[1]![4]).toBeUndefined();
+      expect(mockRunnerSend.mock.calls[1]![6]).toBe("xhigh");
+      expect(turnTelemetryStore.record.mock.calls[1]![0]).toMatchObject({ effort: "xhigh", effortSource: "static" });
+    });
+
+    it("T4: voice path delivers nothing even with the field set (carve-out)", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      const id = setFable("max");
+      const item = makeWorkItem({ text: "voice turn", source: { kind: "ws", id: "voice-1", label: "voice" } });
+      await manager.spawnTurn({ ...makeSmsCtx({ agentId: id, threadId: "voice:1", workItem: item }), channel: "voice" as const });
+      expect(routeModel).not.toHaveBeenCalled();
+      expect(mockRunnerSend.mock.calls[0]![4]).toBeUndefined();
+      expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+      expect(staticWarns()).toHaveLength(0);
+    });
+
+    it("T5a: haiku agent with the field — nothing delivered, exactly one warn across two turns, envelope unchanged", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      registry._agents.set("agent-hx", makeAgentConfig({ id: "agent-hx", name: "Hx", model: "claude-haiku-4-5", effort: "max" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-hx", threadId: "sms:line-1:t5a1" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-hx", threadId: "sms:line-1:t5a2" }));
+      expect(routeModel).not.toHaveBeenCalled();
+      expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+      expect(mockRunnerSend.mock.calls[1]![6]).toBeUndefined();
+      expect(mockRunnerSend.mock.calls[0]![4]).toEqual({ maxTurns: 20, timeoutMs: 120_000, budgetUsd: 1 });
+      expect(staticWarns()).toHaveLength(1);
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).not.toHaveProperty("effortSource");
+    });
+
+    it("T5b: off-catalog claude id with the field — nothing delivered, one static warn (plus the KPR-338 off-catalog warn)", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      mockSupportsEffort.mockReturnValue(false);
+      registry._agents.set("agent-ox", makeAgentConfig({ id: "agent-ox", name: "Ox", model: "claude-mythos-9", effort: "high" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-ox", threadId: "sms:line-1:t5b1" }));
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-ox", threadId: "sms:line-1:t5b2" }));
+      expect(routeModel).not.toHaveBeenCalled();
+      expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+      expect(staticWarns()).toHaveLength(1);
+    });
+
+    it("T5c: non-adopter makes no supportsEffort call on the router-off path (inverse lens)", async () => {
+      (appConfig as any).modelRouter.enabled = false;
+      const id = setFable(undefined);
+      mockSupportsEffort.mockClear();
+      await manager.spawnTurn(makeSmsCtx({ agentId: id }));
+      expect(mockSupportsEffort).not.toHaveBeenCalled();
+      expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+    });
+
+    it("T6: round-1 reaction with the field max — pin wins (low), source pin, classifier not called", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      const id = setFable("max");
+      await manager.spawnTurn(makeConfCtx(1, id));
+      expect(routeModel).not.toHaveBeenCalled();
+      const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+      expect(effort).toBe("low");
+      expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 5 });
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "low", effortSource: "pin" });
+    });
+
+    it("T6b: round-0 conference turn with the field — static wins, classifier skipped", async () => {
+      (appConfig as any).modelRouter.enabled = true;
+      vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "low" }));
+      const id = setFable("max");
+      await manager.spawnTurn(makeConfCtx(0, id));
+      expect(routeModel).not.toHaveBeenCalled();
+      expect(mockRunnerSend.mock.calls[0]![6]).toBe("max");
+    });
+
+    it("D6: effortSource can never land without effort — the stamp nests the source inside the effort spread", async () => {
+      const id = setFable(undefined);
+      const prepareSpawnSpy = vi
+        .spyOn(manager as unknown as { prepareSpawn: (ctx: unknown) => Promise<unknown> }, "prepareSpawn")
+        .mockResolvedValueOnce({
+          prompt: "hand-built",
+          route: { provider: "claude", model: "claude-fable-5-1" },
+          resourceLimits: undefined,
+          routerCostUsd: 0,
+          effortOverride: undefined,
+          effortSource: "static", // deliberately inconsistent — a future shaping-site bug
+        });
+      try {
+        await manager.spawnTurn(makeSmsCtx({ agentId: id }));
+      } finally {
+        prepareSpawnSpy.mockRestore();
+      }
+      expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc).not.toHaveProperty("effort");
+      expect(doc).not.toHaveProperty("effortSource");
     });
   });
 
