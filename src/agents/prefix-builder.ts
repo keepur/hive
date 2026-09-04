@@ -4,10 +4,11 @@
  * write-through prefix cache (KPR-213) can share the assembly logic without
  * pulling in the full runner.
  *
- * The prefix is everything in `buildSystemPrompt` EXCEPT the trailing
- * datetime — datetime stays in the runner because it changes every minute
- * and would invalidate the cache continuously. The runner appends datetime
- * after fetching the cached prefix.
+ * The prefix IS the whole system prompt (KPR-432): the minute-granular
+ * datetime is no longer part of any system prompt or Lane B instructions —
+ * it would invalidate the API prompt cache (a strict tools → system →
+ * messages prefix match) on every minute rollover. Both lanes append it to
+ * the TURN INPUT via appendDateTimeTrailer (below) instead.
  *
  * Inputs are deterministic per agent: agentConfig is constructor-stable and
  * the context fields (memoryManager, teamRoster, plugins, skillIndex,
