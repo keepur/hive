@@ -175,16 +175,25 @@ export function inertTopLevelFields(
   return out;
 }
 
+const tierDefaultWarned = new Set<string>();
+
 /**
- * Infer tier from a model ID string. KPR-338: exported — prepareSpawn derives
- * the agent's STATIC tier for resource limits and audit (tier is a per-agent
- * fact now, never a per-turn decision). Claude-id substring heuristic —
- * meaningless on provider-prefixed pilot ids; callers gate on the
- * claude-static route.
+ * Infer tier from a Claude model id. KPR-338: exported — prepareSpawn derives
+ * the agent's STATIC tier for resource limits and audit. Substring families,
+ * in precedence order; meaningless on provider-prefixed ids (callers gate on
+ * the claude-static route). KPR-433: Fable-class ids (fable, mythos — the
+ * Mythos-tier surface above Opus) resolve to the opus envelope; an id that
+ * matches no family falls to sonnet and warns once per process so a new
+ * model name never silently lands on the mid-tier cap again.
  */
 export function modelToTier(model: string): ModelTier {
   if (model.includes("opus")) return "opus";
   if (model.includes("haiku")) return "haiku";
+  if (model.includes("fable") || model.includes("mythos")) return "opus";
+  if (model !== "" && !model.includes("/") && !model.includes("sonnet") && !tierDefaultWarned.has(model)) {
+    tierDefaultWarned.add(model);
+    log.warn("Model id matched no tier family — defaulting to the sonnet envelope", { model });
+  }
   return "sonnet";
 }
 

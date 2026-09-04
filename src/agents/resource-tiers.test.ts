@@ -68,5 +68,38 @@ describe("describeLimitSource / inertTopLevelFields (KPR-433 D3/D5 helpers)", ()
   });
 });
 
-// Task 2 appends `describe("modelToTier (KPR-433 D1)")` here.
-void modelToTier;
+describe("modelToTier (KPR-433 D1)", () => {
+  it.each([
+    ["claude-opus-5", "opus"],
+    ["claude-haiku-4-5", "haiku"],
+    ["claude-sonnet-5", "sonnet"],
+    ["claude-fable-5-1", "opus"],
+    ["claude-fable-5", "opus"],
+    ["claude-mythos-5-1", "opus"],
+    ["claude-opus-fable-x", "opus"], // §7.1 precedence — opus either way
+  ] as Array<[string, ModelTier]>)("%s → %s without warning", (model, tier) => {
+    expect(modelToTier(model)).toBe(tier);
+    expect(mockWarn).not.toHaveBeenCalled();
+  });
+
+  it("an unrecognized bare Claude id falls to sonnet and warns exactly once per process per id", () => {
+    expect(modelToTier("claude-newname-9")).toBe("sonnet");
+    expect(modelToTier("claude-newname-9")).toBe("sonnet");
+    expect(mockWarn).toHaveBeenCalledTimes(1);
+    expect(mockWarn).toHaveBeenCalledWith("Model id matched no tier family — defaulting to the sonnet envelope", {
+      model: "claude-newname-9",
+    });
+  });
+
+  it("the empty id (vanished-agent guard) never warns (§7.2)", () => {
+    expect(modelToTier("")).toBe("sonnet");
+    expect(mockWarn).not.toHaveBeenCalled();
+  });
+
+  it("a prefixed id never warns — the `/` gate's own pin (§7.3; :2100 runs on every Lane A/B turn)", () => {
+    expect(modelToTier("codex/gpt-5.5")).toBe("sonnet");
+    expect(modelToTier("codex/gpt-5.5")).toBe("sonnet");
+    expect(modelToTier("kimi/kimi-k3")).toBe("sonnet");
+    expect(mockWarn).not.toHaveBeenCalled();
+  });
+});

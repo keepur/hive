@@ -780,18 +780,46 @@ describe("AgentManager", () => {
       expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
     });
 
-    it("KPR-422: a custom top-level timeoutMs survives to the runner on the router-on path (the fable shape)", async () => {
+    it("KPR-422: a custom top-level timeoutMs survives to the runner on the router-on path (sonnet tier)", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
-      // claude-fable-5: no opus/haiku substring → static tier "sonnet". Pre-fix
-      // the hardcoded sonnet default (300s) silently overrode the agent's own
-      // 30-minute timeoutMs; turns died at exactly 5:00 into the KPR-402 chain.
+      // Pre-fix the hardcoded sonnet default (300s) silently overrode the
+      // agent's own 30-minute timeoutMs; turns died at exactly 5:00 into the
+      // KPR-402 chain. Originally pinned on claude-fable-5 (then a sonnet-tier
+      // id); KPR-433 moved fable to opus, so this keeps the sonnet path on a
+      // sonnet id and the sibling below pins the fable shape as opus.
+      registry._agents.set(
+        "agent-long-sonnet",
+        makeAgentConfig({
+          id: "agent-long-sonnet",
+          name: "AgentLongSonnet",
+          model: "claude-sonnet-5",
+          timeoutMs: 1_800_000,
+        }),
+      );
+      vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
+
+      await manager.spawnTurn(makeSmsCtx({ agentId: "agent-long-sonnet" }));
+
+      const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
+      expect(resourceLimits).toEqual({
+        timeoutMs: 1_800_000,
+        maxTurns: RESOURCE_TIER_DEFAULTS.sonnet.maxTurns,
+        budgetUsd: RESOURCE_TIER_DEFAULTS.sonnet.budgetUsd,
+      });
+    });
+
+    it("KPR-433: the fable shape resolves the opus envelope; its top-level timeoutMs still delivers while the dead resourceTiers.sonnet key is ignored (§7.4)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
       registry._agents.set(
         "agent-fable",
         makeAgentConfig({
           id: "agent-fable",
           name: "AgentFable",
-          model: "claude-fable-5",
+          model: "claude-fable-5-1",
           timeoutMs: 1_800_000,
+          budgetUsd: 40,
+          maxTurns: 80,
+          resourceTiers: { sonnet: { timeoutMs: 1_800_000 } },
         }),
       );
       vi.mocked(routeModel).mockResolvedValue(makeRouterResult());
@@ -801,8 +829,8 @@ describe("AgentManager", () => {
       const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
       expect(resourceLimits).toEqual({
         timeoutMs: 1_800_000,
-        maxTurns: RESOURCE_TIER_DEFAULTS.sonnet.maxTurns,
-        budgetUsd: RESOURCE_TIER_DEFAULTS.sonnet.budgetUsd,
+        maxTurns: RESOURCE_TIER_DEFAULTS.opus.maxTurns,
+        budgetUsd: RESOURCE_TIER_DEFAULTS.opus.budgetUsd,
       });
     });
 
@@ -6062,7 +6090,7 @@ describe("AgentManager", () => {
   });
 
   describe("static per-agent effort field (KPR-430)", () => {
-    const FABLE_TIER_LIMITS = { maxTurns: 50, timeoutMs: 300_000, budgetUsd: 5 }; // modelToTier(fable) → sonnet
+    const FABLE_TIER_LIMITS = { maxTurns: 200, timeoutMs: 600_000, budgetUsd: 50 }; // modelToTier(fable) → opus (KPR-433)
 
     function setFable(effort?: "low" | "medium" | "high" | "xhigh" | "max", id = "agent-fx") {
       registry._agents.set(id, makeAgentConfig({ id, name: "Fx", model: "claude-fable-5-1", ...(effort ? { effort } : {}) }));
@@ -6192,7 +6220,7 @@ describe("AgentManager", () => {
       expect(routeModel).not.toHaveBeenCalled();
       const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
       expect(effort).toBe("low");
-      expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 5 });
+      expect(resourceLimits).toEqual({ maxTurns: 6, timeoutMs: 120_000, budgetUsd: 50 });
       expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "low", effortSource: "pin" });
     });
 

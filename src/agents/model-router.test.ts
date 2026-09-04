@@ -80,8 +80,10 @@ describe("resolveResourceLimits", () => {
 
   describe("top-level agentTimeoutMs participation (KPR-422)", () => {
     it("honors a custom top-level timeoutMs over the tier default (the fable shape)", () => {
-      // claude-fable-5 → modelToTier "sonnet"; timeoutMs 1_800_000 on the
-      // agent def was dead config pre-KPR-422 (turns killed at 300s).
+      // A sonnet-tier agent with timeoutMs 1_800_000 on its def — dead config
+      // pre-KPR-422 (turns killed at 300s). Historically the fable id landed
+      // here; since KPR-433 fable/mythos ids resolve to opus, so this pins the
+      // sonnet path directly (the tier argument is explicit).
       const limits = resolveResourceLimits("sonnet", undefined, 1_800_000);
       expect(limits.timeoutMs).toBe(1_800_000);
       // maxTurns/budgetUsd stay tier-defaulted — deliberately out of scope.
