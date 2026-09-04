@@ -94,11 +94,20 @@ export interface ProviderTurnAssembly {
    * Assembled system instructions — the full Lane B prompt from the shared
    * section helpers (buildProviderInstructions via runner.buildProviderPrompt):
    * soul → archetype card → systemPrompt → constitution → team summary →
-   * memory → datetime, with the tool-dependent sections (toolkit, file-tier
-   * guidance, skills) rendered unconditionally post-KPR-352
-   * (`toolsExecutable: true` — Lane B invariant).
+   * memory (no datetime — KPR-432), with the tool-dependent sections
+   * (toolkit, file-tier guidance, skills) rendered unconditionally
+   * post-KPR-352 (`toolsExecutable: true` — Lane B invariant).
    */
   instructions: string;
+  /**
+   * KPR-432: primary assemblies deliver the Pacific datetime as the last line
+   * of each turn's input (LaneBTurnScaffold.runTurn appends it to
+   * request.prompt). Nested delegate assemblies keep Claude parity (no
+   * trailer) and set false. Optional because this type is frozen provider ABI
+   * (provider-abi.ts): absent ⇒ no trailer — a plugin-built assembly is never
+   * broken by the field, only datetime-less.
+   */
+  datetimeInTurnInput?: boolean;
   /** Bridgeable subset for the route provider — already partitioned. */
   toolInventory: HiveToolInventoryEntry[];
   /**
@@ -209,6 +218,7 @@ export async function assembleProviderTurn(input: {
     const sessionCwd = input.runner.resolveTurnCwd(input.workItemContext);
     return {
       instructions,
+      datetimeInTurnInput: true,
       toolInventory: bridgeable,
       omittedTools: omitted,
       guardrailGate,
@@ -288,6 +298,7 @@ export function buildNestedDelegateAssembly(input: NestedDelegateAssemblyInput):
   return {
     assembly: {
       instructions,
+      datetimeInTurnInput: false, // KPR-432: Claude parity — delegate prompts carry no datetime
       toolInventory,
       // Directive 2 ([D5] spec-review): nothing was partitioned away — the
       // nested inventory is all-bridgeable by construction. Pinned (T4).

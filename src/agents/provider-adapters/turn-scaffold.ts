@@ -28,6 +28,7 @@ import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
 import { ToolBridge } from "./tool-bridge.js";
 import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
+import { appendDateTimeTrailer } from "../prefix-builder.js";
 
 /** Scaffold-owned turn accumulator (§4.1). */
 export interface LaneBTurnTotals {
@@ -128,7 +129,15 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
     }
   }
 
-  async runTurn(request: AgentProviderTurnRequest): Promise<RunResult> {
+  async runTurn(incoming: AgentProviderTurnRequest): Promise<RunResult> {
+    // KPR-432: FIRST statement — before the ToolBridge is constructed (closed
+    // only in the finally below), so nothing is armed if this ever threw.
+    // Primary assemblies carry the datetime as the last line of the turn
+    // input; nested delegate assemblies (Claude parity) and flag-less
+    // plugin-built assemblies pass the prompt through byte-identical.
+    const request: AgentProviderTurnRequest = this.scaffoldInit.assembly.datetimeInTurnInput
+      ? { ...incoming, prompt: appendDateTimeTrailer(incoming.prompt) }
+      : incoming;
     const startedAt = Date.now();
     const abortController = new AbortController();
     this.currentAbortController = abortController;

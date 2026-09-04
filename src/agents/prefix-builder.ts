@@ -4,10 +4,11 @@
  * write-through prefix cache (KPR-213) can share the assembly logic without
  * pulling in the full runner.
  *
- * The prefix is everything in `buildSystemPrompt` EXCEPT the trailing
- * datetime — datetime stays in the runner because it changes every minute
- * and would invalidate the cache continuously. The runner appends datetime
- * after fetching the cached prefix.
+ * The prefix IS the whole system prompt (KPR-432): the minute-granular
+ * datetime is no longer part of any system prompt or Lane B instructions —
+ * it would invalidate the API prompt cache (a strict tools → system →
+ * messages prefix match) on every minute rollover. Both lanes append it to
+ * the TURN INPUT via appendDateTimeTrailer (below) instead.
  *
  * Inputs are deterministic per agent: agentConfig is constructor-stable and
  * the context fields (memoryManager, teamRoster, plugins, skillIndex,
@@ -215,9 +216,13 @@ export async function memorySections(
 }
 
 /**
- * Datetime trailer — the ONE definition both lanes append last
- * (agent-runner.ts:376-378 format string, verbatim). Kept out of buildPrefix
- * so the KPR-213 cache never holds a timestamp.
+ * Datetime trailer — the ONE definition both lanes use. KPR-432: it is no
+ * longer part of any system prompt / instructions (a minute-granular line
+ * there invalidated the API prompt cache — tools → system → messages is a
+ * strict prefix match — on every minute rollover, rewriting the whole
+ * transcript). Both lanes append it to the TURN INPUT via
+ * appendDateTimeTrailer instead: Claude lane in AgentRunner.send(), Lane B in
+ * LaneBTurnScaffold.runTurn() for primary assemblies. Bytes unchanged.
  */
 export function formatDateTimeTrailer(now: Date = new Date()): string {
   const pacific = now.toLocaleString("en-US", {
@@ -231,6 +236,18 @@ export function formatDateTimeTrailer(now: Date = new Date()): string {
     hour12: true,
   });
   return `**Current date/time**: ${pacific} (Pacific Time)`;
+}
+
+/** Turn-input joiner (KPR-432): the trailer rides the user message, not the system prompt. */
+export const TURN_TRAILER_JOINER = "\n\n";
+
+/**
+ * KPR-432: compose a turn's input with the datetime trailer as its last line.
+ * The single composition point for both lanes — nothing else may append a
+ * trailer (KPR-349 §D1 "one definition" now covers placement as well as text).
+ */
+export function appendDateTimeTrailer(prompt: string, now: Date = new Date()): string {
+  return `${prompt}${TURN_TRAILER_JOINER}${formatDateTimeTrailer(now)}`;
 }
 
 /**
@@ -305,7 +322,7 @@ export interface ProviderInstructionsInput {
 }
 
 export interface ProviderInstructionsResult {
-  /** Full Lane B instruction text, datetime last (provider prompt caching is prefix-based too). */
+  /** Full Lane B instruction text, no datetime (KPR-432 — the trailer rides the turn input so provider prompt caching, prefix-based too, holds). */
   instructions: string;
   /** Raw hot-tier block → assembly.memory.hotTierPrompt. Single-injection: already folded into instructions. */
   hotTierPrompt?: string;
@@ -327,7 +344,7 @@ export function skillsSection(skillIndex: ProviderSkillIndexEntry[]): string {
  * soul → archetype card → systemPrompt → constitution → team summary →
  * †toolkit → †follow-through (KPR-393) → †file-tier guidance (iff memory entry in inventory) →
  * †skills (iff index non-empty) → hot-tier/legacy memory (interior
- * tool-claim lines separately gated) → datetime trailer.
+ * tool-claim lines separately gated). No datetime trailer (KPR-432).
  */
 export async function buildProviderInstructions(
   agentConfig: AgentConfig,
@@ -371,8 +388,6 @@ export async function buildProviderInstructions(
     recallToolName: input.toolsExecutable ? "mcp__structured-memory__memory_recall" : undefined,
   });
   parts.push(...memory.blocks);
-
-  parts.push(formatDateTimeTrailer());
 
   return { instructions: parts.join(SECTION_JOINER), hotTierPrompt: memory.hotTierPrompt };
 }

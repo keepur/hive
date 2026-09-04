@@ -60,7 +60,7 @@ function makeRunner(
     buildProviderPrompt:
       extra.buildProviderPrompt ??
       vi.fn(async () => ({
-        instructions: "ASSEMBLED-INSTRUCTIONS\n\n---\n\n**Current date/time**: fixture (Pacific Time)",
+        instructions: "ASSEMBLED-INSTRUCTIONS",
         hotTierPrompt: "HOT-TIER-BLOCK",
         skillEntries: [{ name: "fixture-skill", description: "d", path: "/tmp/fixture/SKILL.md" }],
       })),
@@ -88,8 +88,8 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
       provider: "openai",
     });
     // Instructions are the runner-assembled prompt (NOT the old soul\n\nsystem shape).
-    expect(assembly.instructions).toContain("ASSEMBLED-INSTRUCTIONS");
-    expect(assembly.instructions).toMatch(/\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    expect(assembly.instructions).toBe("ASSEMBLED-INSTRUCTIONS");
+    expect(assembly.datetimeInTurnInput).toBe(true); // KPR-432: primary opts in
     expect(assembly.instructions).not.toBe("pilot soul\n\npilot system");
     expect(assembly.toolInventory).toEqual([bridgeable]);
     expect(assembly.omittedTools).toEqual([{ name: "Bash", transport: "claude-builtin", compatibility: "claude-only" }]);
@@ -124,7 +124,7 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
   it("KPR-349: runner returning hotTierPrompt undefined → assembly.memory is {} (347 optional-field shape preserved)", async () => {
     const runner = makeRunner([makeEntry()], {
       buildProviderPrompt: vi.fn(async () => ({
-        instructions: "X\n\n---\n\n**Current date/time**: fixture (Pacific Time)",
+        instructions: "X",
         hotTierPrompt: undefined,
         skillEntries: [],
       })),
@@ -382,5 +382,16 @@ describe("buildNestedDelegateAssembly (KPR-354 §D5.3, T4)", () => {
       runner: makeRunner([makeEntry()]), config: makeAgentConfig(), provider: "openai",
     });
     expect(without.delegateTurnRunner).toBeUndefined();
+  });
+
+  it("KPR-432: nested delegate assembly never carries the datetime (datetimeInTurnInput false)", () => {
+    const { assembly } = buildNestedDelegateAssembly({
+      config: makeAgentConfig(),
+      delegate: "linear",
+      entry: makeEntry(),
+      sessionCwd: "/tmp/kpr432-nested",
+    });
+    expect(assembly.datetimeInTurnInput).toBe(false);
+    expect(assembly.instructions).not.toContain("**Current date/time**");
   });
 });

@@ -17,7 +17,7 @@ import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildPrefix, buildProviderInstructions, SECTION_JOINER, formatDateTimeTrailer } from "./prefix-builder.js";
+import { buildPrefix, buildProviderInstructions, appendDateTimeTrailer } from "./prefix-builder.js";
 import { deriveProviderSkillIndex } from "./provider-adapters/skill-index.js";
 import {
   buildGenericDelegatePrompt,
@@ -428,10 +428,12 @@ export class AgentRunner {
       ? await this.prefixCache.getOrBuild(this.agentConfig.id, () => buildPrefix(this.agentConfig, buildContext))
       : await buildPrefix(this.agentConfig, buildContext);
 
-    // Date/time last — changes every minute, so placing it at the end
-    // preserves the static prefix for prompt caching. Single definition
-    // shared with Lane B (KPR-349 §D1: the two lanes cannot drift).
-    return `${prefix}${SECTION_JOINER}${formatDateTimeTrailer()}`;
+    // KPR-432: no datetime here. The trailer is appended to the TURN INPUT in
+    // send() (appendDateTimeTrailer), so this string is byte-stable across
+    // minutes and the API prompt cache (tools → system → messages, strict
+    // prefix) holds the transcript. Single definition shared with Lane B
+    // (KPR-349 §D1: the two lanes cannot drift).
+    return prefix;
   }
 
 
@@ -2044,8 +2046,15 @@ export class AgentRunner {
       toolSearchEnvValue = toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto";
     }
 
+    // KPR-432: the datetime rides the turn input, not the system prompt.
+    // Computed here — after every upstream re-wrap (outage replay, deadline
+    // continuation, meeting ack) — so a replayed turn carries the time it
+    // actually ran. Same pre-try surface as buildSystemPrompt above: nothing
+    // (ticket, timer, abort controller) is armed yet.
+    const turnPrompt = appendDateTimeTrailer(prompt);
+
     const q = query({
-      prompt,
+      prompt: turnPrompt,
       options: {
         model: effectiveModel,
         systemPrompt,

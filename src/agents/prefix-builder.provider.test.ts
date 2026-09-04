@@ -203,7 +203,7 @@ describe("buildProviderInstructions — composition / order", () => {
     return { cfg, input };
   }
 
-  it("full assembly renders every layer in spec order, datetime last", async () => {
+  it("full assembly renders every layer in spec order, no datetime (KPR-432)", async () => {
     const { cfg, input } = richInput(true);
     const { instructions } = await buildProviderInstructions(cfg, input);
 
@@ -218,22 +218,21 @@ describe("buildProviderInstructions — composition / order", () => {
       "## File-Tier Memory",
       "## Your skills",
       "## Your Memory",
-      "**Current date/time**",
     ].map((s) => instructions.indexOf(s));
 
     for (let i = 0; i < order.length; i++) expect(order[i]).toBeGreaterThan(-1);
     for (let i = 1; i < order.length; i++) expect(order[i]).toBeGreaterThan(order[i - 1]!);
 
-    expect(instructions).toMatch(/\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    expect(instructions).not.toContain("**Current date/time**");
   });
 
   it("sections are joined by \\n\\n---\\n\\n (joiners = sections − 1)", async () => {
     const { cfg, input } = richInput(true);
     const { instructions } = await buildProviderInstructions(cfg, input);
-    // 11 sections: soul, card, systemPrompt, constitution, team, toolkit,
-    // follow-through, file-tier, skills, memory, datetime → 10 joiners.
+    // 10 sections: soul, card, systemPrompt, constitution, team, toolkit,
+    // follow-through, file-tier, skills, memory → 9 joiners (datetime left the instructions in KPR-432).
     const joinerCount = instructions.split(SECTION_JOINER).length - 1;
-    expect(joinerCount).toBe(10);
+    expect(joinerCount).toBe(9);
   });
 
   it("hotTierPrompt is returned alongside the folded-in instructions", async () => {
@@ -243,13 +242,13 @@ describe("buildProviderInstructions — composition / order", () => {
     expect(result.instructions).toContain(result.hotTierPrompt!);
   });
 
-  it("bare-bones agent → systemPrompt + datetime only, no 'You are ' fallback", async () => {
+  it("bare-bones agent → systemPrompt only, no datetime, no 'You are ' fallback", async () => {
     const cfg = makeAgentConfig({ soul: "" });
     const { instructions } = await buildProviderInstructions(cfg, makeInput({ toolsExecutable: false }));
     const parts = instructions.split(SECTION_JOINER);
-    expect(parts).toHaveLength(2);
+    expect(parts).toHaveLength(1);
     expect(parts[0]).toBe("GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.");
-    expect(parts[1]).toMatch(/^\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    expect(instructions).not.toContain("**Current date/time**");
     expect(instructions).not.toContain("You are GoldenAgent");
   });
 });
