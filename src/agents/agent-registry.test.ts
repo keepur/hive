@@ -125,6 +125,15 @@ describe("toolSearch field (KPR-329)", () => {
   });
 });
 
+describe("effort field (KPR-430)", () => {
+  it("toAgentConfig passes each effort level through and leaves it undefined when absent", () => {
+    for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
+      expect(toAgentConfig(makeDefinition({ effort: level }), {}).effort).toBe(level);
+    }
+    expect(toAgentConfig(makeDefinition(), {}).effort).toBeUndefined();
+  });
+});
+
 describe("toAgentConfig autonomy resolution", () => {
   it("resolves autonomy flags from definition and instance ceiling", () => {
     const def = makeDefinition({

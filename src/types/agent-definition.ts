@@ -1,6 +1,7 @@
 import type { AgentSchedule } from "./agent-config.js";
 import type { AgentConfig } from "./agent-config.js";
 import type { ResourceTierOverrides } from "../agents/model-router.js";
+import type { AgentEffort } from "../agents/agent-effort.js";
 import { resolveAutonomy, type AutonomyFlags } from "../agents/autonomy.js";
 
 export interface AgentDefinition {
@@ -82,6 +83,20 @@ export interface AgentDefinition {
    * treated as absent, error logged) — KPR-184 pattern.
    */
   toolSearch?: "auto" | "on" | "off";
+  /**
+   * KPR-430: static per-agent reasoning effort — exactly the SDK's
+   * EffortLevel (`low | medium | high | xhigh | max`). Absent ⇒ today's
+   * behaviour: the KPR-338 per-turn classifier where it runs, SDK default
+   * otherwise. Precedence: round-1 reaction pin > this field > classifier
+   * (the classifier is skipped when this is set). Claude-runtime lanes only
+   * (claude + Lane A, where it wins over the `:effort` suffix through the
+   * {low,medium,high} clamp); a warned no-op on Lane B. Delivered only when
+   * the LLM catalog says the model accepts the param (haiku / off-catalog ⇒
+   * dropped with a warn-once). Validated at admin write time; sanitised at
+   * registry load (invalid → treated as absent, error logged) — KPR-329
+   * pattern.
+   */
+  effort?: AgentEffort;
   timeoutMs: number;
   resourceTiers?: ResourceTierOverrides;
 
@@ -170,6 +185,9 @@ export function toAgentConfig(doc: AgentDefinition, instanceAutonomy?: Partial<A
     // KPR-329: pass through as-is; agent-registry sanitizes invalid values
     // (from legacy/hand-edited docs) to undefined at load time.
     toolSearch: doc.toolSearch,
+    // KPR-430: pass through as-is; agent-registry sanitizes invalid values
+    // (from legacy/hand-edited/REST-written docs) to undefined at load time.
+    effort: doc.effort,
     timeoutMs: doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
     betas: doc.betas,
     metadata: doc.metadata,
