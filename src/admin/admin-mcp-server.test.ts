@@ -816,6 +816,94 @@ describe("toolSearch validation (KPR-329)", () => {
   });
 });
 
+describe("effort validation (KPR-430)", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+  });
+
+  const LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+  const BAD = ["xhighest", 7, ""] as const;
+
+  it.each(LEVELS)("agent_create persists effort=%s", async (level) => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: `fx-${level}`,
+      name: "Fx",
+      model: "claude-fable-5-1",
+      homeBase: "agent-fx",
+      roles: ["Generic"],
+      fields: { effort: level },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get(`fx-${level}`).effort).toBe(level);
+  });
+
+  it.each(BAD)("agent_create rejects effort=%j without writing", async (bad) => {
+    const handler = getHandler(makeTools(), "agent_create");
+    const res = await handler({
+      _id: "bad-effort",
+      name: "Bad",
+      model: "claude-fable-5-1",
+      homeBase: "agent-bad",
+      roles: ["Generic"],
+      fields: { effort: bad },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Invalid effort");
+    expect(agentDocsStore.has("bad-effort")).toBe(false);
+  });
+
+  it("agent_create leaves effort absent-or-null when omitted (no default materialized)", async () => {
+    const handler = getHandler(makeTools(), "agent_create");
+    await handler({
+      _id: "no-effort",
+      name: "NoFx",
+      model: "claude-fable-5-1",
+      homeBase: "agent-no-fx",
+      roles: ["Generic"],
+      fields: {},
+    });
+    expect(agentDocsStore.get("no-effort").effort ?? undefined).toBeUndefined();
+  });
+
+  it.each(LEVELS)("agent_update accepts effort=%s", async (level) => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const handler = getHandler(makeTools(), "agent_update");
+    const res = await handler({ agent_id: "existing-agent", fields: { effort: level } });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("existing-agent").effort).toBe(level);
+  });
+
+  it.each(BAD)("agent_update rejects effort=%j without writing", async (bad) => {
+    agentDocsStore.set("existing-agent", makeBaseAgent({ effort: "high" }));
+    const handler = getHandler(makeTools(), "agent_update");
+    const res = await handler({ agent_id: "existing-agent", fields: { effort: bad } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Invalid effort");
+    expect(agentDocsStore.get("existing-agent").effort).toBe("high");
+  });
+
+  it("agent_update accepts null as an explicit unset", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent({ effort: "max" }));
+    const handler = getHandler(makeTools(), "agent_update");
+    const res = await handler({ agent_id: "existing-agent", fields: { effort: null } });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("existing-agent").effort).toBeNull();
+  });
+
+  it("agent_get renders the Effort line only when set", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent({ effort: "max" }));
+    const handler = getHandler(makeTools(), "agent_get");
+    const res = await handler({ agent_id: "existing-agent" });
+    expect(res.content[0].text).toContain("Effort: max");
+
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const res2 = await handler({ agent_id: "existing-agent" });
+    expect(res2.content[0].text).not.toContain("Effort:");
+  });
+});
+
 describe("KPR-221 — delegateServers validation rejects context-dependent servers", () => {
   beforeEach(() => {
     agentDocsStore = new Map();
