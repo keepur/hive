@@ -5049,13 +5049,16 @@ describe("AgentManager", () => {
           sender: "system",
           source: { kind: "sms", id: "line-1", label: "May" },
         });
-        await manager.spawnTurn(makeCtx(item, "sms"));
+        const result = await manager.spawnTurn(makeCtx(item, "sms"));
 
         expect(routeModel).not.toHaveBeenCalled();
         const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
         // agent-a is the haiku default fixture → haiku tier, no overrides.
         expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.haiku);
         expect(effort).toBeUndefined();
+        // routerCostUsd 0 on the system branch: spawnTurn adds shaping.routerCostUsd
+        // to the run cost, so the delivered cost is exactly the runner's 0.01.
+        expect(result.usage.costUsd).toBe(0.01);
       });
 
       it("KPR-431: system-sender envelope honors resourceTiers overrides and the top-level timeoutMs (same resolver as human turns)", async () => {
