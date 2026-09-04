@@ -2384,10 +2384,30 @@ describe("AgentRunner effort option (KPR-312, via send)", () => {
     expect("thinking" in opts).toBe(false);
   });
 
-  it("drops values outside the SDK-deliverable subset (defensive)", async () => {
-    const runner = makeRunner();
-    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, "xhigh" as never);
-    expect("effort" in getCapturedOptions()).toBe(false);
+  it("KPR-430: delivers the SDK-only levels xhigh and max (static field path)", async () => {
+    for (const level of ["xhigh", "max"] as const) {
+      const runner = makeRunner();
+      await runner.send("hi", undefined, undefined, undefined, undefined, undefined, level);
+      const opts = getCapturedOptions();
+      expect(opts.effort).toBe(level);
+      expect("thinking" in opts).toBe(false);
+    }
+  });
+
+  it("KPR-430: delivers every AgentEffort level", async () => {
+    for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
+      const runner = makeRunner();
+      await runner.send("hi", undefined, undefined, undefined, undefined, undefined, level);
+      expect(getCapturedOptions().effort).toBe(level);
+    }
+  });
+
+  it("drops the Lane B suffix-only levels minimal/none (no SDK counterpart)", async () => {
+    for (const level of ["minimal", "none"] as const) {
+      const runner = makeRunner();
+      await runner.send("hi", undefined, undefined, undefined, undefined, undefined, level);
+      expect("effort" in getCapturedOptions()).toBe(false);
+    }
   });
 });
 
