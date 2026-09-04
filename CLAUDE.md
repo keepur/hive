@@ -187,6 +187,7 @@ Admin MCP tools or the REST API manage agent CRUD. The engine ships one baseline
 - **Hot reload**: SIGUSR1 signal reloads agent definitions from MongoDB. No restart for agent config changes.
 - **Error handling**: catch + log, don't rethrow unless critical. Exit code 1 with valid response = warning, response still delivered.
 - **No `any`** without justification. Strict TypeScript.
+- **Main-module entrypoint guards must be symlink-safe (KPR-428)**: never gate a script/process entry on a raw `argv[1] === fileURLToPath(import.meta.url)` comparison — node resolves `import.meta.url` through symlinks (and percent-encodes it) while `argv[1]` stays as typed, so under a symlinked checkout the guard silently no-ops. Use the shared idiom: compare `pathToFileURL(argv[1]).href` first, then fall back to `realpathSync(argv[1])` against `fileURLToPath(import.meta.url)` — the three sites are `scripts/flatten-skills.ts` (`isMain`), `scripts/voice-latency-baseline.ts`, and `src/voice-worker/main.ts` (`isEntrypoint`, exported for tests). The voice worker is where a regression bites hardest: a no-op guard skips boot and exits 0, which launchd's `KeepAlive.SuccessfulExit: false` treats as a clean exit and never restarts — the worker stays silently down until kickstarted.
 
 ## Security (DOD-212)
 
