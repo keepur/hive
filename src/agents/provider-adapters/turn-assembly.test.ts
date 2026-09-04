@@ -88,8 +88,7 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
       provider: "openai",
     });
     // Instructions are the runner-assembled prompt (NOT the old soul\n\nsystem shape).
-    expect(assembly.instructions).toContain("ASSEMBLED-INSTRUCTIONS");
-    expect(assembly.instructions).not.toContain("**Current date/time**");
+    expect(assembly.instructions).toBe("ASSEMBLED-INSTRUCTIONS");
     expect(assembly.datetimeInTurnInput).toBe(true); // KPR-432: primary opts in
     expect(assembly.instructions).not.toBe("pilot soul\n\npilot system");
     expect(assembly.toolInventory).toEqual([bridgeable]);

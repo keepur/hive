@@ -53,7 +53,10 @@ export interface LaneBProviderKit {
    *  containment, ToolBridge lifecycle, usage accounting come free.
    *  - KPR-432: `harness.request.prompt` already ends with the engine's datetime
    *    trailer for primary assemblies (`datetimeInTurnInput`); plugin adapters
-   *    must not append their own. Additive optional field — no ABI version bump. */
+   *    must not append their own. Additive optional field — no ABI version bump.
+   *    A plugin that implements AgentProviderAdapter directly (bypassing this
+   *    scaffold) receives no datetime at all — it no longer rides `instructions`;
+   *    extend the scaffold to get it. */
   LaneBTurnScaffold: typeof LaneBTurnScaffold;
   /** The shared bounded tool-dispatch loop (codex/gemini/grok template). */
   runBoundedDispatchLoop: typeof runBoundedDispatchLoop;
