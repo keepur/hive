@@ -1844,7 +1844,7 @@ export class AgentManager {
       resourceLimits: undefined,
       routerCostUsd: 0,
       effortOverride: undefined,
-    }, runResult, false);
+    }, runResult, resumedSession);
     lease.lastTurn = { ctx, result: turnResult };
 
     if (runResult.error) {

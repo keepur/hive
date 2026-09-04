@@ -6411,6 +6411,14 @@ describe("AgentManager", () => {
       // lease's resumedSession computation (`lease.turns === 1 &&
       // !!ctx.sessionId`) must report it as such.
       expect(r1.resumedSession).toBe(true);
+      // KPR-429 regression: recordSpawnObservability's resumedSession arg
+      // must be the same computed value threaded into finalizeSpawnResult
+      // above, not a hardcoded `false` — the persisted
+      // agent_turn_telemetry.resumedSession must agree with
+      // TurnResult.resumedSession on the lease-opening turn.
+      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
+      const telDoc1 = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(telDoc1.resumedSession).toBe(true);
       expect(r1.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, initToFirstTokenMs: expect.any(Number) });
       // Ticket outlives the turn — the lease holds lock + one budget slot.
       const snap1 = manager.getSnapshot().perAgent["agent-a"]!;
@@ -6427,6 +6435,9 @@ describe("AgentManager", () => {
       // Turn 2 rides the already-open streaming query() — no fresh resume,
       // so resumedSession must be false even though ctx.sessionId is set.
       expect(r2.resumedSession).toBe(false);
+      expect(turnTelemetryStore.record).toHaveBeenCalledTimes(2);
+      const telDoc2 = turnTelemetryStore.record.mock.calls[1]![0];
+      expect(telDoc2.resumedSession).toBe(false);
       expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1); // still ONE ticket
       expect(pushed).toEqual(["hello over voice", "hello over voice"]); // one push per turn, in order
 
