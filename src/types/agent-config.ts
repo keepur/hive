@@ -1,4 +1,4 @@
-import type { ResourceTierOverrides } from "../agents/model-router.js";
+import type { ResourceTierOverrides } from "../agents/resource-tiers.js";
 import type { AgentEffort } from "../agents/agent-effort.js";
 import type { AutonomyFlags } from "../agents/autonomy.js";
 

@@ -36,6 +36,7 @@ import {
   __resetRouterStateForTests,
   type ModelRouterResult,
 } from "./model-router.js";
+import * as tiers from "./resource-tiers.js";
 
 describe("resolveResourceLimits", () => {
   it("returns global defaults when no agent overrides", () => {
@@ -304,5 +305,12 @@ describe("routeModel — effort-only classifier (KPR-338, registry transport KPR
       const r = await routeModel("thanks");
       expect(r).toEqual({ costUsd: 0, durationMs: 0, effort: "low", method: "heuristic" });
     });
+  });
+});
+
+describe("KPR-433 D0: model-router re-exports the lifted resource-tiers surface (same objects)", () => {
+  it("resolveResourceLimits / RESOURCE_TIER_DEFAULTS are the resource-tiers objects, not copies", () => {
+    expect(resolveResourceLimits).toBe(tiers.resolveResourceLimits);
+    expect(RESOURCE_TIER_DEFAULTS).toBe(tiers.RESOURCE_TIER_DEFAULTS);
   });
 });

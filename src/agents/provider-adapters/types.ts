@@ -1,4 +1,4 @@
-import type { ResourceLimits } from "../model-router.js";
+import type { ResourceLimits } from "../resource-tiers.js";
 import type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner.js";
 
 export type AgentProviderId = "claude" | "openai" | "gemini" | "codex" | "kimi" | "deepseek" | "grok";

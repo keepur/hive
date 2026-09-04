@@ -46,7 +46,7 @@ import {
 } from "./server-traits.js";
 import { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
 
-import type { ResourceLimits } from "./model-router.js";
+import type { ResourceLimits } from "./resource-tiers.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import { createTeamRosterMcpServer } from "../team-roster/team-roster-mcp-server.js";
