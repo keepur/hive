@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -24,7 +24,12 @@ describe("isEntrypoint (KPR-428)", () => {
   let tmp: string;
 
   beforeEach(() => {
-    tmp = mkdtempSync(join(tmpdir(), "voice-worker-entrypoint-test-"));
+    // realpathSync up front: on macOS, tmpdir() paths live under `/var`,
+    // itself a symlink to `/private/var` — without this, `tmp` (and every
+    // path built from it) is not its own realpath, so the "direct
+    // invocation" case below would silently fall through to the realpath
+    // fallback branch instead of exercising the fast path it's named for.
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "voice-worker-entrypoint-test-")));
   });
 
   afterEach(() => {
@@ -45,6 +50,14 @@ describe("isEntrypoint (KPR-428)", () => {
 
   it("returns true on direct invocation (argv[1] === the real module path)", () => {
     const real = join(tmp, "real.ts");
+    writeFileSync(real, "");
+    expect(isEntrypoint(real, moduleUrlFor(real))).toBe(true);
+  });
+
+  it("returns true on direct invocation when the path needs percent-encoding (a space in a directory name)", () => {
+    const spaceDir = join(tmp, "space dir");
+    mkdirSync(spaceDir);
+    const real = join(spaceDir, "real.ts");
     writeFileSync(real, "");
     expect(isEntrypoint(real, moduleUrlFor(real))).toBe(true);
   });
