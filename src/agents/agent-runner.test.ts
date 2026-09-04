@@ -232,8 +232,14 @@ function getCapturedOptions(): Record<string, any> {
   return call[0].options ?? {};
 }
 
+function getCapturedPrompt(): string {
+  const call = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
+  return call[0].prompt;
+}
+
 // ── Import after mocks ──────────────────────────────────────────────
 import { AgentRunner, resolveToolSearchEnv, resolveToolSearchMode } from "./agent-runner.js";
+import { buildPrefix } from "./prefix-builder.js";
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 
@@ -2103,7 +2109,7 @@ describe("AgentRunner toolkit section prompt (via send)", () => {
     expect(options.systemPrompt).toContain("- custom-tool — A custom tool for testing");
   });
 
-  it("places toolkit section between constitution and date/time (assembly order)", async () => {
+  it("places toolkit section after constitution; no date/time in the system prompt (KPR-432)", async () => {
     memoryManager.read.mockImplementation((path: string) => {
       if (path === "shared/constitution.md") return Promise.resolve("CONSTITUTION_MARKER");
       return Promise.resolve(null);
@@ -2121,10 +2127,10 @@ describe("AgentRunner toolkit section prompt (via send)", () => {
 
     const constIdx = options.systemPrompt.indexOf("CONSTITUTION_MARKER");
     const toolkitIdx = options.systemPrompt.indexOf("## Your toolkit");
-    const dateIdx = options.systemPrompt.indexOf("**Current date/time**");
     expect(constIdx).toBeGreaterThan(-1);
     expect(toolkitIdx).toBeGreaterThan(constIdx);
-    expect(dateIdx).toBeGreaterThan(toolkitIdx);
+    expect(options.systemPrompt).not.toContain("**Current date/time**");
+    expect(getCapturedPrompt()).toMatch(/\n\n\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
   });
 });
 
@@ -3836,24 +3842,29 @@ describe("AgentRunner is_error result guard (KPR-312, via send)", () => {
   });
 });
 
-describe("buildSystemPrompt datetime composition (KPR-349 §D2 pin)", () => {
-  it("output is <prefix> + joiner + Pacific datetime trailer, datetime last", async () => {
+describe("buildSystemPrompt is the bare prefix (KPR-432 supersedes the KPR-349 §D2 datetime pin)", () => {
+  it("output equals buildPrefix output byte-for-byte — no joiner, no datetime trailer", async () => {
     const memoryManager = makeMockMemoryManager();
-    const runner = new AgentRunner(
-      makeAgentConfig({ systemPrompt: "PIN-SYSTEM-PROMPT" }),
-      memoryManager as never,
+    const cfg = makeAgentConfig({ systemPrompt: "PIN-SYSTEM-PROMPT" });
+    const runner = new AgentRunner(cfg, memoryManager as never, [], new Map(), "{}");
+    const r = runner as unknown as {
+      buildSystemPrompt(c: string[], d?: string[]): Promise<string>;
+      autoInjectedServerNames(): ReadonlySet<string>;
+    };
+    const out = await r.buildSystemPrompt([]);
+    expect(out).toBe(
+      await buildPrefix(cfg, {
+        coreServerNames: [],
+        activeDelegateNames: [],
+        memoryManager: memoryManager as never,
+        plugins: [],
+        skillIndex: new Map(),
+        eventSubscribersJson: "{}",
+        autoInjectedServers: r.autoInjectedServerNames(),
+      }),
     );
-    const out = await (
-      runner as unknown as { buildSystemPrompt(c: string[], d?: string[]): Promise<string> }
-    ).buildSystemPrompt([]);
-    // Full-output shape: prefix, then the exact joiner, then the trailer — nothing after.
-    expect(out).toMatch(/^[\s\S]+\n\n---\n\n\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
     expect(out).toContain("PIN-SYSTEM-PROMPT");
-    // Trailer text renders an en-US Pacific timestamp (weekday, month day, year, h:mm AM/PM).
-    const trailer = out.slice(out.lastIndexOf("**Current date/time**"));
-    expect(trailer).toMatch(
-      /^\*\*Current date\/time\*\*: (Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), [A-Z][a-z]+ \d{1,2}, \d{4} at \d{1,2}:\d{2} (AM|PM) \(Pacific Time\)$/,
-    );
+    expect(out).not.toContain("**Current date/time**");
   });
 });
 
@@ -3904,11 +3915,11 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
     expect(cache.getOrBuild).toHaveBeenCalledTimes(1);
   });
 
-  it("Lane B: instructions end with the Pacific datetime trailer", async () => {
+  it("Lane B: instructions carry no datetime trailer (KPR-432)", async () => {
     const cache = makeSpyPrefixCache();
     const runner = makeRunnerWithCache(cache);
     const { instructions } = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
-    expect(instructions).toMatch(/\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    expect(instructions).not.toContain("**Current date/time**");
   });
 
   it("Lane B: a rendered hot-tier block is returned AND folded into instructions exactly once (single-injection)", async () => {
@@ -4077,5 +4088,51 @@ describe("AgentRunner — KPR-390 worker-pool wiring", () => {
     expect(
       noMembership.buildToolTransportInventory().find((e) => e.name === "worker-pool"),
     ).toBeUndefined();
+  });
+});
+
+describe("KPR-432: datetime rides the turn input, system prompt is byte-stable across minutes", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockQueryOverride = null;
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("two sends a minute apart: identical systemPrompt, prompts end in their own minute's trailer", async () => {
+    vi.useFakeTimers();
+    const runner = makeRunner({ systemPrompt: "STABLE-PIN" });
+
+    vi.setSystemTime(new Date("2026-09-04T17:16:59Z")); // 10:16:59 AM PDT
+    await runner.send("first");
+    const sys1 = getCapturedOptions().systemPrompt as string;
+    const prompt1 = getCapturedPrompt();
+
+    vi.setSystemTime(new Date("2026-09-04T17:17:01Z")); // 10:17:01 AM PDT
+    await runner.send("second");
+    const sys2 = getCapturedOptions().systemPrompt as string;
+    const prompt2 = getCapturedPrompt();
+
+    expect(sys1).toBe(sys2); // the headline invariant — negative-verified in the plan
+    expect(sys1).not.toContain("**Current date/time**");
+    expect(prompt1).toBe("first\n\n**Current date/time**: Friday, September 4, 2026 at 10:16 AM (Pacific Time)");
+    expect(prompt2).toBe("second\n\n**Current date/time**: Friday, September 4, 2026 at 10:17 AM (Pacific Time)");
+  });
+
+  it("systemPromptOverride turns keep the override bytes and still get the trailer on the prompt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-04T17:17:01Z"));
+    const runner = makeRunner();
+    await runner.send("hello", undefined, undefined, undefined, undefined, "VOICE-OVERRIDE");
+    expect(getCapturedOptions().systemPrompt).toBe("VOICE-OVERRIDE");
+    expect(getCapturedPrompt()).toBe("hello\n\n**Current date/time**: Friday, September 4, 2026 at 10:17 AM (Pacific Time)");
+  });
+
+  it("the promptLength log reports the caller's length, pre-trailer", async () => {
+    const runner = makeRunner();
+    await runner.send("hello");
+    expect(mockLog.info).toHaveBeenCalledWith("Sending prompt to agent", expect.objectContaining({ promptLength: 5 }));
   });
 });
