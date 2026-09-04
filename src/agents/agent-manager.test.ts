@@ -6078,16 +6078,18 @@ describe("AgentManager", () => {
       expect(doc.effortSource).toBe("static");
     });
 
-    it("T2: static absent, router on — five shaping fields unchanged; source router only when the classifier returned an effort", async () => {
+    it("T2: static absent, router on — resourceLimits, prompt and delivered effort unchanged; source router only when the classifier returned an effort", async () => {
       (appConfig as any).modelRouter.enabled = true;
       const id = setFable(undefined);
 
       vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "high" }));
       await manager.spawnTurn(makeSmsCtx({ agentId: id, threadId: "sms:line-1:t2a" }));
       expect(routeModel).toHaveBeenCalledTimes(1);
-      const [, , , , limitsA, , effortA] = mockRunnerSend.mock.calls[0]!;
+      const [promptA, , , , limitsA, , effortA] = mockRunnerSend.mock.calls[0]!;
       expect(effortA).toBe("high");
       expect(limitsA).toEqual(FABLE_TIER_LIMITS);
+      // Non-adopter prompt shaping untouched: the KPR-224 sender prefix + text.
+      expect(promptA).toContain("hello over sms");
       expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "high", effortSource: "router" });
 
       // no-key / fallback shape: routeModel returns no effort ⇒ no effort, no source
