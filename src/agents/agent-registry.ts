@@ -5,6 +5,7 @@ import { toAgentConfig } from "../types/agent-definition.js";
 import { config as appConfig } from "../config.js";
 import { getArchetype } from "../archetypes/registry.js";
 import { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
+import { isAgentEffort, type AgentEffort } from "./agent-effort.js";
 import "../archetypes/index.js";
 import type { Collection, ChangeStream } from "mongodb";
 
@@ -70,6 +71,27 @@ function sanitizeToolSearch(agentId: string, value: unknown): "auto" | "on" | "o
     agent: agentId,
     value: String(value),
     remediation: 'Fix via admin_agent_update (toolSearch: "auto" | "on" | "off") or unset the field.',
+  });
+  return undefined;
+}
+
+/**
+ * KPR-430: sanitize the optional `effort` field. Invalid values (anything
+ * other than low | medium | high | xhigh | max | absent) are treated as
+ * absent — the agent falls back to the per-turn classifier / SDK default —
+ * and an error is logged so the operator can repair the doc. Mirrors the
+ * KPR-329 toolSearch sanitizer: the admin tool rejects malformed inputs at
+ * create/update; this guards pre-existing, hand-edited, or REST-written
+ * data on engine boot. `null` is an intentional unset (no log).
+ */
+function sanitizeEffort(agentId: string, value: unknown): AgentEffort | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (isAgentEffort(value)) return value;
+  log.error("Invalid effort value — must be low | medium | high | xhigh | max. Treating as absent.", {
+    agent: agentId,
+    value: String(value),
+    remediation:
+      'Fix via admin_agent_update (effort: "low" | "medium" | "high" | "xhigh" | "max") or unset the field (effort: null).',
   });
   return undefined;
 }
@@ -245,6 +267,9 @@ export class AgentRegistry {
       // KPR-329: sanitize the optional toolSearch override before any
       // downstream consumer (spawn env resolution, prefix builder) sees it.
       agentConfig.toolSearch = sanitizeToolSearch(agentConfig.id, agentConfig.toolSearch);
+      // KPR-430: sanitize the optional static effort before prepareSpawn
+      // (the only consumer) sees it.
+      agentConfig.effort = sanitizeEffort(agentConfig.id, agentConfig.effort);
       currentIds.add(agentConfig.id);
 
       // Disabled check FIRST — skip all validation for disabled agents.

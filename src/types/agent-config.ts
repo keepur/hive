@@ -1,4 +1,5 @@
 import type { ResourceTierOverrides } from "../agents/model-router.js";
+import type { AgentEffort } from "../agents/agent-effort.js";
 import type { AutonomyFlags } from "../agents/autonomy.js";
 
 export interface AgentSchedule {
@@ -47,6 +48,12 @@ export interface AgentConfig {
    * anything, which resolveToolSearchEnv treats as absent.
    */
   toolSearch?: "auto" | "on" | "off";
+  /**
+   * KPR-430: static per-agent effort (SDK EffortLevel). Guaranteed
+   * valid-or-undefined post-registry-load (sanitized there); hand-built
+   * configs may carry anything, which prepareSpawn treats as absent.
+   */
+  effort?: AgentEffort;
   /**
    * Response timeout in ms. Default 300000 (5 min). Honored on every lane
    * (KPR-422): on the claude/router-on path it participates in

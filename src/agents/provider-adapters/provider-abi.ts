@@ -77,6 +77,7 @@ export type {
   AgentProviderTurnRequest,
   SessionSemantics,
   ReasoningEffort,
+  TurnEffort,
   GuardrailGate,
   GuardrailToolCall,
   GuardrailDecision,

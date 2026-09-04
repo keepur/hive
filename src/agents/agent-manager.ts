@@ -36,7 +36,8 @@ import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import { ClaudeAgentAdapter } from "./provider-adapters/claude-agent-adapter.js";
 import type { CodexReasoningEffort } from "./provider-adapters/codex-subscription-adapter.js";
 import type { LaneBModuleDeps } from "./provider-adapters/provider-module.js";
-import type { AgentProviderAdapter, ReasoningEffort } from "./provider-adapters/types.js";
+import type { AgentProviderAdapter, ReasoningEffort, TurnEffort } from "./provider-adapters/types.js";
+import { isAgentEffort, type AgentEffort, type EffortSource } from "./agent-effort.js";
 import { persistsResumableHandle } from "./provider-adapters/types.js";
 // KPR-394 (§4.3/§4.4): both Lane B construction sites resolve through the
 // runtime provider registry — builtin seed + hive-plugin-add-loaded
@@ -318,9 +319,17 @@ interface SpawnShaping {
    * reached when the static model is effort-capable (prepareSpawn's skip
    * guarantees deliverability); undefined on voice/skip/failure paths and
    * for pilots. KPR-346: ALSO set by prepareSpawn's Lane A branch (clamped
-   * static :effort suffix — §D6).
+   * static :effort suffix — §D6). KPR-430: ALSO set by the static agent
+   * `effort` field (claude lane, every non-voice, non-round-1 path; Lane A
+   * through the clamp) — precedence pin > static > router.
    */
-  effortOverride: ReasoningEffort | undefined;
+  effortOverride: TurnEffort | undefined;
+  /**
+   * KPR-430 D6: provenance of effortOverride for telemetry. Optional —
+   * set ONLY where effortOverride is set (the telemetry stamp additionally
+   * nests it inside the effort spread, so a source can never land alone).
+   */
+  effortSource?: EffortSource;
   /** Execution bounds. Claude lane: static-tier bounds, set ONLY on the
    *  router-on path (KPR-338 path-preserving rule) — undefined elsewhere so
    *  the runner's per-agent legacy fallback (timeoutMs/maxTurns/budgetUsd)
@@ -559,6 +568,13 @@ export class AgentManager {
   /** KPR-346 (§D6): once-per-(agent,model) warn when a Lane A :effort suffix
    *  is outside the SDK-deliverable {low,medium,high} set. */
   private readonly laneAEffortClampWarned = new Set<string>();
+  /** KPR-430: once-per-(agent,model) warn when a static `effort` field is
+   *  set but the Claude-lane model cannot receive the param (haiku tier or
+   *  off-catalog — the KPR-338 deliverability gate). */
+  private readonly staticEffortDroppedWarned = new Set<string>();
+  /** KPR-430: once-per-(agent,model) warn when a static `effort` field is
+   *  set on a Lane B agent, where request.effort is ignored by contract. */
+  private readonly laneBEffortFieldWarned = new Set<string>();
   /**
    * KPR-306: per-provider circuit breakers. Read-only surface — KPR-307's
    * dispatcher-side consumer and the CircuitBreakerHeartbeat both reach it
@@ -1899,27 +1915,65 @@ export class AgentManager {
   }
 
   /**
-   * KPR-346 (§D6): Lane A :effort delivery. The runner's existing narrowing
-   * (agent-runner.ts — only {low,medium,high} reach SDK Options.effort) is
-   * the deliverable set; clamping HERE (with a warn) makes the drop explicit
-   * at the shaping seam instead of silently swallowed by the runner.
-   * Whether the foreign endpoint honors, ignores, or rejects the param is
-   * validation item V4 (Task 5).
+   * KPR-346 (§D6) + KPR-430: Lane A effort delivery. The runner's deliverable
+   * set on a foreign endpoint stays {low,medium,high}; clamping HERE (with a
+   * warn) makes the drop explicit at the shaping seam. `source` only shapes
+   * the warn text — the caller decides the telemetry source. The substring
+   * "outside the deliverable" is load-bearing for the clamp-warn filters in
+   * agent-manager.test.ts (KPR-346 T5, KPR-430 T7b/T7d, KPR-392 grok).
    */
   private clampLaneAEffort(
     agentId: string,
     model: string,
-    effort: CodexReasoningEffort | undefined,
+    effort: TurnEffort | undefined,
+    source: "static" | "suffix",
   ): ReasoningEffort | undefined {
     if (!effort) return undefined;
     if (effort === "low" || effort === "medium" || effort === "high") return effort;
-    const key = `${agentId}:${model}`;
+    // Keyed per source (review round 3): the suffix and the static field are
+    // distinct drop conditions — a suffix warn must not silence a later
+    // static-field drop on the same (agent, model), or vice versa.
+    const key = `${agentId}:${model}:${source}`;
     if (!this.laneAEffortClampWarned.has(key)) {
       this.laneAEffortClampWarned.add(key);
-      log.warn("Lane A :effort suffix outside the deliverable {low,medium,high} set — dropped", {
+      log.warn(
+        `${source === "static" ? "Static effort field" : "Lane A :effort suffix"} outside the deliverable {low,medium,high} set — dropped`,
+        { agentId, model, effort, source },
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * KPR-430 D3: the agent's static `effort`, if deliverable on this
+   * Claude-lane turn. Gate ≡ KPR-338's (haiku tier or off-catalog ⇒
+   * undeliverable). Warn once per (agent, model) when a set field is
+   * dropped — clampLaneAEffort's pattern. Called exactly once per turn,
+   * immediately before the router gate (after the voice / round-1 / Lane A /
+   * Lane B returns), so Lane B agents never see a spurious off-catalog warn.
+   * Tolerates a vanished agentConfig (KPR-306 wedged-permit hazard) and makes
+   * NO registry call when the field is unset (non-adopters byte-identical).
+   */
+  private resolveStaticClaudeEffort(
+    agentConfig: AgentConfig | undefined,
+    staticTier: ModelTier,
+    agentId: string,
+  ): AgentEffort | undefined {
+    const effort = agentConfig?.effort;
+    if (!agentConfig || !isAgentEffort(effort)) return undefined;
+    if (staticTier !== "haiku" && getLLMRegistry().supportsEffort(agentConfig.model)) return effort;
+    const key = `${agentId}:${agentConfig.model}`;
+    if (!this.staticEffortDroppedWarned.has(key)) {
+      this.staticEffortDroppedWarned.add(key);
+      log.warn("Static effort field set but the agent model cannot receive the effort param — dropped", {
         agentId,
-        model,
+        model: agentConfig.model,
         effort,
+        reason: staticTier === "haiku" ? "haiku-tier" : "off-catalog (supportsEffort false)",
+        remediation:
+          staticTier === "haiku"
+            ? "Unset the field or move the agent off haiku."
+            : "Add the model to src/llm/catalog.ts with the effort capability, or unset the field.",
       });
     }
     return undefined;
@@ -1996,7 +2050,16 @@ export class AgentManager {
       timeoutMs: limits.timeoutMs,
       effort: effortOverride,
     });
-    return { prompt, route: staticRoute, resourceLimits: limits, routerCostUsd: 0, effortOverride };
+    // KPR-430: the pin wins over the static field (never consulted here);
+    // source stamped only where the pin was actually deliverable.
+    return {
+      prompt,
+      route: staticRoute,
+      resourceLimits: limits,
+      routerCostUsd: 0,
+      effortOverride,
+      ...(effortOverride ? { effortSource: "pin" as const } : {}),
+    };
   }
 
   /**
@@ -2093,23 +2156,30 @@ export class AgentManager {
       return this.shapeReactionTurn(prompt, staticRoute, staticTier, agentConfig, ctx.agentId);
     }
 
-    // KPR-346 (§D6): Lane A — the router stays skipped (foreign ids are
-    // off-catalog, supportsEffort false, KPR-322 rule stands; zero classifier
-    // cost) but the static :effort suffix delivers through the Claude
-    // adapter's existing channel. resourceLimits stays undefined — the
-    // runner's per-agent legacy fallback applies; Claude static-tier limits
-    // are never computed for foreign models.
+    // KPR-346 (§D6) + KPR-430: Lane A — the router stays skipped (foreign ids
+    // are off-catalog, supportsEffort false, KPR-322 rule stands; zero
+    // classifier cost). The static `effort` field wins over the :effort
+    // suffix; either delivers through the Claude adapter's existing channel
+    // via the {low,medium,high} clamp (no suffix fallback once the field is
+    // set — a dropped field delivers nothing). resourceLimits stays undefined
+    // — the runner's per-agent legacy fallback applies; Claude static-tier
+    // limits are never computed for foreign models.
     if (isLaneAProvider(staticRoute.provider)) {
+      const fieldEffort = agentConfig && isAgentEffort(agentConfig.effort) ? agentConfig.effort : undefined;
+      const source: "static" | "suffix" = fieldEffort !== undefined ? "static" : "suffix";
+      const effortOverride = this.clampLaneAEffort(
+        ctx.agentId,
+        agentConfig?.model ?? "",
+        fieldEffort ?? ("reasoningEffort" in staticRoute ? staticRoute.reasoningEffort : undefined),
+        source,
+      );
       return {
         prompt,
         route: staticRoute,
         resourceLimits: undefined,
         routerCostUsd: 0,
-        effortOverride: this.clampLaneAEffort(
-          ctx.agentId,
-          agentConfig?.model ?? "",
-          "reasoningEffort" in staticRoute ? staticRoute.reasoningEffort : undefined,
-        ),
+        effortOverride,
+        ...(effortOverride ? { effortSource: source } : {}),
       };
     }
 
@@ -2127,6 +2197,21 @@ export class AgentManager {
     // never a trip, never a streak reset, never a probe close); budgetUsd
     // is still inert on Lane B.
     if (agentConfig && staticRoute.provider !== "claude") {
+      // KPR-430: the static effort field is a documented no-op on Lane B
+      // (request.effort is ignored by contract — the :effort suffix is the
+      // lever there). Say so once per (agent, model) rather than silently.
+      if (isAgentEffort(agentConfig.effort)) {
+        const key = `${ctx.agentId}:${agentConfig.model}`;
+        if (!this.laneBEffortFieldWarned.has(key)) {
+          this.laneBEffortFieldWarned.add(key);
+          log.warn("Static effort field is not delivered on this provider — use the model's :effort suffix instead", {
+            agentId: ctx.agentId,
+            model: agentConfig.model,
+            provider: staticRoute.provider,
+            effort: agentConfig.effort,
+          });
+        }
+      }
       return {
         prompt,
         route: staticRoute,
@@ -2145,8 +2230,25 @@ export class AgentManager {
     // when the agent's static provider isn't Claude (pilot gate — calling
     // the router for a pilot charged routerCostUsd for an output the pilot
     // ignores and misattributed the Claude model in telemetry/audit — R-311.2).
+    // KPR-430 D3: the static field is resolved exactly once per turn, HERE —
+    // after the voice / round-1 / Lane A / Lane B returns and before the
+    // router gate — and rides every remaining claude-lane path: router-off,
+    // system-sender (cron, reflection, bg-/code-task callbacks,
+    // meeting-monitor prompts, worker-pool boss re-entry, first-boot), the
+    // haiku/off-catalog skip (where it resolves undefined + warns), and the
+    // router-on path (where it short-circuits the classifier below).
+    // resourceLimits on each path is byte-identical to pre-KPR-430.
+    const staticEffort = this.resolveStaticClaudeEffort(agentConfig, staticTier, ctx.agentId);
+
     if (!agentConfig || !appConfig.modelRouter.enabled || item.sender === "system" || staticRoute.provider !== "claude") {
-      return { prompt, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+      return {
+        prompt,
+        route: staticRoute,
+        resourceLimits: undefined,
+        routerCostUsd: 0,
+        effortOverride: staticEffort,
+        ...(staticEffort ? { effortSource: "static" as const } : {}),
+      };
     }
 
     // KPR-338: the turn's model is ALWAYS agentConfig.model (fixed-tier
@@ -2175,6 +2277,20 @@ export class AgentManager {
       return { prompt, route: staticRoute, resourceLimits: staticLimits, routerCostUsd: 0, effortOverride: undefined };
     }
 
+    // KPR-430 D4: static field set and deliverable ⇒ the classifier's only
+    // output would be discarded — skip the call (no sidecar latency, no
+    // routerCostUsd). Shape is the merge branch's, minus the call.
+    if (staticEffort !== undefined) {
+      return {
+        prompt,
+        route: staticRoute,
+        resourceLimits: staticLimits,
+        routerCostUsd: 0,
+        effortOverride: staticEffort,
+        effortSource: "static",
+      };
+    }
+
     try {
       const result = await routeModel(item.text, {
         // H3 guard (KPR-312): file-bearing messages must not short-circuit on
@@ -2186,7 +2302,16 @@ export class AgentManager {
       // SpawnShaping.effortOverride → AgentProviderTurnRequest.effort →
       // Options.effort. The classifier's tier/model outputs are no longer
       // read (deleted from the contract in the next commit).
-      return { prompt, route: staticRoute, resourceLimits: staticLimits, routerCostUsd: result.costUsd, effortOverride: result.effort };
+      // KPR-430: source stamped only when the classifier actually returned an
+      // effort — routeModel's no-key and fallback paths return none.
+      return {
+        prompt,
+        route: staticRoute,
+        resourceLimits: staticLimits,
+        routerCostUsd: result.costUsd,
+        effortOverride: result.effort,
+        ...(result.effort ? { effortSource: "router" as const } : {}),
+      };
     } catch (err) {
       // Belt-and-braces (routeModel owns its own fallback and should not
       // throw). Degenerate shape preserved: resourceLimits stays undefined on
@@ -2245,7 +2370,14 @@ export class AgentManager {
           toolMs: result.toolMs,
           toolCalls: result.toolCalls,
           resumedSession,
-          ...(shaping.effortOverride ? { effort: shaping.effortOverride } : {}),
+          // KPR-430 D6: effortSource nests INSIDE the effort spread — it can
+          // never land without effort, whatever a shaping site did.
+          ...(shaping.effortOverride
+            ? {
+                effort: shaping.effortOverride,
+                ...(shaping.effortSource ? { effortSource: shaping.effortSource } : {}),
+              }
+            : {}),
           ...(confRound !== undefined ? { conferenceRound: confRound } : {}),
           ...(injectionMode ? { injectionMode } : {}),
           // KPR-401: sparse — only aborted:true is ever written.

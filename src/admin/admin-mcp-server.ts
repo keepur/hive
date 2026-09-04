@@ -18,6 +18,7 @@ import type { AutonomyFlags } from "../agents/autonomy.js";
 import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
 import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
 import { IN_PROCESS_PORTED_SERVERS } from "../agents/in-process-servers.js";
+import { AGENT_EFFORT_LEVELS, isAgentEffort, type AgentEffort } from "../agents/agent-effort.js";
 import { createLogger } from "../logging/logger.js";
 import { config as appConfig } from "../config.js";
 import { envValue } from "../agents/provider-adapters/oauth-credentials.js";
@@ -83,6 +84,24 @@ function checkToolSearch(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   if (value === "auto" || value === "on" || value === "off") return null;
   return `Invalid toolSearch: "${String(value)}". Must be one of: auto, on, off — or omit the field to inherit the hive.yaml toolSearch.mode (engine default: auto).`;
+}
+
+/**
+ * KPR-430: validate the optional `effort` field at the write boundary.
+ * Returns an error string for the tool response, or null if acceptable.
+ * `undefined`/`null` are acceptable (absent / explicit unset — per-turn
+ * classifier or SDK default). The registry re-sanitizes at load as defense
+ * in depth (REST-written docs bypass this check, exactly like toolSearch).
+ */
+function checkEffort(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (isAgentEffort(value)) return null;
+  return (
+    `Invalid effort: "${String(value)}". Must be one of: ${AGENT_EFFORT_LEVELS.join(", ")} — ` +
+    `or omit/unset the field to keep the per-turn classifier / SDK default. ` +
+    `Claude-runtime lanes only (claude, kimi, deepseek); on openai/gemini/codex/grok use the model's :effort suffix instead. ` +
+    `xhigh requires Sonnet 5 / Opus 4.7+ / Fable (the SDK documents a fallback to high elsewhere).`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +363,10 @@ export function buildAdminTools(deps: AdminToolDeps) {
             lines.push(`Spawn Budget: ${resolved} (source: ${source})`);
           }
           lines.push(`Timeout: ${doc.timeoutMs ?? AGENT_DEFINITION_DEFAULTS.timeoutMs}ms`);
+          if (doc.effort)
+            lines.push(
+              `Effort: ${doc.effort} (static — KPR-430; wins over the per-turn classifier, round-1 pin wins over it)`,
+            );
           lines.push(`Disabled: ${doc.disabled ?? false}`);
           if (doc.slackBot) lines.push(`Slack Bot: ${doc.slackBot}`);
           lines.push(`\n--- Soul ---\n${doc.soul ?? "(not set)"}`);
@@ -410,7 +433,11 @@ export function buildAdminTools(deps: AdminToolDeps) {
           .record(z.string(), z.any())
           .optional()
           .describe(
-            "Additional fields (channels, passiveChannels, schedule, coreServers override, delegateServers, plugins, autonomy, archetypeConfig, budgetUsd, maxTurns, etc.)",
+            "Additional fields (channels, passiveChannels, schedule, coreServers override, delegateServers, plugins, autonomy, archetypeConfig, budgetUsd, maxTurns, toolSearch, effort, etc.). " +
+              "`effort`: static per-agent reasoning effort — one of low, medium, high, xhigh, max (the SDK EffortLevel). " +
+              "Wins over the per-turn classifier (which is then skipped); the round-1 meeting-reaction pin still wins over it. " +
+              "Claude-runtime lanes only (claude + kimi/deepseek, clamped to low/medium/high there); a no-op on openai/gemini/codex/grok — use the model's :effort suffix instead. " +
+              "Dropped with a warning on haiku-tier / off-catalog models. xhigh requires Sonnet 5 / Opus 4.7+ / Fable. Omit to keep today's behaviour.",
           ),
       },
       async ({ _id, name, roles, aliases, model, homeBase, soul, systemPrompt, archetype, title, fields }) => {
@@ -460,6 +487,11 @@ export function buildAdminTools(deps: AdminToolDeps) {
           if (toolSearchError) {
             return { isError: true, content: [{ type: "text", text: toolSearchError }] };
           }
+          // KPR-430: reject invalid effort at the write boundary.
+          const effortError = checkEffort(f.effort);
+          if (effortError) {
+            return { isError: true, content: [{ type: "text", text: effortError }] };
+          }
           const now = new Date();
           const doc: AgentDefinition = {
             _id,
@@ -501,6 +533,9 @@ export function buildAdminTools(deps: AdminToolDeps) {
               AGENT_DEFINITION_DEFAULTS.spawnBudget,
             // KPR-329: optional; absent = inherit hive.yaml toolSearch.mode.
             toolSearch: f.toolSearch as "auto" | "on" | "off" | undefined,
+            // KPR-430: optional; absent (BSON null when omitted — the
+            // registry treats null as absent) = per-turn classifier / SDK default.
+            effort: f.effort as AgentEffort | undefined,
             timeoutMs: (f.timeoutMs as number) ?? AGENT_DEFINITION_DEFAULTS.timeoutMs,
             disabled: (f.disabled as boolean) ?? false,
             slackBot: f.slackBot as string | undefined,
@@ -558,7 +593,10 @@ export function buildAdminTools(deps: AdminToolDeps) {
           .describe(
             "Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.). " +
               "For `model`: bare id routes to Claude; <provider>/<model>[:effort] routes elsewhere " +
-              "(e.g. 'codex/gpt-5.5:medium', 'grok/grok-4.6') — call agent_model_catalog_list to check valid ids per provider.",
+              "(e.g. 'codex/gpt-5.5:medium', 'grok/grok-4.6') — call agent_model_catalog_list to check valid ids per provider." +
+              " `effort`: static per-agent reasoning effort — low | medium | high | xhigh | max, or null to unset. Wins over the per-turn classifier; " +
+              "the round-1 meeting-reaction pin wins over it. Claude-runtime lanes only (no-op on openai/gemini/codex/grok — use the :effort model suffix). " +
+              "xhigh requires Sonnet 5 / Opus 4.7+ / Fable. Takes effect on the next spawn after SIGUSR1.",
           ),
       },
       async ({ agent_id, homeBase, soul, systemPrompt, archetype, title, roles, aliases, fields }) => {
@@ -612,6 +650,15 @@ export function buildAdminTools(deps: AdminToolDeps) {
             const toolSearchError = checkToolSearch(merged.toolSearch);
             if (toolSearchError) {
               return { isError: true, content: [{ type: "text", text: toolSearchError }] };
+            }
+          }
+
+          // KPR-430: reject invalid effort at the write boundary. null is
+          // allowed through (explicit unset — registry treats it as absent).
+          if ("effort" in merged) {
+            const effortError = checkEffort(merged.effort);
+            if (effortError) {
+              return { isError: true, content: [{ type: "text", text: effortError }] };
             }
           }
 

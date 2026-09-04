@@ -1,4 +1,4 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions, type EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -70,9 +70,22 @@ import { createWorkerPoolMcpServer } from "../workers/worker-pool-mcp-server.js"
 import type { MeetingWorkerPool, WorkerPoolTurnContext } from "../workers/meeting-worker-pool.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
-import type { ReasoningEffort } from "./provider-adapters/types.js";
+import type { TurnEffort } from "./provider-adapters/types.js";
+import { isAgentEffort, type AgentEffort } from "./agent-effort.js";
 // KPR-394 (§4.11): plugin provider ids widen the admin model-catalog tools.
 import { listPluginProviderIds } from "./provider-adapters/provider-registry.js";
+
+// KPR-430: compile-time pin — AgentEffort ≡ SDK EffortLevel in BOTH
+// directions. If the SDK adds or removes a level, this fails typecheck
+// rather than the runner silently narrowing (dropping a level) or
+// over-delivering (a param the API 400s on). `void` keeps the warn-level
+// @typescript-eslint/no-unused-vars rule quiet.
+const _agentEffortIsSdkEffort: [AgentEffort] extends [EffortLevel]
+  ? [EffortLevel] extends [AgentEffort]
+    ? true
+    : never
+  : never = true;
+void _agentEffortIsSdkEffort;
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -1937,7 +1950,7 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: ReasoningEffort): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: TurnEffort): Promise<RunResult> {
     // KPR-346 (§D5): Lane A passthrough — the CLI model is the FOREIGN id;
     // agentConfig.model keeps the prefixed string (kimi/…) so telemetry and
     // the activity log attribute the provider via the model string untouched.
@@ -2041,15 +2054,17 @@ export class AgentRunner {
 
         maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
         maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
-        // KPR-312: per-turn reasoning effort from the complexity classifier.
-        // ReasoningEffort and the SDK's EffortLevel overlap but neither is a
-        // superset (ReasoningEffort has minimal/none/xhigh; EffortLevel has
-        // max) — only the shared {low, medium, high} subset is deliverable
-        // (routeModel emits nothing else; the narrowing also satisfies the
-        // SDK's EffortLevel type). Deliberately NO `thinking` key: toggling
-        // thinking config turn-to-turn invalidates the messages-tier prompt
-        // cache — the exact cost class KPR-312 avoids.
-        ...(effort === "low" || effort === "medium" || effort === "high" ? { effort } : {}),
+        // KPR-312 → KPR-430: per-turn reasoning effort. The channel carries
+        // TurnEffort (= ReasoningEffort | "max"); the SDK accepts exactly
+        // AgentEffort (= EffortLevel, pinned equal at the top of this file),
+        // so `minimal`/`none` are dropped and everything else — including the
+        // static field's `xhigh`/`max` — is delivered. The runner is a pure
+        // narrowing: precedence and deliverability gating live in
+        // prepareSpawn. Deliberately NO `thinking` key: toggling thinking
+        // config turn-to-turn invalidates the messages-tier prompt cache —
+        // the exact cost class KPR-312 avoids (a per-agent constant effort
+        // has no such cost).
+        ...(isAgentEffort(effort) ? { effort } : {}),
         // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
         // may return arbitrary SDK options, but we explicitly pick only the safe ones
         // so a rogue archetype can't override security invariants (permissionMode,
