@@ -632,6 +632,61 @@ describe("AgentRegistry toolSearch sanitization (KPR-329)", () => {
   });
 });
 
+describe("AgentRegistry effort sanitization (KPR-430)", () => {
+  beforeAll(async () => {
+    const registryModule = await import("./agent-registry.js");
+    AgentRegistry = registryModule.AgentRegistry;
+  });
+
+  /** Capture engine log output (the logger writes to process.stderr, not console). */
+  function captureStderr() {
+    const lines: string[] = [];
+    const capture = (chunk: string | Uint8Array): boolean => {
+      lines.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(capture);
+    return { lines, restore: () => spy.mockRestore() };
+  }
+
+  it("strips an invalid effort value at load, logs an error, and keeps the agent active", async () => {
+    const def = makeDefinition({ _id: "bad-fx", effort: "xhighest" as never });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const cap = captureStderr();
+    try {
+      await registry.load();
+      const cfg = registry.get("bad-fx");
+      expect(cfg).toBeDefined();
+      expect(cfg!.effort).toBeUndefined();
+      expect(
+        cap.lines.filter((l) => l.includes("Invalid effort value") && l.includes("bad-fx")),
+      ).toHaveLength(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("treats null as an intentional unset without logging", async () => {
+    const def = makeDefinition({ _id: "null-fx", effort: null as never });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const cap = captureStderr();
+    try {
+      await registry.load();
+      expect(registry.get("null-fx")!.effort).toBeUndefined();
+      expect(cap.lines.filter((l) => l.includes("Invalid effort value"))).toHaveLength(0);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("preserves a valid effort value at load", async () => {
+    const def = makeDefinition({ _id: "good-fx", effort: "max" });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    await registry.load();
+    expect(registry.get("good-fx")!.effort).toBe("max");
+  });
+});
+
 describe("KPR-221 — AgentRegistry hard-rejects context-dependent servers in delegateServers", () => {
   beforeAll(async () => {
     const registryModule = await import("./agent-registry.js");
