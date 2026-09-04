@@ -5145,7 +5145,7 @@ describe("AgentManager", () => {
 
         expect(result).toBeDefined(); // the turn ran — the fault was contained
         // routerCostUsd 0 on the catch path: spawnTurn adds shaping.routerCostUsd
-        // to the runner's cost (agent-manager.ts:1866); makeRunResult's 0.01 must
+        // to the runner's cost (agent-manager.ts:1882); makeRunResult's 0.01 must
         // arrive unchanged.
         expect(result.usage.costUsd).toBe(0.01);
         expect(routeModel).toHaveBeenCalledTimes(1);
