@@ -1919,13 +1919,14 @@ export class AgentManager {
    * set on a foreign endpoint stays {low,medium,high}; clamping HERE (with a
    * warn) makes the drop explicit at the shaping seam. `source` only shapes
    * the warn text — the caller decides the telemetry source. The substring
-   * "outside the deliverable" is load-bearing for two KPR-346 tests.
+   * "outside the deliverable" is load-bearing for the clamp-warn filters in
+   * agent-manager.test.ts (KPR-346 T5, KPR-430 T7b/T7d, KPR-392 grok).
    */
   private clampLaneAEffort(
     agentId: string,
     model: string,
     effort: TurnEffort | undefined,
-    source: "static" | "suffix" = "suffix",
+    source: "static" | "suffix",
   ): ReasoningEffort | undefined {
     if (!effort) return undefined;
     if (effort === "low" || effort === "medium" || effort === "high") return effort;
