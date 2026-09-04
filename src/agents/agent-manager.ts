@@ -2225,11 +2225,6 @@ export class AgentManager {
       };
     }
 
-    // Router gate (KPR-311): skip when disabled, for system senders
-    // (scheduler/cron), when the agent vanished mid-turn (guard above), or
-    // when the agent's static provider isn't Claude (pilot gate — calling
-    // the router for a pilot charged routerCostUsd for an output the pilot
-    // ignores and misattributed the Claude model in telemetry/audit — R-311.2).
     // KPR-430 D3: the static field is resolved exactly once per turn, HERE —
     // after the voice / round-1 / Lane A / Lane B returns and before the
     // router gate — and rides every remaining claude-lane path: router-off,
@@ -2237,10 +2232,20 @@ export class AgentManager {
     // meeting-monitor prompts, worker-pool boss re-entry, first-boot), the
     // haiku/off-catalog skip (where it resolves undefined + warns), and the
     // router-on path (where it short-circuits the classifier below).
-    // resourceLimits on each path is byte-identical to pre-KPR-430.
+    // resourceLimits: router-off keeps undefined (runner legacy fallback);
+    // system-sender receives the static-tier envelope — KPR-431, below.
     const staticEffort = this.resolveStaticClaudeEffort(agentConfig, staticTier, ctx.agentId);
 
-    if (!agentConfig || !appConfig.modelRouter.enabled || item.sender === "system" || staticRoute.provider !== "claude") {
+    // Router gate (KPR-311): skip when disabled, when the agent vanished
+    // mid-turn (guard above — MUST stay the first disjunct: with no config
+    // there is no tier to resolve, and the turn has to flow on to fail inside
+    // the recorded try, KPR-306 wedged-permit hazard), or when the agent's
+    // static provider isn't Claude (pilot gate — calling the router for a
+    // pilot charged routerCostUsd for an output the pilot ignores and
+    // misattributed the Claude model in telemetry/audit — R-311.2; Lane A/B
+    // returned above, so this disjunct is belt-and-braces here). System
+    // senders no longer return here — KPR-431, below.
+    if (!agentConfig || !appConfig.modelRouter.enabled || staticRoute.provider !== "claude") {
       return {
         prompt,
         route: staticRoute,
@@ -2253,11 +2258,35 @@ export class AgentManager {
 
     // KPR-338: the turn's model is ALWAYS agentConfig.model (fixed-tier
     // invariant, kpr-338-spec §1.3). Execution bounds derive from the agent's
-    // STATIC tier — same path that carried router-derived limits before
-    // (path-preserving), explicitly NOT effort-keyed. KPR-422: the agent's
+    // STATIC tier, explicitly NOT effort-keyed. KPR-422: the agent's
     // top-level timeoutMs participates in the resolution (tier override >
     // top-level > tier default) — it is no longer dead config on this path.
+    // KPR-431: computed BEFORE the sender check so every Claude/router-on
+    // turn — human, system, classifier-failed — resolves the same envelope;
+    // the agent-def maxTurns/budgetUsd are dead config on this whole path.
     const staticLimits = resolveResourceLimits(staticTier, agentConfig.resourceTiers, agentConfig.timeoutMs);
+
+    // KPR-431: system senders (scheduler/cron, reflection, callback/event
+    // deliveries, bg-/code-task completion callbacks, meeting-monitor prompts,
+    // worker-pool boss re-entry, first-boot) skip the classifier exactly as
+    // before (R-311 — no routerCostUsd, no effort hint) but receive the SAME
+    // static-tier envelope a human turn on this agent receives. This
+    // deliberately supersedes kpr-338-spec §3.2 rules (a)/(b) for this path
+    // (KPR-431). An agent's envelope is a per-agent fact, never a per-sender
+    // one. Placed before the haiku/off-catalog skip so its warn-once keeps
+    // firing only on paths where an effort hint could have been delivered.
+    // KPR-430's static effort field rides this branch exactly as it rode the
+    // gate return it replaces (a system turn with a static effort delivers it).
+    if (item.sender === "system") {
+      return {
+        prompt,
+        route: staticRoute,
+        resourceLimits: staticLimits,
+        routerCostUsd: 0,
+        effortOverride: staticEffort,
+        ...(staticEffort ? { effortSource: "static" as const } : {}),
+      };
+    }
 
     // Haiku-skip (replaces router H1) + effort-capability gate (kpr-338-spec
     // §3.1 residual, plan D1/D2): when the static model cannot receive the
@@ -2314,10 +2343,12 @@ export class AgentManager {
       };
     } catch (err) {
       // Belt-and-braces (routeModel owns its own fallback and should not
-      // throw). Degenerate shape preserved: resourceLimits stays undefined on
-      // this path (KPR-338 path-preserving rule — runner legacy fallback).
+      // throw). KPR-431: a classifier fault costs the effort hint only — the
+      // static-tier envelope is a per-agent fact computed above and is
+      // delivered regardless (supersedes the KPR-338 "resourceLimits stays
+      // undefined" degenerate shape on this path).
       log.warn("Model router failed, using defaults", { agentId: ctx.agentId, error: String(err) });
-      return { prompt, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+      return { prompt, route: staticRoute, resourceLimits: staticLimits, routerCostUsd: 0, effortOverride: undefined };
     }
   }
 
