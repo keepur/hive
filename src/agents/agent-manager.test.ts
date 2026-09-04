@@ -4025,6 +4025,23 @@ describe("AgentManager", () => {
         expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "medium", effortSource: "suffix" });
       });
 
+      it("KPR-430 T7d: the clamp warn-once key is per source — a suffix drop does not silence a later static-field drop on the same (agent, model)", async () => {
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:xhigh", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr430-d1" }));
+        registry._agents.set(
+          "agent-kimi",
+          makeAgentConfig({ id: "agent-kimi", name: "AgentKimi", model: "kimi/kimi-k3:xhigh", effort: "max", coreServers: [] }),
+        );
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr430-d2" }));
+        await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr430-d3" }));
+        expect(mockRunnerSend.mock.calls.map((c) => c[6])).toEqual([undefined, undefined, undefined]);
+        const clampWarns = mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("outside the deliverable"));
+        expect(clampWarns.map((c) => String(c[0]).startsWith("Static effort field"))).toEqual([false, true]);
+      });
+
       it("T5: Lane A resourceLimits stays undefined (runner legacy fallback)", async () => {
         await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId: "sms:line-1:kpr346-limits" }));
         const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;

@@ -1929,7 +1929,10 @@ export class AgentManager {
   ): ReasoningEffort | undefined {
     if (!effort) return undefined;
     if (effort === "low" || effort === "medium" || effort === "high") return effort;
-    const key = `${agentId}:${model}`;
+    // Keyed per source (review round 3): the suffix and the static field are
+    // distinct drop conditions — a suffix warn must not silence a later
+    // static-field drop on the same (agent, model), or vice versa.
+    const key = `${agentId}:${model}:${source}`;
     if (!this.laneAEffortClampWarned.has(key)) {
       this.laneAEffortClampWarned.add(key);
       log.warn(
