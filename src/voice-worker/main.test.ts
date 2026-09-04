@@ -62,6 +62,15 @@ describe("isEntrypoint (KPR-428)", () => {
     expect(isEntrypoint(real, moduleUrlFor(real))).toBe(true);
   });
 
+  it("returns true via the direct URL comparison alone, before ever touching the filesystem", () => {
+    // A nonexistent argv[1] denies the realpath fallback its rescue (it
+    // throws ENOENT and the catch returns false) — so this only passes if
+    // the fast-path pathToFileURL comparison itself is correct, isolating
+    // it from the fallback branch the other cases above can't discriminate.
+    const ghost = join(tmp, "space dir", "never-created.ts");
+    expect(isEntrypoint(ghost, pathToFileURL(ghost).href)).toBe(true);
+  });
+
   it("returns true when argv[1] is a symlink to the real module path (the KPR-428 regression case)", () => {
     const real = join(tmp, "real.ts");
     writeFileSync(real, "");
