@@ -50,7 +50,10 @@ export interface LaneBProviderKit {
   /** === LANE_B_PROVIDER_ABI_VERSION — belt-and-braces runtime assertion. */
   abiVersion: number;
   /** Abstract per-turn lifecycle base (KPR-391) — EXTEND IT: deadline,
-   *  containment, ToolBridge lifecycle, usage accounting come free. */
+   *  containment, ToolBridge lifecycle, usage accounting come free.
+   *  - KPR-432: `harness.request.prompt` already ends with the engine's datetime
+   *    trailer for primary assemblies (`datetimeInTurnInput`); plugin adapters
+   *    must not append their own. Additive optional field — no ABI version bump. */
   LaneBTurnScaffold: typeof LaneBTurnScaffold;
   /** The shared bounded tool-dispatch loop (codex/gemini/grok template). */
   runBoundedDispatchLoop: typeof runBoundedDispatchLoop;

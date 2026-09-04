@@ -464,3 +464,46 @@ describe("LaneBTurnScaffold — wall-clock deadline (#407)", () => {
     expect(firedDuringTurn).toBe(true);
   });
 });
+
+describe("KPR-432: datetime trailer on the turn input", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("primary assembly (datetimeInTurnInput: true) → harness.request.prompt ends with the trailer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-04T17:17:01Z")); // 10:17 AM PDT
+    let seen: string | undefined;
+    const adapter = new TestScaffoldAdapter(
+      async (harness) => {
+        seen = harness.request.prompt;
+        return { kind: "success", text: "ok", sessionId: "s-1" };
+      },
+      makeAssembly({ datetimeInTurnInput: true }),
+    );
+    await adapter.runTurn(req({ prompt: "hello" }));
+    expect(seen).toBe("hello\n\n**Current date/time**: Friday, September 4, 2026 at 10:17 AM (Pacific Time)");
+  });
+
+  it("nested assembly (false) and flag-less assembly → prompt byte-identical", async () => {
+    for (const assembly of [makeAssembly({ datetimeInTurnInput: false }), makeAssembly()]) {
+      let seen: string | undefined;
+      const adapter = new TestScaffoldAdapter(async (harness) => {
+        seen = harness.request.prompt;
+        return { kind: "success", text: "ok", sessionId: "s-1" };
+      }, assembly);
+      await adapter.runTurn(req({ prompt: "hello" }));
+      expect(seen).toBe("hello");
+    }
+  });
+
+  it("the rewrite precedes ToolBridge construction: a pre-request throw still closes the bridge (unchanged)", async () => {
+    const adapter = new TestScaffoldAdapter(
+      () => {
+        throw new Error("pre-request");
+      },
+      makeAssembly({ datetimeInTurnInput: true }),
+    );
+    const result = await adapter.runTurn(req());
+    expect(result.error).toBe("pre-request");
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+  });
+});
