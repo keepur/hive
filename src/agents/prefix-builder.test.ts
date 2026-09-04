@@ -27,7 +27,13 @@ vi.mock("../config.js", async (importOriginal) => {
   };
 });
 
-import { buildPrefix, type PrefixBuildContext } from "./prefix-builder.js";
+import {
+  buildPrefix,
+  type PrefixBuildContext,
+  appendDateTimeTrailer,
+  formatDateTimeTrailer,
+  TURN_TRAILER_JOINER,
+} from "./prefix-builder.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -192,5 +198,16 @@ describe("buildPrefix", () => {
     expect(out).toContain("- /memories/agents/test-agent/notes.md");
     expect(out).toContain("`view`");
     expect(out).not.toContain("memory_read");
+  });
+});
+
+describe("appendDateTimeTrailer (KPR-432)", () => {
+  it("is <prompt> + TURN_TRAILER_JOINER + formatDateTimeTrailer(now), bytes-exact", () => {
+    const now = new Date("2026-09-04T17:17:01Z"); // 10:17 AM PDT
+    expect(TURN_TRAILER_JOINER).toBe("\n\n");
+    expect(appendDateTimeTrailer("hello", now)).toBe(`hello\n\n${formatDateTimeTrailer(now)}`);
+    expect(appendDateTimeTrailer("hello", now)).toMatch(
+      /^hello\n\n\*\*Current date\/time\*\*: Friday, September 4, 2026 at 10:17 AM \(Pacific Time\)$/,
+    );
   });
 });
