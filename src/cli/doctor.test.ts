@@ -1042,6 +1042,25 @@ describe("renderResourceEnvelopesSection (KPR-433 D5, informational)", () => {
   it("T8: emits only — returns void (cannot alter the exit code)", () => {
     expect(renderResourceEnvelopesSection([fableRow], true, capture().emit)).toBeUndefined();
   });
+  it("N1: resourceEnvelopesForDoctor is only awaited when config.modelRouter.enabled is true; router-off passes [] and the renderer still gets its router-off flag", () => {
+    // runDoctor() has no dynamic-mocking harness in this file (it dynamically
+    // imports ../config.js and hits live Mongo fetchers) — every other test
+    // in this describe block verifies wiring by scanning doctor.ts source,
+    // and this one follows the same T8 idiom to pin the router-off gate.
+    const src = readFileSync(join(import.meta.dirname, "doctor.ts"), "utf-8");
+    const call = src.indexOf("resourceEnvelopesForDoctor(config.mongo.uri, config.mongo.dbName)");
+    const gateStart = src.lastIndexOf("const envelopeRows = config.modelRouter.enabled");
+    expect(call).toBeGreaterThan(-1);
+    expect(gateStart).toBeGreaterThan(-1);
+    // The fetcher call must be textually inside the ternary's truthy branch,
+    // not a bare unconditional await — i.e. it appears after the ternary
+    // condition and before the `: []` fallback that renders under router-off.
+    const fallback = src.indexOf(": []", gateStart);
+    expect(fallback).toBeGreaterThan(-1);
+    expect(call).toBeGreaterThan(gateStart);
+    expect(call).toBeLessThan(fallback);
+    expect(src.slice(gateStart, fallback)).not.toMatch(/^\s*const envelopeRows = await resourceEnvelopesForDoctor/m);
+  });
   it("T8: wired after Spawn coordinator, skipped line in the config-not-loaded branch, no allPassed in the hunk", () => {
     const src = readFileSync(join(import.meta.dirname, "doctor.ts"), "utf-8");
     const spawn = src.indexOf("renderSpawnCoordinatorSection(coordinatorRows);");

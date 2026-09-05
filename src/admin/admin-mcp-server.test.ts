@@ -1684,4 +1684,33 @@ describe("KPR-433 — effective envelope visibility (agent_get D3, write notes D
     expect(agentDocsStore.get("f3").budgetUsd).toBe(10);
     expect(r.content[0].text).not.toContain("Note:");
   });
+  it("N2: a throw inside envelope-note computation (post-write) never surfaces as agent_create/agent_update error — the write already landed and the note is just dropped", async () => {
+    // resourceTiers is read via `agentOverrides?.[tier]` inside
+    // resolveResourceLimits — a Proxy that throws on any property get
+    // reproduces a fault happening strictly inside note computation, after
+    // insertOne/updateOne has already resolved.
+    const throwingResourceTiers = new Proxy(
+      {},
+      {
+        get(): never {
+          throw new Error("boom: resourceTiers access exploded");
+        },
+      },
+    ) as unknown as Record<string, unknown>;
+
+    const createRes = await create("f-throw", "claude-fable-5-1", { resourceTiers: throwingResourceTiers });
+    expect(createRes.isError).toBeFalsy();
+    expect(createRes.content[0].text).toContain("created with model claude-fable-5-1");
+    expect(createRes.content[0].text).not.toContain("Note:");
+    expect(createRes.content[0].text).not.toContain("agent_create error");
+    expect(agentDocsStore.get("f-throw")).toBeDefined(); // the write persisted regardless
+
+    agentDocsStore.set("fable", fableDoc());
+    const updateRes = await update("fable", { fields: { resourceTiers: throwingResourceTiers } });
+    expect(updateRes.isError).toBeFalsy();
+    expect(updateRes.content[0].text).toContain("Agent 'fable' updated: resourceTiers. Version saved.");
+    expect(updateRes.content[0].text).not.toContain("Note:");
+    expect(updateRes.content[0].text).not.toContain("agent_update error");
+    expect(agentDocsStore.get("fable").resourceTiers).toBe(throwingResourceTiers); // the write persisted regardless
+  });
 });

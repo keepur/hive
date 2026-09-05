@@ -130,6 +130,28 @@ function envelopeWriteNote(
 }
 
 /**
+ * KPR-433 review fix (N2): throw-safe wrapper around {@link envelopeWriteNote}.
+ * `agent_create`/`agent_update` compute the note AFTER the Mongo write has
+ * already landed (insertOne/updateOne), inside the handler's shared
+ * try/catch — so an uncaught throw here would surface as an
+ * `agent_create error:`/`agent_update error:` response for a write that in
+ * fact persisted. The note is purely advisory (KPR-433 D4); swallow any
+ * fault and fall back to no note rather than lying about the write's
+ * success.
+ */
+function safeEnvelopeWriteNote(
+  doc: EnvelopeDocLike,
+  written: { budgetUsd?: unknown; maxTurns?: unknown },
+  judgeExisting: boolean,
+): string {
+  try {
+    return envelopeWriteNote(doc, written, judgeExisting);
+  } catch {
+    return "";
+  }
+}
+
+/**
  * KPR-184: returns an error message if `delegateServers` references any
  * KPR-122-ported in-process server, or null if the list is clean (or
  * undefined / empty). The 10 ported servers can't be delegated because the
@@ -659,7 +681,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
 
           // KPR-433 D4: fields-supplied budgetUsd/maxTurns only (the doc
           // materializes 10 / 200 — those must not note on every create).
-          const envelopeNote = envelopeWriteNote(doc, { budgetUsd: f.budgetUsd, maxTurns: f.maxTurns }, false);
+          const envelopeNote = safeEnvelopeWriteNote(doc, { budgetUsd: f.budgetUsd, maxTurns: f.maxTurns }, false);
 
           return {
             content: [
@@ -804,7 +826,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
           // tier when the write changes `model`; pre-existing top-level values
           // count only when `model` or `resourceTiers` changed (the envelope
           // moved under them). `null` in the bag = absent (§7.5).
-          const envelopeNote = envelopeWriteNote(
+          const envelopeNote = safeEnvelopeWriteNote(
             { ...existing, ...merged } as unknown as EnvelopeDocLike,
             { budgetUsd: merged.budgetUsd, maxTurns: merged.maxTurns },
             "model" in merged || "resourceTiers" in merged,

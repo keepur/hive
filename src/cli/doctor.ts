@@ -751,9 +751,15 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // KPR-220 Phase 11: spawn-coordinator per-agent stats.
     const coordinatorRows = await spawnCoordinatorStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderSpawnCoordinatorSection(coordinatorRows);
-    // KPR-433 D5: effective Claude-lane envelopes — informational only, NEVER
-    // contributes to allPassed (KPR-296 canon).
-    const envelopeRows = await resourceEnvelopesForDoctor(config.mongo.uri, config.mongo.dbName);
+    // KPR-433 D5 (N1 review fix): effective Claude-lane envelopes —
+    // informational only, NEVER contributes to allPassed (KPR-296 canon).
+    // Only fetch when the router is on: under router-off the renderer prints
+    // its single router-off line without consulting rows at all, so the
+    // fetch (a Mongo round-trip that can also warn-once via modelToTier) is
+    // wasted work on a path where no tier envelope applies.
+    const envelopeRows = config.modelRouter.enabled
+      ? await resourceEnvelopesForDoctor(config.mongo.uri, config.mongo.dbName)
+      : [];
     renderResourceEnvelopesSection(envelopeRows, config.modelRouter.enabled);
     // KPR-306: provider circuit-breaker per-provider stats. Informational —
     // NEVER contributes to allPassed (D4).
