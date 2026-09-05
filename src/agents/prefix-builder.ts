@@ -411,6 +411,9 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
 
 // ── Lane B composition (KPR-349 §D1/§D3) ───────────────────────────
 
+/** KPR-434 D5: where a Lane B assembly delivers the memory block — decided by the route's session semantics at the assembly seam. */
+export type ProviderMemoryPlacement = "instructions" | "turn-input";
+
 export interface ProviderInstructionsInput {
   /** Partitioned bridgeable inventory (assembly.toolInventory). */
   toolInventory: HiveToolInventoryEntry[];
@@ -426,16 +429,33 @@ export interface ProviderInstructionsInput {
    * tool-instruction lines inside the memory block (memorySections).
    */
   toolsExecutable: boolean;
+  /**
+   * KPR-434 D5: "instructions" folds the memory block into the instructions
+   * (stateless-replay providers — hive re-sends the whole context every turn,
+   * and a memory-bearing user item in provider_turn_history could be
+   * whole-turn-trimmed away); "turn-input" leaves it out (server-resumable
+   * providers — the scaffold delivers it under the digest gate). Decided at
+   * the assembly seam from sessionSemanticsForRoute; never here.
+   */
+  memoryPlacement: ProviderMemoryPlacement;
   memoryManager: MemoryManager;
   teamRoster?: TeamRoster;
   plugins: LoadedPlugin[];
 }
 
 export interface ProviderInstructionsResult {
-  /** Full Lane B instruction text, no datetime (KPR-432 — the trailer rides the turn input so provider prompt caching, prefix-based too, holds). */
+  /**
+   * Full Lane B instruction text, no datetime (KPR-432 — the trailer rides the
+   * turn input so provider prompt caching, prefix-based too, holds) and — for
+   * "turn-input" placement — no memory block (KPR-434).
+   */
   instructions: string;
-  /** Raw hot-tier block → assembly.memory.hotTierPrompt. Single-injection: already folded into instructions. */
+  /** Raw hot-tier block → assembly.memory.hotTierPrompt. Folded into `instructions` ONLY for "instructions" placement. */
   hotTierPrompt?: string;
+  /** KPR-434: the whole rendered memory block (hot tier OR legacy memory.md + listing), rendered once either way; undefined ⇔ no memory. */
+  memoryBlock?: string;
+  /** KPR-434: memoryDigest(memoryBlock); present iff memoryBlock is. */
+  memoryDigest?: string;
 }
 
 /** §D6 skills section — mirrors the SDK's function (index in context, content on demand), not its bytes. */
@@ -452,9 +472,11 @@ export function skillsSection(skillIndex: ProviderSkillIndexEntry[]): string {
  * Claude-specific fragments, plus the inventory-rendered toolkit and the
  * skills section. Layer order (spec G2, † = gated by toolsExecutable):
  * soul → archetype card → systemPrompt → constitution → team summary →
- * †toolkit → †follow-through (KPR-393) → †file-tier guidance (iff memory entry in inventory) →
- * †skills (iff index non-empty) → hot-tier/legacy memory (interior
- * tool-claim lines separately gated). No datetime trailer (KPR-432).
+ * †toolkit → †follow-through (KPR-393) → †file-tier guidance (iff memory entry in inventory;
+ * wording by memoryPlacement — KPR-434) →
+ * †skills (iff index non-empty) → hot-tier/legacy memory ONLY for
+ * memoryPlacement "instructions" (KPR-434 D5; interior tool-claim lines
+ * separately gated). No datetime trailer (KPR-432).
  */
 export async function buildProviderInstructions(
   agentConfig: AgentConfig,
@@ -484,20 +506,29 @@ export async function buildProviderInstructions(
     // Claude lane's coreServerNames check — but the inventory is Lane B's
     // source of truth for what is actually bridged).
     if (input.toolInventory.some((e) => e.name === "memory")) {
-      parts.push(fileTierMemoryGuidance("instructions"));
+      parts.push(fileTierMemoryGuidance(input.memoryPlacement === "instructions" ? "instructions" : "conversation"));
     }
     if (input.skillIndex.length > 0) {
       parts.push(skillsSection(input.skillIndex));
     }
   }
 
-  const memory = await memorySections(input.memoryManager, agentConfig.id, {
+  // KPR-434: rendered ONCE either way (renderMemoryBlock); pushed into the
+  // instructions only for stateless-replay placement.
+  const memory = await renderMemoryBlock(input.memoryManager, agentConfig.id, {
     toolsExecutable: input.toolsExecutable,
     // §D5 option (a): the bridged tool name — the model-visible name of the
     // structured-memory server's memory_recall tool on every Lane B bridge.
     recallToolName: input.toolsExecutable ? "mcp__structured-memory__memory_recall" : undefined,
   });
-  parts.push(...memory.blocks);
+  if (memory !== undefined && input.memoryPlacement === "instructions") {
+    parts.push(memory.block);
+  }
 
-  return { instructions: parts.join(SECTION_JOINER), hotTierPrompt: memory.hotTierPrompt };
+  return {
+    instructions: parts.join(SECTION_JOINER),
+    hotTierPrompt: memory?.hotTierPrompt,
+    memoryBlock: memory?.block,
+    memoryDigest: memory?.digest,
+  };
 }

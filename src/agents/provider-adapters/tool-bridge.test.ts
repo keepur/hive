@@ -724,6 +724,7 @@ describe("KPR-349 T5 — memory tools pin (real AgentRunner + bridge)", () => {
       toolInventory: inventory,
       skillIndex: [],
       toolsExecutable: true,
+      memoryPlacement: "instructions",
       memoryManager: memMgr as never,
       plugins: [],
     });
@@ -732,6 +733,7 @@ describe("KPR-349 T5 — memory tools pin (real AgentRunner + bridge)", () => {
       toolInventory: inventory.filter((e) => e.name !== "memory"),
       skillIndex: [],
       toolsExecutable: true,
+      memoryPlacement: "instructions",
       memoryManager: memMgr as never,
       plugins: [],
     });

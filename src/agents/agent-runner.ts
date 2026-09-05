@@ -1705,17 +1705,39 @@ export class AgentRunner {
   async buildProviderPrompt(opts: {
     toolInventory: HiveToolInventoryEntry[];
     toolsExecutable: boolean;
-  }): Promise<{ instructions: string; hotTierPrompt?: string; skillEntries: ProviderSkillIndexEntry[] }> {
+    /**
+     * KPR-434 D5: decided by assembleProviderTurn from the route's session
+     * semantics. Inlined union (≡ prefix-builder's ProviderMemoryPlacement) on
+     * purpose: this method is on agent-runner.d.ts, which ships in the
+     * provider-ABI d.ts closure via provider-abi.ts's RunResult re-export —
+     * naming the prefix-builder alias here would pull prefix-builder.d.ts into
+     * pkg/types/ (KPR-407 "resist growth").
+     */
+    memoryPlacement: "instructions" | "turn-input";
+  }): Promise<{
+    instructions: string;
+    hotTierPrompt?: string;
+    memoryBlock?: string;
+    memoryDigest?: string;
+    skillEntries: ProviderSkillIndexEntry[];
+  }> {
     const skillEntries = deriveProviderSkillIndex(this.buildNativeSkills());
     const result = await buildProviderInstructions(this.agentConfig, {
       toolInventory: opts.toolInventory,
       skillIndex: skillEntries,
       toolsExecutable: opts.toolsExecutable,
+      memoryPlacement: opts.memoryPlacement,
       memoryManager: this.memoryManager,
       teamRoster: this.teamRoster,
       plugins: this.plugins,
     });
-    return { instructions: result.instructions, hotTierPrompt: result.hotTierPrompt, skillEntries };
+    return {
+      instructions: result.instructions,
+      hotTierPrompt: result.hotTierPrompt,
+      memoryBlock: result.memoryBlock,
+      memoryDigest: result.memoryDigest,
+      skillEntries,
+    };
   }
 
   /**

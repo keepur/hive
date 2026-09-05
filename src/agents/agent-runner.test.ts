@@ -3978,7 +3978,7 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
   it("Lane B: buildProviderPrompt never touches the prefix cache (uncached by ruling)", async () => {
     const cache = makeSpyPrefixCache();
     const runner = makeRunnerWithCache(cache);
-    await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
+    await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false, memoryPlacement: "instructions" });
     expect(cache.getOrBuild).not.toHaveBeenCalled();
     expect(cache.invalidateAgent).not.toHaveBeenCalled();
     expect(cache.invalidateAll).not.toHaveBeenCalled();
@@ -3996,22 +3996,36 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
   it("Lane B: instructions carry no datetime trailer (KPR-432)", async () => {
     const cache = makeSpyPrefixCache();
     const runner = makeRunnerWithCache(cache);
-    const { instructions } = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
+    const { instructions } = await runner.buildProviderPrompt({
+      toolInventory: [],
+      toolsExecutable: false,
+      memoryPlacement: "instructions",
+    });
     expect(instructions).not.toContain("**Current date/time**");
   });
 
-  it("Lane B: a rendered hot-tier block is returned AND folded into instructions exactly once (single-injection)", async () => {
+  it("Lane B, instructions placement: a rendered hot-tier block is returned AND folded into instructions exactly once (single-injection)", async () => {
+    const HOT = "HOT-TIER-UNIQUE-MARKER-XYZ";
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(HOT);
+    const runner = makeRunnerWithCache(makeSpyPrefixCache(), memoryManager);
+    const r = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false, memoryPlacement: "instructions" });
+    expect(r.hotTierPrompt).toBe(HOT);
+    expect(r.memoryBlock).toBe(HOT);
+    expect(r.memoryDigest).toBe(memoryDigest(HOT));
+    expect(r.instructions.split(HOT).length - 1).toBe(1);
+  });
+
+  it("Lane B, turn-input placement (KPR-434): the block is returned and NOT folded into instructions", async () => {
     const HOT = "HOT-TIER-UNIQUE-MARKER-XYZ";
     const memoryManager = makeMockMemoryManager();
     memoryManager.getHotTierPrompt.mockResolvedValue(HOT);
     const cache = makeSpyPrefixCache();
     const runner = makeRunnerWithCache(cache, memoryManager);
-    const { instructions, hotTierPrompt } = await runner.buildProviderPrompt({
-      toolInventory: [],
-      toolsExecutable: false,
-    });
-    expect(hotTierPrompt).toBe(HOT);
-    expect(instructions.split(HOT).length - 1).toBe(1);
+    const r = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false, memoryPlacement: "turn-input" });
+    expect(r.memoryBlock).toBe(HOT);
+    expect(r.instructions).not.toContain(HOT);
+    expect(cache.getOrBuild).not.toHaveBeenCalled(); // still uncached by ruling
   });
 });
 

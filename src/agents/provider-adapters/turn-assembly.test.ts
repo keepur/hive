@@ -14,6 +14,10 @@ import {
   ProviderCircuitBreakerRegistry,
   DEFAULT_CIRCUIT_BREAKER_CONFIG,
 } from "../provider-circuit-breaker.js";
+import {
+  __registerActivePluginProviderForTests,
+  __resetPluginProvidersForTests,
+} from "./provider-registry.js";
 
 const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
 vi.mock("../../logging/logger.js", () => ({
@@ -62,6 +66,8 @@ function makeRunner(
       vi.fn(async () => ({
         instructions: "ASSEMBLED-INSTRUCTIONS",
         hotTierPrompt: "HOT-TIER-BLOCK",
+        memoryBlock: "HOT-TIER-BLOCK",
+        memoryDigest: "0123456789abcdef",
         skillEntries: [{ name: "fixture-skill", description: "d", path: "/tmp/fixture/SKILL.md" }],
       })),
   } as unknown as AgentRunner;
@@ -93,12 +99,14 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     expect(assembly.instructions).not.toBe("pilot soul\n\npilot system");
     expect(assembly.toolInventory).toEqual([bridgeable]);
     expect(assembly.omittedTools).toEqual([{ name: "Bash", transport: "claude-builtin", compatibility: "claude-only" }]);
-    expect(assembly.memory).toEqual({ hotTierPrompt: "HOT-TIER-BLOCK" });
+    expect(assembly.memory).toEqual({ hotTierPrompt: "HOT-TIER-BLOCK", block: "HOT-TIER-BLOCK", digest: "0123456789abcdef" });
+    expect(assembly.memoryInTurnInput).toBe(true); // KPR-434: openai is server-resumable
     expect(assembly.skillIndex).toEqual([{ name: "fixture-skill", description: "d", path: "/tmp/fixture/SKILL.md" }]);
     // buildProviderPrompt receives the PARTITIONED (bridgeable) inventory + toolsExecutable:true for openai.
     expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith({
       toolInventory: [bridgeable],
       toolsExecutable: true,
+      memoryPlacement: "turn-input",
     });
     // KPR-348: the assembly carries the in-process servers + resolved cwd.
     expect(assembly.inProcessServers).toBe(plantedServers);
@@ -109,7 +117,7 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     const runner = makeRunner([makeEntry()]);
     await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "gemini" });
     expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith(
-      expect.objectContaining({ toolsExecutable: true }),
+      expect.objectContaining({ toolsExecutable: true, memoryPlacement: "turn-input" }),
     );
   });
 
@@ -117,7 +125,7 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     const runner = makeRunner([makeEntry()]);
     await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "codex" });
     expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith(
-      expect.objectContaining({ toolsExecutable: true }),
+      expect.objectContaining({ toolsExecutable: true, memoryPlacement: "instructions" }),
     );
   });
 
@@ -131,7 +139,47 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     });
     const assembly = await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "openai" });
     expect(assembly.memory).toEqual({});
+    expect(assembly.memoryInTurnInput).toBe(true); // KPR-434: openai ⇒ turn-input even when there is no block to deliver
     expect(assembly.skillIndex).toEqual([]);
+  });
+
+  it("KPR-434 D5: placement by session semantics — openai/gemini turn-input, codex/grok instructions", async () => {
+    for (const [provider, expected] of [
+      ["openai", true],
+      ["gemini", true],
+      ["codex", false],
+      ["grok", false],
+    ] as const) {
+      const runner = makeRunner([makeEntry()]);
+      const assembly = await assembleProviderTurn({ runner, config: makeAgentConfig(), provider });
+      expect(assembly.memoryInTurnInput).toBe(expected);
+      expect(runner.buildProviderPrompt as unknown as Mock).toHaveBeenCalledWith(
+        expect.objectContaining({ memoryPlacement: expected ? "turn-input" : "instructions" }),
+      );
+    }
+  });
+
+  it("KPR-434 D5: a REGISTERED plugin provider follows its declared semantics (stateless ⇒ instructions, server-resumable ⇒ turn-input)", async () => {
+    try {
+      __registerActivePluginProviderForTests({
+        id: "solr",
+        module: { provider: "solr", createAdapter: () => ({}) as never },
+        semantics: "stateless-replay",
+        source: { plugin: "hive-plugin-solr" },
+      });
+      __registerActivePluginProviderForTests({
+        id: "srvr",
+        module: { provider: "srvr", createAdapter: () => ({}) as never },
+        semantics: "server-resumable",
+        source: { plugin: "hive-plugin-srvr" },
+      });
+      const stateless = await assembleProviderTurn({ runner: makeRunner([makeEntry()]), config: makeAgentConfig(), provider: "solr" });
+      expect(stateless.memoryInTurnInput).toBe(false);
+      const resumable = await assembleProviderTurn({ runner: makeRunner([makeEntry()]), config: makeAgentConfig(), provider: "srvr" });
+      expect(resumable.memoryInTurnInput).toBe(true);
+    } finally {
+      __resetPluginProvidersForTests();
+    }
   });
 
   it("KPR-348: a resolveTurnCwd throw rejects with TurnAssemblyError (classifies non-provider)", async () => {
@@ -316,6 +364,14 @@ describe("buildNestedDelegateAssembly (KPR-354 §D5.3, T4)", () => {
       sessionCwd: "/tmp/nested",
     });
     expect(sse.assembly.toolInventory[0].transport).toBe("sse");
+  });
+
+  it("KPR-434: nested delegate assembly never carries memory (memoryInTurnInput false, memory {})", () => {
+    const { assembly } = buildNestedDelegateAssembly({
+      config: makeAgentConfig(), delegate: "google", entry: makeSubagentEntry(), sessionCwd: "/tmp/nested",
+    });
+    expect(assembly.memoryInTurnInput).toBe(false);
+    expect(assembly.memory).toEqual({});
   });
 
   it("directive 2 pin: omittedTools strictly equals []", () => {

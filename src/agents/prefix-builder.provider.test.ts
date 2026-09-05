@@ -30,6 +30,8 @@ import {
   buildProviderInstructions,
   skillsSection,
   SECTION_JOINER,
+  memoryDigest,
+  MEMORY_TURN_HEADER,
   type ProviderInstructionsInput,
 } from "./prefix-builder.js";
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
@@ -157,6 +159,7 @@ function makeInput(overrides: Partial<ProviderInstructionsInput> = {}): Provider
     toolInventory: [],
     skillIndex: [],
     toolsExecutable: false,
+    memoryPlacement: "instructions",
     memoryManager: makeMemoryManager() as never,
     teamRoster: undefined,
     plugins: [],
@@ -235,11 +238,50 @@ describe("buildProviderInstructions — composition / order", () => {
     expect(joinerCount).toBe(9);
   });
 
-  it("hotTierPrompt is returned alongside the folded-in instructions", async () => {
+  it("instructions placement: hot tier folded in ONCE, and memoryBlock/memoryDigest returned too (rendered once either way)", async () => {
     const { cfg, input } = richInput(true);
-    const result = await buildProviderInstructions(cfg, input);
+    const result = await buildProviderInstructions(cfg, { ...input, memoryPlacement: "instructions" });
     expect(result.hotTierPrompt).toContain("## Your Memory");
-    expect(result.instructions).toContain(result.hotTierPrompt!);
+    expect(result.instructions.split(result.hotTierPrompt!).length - 1).toBe(1);
+    expect(result.memoryBlock).toBe(result.hotTierPrompt);
+    expect(result.memoryDigest).toBe(memoryDigest(result.memoryBlock!));
+    expect(result.instructions).toContain("already injected in this prompt");
+    expect(result.instructions).not.toContain(MEMORY_TURN_HEADER);
+  });
+
+  it("turn-input placement (KPR-434 D5): NO memory in the instructions, 'conversation' guidance, block + digest returned", async () => {
+    const { cfg, input } = richInput(true);
+    const result = await buildProviderInstructions(cfg, { ...input, memoryPlacement: "turn-input" });
+    expect(result.instructions).not.toContain("## Your Memory");
+    expect(result.instructions).not.toContain("Golden fact");
+    expect(result.instructions).toContain("delivered in the conversation");
+    expect(result.instructions).not.toContain("already injected in this prompt");
+    expect(result.memoryBlock).toContain("## Your Memory");
+    expect(result.memoryBlock).toContain("mcp__structured-memory__memory_recall"); // Lane B bridged name inside the block
+    expect(result.hotTierPrompt).toBe(result.memoryBlock);
+    expect(result.memoryDigest).toBe(memoryDigest(result.memoryBlock!));
+    // 9 sections (memory left) ⇒ 8 joiners
+    expect(result.instructions.split(SECTION_JOINER).length - 1).toBe(8);
+  });
+
+  it("turn-input placement, legacy fallback: memory.md + listing leave the instructions and ride memoryBlock", async () => {
+    const result = await buildProviderInstructions(
+      makeAgentConfig(),
+      makeInput({ toolsExecutable: true, memoryPlacement: "turn-input", memoryManager: legacyFallbackMemory() as never }),
+    );
+    expect(result.instructions).not.toContain("GOLDEN-LEGACY-MEMORY");
+    expect(result.instructions).not.toContain("## Available Memory Files");
+    expect(result.memoryBlock).toContain("GOLDEN-LEGACY-MEMORY body.");
+    expect(result.memoryBlock).toContain("/memories/agents/golden-agent/projects.md");
+    expect(result.hotTierPrompt).toBeUndefined();
+  });
+
+  it("no memory at all ⇒ memoryBlock/memoryDigest undefined on both placements", async () => {
+    for (const memoryPlacement of ["instructions", "turn-input"] as const) {
+      const result = await buildProviderInstructions(makeAgentConfig(), makeInput({ memoryPlacement }));
+      expect(result.memoryBlock).toBeUndefined();
+      expect(result.memoryDigest).toBeUndefined();
+    }
   });
 
   it("bare-bones agent → systemPrompt only, no datetime, no 'You are ' fallback", async () => {
