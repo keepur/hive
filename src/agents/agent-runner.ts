@@ -1488,8 +1488,9 @@ export class AgentRunner {
           agentId: this.agentConfig.id,
           memoryScopes: this.resolveMemoryScopes(),
           // KPR-213: write-through prefix cache invalidation. Path-aware:
-          // agents/<id>/... invalidates that agent; shared/* invalidates
-          // everyone; status/* is operational telemetry and does not affect prompts.
+          // shared/* invalidates everyone; status/* is operational telemetry
+          // and does not affect prompts; agents/<id>/* is scope `none` since
+          // KPR-434 (agent memory rides the turn input under the digest gate).
           onWrite: this.prefixCache
             ? (path, reason) => invalidatePrefixCacheByMemoryPath(this.prefixCache!, path, reason)
             : undefined,
@@ -1644,14 +1645,10 @@ export class AgentRunner {
           context: this.structuredMemoryContextRef,
           qdrantUrl: process.env.QDRANT_URL,
           ollamaUrl: process.env.OLLAMA_URL,
-          // KPR-213: structured-memory mutations affect the agent's hot-tier
-          // and therefore its prefix. Bulk paths pass null → invalidateAll.
-          onMutate: this.prefixCache
-            ? (mutAgentId, reason) => {
-                if (mutAgentId === null) this.prefixCache!.invalidateAll(reason);
-                else this.prefixCache!.invalidateAgent(mutAgentId, reason);
-              }
-            : undefined,
+          // KPR-434: no onMutate — structured-memory writes no longer touch
+          // the prefix (the hot tier left the system prompt; the digest gate
+          // in send() sees the change on the next turn). prefixCache stays
+          // for buildSystemPrompt.
         });
       }
       servers["structured-memory"] = this.structuredMemoryMcpServer;

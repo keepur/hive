@@ -277,10 +277,11 @@ async function main(): Promise<void> {
   // Initialize core systems
   const memoryManager = new MemoryManager(db);
   await memoryManager.init();
-  // KPR-213: FS-style memory writes (constitution, agent memory.md) flow
-  // through MemoryManager.write — wire prompt-prefix invalidation here.
-  // Path-aware: shared/* invalidates all; agents/<id>/* invalidates that agent;
-  // status/* is operational telemetry and does not affect prompts.
+  // KPR-213: FS-style memory writes flow through MemoryManager.write — wire
+  // prompt-prefix invalidation here. Path-aware: shared/* (constitution)
+  // invalidates all; status/* is operational telemetry and does not affect
+  // prompts; agents/<id>/* no longer touches the prefix (KPR-434 — agent
+  // memory rides the turn input under the digest gate).
   memoryManager.setOnWrite((path, reason) => {
     invalidatePrefixCacheByMemoryPath(prefixCache, path, reason);
   });
@@ -292,14 +293,6 @@ async function main(): Promise<void> {
   const memoryStore = new MemoryStore(db, memoryEmbedder);
   await memoryStore.init();
   memoryManager.memoryStore = memoryStore;
-  // KPR-213: structured-memory mutations from autoDream lifecycle and the
-  // knowledge-extractor go through this shared store instance (separate
-  // from the per-MCP stores — those wire onMutate themselves). Bulk-id
-  // paths pass `null` → invalidateAll.
-  memoryStore.setOnMutate((agentId, reason) => {
-    if (agentId === null) prefixCache.invalidateAll(reason);
-    else prefixCache.invalidateAgent(agentId, reason);
-  });
   const memoryLifecycle = new MemoryLifecycle(
     memoryStore,
     memoryEmbedder,

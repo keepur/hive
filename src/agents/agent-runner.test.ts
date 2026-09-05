@@ -103,6 +103,20 @@ vi.mock("../memory/memory-mcp-server.js", async (importOriginal) => {
   };
 });
 
+// KPR-434: the runner passes NO onMutate to the structured-memory server any
+// more (the hot tier left the prefix). Wrapping mock: capture deps, delegate.
+const structuredMemoryDepsCapture = vi.hoisted(() => ({ deps: [] as any[] }));
+vi.mock("../memory/structured-memory-mcp-server.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../memory/structured-memory-mcp-server.js")>();
+  return {
+    ...actual,
+    createStructuredMemoryMcpServer: vi.fn((deps: any) => {
+      structuredMemoryDepsCapture.deps.push(deps);
+      return actual.createStructuredMemoryMcpServer(deps);
+    }),
+  };
+});
+
 // ── Logger mock ─────────────────────────────────────────────────────
 // Hoisted so every createLogger() call shares ONE set of spies. agent-runner.ts
 // binds its logger at module load, so a factory returning a fresh object per
@@ -3431,6 +3445,40 @@ describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
     } finally {
       (config.workflow as any).enabled = orig;
     }
+  });
+
+  it("KPR-434 (T6, structural proxy): structured-memory gets NO onMutate even with a prefix cache — the runner has no listener left that could re-run the prefix builder on a mutation", async () => {
+    // Spec T6 asks "a structured-memory mutation no longer re-runs the
+    // getOrBuild builder; a constitution write still does". This suite drives
+    // no real MemoryStore mutation (the MCP-owned store is lazy-init against a
+    // fake db), so the pin is STRUCTURAL: the only wire that could re-run the
+    // builder on a mutation was `deps.onMutate → prefixCache.invalidate*`, and
+    // it is now absent. The constitution half ("shared/* still invalidates
+    // all") is pinned at the scope table in prefix-invalidation.test.ts, which
+    // is exactly the path memoryManager.setOnWrite (index.ts) still feeds.
+    structuredMemoryDepsCapture.deps.length = 0;
+    const cache = {
+      getOrBuild: vi.fn(<T>(_id: string, build: () => T) => build()),
+      invalidateAgent: vi.fn(),
+      invalidateAll: vi.fn(),
+    };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeDb(),
+      cache as never,
+    );
+    await runner.send("hello");
+    expect(structuredMemoryDepsCapture.deps).toHaveLength(1);
+    expect(structuredMemoryDepsCapture.deps[0]).not.toHaveProperty("onMutate");
+    expect(cache.getOrBuild).toHaveBeenCalledTimes(1); // the prefix cache is still read through
+    expect(cache.invalidateAgent).not.toHaveBeenCalled();
+    expect(cache.invalidateAll).not.toHaveBeenCalled();
   });
 
   it("code-search becomes an in-process SDK server when codeAccess is on", async () => {
