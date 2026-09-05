@@ -2413,6 +2413,10 @@ export class AgentManager {
           ...(injectionMode ? { injectionMode } : {}),
           // KPR-401: sparse — only aborted:true is ever written.
           ...(result.aborted ? { aborted: true as const } : {}),
+          // KPR-434 D6: sparse memory flags (the KPR-401 `aborted` shape —
+          // only ever written true; absent keys stay absent).
+          ...(result.memoryDigestInjected !== undefined ? { memoryInjected: true as const } : {}),
+          ...(result.memoryRenderFailed ? { memoryRenderFailed: true as const } : {}),
         })
         .catch(() => {
           // Already logged inside the store via withRetry. Swallow here.

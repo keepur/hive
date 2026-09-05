@@ -6495,6 +6495,54 @@ describe("AgentManager", () => {
     });
   });
 
+  describe("memory telemetry (KPR-434 D6)", () => {
+    beforeEach(() => {
+      // Redundant with the outer beforeEach prime (:467) — kept deliberately, matching the
+      // sibling KPR-389/KPR-399 describes' own re-prime so a future outer-prime removal
+      // cannot silently break this block.
+      mockConversationIndex.mockResolvedValue(undefined);
+    });
+
+    it("memoryInjected: true iff RunResult.memoryDigestInjected is set — sparse", async () => {
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ memoryDigestInjected: "0123456789abcdef" }));
+      await manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-tel-inj" }));
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc.memoryInjected).toBe(true);
+      expect(doc).not.toHaveProperty("memoryRenderFailed");
+    });
+
+    it("memoryRenderFailed: true iff RunResult.memoryRenderFailed — sparse; a plain turn carries neither key", async () => {
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ memoryRenderFailed: true }));
+      await manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-tel-fail" }));
+      expect(turnTelemetryStore.record.mock.calls[0]![0].memoryRenderFailed).toBe(true);
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).not.toHaveProperty("memoryInjected");
+
+      await manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-tel-plain" }));
+      const plain = turnTelemetryStore.record.mock.calls[1]![0];
+      expect(plain).not.toHaveProperty("memoryInjected");
+      expect(plain).not.toHaveProperty("memoryRenderFailed");
+    });
+
+    it("T1 (manager half): a memoryRenderFailed result is a SUCCESS to the breaker — never a claude fault", async () => {
+      const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ memoryRenderFailed: true }));
+      await manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-brk-soft" }));
+      expect(recordSpy).toHaveBeenCalledTimes(1);
+      expect(recordSpy.mock.calls[0]![1]).toEqual({ outcome: "success" });
+      expect(manager.circuitBreakers.stateFor("claude")!.consecutiveHardFaults).toBe(0);
+    });
+
+    it("T1 hazard pin (why send() must catch): a THROWN Mongo-shaped error out of the adapter classifies connect-fail on the claude breaker", async () => {
+      // This is the exact shape the fail-soft catch prevents (spec D2). It is
+      // pinned here — not fixed — so a future refactor that lets the render
+      // throw again shows up as a breaker fault in this row's twin above.
+      const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+      mockRunnerSend.mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:27017"));
+      await expect(manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-brk-hazard" }))).rejects.toThrow(/ECONNREFUSED/);
+      expect(recordSpy.mock.calls[0]![1]).toMatchObject({ outcome: "fault", kind: "connect-fail" });
+    });
+  });
+
   describe("conferenceRoundOf (KPR-389 D1)", () => {
     it.each([
       ["round 0", { conferenceRound: 0 }, 0],
