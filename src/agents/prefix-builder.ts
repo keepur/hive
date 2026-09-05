@@ -18,6 +18,7 @@
  * tool-handler layer.
  */
 
+import { createHash } from "node:crypto";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { MemoryManager } from "../memory/memory-manager.js";
@@ -110,12 +111,34 @@ export async function teamSummarySection(agentId: string, teamRoster?: TeamRoste
   }
 }
 
-/** KPR-327 static file-tier guidance text, verbatim (prefix-builder.ts:137-141). */
-export function fileTierMemoryGuidance(): string {
+/**
+ * KPR-434: where the agent's memory block is delivered, which decides the
+ * file-tier guidance wording (spec goal 5 — never tell the agent memory is
+ * "in this prompt" on a turn where it is not).
+ *  - "instructions": the block still rides the system prompt / Lane B
+ *    instructions (stateless-replay providers after D5).
+ *  - "conversation": the block rides the turn input under the digest gate
+ *    (Claude lane, Lane A, Lane B server-resumable).
+ */
+export type MemoryPlacement = "instructions" | "conversation";
+
+/**
+ * KPR-327 static file-tier guidance text. KPR-434: takes the memory placement.
+ * "instructions" returns the pre-434 bytes verbatim; "conversation" replaces
+ * the middle sentence. The "when present" hedge is load-bearing: an agent with
+ * `memory` in coreServers and an empty hot tier (and no legacy memory.md) gets
+ * no block at all, and the guidance must not claim a delivery that never
+ * happened (spec §8 edge 4). First and last sentences are identical in both.
+ */
+export function fileTierMemoryGuidance(placement: MemoryPlacement): string {
+  const middle =
+    placement === "instructions"
+      ? "Your hot-tier memory is already injected in this prompt — do **not** re-`view` files to rediscover what's already here. "
+      : "Your memory, when present, is delivered in the conversation — at the start of a session and again whenever it changes — do **not** re-`view` files to rediscover what's already there. ";
   return (
     "## File-Tier Memory\n" +
     "You have a file-tier memory at `/memories` (tools: view, create, str_replace, insert, delete, rename). " +
-    "Your hot-tier memory is already injected in this prompt — do **not** re-`view` files to rediscover what's already here. " +
+    middle +
     "`view` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there."
   );
 }
@@ -215,6 +238,66 @@ export async function memorySections(
   return { blocks };
 }
 
+// ── KPR-434: memory rides the turn input ────────────────────────────
+
+/** KPR-434: the memory block as ONE string (memorySections blocks joined by SECTION_JOINER) and its identity. */
+export interface RenderedMemoryBlock {
+  block: string;
+  /** 16 hex chars of sha256(block) — memoryDigest(). 64 bits; collision is the one theoretical gap path (spec §5.3). */
+  digest: string;
+  /** Raw hot-tier block passed through from memorySections (Lane B ProviderMemoryBundle carrier). */
+  hotTierPrompt?: string;
+}
+
+/** sha256 of the rendered bytes, first 16 hex chars. "Would the agent see something different" — covers legacy memory.md for free. */
+export function memoryDigest(block: string): string {
+  return createHash("sha256").update(block, "utf8").digest("hex").slice(0, 16);
+}
+
+/**
+ * KPR-434: ONE rendering for both lanes. memorySections is unchanged; this
+ * wraps its blocks into the single string the turn input carries, plus the
+ * digest the session mark compares against. `undefined` ⇔ memorySections
+ * returned no blocks (no hot tier, no legacy memory.md, no files): nothing is
+ * delivered and nothing is claimed (spec §8 edge 4).
+ */
+export async function renderMemoryBlock(
+  memoryManager: MemoryManager,
+  agentId: string,
+  opts: MemorySectionsOptions,
+): Promise<RenderedMemoryBlock | undefined> {
+  const memory = await memorySections(memoryManager, agentId, opts);
+  if (memory.blocks.length === 0) return undefined;
+  const block = memory.blocks.join(SECTION_JOINER);
+  return {
+    block,
+    digest: memoryDigest(block),
+    ...(memory.hotTierPrompt !== undefined ? { hotTierPrompt: memory.hotTierPrompt } : {}),
+  };
+}
+
+/**
+ * KPR-434 injection rule — the ONE predicate both lanes apply.
+ * fresh session ⇒ always; resumed ⇒ iff the bytes changed since the session's
+ * paired mark; no block ⇒ never. `memoryDigestSeen` undefined on a resumed
+ * session (no mark, unpaired row, failed read) ⇒ inject: duplicate, never gap.
+ */
+export function shouldInjectMemory(a: { sessionId?: string; digest?: string; memoryDigestSeen?: string }): boolean {
+  return a.digest !== undefined && (!a.sessionId || a.digest !== a.memoryDigestSeen);
+}
+
+/**
+ * Engine-authored framing line for the turn-input memory block — bytes
+ * EXPORTED so tests pin the same string the runner emits (KPR-417 precedent).
+ * Wording: "Your memory", not "hot tier" (legacy memory.md agents ride the
+ * same header); "may occasionally be repeated" is true on the documented
+ * duplicate paths (compaction, error/abort turns, races) — "is not repeated"
+ * would have been false.
+ */
+export const MEMORY_TURN_HEADER =
+  "[Your memory, current as of this turn. Delivered at the start of a session and again whenever it changes " +
+  "(it may occasionally be repeated unchanged); it supersedes any earlier memory block in this conversation.]";
+
 /**
  * Datetime trailer — the ONE definition both lanes use. KPR-432: it is no
  * longer part of any system prompt / instructions (a minute-granular line
@@ -243,11 +326,33 @@ export const TURN_TRAILER_JOINER = "\n\n";
 
 /**
  * KPR-432: compose a turn's input with the datetime trailer as its last line.
- * The single composition point for both lanes — nothing else may append a
+ * Called only through composeTurnInput (KPR-434) — nothing else may append a
  * trailer (KPR-349 §D1 "one definition" now covers placement as well as text).
  */
 export function appendDateTimeTrailer(prompt: string, now: Date = new Date()): string {
   return `${prompt}${TURN_TRAILER_JOINER}${formatDateTimeTrailer(now)}`;
+}
+
+/**
+ * KPR-434: the ONE turn-input composition point for both lanes. Memory (if
+ * any) first — long context first, the ask last — then the message, then the
+ * datetime as the last line (KPR-432 goal 3). `datetime` defaults to true;
+ * the Lane B scaffold passes the assembly's `datetimeInTurnInput` so a
+ * flag-less plugin assembly keeps its KPR-432 shape (no trailer). This is now
+ * the only production caller of appendDateTimeTrailer: KPR-432's "nothing
+ * else may append a trailer" extends to "nothing else composes memory into a
+ * turn". Memory-less: byte-identical to appendDateTimeTrailer(prompt, now).
+ */
+export function composeTurnInput(input: {
+  prompt: string;
+  memoryBlock?: string;
+  datetime?: boolean;
+  now?: Date;
+}): string {
+  const body = input.memoryBlock
+    ? `${MEMORY_TURN_HEADER}${TURN_TRAILER_JOINER}${input.memoryBlock}${TURN_TRAILER_JOINER}${input.prompt}`
+    : input.prompt;
+  return input.datetime === false ? body : appendDateTimeTrailer(body, input.now);
 }
 
 /**
@@ -289,7 +394,7 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
 
   // KPR-327 guidance gate — keyed on coreServerNames, unchanged.
   if (ctx.coreServerNames.includes("memory")) {
-    parts.push(fileTierMemoryGuidance());
+    parts.push(fileTierMemoryGuidance("instructions"));
   }
 
   // Claude lane always has tools: toolsExecutable true, bare recall name.
@@ -374,7 +479,7 @@ export async function buildProviderInstructions(
     // Claude lane's coreServerNames check — but the inventory is Lane B's
     // source of truth for what is actually bridged).
     if (input.toolInventory.some((e) => e.name === "memory")) {
-      parts.push(fileTierMemoryGuidance());
+      parts.push(fileTierMemoryGuidance("instructions"));
     }
     if (input.skillIndex.length > 0) {
       parts.push(skillsSection(input.skillIndex));

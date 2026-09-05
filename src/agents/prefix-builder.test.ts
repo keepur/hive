@@ -33,6 +33,13 @@ import {
   appendDateTimeTrailer,
   formatDateTimeTrailer,
   TURN_TRAILER_JOINER,
+  SECTION_JOINER,
+  renderMemoryBlock,
+  memoryDigest,
+  shouldInjectMemory,
+  composeTurnInput,
+  fileTierMemoryGuidance,
+  MEMORY_TURN_HEADER,
 } from "./prefix-builder.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -209,5 +216,89 @@ describe("appendDateTimeTrailer (KPR-432)", () => {
     expect(appendDateTimeTrailer("hello", now)).toMatch(
       /^hello\n\n\*\*Current date\/time\*\*: Friday, September 4, 2026 at 10:17 AM \(Pacific Time\)$/,
     );
+  });
+});
+
+describe("KPR-434 D1 helpers", () => {
+  const NOW = new Date("2026-09-05T17:17:01Z"); // 10:17 AM PDT
+  const PRE_434_GUIDANCE =
+    "## File-Tier Memory\n" +
+    "You have a file-tier memory at `/memories` (tools: view, create, str_replace, insert, delete, rename). " +
+    "Your hot-tier memory is already injected in this prompt — do **not** re-`view` files to rediscover what's already here. " +
+    "`view` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there.";
+
+  it("shouldInjectMemory truth table: no digest ⇒ false; no sessionId ⇒ true; equal ⇒ false; differ ⇒ true; resumed without a mark ⇒ true", () => {
+    expect(shouldInjectMemory({ sessionId: undefined, digest: undefined })).toBe(false);
+    expect(shouldInjectMemory({ sessionId: "s", digest: undefined, memoryDigestSeen: "d" })).toBe(false);
+    expect(shouldInjectMemory({ sessionId: undefined, digest: "d" })).toBe(true);
+    expect(shouldInjectMemory({ sessionId: "s", digest: "d", memoryDigestSeen: "d" })).toBe(false);
+    expect(shouldInjectMemory({ sessionId: "s", digest: "d", memoryDigestSeen: "e" })).toBe(true);
+    expect(shouldInjectMemory({ sessionId: "s", digest: "d", memoryDigestSeen: undefined })).toBe(true);
+  });
+
+  it("memoryDigest is stable and 16 lowercase hex chars; distinct inputs differ", () => {
+    expect(memoryDigest("## Your Memory\nA")).toBe(memoryDigest("## Your Memory\nA"));
+    expect(memoryDigest("## Your Memory\nA")).toMatch(/^[0-9a-f]{16}$/);
+    expect(memoryDigest("## Your Memory\nA")).not.toBe(memoryDigest("## Your Memory\nB"));
+  });
+
+  it("renderMemoryBlock: undefined on no blocks", async () => {
+    const mm = makeMemoryManager();
+    expect(await renderMemoryBlock(mm as any, "test-agent", { toolsExecutable: true })).toBeUndefined();
+  });
+
+  it("renderMemoryBlock: hot tier ⇒ block === hotTierPrompt, hotTierPrompt passed through, digest matches", async () => {
+    const mm = makeMemoryManager({ getHotTierPrompt: vi.fn().mockResolvedValue("## Your Memory\nHOT") });
+    const r = await renderMemoryBlock(mm as any, "test-agent", { toolsExecutable: true });
+    expect(r).toEqual({
+      block: "## Your Memory\nHOT",
+      digest: memoryDigest("## Your Memory\nHOT"),
+      hotTierPrompt: "## Your Memory\nHOT",
+    });
+    expect(mm.getHotTierPrompt).toHaveBeenCalledWith("test-agent", 3000, undefined); // Claude-lane two-arg shape preserved
+  });
+
+  it("renderMemoryBlock: legacy fallback joins memory.md + file listing with SECTION_JOINER, no hotTierPrompt key", async () => {
+    const mm = makeMemoryManager({
+      getHotTierPrompt: vi.fn().mockResolvedValue(null),
+      read: vi.fn().mockImplementation(async (p: string) => (p === "agents/test-agent/memory.md" ? "LEGACY-BODY" : null)),
+      list: vi.fn().mockResolvedValue(["memory.md", "notes.md"]),
+    });
+    const r = await renderMemoryBlock(mm as any, "test-agent", { toolsExecutable: true });
+    expect(r!.block.split(SECTION_JOINER)).toHaveLength(2);
+    expect(r!.block.startsWith("## Your Memory\nLEGACY-BODY")).toBe(true);
+    expect(r!.block).toContain("## Available Memory Files");
+    expect(r!.block).toContain("- /memories/agents/test-agent/notes.md");
+    expect(r!.digest).toBe(memoryDigest(r!.block));
+    expect(r).not.toHaveProperty("hotTierPrompt");
+  });
+
+  it("composeTurnInput bytes: memory first, message, datetime last; memory-less === appendDateTimeTrailer (KPR-432 T4 pin survives)", () => {
+    expect(composeTurnInput({ prompt: "hi", memoryBlock: "## Your Memory\nA", now: NOW })).toBe(
+      `${MEMORY_TURN_HEADER}\n\n## Your Memory\nA\n\nhi\n\n${formatDateTimeTrailer(NOW)}`,
+    );
+    expect(composeTurnInput({ prompt: "hi", now: NOW })).toBe(appendDateTimeTrailer("hi", NOW));
+    expect(composeTurnInput({ prompt: "hi", memoryBlock: "M", datetime: false })).toBe(
+      `${MEMORY_TURN_HEADER}\n\nM\n\nhi`,
+    );
+    expect(composeTurnInput({ prompt: "hi", datetime: false })).toBe("hi");
+  });
+
+  it("fileTierMemoryGuidance: 'instructions' is the pre-434 string byte-for-byte; 'conversation' tells the truth", () => {
+    expect(fileTierMemoryGuidance("instructions")).toBe(PRE_434_GUIDANCE);
+    const conv = fileTierMemoryGuidance("conversation");
+    expect(conv).toContain("delivered in the conversation");
+    expect(conv).toContain("when present");
+    expect(conv).not.toContain("already injected in this prompt");
+    expect(conv.startsWith("## File-Tier Memory\nYou have a file-tier memory at `/memories`")).toBe(true);
+    expect(conv.endsWith("record durable file-worthy material there.")).toBe(true);
+  });
+
+  it("MEMORY_TURN_HEADER wording (exported bytes, KPR-417 precedent)", () => {
+    expect(MEMORY_TURN_HEADER).toContain("Your memory");
+    expect(MEMORY_TURN_HEADER).toContain("may occasionally be repeated");
+    expect(MEMORY_TURN_HEADER).toContain("supersedes any earlier memory block");
+    expect(MEMORY_TURN_HEADER).not.toContain("hot tier");
+    expect(MEMORY_TURN_HEADER).not.toContain("is not repeated");
   });
 });
