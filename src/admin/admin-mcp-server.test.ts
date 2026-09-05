@@ -20,7 +20,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 
 // KPR-381: admin-mcp-server now imports the config singleton for the gemini
 // key. Mock it — the real config.ts throws on missing SLACK_* env at import.
-const mockConfig = vi.hoisted(() => ({ gemini: { apiKey: "test-gemini-key" } }));
+// KPR-433: the envelope surfaces gate on modelRouter.enabled (T9 flips it).
+const mockConfig = vi.hoisted(() => ({ gemini: { apiKey: "test-gemini-key" }, modelRouter: { enabled: true } }));
 vi.mock("../config.js", () => ({ config: mockConfig }));
 
 let agentDocsStore = new Map<string, any>();
@@ -1546,5 +1547,141 @@ describe("agent_model_catalog — plugin providers (KPR-394)", () => {
     });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("always resolved live");
+  });
+});
+
+describe("KPR-433 — effective envelope visibility (agent_get D3, write notes D4)", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+    mockConfig.modelRouter.enabled = true;
+  });
+  afterEach(() => {
+    mockConfig.modelRouter.enabled = true;
+  });
+  const fableDoc = (over: Record<string, any> = {}) =>
+    makeBaseAgent({
+      _id: "fable",
+      model: "claude-fable-5-1",
+      budgetUsd: 40,
+      maxTurns: 80,
+      timeoutMs: 1_800_000,
+      resourceTiers: { sonnet: { timeoutMs: 1_800_000 } },
+      effort: "max",
+      ...over,
+    });
+  const get = async (id: string) =>
+    (await getHandler(makeTools(), "agent_get")({ agent_id: id })).content[0].text as string;
+  const create = (id: string, model: string, fields: Record<string, unknown>) =>
+    getHandler(
+      makeTools(),
+      "agent_create",
+    )({ _id: id, name: id, model, homeBase: `agent-${id}`, roles: ["X"], fields });
+  const update = (id: string, args: Record<string, unknown>) =>
+    getHandler(makeTools(), "agent_update")({ agent_id: id, ...args });
+  const NOTE =
+    "Note: budgetUsd/maxTurns are inert on the Claude/router-on path (effective: $50 / 200 from tier opus). Override with resourceTiers.opus.{budgetUsd,maxTurns}. They remain live on Lane A/B and under modelRouter.enabled: false.";
+
+  it("T3: fable doc → opus block with sources + inert note naming both fields; block after Max Turns, before Spawn Budget; Effort still after", async () => {
+    agentDocsStore.set("fable", fableDoc());
+    const text = await get("fable");
+    expect(text).toContain("Budget: $40");
+    expect(text).toContain(
+      "Effective envelope (Claude lane, router-on — KPR-338/422/431): tier=opus (from model claude-fable-5-1)",
+    );
+    expect(text).toContain(
+      "  timeoutMs=1800000 (source: top-level)  maxTurns=200 (source: tier default)  budgetUsd=$50 (source: tier default)",
+    );
+    expect(text).toContain(
+      "  Note: top-level budgetUsd=$40 and maxTurns=80 are inert on this path — set resourceTiers.opus.{budgetUsd,maxTurns} to override. (Top-level values stay live on Lane A/B and router-off.)",
+    );
+    const at = (s: string) => text.indexOf(s);
+    expect(at("Max Turns: 80")).toBeLessThan(at("Effective envelope"));
+    expect(at("Effective envelope")).toBeLessThan(at("Spawn Budget:"));
+    expect(at("Effort: max")).toBeGreaterThan(at("Effective envelope"));
+  });
+  it("T3: no note when top-level equals effective (300_000 sentinel included); a resourceTiers override shows as the source", async () => {
+    agentDocsStore.set(
+      "o",
+      makeBaseAgent({ _id: "o", model: "claude-opus-5", budgetUsd: 50, maxTurns: 200, timeoutMs: 300_000 }),
+    );
+    const a = await get("o");
+    expect(a).toContain("tier=opus (from model claude-opus-5)");
+    expect(a).toContain("timeoutMs=600000 (source: tier default)");
+    expect(a).not.toContain("Note: top-level");
+    agentDocsStore.set(
+      "v",
+      fableDoc({ _id: "v", timeoutMs: 300_000, resourceTiers: { opus: { budgetUsd: 40, maxTurns: 80 } } }),
+    );
+    const b = await get("v");
+    expect(b).toContain("maxTurns=80 (source: resourceTiers.opus)  budgetUsd=$40 (source: resourceTiers.opus)");
+    expect(b).not.toContain("Note: top-level");
+  });
+  it("T3: prefixed models get the lane one-liner (Lane A vs Lane B, never a tier); router-off gets the single live line, no note", async () => {
+    agentDocsStore.set("k", makeBaseAgent({ _id: "k", model: "kimi/kimi-k3" }));
+    agentDocsStore.set("c", makeBaseAgent({ _id: "c", model: "codex/gpt-5.5:medium" }));
+    expect(await get("k")).toContain(
+      "Effective envelope: Lane A — top-level maxTurns/timeoutMs/budgetUsd are live (runner fallback).",
+    );
+    const c = await get("c");
+    expect(c).toContain(
+      "Effective envelope: Lane B — top-level maxTurns/timeoutMs are live (dispatch-loop rounds / wall-clock); budgetUsd is inert on this lane.",
+    );
+    expect(c).not.toContain("tier=");
+    mockConfig.modelRouter.enabled = false;
+    agentDocsStore.set("fable", fableDoc());
+    const off = await get("fable");
+    expect(off).toContain(
+      "Effective envelope: Claude lane, router-off — top-level maxTurns/timeoutMs/budgetUsd are live",
+    );
+    expect(off).not.toContain("tier=opus");
+    expect(off).not.toContain("Note: top-level");
+  });
+  it("T3: a garbage (non-string) model renders no effective-envelope block and never throws", async () => {
+    agentDocsStore.set("g", makeBaseAgent({ _id: "g", model: null as unknown as string }));
+    const g = await get("g");
+    expect(g).not.toContain("Effective envelope");
+    const res = await getHandler(makeTools(), "agent_get")({ agent_id: "g" });
+    expect(res.isError).toBeFalsy();
+  });
+  it("T4: agent_create notes on an inert fields value (write succeeds); not when the matching resourceTiers.<tier> field is set; not on a prefixed model", async () => {
+    const r1 = await create("f1", "claude-fable-5-1", { budgetUsd: 40 });
+    expect(r1.isError).toBeFalsy();
+    expect(r1.content[0].text).toContain("created with model claude-fable-5-1");
+    expect(r1.content[0].text).toContain(NOTE);
+    expect(agentDocsStore.get("f1").budgetUsd).toBe(40);
+    const r2 = await create("f2", "claude-fable-5-1", {
+      budgetUsd: 40,
+      maxTurns: 80,
+      resourceTiers: { opus: { budgetUsd: 40, maxTurns: 80 } },
+    });
+    expect(r2.content[0].text).not.toContain("Note:");
+    const r3 = await create("sol", "codex/gpt-5.5", { budgetUsd: 40, maxTurns: 80 });
+    expect(r3.content[0].text).not.toContain("Note:");
+  });
+  it("T4: agent_update notes on an inert maxTurns — write + version row unchanged in shape; null unset (§7.5) and unrelated writes never note", async () => {
+    agentDocsStore.set("fable", fableDoc());
+    const res = await update("fable", { fields: { maxTurns: 80 } });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toContain("Agent 'fable' updated: maxTurns. Version saved.");
+    expect(res.content[0].text).toContain(NOTE);
+    expect(agentDocsStore.get("fable").maxTurns).toBe(80);
+    expect(agentVersionsStore).toHaveLength(1);
+    expect(agentVersionsStore[0].changedFields).toEqual(["maxTurns"]);
+    expect((await update("fable", { fields: { budgetUsd: null } })).content[0].text).not.toContain("Note:");
+    expect((await update("fable", { soul: "quiet" })).content[0].text).not.toContain("Note:");
+  });
+  it("T9: model-only update opus → fable with pre-existing budgetUsd 40 notes; not under router-off; a create with no budget/turns in fields never notes", async () => {
+    agentDocsStore.set("m", makeBaseAgent({ _id: "m", model: "claude-opus-5", budgetUsd: 40, maxTurns: 200 }));
+    expect((await update("m", { fields: { model: "claude-fable-5-1" } })).content[0].text).toContain(NOTE);
+    mockConfig.modelRouter.enabled = false;
+    agentDocsStore.set("m", makeBaseAgent({ _id: "m", model: "claude-opus-5", budgetUsd: 40, maxTurns: 200 }));
+    const off = await update("m", { fields: { model: "claude-fable-5-1" } });
+    expect(off.isError).toBeFalsy();
+    expect(off.content[0].text).not.toContain("Note:");
+    mockConfig.modelRouter.enabled = true;
+    const r = await create("f3", "claude-fable-5-1", {});
+    expect(agentDocsStore.get("f3").budgetUsd).toBe(10);
+    expect(r.content[0].text).not.toContain("Note:");
   });
 });

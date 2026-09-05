@@ -19,12 +19,115 @@ import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
 import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
 import { IN_PROCESS_PORTED_SERVERS } from "../agents/in-process-servers.js";
 import { AGENT_EFFORT_LEVELS, isAgentEffort, type AgentEffort } from "../agents/agent-effort.js";
+import {
+  describeLimitSource,
+  explainResourceLimits,
+  inertTopLevelFields,
+  modelToTier,
+  resolveResourceLimits,
+  type ResourceTierOverrides,
+} from "../agents/resource-tiers.js";
+import { isLaneAProvider } from "../agents/provider-adapters/passthrough-providers.js";
 import { createLogger } from "../logging/logger.js";
 import { config as appConfig } from "../config.js";
 import { envValue } from "../agents/provider-adapters/oauth-credentials.js";
 import { getCachedGeminiModels, setCachedGeminiModels } from "./model-catalog-cache.js";
 
 const log = createLogger("admin-mcp");
+
+/**
+ * KPR-433 D3/D4: lane classification for the envelope surfaces. Bare id ⇒
+ * Claude lane (the tier envelope applies on the router-on path);
+ * `<provider>/…` ⇒ Lane A (kimi/deepseek — runner fallback, all three
+ * top-level fields live) or Lane B (every other prefix, plugin providers
+ * included — maxTurns/timeoutMs live, budgetUsd inert; KPR-338 rule (d)). An
+ * orphan prefix routes to Claude under canon but is labelled Lane B here —
+ * accepted (the doctor's provider-plugins orphan scan already warns on it).
+ */
+function laneOf(model: string): "claude" | "lane-a" | "lane-b" {
+  const slash = model.indexOf("/");
+  if (slash < 0) return "claude";
+  return isLaneAProvider(model.slice(0, slash).toLowerCase()) ? "lane-a" : "lane-b";
+}
+
+type EnvelopeDocLike = {
+  model: string;
+  resourceTiers?: ResourceTierOverrides;
+  timeoutMs?: number;
+  maxTurns?: number;
+  budgetUsd?: number;
+};
+
+/**
+ * KPR-433 D3: the agent_get "Effective envelope" lines. Claude lane +
+ * router-on: tier, per-field value + source, and an inert note only when a
+ * top-level value differs from the effective one (timeoutMs mentioned only
+ * when it is neither the 300_000 sentinel nor the effective value). Prefixed
+ * ids and router-off collapse to one lane-specific line.
+ */
+function renderEffectiveEnvelopeLines(doc: EnvelopeDocLike): string[] {
+  if (typeof doc.model !== "string") return [];
+  const lane = laneOf(doc.model);
+  if (lane === "lane-a") {
+    return ["Effective envelope: Lane A — top-level maxTurns/timeoutMs/budgetUsd are live (runner fallback)."];
+  }
+  if (lane === "lane-b") {
+    return [
+      "Effective envelope: Lane B — top-level maxTurns/timeoutMs are live (dispatch-loop rounds / wall-clock); budgetUsd is inert on this lane.",
+    ];
+  }
+  if (!appConfig.modelRouter.enabled) {
+    return [
+      "Effective envelope: Claude lane, router-off — top-level maxTurns/timeoutMs/budgetUsd are live (runner fallback); the tier envelope is not applied.",
+    ];
+  }
+  const tier = modelToTier(doc.model);
+  const e = explainResourceLimits(tier, doc.resourceTiers, doc.timeoutMs);
+  const lines = [
+    `Effective envelope (Claude lane, router-on — KPR-338/422/431): tier=${tier} (from model ${doc.model})`,
+    `  timeoutMs=${e.timeoutMs} (source: ${describeLimitSource(e.sources.timeoutMs, tier)})  maxTurns=${e.maxTurns} (source: ${describeLimitSource(e.sources.maxTurns, tier)})  budgetUsd=$${e.budgetUsd} (source: ${describeLimitSource(e.sources.budgetUsd, tier)})`,
+  ];
+  const inert = inertTopLevelFields(doc, e);
+  if (inert.length > 0) {
+    const verb = inert.length === 1 ? "is" : "are";
+    lines.push(
+      `  Note: top-level ${inert.map((f) => f.label).join(" and ")} ${verb} inert on this path — set resourceTiers.${tier}.{${inert.map((f) => f.field).join(",")}} to override. (Top-level values stay live on Lane A/B and router-off.)`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * KPR-433 D4: appended, never blocking. `doc` is the post-write document
+ * (create: the inserted doc; update: `{ ...existing, ...merged }`); `written`
+ * is this call's own fields bag (null counts as absent — §7.5);
+ * `judgeExisting` widens the check to the document's pre-existing top-level
+ * values — agent_update only, when the write changes `model` or
+ * `resourceTiers` (the envelope moves under them). agent_create passes
+ * false: it materializes budgetUsd 10 / maxTurns 200 into every doc, so only
+ * fields-supplied values may trigger there. Router-off ⇒ the fields are live
+ * ⇒ no note. Returns "" when nothing is inert.
+ */
+function envelopeWriteNote(
+  doc: EnvelopeDocLike,
+  written: { budgetUsd?: unknown; maxTurns?: unknown },
+  judgeExisting: boolean,
+): string {
+  if (typeof doc.model !== "string" || !appConfig.modelRouter.enabled || laneOf(doc.model) !== "claude") return "";
+  const tier = modelToTier(doc.model);
+  const eff = resolveResourceLimits(tier, doc.resourceTiers, doc.timeoutMs);
+  const pick = (w: unknown, existing: unknown): unknown =>
+    w !== undefined && w !== null ? w : judgeExisting ? existing : undefined;
+  const budget = pick(written.budgetUsd, doc.budgetUsd);
+  const turns = pick(written.maxTurns, doc.maxTurns);
+  const inert =
+    (typeof budget === "number" && budget !== eff.budgetUsd) || (typeof turns === "number" && turns !== eff.maxTurns);
+  if (!inert) return "";
+  return (
+    `\nNote: budgetUsd/maxTurns are inert on the Claude/router-on path (effective: $${eff.budgetUsd} / ${eff.maxTurns} from tier ${tier}). ` +
+    `Override with resourceTiers.${tier}.{budgetUsd,maxTurns}. They remain live on Lane A/B and under modelRouter.enabled: false.`
+  );
+}
 
 /**
  * KPR-184: returns an error message if `delegateServers` references any
@@ -346,6 +449,10 @@ export function buildAdminTools(deps: AdminToolDeps) {
           if (doc.subscribe?.length) lines.push(`Subscribe: [${doc.subscribe.join(", ")}]`);
           lines.push(`Budget: $${doc.budgetUsd ?? AGENT_DEFINITION_DEFAULTS.budgetUsd}`);
           lines.push(`Max Turns: ${doc.maxTurns ?? AGENT_DEFINITION_DEFAULTS.maxTurns}`);
+          // KPR-433 D3: what the runtime actually delivers on the Claude/router-on
+          // path, with sources — the raw Budget/Max Turns lines above stay (live
+          // on Lane A/B and router-off).
+          lines.push(...renderEffectiveEnvelopeLines(doc));
           // KPR-220 Phase 4: spawnBudget is the live field; maxConcurrent is
           // retained as a deprecated fallback for legacy docs.
           {
@@ -550,11 +657,15 @@ export function buildAdminTools(deps: AdminToolDeps) {
 
           await agentDefs.insertOne(doc as never);
 
+          // KPR-433 D4: fields-supplied budgetUsd/maxTurns only (the doc
+          // materializes 10 / 200 — those must not note on every create).
+          const envelopeNote = envelopeWriteNote(doc, { budgetUsd: f.budgetUsd, maxTurns: f.maxTurns }, false);
+
           return {
             content: [
               {
                 type: "text",
-                text: `Agent '${_id}' (${name}) created with model ${model}${archetype ? ` — archetype ${archetype}` : ""}. Change will take effect within 30 seconds.`,
+                text: `Agent '${_id}' (${name}) created with model ${model}${archetype ? ` — archetype ${archetype}` : ""}. Change will take effect within 30 seconds.${envelopeNote}`,
               },
             ],
           };
@@ -689,11 +800,21 @@ export function buildAdminTools(deps: AdminToolDeps) {
             { $set: { ...merged, updatedAt: new Date(), updatedBy: agentId } },
           );
 
+          // KPR-433 D4: judged against the merged document — the new model's
+          // tier when the write changes `model`; pre-existing top-level values
+          // count only when `model` or `resourceTiers` changed (the envelope
+          // moved under them). `null` in the bag = absent (§7.5).
+          const envelopeNote = envelopeWriteNote(
+            { ...existing, ...merged } as unknown as EnvelopeDocLike,
+            { budgetUsd: merged.budgetUsd, maxTurns: merged.maxTurns },
+            "model" in merged || "resourceTiers" in merged,
+          );
+
           return {
             content: [
               {
                 type: "text",
-                text: `Agent '${agent_id}' updated: ${changedFields.join(", ")}. Version saved. Change will take effect within 30 seconds.`,
+                text: `Agent '${agent_id}' updated: ${changedFields.join(", ")}. Version saved. Change will take effect within 30 seconds.${envelopeNote}`,
               },
             ],
           };
