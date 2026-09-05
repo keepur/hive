@@ -246,7 +246,7 @@ import { AgentRunner, type RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
 import { ProviderCircuitBreakerRegistry, ProviderCircuitOpenError } from "./provider-circuit-breaker.js";
 import type { WorkItem } from "../types/work-item.js";
-import { routeModel, RESOURCE_TIER_DEFAULTS } from "./model-router.js";
+import { routeModel, RESOURCE_TIER_DEFAULTS, resolveResourceLimits } from "./model-router.js";
 import type { ModelRouterResult } from "./model-router.js";
 import type { AgentProviderId } from "./provider-adapters/types.js";
 import { buildGenericDelegatePrompt, type DelegateTurnRunner } from "./provider-adapters/turn-assembly.js";
@@ -5039,18 +5039,172 @@ describe("AgentManager", () => {
         expect(effort).toBe("high");
       });
 
-      it("skips the router for sender === 'system' (scheduler/cron)", async () => {
+      it("skips the router for sender === 'system' (scheduler/cron) but delivers the static-tier envelope (KPR-431)", async () => {
+        // KPR-431 supersedes kpr-338-spec §3.2 rules (a)/(b) on this path:
+        // pre-431 this pin asserted resourceLimits undefined (runner legacy
+        // fallback). The classifier half is unchanged — never called.
         (appConfig as any).modelRouter.enabled = true;
         const item = makeWorkItem({
           text: "execute your scheduled digest task",
           sender: "system",
           source: { kind: "sms", id: "line-1", label: "May" },
         });
-        await manager.spawnTurn(makeCtx(item, "sms"));
+        const result = await manager.spawnTurn(makeCtx(item, "sms"));
+
+        expect(routeModel).not.toHaveBeenCalled();
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        // agent-a is the haiku default fixture → haiku tier, no overrides.
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.haiku);
+        expect(effort).toBeUndefined();
+        // routerCostUsd 0 on the system branch: spawnTurn adds shaping.routerCostUsd
+        // to the run cost, so the delivered cost is exactly the runner's 0.01.
+        expect(result.usage.costUsd).toBe(0.01);
+      });
+
+      it("KPR-431: system-sender envelope honors resourceTiers overrides and the top-level timeoutMs (same resolver as human turns)", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        registry._agents.set(
+          "agent-opus-ov",
+          makeAgentConfig({
+            id: "agent-opus-ov",
+            name: "OpusOverride",
+            model: "claude-opus-4-7",
+            timeoutMs: 900_000,
+            resourceTiers: { opus: { maxTurns: 300 } },
+            // Raw legacy fields deliberately thin — they must NOT leak through.
+            maxTurns: 20,
+            budgetUsd: 10,
+          }),
+        );
+        const item = makeWorkItem({
+          text: "execute your scheduled digest task",
+          sender: "system",
+          source: { kind: "sms", id: "line-1", label: "May" },
+        });
+        await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-opus-ov", threadId: "sms:line-1:kpr431-ov" });
 
         expect(routeModel).not.toHaveBeenCalled();
         const [, , , , resourceLimits] = mockRunnerSend.mock.calls[0]!;
-        expect(resourceLimits).toBeUndefined();
+        expect(resourceLimits).toEqual({ maxTurns: 300, timeoutMs: 900_000, budgetUsd: RESOURCE_TIER_DEFAULTS.opus.budgetUsd });
+      });
+
+      it("KPR-431: a system turn and a human turn on the same agent receive deep-equal limits; routeModel runs once (the human turn)", async () => {
+        // agent-s is sonnet + effort-capable, so the human turn reaches the
+        // classifier; on the haiku default it never would and the call-count
+        // assertion would be vacuous.
+        (appConfig as any).modelRouter.enabled = true;
+        // Once, not persistent: the human turn consumes exactly one classifier
+        // result, and a persistent value would leak past clearAllMocks.
+        vi.mocked(routeModel).mockResolvedValueOnce(makeRouterResult({ effort: "high" }));
+        const human = makeWorkItem({ text: "please reconcile the ledger", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn({ ...makeCtx(human, "sms"), agentId: "agent-s", threadId: "sms:line-1:kpr431-h" });
+        const sys = makeWorkItem({
+          text: "execute your scheduled digest task",
+          sender: "system",
+          source: { kind: "sms", id: "line-1", label: "May" },
+        });
+        await manager.spawnTurn({ ...makeCtx(sys, "sms"), agentId: "agent-s", threadId: "sms:line-1:kpr431-s" });
+
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        const humanLimits = mockRunnerSend.mock.calls[0]![4];
+        const systemLimits = mockRunnerSend.mock.calls[1]![4];
+        expect(humanLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(systemLimits).toEqual(humanLimits);
+        // Effort channel unchanged: the classifier's hint rides the human turn only.
+        expect(mockRunnerSend.mock.calls[0]![6]).toBe("high");
+        expect(mockRunnerSend.mock.calls[1]![6]).toBeUndefined();
+      });
+
+      it("KPR-431: a reflection turn (kind=reflection, sender system) receives the static-tier envelope", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        const threadId = "sms:line-1:kpr431-reflect";
+        await manager.spawnTurn({
+          agentId: "agent-a",
+          sessionId: undefined,
+          channelId: "line-1",
+          threadId,
+          workItem: makeWorkItem({
+            text: "[System — end of conversation reflection]",
+            threadId,
+            source: { kind: "sms" as const, id: "line-1", label: "line-1" },
+            sender: "system",
+          }),
+          channel: "sms",
+          kind: "reflection",
+        });
+
+        expect(routeModel).not.toHaveBeenCalled();
+        expect(mockRunnerSend.mock.calls[0]![4]).toEqual(RESOURCE_TIER_DEFAULTS.haiku);
+      });
+
+      it("KPR-431: a classifier fault (routeModel throws) still delivers the static-tier envelope — effort hint only is lost", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        vi.mocked(routeModel).mockRejectedValueOnce(new Error("classifier sidecar down"));
+        const item = makeWorkItem({ text: "please reconcile the ledger", source: { kind: "sms", id: "line-1", label: "May" } });
+        const result = await manager.spawnTurn({ ...makeCtx(item, "sms"), agentId: "agent-s", threadId: "sms:line-1:kpr431-catch" });
+
+        expect(result).toBeDefined(); // the turn ran — the fault was contained
+        // routerCostUsd 0 on the catch path: spawnTurn adds shaping.routerCostUsd
+        // to the runner's cost (agent-manager.ts:1882); makeRunResult's 0.01 must
+        // arrive unchanged.
+        expect(result.usage.costUsd).toBe(0.01);
+        expect(routeModel).toHaveBeenCalledTimes(1);
+        const [, , , , resourceLimits, , effort] = mockRunnerSend.mock.calls[0]!;
+        expect(resourceLimits).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+        expect(effort).toBeUndefined();
+        expect(mockLogWarn.mock.calls.some((c) => String(c[0]).includes("Model router failed"))).toBe(true);
+      });
+
+      it("KPR-431: the off-catalog effort warn-once does not fire on a system turn (branch sits before the haiku/off-catalog skip)", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        registry._agents.set(
+          "agent-offcat",
+          makeAgentConfig({ id: "agent-offcat", name: "OffCatalog", model: "claude-custom-9" }),
+        );
+        mockSupportsEffort.mockImplementation((m: string) => m !== "claude-custom-9" && !m.includes("haiku"));
+        const effortWarns = () => mockLogWarn.mock.calls.filter((c) => String(c[0]).includes("effort hints disabled"));
+
+        const sys = makeWorkItem({
+          text: "execute your scheduled digest task",
+          sender: "system",
+          source: { kind: "sms", id: "line-1", label: "May" },
+        });
+        await manager.spawnTurn({ ...makeCtx(sys, "sms"), agentId: "agent-offcat", threadId: "sms:line-1:kpr431-oc-sys" });
+        expect(effortWarns()).toHaveLength(0);
+        // custom id → sonnet tier by the substring heuristic (modelToTier).
+        expect(mockRunnerSend.mock.calls[0]![4]).toEqual(RESOURCE_TIER_DEFAULTS.sonnet);
+
+        // Control: the next HUMAN turn on the same agent reaches the skip and warns exactly once.
+        const human = makeWorkItem({ text: "hello there team", source: { kind: "sms", id: "line-1", label: "May" } });
+        await manager.spawnTurn({ ...makeCtx(human, "sms"), agentId: "agent-offcat", threadId: "sms:line-1:kpr431-oc-h" });
+        expect(effortWarns()).toHaveLength(1);
+        expect(routeModel).not.toHaveBeenCalled();
+      });
+
+      it("KPR-431 / KPR-400 E8: on a system turn the acquire-meta deadlineMs stays ≥ the delivered timeoutMs with a resourceTiers override", async () => {
+        (appConfig as any).modelRouter.enabled = true;
+        registry._agents.set(
+          "agent-opus-dl",
+          makeAgentConfig({
+            id: "agent-opus-dl",
+            name: "OpusDeadline",
+            model: "claude-opus-4-7",
+            resourceTiers: { opus: { timeoutMs: 1_800_000 } },
+          }),
+        );
+        const acquireSpy = vi.spyOn(manager.circuitBreakers, "acquire");
+        const sys = makeWorkItem({
+          text: "execute your scheduled digest task",
+          sender: "system",
+          source: { kind: "sms", id: "line-1", label: "May" },
+        });
+        await manager.spawnTurn({ ...makeCtx(sys, "sms"), agentId: "agent-opus-dl", threadId: "sms:line-1:kpr431-dl" });
+
+        const delivered = mockRunnerSend.mock.calls[0]![4] as { timeoutMs: number };
+        expect(delivered.timeoutMs).toBe(1_800_000);
+        const meta = acquireSpy.mock.calls.at(-1)![1] as { deadlineMs: number };
+        expect(meta.deadlineMs).toBeGreaterThanOrEqual(delivered.timeoutMs);
+        expect(meta.deadlineMs).toBe(1_800_000);
       });
 
       it("pilot gate: routeModel is never called for a non-Claude-static agent, even with the router enabled", async () => {
@@ -6120,7 +6274,7 @@ describe("AgentManager", () => {
       expect(docB).not.toHaveProperty("effortSource");
     });
 
-    it("T3: router-off and system-sender paths deliver the static value with resourceLimits undefined", async () => {
+    it("T3: router-off delivers the static value with resourceLimits undefined; system-sender delivers it with the static-tier envelope (KPR-431)", async () => {
       const id = setFable("xhigh");
       (appConfig as any).modelRouter.enabled = false;
       await manager.spawnTurn(makeSmsCtx({ agentId: id, threadId: "sms:line-1:t3a" }));
@@ -6136,7 +6290,11 @@ describe("AgentManager", () => {
       });
       await manager.spawnTurn(makeSmsCtx({ agentId: id, threadId: "sms:line-1:t3b", workItem: sys }));
       expect(routeModel).not.toHaveBeenCalled();
-      expect(mockRunnerSend.mock.calls[1]![4]).toBeUndefined();
+      // KPR-431: system turns carry the static-tier envelope (fable id → sonnet tier).
+      const fableCfg = registry._agents.get(id)!;
+      expect(mockRunnerSend.mock.calls[1]![4]).toEqual(
+        resolveResourceLimits("sonnet", fableCfg.resourceTiers, fableCfg.timeoutMs),
+      );
       expect(mockRunnerSend.mock.calls[1]![6]).toBe("xhigh");
       expect(turnTelemetryStore.record.mock.calls[1]![0]).toMatchObject({ effort: "xhigh", effortSource: "static" });
     });
