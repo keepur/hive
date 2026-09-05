@@ -758,3 +758,55 @@ describe("renderProviderPluginsSection (KPR-394)", () => {
     expect(out).toContain("unknown-prefix canon");
   });
 });
+
+import { resourceEnvelopesForDoctor } from "./doctor-checks.js";
+
+describe("resourceEnvelopesForDoctor (KPR-433 D5)", () => {
+  beforeEach(() => {
+    mongoMocks.connect.mockReset().mockResolvedValue(undefined);
+    mongoMocks.close.mockReset().mockResolvedValue(undefined);
+    mongoMocks.find.mockReset();
+  });
+  it("maps bare-model agents to rows (tier, sources, inert labels), skips prefixed ids, sorts by agentId, pins filter + projection", async () => {
+    mongoMocks.find.mockReturnValue({
+      toArray: async () => [
+        { _id: "sol", model: "codex/gpt-5.5", budgetUsd: 40, maxTurns: 80 },
+        {
+          _id: "fable",
+          model: "claude-fable-5-1",
+          budgetUsd: 40,
+          maxTurns: 80,
+          timeoutMs: 1_800_000,
+          resourceTiers: { sonnet: { timeoutMs: 1_800_000 } },
+        },
+        { _id: "chloe", model: "claude-opus-5", budgetUsd: 50, maxTurns: 200, timeoutMs: 300_000 },
+        { _id: "rae", model: "claude-haiku-4-5", budgetUsd: 10, maxTurns: 200, timeoutMs: 300_000 },
+      ],
+    });
+    const rows = await resourceEnvelopesForDoctor("mongodb://x", "hive_test");
+    expect(rows?.map((r) => r.agentId)).toEqual(["chloe", "fable", "rae"]);
+    expect(rows?.[1]).toEqual({
+      agentId: "fable",
+      model: "claude-fable-5-1",
+      tier: "opus",
+      timeoutMs: 1_800_000,
+      maxTurns: 200,
+      budgetUsd: 50,
+      sources: { timeoutMs: "top-level", maxTurns: "tier-default", budgetUsd: "tier-default" },
+      inert: ["budgetUsd=$40", "maxTurns=80"],
+    });
+    expect(rows?.[0].inert).toEqual([]);
+    expect(rows?.[2].inert).toEqual(["budgetUsd=$10", "maxTurns=200"]); // materialized defaults flag — accepted noise
+    expect(mongoMocks.find).toHaveBeenCalledWith(
+      { disabled: { $ne: true } },
+      { projection: { _id: 1, model: 1, resourceTiers: 1, timeoutMs: 1, maxTurns: 1, budgetUsd: 1 } },
+    );
+  });
+  it("[] when no Claude-lane agent exists; null (rendered unavailable) when Mongo is unreachable (§7.6), client still closed", async () => {
+    mongoMocks.find.mockReturnValue({ toArray: async () => [{ _id: "sol", model: "codex/gpt-5.5" }] });
+    await expect(resourceEnvelopesForDoctor("mongodb://x", "hive_test")).resolves.toEqual([]);
+    mongoMocks.connect.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    await expect(resourceEnvelopesForDoctor("mongodb://down", "hive_test")).resolves.toBeNull();
+    expect(mongoMocks.close).toHaveBeenCalledTimes(2);
+  });
+});

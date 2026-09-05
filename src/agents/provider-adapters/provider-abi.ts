@@ -117,5 +117,5 @@ export type {
   OmittedToolRecord,
 } from "./tool-transport.js";
 export type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner.js";
-export type { ResourceLimits } from "../model-router.js";
+export type { ResourceLimits } from "../resource-tiers.js";
 export type { TurnHistoryStore } from "../turn-history-store.js";

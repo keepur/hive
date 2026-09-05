@@ -1,6 +1,6 @@
 import type { AgentSchedule } from "./agent-config.js";
 import type { AgentConfig } from "./agent-config.js";
-import type { ResourceTierOverrides } from "../agents/model-router.js";
+import type { ResourceTierOverrides } from "../agents/resource-tiers.js";
 import type { AgentEffort } from "../agents/agent-effort.js";
 import { resolveAutonomy, type AutonomyFlags } from "../agents/autonomy.js";
 

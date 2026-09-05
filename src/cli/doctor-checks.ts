@@ -8,6 +8,14 @@ import {
 } from "../plugins/provider-decl.js";
 import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { LANE_B_PROVIDER_ABI_VERSION } from "../agents/provider-adapters/provider-abi.js";
+import {
+  explainResourceLimits,
+  inertTopLevelFields,
+  modelToTier,
+  type ExplainedResourceLimits,
+  type ModelTier,
+  type ResourceTierOverrides,
+} from "../agents/resource-tiers.js";
 
 export type CheckGroup = "prereq" | "config" | "agents" | "services";
 
@@ -401,6 +409,77 @@ export async function spawnCoordinatorStatsForDoctor(uri: string, dbName: string
       .sort((a, b) => a.agentId.localeCompare(b.agentId));
   } catch {
     return [];
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+/**
+ * KPR-433 D5: one Claude-lane (bare model id) agent's effective router-on
+ * envelope with per-field sources and the top-level fields that path does not
+ * deliver (rendered labels, e.g. `budgetUsd=$40`).
+ */
+export interface ResourceEnvelopeRow {
+  agentId: string;
+  model: string;
+  tier: ModelTier;
+  timeoutMs: number;
+  maxTurns: number;
+  budgetUsd: number;
+  sources: ExplainedResourceLimits["sources"];
+  inert: string[];
+}
+
+/**
+ * KPR-433 D5: read-only doctor adapter over `agent_definitions` (mirrors the
+ * sibling `*ForDoctor` fetchers — dynamic driver import, short-lived client,
+ * try/finally close). Enabled agents only; prefixed (Lane A/B) ids are
+ * skipped — the tier envelope does not apply to them. Returns `null` when
+ * Mongo is unreachable (rendered `○ unavailable`), `[]` when no Claude-lane
+ * agent exists. modelToTier is called per bare id, so an unrecognized id
+ * emits D1's warn line once mid-doctor output — accepted.
+ */
+export async function resourceEnvelopesForDoctor(uri: string, dbName: string): Promise<ResourceEnvelopeRow[] | null> {
+  const { MongoClient } = await import("mongodb");
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+  try {
+    await client.connect();
+    const docs = await client
+      .db(dbName)
+      .collection("agent_definitions")
+      .find<{
+        _id: unknown;
+        model?: unknown;
+        resourceTiers?: ResourceTierOverrides;
+        timeoutMs?: unknown;
+        maxTurns?: unknown;
+        budgetUsd?: unknown;
+      }>(
+        { disabled: { $ne: true } },
+        { projection: { _id: 1, model: 1, resourceTiers: 1, timeoutMs: 1, maxTurns: 1, budgetUsd: 1 } },
+      )
+      .toArray();
+    const rows: ResourceEnvelopeRow[] = [];
+    for (const d of docs) {
+      const model = typeof d.model === "string" ? d.model : "";
+      if (model === "" || model.includes("/")) continue;
+      const tier = modelToTier(model);
+      const timeoutMs = typeof d.timeoutMs === "number" ? d.timeoutMs : undefined;
+      const e = explainResourceLimits(tier, d.resourceTiers, timeoutMs);
+      rows.push({
+        agentId: String(d._id),
+        model,
+        tier,
+        timeoutMs: e.timeoutMs,
+        maxTurns: e.maxTurns,
+        budgetUsd: e.budgetUsd,
+        sources: e.sources,
+        inert: inertTopLevelFields({ timeoutMs, maxTurns: d.maxTurns, budgetUsd: d.budgetUsd }, e).map((f) => f.label),
+      });
+    }
+    return rows.sort((a, b) => a.agentId.localeCompare(b.agentId));
+  } catch {
+    return null;
   } finally {
     await client.close().catch(() => {});
   }

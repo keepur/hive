@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,6 +10,7 @@ import {
   renderPrefixCacheSection,
   renderPromptCacheSection,
   renderSpawnCoordinatorSection,
+  renderResourceEnvelopesSection,
   resolveRequiredEnvVars,
 } from "./doctor.js";
 import type { DatastoreIdentityReport } from "./doctor-checks.js";
@@ -990,5 +991,87 @@ describe("renderDatastoreIdentitySection (KPR-296)", () => {
     expect(out).toContain("TEMP directory");
     expect(out).toContain("○ identity sentinel absent, DB empty");
     expect(out).toContain("engine identity monitor: mismatch");
+  });
+});
+
+describe("renderResourceEnvelopesSection (KPR-433 D5, informational)", () => {
+  const capture = () => {
+    const lines: string[] = [];
+    return { lines, emit: (l: string) => lines.push(l) };
+  };
+  const fableRow = {
+    agentId: "fable",
+    model: "claude-fable-5-1",
+    tier: "opus" as const,
+    timeoutMs: 1_800_000,
+    maxTurns: 200,
+    budgetUsd: 50,
+    sources: {
+      timeoutMs: "top-level" as const,
+      maxTurns: "tier-default" as const,
+      budgetUsd: "tier-default" as const,
+    },
+    inert: ["budgetUsd=$40", "maxTurns=80"],
+  };
+  it("one line per agent with tier, sources and the ⚠ inert suffix + override note; no ⚠/note when nothing is inert", () => {
+    const a = capture();
+    renderResourceEnvelopesSection([fableRow], true, a.emit);
+    expect(a.lines[0]).toBe("\nResource envelopes (Claude lane, router-on — KPR-433)");
+    expect(a.lines[1]).toBe(
+      "  fable: tier=opus (claude-fable-5-1) timeoutMs=1800000 (top-level) maxTurns=200 (tier default) budgetUsd=$50 (tier default)  ⚠ inert: budgetUsd=$40, maxTurns=80",
+    );
+    expect(a.lines.join("\n")).toContain("override via resourceTiers.<tier>");
+    const b = capture();
+    renderResourceEnvelopesSection([{ ...fableRow, inert: [] }], true, b.emit);
+    expect(b.lines.join("\n")).not.toMatch(/⚠|note:/);
+  });
+  it("empty state, unavailable state, and T8 router-off (single line, no ⚠)", () => {
+    const empty = capture();
+    renderResourceEnvelopesSection([], true, empty.emit);
+    expect(empty.lines[1]).toBe("  ○ no Claude-lane agents");
+    const down = capture();
+    renderResourceEnvelopesSection(null, true, down.emit);
+    expect(down.lines[1]).toBe("  ○ unavailable — MongoDB unreachable");
+    const off = capture();
+    renderResourceEnvelopesSection([fableRow], false, off.emit);
+    expect(off.lines).toEqual([
+      "\nResource envelopes (Claude lane, router-on — KPR-433)",
+      "  ○ model router off — top-level maxTurns/timeoutMs/budgetUsd are live; tier envelope not applied",
+    ]);
+  });
+  it("T8: emits only — returns void (cannot alter the exit code)", () => {
+    expect(renderResourceEnvelopesSection([fableRow], true, capture().emit)).toBeUndefined();
+  });
+  it("N1: resourceEnvelopesForDoctor is only awaited when config.modelRouter.enabled is true; router-off passes [] and the renderer still gets its router-off flag", () => {
+    // runDoctor() has no dynamic-mocking harness in this file (it dynamically
+    // imports ../config.js and hits live Mongo fetchers) — every other test
+    // in this describe block verifies wiring by scanning doctor.ts source,
+    // and this one follows the same T8 idiom to pin the router-off gate.
+    const src = readFileSync(join(import.meta.dirname, "doctor.ts"), "utf-8");
+    const call = src.indexOf("resourceEnvelopesForDoctor(config.mongo.uri, config.mongo.dbName)");
+    const gateStart = src.lastIndexOf("const envelopeRows = config.modelRouter.enabled");
+    expect(call).toBeGreaterThan(-1);
+    expect(gateStart).toBeGreaterThan(-1);
+    // The fetcher call must be textually inside the ternary's truthy branch,
+    // not a bare unconditional await — i.e. it appears after the ternary
+    // condition and before the `: []` fallback that renders under router-off.
+    const fallback = src.indexOf(": []", gateStart);
+    expect(fallback).toBeGreaterThan(-1);
+    expect(call).toBeGreaterThan(gateStart);
+    expect(call).toBeLessThan(fallback);
+    expect(src.slice(gateStart, fallback)).not.toMatch(/^\s*const envelopeRows = await resourceEnvelopesForDoctor/m);
+  });
+  it("T8: wired after Spawn coordinator, skipped line in the config-not-loaded branch, no allPassed in the hunk", () => {
+    const src = readFileSync(join(import.meta.dirname, "doctor.ts"), "utf-8");
+    const spawn = src.indexOf("renderSpawnCoordinatorSection(coordinatorRows);");
+    const envelopes = src.indexOf("renderResourceEnvelopesSection(envelopeRows, config.modelRouter.enabled);");
+    const breaker = src.indexOf("renderCircuitBreakerSection(breakerRows);");
+    expect(spawn).toBeGreaterThan(-1);
+    expect(envelopes).toBeGreaterThan(spawn);
+    expect(breaker).toBeGreaterThan(envelopes);
+    expect(src.slice(spawn, breaker)).not.toMatch(/allPassed\s*=/); // no assignment in the hunk — comments (doctor.ts:709-710 and the inserted KPR-296 note) may name it
+    expect(src).toContain(
+      'console.log("\\nResource envelopes (Claude lane, router-on — KPR-433)");\n    console.log("  ○ skipped: config not loaded");',
+    );
   });
 });
