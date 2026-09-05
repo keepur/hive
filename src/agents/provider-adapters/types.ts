@@ -137,6 +137,15 @@ export interface AgentProviderTurnRequest {
    * PR #402 fix, timeoutMs as the wall-clock turn deadline.)
    */
   effort?: TurnEffort;
+  /**
+   * KPR-434: the session's persisted memory digest (`sessions.memoryDigest`),
+   * resolved post-lock by the manager and PAIRED to `sessionId` (undefined
+   * whenever the row does not name the session being resumed). The Claude
+   * adapter forwards it to runner.send; the Lane B scaffold reads it for
+   * server-resumable assemblies. Additive optional — frozen provider ABI, no
+   * version bump.
+   */
+  memoryDigestSeen?: string;
 }
 
 export interface AgentProviderAdapter {

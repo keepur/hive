@@ -8,7 +8,10 @@
  * datetime is no longer part of any system prompt or Lane B instructions —
  * it would invalidate the API prompt cache (a strict tools → system →
  * messages prefix match) on every minute rollover. Both lanes append it to
- * the TURN INPUT via appendDateTimeTrailer (below) instead.
+ * the TURN INPUT via appendDateTimeTrailer (below) instead. KPR-434: agent
+ * memory is not in the prefix either — it rides the turn input under a
+ * per-session digest gate (composeTurnInput / renderMemoryBlock below), so a
+ * memory write never rewrites the transcript's cache.
  *
  * Inputs are deterministic per agent: agentConfig is constructor-stable and
  * the context fields (memoryManager, teamRoster, plugins, skillIndex,
@@ -356,10 +359,15 @@ export function composeTurnInput(input: {
 }
 
 /**
- * Build the cacheable prefix for an agent. Signature and output UNCHANGED
- * (KPR-349 golden gate) — now a composition of the exported helpers.
+ * Build the cacheable prefix for an agent. KPR-434: agent memory is NO
+ * LONGER part of the prefix — every hot-tier / legacy memory.md write used to
+ * rewrite these bytes, and the API prompt cache (a strict tools → system →
+ * messages prefix match) then re-wrote the whole transcript. Memory rides the
+ * TURN INPUT under the digest gate instead (AgentRunner.send →
+ * renderMemoryBlock / shouldInjectMemory / composeTurnInput). The KPR-349
+ * golden gate was re-pinned at this shape in KPR-434 (D7).
  * Layer order: soul → archetype card → systemPrompt → constitution →
- * team summary → toolkit → file-tier guidance → hot-tier/legacy memory.
+ * team summary → toolkit → file-tier guidance.
  */
 export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildContext): Promise<string> {
   const parts: string[] = [];
@@ -392,14 +400,11 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
     }),
   );
 
-  // KPR-327 guidance gate — keyed on coreServerNames, unchanged.
+  // KPR-327 guidance gate — keyed on coreServerNames, unchanged. KPR-434:
+  // "conversation" placement — the block is delivered in the turn input.
   if (ctx.coreServerNames.includes("memory")) {
-    parts.push(fileTierMemoryGuidance("instructions"));
+    parts.push(fileTierMemoryGuidance("conversation"));
   }
-
-  // Claude lane always has tools: toolsExecutable true, bare recall name.
-  const memory = await memorySections(ctx.memoryManager, agentConfig.id, { toolsExecutable: true });
-  parts.push(...memory.blocks);
 
   return parts.join(SECTION_JOINER);
 }

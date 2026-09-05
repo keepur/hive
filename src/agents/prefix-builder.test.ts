@@ -163,27 +163,30 @@ describe("buildPrefix", () => {
     expect(out).not.toContain("## Your Memory");
   });
 
-  it("uses hot-tier prompt when MemoryManager returns one", async () => {
+  it("KPR-434: a rendered hot tier never enters the prefix (it rides the turn input)", async () => {
     const mm = makeMemoryManager({
-      getHotTierPrompt: vi.fn().mockResolvedValue("HOT-TIER-MARKER"),
+      getHotTierPrompt: vi.fn().mockResolvedValue("## Your Memory\nHOT-TIER-MARKER"),
     });
-    const cfg = makeAgentConfig();
-    const out = await buildPrefix(cfg, makeCtx({ memoryManager: mm as any }));
-    expect(out).toContain("HOT-TIER-MARKER");
+    const out = await buildPrefix(makeAgentConfig(), makeCtx({ memoryManager: mm as any, coreServerNames: ["memory"] }));
+    expect(out).not.toContain("HOT-TIER-MARKER");
+    expect(out).not.toContain("## Your Memory");
+    expect(out).toContain("delivered in the conversation");
+    expect(out).not.toContain("already injected in this prompt");
+    expect(mm.getHotTierPrompt).not.toHaveBeenCalled(); // the prefix reads no agent memory at all
   });
 
-  it("falls back to legacy memory.md blob when no hot-tier prompt", async () => {
+  it("KPR-434: legacy memory.md + file listing never enter the prefix either", async () => {
     const mm = makeMemoryManager({
       getHotTierPrompt: vi.fn().mockResolvedValue(null),
-      read: vi.fn().mockImplementation(async (path: string) => {
-        if (path === "agents/test-agent/memory.md") return "LEGACY-MEMORY-BODY";
-        return null;
-      }),
-      list: vi.fn().mockResolvedValue([]),
+      read: vi.fn().mockImplementation(async (path: string) => (path === "agents/test-agent/memory.md" ? "LEGACY-MEMORY-BODY" : null)),
+      list: vi.fn().mockResolvedValue(["memory.md", "notes.md"]),
     });
-    const cfg = makeAgentConfig();
-    const out = await buildPrefix(cfg, makeCtx({ memoryManager: mm as any }));
-    expect(out).toContain("LEGACY-MEMORY-BODY");
+    const out = await buildPrefix(makeAgentConfig(), makeCtx({ memoryManager: mm as any }));
+    expect(out).not.toContain("LEGACY-MEMORY-BODY");
+    expect(out).not.toContain("## Available Memory Files");
+    expect(mm.list).not.toHaveBeenCalled();
+    expect(mm.read).toHaveBeenCalledWith("shared/constitution.md"); // the ONLY memoryManager read left in the prefix
+    expect(mm.read).not.toHaveBeenCalledWith("agents/test-agent/memory.md");
   });
 
   it("KPR-327: includes memory-first block only when agent has the memory server", async () => {
@@ -196,15 +199,15 @@ describe("buildPrefix", () => {
     expect(without).not.toContain("## File-Tier Memory");
   });
 
-  it("KPR-327: legacy fallback references view with /memories paths, not memory_read", async () => {
+  it("KPR-327/KPR-434: legacy fallback block references view with /memories paths, not memory_read", async () => {
     const mm = makeMemoryManager({
       getHotTierPrompt: vi.fn().mockResolvedValue(null),
       list: vi.fn().mockResolvedValue(["notes.md"]),
     });
-    const out = await buildPrefix(makeAgentConfig(), makeCtx({ memoryManager: mm as any }));
-    expect(out).toContain("- /memories/agents/test-agent/notes.md");
-    expect(out).toContain("`view`");
-    expect(out).not.toContain("memory_read");
+    const r = await renderMemoryBlock(mm as any, "test-agent", { toolsExecutable: true });
+    expect(r!.block).toContain("- /memories/agents/test-agent/notes.md");
+    expect(r!.block).toContain("`view`");
+    expect(r!.block).not.toContain("memory_read");
   });
 });
 

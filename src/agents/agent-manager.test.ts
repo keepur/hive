@@ -900,6 +900,7 @@ describe("AgentManager", () => {
         undefined,
         undefined,
         undefined,
+        undefined,
       );
     });
   });
@@ -5291,8 +5292,10 @@ describe("AgentManager", () => {
         expect(mockCodexConstructor).not.toHaveBeenCalled();
         expect(mockGeminiConstructor).not.toHaveBeenCalled();
         // KPR-338: send carries no per-turn model — arity pin proves no extra
-        // positional survives (the type system enforces the rest).
-        expect(mockRunnerSend.mock.calls[0]!.length).toBe(7);
+        // positional survives (the type system enforces the rest). KPR-434:
+        // 8, not 7 — the adapter forwards request.memoryDigestSeen as the last
+        // positional on every call (undefined here: fresh SMS thread, no mark).
+        expect(mockRunnerSend.mock.calls[0]!.length).toBe(8);
         // Telemetry + audit both read the agent's STATIC model, not the route junk.
         expect(turnTelemetryStore.record).toHaveBeenCalledWith(
           expect.objectContaining({ model: "claude-sonnet-4-6" }),
