@@ -243,6 +243,24 @@ export interface MemoryMarkInput {
   text: string;
   /** !!finalAttemptSessionId — the finalized attempt launched with a handle. */
   resumedSession: boolean;
+  /**
+   * KPR-434 review fix: `sessionSemanticsForRoute(route.provider) === "client-transcript"`
+   * (claude + Lane A kimi/deepseek — the SAME gate `abortPersist` already applies to its
+   * own `hasObservedProgress` use, `agent-manager.ts` ~:2606). R2's "the request was sent
+   * ⇒ the transcript carries the block" reasoning is a CLIENT-TRANSCRIPT fact: those
+   * providers flush a locally/CLI-held transcript incrementally, so a partial turn's
+   * injected memory really is retained across the error. On server-resumable Lane B
+   * (openai/gemini), an errored/interrupted turn's `sessionId` reverts to
+   * `fallbackSessionId` — the PRE-turn head, unchanged — because the vendor only
+   * commits a new resumable point on a clean completion; nothing was durably chained
+   * forward, so a tool call before the failure proves nothing about what the NEXT
+   * resume will see. Without this gate, R2 would advance the mark on such a turn,
+   * the next resume would skip re-injecting (digest unchanged), and the agent would
+   * run memory-less against a chain that never received the block — the ticket's
+   * covering invariant turned inside out into a gap. `false` here forces R2 down to
+   * a bare `!error`, matching pre-434 "on this provider only a clean turn counts."
+   */
+  clientTranscript: boolean;
 }
 
 /**
@@ -252,9 +270,13 @@ export interface MemoryMarkInput {
  *  R1 compaction wins — the block may sit on either side of the boundary; one
  *     duplicate beats a gap (⚠A6).
  *  R2 "request was sent" proof = hasObservedProgress (KPR-398, the SAME
- *     predicate the abort-persist gate uses) — error_max_turns /
- *     error_max_budget_usd set `error` on a delivered turn whose transcript
- *     certainly carries the block; a bare !error would re-inject every turn.
+ *     predicate the abort-persist gate uses), but ONLY on `clientTranscript`
+ *     routes — error_max_turns / error_max_budget_usd set `error` on a
+ *     delivered turn whose transcript certainly carries the block; a bare
+ *     `!error` would re-inject every turn. On a non-client-transcript route
+ *     (server-resumable Lane B) an error means no new resumable point was
+ *     committed at all, so progress proves nothing there — see
+ *     `MemoryMarkInput.clientTranscript`'s doc comment.
  *  R3 advance only to the digest this turn actually injected — never a
  *     post-turn re-render (that would swallow a sibling's concurrent write, ⚠A5).
  *  R4 a fresh session whose first turn delivered nothing (empty hot tier,
@@ -266,7 +288,7 @@ export interface MemoryMarkInput {
  */
 export function resolveMemoryMark(a: MemoryMarkInput): string | null | undefined {
   if (a.compactions > 0) return null; // R1
-  const delivered = !a.error || hasObservedProgress(a); // R2
+  const delivered = !a.error || (a.clientTranscript && hasObservedProgress(a)); // R2
   if (a.injected !== undefined && delivered) return a.injected; // R3
   if (!a.resumedSession) return null; // R4
   return undefined; // R5
@@ -2624,6 +2646,7 @@ export class AgentManager {
       streamed: result.streamed,
       text: result.text,
       resumedSession,
+      clientTranscript: sessionSemanticsForRoute(route.provider) === "client-transcript",
     });
 
     if (result.sessionId && !result.aborted) {

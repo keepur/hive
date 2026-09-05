@@ -6773,6 +6773,36 @@ describe("AgentManager", () => {
       await manager.spawnTurn(ctxOf("sms:line-1:kpr434-mint", "s-old"));
       expect(sessionStore.set).not.toHaveBeenCalled();
     });
+
+    // Review fix (post-implementation, fable round 2): on a server-resumable
+    // Lane B route, an errored turn that made progress must NOT advance the
+    // mark — the vendor never committed a new resumable point (sessionId
+    // reverts to the same id this attempt resumed), so the next resume never
+    // actually saw the injected block. R2's client-transcript-only gate keeps
+    // the mark untouched (R5) here instead of falsely advancing it.
+    it("openai, resumed, errored WITH progress, unchanged id: the mark is left untouched, not advanced (R2 gated off Lane B)", async () => {
+      registry._agents.set(
+        "openai-pilot",
+        makeAgentConfig({ id: "openai-pilot", name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+      );
+      const ctx: TurnContext = {
+        ...makeSmsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr434-openai-noadvance", sessionId: "resp_1" }),
+        sessionProvider: "openai",
+      };
+      sessionStore._sessions.set(`openai-pilot:${ctx.threadId}`, {
+        sessionId: "resp_1",
+        provider: "openai",
+        memoryDigest: "dOld",
+      });
+      // Mid-loop failure after a tool call: sessionId reverts to the fallback
+      // (the pre-turn head, "resp_1" — unchanged), error set, real progress.
+      mockOpenAIRunTurn.mockResolvedValueOnce(
+        makeRunResult({ error: "error_max_turns", sessionId: "resp_1", toolCalls: 3, memoryDigestInjected: "dNew" }),
+      );
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.set).toHaveBeenCalledWith("openai-pilot", ctx.threadId, "resp_1", "openai", expect.anything(), undefined);
+      expect(sessionStore._sessions.get(`openai-pilot:${ctx.threadId}`)?.memoryDigest).toBe("dOld"); // never overwritten to "dNew"
+    });
   });
 
   describe("conferenceRoundOf (KPR-389 D1)", () => {
@@ -6987,7 +7017,10 @@ describe("AgentManager — KPR-390 worker pool handshake", () => {
 });
 
 describe("resolveMemoryMark (KPR-434 D4.2) — truth table, one row per rule", () => {
-  const base = { compactions: 0, toolCalls: 0, streamed: false, text: "", resumedSession: true };
+  // clientTranscript: true ⇒ claude/Lane-A shape — R2's hasObservedProgress
+  // relaxation applies (the original rows below, unchanged). A dedicated
+  // block further down pins clientTranscript: false (server-resumable Lane B).
+  const base = { compactions: 0, toolCalls: 0, streamed: false, text: "", resumedSession: true, clientTranscript: true };
 
   it("R1: compaction wins — null even when this turn injected", () => {
     expect(resolveMemoryMark({ ...base, injected: "d", compactions: 1 })).toBeNull();
@@ -7017,5 +7050,31 @@ describe("resolveMemoryMark (KPR-434 D4.2) — truth table, one row per rule", (
   it("`aborted` is read by no rule", () => {
     expect(resolveMemoryMark({ ...base, injected: "d", aborted: true })).toBe("d");
     expect(resolveMemoryMark({ ...base, aborted: true, resumedSession: false })).toBeNull();
+  });
+
+  // Review fix (post-implementation, fable round 2): R2's progress relaxation
+  // is a client-transcript-only fact. On a server-resumable Lane B route
+  // (openai/gemini) an errored/interrupted turn's persisted sessionId reverts
+  // to the PRE-turn head (fallbackSessionId) — the vendor commits no new
+  // resumable point at all — so a tool call before the failure proves nothing
+  // about what the NEXT resume will see. Without this gate the mark would
+  // advance while the actual chain the next turn resumes from never received
+  // the block: a gap, not a duplicate.
+  describe("clientTranscript: false (server-resumable Lane B — openai/gemini)", () => {
+    const nonCT = { ...base, clientTranscript: false };
+
+    it("R2 does NOT relax on error even with full progress — mark is left untouched (R5), never advanced", () => {
+      expect(resolveMemoryMark({ ...nonCT, injected: "d", error: "error_max_turns", toolCalls: 12, streamed: true, text: "partial" })).toBeUndefined();
+    });
+    it("a FRESH turn with progress+error still nulls (R4 over the relaxed-R2 residual) — never inherits the old mark", () => {
+      expect(resolveMemoryMark({ ...nonCT, injected: "d", error: "boom", toolCalls: 3, resumedSession: false })).toBeNull();
+    });
+    it("a clean (error-less) turn still advances the mark normally — the gate only narrows the error path", () => {
+      expect(resolveMemoryMark({ ...nonCT, injected: "d" })).toBe("d");
+    });
+    it("compaction (R1) and resumed-nothing-new (R5) are unaffected by the gate", () => {
+      expect(resolveMemoryMark({ ...nonCT, injected: "d", compactions: 1 })).toBeNull();
+      expect(resolveMemoryMark(nonCT)).toBeUndefined();
+    });
   });
 });

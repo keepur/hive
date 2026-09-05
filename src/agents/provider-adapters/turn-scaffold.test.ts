@@ -583,6 +583,17 @@ describe("KPR-434: memory block on the turn input (server-resumable assemblies)"
     expect(flagged.seen()).toBe(appendDateTimeTrailer("hello", NOW));
   });
 
+  it("hardening (review): digest without a paired block delivers nothing and never claims memoryDigestInjected", async () => {
+    // Engine-built assemblies always pair block+digest (turn-assembly.ts); a
+    // hand-built or malformed plugin assembly might not — this must not stamp
+    // the mark as advanced for a block the model never actually received.
+    const mismatched = memAssembly({ memory: { digest: "digest-only-no-block" } });
+    const { adapter, seen } = capture(mismatched);
+    const result = await adapter.runTurn(req({ prompt: "hello" }));
+    expect(seen()).toBe(appendDateTimeTrailer("hello", NOW));
+    expect(result).not.toHaveProperty("memoryDigestInjected");
+  });
+
   it("the compose still precedes ToolBridge construction: a pre-request throw still closes the bridge exactly once", async () => {
     const adapter = new TestScaffoldAdapter(
       () => {

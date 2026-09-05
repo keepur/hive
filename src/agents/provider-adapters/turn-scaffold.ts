@@ -215,7 +215,11 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
         outputTokens: totals.outputTokens,
         cacheReadTokens: totals.cacheReadTokens,
         toolStats: bridge.stats,
-        memoryDigestInjected: injectMemory ? a.memory?.digest : undefined,
+        // Hardening (review): key on `block`, not just `digest` — an engine-built
+        // assembly always pairs the two (turn-assembly.ts), but a plugin-built one
+        // carrying `digest` without `block` would otherwise deliver nothing to the
+        // model while still stamping the mark as advanced.
+        memoryDigestInjected: injectMemory && a.memory?.block !== undefined ? a.memory.digest : undefined,
       });
 
     const abortedResult = (): RunResult =>
